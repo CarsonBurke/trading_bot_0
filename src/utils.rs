@@ -16,7 +16,7 @@ pub fn convert_historical(data: &Vec<historical::Bar>) -> Data {
 
 /// Get the relative strength index value for each data point
 pub fn get_rsi_values(data: &Data) -> Data {
-    let diffs = get_differences(&data);
+    let diffs = get_differences(data);
 
     let mut upwards = Vec::new();
     let mut downwards = Vec::new();
@@ -40,9 +40,11 @@ pub fn get_rsi_values(data: &Data) -> Data {
     let rsi_values = upward_avg
         .iter()
         .zip(downward_avg.iter())
-        .map(|(up, down)| 100. * up / (up + down))
+        .map(|(up, down)| {
+            let rs = up / down;
+            100. - (100. / (1. + rs))
+        })
         .collect();
-    println!("RSI values {rsi_values:?}");
     rsi_values
 }
 
@@ -67,9 +69,9 @@ pub fn ema(data: &Data, alpha: f64) -> Data {
 
         let previous = {
             let (previous_index, overflowed) = index.overflowing_sub(1);
-
             if overflowed {
-                0.
+                averages.push(*value * alpha);
+                continue;
             } else {
                 averages[previous_index]
             }
@@ -77,7 +79,7 @@ pub fn ema(data: &Data, alpha: f64) -> Data {
         let avg = *value * alpha + previous * (1. - alpha);
         averages.push(avg);
     }
-    println!("EWMs {averages:?}");
+    println!("EMA: {averages:?}");
     averages
 }
 
@@ -94,7 +96,7 @@ pub fn get_differences(data: &Data) -> Data {
                 data[previous_index]
             }
         };
-        diff.push(previous - value)
+        diff.push(value - previous)
     }
 
     diff
@@ -210,13 +212,16 @@ pub fn rsi_chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
 
     chart.configure_mesh().light_line_style(WHITE).draw()?;
 
-    chart.draw_series(AreaSeries::new(
-        data.iter()
-            .enumerate()
-            .map(|(index, value)| (index as u32, *value as f32)),
+    chart.draw_series(
+        AreaSeries::new(
+            data.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value as f32)),
             0.0,
             BLUE.mix(0.2),
-    ).border_style(BLUE))?;
+        )
+        .border_style(BLUE),
+    )?;
 
     root.present()
         .expect("unable to write chart to file, perhaps there is no directory");
