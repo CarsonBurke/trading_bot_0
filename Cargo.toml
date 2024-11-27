@@ -6,4 +6,6 @@ edition = "2021"
 [dependencies]
 clap = "4.5.21"
 ibapi = "1.0.3"
+ordered-float = "4.5.0"
+plotters = "0.3.7"
 time = "0.3.36"
