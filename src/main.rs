@@ -3,7 +3,7 @@ use ibapi::{
     accounts::{AccountSummaries, AccountSummaryTags}, client::Subscription, contracts::Contract, market_data::{historical::{BarSize, HistoricalData, ToDuration, WhatToShow}, realtime}, orders::{order_builder, Action, PlaceOrder}, Client
 };
 use time::{macros::datetime, OffsetDateTime};
-use utils::{chart, convert_historical, get_rsi_values, rsi_chart};
+use utils::{candle_chart, chart, convert_historical, get_rsi_values, rsi_chart};
 
 mod constants;
 mod utils;
@@ -28,6 +28,8 @@ fn main() {
 
     chart(&data).unwrap();
     rsi_chart(&rsi_values).unwrap();
+
+    candle_chart(&historical_data.bars).unwrap();
 }
 
 fn account_info(client: &Client) {
