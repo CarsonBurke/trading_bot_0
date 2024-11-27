@@ -79,7 +79,6 @@ pub fn ema(data: &Data, alpha: f64) -> Data {
         let avg = *value * alpha + previous * (1. - alpha);
         averages.push(avg);
     }
-    println!("EMA: {averages:?}");
     averages
 }
 
@@ -227,4 +226,46 @@ pub fn rsi_chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
         .expect("unable to write chart to file, perhaps there is no directory");
 
     Ok(())
+}
+
+pub fn buy_sell_chart(
+    buy_indexes: Vec<(usize, f64)>,
+    sell_indexes: Vec<(usize, f64)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new("charts/buy_sell_chart.png", (1024, 768)).into_drawing_area();
+
+    let mut filled_buy = buy_indexes.iter().map(|(index, price)| *price as f32).collect::<Vec<f32>>();
+    let mut filled_sell = sell_indexes.iter().map(|(index, price)| *price as f32).collect::<Vec<f32>>();
+
+    let mut chart = plotters::chart::ChartBuilder::on(&root)
+        .caption("RSI", ("sans-serif", 20))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(30)
+        .build_cartesian_2d(0..filled_buy.len() as u32, 0f32..100f32)?;
+
+    chart.configure_mesh().light_line_style(WHITE).draw()?;
+
+    chart.draw_series(
+        AreaSeries::new(
+            filled_buy.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value as f32)),
+            0.0,
+            BLUE.mix(0.2),
+        )
+        .border_style(BLUE),
+    )?;
+
+    root.present()
+        .expect("unable to write chart to file, perhaps there is no directory");
+
+    Ok(())
+}
+
+/// Returns how many stocks can be bought for a given a total price and a max amount
+pub fn round_to_stock(price: f64, max: f64) -> (f64, u32) {
+    let quantity = (max / price).floor() as u32;
+
+    (price * quantity as f64, quantity)
 }

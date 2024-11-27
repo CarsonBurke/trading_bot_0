@@ -3,6 +3,7 @@ use ibapi::{
     accounts::{AccountSummaries, AccountSummaryTags}, client::Subscription, contracts::Contract, market_data::{historical::{BarSize, HistoricalData, ToDuration, WhatToShow}, realtime}, orders::{order_builder, Action, PlaceOrder}, Client
 };
 use time::{macros::datetime, OffsetDateTime};
+use types::Account;
 use utils::{candle_chart, chart, convert_historical, get_rsi_values, rsi_chart};
 
 mod constants;
@@ -18,6 +19,9 @@ fn main() {
     println!("Successfully connected to TWS at {connection_url}");
 
     account_info(&client);
+
+    let mut account = Account::default();
+
     let historical_data = historical_data(&client);
     // market_depth(&client);
     // bars(&client);
@@ -30,6 +34,8 @@ fn main() {
     rsi_chart(&rsi_values).unwrap();
 
     candle_chart(&historical_data.bars).unwrap();
+
+    strategies::basic::basic(&client, &data, &mut account);
 }
 
 fn account_info(client: &Client) {
@@ -61,7 +67,7 @@ fn historical_data(client: &Client) -> HistoricalData {
         )
         .expect("historical data request failed");
 
-    println!(
+/*     println!(
         "start: {:?}, end: {:?}",
         historical_data.start, historical_data.end
     );
@@ -70,7 +76,7 @@ fn historical_data(client: &Client) -> HistoricalData {
         println!("{bar:?}");
     }
 
-    println!("data points: {}", historical_data.bars.len());
+    println!("data points: {}", historical_data.bars.len()); */
 
     historical_data
 }
