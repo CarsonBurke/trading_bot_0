@@ -8,13 +8,12 @@ use ibapi::{
 };
 
 use crate::{
-    constants::{self, rsi, BUY_WEIGHT, MAX_CHANGE, SELL_WEIGHT},
+    constants::{self, rsi, BUY_WEIGHT, MAX_CHANGE, SELL_WEIGHT, TICKER},
     types::{Account, Data, Position},
     utils::{assets_chart, buy_sell_chart, get_rsi_values, round_to_stock},
 };
 
 pub fn basic(client: &Client, data: &Data, account: &mut Account) {
-    let ticker = "NVDA";
 
     let mut total_assets = Vec::new();
     let mut positioned_assets = Vec::new();
@@ -33,10 +32,10 @@ pub fn basic(client: &Client, data: &Data, account: &mut Account) {
     account.cash = 10_000.;
     account
         .positions
-        .insert(ticker.to_string(), Position::default());
+        .insert(TICKER.to_string(), Position::default());
 
     for ((index, price), rsi) in data.iter().enumerate().zip(rsi_values) {
-        let position = account.positions.get_mut(ticker).unwrap();
+        let position = account.positions.get_mut(TICKER).unwrap();
 
         let positioned = position.value_with_price(*price);
         positioned_assets.push(positioned);
@@ -120,7 +119,7 @@ pub fn basic(client: &Client, data: &Data, account: &mut Account) {
     let cash = account.cash;
     println!("ended up with cash: {cash:?}");
 
-    let value = account.positions.get(ticker).unwrap().quantity as f64 * *data.last().unwrap();
+    let value = account.positions.get(TICKER).unwrap().quantity as f64 * *data.last().unwrap();
     println!("ended up with value: {value:?}");
 
     let total = cash + value;
@@ -128,7 +127,7 @@ pub fn basic(client: &Client, data: &Data, account: &mut Account) {
 
     println!("assest positions over time {:?}", positioned_assets);
 
-    buy_sell_chart(&data, &buy_indexes, &sell_indexes).unwrap();
+    buy_sell_chart(data, &buy_indexes, &sell_indexes).unwrap();
     assets_chart(&total_assets, &positioned_assets).unwrap();
 }
 

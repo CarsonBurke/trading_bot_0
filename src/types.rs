@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
+use ibapi::market_data::historical;
 
 /// A list of prices, where the last index is the most recent
 pub type Data = Vec<f64>;
@@ -16,6 +17,9 @@ pub struct Account {
 
 /// A list of positions 
 pub type Positions = HashMap<String, Position>;
+
+/// Key: Ticker, Value: Historical Bars
+pub type MappedHistorical = HashMap<String, Vec<historical::Bar>>;
 
 #[derive(Default, Debug)]
 pub struct Position {

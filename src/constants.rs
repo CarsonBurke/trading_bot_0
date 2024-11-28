@@ -1,9 +1,14 @@
-pub const TICKERS: [&str; 1] = ["TSLA"/* , "AAPL", "MSFT" */];
+pub const TICKERS: [&str; 6] = ["TSLA", "AAPL", "MSFT", "AMD", "INTC", "NVDA"];
+pub const TICKER: &str = "MSFT";
 
 pub mod rsi {
     pub const MIN_SELL: f64 = 60.;
     pub const MAX_BUY: f64 = 40.;
     pub const MOVING_AVG_DAYS: u32 = 14;
+}
+
+pub mod files {
+    pub const DATA_PATH: &str = "data/";
 }
 
 /// The maximum amount of assets change that can be made in a single position in a trade
