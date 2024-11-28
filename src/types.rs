@@ -20,17 +20,30 @@ pub type Positions = HashMap<String, Position>;
 #[derive(Default, Debug)]
 pub struct Position {
     pub quantity: u32,
+    /// The average price that these positions were purchased at
+    pub avg_price: f64,
 }
 
 impl Position {
     pub fn new(quantity: u32) -> Self {
         Self {
             quantity,
+            avg_price: 0.,
         }
     }
 
+    pub fn add(&mut self, price: f64, quantity: u32) {
+        let sum = self.avg_price * self.quantity as f64;
+        self.quantity += quantity;
+        self.avg_price = (sum + price * quantity as f64) / (self.quantity as f64);
+    }
+
     /// The total value of the position based on a provided Price Per Unit
-    pub fn value(&self, ppu: f64) -> f64 {
-        ppu * self.quantity as f64
+    pub fn value(&self) -> f64 {
+        self.avg_price * self.quantity as f64
+    }
+
+    pub fn value_with_price(&self, price: f64) -> f64 {
+        price * self.quantity as f64
     }
 }

@@ -1,7 +1,16 @@
 pub const TICKERS: [&str; 1] = ["TSLA"/* , "AAPL", "MSFT" */];
 
 pub mod rsi {
-    pub const MIN_SELL: f64 = 70.;
+    pub const MIN_SELL: f64 = 60.;
     pub const MAX_BUY: f64 = 40.;
     pub const MOVING_AVG_DAYS: u32 = 14;
 }
+
+/// The maximum amount of assets change that can be made in a single position in a trade
+pub const MAX_CHANGE: f64 = 1.;
+/// A ticker may have no more than this percept in total assets
+pub const MAX_VALUE_PER_TICKER: f64 = 0.1;
+/// Preference for percent of which to buy
+pub const BUY_WEIGHT: f64 = 0.8;
+/// Preference for percent of which to sell
+pub const SELL_WEIGHT: f64 = 0.3;

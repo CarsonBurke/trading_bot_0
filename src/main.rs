@@ -6,9 +6,9 @@ use time::{macros::datetime, OffsetDateTime};
 use types::Account;
 use utils::{candle_chart, chart, convert_historical, get_rsi_values, rsi_chart};
 
-mod constants;
+pub mod constants;
 mod utils;
-mod strategies;
+pub mod strategies;
 mod types;
 
 fn main() {
@@ -52,7 +52,7 @@ fn account_info(client: &Client) {
 }
 
 fn historical_data(client: &Client) -> HistoricalData {
-    let ticker = "TSLA";
+    let ticker = "NVDA";
 
     let contract = Contract::stock(ticker);
 
@@ -60,7 +60,7 @@ fn historical_data(client: &Client) -> HistoricalData {
         .historical_data(
             &contract,
             OffsetDateTime::now_utc(),
-            30.days(),
+            360.days(),
             BarSize::Hour,
             WhatToShow::Trades,
             true,

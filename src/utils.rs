@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use ibapi::market_data::{historical, realtime};
 use plotters::{
     coord::types::RangedCoordf32,
-    prelude::{BitMapBackend, CandleStick, IntoDrawingArea},
-    series::{AreaSeries, LineSeries},
-    style::{Color, BLUE, GREEN, RED, WHITE},
+    data,
+    prelude::{BitMapBackend, CandleStick, Circle, EmptyElement, IntoDrawingArea, Text},
+    series::{AreaSeries, LineSeries, PointSeries},
+    style::{Color, BLUE, GREEN, RED, WHITE, YELLOW},
 };
 use time::OffsetDateTime;
 
@@ -199,7 +202,7 @@ pub fn candle_chart(bars: &[historical::Bar]) -> Result<(), Box<dyn std::error::
 }
 
 pub fn rsi_chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
-    let root = BitMapBackend::new("charts/rsi_chart.png", (1024, 768)).into_drawing_area();
+    let root = BitMapBackend::new("charts/rsi.png", (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
@@ -229,32 +232,170 @@ pub fn rsi_chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn buy_sell_chart(
-    buy_indexes: Vec<(usize, f64)>,
-    sell_indexes: Vec<(usize, f64)>,
+    data: &Data,
+    buy_indexes: &HashMap<usize, (f64, u32)>,
+    sell_indexes: &HashMap<usize, (f64, u32)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root = BitMapBackend::new("charts/buy_sell_chart.png", (1024, 768)).into_drawing_area();
+    let root = BitMapBackend::new("charts/buy_sell.png", (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
 
-    let mut filled_buy = buy_indexes.iter().map(|(index, price)| *price as f32).collect::<Vec<f32>>();
-    let mut filled_sell = sell_indexes.iter().map(|(index, price)| *price as f32).collect::<Vec<f32>>();
+    let mut filled_buy = Vec::new();
+    let mut filled_sell = Vec::new();
+
+    for i in 0..data.len() {
+        if let Some(buy) = buy_indexes.get(&i) {
+            filled_buy.push(buy.0 / buy.1 as f64);
+            filled_sell.push(0.0);
+            continue;
+        }
+
+        if let Some(sell) = sell_indexes.get(&i) {
+            filled_buy.push(0.0 / sell.1 as f64);
+            filled_sell.push(sell.0);
+            continue;
+        }
+    }
+
+    let y_min = data
+        .iter()
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap()
+        * 0.9;
+    let y_max = data
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap()
+        * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("RSI", ("sans-serif", 20))
+        .caption("Buy Sell Chart", ("sans-serif", 20))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(30)
-        .build_cartesian_2d(0..filled_buy.len() as u32, 0f32..100f32)?;
+        .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
+
+    chart.configure_mesh().light_line_style(WHITE).draw()?;
+
+    // Data
+    chart.draw_series(
+        AreaSeries::new(
+            data.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value)),
+            0.0,
+            BLUE.mix(0.2),
+        )
+        .border_style(BLUE),
+    )?;
+    // Sell
+    /* chart.draw_series(
+        AreaSeries::new(
+            filled_sell
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value)),
+            0.0,
+            YELLOW.mix(0.0),
+        )
+        .border_style(YELLOW),
+    )?; */
+
+    // Sell
+    /* chart.draw_series(
+        PointSeries::<_, _, Circle<>>::new(
+            filled_sell
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value)),
+            5,
+            YELLOW.mix(0.5),
+        ),
+    )?; */
+    let sells = sell_indexes
+        .iter()
+        .map(|(index, value)| (*index as u32, value.0 / value.1 as f64));
+    println!("{:?}", sells.collect::<Vec<_>>());
+
+    chart.draw_series(PointSeries::of_element(
+        sell_indexes
+            .iter()
+            .map(|(index, value)| (*index as u32, value.0 / value.1 as f64)),
+        5,
+        YELLOW.filled(),
+        &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
+    ))?;
+    // buys
+
+    chart.draw_series(PointSeries::of_element(
+        buy_indexes
+            .iter()
+            .map(|(index, value)| (*index as u32, value.0 / value.1 as f64)),
+        5,
+        BLUE.filled(),
+        &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
+    ))?;
+
+    root.present()
+        .expect("unable to write chart to file, perhaps there is no directory");
+
+    Ok(())
+}
+
+pub fn assets_chart(
+    assets: &Data,
+    positioned_assets: &Data,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new("charts/assets.png", (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let y_max = *assets
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap() as f32
+        * 1.1;
+
+    let mut chart = plotters::chart::ChartBuilder::on(&root)
+        .caption("Assets: Total; Positioned; Cash", ("sans-serif", 20))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..assets.len() as u32, 0.0..y_max)?;
 
     chart.configure_mesh().light_line_style(WHITE).draw()?;
 
     chart.draw_series(
         AreaSeries::new(
-            filled_buy.iter()
+            assets.iter()
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value as f32)),
             0.0,
             BLUE.mix(0.2),
         )
         .border_style(BLUE),
+    )?;
+
+    chart.draw_series(
+        AreaSeries::new(
+            positioned_assets.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value as f32)),
+            0.0,
+            RED.mix(0.2),
+        )
+        .border_style(RED),
+    )?;
+
+    let cash = assets.iter().zip(positioned_assets).map(|(a, b)| a - b);
+
+    chart.draw_series(
+        AreaSeries::new(
+            cash
+                .enumerate()
+                .map(|(index, value)| (index as u32, value as f32)),
+            0.0,
+            GREEN.mix(0.2),
+        )
+        .border_style(GREEN),
     )?;
 
     root.present()
@@ -268,4 +409,10 @@ pub fn round_to_stock(price: f64, max: f64) -> (f64, u32) {
     let quantity = (max / price).floor() as u32;
 
     (price * quantity as f64, quantity)
+}
+
+pub fn estimate_stock_value(financials: String) {
+    // based on growth, with a weighted preference (ema) for more recent data
+    // quarterly for the last 3 years?
+    // total revenue is all that matters? Or also care about cost of revenue and marginal?
 }
