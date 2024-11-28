@@ -1,6 +1,6 @@
 # Trading bot 0
 
-A trading bot employing a variety of heuristics to make profit short and long-term trades
+A trading bot employing a variety of heuristics to make profitable short and long-term trades
 
 | ![Screenshot From 2024-11-27 21-38-01](https://github.com/user-attachments/assets/b7d867be-14d1-4f08-9c2f-ca6bc66d830a) |
 |:--:| 
