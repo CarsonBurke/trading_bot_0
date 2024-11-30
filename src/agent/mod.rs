@@ -1,12 +1,15 @@
+use std::fs;
+
 use enum_map::{enum_map, EnumMap};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::constants::agent::LEARNING_RATE;
 
-pub mod train;
 pub mod create;
 pub mod runner;
+pub mod train;
 
 #[derive(Default, Clone)]
 pub struct Agent {
@@ -14,21 +17,33 @@ pub struct Agent {
     pub id: Uuid,
 }
 
-#[derive(Clone, Copy)]
+impl Agent {
+    pub fn from_weights_file() -> Self {
+
+        let file = fs::read("weights/weights.bin").unwrap();
+        let weights: Weights = postcard::from_bytes(&file).unwrap();
+
+        Self {
+            id: Uuid::default(),
+            weights,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Weights {
     pub map: WeightMap,
 }
 
 impl Weights {
     fn mutate(&mut self) {
-
         let mut rng = rand::thread_rng();
 
         for weight in self.map.values_mut() {
             *weight += rng.gen_range(-LEARNING_RATE..LEARNING_RATE);
             // could clamp it. I think I will because it is similar to RELU
             *weight = weight.clamp(0.0, 1.0);
-        };
+        }
     }
 }
 
@@ -51,9 +66,15 @@ impl Default for Weights {
     }
 }
 
+impl ToString for Weights {
+    fn to_string(&self) -> String {
+        format!("{:?}", self)
+    }
+}
+
 pub type WeightMap = EnumMap<Weight, f64>;
 
-#[derive(Clone, Copy, enum_map::Enum)]
+#[derive(Clone, Copy, enum_map::Enum, Debug, Serialize, Deserialize)]
 pub enum Weight {
     MinRsiSell,
     MaxRsiBuy,

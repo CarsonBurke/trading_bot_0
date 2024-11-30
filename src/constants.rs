@@ -9,6 +9,7 @@ pub mod rsi {
 
 pub mod files {
     pub const DATA_PATH: &str = "data/";
+    pub const WEIGHTS_PATH: &str = "weights/";
 }
 
 pub mod agent {

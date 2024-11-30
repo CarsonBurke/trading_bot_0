@@ -5,7 +5,7 @@ use ibapi::Client;
 use uuid::Uuid;
 
 use crate::{
-    agent::Agent, charts::general::assets_chart, constants::agent::{TARGET_AGENT_COUNT, TARGET_GENERATIONS}, data::historical::get_historical_data, strategies, types::{Account, MakeCharts}, utils::{convert_historical, get_rsi_values}
+    agent::Agent, charts::general::assets_chart, constants::{agent::{TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::WEIGHTS_PATH}, data::historical::get_historical_data, strategies, types::{Account, MakeCharts}, utils::{convert_historical, get_rsi_values}
 };
 
 use super::{create::create_agents};
@@ -81,7 +81,6 @@ pub fn train_agents(client: &Client) {
 
         let (best_agent_id, best_agent_total_assets) = agents_vec.first().unwrap();
         let best_agent = agents.get(best_agent_id).unwrap();
-        let best_agent_assets = assets_by_agent.get(best_agent_id).unwrap();
 
         best_of_gens.push(best_agent.clone());
 
@@ -109,6 +108,14 @@ pub fn train_agents(client: &Client) {
         Some(MakeCharts { generation: TARGET_GENERATIONS - 1}),
     );
     println!("Final assets {assets}");
+
+    record_weights(last_agent);
 }
 
-pub fn record_weights() {}
+pub fn record_weights(agent: &Agent) {
+    let dir = WEIGHTS_PATH;
+    fs::write(format!("{dir}/weights.txt"), agent.weights.to_string()).unwrap();
+
+    let encoded = postcard::to_stdvec(&agent.weights).unwrap();
+    fs::write(format!("{dir}/weights.bin"), encoded).unwrap();
+}
