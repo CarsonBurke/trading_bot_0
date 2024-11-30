@@ -1,3 +1,4 @@
+use agent::train::train_agents;
 use clap::{arg, Command};
 use constants::{files, TICKER, TICKERS};
 use hashbrown::{HashMap, HashSet};
@@ -12,15 +13,14 @@ use ibapi::{
     orders::{order_builder, Action, PlaceOrder},
     Client,
 };
-use std::{fs, os};
-use time::{macros::datetime, OffsetDateTime};
-use types::{Account, MappedHistorical};
-use utils::{candle_chart, chart, convert_historical, get_rsi_values, rsi_chart};
 
 pub mod constants;
 pub mod strategies;
+pub mod agent;
+pub mod data;
 mod types;
 mod utils;
+pub mod charts;
 
 fn main() {
     println!("Trying to connect to IB API!");
@@ -30,25 +30,27 @@ fn main() {
     println!("Successfully connected to TWS at {connection_url}");
 
     // account_info(&client);
-    let mut account = Account::default();
+    // let mut account = Account::default();
 
     // let historical_data = historical_data(&client);
     // market_depth(&client);
     // bars(&client);
     // place_order(&client);
 
-    let mapped_historical = get_historical_data(&client);
+    // let mapped_historical = get_historical_data(&client);
     
-    let tsla = mapped_historical.get("TSLA").unwrap();
-    let data = convert_historical(tsla);
-    let rsi_values = get_rsi_values(&data);
+    // let stock_data = mapped_historical.get(TICKER).unwrap();
+    // let data = convert_historical(stock_data);
 
-    chart(&data).unwrap();
-    rsi_chart(&rsi_values).unwrap();
+    // strategies::basic::basic(&client, &data, &mut account);
+    // let rsi_values = get_rsi_values(&data);
 
-    candle_chart(&tsla).unwrap();
+    // chart(&data).unwrap();
+    // rsi_chart(&rsi_values).unwrap();
 
-    strategies::basic::basic(&client, &data, &mut account);
+    // candle_chart(&stock_data).unwrap();
+
+    train_agents(&client);
 }
 
 fn account_info(client: &Client) {
@@ -62,108 +64,6 @@ fn account_info(client: &Client) {
             AccountSummaries::End => subscription.cancel(),
         }
     }
-}
-
-fn get_historical_data(client: &Client) -> MappedHistorical {
-    if let Some(data) = get_historical_data_from_files() {
-        return data;
-    };
-
-    get_historical_data_from_ibkr(client)
-}
-
-fn get_historical_data_from_files() -> Option<MappedHistorical> {
-    let dir = fs::read_dir(files::DATA_PATH).ok()?;
-
-    let mut data = HashMap::new();
-
-    let tickers_set: HashSet<String> =
-        HashSet::from_iter(TICKERS.iter().map(|str| str.to_string()));
-
-    for path in dir {
-        let Ok(entry) = path else {
-            continue;
-        };
-
-        let filename_extended = entry.file_name().to_str().unwrap().to_string();
-        let (os_filename, _) = filename_extended.split_once('.').unwrap();
-        let filename = os_filename.to_string();
-
-        if !tickers_set.contains(&filename) {
-            continue;
-        }
-
-        let file = fs::read(format!("{}/{}", files::DATA_PATH, filename_extended)).ok()?;
-        let bars: Vec<historical::Bar> = postcard::from_bytes(&file).ok()?;
-
-        data.insert(filename, bars);
-    }
-
-    Some(data)
-}
-
-fn get_historical_data_from_ibkr(client: &Client) -> MappedHistorical {
-    let mut data = HashMap::new();
-
-    fs::create_dir(files::DATA_PATH).ok().unwrap();
-
-    for ticker in TICKERS {
-        let contract = Contract::stock(ticker);
-
-        let historical_data = client
-            .historical_data(
-                &contract,
-                OffsetDateTime::now_utc(),
-                360.days(),
-                BarSize::Hour,
-                WhatToShow::Trades,
-                true,
-            )
-            .expect("historical data request failed");
-
-        // Write compacted data to a file
-
-        let encoded = postcard::to_allocvec(&historical_data.bars).unwrap();
-
-        fs::write(
-            format!("{}/{}.bin", files::DATA_PATH, ticker),
-            encoded.as_slice(),
-        )
-        .ok()
-        .unwrap();
-
-        data.insert(ticker.to_string(), historical_data.bars);
-    }
-
-    data
-}
-
-fn historical_data(client: &Client) -> HistoricalData {
-    let contract = Contract::stock(TICKER);
-
-    let historical_data = client
-        .historical_data(
-            &contract,
-            OffsetDateTime::now_utc(),
-            360.days(),
-            BarSize::Hour,
-            WhatToShow::Trades,
-            true,
-        )
-        .expect("historical data request failed");
-
-    /*     println!(
-        "start: {:?}, end: {:?}",
-        historical_data.start, historical_data.end
-    );
-
-    for bar in &historical_data.bars {
-        println!("{bar:?}");
-    }
-
-    println!("data points: {}", historical_data.bars.len()); */
-
-    historical_data
 }
 
 fn market_data(client: &Client) {

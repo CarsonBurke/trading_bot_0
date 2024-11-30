@@ -51,3 +51,7 @@ impl Position {
         price * self.quantity as f64
     }
 }
+
+pub struct MakeCharts {
+    pub generation: u32,
+}
