@@ -16,4 +16,8 @@ postcard = { version = "1.1.0", features = ["use-std"] }
 rand = "0.8.5"
 serde = "1.0.215"
 time = "0.3.36"
-uuid = "1.11.0"
+uuid = { version = "1.11.0", features = ["v4"] }
+
+[features]
+default = ["debug_training"]
+debug_training = []

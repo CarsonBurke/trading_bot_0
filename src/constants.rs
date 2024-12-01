@@ -10,12 +10,14 @@ pub mod rsi {
 pub mod files {
     pub const DATA_PATH: &str = "data/";
     pub const WEIGHTS_PATH: &str = "weights/";
+    pub const TRAINING_PATH: &str = "training/";
 }
 
 pub mod agent {
-    pub const LEARNING_RATE: f64 = 0.005;
+    pub const LEARNING_RATE: f64 = 0.003;
     /// How many agents we want in training at each training step
     pub const TARGET_AGENT_COUNT: u32 = 100;
+    pub const KEEP_PERCENT_AGENTS_PER_GENERATION: u32 = 50;
     /// How many generations to run to train the agents
     pub const TARGET_GENERATIONS: u32 = 100;
 }

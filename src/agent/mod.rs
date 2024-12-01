@@ -24,7 +24,7 @@ impl Agent {
         let weights: Weights = postcard::from_bytes(&file).unwrap();
 
         Self {
-            id: Uuid::default(),
+            id: Uuid::new_v4(),
             weights,
         }
     }
@@ -59,8 +59,8 @@ impl Default for Weights {
                 Weight::DiffToBuy => 0.05,
                 Weight::DiffToSell => 0.05,
                 Weight::RsiEmaAlpha => 0.2,
-                Weight::ReboundSellThreshold => 0.05,
-                Weight::ReboundBuyThreshold => 0.05,
+                Weight::ReboundSellThreshold => 0.15,
+                Weight::ReboundBuyThreshold => 0.15,
             },
         }
     }

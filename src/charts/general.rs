@@ -203,35 +203,8 @@ pub fn buy_sell_chart(
         )
         .border_style(BLUE),
     )?;
-    // Sell
-    /* chart.draw_series(
-        AreaSeries::new(
-            filled_sell
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value)),
-            0.0,
-            YELLOW.mix(0.0),
-        )
-        .border_style(YELLOW),
-    )?; */
-
-    // Sell
-    /* chart.draw_series(
-        PointSeries::<_, _, Circle<>>::new(
-            filled_sell
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value)),
-            5,
-            YELLOW.mix(0.5),
-        ),
-    )?; */
-    let sells = sell_indexes
-        .iter()
-        .map(|(index, value)| (*index as u32, value.0 / value.1 as f64));
-    println!("{:?}", sells.collect::<Vec<_>>());
-
+    
+    // Sells
     chart.draw_series(PointSeries::of_element(
         sell_indexes
             .iter()
@@ -240,8 +213,8 @@ pub fn buy_sell_chart(
         YELLOW.filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
-    // buys
 
+    // Buys
     chart.draw_series(PointSeries::of_element(
         buy_indexes
             .iter()
@@ -261,6 +234,7 @@ pub fn assets_chart(
     dir: &String,
     assets: &Data,
     cash: &Data,
+    positioned: Option<&Data>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/assets.png");
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
@@ -293,13 +267,19 @@ pub fn assets_chart(
         .border_style(BLUE),
     )?;
 
-    let positioned = assets.iter().zip(cash).map(|(a, b)| a - b);
+    let positioned = {
+        if let Some(positioned) = positioned {
+            positioned
+        } else {
+            &assets.iter().zip(cash).map(|(a, b)| a - b).collect::<Vec<f64>>()
+        }
+    };
 
     chart.draw_series(
         AreaSeries::new(
-            positioned
+            positioned.iter()
                 .enumerate()
-                .map(|(index, value)| (index as u32, value as f32)),
+                .map(|(index, value)| (index as u32, *value as f32)),
             0.0,
             RED.mix(0.2),
         )

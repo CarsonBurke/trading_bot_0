@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fs};
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use ibapi::market_data::{historical, realtime};
@@ -115,4 +115,8 @@ pub fn estimate_stock_value(financials: String) {
     // based on growth, with a weighted preference (ema) for more recent data
     // quarterly for the last 3 years?
     // total revenue is all that matters? Or also care about cost of revenue and marginal?
+}
+
+pub fn create_folder_if_not_exists(dir: &String) {
+    let _ = fs::create_dir_all(dir);
 }
