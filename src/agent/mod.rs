@@ -83,7 +83,7 @@ impl Default for Weights {
                 Weight::RsiSellAmountWeight => 0.5,
                 Weight::DiffToBuy => 0.05,
                 Weight::DiffToSell => 0.05,
-                Weight::DeciderRsiEmaAlpha => 0.15,
+                Weight::DeciderRsiEmaAlpha => 0.02/* 15 */,
                 Weight::AmountRsiEmaAlpha => 0.02,
                 Weight::ReboundSellThreshold => 0.05,
                 Weight::ReboundBuyThreshold => 0.05,

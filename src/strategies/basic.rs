@@ -114,110 +114,28 @@ pub fn basic(
             let amount_rsi_values = amount_rsi_values_by_ticker.get(ticker).unwrap();
             let amount_rsi = amount_rsi_values[index];
 
-            let position = account.positions.get_mut(ticker).unwrap();
-
-            if decider_rsi >= agent.weights.map[Weight::MinRsiSell] * 100.0
-                || highest_rsis.contains_key(ticker)
-            {
-                // Record the RSI if it's a new local maximum
-                if let Some(ticker_highest_rsi) = highest_rsis.get(ticker) {
-                    if decider_rsi > *ticker_highest_rsi {
-                        highest_rsis.insert(ticker.to_string(), decider_rsi);
-                        continue;
-                    }
-                } else {
-                    highest_rsis.insert(ticker.to_string(), decider_rsi);
-                }
-                // Require the rsi to have rebounded slightly down before we can purchase
-                if let Some(ticker_highest_rsi) = highest_rsis.get(ticker) {
-                    let max = ticker_highest_rsi
-                        + ticker_highest_rsi * agent.weights.map[Weight::ReboundSellThreshold];
-                    if decider_rsi > max {
-                        continue;
-                    }
-                }
-
-                highest_rsis.remove(ticker);
-
-                if position.avg_price >= price {
-                    continue;
-                }
-                if position.quantity == 0 {
-                    /* println!("no position to sell"); */
-                    continue;
-                }
-                /* if let Some(last_sell_price) = last_sell_price.get(ticker) {
-                    let percent_of_last_sell = price / last_sell_price;
-
-                    // Iterate if we are below X% of last sell
-                    if percent_of_last_sell < 1. + agent.weights.map[Weight::DiffToSell] {
-                        continue;
-                    }
-                } */
-
-                // println!("decider rsi: {}", decider_rsi);
-                // println!("amount rsi: {}", amount_rsi);
-                // println!("diff {}", decider_rsi - amount_rsi);
-                let rsi_diff = (amount_rsi - decider_rsi).abs();
-                let Some((sell_price, sell_quantity)) = get_sell_price_quantity(
-                    position,
+            if can_try_sell(ticker, decider_rsi, &mut highest_rsis, agent) {
+                try_sell(
+                    ticker,
+                    index,
                     price,
-                    rsi_diff,
-                    assets / (TICKERS.len() / 2) as f64,
+                    amount_rsi,
+                    decider_rsi,
+                    assets,
                     agent,
-                ) else {
-                    continue;
-                };
-
-                if sell_quantity == 0 {
-                    continue;
-                }
-
-                // Sell
-
-                // println!("sold at rsi_diff {}", rsi_diff);
-
-                highest_rsis.remove(ticker);
-
-                last_sell_price.insert(ticker.to_string(), price);
-                last_buy_price.remove(ticker);
-
-                let ticker_sell_indexes = sell_indexes.get_mut(ticker).unwrap();
-                ticker_sell_indexes.insert(index, (sell_price, sell_quantity));
-
-                position.quantity -= sell_quantity;
-                account.cash += sell_price;
-                continue;
+                    account,
+                    &mut highest_rsis,
+                    &mut last_sell_price,
+                    &mut last_buy_price,
+                    &mut sell_indexes,
+                );
             }
 
             if price * 1.1 > account.cash {
                 continue;
             }
 
-            if decider_rsi <= agent.weights.map[Weight::MaxRsiBuy] * 100.0
-                || lowest_rsis.contains_key(ticker)
-            {
-                // Record the RSI if it's a new local minimum
-                if let Some(ticker_lowest_rsi) = lowest_rsis.get(ticker) {
-                    if decider_rsi < *ticker_lowest_rsi {
-                        lowest_rsis.insert(ticker.to_string(), decider_rsi);
-                        continue;
-                    }
-                } else {
-                    lowest_rsis.insert(ticker.to_string(), decider_rsi);
-                }
-
-                // Require the rsi to have rebounded slightly down before we can purchase
-                if let Some(ticker_lowest_rsi) = lowest_rsis.get(ticker) {
-                    let min = ticker_lowest_rsi
-                        + ticker_lowest_rsi * agent.weights.map[Weight::ReboundSellThreshold];
-                    if decider_rsi < min {
-                        continue;
-                    }
-                }
-
-                lowest_rsis.remove(ticker);
-
+            if can_try_buy(ticker, decider_rsi, &mut lowest_rsis, agent) {
                 if let Some(last_buy_price) = last_buy_price.get(ticker) {
                     let percent_of_last_buy = price / last_buy_price;
 
@@ -226,10 +144,13 @@ pub fn basic(
                         continue;
                     }
                 };
+
+                let position = account.positions.get_mut(ticker).unwrap();
+
                 // println!("decider rsi: {}", decider_rsi);
                 // println!("amount rsi: {}", amount_rsi);
                 // println!("diff {}", decider_rsi - amount_rsi);
-                let rsi_diff = amount_rsi - decider_rsi.abs();
+                let rsi_diff = amount_rsi;
                 let Some((total_price, buy_quantity)) = get_buy_price_quantity(
                     position,
                     price,
@@ -352,9 +273,6 @@ pub fn can_try_sell(
     highest_rsis: &mut HashMap<String, f64>,
     agent: &Agent,
 ) -> bool {
-    if decider_rsi < agent.weights.map[Weight::MinRsiSell] * 100.0 {
-        return false;
-    }
     // Record the RSI if it's a new local maximum
     if let Some(ticker_highest_rsi) = highest_rsis.get(ticker) {
         if decider_rsi > *ticker_highest_rsi {
@@ -370,16 +288,116 @@ pub fn can_try_sell(
     if let Some(ticker_highest_rsi) = highest_rsis.get(ticker) {
         let max = ticker_highest_rsi
             + ticker_highest_rsi * agent.weights.map[Weight::ReboundSellThreshold];
-        if decider_rsi > max {
-            return false;
+        if decider_rsi <= max {
+            highest_rsis.remove(ticker);
+            return true;
         }
     }
 
-    highest_rsis.remove(ticker);
-    true;
+    if decider_rsi < agent.weights.map[Weight::MinRsiSell] * 100.0 {
+        return false;
+    }
+
+    true
 }
 
-pub fn can_try_buy() {}
+pub fn can_try_buy(
+    ticker: &String,
+    decider_rsi: f64,
+    lowest_rsis: &mut HashMap<String, f64>,
+    agent: &Agent,
+) -> bool {
+    // Record the RSI if it's a new local minimum
+    if let Some(ticker_lowest_rsi) = lowest_rsis.get(ticker) {
+        if decider_rsi < *ticker_lowest_rsi {
+            lowest_rsis.insert(ticker.to_string(), decider_rsi);
+            return false;
+        }
+    } else {
+        lowest_rsis.insert(ticker.to_string(), decider_rsi);
+    }
+
+    // Require the rsi to have rebounded slightly down before we can purchase
+    if let Some(ticker_lowest_rsi) = lowest_rsis.get(ticker) {
+        let min =
+            ticker_lowest_rsi + ticker_lowest_rsi * agent.weights.map[Weight::ReboundSellThreshold];
+        if decider_rsi >= min {
+            lowest_rsis.remove(ticker);
+            return true;
+        }
+    }
+
+    if decider_rsi > agent.weights.map[Weight::MaxRsiBuy] * 100.0 {
+        return false;
+    }
+    true
+}
+
+pub fn try_sell(
+    ticker: &String,
+    index: usize,
+    price: f64,
+    amount_rsi: f64,
+    decider_rsi: f64,
+    assets: f64,
+    agent: &Agent,
+    account: &mut Account,
+    highest_rsis: &mut HashMap<String, f64>,
+    last_sell_price: &mut HashMap<String, f64>,
+    last_buy_price: &mut HashMap<String, f64>,
+    sell_indexes: &mut HashMap<String, HashMap<usize, (f64, u32)>>,
+) {
+    let position = account.positions.get_mut(ticker).unwrap();
+
+    if position.avg_price >= price {
+        return;
+    }
+    if position.quantity == 0 {
+        /* println!("no position to sell"); */
+        return;
+    }
+    /* if let Some(last_sell_price) = last_sell_price.get(ticker) {
+        let percent_of_last_sell = price / last_sell_price;
+
+        // Iterate if we are below X% of last sell
+        if percent_of_last_sell < 1. + agent.weights.map[Weight::DiffToSell] {
+            continue;
+        }
+    } */
+
+    // println!("decider rsi: {}", decider_rsi);
+    // println!("amount rsi: {}", amount_rsi);
+    // println!("diff {}", decider_rsi - amount_rsi);
+    let rsi_diff = amount_rsi;
+    let Some((sell_price, sell_quantity)) = get_sell_price_quantity(
+        position,
+        price,
+        rsi_diff,
+        assets / (TICKERS.len() / 2) as f64,
+        agent,
+    ) else {
+        return;
+    };
+
+    if sell_quantity == 0 {
+        return;
+    }
+
+    // Sell
+
+    // println!("sold at rsi_diff {}", rsi_diff);
+
+    highest_rsis.remove(ticker);
+
+    last_sell_price.insert(ticker.to_string(), price);
+    last_buy_price.remove(ticker);
+
+    let ticker_sell_indexes = sell_indexes.get_mut(ticker).unwrap();
+    ticker_sell_indexes.insert(index, (sell_price, sell_quantity));
+
+    position.quantity -= sell_quantity;
+    account.cash += sell_price;
+}
 
 pub fn get_sell_price_quantity(
     position: &Position,
