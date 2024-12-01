@@ -114,8 +114,8 @@ pub fn candle_chart(
     Ok(())
 }
 
-pub fn rsi_chart(dir: &String, data: &Data) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/rsi.png");
+pub fn rsi_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("{dir}/{name}.png");
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
@@ -203,14 +203,16 @@ pub fn buy_sell_chart(
         )
         .border_style(BLUE),
     )?;
+
+    let point_size = 4;
     
     // Sells
     chart.draw_series(PointSeries::of_element(
         sell_indexes
             .iter()
             .map(|(index, value)| (*index as u32, value.0 / value.1 as f64)),
-        5,
-        YELLOW.filled(),
+            point_size,
+        YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
@@ -219,8 +221,8 @@ pub fn buy_sell_chart(
         buy_indexes
             .iter()
             .map(|(index, value)| (*index as u32, value.0 / value.1 as f64)),
-        5,
-        BLUE.filled(),
+            point_size,
+        RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 

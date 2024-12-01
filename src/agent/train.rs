@@ -5,7 +5,7 @@ use ibapi::Client;
 use uuid::Uuid;
 
 use crate::{
-    agent::Agent, charts::general::assets_chart, constants::{agent::{KEEP_PERCENT_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::{TRAINING_PATH, WEIGHTS_PATH}}, data::historical::get_historical_data, strategies, types::{Account, MakeCharts}, utils::{convert_historical, get_rsi_values}
+    agent::Agent, charts::general::assets_chart, constants::{agent::{ KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::{TRAINING_PATH, WEIGHTS_PATH}}, data::historical::get_historical_data, strategies, types::{Account, MakeCharts}, utils::{convert_historical, get_rsi_values}
 };
 
 use super::{create::create_agents};
@@ -13,6 +13,7 @@ use super::{create::create_agents};
 pub fn train_agents(client: &Client) {
     let mapped_historical = get_historical_data(client);
 
+    let mut most_final_assets = 0.0;
     let mut best_of_gens = Vec::<Agent>::new();
 
     let mut agents = create_agents();
@@ -33,19 +34,23 @@ pub fn train_agents(client: &Client) {
 
         agents_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        record_agents(&agents_vec, gen);
+        record_finances(&agents_vec, gen);
 
-        // let mut agents_vec = assets_by_agent
-        //     .iter().rev()
-        //     .map(|(k, v)| (*v, *k))
-        //     .collect::<Vec<(Uuid, f64)>>();
-        // agents_vec.sort_by(|a, b| b.1.partial_cmp(&a .1).unwrap());
+        agents_vec.truncate(KEEP_AGENTS_PER_GENERATION as usize);
 
-        // Kill all but the top 10 agents
-        agents_vec.truncate((TARGET_AGENT_COUNT / KEEP_PERCENT_AGENTS_PER_GENERATION) as usize);
         let agents_set: HashSet<Uuid> = HashSet::from_iter(agents_vec.iter().map(|a| a.0));
 
         agents.retain(|id, _| agents_set.contains(id));
+
+        //
+
+        let (gen_best_agent_id, gen_best_assets) = agents_vec[0];
+        if gen_best_assets > most_final_assets {
+                most_final_assets = gen_best_assets;
+        }
+
+        let best_gen_agent = agents.get(&gen_best_agent_id).unwrap();
+        best_of_gens.push(best_gen_agent.clone());
 
         // duplicate agents
 
@@ -54,8 +59,7 @@ pub fn train_agents(client: &Client) {
         // Has the potantial to create a few more agents than the target count, which seems fine
         while new_agents.len() + agents.len() < TARGET_AGENT_COUNT as usize {
             for (_, agent) in agents.iter() {
-                let mut cloned_agent = agent.clone();
-                cloned_agent.id = Uuid::new_v4();
+                let cloned_agent = agent.clone();
 
                 new_agents.push(cloned_agent);
             }
@@ -71,17 +75,13 @@ pub fn train_agents(client: &Client) {
             agent.weights.mutate();
         }
 
-        println!("total agents count: {}", agents.len());
-
-        // assign agents to agents vec
-
-        let (best_agent_id, best_agent_total_assets) = agents_vec.first().unwrap();
-        let best_agent = agents.get(best_agent_id).unwrap();
-
-        best_of_gens.push(best_agent.clone());
+        //
 
         println!("completed generation {gen}");
+        println!("Highest this gen: {gen_best_assets}");
     }
+
+    println!("Completed training");
 
     let first_agent = best_of_gens.first().unwrap();
     println!("First agent =====");
@@ -115,7 +115,7 @@ pub fn train_agents(client: &Client) {
 }
 
 #[cfg(feature = "debug_training")]
-fn record_agents(agents: &[(Uuid, f64)], gen: u32) {
+fn record_finances(agents: &[(Uuid, f64)], gen: u32) {
     use crate::utils::create_folder_if_not_exists;
 
     let dir = format!("{TRAINING_PATH}/gens/{gen}");

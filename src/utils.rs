@@ -19,7 +19,8 @@ pub fn convert_historical(data: &Vec<historical::Bar>) -> Data {
 
 /// Get the relative strength index value for each data point
 pub fn get_rsi_values(data: &Data, ema_alpha: f64) -> Data {
-    let diffs = get_differences(data);
+    let mut diffs = get_differences(data);
+    diffs[0] = 1.;
 
     let mut upwards = Vec::new();
     let mut downwards = Vec::new();
@@ -35,10 +36,8 @@ pub fn get_rsi_values(data: &Data, ema_alpha: f64) -> Data {
         upwards.push(0.);
     }
 
-    let alpha = 1. / (MOVING_AVG_DAYS as f64 + 1.);
-
-    let upward_avg = ema(&upwards, alpha);
-    let downward_avg = ema(&downwards, alpha);
+    let upward_avg = ema(&upwards, ema_alpha);
+    let downward_avg = ema(&downwards, ema_alpha);
 
     let rsi_values = upward_avg
         .iter()
@@ -59,7 +58,8 @@ pub fn get_rsi_values(data: &Data, ema_alpha: f64) -> Data {
 ///
 pub fn ema(data: &Data, alpha: f64) -> Data {
     let mut averages = Vec::new();
-
+    let mut previous = data[0];
+    
     for (index, value) in data.iter().enumerate() {
         // let mut sum = 0.;
         // let steps_back = (index as u32 - MOVING_AVG_DAYS).min(0);
@@ -70,17 +70,21 @@ pub fn ema(data: &Data, alpha: f64) -> Data {
 
         // averages.push(sum / steps_back as f64);
 
-        let previous = {
+        /* let previous = {
             let (previous_index, overflowed) = index.overflowing_sub(1);
             if overflowed {
-                averages.push(*value * alpha);
+                println!("overflowed value {}", value);
+                averages.push(*value/*  * alpha */);
                 continue;
             } else {
                 averages[previous_index]
             }
-        };
+        }; */
+
         let avg = *value * alpha + previous * (1. - alpha);
         averages.push(avg);
+
+        previous = avg;
     }
     averages
 }
