@@ -48,7 +48,7 @@ pub fn train_agents(client: &Client) {
                 most_final_assets = gen_best_assets;
         }
 
-        let best_gen_agent = agents.get(&gen_best_agent_id).unwrap();
+        let best_gen_agent = agents.get(&gen_best_agent_id).unwrap().clone();
         best_of_gens.push(best_gen_agent.clone());
 
         // duplicate agents
@@ -58,13 +58,9 @@ pub fn train_agents(client: &Client) {
         // Has the potantial to create a few more agents than the target count, which seems fine
         while new_agents.len() + agents.len() < TARGET_AGENT_COUNT as usize {
             for (_, agent) in agents.iter() {
-                let cloned_agent = agent.clone();
-
-                new_agents.push_front(cloned_agent);
+                new_agents.push_front(agent.clone());
             }
         }
-
-        let best = new_agents.pop_front().unwrap();
 
         while let Some(agent) = new_agents.pop_back() {
             agents.insert(agent.id, agent);
@@ -77,7 +73,7 @@ pub fn train_agents(client: &Client) {
         }
 
         // Add the best agent without mutations
-        agents.insert(best.id, best);
+        agents.insert(gen_best_agent_id, best_gen_agent);
 
         //
 

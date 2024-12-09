@@ -5,7 +5,7 @@ use ibapi::Client;
 use rust_neural_network::neural_network::{Input, InputName, NeuralNetwork, Output, OutputName};
 
 use crate::{
-    constants::{agent::{KEEP_AGENTS_PER_GENERATION, TARGET_GENERATIONS}, neural_net, TICKERS},
+    constants::{agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, neural_net, TICKERS},
     data::historical::get_historical_data,
     neural_net::create::create_mapped_indicators,
     strategies::baisc_nn::baisc_nn,
@@ -89,7 +89,7 @@ pub fn train_networks(client: &Client) {
         neural_net_ids.truncate(KEEP_AGENTS_PER_GENERATION as usize);
 
         let id_set: HashSet<u32> = HashSet::from_iter(neural_net_ids.iter().map(|a| a.0));
-        neural_net_ids.retain(|id| id_set.contains(&id.0));
+        neural_nets.retain(|id, _| id_set.contains(id));
 
         //
 
@@ -98,20 +98,18 @@ pub fn train_networks(client: &Client) {
             most_final_assets = gen_best_assets;
         }
 
-        let best_gen_net = neural_nets.get(&best_net_id).unwrap();
+        let best_gen_net = neural_nets.get(&best_net_id).unwrap().clone();
         best_of_gens.push(best_gen_net.clone());
 
         // duplicate neural nets
 
         let mut new_nets = VecDeque::new();
 
-        while new_nets.len() < neural_nets.len() {
+        while new_nets.len() + neural_nets.len() < TARGET_AGENT_COUNT as usize {
             for (_, neural_net) in neural_nets.iter() {
                 new_nets.push_front(neural_net.clone());
             }
         }
-
-        let best_net = new_nets.pop_front().unwrap();
 
         while let Some(net) = new_nets.pop_back() {
             neural_nets.insert(net.id, net);
@@ -123,9 +121,9 @@ pub fn train_networks(client: &Client) {
             net.mutate();
         }
 
-        neural_nets.insert(best_net.id, best_net);
+        neural_nets.insert(best_net_id, best_gen_net);
 
-        println!("Completed generation: {gen}");
+        println!("Completed generation: {gen} with networks: {}", neural_nets.len());
         println!("Highest this gen: {gen_best_assets:.2}");
     }
 
@@ -154,11 +152,19 @@ pub fn train_networks(client: &Client) {
         &mapped_indicators,
         &mut inputs,
         Some(MakeCharts {
-            generation: TARGET_GENERATIONS,
+            generation: TARGET_GENERATIONS - 1,
         }),
     );
 
     println!("Final assets: {final_assets:.2}");
+
+    let start = 10_000.0;
+    println!("Profit: ${:.2} ({:.2}%)", final_assets - start, ((final_assets - start) / start) * 100.0);
+
+    let diff = final_assets - first_assets;
+    println!("Improvement from training of : ${diff:.2} ({:.2}%)", (final_assets - first_assets) / start * 100.0);
+
+    last_net.write_to_file();
 }
 
 #[cfg(feature = "debug_training")]

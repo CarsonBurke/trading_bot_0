@@ -2,7 +2,11 @@ use hashbrown::HashMap;
 use rust_neural_network::neural_network::{Input, NeuralNetwork};
 
 use crate::{
-    charts::general::{assets_chart, buy_sell_chart, simple_chart}, constants::{self, files::TRAINING_PATH, TICKERS}, neural_net::create::Indicators, types::{Account, Data, MakeCharts, MappedHistorical, Position}, utils::{convert_historical, create_folder_if_not_exists, ema, find_highest, get_rsi_values}
+    charts::general::{assets_chart, buy_sell_chart, simple_chart},
+    constants::{self, files::TRAINING_PATH, TICKERS},
+    neural_net::create::Indicators,
+    types::{Account, Data, MakeCharts, MappedHistorical, Position},
+    utils::{convert_historical, create_folder_if_not_exists, ema, find_highest, get_rsi_values},
 };
 
 pub fn baisc_nn(
@@ -16,7 +20,9 @@ pub fn baisc_nn(
     let indexes = mapped_data.get(TICKERS[0]).unwrap().len();
 
     for ticker in TICKERS {
-        account.positions.insert(ticker.to_string(), Position::default());
+        account
+            .positions
+            .insert(ticker.to_string(), Position::default());
     }
 
     let mut positions_by_ticker: HashMap<String, Vec<f64>> = HashMap::new();
@@ -94,9 +100,19 @@ pub fn baisc_nn(
             // let values = inputs.iter().map(|input| input.values[0]).collect::<Vec<f64>>();
             // println!("inputs: {values:?}");
 
-            match output_index as u32 {
-                constants::neural_net::BUY_INDEX => {
-                    let buy = percent.min(account.cash);
+            if output_index as u32 == constants::neural_net::CHANGE_INDEX {
+                let gross_want = assets * percent / 100.;
+                let current = match position.quantity {
+                    0. => 0.,
+                    _ => position.value_with_price(price),
+                };
+
+                // If we want more than we have, try to buy
+                if gross_want > current {
+                    let buy = (gross_want - current).min(account.cash);
+                    if buy == 0. {
+                        continue;
+                    }
                     let quantity = buy / price;
 
                     position.add(price, quantity);
@@ -106,20 +122,26 @@ pub fn baisc_nn(
                         .get_mut(ticker)
                         .unwrap()
                         .insert(index, (price, quantity));
-                }
-                constants::neural_net::SELL_INDEX => {
-                    let sell = percent.min(position.value_with_price(price));
-                    let quantity = sell / price;
 
-                    position.quantity -= quantity;
-                    account.cash += sell;
-
-                    sell_indexes
-                        .get_mut(ticker)
-                        .unwrap()
-                        .insert(index, (price, quantity));
+                    continue;
                 }
-                _ => {}
+
+                // Otherwise we want less than we have, try to sell
+
+                let sell = ((gross_want - current).abs()).min(current);
+                if sell == 0. {
+                    continue;
+                }
+                
+                let quantity = sell / price;
+
+                position.quantity -= quantity;
+                account.cash += sell;
+
+                sell_indexes
+                    .get_mut(ticker)
+                    .unwrap()
+                    .insert(index, (price, quantity));
             }
         }
     }
@@ -131,7 +153,7 @@ pub fn baisc_nn(
         create_folder_if_not_exists(&base_dir);
 
         assets_chart(&base_dir, &total_assets, &cash_graph, None);
-        
+
         for (ticker, bars) in mapped_data.iter() {
             let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker}", charts_config.generation);
             create_folder_if_not_exists(&ticker_dir);

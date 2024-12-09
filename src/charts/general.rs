@@ -171,13 +171,13 @@ pub fn buy_sell_chart(
 
     for i in 0..data.len() {
         if let Some(buy) = buy_indexes.get(&i) {
-            filled_buy.push(buy.0 / buy.1 as f64);
+            filled_buy.push(buy.0);
             filled_sell.push(0.0);
             continue;
         }
 
         if let Some(sell) = sell_indexes.get(&i) {
-            filled_buy.push(0.0 / sell.1 as f64);
+            filled_buy.push(0.0);
             filled_sell.push(sell.0);
             continue;
         }
@@ -221,7 +221,7 @@ pub fn buy_sell_chart(
     chart.draw_series(PointSeries::of_element(
         sell_indexes
             .iter()
-            .map(|(index, value)| (*index as u32, value.0 / value.1 as f64)),
+            .map(|(index, value)| (*index as u32, value.0)),
             point_size,
         YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
@@ -231,7 +231,7 @@ pub fn buy_sell_chart(
     chart.draw_series(PointSeries::of_element(
         buy_indexes
             .iter()
-            .map(|(index, value)| (*index as u32, value.0 / value.1 as f64)),
+            .map(|(index, value)| (*index as u32, value.0)),
             point_size,
         RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
