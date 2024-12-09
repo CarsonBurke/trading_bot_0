@@ -6,7 +6,7 @@ use plotters::{
     data,
     prelude::{BitMapBackend, CandleStick, Circle, EmptyElement, IntoDrawingArea, Text},
     series::{AreaSeries, LineSeries, PointSeries},
-    style::{Color, BLUE, GREEN, RED, WHITE, YELLOW},
+    style::{full_palette::PURPLE, Color, BLUE, GREEN, RED, WHITE, YELLOW},
 };
 use time::OffsetDateTime;
 
@@ -308,6 +308,65 @@ pub fn assets_chart(
             GREEN.mix(0.2),
         )
         .border_style(GREEN),
+    )?;
+
+    root.present()
+        .expect("unable to write chart to file, perhaps there is no directory");
+
+    Ok(())
+}
+
+pub fn want_chart(
+    dir: &String,
+    data: &Data,
+    want_indexes: &HashMap<usize, f64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("{dir}/want.png");
+    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut wants = Vec::new();
+
+    for i in 0..data.len() {
+        if let Some(want) = want_indexes.get(&i) {
+            wants.push(*want);
+            continue;
+        }
+
+        wants.push(0.0);
+    }
+
+    let y_min = wants
+        .iter()
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap()
+        * 0.9;
+    let y_max = wants
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap()
+        * 1.1;
+
+    let mut chart = plotters::chart::ChartBuilder::on(&root)
+        .caption("Buy Sell Chart", ("sans-serif", 20))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(30)
+        .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
+
+    chart.configure_mesh().light_line_style(WHITE).draw()?;
+
+    // Wants
+
+    chart.draw_series(
+        AreaSeries::new(
+            wants.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value)),
+            0.0,
+            PURPLE.mix(0.2),
+        )
+        .border_style(PURPLE),
     )?;
 
     root.present()

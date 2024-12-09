@@ -30,9 +30,11 @@ pub fn create_mapped_indicators(mapped_data: &MappedHistorical) -> HashMap<Strin
 
 fn create_indicators(data: Vec<f64>) -> Indicators {
     enum_map! {
+        Indicator::EMADiff7 => ema_diff_percent(&data, 1. / 7.),
         Indicator::EMADiff14 => ema_diff_percent(&data, 1. / 14.),
         Indicator::EMADiff50 => ema_diff_percent(&data, 1. / 50.),
         Indicator::EMADiff100 => ema_diff_percent(&data, 1. / 100.),
+        Indicator::RSI7 => get_rsi_percents(&data, 1. / 7.),
         Indicator::RSI14 => get_rsi_percents(&data, 1. / 14.),
         Indicator::RSI28 => get_rsi_percents(&data, 1. / 28.),
         Indicator::RSI50 => get_rsi_percents(&data, 1. / 50.),
@@ -75,9 +77,11 @@ pub type Indicators = EnumMap<Indicator, Vec<f64>>;
 
 #[derive(enum_map::Enum, Clone, Copy, )]
 pub enum Indicator {
+    EMADiff7,
     EMADiff14,
     EMADiff50,
     EMADiff100,
+    RSI7,
     RSI14,
     RSI28,
     RSI50,

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use hashbrown::HashSet;
 use ibapi::Client;
+
 use rust_neural_network::neural_network::{Input, InputName, NeuralNetwork, Output, OutputName};
 
 use crate::{
@@ -14,7 +15,7 @@ use crate::{
 
 use super::create::create_networks;
 
-pub fn train_networks(client: &Client) {
+pub async fn train_networks(client: &Client) {
 
     let mapped_historical = get_historical_data(client);
     let mapped_indicators = create_mapped_indicators(&mapped_historical);
@@ -68,18 +69,30 @@ pub fn train_networks(client: &Client) {
 
     for gen in 0..TARGET_GENERATIONS {
         let mut neural_net_ids = Vec::new();
+        let mut handles = Vec::new();
 
         for (_, neural_net) in neural_nets.iter_mut() {
-            let assets = baisc_nn(
-                &mapped_historical,
-                &mut Account::default(),
-                neural_net,
-                &mapped_indicators,
-                &mut inputs,
-                None,
-            );
-            println!("assets: {:.2}", assets);
-            neural_net_ids.push((neural_net.id, assets));
+            let handle = tokio::task::spawn(async {
+                let assets = baisc_nn(
+                    &mapped_historical,
+                    &mut Account::default(),
+                    neural_net,
+                    &mapped_indicators,
+                    &mut inputs,
+                    None,
+                );
+                println!("assets: {:.2}", assets);
+                // neural_net_ids.push((neural_net.id, assets));
+
+                (neural_net.id, assets)
+            });
+
+            handles.push(handle)
+        }
+
+        for handle in handles {
+            let (net_id, assets) = handle.await.unwrap();
+            neural_net_ids.push((net_id, assets));
         }
 
         neural_net_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -121,7 +134,7 @@ pub fn train_networks(client: &Client) {
             net.mutate();
         }
 
-        neural_nets.insert(best_net_id, best_gen_net);
+        neural_nets.insert(best_gen_net.id, best_gen_net);
 
         println!("Completed generation: {gen} with networks: {}", neural_nets.len());
         println!("Highest this gen: {gen_best_assets:.2}");

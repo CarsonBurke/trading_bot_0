@@ -73,7 +73,7 @@ pub fn train_agents(client: &Client) {
         }
 
         // Add the best agent without mutations
-        agents.insert(gen_best_agent_id, best_gen_agent);
+        agents.insert(best_gen_agent.id, best_gen_agent);
 
         //
 

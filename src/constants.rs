@@ -14,7 +14,7 @@ pub mod agent {
     pub const LEARNING_RATE: f64 = 0.003/* 0.003 */;
     /// How many agents we want in training at each training step
     pub const TARGET_AGENT_COUNT: u32 = 100;
-    pub const KEEP_AGENTS_PER_GENERATION: u32 = 30;
+    pub const KEEP_AGENTS_PER_GENERATION: u32 = 20;
     /// How many generations to run to train the agents
     pub const TARGET_GENERATIONS: u32 = 20;
     pub const MAX_WEIGHT: f64 = 1.0;
