@@ -74,7 +74,8 @@ pub async fn train_networks(client: &Client) {
         let mut handles = Vec::new();
 
         for (_, neural_net) in neural_nets.iter_mut() {
-            // let mut neural_net = neural_net.clone();
+            let id = neural_net.id;
+            let neural_net = neural_net.clone();
 
             let cloned_inputs = inputs.clone();
 
@@ -85,7 +86,7 @@ pub async fn train_networks(client: &Client) {
                 let assets = baisc_nn(
                     &cloned_historical,
                     &mut Account::default(),
-                    *neural_net,
+                    neural_net,
                     &cloned_indicators,
                     cloned_inputs,
                     None,
@@ -93,7 +94,7 @@ pub async fn train_networks(client: &Client) {
                 println!("assets: {:.2}", assets);
                 // neural_net_ids.push((neural_net.id, assets));
 
-                (neural_net.id, assets)
+                (id, assets)
             });
 
             handles.push(handle)
@@ -154,24 +155,24 @@ pub async fn train_networks(client: &Client) {
 
     println!("Completed training");
 
-    let first_net = best_of_gens.first_mut().unwrap();
+    let first_net = best_of_gens.first().unwrap();
 
     let first_assets = baisc_nn(
         &mapped_historical,
         &mut Account::default(),
-        *first_net,
+        first_net.clone(),
         &mapped_indicators,
         inputs.clone(),
         Some(MakeCharts { generation: 0 }),
     );
     println!("Gen 1 final assets: {first_assets:.2}");
 
-    let last_net = best_of_gens.last_mut().unwrap();
+    let last_net = best_of_gens.last().unwrap();
 
     let final_assets = baisc_nn(
         &mapped_historical,
         &mut Account::default(),
-        *last_net,
+        last_net.clone(),
         &mapped_indicators,
         inputs,
         Some(MakeCharts {
