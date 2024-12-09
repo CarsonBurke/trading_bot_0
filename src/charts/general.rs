@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+use hashbrown::HashMap;
 use ibapi::market_data::{historical, realtime};
 use plotters::{
     coord::types::RangedCoordf32,
@@ -11,7 +10,7 @@ use plotters::{
 };
 use time::OffsetDateTime;
 
-use crate::{constants::rsi::MOVING_AVG_DAYS, types::Data};
+use crate::{types::Data};
 
 pub fn chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
     let root = BitMapBackend::new("charts/chart.png", (1024, 768)).into_drawing_area();
@@ -114,17 +113,29 @@ pub fn candle_chart(
     Ok(())
 }
 
-pub fn rsi_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn std::error::Error>> {
+pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.png");
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
+    let y_min = data
+    .iter()
+    .min_by(|a, b| a.partial_cmp(b).unwrap())
+    .unwrap().min(0f64) as f32
+    * 0.9;
+
+let y_max = data
+    .iter()
+    .max_by(|a, b| a.partial_cmp(b).unwrap())
+    .unwrap().max(100f64) as f32
+    * 1.1;
+
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("RSI", ("sans-serif", 20))
+        .caption(name, ("sans-serif", 20))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(30)
-        .build_cartesian_2d(0..data.len() as u32, 0f32..100f32)?;
+        .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
     chart.configure_mesh().light_line_style(WHITE).draw()?;
 
@@ -148,8 +159,8 @@ pub fn rsi_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn st
 pub fn buy_sell_chart(
     dir: &String,
     data: &Data,
-    buy_indexes: &HashMap<usize, (f64, u32)>,
-    sell_indexes: &HashMap<usize, (f64, u32)>,
+    buy_indexes: &HashMap<usize, (f64, f64)>,
+    sell_indexes: &HashMap<usize, (f64, f64)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/buy_sell.png");
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();

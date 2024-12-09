@@ -1,4 +1,4 @@
-use agent::train::train_agents;
+use agent::train;
 use ibapi::{
     accounts::{AccountSummaries, AccountSummaryTags},
     client::Subscription,
@@ -18,6 +18,7 @@ pub mod data;
 mod types;
 mod utils;
 pub mod charts;
+pub mod neural_net;
 
 fn main() {
     println!("Trying to connect to IB API!");
@@ -47,7 +48,8 @@ fn main() {
 
     // candle_chart(&stock_data).unwrap();
 
-    train_agents(&client);
+    // agent::train::train_agents(&client);
+    neural_net::train::train_networks(&client);
 }
 
 fn account_info(client: &Client) {

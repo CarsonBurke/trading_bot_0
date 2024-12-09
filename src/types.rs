@@ -23,20 +23,20 @@ pub type MappedHistorical = HashMap<String, Vec<historical::Bar>>;
 
 #[derive(Default, Debug)]
 pub struct Position {
-    pub quantity: u32,
+    pub quantity: f64,
     /// The average price that these positions were purchased at
     pub avg_price: f64,
 }
 
 impl Position {
-    pub fn new(quantity: u32) -> Self {
+    pub fn new(quantity: f64) -> Self {
         Self {
             quantity,
             avg_price: 0.,
         }
     }
 
-    pub fn add(&mut self, price: f64, quantity: u32) {
+    pub fn add(&mut self, price: f64, quantity: f64) {
         let sum = self.avg_price * self.quantity as f64;
         self.quantity += quantity;
         self.avg_price = (sum + price * quantity as f64) / (self.quantity as f64);

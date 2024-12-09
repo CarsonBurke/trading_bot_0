@@ -77,10 +77,11 @@ impl Default for Weights {
                 Weight::ReboundBuyThreshold => rng.gen_range(MIN_WEIGHT..MAX_WEIGHT),
             }, */
             map: enum_map! {
-                Weight::MinRsiSell => 0.7,
-                Weight::MaxRsiBuy => 0.3,
-                Weight::RsiBuyAmountWeight => 0.5,
-                Weight::RsiSellAmountWeight => 0.5,
+                Weight::MinRsiSell => 0.6,
+                Weight::MaxRsiBuy => 0.4,
+                Weight::RsiBuyAmountWeight => 0.8,
+                Weight::RsiSellAmountWeight => 0.8,
+                Weight::PriceEmaAlpha => 0.05,
                 Weight::DiffToBuy => 0.05,
                 Weight::DiffToSell => 0.05,
                 Weight::DeciderRsiEmaAlpha => 0.02/* 15 */,
@@ -106,6 +107,7 @@ pub enum Weight {
     MaxRsiBuy,
     RsiBuyAmountWeight,
     RsiSellAmountWeight,
+    PriceEmaAlpha,
     DiffToBuy,
     DiffToSell,
     DeciderRsiEmaAlpha,

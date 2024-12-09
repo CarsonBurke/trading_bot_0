@@ -11,14 +11,14 @@ use plotters::{
 };
 use time::OffsetDateTime;
 
-use crate::{constants::rsi::MOVING_AVG_DAYS, types::Data};
+use crate::types::Data;
 
 pub fn convert_historical(data: &Vec<historical::Bar>) -> Data {
     data.iter().map(|bar| bar.close).collect()
 }
 
 /// Get the relative strength index value for each data point
-pub fn get_rsi_values(data: &Data, ema_alpha: f64) -> Data {
+pub fn get_rsi_values(data: &[f64], ema_alpha: f64) -> Data {
     let mut diffs = get_differences(data);
     diffs[0] = 1.;
 
@@ -50,37 +50,50 @@ pub fn get_rsi_values(data: &Data, ema_alpha: f64) -> Data {
     rsi_values
 }
 
+/// Get the relative strength index value for each data point
+pub fn get_rsi_percents(data: &[f64], ema_alpha: f64) -> Data {
+    let mut diffs = get_differences(data);
+    diffs[0] = 1.;
+
+    let mut upwards = Vec::new();
+    let mut downwards = Vec::new();
+
+    for diff in diffs.iter() {
+        if *diff >= 0. {
+            upwards.push(*diff);
+            downwards.push(0.);
+            continue;
+        }
+
+        downwards.push(diff.abs());
+        upwards.push(0.);
+    }
+
+    let upward_avg = ema(&upwards, ema_alpha);
+    let downward_avg = ema(&downwards, ema_alpha);
+
+    let rsi_values = upward_avg
+        .iter()
+        .zip(downward_avg.iter())
+        .map(|(up, down)| {
+            let rs = up / down;
+            1. - (1. / (1. + rs))
+        })
+        .collect();
+    rsi_values
+}
+
 /// Calcualtes the exponential moving average
 ///
 /// # Arguments
 ///
 /// * `alpha` - The exponential weight to apply to the previous average. For example, 0.18 adds 18% of the previous average
 ///
-pub fn ema(data: &Data, alpha: f64) -> Data {
+pub fn ema(data: &[f64], alpha: f64) -> Data {
     let mut averages = Vec::new();
     let mut previous = data[0];
-    
+
     for (index, value) in data.iter().enumerate() {
-        // let mut sum = 0.;
-        // let steps_back = (index as u32 - MOVING_AVG_DAYS).min(0);
-
-        // for i in steps_back..(index as u32) {
-        //     sum += *value * alpha + averages.get()/* (alpha.powf((i - steps_back) as f64)) */;
-        // }
-
-        // averages.push(sum / steps_back as f64);
-
-        /* let previous = {
-            let (previous_index, overflowed) = index.overflowing_sub(1);
-            if overflowed {
-                println!("overflowed value {}", value);
-                averages.push(*value/*  * alpha */);
-                continue;
-            } else {
-                averages[previous_index]
-            }
-        }; */
-
         let avg = *value * alpha + previous * (1. - alpha);
         averages.push(avg);
 
@@ -89,7 +102,36 @@ pub fn ema(data: &Data, alpha: f64) -> Data {
     averages
 }
 
-pub fn get_differences(data: &Data) -> Data {
+pub fn ema_diff_percent(data: &[f64], alpha: f64) -> Data {
+    let mut averages = Vec::new();
+    let mut previous = data[0];
+
+    for (index, value) in data.iter().enumerate() {
+        let avg = *value * alpha + previous * (1. - alpha);
+        let diff_percent = (value - avg) / value;
+        averages.push(diff_percent);
+
+        previous = avg;
+    }
+    averages
+}
+
+pub fn get_macd(data: &[f64]) -> Data {
+    let ema_12 = ema(data, 1. / 12.);
+    let ema_26 = ema(data, 1. / 26.);
+
+    ema_12.iter().zip(ema_26.iter()).map(|(a, b)| a - b).collect()
+}
+
+fn get_stochastic_oscillator(bars: &[historical::Bar]) -> Data {
+    Vec::new()
+}
+
+fn get_w_percent_range(bars: &[historical::Bar]) -> Data {
+    Vec::new()
+}
+
+pub fn get_differences(data: &[f64]) -> Data {
     let mut diff = vec![];
 
     for (index, value) in data.iter().enumerate() {
@@ -123,4 +165,21 @@ pub fn estimate_stock_value(financials: String) {
 
 pub fn create_folder_if_not_exists(dir: &String) {
     let _ = fs::create_dir_all(dir);
+}
+
+pub fn find_highest<T: std::cmp::PartialOrd>(iter: &[T]) -> (usize, &T) {
+    let mut best_index = 0;
+    let mut highest_value = &iter[0];
+
+    for i in 1..iter.len() {
+        let value = &iter[1];
+
+        if value <= highest_value {
+            continue;
+        }
+        best_index = i;
+        highest_value = value;
+    }
+
+    (best_index, highest_value)
 }

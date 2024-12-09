@@ -1,9 +1,6 @@
 use core::f64;
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-};
 
+use hashbrown::HashMap;
 use ibapi::{
     client,
     market_data::historical::{self, HistoricalData},
@@ -13,10 +10,10 @@ use time::convert::Week;
 
 use crate::{
     agent::{self, Agent, Weight},
-    charts::general::{assets_chart, buy_sell_chart, candle_chart, rsi_chart},
+    charts::general::{assets_chart, buy_sell_chart, candle_chart, simple_chart},
     constants::{self, files::TRAINING_PATH, rsi, MAX_VALUE_PER_TICKER, TICKERS},
     types::{Account, MakeCharts, MappedHistorical, Position},
-    utils::{convert_historical, create_folder_if_not_exists, get_rsi_values, round_to_stock},
+    utils::{convert_historical, create_folder_if_not_exists, ema, get_rsi_values, round_to_stock},
 };
 
 /// Returns: total assets
@@ -50,6 +47,14 @@ pub fn basic(
         let data = convert_historical(bars);
         let rsi = get_rsi_values(&data, agent.weights.map[Weight::AmountRsiEmaAlpha]);
         amount_rsi_values_by_ticker.insert(ticker, rsi);
+    }
+
+    let mut price_emas_by_ticker = HashMap::new();
+
+    for (ticker, bars) in mapped_data.iter() {
+        let data = convert_historical(bars);
+        let ema = ema(&data, agent.weights.map[Weight::PriceEmaAlpha]);
+        price_emas_by_ticker.insert(ticker, ema);
     }
 
     let mut buy_indexes = HashMap::new();
@@ -114,6 +119,8 @@ pub fn basic(
             let amount_rsi_values = amount_rsi_values_by_ticker.get(ticker).unwrap();
             let amount_rsi = amount_rsi_values[index];
 
+            let price_ema = price_emas_by_ticker.get(ticker).unwrap()[index];
+
             if can_try_sell(ticker, decider_rsi, &mut highest_rsis, agent) {
                 try_sell(
                     ticker,
@@ -128,6 +135,7 @@ pub fn basic(
                     &mut last_sell_price,
                     &mut last_buy_price,
                     &mut sell_indexes,
+                    price_ema,
                 );
             }
 
@@ -155,9 +163,10 @@ pub fn basic(
                     position,
                     price,
                     rsi_diff,
-                    assets / (TICKERS.len() / 2) as f64,
+                    assets, /*  / (TICKERS.len() / 2) as f64 */
                     account.cash,
                     agent,
+                    price_ema,
                 ) else {
                     continue;
                 };
@@ -189,9 +198,9 @@ pub fn basic(
                 last_sell_price.remove(ticker);
 
                 let ticker_buy_indexes = buy_indexes.get_mut(ticker).unwrap();
-                ticker_buy_indexes.insert(index, (total_price, buy_quantity));
+                ticker_buy_indexes.insert(index, (total_price, buy_quantity as f64));
 
-                position.add(price, buy_quantity);
+                position.add(price, buy_quantity as f64);
                 account.cash -= total_price;
                 continue;
             }
@@ -230,7 +239,7 @@ pub fn basic(
 
             let data = convert_historical(bars);
 
-            candle_chart(&ticker_dir, bars);
+            /* candle_chart(&ticker_dir, bars); */
 
             let ticker_buy_indexes = buy_indexes.get(ticker).unwrap();
             let ticker_sell_indexes = sell_indexes.get(ticker).unwrap();
@@ -242,17 +251,20 @@ pub fn basic(
             );
 
             let rsi_values = decider_rsi_values_by_ticker.get(ticker).unwrap();
-            rsi_chart(&ticker_dir, "decider_rsi", &rsi_values);
+            simple_chart(&ticker_dir, "decider_rsi", &rsi_values);
 
             let amount_rsi_values = amount_rsi_values_by_ticker.get(ticker).unwrap();
-            rsi_chart(&ticker_dir, "amount_rsi", &amount_rsi_values);
+            simple_chart(&ticker_dir, "amount_rsi", &amount_rsi_values);
 
-            let rsi_diff_values = rsi_values
+            let price_ema_values = price_emas_by_ticker.get(ticker).unwrap();
+            simple_chart(&ticker_dir, "price_ema", &price_ema_values);
+
+            /* let rsi_diff_values = rsi_values
                 .iter()
                 .zip(amount_rsi_values.iter())
                 .map(|(decider, amount)| amount - decider)
                 .collect();
-            rsi_chart(&ticker_dir, "rsi_diff", &rsi_diff_values);
+            simple_chart(&ticker_dir, "rsi_diff", &rsi_diff_values); */
 
             let positioned_assets = positions_by_ticker.get(ticker).unwrap();
             assets_chart(
@@ -273,6 +285,20 @@ pub fn can_try_sell(
     highest_rsis: &mut HashMap<String, f64>,
     agent: &Agent,
 ) -> bool {
+    // Require the rsi to have rebounded slightly down before we can purchase
+    /* if let Some(ticker_highest_rsi) = highest_rsis.get(ticker) {
+        let max = ticker_highest_rsi
+            + ticker_highest_rsi * agent.weights.map[Weight::ReboundSellThreshold];
+        if decider_rsi <= max {
+            // highest_rsis.remove(ticker);
+            return true;
+        }
+    } */
+
+    if decider_rsi < agent.weights.map[Weight::MinRsiSell] * 100.0 {
+        return false;
+    }
+
     // Record the RSI if it's a new local maximum
     if let Some(ticker_highest_rsi) = highest_rsis.get(ticker) {
         if decider_rsi > *ticker_highest_rsi {
@@ -284,19 +310,6 @@ pub fn can_try_sell(
     } else {
         highest_rsis.insert(ticker.to_string(), decider_rsi);
     }
-    // Require the rsi to have rebounded slightly down before we can purchase
-    if let Some(ticker_highest_rsi) = highest_rsis.get(ticker) {
-        let max = ticker_highest_rsi
-            + ticker_highest_rsi * agent.weights.map[Weight::ReboundSellThreshold];
-        if decider_rsi <= max {
-            highest_rsis.remove(ticker);
-            return true;
-        }
-    }
-
-    if decider_rsi < agent.weights.map[Weight::MinRsiSell] * 100.0 {
-        return false;
-    }
 
     true
 }
@@ -307,6 +320,20 @@ pub fn can_try_buy(
     lowest_rsis: &mut HashMap<String, f64>,
     agent: &Agent,
 ) -> bool {
+    // Require the rsi to have rebounded slightly down before we can purchase
+    /* if let Some(ticker_lowest_rsi) = lowest_rsis.get(ticker) {
+        let min =
+            ticker_lowest_rsi + ticker_lowest_rsi * agent.weights.map[Weight::ReboundSellThreshold];
+        if decider_rsi >= min {
+            // lowest_rsis.remove(ticker);
+            return true;
+        }
+    } */
+
+    if decider_rsi > agent.weights.map[Weight::MaxRsiBuy] * 100.0 {
+        return false;
+    }
+
     // Record the RSI if it's a new local minimum
     if let Some(ticker_lowest_rsi) = lowest_rsis.get(ticker) {
         if decider_rsi < *ticker_lowest_rsi {
@@ -315,20 +342,6 @@ pub fn can_try_buy(
         }
     } else {
         lowest_rsis.insert(ticker.to_string(), decider_rsi);
-    }
-
-    // Require the rsi to have rebounded slightly down before we can purchase
-    if let Some(ticker_lowest_rsi) = lowest_rsis.get(ticker) {
-        let min =
-            ticker_lowest_rsi + ticker_lowest_rsi * agent.weights.map[Weight::ReboundSellThreshold];
-        if decider_rsi >= min {
-            lowest_rsis.remove(ticker);
-            return true;
-        }
-    }
-
-    if decider_rsi > agent.weights.map[Weight::MaxRsiBuy] * 100.0 {
-        return false;
     }
     true
 }
@@ -345,14 +358,15 @@ pub fn try_sell(
     highest_rsis: &mut HashMap<String, f64>,
     last_sell_price: &mut HashMap<String, f64>,
     last_buy_price: &mut HashMap<String, f64>,
-    sell_indexes: &mut HashMap<String, HashMap<usize, (f64, u32)>>,
+    sell_indexes: &mut HashMap<String, HashMap<usize, (f64, f64)>>,
+    price_ema: f64,
 ) {
     let position = account.positions.get_mut(ticker).unwrap();
 
     if position.avg_price >= price {
         return;
     }
-    if position.quantity == 0 {
+    if position.quantity == 0. {
         /* println!("no position to sell"); */
         return;
     }
@@ -373,8 +387,10 @@ pub fn try_sell(
         position,
         price,
         rsi_diff,
-        assets / (TICKERS.len() / 2) as f64,
+        assets, /*  / (TICKERS.len() / 2) as f64 */
+        account.cash,
         agent,
+        price_ema,
     ) else {
         return;
     };
@@ -393,9 +409,9 @@ pub fn try_sell(
     last_buy_price.remove(ticker);
 
     let ticker_sell_indexes = sell_indexes.get_mut(ticker).unwrap();
-    ticker_sell_indexes.insert(index, (sell_price, sell_quantity));
+    ticker_sell_indexes.insert(index, (sell_price, sell_quantity as f64));
 
-    position.quantity -= sell_quantity;
+    position.quantity -= sell_quantity as f64;
     account.cash += sell_price;
 }
 
@@ -404,14 +420,37 @@ pub fn get_sell_price_quantity(
     price: f64,
     rsi: f64,
     assets: f64,
+    cash: f64,
     agent: &Agent,
+    price_ema: f64,
 ) -> Option<(f64, u32)> {
-    let available_sell = (position.quantity as f64) * price;
+    // let available_sell = (position.quantity as f64) * price;
+    // let weight = agent.weights.map[Weight::RsiSellAmountWeight];
+
+    // let sell_want = max_sell_for_rsi(rsi, assets, available_sell, weight).min(available_sell);
+
+    let available =
+        cash.min((assets/* - position.value_with_price(price) */) / TICKERS.len() as f64);
+    let has = position.value_with_price(price);
     let weight = agent.weights.map[Weight::RsiSellAmountWeight];
 
-    let sell_want = max_sell_for_rsi(rsi, assets, available_sell, weight).min(available_sell);
+    let diff_from_avg = price_ema - price;
+    let percent_diff_from_avg = diff_from_avg / price_ema;
+    if percent_diff_from_avg < 0. {
+        return None;
+    }
+
+    let percent = percent_diff_from_avg.powf(weight); /* ((100. - rsi) / 100.) * weight/* .powf(weight * 10.) */; */
+    // How much of this stock we want to have
+    let want = available * percent;
+    // if want <= has {
+    //     return None
+    // }
+    // println!("want: {}", want);
+    // println!("has: {}", position.value_with_price(price));
+    let sell_want = (has - want).min(has);
     if sell_want < price {
-        return Some((price, 1));
+        return None; /* Some((price, 1)); */
     }
 
     Some(round_to_stock(price, sell_want))
@@ -424,11 +463,30 @@ pub fn get_buy_price_quantity(
     assets: f64,
     cash: f64,
     agent: &Agent,
+    price_ema: f64,
 ) -> Option<(f64, u32)> {
-    let available_cash = cash.min(assets /* - position.value_with_price(price) */);
+    // let available_cash = cash.min(assets /* - position.value_with_price(price) */);
+    // let weight = agent.weights.map[Weight::RsiBuyAmountWeight];
+
+    // let buy_want = max_buy_for_rsi(rsi, assets, available_cash, weight).min(available_cash);
+
+    let available =
+        cash.min((assets/* - position.value_with_price(price) */) / TICKERS.len() as f64);
     let weight = agent.weights.map[Weight::RsiBuyAmountWeight];
 
-    let buy_want = max_buy_for_rsi(rsi, assets, available_cash, weight).min(available_cash);
+    let diff_from_avg = price_ema - price;
+    let percent_diff_from_avg = diff_from_avg / price_ema;
+    if percent_diff_from_avg < 0. {
+        return None;
+    }
+
+    let percent = percent_diff_from_avg.powf(weight); /* ((100. - rsi) / 100.) * weight; */
+ /* ((100. - rsi) / 100.).powf(weight * 10.); */
+    // How much of this stock we want to have
+    let want = available * percent;
+
+    let buy_want = want - position.value_with_price(price);
+    // println!("buy want: {}", buy_want);
     if buy_want < price {
         return None;
     }
@@ -440,7 +498,7 @@ pub fn max_buy_for_rsi(rsi: f64, assets: f64, available: f64, weight: f64) -> f6
         return available * (rsi / 100.) * (1. - weight);
     }
     /* available *  */
-    assets * (rsi / 100.) * weight
+    assets * ((rsi::MIDDLE - rsi) / 100. / 100.).powf(1. - weight)
 }
 
 pub fn max_sell_for_rsi(rsi: f64, assets: f64, holding: f64, weight: f64) -> f64 {
@@ -448,5 +506,5 @@ pub fn max_sell_for_rsi(rsi: f64, assets: f64, holding: f64, weight: f64) -> f64
         return holding * (rsi / 100.) * (1. - weight);
     }
     /* holding *  */
-    assets * (rsi / 100.) * weight
+    assets * ((rsi - rsi::MIDDLE) / 100. / 10.).powf(1. - weight)
 }

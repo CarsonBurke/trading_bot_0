@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs};
+use std::{collections::{BTreeMap, VecDeque}, fs};
 
 use hashbrown::{HashMap, HashSet};
 use ibapi::Client;
@@ -39,7 +39,6 @@ pub fn train_agents(client: &Client) {
         agents_vec.truncate(KEEP_AGENTS_PER_GENERATION as usize);
 
         let agents_set: HashSet<Uuid> = HashSet::from_iter(agents_vec.iter().map(|a| a.0));
-
         agents.retain(|id, _| agents_set.contains(id));
 
         //
@@ -54,18 +53,20 @@ pub fn train_agents(client: &Client) {
 
         // duplicate agents
 
-        let mut new_agents = Vec::new();
+        let mut new_agents = VecDeque::new();
 
         // Has the potantial to create a few more agents than the target count, which seems fine
         while new_agents.len() + agents.len() < TARGET_AGENT_COUNT as usize {
             for (_, agent) in agents.iter() {
                 let cloned_agent = agent.clone();
 
-                new_agents.push(cloned_agent);
+                new_agents.push_front(cloned_agent);
             }
         }
 
-        while let Some(agent) = new_agents.pop() {
+        let best = new_agents.pop_front().unwrap();
+
+        while let Some(agent) = new_agents.pop_back() {
             agents.insert(agent.id, agent);
         }
 
@@ -75,9 +76,12 @@ pub fn train_agents(client: &Client) {
             agent.weights.mutate();
         }
 
+        // Add the best agent without mutations
+        agents.insert(best.id, best);
+
         //
 
-        println!("completed generation {gen}");
+        println!("completed generation: {gen}");
         println!("Highest this gen: {gen_best_assets}");
     }
 
