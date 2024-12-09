@@ -20,7 +20,8 @@ mod utils;
 pub mod charts;
 pub mod neural_net;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Trying to connect to IB API!");
     let connection_url = "127.0.0.1:4001";
 
@@ -49,7 +50,7 @@ fn main() {
     // candle_chart(&stock_data).unwrap();
 
     // agent::train::train_agents(&client);
-    neural_net::train::train_networks(&client);
+    neural_net::train::train_networks(&client).await;
 }
 
 fn account_info(client: &Client) {

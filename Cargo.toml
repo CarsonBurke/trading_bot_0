@@ -17,7 +17,7 @@ rand = "0.8.5"
 rust_neural_network = "0.5.0"
 serde = "1.0.215"
 time = "0.3.36"
-tokio = { version = "1.42.0", features = ["rt"] }
+tokio = { version = "1.42.0", features = ["full"] }
 uuid = { version = "1.11.0", features = ["v4"] }
 
 [features]

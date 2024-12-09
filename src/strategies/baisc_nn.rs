@@ -12,9 +12,9 @@ use crate::{
 pub fn baisc_nn(
     mapped_data: &MappedHistorical,
     account: &mut Account,
-    neural_network: &mut NeuralNetwork,
+    mut neural_network: NeuralNetwork,
     mapped_indicators: &HashMap<String, Indicators>,
-    inputs: &mut [Input],
+    mut inputs: Vec<Input>,
     make_charts: Option<MakeCharts>,
 ) -> f64 {
     let indexes = mapped_data.get(TICKERS[0]).unwrap().len();
@@ -94,7 +94,7 @@ pub fn baisc_nn(
 
             // Forward propagate
 
-            neural_network.forward_propagate(inputs);
+            neural_network.forward_propagate(&inputs);
 
             let last_layer = neural_network.activation_layers.last().unwrap();
 

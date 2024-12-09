@@ -6,7 +6,10 @@ use ibapi::Client;
 use rust_neural_network::neural_network::{Input, InputName, NeuralNetwork, Output, OutputName};
 
 use crate::{
-    constants::{agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, neural_net, TICKERS},
+    constants::{
+        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
+        neural_net, TICKERS,
+    },
     data::historical::get_historical_data,
     neural_net::create::create_mapped_indicators,
     strategies::baisc_nn::baisc_nn,
@@ -16,7 +19,6 @@ use crate::{
 use super::create::create_networks;
 
 pub async fn train_networks(client: &Client) {
-
     let mapped_historical = get_historical_data(client);
     let mapped_indicators = create_mapped_indicators(&mapped_historical);
 
@@ -72,13 +74,20 @@ pub async fn train_networks(client: &Client) {
         let mut handles = Vec::new();
 
         for (_, neural_net) in neural_nets.iter_mut() {
-            let handle = tokio::task::spawn(async {
+            // let mut neural_net = neural_net.clone();
+
+            let cloned_inputs = inputs.clone();
+
+            let cloned_historical = mapped_historical.clone();
+            let cloned_indicators = mapped_indicators.clone();
+
+            let handle = tokio::task::spawn(async move {
                 let assets = baisc_nn(
-                    &mapped_historical,
+                    &cloned_historical,
                     &mut Account::default(),
-                    neural_net,
-                    &mapped_indicators,
-                    &mut inputs,
+                    *neural_net,
+                    &cloned_indicators,
+                    cloned_inputs,
                     None,
                 );
                 println!("assets: {:.2}", assets);
@@ -136,7 +145,10 @@ pub async fn train_networks(client: &Client) {
 
         neural_nets.insert(best_gen_net.id, best_gen_net);
 
-        println!("Completed generation: {gen} with networks: {}", neural_nets.len());
+        println!(
+            "Completed generation: {gen} with networks: {}",
+            neural_nets.len()
+        );
         println!("Highest this gen: {gen_best_assets:.2}");
     }
 
@@ -147,12 +159,10 @@ pub async fn train_networks(client: &Client) {
     let first_assets = baisc_nn(
         &mapped_historical,
         &mut Account::default(),
-        first_net,
+        *first_net,
         &mapped_indicators,
-        &mut inputs,
-        Some(MakeCharts {
-            generation: 0,
-        }),
+        inputs.clone(),
+        Some(MakeCharts { generation: 0 }),
     );
     println!("Gen 1 final assets: {first_assets:.2}");
 
@@ -161,9 +171,9 @@ pub async fn train_networks(client: &Client) {
     let final_assets = baisc_nn(
         &mapped_historical,
         &mut Account::default(),
-        last_net,
+        *last_net,
         &mapped_indicators,
-        &mut inputs,
+        inputs,
         Some(MakeCharts {
             generation: TARGET_GENERATIONS - 1,
         }),
@@ -172,10 +182,17 @@ pub async fn train_networks(client: &Client) {
     println!("Final assets: {final_assets:.2}");
 
     let start = 10_000.0;
-    println!("Profit: ${:.2} ({:.2}%)", final_assets - start, ((final_assets - start) / start) * 100.0);
+    println!(
+        "Profit: ${:.2} ({:.2}%)",
+        final_assets - start,
+        ((final_assets - start) / start) * 100.0
+    );
 
     let diff = final_assets - first_assets;
-    println!("Improvement from training of : ${diff:.2} ({:.2}%)", (final_assets - first_assets) / start * 100.0);
+    println!(
+        "Improvement from training of : ${diff:.2} ({:.2}%)",
+        (final_assets - first_assets) / start * 100.0
+    );
 
     last_net.write_to_file();
 }
