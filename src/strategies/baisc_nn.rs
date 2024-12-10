@@ -3,7 +3,7 @@ use rust_neural_network::neural_network::{Input, NeuralNetwork};
 
 use crate::{
     charts::general::{assets_chart, buy_sell_chart, simple_chart, want_chart},
-    constants::{self, files::TRAINING_PATH, TICKERS},
+    constants::{self, files::TRAINING_PATH, neural_net::{INDEX_STEP, MAX_STEPS}, TICKERS},
     neural_net::create::Indicators,
     types::{Account, Data, MakeCharts, MappedHistorical, Position},
     utils::{convert_historical, create_folder_if_not_exists, ema, find_highest, get_rsi_values},
@@ -87,11 +87,25 @@ pub fn baisc_nn(
                 _ => (price - position.avg_price) / position.avg_price,
             };
 
-            let indicators = mapped_indicators.get(ticker).unwrap();
-            for (key, val) in indicators.iter() {
-                inputs[key as usize + 3].values[0] = val[index];
+            let min = index.saturating_sub(MAX_STEPS * INDEX_STEP);
+            for i in (index..min).step_by(INDEX_STEP) {
+                let diff_percent = (mapped_data.get(ticker).unwrap()[i].close - price) / price;
+                inputs[i + 3].values[0] = diff_percent;
             }
 
+            // let indicators = mapped_indicators.get(ticker).unwrap();
+            // for (key, val) in indicators.iter() {
+            //     inputs[key as usize + 3].values[0] = val[index];
+            // }
+
+            // println!(
+            //     "inputs 0: {} inputs 1: {} inputs 2: {} avg_price: {} quantity {}",
+            //     inputs[0].values[0],
+            //     inputs[1].values[0],
+            //     inputs[2].values[0],
+            //     position.avg_price,
+            //     position.quantity
+            // );
             // Forward propagate
 
             neural_network.forward_propagate(&inputs);
@@ -102,59 +116,109 @@ pub fn baisc_nn(
             if *percent <= 0. {
                 continue;
             }
+
+            if output_index == constants::neural_net::HOLD_INDEX as usize {
+                continue;
+            }
+
             // println!("index: {}, value: {}", index, percent);
             // let values = inputs.iter().map(|input| input.values[0]).collect::<Vec<f64>>();
             // println!("inputs: {values:?}");
 
-            if output_index as u32 == constants::neural_net::CHANGE_INDEX {
-                // Get the want from the determined percent, at a maximum of 10%
-                let gross_want = assets * (percent / 1000.).min(0.2);
-                let current = match position.quantity {
-                    0. => 0.,
-                    _ => position.value_with_price(price),
-                };
+            let change = last_layer[constants::neural_net::BUY_INDEX]
+                - last_layer[constants::neural_net::SELL_INDEX];
+            let current = match position.quantity {
+                0. => 0.,
+                _ => position.value_with_price(price),
+            };
 
-                want_indexes
-                    .get_mut(ticker)
-                    .unwrap()
-                    .insert(index, gross_want);
+            want_indexes.get_mut(ticker).unwrap().insert(index, change);
 
-                // If we want more than we have, try to buy
-                if gross_want > current {
-                    let buy = (gross_want - current).min(account.cash);
-                    if buy == 0. {
-                        continue;
-                    }
-                    
-                    let quantity = buy / price;
-
-                    position.add(price, quantity);
-                    account.cash -= buy;
-
-                    buy_indexes
-                        .get_mut(ticker)
-                        .unwrap()
-                        .insert(index, (price, quantity));
+            // println!("change: {change}, current: {current}");
+            if change > 0. {
+                let buy = (change).min(account.cash);
+                if buy == 0. {
                     continue;
                 }
 
-                // Otherwise we want less than we have, try to sell
+                let quantity = buy / price;
 
-                let sell = ((gross_want - current).abs()).min(current);
-                if sell == 0. {
-                    continue;
-                }
+                position.add(price, quantity);
+                account.cash -= buy;
 
-                let quantity = sell / price;
-
-                position.quantity -= quantity;
-                account.cash += sell;
-
-                sell_indexes
+                buy_indexes
                     .get_mut(ticker)
                     .unwrap()
                     .insert(index, (price, quantity));
+                continue;
             }
+
+            let sell = (change.abs()).min(current);
+            if sell == 0. {
+                continue;
+            }
+
+            let quantity = sell / price;
+
+            position.quantity -= quantity;
+            account.cash += sell;
+
+            sell_indexes
+                .get_mut(ticker)
+                .unwrap()
+                .insert(index, (price, quantity));
+
+            continue;
+
+            // if output_index as u32 == constants::neural_net::CHANGE_INDEX {
+            //     // Get the want from the determined percent, at a maximum of 10%
+            //     let gross_want = assets * percent / 1000./* (percent / 1000.).min(0.2) */;
+            //     let current = match position.quantity {
+            //         0. => 0.,
+            //         _ => position.value_with_price(price),
+            //     };
+
+            //     want_indexes
+            //         .get_mut(ticker)
+            //         .unwrap()
+            //         .insert(index, gross_want);
+
+            //     // If we want more than we have, try to buy
+            //     if gross_want > current {
+            //         let buy = (gross_want - current).min(account.cash);
+            //         if buy == 0. {
+            //             continue;
+            //         }
+
+            //         let quantity = buy / price;
+
+            //         position.add(price, quantity);
+            //         account.cash -= buy;
+
+            //         buy_indexes
+            //             .get_mut(ticker)
+            //             .unwrap()
+            //             .insert(index, (price, quantity));
+            //         continue;
+            //     }
+
+            //     // Otherwise we want less than we have, try to sell
+
+            //     let sell = ((gross_want - current).abs()).min(current);
+            //     if sell == 0. {
+            //         continue;
+            //     }
+
+            //     let quantity = sell / price;
+
+            //     position.quantity -= quantity;
+            //     account.cash += sell;
+
+            //     sell_indexes
+            //         .get_mut(ticker)
+            //         .unwrap()
+            //         .insert(index, (price, quantity));
+            // }
         }
     }
 

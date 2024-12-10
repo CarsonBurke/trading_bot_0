@@ -7,6 +7,7 @@ license = "GPL-3.0"
 [dependencies]
 chrono = "0.4.38"
 clap = "4.5.21"
+colored = "2.1.0"
 enum-map = { version = "2.7.3", features = ["serde"] }
 hashbrown = "0.15.2"
 ibapi = { version = "1.0.3" }

@@ -85,7 +85,7 @@ pub fn candle_chart(
         .caption("Candle Chart", ("sans-serif", 20))
         .margin(5)
         .x_label_area_size(30)
-        .y_label_area_size(30)
+        .y_label_area_size(50)
         .build_cartesian_2d(0..bars.len() as u32, y_min..y_max)?;
 
     chart.configure_mesh().light_line_style(WHITE).draw()?;
@@ -121,20 +121,20 @@ pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn
     let y_min = data
     .iter()
     .min_by(|a, b| a.partial_cmp(b).unwrap())
-    .unwrap().min(0f64) as f32
+    .unwrap()
     * 0.9;
 
 let y_max = data
     .iter()
     .max_by(|a, b| a.partial_cmp(b).unwrap())
-    .unwrap().max(100f64) as f32
+    .unwrap()
     * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
         .caption(name, ("sans-serif", 20))
         .margin(5)
         .x_label_area_size(30)
-        .y_label_area_size(30)
+        .y_label_area_size(50)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
     chart.configure_mesh().light_line_style(WHITE).draw()?;
@@ -143,7 +143,7 @@ let y_max = data
         AreaSeries::new(
             data.iter()
                 .enumerate()
-                .map(|(index, value)| (index as u32, *value as f32)),
+                .map(|(index, value)| (index as u32, *value)),
             0.0,
             BLUE.mix(0.2),
         )
@@ -198,7 +198,7 @@ pub fn buy_sell_chart(
         .caption("Buy Sell Chart", ("sans-serif", 20))
         .margin(5)
         .x_label_area_size(30)
-        .y_label_area_size(30)
+        .y_label_area_size(50)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
     chart.configure_mesh().light_line_style(WHITE).draw()?;
@@ -351,7 +351,7 @@ pub fn want_chart(
         .caption("Buy Sell Chart", ("sans-serif", 20))
         .margin(5)
         .x_label_area_size(30)
-        .y_label_area_size(30)
+        .y_label_area_size(50)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
     chart.configure_mesh().light_line_style(WHITE).draw()?;

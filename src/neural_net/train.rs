@@ -1,24 +1,22 @@
 use std::collections::VecDeque;
 
-use hashbrown::HashSet;
+use colored::Colorize;
+use hashbrown::{HashMap, HashSet};
 use ibapi::Client;
 
 use rust_neural_network::neural_network::{Input, InputName, NeuralNetwork, Output, OutputName};
 
 use crate::{
-    constants::{
-        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
-        neural_net, TICKERS,
-    },
-    data::historical::get_historical_data,
-    neural_net::create::create_mapped_indicators,
-    strategies::baisc_nn::baisc_nn,
-    types::{Account, MakeCharts},
+    charts::general::simple_chart, constants::{
+        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, MAX_STEPS}, TICKERS
+    }, data::historical::get_historical_data, neural_net::create::create_mapped_indicators, strategies::baisc_nn::baisc_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
 };
 
-use super::create::create_networks;
+use super::create::{create_networks, Indicator, Indicators};
 
 pub async fn train_networks(client: &Client) {
+    let time = std::time::Instant::now();
+
     let mapped_historical = get_historical_data(client);
     let mapped_indicators = create_mapped_indicators(&mapped_historical);
 
@@ -46,12 +44,22 @@ pub async fn train_networks(client: &Client) {
         },
     ];
 
-    let indicators = mapped_indicators.get(TICKERS[0]).unwrap();
-    for index in 0..indicators.len() {
+    let input_count = inputs.len();
+
+    // let indicators = mapped_indicators.get(TICKERS[0]).unwrap();
+    // for index in 0..indicators.len() {
+    //     inputs.push(Input {
+    //         name: InputName::X,
+    //         values: vec![1.],
+    //         weight_ids: vec![(index + input_count) as u32],
+    //     });
+    // }
+
+    for i in 0..MAX_STEPS {
         inputs.push(Input {
             name: InputName::X,
-            values: vec![1.],
-            weight_ids: vec![(index + inputs.len()) as u32],
+            values: vec![0.],
+            weight_ids: vec![(i + input_count) as u32],
         });
     }
 
@@ -150,7 +158,7 @@ pub async fn train_networks(client: &Client) {
             "Completed generation: {gen} with networks: {}",
             neural_nets.len()
         );
-        println!("Highest this gen: {gen_best_assets:.2}");
+        println!("{} {gen_best_assets:.2}", "Highest this gen:".bright_green());
     }
 
     println!("Completed training");
@@ -194,8 +202,12 @@ pub async fn train_networks(client: &Client) {
         "Improvement from training of : ${diff:.2} ({:.2}%)",
         (final_assets - first_assets) / start * 100.0
     );
+    
+    chart_indicators(&mapped_indicators);
 
     last_net.write_to_file();
+
+    println!("Completed training in {} seconds", time.elapsed().as_secs());
 }
 
 #[cfg(feature = "debug_training")]
@@ -214,4 +226,19 @@ fn record_finances(neural_net_ids: &[(u32, f64)], gen: u32) {
         format!("{agents_only_finances:.2?}"),
     )
     .unwrap();
+}
+
+pub fn chart_indicators(mapped_indicators: &HashMap<String, Indicators>) {
+    for (ticker, indicators) in mapped_indicators.iter() {
+        
+        let dir = format!("{TRAINING_PATH}/indicators/{ticker}");
+        create_folder_if_not_exists(&dir);
+
+        simple_chart(&dir, "EmaDiff100", &indicators[Indicator::EMADiff100]).unwrap();
+        simple_chart(&dir, "EmaDiff1000", &indicators[Indicator::EMADiff1000]).unwrap();
+        simple_chart(&dir, "Rsi100", &indicators[Indicator::RSI100]).unwrap();
+
+        simple_chart(&dir, "StochasticOscillator", &indicators[Indicator::StochasticOscillator]).unwrap();
+        simple_chart(&dir, "MacdDiff", &indicators[Indicator::MACDDiff]).unwrap();
+    }
 }

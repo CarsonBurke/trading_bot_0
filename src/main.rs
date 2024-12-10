@@ -11,14 +11,14 @@ use ibapi::{
     Client,
 };
 
-pub mod constants;
-pub mod strategies;
 pub mod agent;
+pub mod charts;
+pub mod constants;
 pub mod data;
+pub mod neural_net;
+pub mod strategies;
 mod types;
 mod utils;
-pub mod charts;
-pub mod neural_net;
 
 #[tokio::main]
 async fn main() {
@@ -37,7 +37,7 @@ async fn main() {
     // place_order(&client);
 
     // let mapped_historical = get_historical_data(&client);
-    
+
     // let stock_data = mapped_historical.get(TICKER).unwrap();
     // let data = convert_historical(stock_data);
 

@@ -78,6 +78,7 @@ pub fn get_rsi_percents(data: &[f64], ema_alpha: f64) -> Data {
         .map(|(up, down)| {
             let rs = up / down;
             1. - (1. / (1. + rs))
+            /* (100. - (100. / (1. + rs))) / 100. */
         })
         .collect();
     rsi_values
@@ -108,7 +109,7 @@ pub fn ema_diff_percent(data: &[f64], alpha: f64) -> Data {
 
     for (index, value) in data.iter().enumerate() {
         let avg = *value * alpha + previous * (1. - alpha);
-        let diff_percent = (value - avg) / value;
+        let diff_percent = (value - avg) / avg;
         averages.push(diff_percent);
 
         previous = avg;
@@ -123,12 +124,50 @@ pub fn get_macd(data: &[f64]) -> Data {
     ema_12.iter().zip(ema_26.iter()).map(|(a, b)| a - b).collect()
 }
 
-fn get_stochastic_oscillator(bars: &[historical::Bar]) -> Data {
-    Vec::new()
+pub fn get_stochastic_oscillator(bars: &[historical::Bar]) -> Data {
+    let mut values = Vec::new();
+
+    for (index, bar) in bars.iter().enumerate() {
+        let high = bars
+            .iter()
+            .take(index + 1)
+            .map(|b| b.high)
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+        let low = bars
+            .iter()
+            .take(index + 1)
+            .map(|b| b.low)
+            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+        values.push((high - low) / bar.close);
+    }
+
+    values
 }
 
-fn get_w_percent_range(bars: &[historical::Bar]) -> Data {
-    Vec::new()
+pub fn get_w_percent_range(bars: &[historical::Bar]) -> Data {
+    let mut values = Vec::new();
+
+    // William's percent range 0-1
+
+    for (index, bar) in bars.iter().enumerate() {
+        let high = bars
+            .iter()
+            .take(index + 1)
+            .map(|b| b.high)
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+        let low = bars
+            .iter()
+            .take(index + 1)
+            .map(|b| b.low)
+            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+        values.push((high - low) / bar.close);
+    }
+
+    values
 }
 
 pub fn get_differences(data: &[f64]) -> Data {

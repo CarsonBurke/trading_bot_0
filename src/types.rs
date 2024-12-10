@@ -29,26 +29,19 @@ pub struct Position {
 }
 
 impl Position {
-    pub fn new(quantity: f64) -> Self {
-        Self {
-            quantity,
-            avg_price: 0.,
-        }
-    }
-
     pub fn add(&mut self, price: f64, quantity: f64) {
-        let sum = self.avg_price * self.quantity as f64;
+        let sum = self.avg_price * self.quantity;
         self.quantity += quantity;
-        self.avg_price = (sum + price * quantity as f64) / (self.quantity as f64);
+        self.avg_price = (sum + price * quantity) / (self.quantity);
     }
 
     /// The total value of the position based on a provided Price Per Unit
     pub fn value(&self) -> f64 {
-        self.avg_price * self.quantity as f64
+        self.avg_price * self.quantity
     }
 
     pub fn value_with_price(&self, price: f64) -> f64 {
-        price * self.quantity as f64
+        price * self.quantity
     }
 }
 
