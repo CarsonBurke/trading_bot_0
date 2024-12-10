@@ -78,9 +78,9 @@ pub async fn train_networks(client: &Client) {
         },
     ];
 
-    for (index, data) in mapped_historical.iter().enumerate() {
-        println!("check {index} {}", data.len());
-    }
+    // for (index, data) in mapped_historical.iter().enumerate() {
+    //     println!("check {index} {}", data.len());
+    // }
 
     let mut neural_nets = create_networks(&inputs, outputs.len());
     let mut rng = rand::thread_rng();

@@ -333,8 +333,7 @@ pub fn want_chart(
     chart.draw_series(
         AreaSeries::new(
             wants.iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value.1)),
+                .map(|(index, value)| (*index as u32, *value)),
             0.0,
             PURPLE.mix(0.2),
         )

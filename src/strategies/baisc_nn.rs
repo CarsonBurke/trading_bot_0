@@ -1,3 +1,4 @@
+use colored::Colorize;
 use hashbrown::HashMap;
 use rust_neural_network::neural_network::{Input, NeuralNetwork};
 
@@ -20,7 +21,7 @@ pub fn baisc_nn(
     mut neural_network: NeuralNetwork,
     // mapped_indicators: &Vec<Indicators>,
     mut inputs: Vec<Input>,
-    make_charts: Option<MakeCharts>,
+    mut make_charts: Option<MakeCharts>,
 ) -> f64 {
     let indexes = mapped_data[0].len();
 
@@ -219,6 +220,14 @@ pub fn baisc_nn(
 
             sell_indexes[ticker_index].insert(index, (price, quantity));
         }
+    }
+
+    if *total_assets.last().unwrap() > 1_000_000. {
+        println!("{}", "total assets exceeds 1m".red());
+
+        make_charts = Some(MakeCharts {
+            generation: 1_000_000,
+        });
     }
 
     if let Some(charts_config) = make_charts {
