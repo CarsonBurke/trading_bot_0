@@ -3,7 +3,12 @@ use rust_neural_network::neural_network::{Input, NeuralNetwork};
 
 use crate::{
     charts::general::{assets_chart, buy_sell_chart, simple_chart, want_chart},
-    constants::{self, files::TRAINING_PATH, neural_net::{INDEX_STEP, MAX_STEPS}, TICKERS},
+    constants::{
+        self,
+        files::TRAINING_PATH,
+        neural_net::{BUY_INDEX, INDEX_STEP, MAX_STEPS, SELL_INDEX},
+        TICKERS,
+    },
     neural_net::create::Indicators,
     types::{Account, Data, MakeCharts, MappedHistorical, Position},
     utils::{convert_historical, create_folder_if_not_exists, ema, find_highest, get_rsi_values},
@@ -13,39 +18,37 @@ pub fn baisc_nn(
     mapped_data: &MappedHistorical,
     account: &mut Account,
     mut neural_network: NeuralNetwork,
-    mapped_indicators: &HashMap<String, Indicators>,
+    // mapped_indicators: &Vec<Indicators>,
     mut inputs: Vec<Input>,
     make_charts: Option<MakeCharts>,
 ) -> f64 {
-    let indexes = mapped_data.get(TICKERS[0]).unwrap().len();
+    let indexes = mapped_data[0].len();
 
-    for ticker in TICKERS {
-        account
-            .positions
-            .insert(ticker.to_string(), Position::default());
+    for ticker_index in TICKERS {
+        account.positions.push(Position::default());
     }
 
-    let mut positions_by_ticker: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut positions_by_ticker: Vec<Vec<f64>> = Vec::new();
 
-    for ticker in mapped_data.keys() {
-        positions_by_ticker.insert(ticker.to_string(), Vec::new());
+    for ticker_index in 0..mapped_data.len() {
+        positions_by_ticker.push(Vec::new());
     }
 
     let mut cash_graph = Vec::new();
     let mut total_assets = Vec::new();
 
-    let mut buy_indexes = HashMap::new();
-    let mut sell_indexes = HashMap::new();
+    let mut buy_indexes = Vec::new();
+    let mut sell_indexes = Vec::new();
 
-    for (ticker, _) in mapped_data.iter() {
-        buy_indexes.insert(ticker.to_string(), HashMap::new());
-        sell_indexes.insert(ticker.to_string(), HashMap::new());
+    for ticker_index in 0..mapped_data.len() {
+        buy_indexes.push(HashMap::new());
+        sell_indexes.push(HashMap::new());
     }
 
-    let mut want_indexes = HashMap::new();
+    let mut want_indexes = Vec::new();
 
-    for (ticker, _) in mapped_data.iter() {
-        want_indexes.insert(ticker.to_string(), HashMap::new());
+    for ticker_index in 0..mapped_data.len() {
+        want_indexes.push(HashMap::new());
     }
 
     account.cash = 10_000.;
@@ -55,16 +58,13 @@ pub fn baisc_nn(
 
         let mut total_positioned = 0.0;
 
-        for (ticker, bars) in mapped_data.iter() {
+        for (ticker_index, bars) in mapped_data.iter().enumerate() {
             let price = bars[index].close;
 
-            let position = account.positions.get_mut(ticker).unwrap();
+            let position = &account.positions[ticker_index];
             let positioned = position.value_with_price(price);
 
-            positions_by_ticker
-                .get_mut(ticker)
-                .unwrap()
-                .push(positioned);
+            positions_by_ticker[ticker_index].push(positioned);
             total_positioned += positioned;
         }
 
@@ -73,10 +73,10 @@ pub fn baisc_nn(
         cash_graph.push(account.cash);
         total_assets.push(assets);
 
-        for (ticker, bars) in mapped_data.iter() {
+        for (ticker_index, bars) in mapped_data.iter().enumerate() {
             let price = bars[index].close;
 
-            let position = account.positions.get_mut(ticker).unwrap();
+            let position = &mut account.positions[ticker_index];
 
             // Assign inputs
 
@@ -87,16 +87,28 @@ pub fn baisc_nn(
                 _ => (price - position.avg_price) / position.avg_price,
             };
 
+            for i in ((index.saturating_sub(INDEX_STEP))..index).rev() {
+                let diff_percent = (mapped_data[ticker_index][i].close - price) / price;
+                // println!("i: {}", index - i);
+                inputs[index - i + 3].values[0] = diff_percent;
+            }
+
             let min = index.saturating_sub(MAX_STEPS * INDEX_STEP);
-            for i in (index..min).step_by(INDEX_STEP) {
-                let diff_percent = (mapped_data.get(ticker).unwrap()[i].close - price) / price;
+            for (i, stocki) in (min..(index - INDEX_STEP - 1)).step_by(INDEX_STEP).rev().enumerate() {
+                let diff_percent = (mapped_data[ticker_index][stocki].close - price) / price;
+                // println!("i: {} index: {} i2: {}", i, index, i / INDEX_STEP + 3);
                 inputs[i + 3].values[0] = diff_percent;
             }
 
-            // let indicators = mapped_indicators.get(ticker).unwrap();
+            // let input_count = MAX_STEPS + 3;
+
+            // let indicators = &mapped_indicators[0];
             // for (key, val) in indicators.iter() {
-            //     inputs[key as usize + 3].values[0] = val[index];
+            //     inputs[key as usize + input_count].values[0] = val[index];
             // }
+
+            // let input_values = inputs.iter().map(|input| input.values[0]).collect::<Vec<f64>>();
+            // println!("inputs: {input_values:?}");
 
             // println!(
             //     "inputs 0: {} inputs 1: {} inputs 2: {} avg_price: {} quantity {}",
@@ -125,19 +137,19 @@ pub fn baisc_nn(
             // let values = inputs.iter().map(|input| input.values[0]).collect::<Vec<f64>>();
             // println!("inputs: {values:?}");
 
-            let change = last_layer[constants::neural_net::BUY_INDEX]
+            /* let change = last_layer[constants::neural_net::BUY_INDEX]
                 - last_layer[constants::neural_net::SELL_INDEX];
             let current = match position.quantity {
                 0. => 0.,
                 _ => position.value_with_price(price),
             };
 
-            want_indexes.get_mut(ticker).unwrap().insert(index, change);
+            want_indexes[ticker_index].insert(index, change);
 
             // println!("change: {change}, current: {current}");
             if change > 0. {
-                let buy = (change).min(account.cash);
-                if buy == 0. {
+                let buy = (change).min(account.cash).min(assets / TICKERS.len() as f64 - current);
+                if buy <= 0. {
                     continue;
                 }
 
@@ -146,10 +158,7 @@ pub fn baisc_nn(
                 position.add(price, quantity);
                 account.cash -= buy;
 
-                buy_indexes
-                    .get_mut(ticker)
-                    .unwrap()
-                    .insert(index, (price, quantity));
+                buy_indexes[ticker_index].insert(index, (price, quantity));
                 continue;
             }
 
@@ -163,62 +172,52 @@ pub fn baisc_nn(
             position.quantity -= quantity;
             account.cash += sell;
 
-            sell_indexes
-                .get_mut(ticker)
-                .unwrap()
-                .insert(index, (price, quantity));
+            sell_indexes[ticker_index].insert(index, (price, quantity));
 
-            continue;
+            continue; */
 
-            // if output_index as u32 == constants::neural_net::CHANGE_INDEX {
-            //     // Get the want from the determined percent, at a maximum of 10%
-            //     let gross_want = assets * percent / 1000./* (percent / 1000.).min(0.2) */;
-            //     let current = match position.quantity {
-            //         0. => 0.,
-            //         _ => position.value_with_price(price),
-            //     };
+            // Get the want from the determined percent, at a maximum of 10%
+            let gross_want = assets * last_layer[BUY_INDEX] / 100. - assets * last_layer[SELL_INDEX] / 100. /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
+            if gross_want <= 1. {
+                continue;
+            }
 
-            //     want_indexes
-            //         .get_mut(ticker)
-            //         .unwrap()
-            //         .insert(index, gross_want);
+            let current = match position.quantity {
+                0. => 0.,
+                _ => position.value_with_price(price),
+            };
 
-            //     // If we want more than we have, try to buy
-            //     if gross_want > current {
-            //         let buy = (gross_want - current).min(account.cash);
-            //         if buy == 0. {
-            //             continue;
-            //         }
+            want_indexes[ticker_index].insert(index, gross_want);
 
-            //         let quantity = buy / price;
+            // If we want more than we have, try to buy
+            if gross_want > current {
+                let buy = (gross_want - current).min(account.cash).min(assets / 5.);
+                if buy == 0. {
+                    continue;
+                }
 
-            //         position.add(price, quantity);
-            //         account.cash -= buy;
+                let quantity = buy / price;
 
-            //         buy_indexes
-            //             .get_mut(ticker)
-            //             .unwrap()
-            //             .insert(index, (price, quantity));
-            //         continue;
-            //     }
+                position.add(price, quantity);
+                account.cash -= buy;
 
-            //     // Otherwise we want less than we have, try to sell
+                buy_indexes[ticker_index].insert(index, (price, quantity));
+                continue;
+            }
 
-            //     let sell = ((gross_want - current).abs()).min(current);
-            //     if sell == 0. {
-            //         continue;
-            //     }
+            // Otherwise we want less than we have, try to sell
 
-            //     let quantity = sell / price;
+            let sell = ((gross_want - current).abs()).min(current).min(assets / 5.);
+            if sell == 0. {
+                continue;
+            }
 
-            //     position.quantity -= quantity;
-            //     account.cash += sell;
+            let quantity = sell / price;
 
-            //     sell_indexes
-            //         .get_mut(ticker)
-            //         .unwrap()
-            //         .insert(index, (price, quantity));
-            // }
+            position.quantity -= quantity;
+            account.cash += sell;
+
+            sell_indexes[ticker_index].insert(index, (price, quantity));
         }
     }
 
@@ -230,19 +229,19 @@ pub fn baisc_nn(
 
         let _ = assets_chart(&base_dir, &total_assets, &cash_graph, None);
 
-        for (ticker, bars) in mapped_data.iter() {
+        for (ticker_index, bars) in mapped_data.iter().enumerate() {
+            let ticker = TICKERS[ticker_index].to_string();
+
             let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker}", charts_config.generation);
             create_folder_if_not_exists(&ticker_dir);
 
             let data = convert_historical(bars);
 
-            /* candle_chart(&ticker_dir, bars); */
-
-            let ticker_buy_indexes = buy_indexes.get(ticker).unwrap();
-            let ticker_sell_indexes = sell_indexes.get(ticker).unwrap();
+            let ticker_buy_indexes = &buy_indexes[ticker_index];
+            let ticker_sell_indexes = &sell_indexes[ticker_index];
             let _ = buy_sell_chart(&ticker_dir, &data, ticker_buy_indexes, ticker_sell_indexes);
 
-            let ticker_want_indexes = want_indexes.get(ticker).unwrap();
+            let ticker_want_indexes = &want_indexes[ticker_index];
             let _ = want_chart(&ticker_dir, &data, ticker_want_indexes);
 
             /* let rsi_diff_values = rsi_values
@@ -252,7 +251,7 @@ pub fn baisc_nn(
                 .collect();
             simple_chart(&ticker_dir, "rsi_diff", &rsi_diff_values); */
 
-            let positioned_assets = positions_by_ticker.get(ticker).unwrap();
+            let positioned_assets = &positions_by_ticker[ticker_index];
             let _ = assets_chart(
                 &ticker_dir,
                 &total_assets,

@@ -17,7 +17,7 @@ pub fn get_historical_data(client: &Client) -> MappedHistorical {
 fn get_historical_data_from_files() -> Option<MappedHistorical> {
     let dir = fs::read_dir(files::DATA_PATH).ok()?;
 
-    let mut data = HashMap::new();
+    let mut data = Vec::new();
 
     let tickers_set: HashSet<String> =
         HashSet::from_iter(TICKERS.iter().map(|str| str.to_string()));
@@ -38,25 +38,27 @@ fn get_historical_data_from_files() -> Option<MappedHistorical> {
         let file = fs::read(format!("{}/{}", files::DATA_PATH, filename_extended)).ok()?;
         let bars: Vec<historical::Bar> = postcard::from_bytes(&file).ok()?;
 
-        data.insert(filename, bars);
+        data.push(bars);
     }
 
     Some(data)
 }
 
 fn get_historical_data_from_ibkr(client: &Client) -> MappedHistorical {
-    let mut data = HashMap::new();
+    let mut data = Vec::new();
 
     fs::create_dir(files::DATA_PATH).ok().unwrap();
 
     for ticker in TICKERS {
+        println!("Downloading data for {ticker}");
         let contract = Contract::stock(ticker);
 
         let historical_data = client
             .historical_data(
                 &contract,
                 OffsetDateTime::now_utc(),
-                360.days(),
+                365.days(),
+                /* 1.years(), */
                 BarSize::Hour,
                 WhatToShow::Trades,
                 true,
@@ -74,7 +76,7 @@ fn get_historical_data_from_ibkr(client: &Client) -> MappedHistorical {
         .ok()
         .unwrap();
 
-        data.insert(ticker.to_string(), historical_data.bars);
+        data.push(historical_data.bars);
     }
 
     data

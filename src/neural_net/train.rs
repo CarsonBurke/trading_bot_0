@@ -2,13 +2,14 @@ use std::collections::VecDeque;
 
 use colored::Colorize;
 use hashbrown::{HashMap, HashSet};
-use ibapi::Client;
+use ibapi::{market_data::historical, Client};
 
+use rand::{seq::{index::sample, SliceRandom}, Rng};
 use rust_neural_network::neural_network::{Input, InputName, NeuralNetwork, Output, OutputName};
 
 use crate::{
     charts::general::simple_chart, constants::{
-        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, MAX_STEPS}, TICKERS
+        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES}, TICKERS
     }, data::historical::get_historical_data, neural_net::create::create_mapped_indicators, strategies::baisc_nn::baisc_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
 };
 
@@ -44,18 +45,20 @@ pub async fn train_networks(client: &Client) {
         },
     ];
 
-    let input_count = inputs.len();
+    let mut input_count = inputs.len();
 
-    // let indicators = mapped_indicators.get(TICKERS[0]).unwrap();
-    // for index in 0..indicators.len() {
-    //     inputs.push(Input {
-    //         name: InputName::X,
-    //         values: vec![1.],
-    //         weight_ids: vec![(index + input_count) as u32],
-    //     });
-    // }
+    let indicators = &mapped_indicators[0];
+    for index in 0..indicators.len() {
+        inputs.push(Input {
+            name: InputName::X,
+            values: vec![1.],
+            weight_ids: vec![(index + input_count) as u32],
+        });
+    }
 
-    for i in 0..MAX_STEPS {
+    input_count = inputs.len();
+
+    for i in 0..(MAX_STEPS+INDEX_STEP) {
         inputs.push(Input {
             name: InputName::X,
             values: vec![0.],
@@ -75,27 +78,40 @@ pub async fn train_networks(client: &Client) {
         },
     ];
 
+    for (index, data) in mapped_historical.iter().enumerate() {
+        println!("check {index} {}", data.len());
+    }
+
     let mut neural_nets = create_networks(&inputs, outputs.len());
+    let mut rng = rand::thread_rng();
 
     for gen in 0..TARGET_GENERATIONS {
         let mut neural_net_ids = Vec::new();
         let mut handles = Vec::new();
 
+        let ticker_indexes = match sample(&mut rng, TICKERS.len() - 1, SAMPLE_INDEXES) {
+            rand::seq::index::IndexVec::USize(v) => v,
+            rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
+        };
+
+        // let ticker_data = mapped_historical.choose_multiple(&mut rng, 10);
+
         for (_, neural_net) in neural_nets.iter_mut() {
             let id = neural_net.id;
             let neural_net = neural_net.clone();
-
             let cloned_inputs = inputs.clone();
 
-            let cloned_historical = mapped_historical.clone();
-            let cloned_indicators = mapped_indicators.clone();
-
+            // let indexes = ticker_indexes.clone();
+            
+            let cloned_historical = ticker_indexes.iter().map(|index| mapped_historical[*index].clone()).collect::<Vec<Vec<historical::Bar>>>();
+            // let cloned_indicators = mapped_indicators.clone();
+            // println!("cloned historical len: {}", cloned_historical.len());
             let handle = tokio::task::spawn(async move {
                 let assets = baisc_nn(
                     &cloned_historical,
                     &mut Account::default(),
                     neural_net,
-                    &cloned_indicators,
+                    // &cloned_indicators,
                     cloned_inputs,
                     None,
                 );
@@ -163,25 +179,30 @@ pub async fn train_networks(client: &Client) {
 
     println!("Completed training");
 
-    let first_net = best_of_gens.first().unwrap();
+    let ticker_indexes = match sample(&mut rng, TICKERS.len(), SAMPLE_INDEXES) {
+        rand::seq::index::IndexVec::USize(v) => v,
+        rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
+    };
 
+    let cloned_historical = ticker_indexes.iter().map(|index| mapped_historical[*index].clone()).collect::<Vec<Vec<historical::Bar>>>();
+
+    let first_net = best_of_gens.first().unwrap();
     let first_assets = baisc_nn(
-        &mapped_historical,
+        &cloned_historical,
         &mut Account::default(),
         first_net.clone(),
-        &mapped_indicators,
+        // &mapped_indicators,
         inputs.clone(),
         Some(MakeCharts { generation: 0 }),
     );
     println!("Gen 1 final assets: {first_assets:.2}");
 
     let last_net = best_of_gens.last().unwrap();
-
     let final_assets = baisc_nn(
-        &mapped_historical,
+        &cloned_historical,
         &mut Account::default(),
         last_net.clone(),
-        &mapped_indicators,
+        // &mapped_indicators,
         inputs,
         Some(MakeCharts {
             generation: TARGET_GENERATIONS - 1,
@@ -228,9 +249,9 @@ fn record_finances(neural_net_ids: &[(u32, f64)], gen: u32) {
     .unwrap();
 }
 
-pub fn chart_indicators(mapped_indicators: &HashMap<String, Indicators>) {
-    for (ticker, indicators) in mapped_indicators.iter() {
-        
+pub fn chart_indicators(mapped_indicators: &Vec<Indicators>) {
+    for (ticker_index, indicators) in mapped_indicators.iter().enumerate() {
+        let ticker = TICKERS[ticker_index];
         let dir = format!("{TRAINING_PATH}/indicators/{ticker}");
         create_folder_if_not_exists(&dir);
 

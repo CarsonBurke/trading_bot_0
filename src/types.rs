@@ -16,10 +16,10 @@ pub struct Account {
 }
 
 /// A list of positions 
-pub type Positions = HashMap<String, Position>;
+pub type Positions = Vec<Position>;
 
 /// Key: Ticker, Value: Historical Bars
-pub type MappedHistorical = HashMap<String, Vec<historical::Bar>>;
+pub type MappedHistorical = Vec<Vec<historical::Bar>>;
 
 #[derive(Default, Debug)]
 pub struct Position {

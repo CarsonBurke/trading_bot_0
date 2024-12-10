@@ -166,23 +166,6 @@ pub fn buy_sell_chart(
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let mut filled_buy = Vec::new();
-    let mut filled_sell = Vec::new();
-
-    for i in 0..data.len() {
-        if let Some(buy) = buy_indexes.get(&i) {
-            filled_buy.push(buy.0);
-            filled_sell.push(0.0);
-            continue;
-        }
-
-        if let Some(sell) = sell_indexes.get(&i) {
-            filled_buy.push(0.0);
-            filled_sell.push(sell.0);
-            continue;
-        }
-    }
-
     let y_min = data
         .iter()
         .min_by(|a, b| a.partial_cmp(b).unwrap())
@@ -319,32 +302,21 @@ pub fn assets_chart(
 pub fn want_chart(
     dir: &String,
     data: &Data,
-    want_indexes: &HashMap<usize, f64>,
+    wants: &HashMap<usize, f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/want.png");
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let mut wants = Vec::new();
-
-    for i in 0..data.len() {
-        if let Some(want) = want_indexes.get(&i) {
-            wants.push(*want);
-            continue;
-        }
-
-        wants.push(0.0);
-    }
-
     let y_min = wants
         .iter()
-        .min_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap()
+        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap_or((&0, &0.)).1
         * 0.9;
     let y_max = wants
         .iter()
-        .max_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap_or((&0, &0.)).1
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
@@ -362,7 +334,7 @@ pub fn want_chart(
         AreaSeries::new(
             wants.iter()
                 .enumerate()
-                .map(|(index, value)| (index as u32, *value)),
+                .map(|(index, value)| (index as u32, *value.1)),
             0.0,
             PURPLE.mix(0.2),
         )

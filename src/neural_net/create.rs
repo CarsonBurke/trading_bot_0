@@ -3,13 +3,20 @@ use hashbrown::HashMap;
 use ibapi::market_data::historical;
 use rust_neural_network::neural_network::{Input, NeuralNetwork};
 
-use crate::{constants::agent::TARGET_AGENT_COUNT, types::MappedHistorical, utils::{convert_historical, ema, ema_diff_percent, get_macd, get_rsi_percents, get_rsi_values, get_stochastic_oscillator, get_w_percent_range}};
+use crate::{
+    constants::agent::TARGET_AGENT_COUNT,
+    types::MappedHistorical,
+    utils::{
+        convert_historical, ema, ema_diff_percent, get_macd, get_rsi_percents, get_rsi_values,
+        get_stochastic_oscillator, get_w_percent_range,
+    },
+};
 
 pub fn create_networks(inputs: &[Input], output_count: usize) -> HashMap<u32, NeuralNetwork> {
     let mut neural_nets = HashMap::new();
 
     for i in 0..TARGET_AGENT_COUNT {
-        let mut neural_net = NeuralNetwork::new();
+        let mut neural_net = NeuralNetwork::new(0., 0.1, 2, 10);
         neural_net.build(inputs, output_count);
         neural_net.mutate();
         neural_nets.insert(neural_net.id, neural_net);
@@ -18,12 +25,12 @@ pub fn create_networks(inputs: &[Input], output_count: usize) -> HashMap<u32, Ne
     neural_nets
 }
 
-pub fn create_mapped_indicators(mapped_data: &MappedHistorical) -> HashMap<String, Indicators> {
-    let mut indicators = HashMap::new();
+pub fn create_mapped_indicators(mapped_data: &MappedHistorical) -> Vec<Indicators> {
+    let mut indicators = Vec::new();
 
-    for (ticker, bars) in mapped_data.iter() {
+    for bars in mapped_data.iter() {
         let data = convert_historical(bars);
-        indicators.insert(ticker.to_string(), create_indicators(data, bars));
+        indicators.push(create_indicators(data, bars));
     }
 
     indicators
@@ -77,7 +84,7 @@ fn create_indicators(data: Vec<f64>, bars: &[historical::Bar]) -> Indicators {
 
 pub type Indicators = EnumMap<Indicator, Vec<f64>>;
 
-#[derive(enum_map::Enum, Clone, Copy, )]
+#[derive(enum_map::Enum, Clone, Copy)]
 pub enum Indicator {
     EMADiff7,
     EMADiff14,
@@ -92,6 +99,5 @@ pub enum Indicator {
     StochasticOscillator,
     /// Difference between the 12 peroid EMA and 26 period EMA
     MACDDiff,
-    WilliamsPercentRange
+    WilliamsPercentRange,
 }
-

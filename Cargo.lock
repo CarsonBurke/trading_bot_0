@@ -1169,9 +1169,9 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 
 [[package]]
 name = "rust_neural_network"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26e47ee9488dee44e403bdab0ab12a00459e722b15f16e9fadbdeafcbad110f6"
+checksum = "174bb3962e797a009b412dc3e04d00ca35d9ccea3c1a7c2470dc5048682a4dc3"
 dependencies = [
  "float-ord",
  "rand 0.7.3",

@@ -15,7 +15,7 @@ ordered-float = "4.5.0"
 plotters = "0.3.7"
 postcard = { version = "1.1.0", features = ["use-std"] }
 rand = "0.8.5"
-rust_neural_network = "0.5.0"
+rust_neural_network = "0.7.0"
 serde = "1.0.215"
 time = "0.3.36"
 tokio = { version = "1.42.0", features = ["full"] }
