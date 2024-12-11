@@ -130,9 +130,9 @@ pub fn baisc_nn(
                 continue;
             }
 
-            if output_index == constants::neural_net::HOLD_INDEX as usize {
+            /* if output_index == constants::neural_net::HOLD_INDEX as usize {
                 continue;
-            }
+            } */
 
             // println!("index: {}, value: {}", index, percent);
             // let values = inputs.iter().map(|input| input.values[0]).collect::<Vec<f64>>();
@@ -178,7 +178,7 @@ pub fn baisc_nn(
             continue; */
 
             // Get the want from the determined percent, at a maximum of 10%
-            let gross_want = assets * last_layer[BUY_INDEX] / 100. - assets * last_layer[SELL_INDEX] / 100. /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
+            let gross_want = assets * last_layer[BUY_INDEX] / 100. /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
             if gross_want <= 1. {
                 continue;
             }

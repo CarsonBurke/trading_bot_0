@@ -308,6 +308,10 @@ pub fn want_chart(
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
+    let smoothed_wants = (0..data.len()).map(|index| {
+        (index as u32, *wants.get(&index).unwrap_or(&0.))
+    } ).collect::<Vec<(u32, f64)>>();
+
     let y_min = wants
         .iter()
         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
@@ -332,8 +336,9 @@ pub fn want_chart(
 
     chart.draw_series(
         AreaSeries::new(
-            wants.iter()
-                .map(|(index, value)| (*index as u32, *value)),
+            smoothed_wants,
+            /* wants.iter()
+                .map(|(index, value)| (*index as u32, *value)), */
             0.0,
             PURPLE.mix(0.2),
         )
