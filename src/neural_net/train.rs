@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use colored::Colorize;
 use hashbrown::{HashMap, HashSet};
@@ -18,7 +18,7 @@ use super::create::{create_networks, Indicator, Indicators};
 pub async fn train_networks(client: &Client) {
     let time = std::time::Instant::now();
 
-    let mapped_historical = get_historical_data(client);
+    let mapped_historical = Arc::new(get_historical_data(client));
     let mapped_indicators = create_mapped_indicators(&mapped_historical);
 
     let mut most_final_assets = 0.0;
@@ -66,6 +66,8 @@ pub async fn train_networks(client: &Client) {
         });
     }
 
+    let inputs_arc = Arc::new(inputs.to_vec());
+
     let outputs = vec![
         Output {
             name: OutputName::Result,
@@ -99,11 +101,13 @@ pub async fn train_networks(client: &Client) {
         for (_, neural_net) in neural_nets.iter_mut() {
             let id = neural_net.id;
             let neural_net = neural_net.clone();
-            let cloned_inputs = inputs.clone();
+            let cloned_inputs = inputs.to_vec();// Arc::clone(&inputs_arc);
+
+            let cloned_historical = Arc::clone(&mapped_historical);
 
             // let indexes = ticker_indexes.clone();
             
-            let cloned_historical = ticker_indexes.iter().map(|index| mapped_historical[*index].clone()).collect::<Vec<Vec<historical::Bar>>>();
+            // let cloned_historical = ticker_indexes.iter().map(|index| mapped_historical[*index].clone()).collect::<Vec<Vec<historical::Bar>>>();
             // let cloned_indicators = mapped_indicators.clone();
             // println!("cloned historical len: {}", cloned_historical.len());
             let handle = tokio::task::spawn(async move {
@@ -192,7 +196,7 @@ pub async fn train_networks(client: &Client) {
         &mut Account::default(),
         first_net.clone(),
         // &mapped_indicators,
-        inputs.clone(),
+        inputs.to_vec(),
         Some(MakeCharts { generation: 0 }),
     );
     println!("Gen 1 final assets: {first_assets:.2}");
@@ -203,7 +207,7 @@ pub async fn train_networks(client: &Client) {
         &mut Account::default(),
         last_net.clone(),
         // &mapped_indicators,
-        inputs,
+        inputs.to_vec(),
         Some(MakeCharts {
             generation: TARGET_GENERATIONS - 1,
         }),
