@@ -19,8 +19,8 @@ use crate::{
 };
 
 pub fn baisc_nn(
+    ticker_sets: &[Vec<usize>],
     mapped_data: &MappedHistorical,
-    account: &mut Account,
     mut neural_network: NeuralNetwork,
     // mapped_indicators: &Vec<Indicators>,
     mut inputs: Vec<Input>,
@@ -31,14 +31,11 @@ pub fn baisc_nn(
     let mut all_assets = 0.;
     let mut all_min: f64 = f64::MAX;
 
-    for ticker_set in 0..TICKER_SETS {
-        let ticker_indexes = match sample(&mut rng, TICKERS.len() - 1, SAMPLE_INDEXES) {
-            rand::seq::index::IndexVec::USize(v) => v,
-            rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
-        };
-        let tickers_slice = ticker_indexes.as_slice();
+    for (ticker_set_index, ticker_set) in ticker_sets.iter().enumerate() {
+        let tickers_slice = ticker_set.as_slice();
 
         let indexes = mapped_data[0].len();
+        let mut account = Account::default();
 
         for ticker_index in 0..mapped_data.len() {
             account.positions.push(Position::default());
@@ -253,7 +250,7 @@ pub fn baisc_nn(
         all_min = all_min.min(final_assets);
 
         // If we're on our last set
-        if ticker_set == TICKER_SETS - 1 {
+        if ticker_set_index == TICKER_SETS - 1 {
             if final_assets > 1_000_000. {
                 println!("{}", "total assets exceeds 1m".red());
 

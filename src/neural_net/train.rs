@@ -9,7 +9,7 @@ use rust_neural_network::neural_network::{Input, InputName, NeuralNetwork, Outpu
 
 use crate::{
     charts::general::simple_chart, constants::{
-        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES}, TICKERS
+        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
     }, data::historical::get_historical_data, neural_net::create::create_mapped_indicators, strategies::baisc_nn::baisc_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
 };
 
@@ -52,7 +52,7 @@ pub async fn train_networks(client: &Client) {
         inputs.push(Input {
             name: InputName::X,
             values: vec![1.],
-            weight_ids: vec![(index + input_count) as u32],
+            weight_ids: vec![index + input_count],
         });
     }
 
@@ -62,11 +62,11 @@ pub async fn train_networks(client: &Client) {
         inputs.push(Input {
             name: InputName::X,
             values: vec![0.],
-            weight_ids: vec![(i + input_count) as u32],
+            weight_ids: vec![i + input_count],
         });
     }
 
-    let inputs_arc = Arc::new(inputs.to_vec());
+    // let inputs_arc = Arc::new(inputs.to_vec());
 
     let outputs = vec![
         Output {
@@ -95,6 +95,7 @@ pub async fn train_networks(client: &Client) {
             rand::seq::index::IndexVec::USize(v) => v,
             rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
         };
+        let tickers_set = generate_tickers_set(&mut rng);
 
         // let ticker_data = mapped_historical.choose_multiple(&mut rng, 10);
 
@@ -104,6 +105,7 @@ pub async fn train_networks(client: &Client) {
             let cloned_inputs = inputs.to_vec();// Arc::clone(&inputs_arc);
 
             let cloned_historical = Arc::clone(&mapped_historical);
+            let cloned_tickers_set = tickers_set.to_vec();
 
             // let indexes = ticker_indexes.clone();
             
@@ -112,8 +114,8 @@ pub async fn train_networks(client: &Client) {
             // println!("cloned historical len: {}", cloned_historical.len());
             let handle = tokio::task::spawn(async move {
                 let assets = baisc_nn(
+                    &cloned_tickers_set,
                     &cloned_historical,
-                    &mut Account::default(),
                     neural_net,
                     // &cloned_indicators,
                     cloned_inputs,
@@ -191,9 +193,12 @@ pub async fn train_networks(client: &Client) {
     let cloned_historical = ticker_indexes.iter().map(|index| mapped_historical[*index].clone()).collect::<Vec<Vec<historical::Bar>>>();
 
     let first_net = best_of_gens.first().unwrap();
+
+    let tickers_set = generate_tickers_set(&mut rng);
+
     let first_assets = baisc_nn(
+        &tickers_set,
         &cloned_historical,
-        &mut Account::default(),
         first_net.clone(),
         // &mapped_indicators,
         inputs.to_vec(),
@@ -203,8 +208,8 @@ pub async fn train_networks(client: &Client) {
 
     let last_net = best_of_gens.last().unwrap();
     let final_assets = baisc_nn(
+        &tickers_set,
         &cloned_historical,
-        &mut Account::default(),
         last_net.clone(),
         // &mapped_indicators,
         inputs.to_vec(),
@@ -266,4 +271,20 @@ pub fn chart_indicators(mapped_indicators: &Vec<Indicators>) {
         simple_chart(&dir, "StochasticOscillator", &indicators[Indicator::StochasticOscillator]).unwrap();
         simple_chart(&dir, "MacdDiff", &indicators[Indicator::MACDDiff]).unwrap();
     }
+}
+
+pub fn generate_tickers_set(rng: &mut impl rand::Rng) -> Vec<Vec<usize>> {
+    let mut tickers_set = Vec::new();
+    
+    for _ in 0..TICKER_SETS {
+        let indexes = match sample(rng, TICKERS.len() - 1, SAMPLE_INDEXES) {
+            rand::seq::index::IndexVec::USize(v) => v,
+            rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
+        };
+
+        tickers_set.push(indexes.clone());
+    }
+
+
+    tickers_set
 }
