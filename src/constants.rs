@@ -40,7 +40,7 @@ pub mod neural_net {
     pub const INDEX_STEP: usize = 10;
     pub const MAX_STEPS: usize = 100;
     pub const SAMPLE_INDEXES: usize = 10;
-    pub const TICKER_SETS: usize = 10;
+    pub const TICKER_SETS: usize = 1;
 }
 
 /// A ticker may have no more than this percept in total assets

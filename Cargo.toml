@@ -24,3 +24,9 @@ uuid = { version = "1.11.0", features = ["v4"] }
 [features]
 default = ["debug_training"]
 debug_training = []
+
+[profile.release]
+debug = 1
+
+# [rust]
+# debuginfo-level = 1
