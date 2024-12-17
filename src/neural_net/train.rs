@@ -10,7 +10,7 @@ use rust_neural_network::neural_network::{Input, InputName, NeuralNetwork, Outpu
 use crate::{
     charts::general::simple_chart, constants::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
-    }, data::historical::get_historical_data, neural_net::create::create_mapped_indicators, strategies::baisc_nn::baisc_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
+    }, data::historical::get_historical_data, neural_net::create::create_mapped_indicators, strategies::basic_nn::baisc_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
 };
 
 use super::create::{create_networks, Indicator, Indicators};
@@ -91,10 +91,6 @@ pub async fn train_networks(client: &Client) {
         let mut neural_net_ids = Vec::new();
         let mut handles = Vec::new();
 
-        let ticker_indexes = match sample(&mut rng, TICKERS.len() - 1, SAMPLE_INDEXES) {
-            rand::seq::index::IndexVec::USize(v) => v,
-            rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
-        };
         let tickers_set = generate_tickers_set(&mut rng);
 
         // let ticker_data = mapped_historical.choose_multiple(&mut rng, 10);
@@ -185,12 +181,7 @@ pub async fn train_networks(client: &Client) {
 
     println!("Completed training");
 
-    let ticker_indexes = match sample(&mut rng, TICKERS.len(), SAMPLE_INDEXES) {
-        rand::seq::index::IndexVec::USize(v) => v,
-        rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
-    };
-
-    let cloned_historical = ticker_indexes.iter().map(|index| mapped_historical[*index].clone()).collect::<Vec<Vec<historical::Bar>>>();
+    let cloned_historical = Arc::clone(&mapped_historical);
 
     let first_net = best_of_gens.first().unwrap();
 

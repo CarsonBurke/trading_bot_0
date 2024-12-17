@@ -29,6 +29,7 @@ pub mod agent {
     pub const TARGET_GENERATIONS: u32 = 1000;
     pub const MAX_WEIGHT: f64 = 1.0;
     pub const MIN_WEIGHT: f64 = 0.0;
+    pub const STARTING_CASH: f64 = 10_000.;
 }
 
 pub mod neural_net {

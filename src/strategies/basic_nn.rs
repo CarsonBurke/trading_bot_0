@@ -8,10 +8,7 @@ use rust_neural_network::neural_network::{Input, NeuralNetwork};
 use crate::{
     charts::general::{assets_chart, buy_sell_chart, simple_chart, want_chart},
     constants::{
-        self,
-        files::TRAINING_PATH,
-        neural_net::{BUY_INDEX, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, SELL_INDEX, TICKER_SETS},
-        TICKERS,
+        self, agent::STARTING_CASH, files::TRAINING_PATH, neural_net::{BUY_INDEX, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, SELL_INDEX, TICKER_SETS}, TICKERS
     },
     neural_net::create::Indicators,
     types::{Account, Data, MakeCharts, MappedHistorical, Position},
@@ -26,7 +23,6 @@ pub fn baisc_nn(
     mut inputs: Vec<Input>,
     mut make_charts: Option<MakeCharts>,
 ) -> f64 {
-    let mut rng = rand::thread_rng();
 
     let mut all_assets = 0.;
     let mut all_min: f64 = f64::MAX;
@@ -64,7 +60,7 @@ pub fn baisc_nn(
             want_indexes.push(HashMap::new());
         }
 
-        account.cash = 10_000.;
+        account.cash = STARTING_CASH;
 
         for index in 100..indexes {
             // Get and record some important data
@@ -200,7 +196,7 @@ pub fn baisc_nn(
                 continue; */
 
                 // Get the want from the determined percent, at a maximum of 10%
-                let gross_want = assets * last_layer[BUY_INDEX] / 100. /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
+                let gross_want = (assets * last_layer[BUY_INDEX] / 100.).min(assets / SAMPLE_INDEXES as f64) /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
                 if gross_want <= 1. {
                     continue;
                 }
@@ -235,6 +231,11 @@ pub fn baisc_nn(
                     continue;
                 }
 
+                // If we make a really dumb sell (selling lower than we avg bought) then criple the bot
+                if price <= position.avg_price {
+                    continue;
+                }
+
                 let quantity = sell / price;
 
                 position.quantity -= quantity;
@@ -254,9 +255,9 @@ pub fn baisc_nn(
             if final_assets > 1_000_000. {
                 println!("{}", "total assets exceeds 1m".red());
 
-                make_charts = Some(MakeCharts {
-                    generation: 1_000_000,
-                });
+                // make_charts = Some(MakeCharts {
+                //     generation: 1_000_000,
+                // });
             }
 
             if let Some(charts_config) = &make_charts {
