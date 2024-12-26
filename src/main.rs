@@ -10,6 +10,7 @@ use ibapi::{
     orders::{order_builder, Action, PlaceOrder},
     Client,
 };
+use ndarray::Array2;
 
 pub mod agent;
 pub mod charts;
@@ -48,6 +49,14 @@ async fn main() {
     // rsi_chart(&rsi_values).unwrap();
 
     // candle_chart(&stock_data).unwrap();
+    
+    // let arr1: Array2<u32> = Array2::from_shape_vec([4, 1], vec![2, 2, 2, 2]).unwrap();
+    // let arr2: Array2<u32> = Array2::from_shape_vec([4, 1], vec![1, 1, 1, 1]).unwrap();
+
+    // let prod = arr1.dot(&arr2);
+    // println!("prod {prod}");
+
+    // panic!("done");
 
     // agent::train::train_agents(&client);
     neural_net::train::train_networks(&client).await;

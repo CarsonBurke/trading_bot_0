@@ -1,7 +1,7 @@
 use enum_map::{enum_map, EnumMap};
 use hashbrown::HashMap;
 use ibapi::market_data::historical;
-use rust_neural_network::neural_network::{Input, NeuralNetwork};
+use rust_neural_network::neural_network::{NeuralNetwork};
 
 use crate::{
     constants::agent::TARGET_AGENT_COUNT,
@@ -12,12 +12,11 @@ use crate::{
     },
 };
 
-pub fn create_networks(inputs: &[Input], output_count: usize) -> HashMap<u32, NeuralNetwork> {
+pub fn create_networks(input_count: usize, output_count: usize) -> HashMap<u32, NeuralNetwork> {
     let mut neural_nets = HashMap::new();
 
     for i in 0..TARGET_AGENT_COUNT {
-        let mut neural_net = NeuralNetwork::new(0., 0.1, 2, 10);
-        neural_net.build(inputs, output_count);
+        let mut neural_net = NeuralNetwork::new(0.001, 0.001, vec![input_count, 10, 10, output_count]);
         neural_net.mutate();
         neural_nets.insert(neural_net.id, neural_net);
     }

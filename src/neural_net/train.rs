@@ -5,7 +5,7 @@ use hashbrown::{HashMap, HashSet};
 use ibapi::{market_data::historical, Client};
 
 use rand::{seq::{index::sample, SliceRandom}, Rng};
-use rust_neural_network::neural_network::{Input, InputName, NeuralNetwork, Output, OutputName};
+use rust_neural_network::neural_network::NeuralNetwork;
 
 use crate::{
     charts::general::simple_chart, constants::{
@@ -26,65 +26,34 @@ pub async fn train_networks(client: &Client) {
 
     let mut inputs = vec![
         // Percent of assets that are in cash
-        Input {
-            name: InputName::X,
-            values: vec![1.],
-            weight_ids: vec![0],
-        },
+        0.,
         // Percent of total assets in the position
-        Input {
-            name: InputName::X,
-            values: vec![1.],
-            weight_ids: vec![1],
-        },
+        0.,
         // Percent difference between current price and average purchase price (or 0 if we have no money in position)
-        Input {
-            name: InputName::X,
-            values: vec![1.],
-            weight_ids: vec![2],
-        },
+        0.,
     ];
-
-    let mut input_count = inputs.len();
 
     let indicators = &mapped_indicators[0];
-    for index in 0..indicators.len() {
-        inputs.push(Input {
-            name: InputName::X,
-            values: vec![1.],
-            weight_ids: vec![index + input_count],
-        });
+    for _ in 0..indicators.len() {
+        inputs.push(0.);
     }
 
-    input_count = inputs.len();
-
-    for i in 0..(MAX_STEPS+INDEX_STEP) {
-        inputs.push(Input {
-            name: InputName::X,
-            values: vec![0.],
-            weight_ids: vec![i + input_count],
-        });
+    for _ in 0..(MAX_STEPS+INDEX_STEP) {
+        inputs.push(0.);
     }
 
+    let input_count = inputs.len();
+
+    println!("Inputs {}", input_count);
     // let inputs_arc = Arc::new(inputs.to_vec());
 
-    let outputs = vec![
-        Output {
-            name: OutputName::Result,
-        },
-        Output {
-            name: OutputName::Result,
-        },
-        Output {
-            name: OutputName::Result,
-        },
-    ];
+    let output_count = 4;
 
     // for (index, data) in mapped_historical.iter().enumerate() {
     //     println!("check {index} {}", data.len());
     // }
 
-    let mut neural_nets = create_networks(&inputs, outputs.len());
+    let mut neural_nets = create_networks(input_count, output_count);
     let mut rng = rand::thread_rng();
 
     for gen in 0..TARGET_GENERATIONS {
@@ -98,7 +67,7 @@ pub async fn train_networks(client: &Client) {
         for (_, neural_net) in neural_nets.iter_mut() {
             let id = neural_net.id;
             let neural_net = neural_net.clone();
-            let cloned_inputs = inputs.to_vec();// Arc::clone(&inputs_arc);
+            // let cloned_inputs = inputs.to_vec();// Arc::clone(&inputs_arc);
 
             let cloned_historical = Arc::clone(&mapped_historical);
             let cloned_tickers_set = tickers_set.to_vec();
@@ -114,7 +83,7 @@ pub async fn train_networks(client: &Client) {
                     &cloned_historical,
                     neural_net,
                     // &cloned_indicators,
-                    cloned_inputs,
+                    input_count,
                     None,
                 );
                 println!("assets: {:.2}", assets);
@@ -192,7 +161,8 @@ pub async fn train_networks(client: &Client) {
         &cloned_historical,
         first_net.clone(),
         // &mapped_indicators,
-        inputs.to_vec(),
+        // inputs.to_vec(),
+        input_count,
         Some(MakeCharts { generation: 0 }),
     );
     println!("Gen 1 final assets: {first_assets:.2}");
@@ -203,7 +173,8 @@ pub async fn train_networks(client: &Client) {
         &cloned_historical,
         last_net.clone(),
         // &mapped_indicators,
-        inputs.to_vec(),
+        // inputs.to_vec(),
+        input_count,
         Some(MakeCharts {
             generation: TARGET_GENERATIONS - 1,
         }),

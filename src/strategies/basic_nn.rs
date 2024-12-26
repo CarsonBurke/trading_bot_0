@@ -3,7 +3,7 @@ use core::f64;
 use colored::Colorize;
 use hashbrown::HashMap;
 use rand::seq::index::sample;
-use rust_neural_network::neural_network::{Input, NeuralNetwork};
+use rust_neural_network::neural_network::{NeuralNetwork};
 
 use crate::{
     charts::general::{assets_chart, buy_sell_chart, simple_chart, want_chart},
@@ -18,10 +18,10 @@ use crate::{
 pub fn baisc_nn(
     ticker_sets: &[Vec<usize>],
     mapped_data: &MappedHistorical,
-    mut neural_network: NeuralNetwork,
+    neural_network: NeuralNetwork,
     // mapped_indicators: &Vec<Indicators>,
-    mut inputs: Vec<Input>,
-    mut make_charts: Option<MakeCharts>,
+    inputs_count: usize,
+    make_charts: Option<MakeCharts>,
 ) -> f64 {
 
     let mut all_assets = 0.;
@@ -95,17 +95,19 @@ pub fn baisc_nn(
 
                 // Assign inputs
 
-                inputs[0].values[0] = account.cash / assets;
-                inputs[1].values[0] = position.value_with_price(price) / assets;
-                inputs[2].values[0] = match position.quantity {
+                let mut inputs = vec![0.; inputs_count];
+
+                inputs[0] = (account.cash / assets) as f32;
+                inputs[1] = (position.value_with_price(price) / assets) as f32;
+                inputs[2] = match position.quantity {
                     0. => 0.,
-                    _ => (price - position.avg_price) / position.avg_price,
+                    _ => ((price - position.avg_price) / position.avg_price) as f32,
                 };
 
                 for i in ((index.saturating_sub(INDEX_STEP))..index).rev() {
                     let diff_percent = (price - mapped_data[ticker_index][i].close) / price;
                     // println!("i: {}", index - i);
-                    inputs[index - i + 3].values[0] = diff_percent;
+                    inputs[index - i + 3] = diff_percent as f32;
                 }
 
                 let min = index.saturating_sub(MAX_STEPS * INDEX_STEP);
@@ -116,7 +118,7 @@ pub fn baisc_nn(
                 {
                     let diff_percent = (price - mapped_data[ticker_index][bari].close) / price;
                     // println!("i: {} index: {} i2: {}", i, index, i / INDEX_STEP + 3);
-                    inputs[i + 3].values[0] = diff_percent;
+                    inputs[i + 3] = diff_percent as f32;
                 }
 
                 // let input_count = MAX_STEPS + 3;
@@ -139,13 +141,14 @@ pub fn baisc_nn(
                 // );
                 // Forward propagate
 
-                neural_network.forward_propagate(&inputs);
+                let activation_layers = neural_network.forward_propagate(inputs);
+                let last_layer: Vec<f32> = activation_layers.last().unwrap().rows().into_iter().map(|x| x[0]).collect();
 
-                let last_layer = neural_network.activation_layers.last().unwrap();
+                // println!("activation layers: {activation_layers:?}");
 
                 /* let (output_index, percent) = find_highest(last_layer);
                 if *percent <= 0. {
-                    continue;
+                    continue;z
                 } */
 
                 /* if output_index == constants::neural_net::HOLD_INDEX as usize {
@@ -196,7 +199,10 @@ pub fn baisc_nn(
                 continue; */
 
                 // Get the want from the determined percent, at a maximum of 10%
-                let gross_want = (assets * last_layer[BUY_INDEX] / 100.).min(assets / SAMPLE_INDEXES as f64) /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
+
+                let output = last_layer[BUY_INDEX] as f64;
+                // println!("output: {}", output);
+                let gross_want = (assets * output).min(assets / SAMPLE_INDEXES as f64) /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
                 if gross_want <= 1. {
                     continue;
                 }
