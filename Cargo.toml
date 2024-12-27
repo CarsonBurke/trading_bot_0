@@ -1,0 +1,33 @@
+[package]
+name = "trading_bot_0"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+
+[dependencies]
+chrono = "0.4.38"
+clap = "4.5.21"
+colored = "2.1.0"
+enum-map = { version = "2.7.3", features = ["serde"] }
+hashbrown = "0.15.2"
+ibapi = { version = "1.0.3" }
+ndarray = "0.16.1"
+ordered-float = "4.5.0"
+plotters = "0.3.7"
+postcard = { version = "1.1.0", features = ["use-std"] }
+rand = "0.8.5"
+rust_neural_network = "0.18.0"
+serde = "1.0.215"
+time = "0.3.36"
+tokio = { version = "1.42.0", features = ["full"] }
+uuid = { version = "1.11.0", features = ["v4"] }
+
+[features]
+default = ["debug_training"]
+debug_training = []
+
+[profile.release]
+debug = 1
+
+# [rust]
+# debuginfo-level = 1
