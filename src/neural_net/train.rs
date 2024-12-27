@@ -10,7 +10,7 @@ use rust_neural_network::neural_network::NeuralNetwork;
 use crate::{
     charts::general::simple_chart, constants::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
-    }, data::historical::get_historical_data, neural_net::create::create_mapped_indicators, strategies::basic_nn::baisc_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
+    }, data::historical::get_historical_data, neural_net::create::create_mapped_indicators, strategies::basic_nn::basic_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
 };
 
 use super::create::{create_networks, Indicator, Indicators};
@@ -78,7 +78,7 @@ pub async fn train_networks(client: &Client) {
             // let cloned_indicators = mapped_indicators.clone();
             // println!("cloned historical len: {}", cloned_historical.len());
             let handle = tokio::task::spawn(async move {
-                let assets = baisc_nn(
+                let assets = basic_nn(
                     &cloned_tickers_set,
                     &cloned_historical,
                     neural_net,
@@ -156,7 +156,7 @@ pub async fn train_networks(client: &Client) {
 
     let tickers_set = generate_tickers_set(&mut rng);
 
-    let first_assets = baisc_nn(
+    let first_assets = basic_nn(
         &tickers_set,
         &cloned_historical,
         first_net.clone(),
@@ -168,7 +168,7 @@ pub async fn train_networks(client: &Client) {
     println!("Gen 1 final assets: {first_assets:.2}");
 
     let last_net = best_of_gens.last().unwrap();
-    let final_assets = baisc_nn(
+    let final_assets = basic_nn(
         &tickers_set,
         &cloned_historical,
         last_net.clone(),

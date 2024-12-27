@@ -15,7 +15,7 @@ use crate::{
     utils::{convert_historical, create_folder_if_not_exists, ema, find_highest, get_rsi_values},
 };
 
-pub fn baisc_nn(
+pub fn basic_nn(
     ticker_sets: &[Vec<usize>],
     mapped_data: &MappedHistorical,
     neural_network: NeuralNetwork,
