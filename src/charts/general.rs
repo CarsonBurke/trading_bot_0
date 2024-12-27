@@ -216,7 +216,7 @@ pub fn buy_sell_chart(
             .iter()
             .map(|(index, value)| (*index as u32, value.0)),
             point_size,
-        RED.mix(0.9).filled(),
+        BLUE.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
