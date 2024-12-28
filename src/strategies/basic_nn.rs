@@ -15,7 +15,7 @@ use crate::{
     utils::{convert_historical, create_folder_if_not_exists, ema, find_highest, get_rsi_values},
 };
 
-pub fn baisc_nn(
+pub fn basic_nn(
     ticker_sets: &[Vec<usize>],
     mapped_data: &MappedHistorical,
     neural_network: NeuralNetwork,
@@ -200,14 +200,12 @@ pub fn baisc_nn(
 
                 // Get the want from the determined percent, at a maximum of 10%
 
-                let buy_output = last_layer[BUY_INDEX] as f64;
-                let sell_output = last_layer[SELL_INDEX] as f64;
-
+                let output = last_layer[BUY_INDEX] as f64;
                 // println!("output: {}", output);
-                let gross_want = (assets * (buy_output - sell_output))/* .min(assets / SAMPLE_INDEXES as f64) */.max(0.) /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
-                // if gross_want <= 1. {
-                //     continue;
-                // }
+                let gross_want = (assets * output).min(assets / SAMPLE_INDEXES as f64) /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
+                if gross_want <= 1. {
+                    continue;
+                }
 
                 let current = match position.quantity {
                     0. => 0.,
@@ -218,7 +216,7 @@ pub fn baisc_nn(
 
                 // If we want more than we have, try to buy
                 if gross_want > current {
-                    let buy = (gross_want - current).min(account.cash);
+                    let buy = (gross_want - current).min(account.cash).min(assets / 5.);
                     if buy == 0. {
                         continue;
                     }
@@ -234,13 +232,13 @@ pub fn baisc_nn(
 
                 // Otherwise we want less than we have, try to sell
 
-                // If we want a really dumb sell (selling lower than we avg bought)
-                if price <= position.avg_price {
+                let sell = ((gross_want - current).abs()).min(current).min(assets / 5.);
+                if sell == 0. {
                     continue;
                 }
 
-                let sell = (gross_want - current).abs().min(current);// ((gross_want - current).abs()).min(current);
-                if sell == 0. {
+                // If we make a really dumb sell (selling lower than we avg bought) then criple the bot
+                if price <= position.avg_price {
                     continue;
                 }
 
