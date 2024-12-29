@@ -16,7 +16,7 @@ pub fn create_networks(input_count: usize, output_count: usize) -> HashMap<u32, 
     let mut neural_nets = HashMap::new();
 
     for i in 0..TARGET_AGENT_COUNT {
-        let mut neural_net = NeuralNetwork::new(0.001, 0.001, vec![input_count, 10, 10, output_count]);
+        let mut neural_net = NeuralNetwork::new(0., 0.1, vec![input_count, 10, 10, output_count]);
         neural_net.mutate();
         neural_nets.insert(neural_net.id, neural_net);
     }
