@@ -62,7 +62,7 @@ pub fn basic_nn(
 
         account.cash = STARTING_CASH;
 
-        for index in 100..indexes {
+        for index in (MAX_STEPS * INDEX_STEP)..indexes {
             // Get and record some important data
 
             let mut total_positioned = 0.0;

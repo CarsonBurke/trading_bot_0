@@ -38,8 +38,8 @@ pub mod neural_net {
     pub const SELL_INDEX: usize = 1;
     /* pub const CHANGE_INDEX: u32 = 0; */
     pub const HOLD_INDEX: u32 = 2;
-    pub const INDEX_STEP: usize = 10;
-    pub const MAX_STEPS: usize = 100;
+    pub const INDEX_STEP: usize = 4;
+    pub const MAX_STEPS: usize = 500;
     pub const SAMPLE_INDEXES: usize = 10;
     pub const TICKER_SETS: usize = 5;
 }
