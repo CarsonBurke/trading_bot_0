@@ -189,6 +189,25 @@ pub fn get_differences(data: &[f64]) -> Data {
     diff
 }
 
+pub fn get_diff_percents(data: &[f64]) -> Data {
+    let mut diff = vec![];
+
+    for (index, value) in data.iter().enumerate() {
+        let previous = {
+            let (previous_index, overflowed) = index.overflowing_sub(1);
+
+            if overflowed {
+                100.
+            } else {
+                data[previous_index]
+            }
+        };
+        diff.push((value - previous) / previous)
+    }
+
+    diff
+}
+
 /// Returns how many stocks can be bought for a given a total price and a max amount
 pub fn round_to_stock(price: f64, max: f64) -> (f64, u32) {
     let quantity = (max / price).floor() as u32;

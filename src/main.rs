@@ -26,8 +26,8 @@ async fn main() {
     println!("Trying to connect to IB API!");
     let connection_url = "127.0.0.1:4001";
 
-    let client = Client::connect(connection_url, 1).expect("connection to TWS failed!");
-    println!("Successfully connected to TWS at {connection_url}");
+/*     let client = Client::connect(connection_url, 1).expect("connection to TWS failed!");
+    println!("Successfully connected to TWS at {connection_url}"); */
 
     // account_info(&client);
     // let mut account = Account::default();
@@ -59,7 +59,7 @@ async fn main() {
     // panic!("done");
 
     // agent::train::train_agents(&client);
-    neural_net::train::train_networks(&client).await;
+    neural_net::train::train_networks().await;
 }
 
 fn account_info(client: &Client) {

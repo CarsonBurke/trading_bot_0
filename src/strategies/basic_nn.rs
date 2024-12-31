@@ -19,6 +19,7 @@ pub fn basic_nn(
     ticker_sets: &[Vec<usize>],
     mapped_data: &MappedHistorical,
     neural_network: NeuralNetwork,
+    mapped_diffs: &[Data],
     // mapped_indicators: &Vec<Indicators>,
     inputs_count: usize,
     make_charts: Option<MakeCharts>,
@@ -33,13 +34,13 @@ pub fn basic_nn(
         let indexes = mapped_data[0].len();
         let mut account = Account::default();
 
-        for ticker_index in 0..mapped_data.len() {
+        for _ in 0..indexes {
             account.positions.push(Position::default());
         }
 
         let mut positions_by_ticker: Vec<Vec<f64>> = Vec::new();
 
-        for ticker_index in 0..mapped_data.len() {
+        for _ in 0..indexes {
             positions_by_ticker.push(Vec::new());
         }
 
@@ -49,14 +50,14 @@ pub fn basic_nn(
         let mut buy_indexes = Vec::new();
         let mut sell_indexes = Vec::new();
 
-        for ticker_index in 0..mapped_data.len() {
+        for _ in 0..indexes {
             buy_indexes.push(HashMap::new());
             sell_indexes.push(HashMap::new());
         }
 
         let mut want_indexes = Vec::new();
 
-        for ticker_index in 0..mapped_data.len() {
+        for _ in 0..indexes {
             want_indexes.push(HashMap::new());
         }
 
@@ -75,7 +76,7 @@ pub fn basic_nn(
 
                 let position = &account.positions[ticker_index];
                 let positioned = position.value_with_price(price);
-
+                
                 positions_by_ticker[ticker_index].push(positioned);
                 total_positioned += positioned;
             }
@@ -93,6 +94,8 @@ pub fn basic_nn(
 
                 let position = &mut account.positions[ticker_index];
 
+                let diffs = &mapped_diffs[ticker_index];
+
                 // Assign inputs
 
                 let mut inputs = vec![0.; inputs_count];
@@ -103,12 +106,18 @@ pub fn basic_nn(
                     0. => 0.,
                     _ => ((price - position.avg_price) / position.avg_price) as f32,
                 };
+                
+                // Previous few indexes with full density
 
                 for i in ((index.saturating_sub(INDEX_STEP))..index).rev() {
-                    let diff_percent = (price - mapped_data[ticker_index][i].close) / price;
+                    let diff_percent = (price - bars[i].close) / price;
                     // println!("i: {}", index - i);
                     inputs[index - i + 3] = diff_percent as f32;
+
+                    /* inputs[index - i + 3] = diffs[i] as f32; */
                 }
+
+                // Previous indexes up until MAX_STEPS or 0 at INDEX_STEP density
 
                 let min = index.saturating_sub(MAX_STEPS * INDEX_STEP);
                 for (i, bari) in (min..(index - INDEX_STEP - 1))
@@ -116,9 +125,11 @@ pub fn basic_nn(
                     .rev()
                     .enumerate()
                 {
-                    let diff_percent = (price - mapped_data[ticker_index][bari].close) / price;
+                    let diff_percent = (price - bars[bari].close) / price;
                     // println!("i: {} index: {} i2: {}", i, index, i / INDEX_STEP + 3);
                     inputs[i + 3] = diff_percent as f32;
+
+                    /* inputs[i + 3] = diffs[bari] as f32; */
                 }
 
                 // let input_count = MAX_STEPS + 3;
@@ -203,7 +214,7 @@ pub fn basic_nn(
                 let output = last_layer[BUY_INDEX] as f64;
                 // println!("output: {}", output);
                 let gross_want = (assets * output).min(assets / SAMPLE_INDEXES as f64) /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
-                if gross_want <= 1. {
+                if gross_want < 0. {
                     continue;
                 }
 
@@ -216,7 +227,7 @@ pub fn basic_nn(
 
                 // If we want more than we have, try to buy
                 if gross_want > current {
-                    let buy = (gross_want - current).min(account.cash).min(assets / 5.);
+                    let buy = (gross_want - current).min(account.cash);
                     if buy == 0. {
                         continue;
                     }
@@ -232,12 +243,12 @@ pub fn basic_nn(
 
                 // Otherwise we want less than we have, try to sell
 
-                let sell = ((gross_want - current).abs()).min(current).min(assets / 5.);
+                let sell = ((gross_want - current).abs()).min(current);
                 if sell == 0. {
                     continue;
                 }
 
-                // If we make a really dumb sell (selling lower than we avg bought) then criple the bot
+                // If we make a really dumb sell (selling lower than we avg bought)
                 if price <= position.avg_price {
                     continue;
                 }
@@ -292,6 +303,9 @@ pub fn basic_nn(
 
                     let ticker_want_indexes = &want_indexes[ticker_index];
                     let _ = want_chart(&ticker_dir, &data, ticker_want_indexes);
+
+                    let diff_percents = &mapped_diffs[ticker_index];
+                    let _ = simple_chart(&ticker_dir, "diff percents", diff_percents);
 
                     /* let rsi_diff_values = rsi_values
                         .iter()

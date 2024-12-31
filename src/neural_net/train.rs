@@ -10,16 +10,18 @@ use rust_neural_network::neural_network::NeuralNetwork;
 use crate::{
     charts::general::simple_chart, constants::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
-    }, data::historical::get_historical_data, neural_net::create::create_mapped_indicators, strategies::basic_nn::basic_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
+    }, data::historical::get_historical_data, neural_net::create::{create_mapped_diffs, create_mapped_indicators}, strategies::basic_nn::basic_nn, types::{Account, MakeCharts}, utils::create_folder_if_not_exists
 };
 
 use super::create::{create_networks, Indicator, Indicators};
 
-pub async fn train_networks(client: &Client) {
+pub async fn train_networks() {
     let time = std::time::Instant::now();
 
-    let mapped_historical = Arc::new(get_historical_data(client));
+    let mapped_historical = Arc::new(get_historical_data());
     let mapped_indicators = create_mapped_indicators(&mapped_historical);
+
+    let mapped_diffs = Arc::new(create_mapped_diffs(&mapped_historical));
 
     let mut most_final_assets = 0.0;
     let mut best_of_gens = Vec::<NeuralNetwork>::new();
@@ -70,6 +72,7 @@ pub async fn train_networks(client: &Client) {
             // let cloned_inputs = inputs.to_vec();// Arc::clone(&inputs_arc);
 
             let cloned_historical = Arc::clone(&mapped_historical);
+            let cloned_diffs = Arc::clone(&mapped_diffs);
             let cloned_tickers_set = tickers_set.to_vec();
 
             // let indexes = ticker_indexes.clone();
@@ -82,6 +85,7 @@ pub async fn train_networks(client: &Client) {
                     &cloned_tickers_set,
                     &cloned_historical,
                     neural_net,
+                    &cloned_diffs,
                     // &cloned_indicators,
                     input_count,
                     None,
@@ -162,6 +166,7 @@ pub async fn train_networks(client: &Client) {
         first_net.clone(),
         // &mapped_indicators,
         // inputs.to_vec(),
+        &mapped_diffs,
         input_count,
         Some(MakeCharts { generation: 0 }),
     );
@@ -172,6 +177,7 @@ pub async fn train_networks(client: &Client) {
         &tickers_set,
         &cloned_historical,
         last_net.clone(),
+        &mapped_diffs,
         // &mapped_indicators,
         // inputs.to_vec(),
         input_count,

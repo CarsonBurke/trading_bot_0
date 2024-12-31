@@ -2,6 +2,7 @@ use std::fs;
 
 use hashbrown::{HashMap, HashSet};
 use ibapi::{
+    client,
     contracts::Contract,
     market_data::historical::{self, BarSize, ToDuration, WhatToShow},
     Client,
@@ -9,19 +10,32 @@ use ibapi::{
 use time::OffsetDateTime;
 
 use crate::{
-    constants::{files, TICKERS},
+    constants::{files::{self, DATA_PATH}, TICKERS},
     types::MappedHistorical,
     utils::create_folder_if_not_exists,
 };
 
-pub fn get_historical_data(client: &Client) -> MappedHistorical {
+pub fn get_historical_data() -> MappedHistorical {
     let mut data = Vec::new();
+    let opt_client: Option<Client> = None;
 
     for ticker in TICKERS.iter() {
+        // Try to get the data from local files
         if let Some(bars) = get_historical_data_from_files(ticker) {
             data.push(bars);
             continue;
         }
+
+        // Otherwise get the data from IBKR
+
+        let client = match &opt_client {
+            Some(client) => client,
+            None => {
+                let connection_url = "127.0.0.1:4001";
+
+                &Client::connect(connection_url, 1).expect("connection to TWS failed!")
+            }
+        };
 
         data.push(get_historical_data_from_ibkr(client, ticker));
     }
@@ -47,7 +61,12 @@ fn get_historical_data_from_ibkr(client: &Client, ticker: &str) -> Vec<historica
         .historical_data(
             &contract,
             OffsetDateTime::now_utc(),
-            365.days(),
+            match DATA_PATH {
+                "data" => 356.days(),
+                "long_data" => 5.years(),
+                "extra_long_data" => 20.years(),
+                _ => 356.days(),
+            },
             /* 1.years(), */
             BarSize::Hour,
             WhatToShow::Trades,

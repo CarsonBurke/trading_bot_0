@@ -1,2 +1,14 @@
+use ndarray::Array2;
+
 pub mod train;
 pub mod create;
+
+pub struct Replay {
+    // The inputs provided to the network at a certain point
+    pub state: Array2<f32>,
+    // How much the network was rewarded for this action for the coinciding state
+    pub reward: f32,
+    // The amount of stock that was bought or sold (sold would be negative)
+    // Maybe this should be the output parameters instead
+    pub action: f64,
+}

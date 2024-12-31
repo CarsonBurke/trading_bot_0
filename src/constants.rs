@@ -26,7 +26,7 @@ pub mod agent {
     pub const TARGET_AGENT_COUNT: u32 = 200;
     pub const KEEP_AGENTS_PER_GENERATION: u32 = 50;
     /// How many generations to run to train the agents
-    pub const TARGET_GENERATIONS: u32 = 1000;
+    pub const TARGET_GENERATIONS: u32 = 200;
     pub const MAX_WEIGHT: f64 = 1.0;
     pub const MIN_WEIGHT: f64 = 0.0;
     pub const STARTING_CASH: f64 = 10_000.;
@@ -38,8 +38,8 @@ pub mod neural_net {
     pub const SELL_INDEX: usize = 1;
     /* pub const CHANGE_INDEX: u32 = 0; */
     pub const HOLD_INDEX: u32 = 2;
-    pub const INDEX_STEP: usize = 4;
-    pub const MAX_STEPS: usize = 500;
+    pub const INDEX_STEP: usize = 3;
+    pub const MAX_STEPS: usize = 200;
     pub const SAMPLE_INDEXES: usize = 10;
     pub const TICKER_SETS: usize = 5;
 }
