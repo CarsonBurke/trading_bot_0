@@ -1,7 +1,8 @@
 use ndarray::Array2;
 
-pub mod train;
+pub mod train_genetic;
 pub mod create;
+pub mod train_qlearning;
 
 pub struct Replay {
     // The inputs provided to the network at a certain point

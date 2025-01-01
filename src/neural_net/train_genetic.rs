@@ -15,7 +15,7 @@ use crate::{
 
 use super::create::{create_networks, Indicator, Indicators};
 
-pub async fn train_networks() {
+pub async fn train_networks_genetic() {
     let time = std::time::Instant::now();
 
     let mapped_historical = Arc::new(get_historical_data());
@@ -86,7 +86,7 @@ pub async fn train_networks() {
                 let assets = basic_nn(
                     &cloned_tickers_set,
                     &cloned_historical,
-                    neural_net,
+                    &neural_net,
                     &cloned_diffs,
                     // &cloned_indicators,
                     input_count,
@@ -165,7 +165,7 @@ pub async fn train_networks() {
     let first_assets = basic_nn(
         &tickers_set,
         &cloned_historical,
-        first_net.clone(),
+        first_net,
         // &mapped_indicators,
         // inputs.to_vec(),
         &mapped_diffs,
@@ -178,7 +178,7 @@ pub async fn train_networks() {
     let final_assets = basic_nn(
         &tickers_set,
         &cloned_historical,
-        last_net.clone(),
+        last_net,
         &mapped_diffs,
         // &mapped_indicators,
         // inputs.to_vec(),

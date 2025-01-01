@@ -18,7 +18,7 @@ use crate::{
 pub fn basic_nn(
     ticker_sets: &[Vec<usize>],
     mapped_data: &MappedHistorical,
-    neural_network: NeuralNetwork,
+    neural_network: &NeuralNetwork,
     mapped_diffs: &[Data],
     // mapped_indicators: &Vec<Indicators>,
     inputs_count: usize,

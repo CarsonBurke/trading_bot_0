@@ -59,7 +59,7 @@ async fn main() {
     // panic!("done");
 
     // agent::train::train_agents(&client);
-    neural_net::train::train_networks().await;
+    neural_net::train_genetic::train_networks_genetic().await;
 }
 
 fn account_info(client: &Client) {
