@@ -95,6 +95,13 @@ pub fn train_networks_qlearning() {
             input_count,
             Some(MakeCharts { generation: 0 }),
         );
+        
+        // Periodically run a replay
+        // Unclear exactly how to integrate this
+
+        
+
+        //
 
         println!("Completed generation: {gen} with assets: {}", assets);
     }
