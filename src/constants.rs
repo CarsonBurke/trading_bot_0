@@ -30,7 +30,7 @@ pub mod agent {
     pub const TARGET_AGENT_COUNT: u32 = 150;
     pub const KEEP_AGENTS_PER_GENERATION: u32 = 50;
     /// How many generations to run to train the agents
-    pub const TARGET_GENERATIONS: u32 = 10;
+    pub const TARGET_GENERATIONS: u32 = 100;
     pub const MAX_WEIGHT: f64 = 1.0;
     pub const MIN_WEIGHT: f64 = 0.0;
     pub const STARTING_CASH: f64 = 10_000.;

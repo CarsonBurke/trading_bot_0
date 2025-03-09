@@ -91,7 +91,7 @@ pub fn basic(
         let mut total_positioned = 0.0;
 
         for (ticker, bars) in mapped_data.iter().enumerate() {
-            let price = bars[ticker].close;
+            let price = bars[index].close;
 
             let position = account.positions.get_mut(ticker).unwrap();
             let positioned = position.value_with_price(price);
@@ -109,7 +109,7 @@ pub fn basic(
         // Conduct buys and sells
 
         for (ticker, bars) in mapped_data.iter().enumerate() {
-            let price = bars[ticker].close;
+            let price = bars[index].close;
 
             let decider_rsi_values = decider_rsi_values_by_ticker.get(ticker).unwrap();
             let decider_rsi = decider_rsi_values[index];
@@ -157,7 +157,7 @@ pub fn basic(
                 // println!("amount rsi: {}", amount_rsi);
                 // println!("diff {}", decider_rsi - amount_rsi);
                 let rsi_diff = amount_rsi;
-                let Some((total_price, buy_quantity)) = get_buy_price_quantity(
+                let Some((total_buy, buy_quantity)) = get_buy_price_quantity(
                     position,
                     price,
                     rsi_diff,
@@ -195,11 +195,10 @@ pub fn basic(
                 last_buy_price.insert(ticker, price);
                 last_sell_price.remove(&ticker);
 
-                let ticker_buy_indexes = buy_indexes.get_mut(ticker).unwrap();
-                ticker_buy_indexes.insert(index, (total_price, buy_quantity as f64));
+                buy_indexes[ticker].insert(index, (price, buy_quantity as f64));
 
                 position.add(price, buy_quantity as f64);
-                account.cash -= total_price;
+                account.cash -= total_buy;
                 continue;
             }
         }
@@ -229,34 +228,35 @@ pub fn basic(
         let base_dir = format!("{TRAINING_PATH}/gens/{}", charts_config.generation);
         create_folder_if_not_exists(&base_dir);
 
-        assets_chart(&base_dir, &total_assets, &cash_graph, None);
+        let _ = assets_chart(&base_dir, &total_assets, &cash_graph, None);
 
         for (ticker, bars) in mapped_data.iter().enumerate() {
+            let ticker_name = TICKERS[ticker].to_string();
 
-            let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker}", charts_config.generation);
+            let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker_name}", charts_config.generation);
             create_folder_if_not_exists(&ticker_dir);
 
             let data = convert_historical(bars);
 
             /* candle_chart(&ticker_dir, bars); */
 
-            let ticker_buy_indexes = buy_indexes.get(ticker).unwrap();
-            let ticker_sell_indexes = sell_indexes.get(ticker).unwrap();
-            buy_sell_chart(
+            let ticker_buy_indexes = &buy_indexes[ticker];
+            let ticker_sell_indexes = &sell_indexes[ticker];
+            let _ = buy_sell_chart(
                 &ticker_dir,
                 &data,
                 &ticker_buy_indexes,
                 &ticker_sell_indexes,
             );
 
-            let rsi_values = decider_rsi_values_by_ticker.get(ticker).unwrap();
-            simple_chart(&ticker_dir, "decider_rsi", &rsi_values);
+            let rsi_values = &decider_rsi_values_by_ticker[ticker];
+            let _ = simple_chart(&ticker_dir, "decider_rsi", &rsi_values);
 
-            let amount_rsi_values = amount_rsi_values_by_ticker.get(ticker).unwrap();
-            simple_chart(&ticker_dir, "amount_rsi", &amount_rsi_values);
+            let amount_rsi_values = &amount_rsi_values_by_ticker[ticker];
+            let _ = simple_chart(&ticker_dir, "amount_rsi", &amount_rsi_values);
 
-            let price_ema_values = price_emas_by_ticker.get(ticker).unwrap();
-            simple_chart(&ticker_dir, "price_ema", &price_ema_values);
+            let price_ema_values = &price_emas_by_ticker[ticker];
+            let _ = simple_chart(&ticker_dir, "price_ema", &price_ema_values);
 
             /* let rsi_diff_values = rsi_values
                 .iter()
@@ -265,8 +265,8 @@ pub fn basic(
                 .collect();
             simple_chart(&ticker_dir, "rsi_diff", &rsi_diff_values); */
 
-            let positioned_assets = positions_by_ticker.get(ticker).unwrap();
-            assets_chart(
+            let positioned_assets = &positions_by_ticker[ticker];
+            let _ = assets_chart(
                 &ticker_dir,
                 &total_assets,
                 &cash_graph,
@@ -382,7 +382,7 @@ pub fn try_sell(
     // println!("amount rsi: {}", amount_rsi);
     // println!("diff {}", decider_rsi - amount_rsi);
     let rsi_diff = amount_rsi;
-    let Some((sell_price, sell_quantity)) = get_sell_price_quantity(
+    let Some((total_sell, sell_quantity)) = get_sell_price_quantity(
         &position,
         price,
         rsi_diff,
@@ -407,11 +407,10 @@ pub fn try_sell(
     last_sell_price.insert(ticker, price);
     last_buy_price.remove(&ticker);
 
-    let ticker_sell_indexes = sell_indexes.get_mut(ticker).unwrap();
-    ticker_sell_indexes.insert(index, (sell_price, sell_quantity as f64));
+    sell_indexes[ticker].insert(index, (price, sell_quantity as f64));
 
     position.quantity -= sell_quantity as f64;
-    account.cash += sell_price;
+    account.cash += total_sell;
 }
 
 pub fn get_sell_price_quantity(
@@ -441,7 +440,7 @@ pub fn get_sell_price_quantity(
 
     let percent = percent_diff_from_avg.powf(weight); /* ((100. - rsi) / 100.) * weight/* .powf(weight * 10.) */; */
     // How much of this stock we want to have
-    let want = available * percent;
+    let want = (available * percent).min(has);
     // if want <= has {
     //     return None
     // }
@@ -482,7 +481,7 @@ pub fn get_buy_price_quantity(
     let percent = percent_diff_from_avg.powf(weight); /* ((100. - rsi) / 100.) * weight; */
     /* ((100. - rsi) / 100.).powf(weight * 10.); */
     // How much of this stock we want to have
-    let want = available * percent;
+    let want = (available * percent).min(available);
 
     let buy_want = want - position.value_with_price(price);
     // println!("buy want: {}", buy_want);
