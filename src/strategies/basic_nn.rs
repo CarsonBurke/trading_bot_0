@@ -170,8 +170,8 @@ pub fn basic_nn(
                 // let values = inputs.iter().map(|input| input.values[0]).collect::<Vec<f64>>();
                 // println!("inputs: {values:?}");
 
-                /* let change = last_layer[constants::neural_net::BUY_INDEX]
-                    - last_layer[constants::neural_net::SELL_INDEX];
+                let change = last_layer[constants::neural_net::BUY_INDEX] as f64
+                    - last_layer[constants::neural_net::SELL_INDEX] as f64;
                 let current = match position.quantity {
                     0. => 0.,
                     _ => position.value_with_price(price),
@@ -181,7 +181,7 @@ pub fn basic_nn(
 
                 // println!("change: {change}, current: {current}");
                 if change > 0. {
-                    let buy = (change).min(account.cash).min(assets / TICKERS.len() as f64 - current);
+                    let buy = (change).min(account.cash).min(assets / SAMPLE_INDEXES as f64 - current);
                     if buy <= 0. {
                         continue;
                     }
@@ -207,11 +207,11 @@ pub fn basic_nn(
 
                 sell_indexes[ticker_index].insert(index, (price, quantity));
 
-                continue; */
+                continue;
 
                 // Get the want from the determined percent, at a maximum of 10%
 
-                let output = last_layer[BUY_INDEX] as f64;
+                /* let output = last_layer[BUY_INDEX] as f64;
                 // println!("output: {}", output);
                 let gross_want = (assets * output).min(assets / SAMPLE_INDEXES as f64) /* - assets * last_layer[SELL_INDEX] / 100. */ /* *percent *//* assets * percent / 10000. *//* assets * (percent / 1000.).min(0.2) */;
                 if gross_want < 0. {
@@ -258,7 +258,7 @@ pub fn basic_nn(
                 position.quantity -= quantity;
                 account.cash += sell;
 
-                sell_indexes[ticker_index].insert(index, (price, quantity));
+                sell_indexes[ticker_index].insert(index, (price, quantity)); */
             }
         }
 
@@ -304,8 +304,8 @@ pub fn basic_nn(
                     let ticker_want_indexes = &want_indexes[ticker_index];
                     let _ = want_chart(&ticker_dir, &data, ticker_want_indexes);
 
-                    let diff_percents = &mapped_diffs[ticker_index];
-                    let _ = simple_chart(&ticker_dir, "diff percents", diff_percents);
+                    /* let diff_percents = &mapped_diffs[ticker_index];
+                    let _ = simple_chart(&ticker_dir, "diff percents", diff_percents); */
 
                     /* let rsi_diff_values = rsi_values
                         .iter()

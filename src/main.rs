@@ -11,6 +11,7 @@ use ibapi::{
     Client,
 };
 use ndarray::Array2;
+use colored::{self, Colorize};
 
 pub mod agent;
 pub mod charts;
@@ -23,8 +24,7 @@ mod utils;
 
 #[tokio::main]
 async fn main() {
-    println!("Trying to connect to IB API!");
-    let connection_url = "127.0.0.1:4001";
+    println!("{}", "Start".green());
 
 /*     let client = Client::connect(connection_url, 1).expect("connection to TWS failed!");
     println!("Successfully connected to TWS at {connection_url}"); */
@@ -58,8 +58,10 @@ async fn main() {
 
     // panic!("done");
 
-    // agent::train::train_agents(&client);
-    neural_net::train_genetic::train_networks_genetic().await;
+    agent::train::train_agents();
+    // neural_net::train_genetic::train_networks_genetic().await;
+
+    println!("{}", "End".green())
 }
 
 fn account_info(client: &Client) {

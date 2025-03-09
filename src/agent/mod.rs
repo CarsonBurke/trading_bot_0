@@ -88,6 +88,9 @@ impl Default for Weights {
                 Weight::AmountRsiEmaAlpha => 0.02,
                 Weight::ReboundSellThreshold => 0.05,
                 Weight::ReboundBuyThreshold => 0.05,
+                Weight::DropBuyThreshold => 0.05,
+                Weight::ReboundSellPriceThreshold => 0.05,
+                Weight::ReboundBuyPriceThreshold => 0.05,
             },
         }
     }
@@ -112,8 +115,14 @@ pub enum Weight {
     DiffToSell,
     DeciderRsiEmaAlpha,
     AmountRsiEmaAlpha,
-    // What RSI amount / 100 the position needs to go back up before it can be purchased
+    // What RSI amount / 100 the position needs to go back up before it can be sold
     ReboundSellThreshold,
-    // What RSI amount / 100 the position needs to go down before it can be sold
+    // What RSI amount / 100 the position needs to go down before it can be bought
     ReboundBuyThreshold,
+    // How much the price needs to drop from the previous purchase before a new purchase can be made (if bought at 100 and this is 0.05, then it must drop 5%, down to 95, for us to purchase again)
+    DropBuyThreshold,
+    // What price difference % from previous local maximum necessary to allow a sell
+    ReboundSellPriceThreshold,
+    // What price difference % from previous local minimum necessary to allow a purchase
+    ReboundBuyPriceThreshold,
 }
