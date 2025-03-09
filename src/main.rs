@@ -58,7 +58,7 @@ async fn main() {
 
     // panic!("done");
 
-    agent::train::train_agents();
+    agent::train::train_agents().await;
     // neural_net::train_genetic::train_networks_genetic().await;
 
     println!("{}", "End".green())

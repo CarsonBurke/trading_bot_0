@@ -226,13 +226,12 @@ pub fn basic(
     if let Some(charts_config) = make_charts {
         println!("Generating charts for gen: {}", charts_config.generation);
 
-        let base_dir = format!("training/gens/{}", charts_config.generation);
+        let base_dir = format!("{TRAINING_PATH}/gens/{}", charts_config.generation);
         create_folder_if_not_exists(&base_dir);
 
         assets_chart(&base_dir, &total_assets, &cash_graph, None);
 
         for (ticker, bars) in mapped_data.iter().enumerate() {
-            let price = bars[ticker].close;
 
             let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker}", charts_config.generation);
             create_folder_if_not_exists(&ticker_dir);

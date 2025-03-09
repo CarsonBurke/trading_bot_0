@@ -280,7 +280,7 @@ pub fn basic_nn(
             if let Some(charts_config) = &make_charts {
                 println!("Generating charts for gen: {}", charts_config.generation);
 
-                let base_dir = format!("training/gens/{}", charts_config.generation);
+                let base_dir = format!("{TRAINING_PATH}/gens/{}", charts_config.generation);
                 create_folder_if_not_exists(&base_dir);
 
                 let _ = assets_chart(&base_dir, &total_assets, &cash_graph, None);

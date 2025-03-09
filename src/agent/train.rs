@@ -1,16 +1,28 @@
-use std::{collections::{BTreeMap, VecDeque}, fs};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fs, sync::Arc,
+};
 
 use hashbrown::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::{
-    agent::Agent, charts::general::assets_chart, constants::{agent::{ KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::{TRAINING_PATH, WEIGHTS_PATH}}, data::historical::get_historical_data, strategies, types::{Account, MakeCharts}, utils::{convert_historical, get_rsi_values}
+    agent::Agent,
+    charts::general::assets_chart,
+    constants::{
+        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
+        files::{TRAINING_PATH, WEIGHTS_PATH},
+    },
+    data::historical::get_historical_data,
+    strategies,
+    types::{Account, MakeCharts},
+    utils::{convert_historical, get_rsi_values},
 };
 
-use super::{create::create_agents};
+use super::create::create_agents;
 
-pub fn train_agents() {
-    let mapped_historical = get_historical_data();
+pub async fn train_agents() {
+    let mapped_historical = Arc::new(get_historical_data());
 
     let mut most_final_assets = 0.0;
     let mut best_of_gens = Vec::<Agent>::new();
@@ -18,17 +30,33 @@ pub fn train_agents() {
     let mut agents = create_agents();
 
     for gen in 0..TARGET_GENERATIONS {
+        let mut handles = Vec::new();
+
+        for (id, agent) in agents.iter_mut() {
+            let id = *id;
+            let cloned_agent = agent.clone();
+            let cloned_historical = Arc::clone(&mapped_historical);
+
+            let handle = tokio::task::spawn(async move {
+                let assets = strategies::basic::basic(
+                    &cloned_historical,
+                    &cloned_agent,
+                    &mut Account::default(),
+                    None,
+                );
+                println!("assets: {:.2}", assets);
+
+                (id, assets)
+            });
+
+            handles.push(handle)
+        }
+
         let mut agents_vec = Vec::new();
 
-        for (_, agent) in agents.iter() {
-            let assets = strategies::basic::basic(
-                &mapped_historical,
-                agent,
-                &mut Account::default(),
-                None,
-            );
-
-            agents_vec.push((agent.id, assets));
+        for handle in handles {
+            let (agent_id, assets) = handle.await.unwrap();
+            agents_vec.push((agent_id, assets));
         }
 
         agents_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -44,7 +72,7 @@ pub fn train_agents() {
 
         let (gen_best_agent_id, gen_best_assets) = agents_vec[0];
         if gen_best_assets > most_final_assets {
-                most_final_assets = gen_best_assets;
+            most_final_assets = gen_best_assets;
         }
 
         let best_gen_agent = agents.get(&gen_best_agent_id).unwrap().clone();
@@ -89,7 +117,7 @@ pub fn train_agents() {
         &mapped_historical,
         first_agent,
         &mut Account::default(),
-        Some(MakeCharts { generation: 0}),
+        Some(MakeCharts { generation: 0 }),
     );
     println!("Final assets: ${first_assets}");
 
@@ -100,15 +128,24 @@ pub fn train_agents() {
         &mapped_historical,
         last_agent,
         &mut Account::default(),
-        Some(MakeCharts { generation: TARGET_GENERATIONS - 1}),
+        Some(MakeCharts {
+            generation: TARGET_GENERATIONS - 1,
+        }),
     );
     println!("Final assets: ${final_assets}");
 
     let start = 10_000.0;
-    println!("Profit: ${:.2} ({:.2}%)", final_assets - start, ((final_assets - start) / start) * 100.0);
+    println!(
+        "Profit: ${:.2} ({:.2}%)",
+        final_assets - start,
+        ((final_assets - start) / start) * 100.0
+    );
 
     let diff = final_assets - first_assets;
-    println!("Improvement from training of : ${diff:.2} ({:.2}%)", (final_assets - first_assets) / start * 100.0);
+    println!(
+        "Improvement from training of : ${diff:.2} ({:.2}%)",
+        (final_assets - first_assets) / start * 100.0
+    );
 
     record_weights(last_agent);
 }
@@ -122,7 +159,11 @@ fn record_finances(agents: &[(Uuid, f64)], gen: u32) {
 
     let agents_only_finances = agents.iter().map(|a| a.1).collect::<Vec<f64>>();
 
-    fs::write(format!("{dir}/agents.txt"), format!("{agents_only_finances:?}")).unwrap();
+    fs::write(
+        format!("{dir}/agents.txt"),
+        format!("{agents_only_finances:?}"),
+    )
+    .unwrap();
 }
 
 pub fn record_weights(agent: &Agent) {
