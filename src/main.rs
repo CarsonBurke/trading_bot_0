@@ -1,4 +1,5 @@
-use agent::train;
+use agent::train::{self, AgentStrategy};
+use colored::{self, Colorize};
 use ibapi::{
     accounts::{AccountSummaries, AccountSummaryTags},
     client::Subscription,
@@ -11,7 +12,6 @@ use ibapi::{
     Client,
 };
 use ndarray::Array2;
-use colored::{self, Colorize};
 
 pub mod agent;
 pub mod charts;
@@ -26,7 +26,7 @@ mod utils;
 async fn main() {
     println!("{}", "Start".green());
 
-/*     let client = Client::connect(connection_url, 1).expect("connection to TWS failed!");
+    /*     let client = Client::connect(connection_url, 1).expect("connection to TWS failed!");
     println!("Successfully connected to TWS at {connection_url}"); */
 
     // account_info(&client);
@@ -49,7 +49,7 @@ async fn main() {
     // rsi_chart(&rsi_values).unwrap();
 
     // candle_chart(&stock_data).unwrap();
-    
+
     // let arr1: Array2<u32> = Array2::from_shape_vec([4, 1], vec![2, 2, 2, 2]).unwrap();
     // let arr2: Array2<u32> = Array2::from_shape_vec([4, 1], vec![1, 1, 1, 1]).unwrap();
 
@@ -58,7 +58,7 @@ async fn main() {
 
     // panic!("done");
 
-    agent::train::train_agents().await;
+    agent::train::train_agents(AgentStrategy::PriceRebound).await;
     // neural_net::train_genetic::train_networks_genetic().await;
 
     println!("{}", "End".green())

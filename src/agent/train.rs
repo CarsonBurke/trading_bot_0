@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs, sync::Arc,
+    fs,
+    sync::Arc,
 };
 
 use hashbrown::{HashMap, HashSet};
@@ -15,13 +16,20 @@ use crate::{
     },
     data::historical::get_historical_data,
     strategies,
-    types::{Account, MakeCharts},
+    types::{Account, MakeCharts, MappedHistorical},
     utils::{convert_historical, get_rsi_values},
 };
 
 use super::create::create_agents;
 
-pub async fn train_agents() {
+#[derive(Copy, Clone)]
+pub enum AgentStrategy {
+    Combined,
+    RsiRebound,
+    PriceRebound,
+}
+
+pub async fn train_agents(strategy: AgentStrategy) {
     let mapped_historical = Arc::new(get_historical_data());
 
     let mut most_final_assets = 0.0;
@@ -38,12 +46,13 @@ pub async fn train_agents() {
             let cloned_historical = Arc::clone(&mapped_historical);
 
             let handle = tokio::task::spawn(async move {
-                let assets = strategies::basic::basic(
+                /* let assets = strategies::basic::basic(
                     &cloned_historical,
                     &cloned_agent,
                     &mut Account::default(),
                     None,
-                );
+                ); */
+                let assets = run_strategy(strategy, &cloned_agent, &cloned_historical, None);
                 println!("assets: {:.2}", assets);
 
                 (id, assets)
@@ -113,10 +122,10 @@ pub async fn train_agents() {
     let first_agent = best_of_gens.first().unwrap();
     println!("First agent =====");
 
-    let first_assets = strategies::basic::basic(
+    let first_assets = run_strategy(
+        strategy,
+        &first_agent,
         &mapped_historical,
-        first_agent,
-        &mut Account::default(),
         Some(MakeCharts { generation: 0 }),
     );
     println!("Final assets: ${first_assets}");
@@ -124,10 +133,10 @@ pub async fn train_agents() {
     let last_agent = best_of_gens.last().unwrap();
     println!("Last agent =====");
 
-    let final_assets = strategies::basic::basic(
+    let final_assets = run_strategy(
+        strategy,
+        &last_agent,
         &mapped_historical,
-        last_agent,
-        &mut Account::default(),
         Some(MakeCharts {
             generation: TARGET_GENERATIONS - 1,
         }),
@@ -172,4 +181,40 @@ pub fn record_weights(agent: &Agent) {
 
     let encoded = postcard::to_stdvec(&agent.weights).unwrap();
     fs::write(format!("{dir}/weights.bin"), encoded).unwrap();
+}
+
+/// Returns: the total final value of assets
+pub fn run_strategy(
+    strategy: AgentStrategy,
+    agent: &Agent,
+    mapped_data: &MappedHistorical,
+    make_charts: Option<MakeCharts>,
+) -> f64 {
+    match strategy {
+        AgentStrategy::PriceRebound => {
+            return strategies::price_rebound::basic(
+                &mapped_data,
+                &agent,
+                &mut Account::default(),
+                make_charts,
+            )
+        }
+        AgentStrategy::Combined => {
+            return 1.;
+            /* return strategies::combined::basic(
+                &mapped_data,
+                &agent,
+                &mut Account::default(),
+                make_charts,
+            ) */
+        }
+        AgentStrategy::RsiRebound => {
+            return strategies::rsi_rebound::basic(
+                &mapped_data,
+                &agent,
+                &mut Account::default(),
+                make_charts,
+            )
+        }
+    }
 }

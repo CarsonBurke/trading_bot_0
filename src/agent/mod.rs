@@ -82,15 +82,20 @@ impl Default for Weights {
                 Weight::RsiBuyAmountWeight => 0.8,
                 Weight::RsiSellAmountWeight => 0.8,
                 Weight::PriceEmaAlpha => 0.05,
-                Weight::DiffToBuy => 0.05,
                 Weight::DiffToSell => 0.05,
                 Weight::DeciderRsiEmaAlpha => 0.02/* 15 */,
                 Weight::AmountRsiEmaAlpha => 0.02,
-                Weight::ReboundSellThreshold => 0.05,
-                Weight::ReboundBuyThreshold => 0.05,
-                Weight::DropBuyThreshold => 0.05,
-                Weight::ReboundSellPriceThreshold => 0.05,
-                Weight::ReboundBuyPriceThreshold => 0.05,
+                Weight::ReboundSellThreshold => 0.01,
+                Weight::ReboundBuyThreshold => 0.01,
+                Weight::DropBuyThreshold => 0.001,
+                Weight::ReboundSellPriceThreshold => 0.015,
+                Weight::ReboundBuyPriceThreshold => 0.005,
+                Weight::MaxReboundBuyPriceThreshold => 0.04,
+                Weight::SellPercent => 0.8,
+                Weight::BuyPercent => 0.1,
+                Weight::SellDropBuyTreshold => 0.03,
+                Weight::BuyDistanceWeightAmount => 0.05,
+                Weight::SellDistanceWeightAmount => 0.05,
             },
         }
     }
@@ -111,7 +116,6 @@ pub enum Weight {
     RsiBuyAmountWeight,
     RsiSellAmountWeight,
     PriceEmaAlpha,
-    DiffToBuy,
     DiffToSell,
     DeciderRsiEmaAlpha,
     AmountRsiEmaAlpha,
@@ -125,4 +129,15 @@ pub enum Weight {
     ReboundSellPriceThreshold,
     // What price difference % from previous local minimum necessary to allow a purchase
     ReboundBuyPriceThreshold,
+    //
+    MaxReboundBuyPriceThreshold,
+    // How much to sell each sale
+    SellPercent,
+    // How much to buy each buy
+    BuyPercent,
+    // How much the price needs to drop after the latest sell before we are allowed to buy again
+    SellDropBuyTreshold,
+    // For each percent from the maximum, buy more
+    BuyDistanceWeightAmount,
+    SellDistanceWeightAmount,
 }

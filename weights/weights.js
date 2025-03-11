@@ -1,0 +1,22 @@
+let Weights = {
+  map: {
+    MinRsiSell: 0.6036238648322303,
+    MaxRsiBuy: 0.3996536177924444,
+    RsiBuyAmountWeight: 0.801396294549144,
+    RsiSellAmountWeight: 0.7965905847722562,
+    PriceEmaAlpha: 0.03405824976925634,
+    DiffToBuy: 0.04552158781223344,
+    DiffToSell: 0.05123266716607858,
+    DeciderRsiEmaAlpha: 0.016386751599301853,
+    AmountRsiEmaAlpha: 0.005392598771291349,
+    ReboundSellThreshold: 0.010395350062407483,
+    ReboundBuyThreshold: 0.0002781873675507206,
+    DropBuyThreshold: -0.0031003614868275525,
+    ReboundSellPriceThreshold: 0.018736955866450307,
+    ReboundBuyPriceThreshold: -0.00275018556222352,
+    MaxReboundBuyPriceThreshold: 0.030034654999130415,
+    SellPercent: 0.8056535853396364,
+    BuyPercent: 0.13736212948846754,
+    SellDropBuyTreshold: 0.02745811421202763,
+  },
+};

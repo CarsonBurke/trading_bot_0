@@ -215,6 +215,12 @@ pub fn round_to_stock(price: f64, max: f64) -> (f64, u32) {
     (price * quantity as f64, quantity)
 }
 
+pub fn round_to_stock_fractional(price: f64, max: f64) -> (f64, f64) {
+    let quantity = max / price;
+
+    (max, quantity)
+}
+
 pub fn estimate_stock_value(financials: String) {
     // based on growth, with a weighted preference (ema) for more recent data
     // quarterly for the last 3 years?
@@ -240,4 +246,21 @@ pub fn find_highest<T: std::cmp::PartialOrd>(iter: &[T]) -> (usize, &T) {
     }
 
     (best_index, highest_value)
+}
+
+pub fn min_transaction_cost(assets: f64) -> f64 {
+    assets / 300.
+}
+
+pub fn is_min_transaction(assets: f64, transaction: f64) -> bool {
+    return transaction > min_transaction_cost(assets)
+}
+
+pub fn percent_diff(bigger: f64, smaller: f64) -> f64 {
+    (bigger - smaller) / bigger
+}
+
+pub fn percent_diff_abs(num1: f64, num2: f64) -> f64 {
+    let diff = (num1 - num2) / num1;
+    diff.abs()
 }
