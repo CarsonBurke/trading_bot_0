@@ -6,7 +6,7 @@ A trading bot employing a variety of heuristics to make profitable short and lon
 |:--:| 
 |*Total assets doubling from $10,000 -> $20,000 over the course of a year using one of the homemade strategic trading algorithms* |
 
-Thanks to [rust-ibapi]([rust-ibapi](https://github.com/wboayue/rust-ibapi)) and its contributors for making this possible
+Thanks to [rust-ibapi](https://github.com/wboayue/rust-ibapi) and its contributors for making this possible
 
 # Usage
 
