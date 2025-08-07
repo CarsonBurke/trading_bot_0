@@ -5,10 +5,10 @@ const OBSERVATION_DIM: i64 = 10; // price, volume, moving averages, etc.
 const ACTION_DIM: i64 = 3; // buy, sell, hold
 const HIDDEN_DIM: i64 = 64;
 const LEARNING_RATE: f64 = 1e-4;
-const GAMMA: f32 = 0.99;
-const EPSILON: f32 = 0.2;
-const VALUE_COEF: f32 = 0.5;
-const ENTROPY_COEF: f32 = 0.01;
+const GAMMA: f64 = 0.99;
+const EPSILON: f64 = 0.2;
+const VALUE_COEF: f64 = 0.5;
+const ENTROPY_COEF: f64 = 0.01;
 
 struct ActorCritic {
     shared: nn::Sequential,
@@ -43,11 +43,11 @@ impl ActorCritic {
 }
 
 struct TradingEnvironment {
-    prices: Vec<f32>,
+    prices: Vec<f64>,
     current_step: usize,
-    position: f32,
-    cash: f32,
-    initial_cash: f32,
+    position: f64,
+    cash: f64,
+    initial_cash: f64,
 }
 
 impl TradingEnvironment {
@@ -59,7 +59,7 @@ impl TradingEnvironment {
         for _ in 1..1000 {
             // Tend to increase more than decrease
             let change = rng.random_range(-2.0..4.0);
-            let new_price = (*prices.last().unwrap() as f32 + change).max(1.0_f32);
+            let new_price = (*prices.last().unwrap() as f64 + change).max(1.0_f64);
             prices.push(new_price);
         }
 
@@ -97,10 +97,10 @@ impl TradingEnvironment {
         // Simple moving averages - normalize
         let ma5 = self.prices[self.current_step.saturating_sub(5)..=self.current_step]
             .iter()
-            .sum::<f32>() / 5.0;
+            .sum::<f64>() / 5.0;
         let ma10 = self.prices[self.current_step.saturating_sub(10)..=self.current_step]
             .iter()
-            .sum::<f32>() / 10.0;
+            .sum::<f64>() / 10.0;
 
         obs.push(ma5 / 100.0);
         obs.push(ma10 / 100.0);
@@ -116,7 +116,7 @@ impl TradingEnvironment {
         Tensor::from_slice(&obs).view([1, OBSERVATION_DIM])
     }
 
-    fn learn_step(&mut self, action: i64) -> (Tensor, f32, bool) {
+    fn learn_step(&mut self, action: i64) -> (Tensor, f64, bool) {
         let current_price = self.prices[self.current_step];
         let portfolio_value_before = self.cash + self.position * current_price;
 
@@ -152,11 +152,11 @@ impl TradingEnvironment {
 struct PPOBuffer {
     observations: Vec<Tensor>,
     actions: Vec<i64>,
-    rewards: Vec<f32>,
-    values: Vec<f32>,
-    log_probs: Vec<f32>,
-    advantages: Vec<f32>,
-    returns: Vec<f32>,
+    rewards: Vec<f64>,
+    values: Vec<f64>,
+    log_probs: Vec<f64>,
+    advantages: Vec<f64>,
+    returns: Vec<f64>,
 }
 
 impl PPOBuffer {
@@ -172,7 +172,7 @@ impl PPOBuffer {
         }
     }
 
-    fn add(&mut self, obs: Tensor, action: i64, reward: f32, value: f32, log_prob: f32) {
+    fn add(&mut self, obs: Tensor, action: i64, reward: f64, value: f64, log_prob: f64) {
         self.observations.push(obs);
         self.actions.push(action);
         self.rewards.push(reward);
@@ -198,8 +198,8 @@ impl PPOBuffer {
         }
 
         // Normalize advantages
-        let mean: f32 = advantages.iter().sum::<f32>() / advantages.len() as f32;
-        let var: f32 = advantages.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / advantages.len() as f32;
+        let mean: f64 = advantages.iter().sum::<f64>() / advantages.len() as f64;
+        let var: f64 = advantages.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / advantages.len() as f64;
         let std = (var + 1e-8).sqrt();
 
         for adv in &mut advantages {
@@ -248,8 +248,8 @@ fn main() {
                 obs.shallow_clone(),
                 action,
                 0.0, // Will be updated with actual reward
-                value.double_value(&[]) as f32,
-                log_prob.double_value(&[]) as f32,
+                value.double_value(&[]) as f64,
+                log_prob.double_value(&[]) as f64,
             );
 
             let (next_obs, reward, done) = env.learn_step(action);
