@@ -1,16 +1,24 @@
-use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Tensor};
-use rand::Rng;
+use hashbrown::HashMap;
+use tch::{nn, nn::Module, Tensor};
 
-const OBSERVATION_DIM: i64 = 10; // price, volume, moving averages, etc.
-const ACTION_DIM: i64 = 3; // buy, sell, hold
-const HIDDEN_DIM: i64 = 64;
-const LEARNING_RATE: f64 = 1e-4;
-const GAMMA: f64 = 0.99;
-const EPSILON: f64 = 0.2;
-const VALUE_COEF: f64 = 0.5;
-const ENTROPY_COEF: f64 = 0.01;
+use crate::charts::general::{assets_chart, buy_sell_chart, reward_chart};
+use crate::constants::files::TRAINING_PATH;
+use crate::constants::TICKERS;
+use crate::types::MappedHistorical;
+use crate::utils::create_folder_if_not_exists;
 
-struct ActorCritic {
+pub mod train;
+
+pub const OBSERVATION_DIM: i64 = 10; // price, volume, moving averages, etc.
+pub const ACTION_DIM: i64 = 3; // buy, sell, hold
+pub const HIDDEN_DIM: i64 = 64;
+pub const LEARNING_RATE: f64 = 1e-4;
+pub const GAMMA: f64 = 0.99;
+pub const EPSILON: f64 = 0.2;
+pub const VALUE_COEF: f64 = 0.5;
+pub const ENTROPY_COEF: f64 = 0.01;
+
+pub struct ActorCritic {
     shared: nn::Sequential,
     actor_head: nn::Linear,
     critic_head: nn::Linear,
@@ -19,9 +27,19 @@ struct ActorCritic {
 impl ActorCritic {
     fn new(vs: &nn::Path) -> Self {
         let shared = nn::seq()
-            .add(nn::linear(vs / "fc1", OBSERVATION_DIM, HIDDEN_DIM, Default::default()))
+            .add(nn::linear(
+                vs / "fc1",
+                OBSERVATION_DIM,
+                HIDDEN_DIM,
+                Default::default(),
+            ))
             .add_fn(|xs| xs.relu())
-            .add(nn::linear(vs / "fc2", HIDDEN_DIM, HIDDEN_DIM, Default::default()))
+            .add(nn::linear(
+                vs / "fc2",
+                HIDDEN_DIM,
+                HIDDEN_DIM,
+                Default::default(),
+            ))
             .add_fn(|xs| xs.relu());
 
         let actor_head = nn::linear(vs / "actor", HIDDEN_DIM, ACTION_DIM, Default::default());
@@ -42,7 +60,7 @@ impl ActorCritic {
     }
 }
 
-struct TradingEnvironment {
+pub struct TradingEnvironment {
     prices: Vec<f64>,
     current_step: usize,
     position: f64,
@@ -51,20 +69,9 @@ struct TradingEnvironment {
 }
 
 impl TradingEnvironment {
-    fn new() -> Self {
-        let mut rng = rand::rng();
-        let mut prices = vec![100.0];
-
-        // Generate fake price data
-        for _ in 1..1000 {
-            // Tend to increase more than decrease
-            let change = rng.random_range(-2.0..4.0);
-            let new_price = (*prices.last().unwrap() as f64 + change).max(1.0_f64);
-            prices.push(new_price);
-        }
-
+    fn new(ticker_count: usize) -> Self {
         TradingEnvironment {
-            prices,
+            prices: vec![],
             current_step: 10,
             position: 0.0,
             cash: 10000.0,
@@ -72,7 +79,8 @@ impl TradingEnvironment {
         }
     }
 
-    fn reset(&mut self) -> Tensor {
+    fn reset(&mut self, ticker_count: usize, prices: Vec<f64>) -> Tensor {
+        self.prices = prices;
         self.current_step = 10;
         self.position = 0.0;
         self.cash = self.initial_cash;
@@ -83,12 +91,15 @@ impl TradingEnvironment {
         let mut obs = vec![];
 
         // Current price - normalize
-        obs.push(self.prices[self.current_step] / 100.0);
+        obs.push((self.prices[self.current_step] / 100.0) as f32);
 
         // Price changes - normalize
         for i in 1..5 {
             if self.current_step >= i {
-                obs.push((self.prices[self.current_step] - self.prices[self.current_step - i]) / 100.0);
+                obs.push(
+                    ((self.prices[self.current_step] - self.prices[self.current_step - i]) / 100.0)
+                        as f32,
+                );
             } else {
                 obs.push(0.0);
             }
@@ -97,15 +108,17 @@ impl TradingEnvironment {
         // Simple moving averages - normalize
         let ma5 = self.prices[self.current_step.saturating_sub(5)..=self.current_step]
             .iter()
-            .sum::<f64>() / 5.0;
+            .sum::<f64>()
+            / 5.0;
         let ma10 = self.prices[self.current_step.saturating_sub(10)..=self.current_step]
             .iter()
-            .sum::<f64>() / 10.0;
+            .sum::<f64>()
+            / 10.0;
 
-        obs.push(ma5 / 100.0);
-        obs.push(ma10 / 100.0);
-        obs.push(self.position / 100.0); // normalize position
-        obs.push(self.cash / self.initial_cash);
+        obs.push((ma5 / 100.0) as f32);
+        obs.push((ma10 / 100.0) as f32);
+        obs.push((self.position / 100.0) as f32); // normalize position
+        obs.push((self.cash / self.initial_cash) as f32);
 
         // Ensure we have exactly OBSERVATION_DIM elements
         while obs.len() < OBSERVATION_DIM as usize {
@@ -116,20 +129,33 @@ impl TradingEnvironment {
         Tensor::from_slice(&obs).view([1, OBSERVATION_DIM])
     }
 
-    fn learn_step(&mut self, action: i64) -> (Tensor, f64, bool) {
+    fn learn_step(
+        &mut self,
+        action: i64,
+        history: &mut History,
+        ticker_index: usize,
+    ) -> (Tensor, f64) {
         let current_price = self.prices[self.current_step];
         let portfolio_value_before = self.cash + self.position * current_price;
 
         match action {
-            0 => { // Buy
+            0 => {
+                // Buy
                 let shares_to_buy = (self.cash * 0.1 / current_price).floor();
                 self.position += shares_to_buy;
                 self.cash -= shares_to_buy * current_price;
+
+                history.buys[ticker_index]
+                    .insert(self.current_step, (current_price, shares_to_buy));
             }
-            1 => { // Sell
+            1 => {
+                // Sell
                 let shares_to_sell = (self.position * 0.1).floor();
                 self.position -= shares_to_sell;
                 self.cash += shares_to_sell * current_price;
+
+                history.sells[ticker_index]
+                    .insert(self.current_step, (current_price, shares_to_sell));
             }
             _ => {} // Hold
         }
@@ -138,18 +164,108 @@ impl TradingEnvironment {
 
         let new_price = self.prices[self.current_step];
         let portfolio_value_after = self.cash + self.position * new_price;
-        let reward = ((portfolio_value_after - portfolio_value_before) / self.initial_cash).clamp(-1.0, 1.0);
+        let reward =
+            ((portfolio_value_after - portfolio_value_before) / self.initial_cash).clamp(-1.0, 1.0);
 
-        let done = self.current_step >= self.prices.len() - 1;
         let next_obs = self.get_observation();
-        if self.current_step % 100 == 0 {
-            println!("total assets {}", self.cash + self.position * new_price);
-        }
-        (next_obs, reward, done)
+
+        history.positioned[ticker_index].push(self.position);
+        history.cash[ticker_index].push(self.cash);
+        history.rewards[ticker_index].push(reward);
+
+        // if self.current_step % 100 == 0 {
+        //     println!("total assets {}", self.cash + self.position * new_price);
+        // }
+
+        (next_obs, reward)
     }
 }
 
-struct PPOBuffer {
+pub struct History {
+    pub buys: Vec<HashMap<usize, (f64, f64)>>,
+    pub sells: Vec<HashMap<usize, (f64, f64)>>,
+    pub positioned: Vec<Vec<f64>>,
+    pub cash: Vec<Vec<f64>>,
+    pub rewards: Vec<Vec<f64>>,
+}
+
+impl History {
+    pub fn new(ticker_count: usize) -> Self {
+        History {
+            buys: vec![HashMap::new(); ticker_count],
+            sells: vec![HashMap::new(); ticker_count],
+            positioned: vec![vec![]; ticker_count],
+            cash: vec![vec![]; ticker_count],
+            rewards: vec![vec![]; ticker_count],
+        }
+    }
+
+    pub fn record(&self, generation: u32, mapped_historical: &MappedHistorical) {
+
+        let base_dir = format!("{TRAINING_PATH}/gens/{}", generation);
+        create_folder_if_not_exists(&base_dir);
+
+        for (ticker_index, bars) in mapped_historical.iter().enumerate() {
+            let prices = bars.iter().map(|bar| bar.close).collect::<Vec<f64>>();
+
+            let ticker = TICKERS[ticker_index].to_string();
+            let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker}", generation);
+            create_folder_if_not_exists(&ticker_dir);
+
+            let ticker_buy_indexes = &self.buys[ticker_index];
+            let ticker_sell_indexes = &self.sells[ticker_index];
+            let _ = buy_sell_chart(
+                &ticker_dir,
+                &prices,
+                ticker_buy_indexes,
+                ticker_sell_indexes,
+            );
+
+            let ticker_reward_indexes = &self.rewards[ticker_index];
+            let _ = reward_chart(&ticker_dir, ticker_reward_indexes);
+
+            let positioned_assets = &self.positioned[ticker_index];
+            let cash_indexes = &self.cash[ticker_index];
+            let total_assets = positioned_assets
+                .iter()
+                .zip(cash_indexes.iter())
+                .map(|(a, b)| a + b)
+                .collect::<Vec<f64>>();
+
+            let _ = assets_chart(
+                &ticker_dir,
+                &total_assets,
+                &cash_indexes,
+                Some(positioned_assets),
+            );
+        }
+    }
+
+    /// The ticker with the lowest final assets with the assets amount
+    pub fn ticker_lowest_final_assets(&self) -> (usize, f64) {
+        self.cash
+            .iter()
+            .enumerate()
+            .zip(self.positioned.iter())
+            .map(|((cash_index, cash), positioned)| {
+                (cash_index, cash.last().unwrap() + positioned.last().unwrap())
+            })
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+    }
+    
+    /// Avg final assets across participating tickers
+    pub fn avg_final_assets(&self) -> f64 {
+        self.cash
+            .iter()
+            .zip(self.positioned.iter())
+            .map(|(cash, positioned)| cash.last().unwrap() + positioned.last().unwrap())
+            .sum::<f64>()
+            / self.cash.len() as f64
+    }
+}
+
+pub struct PPOBuffer {
     observations: Vec<Tensor>,
     actions: Vec<i64>,
     rewards: Vec<f64>,
@@ -199,7 +315,11 @@ impl PPOBuffer {
 
         // Normalize advantages
         let mean: f64 = advantages.iter().sum::<f64>() / advantages.len() as f64;
-        let var: f64 = advantages.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / advantages.len() as f64;
+        let var: f64 = advantages
+            .iter()
+            .map(|x| (x - mean) * (x - mean))
+            .sum::<f64>()
+            / advantages.len() as f64;
         let std = (var + 1e-8).sqrt();
 
         for adv in &mut advantages {
@@ -219,101 +339,4 @@ impl PPOBuffer {
         self.advantages.clear();
         self.returns.clear();
     }
-}
-
-fn main() {
-    let device = Device::Cpu;
-    let vs = nn::VarStore::new(device);
-    let model = ActorCritic::new(&vs.root());
-    let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
-
-    let mut env = TradingEnvironment::new();
-    let mut buffer = PPOBuffer::new();
-
-    for episode in 0..1000 {
-        let mut obs = env.reset();
-        let mut episode_reward = 0.0;
-
-        // Collect trajectory
-        loop {
-            let (action_logits, value) = tch::no_grad(|| {
-                model.forward(&obs)
-            });
-
-            let probs = action_logits.softmax(-1, tch::Kind::Float);
-            let action = probs.multinomial(1, true).int64_value(&[0]);
-            let log_prob = probs.log().gather(1, &Tensor::from_slice(&[action]).view([1, 1]), false);
-
-            buffer.add(
-                obs.shallow_clone(),
-                action,
-                0.0, // Will be updated with actual reward
-                value.double_value(&[]) as f64,
-                log_prob.double_value(&[]) as f64,
-            );
-
-            let (next_obs, reward, done) = env.learn_step(action);
-            buffer.rewards.last_mut().unwrap().clone_from(&reward);
-            episode_reward += reward;
-
-            if done {
-                break;
-            }
-
-            obs = next_obs;
-        }
-
-        buffer.compute_advantages();
-
-        // PPO update
-        for _ in 0..3 {
-            let obs_batch = Tensor::cat(&buffer.observations, 0);
-            let actions_batch = Tensor::from_slice(&buffer.actions).view([-1, 1]);
-            let old_log_probs = Tensor::from_slice(&buffer.log_probs);
-            let advantages = Tensor::from_slice(&buffer.advantages);
-            let returns = Tensor::from_slice(&buffer.returns);
-
-            let (action_logits, values) = model.forward(&obs_batch);
-            let values = values.squeeze();
-
-            // Check for NaN values and skip update if found
-            if values.isnan().any().int64_value(&[]) != 0 {
-                println!("Warning: NaN detected in values, skipping update");
-                break;
-            }
-
-            let probs = action_logits.softmax(-1, tch::Kind::Float);
-            let log_probs = probs.log().gather(1, &actions_batch, false).squeeze();
-
-            let ratio = (log_probs - old_log_probs).exp();
-            let clipped_ratio = ratio.clamp((1.0 - EPSILON) as f64, (1.0 + EPSILON) as f64);
-
-            let policy_loss = -Tensor::min_other(&(ratio * &advantages), &(clipped_ratio * &advantages)).mean(tch::Kind::Float);
-
-            let value_loss = (values - returns).pow_tensor_scalar(2).mean(tch::Kind::Float);
-
-            let entropy = -(probs.copy() * probs.log()).sum_dim_intlist(&[1i64][..], false, tch::Kind::Float).mean(tch::Kind::Float);
-
-            let total_loss = &policy_loss + VALUE_COEF * &value_loss - ENTROPY_COEF * &entropy;
-
-            // Check for NaN in total loss
-            if total_loss.isnan().any().int64_value(&[]) != 0 {
-                println!("Warning: NaN detected in loss, skipping update");
-                break;
-            }
-
-            opt.zero_grad();
-            total_loss.backward();
-
-            opt.step();
-        }
-
-        buffer.clear();
-
-        if episode % 10 == 0 {
-            println!("Episode {}: Reward = {:.4}", episode, episode_reward);
-        }
-    }
-
-    println!("Training completed!");
 }

@@ -59,7 +59,8 @@ async fn main() {
 
     // panic!("done");
 
-    agent::train::train_agents(AgentStrategy::PriceRebound).await;
+    custom_rl::train::train();
+    // agent::train::train_agents(AgentStrategy::PriceRebound).await;
     // neural_net::train_genetic::train_networks_genetic().await;
 
     println!("{}", "End".green())

@@ -350,3 +350,50 @@ pub fn want_chart(
 
     Ok(())
 }
+
+pub fn reward_chart(
+    dir: &String,
+    rewards: &Vec<f64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("{dir}/reward.png");
+    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let y_min = rewards
+        .iter()
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(&0.)
+        * 0.9;
+    let y_max = rewards
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(&0.)
+        * 1.1;
+
+    let mut chart = plotters::chart::ChartBuilder::on(&root)
+        .caption("Buy Sell Chart", ("sans-serif", 20))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..rewards.len() as u32, y_min..y_max)?;
+
+    chart.configure_mesh().light_line_style(WHITE).draw()?;
+
+    // Rewards
+
+    chart.draw_series(
+        AreaSeries::new(
+            rewards.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value)),
+            0.0,
+            YELLOW.mix(0.2),
+        )
+        .border_style(YELLOW),
+    )?;
+
+    root.present()
+        .expect("unable to write chart to file, perhaps there is no directory");
+
+    Ok(())
+}
