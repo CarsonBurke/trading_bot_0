@@ -3,11 +3,17 @@ name = "trading_bot_0"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0"
+description = "A trading bot using machine learning and genetic algorithms, working with the IBKR API"
+repository = "https://github.com/CarsonBurke/trading_bot_0"
+keywords = ["trading", "finance", "deep-learning", "machine-learning"]
+categories = ["science"]
 
 [dependencies]
+anyhow = "1.0.98"
 chrono = "0.4.38"
 clap = "4.5.21"
 colored = "2.1.0"
+cpython = "0.7.2"
 enum-map = { version = "2.7.3", features = ["serde"] }
 hashbrown = "0.15.2"
 ibapi = { version = "1.0.3" }
@@ -18,6 +24,7 @@ postcard = { version = "1.1.0", features = ["use-std"] }
 rand = "0.8.5"
 rust_neural_network = "0.18.0"
 serde = "1.0.215"
+tch = { version = "0.20.0", features = ["download-libtorch"] }
 time = "0.3.36"
 tokio = { version = "1.42.0", features = ["full"] }
 uuid = { version = "1.11.0", features = ["v4"] }
