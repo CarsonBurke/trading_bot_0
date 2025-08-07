@@ -18,8 +18,9 @@ pub mod charts;
 pub mod constants;
 pub mod data;
 pub mod neural_net;
-// pub mod torch;
+// pub mod torch_rl;
 pub mod strategies;
+pub mod custom_rl;
 mod types;
 mod utils;
 
