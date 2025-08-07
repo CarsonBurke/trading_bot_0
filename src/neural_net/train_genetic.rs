@@ -247,8 +247,8 @@ pub fn generate_tickers_set(rng: &mut impl rand::Rng) -> Vec<Vec<usize>> {
     let mut tickers_set = Vec::new();
     
     for _ in 0..TICKER_SETS {
-        let indexes = match sample(rng, TICKERS.len() - 1, SAMPLE_INDEXES) {
-            rand::seq::index::IndexVec::USize(v) => v,
+        let indexes: Vec<usize> = match sample(rng, TICKERS.len() - 1, SAMPLE_INDEXES) {
+            rand::seq::index::IndexVec::U64(v) => v.into_iter().map(|i| i as usize).collect(),
             rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
         };
 
