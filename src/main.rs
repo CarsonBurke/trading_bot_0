@@ -13,6 +13,8 @@ use ibapi::{
 };
 use ndarray::Array2;
 
+use crate::custom_rl::check::check;
+
 pub mod agent;
 pub mod charts;
 pub mod constants;
@@ -20,6 +22,7 @@ pub mod data;
 pub mod neural_net;
 pub mod strategies;
 pub mod custom_rl;
+pub mod candle;
 mod types;
 mod utils;
 
@@ -59,6 +62,7 @@ async fn main() {
 
     // panic!("done");
 
+    // candle::rocm_check::check();
     custom_rl::train::train();
     // agent::train::train_agents(AgentStrategy::PriceRebound).await;
     // neural_net::train_genetic::train_networks_genetic().await;

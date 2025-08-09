@@ -2,35 +2,40 @@ use rand::{rng, seq::IndexedRandom, Rng};
 use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Tensor};
 
 use crate::{
-    constants::TICKERS, custom_rl::{
-        ActorCritic, History, PPOBuffer, TradingEnvironment, ENTROPY_COEF, EPSILON, LEARNING_RATE,
-        VALUE_COEF,
-    }, data::historical::get_historical_data
+    constants::TICKERS,
+    custom_rl::{
+        ActorCritic, GenHistory, MetaHistory, PPOBuffer, TradingEnvironment, ENTROPY_COEF, EPSILON,
+        LEARNING_RATE, VALUE_COEF,
+    },
+    data::historical::get_historical_data,
 };
 
 pub fn train() {
     let mapped_historical = get_historical_data();
-
-    let device = Device::Cpu;
+    
+    let device = Device::cuda_if_available();
     let vs = nn::VarStore::new(device);
     let model = ActorCritic::new(&vs.root());
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
-    let mut env = TradingEnvironment::new(mapped_historical.len());
+    let mut env = TradingEnvironment::new();
     let mut buffer = PPOBuffer::new();
+    let mut meta_history = MetaHistory::default();
 
     for generation in 0..1000 {
-        let mut history = History::new(mapped_historical.len());
+        let mut gen_history = GenHistory::new(mapped_historical.len());
 
         for (ticker_index, bars) in mapped_historical.iter().enumerate() {
             let prices = bars.iter().map(|bar| bar.close).collect::<Vec<f64>>();
 
-            let mut obs = env.reset(ticker_index, prices.clone());
+            let mut obs = env.reset(prices.clone());
             let mut episode_reward = 0.0;
 
             // Collect trajectory
             for _ in env.current_step..prices.len() - 1 {
                 let (action_logits, value) = tch::no_grad(|| model.forward(&obs));
+
+                let actions: Vec<f64> = action_logits.flatten(0, -1).try_into().unwrap();
 
                 let probs = action_logits.softmax(-1, tch::Kind::Float);
                 let action = probs.multinomial(1, true).int64_value(&[0]);
@@ -47,7 +52,7 @@ pub fn train() {
                     log_prob.double_value(&[]),
                 );
 
-                let (next_obs, reward) = env.learn_step(action, &mut history, ticker_index);
+                let (next_obs, reward) = env.learn_step(&actions, &mut gen_history, ticker_index);
                 buffer.rewards.last_mut().unwrap().clone_from(&reward);
                 episode_reward += reward;
 
@@ -59,12 +64,12 @@ pub fn train() {
             // PPO update
             for _ in 0..3 {
                 let obs_batch = Tensor::cat(&buffer.observations, 0);
-                let actions_batch = Tensor::from_slice(&buffer.actions).view([-1, 1]);
+                let actions_batch = Tensor::from_slice(&buffer.actions);
                 let old_log_probs = Tensor::from_slice(&buffer.log_probs);
                 let advantages = Tensor::from_slice(&buffer.advantages);
                 let returns = Tensor::from_slice(&buffer.returns);
 
-                let (action_logits, values) = model.forward(&obs_batch);
+                let (action_output, values) = model.forward(&obs_batch);
                 let values = values.squeeze();
 
                 // Check for NaN values and skip update if found
@@ -73,10 +78,18 @@ pub fn train() {
                     break;
                 }
 
-                let probs = action_logits.softmax(-1, tch::Kind::Float);
-                let log_probs = probs.log().gather(1, &actions_batch, false).squeeze();
+                // For continuous actions (% position), compute log probability assuming Gaussian distribution
+                // action_output should contain mean and log_std for the distribution
+                let action_mean = action_output.narrow(1, 0, 1).squeeze();
+                let action_log_std = action_output.narrow(1, 1, 1).squeeze();
+                let action_std = action_log_std.exp();
 
-                let ratio = (log_probs - old_log_probs).exp();
+                // Compute log probabilities for continuous actions
+                let log_probs = -0.5 * ((actions_batch - &action_mean) / &action_std).pow_tensor_scalar(2)
+                    - action_log_std.copy()
+                    - 0.5 * std::f64::consts::LN_2 * std::f64::consts::PI;
+
+                let ratio: Tensor = (&log_probs - &old_log_probs).exp();
                 let clipped_ratio = ratio.clamp(1.0 - EPSILON, 1.0 + EPSILON);
 
                 let policy_loss =
@@ -87,9 +100,9 @@ pub fn train() {
                     .pow_tensor_scalar(2)
                     .mean(tch::Kind::Float);
 
-                let entropy = -(probs.copy() * probs.log())
-                    .sum_dim_intlist(&[1i64][..], false, tch::Kind::Float)
-                    .mean(tch::Kind::Float);
+                // Entropy for continuous Gaussian distribution
+                let entropy = 0.5 * (2.0 * std::f64::consts::PI * std::f64::consts::E)
+                    .ln() + action_log_std.mean(tch::Kind::Float);
 
                 let total_loss = &policy_loss + VALUE_COEF * &value_loss - ENTROPY_COEF * &entropy;
 
@@ -107,15 +120,23 @@ pub fn train() {
 
             buffer.clear();
         }
-        
+
         #[cfg(feature = "debug_training")]
-        history.record(generation, &mapped_historical);
-        
-        let (lowest_ticker_index, lowest_assets) = history.ticker_lowest_final_assets();
+        if generation % 10 == 0 {
+            gen_history.record(generation, &mapped_historical);
+
+            meta_history.record(&gen_history);
+            meta_history.chart(generation);
+        }
+
+        let (lowest_ticker_index, lowest_assets) = gen_history.ticker_lowest_final_assets();
         let lowest_ticker = TICKERS[lowest_ticker_index as usize];
-        let avg_assets = history.avg_final_assets();
-        
-        println!("generation {} - Lowest assets {} for ticker {}, average {}", generation, lowest_assets, lowest_ticker, avg_assets);
+        let avg_assets = gen_history.avg_final_assets();
+
+        println!(
+            "generation {} - Lowest assets {} for ticker {}, average {}",
+            generation, lowest_assets, lowest_ticker, avg_assets
+        );
     }
 
     println!("Training completed!");

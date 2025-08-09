@@ -10,6 +10,8 @@ categories = ["science"]
 
 [dependencies]
 anyhow = "1.0.98"
+candle-core = { version = "0.9.1" }
+candle-nn = {version = "0.9.1" }
 chrono = "0.4.38"
 clap = "4.5.21"
 colored = "2.1.0"
@@ -24,7 +26,7 @@ postcard = { version = "1.1.0", features = ["use-std"] }
 rand = "0.9.1"
 rust_neural_network = "0.18.0"
 serde = "1.0.215"
-tch = { version = "0.20.0", features = ["download-libtorch"] }
+tch = { version = "0.20.0", features = ["download-libtorch", "rl-python"] }
 time = "0.3.36"
 tokio = { version = "1.42.0", features = ["full"] }
 uuid = { version = "1.11.0", features = ["v4"] }

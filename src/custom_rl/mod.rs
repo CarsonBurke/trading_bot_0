@@ -1,22 +1,30 @@
 use hashbrown::HashMap;
 use tch::{nn, nn::Module, Tensor};
 
-use crate::charts::general::{assets_chart, buy_sell_chart, reward_chart};
+use crate::charts::general::{assets_chart, buy_sell_chart, reward_chart, simple_chart};
 use crate::constants::files::TRAINING_PATH;
 use crate::constants::TICKERS;
-use crate::types::MappedHistorical;
+use crate::types::{MappedHistorical, Position};
 use crate::utils::create_folder_if_not_exists;
 
 pub mod train;
+pub mod check;
 
-pub const OBSERVATION_DIM: i64 = 10; // price, volume, moving averages, etc.
-pub const ACTION_DIM: i64 = 3; // buy, sell, hold
+pub const OBSERVATION_DIM: i64 = 1000; // price, volume, moving averages, etc.
+pub const ACTION_DIM: i64 = 2; // want amount, hold
 pub const HIDDEN_DIM: i64 = 64;
 pub const LEARNING_RATE: f64 = 1e-4;
 pub const GAMMA: f64 = 0.99;
 pub const EPSILON: f64 = 0.2;
 pub const VALUE_COEF: f64 = 0.5;
 pub const ENTROPY_COEF: f64 = 0.01;
+
+pub struct ActionIndex;
+
+impl ActionIndex {
+    pub const WANT: usize = 0;
+    pub const HOLD: usize = 1;
+}
 
 pub struct ActorCritic {
     shared: nn::Sequential,
@@ -63,26 +71,26 @@ impl ActorCritic {
 pub struct TradingEnvironment {
     prices: Vec<f64>,
     current_step: usize,
-    position: f64,
+    position: Position,
     cash: f64,
     initial_cash: f64,
 }
 
 impl TradingEnvironment {
-    fn new(ticker_count: usize) -> Self {
+    fn new() -> Self {
         TradingEnvironment {
             prices: vec![],
-            current_step: 10,
-            position: 0.0,
+            current_step: 500,
+            position: Position::default(),
             cash: 10000.0,
             initial_cash: 10000.0,
         }
     }
 
-    fn reset(&mut self, ticker_count: usize, prices: Vec<f64>) -> Tensor {
+    fn reset(&mut self, prices: Vec<f64>) -> Tensor {
         self.prices = prices;
-        self.current_step = 10;
-        self.position = 0.0;
+        self.current_step = 500;
+        self.position = Position::default();
         self.cash = self.initial_cash;
         self.get_observation()
     }
@@ -90,35 +98,37 @@ impl TradingEnvironment {
     fn get_observation(&self) -> Tensor {
         let mut obs = vec![];
 
-        // Current price - normalize
-        obs.push((self.prices[self.current_step] / 100.0) as f32);
-
-        // Price changes - normalize
-        for i in 1..5 {
-            if self.current_step >= i {
-                obs.push(
-                    ((self.prices[self.current_step] - self.prices[self.current_step - i]) / 100.0)
-                        as f32,
-                );
-            } else {
-                obs.push(0.0);
-            }
-        }
+        let total_assets = self
+            .position
+            .value_with_price(self.prices[self.current_step])
+            + self.cash;
+        let price = self.prices[self.current_step];
 
         // Simple moving averages - normalize
-        let ma5 = self.prices[self.current_step.saturating_sub(5)..=self.current_step]
-            .iter()
-            .sum::<f64>()
-            / 5.0;
-        let ma10 = self.prices[self.current_step.saturating_sub(10)..=self.current_step]
-            .iter()
-            .sum::<f64>()
-            / 10.0;
+        let moving_average_times = vec![5, 10, 20, 50, 100, 200, 400, 800];
+        for &time in &moving_average_times {
+            let ma = self.prices[self.current_step.saturating_sub(time)..=self.current_step]
+                .iter()
+                .sum::<f64>()
+                / time as f64;
 
-        obs.push((ma5 / 100.0) as f32);
-        obs.push((ma10 / 100.0) as f32);
-        obs.push((self.position / 100.0) as f32); // normalize position
-        obs.push((self.cash / self.initial_cash) as f32);
+            obs.push((ma / 100.0) as f32);
+        }
+
+        obs.push(self.position.appreciation(price) as f32);
+        obs.push((self.cash / total_assets) as f32);
+
+        // Price changes - normalize
+        for i in 0..(OBSERVATION_DIM as usize - obs.len()) {
+            if self.current_step >= i {
+                if let Some(previous_price) = self.prices.get(self.current_step - i) {
+                    obs.push(((self.prices[self.current_step] - previous_price) / previous_price) as f32);
+                    continue;
+                }
+            }
+
+            obs.push(0.0);
+        }
 
         // Ensure we have exactly OBSERVATION_DIM elements
         while obs.len() < OBSERVATION_DIM as usize {
@@ -131,57 +141,81 @@ impl TradingEnvironment {
 
     fn learn_step(
         &mut self,
-        action: i64,
-        history: &mut History,
+        actions: &[f64],
+        history: &mut GenHistory,
         ticker_index: usize,
     ) -> (Tensor, f64) {
         let current_price = self.prices[self.current_step];
-        let portfolio_value_before = self.cash + self.position * current_price;
+        let portfolio_value_before = self.cash + self.position.value_with_price(current_price);
 
-        match action {
-            0 => {
-                // Buy
-                let shares_to_buy = (self.cash * 0.1 / current_price).floor();
-                self.position += shares_to_buy;
-                self.cash -= shares_to_buy * current_price;
+        let mut reward = 0.0;
 
-                history.buys[ticker_index]
-                    .insert(self.current_step, (current_price, shares_to_buy));
+        // if actions[ActionIndex::HOLD] >= 1.0 {
+        //     // Do nothing
+        // } else {
+            // See if we should buy or sell
+            let net_action = (actions[ActionIndex::WANT] - actions[ActionIndex::HOLD])/ 10.0;
+
+            if net_action > 0.0 {
+                // Buy percent of portfolio value
+                let buy_total = (portfolio_value_before * net_action).floor().min(self.cash);
+                if buy_total > 0.0 {
+                    self.cash -= buy_total;
+
+                    let quantity = buy_total / current_price;
+                    self.position.add(current_price, quantity);
+
+                    history.buys[ticker_index].insert(self.current_step, (current_price, quantity));
+                }
+            } else if net_action < 0.0 {
+                // Sell percent of asset
+                let position_value = self.position.value_with_price(current_price);
+                let sell_total = ((position_value) * -net_action)
+                    .floor()
+                    .min(position_value);
+
+                if sell_total > 0.0 {
+                    let quantity = sell_total / current_price;
+                    // reward += self.position.appreciation(current_price) * quantity;
+                    // println!("reward {} appreciation {}", reward, self.position.appreciation(current_price) * 100.0);
+                    self.cash += sell_total;
+                    
+                    self.position.quantity -= quantity;
+
+                    history.sells[ticker_index]
+                        .insert(self.current_step, (current_price, quantity));
+                }
             }
-            1 => {
-                // Sell
-                let shares_to_sell = (self.position * 0.1).floor();
-                self.position -= shares_to_sell;
-                self.cash += shares_to_sell * current_price;
-
-                history.sells[ticker_index]
-                    .insert(self.current_step, (current_price, shares_to_sell));
-            }
-            _ => {} // Hold
-        }
+        // }
 
         self.current_step += 1;
 
         let new_price = self.prices[self.current_step];
-        let portfolio_value_after = self.cash + self.position * new_price;
-        let reward =
-            ((portfolio_value_after - portfolio_value_before) / self.initial_cash).clamp(-1.0, 1.0);
+        let position_value = self.position.value_with_price(new_price);
+        let portfolio_value_after = self.cash + position_value;
+        // Reward based on asset appreciation
+        // let reward = ((portfolio_value_after - portfolio_value_before) / self.initial_cash).clamp(-1.0, 1.0);
+        // reward based on portfolio value
+        let reward = (portfolio_value_after - self.initial_cash) / self.initial_cash;
+        
+        // asset appreciation but based on position (avoids positive when position is negative)
+        // let reward = if self.position.quantity > 0.0 {
+        //     self.position.appreciation(new_price) * self.position.quantity
+        // } else {
+        //     0.0
+        // };
 
         let next_obs = self.get_observation();
 
-        history.positioned[ticker_index].push(self.position);
+        history.positioned[ticker_index].push(position_value);
         history.cash[ticker_index].push(self.cash);
         history.rewards[ticker_index].push(reward);
-
-        // if self.current_step % 100 == 0 {
-        //     println!("total assets {}", self.cash + self.position * new_price);
-        // }
 
         (next_obs, reward)
     }
 }
 
-pub struct History {
+pub struct GenHistory {
     pub buys: Vec<HashMap<usize, (f64, f64)>>,
     pub sells: Vec<HashMap<usize, (f64, f64)>>,
     pub positioned: Vec<Vec<f64>>,
@@ -189,9 +223,9 @@ pub struct History {
     pub rewards: Vec<Vec<f64>>,
 }
 
-impl History {
+impl GenHistory {
     pub fn new(ticker_count: usize) -> Self {
-        History {
+        GenHistory {
             buys: vec![HashMap::new(); ticker_count],
             sells: vec![HashMap::new(); ticker_count],
             positioned: vec![vec![]; ticker_count],
@@ -201,7 +235,6 @@ impl History {
     }
 
     pub fn record(&self, generation: u32, mapped_historical: &MappedHistorical) {
-
         let base_dir = format!("{TRAINING_PATH}/gens/{}", generation);
         create_folder_if_not_exists(&base_dir);
 
@@ -248,12 +281,15 @@ impl History {
             .enumerate()
             .zip(self.positioned.iter())
             .map(|((cash_index, cash), positioned)| {
-                (cash_index, cash.last().unwrap() + positioned.last().unwrap())
+                (
+                    cash_index,
+                    cash.last().unwrap() + positioned.last().unwrap(),
+                )
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap()
     }
-    
+
     /// Avg final assets across participating tickers
     pub fn avg_final_assets(&self) -> f64 {
         self.cash
@@ -262,6 +298,26 @@ impl History {
             .map(|(cash, positioned)| cash.last().unwrap() + positioned.last().unwrap())
             .sum::<f64>()
             / self.cash.len() as f64
+    }
+}
+
+#[derive(Default)]
+pub struct MetaHistory {
+    pub min_assets: Vec<f64>,
+    pub avg_assets: Vec<f64>,
+}
+
+impl MetaHistory {
+    pub fn record(&mut self, history: &GenHistory) {
+        self.min_assets.push(history.ticker_lowest_final_assets().1);
+        self.avg_assets.push(history.avg_final_assets());
+    }
+    
+    pub fn chart(&self, generation: u32) {
+        let base_dir = format!("{TRAINING_PATH}/gens/{}", generation);
+        create_folder_if_not_exists(&base_dir);
+        let _ = simple_chart(&base_dir, "min_assets", &self.min_assets);
+        let _ = simple_chart(&base_dir, "avg_assets", &self.avg_assets);
     }
 }
 

@@ -12,6 +12,10 @@ pub const TICKERS: [&str; 7] = [
     // iShares S&P500 ETF
     "SPY", "TSLA", "AAPL", "MSFT", "AMD", "INTC", "NVDA",
 ];
+// pub const TICKERS: [&str; 1] = [
+//     // iShares S&P500 ETF
+//     "NVDA",
+// ];
 
 pub mod rsi {
     pub const MIDDLE: f64 = 50.;

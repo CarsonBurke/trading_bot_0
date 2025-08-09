@@ -43,6 +43,14 @@ impl Position {
     pub fn value_with_price(&self, price: f64) -> f64 {
         price * self.quantity
     }
+    
+    /// The percentage appreciation of the position based on a provided Price Per Unit
+    pub fn appreciation(&self, price: f64) -> f64 {
+        if self.quantity == 0.0 {
+            return 0.0;
+        }
+        (price - self.avg_price) / self.avg_price
+    }
 }
 
 pub struct MakeCharts {
