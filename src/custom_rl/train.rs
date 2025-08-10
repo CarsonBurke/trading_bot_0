@@ -4,7 +4,7 @@ use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Tensor};
 use crate::{
     constants::TICKERS,
     custom_rl::{
-        ActorCritic, GenHistory, MetaHistory, PPOBuffer, TradingEnvironment, ENTROPY_COEF, EPSILON,
+        ActorCritic, EpisodeHistory, MetaHistory, PPOBuffer, TradingEnvironment, ENTROPY_COEF, EPSILON,
         LEARNING_RATE, VALUE_COEF,
     },
     data::historical::get_historical_data,
@@ -23,7 +23,7 @@ pub fn train() {
     let mut meta_history = MetaHistory::default();
 
     for generation in 0..1000 {
-        let mut gen_history = GenHistory::new(mapped_historical.len());
+        let mut gen_history = EpisodeHistory::new(mapped_historical.len());
 
         for (ticker_index, bars) in mapped_historical.iter().enumerate() {
             let prices = bars.iter().map(|bar| bar.close).collect::<Vec<f64>>();

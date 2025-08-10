@@ -25,6 +25,7 @@ pub mod custom_rl;
 pub mod official_rl;
 pub mod candle;
 pub mod burn;
+pub mod history;
 mod types;
 mod utils;
 
