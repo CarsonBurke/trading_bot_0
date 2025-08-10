@@ -22,7 +22,9 @@ pub mod data;
 pub mod neural_net;
 pub mod strategies;
 pub mod custom_rl;
+pub mod official_rl;
 pub mod candle;
+pub mod burn;
 mod types;
 mod utils;
 
@@ -63,7 +65,8 @@ async fn main() {
     // panic!("done");
 
     // candle::rocm_check::check();
-    custom_rl::train::train();
+    // custom_rl::train::train();
+    burn::check::check();
     // agent::train::train_agents(AgentStrategy::PriceRebound).await;
     // neural_net::train_genetic::train_networks_genetic().await;
 

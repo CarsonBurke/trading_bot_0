@@ -8,7 +8,7 @@
 use tch::kind::{FLOAT_CPU, INT64_CPU};
 use tch::{nn, nn::OptimizerConfig, Kind::Float, Tensor};
 
-use crate::torch::vec_gym_evn::VecGymEnv;
+use super::vec_gym_env::VecGymEnv;
 
 const ENV_NAME: &str = "SpaceInvadersNoFrameskip-v4";
 const NPROCS: i64 = 16;
