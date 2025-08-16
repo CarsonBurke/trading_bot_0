@@ -1,5 +1,8 @@
 pub mod check;
 pub mod train;
-pub mod model;
 mod agent;
+mod env;
+mod action;
 mod linear_ppo;
+mod obs_state;
+mod constants;
