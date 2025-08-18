@@ -12,7 +12,39 @@ pub type TimedData = Vec<(f64, f64)>;
 #[derive(Default, Debug)]
 pub struct Account {
     pub cash: f64,
+    pub total_assets: f64,
     pub positions: Positions,
+}
+
+impl Account {
+    pub fn new(cash: f64, ticker_count: usize) -> Self {
+        
+        Self {
+            cash,
+            total_assets: cash,
+            positions: vec![Position::default(); ticker_count],
+        }
+    }
+    
+    pub fn update_total(&mut self, prices: &[f64]) {
+        self.total_assets = self.position_values(prices).iter().sum::<f64>() + self.cash;
+    }
+    
+    pub fn cash_cost_basis_ratio(&self) -> f64 {
+        self.cash / self.cost_basis()
+    }
+    
+    pub fn cost_basis(&self) -> f64 {
+        self.positions.iter().map(|p| p.value()).sum::<f64>()
+    }
+    
+    pub fn position_percents(&self, prices: &[f64]) -> Vec<f64> {
+        self.positions.iter().enumerate().map(|(index, p)| p.value_with_price(prices[index]) / self.total_assets).collect()
+    }
+    
+    pub fn position_values(&self, prices: &[f64]) -> Vec<f64> {
+        self.positions.iter().enumerate().map(|(index, p)| p.value_with_price(prices[index])).collect()
+    }
 }
 
 /// A list of positions 
@@ -21,7 +53,7 @@ pub type Positions = Vec<Position>;
 /// Key: Ticker, Value: Historical Bars
 pub type MappedHistorical = Vec<Vec<historical::Bar>>;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct Position {
     pub quantity: f64,
     /// The average price that these positions were purchased at
@@ -35,11 +67,12 @@ impl Position {
         self.avg_price = (sum + price * quantity) / (self.quantity);
     }
 
-    /// The total value of the position based on a provided Price Per Unit
+    /// The total value of the position based on the purchased avg price
     pub fn value(&self) -> f64 {
         self.avg_price * self.quantity
     }
 
+    /// The total value of the position based on a provided Price Per Unit
     pub fn value_with_price(&self, price: f64) -> f64 {
         price * self.quantity
     }

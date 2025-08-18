@@ -4,7 +4,7 @@ use tch::{nn, nn::Module, Tensor};
 use crate::charts::general::{assets_chart, buy_sell_chart, reward_chart, simple_chart};
 use crate::constants::files::TRAINING_PATH;
 use crate::constants::TICKERS;
-use crate::history::episode::EpisodeHistory;
+use crate::history::episode_tickers_separate::EpisodeHistory;
 use crate::types::{MappedHistorical, Position};
 use crate::utils::create_folder_if_not_exists;
 

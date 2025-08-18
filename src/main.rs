@@ -1,19 +1,15 @@
-use agent::train::{self, AgentStrategy};
+#![feature(slice_as_array)]
+
 use colored::{self, Colorize};
 use ibapi::{
     accounts::{AccountSummaries, AccountSummaryTags},
-    client::Subscription,
     contracts::Contract,
     market_data::{
-        historical::{self, BarSize, HistoricalData, ToDuration, WhatToShow},
         realtime,
     },
     orders::{order_builder, Action, PlaceOrder},
     Client,
 };
-use ndarray::Array2;
-
-use crate::custom_rl::check::check;
 
 pub mod agent;
 pub mod charts;
@@ -67,7 +63,7 @@ async fn main() {
 
     // candle::rocm_check::check();
     // custom_rl::train::train();
-    burn::check::check();
+    burn::train::run_training();
     // agent::train::train_agents(AgentStrategy::PriceRebound).await;
     // neural_net::train_genetic::train_networks_genetic().await;
 

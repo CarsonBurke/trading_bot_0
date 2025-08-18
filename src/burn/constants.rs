@@ -1,1 +1,1 @@
-pub const OBSERVATION_SIZE: usize = 2;
+pub const OBSERVATION_SIZE: usize = 1500;

@@ -20,13 +20,13 @@ use crate::{
     },
     data::historical::get_historical_data,
     neural_net::{
-        create::{create_mapped_diffs, create_mapped_indicators},
+        create::create_mapped_indicators,
         train_genetic::{chart_indicators, generate_tickers_set},
         Replay,
     },
     strategies::basic_nn::basic_nn,
     types::{Account, MakeCharts},
-    utils::create_folder_if_not_exists,
+    utils::{create_folder_if_not_exists, get_mapped_price_deltas},
 };
 
 use super::create::{create_networks, Indicator, Indicators};
@@ -37,7 +37,7 @@ pub fn train_networks_qlearning() {
     let mapped_historical = Arc::new(get_historical_data());
     let mapped_indicators = create_mapped_indicators(&mapped_historical);
 
-    let mapped_diffs = Arc::new(create_mapped_diffs(&mapped_historical));
+    let mapped_diffs = Arc::new(get_mapped_price_deltas(&mapped_historical));
 
     let mut most_final_assets = 0.0;
     let mut best_of_gens = Vec::<NeuralNetwork>::new();

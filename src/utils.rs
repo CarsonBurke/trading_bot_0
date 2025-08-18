@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs};
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
-use ibapi::market_data::{historical, realtime};
+use ibapi::market_data::{historical::{self, Bar}, realtime};
 use plotters::{
     coord::types::RangedCoordf32,
     data,
@@ -11,7 +11,7 @@ use plotters::{
 };
 use time::OffsetDateTime;
 
-use crate::types::Data;
+use crate::types::{Data, MappedHistorical};
 
 pub fn convert_historical(data: &Vec<historical::Bar>) -> Data {
     data.iter().map(|bar| bar.close).collect()
@@ -189,7 +189,11 @@ pub fn get_differences(data: &[f64]) -> Data {
     diff
 }
 
-pub fn get_diff_percents(data: &[f64]) -> Data {
+pub fn get_mapped_price_deltas(data: &MappedHistorical) -> Vec<Vec<f64>> {
+    data.iter().map(|bars| get_price_deltas(bars)).collect()
+}
+
+pub fn get_price_deltas(data: &[Bar]) -> Vec<f64> {
     let mut diff = vec![];
 
     for (index, value) in data.iter().enumerate() {
@@ -199,10 +203,10 @@ pub fn get_diff_percents(data: &[f64]) -> Data {
             if overflowed {
                 100.
             } else {
-                data[previous_index]
+                data[previous_index].close
             }
         };
-        diff.push((value - previous) / previous)
+        diff.push((value.close - previous) / previous)
     }
 
     diff

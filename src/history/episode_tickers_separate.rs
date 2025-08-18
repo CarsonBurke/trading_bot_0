@@ -2,6 +2,7 @@ use hashbrown::HashMap;
 
 use crate::{charts::general::{assets_chart, buy_sell_chart, reward_chart}, constants::{files::TRAINING_PATH, TICKERS}, types::MappedHistorical, utils::create_folder_if_not_exists};
 
+#[derive(Debug)]
 pub struct EpisodeHistory {
     pub buys: Vec<HashMap<usize, (f64, f64)>>,
     pub sells: Vec<HashMap<usize, (f64, f64)>>,

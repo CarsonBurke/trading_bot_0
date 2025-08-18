@@ -226,6 +226,81 @@ pub fn buy_sell_chart(
     Ok(())
 }
 
+pub fn buy_sell_chart_vec(
+    dir: &String,
+    data: &Data,
+    buy_indexes: &[f64],
+    sell_indexes: &[f64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("{dir}/buy_sell_vec.png");
+    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let y_min = data
+        .iter()
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap()
+        * 0.9;
+    let y_max = data
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap()
+        * 1.1;
+
+    let mut chart = plotters::chart::ChartBuilder::on(&root)
+        .caption("Buy Sell Chart Vec", ("sans-serif", 20))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
+
+    chart.configure_mesh().light_line_style(WHITE).draw()?;
+
+    // Data
+    chart.draw_series(
+        AreaSeries::new(
+            data.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value)),
+            0.0,
+            BLUE.mix(0.2),
+        )
+        .border_style(BLUE),
+    )?;
+
+    let point_size = 4;
+
+    // Sells
+    chart.draw_series(PointSeries::of_element(
+        sell_indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, &value)| value > 0.0)
+            .map(|(index, _)| (index as u32, data[index])),
+            point_size,
+        YELLOW.mix(0.9).filled(),
+        &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
+    ))?;
+
+    // Buys
+    chart.draw_series(PointSeries::of_element(
+        buy_indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, &value)| value > 0.0)
+            .map(|(index, _)| (index as u32, data[index])),
+            point_size,
+        RED.mix(0.9).filled(),
+        &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
+    ))?;
+
+    root.present()
+        .expect("unable to write chart to file, perhaps there is no directory");
+
+    Ok(())
+}
+
+
 pub fn assets_chart(
     dir: &String,
     assets: &Data,

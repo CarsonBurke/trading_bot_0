@@ -7,7 +7,7 @@ use crate::{
     constants::agent::{LEARNING_RATE, TARGET_AGENT_COUNT},
     types::{Data, MappedHistorical},
     utils::{
-        convert_historical, ema, ema_diff_percent, get_diff_percents, get_macd, get_rsi_percents, get_rsi_values, get_stochastic_oscillator, get_w_percent_range
+        convert_historical, ema, ema_diff_percent, get_price_deltas, get_macd, get_rsi_percents, get_rsi_values, get_stochastic_oscillator, get_w_percent_range
     },
 };
 
@@ -37,17 +37,6 @@ pub fn create_mapped_indicators(mapped_data: &MappedHistorical) -> Vec<Indicator
     }
 
     indicators
-}
-
-pub fn create_mapped_diffs(mapped_data: &MappedHistorical) -> Vec<Data> {
-    let mut diffs = Vec::new();
-
-    for bars in mapped_data.iter() {
-        let data = convert_historical(bars);
-        diffs.push(get_w_percent_range(bars));
-    }
-
-    diffs
 }
 
 fn create_indicators(data: Vec<f64>, bars: &[historical::Bar]) -> Indicators {

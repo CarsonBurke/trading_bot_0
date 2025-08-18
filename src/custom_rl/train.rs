@@ -4,10 +4,10 @@ use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Tensor};
 use crate::{
     constants::TICKERS,
     custom_rl::{
-        ActorCritic, EpisodeHistory, MetaHistory, PPOBuffer, TradingEnvironment, ENTROPY_COEF, EPSILON,
+        ActorCritic, EpisodeHistory, PPOBuffer, TradingEnvironment, ENTROPY_COEF, EPSILON,
         LEARNING_RATE, VALUE_COEF,
     },
-    data::historical::get_historical_data,
+    data::historical::get_historical_data, history::meta_tickers_separate::MetaHistory,
 };
 
 pub fn train() {

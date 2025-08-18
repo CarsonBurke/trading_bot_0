@@ -1,9 +1,9 @@
 use crate::charts::general::simple_chart;
-use crate::history::episode::EpisodeHistory;
+use crate::history::episode_tickers_separate::EpisodeHistory;
 use crate::constants::files::TRAINING_PATH;
 use crate::utils::create_folder_if_not_exists;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct MetaHistory {
     pub min_assets: Vec<f64>,
     pub avg_assets: Vec<f64>,
