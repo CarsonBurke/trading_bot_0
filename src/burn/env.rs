@@ -80,8 +80,8 @@ impl Environment for Env {
         self.account.update_total(current_prices);
         let total_assets = self.account.total_assets;
         
-        let mut buys = Vec::new();
-        let mut sells = Vec::new();
+        let mut buys = Vec::with_capacity(current_prices.len());
+        let mut sells = Vec::with_capacity(current_prices.len());
 
         match action {
             TradeAction::Buy => {
@@ -91,7 +91,7 @@ impl Environment for Env {
                     self.account.cash -= buy_total;
 
                     let quantity = buy_total / current_prices[self.step];
-                    self.account.positions[0].add(current_prices[0], quantity);
+                    self.account.positions[0].add(current_prices[self.step], quantity);
 
                     buys.push(current_prices[self.step]);
                 }
@@ -117,7 +117,7 @@ impl Environment for Env {
 
         for (index, _) in self.tickers.iter().enumerate() {
             self.episode_history.positioned[index]
-                .push(self.account.positions[index].value_with_price(current_prices[index]));
+                .push(self.account.positions[index].value_with_price(self.prices[index][self.step]));
         }
         self.episode_history.cash.push(self.account.cash);
 

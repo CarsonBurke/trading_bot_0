@@ -52,13 +52,16 @@ impl ObservationState {
             data: data.try_into().unwrap(),
         }
     }
-    
+
     pub fn new_random() -> Self {
         Self {
-            data: [1.0; OBSERVATION_SIZE],
+            data: (0..OBSERVATION_SIZE)
+                .map(|_| rand::random::<f64>() as ElemType)
+                .collect::<Vec<ElemType>>()
+                .try_into()
+                .unwrap(),
         }
     }
-
 }
 
 impl State for ObservationState {
