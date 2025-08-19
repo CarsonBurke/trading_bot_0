@@ -1,9 +1,14 @@
 use burn::{
-    backend::{Autodiff, NdArray, Wgpu}, module::Module, nn::{Initializer, Linear, LinearConfig}, optim::AdamWConfig, prelude::Backend, tensor::{
+    backend::{Autodiff, NdArray, Wgpu},
+    module::Module,
+    nn::{Initializer, Linear, LinearConfig},
+    optim::AdamWConfig,
+    prelude::Backend,
+    tensor::{
         activation::{relu, softmax},
         backend::AutodiffBackend,
         Tensor,
-    }
+    },
 };
 
 use crate::{
@@ -19,10 +24,12 @@ use crate::{
         env::Env,
     },
     data::historical::get_historical_data,
-    history::{episode_tickers_separate::EpisodeHistory, meta_tickers_separate::MetaHistory}, utils::get_price_deltas,
+    history::{episode_tickers_separate::EpisodeHistory, meta_tickers_separate::MetaHistory},
+    utils::get_price_deltas,
 };
 
-const MEMORY_SIZE: usize = 512;
+const MEMORY_SIZE: usize = 256;
+// 512;
 const DENSE_SIZE: usize = 128;
 const MAX_EPISODES: usize = 1000;
 
@@ -74,14 +81,11 @@ impl<B: Backend> PPOModel<B> for Net<B> {}
 type MyAgent<E, B> = PPO<E, B, Net<B>>;
 
 pub fn run_training() {
-    println!("start run");
-    train::<Env, Autodiff<NdArray<ElemType>>>();
+    train::<Env, Autodiff<Wgpu<ElemType>>>();
 }
 
 pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
-    println!("start train");
     let mut env = E::new(false);
-
     let mut model = Net::<B>::new(
         <<E as Environment>::StateType as State>::size(),
         DENSE_SIZE,
@@ -89,22 +93,21 @@ pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
     );
     let agent = MyAgent::default();
     let config = PPOTrainingConfig::default();
-
     let mut optimizer = AdamWConfig::new()
         .with_grad_clipping(config.clip_grad.clone())
         .init();
     let mut memory = Memory::<E, B, MEMORY_SIZE>::default();
-    println!("made things");
+    
     for _ in 0..MAX_EPISODES {
-        println!("start episode");
         env.reset();
         let mut done = false;
-        println!("pre steps");
+        
         while !done {
             let state = env.state();
+
             if let Some(action) = MyAgent::<E, _>::react_with_model(&state, &model) {
                 let snapshot = env.step(action);
-
+               
                 memory.push(
                     state,
                     *snapshot.state(),
@@ -112,11 +115,16 @@ pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
                     snapshot.reward().clone(),
                     snapshot.done(),
                 );
-                
+
                 done = snapshot.done();
             }
+            else {
+                println!("No action selected");
+                println!("state {:?}", state);
+                panic!();
+            }
         }
-        println!("pre train");
+        
         model = MyAgent::train::<MEMORY_SIZE>(model, &memory, &mut optimizer, &config);
         memory.clear();
     }

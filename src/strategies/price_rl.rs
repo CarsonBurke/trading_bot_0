@@ -10,7 +10,7 @@ pub fn price_rl(
 ) {
     let time = std::time::Instant::now();
 
-    let mapped_historical = get_historical_data();
+    let mapped_historical = get_historical_data(None);
     
     
 }

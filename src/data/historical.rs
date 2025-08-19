@@ -15,11 +15,13 @@ use crate::{
     utils::create_folder_if_not_exists,
 };
 
-pub fn get_historical_data() -> MappedHistorical {
+pub fn get_historical_data(tickers: Option<&[&str]>) -> MappedHistorical {
+    let tickers = tickers.unwrap_or(&TICKERS);
+
     let mut data = Vec::new();
     let opt_client: Option<Client> = None;
 
-    for ticker in TICKERS.iter() {
+    for ticker in tickers.iter() {
         // Try to get the data from local files
         if let Some(bars) = get_historical_data_from_files(ticker) {
             data.push(bars);

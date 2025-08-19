@@ -14,4 +14,4 @@ pub use model::Model;
 pub use snapshot::Snapshot;
 pub use state::State;
 
-pub type ElemType = f64;
+pub type ElemType = f32;

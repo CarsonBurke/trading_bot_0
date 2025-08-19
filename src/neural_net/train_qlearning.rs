@@ -34,7 +34,7 @@ use super::create::{create_networks, Indicator, Indicators};
 pub fn train_networks_qlearning() {
     let time = std::time::Instant::now();
 
-    let mapped_historical = Arc::new(get_historical_data());
+    let mapped_historical = Arc::new(get_historical_data(None));
     let mapped_indicators = create_mapped_indicators(&mapped_historical);
 
     let mapped_diffs = Arc::new(get_mapped_price_deltas(&mapped_historical));

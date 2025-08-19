@@ -48,9 +48,10 @@ impl EpisodeHistory {
             let positioned_assets = &self.positioned[ticker_index];
             let total_assets = positioned_assets
                 .iter()
-                .enumerate()
-                .map(|(index, positioned)| positioned + &self.cash[index])
+                .zip(self.cash.iter())
+                .map(|(positioned, cash)| positioned + cash)
                 .collect::<Vec<f64>>();
+            println!("positioned len {} total len {} cash len {}", positioned_assets.len(), total_assets.len(), self.cash.len());
             let _ = assets_chart(
                 &ticker_dir,
                 &total_assets,

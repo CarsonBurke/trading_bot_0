@@ -11,7 +11,7 @@ use crate::{
 };
 
 pub fn train() {
-    let mapped_historical = get_historical_data();
+    let mapped_historical = get_historical_data(None);
     
     let device = Device::cuda_if_available();
     let vs = nn::VarStore::new(device);

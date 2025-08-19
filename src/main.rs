@@ -1,5 +1,8 @@
 #![feature(slice_as_array)]
 
+// For burn Wgpu
+#![recursion_limit = "256"]
+
 use colored::{self, Colorize};
 use ibapi::{
     accounts::{AccountSummaries, AccountSummaryTags},

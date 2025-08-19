@@ -12,7 +12,7 @@ use crate::{
     charts::general::assets_chart,
     constants::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
-        files::{TRAINING_PATH, WEIGHTS_PATH},
+        files::{TRAINING_PATH, WEIGHTS_PATH}, TICKERS,
     },
     data::historical::get_historical_data,
     strategies,
@@ -30,7 +30,7 @@ pub enum AgentStrategy {
 }
 
 pub async fn train_agents(strategy: AgentStrategy) {
-    let mapped_historical = Arc::new(get_historical_data());
+    let mapped_historical = Arc::new(get_historical_data(None));
 
     let mut most_final_assets = 0.0;
     let mut best_of_gens = Vec::<Agent>::new();

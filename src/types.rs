@@ -4,11 +4,6 @@ use ibapi::market_data::historical;
 /// A list of prices, where the last index is the most recent
 pub type Data = Vec<f64>;
 
-pub type SparseData = Vec<Option<f64>>;
-
-/// A list of tuples of (time, price), where the last index is the most recent
-pub type TimedData = Vec<(f64, f64)>;
-
 #[derive(Default, Debug)]
 pub struct Account {
     pub cash: f64,
@@ -31,7 +26,8 @@ impl Account {
     }
     
     pub fn cash_cost_basis_ratio(&self) -> f64 {
-        self.cash / self.cost_basis()
+
+        self.total_assets / (self.cost_basis() + f64::EPSILON)
     }
     
     pub fn cost_basis(&self) -> f64 {
