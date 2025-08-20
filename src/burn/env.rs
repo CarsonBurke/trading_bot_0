@@ -1,3 +1,5 @@
+use rand::{rngs::ThreadRng, seq::IndexedRandom};
+
 use crate::{
     burn::{
         action::TradeAction,
@@ -24,12 +26,16 @@ pub struct Env {
     price_deltas: Vec<Vec<f64>>,
     state: ObservationState,
     visualized: bool,
+    rng: ThreadRng,
 }
 
 impl Env {
     const STARTING_STEP: usize = OBSERVATION_SIZE;
+    const STARTING_CASH: f64 = 10_000.0;
     const BUY_PERCENT: f64 = 0.05;
     const SELL_PERCENT: f64 = 0.05;
+
+    fn on_done() {}
 }
 
 impl Environment for Env {
@@ -38,50 +44,37 @@ impl Environment for Env {
     type RewardType = ElemType;
 
     fn new(visualized: bool) -> Self {
+
         let tickers = vec![
             // "SPY".to_string(),
-            // "TSLA".to_string(),
+            "TSLA".to_string(),
             // "AAPL".to_string(),
-            // "MSFT".to_string(),
+            // "TSLA".to_string(),
             // "AMD".to_string(),
             // "INTC".to_string(),
-            "NVDA".to_string(),
+            // "NVDA".to_string(),
         ];
-
-        let mapped_bars = get_historical_data(Some(
-            &tickers
-                .iter()
-                .map(|ticker| ticker.as_str())
-                .collect::<Vec<&str>>(),
-        ));
-        let price_deltas = get_mapped_price_deltas(&mapped_bars);
 
         Self {
             step: Self::STARTING_STEP,
+            rng: rand::rng(),
             episode: 0,
-            account: Account::new(10_000., tickers.len()),
+            account: Account::new(Self::STARTING_CASH, tickers.len()),
             episode_history: EpisodeHistory::new(tickers.len()),
             meta_history: MetaHistory::default(),
             tickers,
-            prices: mapped_bars
-                .iter()
-                .map(|bar| bar.iter().map(|bar| bar.close).collect())
-                .collect(),
-            price_deltas,
+            prices: vec![],
+            price_deltas: vec![],
             state: ObservationState::new_random(),
             visualized,
         }
     }
 
     fn step(&mut self, action: Self::ActionType) -> Snapshot<Self> {
-        
         let current_prices = &self.prices[0];
 
-        self.account.update_total(current_prices);
+        self.account.update_total(&self.prices, self.step);
         let total_assets = self.account.total_assets;
-        
-        let mut buys = Vec::with_capacity(current_prices.len());
-        let mut sells = Vec::with_capacity(current_prices.len());
 
         match action {
             TradeAction::Buy => {
@@ -93,7 +86,8 @@ impl Environment for Env {
                     let quantity = buy_total / current_prices[self.step];
                     self.account.positions[0].add(current_prices[self.step], quantity);
 
-                    buys.push(current_prices[self.step]);
+                    self.episode_history.buys[0]
+                        .insert(self.step, (current_prices[self.step], quantity));
                 }
             }
             TradeAction::Sell => {
@@ -106,18 +100,17 @@ impl Environment for Env {
                     let quantity = sell_total / current_prices[self.step];
                     self.account.positions[0].quantity -= quantity;
 
-                    sells.push(current_prices[self.step]);
+                    self.episode_history.sells[0]
+                        .insert(self.step, (current_prices[self.step], quantity));
                 }
             }
             TradeAction::Hold => {}
         }
-        
-        self.episode_history.buys.push(buys);
-        self.episode_history.sells.push(sells);
 
         for (index, _) in self.tickers.iter().enumerate() {
-            self.episode_history.positioned[index]
-                .push(self.account.positions[index].value_with_price(self.prices[index][self.step]));
+            self.episode_history.positioned[index].push(
+                self.account.positions[index].value_with_price(self.prices[index][self.step]),
+            );
         }
         self.episode_history.cash.push(self.account.cash);
 
@@ -127,39 +120,67 @@ impl Environment for Env {
         let next_prices = &self.prices[0];
 
         self.state =
-            ObservationState::new(self.step, &self.account, next_prices, &self.price_deltas);
+            ObservationState::new(self.step, &self.account, &self.prices, &self.price_deltas);
 
         // Reward
 
-        self.account.update_total(next_prices);
-        let portfolio_delta_percent = (self.account.total_assets - total_assets) / total_assets;
-        let reward = portfolio_delta_percent;
+        self.account.update_total(&self.prices, self.step);
+        let reward = (self.account.total_assets - total_assets) / total_assets;
+        // let reward = self.account.total_assets - Self::STARTING_CASH;
 
         self.episode_history.rewards.push(reward);
 
         // Done
 
-        let is_done = self.step + 1 > self.prices[0].len();
+        let is_done = self.step + 2 > self.prices[0].len();
 
         if is_done {
-            println!("Episode {} - Total Assets: {}", self.episode, self.account.total_assets);
-            
+            println!(
+                "Episode {} - Total Assets: {:.2} cumulative reward {:.2} tickers {:?}",
+                self.episode,
+                self.account.total_assets,
+                self.episode_history.rewards.iter().sum::<f64>(),
+                self.tickers
+            );
+
             self.episode_history
                 .record(self.episode, &self.tickers, &self.prices);
             self.meta_history.record(&self.episode_history);
+
+            if self.episode % 5 == 0 {
+                self.meta_history.chart(self.episode);
+            }
+
             self.episode += 1;
         }
-        return Snapshot::new(self.state, 0.0, is_done);
+        return Snapshot::new(self.state, reward as ElemType, is_done);
     }
 
     fn reset(&mut self) -> Snapshot<Self> {
-        self.account = Account::new(10_000., self.tickers.len());
+        self.tickers = vec![vec!["TSLA", "AAPL", "AMD", "INTC", "MSFT"]
+            .choose(&mut self.rng)
+            .unwrap()
+            .to_string()];
+        let mapped_bars = get_historical_data(Some(
+            &self
+                .tickers
+                .iter()
+                .map(|ticker| ticker.as_str())
+                .collect::<Vec<&str>>(),
+        ));
+        self.prices = mapped_bars
+            .iter()
+            .map(|bar| bar.iter().map(|bar| bar.close).collect())
+            .collect();
+        self.price_deltas = get_mapped_price_deltas(&mapped_bars);
+
+        self.account = Account::new(Self::STARTING_CASH, self.tickers.len());
         self.step = Self::STARTING_STEP;
-        
+
         self.episode_history = EpisodeHistory::new(self.tickers.len());
         self.state = ObservationState::new_random();
 
-        Snapshot::new(self.state, 0.0, true)
+        Snapshot::new(self.state, 0.0, false)
     }
 
     fn state(&self) -> Self::StateType {

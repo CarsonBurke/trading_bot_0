@@ -21,25 +21,29 @@ impl Account {
         }
     }
     
-    pub fn update_total(&mut self, prices: &[f64]) {
-        self.total_assets = self.position_values(prices).iter().sum::<f64>() + self.cash;
+    pub fn update_total(&mut self, prices: &[Vec<f64>], step: usize) {
+        self.total_assets = self.position_values(prices, step).iter().sum::<f64>() + self.cash;
     }
     
     pub fn cash_cost_basis_ratio(&self) -> f64 {
-
-        self.total_assets / (self.cost_basis() + f64::EPSILON)
+        let cost_basis = self.cost_basis();
+        if cost_basis == 0.0 {
+            return 0.0;
+        }
+        
+        self.total_assets / cost_basis
     }
     
     pub fn cost_basis(&self) -> f64 {
         self.positions.iter().map(|p| p.value()).sum::<f64>()
     }
     
-    pub fn position_percents(&self, prices: &[f64]) -> Vec<f64> {
-        self.positions.iter().enumerate().map(|(index, p)| p.value_with_price(prices[index]) / self.total_assets).collect()
+    pub fn position_percents(&self, prices: &[Vec<f64>], step: usize) -> Vec<f64> {
+        self.positions.iter().enumerate().map(|(index, p)| p.value_with_price(prices[index][step]) / self.total_assets).collect()
     }
     
-    pub fn position_values(&self, prices: &[f64]) -> Vec<f64> {
-        self.positions.iter().enumerate().map(|(index, p)| p.value_with_price(prices[index])).collect()
+    pub fn position_values(&self, prices: &[Vec<f64>], step: usize) -> Vec<f64> {
+        self.positions.iter().enumerate().map(|(index, p)| p.value_with_price(prices[index][step])).collect()
     }
 }
 

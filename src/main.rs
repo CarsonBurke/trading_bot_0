@@ -32,6 +32,13 @@ mod utils;
 async fn main() {
     println!("{}", "Start".green());
 
+    // Allow for larger stack size
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| burn::train::run_training()).unwrap()
+        .join()
+        .unwrap();
+    
     /*     let client = Client::connect(connection_url, 1).expect("connection to TWS failed!");
     println!("Successfully connected to TWS at {connection_url}"); */
 
@@ -66,7 +73,7 @@ async fn main() {
 
     // candle::rocm_check::check();
     // custom_rl::train::train();
-    burn::train::run_training();
+    
     // agent::train::train_agents(AgentStrategy::PriceRebound).await;
     // neural_net::train_genetic::train_networks_genetic().await;
 

@@ -9,8 +9,8 @@ use crate::{
 
 #[derive(Debug)]
 pub struct EpisodeHistory {
-    pub buys: Vec<Vec<f64>>,
-    pub sells: Vec<Vec<f64>>,
+    pub buys: Vec<HashMap<usize, (f64, f64)>>,
+    pub sells: Vec<HashMap<usize, (f64, f64)>>,
     pub positioned: Vec<Vec<f64>>,
     pub cash: Vec<f64>,
     pub rewards: Vec<f64>,
@@ -19,8 +19,8 @@ pub struct EpisodeHistory {
 impl EpisodeHistory {
     pub fn new(ticker_count: usize) -> Self {
         EpisodeHistory {
-            buys: vec![vec![]; ticker_count],
-            sells: vec![vec![]; ticker_count],
+            buys: vec![HashMap::new(); ticker_count],
+            sells: vec![HashMap::new(); ticker_count],
             positioned: vec![vec![]; ticker_count],
             cash: Vec::new(),
             rewards: Vec::new(),
@@ -38,7 +38,7 @@ impl EpisodeHistory {
 
             let ticker_buy_indexes = &self.buys[ticker_index];
             let ticker_sell_indexes = &self.sells[ticker_index];
-            let _ = buy_sell_chart_vec(
+            let _ = buy_sell_chart(
                 &ticker_dir,
                 &prices,
                 ticker_buy_indexes,
@@ -51,7 +51,7 @@ impl EpisodeHistory {
                 .zip(self.cash.iter())
                 .map(|(positioned, cash)| positioned + cash)
                 .collect::<Vec<f64>>();
-            println!("positioned len {} total len {} cash len {}", positioned_assets.len(), total_assets.len(), self.cash.len());
+
             let _ = assets_chart(
                 &ticker_dir,
                 &total_assets,
@@ -82,7 +82,7 @@ impl EpisodeHistory {
     }
 
     pub fn final_assets(&self) -> f64 {
-        let positioned = self.positioned.last().unwrap().iter().sum::<f64>();
+        let positioned = self.positioned.iter().map(|p| p.last().unwrap()).sum::<f64>();
         positioned + self.cash.last().unwrap()
     }
 }

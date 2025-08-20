@@ -20,33 +20,63 @@ impl ObservationState {
     pub fn new(
         step: usize,
         account: &Account,
-        current_prices: &[f64],
+        prices: &[Vec<f64>],
         ticker_price_deltas: &[Vec<f64>],
     ) -> Self {
         let mut data: Vec<ElemType> = Vec::new();
 
-        data.push(account.cash_cost_basis_ratio() as ElemType);
         data.push((account.cash / account.total_assets) as ElemType);
         data.extend(
             account
-                .position_percents(current_prices)
+                .position_percents(prices, step)
                 .iter()
                 .map(|percent| *percent as ElemType)
                 .collect::<Vec<ElemType>>(),
         );
+        for (ticker_index, position) in account.positions.iter().enumerate() {
+            data.push(position.appreciation(prices[ticker_index][step]) as f32);
+        }
+
+        // Simple moving averages - normalized
+
+        // for (ticker_index, _) in account.positions.iter().enumerate() {
+
+        //     let moving_average_times = vec![5, 10, 20, 50, 100, 200, 400, 800];
+        //     for &time in &moving_average_times {
+        //         let ma = prices[ticker_index][step.saturating_sub(time)..=step]
+        //             .iter()
+        //             .sum::<f64>()
+        //             / time as f64;
+
+        //         data.push((ma / 100.0) as f32);
+        //     }
+        // }
+
+        // for prices in prices.iter() {
+        //     for i in 0..(OBSERVATION_SIZE - data.len()) {
+        //         if let Some(price) = prices.get(step - i) {
+        //             data.push((*price / 100.0) as ElemType);
+        //             continue;
+        //         }
+
+        //         data.push(0.0)
+        //     }
+        // }
 
         for price_deltas in ticker_price_deltas.iter() {
             for i in 0..(OBSERVATION_SIZE - data.len()) {
-                if step >= i {
-                    if let Some(price_diff) = price_deltas.get(step - i) {
-                        data.push(*price_diff as ElemType);
-                        continue;
-                    }
+                if let Some(price_diff) = price_deltas.get(step - i) {
+                    data.push(*price_diff as ElemType);
+                    continue;
                 }
 
                 data.push(0.0)
             }
         }
+
+        // while data.len() < OBSERVATION_SIZE {
+        //     data.push(0.0);
+        // }
 
         Self {
             data: data.try_into().unwrap(),
@@ -56,7 +86,7 @@ impl ObservationState {
     pub fn new_random() -> Self {
         Self {
             data: (0..OBSERVATION_SIZE)
-                .map(|_| rand::random::<f64>() as ElemType)
+                .map(|_| rand::random_range(-0.1..0.1) as ElemType)
                 .collect::<Vec<ElemType>>()
                 .try_into()
                 .unwrap(),

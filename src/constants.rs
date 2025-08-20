@@ -23,7 +23,7 @@ pub mod rsi {
 
 pub mod files {
     // 1 year
-    pub const DATA_PATH: &str = "data/";
+    pub const DATA_PATH: &str = "long_data/";// "data/";
     // 5 years
     pub const LONG_DATA_PATH: &str = "long_data/";
     // 20 years

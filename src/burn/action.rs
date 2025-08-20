@@ -15,16 +15,12 @@ impl TradeAction {
             0 => TradeAction::Buy,
             1 => TradeAction::Sell,
             2 => TradeAction::Hold,
-            _ => TradeAction::Hold,
+            _ => panic!("Invalid action"),
         }
     }
 }
 
 impl Action for TradeAction {
-    fn size() -> usize {
-        Self::enumerate().len()
-    }
-
     fn random() -> Self {
         (rand::rng().random_range(0..Self::size()) as u32).into()
     }
@@ -40,7 +36,7 @@ impl From<u32> for TradeAction {
             0 => TradeAction::Buy,
             1 => TradeAction::Sell,
             2 => TradeAction::Hold,
-            _ => TradeAction::Hold,
+            _ => panic!("Invalid action"),
         }
     }
 }
