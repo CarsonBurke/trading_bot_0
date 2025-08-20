@@ -1,4 +1,7 @@
+use std::time::Instant;
+
 use rand::{rngs::ThreadRng, seq::IndexedRandom};
+use time::Duration;
 
 use crate::{
     burn::{
@@ -26,6 +29,7 @@ pub struct Env {
     price_deltas: Vec<Vec<f64>>,
     state: ObservationState,
     visualized: bool,
+    episode_start: Instant,
     rng: ThreadRng,
 }
 
@@ -57,6 +61,7 @@ impl Environment for Env {
 
         Self {
             step: Self::STARTING_STEP,
+            episode_start: Instant::now(),
             rng: rand::rng(),
             episode: 0,
             account: Account::new(Self::STARTING_CASH, tickers.len()),
