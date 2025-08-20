@@ -23,9 +23,10 @@ use crate::{
 };
 
 const MEMORY_SIZE: usize = 4_096;
-const DENSE_SIZE: usize = 128;
+const DENSE_SIZE: usize = 32;
 const MAX_EPISODES: usize = 1000;
-const KERNEL_SIZE: usize = 20;
+const KERNEL_SIZE: usize = 3;
+const TICKER_COUNT: usize = 1;
 
 pub fn run_training() {
     train::<Env, Autodiff<Vulkan<ElemType>>>();
@@ -38,6 +39,7 @@ pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
         DENSE_SIZE,
         <<E as Environment>::ActionType as Action>::size(),
         KERNEL_SIZE,
+        TICKER_COUNT
     );
     let agent = ConvAgent::default();
     let config = PPOTrainingConfig {

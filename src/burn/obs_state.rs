@@ -52,27 +52,27 @@ impl ObservationState {
         //     }
         // }
 
-        // for prices in prices.iter() {
-        //     for i in 0..(OBSERVATION_SIZE - data.len()) {
-        //         if let Some(price) = prices.get(step - i) {
-        //             data.push((*price / 100.0) as ElemType);
-        //             continue;
-        //         }
-
-        //         data.push(0.0)
-        //     }
-        // }
-
-        for price_deltas in ticker_price_deltas.iter() {
+        for prices in prices.iter() {
             for i in 0..(OBSERVATION_SIZE - data.len()) {
-                if let Some(price_diff) = price_deltas.get(step - i) {
-                    data.push(*price_diff as ElemType);
+                if let Some(price) = prices.get(step - i) {
+                    data.push((*price / 100.0) as ElemType);
                     continue;
                 }
 
                 data.push(0.0)
             }
         }
+
+        // for price_deltas in ticker_price_deltas.iter() {
+        //     for i in 0..(OBSERVATION_SIZE - data.len()) {
+        //         if let Some(price_diff) = price_deltas.get(step - i) {
+        //             data.push(*price_diff as ElemType);
+        //             continue;
+        //         }
+
+        //         data.push(0.0)
+        //     }
+        // }
 
         // while data.len() < OBSERVATION_SIZE {
         //     data.push(0.0);

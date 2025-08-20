@@ -130,8 +130,10 @@ impl Environment for Env {
         // Reward
 
         self.account.update_total(&self.prices, self.step);
-        let reward = (self.account.total_assets - total_assets) / total_assets;
+        // let reward = (self.account.total_assets - total_assets) / total_assets;
         // let reward = self.account.total_assets - Self::STARTING_CASH;
+        // Increase/decrease in value of positions
+        let reward = self.account.positions.iter().enumerate().map(|(index, position)| position.appreciation(self.prices[index][self.step])).sum();
 
         self.episode_history.rewards.push(reward);
 
@@ -141,11 +143,12 @@ impl Environment for Env {
 
         if is_done {
             println!(
-                "Episode {} - Total Assets: {:.2} cumulative reward {:.2} tickers {:?}",
+                "Episode {} - Total Assets: {:.2} cumulative reward {:.2} tickers {:?} time secs {}",
                 self.episode,
                 self.account.total_assets,
                 self.episode_history.rewards.iter().sum::<f64>(),
-                self.tickers
+                self.tickers,
+                Instant::now().duration_since(self.episode_start).as_secs()
             );
 
             self.episode_history
@@ -155,6 +158,8 @@ impl Environment for Env {
             if self.episode % 5 == 0 {
                 self.meta_history.chart(self.episode);
             }
+            
+            self.episode_start = Instant::now();
 
             self.episode += 1;
         }

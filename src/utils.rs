@@ -212,6 +212,29 @@ pub fn get_price_deltas(data: &[Bar]) -> Vec<f64> {
     diff
 }
 
+// pub fn get_mapped_price_normals(data: &MappedHistorical) -> Vec<Vec<f64>> {
+//     data.iter().map(|bars| get_price_normals(bars)).collect()
+// }
+
+// pub fn get_price_normals(data: &[Bar]) -> Vec<f64> {
+//     let mut diff = vec![];
+
+//     for (index, value) in data.iter().enumerate() {
+//         let previous = {
+//             let (previous_index, overflowed) = index.overflowing_sub(1);
+
+//             if overflowed {
+//                 100.
+//             } else {
+//                 data[previous_index].close
+//             }
+//         };
+//         diff.push((value.close - previous) / previous)
+//     }
+
+//     diff
+// }
+
 /// Returns how many stocks can be bought for a given a total price and a max amount
 pub fn round_to_stock(price: f64, max: f64) -> (f64, u32) {
     let quantity = (max / price).floor() as u32;
