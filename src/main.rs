@@ -2,6 +2,8 @@
 
 // For burn Wgpu
 #![recursion_limit = "256"]
+#![feature(f16)] 
+#![feature(stdarch_x86_avx512_bf16)]
 
 use colored::{self, Colorize};
 use ibapi::{
@@ -34,7 +36,7 @@ async fn main() {
 
     // Allow for larger stack size
     std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
+        .stack_size(128 * 1024 * 1024)
         .spawn(|| burn::train::run_training()).unwrap()
         .join()
         .unwrap();

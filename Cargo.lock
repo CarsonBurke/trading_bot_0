@@ -409,6 +409,7 @@ dependencies = [
  "burn-candle",
  "burn-core",
  "burn-cuda",
+ "burn-ir",
  "burn-ndarray",
  "burn-remote",
  "burn-rocm",

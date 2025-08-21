@@ -1,8 +1,6 @@
 use burn::{
     backend::{Autodiff, NdArray, Vulkan, Wgpu}, grad_clipping::GradientClippingConfig, module::Module, nn::{Initializer, Linear, LinearConfig}, optim::AdamWConfig, prelude::Backend, tensor::{
-        activation::{gelu, relu, silu, softmax},
-        backend::AutodiffBackend,
-        Tensor,
+        activation::{gelu, relu, silu, softmax}, backend::AutodiffBackend, bf16, f16, DType, Tensor
     }
 };
 
@@ -22,17 +20,20 @@ use crate::{
     utils::get_price_deltas,
 };
 
-const MEMORY_SIZE: usize = 4_096;
-const DENSE_SIZE: usize = 32;
+// const MEMORY_SIZE: usize = 4_096;
+// const MEMORY_SIZE: usize = 16_384;
+const MEMORY_SIZE: usize = 512;
+const DENSE_SIZE: usize = 8;
 const MAX_EPISODES: usize = 1000;
 const KERNEL_SIZE: usize = 3;
 const TICKER_COUNT: usize = 1;
 
 pub fn run_training() {
-    train::<Env, Autodiff<Vulkan<ElemType>>>();
+    train::<Env, Autodiff<Wgpu<ElemType>>>();
 }
 
 pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
+    
     let mut env = E::new(false);
     let mut model = ConvNet::<B>::new(
         <<E as Environment>::StateType as State>::size(),
@@ -43,9 +44,11 @@ pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
     );
     let agent = ConvAgent::default();
     let config = PPOTrainingConfig {
-        batch_size: 512,
+        batch_size: 64,
+        // batch_size: 512,
+        // batch_size: 2048,
         entropy_weight: 0.01,
-        learning_rate: 1e-3,
+        learning_rate: 3e-4,
         epochs: 5,
         clip_grad: Some(GradientClippingConfig::Norm(0.5)),
         ..Default::default()

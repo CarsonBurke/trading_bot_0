@@ -130,10 +130,10 @@ impl Environment for Env {
         // Reward
 
         self.account.update_total(&self.prices, self.step);
-        // let reward = (self.account.total_assets - total_assets) / total_assets;
+        let reward = (self.account.total_assets - total_assets) / total_assets;
         // let reward = self.account.total_assets - Self::STARTING_CASH;
         // Increase/decrease in value of positions
-        let reward = self.account.positions.iter().enumerate().map(|(index, position)| position.appreciation(self.prices[index][self.step])).sum();
+        // let reward = self.account.positions.iter().enumerate().map(|(index, position)| position.appreciation(self.prices[index][self.step])).sum();
 
         self.episode_history.rewards.push(reward);
 

@@ -53,6 +53,7 @@ impl<B: Backend> ConvNet<B> {
             
             Conv1dConfig::new(dense_size, dense_size, kernel_size)
                 .with_dilation(dilation)
+                .with_groups(dense_size)
                 .with_padding(PaddingConfig1d::Explicit(padding))
                 .init(&Default::default())
         }).collect();
