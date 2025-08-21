@@ -35,7 +35,7 @@ impl Account {
     }
     
     pub fn cost_basis(&self) -> f64 {
-        self.positions.iter().map(|p| p.value()).sum::<f64>()
+        self.positions.iter().map(|p| p.cost_basis()).sum::<f64>()
     }
     
     pub fn position_percents(&self, prices: &[Vec<f64>], step: usize) -> Vec<f64> {
@@ -68,7 +68,7 @@ impl Position {
     }
 
     /// The total value of the position based on the purchased avg price
-    pub fn value(&self) -> f64 {
+    pub fn cost_basis(&self) -> f64 {
         self.avg_price * self.quantity
     }
 

@@ -194,7 +194,7 @@ pub fn get_mapped_price_deltas(data: &MappedHistorical) -> Vec<Vec<f64>> {
 }
 
 pub fn get_price_deltas(data: &[Bar]) -> Vec<f64> {
-    let mut diff = vec![];
+    let mut diff = Vec::with_capacity(data.len());
 
     for (index, value) in data.iter().enumerate() {
         let previous = {
@@ -212,28 +212,21 @@ pub fn get_price_deltas(data: &[Bar]) -> Vec<f64> {
     diff
 }
 
-// pub fn get_mapped_price_normals(data: &MappedHistorical) -> Vec<Vec<f64>> {
-//     data.iter().map(|bars| get_price_normals(bars)).collect()
-// }
+pub fn get_mapped_price_normals(data: &MappedHistorical) -> Vec<Vec<f64>> {
+    data.iter().map(|bars| get_price_normals(bars)).collect()
+}
 
-// pub fn get_price_normals(data: &[Bar]) -> Vec<f64> {
-//     let mut diff = vec![];
+pub fn get_price_normals(data: &[Bar]) -> Vec<f64> {
+    let mut norms = Vec::with_capacity(data.len());
+    
+    let min = data.iter().min_by(|a, b| a.close.partial_cmp(&b.close).unwrap()).unwrap().close;
 
-//     for (index, value) in data.iter().enumerate() {
-//         let previous = {
-//             let (previous_index, overflowed) = index.overflowing_sub(1);
+    for price in data.iter() {
+        norms.push((price.close - min) / min)
+    }
 
-//             if overflowed {
-//                 100.
-//             } else {
-//                 data[previous_index].close
-//             }
-//         };
-//         diff.push((value.close - previous) / previous)
-//     }
-
-//     diff
-// }
+    norms
+}
 
 /// Returns how many stocks can be bought for a given a total price and a max amount
 pub fn round_to_stock(price: f64, max: f64) -> (f64, u32) {

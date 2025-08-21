@@ -21,9 +21,9 @@ impl ObservationState {
         step: usize,
         account: &Account,
         prices: &[Vec<f64>],
-        ticker_price_deltas: &[Vec<f64>],
+        ticker_price_obs: &[Vec<f64>],
     ) -> Self {
-        let mut data: Vec<f16> = Vec::with_capacity(prices[0].len());
+        let mut data: Vec<f16> = Vec::with_capacity(OBSERVATION_SIZE);
 
         data.push((account.cash / account.total_assets) as f16);
         data.extend(
@@ -64,7 +64,7 @@ impl ObservationState {
         //     }
         // }
 
-        for price_deltas in ticker_price_deltas.iter() {
+        for price_deltas in ticker_price_obs.iter() {
             for i in 0..(OBSERVATION_SIZE - data.len()) {
                 if let Some(price_diff) = price_deltas.get(step - i) {
                     data.push(*price_diff as f16);

@@ -9,12 +9,7 @@ use crate::{
         agent::base::{Action, ElemType, Environment, Snapshot},
         constants::OBSERVATION_SIZE,
         obs_state::ObservationState,
-    },
-    constants::TICKERS,
-    data::historical::get_historical_data,
-    history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
-    types::Account,
-    utils::{get_mapped_price_deltas, get_price_deltas},
+    }, charts::general::simple_chart, constants::TICKERS, data::historical::get_historical_data, history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory}, types::Account, utils::{get_mapped_price_deltas, get_mapped_price_normals, get_price_deltas}
 };
 
 #[derive(Debug)]
@@ -109,15 +104,15 @@ impl Environment for Env {
                     self.episode_history.sells[0]
                         .insert(self.step, (current_prices[self.step], quantity));
 
-                    reward += self
-                        .account
-                        .positions
-                        .iter()
-                        .enumerate()
-                        .map(|(index, position)| {
-                            position.appreciation(self.prices[index][self.step]) * sell_total
-                        })
-                        .sum::<f64>();
+                    // reward += self
+                    //     .account
+                    //     .positions
+                    //     .iter()
+                    //     .enumerate()
+                    //     .map(|(index, position)| {
+                    //         position.appreciation(self.prices[index][self.step]) * sell_total
+                    //     })
+                    //     .sum::<f64>();
                 }
             }
             TradeAction::Hold => {}
@@ -141,10 +136,19 @@ impl Environment for Env {
         // Reward
 
         self.account.update_total(&self.prices, self.step);
-        // let reward = (self.account.total_assets - total_assets) / total_assets;
+        let reward = (self.account.total_assets - total_assets) / total_assets;
         // let reward = self.account.total_assets - Self::STARTING_CASH;
         // Increase/decrease in value of positions
-        // let reward = self.account.positions.iter().enumerate().map(|(index, position)| position.appreciation(self.prices[index][self.step])).sum();
+        // let reward = self
+        //     .account
+        //     .positions
+        //     .iter()
+        //     .enumerate()
+        //     .map(|(index, position)| {
+        //         position.appreciation(self.prices[index][self.step])
+        //             * position.cost_basis()
+        //     })
+        //     .sum();
 
         self.episode_history.rewards.push(reward);
 
@@ -178,10 +182,13 @@ impl Environment for Env {
     }
 
     fn reset(&mut self) -> Snapshot<Self> {
-        self.tickers = vec![vec!["TSLA", "AAPL", "AMD", "INTC", "MSFT"]
-            .choose(&mut self.rng)
-            .unwrap()
-            .to_string()];
+        self.tickers = vec![
+            "NVDA".to_string(),
+            // vec!["TSLA", "AAPL", "AMD", "INTC", "MSFT"]
+            // .choose(&mut self.rng)
+            // .unwrap()
+            // .to_string()
+        ];
         let mapped_bars = get_historical_data(Some(
             &self
                 .tickers
@@ -193,13 +200,19 @@ impl Environment for Env {
             .iter()
             .map(|bar| bar.iter().map(|bar| bar.close).collect())
             .collect();
-        self.price_deltas = get_mapped_price_deltas(&mapped_bars);
+        self.price_deltas = get_mapped_price_normals(&mapped_bars);
 
         self.account = Account::new(Self::STARTING_CASH, self.tickers.len());
         self.step = Self::STARTING_STEP;
 
         self.episode_history = EpisodeHistory::new(self.tickers.len());
         self.state = ObservationState::new_random();
+        
+        if self.episode == 0 {
+        for (ticker_index, _) in self.tickers.iter().enumerate() {
+            let _ = simple_chart(&"training/data".to_string(), format!("price_observations_{}", ticker_index).as_str(), &self.price_deltas[ticker_index]);
+        }
+        }
 
         Snapshot::new(self.state, 0.0, false)
     }

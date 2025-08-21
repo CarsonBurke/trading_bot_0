@@ -33,7 +33,7 @@ impl EpisodeHistory {
 
         for (ticker_index, prices) in prices.iter().enumerate() {
             let ticker = &tickers[ticker_index];
-            let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker:?}", episode);
+            let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker}", episode);
             create_folder_if_not_exists(&ticker_dir);
 
             let ticker_buy_indexes = &self.buys[ticker_index];
