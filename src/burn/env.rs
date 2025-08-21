@@ -48,7 +48,6 @@ impl Environment for Env {
     type RewardType = ElemType;
 
     fn new(visualized: bool) -> Self {
-
         let tickers = vec![
             // "SPY".to_string(),
             "TSLA".to_string(),
@@ -81,6 +80,8 @@ impl Environment for Env {
         self.account.update_total(&self.prices, self.step);
         let total_assets = self.account.total_assets;
 
+        let mut reward = 0.0;
+
         match action {
             TradeAction::Buy => {
                 let buy_total = (total_assets * Self::BUY_PERCENT).min(self.account.cash);
@@ -107,6 +108,16 @@ impl Environment for Env {
 
                     self.episode_history.sells[0]
                         .insert(self.step, (current_prices[self.step], quantity));
+
+                    reward += self
+                        .account
+                        .positions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, position)| {
+                            position.appreciation(self.prices[index][self.step]) * sell_total
+                        })
+                        .sum::<f64>();
                 }
             }
             TradeAction::Hold => {}
@@ -130,7 +141,7 @@ impl Environment for Env {
         // Reward
 
         self.account.update_total(&self.prices, self.step);
-        let reward = (self.account.total_assets - total_assets) / total_assets;
+        // let reward = (self.account.total_assets - total_assets) / total_assets;
         // let reward = self.account.total_assets - Self::STARTING_CASH;
         // Increase/decrease in value of positions
         // let reward = self.account.positions.iter().enumerate().map(|(index, position)| position.appreciation(self.prices[index][self.step])).sum();
@@ -158,7 +169,7 @@ impl Environment for Env {
             if self.episode % 5 == 0 {
                 self.meta_history.chart(self.episode);
             }
-            
+
             self.episode_start = Instant::now();
 
             self.episode += 1;
