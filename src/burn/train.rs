@@ -22,8 +22,8 @@ use crate::{
 
 // const MEMORY_SIZE: usize = 4_096;
 // const MEMORY_SIZE: usize = 16_384;
-const MEMORY_SIZE: usize = 512;
-const DENSE_SIZE: usize = 8;
+const MEMORY_SIZE: usize = 1024;
+const DENSE_SIZE: usize = 16;
 const MAX_EPISODES: usize = 1000;
 const KERNEL_SIZE: usize = 3;
 const TICKER_COUNT: usize = 1;
@@ -44,7 +44,7 @@ pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
     );
     let agent = ConvAgent::default();
     let config = PPOTrainingConfig {
-        batch_size: 64,
+        batch_size: 256,
         // batch_size: 512,
         // batch_size: 2048,
         entropy_weight: 0.01,

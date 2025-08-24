@@ -200,7 +200,7 @@ impl Environment for Env {
             .iter()
             .map(|bar| bar.iter().map(|bar| bar.close).collect())
             .collect();
-        self.price_deltas = get_mapped_price_normals(&mapped_bars);
+        self.price_deltas = get_mapped_price_deltas(&mapped_bars);
 
         self.account = Account::new(Self::STARTING_CASH, self.tickers.len());
         self.step = Self::STARTING_STEP;
