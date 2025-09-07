@@ -23,7 +23,7 @@ pub mod data;
 pub mod neural_net;
 pub mod strategies;
 pub mod custom_rl;
-pub mod official_rl;
+pub mod torch;
 pub mod candle;
 pub mod burn;
 pub mod history;
