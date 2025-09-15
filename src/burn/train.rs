@@ -13,7 +13,7 @@ use crate::{
                 config::PPOTrainingConfig,
                 model::{PPOModel, PPOOutput},
             },
-        }, conv::{ConvAgent, ConvNet}, env::Env
+        }, conv::ConvAgent, env::Env, linear::{LinearAgent, LinearNet}
     },
     data::historical::get_historical_data,
     history::{episode_tickers_separate::EpisodeHistory, meta_tickers_separate::MetaHistory},
@@ -22,7 +22,7 @@ use crate::{
 
 // const MEMORY_SIZE: usize = 4_096;
 // const MEMORY_SIZE: usize = 16_384;
-const MEMORY_SIZE: usize = 1024;
+const MEMORY_SIZE: usize = 2048;
 const DENSE_SIZE: usize = 16;
 const MAX_EPISODES: usize = 1000;
 const KERNEL_SIZE: usize = 3;
@@ -35,22 +35,22 @@ pub fn run_training() {
 pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
     
     let mut env = E::new(false);
-    let mut model = ConvNet::<B>::new(
+    let mut model = LinearNet::<B>::new(
         <<E as Environment>::StateType as State>::size(),
         DENSE_SIZE,
         <<E as Environment>::ActionType as Action>::size(),
-        KERNEL_SIZE,
-        TICKER_COUNT
+        // KERNEL_SIZE,
+        // TICKER_COUNT
     );
-    let agent = ConvAgent::default();
+    let agent = LinearAgent::default();
     let config = PPOTrainingConfig {
-        batch_size: 256,
+        batch_size: 512,
         // batch_size: 512,
         // batch_size: 2048,
-        entropy_weight: 0.01,
-        learning_rate: 3e-4,
-        epochs: 5,
-        clip_grad: Some(GradientClippingConfig::Norm(0.5)),
+        // entropy_weight: 0.01,
+        // learning_rate: 3e-4,
+        epochs: 6,
+        clip_grad: Some(GradientClippingConfig::Norm(0.8)),
         ..Default::default()
     };
     let mut optimizer = AdamWConfig::new()
@@ -65,7 +65,7 @@ pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
         while !done {
             let state = env.state();
 
-            if let Some(action) = ConvAgent::<E, _>::react_with_model(&state, &model) {
+            if let Some(action) = LinearAgent::<E, _>::react_with_model(&state, &model) {
                 let snapshot = env.step(action);
 
                 memory.push(
@@ -78,7 +78,7 @@ pub fn train<E: Environment, B: AutodiffBackend>() -> impl Agent<E> {
 
                 if memory.len() >= MEMORY_SIZE {
                     println!("Memory limit reached - training model");
-                    model = ConvAgent::train::<MEMORY_SIZE>(model, &memory, &mut optimizer, &config);
+                    model = LinearAgent::train::<MEMORY_SIZE>(model, &memory, &mut optimizer, &config);
                     memory.clear();
                 }
 

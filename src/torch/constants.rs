@@ -1,0 +1,1 @@
+pub const OBSERVATION_SIZE: usize = 1000;

@@ -16,19 +16,20 @@ use ibapi::{
     Client,
 };
 
-pub mod agent;
-pub mod charts;
-pub mod constants;
-pub mod data;
-pub mod neural_net;
-pub mod strategies;
-pub mod custom_rl;
-pub mod torch;
-pub mod candle;
-pub mod burn;
-pub mod history;
+mod agent;
+mod charts;
+mod constants;
+mod data;
+mod neural_net;
+mod strategies;
+mod custom_rl;
+mod torch;
+mod candle;
+mod burn;
+mod history;
 mod types;
 mod utils;
+mod gym;
 
 #[tokio::main]
 async fn main() {

@@ -9,9 +9,11 @@
 use tch::kind::{FLOAT_CPU, INT64_CPU};
 use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 
+use crate::gym::base::Environment;
+use crate::torch::env::Env;
+
 use super::vec_gym_env::VecGymEnv;
 
-const ENV_NAME: &str = "SpaceInvadersNoFrameskip-v4";
 const NPROCS: i64 = 8;
 const NSTEPS: i64 = 256;
 const NSTACK: i64 = 4;
@@ -67,7 +69,7 @@ impl FrameStack {
 }
 
 pub fn train() -> cpython::PyResult<()> {
-    let env = VecGymEnv::new(ENV_NAME, None, NPROCS)?;
+    let env = Environment::new(false);
     println!("action space: {}", env.action_space());
     println!("observation space: {:?}", env.observation_space());
 
@@ -158,7 +160,7 @@ pub fn train() -> cpython::PyResult<()> {
 }
 
 pub fn sample<T: AsRef<std::path::Path>>(weight_file: T) -> cpython::PyResult<()> {
-    let env = VecGymEnv::new(ENV_NAME, Some("/dev/shm"), 1)?;
+    let env = Environment::new(false);
     println!("action space: {}", env.action_space());
     println!("observation space: {:?}", env.observation_space());
 

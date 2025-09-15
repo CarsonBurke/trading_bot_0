@@ -1,5 +1,5 @@
 use burn::{
-    backend::{Autodiff, NdArray, Vulkan, Wgpu}, grad_clipping::GradientClippingConfig, module::Module, nn::{Initializer, Linear, LinearConfig}, optim::AdamWConfig, prelude::Backend, tensor::{
+    backend::{Autodiff, NdArray, Vulkan, Wgpu}, grad_clipping::GradientClippingConfig, module::Module, nn::{Dropout, DropoutConfig, Initializer, Linear, LinearConfig}, optim::AdamWConfig, prelude::Backend, tensor::{
         activation::{gelu, relu, silu, softmax},
         backend::AutodiffBackend,
         Tensor,
@@ -26,6 +26,7 @@ use crate::{
 #[derive(Module, Debug)]
 pub struct LinearNet<B: Backend> {
     linear: Linear<B>,
+    hidden: Vec<Linear<B>>,
     linear_actor: Linear<B>,
     linear_critic: Linear<B>,
 }
@@ -36,6 +37,7 @@ impl<B: Backend> LinearNet<B> {
         let initializer = Initializer::XavierUniform { gain: 1.0 };
         Self {
             linear: LinearConfig::new(input_size, dense_size).with_initializer(initializer.clone()).init(&Default::default()),
+            hidden: Vec::new(),
             linear_actor: LinearConfig::new(dense_size, output_size).with_initializer(initializer.clone()).init(&Default::default()),
             linear_critic: LinearConfig::new(dense_size, 1).with_initializer(initializer).init(&Default::default()),
         }

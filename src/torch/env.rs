@@ -4,18 +4,10 @@ use rand::{rngs::ThreadRng, seq::IndexedRandom};
 use time::Duration;
 
 use crate::{
-    burn::{
-        action::TradeAction,
-        agent::base::{Action, ElemType, Environment, Snapshot},
-        constants::OBSERVATION_SIZE,
-        obs_state::ObservationState,
-    },
-    charts::general::simple_chart,
-    constants::TICKERS,
-    data::historical::get_historical_data,
-    history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
-    types::Account,
-    utils::{create_folder_if_not_exists, get_mapped_price_deltas, get_mapped_price_normals, get_price_deltas},
+    charts::general::simple_chart, constants::TICKERS, data::historical::get_historical_data, gym::{
+        action_discrete::ActionDiscrete,
+        base::{Action, ElemType, Environment, Snapshot},
+    }, history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory}, torch::{constants::OBSERVATION_SIZE, obs_state::ObservationState}, types::Account, utils::{create_folder_if_not_exists, get_mapped_price_deltas, get_mapped_price_normals, get_price_deltas}
 };
 
 #[derive(Debug)]
@@ -44,7 +36,7 @@ impl Env {
 }
 
 impl Environment for Env {
-    type ActionType = TradeAction;
+    type ActionType = ActionDiscrete;
     type StateType = ObservationState;
     type RewardType = ElemType;
 
@@ -84,7 +76,7 @@ impl Environment for Env {
         let mut reward = 0.0;
 
         match action {
-            TradeAction::Buy => {
+            ActionDiscrete::Buy => {
                 let buy_total = (total_assets * Self::BUY_PERCENT).min(self.account.cash);
 
                 if buy_total > 0.0 {
@@ -97,7 +89,7 @@ impl Environment for Env {
                         .insert(self.step, (current_prices[self.step], quantity));
                 }
             }
-            TradeAction::Sell => {
+            ActionDiscrete::Sell => {
                 let sell_total = (total_assets * Self::SELL_PERCENT)
                     .min(self.account.positions[0].value_with_price(current_prices[self.step]));
 
@@ -121,7 +113,7 @@ impl Environment for Env {
                     //     .sum::<f64>();
                 }
             }
-            TradeAction::Hold => {}
+            ActionDiscrete::Hold => {}
         }
 
         for (index, _) in self.tickers.iter().enumerate() {
