@@ -21,12 +21,9 @@ impl ActionDiscrete {
 }
 
 impl Action for ActionDiscrete {
-    fn random() -> Self {
-        (rand::rng().random_range(0..Self::size()) as u32).into()
-    }
 
-    fn enumerate() -> Vec<Self> {
-        vec![ActionDiscrete::Buy, ActionDiscrete::Sell, ActionDiscrete::Hold]
+    fn size() -> usize {
+        vec![ActionDiscrete::Buy, ActionDiscrete::Sell, ActionDiscrete::Hold].len()
     }
 }
 

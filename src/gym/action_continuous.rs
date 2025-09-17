@@ -1,51 +1,26 @@
 use rand::Rng;
 
-use crate::gym::base::Action;
+#[derive(Debug, Clone)]
+pub struct ActionsContinuous(pub Vec<f32>);
 
-#[derive(Debug, Clone, Copy)]
-pub struct ActionContinuous(pub f32);
-
-impl ActionContinuous {
-    pub fn new(id: u32) -> Self {
-        match id {
-            0 => ActionContinuous::Buy,
-            1 => ActionContinuous::Sell,
-            2 => ActionContinuous::Hold,
-            _ => panic!("Invalid action"),
-        }
+impl ActionsContinuous {
+    pub fn new(values: Vec<f32>) -> Self {
+        ActionsContinuous(values)
     }
-}
-
-impl Action for ActionContinuous {
-    fn random() -> Self {
-        (rand::rng().random_range(0..Self::size()) as f32).into()
+    
+    pub fn new_random(size: usize) -> Self {
+        let mut rng = rand::rng();
+        let values = (0..size).map(|_| rng.random_range(-1.0..1.0)).collect();
+        ActionsContinuous(values)
     }
-
-    fn enumerate() -> Vec<Self> {
-        vec![ActionContinuous::Buy, ActionContinuous::Sell, ActionContinuous::Hold]
+    
+    pub fn new_random_with_range(size: usize, min: f32, max: f32) -> Self {
+        let mut rng = rand::rng();
+        let values = (0..size).map(|_| rng.random_range(min..max)).collect();
+        ActionsContinuous(values)
     }
-}
-
-impl From<f32> for ActionContinuous {
-    fn from(value: f32) -> Self {
-        ActionContinuous(value)
-    }
-}
-
-impl From<ActionContinuous> for f32 {
-    fn from(action: ActionContinuous) -> Self {
-        action.0
-    }
-}
-
-impl From<u32> for ActionContinuous {
-    fn from(value: u32) -> Self {
-        ActionContinuous(value as f32)
-    }
-}
-
-impl From<ActionContinuous> for u32 {
-    fn from(action: ActionContinuous) -> Self {
-        action.0 as u32
+    
+    pub fn size(&self) -> usize {
+        self.0.len()
     }
 }
