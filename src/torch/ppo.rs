@@ -69,7 +69,7 @@ impl FrameStack {
 }
 
 pub fn train() -> cpython::PyResult<()> {
-    let env = Environment::new(false);
+    let env: Env = Environment::new(false);
     println!("action space: {}", env.action_space());
     println!("observation space: {:?}", env.observation_space());
 
@@ -159,26 +159,27 @@ pub fn train() -> cpython::PyResult<()> {
     Ok(())
 }
 
-pub fn sample<T: AsRef<std::path::Path>>(weight_file: T) -> cpython::PyResult<()> {
-    let env = Environment::new(false);
-    println!("action space: {}", env.action_space());
-    println!("observation space: {:?}", env.observation_space());
+// Pretty sure I can ignore this, used for inference after training?
+// pub fn sample<T: AsRef<std::path::Path>>(weight_file: T) -> cpython::PyResult<()> {
+//     let env = Environment::new(false);
+//     println!("action space: {}", env.action_space());
+//     println!("observation space: {:?}", env.observation_space());
 
-    let mut vs = nn::VarStore::new(tch::Device::Cpu);
-    let model = model(&vs.root(), env.action_space());
-    vs.load(weight_file).unwrap();
+//     let mut vs = nn::VarStore::new(tch::Device::Cpu);
+//     let model = model(&vs.root(), env.action_space());
+//     vs.load(weight_file).unwrap();
 
-    let mut frame_stack = FrameStack::new(1, NSTACK);
-    let mut obs = frame_stack.update(&env.reset()?, None);
+//     let mut frame_stack = FrameStack::new(1, NSTACK);
+//     let mut obs = frame_stack.update(&env.reset()?, None);
 
-    for _index in 0..5000 {
-        let (_critic, actor) = tch::no_grad(|| model(obs));
-        let probs = actor.softmax(-1, Kind::Float);
-        let actions = probs.multinomial(1, true).squeeze_dim(-1);
-        let step = env.step(Vec::<i64>::try_from(&actions).unwrap())?;
+//     for _index in 0..5000 {
+//         let (_critic, actor) = tch::no_grad(|| model(obs));
+//         let probs = actor.softmax(-1, Kind::Float);
+//         let actions = probs.multinomial(1, true).squeeze_dim(-1);
+//         let step = env.step(Vec::<i64>::try_from(&actions).unwrap())?;
 
-        let masks = Tensor::from(1f32) - step.is_done;
-        obs = frame_stack.update(&step.obs, Some(&masks));
-    }
-    Ok(())
-}
+//         let masks = Tensor::from(1f32) - step.is_done;
+//         obs = frame_stack.update(&step.obs, Some(&masks));
+//     }
+//     Ok(())
+// }
