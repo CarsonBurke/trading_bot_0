@@ -1,6 +1,6 @@
 use rand::Rng;
 
-use crate::gym::base::Action;
+use crate::burn::agent::base::Action;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TradeAction {
