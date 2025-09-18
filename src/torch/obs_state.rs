@@ -1,8 +1,8 @@
 use crate::{
-    gym::base::State, torch::constants::OBSERVATION_SIZE, types::Account
+    gym::base::State, torch::constants::OBSERVATION_SPACE, types::Account
 };
 
-pub type ObservationData = [f16; OBSERVATION_SIZE];
+pub type ObservationData = [f16; OBSERVATION_SPACE];
 
 /// Observation data to feed into the neural network.
 #[derive(Debug, Clone, Copy)]
@@ -17,7 +17,7 @@ impl ObservationState {
         prices: &[Vec<f64>],
         ticker_price_obs: &[Vec<f64>],
     ) -> Self {
-        let mut data: Vec<f16> = Vec::with_capacity(OBSERVATION_SIZE);
+        let mut data: Vec<f16> = Vec::with_capacity(OBSERVATION_SPACE);
 
         data.push((account.cash / account.total_assets) as f16);
         data.extend(
@@ -59,7 +59,7 @@ impl ObservationState {
         // }
 
         for price_deltas in ticker_price_obs.iter() {
-            for i in 0..(OBSERVATION_SIZE - data.len()) {
+            for i in 0..(OBSERVATION_SPACE - data.len()) {
                 if let Some(price_diff) = price_deltas.get(step - i) {
                     data.push(*price_diff as f16);
                     continue;
@@ -80,7 +80,7 @@ impl ObservationState {
 
     pub fn new_random() -> Self {
         Self {
-            data: (0..OBSERVATION_SIZE)
+            data: (0..OBSERVATION_SPACE)
                 .map(|_| rand::random_range(-0.1..0.1) as f16)
                 .collect::<Vec<f16>>()
                 .try_into()
@@ -93,7 +93,7 @@ impl State for ObservationState {
     type Data = ObservationData;
 
     fn size() -> usize {
-        OBSERVATION_SIZE
+        OBSERVATION_SPACE
     }
 
     // fn to_tensor<B: Backend>(&self) -> Tensor<B, 1> {

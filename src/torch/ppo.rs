@@ -9,7 +9,8 @@
 use tch::kind::{FLOAT_CPU, INT64_CPU};
 use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 
-use crate::gym::base::Environment;
+use crate::gym::base::{Agent, Environment};
+use crate::torch::constants::{ACTION_SPACE, MEMORY_SIZE, OBSERVATION_SPACE};
 use crate::torch::env::Env;
 
 use super::vec_gym_env::VecGymEnv;
@@ -70,12 +71,12 @@ impl FrameStack {
 
 pub fn train() -> cpython::PyResult<()> {
     let env: Env = Environment::new(false);
-    println!("action space: {}", env.action_space());
-    println!("observation space: {:?}", env.observation_space());
+    println!("action space: {}", ACTION_SPACE);
+    println!("observation space: {:?}", OBSERVATION_SPACE);
 
     let device = tch::Device::cuda_if_available();
     let vs = nn::VarStore::new(device);
-    let model = model(&vs.root(), env.action_space());
+    let model = model(&vs.root(), ACTION_SPACE as i64);
     let mut opt = nn::Adam::default().build(&vs, 1e-4).unwrap();
 
     let mut sum_rewards = Tensor::zeros([NPROCS], FLOAT_CPU);
@@ -93,6 +94,42 @@ pub fn train() -> cpython::PyResult<()> {
         let s_rewards = Tensor::zeros([NSTEPS, NPROCS], FLOAT_CPU);
         let s_actions = Tensor::zeros([NSTEPS, NPROCS], INT64_CPU);
         let s_masks = Tensor::zeros([NSTEPS, NPROCS], FLOAT_CPU);
+        
+        // Custom loop
+        
+        env.reset();
+        
+        let mut done = false;
+        while !done {
+            let state = env.state();
+            
+            if let Some(action) = Agent::<E, _>::react_with_model(&state, &model) {
+                let snapshot = env.step(action);
+
+                memory.push(
+                    state,
+                    *snapshot.state(),
+                    action,
+                    snapshot.reward().clone(),
+                    snapshot.done(),
+                );
+
+                if memory.len() >= MEMORY_SIZE {
+                    println!("Memory limit reached - training model");
+                    model = LinearAgent::train::<MEMORY_SIZE>(model, &memory, &mut optimizer, &config);
+                    memory.clear();
+                }
+
+                done = snapshot.done();
+            } else {
+                println!("No action selected");
+                println!("state {:?}", state);
+                panic!();
+            }
+        }
+        
+        //
+        
         for s in 0..NSTEPS {
             let (critic, actor) = tch::no_grad(|| model(&s_states.get(s)));
             let probs = actor.softmax(-1, Kind::Float);

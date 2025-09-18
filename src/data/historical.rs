@@ -33,7 +33,7 @@ pub fn get_historical_data(tickers: Option<&[&str]>) -> MappedHistorical {
         let client = match &opt_client {
             Some(client) => client,
             None => {
-                let connection_url = "127.0.0.1:4001";
+                let connection_url = "127.0.0.1:4002";
 
                 &Client::connect(connection_url, 1).expect("connection to TWS failed!")
             }

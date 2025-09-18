@@ -7,7 +7,7 @@ use crate::{
     charts::general::simple_chart, constants::TICKERS, data::historical::get_historical_data, gym::{
         action_discrete::ActionDiscrete,
         base::{Action, ElemType, Environment, Snapshot},
-    }, history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory}, torch::{constants::OBSERVATION_SIZE, obs_state::ObservationState}, types::Account, utils::{create_folder_if_not_exists, get_mapped_price_deltas, get_mapped_price_normals, get_price_deltas}
+    }, history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory}, torch::{constants::OBSERVATION_SPACE, obs_state::ObservationState}, types::Account, utils::{create_folder_if_not_exists, get_mapped_price_deltas, get_mapped_price_normals, get_price_deltas}
 };
 
 #[derive(Debug)]
@@ -27,7 +27,7 @@ pub struct Env {
 }
 
 impl Env {
-    const STARTING_STEP: usize = OBSERVATION_SIZE;
+    const STARTING_STEP: usize = OBSERVATION_SPACE;
     const STARTING_CASH: f64 = 10_000.0;
     const BUY_PERCENT: f64 = 0.05;
     const SELL_PERCENT: f64 = 0.05;
