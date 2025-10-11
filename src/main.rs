@@ -35,12 +35,16 @@ mod gym;
 async fn main() {
     println!("{}", "Start".green());
 
+    // Burn
     // Allow for larger stack size
-    std::thread::Builder::new()
+    /*std::thread::Builder::new()
         .stack_size(128 * 1024 * 1024)
         .spawn(|| burn::train::run_training()).unwrap()
         .join()
-        .unwrap();
+        .unwrap();*/
+    
+    // Torch Continuous multi ticker
+    torch::ppo::train();
     
     /*     let client = Client::connect(connection_url, 1).expect("connection to TWS failed!");
     println!("Successfully connected to TWS at {connection_url}"); */

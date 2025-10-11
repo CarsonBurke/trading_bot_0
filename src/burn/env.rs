@@ -136,6 +136,7 @@ impl Environment for Env {
         self.step += 1;
         let next_prices = &self.prices[0];
 
+        //  I think prices and price deltas needs to be sliced at current tick
         self.state =
             ObservationState::new(self.step, &self.account, &self.prices, &self.price_deltas);
 
