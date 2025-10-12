@@ -103,12 +103,12 @@ impl Env {
 
             if self.get_is_done() == 1.0 {
                 println!(
-                    "Episode {} - Total Assets: {:.2} cumulative reward {:.2} tickers {:?} time secs {}",
+                    "Episode {} - Total Assets: {:.2} cumulative reward {:.2} tickers {:?} time secs {:.2}",
                     self.episode,
                     self.account.total_assets,
                     self.episode_history.rewards.iter().sum::<f64>(),
                     self.tickers,
-                    Instant::now().duration_since(self.episode_start).as_secs()
+                    Instant::now().duration_since(self.episode_start).as_secs_f32()
                 );
 
                 self.episode_history
@@ -144,7 +144,7 @@ impl Env {
         for (ticker_index, action) in actions.iter().enumerate() {
             // Assume it is already hyperbolized
             // let action = (*action).min(-1).max(1);
-
+            // println!("action {}", action);
             let current_price = self.prices[ticker_index][self.step];
 
             if *action > 0.0 {

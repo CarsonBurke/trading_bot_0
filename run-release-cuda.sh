@@ -1,0 +1,1 @@
+env LIBTORCH=/home/marvin/Downloads/libtorch LIBTORCH_BYPASS_VERSION_CHECK=1 DEP_TCH_LIBTORCH_LIB=~/Downloads/libtorch/lib/libtorch_cuda.so LD_LIBRARY_PATH=/home/marvin/Downloads/libtorch/lib cargo run --release

@@ -10,7 +10,8 @@ categories = ["science"]
 
 [dependencies]
 anyhow = "1.0.98"
-burn = {version = "0.18.0", features = ["wgpu", "rocm", "cuda", "ndarray", "autodiff", "vulkan", "fusion"]}
+# conflicts with torch > 0.19, have to disable for torch variant
+# burn = {version = "0.18.0", features = ["wgpu", "rocm", "cuda", "ndarray", "autodiff", "vulkan", "fusion"]}
 candle-core = { version = "0.9.1" }
 candle-nn = {version = "0.9.1" }
 chrono = "0.4.38"
@@ -28,7 +29,7 @@ rand = "0.9.1"
 ringbuffer = "0.16.0"
 rust_neural_network = "0.18.0"
 serde = "1.0.215"
-tch = { version = "0.19.0", features = ["download-libtorch", "rl-python"] }
+tch = { version = "0.20.0", features = ["rl-python", "download-libtorch"] }
 time = "0.3.36"
 tokio = { version = "1.42.0", features = ["full"] }
 uuid = { version = "1.11.0", features = ["v4"] }
