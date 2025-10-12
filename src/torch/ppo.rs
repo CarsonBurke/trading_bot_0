@@ -9,12 +9,10 @@
 use tch::kind::{FLOAT_CPU, INT64_CPU, INT64_CUDA};
 use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 
-use crate::torch::constants::{TICKERS_COUNT, OBSERVATION_SPACE};
+use crate::torch::constants::{OBSERVATIONS_PER_TICKER, OBSERVATION_SPACE, TICKERS_COUNT};
 use crate::torch::step::Env;
 
 pub const NPROCS: i64 = 1; // DEFAULT 8 but disabled as unsure if step can handle multiple procs
-const NSTEPS: i64 = 256;
-const MEMORY_SIZE: i64 = NPROCS * NSTEPS;
 const UPDATES: i64 = 1000000;
 const OPTIM_BATCHSIZE: i64 = 64;
 const OPTIM_EPOCHS: i64 = 4;
@@ -28,25 +26,28 @@ fn model(p: &nn::Path, nact: i64) -> Model {
         stride: s,
         ..Default::default()
     };
+
+    // 1D CNN for time series: input shape [batch, channels=TICKERS_COUNT, length=OBSERVATIONS_PER_TICKER]
+    // With TICKERS_COUNT=5 and OBSERVATIONS_PER_TICKER=200: [batch, 5, 200]
     let seq = nn::seq()
-        .add(nn::conv2d(p / "c1", TICKERS_COUNT, 64, 8, stride(4)))
+        .add(nn::conv1d(p / "c1", TICKERS_COUNT, 64, 8, stride(4)))  // (200-8)/4+1 = 49
         .add_fn(|xs| xs.relu())
-        .add(nn::conv2d(p / "c2", 64, 128, 4, stride(2)))
+        .add(nn::conv1d(p / "c2", 64, 128, 5, stride(2)))            // (49-5)/2+1 = 23
         .add_fn(|xs| xs.relu())
-        .add(nn::conv2d(p / "c3", 128, 256, 3, stride(1)))
+        .add(nn::conv1d(p / "c3", 128, 256, 3, stride(2)))           // (23-3)/2+1 = 11
         .add_fn(|xs| xs.relu().flat_view())
-        // 256 * 61 = 15616
-        .add(nn::linear(p / "l1", 15616, 512, Default::default()))
+        // Flattened size: 256 * 11 = 2816
+        .add(nn::linear(p / "l1", 2816, 512, Default::default()))
         .add_fn(|xs| xs.relu());
-    
+
     let critic = nn::linear(p / "cl", 512, 1, Default::default());
     let actor_mean = nn::linear(p / "al", 512, nact, Default::default());
     let actor_log_std = nn::linear(p / "al_log_std", 512, nact, Default::default());
-    
+
     let device = p.device();
     Box::new(move |xs: &Tensor| {
         let xs = xs.to_device(device).apply(&seq);
-        
+
         let critic_value = xs.apply(&critic);
 
         // Action mean passed through tanh to bound actions to [-1, 1]
@@ -54,42 +55,15 @@ fn model(p: &nn::Path, nact: i64) -> Model {
 
         // Log std for numerical stability, clamped to reasonable range
         let action_log_std = xs.apply(&actor_log_std).clamp(-20.0, 2.0);
-        
+
         (critic_value, (action_mean, action_log_std))
     })
 }
 
-#[derive(Debug)]
-struct FrameStack {
-    data: Tensor,
-    nprocs: i64,
-    nstack: i64,
-}
-
-impl FrameStack {
-    fn new(nprocs: i64, nstack: i64) -> FrameStack {
-        FrameStack {
-            data: Tensor::zeros([nprocs, nstack, 84, 84], FLOAT_CPU),
-            nprocs,
-            nstack,
-        }
-    }
-
-    fn update<'a>(&'a mut self, img: &Tensor, masks: Option<&Tensor>) -> &'a Tensor {
-        if let Some(masks) = masks {
-            self.data *= masks.view([self.nprocs, 1, 1, 1])
-        };
-        let slice = |i| self.data.narrow(1, i, 1);
-        for i in 1..self.nstack {
-            slice(i - 1).copy_(&slice(i))
-        }
-        slice(self.nstack - 1).copy_(img);
-        &self.data
-    }
-}
-
 pub fn train() {
     let mut env = Env::new();
+    let n_steps = env.max_step as i64;
+    let memory_size = n_steps * NPROCS;
     println!("action space: {}", TICKERS_COUNT);
     println!("observation space: {:?}", OBSERVATION_SPACE);
 
@@ -102,69 +76,82 @@ pub fn train() {
     let mut total_rewards = 0f64;
     let mut total_episodes = 0f64;
 
-    let mut obs_buffer = FrameStack::new(NPROCS, TICKERS_COUNT);
-    let _ = obs_buffer.update(&env.reset(), None);
-    let s_states = Tensor::zeros([NSTEPS + 1, NPROCS, TICKERS_COUNT, 84, 84], FLOAT_CPU);
+    let mut current_obs = env.reset();
+    let s_states = Tensor::zeros([n_steps + 1, NPROCS, TICKERS_COUNT, OBSERVATIONS_PER_TICKER as i64], FLOAT_CPU);
 
-    for update_index in 0..UPDATES {
+    for episode in 0..UPDATES {
         s_states.get(0).copy_(&s_states.get(-1));
-        let s_values = Tensor::zeros([NSTEPS, NPROCS], FLOAT_CPU);
-        let s_rewards = Tensor::zeros([NSTEPS, NPROCS], FLOAT_CPU);
-        let s_actions = Tensor::zeros([NSTEPS, NPROCS], INT64_CPU);
-        let s_masks = Tensor::zeros([NSTEPS, NPROCS], FLOAT_CPU);
+        let s_values = Tensor::zeros([n_steps, NPROCS], FLOAT_CPU);
+        let s_rewards = Tensor::zeros([n_steps, NPROCS], FLOAT_CPU);
+        let s_actions = Tensor::zeros([n_steps, NPROCS, TICKERS_COUNT], FLOAT_CPU);
+        let s_masks = Tensor::zeros([n_steps, NPROCS], FLOAT_CPU);
 
         // Custom loop
 
-        env.reset();
+        let _ = env.reset();
+        env.episode = episode as usize;
 
-        for s in 0..NSTEPS {
-            let (critic, (action_mean, action_log_std)) = tch::no_grad(|| model(&s_states.get(s)));
+        s_states.get(0).copy_(&current_obs);
+        
+        for step in OBSERVATIONS_PER_TICKER..env.max_step {
+            env.step = step;
             
+            let (critic, (action_mean, action_log_std)) = tch::no_grad(|| model(&s_states.get(step as i64)));
+
             let action_std = action_log_std.exp();
             let noise = Tensor::randn_like(&action_mean);
             let actions = (action_mean + action_std * noise).clamp(-1.0, 1.0);
-            
-            println!("actions {}", actions);
-            // Make sure they are hyperbolized
-            
-            let actions_flat = Vec::<f64>::try_from(&actions).unwrap();
+
+            // Flatten the actions tensor [NPROCS, TICKERS_COUNT] to 1D before converting
+            let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let actions_vec: Vec<Vec<f64>> = actions_flat
                 .chunks(TICKERS_COUNT as usize)
                 .map(|chunk| chunk.to_vec())
                 .collect();
             
-            let step = env.step(actions_vec);
+            // println!("Actions: {:?}", actions_vec);
 
-            sum_rewards += &step.reward;
+            let step_state = env.step(actions_vec);
+
+            // println!("Step reward: {:?}", step_state.reward);
+
+            sum_rewards += &step_state.reward;
             total_rewards +=
-                f64::try_from((&sum_rewards * &step.is_done).sum(Kind::Float)).unwrap();
-            total_episodes += f64::try_from(step.is_done.sum(Kind::Float)).unwrap();
+                f64::try_from((&sum_rewards * &step_state.is_done).sum(Kind::Float)).unwrap();
+            total_episodes += f64::try_from(step_state.is_done.sum(Kind::Float)).unwrap();
 
-            let masks = Tensor::from(1f32) - step.is_done;
+            let masks = Tensor::from(1f32) - &step_state.is_done;
             sum_rewards *= &masks;
-            let obs = obs_buffer.update(&step.obs, Some(&masks));
-            s_actions.get(s).copy_(&actions);
-            s_values.get(s).copy_(&critic.squeeze_dim(-1));
-            s_states.get(s + 1).copy_(obs);
-            s_rewards.get(s).copy_(&step.reward);
-            s_masks.get(s).copy_(&masks);
+
+            s_actions.get(step as i64).copy_(&actions);
+            s_values.get(step as i64).copy_(&critic.squeeze_dim(-1));
+            s_states.get(step as i64 + 1).copy_(&step_state.obs);
+            s_rewards.get(step as i64).copy_(&step_state.reward);
+            s_masks.get(step as i64).copy_(&masks);
+
+            current_obs = step_state.obs;
+            
+            env.step += 1;
         }
+        
+        println!("total rewards: {} sum rewards: {}", total_rewards, sum_rewards);
+        
         let states = s_states
-            .narrow(0, 0, NSTEPS)
-            .view([MEMORY_SIZE, TICKERS_COUNT, 84, 84]);
+            .narrow(0, 0, n_steps)
+            .view([memory_size, TICKERS_COUNT, OBSERVATIONS_PER_TICKER as i64]);
         let returns = {
-            let r = Tensor::zeros([NSTEPS + 1, NPROCS], FLOAT_CPU);
+            let r = Tensor::zeros([n_steps + 1, NPROCS], FLOAT_CPU);
             let critic = tch::no_grad(|| model(&s_states.get(-1)).0);
             r.get(-1).copy_(&critic.view([NPROCS]));
-            for s in (0..NSTEPS).rev() {
+            for s in (0..n_steps).rev() {
                 let r_s = s_rewards.get(s) + r.get(s + 1) * s_masks.get(s) * 0.99;
                 r.get(s).copy_(&r_s);
             }
-            r.narrow(0, 0, NSTEPS).view([MEMORY_SIZE, 1])
+            r.narrow(0, 0, n_steps).view([memory_size, 1])
         };
-        let actions = s_actions.view([MEMORY_SIZE]);
+        let actions = s_actions.view([memory_size, TICKERS_COUNT]);
         for _index in 0..OPTIM_EPOCHS {
-            let batch_indexes = Tensor::randint(MEMORY_SIZE, [OPTIM_BATCHSIZE], INT64_CUDA);
+            let batch_indexes = Tensor::randint(memory_size, [OPTIM_BATCHSIZE], INT64_CPU);
             let states = states.index_select(0, &batch_indexes);
             let actions = actions.index_select(0, &batch_indexes);
             let returns = returns.index_select(0, &batch_indexes);
@@ -191,18 +178,18 @@ pub fn train() {
             // Moderately aggressive clip
             opt.backward_step_clip_norm(&loss, 1.0);
         }
-        if update_index > 0 && update_index % 25 == 0 {
+        if episode > 0 && episode % 25 == 0 {
             println!(
                 "{} {:.0} {}",
-                update_index,
+                episode,
                 total_episodes,
                 total_rewards / total_episodes
             );
             total_rewards = 0.;
             total_episodes = 0.;
         }
-        if update_index > 0 && update_index % 1000 == 0 {
-            if let Err(err) = vs.save(format!("trpo{update_index}.ot")) {
+        if episode > 0 && episode % 1000 == 0 {
+            if let Err(err) = vs.save(format!("trpo{episode}.ot")) {
                 println!("error while saving {err}")
             }
         }

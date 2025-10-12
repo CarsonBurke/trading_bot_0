@@ -1,2 +1,3 @@
-pub const OBSERVATION_SPACE: usize = 1000;
 pub const TICKERS_COUNT: i64 = 5;
+pub const OBSERVATIONS_PER_TICKER: usize = 200;
+pub const OBSERVATION_SPACE: usize = TICKERS_COUNT as usize * OBSERVATIONS_PER_TICKER;
