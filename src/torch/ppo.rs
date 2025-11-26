@@ -1,4 +1,5 @@
 use std::time::Instant;
+use serde::de::value;
 use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::constants::{OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT};
@@ -259,17 +260,30 @@ pub fn train() {
                 // Compute advantages = returns - critic_prediction
                 // returns is constant (no gradients), critic has gradients
                 let advantages = &returns_sample - &critic;
-
-                // Value loss: MSE between critic prediction and returns
-                // This trains the critic to predict returns accurately
-                let value_loss = advantages.pow_tensor_scalar(2).mean(Kind::Float);
-
+                // Old predictions from buffer
+                let values_old_sample = s_values
+                    .view([memory_size, 1])
+                    .index_select(0, &batch_indexes);
+                
+                // Clipped value prediction
+                let value_pred_clipped =
+                    &values_old_sample + (&critic - &values_old_sample).clamp(-0.2, 0.2);
+                
+                // Unclipped and clipped MSE vs returns
+                let value_loss_unclipped = (&critic - &returns_sample).pow_tensor_scalar(2);
+                let value_loss_clipped   = (&value_pred_clipped - &returns_sample).pow_tensor_scalar(2);
+                
+                // Final value loss
+                let value_loss = value_loss_unclipped
+                    .max_other(&value_loss_clipped)
+                    .mean(Kind::Float);
+               
                 // For policy gradient: use detached advantages and normalize
                 // Detaching prevents policy gradients from affecting the critic through advantages
                 let advantages_detached = advantages.detach();
                 let adv_mean = advantages_detached.mean(Kind::Float);
                 let adv_std = advantages_detached.std(false);
-                let advantages_normalized = (&advantages_detached - adv_mean) / (adv_std + 1e-8);
+                let advantages_normalized = ((&advantages_detached - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
 
                 let action_loss = (-advantages_normalized * action_log_probs).mean(Kind::Float);
                 // Increased entropy bonus from 0.01 to 0.05 to encourage more exploration

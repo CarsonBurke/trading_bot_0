@@ -25,22 +25,22 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     let c1 = nn::conv1d(p / "c1", 1, 64, 8, stride(2));  // Regular conv for stem
 
     // Block 2: 64 -> 128 channels (depthwise + pointwise)
-    let gn2 = nn::group_norm(p / "gn2", 32, 64, Default::default());
+    let gn2 = nn::group_norm(p / "gn2", 8, 64, Default::default());
     let c2_dw = nn::conv1d(p / "c2_dw", 64, 64, 5, nn::ConvConfig { stride: 2, groups: 64, ..Default::default() });  // Depthwise
     let c2_pw = nn::conv1d(p / "c2_pw", 64, 128, 1, Default::default());  // Pointwise 1x1 to expand
 
     // Block 3: 128 -> 256 channels (depthwise + pointwise)
-    let gn3 = nn::group_norm(p / "gn3", 32, 128, Default::default());
+    let gn3 = nn::group_norm(p / "gn3", 8, 128, Default::default());
     let c3_dw = nn::conv1d(p / "c3_dw", 128, 128, 3, nn::ConvConfig { stride: 2, groups: 128, ..Default::default() });  // Depthwise
     let c3_pw = nn::conv1d(p / "c3_pw", 128, 256, 1, Default::default());  // Pointwise 1x1 to expand
 
     // Block 4: 256 -> 256 channels (depthwise + pointwise)
-    let gn4 = nn::group_norm(p / "gn4", 32, 256, Default::default());
+    let gn4 = nn::group_norm(p / "gn4", 8, 256, Default::default());
     let c4_dw = nn::conv1d(p / "c4_dw", 256, 256, 3, nn::ConvConfig { stride: 1, groups: 256, ..Default::default() });  // Depthwise
     let c4_pw = nn::conv1d(p / "c4_pw", 256, 256, 1, Default::default());  // Pointwise 1x1 (maintain)
 
     // Block 5: 256 -> 256 channels (depthwise + pointwise) with residual
-    let gn5 = nn::group_norm(p / "gn5", 32, 256, Default::default());
+    let gn5 = nn::group_norm(p / "gn5", 8, 256, Default::default());
     let c5_dw = nn::conv1d(p / "c5_dw", 256, 256, 3, nn::ConvConfig { stride: 1, groups: 256, padding: 1, ..Default::default() });  // Depthwise with padding
     let c5_pw = nn::conv1d(p / "c5_pw", 256, 256, 1, Default::default());  // Pointwise 1x1 (maintain)
 
