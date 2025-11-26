@@ -72,9 +72,6 @@ pub fn train() {
 
     for episode in 0..UPDATES {
         let mut episode_reward = 0.0;
-        
-        s_price_deltas.get(0).copy_(&s_price_deltas.get(-1));
-        s_static_obs.get(0).copy_(&s_static_obs.get(-1));
 
         let s_values = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
         let s_rewards = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
