@@ -178,7 +178,7 @@ impl Env {
 
     fn get_unrealized_pnl_reward(&self, absolute_step: usize) -> f64 {
         if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
-            // Calculate portfolio value with new positions at next step's prices
+            // Current portfolio value with new positions at next step's prices
             let next_absolute_step = absolute_step + 1;
             let total_assets_after_trade = self
                 .account
@@ -187,8 +187,6 @@ impl Env {
                 .sum::<f64>()
                 + self.account.cash;
 
-            // Log return: ln(after/before) - naturally bounded and symmetric
-            // 10% gain → 0.095, 10% loss → -0.105
             (total_assets_after_trade / self.account.total_assets).ln()
         } else {
             0.0
