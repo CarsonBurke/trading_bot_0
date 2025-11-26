@@ -11,6 +11,8 @@ const OPTIM_MINIBATCH: i64 = 512;  // Mini-batch size for GPU processing (avoids
 const OPTIM_EPOCHS: i64 = 4; 
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
+const GAMMA: f64 = 0.995;
+const GAE_LAMBDA: f64 = 0.98;
 
 pub fn train() {
     let mut env = Env::new();
@@ -31,7 +33,7 @@ pub fn train() {
     let mut vs = nn::VarStore::new(device);
     let model = model(&vs.root(), TICKERS_COUNT * 2);  // 2 actions per ticker: buy/sell + hold
     // Reduced learning rate to prevent premature convergence
-    let mut opt = nn::Adam::default().build(&vs, 1e-4).unwrap();
+    let mut opt = nn::Adam::default().build(&vs, 2e-4).unwrap();
 
     // Disabled FP16 - with GAP reducing params from 39M to 284K, FP32 easily fits in VRAM
     // FP16 causes NaN issues in tch-rs, especially with complex architectures
@@ -187,21 +189,45 @@ pub fn train() {
             STATIC_OBSERVATIONS as i64,
         ]);
 
-        let returns = {
-            let r = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Float, device));
-            let critic = tch::no_grad(|| {
+        let (advantages, returns) = {
+            let gae = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Float, device));
+            let returns = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Float, device));
+
+            // Bootstrap value for next state
+            let next_value = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(-1).to_device(device);
                 let static_obs = s_static_obs.get(-1);
-                model(&price_deltas_gpu, &static_obs, false).0  // eval mode in FP32
+                model(&price_deltas_gpu, &static_obs, false).0.view([NPROCS])
             });
-            r.get(-1).copy_(&critic.view([NPROCS]));
-            // Increased discount factor from 0.99 to 0.995 for longer-term thinking
-            // This encourages holding profitable positions longer
+
+            // Compute GAE backwards
             for s in (0..n_steps).rev() {
-                let r_s = s_rewards.get(s) + r.get(s + 1) * s_masks.get(s) * 0.995;
-                r.get(s).copy_(&r_s);
+                let value_t = s_values.get(s);
+                let value_next = if s == n_steps - 1 {
+                    next_value.shallow_clone()
+                } else {
+                    s_values.get(s + 1)
+                };
+
+                // TD error: δ_t = r_t + γ * V(s_{t+1}) * mask - V(s_t)
+                let delta = s_rewards.get(s) + GAMMA * &value_next * s_masks.get(s) - &value_t;
+
+                // GAE: A_t = δ_t + γ * λ * mask * A_{t+1}
+                let gae_next = if s == n_steps - 1 {
+                    Tensor::zeros_like(&delta)
+                } else {
+                    gae.get(s + 1)
+                };
+                let gae_t = delta + GAMMA * GAE_LAMBDA * s_masks.get(s) * gae_next;
+                gae.get(s).copy_(&gae_t);
+
+                // Returns: R_t = A_t + V(s_t)
+                let return_t = &gae_t + &value_t;
+                returns.get(s).copy_(&return_t);
             }
-            r.narrow(0, 0, n_steps).view([memory_size, 1])
+
+            (gae.narrow(0, 0, n_steps).view([memory_size, 1]),
+             returns.narrow(0, 0, n_steps).view([memory_size, 1]))
         };
         let actions = s_actions.view([memory_size, TICKERS_COUNT * 2]);
         let old_log_probs = s_log_probs.view([memory_size]);
@@ -229,6 +255,7 @@ pub fn train() {
                 let static_obs_sample = static_obs_batch.index_select(0, &batch_indexes);
                 let actions_sample = actions.index_select(0, &batch_indexes);
                 let returns_sample = returns.index_select(0, &batch_indexes);
+                let advantages_sample = advantages.index_select(0, &batch_indexes);
                 let old_log_probs_sample = old_log_probs.index_select(0, &batch_indexes);
 
                 let (critic, (action_mean, action_log_std)) = model(&price_deltas_sample, &static_obs_sample, true);  // train mode during optimization
@@ -271,32 +298,28 @@ pub fn train() {
                     .sum_dim_intlist(-1, false, Kind::Float)
                     .mean(Kind::Float);
 
-                // Compute advantages = returns - critic_prediction
-                // returns is constant (no gradients), critic has gradients
-                let advantages = &returns_sample - &critic;
                 // Old predictions from buffer
                 let values_old_sample = s_values
                     .view([memory_size, 1])
                     .index_select(0, &batch_indexes);
-                
+
                 // Clipped value prediction
                 let value_pred_clipped =
                     &values_old_sample + (&critic - &values_old_sample).clamp(-0.2, 0.2);
-                
+
                 // Unclipped and clipped MSE vs returns
                 let value_loss_unclipped = (&critic - &returns_sample).pow_tensor_scalar(2);
                 let value_loss_clipped   = (&value_pred_clipped - &returns_sample).pow_tensor_scalar(2);
-                
+
                 // Final value loss
                 let value_loss = value_loss_unclipped
                     .max_other(&value_loss_clipped)
                     .mean(Kind::Float);
-               
-                // PPO clipped objective
-                let advantages_detached = advantages.detach();
-                let adv_mean = advantages_detached.mean(Kind::Float);
-                let adv_std = advantages_detached.std(false);
-                let advantages_normalized = ((&advantages_detached - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
+
+                // PPO clipped objective with pre-computed GAE advantages
+                let adv_mean = advantages_sample.mean(Kind::Float);
+                let adv_std = advantages_sample.std(false);
+                let advantages_normalized = ((&advantages_sample - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
 
                 let ratio = (action_log_probs - &old_log_probs_sample).exp();
                 let unclipped_obj = &ratio * &advantages_normalized;
