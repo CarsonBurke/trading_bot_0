@@ -10,7 +10,7 @@ use plotters::{
 };
 use time::OffsetDateTime;
 
-use crate::{types::Data};
+use crate::types::Data;
 
 pub fn chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
     let root = BitMapBackend::new("charts/chart.png", (1024, 768)).into_drawing_area();
@@ -113,22 +113,26 @@ pub fn candle_chart(
     Ok(())
 }
 
-pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn std::error::Error>> {
+pub fn simple_chart(
+    dir: &String,
+    name: &str,
+    data: &Data,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.png");
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
     let y_min = data
-    .iter()
-    .min_by(|a, b| a.partial_cmp(b).unwrap())
-    .unwrap()
-    * 0.9;
+        .iter()
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap()
+        * 0.9;
 
-let y_max = data
-    .iter()
-    .max_by(|a, b| a.partial_cmp(b).unwrap())
-    .unwrap()
-    * 1.1;
+    let y_max = data
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap()
+        * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
         .caption(name, ("sans-serif", 20))
@@ -199,13 +203,13 @@ pub fn buy_sell_chart(
     )?;
 
     let point_size = 4;
-    
+
     // Sells
     chart.draw_series(PointSeries::of_element(
         sell_indexes
             .iter()
             .map(|(index, value)| (*index as u32, value.0)),
-            point_size,
+        point_size,
         YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
@@ -215,7 +219,7 @@ pub fn buy_sell_chart(
         buy_indexes
             .iter()
             .map(|(index, value)| (*index as u32, value.0)),
-            point_size,
+        point_size,
         RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
@@ -277,7 +281,7 @@ pub fn buy_sell_chart_vec(
             .enumerate()
             .filter(|(_, &value)| value > 0.0)
             .map(|(index, _)| (index as u32, data[index])),
-            point_size,
+        point_size,
         YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
@@ -289,7 +293,7 @@ pub fn buy_sell_chart_vec(
             .enumerate()
             .filter(|(_, &value)| value > 0.0)
             .map(|(index, _)| (index as u32, data[index])),
-            point_size,
+        point_size,
         RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
@@ -299,7 +303,6 @@ pub fn buy_sell_chart_vec(
 
     Ok(())
 }
-
 
 pub fn assets_chart(
     dir: &String,
@@ -342,13 +345,18 @@ pub fn assets_chart(
         if let Some(positioned) = positioned {
             positioned
         } else {
-            &assets.iter().zip(cash).map(|(a, b)| a - b).collect::<Vec<f64>>()
+            &assets
+                .iter()
+                .zip(cash)
+                .map(|(a, b)| a - b)
+                .collect::<Vec<f64>>()
         }
     };
 
     chart.draw_series(
         AreaSeries::new(
-            positioned.iter()
+            positioned
+                .iter()
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value as f32)),
             0.0,
@@ -383,19 +391,21 @@ pub fn want_chart(
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let smoothed_wants = (0..data.len()).map(|index| {
-        (index as u32, *wants.get(&index).unwrap_or(&0.))
-    } ).collect::<Vec<(u32, f64)>>();
+    let smoothed_wants = (0..data.len())
+        .map(|index| (index as u32, *wants.get(&index).unwrap_or(&0.)))
+        .collect::<Vec<(u32, f64)>>();
 
     let y_min = wants
         .iter()
         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap_or((&0, &0.)).1
+        .unwrap_or((&0, &0.))
+        .1
         * 0.9;
     let y_max = wants
         .iter()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap_or((&0, &0.)).1
+        .unwrap_or((&0, &0.))
+        .1
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
@@ -413,7 +423,7 @@ pub fn want_chart(
         AreaSeries::new(
             smoothed_wants,
             /* wants.iter()
-                .map(|(index, value)| (*index as u32, *value)), */
+            .map(|(index, value)| (*index as u32, *value)), */
             0.0,
             PURPLE.mix(0.2),
         )
@@ -426,10 +436,7 @@ pub fn want_chart(
     Ok(())
 }
 
-pub fn reward_chart(
-    dir: &String,
-    rewards: &Vec<f64>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn reward_chart(dir: &String, rewards: &Vec<f64>) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/reward.png");
     let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
     root.fill(&WHITE)?;
@@ -446,7 +453,7 @@ pub fn reward_chart(
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Buy Sell Chart", ("sans-serif", 20))
+        .caption("Rewards", ("sans-serif", 20))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
@@ -458,7 +465,8 @@ pub fn reward_chart(
 
     chart.draw_series(
         AreaSeries::new(
-            rewards.iter()
+            rewards
+                .iter()
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value)),
             0.0,
@@ -466,6 +474,49 @@ pub fn reward_chart(
         )
         .border_style(YELLOW),
     )?;
+
+    root.present()
+        .expect("unable to write chart to file, perhaps there is no directory");
+
+    Ok(())
+}
+
+pub fn hold_action_chart(
+    dir: &String,
+    hold_actions: &Vec<f64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("{dir}/hold_action.png");
+    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let y_min = hold_actions
+        .iter()
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(&-1.0)
+        * 1.1;
+    let y_max = hold_actions
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(&1.0)
+        * 1.1;
+
+    let mut chart = plotters::chart::ChartBuilder::on(&root)
+        .caption("Hold Action (range: -1 to 1)", ("sans-serif", 20))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..hold_actions.len() as u32, y_min..y_max)?;
+
+    chart.configure_mesh().light_line_style(WHITE).draw()?;
+
+    // Hold actions as line series
+    chart.draw_series(LineSeries::new(
+        hold_actions
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as u32, *value)),
+        PURPLE,
+    ))?;
 
     root.present()
         .expect("unable to write chart to file, perhaps there is no directory");

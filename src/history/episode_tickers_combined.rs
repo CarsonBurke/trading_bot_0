@@ -1,7 +1,7 @@
 use hashbrown::HashMap;
 
 use crate::{
-    charts::general::{assets_chart, buy_sell_chart, buy_sell_chart_vec, reward_chart},
+    charts::general::{assets_chart, buy_sell_chart, buy_sell_chart_vec, hold_action_chart, reward_chart},
     constants::{files::TRAINING_PATH, TICKERS},
     types::MappedHistorical,
     utils::create_folder_if_not_exists,
@@ -14,6 +14,7 @@ pub struct EpisodeHistory {
     pub positioned: Vec<Vec<f64>>,
     pub cash: Vec<f64>,
     pub rewards: Vec<f64>,
+    pub hold_actions: Vec<Vec<f64>>,  // Hold action value for each ticker at each step
 }
 
 impl EpisodeHistory {
@@ -24,6 +25,7 @@ impl EpisodeHistory {
             positioned: vec![vec![]; ticker_count],
             cash: Vec::new(),
             rewards: Vec::new(),
+            hold_actions: vec![vec![]; ticker_count],
         }
     }
 
@@ -57,6 +59,12 @@ impl EpisodeHistory {
                 &total_assets,
                 &self.cash,
                 Some(positioned_assets),
+            );
+
+            // Chart hold actions for this ticker
+            let _ = hold_action_chart(
+                &ticker_dir,
+                &self.hold_actions[ticker_index],
             );
         }
 

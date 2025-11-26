@@ -15,7 +15,7 @@ use crate::torch::model::model;
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: tch::Device,
-) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor) -> (Tensor, (Tensor, Tensor))>), Box<dyn std::error::Error>> {
+) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor))>), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
     let model = model(&vs.root(), TICKERS_COUNT);
 
@@ -37,11 +37,11 @@ pub fn load_model<P: AsRef<Path>>(
 /// # Returns
 /// * (critic_value, (action_mean, action_log_std))
 pub fn infer(
-    model: &dyn Fn(&Tensor, &Tensor) -> (Tensor, (Tensor, Tensor)),
+    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor)),
     price_deltas: &Tensor,
     static_obs: &Tensor,
 ) -> (Tensor, (Tensor, Tensor)) {
-    tch::no_grad(|| model(price_deltas, static_obs))
+    tch::no_grad(|| model(price_deltas, static_obs, false))  // eval mode for inference
 }
 
 /// Sample actions from the model (for inference/evaluation)
@@ -55,13 +55,13 @@ pub fn infer(
 /// # Returns
 /// * Action tensor [batch, TICKERS_COUNT] in range approximately [-1, 1]
 pub fn sample_actions(
-    model: &dyn Fn(&Tensor, &Tensor) -> (Tensor, (Tensor, Tensor)),
+    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor)),
     price_deltas: &Tensor,
     static_obs: &Tensor,
     deterministic: bool,
 ) -> Tensor {
     let (_critic, (action_mean, action_log_std)) = tch::no_grad(|| {
-        model(price_deltas, static_obs)
+        model(price_deltas, static_obs, false)  // eval mode for inference
     });
 
     if deterministic {

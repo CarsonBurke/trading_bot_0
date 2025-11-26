@@ -22,14 +22,9 @@ pub mod rsi {
 }
 
 pub mod files {
-    // 1 year
-    pub const DATA_PATH: &str = "long_data/";// "data/";
-    // 5 years
-    pub const LONG_DATA_PATH: &str = "long_data/";
-    // 20 years
-    pub const EXTRA_LONG_DATA_PATH: &str = "extra_long_data/";
-    pub const WEIGHTS_PATH: &str = "weights/";
-    pub const TRAINING_PATH: &str = "training/";
+    pub const DATA_PATH: &str = "long_data";
+    pub const WEIGHTS_PATH: &str = "weights";
+    pub const TRAINING_PATH: &str = "training";
 }
 
 pub mod agent {

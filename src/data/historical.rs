@@ -66,11 +66,11 @@ fn get_historical_data_from_ibkr(client: &Client, ticker: &str) -> Vec<historica
             match DATA_PATH {
                 "data" => 356.days(),
                 "long_data" => 5.years(),
+                "very_long_data" => 10.years(),
                 "extra_long_data" => 20.years(),
-                _ => 356.days(),
+                _ => panic!("no data path provided"),
             },
-            /* 1.years(), */
-            BarSize::Hour,
+            BarSize::Min5,
             WhatToShow::Trades,
             true,
         )

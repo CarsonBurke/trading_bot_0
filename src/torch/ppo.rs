@@ -9,16 +9,16 @@ use std::time::Instant;
    reference python implementation.
 */
 use tch::kind::FLOAT_CPU;
-use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
+use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
-use crate::torch::constants::{TICKERS_COUNT, OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS};
+use crate::torch::constants::{OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT};
 use crate::torch::step::Env;
 use crate::torch::model::model;
 
 pub const NPROCS: i64 = 1; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
-const OPTIM_BATCHSIZE: i64 = 2048; // Reduced due to larger model size (~96M params in FC layers)
-const OPTIM_EPOCHS: i64 = 4; // More epochs to extract more learning per rollout
+const OPTIM_BATCHSIZE: i64 = 12000;
+const OPTIM_EPOCHS: i64 = 4; 
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
 
@@ -26,9 +26,9 @@ pub fn train() {
     let mut env = Env::new();
     // n_steps is the episode length - use constant since all episodes are same length
     // Episodes are capped at 1500 steps, minus 2 for buffer = 1498
-    let n_steps = 1498i64;
+    let n_steps = STEPS_PER_EPISODE as i64;
     let memory_size = n_steps * NPROCS;
-    println!("action space: {}", TICKERS_COUNT);
+    println!("action space: {} (2 actions per ticker: buy/sell + hold)", TICKERS_COUNT * 2);
     println!("observation space: {:?}", OBSERVATION_SPACE);
 
     println!("CUDA available: {}", tch::Cuda::is_available());
@@ -38,10 +38,14 @@ pub fn train() {
     let device = tch::Device::cuda_if_available();
     println!("Using device {:?}", device);
 
-    let vs = nn::VarStore::new(device);
-    let model = model(&vs.root(), TICKERS_COUNT);
+    let mut vs = nn::VarStore::new(device);
+    let model = model(&vs.root(), TICKERS_COUNT * 2);  // 2 actions per ticker: buy/sell + hold
     // Reduced learning rate to prevent premature convergence
     let mut opt = nn::Adam::default().build(&vs, 1e-4).unwrap();
+
+    // Enable mixed precision training for VRAM savings and speed
+    // Fixed batch norm epsilon (1e-4 instead of 1e-5) to prevent FP16 NaN issues
+    vs.half();
 
     // Create device-specific kind
     let float_kind = (Kind::Float, device);
@@ -52,17 +56,19 @@ pub fn train() {
     let mut total_episodes = 0f64;
 
     let (current_price_deltas_init, current_static_obs_init) = env.reset();
-    let mut current_price_deltas = current_price_deltas_init.to_device(device);
-    let mut current_static_obs = current_static_obs_init.to_device(device);
+    let mut current_price_deltas = current_price_deltas_init.to_kind(Kind::Half);  // Convert to FP16 on CPU
+    let mut current_static_obs = current_static_obs_init.to_device(device).to_kind(Kind::Half);  // Convert to FP16 on GPU
 
     // Separate storage for price deltas and static observations
+    // Store price deltas on CPU in FP16 to save VRAM (2400 deltas × 12000 steps is too large for GPU)
+    // Only move to GPU during training batches
     let s_price_deltas = Tensor::zeros(
         [
             n_steps + 1,
             NPROCS,
             TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         ],
-        float_kind,
+        (Kind::Half, Device::Cpu),  // Store on CPU in FP16 to save VRAM and match GPU precision
     );
     let s_static_obs = Tensor::zeros(
         [
@@ -70,25 +76,25 @@ pub fn train() {
             NPROCS,
             STATIC_OBSERVATIONS as i64,
         ],
-        float_kind,
+        (Kind::Half, device),  // Keep static obs on GPU in FP16
     );
 
     for episode in 0..UPDATES {
         s_price_deltas.get(0).copy_(&s_price_deltas.get(-1));
         s_static_obs.get(0).copy_(&s_static_obs.get(-1));
 
-        let s_values = Tensor::zeros([n_steps, NPROCS], float_kind);
-        let s_rewards = Tensor::zeros([n_steps, NPROCS], float_kind);
-        let s_actions = Tensor::zeros([n_steps, NPROCS, TICKERS_COUNT * 2], float_kind);
-        let s_masks = Tensor::zeros([n_steps, NPROCS], float_kind);
+        let s_values = Tensor::zeros([n_steps, NPROCS], (Kind::Half, device));
+        let s_rewards = Tensor::zeros([n_steps, NPROCS], (Kind::Half, device));
+        let s_actions = Tensor::zeros([n_steps, NPROCS, TICKERS_COUNT * 2], (Kind::Half, device));
+        let s_masks = Tensor::zeros([n_steps, NPROCS], (Kind::Half, device));
 
         // Custom loop
         let (price_deltas_reset, static_obs_reset) = env.reset();
-        current_price_deltas = price_deltas_reset.to_device(device);
-        current_static_obs = static_obs_reset.to_device(device);
+        current_price_deltas = price_deltas_reset.to_kind(Kind::Half);  // Convert to FP16 on CPU
+        current_static_obs = static_obs_reset.to_device(device).to_kind(Kind::Half);  // Convert to FP16 on GPU
         env.episode = episode as usize;
 
-        s_price_deltas.get(0).copy_(&current_price_deltas);
+        s_price_deltas.get(0).copy_(&current_price_deltas);  // CPU to CPU (FP16)
         s_static_obs.get(0).copy_(&current_static_obs);
 
         // Use a separate index (s) for tensor storage, starting from 0
@@ -98,9 +104,13 @@ pub fn train() {
             env.step = step;
 
             let (critic, (action_mean, action_log_std)) = tch::no_grad(|| {
+                // Move price deltas from CPU to GPU (already in FP16)
+                let price_deltas_gpu = s_price_deltas.get(s).to_device(device);
+                let static_obs_half = s_static_obs.get(s);
                 model(
-                    &s_price_deltas.get(s),
-                    &s_static_obs.get(s),
+                    &price_deltas_gpu,
+                    &static_obs_half,
+                    false,  // eval mode during rollout for stable observations
                 )
             });
 
@@ -113,13 +123,13 @@ pub fn train() {
             // Dividing z by 2 makes the squashing much gentler:
             // - sigmoid(z/2) changes more slowly than sigmoid(z)
             // - Reduces saturation at extremes
-            // - With std max of 0.37, most samples stay in moderate range
+            // - With std range [0.368, 2.718], provides good exploration without extreme saturation
             let actions = (z / 2.0).sigmoid() * 2.0 - 1.0;
 
             // Flatten the actions tensor [NPROCS, TICKERS_COUNT] to 1D before converting
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let actions_vec: Vec<Vec<f64>> = actions_flat
-                .chunks(TICKERS_COUNT * 2)
+                .chunks(TICKERS_COUNT as usize * 2)
                 .map(|chunk| chunk.to_vec())
                 .collect();
 
@@ -129,10 +139,11 @@ pub fn train() {
 
             // println!("Step reward: {:?}", step_state.reward);
 
-            let reward = step_state.reward.to_device(device);
+            let reward = step_state.reward.to_device(device).to_kind(Kind::Half);
             let is_done = step_state.is_done.to_device(device);
-            let price_deltas = step_state.price_deltas.to_device(device);
-            let static_obs = step_state.static_obs.to_device(device);
+            // Keep price deltas on CPU for storage in FP16, only move to GPU when needed
+            let price_deltas = step_state.price_deltas.to_kind(Kind::Half);
+            let static_obs = step_state.static_obs.to_device(device).to_kind(Kind::Half);
 
             sum_rewards += &reward;
             total_rewards += f64::try_from((&sum_rewards * &is_done).sum(Kind::Float)).unwrap();
@@ -169,9 +180,11 @@ pub fn train() {
         ]);
 
         let returns = {
-            let r = Tensor::zeros([n_steps + 1, NPROCS], float_kind);
+            let r = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Half, device));
             let critic = tch::no_grad(|| {
-                model(&s_price_deltas.get(-1), &s_static_obs.get(-1)).0
+                let price_deltas_gpu = s_price_deltas.get(-1).to_device(device);
+                let static_obs_half = s_static_obs.get(-1);
+                model(&price_deltas_gpu, &static_obs_half, false).0  // eval mode, stays in FP16
             });
             r.get(-1).copy_(&critic.view([NPROCS]));
             // Increased discount factor from 0.99 to 0.995 for longer-term thinking
@@ -188,12 +201,16 @@ pub fn train() {
 
         for _index in 0..OPTIM_EPOCHS {
             let batch_indexes = Tensor::randint(memory_size, [OPTIM_BATCHSIZE], int64_kind);
-            let price_deltas_sample = price_deltas_batch.index_select(0, &batch_indexes);
+            // For CPU tensor indexing, need CPU indices
+            let batch_indexes_cpu = batch_indexes.to_device(tch::Device::Cpu);
+            // Move price deltas batch to GPU (already in FP16)
+            let price_deltas_sample = price_deltas_batch.index_select(0, &batch_indexes_cpu).to_device(device);
             let static_obs_sample = static_obs_batch.index_select(0, &batch_indexes);
             let actions = actions.index_select(0, &batch_indexes);
             let returns = returns.index_select(0, &batch_indexes);
 
-            let (critic, (action_mean, action_log_std)) = model(&price_deltas_sample, &static_obs_sample);
+            let (critic, (action_mean, action_log_std)) = model(&price_deltas_sample, &static_obs_sample, true);  // train mode during optimization
+            // All outputs stay in FP16
 
             // Recover the unsquashed Gaussian samples z from actions
             // action = 2 * sigmoid(z/2) - 1  =>  z = 2 * logit((action + 1) / 2)
@@ -232,16 +249,21 @@ pub fn train() {
                 .sum_dim_intlist(-1, false, Kind::Float)
                 .mean(Kind::Float);
 
-            let advantages = returns - critic;
+            // Compute advantages = returns - critic_prediction
+            // returns is constant (no gradients), critic has gradients
+            let advantages = &returns - &critic;
 
-            // For policy gradient: detach advantages first, then normalize
-            // This prevents wasting computation on gradients we immediately discard
+            // Value loss: MSE between critic prediction and returns
+            // This trains the critic to predict returns accurately
+            let value_loss = advantages.pow_tensor_scalar(2).mean(Kind::Float);
+
+            // For policy gradient: use detached advantages and normalize
+            // Detaching prevents policy gradients from affecting the critic through advantages
             let advantages_detached = advantages.detach();
             let adv_mean = advantages_detached.mean(Kind::Float);
             let adv_std = advantages_detached.std(false);
             let advantages_normalized = (&advantages_detached - adv_mean) / (adv_std + 1e-8);
 
-            let value_loss = (&advantages * &advantages).mean(Kind::Float);
             let action_loss = (-advantages_normalized * action_log_probs).mean(Kind::Float);
             // Increased entropy bonus from 0.01 to 0.05 to encourage more exploration
             let loss = value_loss * 0.5 + action_loss - dist_entropy * 0.05;
@@ -255,7 +277,9 @@ pub fn train() {
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
             let (_, (debug_mean, debug_log_std)) = tch::no_grad(|| {
-                model(&s_price_deltas.get(0), &s_static_obs.get(0))
+                let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
+                let static_obs_half = s_static_obs.get(0);
+                model(&price_deltas_gpu, &static_obs_half, false)  // Stays in FP16
             });
 
             // Show actual squashed actions, not raw mean

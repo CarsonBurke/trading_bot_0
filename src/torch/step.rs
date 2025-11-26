@@ -10,8 +10,7 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_HISTORY_LEN, OBSERVATION_SPACE,
-            PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
+            ACTION_HISTORY_LEN, OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT
         },
         ppo::NPROCS,
     },
@@ -32,7 +31,7 @@ pub struct Env {
     meta_history: MetaHistory,
     episode_start: Instant,
     pub episode: usize,
-    action_history: VecDeque<Vec<f64>>, // Store last 5 actions (each action is a vec of TICKERS_COUNT values)
+    action_history: VecDeque<Vec<f64>>,
     episode_start_offset: usize,        // Random starting point in historical data for this episode
     total_data_length: usize,           // Total length of historical data
 }
@@ -42,18 +41,13 @@ impl Env {
 
     pub fn new() -> Self {
         let tickers = vec![
-            "TSLA".to_string(),
-            "AAPL".to_string(),
-            "AMD".to_string(),
-            "INTC".to_string(),
-            "MSFT".to_string(),
-        ]; // vec![
-           // "NVDA".to_string(),
-           // vec!["TSLA", "AAPL", "AMD", "INTC", "MSFT"]
-           // .choose(&mut self.rng)
-           // .unwrap()
-           // .to_string()
-           // ];
+            // "TSLA".to_string(),
+            // "AAPL".to_string(),
+            // "AMD".to_string(),
+            // "INTC".to_string(),
+            // "MSFT".to_string(),
+            "NVDA".to_string()
+        ];
 
         let mapped_bars = get_historical_data(Some(
             &tickers
@@ -111,14 +105,14 @@ impl Env {
 
             // Store actions in history
             self.action_history.push_back(actions.clone());
-            if self.action_history.len() > 5 {
+            if self.action_history.len() > ACTION_HISTORY_LEN {
                 self.action_history.pop_front();
             }
             
-            let (buy_sell_actions, hold_actions) = actions.split_at(TICKERS_COUNT);
+            let (buy_sell_actions, hold_actions) = actions.split_at(TICKERS_COUNT as usize);
 
-            // Execute trade based on current observations
-            let _ = self.trade(actions, absolute_step);
+            // Execute trade based on current observations (only use buy/sell actions)
+            let _ = self.trade(buy_sell_actions, absolute_step);
 
             let reward = self.get_unrealized_pnl_reward(absolute_step);
 
@@ -129,6 +123,8 @@ impl Env {
                     self.account.positions[index]
                         .value_with_price(self.prices[index][absolute_step]),
                 );
+                // Record hold action for this ticker
+                self.episode_history.hold_actions[index].push(hold_actions[index]);
             }
             self.episode_history.cash.push(self.account.cash);
 
@@ -195,7 +191,7 @@ impl Env {
 
             // Log return: ln(after/before) - naturally bounded and symmetric
             // 10% gain → 0.095, 10% loss → -0.105
-            (total_assets_after_trade / self.account.total_assets).ln()
+            (total_assets_after_trade / self.account.total_assets).ln() * 100.0
         } else {
             0.0
         }
@@ -223,7 +219,7 @@ impl Env {
                     self.episode_history.buys[ticker_index]
                         .insert(absolute_step, (current_price, quantity));
 
-                    let reward = (self.max_prices[ticker_index] / current_price).ln() * quantity;
+                    let reward = (self.max_prices[ticker_index] / current_price).ln() * quantity * 100.0;
                     total_reward += reward;
                 }
 
@@ -323,7 +319,7 @@ impl Env {
                     static_obs.push(action as f32);
                 }
             } else {
-                // Pad with zeros if we don't have 5 actions yet
+                // Pad with zeros if we don't have ACTION_HISTORY_LEN actions yet
                 for _ in 0..(TICKERS_COUNT * 2) {
                     static_obs.push(0.0f32);
                 }
@@ -336,10 +332,10 @@ impl Env {
     pub fn reset(&mut self) -> (Tensor, Tensor) {
         // Randomly select starting point in historical data
         // Leave at least 1500 steps for a full episode + observations buffer
-        let min_episode_length = 1500;
+       
         let max_start = self
             .total_data_length
-            .saturating_sub(min_episode_length + PRICE_DELTAS_PER_TICKER);
+            .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
 
         let mut rng = rand::thread_rng();
         self.episode_start_offset = if max_start > PRICE_DELTAS_PER_TICKER {
@@ -351,7 +347,7 @@ impl Env {
         self.step = 0;
         // Episode runs from offset to end of data (or max length)
         self.max_step =
-            (self.total_data_length - self.episode_start_offset).min(min_episode_length) - 2;
+            (self.total_data_length - self.episode_start_offset).min(STEPS_PER_EPISODE) - 2;
 
         self.account = Account::new(Self::STARTING_CASH, self.tickers.len());
 
