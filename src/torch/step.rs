@@ -189,7 +189,7 @@ impl Env {
 
             // Log return: ln(after/before) - naturally bounded and symmetric
             // 10% gain → 0.095, 10% loss → -0.105
-            (total_assets_after_trade / self.account.total_assets).ln() * 100.0
+            (total_assets_after_trade / self.account.total_assets).ln()
         } else {
             0.0
         }
