@@ -1,5 +1,4 @@
 use std::time::Instant;
-use serde::de::value;
 use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::constants::{OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT};
