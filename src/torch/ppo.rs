@@ -80,6 +80,7 @@ pub fn train() {
         let s_rewards = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
         let s_actions = Tensor::zeros([n_steps, NPROCS, TICKERS_COUNT * 2], (Kind::Float, device));
         let s_masks = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
+        let s_log_probs = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
 
         // Custom loop
         let (price_deltas_reset, static_obs_reset) = env.reset();
@@ -112,12 +113,26 @@ pub fn train() {
             let noise = Tensor::randn_like(&action_mean);
             let z = &action_mean + &action_std * noise;
 
+            // Compute log probability for the sampled z
+            let z_normalized = (&z - &action_mean) / &action_std;
+            let z_squared = z_normalized.pow_tensor_scalar(2);
+            let two_log_std = &action_log_std * 2.0;
+            let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
+
             // Softer sigmoid squashing: action = 2 * sigmoid(z/2) - 1
             // Dividing z by 2 makes the squashing much gentler:
             // - sigmoid(z/2) changes more slowly than sigmoid(z)
             // - Reduces saturation at extremes
             // - With std range [0.368, 2.718], provides good exploration without extreme saturation
-            let actions = (z / 2.0).sigmoid() * 2.0 - 1.0;
+            let actions = (&z / 2.0).sigmoid() * 2.0 - 1.0;
+
+            // Compute log Jacobian for the squashing transformation
+            let sigmoid_z_half = (&z / 2.0).sigmoid();
+            let one_minus_sigmoid = Tensor::from(1.0) - &sigmoid_z_half;
+            let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
+
+            // Final log probability
+            let action_log_prob = (log_prob_z - log_jacobian).sum_dim_intlist(-1, false, Kind::Float);
 
             // Flatten the actions tensor [NPROCS, TICKERS_COUNT] to 1D before converting
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
@@ -150,6 +165,7 @@ pub fn train() {
 
             s_actions.get(s).copy_(&actions);
             s_values.get(s).copy_(&critic.squeeze_dim(-1));
+            s_log_probs.get(s).copy_(&action_log_prob);
             s_price_deltas.get(s + 1).copy_(&price_deltas);
             s_static_obs.get(s + 1).copy_(&static_obs);
             s_rewards.get(s).copy_(&reward);
@@ -192,6 +208,7 @@ pub fn train() {
             r.narrow(0, 0, n_steps).view([memory_size, 1])
         };
         let actions = s_actions.view([memory_size, TICKERS_COUNT * 2]);
+        let old_log_probs = s_log_probs.view([memory_size]);
 
         let opt_start = Instant::now();
 
@@ -216,6 +233,7 @@ pub fn train() {
                 let static_obs_sample = static_obs_batch.index_select(0, &batch_indexes);
                 let actions_sample = actions.index_select(0, &batch_indexes);
                 let returns_sample = returns.index_select(0, &batch_indexes);
+                let old_log_probs_sample = old_log_probs.index_select(0, &batch_indexes);
 
                 let (critic, (action_mean, action_log_std)) = model(&price_deltas_sample, &static_obs_sample, true);  // train mode during optimization
                 // All outputs in FP32
@@ -278,15 +296,20 @@ pub fn train() {
                     .max_other(&value_loss_clipped)
                     .mean(Kind::Float);
                
-                // For policy gradient: use detached advantages and normalize
-                // Detaching prevents policy gradients from affecting the critic through advantages
+                // PPO clipped objective
                 let advantages_detached = advantages.detach();
                 let adv_mean = advantages_detached.mean(Kind::Float);
                 let adv_std = advantages_detached.std(false);
                 let advantages_normalized = ((&advantages_detached - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
 
-                let action_loss = (-advantages_normalized * action_log_probs).mean(Kind::Float);
-                // Increased entropy bonus from 0.01 to 0.05 to encourage more exploration
+                let ratio = (action_log_probs - &old_log_probs_sample).exp();
+                let unclipped_obj = &ratio * &advantages_normalized;
+
+                let ratio_clipped = ratio.clamp(0.8, 1.2);
+                let clipped_obj = ratio_clipped * &advantages_normalized;
+
+                let action_loss = -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
+                // Relatively high 0.05 entropy bonus to encourage more exploration
                 let loss = value_loss * 0.5 + action_loss - dist_entropy * 0.05;
 
                 // Moderately aggressive clip
