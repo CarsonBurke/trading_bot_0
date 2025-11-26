@@ -1,14 +1,4 @@
 use std::time::Instant;
-
-/* Proximal Policy Optimization (PPO) model.
-
-   Proximal Policy Optimization Algorithms, Schulman et al. 2017
-   https://arxiv.org/abs/1707.06347
-
-   See https://spinningup.openai.com/en/latest/algorithms/ppo.html for a
-   reference python implementation.
-*/
-use tch::kind::FLOAT_CPU;
 use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::constants::{OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT};
@@ -17,7 +7,7 @@ use crate::torch::model::model;
 
 pub const NPROCS: i64 = 1; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
-const OPTIM_BATCHSIZE: i64 = 12000;
+const OPTIM_MINIBATCH: i64 = 512;  // Mini-batch size for GPU processing (avoids OOM)
 const OPTIM_EPOCHS: i64 = 4; 
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
@@ -43,9 +33,9 @@ pub fn train() {
     // Reduced learning rate to prevent premature convergence
     let mut opt = nn::Adam::default().build(&vs, 1e-4).unwrap();
 
-    // Enable mixed precision training for VRAM savings and speed
-    // Fixed batch norm epsilon (1e-4 instead of 1e-5) to prevent FP16 NaN issues
-    vs.half();
+    // Disabled FP16 - with GAP reducing params from 39M to 284K, FP32 easily fits in VRAM
+    // FP16 causes NaN issues in tch-rs, especially with complex architectures
+    // vs.half();
 
     // Create device-specific kind
     let float_kind = (Kind::Float, device);
@@ -56,11 +46,11 @@ pub fn train() {
     let mut total_episodes = 0f64;
 
     let (current_price_deltas_init, current_static_obs_init) = env.reset();
-    let mut current_price_deltas = current_price_deltas_init.to_kind(Kind::Half);  // Convert to FP16 on CPU
-    let mut current_static_obs = current_static_obs_init.to_device(device).to_kind(Kind::Half);  // Convert to FP16 on GPU
+    let mut current_price_deltas = current_price_deltas_init;  // Keep in FP32
+    let mut current_static_obs = current_static_obs_init.to_device(device);  // Keep in FP32
 
     // Separate storage for price deltas and static observations
-    // Store price deltas on CPU in FP16 to save VRAM (2400 deltas × 12000 steps is too large for GPU)
+    // Store price deltas on CPU to save VRAM (2400 deltas × 12000 steps is large)
     // Only move to GPU during training batches
     let s_price_deltas = Tensor::zeros(
         [
@@ -68,7 +58,7 @@ pub fn train() {
             NPROCS,
             TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         ],
-        (Kind::Half, Device::Cpu),  // Store on CPU in FP16 to save VRAM and match GPU precision
+        (Kind::Float, Device::Cpu),  // Store on CPU in FP32
     );
     let s_static_obs = Tensor::zeros(
         [
@@ -76,25 +66,27 @@ pub fn train() {
             NPROCS,
             STATIC_OBSERVATIONS as i64,
         ],
-        (Kind::Half, device),  // Keep static obs on GPU in FP16
+        (Kind::Float, device),  // Keep static obs on GPU in FP32
     );
 
     for episode in 0..UPDATES {
+        let mut episode_reward = 0.0;
+        
         s_price_deltas.get(0).copy_(&s_price_deltas.get(-1));
         s_static_obs.get(0).copy_(&s_static_obs.get(-1));
 
-        let s_values = Tensor::zeros([n_steps, NPROCS], (Kind::Half, device));
-        let s_rewards = Tensor::zeros([n_steps, NPROCS], (Kind::Half, device));
-        let s_actions = Tensor::zeros([n_steps, NPROCS, TICKERS_COUNT * 2], (Kind::Half, device));
-        let s_masks = Tensor::zeros([n_steps, NPROCS], (Kind::Half, device));
+        let s_values = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
+        let s_rewards = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
+        let s_actions = Tensor::zeros([n_steps, NPROCS, TICKERS_COUNT * 2], (Kind::Float, device));
+        let s_masks = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
 
         // Custom loop
         let (price_deltas_reset, static_obs_reset) = env.reset();
-        current_price_deltas = price_deltas_reset.to_kind(Kind::Half);  // Convert to FP16 on CPU
-        current_static_obs = static_obs_reset.to_device(device).to_kind(Kind::Half);  // Convert to FP16 on GPU
+        current_price_deltas = price_deltas_reset;  // Keep in FP32
+        current_static_obs = static_obs_reset.to_device(device);  // Keep in FP32
         env.episode = episode as usize;
 
-        s_price_deltas.get(0).copy_(&current_price_deltas);  // CPU to CPU (FP16)
+        s_price_deltas.get(0).copy_(&current_price_deltas);  // CPU to CPU (FP32)
         s_static_obs.get(0).copy_(&current_static_obs);
 
         // Use a separate index (s) for tensor storage, starting from 0
@@ -139,14 +131,17 @@ pub fn train() {
 
             // println!("Step reward: {:?}", step_state.reward);
 
-            let reward = step_state.reward.to_device(device).to_kind(Kind::Half);
+            let reward = step_state.reward.to_device(device);
             let is_done = step_state.is_done.to_device(device);
-            // Keep price deltas on CPU for storage in FP16, only move to GPU when needed
-            let price_deltas = step_state.price_deltas.to_kind(Kind::Half);
-            let static_obs = step_state.static_obs.to_device(device).to_kind(Kind::Half);
+            // Keep price deltas on CPU for storage, only move to GPU when needed
+            let price_deltas = step_state.price_deltas;
+            let static_obs = step_state.static_obs.to_device(device);
 
             sum_rewards += &reward;
-            total_rewards += f64::try_from((&sum_rewards * &is_done).sum(Kind::Float)).unwrap();
+            
+            let reward_float = f64::try_from((&sum_rewards * &is_done).sum(Kind::Float)).unwrap();
+            episode_reward += reward_float;
+            total_rewards += reward_float;
             total_episodes += f64::try_from(is_done.sum(Kind::Float)).unwrap();
 
             let masks = Tensor::from(1f32).to_device(device) - &is_done;
@@ -166,8 +161,8 @@ pub fn train() {
         }
 
         println!(
-            "total rewards: {} sum rewards: {}",
-            total_rewards, sum_rewards
+            "episode rewards: {}",
+            episode_reward
         );
 
         let price_deltas_batch = s_price_deltas.narrow(0, 0, n_steps).view([
@@ -180,11 +175,11 @@ pub fn train() {
         ]);
 
         let returns = {
-            let r = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Half, device));
+            let r = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Float, device));
             let critic = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(-1).to_device(device);
-                let static_obs_half = s_static_obs.get(-1);
-                model(&price_deltas_gpu, &static_obs_half, false).0  // eval mode, stays in FP16
+                let static_obs = s_static_obs.get(-1);
+                model(&price_deltas_gpu, &static_obs, false).0  // eval mode in FP32
             });
             r.get(-1).copy_(&critic.view([NPROCS]));
             // Increased discount factor from 0.99 to 0.995 for longer-term thinking
@@ -199,78 +194,91 @@ pub fn train() {
 
         let opt_start = Instant::now();
 
-        for _index in 0..OPTIM_EPOCHS {
-            let batch_indexes = Tensor::randint(memory_size, [OPTIM_BATCHSIZE], int64_kind);
-            // For CPU tensor indexing, need CPU indices
-            let batch_indexes_cpu = batch_indexes.to_device(tch::Device::Cpu);
-            // Move price deltas batch to GPU (already in FP16)
-            let price_deltas_sample = price_deltas_batch.index_select(0, &batch_indexes_cpu).to_device(device);
-            let static_obs_sample = static_obs_batch.index_select(0, &batch_indexes);
-            let actions = actions.index_select(0, &batch_indexes);
-            let returns = returns.index_select(0, &batch_indexes);
+        for _epoch in 0..OPTIM_EPOCHS {
+            // Shuffle indices for this epoch
+            let shuffled_indices = Tensor::randperm(memory_size, int64_kind);
 
-            let (critic, (action_mean, action_log_std)) = model(&price_deltas_sample, &static_obs_sample, true);  // train mode during optimization
-            // All outputs stay in FP16
+            // Process in mini-batches to avoid VRAM overflow
+            let num_minibatches = (memory_size + OPTIM_MINIBATCH - 1) / OPTIM_MINIBATCH;
 
-            // Recover the unsquashed Gaussian samples z from actions
-            // action = 2 * sigmoid(z/2) - 1  =>  z = 2 * logit((action + 1) / 2)
-            // Add small epsilon for numerical stability
-            let eps = 1e-6;
-            let action_01 = (&actions + 1.0) / 2.0;  // Transform from [-1, 1] to [0, 1]
-            let action_01_clamped = action_01.clamp(eps, 1.0 - eps);  // Prevent log(0)
-            let one_minus_action = Tensor::from(1.0) - &action_01_clamped;
-            let z = (&action_01_clamped.log() - one_minus_action.log()) * 2.0;  // 2 * logit function
+            for minibatch_idx in 0..num_minibatches {
+                let start_idx = minibatch_idx * OPTIM_MINIBATCH;
+                let end_idx = (start_idx + OPTIM_MINIBATCH).min(memory_size);
+                let minibatch_size = end_idx - start_idx;
 
-            // Compute log probability of z under Gaussian N(action_mean, action_std)
-            let action_std = action_log_std.exp();
-            let z_normalized = (&z - &action_mean) / &action_std;
-            let z_squared = z_normalized.pow_tensor_scalar(2);
-            let two_log_std = &action_log_std * 2.0;
-            let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
+                // Get indices for this mini-batch
+                let batch_indexes = shuffled_indices.narrow(0, start_idx, minibatch_size);
+                let batch_indexes_cpu = batch_indexes.to_device(tch::Device::Cpu);
 
-            // Compute log Jacobian correction for softer sigmoid squashing
-            // action = 2 * sigmoid(z/2) - 1
-            // |d_action/dz| = sigmoid(z/2) * (1 - sigmoid(z/2))
-            // log|d_action/dz| = log(sigmoid(z/2)) + log(1 - sigmoid(z/2))
-            let sigmoid_z_half = (&z / 2.0).sigmoid();
-            let one_minus_sigmoid = Tensor::from(1.0) - &sigmoid_z_half;
-            let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
+                // Move only mini-batch to GPU (in FP32)
+                let price_deltas_sample = price_deltas_batch.index_select(0, &batch_indexes_cpu).to_device(device);
+                let static_obs_sample = static_obs_batch.index_select(0, &batch_indexes);
+                let actions_sample = actions.index_select(0, &batch_indexes);
+                let returns_sample = returns.index_select(0, &batch_indexes);
 
-            // Final log probability: log p(action) = log p(z) - log|d_action/dz|
-            let action_log_probs = (log_prob_z - log_jacobian)
-                .sum_dim_intlist(-1, false, Kind::Float);
+                let (critic, (action_mean, action_log_std)) = model(&price_deltas_sample, &static_obs_sample, true);  // train mode during optimization
+                // All outputs in FP32
 
-            // Entropy approximation: Use base Gaussian entropy
-            // Note: Exact entropy of sigmoid-squashed distribution is complex to compute
-            // Using Gaussian entropy as approximation is standard practice for regularization
-            let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * action_log_std;
-            let dist_entropy = entropy_components
-                .g_mul_scalar(0.5)
-                .sum_dim_intlist(-1, false, Kind::Float)
-                .mean(Kind::Float);
+                // Recover the unsquashed Gaussian samples z from actions
+                // action = 2 * sigmoid(z/2) - 1  =>  z = 2 * logit((action + 1) / 2)
+                // Add small epsilon for numerical stability
+                let eps = 1e-6;
+                let action_01 = (&actions_sample + 1.0) / 2.0;  // Transform from [-1, 1] to [0, 1]
+                let action_01_clamped = action_01.clamp(eps, 1.0 - eps);  // Prevent log(0)
+                let one_minus_action = Tensor::from(1.0) - &action_01_clamped;
+                let z = (&action_01_clamped.log() - one_minus_action.log()) * 2.0;  // 2 * logit function
 
-            // Compute advantages = returns - critic_prediction
-            // returns is constant (no gradients), critic has gradients
-            let advantages = &returns - &critic;
+                // Compute log probability of z under Gaussian N(action_mean, action_std)
+                let action_std = action_log_std.exp();
+                let z_normalized = (&z - &action_mean) / &action_std;
+                let z_squared = z_normalized.pow_tensor_scalar(2);
+                let two_log_std = &action_log_std * 2.0;
+                let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
 
-            // Value loss: MSE between critic prediction and returns
-            // This trains the critic to predict returns accurately
-            let value_loss = advantages.pow_tensor_scalar(2).mean(Kind::Float);
+                // Compute log Jacobian correction for softer sigmoid squashing
+                // action = 2 * sigmoid(z/2) - 1
+                // |d_action/dz| = sigmoid(z/2) * (1 - sigmoid(z/2))
+                // log|d_action/dz| = log(sigmoid(z/2)) + log(1 - sigmoid(z/2))
+                let sigmoid_z_half = (&z / 2.0).sigmoid();
+                let one_minus_sigmoid = Tensor::from(1.0) - &sigmoid_z_half;
+                let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
 
-            // For policy gradient: use detached advantages and normalize
-            // Detaching prevents policy gradients from affecting the critic through advantages
-            let advantages_detached = advantages.detach();
-            let adv_mean = advantages_detached.mean(Kind::Float);
-            let adv_std = advantages_detached.std(false);
-            let advantages_normalized = (&advantages_detached - adv_mean) / (adv_std + 1e-8);
+                // Final log probability: log p(action) = log p(z) - log|d_action/dz|
+                let action_log_probs = (log_prob_z - log_jacobian)
+                    .sum_dim_intlist(-1, false, Kind::Float);
 
-            let action_loss = (-advantages_normalized * action_log_probs).mean(Kind::Float);
-            // Increased entropy bonus from 0.01 to 0.05 to encourage more exploration
-            let loss = value_loss * 0.5 + action_loss - dist_entropy * 0.05;
+                // Entropy approximation: Use base Gaussian entropy
+                // Note: Exact entropy of sigmoid-squashed distribution is complex to compute
+                // Using Gaussian entropy as approximation is standard practice for regularization
+                let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * action_log_std;
+                let dist_entropy = entropy_components
+                    .g_mul_scalar(0.5)
+                    .sum_dim_intlist(-1, false, Kind::Float)
+                    .mean(Kind::Float);
 
-            // Moderately aggressive clip
-            opt.backward_step_clip_norm(&loss, 2.0);
-        }
+                // Compute advantages = returns - critic_prediction
+                // returns is constant (no gradients), critic has gradients
+                let advantages = &returns_sample - &critic;
+
+                // Value loss: MSE between critic prediction and returns
+                // This trains the critic to predict returns accurately
+                let value_loss = advantages.pow_tensor_scalar(2).mean(Kind::Float);
+
+                // For policy gradient: use detached advantages and normalize
+                // Detaching prevents policy gradients from affecting the critic through advantages
+                let advantages_detached = advantages.detach();
+                let adv_mean = advantages_detached.mean(Kind::Float);
+                let adv_std = advantages_detached.std(false);
+                let advantages_normalized = (&advantages_detached - adv_mean) / (adv_std + 1e-8);
+
+                let action_loss = (-advantages_normalized * action_log_probs).mean(Kind::Float);
+                // Increased entropy bonus from 0.01 to 0.05 to encourage more exploration
+                let loss = value_loss * 0.5 + action_loss - dist_entropy * 0.05;
+
+                // Moderately aggressive clip
+                opt.backward_step_clip_norm(&loss, 2.0);
+            }  // End mini-batch loop
+        }  // End epoch loop
         
         let opt_end = Instant::now();
         

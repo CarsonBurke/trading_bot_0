@@ -10,7 +10,7 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_HISTORY_LEN, OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT
+            ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, RANDOM_EPISODE_START, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT
         },
         ppo::NPROCS,
     },
@@ -25,7 +25,6 @@ pub struct Env {
     pub prices: Vec<Vec<f64>>,
     max_prices: Vec<f64>,
     price_deltas: Vec<Vec<f64>>,
-    obs: Tensor,
     account: Account,
     episode_history: EpisodeHistory,
     meta_history: MetaHistory,
@@ -78,7 +77,6 @@ impl Env {
             max_prices,
             prices,
             price_deltas,
-            obs: Tensor::zeros(&[1], (tch::Kind::Float, tch::Device::Cpu)),
             account: Account::default(),
             episode_history: EpisodeHistory::new(tickers.len()),
             meta_history: MetaHistory::default(),
@@ -330,16 +328,16 @@ impl Env {
     }
 
     pub fn reset(&mut self) -> (Tensor, Tensor) {
-        // Randomly select starting point in historical data
-        // Leave at least 1500 steps for a full episode + observations buffer
+        // Leave at least STEPS_PER_EPISODE steps for a full episode + observations buffer
        
         let max_start = self
             .total_data_length
             .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
 
-        let mut rng = rand::thread_rng();
-        self.episode_start_offset = if max_start > PRICE_DELTAS_PER_TICKER {
-            rng.gen_range(PRICE_DELTAS_PER_TICKER..max_start)
+
+        self.episode_start_offset = if RANDOM_EPISODE_START && max_start > PRICE_DELTAS_PER_TICKER {
+            let mut rng = rand::rng();
+            rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
         } else {
             PRICE_DELTAS_PER_TICKER
         };
@@ -384,10 +382,4 @@ pub struct Step {
     pub price_deltas: Tensor,
     pub static_obs: Tensor,
     pub is_done: Tensor,
-}
-
-pub struct ProcValues {
-    pub reward: f64,
-    pub obs: Vec<f32>,
-    pub is_done: bool,
 }

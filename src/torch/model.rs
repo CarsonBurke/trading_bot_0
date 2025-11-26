@@ -36,8 +36,13 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
     // Block 4: 256 -> 256 channels (depthwise + pointwise)
     let gn4 = nn::group_norm(p / "gn4", 32, 256, Default::default());
-    let c4_dw = nn::conv1d(p / "c4_dw", 256, 256, 3, nn::ConvConfig { stride: 2, groups: 256, ..Default::default() });  // Depthwise
+    let c4_dw = nn::conv1d(p / "c4_dw", 256, 256, 3, nn::ConvConfig { stride: 1, groups: 256, ..Default::default() });  // Depthwise
     let c4_pw = nn::conv1d(p / "c4_pw", 256, 256, 1, Default::default());  // Pointwise 1x1 (maintain)
+
+    // Block 5: 256 -> 256 channels (depthwise + pointwise) with residual
+    let gn5 = nn::group_norm(p / "gn5", 32, 256, Default::default());
+    let c5_dw = nn::conv1d(p / "c5_dw", 256, 256, 3, nn::ConvConfig { stride: 1, groups: 256, padding: 1, ..Default::default() });  // Depthwise with padding
+    let c5_pw = nn::conv1d(p / "c5_pw", 256, 256, 1, Default::default());  // Pointwise 1x1 (maintain)
 
     // FC layers: conv features + static observations
     // Calculate expected conv output size with GAP:
@@ -101,6 +106,11 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
         // Block 4: Pre-GN → Depthwise → Pointwise → SiLU
         let x = x.apply(&gn4).apply(&c4_dw).apply(&c4_pw).silu();
+
+        // Block 5: Pre-GN → Depthwise → Pointwise → SiLU + Residual
+        let x5_input = x.shallow_clone();  // Save for residual
+        let x = x.apply(&gn5).apply(&c5_dw).apply(&c5_pw);
+        let x = (x + x5_input).silu();  // Residual connection + activation
 
         // Apply Global Average Pooling per ticker: [batch*TICKERS, 256, 148] -> [batch*TICKERS, 256]
         // This reduces spatial dimension from 148 to 1 by averaging across time

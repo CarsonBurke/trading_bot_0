@@ -5,3 +5,4 @@ pub const PRICE_DELTAS_PER_TICKER: usize = 2400;
 pub const STATIC_OBSERVATIONS: usize = 1 + 1 + TICKERS_COUNT as usize + (ACTION_HISTORY_LEN * TICKERS_COUNT as usize * 2);
 pub const OBSERVATION_SPACE: usize = (TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
 pub const STEPS_PER_EPISODE: usize = 12_000;
+pub const RANDOM_EPISODE_START: bool = false;
