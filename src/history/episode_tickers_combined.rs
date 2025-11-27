@@ -30,12 +30,16 @@ impl EpisodeHistory {
     }
 
     pub fn record(&self, episode: usize, tickers: &[String], prices: &[Vec<f64>]) {
-        let episode_dir = format!("{TRAINING_PATH}/gens/{}", episode);
+        self.record_to_path(&format!("{TRAINING_PATH}/gens"), episode, tickers, prices);
+    }
+
+    pub fn record_to_path(&self, base_path: &str, episode: usize, tickers: &[String], prices: &[Vec<f64>]) {
+        let episode_dir = format!("{}/{}", base_path, episode);
         create_folder_if_not_exists(&episode_dir);
 
         for (ticker_index, prices) in prices.iter().enumerate() {
             let ticker = &tickers[ticker_index];
-            let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker}", episode);
+            let ticker_dir = format!("{}/{}/{ticker}", base_path, episode);
             create_folder_if_not_exists(&ticker_dir);
 
             let ticker_buy_indexes = &self.buys[ticker_index];
@@ -61,7 +65,6 @@ impl EpisodeHistory {
                 Some(positioned_assets),
             );
 
-            // Chart hold actions for this ticker
             let _ = hold_action_chart(
                 &ticker_dir,
                 &self.hold_actions[ticker_index],

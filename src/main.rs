@@ -44,7 +44,7 @@ struct Cli {
 enum Commands {
     Train,
     Infer {
-        #[arg(short, long, default_value = "weights/infer.ot")]
+        #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
         #[arg(short, long, default_value_t = 10)]
@@ -57,7 +57,7 @@ enum Commands {
         temperature: f64,
     },
     Paper {
-        #[arg(short, long, default_value = "weights/infer.ot")]
+        #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
         #[arg(short, long, value_delimiter = ',', default_value = "TSLA,AAPL")]

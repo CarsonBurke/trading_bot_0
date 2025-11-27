@@ -52,8 +52,7 @@ pub fn run_inference<P: AsRef<Path>>(
 
     let (_vs, model) = load_model(weight_path, device)?;
 
-    let mut env = Env::new();
-    let n_steps = STEPS_PER_EPISODE as i64;
+    let mut env = Env::new(false);
 
     let mut total_rewards = 0.0;
     let mut total_episodes = 0;
@@ -102,6 +101,8 @@ pub fn run_inference<P: AsRef<Path>>(
 
         total_rewards += episode_reward;
         total_episodes += 1;
+
+        env.record_inference(episode);
 
         let episode_time = Instant::now().duration_since(episode_start).as_secs_f32();
         println!(

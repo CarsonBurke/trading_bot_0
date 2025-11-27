@@ -9,6 +9,7 @@ There are many trading bots and strategies in this repo.
 - `src/burn/` burn model, abandoned due to poor performance
 - `training/` training episodes (`gens/`) and metadata (`data/`)
 - `weights/` trained or partially trained model schemas
+- `infer/` inference results and metadata
 
 ## Programmatic Strategies with Genetic Algorithm Optimization
 

@@ -2,6 +2,7 @@ use rand::Rng;
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use colored::Colorize;
 use tch::Tensor;
 
 use crate::{
@@ -10,7 +11,7 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_HISTORY_LEN, ACTION_THRESHOLD, MIN_ORDER_VALUE, PRICE_DELTAS_PER_TICKER, RANDOM_EPISODE_START, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT
+            ACTION_HISTORY_LEN, ACTION_THRESHOLD, MIN_ORDER_VALUE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT
         },
         ppo::NPROCS,
     },
@@ -34,14 +35,15 @@ pub struct Env {
     episode_start: Instant,
     pub episode: usize,
     action_history: VecDeque<Vec<f64>>,
-    episode_start_offset: usize,        // Random starting point in historical data for this episode
-    total_data_length: usize,           // Total length of historical data
+    episode_start_offset: usize,
+    total_data_length: usize,
+    random_start: bool,
 }
 
 impl Env {
     const STARTING_CASH: f64 = 10_000.0;
 
-    pub fn new() -> Self {
+    pub fn new(random_start: bool) -> Self {
         let tickers = vec![
             // "TSLA".to_string(),
             // "AAPL".to_string(),
@@ -89,6 +91,7 @@ impl Env {
             action_history: VecDeque::with_capacity(5),
             episode_start_offset: 0,
             total_data_length,
+            random_start,
         }
     }
 
@@ -132,11 +135,41 @@ impl Env {
             self.episode_history.rewards.push(reward);
 
             if is_done == 1.0 {
+                let start_price = self.prices[0][self.episode_start_offset];
+                let end_price = self.prices[0][absolute_step];
+                let buy_hold_return = (end_price / start_price - 1.0) * 100.0;
+                let strategy_return = (self.account.total_assets / Self::STARTING_CASH - 1.0) * 100.0;
+                let outperformance = strategy_return - buy_hold_return;
+
+                let strategy_str = if strategy_return >= 0.0 {
+                    format!("{:.2}%", strategy_return).green()
+                } else {
+                    format!("{:.2}%", strategy_return).red()
+                };
+
+                let buy_hold_str = if buy_hold_return >= 0.0 {
+                    format!("{:.2}%", buy_hold_return).cyan()
+                } else {
+                    format!("{:.2}%", buy_hold_return).red()
+                };
+
+                let outperf_str = if outperformance > 0.0 {
+                    format!("+{:.2}%", outperformance).bright_green().bold()
+                } else if outperformance < 0.0 {
+                    format!("{:.2}%", outperformance).bright_red().bold()
+                } else {
+                    format!("{:.2}%", outperformance).yellow()
+                };
+
                 println!(
-                    "Episode {} - Total Assets: {:.2} cumulative reward {:.2} tickers {:?} time secs {:.2}",
-                    self.episode,
-                    self.account.total_assets,
+                    "{} {} - Total Assets: {} ({}) cumulative reward {:.2} | Buy&Hold: {} | Outperformance: {} | tickers {:?} time {:.2}s",
+                    "Episode".bright_blue(),
+                    self.episode.to_string().bright_blue().bold(),
+                    format!("${:.2}", self.account.total_assets).bright_white().bold(),
+                    strategy_str,
                     self.episode_history.rewards.iter().sum::<f64>(),
+                    buy_hold_str,
+                    outperf_str,
                     self.tickers,
                     Instant::now().duration_since(self.episode_start).as_secs_f32()
                 );
@@ -343,7 +376,7 @@ impl Env {
             .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
 
 
-        self.episode_start_offset = if RANDOM_EPISODE_START && max_start > PRICE_DELTAS_PER_TICKER {
+        self.episode_start_offset = if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
             let mut rng = rand::rng();
             rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
         } else {
@@ -382,6 +415,13 @@ impl Env {
             Tensor::from_slice(&static_obs).view([1, STATIC_OBSERVATIONS as i64]);
 
         (price_deltas_tensor, static_obs_tensor)
+    }
+
+    pub fn record_inference(&self, episode: usize) {
+        let infer_dir = "infer";
+        create_folder_if_not_exists(&infer_dir.to_string());
+
+        self.episode_history.record_to_path(infer_dir, episode, &self.tickers, &self.prices);
     }
 }
 

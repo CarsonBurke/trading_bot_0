@@ -1,6 +1,7 @@
-/target
+target
 training
 weights
+infer
 data
 long_data
 burn_custom/
