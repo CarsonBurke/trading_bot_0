@@ -1,5 +1,6 @@
 pub mod ppo;
 pub mod infer;
+pub mod ibkr_infer;
 pub mod model;
 mod vec_gym_env;
 mod gym_env;

@@ -10,7 +10,7 @@ use ibapi::{
 use time::OffsetDateTime;
 
 use crate::{
-    constants::{files::{self, DATA_PATH}, TICKERS},
+    constants::{TICKERS, api, files::{self, DATA_PATH}},
     types::MappedHistorical,
     utils::create_folder_if_not_exists,
 };
@@ -33,9 +33,7 @@ pub fn get_historical_data(tickers: Option<&[&str]>) -> MappedHistorical {
         let client = match &opt_client {
             Some(client) => client,
             None => {
-                let connection_url = "127.0.0.1:4002";
-
-                &Client::connect(connection_url, 1).expect("connection to TWS failed!")
+                &Client::connect(api::CONNECTION_URL, 1).expect("connection to TWS failed!")
             }
         };
 

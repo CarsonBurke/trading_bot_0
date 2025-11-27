@@ -15,7 +15,7 @@ anyhow = "1.0.98"
 candle-core = { version = "0.9.1" }
 candle-nn = {version = "0.9.1" }
 chrono = "0.4.38"
-clap = "4.5.21"
+clap = { version = "4.5.21", features = ["derive"] }
 colored = "2.1.0"
 cpython = "0.7.2"
 enum-map = { version = "2.7.3", features = ["serde"] }

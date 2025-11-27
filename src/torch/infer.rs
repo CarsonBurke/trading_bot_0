@@ -1,77 +1,118 @@
-use tch::{nn, Tensor};
+use tch::{nn, Device, Tensor};
 use std::path::Path;
+use std::time::Instant;
 
-use crate::torch::constants::TICKERS_COUNT;
+use crate::torch::constants::{STEPS_PER_EPISODE, TICKERS_COUNT};
 use crate::torch::model::model;
+use crate::torch::step::Env;
 
-/// Load a trained PPO model from a weights file
-///
-/// # Arguments
-/// * `weight_path` - Path to the saved model weights (e.g., "weights/ppo_ep100.ot")
-/// * `device` - Device to load the model on (CPU or CUDA)
-///
-/// # Returns
-/// * VarStore with loaded weights and the model function
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: tch::Device,
 ) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor))>), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
-    let model = model(&vs.root(), TICKERS_COUNT);
-
+    let model_fn = model(&vs.root(), TICKERS_COUNT * 2);
     vs.load(weight_path)?;
-
-    println!("Model loaded successfully");
-    println!("Device: {:?}", device);
-
-    Ok((vs, model))
+    println!("Model loaded on {:?}", device);
+    Ok((vs, model_fn))
 }
 
-/// Run inference with a loaded model
-///
-/// # Arguments
-/// * `model` - The loaded model function
-/// * `price_deltas` - Price deltas tensor [batch, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER]
-/// * `static_obs` - Static observations tensor [batch, STATIC_OBSERVATIONS]
-///
-/// # Returns
-/// * (critic_value, (action_mean, action_log_std))
-pub fn infer(
-    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor)),
-    price_deltas: &Tensor,
-    static_obs: &Tensor,
-) -> (Tensor, (Tensor, Tensor)) {
-    tch::no_grad(|| model(price_deltas, static_obs, false))  // eval mode for inference
-}
-
-/// Sample actions from the model (for inference/evaluation)
-///
-/// # Arguments
-/// * `model` - The loaded model function
-/// * `price_deltas` - Price deltas tensor [batch, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER]
-/// * `static_obs` - Static observations tensor [batch, STATIC_OBSERVATIONS]
-/// * `deterministic` - If true, use mean action; if false, sample with noise
-///
-/// # Returns
-/// * Action tensor [batch, TICKERS_COUNT] in range approximately [-1, 1]
 pub fn sample_actions(
     model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor)),
     price_deltas: &Tensor,
     static_obs: &Tensor,
     deterministic: bool,
+    temperature: f64,
 ) -> Tensor {
     let (_critic, (action_mean, action_log_std)) = tch::no_grad(|| {
-        model(price_deltas, static_obs, false)  // eval mode for inference
+        model(price_deltas, static_obs, false)
     });
 
-    if deterministic {
-        // Use mean action (no exploration)
+    if deterministic || temperature == 0.0 {
         (action_mean / 2.0).sigmoid() * 2.0 - 1.0
     } else {
-        // Sample with noise (exploration)
-        let action_std = action_log_std.exp();
+        let action_std = action_log_std.exp() * temperature;
         let noise = Tensor::randn_like(&action_mean);
-        let z = action_mean + action_std * noise;
+        let z = &action_mean + &action_std * noise;
         (z / 2.0).sigmoid() * 2.0 - 1.0
     }
+}
+
+pub fn run_inference<P: AsRef<Path>>(
+    weight_path: P,
+    num_episodes: usize,
+    deterministic: bool,
+    temperature: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting inference run...");
+    println!("Loading model from: {:?}", weight_path.as_ref());
+
+    let device = Device::cuda_if_available();
+    println!("Using device: {:?}", device);
+
+    let (_vs, model) = load_model(weight_path, device)?;
+
+    let mut env = Env::new();
+    let n_steps = STEPS_PER_EPISODE as i64;
+
+    let mut total_rewards = 0.0;
+    let mut total_episodes = 0;
+
+    for episode in 0..num_episodes {
+        let episode_start = Instant::now();
+        let mut episode_reward = 0.0;
+
+        let (price_deltas_reset, static_obs_reset) = env.reset();
+        let mut current_price_deltas = price_deltas_reset;
+        let mut current_static_obs = static_obs_reset.to_device(device);
+
+        env.episode = episode;
+
+        for step in 0..env.max_step {
+            env.step = step;
+
+            let price_deltas_gpu = current_price_deltas.to_device(device);
+            let actions = sample_actions(
+                model.as_ref(),
+                &price_deltas_gpu,
+                &current_static_obs,
+                deterministic,
+                temperature,
+            );
+
+            let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
+            let actions_vec: Vec<Vec<f64>> = actions_flat
+                .chunks(TICKERS_COUNT as usize * 2)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+
+            let step_state = env.step(actions_vec);
+
+            let reward = f64::try_from(step_state.reward.sum(tch::Kind::Float)).unwrap();
+            episode_reward += reward;
+
+            current_price_deltas = step_state.price_deltas;
+            current_static_obs = step_state.static_obs.to_device(device);
+
+            let is_done = f64::try_from(step_state.is_done.sum(tch::Kind::Float)).unwrap();
+            if is_done > 0.0 {
+                break;
+            }
+        }
+
+        total_rewards += episode_reward;
+        total_episodes += 1;
+
+        let episode_time = Instant::now().duration_since(episode_start).as_secs_f32();
+        println!(
+            "Episode {}: Reward: {:.4}, Time: {:.2}s",
+            episode, episode_reward, episode_time
+        );
+    }
+
+    println!("\n=== Inference Summary ===");
+    println!("Total episodes: {}", total_episodes);
+    println!("Average reward: {:.4}", total_rewards / total_episodes as f64);
+
+    Ok(())
 }

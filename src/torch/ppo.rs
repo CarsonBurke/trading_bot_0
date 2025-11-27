@@ -8,11 +8,19 @@ use crate::torch::model::model;
 pub const NPROCS: i64 = 1; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
 const OPTIM_MINIBATCH: i64 = 512;  // Mini-batch size for GPU processing (avoids OOM)
-const OPTIM_EPOCHS: i64 = 4; 
+const OPTIM_EPOCHS: i64 = 4;
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
 const GAMMA: f64 = 0.995;
 const GAE_LAMBDA: f64 = 0.98;
+
+// PPO hyperparameters
+const PPO_CLIP_RATIO: f64 = 0.2;  // Clip range for policy ratio (typically 0.1-0.3)
+const VALUE_CLIP_RANGE: f64 = 0.2;  // Clip range for value function
+const ENTROPY_COEF: f64 = 0.05;  // Entropy bonus coefficient
+const VALUE_LOSS_COEF: f64 = 0.5;  // Value loss coefficient
+const MAX_GRAD_NORM: f64 = 2.0;  // Gradient clipping norm
+const TARGET_KL: f64 = 0.03;  // Target KL divergence for early stopping
 
 pub fn train() {
     let mut env = Env::new();
@@ -96,12 +104,12 @@ pub fn train() {
             env.step = step;
 
             let (critic, (action_mean, action_log_std)) = tch::no_grad(|| {
-                // Move price deltas from CPU to GPU (already in FP16)
+                // Move price deltas from CPU to GPU (FP32)
                 let price_deltas_gpu = s_price_deltas.get(s).to_device(device);
-                let static_obs_half = s_static_obs.get(s);
+                let static_obs = s_static_obs.get(s);
                 model(
                     &price_deltas_gpu,
-                    &static_obs_half,
+                    &static_obs,
                     false,  // eval mode during rollout for stable observations
                 )
             });
@@ -125,7 +133,8 @@ pub fn train() {
             let actions = (&z / 2.0).sigmoid() * 2.0 - 1.0;
 
             // Compute log Jacobian for the squashing transformation
-            let sigmoid_z_half = (&z / 2.0).sigmoid();
+            // Add clamping for numerical stability to prevent log(0) = -inf
+            let sigmoid_z_half = (&z / 2.0).sigmoid().clamp(1e-7, 1.0 - 1e-7);
             let one_minus_sigmoid = Tensor::from(1.0) - &sigmoid_z_half;
             let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
 
@@ -233,8 +242,11 @@ pub fn train() {
         let old_log_probs = s_log_probs.view([memory_size]);
 
         let opt_start = Instant::now();
+        let mut early_stopped = false;
+        let mut total_kl = 0.0;
+        let mut num_kl_samples = 0;
 
-        for _epoch in 0..OPTIM_EPOCHS {
+        'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             // Shuffle indices for this epoch
             let shuffled_indices = Tensor::randperm(memory_size, int64_kind);
 
@@ -281,7 +293,8 @@ pub fn train() {
                 // action = 2 * sigmoid(z/2) - 1
                 // |d_action/dz| = sigmoid(z/2) * (1 - sigmoid(z/2))
                 // log|d_action/dz| = log(sigmoid(z/2)) + log(1 - sigmoid(z/2))
-                let sigmoid_z_half = (&z / 2.0).sigmoid();
+                // Add clamping for numerical stability to prevent log(0) = -inf
+                let sigmoid_z_half = (&z / 2.0).sigmoid().clamp(1e-7, 1.0 - 1e-7);
                 let one_minus_sigmoid = Tensor::from(1.0) - &sigmoid_z_half;
                 let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
 
@@ -305,7 +318,7 @@ pub fn train() {
 
                 // Clipped value prediction
                 let value_pred_clipped =
-                    &values_old_sample + (&critic - &values_old_sample).clamp(-0.2, 0.2);
+                    &values_old_sample + (&critic - &values_old_sample).clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
 
                 // Unclipped and clipped MSE vs returns
                 let value_loss_unclipped = (&critic - &returns_sample).pow_tensor_scalar(2);
@@ -321,20 +334,40 @@ pub fn train() {
                 let adv_std = advantages_sample.std(false);
                 let advantages_normalized = ((&advantages_sample - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
 
-                let ratio = (action_log_probs - &old_log_probs_sample).exp();
+                let ratio = (&action_log_probs - &old_log_probs_sample).exp();
                 let unclipped_obj = &ratio * &advantages_normalized;
 
-                let ratio_clipped = ratio.clamp(0.8, 1.2);
+                let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
                 let clipped_obj = ratio_clipped * &advantages_normalized;
 
                 let action_loss = -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
-                // Relatively high 0.05 entropy bonus to encourage more exploration
-                let loss = value_loss * 0.5 + action_loss - dist_entropy * 0.05;
 
-                // Moderately aggressive clip
-                opt.backward_step_clip_norm(&loss, 2.0);
+                // Compute approximate KL divergence for early stopping
+                // KL ≈ (ratio - 1) - log(ratio)
+                let approx_kl = ((&ratio - 1.0) - (&action_log_probs - &old_log_probs_sample))
+                    .mean(Kind::Float);
+                let approx_kl_value = f64::try_from(approx_kl).unwrap();
+
+                total_kl += approx_kl_value;
+                num_kl_samples += 1;
+
+                let loss = value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
+
+                opt.backward_step_clip_norm(&loss, MAX_GRAD_NORM);
+
+                // Check for early stopping based on KL divergence
+                if approx_kl_value > TARGET_KL {
+                    println!("Early stopping at epoch {}/{}, minibatch {}/{}: KL divergence {:.4} > target {:.4}",
+                        _epoch + 1, OPTIM_EPOCHS, minibatch_idx + 1, num_minibatches, approx_kl_value, TARGET_KL);
+                    early_stopped = true;
+                    break 'epoch_loop;
+                }
             }  // End mini-batch loop
         }  // End epoch loop
+
+        if early_stopped {
+            println!("Training stopped early due to high KL divergence");
+        }
         
         let opt_end = Instant::now();
         
@@ -342,8 +375,8 @@ pub fn train() {
             // Debug: Check if exploration has collapsed or network diverged
             let (_, (debug_mean, debug_log_std)) = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
-                let static_obs_half = s_static_obs.get(0);
-                model(&price_deltas_gpu, &static_obs_half, false)  // Stays in FP16
+                let static_obs = s_static_obs.get(0);
+                model(&price_deltas_gpu, &static_obs, false)
             });
 
             // Show actual squashed actions, not raw mean
@@ -353,12 +386,15 @@ pub fn train() {
             let mean_std = f64::try_from(debug_log_std.exp().mean(Kind::Float)).unwrap();
             let max_raw_action = f64::try_from(debug_mean.abs().max()).unwrap();
 
+            let avg_kl = if num_kl_samples > 0 { total_kl / num_kl_samples as f64 } else { 0.0 };
+
             println!(
-                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, Action (squashed): {:.3}, Action (raw): {:.1}, Max |raw|: {:.1}, Std: {:.4}",
+                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, Avg KL: {:.4}, Action (squashed): {:.3}, Action (raw): {:.1}, Max |raw|: {:.1}, Std: {:.4}",
                 episode,
                 total_episodes,
                 total_rewards / total_episodes,
                 opt_end.duration_since(opt_start).as_secs_f32(),
+                avg_kl,
                 mean_squashed_action,
                 mean_raw_action,
                 max_raw_action,

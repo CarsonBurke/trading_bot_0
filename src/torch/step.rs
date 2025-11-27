@@ -10,13 +10,16 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, RANDOM_EPISODE_START, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT
+            ACTION_HISTORY_LEN, ACTION_THRESHOLD, MIN_ORDER_VALUE, PRICE_DELTAS_PER_TICKER, RANDOM_EPISODE_START, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT
         },
         ppo::NPROCS,
     },
     types::Account,
     utils::{create_folder_if_not_exists, get_mapped_price_deltas},
 };
+
+// Reward scaling factors
+const REWARD_SCALE: f64 = 1.0;  // Scale rewards for better gradient signal
 
 pub struct Env {
     pub step: usize,
@@ -197,25 +200,31 @@ impl Env {
         let mut total_reward = 0.0;
 
         for (ticker_index, action) in actions.iter().enumerate() {
+            // Filter out weak signals below threshold
+            if action.abs() < ACTION_THRESHOLD {
+                continue;
+            }
+
             let current_price = self.prices[ticker_index][absolute_step];
 
             if *action > 0.0 {
                 // buy - no reward for buying
                 let max_ownership = self.account.total_assets / self.tickers.len() as f64;
-                let buy_total = (max_ownership
+                let buy_total = ((max_ownership
                     - self.account.positions[ticker_index].value_with_price(current_price))
-                    * (*action as f64);
+                    * (*action as f64)).min(self.account.cash);
 
-                if buy_total > 0.0 {
-                    self.account.cash -= buy_total;
+                if buy_total > MIN_ORDER_VALUE {
 
                     let quantity = buy_total / current_price;
+
+                    self.account.cash -= buy_total;
                     self.account.positions[ticker_index].add(current_price, quantity);
 
                     self.episode_history.buys[ticker_index]
                         .insert(absolute_step, (current_price, quantity));
 
-                    let reward = (self.max_prices[ticker_index] / current_price).ln() * quantity * 100.0;
+                    let reward = (self.max_prices[ticker_index] / current_price).ln() * quantity * REWARD_SCALE;
                     total_reward += reward;
                 }
 
@@ -226,8 +235,8 @@ impl Env {
             let position = &self.account.positions[ticker_index];
             let sell_total = position.value_with_price(current_price) * (-*action as f64);
 
-            if sell_total > 0.0 {
-                let quantity = sell_total / current_price;
+            if sell_total > MIN_ORDER_VALUE {
+
                 let avg_cost = position.avg_price;
 
                 // Realized return: (sell_price - cost_basis) / cost_basis
@@ -239,9 +248,10 @@ impl Env {
                 let trade_weight = sell_total / self.account.total_assets;
 
                 // Time-weighted realized return, scaled by trade size
-                // Multiply by 100 for better gradient signal
-                let trade_reward = log_return * trade_weight * 100.0;
+                let trade_reward = log_return * trade_weight * REWARD_SCALE;
                 total_reward += trade_reward;
+                
+                let quantity = sell_total / current_price;
 
                 self.account.cash += sell_total;
                 self.account.positions[ticker_index].quantity -= quantity;

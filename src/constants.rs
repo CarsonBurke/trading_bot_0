@@ -21,6 +21,10 @@ pub mod rsi {
     pub const MIDDLE: f64 = 50.;
 }
 
+pub mod api {
+    pub const CONNECTION_URL: &str = "127.0.0.1:4002";
+}
+
 pub mod files {
     pub const DATA_PATH: &str = "long_data";
     pub const WEIGHTS_PATH: &str = "weights";
