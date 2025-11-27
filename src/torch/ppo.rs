@@ -15,15 +15,16 @@ const GAMMA: f64 = 0.995;
 const GAE_LAMBDA: f64 = 0.98;
 
 // PPO hyperparameters
-const PPO_CLIP_RATIO: f64 = 0.2;  // Clip range for policy ratio (typically 0.1-0.3)
+const PPO_CLIP_RATIO: f64 = 0.15;  // Clip range for policy ratio (typically 0.1-0.3)
 const VALUE_CLIP_RANGE: f64 = 0.2;  // Clip range for value function
-const ENTROPY_COEF: f64 = 0.05;  // Entropy bonus coefficient
+const ENTROPY_COEF: f64 = 0.005;  // Entropy bonus coefficient
 const VALUE_LOSS_COEF: f64 = 0.5;  // Value loss coefficient
-const MAX_GRAD_NORM: f64 = 2.0;  // Gradient clipping norm
+const MAX_GRAD_NORM: f64 = 0.5;  // Gradient clipping norm
 const TARGET_KL: f64 = 0.03;  // Target KL divergence for early stopping
+const LEARNING_RATE: f64 = 1e-4;  // Learning rate for optimizer
 
 pub fn train() {
-    let mut env = Env::new();
+    let mut env = Env::new(true);
     // n_steps is the episode length - use constant since all episodes are same length
     // Episodes are capped at 1500 steps, minus 2 for buffer = 1498
     let n_steps = STEPS_PER_EPISODE as i64;
@@ -39,9 +40,9 @@ pub fn train() {
     println!("Using device {:?}", device);
 
     let mut vs = nn::VarStore::new(device);
-    let model = model(&vs.root(), TICKERS_COUNT * 2);  // 2 actions per ticker: buy/sell + hold
-    // Reduced learning rate to prevent premature convergence
-    let mut opt = nn::Adam::default().build(&vs, 2e-4).unwrap();
+    let model = model(&vs.root(), TICKERS_COUNT * 2);  // 2 actions per ticker
+
+    let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
     // Disabled FP16 - with GAP reducing params from 39M to 284K, FP32 easily fits in VRAM
     // FP16 causes NaN issues in tch-rs, especially with complex architectures
@@ -56,8 +57,8 @@ pub fn train() {
     let mut total_episodes = 0f64;
 
     let (current_price_deltas_init, current_static_obs_init) = env.reset();
-    let mut current_price_deltas = current_price_deltas_init;  // Keep in FP32
-    let mut current_static_obs = current_static_obs_init.to_device(device);  // Keep in FP32
+    let mut current_price_deltas = current_price_deltas_init;
+    let mut current_static_obs = current_static_obs_init.to_device(device);
 
     // Separate storage for price deltas and static observations
     // Store price deltas on CPU to save VRAM (2400 deltas × 12000 steps is large)
@@ -247,6 +248,9 @@ pub fn train() {
         let mut num_kl_samples = 0;
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
+            let mut epoch_kl_sum = 0.0;
+            let mut epoch_kl_count = 0;
+
             // Shuffle indices for this epoch
             let shuffled_indices = Tensor::randperm(memory_size, int64_kind);
 
@@ -348,22 +352,26 @@ pub fn train() {
                     .mean(Kind::Float);
                 let approx_kl_value = f64::try_from(approx_kl).unwrap();
 
-                total_kl += approx_kl_value;
-                num_kl_samples += 1;
+                epoch_kl_sum += approx_kl_value;
+                epoch_kl_count += 1;
 
                 let loss = value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
 
                 opt.backward_step_clip_norm(&loss, MAX_GRAD_NORM);
+            } 
 
-                // Check for early stopping based on KL divergence
-                if approx_kl_value > TARGET_KL {
-                    println!("Early stopping at epoch {}/{}, minibatch {}/{}: KL divergence {:.4} > target {:.4}",
-                        _epoch + 1, OPTIM_EPOCHS, minibatch_idx + 1, num_minibatches, approx_kl_value, TARGET_KL);
-                    early_stopped = true;
-                    break 'epoch_loop;
-                }
-            }  // End mini-batch loop
-        }  // End epoch loop
+            // Check for early stopping at the end of each epoch based on mean KL divergence
+            let mean_epoch_kl = epoch_kl_sum / epoch_kl_count as f64;
+            total_kl += mean_epoch_kl;
+            num_kl_samples += 1;
+
+            if mean_epoch_kl > TARGET_KL {
+                println!("Early stopping at epoch {}/{}: Mean KL divergence {:.4} > target {:.4}",
+                    _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl, TARGET_KL);
+                early_stopped = true;
+                break 'epoch_loop;
+            }
+        } 
 
         if early_stopped {
             println!("Training stopped early due to high KL divergence");
