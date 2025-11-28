@@ -42,7 +42,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Train,
+    Train {
+        #[arg(short, long)]
+        weights: Option<String>,
+    },
     Infer {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
@@ -81,8 +84,8 @@ async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Train) => {
-            torch::ppo::train();
+        Some(Commands::Train { weights }) => {
+            torch::ppo::train(weights.as_deref());
         }
         Some(Commands::Infer { weights, episodes, deterministic, temperature }) => {
             torch::infer::run_inference(weights, *episodes, *deterministic, *temperature)
@@ -98,7 +101,7 @@ async fn main() {
             ).expect("paper trading failed");
         }
         None => {
-            torch::ppo::train();
+            torch::ppo::train(None);
         }
     }
 

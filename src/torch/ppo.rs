@@ -1,13 +1,16 @@
 use std::time::Instant;
 use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
-use crate::torch::constants::{OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT};
-use crate::torch::step::Env;
+use crate::torch::constants::{
+    OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE,
+    TICKERS_COUNT,
+};
 use crate::torch::model::model;
+use crate::torch::step::Env;
 
 pub const NPROCS: i64 = 1; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
-const OPTIM_MINIBATCH: i64 = 512;  // Mini-batch size for GPU processing (avoids OOM)
+const OPTIM_MINIBATCH: i64 = 512; // Mini-batch size for GPU processing (avoids OOM)
 const OPTIM_EPOCHS: i64 = 4;
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
@@ -15,21 +18,41 @@ const GAMMA: f64 = 0.995;
 const GAE_LAMBDA: f64 = 0.98;
 
 // PPO hyperparameters
-const PPO_CLIP_RATIO: f64 = 0.15;  // Clip range for policy ratio (typically 0.1-0.3)
-const VALUE_CLIP_RANGE: f64 = 0.2;  // Clip range for value function
-const ENTROPY_COEF: f64 = 0.005;  // Entropy bonus coefficient
-const VALUE_LOSS_COEF: f64 = 0.5;  // Value loss coefficient
-const MAX_GRAD_NORM: f64 = 0.5;  // Gradient clipping norm
-const TARGET_KL: f64 = 0.03;  // Target KL divergence for early stopping
-const LEARNING_RATE: f64 = 1e-4;  // Learning rate for optimizer
+const PPO_CLIP_RATIO: f64 = 0.15; // Clip range for policy ratio (typically 0.1-0.3)
+const VALUE_CLIP_RANGE: f64 = 0.2; // Clip range for value function
+const ENTROPY_COEF: f64 = 0.005; // Entropy bonus coefficient
+const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
+const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
+const TARGET_KL: f64 = 0.03; // Target KL divergence for early stopping
+const KL_LR_FACTOR: f64 = 0.5; // KL effect on learning rate
+const MAX_KL_LR_DELTA: f64 = 0.1; // Max bounded change in learning rate due to KL divergence per episode
+const LEARNING_RATE: f64 = 1e-4; // Learning rate for optimizer
 
-pub fn train() {
+pub fn train(weights_path: Option<&str>) {
     let mut env = Env::new(true);
+
+    // Generate data analysis charts for training data
+    println!("Generating data analysis charts...");
+    let data_dir = "training/data";
+    for (ticker_idx, ticker) in env.tickers.iter().enumerate() {
+        if let Err(e) = crate::charts::data_analysis::create_data_analysis_charts(
+            ticker,
+            &env.prices[ticker_idx],
+            data_dir,
+        ) {
+            eprintln!("Warning: Failed to create data analysis charts for {}: {}", ticker, e);
+        }
+    }
+    println!("Data analysis charts generated in {}/", data_dir);
+
     // n_steps is the episode length - use constant since all episodes are same length
     // Episodes are capped at 1500 steps, minus 2 for buffer = 1498
     let n_steps = STEPS_PER_EPISODE as i64;
     let memory_size = n_steps * NPROCS;
-    println!("action space: {} (2 actions per ticker: buy/sell + hold)", TICKERS_COUNT * 2);
+    println!(
+        "action space: {} (2 actions per ticker: buy/sell + hold)",
+        TICKERS_COUNT * 2
+    );
     println!("observation space: {:?}", OBSERVATION_SPACE);
 
     println!("CUDA available: {}", tch::Cuda::is_available());
@@ -40,9 +63,18 @@ pub fn train() {
     println!("Using device {:?}", device);
 
     let mut vs = nn::VarStore::new(device);
-    let model = model(&vs.root(), TICKERS_COUNT * 2);  // 2 actions per ticker
+    let model = model(&vs.root(), TICKERS_COUNT * 2); // 2 actions per ticker
+
+    if let Some(path) = weights_path {
+        println!("Loading weights from: {}", path);
+        vs.load(path).expect("Failed to load weights");
+        println!("Weights loaded successfully, resuming training");
+    } else {
+        println!("Starting training from scratch");
+    }
 
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
+    let mut current_lr = LEARNING_RATE;
 
     // Disabled FP16 - with GAP reducing params from 39M to 284K, FP32 easily fits in VRAM
     // FP16 causes NaN issues in tch-rs, especially with complex architectures
@@ -69,15 +101,11 @@ pub fn train() {
             NPROCS,
             TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         ],
-        (Kind::Float, Device::Cpu),  // Store on CPU in FP32
+        (Kind::Float, Device::Cpu), // Store on CPU in FP32
     );
     let s_static_obs = Tensor::zeros(
-        [
-            n_steps + 1,
-            NPROCS,
-            STATIC_OBSERVATIONS as i64,
-        ],
-        (Kind::Float, device),  // Keep static obs on GPU in FP32
+        [n_steps + 1, NPROCS, STATIC_OBSERVATIONS as i64],
+        (Kind::Float, device), // Keep static obs on GPU in FP32
     );
 
     for episode in 0..UPDATES {
@@ -91,11 +119,11 @@ pub fn train() {
 
         // Custom loop
         let (price_deltas_reset, static_obs_reset) = env.reset();
-        current_price_deltas = price_deltas_reset;  // Keep in FP32
-        current_static_obs = static_obs_reset.to_device(device);  // Keep in FP32
+        current_price_deltas = price_deltas_reset; // Keep in FP32
+        current_static_obs = static_obs_reset.to_device(device); // Keep in FP32
         env.episode = episode as usize;
 
-        s_price_deltas.get(0).copy_(&current_price_deltas);  // CPU to CPU (FP32)
+        s_price_deltas.get(0).copy_(&current_price_deltas); // CPU to CPU (FP32)
         s_static_obs.get(0).copy_(&current_static_obs);
 
         // Use a separate index (s) for tensor storage, starting from 0
@@ -111,7 +139,7 @@ pub fn train() {
                 model(
                     &price_deltas_gpu,
                     &static_obs,
-                    false,  // eval mode during rollout for stable observations
+                    false, // eval mode during rollout for stable observations
                 )
             });
 
@@ -140,7 +168,8 @@ pub fn train() {
             let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
 
             // Final log probability
-            let action_log_prob = (log_prob_z - log_jacobian).sum_dim_intlist(-1, false, Kind::Float);
+            let action_log_prob =
+                (log_prob_z - log_jacobian).sum_dim_intlist(-1, false, Kind::Float);
 
             // Flatten the actions tensor [NPROCS, TICKERS_COUNT] to 1D before converting
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
@@ -162,7 +191,7 @@ pub fn train() {
             let static_obs = step_state.static_obs.to_device(device);
 
             sum_rewards += &reward;
-            
+
             let reward_float = f64::try_from((&sum_rewards * &is_done).sum(Kind::Float)).unwrap();
             episode_reward += reward_float;
             total_rewards += reward_float;
@@ -182,22 +211,17 @@ pub fn train() {
             current_price_deltas = price_deltas;
             current_static_obs = static_obs;
 
-            s += 1;  // Increment storage index
+            s += 1; // Increment storage index
         }
 
-        println!(
-            "episode rewards: {}",
-            episode_reward
-        );
+        println!("episode rewards: {}", episode_reward);
 
-        let price_deltas_batch = s_price_deltas.narrow(0, 0, n_steps).view([
-            memory_size,
-            TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
-        ]);
-        let static_obs_batch = s_static_obs.narrow(0, 0, n_steps).view([
-            memory_size,
-            STATIC_OBSERVATIONS as i64,
-        ]);
+        let price_deltas_batch = s_price_deltas
+            .narrow(0, 0, n_steps)
+            .view([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
+        let static_obs_batch = s_static_obs
+            .narrow(0, 0, n_steps)
+            .view([memory_size, STATIC_OBSERVATIONS as i64]);
 
         let (advantages, returns) = {
             let gae = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Float, device));
@@ -207,7 +231,9 @@ pub fn train() {
             let next_value = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(-1).to_device(device);
                 let static_obs = s_static_obs.get(-1);
-                model(&price_deltas_gpu, &static_obs, false).0.view([NPROCS])
+                model(&price_deltas_gpu, &static_obs, false)
+                    .0
+                    .view([NPROCS])
             });
 
             // Compute GAE backwards
@@ -236,8 +262,10 @@ pub fn train() {
                 returns.get(s).copy_(&return_t);
             }
 
-            (gae.narrow(0, 0, n_steps).view([memory_size, 1]),
-             returns.narrow(0, 0, n_steps).view([memory_size, 1]))
+            (
+                gae.narrow(0, 0, n_steps).view([memory_size, 1]),
+                returns.narrow(0, 0, n_steps).view([memory_size, 1]),
+            )
         };
         let actions = s_actions.view([memory_size, TICKERS_COUNT * 2]);
         let old_log_probs = s_log_probs.view([memory_size]);
@@ -246,6 +274,8 @@ pub fn train() {
         let mut early_stopped = false;
         let mut total_kl = 0.0;
         let mut num_kl_samples = 0;
+        let mut total_loss = 0.0;
+        let mut num_loss_samples = 0;
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             let mut epoch_kl_sum = 0.0;
@@ -267,24 +297,27 @@ pub fn train() {
                 let batch_indexes_cpu = batch_indexes.to_device(tch::Device::Cpu);
 
                 // Move only mini-batch to GPU (in FP32)
-                let price_deltas_sample = price_deltas_batch.index_select(0, &batch_indexes_cpu).to_device(device);
+                let price_deltas_sample = price_deltas_batch
+                    .index_select(0, &batch_indexes_cpu)
+                    .to_device(device);
                 let static_obs_sample = static_obs_batch.index_select(0, &batch_indexes);
                 let actions_sample = actions.index_select(0, &batch_indexes);
                 let returns_sample = returns.index_select(0, &batch_indexes);
                 let advantages_sample = advantages.index_select(0, &batch_indexes);
                 let old_log_probs_sample = old_log_probs.index_select(0, &batch_indexes);
 
-                let (critic, (action_mean, action_log_std)) = model(&price_deltas_sample, &static_obs_sample, true);  // train mode during optimization
-                // All outputs in FP32
+                let (critic, (action_mean, action_log_std)) =
+                    model(&price_deltas_sample, &static_obs_sample, true); // train mode during optimization
+                                                                           // All outputs in FP32
 
                 // Recover the unsquashed Gaussian samples z from actions
                 // action = 2 * sigmoid(z/2) - 1  =>  z = 2 * logit((action + 1) / 2)
                 // Add small epsilon for numerical stability
                 let eps = 1e-6;
-                let action_01 = (&actions_sample + 1.0) / 2.0;  // Transform from [-1, 1] to [0, 1]
-                let action_01_clamped = action_01.clamp(eps, 1.0 - eps);  // Prevent log(0)
+                let action_01 = (&actions_sample + 1.0) / 2.0; // Transform from [-1, 1] to [0, 1]
+                let action_01_clamped = action_01.clamp(eps, 1.0 - eps); // Prevent log(0)
                 let one_minus_action = Tensor::from(1.0) - &action_01_clamped;
-                let z = (&action_01_clamped.log() - one_minus_action.log()) * 2.0;  // 2 * logit function
+                let z = (&action_01_clamped.log() - one_minus_action.log()) * 2.0; // 2 * logit function
 
                 // Compute log probability of z under Gaussian N(action_mean, action_std)
                 let action_std = action_log_std.exp();
@@ -303,8 +336,8 @@ pub fn train() {
                 let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
 
                 // Final log probability: log p(action) = log p(z) - log|d_action/dz|
-                let action_log_probs = (log_prob_z - log_jacobian)
-                    .sum_dim_intlist(-1, false, Kind::Float);
+                let action_log_probs =
+                    (log_prob_z - log_jacobian).sum_dim_intlist(-1, false, Kind::Float);
 
                 // Entropy approximation: Use base Gaussian entropy
                 // Note: Exact entropy of sigmoid-squashed distribution is complex to compute
@@ -321,12 +354,13 @@ pub fn train() {
                     .index_select(0, &batch_indexes);
 
                 // Clipped value prediction
-                let value_pred_clipped =
-                    &values_old_sample + (&critic - &values_old_sample).clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
+                let value_pred_clipped = &values_old_sample
+                    + (&critic - &values_old_sample).clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
 
                 // Unclipped and clipped MSE vs returns
                 let value_loss_unclipped = (&critic - &returns_sample).pow_tensor_scalar(2);
-                let value_loss_clipped   = (&value_pred_clipped - &returns_sample).pow_tensor_scalar(2);
+                let value_loss_clipped =
+                    (&value_pred_clipped - &returns_sample).pow_tensor_scalar(2);
 
                 // Final value loss
                 let value_loss = value_loss_unclipped
@@ -336,7 +370,8 @@ pub fn train() {
                 // PPO clipped objective with pre-computed GAE advantages
                 let adv_mean = advantages_sample.mean(Kind::Float);
                 let adv_std = advantages_sample.std(false);
-                let advantages_normalized = ((&advantages_sample - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
+                let advantages_normalized =
+                    ((&advantages_sample - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
 
                 let ratio = (&action_log_probs - &old_log_probs_sample).exp();
                 let unclipped_obj = &ratio * &advantages_normalized;
@@ -344,7 +379,8 @@ pub fn train() {
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
                 let clipped_obj = ratio_clipped * &advantages_normalized;
 
-                let action_loss = -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
+                let action_loss =
+                    -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
 
                 // Compute approximate KL divergence for early stopping
                 // KL ≈ (ratio - 1) - log(ratio)
@@ -356,29 +392,60 @@ pub fn train() {
                 epoch_kl_count += 1;
 
                 let loss = value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
+                let loss_value = f64::try_from(loss.shallow_clone()).unwrap();
+                total_loss += loss_value;
+                num_loss_samples += 1;
 
                 opt.backward_step_clip_norm(&loss, MAX_GRAD_NORM);
-            } 
+            }
 
-            // Check for early stopping at the end of each epoch based on mean KL divergence
+            // Adaptive learning rate based on mean KL divergence per epoch
             let mean_epoch_kl = epoch_kl_sum / epoch_kl_count as f64;
             total_kl += mean_epoch_kl;
             num_kl_samples += 1;
 
-            if mean_epoch_kl > TARGET_KL {
-                println!("Early stopping at epoch {}/{}: Mean KL divergence {:.4} > target {:.4}",
-                    _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl, TARGET_KL);
-                early_stopped = true;
-                break 'epoch_loop;
+            // Adjust learning rate proportionally to target
+            if mean_epoch_kl.is_finite() && mean_epoch_kl > 0.0 {
+                let kl_ratio = mean_epoch_kl / TARGET_KL;
+                
+                let lr_factor = (-KL_LR_FACTOR * (kl_ratio - 1.0)).exp();
+                let lr_bounced = lr_factor.clamp(1.0 - MAX_KL_LR_DELTA, 1.0 + MAX_KL_LR_DELTA);
+                let new_lr = current_lr * lr_bounced;
+                
+                opt.set_lr(new_lr);
+
+                println!(
+                    "Epoch {}/{}: KL {:.4} vs target {:.4} (ratio: {:.3}): Changing LR from {:.6} to {:.6}",
+                    _epoch + 1,
+                    OPTIM_EPOCHS,
+                    mean_epoch_kl,
+                    TARGET_KL,
+                    kl_ratio,
+                    current_lr,
+                    new_lr
+                );
+                
+                current_lr = new_lr;
+
+                // Early stop if KL is very high
+                if mean_epoch_kl > TARGET_KL * 2.0 {
+                    println!("Early stopping: KL divergence too high");
+                    early_stopped = true;
+                    break 'epoch_loop;
+                }
             }
-        } 
+        }
+
+        // Record mean loss for this episode
+        let mean_loss = total_loss / num_loss_samples as f64;
+        env.meta_history.record_loss(mean_loss);
 
         if early_stopped {
             println!("Training stopped early due to high KL divergence");
         }
-        
+
         let opt_end = Instant::now();
-        
+
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
             let (_, (debug_mean, debug_log_std)) = tch::no_grad(|| {
@@ -394,7 +461,11 @@ pub fn train() {
             let mean_std = f64::try_from(debug_log_std.exp().mean(Kind::Float)).unwrap();
             let max_raw_action = f64::try_from(debug_mean.abs().max()).unwrap();
 
-            let avg_kl = if num_kl_samples > 0 { total_kl / num_kl_samples as f64 } else { 0.0 };
+            let avg_kl = if num_kl_samples > 0 {
+                total_kl / num_kl_samples as f64
+            } else {
+                0.0
+            };
 
             println!(
                 "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, Avg KL: {:.4}, Action (squashed): {:.3}, Action (raw): {:.1}, Max |raw|: {:.1}, Std: {:.4}",
@@ -411,7 +482,10 @@ pub fn train() {
 
             // Warn if network is diverging
             if max_raw_action > 100.0 {
-                println!("WARNING: Network may be diverging! Raw action magnitude: {:.1}", max_raw_action);
+                println!(
+                    "WARNING: Network may be diverging! Raw action magnitude: {:.1}",
+                    max_raw_action
+                );
             }
 
             total_rewards = 0.;

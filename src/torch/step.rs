@@ -6,12 +6,11 @@ use colored::Colorize;
 use tch::Tensor;
 
 use crate::{
-    charts::general::simple_chart,
     data::historical::get_historical_data,
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_HISTORY_LEN, ACTION_THRESHOLD, MIN_ORDER_VALUE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT
+            ACTION_HISTORY_LEN, ACTION_THRESHOLD, MIN_ORDER_VALUE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT, TRANSACTION_COST_PER_SHARE
         },
         ppo::NPROCS,
     },
@@ -21,17 +20,18 @@ use crate::{
 
 // Reward scaling factors
 const REWARD_SCALE: f64 = 1.0;  // Scale rewards for better gradient signal
+const SHARPE_LAMBDA: f64 = 100.0;
 
 pub struct Env {
     pub step: usize,
     pub max_step: usize,
-    tickers: Vec<String>,
+    pub tickers: Vec<String>,
     pub prices: Vec<Vec<f64>>,
     max_prices: Vec<f64>,
     price_deltas: Vec<Vec<f64>>,
     account: Account,
     episode_history: EpisodeHistory,
-    meta_history: MetaHistory,
+    pub meta_history: MetaHistory,
     episode_start: Instant,
     pub episode: usize,
     action_history: VecDeque<Vec<f64>>,
@@ -118,7 +118,7 @@ impl Env {
             // Execute trade based on current observations (only use buy/sell actions)
             let _ = self.trade(buy_sell_actions, absolute_step);
 
-            let reward = self.get_unrealized_pnl_reward(absolute_step);
+            let reward = self.get_risk_adjusted_reward(absolute_step);
 
             let is_done = self.get_is_done();
 
@@ -176,7 +176,7 @@ impl Env {
 
                 self.episode_history
                     .record(self.episode, &self.tickers, &self.prices);
-                self.meta_history.record(&self.episode_history);
+                self.meta_history.record(&self.episode_history, outperformance);
 
                 if self.episode % 5 == 0 {
                     self.meta_history.chart(self.episode);
@@ -229,6 +229,54 @@ impl Env {
         }
     }
 
+    /// Is really just a shifted version of get_unrealized_pnl_reward, need to rethink this
+    #[deprecated]
+    fn get_excess_returns_reward(&self, absolute_step: usize) -> f64 {
+        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+            let next_absolute_step = absolute_step + 1;
+
+            // Calculate strategy log return
+            let total_assets_after_trade = self
+                .account
+                .position_values(&self.prices, next_absolute_step)
+                .iter()
+                .sum::<f64>()
+                + self.account.cash;
+            let strategy_log_return = (total_assets_after_trade / self.account.total_assets).ln();
+
+            // Calculate buy-and-hold log return (using first ticker as benchmark)
+            let current_price = self.prices[0][absolute_step];
+            let next_price = self.prices[0][next_absolute_step];
+            let buy_hold_log_return = (next_price / current_price).ln();
+
+            // Reward excess return over benchmark
+            (strategy_log_return - buy_hold_log_return) * REWARD_SCALE
+        } else {
+            0.0
+        }
+    }
+
+    /// Sharpe ratio-like risk-adjusted reward
+    fn get_risk_adjusted_reward(&self, absolute_step: usize) -> f64 {
+        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+            let next_absolute_step = absolute_step + 1;
+
+            // Calculate current step's return
+            let total_assets_after_trade = self
+                .account
+                .position_values(&self.prices, next_absolute_step)
+                .iter()
+                .sum::<f64>()
+                + self.account.cash;
+            let step_return = (total_assets_after_trade / self.account.total_assets).ln();
+
+            let sharpe_ratio = step_return - SHARPE_LAMBDA * step_return * step_return;
+            sharpe_ratio * REWARD_SCALE
+        } else {
+            0.0
+        }
+    }
+
     fn trade(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let mut total_reward = 0.0;
 
@@ -250,8 +298,9 @@ impl Env {
                 if buy_total > MIN_ORDER_VALUE {
 
                     let quantity = buy_total / current_price;
+                    let transaction_cost = quantity * TRANSACTION_COST_PER_SHARE;
 
-                    self.account.cash -= buy_total;
+                    self.account.cash -= buy_total + transaction_cost;
                     self.account.positions[ticker_index].add(current_price, quantity);
 
                     self.episode_history.buys[ticker_index]
@@ -283,10 +332,11 @@ impl Env {
                 // Time-weighted realized return, scaled by trade size
                 let trade_reward = log_return * trade_weight * REWARD_SCALE;
                 total_reward += trade_reward;
-                
-                let quantity = sell_total / current_price;
 
-                self.account.cash += sell_total;
+                let quantity = sell_total / current_price;
+                let transaction_cost = quantity * TRANSACTION_COST_PER_SHARE;
+
+                self.account.cash += sell_total - transaction_cost;
                 self.account.positions[ticker_index].quantity -= quantity;
 
                 self.episode_history.sells[ticker_index]
@@ -395,17 +445,6 @@ impl Env {
         self.episode_history = EpisodeHistory::new(self.tickers.len());
 
         self.action_history.clear();
-
-        if self.episode == 0 {
-            create_folder_if_not_exists(&"training/data".to_string());
-            for (ticker_index, _) in self.tickers.iter().enumerate() {
-                let _ = simple_chart(
-                    &"training/data".to_string(),
-                    format!("price_observations_{}", ticker_index).as_str(),
-                    &self.price_deltas[ticker_index],
-                );
-            }
-        }
 
         // Return initial observation as two separate tensors
         let (price_deltas, static_obs) = self.get_next_obs();
