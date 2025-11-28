@@ -1,11 +1,18 @@
 # Trading bot 0
 
-Members:
+## Monorepo Members
+
 - `trading_bots/` the various trading bots, most notably the `torch/` RL model
 - `tui/` control and data viewing for training and inference, designed for the torch RL model
 - `shared/` shared code between the members
 
-There are many trading bots and strategies in this repo.
+## Usage
+
+It's recommended to use the `tui/` to start training or inference, or to view training or inference data. It's recommended to begin training/inference from inside the tui using the controls it provides so that it can show logs and track episodes correctly.
+
+```rust
+cd tui && cargo run --release
+```
 
 ## Project Structure
 
@@ -16,22 +23,11 @@ There are many trading bots and strategies in this repo.
 - `weights/` trained or partially trained model schemas
 - `infer/` inference results and metadata
 
-## Programmatic Strategies with Genetic Algorithm Optimization
-
-- `src/agents/` and `src/strategies/` a few different strategies with parameters optimized using genetic algorithm, sees significant improvement over training
-- Interesting research project but not designed for or expecting significant results
-
-### Single ticker (NVDA) training results
-
-| ![Screenshot From 2024-11-27 21-38-01](https://github.com/user-attachments/assets/b7d867be-14d1-4f08-9c2f-ca6bc66d830a)          |
-|:--------------------------------------------------------------------------------------------------------------------------------:|
-| *Total assets doubling from $10,000 -> $20,000 over the course of a year using one of the optimized strategic trading algorithms* |
-
 ## PPO Trading Agent
 
 Multi-asset trading bot using deep RL (PPO) and historical price data.
 
-- `src/torch/` using tch-rs, model derives from their RL example / openAI's PPO implementation with heavy modifications and additions
+- `src/torch/` using tch-rs, model derives from their RL example / SB3 PPO implementation with heavy modifications mentioned below
 - drastically outperforms the programmatic strategies with comparable training time
 - Performs exceptionally well when trained sufficiently (thousands of epochs)
 
@@ -57,5 +53,18 @@ Multi-asset trading bot using deep RL (PPO) and historical price data.
 | ![PPO Gen 305 Final Assets](assets/ppo_gen305_nvda_final_assets.png) |
 | ![PPO Gen 305 NVDA Assets](assets/ppo_gen305_nvda_assets.png)        |
 | ![PPO Gen 305 NVDA Assets](assets/ppo_gen305_nvda_buy_sell.png)      |
+
+## Programmatic Strategies with Genetic Algorithm Optimization
+
+This was the original project, but was effectively superseded by the RL models. They're here if you want to see some interesting use of genetic algorithms for parameter refinement.
+
+- `src/agents/` and `src/strategies/` a few different strategies with parameters optimized using genetic algorithm, sees significant improvement over training
+- Interesting research project but not designed for or expecting significant results
+
+### Single ticker (NVDA) training results
+
+| ![Screenshot From 2024-11-27 21-38-01](https://github.com/user-attachments/assets/b7d867be-14d1-4f08-9c2f-ca6bc66d830a)          |
+|:--------------------------------------------------------------------------------------------------------------------------------:|
+| *Total assets doubling from $10,000 -> $20,000 over the course of a year using one of the optimized strategic trading algorithms* |
 
 Thanks to [rust-ibapi](https://github.com/wboayue/rust-ibapi) and its contributors for making this possible
