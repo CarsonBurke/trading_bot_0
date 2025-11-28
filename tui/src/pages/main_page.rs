@@ -14,7 +14,7 @@ pub fn render(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(7),
+            Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(6),
         ])
