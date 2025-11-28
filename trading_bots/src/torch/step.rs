@@ -352,7 +352,8 @@ impl Env {
 
             let desired_delta = target - current_value;
             
-            if desired_delta.abs() < ACTION_THRESHOLD {
+            let threshold_normal = ACTION_THRESHOLD * self.account.total_assets;
+            if desired_delta.abs() < threshold_normal {
                 continue;
             }
 
