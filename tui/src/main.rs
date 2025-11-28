@@ -25,6 +25,7 @@ mod chart_viewer;
 use chart_viewer::ChartViewer;
 
 // Catppuccin Mocha theme colors
+#[allow(dead_code)]
 mod theme {
     use ratatui::style::Color;
 
@@ -74,7 +75,6 @@ enum DialogMode {
 struct App {
     mode: AppMode,
     dialog_mode: DialogMode,
-    training_process: Option<Child>,
     inference_process: Option<Child>,
     generations: Vec<GenerationInfo>,
     filtered_generations: Vec<GenerationInfo>,
@@ -96,11 +96,22 @@ struct GenerationInfo {
 }
 
 impl App {
+    fn coerce_weights_filename(input: &str) -> String {
+        let trimmed = input.trim();
+
+        // If it's just a number, expand to ppo_ep{N}.ot
+        if trimmed.parse::<u32>().is_ok() {
+            return format!("ppo_ep{}.ot", trimmed);
+        }
+
+        // If it already has the pattern, use as-is
+        trimmed.to_string()
+    }
+
     fn new() -> Result<Self> {
         let mut app = App {
             mode: AppMode::Main,
             dialog_mode: DialogMode::None,
-            training_process: None,
             inference_process: None,
             generations: Vec::new(),
             filtered_generations: Vec::new(),
@@ -158,12 +169,7 @@ impl App {
     }
 
     fn is_training_running(&self) -> bool {
-        if self.training_process.is_some() {
-            return true;
-        }
-
         // Check if there's a cargo process running training in trading_bots directory
-        // This matches: "cargo run ... train" in the trading_bots context
         if let Ok(output) = Command::new("pgrep")
             .args(["-f", "cargo.*trading_bots.*train"])
             .output()
@@ -271,7 +277,7 @@ impl App {
     }
 
     fn start_training(&mut self, weights_file: Option<String>) -> Result<()> {
-        if self.training_process.is_some() {
+        if self.is_training_running() {
             return Ok(());
         }
 
@@ -280,7 +286,10 @@ impl App {
             .arg("--release")
             .arg("--")
             .arg("train")
-            .current_dir("../trading_bots");
+            .current_dir("../trading_bots")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
 
         if let Some(weights) = weights_file {
             let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
@@ -291,8 +300,8 @@ impl App {
             cmd.arg("-w").arg(weights_path);
         }
 
-        let child = cmd.spawn()?;
-        self.training_process = Some(child);
+        // Spawn detached - don't keep the Child handle so process continues after TUI quits
+        cmd.spawn()?;
         Ok(())
     }
 
@@ -322,10 +331,16 @@ impl App {
     }
 
     fn stop_training(&mut self) -> Result<()> {
-        if let Some(mut child) = self.training_process.take() {
-            child.kill()?;
-            child.wait()?;
-        }
+        // Kill any cargo processes running training in trading_bots
+        let _ = Command::new("pkill")
+            .args(["-f", "cargo.*trading_bots.*train"])
+            .output();
+
+        // Also kill the actual binary if it's running
+        let _ = Command::new("pkill")
+            .args(["-f", "trading.*train"])
+            .output();
+
         Ok(())
     }
 
@@ -451,7 +466,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 let weights = if app.input.is_empty() {
                                     None
                                 } else {
-                                    Some(app.input.clone())
+                                    Some(App::coerce_weights_filename(&app.input))
                                 };
                                 app.input.clear();
                                 app.dialog_mode = DialogMode::None;
@@ -472,7 +487,6 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         DialogMode::ConfirmQuit => match key.code {
                             KeyCode::Char('y') | KeyCode::Enter => {
-                                app.stop_training()?;
                                 return Ok(());
                             }
                             KeyCode::Char('n') | KeyCode::Esc => {
@@ -617,21 +631,6 @@ fn run_app<B: ratatui::backend::Backend>(
                 _ => {}
             }
         }
-
-        // Check if training process finished
-        if let Some(child) = &mut app.training_process {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    app.training_process = None;
-                    app.load_generations()?;
-                    app.load_latest_meta_charts()?;
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    app.training_process = None;
-                }
-            }
-        }
     }
 }
 
@@ -648,7 +647,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             render_weights_dialog(f, app, for_training, for_inference);
         }
         DialogMode::ConfirmQuit => {
-            render_confirm_dialog(f, "Quit?", "This will stop any running processes.");
+            render_confirm_dialog(f, "Quit?", "Training processes will continue running in background.");
         }
         DialogMode::ConfirmStopTraining => {
             render_confirm_dialog(f, "Stop Training?", "This will terminate the training process.");
@@ -668,22 +667,26 @@ fn render_main(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    let title = Paragraph::new("Trading Bot TUI")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .block(Block::default().borders(Borders::ALL));
+    let title = Paragraph::new(" 🤖 Trading Bot TUI ")
+        .style(Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::LAVENDER))
+        );
     f.render_widget(title, chunks[0]);
 
     let is_training = app.is_training_running();
     let status = if is_training {
-        "Training: RUNNING"
+        "RUNNING ●"
     } else {
-        "Training: STOPPED"
+        "STOPPED ○"
     };
 
     let status_color = if is_training {
-        Color::Green
+        theme::GREEN
     } else {
-        Color::Red
+        theme::RED
     };
 
     let weights_info = if let Some(weights) = &app.weights_path {
@@ -694,27 +697,36 @@ fn render_main(f: &mut Frame, app: &App) {
 
     let info_text = vec![
         Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::Yellow)),
-            Span::styled(status, Style::default().fg(status_color)),
+            Span::styled("Status: ", Style::default().fg(theme::SUBTEXT1)),
+            Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Weights File: ", Style::default().fg(Color::Yellow)),
-            Span::raw(&app.input),
+            Span::styled("Weights: ", Style::default().fg(theme::SUBTEXT1)),
+            Span::styled(weights_info, Style::default().fg(theme::BLUE)),
         ]),
-        Line::from(weights_info),
     ];
 
     let info = Paragraph::new(info_text)
-        .block(Block::default().borders(Borders::ALL).title("Info"))
+        .style(Style::default().fg(theme::TEXT))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2))
+                .title(" Info ")
+                .title_style(Style::default().fg(theme::SKY))
+        )
         .wrap(Wrap { trim: false });
     f.render_widget(info, chunks[1]);
 
     let meta_chart_items: Vec<Line> = if app.latest_meta_charts.is_empty() {
-        vec![Line::from(Span::styled(
-            "No meta-history charts found yet",
-            Style::default().fg(Color::DarkGray),
-        ))]
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No meta-history charts found yet",
+                Style::default().fg(theme::OVERLAY0),
+            ))
+        ]
     } else {
         app.latest_meta_charts
             .iter()
@@ -724,18 +736,21 @@ fn render_main(f: &mut Frame, app: &App) {
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown");
                 Line::from(vec![
-                    Span::styled("• ", Style::default().fg(Color::Cyan)),
-                    Span::raw(name),
+                    Span::styled(" 📊 ", Style::default().fg(theme::YELLOW)),
+                    Span::styled(name, Style::default().fg(theme::TEXT)),
                 ])
             })
             .collect()
     };
 
     let meta_charts = Paragraph::new(meta_chart_items)
+        .style(Style::default().fg(theme::TEXT))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Latest Meta-History Charts"),
+                .border_style(Style::default().fg(theme::SURFACE2))
+                .title(" 📈 Latest Meta-History Charts ")
+                .title_style(Style::default().fg(theme::PEACH))
         )
         .wrap(Wrap { trim: false });
     f.render_widget(meta_charts, chunks[2]);
@@ -858,14 +873,19 @@ fn render_chart_viewer(f: &mut Frame, app: &mut App) {
 }
 
 fn render_weights_dialog(f: &mut Frame, app: &App, for_training: bool, for_inference: bool) {
-    let area = centered_rect(60, 30, f.area());
+    let area = centered_rect(65, 40, f.area());
+
+    // Render semi-transparent backdrop
+    let backdrop = Block::default()
+        .style(Style::default().bg(theme::CRUST));
+    f.render_widget(backdrop, f.area());
 
     let title = if for_training {
-        "Start Training"
+        " 🚀 Start Training "
     } else if for_inference {
-        "Run Inference"
+        " 🔍 Run Inference "
     } else {
-        "Weights Input"
+        " ⚙️  Weights Input "
     };
 
     let default_text = if for_inference {
@@ -876,83 +896,146 @@ fn render_weights_dialog(f: &mut Frame, app: &App, for_training: bool, for_infer
 
     let dialog = Block::default()
         .title(title)
+        .title_style(Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(theme::LAVENDER))
+        .style(Style::default().bg(theme::MANTLE));
 
     let inner = dialog.inner(area);
     f.render_widget(dialog, area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(5),
+            Constraint::Length(1),
             Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(3),
         ])
         .split(inner);
 
     let prompt_text = vec![
         Line::from(vec![
-            Span::raw("Enter weights filename from "),
-            Span::styled(WEIGHTS_PATH, Style::default().fg(Color::Cyan)),
+            Span::styled("📁 ", Style::default().fg(theme::YELLOW)),
+            Span::styled("Weights Directory: ", Style::default().fg(theme::SUBTEXT1)),
+            Span::styled(WEIGHTS_PATH, Style::default().fg(theme::SAPPHIRE).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("💡 ", Style::default().fg(theme::PEACH)),
+            Span::styled("Shorthand: ", Style::default().fg(theme::SUBTEXT0)),
+            Span::styled("Type '400' for 'ppo_ep400.ot'", Style::default().fg(theme::TEAL).add_modifier(Modifier::ITALIC)),
         ]),
         Line::from(vec![
-            Span::styled("Default: ", Style::default().fg(Color::Yellow)),
-            Span::raw(default_text),
+            Span::styled("   ", Style::default()),
+            Span::styled("Default: ", Style::default().fg(theme::SUBTEXT0)),
+            Span::styled(default_text, Style::default().fg(theme::GREEN).add_modifier(Modifier::ITALIC)),
         ]),
     ];
-    let prompt = Paragraph::new(prompt_text);
+    let prompt = Paragraph::new(prompt_text)
+        .style(Style::default().fg(theme::TEXT));
     f.render_widget(prompt, chunks[0]);
 
-    let input_display = format!("> {}_", app.input);
+    let input_display = if app.input.is_empty() {
+        format!(" {}", default_text)
+    } else {
+        format!(" {}▊", app.input)
+    };
+
     let input_widget = Paragraph::new(input_display)
-        .style(Style::default().fg(Color::Green))
-        .block(Block::default().borders(Borders::ALL).title("Weights File"));
-    f.render_widget(input_widget, chunks[1]);
+        .style(Style::default().fg(theme::TEXT).bg(theme::SURFACE0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::BLUE))
+                .title(" Filename ")
+                .title_style(Style::default().fg(theme::SKY))
+        );
+    f.render_widget(input_widget, chunks[2]);
 
     let help = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::Green)),
-            Span::raw(": Confirm  "),
-            Span::styled("Esc", Style::default().fg(Color::Red)),
-            Span::raw(": Cancel"),
+            Span::styled(" ⏎ ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled("Confirm", Style::default().fg(theme::SUBTEXT1)),
+            Span::raw("   "),
+            Span::styled(" Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+            Span::styled("Cancel", Style::default().fg(theme::SUBTEXT1)),
         ]),
-    ]);
-    f.render_widget(help, chunks[2]);
+    ])
+    .style(Style::default().fg(theme::TEXT))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::SURFACE2))
+    );
+    f.render_widget(help, chunks[4]);
 }
 
 fn render_confirm_dialog(f: &mut Frame, title: &str, message: &str) {
-    let area = centered_rect(50, 25, f.area());
+    let area = centered_rect(55, 30, f.area());
+
+    // Render backdrop
+    let backdrop = Block::default()
+        .style(Style::default().bg(theme::CRUST));
+    f.render_widget(backdrop, f.area());
+
+    let dialog_title = if title.contains("Quit") {
+        " ⚠️  Confirm Quit "
+    } else if title.contains("Stop") {
+        " ⛔ Stop Training "
+    } else {
+        title
+    };
 
     let dialog = Block::default()
-        .title(title)
+        .title(dialog_title)
+        .title_style(Style::default().fg(theme::PEACH).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(theme::MAROON))
+        .style(Style::default().bg(theme::MANTLE));
 
     let inner = dialog.inner(area);
     f.render_widget(dialog, area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(4),
+            Constraint::Length(1),
             Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(2),
         ])
         .split(inner);
 
-    let message_widget = Paragraph::new(message)
-        .style(Style::default().fg(Color::Yellow))
-        .wrap(Wrap { trim: false });
+    let message_widget = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(message, Style::default().fg(theme::TEXT)),
+        ]),
+    ])
+    .wrap(Wrap { trim: false });
     f.render_widget(message_widget, chunks[0]);
 
     let help = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("y/Enter", Style::default().fg(Color::Green)),
-            Span::raw(": Yes  "),
-            Span::styled("n/Esc", Style::default().fg(Color::Red)),
-            Span::raw(": No"),
+            Span::styled(" y ", Style::default().fg(theme::GREEN).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
+            Span::raw(" / "),
+            Span::styled(" ⏎ ", Style::default().fg(theme::GREEN).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
+            Span::styled("  Yes", Style::default().fg(theme::SUBTEXT1)),
+            Span::raw("     "),
+            Span::styled(" n ", Style::default().fg(theme::RED).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
+            Span::raw(" / "),
+            Span::styled(" Esc ", Style::default().fg(theme::RED).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
+            Span::styled("  No", Style::default().fg(theme::SUBTEXT1)),
         ]),
-    ]);
+    ])
+    .style(Style::default().fg(theme::TEXT))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::SURFACE2))
+    );
     f.render_widget(help, chunks[2]);
 }
 
