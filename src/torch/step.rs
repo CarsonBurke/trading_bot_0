@@ -127,8 +127,8 @@ impl Env {
                     self.account.positions[index]
                         .value_with_price(self.prices[index][absolute_step]),
                 );
-                // Record hold action for this ticker
                 self.episode_history.hold_actions[index].push(hold_actions[index]);
+                self.episode_history.raw_actions[index].push(buy_sell_actions[index]);
             }
             self.episode_history.cash.push(self.account.cash);
 

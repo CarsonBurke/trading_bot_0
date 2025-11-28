@@ -523,3 +523,45 @@ pub fn hold_action_chart(
 
     Ok(())
 }
+
+pub fn raw_action_chart(
+    dir: &String,
+    raw_actions: &Vec<f64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("{dir}/raw_action.png");
+    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let y_min = raw_actions
+        .iter()
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(&-1.0)
+        * 1.1;
+    let y_max = raw_actions
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(&1.0)
+        * 1.1;
+
+    let mut chart = plotters::chart::ChartBuilder::on(&root)
+        .caption("Raw Buy/Sell Action Output", ("sans-serif", 20))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..raw_actions.len() as u32, y_min..y_max)?;
+
+    chart.configure_mesh().light_line_style(WHITE).draw()?;
+
+    chart.draw_series(LineSeries::new(
+        raw_actions
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as u32, *value)),
+        RED,
+    ))?;
+
+    root.present()
+        .expect("unable to write chart to file, perhaps there is no directory");
+
+    Ok(())
+}

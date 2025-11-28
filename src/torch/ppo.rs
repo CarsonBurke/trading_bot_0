@@ -24,9 +24,12 @@ const ENTROPY_COEF: f64 = 0.005; // Entropy bonus coefficient
 const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
 const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
 const TARGET_KL: f64 = 0.03; // Target KL divergence for early stopping
+const KL_STOP_MULTIPLIER: f64 = 5.0; // stop episode's epochs if KL divergence exceeds this multiplier of target KL
 const KL_LR_FACTOR: f64 = 0.5; // KL effect on learning rate
 const MAX_KL_LR_DELTA: f64 = 0.1; // Max bounded change in learning rate due to KL divergence per episode
 const LEARNING_RATE: f64 = 1e-4; // Learning rate for optimizer
+const LR_MIN: f64 = 1e-6;
+const LR_MAX: f64 = 2e-4;
 
 pub fn train(weights_path: Option<&str>) {
     let mut env = Env::new(true);
@@ -409,13 +412,13 @@ pub fn train(weights_path: Option<&str>) {
                 let kl_ratio = mean_epoch_kl / TARGET_KL;
                 
                 let lr_factor = (-KL_LR_FACTOR * (kl_ratio - 1.0)).exp();
-                let lr_bounced = lr_factor.clamp(1.0 - MAX_KL_LR_DELTA, 1.0 + MAX_KL_LR_DELTA);
-                let new_lr = current_lr * lr_bounced;
+                let lr_bounded = lr_factor.clamp(1.0 - MAX_KL_LR_DELTA, 1.0 + MAX_KL_LR_DELTA);
+                let new_lr = (current_lr * lr_bounded).clamp(LR_MIN, LR_MAX);
                 
                 opt.set_lr(new_lr);
 
                 println!(
-                    "Epoch {}/{}: KL {:.4} vs target {:.4} (ratio: {:.3}): Changing LR from {:.6} to {:.6}",
+                    "Epoch {}/{}: KL {:.4} vs target {:.4} (ratio: {:.3}): Changing LR from {:.12} to {:.12}",
                     _epoch + 1,
                     OPTIM_EPOCHS,
                     mean_epoch_kl,
@@ -428,7 +431,7 @@ pub fn train(weights_path: Option<&str>) {
                 current_lr = new_lr;
 
                 // Early stop if KL is very high
-                if mean_epoch_kl > TARGET_KL * 2.0 {
+                if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
                     println!("Early stopping: KL divergence too high");
                     early_stopped = true;
                     break 'epoch_loop;
