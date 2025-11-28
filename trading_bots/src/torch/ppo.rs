@@ -37,7 +37,7 @@ pub fn train(weights_path: Option<&str>) {
 
     // Generate data analysis charts for training data
     println!("Generating data analysis charts...");
-    let data_dir = "training/data";
+    let data_dir = "../training/data";
     for (ticker_idx, ticker) in env.tickers.iter().enumerate() {
         if let Err(e) = crate::charts::data_analysis::create_data_analysis_charts(
             ticker,

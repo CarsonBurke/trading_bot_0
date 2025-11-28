@@ -9,6 +9,7 @@ pub struct MetaHistory {
     pub cumulative_reward: Vec<f64>,
     pub outperformance: Vec<f64>,
     pub loss: Vec<f64>,
+    pub total_commissions: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -16,6 +17,7 @@ impl MetaHistory {
         self.final_assets.push(history.final_assets());
         self.cumulative_reward.push(history.rewards.iter().sum::<f64>());
         self.outperformance.push(outperformance);
+        self.total_commissions.push(history.total_commissions);
     }
 
     pub fn record_loss(&mut self, loss: f64) {
@@ -36,6 +38,9 @@ impl MetaHistory {
         }
         if !self.loss.is_empty() {
             let _ = simple_chart(&base_dir, "loss", &self.loss);
+        }
+        if !self.total_commissions.is_empty() {
+            let _ = simple_chart(&base_dir, "total_commissions", &self.total_commissions);
         }
     }
 }

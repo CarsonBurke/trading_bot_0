@@ -6,6 +6,6 @@ pub const STATIC_OBSERVATIONS: usize = 1 + 1 + TICKERS_COUNT as usize + (ACTION_
 pub const OBSERVATION_SPACE: usize = (TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
 pub const STEPS_PER_EPISODE: usize = 10_000; // 12_000;
 
-pub const ACTION_THRESHOLD: f64 = 0.001;
+pub const ACTION_THRESHOLD: f64 = 0.01;
 /// Simulate broker commission rate
 pub const COMMISSION_RATE: f64 = 0.005;

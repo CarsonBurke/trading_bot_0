@@ -103,12 +103,13 @@ pub fn run_inference<P: AsRef<Path>>(
         total_rewards += episode_reward;
         total_episodes += 1;
 
+        let total_commissions = env.episode_history.total_commissions;
         env.record_inference(episode);
 
         let episode_time = Instant::now().duration_since(episode_start).as_secs_f32();
         println!(
-            "Episode {}: Reward: {:.4}, Time: {:.2}s",
-            episode, episode_reward, episode_time
+            "Episode {}: Reward: {:.4}, Commissions: ${:.2}, Time: {:.2}s",
+            episode, episode_reward, total_commissions, episode_time
         );
     }
 

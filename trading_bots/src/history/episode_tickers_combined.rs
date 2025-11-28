@@ -16,6 +16,7 @@ pub struct EpisodeHistory {
     pub rewards: Vec<f64>,
     pub hold_actions: Vec<Vec<f64>>,  // Hold action value for each ticker at each step
     pub raw_actions: Vec<Vec<f64>>,   // Raw buy/sell action outputs for each ticker at each step
+    pub total_commissions: f64,
 }
 
 impl EpisodeHistory {
@@ -28,6 +29,7 @@ impl EpisodeHistory {
             rewards: Vec::new(),
             hold_actions: vec![vec![]; ticker_count],
             raw_actions: vec![vec![]; ticker_count],
+            total_commissions: 0.0,
         }
     }
 

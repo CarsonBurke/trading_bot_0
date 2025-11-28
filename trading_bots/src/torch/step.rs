@@ -33,7 +33,7 @@ pub struct Env {
     max_prices: Vec<f64>,
     price_deltas: Vec<Vec<f64>>,
     account: Account,
-    episode_history: EpisodeHistory,
+    pub episode_history: EpisodeHistory,
     pub meta_history: MetaHistory,
     episode_start: Instant,
     pub episode: usize,
@@ -166,7 +166,7 @@ impl Env {
                 };
 
                 println!(
-                    "{} {} - Total Assets: {} ({}) cumulative reward {:.2} | Buy&Hold: {} | Outperformance: {} | tickers {:?} time {:.2}s",
+                    "{} {} - Total Assets: {} ({}) cumulative reward {:.2} | Buy&Hold: {} | Outperformance: {} | Commissions: {} | tickers {:?} time {:.2}s",
                     "Episode".bright_blue(),
                     self.episode.to_string().bright_blue().bold(),
                     format!("${:.2}", self.account.total_assets).bright_white().bold(),
@@ -174,6 +174,7 @@ impl Env {
                     self.episode_history.rewards.iter().sum::<f64>(),
                     buy_hold_str,
                     outperf_str,
+                    format!("${:.2}", self.episode_history.total_commissions).yellow(),
                     self.tickers,
                     Instant::now().duration_since(self.episode_start).as_secs_f32()
                 );
@@ -342,10 +343,6 @@ impl Env {
     fn trade(&mut self, actions: &[f64], absolute_step: usize) {
 
         for (ticker_index, action) in actions.iter().enumerate() {
-            // Filter out weak signals below threshold
-            if action.abs() < ACTION_THRESHOLD {
-                continue;
-            }
 
             let price = self.prices[ticker_index][absolute_step];
 
@@ -354,12 +351,16 @@ impl Env {
             let current_value = self.account.positions[ticker_index].value_with_price(price);
 
             let desired_delta = target - current_value;
+            
+            if desired_delta.abs() < ACTION_THRESHOLD {
+                continue;
+            }
 
             // BUY
             if desired_delta > 0.0 {
                 let quantity = desired_delta / price;
-                let cost = quantity * COMMISSION_RATE;
-                let total_cost = desired_delta + cost;
+                let commission = quantity * COMMISSION_RATE;
+                let total_cost = desired_delta + commission;
 
                 if total_cost > self.account.cash {
                     continue;
@@ -367,6 +368,7 @@ impl Env {
 
                 self.account.cash -= total_cost;
                 self.account.positions[ticker_index].add(price, quantity);
+                self.episode_history.total_commissions += commission;
 
                 self.episode_history.buys[ticker_index].insert(absolute_step, (price, quantity));
             }
@@ -381,10 +383,11 @@ impl Env {
                 }
 
                 let quantity = trade_value / price;
-                let cost = quantity * COMMISSION_RATE;
+                let commission = quantity * COMMISSION_RATE;
 
-                self.account.cash += trade_value - cost;
+                self.account.cash += trade_value - commission;
                 self.account.positions[ticker_index].quantity -= quantity;
+                self.episode_history.total_commissions += commission;
 
                 self.episode_history.sells[ticker_index].insert(absolute_step, (price, quantity));
             }
@@ -498,7 +501,7 @@ impl Env {
     }
 
     pub fn record_inference(&self, episode: usize) {
-        let infer_dir = "infer";
+        let infer_dir = "../infer";
         create_folder_if_not_exists(&infer_dir.to_string());
 
         self.episode_history

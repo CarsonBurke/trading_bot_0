@@ -216,10 +216,10 @@ impl Environment for Env {
         self.state = ObservationState::new_random();
 
         if self.episode == 0 {
-            create_folder_if_not_exists(&"training/data".to_string());
+            create_folder_if_not_exists(&"../training/data".to_string());
             for (ticker_index, _) in self.tickers.iter().enumerate() {
                 let _ = simple_chart(
-                    &"training/data".to_string(),
+                    &"../training/data".to_string(),
                     format!("price_observations_{}", ticker_index).as_str(),
                     &self.price_deltas[ticker_index],
                 );

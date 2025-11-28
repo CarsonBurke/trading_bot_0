@@ -1,45 +1,7 @@
-[package]
-name = "trading_bot_0"
-version = "0.1.0"
-edition = "2021"
-license = "GPL-3.0"
-description = "A trading bot using machine learning and genetic algorithms, working with the IBKR API"
-repository = "https://github.com/CarsonBurke/trading_bot_0"
-keywords = ["trading", "finance", "deep-learning", "machine-learning"]
-categories = ["science"]
-
-[dependencies]
-anyhow = "1.0.98"
-# conflicts with torch > 0.19, have to disable for torch variant
-# burn = {version = "0.18.0", features = ["wgpu", "rocm", "cuda", "ndarray", "autodiff", "vulkan", "fusion"]}
-candle-core = { version = "0.9.1" }
-candle-nn = {version = "0.9.1" }
-chrono = "0.4.38"
-clap = { version = "4.5.21", features = ["derive"] }
-colored = "2.1.0"
-cpython = "0.7.2"
-enum-map = { version = "2.7.3", features = ["serde"] }
-hashbrown = "0.15.2"
-ibapi = { version = "1.0.3" }
-ndarray = "0.16.1"
-ordered-float = "4.5.0"
-plotters = "0.3.7"
-postcard = { version = "1.1.0", features = ["use-std"] }
-rand = "0.9.1"
-ringbuffer = "0.16.0"
-rust_neural_network = "0.18.0"
-serde = "1.0.215"
-tch = { version = "0.22.0", features = ["rl-python", "download-libtorch"] }
-time = "0.3.36"
-tokio = { version = "1.42.0", features = ["full"] }
-uuid = { version = "1.11.0", features = ["v4"] }
-
-[features]
-default = ["debug_training"]
-debug_training = []
-
-[profile.release]
-debug = 1
-
-# [rust]
-# debuginfo-level = 1
+[workspace]
+resolver = "2"
+members = [
+    "trading_bots",
+    "tui",
+    "shared",
+]

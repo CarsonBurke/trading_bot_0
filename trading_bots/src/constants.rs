@@ -26,9 +26,7 @@ pub mod api {
 }
 
 pub mod files {
-    pub const DATA_PATH: &str = "long_data";
-    pub const WEIGHTS_PATH: &str = "weights";
-    pub const TRAINING_PATH: &str = "training";
+    pub use shared::paths::*;
 }
 
 pub mod agent {
