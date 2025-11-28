@@ -59,6 +59,40 @@ impl ChartViewer {
         Ok(())
     }
 
+    pub fn load_charts(&mut self, chart_paths: &[PathBuf]) -> Result<()> {
+        self.nodes.clear();
+        self.root_indices.clear();
+        self.expanded.clear();
+        self.current_image = None;
+
+        for path in chart_paths {
+            if path.exists() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let chart_idx = self.nodes.len();
+                self.nodes.push(ChartNode::Chart {
+                    name,
+                    path: path.clone(),
+                });
+                self.expanded.push(false);
+                self.root_indices.push(chart_idx);
+            }
+        }
+
+        self.rebuild_flattened();
+
+        if !self.flattened.is_empty() {
+            self.list_state.select(Some(0));
+            self.load_current_image();
+        }
+
+        Ok(())
+    }
+
     fn build_tree(&mut self, path: &PathBuf) -> Result<()> {
         let mut folders = Vec::new();
         let mut charts = Vec::new();
@@ -85,8 +119,9 @@ impl ChartViewer {
                     .into_iter()
                     .filter_map(|e| e.ok())
                 {
+                    let ext = sub_entry.path().extension().and_then(|s| s.to_str());
                     if sub_entry.file_type().is_file()
-                        && sub_entry.path().extension().and_then(|s| s.to_str()) == Some("png")
+                        && (ext == Some("png") || ext == Some("webp"))
                     {
                         let chart_name = sub_entry
                             .file_name()
@@ -111,16 +146,17 @@ impl ChartViewer {
                 });
                 self.expanded.push(false);
                 folders.push(folder_idx);
-            } else if entry.file_type().is_file()
-                && entry.path().extension().and_then(|s| s.to_str()) == Some("png")
-            {
-                let chart_idx = self.nodes.len();
-                self.nodes.push(ChartNode::Chart {
-                    name,
-                    path: entry_path,
-                });
-                self.expanded.push(false);
-                charts.push(chart_idx);
+            } else {
+                let ext = entry.path().extension().and_then(|s| s.to_str());
+                if entry.file_type().is_file() && (ext == Some("png") || ext == Some("webp")) {
+                    let chart_idx = self.nodes.len();
+                    self.nodes.push(ChartNode::Chart {
+                        name,
+                        path: entry_path,
+                    });
+                    self.expanded.push(false);
+                    charts.push(chart_idx);
+                }
             }
         }
 
@@ -160,8 +196,8 @@ impl ChartViewer {
                 let (node_idx, _) = self.flattened[i];
                 if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
                     if let Ok(img) = image::open(path) {
-                        let dyn_img = img.resize(800, 600, image::imageops::FilterType::Lanczos3);
-                        let protocol = self.picker.new_resize_protocol(dyn_img);
+                        // Use original image size, picker will handle fitting to terminal
+                        let protocol = self.picker.new_resize_protocol(img);
                         self.current_image = Some(protocol);
                     }
                 }
@@ -232,7 +268,7 @@ impl ChartViewer {
     pub fn render(&mut self, f: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
             .split(f.area());
 
         self.render_list(f, chunks[0]);
@@ -245,7 +281,7 @@ impl ChartViewer {
             .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)])
             .split(area);
 
-        let title = Paragraph::new("Chart Browser")
+        let title = Paragraph::new(" Meta Charts ")
             .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             .block(Block::default().borders(Borders::ALL));
         f.render_widget(title, chunks[0]);

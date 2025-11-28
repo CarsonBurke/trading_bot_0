@@ -4,3 +4,5 @@ pub mod paths {
     pub const TRAINING_PATH: &str = "../training";
     pub const INFER_PATH: &str = "../infer";
 }
+
+pub mod theme;

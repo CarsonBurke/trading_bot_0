@@ -1,7 +1,8 @@
 use plotters::prelude::*;
+use shared::theme::plotters_colors as theme;
 use std::error::Error;
 
-use crate::utils::create_folder_if_not_exists;
+use crate::{constants::CHART_IMAGE_FORMAT, utils::create_folder_if_not_exists};
 
 pub fn create_data_analysis_charts(
     ticker: &str,
@@ -52,9 +53,9 @@ fn volatility_chart(
         return Ok(());
     }
 
-    let path = format!("{}/volatility.png", dir);
-    let root = BitMapBackend::new(&path, (1200, 600)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{}/volatility.{}", dir, CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(&path, (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let max_vol = rolling_volatility
         .iter()
@@ -68,7 +69,7 @@ fn volatility_chart(
     let mut chart = ChartBuilder::on(&root)
         .caption(
             format!("{} - Rolling 20-Period Volatility (Annualized %)", ticker),
-            ("sans-serif", 30),
+            ("sans-serif", 30, &theme::TEXT),
         )
         .margin(10)
         .x_label_area_size(40)
@@ -82,11 +83,14 @@ fn volatility_chart(
         .configure_mesh()
         .x_desc("Time Step")
         .y_desc("Volatility (%)")
+        .label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0)
         .draw()?;
 
     chart.draw_series(LineSeries::new(
         rolling_volatility.iter().enumerate().map(|(i, v)| (i, *v)),
-        &BLUE,
+        &theme::BLUE,
     ))?;
 
     root.present()?;
@@ -107,9 +111,9 @@ fn returns_distribution_chart(
         return Ok(());
     }
 
-    let path = format!("{}/returns_distribution.png", dir);
-    let root = BitMapBackend::new(&path, (1200, 600)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{}/returns_distribution.{}", dir, CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(&path, (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     // Create histogram bins
     const NUM_BINS: usize = 50;
@@ -129,7 +133,7 @@ fn returns_distribution_chart(
     let mut chart = ChartBuilder::on(&root)
         .caption(
             format!("{} - Returns Distribution", ticker),
-            ("sans-serif", 30),
+            ("sans-serif", 30, &theme::TEXT),
         )
         .margin(10)
         .x_label_area_size(40)
@@ -143,6 +147,9 @@ fn returns_distribution_chart(
         .configure_mesh()
         .x_desc("Return (%)")
         .y_desc("Frequency")
+        .label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0)
         .draw()?;
 
     // Draw histogram as bars
@@ -151,7 +158,7 @@ fn returns_distribution_chart(
         let x_right = min_return + (i + 1) as f64 * bin_width;
         Rectangle::new(
             [(x_left, 0), (x_right, count)],
-            BLUE.filled(),
+            theme::BLUE.filled(),
         )
     }))?;
 
@@ -213,11 +220,11 @@ fn rolling_metrics_chart(
         return Ok(());
     }
 
-    let path = format!("{}/rolling_metrics.png", dir);
-    let root = BitMapBackend::new(&path, (1200, 600)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{}/rolling_metrics.{}", dir, CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(&path, (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
-    let (upper, lower) = root.split_vertically(300);
+    let (upper, lower) = root.split_vertically(400);
 
     // Sharpe ratio chart
     {
@@ -233,7 +240,7 @@ fn rolling_metrics_chart(
         let mut chart = ChartBuilder::on(&upper)
             .caption(
                 format!("{} - Rolling 100-Period Sharpe Ratio", ticker),
-                ("sans-serif", 25),
+                ("sans-serif", 25, &theme::TEXT),
             )
             .margin(10)
             .x_label_area_size(30)
@@ -246,11 +253,14 @@ fn rolling_metrics_chart(
         chart
             .configure_mesh()
             .y_desc("Sharpe Ratio")
+            .label_style(("sans-serif", 15, &theme::TEXT))
+            .axis_style(&theme::SURFACE1)
+            .light_line_style(&theme::SURFACE0)
             .draw()?;
 
         chart.draw_series(LineSeries::new(
             rolling_sharpe.iter().enumerate().map(|(i, v)| (i, *v)),
-            &GREEN,
+            &theme::GREEN,
         ))?;
     }
 
@@ -264,7 +274,7 @@ fn rolling_metrics_chart(
         let mut chart = ChartBuilder::on(&lower)
             .caption(
                 format!("{} - Rolling 100-Period Max Drawdown", ticker),
-                ("sans-serif", 25),
+                ("sans-serif", 25, &theme::TEXT),
             )
             .margin(10)
             .x_label_area_size(40)
@@ -275,11 +285,14 @@ fn rolling_metrics_chart(
             .configure_mesh()
             .x_desc("Time Step")
             .y_desc("Max Drawdown (%)")
+            .label_style(("sans-serif", 15, &theme::TEXT))
+            .axis_style(&theme::SURFACE1)
+            .light_line_style(&theme::SURFACE0)
             .draw()?;
 
         chart.draw_series(LineSeries::new(
             rolling_max_drawdown.iter().enumerate().map(|(i, v)| (i, *v)),
-            &RED,
+            &theme::RED,
         ))?;
     }
 
@@ -296,9 +309,9 @@ fn price_statistics_chart(
         return Ok(());
     }
 
-    let path = format!("{}/price_statistics.png", dir);
-    let root = BitMapBackend::new(&path, (1200, 800)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{}/price_statistics.{}", dir, CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(&path, (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     // Calculate statistics
     let min_price = prices.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -322,7 +335,7 @@ fn price_statistics_chart(
     let mut chart = ChartBuilder::on(&root)
         .caption(
             format!("{} - Price with Statistics", ticker),
-            ("sans-serif", 30),
+            ("sans-serif", 30, &theme::TEXT),
         )
         .margin(10)
         .x_label_area_size(40)
@@ -333,33 +346,37 @@ fn price_statistics_chart(
         .configure_mesh()
         .x_desc("Time Step")
         .y_desc("Price")
+        .label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0)
         .draw()?;
 
     // Price line
     chart.draw_series(LineSeries::new(
         prices.iter().enumerate().map(|(i, p)| (i, *p)),
-        &BLUE,
+        &theme::BLUE,
     ))?
     .label("Price")
-    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &theme::BLUE));
 
     // Mean line
     chart.draw_series(LineSeries::new(
         (0..prices.len()).map(|i| (i, mean_price)),
-        GREEN.stroke_width(2),
+        theme::GREEN.stroke_width(2),
     ))?
     .label(format!("Mean: ${:.2}", mean_price))
-    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN));
+    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], theme::GREEN));
 
     // Add text with statistics
     chart
         .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(&theme::SURFACE0.mix(0.9))
+        .border_style(&theme::SURFACE1)
+        .label_font(("sans-serif", 15, &theme::TEXT))
         .draw()?;
 
     // Draw statistics text box - use draw instead for better control
-    let text_style = TextStyle::from(("sans-serif", 20).into_font()).color(&BLACK);
+    let text_style = TextStyle::from(("sans-serif", 20).into_font()).color(&theme::TEXT);
     let stats_text = format!(
         "Statistics:\nMin: ${:.2}\nMax: ${:.2}\nMean Return: {:.4}%\nStd Return: {:.4}%\nTotal Points: {}",
         min_price, max_price, mean_return, std_return, prices.len()

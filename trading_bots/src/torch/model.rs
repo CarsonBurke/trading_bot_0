@@ -5,6 +5,9 @@ use crate::torch::constants::{
     PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT
 };
 
+// Temporal length after all conv layers: 4400 -> 2197 -> 1099 -> 550 -> 550 -> 550
+const CONV_TEMPORAL_LEN: i64 = 550;
+
 // Model returns (critic_value, (action_mean, action_log_std))
 // Actions are sampled from Gaussian then sigmoid-squashed to approximately [-1, 1]
 pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor))>;
@@ -102,6 +105,10 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     // State-independent log_std parameter for more stable exploration
     let log_std_param = p.var("log_std", &[nact], Init::Const(0.0));
 
+    // Learnable positional embedding for temporal dimension before GAP
+    // Allows model to weight recent vs old patterns differently
+    let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
+
     let device = p.device();
     Box::new(move |price_deltas: &Tensor, static_features: &Tensor, train: bool| {
         let price_deltas = price_deltas.to_device(device);
@@ -132,6 +139,9 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let x5_input = x.shallow_clone();  // Save for residual
         let x = x.apply(&gn5).apply(&c5_dw).apply(&c5_pw);
         let x = (x + x5_input).silu();  // Residual connection + activation
+
+        // Add positional embedding before GAP to preserve recency information
+        let x = x + &pos_embedding;
 
         // Apply Global Average Pooling per ticker using adaptive pooling
         // Shape-agnostic: [batch*TICKERS, 256, T] -> [batch*TICKERS, 256, 1] -> [batch*TICKERS, 256]

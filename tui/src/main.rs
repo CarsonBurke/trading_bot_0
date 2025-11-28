@@ -6,93 +6,94 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    layout::Rect,
+    widgets::ListState,
     Frame, Terminal,
 };
-use shared::paths::{TRAINING_PATH, WEIGHTS_PATH};
+use shared::paths::WEIGHTS_PATH;
 use std::{
     io,
     path::PathBuf,
     process::{Child, Command},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant},
 };
 use walkdir::WalkDir;
 
 mod chart_viewer;
+mod components;
+mod pages;
+mod theme;
+mod utils;
+
 use chart_viewer::ChartViewer;
 
-// Catppuccin Mocha theme colors
-#[allow(dead_code)]
-mod theme {
-    use ratatui::style::Color;
-
-    pub const BASE: Color = Color::Rgb(30, 30, 46);           // #1e1e2e
-    pub const MANTLE: Color = Color::Rgb(24, 24, 37);        // #181825
-    pub const CRUST: Color = Color::Rgb(17, 17, 27);         // #11111b
-    pub const TEXT: Color = Color::Rgb(205, 214, 244);       // #cdd6f4
-    pub const SUBTEXT0: Color = Color::Rgb(166, 173, 200);   // #a6adc8
-    pub const SUBTEXT1: Color = Color::Rgb(186, 194, 222);   // #bac2de
-    pub const SURFACE0: Color = Color::Rgb(49, 50, 68);      // #313244
-    pub const SURFACE1: Color = Color::Rgb(69, 71, 90);      // #45475a
-    pub const SURFACE2: Color = Color::Rgb(88, 91, 112);     // #585b70
-    pub const OVERLAY0: Color = Color::Rgb(108, 112, 134);   // #6c7086
-    pub const OVERLAY1: Color = Color::Rgb(127, 132, 156);   // #7f849c
-    pub const OVERLAY2: Color = Color::Rgb(147, 153, 178);   // #9399b2
-    pub const BLUE: Color = Color::Rgb(137, 180, 250);       // #89b4fa
-    pub const LAVENDER: Color = Color::Rgb(180, 190, 254);   // #b4befe
-    pub const SAPPHIRE: Color = Color::Rgb(116, 199, 236);   // #74c7ec
-    pub const SKY: Color = Color::Rgb(137, 220, 235);        // #89dceb
-    pub const TEAL: Color = Color::Rgb(148, 226, 213);       // #94e2d5
-    pub const GREEN: Color = Color::Rgb(166, 227, 161);      // #a6e3a1
-    pub const YELLOW: Color = Color::Rgb(249, 226, 175);     // #f9e2af
-    pub const PEACH: Color = Color::Rgb(250, 179, 135);      // #fab387
-    pub const MAROON: Color = Color::Rgb(235, 160, 172);     // #eba0ac
-    pub const RED: Color = Color::Rgb(243, 139, 168);        // #f38ba8
-    pub const MAUVE: Color = Color::Rgb(203, 166, 247);      // #cba6f7
-    pub const PINK: Color = Color::Rgb(245, 194, 231);       // #f5c2e7
-    pub const FLAMINGO: Color = Color::Rgb(242, 205, 205);   // #f2cdcd
-    pub const ROSEWATER: Color = Color::Rgb(245, 224, 220);  // #f5e0dc
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum AppMode {
+pub enum AppMode {
     Main,
     GenerationBrowser,
+    InferenceBrowser,
     ChartViewer,
+    Logs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum DialogMode {
+pub enum DialogMode {
     None,
     WeightsInput { for_training: bool, for_inference: bool },
+    InferenceInput { focused_field: InferenceField },
     ConfirmQuit,
     ConfirmStopTraining,
+    PageJump { selected: usize },
 }
 
-struct App {
-    mode: AppMode,
-    dialog_mode: DialogMode,
-    inference_process: Option<Child>,
-    generations: Vec<GenerationInfo>,
-    filtered_generations: Vec<GenerationInfo>,
-    selected_generation: Option<usize>,
-    list_state: ListState,
-    chart_viewer: ChartViewer,
-    input: String,
-    search_input: String,
-    weights_path: Option<String>,
-    searching: bool,
-    list_area: Rect,
-    latest_meta_charts: Vec<PathBuf>,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InferenceField {
+    Weights,
+    Ticker,
+    Episodes,
+}
+
+pub struct App {
+    pub mode: AppMode,
+    pub previous_mode: AppMode,
+    pub dialog_mode: DialogMode,
+    pub inference_process: Option<Child>,
+    pub training_process: Option<Child>,
+    pub training_output: Vec<String>,
+    pub generations: Vec<GenerationInfo>,
+    pub filtered_generations: Vec<GenerationInfo>,
+    pub selected_generation: Option<usize>,
+    pub list_state: ListState,
+    pub inferences: Vec<InferenceInfo>,
+    pub filtered_inferences: Vec<InferenceInfo>,
+    pub selected_inference: Option<usize>,
+    pub inference_list_state: ListState,
+    pub chart_viewer: ChartViewer,
+    pub input: String,
+    pub ticker_input: String,
+    pub episodes_input: String,
+    pub search_input: String,
+    pub inference_search_input: String,
+    pub weights_path: Option<String>,
+    pub searching: bool,
+    pub inference_searching: bool,
+    pub list_area: Rect,
+    pub inference_list_area: Rect,
+    pub latest_meta_charts: Vec<PathBuf>,
+    pub logs_scroll: usize,
+    last_refresh: Instant,
 }
 
 #[derive(Debug, Clone)]
-struct GenerationInfo {
-    number: usize,
-    path: PathBuf,
+pub struct GenerationInfo {
+    pub number: usize,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct InferenceInfo {
+    pub number: usize,
+    pub path: PathBuf,
 }
 
 impl App {
@@ -111,46 +112,102 @@ impl App {
     fn new() -> Result<Self> {
         let mut app = App {
             mode: AppMode::Main,
+            previous_mode: AppMode::Main,
             dialog_mode: DialogMode::None,
             inference_process: None,
+            training_process: None,
+            training_output: Vec::new(),
             generations: Vec::new(),
             filtered_generations: Vec::new(),
             selected_generation: None,
             list_state: ListState::default(),
+            inferences: Vec::new(),
+            filtered_inferences: Vec::new(),
+            selected_inference: None,
+            inference_list_state: ListState::default(),
             chart_viewer: ChartViewer::new(),
             input: String::new(),
+            ticker_input: String::new(),
+            episodes_input: String::new(),
             search_input: String::new(),
+            inference_search_input: String::new(),
             weights_path: None,
             searching: false,
+            inference_searching: false,
             list_area: Rect::default(),
+            inference_list_area: Rect::default(),
             latest_meta_charts: Vec::new(),
+            logs_scroll: 0,
+            last_refresh: Instant::now(),
         };
         app.load_generations()?;
+        app.load_inferences()?;
         app.load_latest_meta_charts()?;
         Ok(app)
     }
 
     fn load_latest_meta_charts(&mut self) -> Result<()> {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::time::SystemTime;
+
         self.latest_meta_charts.clear();
 
-        let data_path = PathBuf::from(TRAINING_PATH).join("data");
-        if !data_path.exists() {
+        let gens_path = PathBuf::from("../training/gens");
+        if !gens_path.exists() {
             return Ok(());
         }
 
-        let mut meta_charts: Vec<(PathBuf, SystemTime)> = Vec::new();
+        // Meta chart base names (without extension) - these are the "namespaces"
+        let meta_chart_bases = vec![
+            "final_assets", "cum_reward", "outperformance", "loss",
+            "assets", "reward", "total_commissions"
+        ];
 
-        for entry in WalkDir::new(&data_path)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file() {
+        // Track the latest file for each chart type: base_name -> (modified_time, path)
+        let mut latest_per_type: HashMap<String, (SystemTime, PathBuf)> = HashMap::new();
+
+        // Scan all generation directories for meta charts
+        if let Ok(entries) = fs::read_dir(&gens_path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if !entry.file_type().ok().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                // Only process numeric directories (generation folders)
                 if let Some(name) = entry.file_name().to_str() {
-                    if name.contains("meta_history") && name.ends_with(".png") {
-                        if let Ok(metadata) = entry.metadata() {
-                            if let Ok(modified) = metadata.modified() {
-                                meta_charts.push((entry.path().to_path_buf(), modified));
+                    if name.parse::<usize>().is_err() {
+                        continue;
+                    }
+                }
+
+                let gen_path = entry.path();
+                if let Ok(files) = fs::read_dir(&gen_path) {
+                    for file in files.filter_map(|e| e.ok()) {
+                        let file_path = file.path();
+                        let ext = file_path.extension().and_then(|s| s.to_str());
+                        if ext != Some("png") && ext != Some("webp") {
+                            continue;
+                        }
+
+                        let file_name = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+                        // Check if this file matches any of our meta chart types
+                        for base in &meta_chart_bases {
+                            if file_name == *base {
+                                if let Ok(metadata) = file.metadata() {
+                                    if let Ok(modified) = metadata.modified() {
+                                        let key = base.to_string();
+                                        let should_update = latest_per_type
+                                            .get(&key)
+                                            .map(|(t, _)| modified > *t)
+                                            .unwrap_or(true);
+
+                                        if should_update {
+                                            latest_per_type.insert(key, (modified, file_path.clone()));
+                                        }
+                                    }
+                                }
+                                break;
                             }
                         }
                     }
@@ -158,8 +215,13 @@ impl App {
             }
         }
 
-        meta_charts.sort_by(|a, b| b.1.cmp(&a.1));
-        self.latest_meta_charts = meta_charts.into_iter().take(4).map(|(path, _)| path).collect();
+        // Collect paths from all found chart types
+        for (_, (_, path)) in latest_per_type {
+            self.latest_meta_charts.push(path);
+        }
+
+        // Sort by filename for consistent ordering
+        self.latest_meta_charts.sort();
 
         Ok(())
     }
@@ -168,28 +230,21 @@ impl App {
         self.is_training_running() || self.inference_process.is_some()
     }
 
-    fn is_training_running(&self) -> bool {
-        // Check if there's a cargo process running training in trading_bots directory
-        if let Ok(output) = Command::new("pgrep")
-            .args(["-f", "cargo.*trading_bots.*train"])
-            .output()
-        {
-            if !output.stdout.is_empty() {
-                return true;
-            }
+    pub fn is_training_running(&self) -> bool {
+        // First check our own child process
+        if self.training_process.is_some() {
+            return true;
         }
 
-        // Also check for the actual binary running with train argument
+        // Check if training was started externally
         if let Ok(output) = Command::new("pgrep")
-            .args(["-f", "trading_bot_0.*train"])
+            .args(["-f", "trading.*train"])
             .output()
         {
             if !output.stdout.is_empty() {
-                // Make sure it's not the TUI itself
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for pid in stdout.lines() {
                     if let Ok(pid_num) = pid.trim().parse::<u32>() {
-                        // Check if this PID is actually a training process, not the TUI
                         if let Ok(cmdline_output) = Command::new("ps")
                             .args(["-p", &pid_num.to_string(), "-o", "args="])
                             .output()
@@ -264,6 +319,123 @@ impl App {
         }
     }
 
+    fn load_inferences(&mut self) -> Result<()> {
+        self.inferences.clear();
+        let inference_path = PathBuf::from("../training/inferences");
+
+        if !inference_path.exists() {
+            return Ok(());
+        }
+
+        for entry in WalkDir::new(&inference_path)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Ok(num) = name.parse::<usize>() {
+                        self.inferences.push(InferenceInfo {
+                            number: num,
+                            path: entry.path().to_path_buf(),
+                        });
+                    }
+                }
+            }
+        }
+
+        self.inferences.sort_by_key(|i| i.number);
+        self.filter_inferences();
+        Ok(())
+    }
+
+    fn filter_inferences(&mut self) {
+        if self.inference_search_input.is_empty() {
+            self.filtered_inferences = self.inferences.clone();
+        } else {
+            self.filtered_inferences = self
+                .inferences
+                .iter()
+                .filter(|i| i.number.to_string().contains(&self.inference_search_input))
+                .cloned()
+                .collect();
+        }
+
+        if let Some(selected) = self.inference_list_state.selected() {
+            if selected >= self.filtered_inferences.len() && !self.filtered_inferences.is_empty() {
+                self.inference_list_state.select(Some(0));
+                self.center_inference_list(0);
+            } else if !self.filtered_inferences.is_empty() {
+                self.center_inference_list(selected);
+            }
+        } else if !self.filtered_inferences.is_empty() {
+            self.inference_list_state.select(Some(0));
+            self.center_inference_list(0);
+        }
+    }
+
+    fn center_inference_list(&mut self, selected: usize) {
+        let visible_height = self.inference_list_area.height.saturating_sub(2) as usize;
+        let center = visible_height / 2;
+
+        let offset = if selected >= center {
+            selected.saturating_sub(center)
+        } else {
+            0
+        };
+
+        self.inference_list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
+    }
+
+    fn next_inference(&mut self) {
+        if self.filtered_inferences.is_empty() {
+            return;
+        }
+        let i = match self.inference_list_state.selected() {
+            Some(i) => {
+                if i >= self.filtered_inferences.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.inference_list_state.select(Some(i));
+        self.center_inference_list(i);
+    }
+
+    fn previous_inference(&mut self) {
+        if self.filtered_inferences.is_empty() {
+            return;
+        }
+        let i = match self.inference_list_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.filtered_inferences.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.inference_list_state.select(Some(i));
+        self.center_inference_list(i);
+    }
+
+    fn scroll_inference_up(&mut self, amount: usize) {
+        for _ in 0..amount {
+            self.previous_inference();
+        }
+    }
+
+    fn scroll_inference_down(&mut self, amount: usize) {
+        for _ in 0..amount {
+            self.next_inference();
+        }
+    }
+
     fn scroll_up(&mut self, amount: usize) {
         for _ in 0..amount {
             self.previous_generation();
@@ -276,10 +448,58 @@ impl App {
         }
     }
 
+    fn maybe_refresh(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if now.duration_since(self.last_refresh) >= Duration::from_secs(1) {
+            self.load_generations()?;
+            self.load_inferences()?;
+            self.load_latest_meta_charts()?;
+            self.last_refresh = now;
+        }
+        Ok(())
+    }
+
+    fn poll_training_output(&mut self) {
+        use std::fs;
+
+        // Check if our child process has exited
+        if let Some(ref mut child) = self.training_process {
+            if let Ok(Some(_status)) = child.try_wait() {
+                self.training_process = None;
+            }
+        }
+
+        // Read from log file (works whether training was started by TUI or externally)
+        let log_path = "../training/training.log";
+        if let Ok(content) = fs::read_to_string(log_path) {
+            let new_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+            // Only update if there are new lines
+            if new_lines.len() > self.training_output.len() || new_lines != self.training_output {
+                self.training_output = new_lines;
+
+                // Keep only last 1000 lines
+                if self.training_output.len() > 1000 {
+                    self.training_output.drain(0..self.training_output.len() - 1000);
+                }
+            }
+        }
+    }
+
     fn start_training(&mut self, weights_file: Option<String>) -> Result<()> {
         if self.is_training_running() {
             return Ok(());
         }
+
+        use std::fs::OpenOptions;
+        use std::process::Stdio;
+
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("../training/training.log")?;
+
+        let log_file_stderr = log_file.try_clone()?;
 
         let mut cmd = Command::new("cargo");
         cmd.arg("run")
@@ -287,9 +507,9 @@ impl App {
             .arg("--")
             .arg("train")
             .current_dir("../trading_bots")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_stderr));
 
         if let Some(weights) = weights_file {
             let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
@@ -300,12 +520,12 @@ impl App {
             cmd.arg("-w").arg(weights_path);
         }
 
-        // Spawn detached - don't keep the Child handle so process continues after TUI quits
-        cmd.spawn()?;
+        let child = cmd.spawn()?;
+        self.training_process = Some(child);
         Ok(())
     }
 
-    fn start_inference(&mut self, weights_file: Option<String>) -> Result<()> {
+    fn start_inference(&mut self, weights_file: Option<String>, ticker: Option<String>, episodes: Option<usize>) -> Result<()> {
         if self.inference_process.is_some() {
             return Ok(());
         }
@@ -325,22 +545,24 @@ impl App {
         };
         cmd.arg("-w").arg(weights_path);
 
+        if let Some(ticker_override) = ticker {
+            cmd.env("TICKER_OVERRIDE", ticker_override);
+        }
+
+        if let Some(ep) = episodes {
+            cmd.arg("-e").arg(ep.to_string());
+        }
+
         let child = cmd.spawn()?;
         self.inference_process = Some(child);
         Ok(())
     }
 
     fn stop_training(&mut self) -> Result<()> {
-        // Kill any cargo processes running training in trading_bots
-        let _ = Command::new("pkill")
-            .args(["-f", "cargo.*trading_bots.*train"])
-            .output();
-
-        // Also kill the actual binary if it's running
-        let _ = Command::new("pkill")
-            .args(["-f", "trading.*train"])
-            .output();
-
+        if let Some(mut child) = self.training_process.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         Ok(())
     }
 
@@ -399,8 +621,18 @@ impl App {
             if idx < self.filtered_generations.len() {
                 self.selected_generation = Some(idx);
                 self.chart_viewer.load_generation(&self.filtered_generations[idx].path)?;
+                self.previous_mode = self.mode;
                 self.mode = AppMode::ChartViewer;
             }
+        }
+        Ok(())
+    }
+
+    fn view_meta_charts(&mut self) -> Result<()> {
+        if !self.latest_meta_charts.is_empty() {
+            self.chart_viewer.load_charts(&self.latest_meta_charts)?;
+            self.previous_mode = self.mode;
+            self.mode = AppMode::ChartViewer;
         }
         Ok(())
     }
@@ -452,6 +684,9 @@ fn run_app<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| ui(f, app))?;
 
+        app.maybe_refresh()?;
+        app.poll_training_output();
+
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -474,7 +709,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 if for_training {
                                     app.start_training(weights)?;
                                 } else if for_inference {
-                                    app.start_inference(weights)?;
+                                    app.start_inference(weights, None, None)?;
                                 }
                             }
                             KeyCode::Char(c) => {
@@ -482,6 +717,75 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Backspace => {
                                 app.input.pop();
+                            }
+                            _ => {}
+                        }
+                        DialogMode::InferenceInput { focused_field } => match key.code {
+                            KeyCode::Esc => {
+                                app.dialog_mode = DialogMode::None;
+                                app.input.clear();
+                                app.ticker_input.clear();
+                                app.episodes_input.clear();
+                            }
+                            KeyCode::Tab => {
+                                app.dialog_mode = DialogMode::InferenceInput {
+                                    focused_field: match focused_field {
+                                        InferenceField::Weights => InferenceField::Ticker,
+                                        InferenceField::Ticker => InferenceField::Episodes,
+                                        InferenceField::Episodes => InferenceField::Weights,
+                                    }
+                                };
+                            }
+                            KeyCode::BackTab => {
+                                app.dialog_mode = DialogMode::InferenceInput {
+                                    focused_field: match focused_field {
+                                        InferenceField::Weights => InferenceField::Episodes,
+                                        InferenceField::Ticker => InferenceField::Weights,
+                                        InferenceField::Episodes => InferenceField::Ticker,
+                                    }
+                                };
+                            }
+                            KeyCode::Enter => {
+                                let weights = if app.input.is_empty() {
+                                    None
+                                } else {
+                                    Some(App::coerce_weights_filename(&app.input))
+                                };
+                                let ticker = if app.ticker_input.is_empty() {
+                                    None
+                                } else {
+                                    Some(app.ticker_input.clone())
+                                };
+                                let episodes = if app.episodes_input.is_empty() {
+                                    None
+                                } else {
+                                    app.episodes_input.parse::<usize>().ok()
+                                };
+
+                                app.input.clear();
+                                app.ticker_input.clear();
+                                app.episodes_input.clear();
+                                app.dialog_mode = DialogMode::None;
+
+                                app.start_inference(weights, ticker, episodes)?;
+                            }
+                            KeyCode::Char(c) => {
+                                match focused_field {
+                                    InferenceField::Weights => app.input.push(c),
+                                    InferenceField::Ticker => app.ticker_input.push(c),
+                                    InferenceField::Episodes => {
+                                        if c.is_numeric() {
+                                            app.episodes_input.push(c);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                match focused_field {
+                                    InferenceField::Weights => { app.input.pop(); }
+                                    InferenceField::Ticker => { app.ticker_input.pop(); }
+                                    InferenceField::Episodes => { app.episodes_input.pop(); }
+                                }
                             }
                             _ => {}
                         }
@@ -504,6 +808,74 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             _ => {}
                         }
+                        DialogMode::PageJump { selected } => {
+                            const PAGE_COUNT: usize = 5;
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.dialog_mode = DialogMode::None;
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    app.dialog_mode = DialogMode::PageJump {
+                                        selected: (selected + 1) % PAGE_COUNT,
+                                    };
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    app.dialog_mode = DialogMode::PageJump {
+                                        selected: if selected == 0 { PAGE_COUNT - 1 } else { selected - 1 },
+                                    };
+                                }
+                                KeyCode::Enter => {
+                                    app.dialog_mode = DialogMode::None;
+                                    match selected {
+                                        0 => app.mode = AppMode::Main,
+                                        1 => {
+                                            app.load_generations()?;
+                                            if !app.filtered_generations.is_empty() {
+                                                app.list_state.select(Some(0));
+                                                app.center_list(0);
+                                            }
+                                            app.mode = AppMode::GenerationBrowser;
+                                        }
+                                        2 => {
+                                            app.load_inferences()?;
+                                            app.mode = AppMode::InferenceBrowser;
+                                        }
+                                        3 => {
+                                            app.view_meta_charts()?;
+                                        }
+                                        4 => app.mode = AppMode::Logs,
+                                        _ => {}
+                                    }
+                                }
+                                KeyCode::Char('1') => {
+                                    app.dialog_mode = DialogMode::None;
+                                    app.mode = AppMode::Main;
+                                }
+                                KeyCode::Char('2') => {
+                                    app.dialog_mode = DialogMode::None;
+                                    app.load_generations()?;
+                                    if !app.filtered_generations.is_empty() {
+                                        app.list_state.select(Some(0));
+                                        app.center_list(0);
+                                    }
+                                    app.mode = AppMode::GenerationBrowser;
+                                }
+                                KeyCode::Char('3') => {
+                                    app.dialog_mode = DialogMode::None;
+                                    app.load_inferences()?;
+                                    app.mode = AppMode::InferenceBrowser;
+                                }
+                                KeyCode::Char('4') => {
+                                    app.dialog_mode = DialogMode::None;
+                                    app.view_meta_charts()?;
+                                }
+                                KeyCode::Char('5') => {
+                                    app.dialog_mode = DialogMode::None;
+                                    app.mode = AppMode::Logs;
+                                }
+                                _ => {}
+                            }
+                        }
                         DialogMode::None => {
                             // Global keybindings (work in all modes when no dialog is open)
                             match key.code {
@@ -512,6 +884,12 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('d') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
                                     app.dialog_mode = DialogMode::ConfirmQuit;
+                                }
+                                KeyCode::Char('o') => {
+                                    // Don't open page jump when searching
+                                    if !app.searching && !app.inference_searching {
+                                        app.dialog_mode = DialogMode::PageJump { selected: 0 };
+                                    }
                                 }
                                 _ => {}
                             }
@@ -522,11 +900,13 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.dialog_mode = DialogMode::ConfirmQuit;
                                 }
                                 KeyCode::Char('s') => {
-                                    app.dialog_mode = DialogMode::WeightsInput { for_training: true, for_inference: false };
+                                    if !app.is_training_running() {
+                                        app.dialog_mode = DialogMode::WeightsInput { for_training: true, for_inference: false };
+                                    }
                                 }
                                 KeyCode::Char('f') => {
                                     if !app.is_anything_running() {
-                                        app.dialog_mode = DialogMode::WeightsInput { for_training: false, for_inference: true };
+                                        app.dialog_mode = DialogMode::InferenceInput { focused_field: InferenceField::Weights };
                                     }
                                 }
                                 KeyCode::Char('x') => {
@@ -534,9 +914,24 @@ fn run_app<B: ratatui::backend::Backend>(
                                         app.dialog_mode = DialogMode::ConfirmStopTraining;
                                     }
                                 }
-                                KeyCode::Char('g') => {
+                                KeyCode::Char('e') => {
                                     app.load_generations()?;
+                                    // Auto-select latest generation (first in list)
+                                    if !app.filtered_generations.is_empty() {
+                                        app.list_state.select(Some(0));
+                                        app.center_list(0);
+                                    }
                                     app.mode = AppMode::GenerationBrowser;
+                                }
+                                KeyCode::Char('i') => {
+                                    app.load_inferences()?;
+                                    app.mode = AppMode::InferenceBrowser;
+                                }
+                                KeyCode::Char('m') => {
+                                    app.view_meta_charts()?;
+                                }
+                                KeyCode::Char('l') => {
+                                    app.mode = AppMode::Logs;
                                 }
                                 _ => {}
                             },
@@ -585,9 +980,51 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                     }
+                    AppMode::InferenceBrowser => {
+                        if app.inference_searching {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.inference_searching = false;
+                                    app.inference_search_input.clear();
+                                    app.filter_inferences();
+                                }
+                                KeyCode::Enter => {
+                                    app.inference_searching = false;
+                                }
+                                KeyCode::Char(c) => {
+                                    app.inference_search_input.push(c);
+                                    app.filter_inferences();
+                                }
+                                KeyCode::Backspace => {
+                                    app.inference_search_input.pop();
+                                    app.filter_inferences();
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    app.mode = AppMode::Main;
+                                }
+                                KeyCode::Char('/') => {
+                                    app.inference_searching = true;
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    app.next_inference();
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.previous_inference();
+                                }
+                                KeyCode::Char('r') => {
+                                    app.load_inferences()?;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     AppMode::ChartViewer => match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => {
-                            app.mode = AppMode::GenerationBrowser;
+                            app.mode = app.previous_mode;
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             app.chart_viewer.next();
@@ -600,6 +1037,38 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         _ => {}
                     },
+                    AppMode::Logs => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            app.mode = AppMode::Main;
+                        }
+                        KeyCode::Char('c') => {
+                            app.training_output.clear();
+                            app.logs_scroll = 0;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.logs_scroll = app.logs_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if !app.training_output.is_empty() {
+                                app.logs_scroll = (app.logs_scroll + 1).min(app.training_output.len().saturating_sub(1));
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            app.logs_scroll = app.logs_scroll.saturating_sub(10);
+                        }
+                        KeyCode::PageDown => {
+                            if !app.training_output.is_empty() {
+                                app.logs_scroll = (app.logs_scroll + 10).min(app.training_output.len().saturating_sub(1));
+                            }
+                        }
+                        KeyCode::Home => {
+                            app.logs_scroll = 0;
+                        }
+                        KeyCode::End => {
+                            app.logs_scroll = app.training_output.len().saturating_sub(1);
+                        }
+                        _ => {}
+                    },
                             }
                         }
                     }
@@ -607,12 +1076,22 @@ fn run_app<B: ratatui::backend::Backend>(
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => match app.mode {
                         AppMode::GenerationBrowser => app.scroll_up(3),
+                        AppMode::InferenceBrowser => app.scroll_inference_up(3),
                         AppMode::ChartViewer => app.chart_viewer.scroll_up(3),
+                        AppMode::Logs => {
+                            app.logs_scroll = app.logs_scroll.saturating_sub(3);
+                        }
                         _ => {}
                     },
                     MouseEventKind::ScrollDown => match app.mode {
                         AppMode::GenerationBrowser => app.scroll_down(3),
+                        AppMode::InferenceBrowser => app.scroll_inference_down(3),
                         AppMode::ChartViewer => app.chart_viewer.scroll_down(3),
+                        AppMode::Logs => {
+                            if !app.training_output.is_empty() {
+                                app.logs_scroll = (app.logs_scroll + 3).min(app.training_output.len().saturating_sub(1));
+                            }
+                        }
                         _ => {}
                     },
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -636,425 +1115,31 @@ fn run_app<B: ratatui::backend::Backend>(
 
 fn ui(f: &mut Frame, app: &mut App) {
     match app.mode {
-        AppMode::Main => render_main(f, app),
-        AppMode::GenerationBrowser => render_generation_browser(f, app),
-        AppMode::ChartViewer => render_chart_viewer(f, app),
+        AppMode::Main => pages::main_page::render(f, app),
+        AppMode::GenerationBrowser => pages::generation_browser::render(f, app),
+        AppMode::InferenceBrowser => pages::inference_browser::render(f, app),
+        AppMode::ChartViewer => app.chart_viewer.render(f),
+        AppMode::Logs => pages::logs_page::render(f, app),
     }
 
     // Render dialog on top if active
     match app.dialog_mode {
         DialogMode::WeightsInput { for_training, for_inference } => {
-            render_weights_dialog(f, app, for_training, for_inference);
+            components::dialogs::weights::render(f, app, for_training, for_inference);
+        }
+        DialogMode::InferenceInput { focused_field } => {
+            components::dialogs::inference::render(f, app, focused_field);
         }
         DialogMode::ConfirmQuit => {
-            render_confirm_dialog(f, "Quit?", "Training processes will continue running in background.");
+            components::dialogs::confirm::render(f, "Quit?", "Training processes will continue running in background.");
         }
         DialogMode::ConfirmStopTraining => {
-            render_confirm_dialog(f, "Stop Training?", "This will terminate the training process.");
+            components::dialogs::confirm::render(f, "Stop Training?", "This will terminate the training process.");
+        }
+        DialogMode::PageJump { selected } => {
+            components::dialogs::page_jump::render(f, selected, app.mode);
         }
         DialogMode::None => {}
     }
 }
 
-fn render_main(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(7),
-            Constraint::Min(0),
-            Constraint::Length(6),
-        ])
-        .split(f.area());
-
-    let title = Paragraph::new(" 🤖 Trading Bot TUI ")
-        .style(Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::LAVENDER))
-        );
-    f.render_widget(title, chunks[0]);
-
-    let is_training = app.is_training_running();
-    let status = if is_training {
-        "RUNNING ●"
-    } else {
-        "STOPPED ○"
-    };
-
-    let status_color = if is_training {
-        theme::GREEN
-    } else {
-        theme::RED
-    };
-
-    let weights_info = if let Some(weights) = &app.weights_path {
-        format!("Weights: {}", weights)
-    } else {
-        format!("Weights: {} (default)", WEIGHTS_PATH)
-    };
-
-    let info_text = vec![
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(theme::SUBTEXT1)),
-            Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Weights: ", Style::default().fg(theme::SUBTEXT1)),
-            Span::styled(weights_info, Style::default().fg(theme::BLUE)),
-        ]),
-    ];
-
-    let info = Paragraph::new(info_text)
-        .style(Style::default().fg(theme::TEXT))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::SURFACE2))
-                .title(" Info ")
-                .title_style(Style::default().fg(theme::SKY))
-        )
-        .wrap(Wrap { trim: false });
-    f.render_widget(info, chunks[1]);
-
-    let meta_chart_items: Vec<Line> = if app.latest_meta_charts.is_empty() {
-        vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  No meta-history charts found yet",
-                Style::default().fg(theme::OVERLAY0),
-            ))
-        ]
-    } else {
-        app.latest_meta_charts
-            .iter()
-            .map(|path| {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
-                Line::from(vec![
-                    Span::styled(" 📊 ", Style::default().fg(theme::YELLOW)),
-                    Span::styled(name, Style::default().fg(theme::TEXT)),
-                ])
-            })
-            .collect()
-    };
-
-    let meta_charts = Paragraph::new(meta_chart_items)
-        .style(Style::default().fg(theme::TEXT))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::SURFACE2))
-                .title(" 📈 Latest Meta-History Charts ")
-                .title_style(Style::default().fg(theme::PEACH))
-        )
-        .wrap(Wrap { trim: false });
-    f.render_widget(meta_charts, chunks[2]);
-
-    let help_text = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("s", Style::default().fg(Color::Green)),
-            Span::raw(": Start Training  "),
-            Span::styled("f", Style::default().fg(Color::Blue)),
-            Span::raw(": Run Inference  "),
-            Span::styled("x", Style::default().fg(Color::Red)),
-            Span::raw(": Stop Training"),
-        ]),
-        Line::from(vec![
-            Span::styled("g", Style::default().fg(Color::Cyan)),
-            Span::raw(": View Generations  "),
-            Span::styled("q", Style::default().fg(Color::Red)),
-            Span::raw(": Quit  "),
-            Span::styled("Ctrl+C/D", Style::default().fg(Color::DarkGray)),
-            Span::raw(": Quit"),
-        ]),
-    ];
-
-    let help = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL).title("Controls"));
-    f.render_widget(help, chunks[3]);
-}
-
-fn render_generation_browser(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(4),
-        ])
-        .split(f.area());
-
-    let title = Paragraph::new("Generation Browser")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(title, chunks[0]);
-
-    let search_style = if app.searching {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let search_text = if app.searching {
-        format!("Search: {}_", app.search_input)
-    } else {
-        format!("Search: {} (press / to search)", app.search_input)
-    };
-
-    let search = Paragraph::new(search_text)
-        .style(search_style)
-        .block(Block::default().borders(Borders::ALL).title("Filter"));
-    f.render_widget(search, chunks[1]);
-
-    let items: Vec<ListItem> = app
-        .filtered_generations
-        .iter()
-        .map(|gen| {
-            ListItem::new(format!("Generation {}", gen.number))
-                .style(Style::default().fg(Color::White))
-        })
-        .collect();
-
-    let list_title = format!(
-        "Generations ({}/{})",
-        app.filtered_generations.len(),
-        app.generations.len()
-    );
-
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(list_title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
-
-    app.list_area = chunks[2];
-    let mut list_state = app.list_state.clone();
-    f.render_stateful_widget(list, chunks[2], &mut list_state);
-
-    let help = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("↑/k", Style::default().fg(Color::Cyan)),
-            Span::raw(": Up  "),
-            Span::styled("↓/j", Style::default().fg(Color::Cyan)),
-            Span::raw(": Down  "),
-            Span::styled("Wheel", Style::default().fg(Color::Cyan)),
-            Span::raw(": Scroll  "),
-            Span::styled("Click", Style::default().fg(Color::Cyan)),
-            Span::raw(": Select"),
-        ]),
-        Line::from(vec![
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::raw(": Search  "),
-            Span::styled("Enter", Style::default().fg(Color::Green)),
-            Span::raw(": View  "),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::raw(": Refresh  "),
-            Span::styled("q/Esc", Style::default().fg(Color::Red)),
-            Span::raw(": Back"),
-        ]),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Controls"));
-    f.render_widget(help, chunks[3]);
-}
-
-fn render_chart_viewer(f: &mut Frame, app: &mut App) {
-    app.chart_viewer.render(f);
-}
-
-fn render_weights_dialog(f: &mut Frame, app: &App, for_training: bool, for_inference: bool) {
-    let area = centered_rect(65, 40, f.area());
-
-    // Render semi-transparent backdrop
-    let backdrop = Block::default()
-        .style(Style::default().bg(theme::CRUST));
-    f.render_widget(backdrop, f.area());
-
-    let title = if for_training {
-        " 🚀 Start Training "
-    } else if for_inference {
-        " 🔍 Run Inference "
-    } else {
-        " ⚙️  Weights Input "
-    };
-
-    let default_text = if for_inference {
-        "infer.ot"
-    } else {
-        "none (train from scratch)"
-    };
-
-    let dialog = Block::default()
-        .title(title)
-        .title_style(Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::LAVENDER))
-        .style(Style::default().bg(theme::MANTLE));
-
-    let inner = dialog.inner(area);
-    f.render_widget(dialog, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ])
-        .split(inner);
-
-    let prompt_text = vec![
-        Line::from(vec![
-            Span::styled("📁 ", Style::default().fg(theme::YELLOW)),
-            Span::styled("Weights Directory: ", Style::default().fg(theme::SUBTEXT1)),
-            Span::styled(WEIGHTS_PATH, Style::default().fg(theme::SAPPHIRE).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("💡 ", Style::default().fg(theme::PEACH)),
-            Span::styled("Shorthand: ", Style::default().fg(theme::SUBTEXT0)),
-            Span::styled("Type '400' for 'ppo_ep400.ot'", Style::default().fg(theme::TEAL).add_modifier(Modifier::ITALIC)),
-        ]),
-        Line::from(vec![
-            Span::styled("   ", Style::default()),
-            Span::styled("Default: ", Style::default().fg(theme::SUBTEXT0)),
-            Span::styled(default_text, Style::default().fg(theme::GREEN).add_modifier(Modifier::ITALIC)),
-        ]),
-    ];
-    let prompt = Paragraph::new(prompt_text)
-        .style(Style::default().fg(theme::TEXT));
-    f.render_widget(prompt, chunks[0]);
-
-    let input_display = if app.input.is_empty() {
-        format!(" {}", default_text)
-    } else {
-        format!(" {}▊", app.input)
-    };
-
-    let input_widget = Paragraph::new(input_display)
-        .style(Style::default().fg(theme::TEXT).bg(theme::SURFACE0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::BLUE))
-                .title(" Filename ")
-                .title_style(Style::default().fg(theme::SKY))
-        );
-    f.render_widget(input_widget, chunks[2]);
-
-    let help = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(" ⏎ ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled("Confirm", Style::default().fg(theme::SUBTEXT1)),
-            Span::raw("   "),
-            Span::styled(" Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
-            Span::styled("Cancel", Style::default().fg(theme::SUBTEXT1)),
-        ]),
-    ])
-    .style(Style::default().fg(theme::TEXT))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::SURFACE2))
-    );
-    f.render_widget(help, chunks[4]);
-}
-
-fn render_confirm_dialog(f: &mut Frame, title: &str, message: &str) {
-    let area = centered_rect(55, 30, f.area());
-
-    // Render backdrop
-    let backdrop = Block::default()
-        .style(Style::default().bg(theme::CRUST));
-    f.render_widget(backdrop, f.area());
-
-    let dialog_title = if title.contains("Quit") {
-        " ⚠️  Confirm Quit "
-    } else if title.contains("Stop") {
-        " ⛔ Stop Training "
-    } else {
-        title
-    };
-
-    let dialog = Block::default()
-        .title(dialog_title)
-        .title_style(Style::default().fg(theme::PEACH).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::MAROON))
-        .style(Style::default().bg(theme::MANTLE));
-
-    let inner = dialog.inner(area);
-    f.render_widget(dialog, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ])
-        .split(inner);
-
-    let message_widget = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(message, Style::default().fg(theme::TEXT)),
-        ]),
-    ])
-    .wrap(Wrap { trim: false });
-    f.render_widget(message_widget, chunks[0]);
-
-    let help = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(" y ", Style::default().fg(theme::GREEN).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
-            Span::raw(" / "),
-            Span::styled(" ⏎ ", Style::default().fg(theme::GREEN).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
-            Span::styled("  Yes", Style::default().fg(theme::SUBTEXT1)),
-            Span::raw("     "),
-            Span::styled(" n ", Style::default().fg(theme::RED).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
-            Span::raw(" / "),
-            Span::styled(" Esc ", Style::default().fg(theme::RED).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
-            Span::styled("  No", Style::default().fg(theme::SUBTEXT1)),
-        ]),
-    ])
-    .style(Style::default().fg(theme::TEXT))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::SURFACE2))
-    );
-    f.render_widget(help, chunks[2]);
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}

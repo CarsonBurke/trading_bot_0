@@ -6,15 +6,17 @@ use plotters::{
     data,
     prelude::{BitMapBackend, CandleStick, Circle, EmptyElement, IntoDrawingArea, Text},
     series::{AreaSeries, LineSeries, PointSeries},
-    style::{full_palette::PURPLE, Color, BLUE, GREEN, RED, WHITE, YELLOW},
+    style::Color,
 };
+use shared::theme::plotters_colors as theme;
 use time::OffsetDateTime;
 
-use crate::types::Data;
+use crate::{constants::{CHART_IMAGE_FORMAT}, types::Data};
 
 pub fn chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
-    let root = BitMapBackend::new("charts/chart.png", (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("charts/chart.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let y_min = *data
         .iter()
@@ -26,16 +28,20 @@ pub fn chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap() as f32;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Chart", ("sans-serif", 20))
+        .caption("Chart", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(30)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh()
+        .label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0)
+        .draw()?;
 
     chart.draw_series(data.iter().enumerate().map(|(index, x)| {
-        CandleStick::new(index as u32, 0., 0., 0., *x as f32, GREEN.filled(), RED, 15)
+        CandleStick::new(index as u32, 0., 0., 0., *x as f32, theme::GREEN.filled(), &theme::RED, 15)
     }))?;
 
     root.present()
@@ -48,10 +54,10 @@ pub fn candle_chart(
     dir: &String,
     bars: &[historical::Bar],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dimensions = (1024, 768);
-    let path = format!("{dir}/candle.png");
+    let dimensions = (2560, 800);
+    let path = format!("{dir}/candle.{}", CHART_IMAGE_FORMAT);
     let root = BitMapBackend::new(path.as_str(), dimensions).into_drawing_area();
-    root.fill(&WHITE)?;
+    root.fill(&theme::BASE)?;
 
     let y_min = bars
         .iter()
@@ -82,13 +88,13 @@ pub fn candle_chart(
     let chrono_range = chrono_dates[0]..chrono_dates[chrono_dates.len() - 1];
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Candle Chart", ("sans-serif", 20))
+        .caption("Candle Chart", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
         .build_cartesian_2d(0..bars.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     let mut draw = chart.draw_series(bars.iter().enumerate().map(|(index, bar)| {
         /* let local = Local.from_utc_datetime(&DateTime::from_timestamp_nanos(bar.date.unix_timestamp_nanos() as i64).naive_local());
@@ -101,8 +107,8 @@ pub fn candle_chart(
             bar.high as f32,
             bar.low as f32,
             bar.close as f32,
-            GREEN.filled(),
-            RED.filled(),
+            theme::GREEN.filled(),
+            theme::RED.filled(),
             dimensions.0 / bars.len() as u32,
         )
     }))?;
@@ -118,9 +124,9 @@ pub fn simple_chart(
     name: &str,
     data: &Data,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/{name}.png");
-    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let y_min = data
         .iter()
@@ -141,7 +147,7 @@ pub fn simple_chart(
         .y_label_area_size(50)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     chart.draw_series(
         AreaSeries::new(
@@ -149,9 +155,9 @@ pub fn simple_chart(
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value)),
             0.0,
-            BLUE.mix(0.2),
+            theme::BLUE.mix(0.2),
         )
-        .border_style(BLUE),
+        .border_style(&theme::BLUE),
     )?;
 
     root.present()
@@ -166,9 +172,9 @@ pub fn buy_sell_chart(
     buy_indexes: &HashMap<usize, (f64, f64)>,
     sell_indexes: &HashMap<usize, (f64, f64)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/buy_sell.png");
-    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{dir}/buy_sell.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let y_min = data
         .iter()
@@ -182,13 +188,13 @@ pub fn buy_sell_chart(
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Buy Sell Chart", ("sans-serif", 20))
+        .caption("Buy Sell Chart", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     // Data
     chart.draw_series(
@@ -197,9 +203,9 @@ pub fn buy_sell_chart(
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value)),
             0.0,
-            BLUE.mix(0.2),
+            theme::BLUE.mix(0.2),
         )
-        .border_style(BLUE),
+        .border_style(&theme::BLUE),
     )?;
 
     let point_size = 4;
@@ -210,7 +216,7 @@ pub fn buy_sell_chart(
             .iter()
             .map(|(index, value)| (*index as u32, value.0)),
         point_size,
-        YELLOW.mix(0.9).filled(),
+        theme::YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
@@ -220,7 +226,7 @@ pub fn buy_sell_chart(
             .iter()
             .map(|(index, value)| (*index as u32, value.0)),
         point_size,
-        RED.mix(0.9).filled(),
+        theme::RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
@@ -236,9 +242,9 @@ pub fn buy_sell_chart_vec(
     buy_indexes: &[f64],
     sell_indexes: &[f64],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/buy_sell_vec.png");
-    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{dir}/buy_sell_vec.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let y_min = data
         .iter()
@@ -252,13 +258,13 @@ pub fn buy_sell_chart_vec(
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Buy Sell Chart Vec", ("sans-serif", 20))
+        .caption("Buy Sell Chart Vec", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     // Data
     chart.draw_series(
@@ -267,9 +273,9 @@ pub fn buy_sell_chart_vec(
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value)),
             0.0,
-            BLUE.mix(0.2),
+            theme::BLUE.mix(0.2),
         )
-        .border_style(BLUE),
+        .border_style(&theme::BLUE),
     )?;
 
     let point_size = 4;
@@ -282,7 +288,7 @@ pub fn buy_sell_chart_vec(
             .filter(|(_, &value)| value > 0.0)
             .map(|(index, _)| (index as u32, data[index])),
         point_size,
-        YELLOW.mix(0.9).filled(),
+        theme::YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
@@ -294,7 +300,7 @@ pub fn buy_sell_chart_vec(
             .filter(|(_, &value)| value > 0.0)
             .map(|(index, _)| (index as u32, data[index])),
         point_size,
-        RED.mix(0.9).filled(),
+        theme::RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
@@ -310,9 +316,9 @@ pub fn assets_chart(
     cash: &Data,
     positioned: Option<&Data>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/assets.png");
-    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{dir}/assets.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let y_max = *assets
         .iter()
@@ -321,13 +327,13 @@ pub fn assets_chart(
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Assets: Total; Positioned; Cash", ("sans-serif", 20))
+        .caption("Assets: Total; Positioned; Cash", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
         .build_cartesian_2d(0..assets.len() as u32, 0.0..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     chart.draw_series(
         AreaSeries::new(
@@ -336,9 +342,9 @@ pub fn assets_chart(
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value as f32)),
             0.0,
-            BLUE.mix(0.2),
+            theme::BLUE.mix(0.2),
         )
-        .border_style(BLUE),
+        .border_style(&theme::BLUE),
     )?;
 
     let positioned = {
@@ -360,9 +366,9 @@ pub fn assets_chart(
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value as f32)),
             0.0,
-            RED.mix(0.2),
+            theme::RED.mix(0.2),
         )
-        .border_style(RED),
+        .border_style(&theme::RED),
     )?;
 
     chart.draw_series(
@@ -371,9 +377,9 @@ pub fn assets_chart(
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value as f32)),
             0.0,
-            GREEN.mix(0.2),
+            theme::GREEN.mix(0.2),
         )
-        .border_style(GREEN),
+        .border_style(&theme::GREEN),
     )?;
 
     root.present()
@@ -387,9 +393,9 @@ pub fn want_chart(
     data: &Data,
     wants: &HashMap<usize, f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/want.png");
-    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{dir}/want.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let smoothed_wants = (0..data.len())
         .map(|index| (index as u32, *wants.get(&index).unwrap_or(&0.)))
@@ -409,13 +415,13 @@ pub fn want_chart(
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Buy Sell Chart", ("sans-serif", 20))
+        .caption("Buy Sell Chart", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     // Wants
 
@@ -425,9 +431,9 @@ pub fn want_chart(
             /* wants.iter()
             .map(|(index, value)| (*index as u32, *value)), */
             0.0,
-            PURPLE.mix(0.2),
+            theme::MAUVE.mix(0.2),
         )
-        .border_style(PURPLE),
+        .border_style(&theme::MAUVE),
     )?;
 
     root.present()
@@ -437,9 +443,9 @@ pub fn want_chart(
 }
 
 pub fn reward_chart(dir: &String, rewards: &Vec<f64>) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/reward.png");
-    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{dir}/reward.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let y_min = rewards
         .iter()
@@ -453,13 +459,13 @@ pub fn reward_chart(dir: &String, rewards: &Vec<f64>) -> Result<(), Box<dyn std:
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Rewards", ("sans-serif", 20))
+        .caption("Rewards", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
         .build_cartesian_2d(0..rewards.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     // Rewards
 
@@ -470,9 +476,9 @@ pub fn reward_chart(dir: &String, rewards: &Vec<f64>) -> Result<(), Box<dyn std:
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value)),
             0.0,
-            YELLOW.mix(0.2),
+            theme::YELLOW.mix(0.2),
         )
-        .border_style(YELLOW),
+        .border_style(&theme::YELLOW),
     )?;
 
     root.present()
@@ -485,9 +491,9 @@ pub fn hold_action_chart(
     dir: &String,
     hold_actions: &Vec<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/hold_action.png");
-    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{dir}/hold_action.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let y_min = hold_actions
         .iter()
@@ -501,13 +507,13 @@ pub fn hold_action_chart(
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Hold Action (range: -1 to 1)", ("sans-serif", 20))
+        .caption("Hold Action (range: -1 to 1)", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
         .build_cartesian_2d(0..hold_actions.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     // Hold actions as line series
     chart.draw_series(LineSeries::new(
@@ -515,7 +521,7 @@ pub fn hold_action_chart(
             .iter()
             .enumerate()
             .map(|(index, value)| (index as u32, *value)),
-        PURPLE,
+        &theme::MAUVE,
     ))?;
 
     root.present()
@@ -528,9 +534,9 @@ pub fn raw_action_chart(
     dir: &String,
     raw_actions: &Vec<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!("{dir}/raw_action.png");
-    let root = BitMapBackend::new(path.as_str(), (1024, 768)).into_drawing_area();
-    root.fill(&WHITE)?;
+    let path = format!("{dir}/raw_action.{}", CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
 
     let y_min = raw_actions
         .iter()
@@ -544,20 +550,20 @@ pub fn raw_action_chart(
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Raw Buy/Sell Action Output", ("sans-serif", 20))
+        .caption("Raw Buy/Sell Action Output", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
         .build_cartesian_2d(0..raw_actions.len() as u32, y_min..y_max)?;
 
-    chart.configure_mesh().light_line_style(WHITE).draw()?;
+    chart.configure_mesh().label_style(("sans-serif", 15, &theme::TEXT)).axis_style(&theme::SURFACE1).light_line_style(&theme::SURFACE0).draw()?;
 
     chart.draw_series(LineSeries::new(
         raw_actions
             .iter()
             .enumerate()
             .map(|(index, value)| (index as u32, *value)),
-        RED,
+        &theme::RED,
     ))?;
 
     root.present()

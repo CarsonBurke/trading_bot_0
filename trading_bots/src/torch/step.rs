@@ -30,7 +30,6 @@ pub struct Env {
     pub max_step: usize,
     pub tickers: Vec<String>,
     pub prices: Vec<Vec<f64>>,
-    max_prices: Vec<f64>,
     price_deltas: Vec<Vec<f64>>,
     account: Account,
     pub episode_history: EpisodeHistory,
@@ -48,11 +47,11 @@ impl Env {
 
     pub fn new(random_start: bool) -> Self {
         let tickers = vec![
-            // "TSLA".to_string(),
-            // "AAPL".to_string(),
-            // "AMD".to_string(),
-            // "INTC".to_string(),
-            // "MSFT".to_string(),
+            "TSLA".to_string(),
+            "AAPL".to_string(),
+            "AMD".to_string(),
+            "INTC".to_string(),
+            "MSFT".to_string(),
             "NVDA".to_string(),
         ];
 
@@ -66,15 +65,6 @@ impl Env {
             .iter()
             .map(|bar| bar.iter().map(|bar| bar.close).collect())
             .collect();
-        let max_prices = prices
-            .iter()
-            .map(|price| {
-                *price
-                    .iter()
-                    .max_by(|a, b| a.partial_cmp(b).unwrap())
-                    .unwrap()
-            })
-            .collect();
         let price_deltas = get_mapped_price_deltas(&mapped_bars);
 
         let total_data_length = prices[0].len();
@@ -82,7 +72,6 @@ impl Env {
         Self {
             step: 0,
             max_step: total_data_length - 2,
-            max_prices,
             prices,
             price_deltas,
             account: Account::default(),
@@ -435,8 +424,8 @@ impl Env {
         let cash_percent = (self.account.cash / self.account.total_assets) as f32;
         let position_percents = self.account.position_percents(&self.prices, absolute_step);
 
-        // Current step (normalized)
-        static_obs.push((self.step + 1) as f32 / self.max_step as f32);
+        // Current step (normalized to [0, 1))
+        static_obs.push(self.step as f32 / self.max_step as f32);
 
         // Cash percent
         static_obs.push(cash_percent);

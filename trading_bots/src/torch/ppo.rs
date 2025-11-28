@@ -165,7 +165,7 @@ pub fn train(weights_path: Option<&str>) {
             // Compute log Jacobian for the scaled tanh transformation
             // log|d_action/dz| = log(1/divisor) + log(1 - tanh(z/divisor)^2)
             //                  = -log(divisor) + log(1 - action^2)
-            let log_jacobian = -TANH_SQUASHING_DIVISOR.ln() + (Tensor::from(1.0) - actions.pow_tensor_scalar(2)).clamp(1e-7, 1.0).log();
+            let log_jacobian = -TANH_SQUASHING_DIVISOR.ln() + (Tensor::from(1.0) - actions.pow_tensor_scalar(2) + 1e-7).log();
 
             // Final log probability
             let action_log_prob =
@@ -270,6 +270,11 @@ pub fn train(weights_path: Option<&str>) {
         let actions = s_actions.view([memory_size, TICKERS_COUNT * 2]);
         let old_log_probs = s_log_probs.view([memory_size]);
 
+        // Normalize advantages globally (not per-minibatch) for consistent policy gradients
+        let adv_mean = advantages.mean(Kind::Float);
+        let adv_std = advantages.std(false);
+        let advantages = ((&advantages - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
+
         let opt_start = Instant::now();
         let mut early_stopped = false;
         let mut total_kl = 0.0;
@@ -326,7 +331,7 @@ pub fn train(weights_path: Option<&str>) {
 
                 // Compute log Jacobian for scaled tanh transformation
                 // log|d_action/dz| = -log(divisor) + log(1 - action^2)
-                let log_jacobian = -TANH_SQUASHING_DIVISOR.ln() + (Tensor::from(1.0) - actions_clamped.pow_tensor_scalar(2)).clamp(1e-7, 1.0).log();
+                let log_jacobian = -TANH_SQUASHING_DIVISOR.ln() + (Tensor::from(1.0) - actions_clamped.pow_tensor_scalar(2) + 1e-7).log();
 
                 // Final log probability: log p(action) = log p(z) - log|d_action/dz|
                 let action_log_probs =
@@ -360,17 +365,12 @@ pub fn train(weights_path: Option<&str>) {
                     .max_other(&value_loss_clipped)
                     .mean(Kind::Float);
 
-                // PPO clipped objective with pre-computed GAE advantages
-                let adv_mean = advantages_sample.mean(Kind::Float);
-                let adv_std = advantages_sample.std(false);
-                let advantages_normalized =
-                    ((&advantages_sample - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
-
+                // PPO clipped objective with pre-computed GAE advantages (globally normalized)
                 let ratio = (&action_log_probs - &old_log_probs_sample).exp();
-                let unclipped_obj = &ratio * &advantages_normalized;
+                let unclipped_obj = &ratio * &advantages_sample;
 
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
-                let clipped_obj = ratio_clipped * &advantages_normalized;
+                let clipped_obj = ratio_clipped * &advantages_sample;
 
                 let action_loss =
                     -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);

@@ -16,6 +16,7 @@ pub const TICKERS: [&str; 7] = [
 //     // iShares S&P500 ETF
 //     "NVDA",
 // ];
+pub const CHART_IMAGE_FORMAT: &str = "png";
 
 pub mod rsi {
     pub const MIDDLE: f64 = 50.;
