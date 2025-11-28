@@ -1,5 +1,10 @@
 # Trading bot 0
 
+Members:
+- `trading_bots/` the various trading bots, most notably the `torch/` RL model
+- `tui/` control and data viewing for training and inference, designed for the torch RL model
+- `shared/` shared code between the members
+
 There are many trading bots and strategies in this repo.
 
 ## Project Structure
