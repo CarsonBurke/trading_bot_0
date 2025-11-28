@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::torch::constants::{STEPS_PER_EPISODE, TICKERS_COUNT};
 use crate::torch::model::model;
 use crate::torch::step::Env;
+use crate::torch::ppo::TANH_SQUASHING_DIVISOR;
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
@@ -29,12 +30,12 @@ pub fn sample_actions(
     });
 
     if deterministic || temperature == 0.0 {
-        (action_mean / 2.0).sigmoid() * 2.0 - 1.0
+        (&action_mean / TANH_SQUASHING_DIVISOR).tanh()
     } else {
         let action_std = action_log_std.exp() * temperature;
         let noise = Tensor::randn_like(&action_mean);
         let z = &action_mean + &action_std * noise;
-        (z / 2.0).sigmoid() * 2.0 - 1.0
+        (&z / TANH_SQUASHING_DIVISOR).tanh()
     }
 }
 

@@ -16,6 +16,7 @@ const OPTIM_EPOCHS: i64 = 4;
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
 const GAMMA: f64 = 0.995;
 const GAE_LAMBDA: f64 = 0.98;
+pub const TANH_SQUASHING_DIVISOR: f64 = 4.0; // Divisor for gentler tanh squashing: action = tanh(z/divisor)
 
 // PPO hyperparameters
 const PPO_CLIP_RATIO: f64 = 0.15; // Clip range for policy ratio (typically 0.1-0.3)
@@ -157,18 +158,14 @@ pub fn train(weights_path: Option<&str>) {
             let two_log_std = &action_log_std * 2.0;
             let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
 
-            // Softer sigmoid squashing: action = 2 * sigmoid(z/2) - 1
-            // Dividing z by 2 makes the squashing much gentler:
-            // - sigmoid(z/2) changes more slowly than sigmoid(z)
-            // - Reduces saturation at extremes
-            // - With std range [0.368, 2.718], provides good exploration without extreme saturation
-            let actions = (&z / 2.0).sigmoid() * 2.0 - 1.0;
+            // Tanh squashing with divisor: action = tanh(z/divisor)
+            // Dividing by divisor makes squashing gentler, staying in more linear region
+            let actions = (&z / TANH_SQUASHING_DIVISOR).tanh();
 
-            // Compute log Jacobian for the squashing transformation
-            // Add clamping for numerical stability to prevent log(0) = -inf
-            let sigmoid_z_half = (&z / 2.0).sigmoid().clamp(1e-7, 1.0 - 1e-7);
-            let one_minus_sigmoid = Tensor::from(1.0) - &sigmoid_z_half;
-            let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
+            // Compute log Jacobian for the scaled tanh transformation
+            // log|d_action/dz| = log(1/divisor) + log(1 - tanh(z/divisor)^2)
+            //                  = -log(divisor) + log(1 - action^2)
+            let log_jacobian = -TANH_SQUASHING_DIVISOR.ln() + (Tensor::from(1.0) - actions.pow_tensor_scalar(2)).clamp(1e-7, 1.0).log();
 
             // Final log probability
             let action_log_prob =
@@ -314,13 +311,11 @@ pub fn train(weights_path: Option<&str>) {
                                                                            // All outputs in FP32
 
                 // Recover the unsquashed Gaussian samples z from actions
-                // action = 2 * sigmoid(z/2) - 1  =>  z = 2 * logit((action + 1) / 2)
-                // Add small epsilon for numerical stability
+                // action = tanh(z/divisor)  =>  z = divisor * atanh(action)
+                // Clamp actions to prevent atanh(±1) = ±inf
                 let eps = 1e-6;
-                let action_01 = (&actions_sample + 1.0) / 2.0; // Transform from [-1, 1] to [0, 1]
-                let action_01_clamped = action_01.clamp(eps, 1.0 - eps); // Prevent log(0)
-                let one_minus_action = Tensor::from(1.0) - &action_01_clamped;
-                let z = (&action_01_clamped.log() - one_minus_action.log()) * 2.0; // 2 * logit function
+                let actions_clamped = actions_sample.clamp(-1.0 + eps, 1.0 - eps);
+                let z = actions_clamped.atanh() * TANH_SQUASHING_DIVISOR;
 
                 // Compute log probability of z under Gaussian N(action_mean, action_std)
                 let action_std = action_log_std.exp();
@@ -329,21 +324,16 @@ pub fn train(weights_path: Option<&str>) {
                 let two_log_std = &action_log_std * 2.0;
                 let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
 
-                // Compute log Jacobian correction for softer sigmoid squashing
-                // action = 2 * sigmoid(z/2) - 1
-                // |d_action/dz| = sigmoid(z/2) * (1 - sigmoid(z/2))
-                // log|d_action/dz| = log(sigmoid(z/2)) + log(1 - sigmoid(z/2))
-                // Add clamping for numerical stability to prevent log(0) = -inf
-                let sigmoid_z_half = (&z / 2.0).sigmoid().clamp(1e-7, 1.0 - 1e-7);
-                let one_minus_sigmoid = Tensor::from(1.0) - &sigmoid_z_half;
-                let log_jacobian = sigmoid_z_half.log() + one_minus_sigmoid.log();
+                // Compute log Jacobian for scaled tanh transformation
+                // log|d_action/dz| = -log(divisor) + log(1 - action^2)
+                let log_jacobian = -TANH_SQUASHING_DIVISOR.ln() + (Tensor::from(1.0) - actions_clamped.pow_tensor_scalar(2)).clamp(1e-7, 1.0).log();
 
                 // Final log probability: log p(action) = log p(z) - log|d_action/dz|
                 let action_log_probs =
                     (log_prob_z - log_jacobian).sum_dim_intlist(-1, false, Kind::Float);
 
                 // Entropy approximation: Use base Gaussian entropy
-                // Note: Exact entropy of sigmoid-squashed distribution is complex to compute
+                // Note: Exact entropy of tanh-squashed distribution is complex to compute
                 // Using Gaussian entropy as approximation is standard practice for regularization
                 let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * action_log_std;
                 let dist_entropy = entropy_components
@@ -387,8 +377,7 @@ pub fn train(weights_path: Option<&str>) {
 
                 // Compute approximate KL divergence for early stopping
                 // KL ≈ (ratio - 1) - log(ratio)
-                let approx_kl = ((&ratio - 1.0) - (&action_log_probs - &old_log_probs_sample))
-                    .mean(Kind::Float);
+                let approx_kl = (&old_log_probs_sample - &action_log_probs).mean(Kind::Float);
                 let approx_kl_value = f64::try_from(approx_kl).unwrap();
 
                 epoch_kl_sum += approx_kl_value;
@@ -458,7 +447,7 @@ pub fn train(weights_path: Option<&str>) {
             });
 
             // Show actual squashed actions, not raw mean
-            let debug_actions = (&debug_mean / 2.0).sigmoid() * 2.0 - 1.0;
+            let debug_actions = (&debug_mean / TANH_SQUASHING_DIVISOR).tanh();
             let mean_squashed_action = f64::try_from(debug_actions.mean(Kind::Float)).unwrap();
             let mean_raw_action = f64::try_from(debug_mean.mean(Kind::Float)).unwrap();
             let mean_std = f64::try_from(debug_log_std.exp().mean(Kind::Float)).unwrap();
@@ -504,30 +493,3 @@ pub fn train(weights_path: Option<&str>) {
         }
     }
 }
-
-// Pretty sure I can ignore this, used for inference after training?
-// Seems like it yes. Loads in weights and then infers a bunch
-//
-// pub fn sample<T: AsRef<std::path::Path>>(weight_file: T) -> cpython::PyResult<()> {
-//     let env = Environment::new(false);
-//     println!("action space: {}", env.action_space());
-//     println!("observation space: {:?}", env.observation_space());
-
-//     let mut vs = nn::VarStore::new(tch::Device::Cpu);
-//     let model = model(&vs.root(), env.action_space());
-//     vs.load(weight_file).unwrap();
-
-//     let mut frame_stack = FrameStack::new(1, NSTACK);
-//     let mut obs = frame_stack.update(&env.reset()?, None);
-
-//     for _index in 0..5000 {
-//         let (_critic, actor) = tch::no_grad(|| model(obs));
-//         let probs = actor.softmax(-1, Kind::Float);
-//         let actions = probs.multinomial(1, true).squeeze_dim(-1);
-//         let step = env.step(Vec::<i64>::try_from(&actions).unwrap())?;
-
-//         let masks = Tensor::from(1f32) - step.is_done;
-//         obs = frame_stack.update(&step.obs, Some(&masks));
-//     }
-//     Ok(())
-// }

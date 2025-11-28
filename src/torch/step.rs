@@ -10,7 +10,8 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_HISTORY_LEN, ACTION_THRESHOLD, MIN_ORDER_VALUE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT, TRANSACTION_COST_PER_SHARE
+            ACTION_HISTORY_LEN, ACTION_THRESHOLD, COMMISSION_RATE, PRICE_DELTAS_PER_TICKER,
+            STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
         },
         ppo::NPROCS,
     },
@@ -19,8 +20,10 @@ use crate::{
 };
 
 // Reward scaling factors
-const REWARD_SCALE: f64 = 1.0;  // Scale rewards for better gradient signal
+const REWARD_SCALE: f64 = 1.0; // Scale rewards for better gradient signal
 const SHARPE_LAMBDA: f64 = 100.0;
+const SORTINO_LAMBDA: f64 = 100.0;
+const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 2.0;
 
 pub struct Env {
     pub step: usize,
@@ -50,7 +53,7 @@ impl Env {
             // "AMD".to_string(),
             // "INTC".to_string(),
             // "MSFT".to_string(),
-            "NVDA".to_string()
+            "NVDA".to_string(),
         ];
 
         let mapped_bars = get_historical_data(Some(
@@ -112,13 +115,13 @@ impl Env {
             if self.action_history.len() > ACTION_HISTORY_LEN {
                 self.action_history.pop_front();
             }
-            
+
             let (buy_sell_actions, hold_actions) = actions.split_at(TICKERS_COUNT as usize);
 
             // Execute trade based on current observations (only use buy/sell actions)
-            let _ = self.trade(buy_sell_actions, absolute_step);
+            self.trade(buy_sell_actions, absolute_step);
 
-            let reward = self.get_risk_adjusted_reward(absolute_step);
+            let reward = self.get_risk_adjusted_benchmarked_reward(absolute_step);
 
             let is_done = self.get_is_done();
 
@@ -138,7 +141,8 @@ impl Env {
                 let start_price = self.prices[0][self.episode_start_offset];
                 let end_price = self.prices[0][absolute_step];
                 let buy_hold_return = (end_price / start_price - 1.0) * 100.0;
-                let strategy_return = (self.account.total_assets / Self::STARTING_CASH - 1.0) * 100.0;
+                let strategy_return =
+                    (self.account.total_assets / Self::STARTING_CASH - 1.0) * 100.0;
                 let outperformance = strategy_return - buy_hold_return;
 
                 let strategy_str = if strategy_return >= 0.0 {
@@ -176,7 +180,8 @@ impl Env {
 
                 self.episode_history
                     .record(self.episode, &self.tickers, &self.prices);
-                self.meta_history.record(&self.episode_history, outperformance);
+                self.meta_history
+                    .record(&self.episode_history, outperformance);
 
                 if self.episode % 5 == 0 {
                     self.meta_history.chart(self.episode);
@@ -257,7 +262,7 @@ impl Env {
     }
 
     /// Sharpe ratio-like risk-adjusted reward
-    fn get_risk_adjusted_reward(&self, absolute_step: usize) -> f64 {
+    fn get_sharpe_ratio_adjusted_reward(&self, absolute_step: usize) -> f64 {
         if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
 
@@ -277,8 +282,64 @@ impl Env {
         }
     }
 
-    fn trade(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
-        let mut total_reward = 0.0;
+    fn get_sortino_ratio_adjusted_reward(&self, absolute_step: usize) -> f64 {
+        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+            let next_absolute_step = absolute_step + 1;
+
+            // Calculate current step's return
+            let total_assets_after_trade = self
+                .account
+                .position_values(&self.prices, next_absolute_step)
+                .iter()
+                .sum::<f64>()
+                + self.account.cash;
+            let step_return = (total_assets_after_trade / self.account.total_assets).ln();
+
+            let downside = if step_return < 0.0 {
+                step_return * step_return
+            } else {
+                0.0
+            };
+            let sortino_ratio = step_return - SORTINO_LAMBDA * downside;
+            sortino_ratio * REWARD_SCALE
+        } else {
+            0.0
+        }
+    }
+
+    fn get_risk_adjusted_benchmarked_reward(&self, absolute_step: usize) -> f64 {
+        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+            let next_absolute_step = absolute_step + 1;
+
+            // Calculate current step's return
+            let total_assets_after_trade = self
+                .account
+                .position_values(&self.prices, next_absolute_step)
+                .iter()
+                .sum::<f64>()
+                + self.account.cash;
+            let step_return = (total_assets_after_trade / self.account.total_assets).ln();
+
+            // First ticker as benchmark
+            let price_curr = self.prices[0][absolute_step];
+            let price_next = self.prices[0][next_absolute_step];
+            let benchmark_return = (price_next / price_curr).ln();
+
+            let excess_return = step_return - benchmark_return;
+
+            let downside = if excess_return < 0.0 {
+                -excess_return
+            } else {
+                0.0
+            };
+            let rar = excess_return - RISK_ADJUSTED_REWARD_LAMBDA * downside;
+            rar * REWARD_SCALE
+        } else {
+            0.0
+        }
+    }
+
+    fn trade(&mut self, actions: &[f64], absolute_step: usize) {
 
         for (ticker_index, action) in actions.iter().enumerate() {
             // Filter out weak signals below threshold
@@ -286,67 +347,48 @@ impl Env {
                 continue;
             }
 
-            let current_price = self.prices[ticker_index][absolute_step];
+            let price = self.prices[ticker_index][absolute_step];
 
-            if *action > 0.0 {
-                // buy - no reward for buying
-                let max_ownership = self.account.total_assets / self.tickers.len() as f64;
-                let buy_total = ((max_ownership
-                    - self.account.positions[ticker_index].value_with_price(current_price))
-                    * (*action as f64)).min(self.account.cash);
+            let max_ownership = self.account.total_assets / self.tickers.len() as f64;
+            let target = max_ownership * ((action + 1.0) / 2.0); // Convert [-1, 1] to [0, 1]
+            let current_value = self.account.positions[ticker_index].value_with_price(price);
 
-                if buy_total > MIN_ORDER_VALUE {
+            let desired_delta = target - current_value;
 
-                    let quantity = buy_total / current_price;
-                    let transaction_cost = quantity * TRANSACTION_COST_PER_SHARE;
+            // BUY
+            if desired_delta > 0.0 {
+                let quantity = desired_delta / price;
+                let cost = quantity * COMMISSION_RATE;
+                let total_cost = desired_delta + cost;
 
-                    self.account.cash -= buy_total + transaction_cost;
-                    self.account.positions[ticker_index].add(current_price, quantity);
-
-                    self.episode_history.buys[ticker_index]
-                        .insert(absolute_step, (current_price, quantity));
-
-                    let reward = (self.max_prices[ticker_index] / current_price).ln() * quantity * REWARD_SCALE;
-                    total_reward += reward;
+                if total_cost > self.account.cash {
+                    continue;
                 }
 
-                continue;
+                self.account.cash -= total_cost;
+                self.account.positions[ticker_index].add(price, quantity);
+
+                self.episode_history.buys[ticker_index].insert(absolute_step, (price, quantity));
             }
+            // SELL
+            else if desired_delta < 0.0 {
+                let position_value = current_value;
+                let desired_sell = -desired_delta;
+                let trade_value = desired_sell.min(position_value);
 
-            // sell - reward based on realized P&L
-            let position = &self.account.positions[ticker_index];
-            let sell_total = position.value_with_price(current_price) * (-*action as f64);
+                if trade_value <= 0.0 {
+                    continue;
+                }
 
-            if sell_total > MIN_ORDER_VALUE {
+                let quantity = trade_value / price;
+                let cost = quantity * COMMISSION_RATE;
 
-                let avg_cost = position.avg_price;
-
-                // Realized return: (sell_price - cost_basis) / cost_basis
-                // Using log return for time-weighted calculation
-                let return_ratio = current_price / avg_cost;
-                let log_return = return_ratio.ln();
-
-                // Weight by the proportion of total assets this trade represents
-                let trade_weight = sell_total / self.account.total_assets;
-
-                // Time-weighted realized return, scaled by trade size
-                let trade_reward = log_return * trade_weight * REWARD_SCALE;
-                total_reward += trade_reward;
-
-                let quantity = sell_total / current_price;
-                let transaction_cost = quantity * TRANSACTION_COST_PER_SHARE;
-
-                self.account.cash += sell_total - transaction_cost;
+                self.account.cash += trade_value - cost;
                 self.account.positions[ticker_index].quantity -= quantity;
 
-                self.episode_history.sells[ticker_index]
-                    .insert(absolute_step, (current_price, quantity));
+                self.episode_history.sells[ticker_index].insert(absolute_step, (price, quantity));
             }
-
-            continue;
         }
-
-        total_reward
     }
 
     fn get_is_done(&self) -> f32 {
@@ -420,11 +462,10 @@ impl Env {
 
     pub fn reset(&mut self) -> (Tensor, Tensor) {
         // Leave at least STEPS_PER_EPISODE steps for a full episode + observations buffer
-       
+
         let max_start = self
             .total_data_length
             .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
-
 
         self.episode_start_offset = if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
             let mut rng = rand::rng();
@@ -460,7 +501,8 @@ impl Env {
         let infer_dir = "infer";
         create_folder_if_not_exists(&infer_dir.to_string());
 
-        self.episode_history.record_to_path(infer_dir, episode, &self.tickers, &self.prices);
+        self.episode_history
+            .record_to_path(infer_dir, episode, &self.tickers, &self.prices);
     }
 }
 

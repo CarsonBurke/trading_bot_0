@@ -14,7 +14,7 @@ use ibapi::{
 };
 
 use crate::constants::api;
-use crate::torch::constants::{ACTION_HISTORY_LEN, ACTION_THRESHOLD, MIN_ORDER_VALUE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
+use crate::torch::constants::{ACTION_HISTORY_LEN, ACTION_THRESHOLD, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::infer::{load_model, sample_actions};
 use crate::types::{Account, Position};
 
@@ -357,70 +357,72 @@ fn execute_trades(
 
         let current_price = current_prices[ticker_idx];
         let position = &account.positions[ticker_idx];
+        
+        // Needs to implement new trade fn logic from step.rs
 
-        if action > 0.0 {
-            let max_ownership = account.total_assets / symbols.len() as f64;
-            let buy_total = (max_ownership - position.value_with_price(current_price)) * action;
+        // if action > 0.0 {
+        //     let max_ownership = account.total_assets / symbols.len() as f64;
+        //     let buy_total = (max_ownership - position.value_with_price(current_price)) * action;
 
-            if buy_total > MIN_ORDER_VALUE {
-                let buy_total_clamped = buy_total.min(account.cash);
+        //     if buy_total > MIN_ORDER_VALUE {
+        //         let buy_total_clamped = buy_total.min(account.cash);
 
-                if buy_total_clamped < MIN_ORDER_VALUE {
-                    continue;
-                }
+        //         if buy_total_clamped < MIN_ORDER_VALUE {
+        //             continue;
+        //         }
 
-                let quantity = (buy_total_clamped / current_price).floor();
+        //         let quantity = (buy_total_clamped / current_price).floor();
 
-                println!("BUY {} shares of {} @ ${:.2} (total: ${:.2})",
-                    quantity, symbols[ticker_idx], current_price, buy_total_clamped);
+        //         println!("BUY {} shares of {} @ ${:.2} (total: ${:.2})",
+        //             quantity, symbols[ticker_idx], current_price, buy_total_clamped);
 
-                let contract = Contract::stock(&symbols[ticker_idx]);
-                let order_id = client.next_order_id();
-                let order = order_builder::market_order(Action::Buy, quantity);
+        //         let contract = Contract::stock(&symbols[ticker_idx]);
+        //         let order_id = client.next_order_id();
+        //         let order = order_builder::market_order(Action::Buy, quantity);
 
-                match client.place_order(order_id, &contract, &order) {
-                    Ok(subscription) => {
-                        for event in &subscription {
-                            if let PlaceOrder::ExecutionData(_) = event {
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => println!("Order failed: {}", e),
-                }
-            }
-        } else {
-            let sell_total = position.value_with_price(current_price) * (-action);
-            if sell_total > MIN_ORDER_VALUE {
-                let quantity = (sell_total / current_price).floor();
+        //         match client.place_order(order_id, &contract, &order) {
+        //             Ok(subscription) => {
+        //                 for event in &subscription {
+        //                     if let PlaceOrder::ExecutionData(_) = event {
+        //                         break;
+        //                     }
+        //                 }
+        //             }
+        //             Err(e) => println!("Order failed: {}", e),
+        //         }
+        //     }
+        // } else {
+        //     let sell_total = position.value_with_price(current_price) * (-action);
+        //     if sell_total > MIN_ORDER_VALUE {
+        //         let quantity = (sell_total / current_price).floor();
 
-                let quantity_clamped = quantity.min(position.quantity);
+        //         let quantity_clamped = quantity.min(position.quantity);
 
-                let sell_total_actual = quantity_clamped * current_price;
+        //         let sell_total_actual = quantity_clamped * current_price;
 
-                if sell_total_actual < MIN_ORDER_VALUE {
-                    continue;
-                }
+        //         if sell_total_actual < MIN_ORDER_VALUE {
+        //             continue;
+        //         }
 
-                println!("SELL {} shares of {} @ ${:.2} (total: ${:.2})",
-                    quantity_clamped, symbols[ticker_idx], current_price, sell_total_actual);
+        //         println!("SELL {} shares of {} @ ${:.2} (total: ${:.2})",
+        //             quantity_clamped, symbols[ticker_idx], current_price, sell_total_actual);
 
-                let contract = Contract::stock(&symbols[ticker_idx]);
-                let order_id = client.next_order_id();
-                let order = order_builder::market_order(Action::Sell, quantity_clamped);
+        //         let contract = Contract::stock(&symbols[ticker_idx]);
+        //         let order_id = client.next_order_id();
+        //         let order = order_builder::market_order(Action::Sell, quantity_clamped);
 
-                match client.place_order(order_id, &contract, &order) {
-                    Ok(subscription) => {
-                        for event in &subscription {
-                            if let PlaceOrder::ExecutionData(_) = event {
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => println!("Order failed: {}", e),
-                }
-            }
-        }
+        //         match client.place_order(order_id, &contract, &order) {
+        //             Ok(subscription) => {
+        //                 for event in &subscription {
+        //                     if let PlaceOrder::ExecutionData(_) = event {
+        //                         break;
+        //                     }
+        //                 }
+        //             }
+        //             Err(e) => println!("Order failed: {}", e),
+        //         }
+        //     }
+        // }
     }
 
     Ok(())
