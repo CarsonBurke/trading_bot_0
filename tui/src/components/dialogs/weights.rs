@@ -26,7 +26,8 @@ pub fn render(f: &mut Frame, app: &App, for_training: bool, for_inference: bool)
 
     let inner = BaseDialog::new(title)
         .width(70)
-        .height(30)
+        .min_height(12)
+        .max_height(16)
         .render(f);
 
     let chunks = Layout::default()

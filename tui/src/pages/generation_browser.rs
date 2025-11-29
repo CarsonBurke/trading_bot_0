@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::App;
+use crate::{components::episode_status, App};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -19,12 +19,19 @@ pub fn render(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    let title = Paragraph::new(" Training Episodes ")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    let is_training = app.is_training_running();
+    let current_episode = app.get_current_episode();
+
+    let mut title_spans = vec![
+        Span::styled(" Training Episodes ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ];
+    title_spans.extend(episode_status::episode_status_spans(is_training, current_episode));
+
+    let title = Paragraph::new(Line::from(title_spans))
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
-    let search_style = if app.searching {
+    let search_style = if app.generation_browser.searching {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
@@ -32,10 +39,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let search_text = if app.searching {
-        format!("Search: {}_", app.search_input)
+    let search_text = if app.generation_browser.searching {
+        format!("Search: {}_", app.generation_browser.search_input)
     } else {
-        format!("Search: {} (press / to search)", app.search_input)
+        format!("Search: {} (press / to search)", app.generation_browser.search_input)
     };
 
     let search = Paragraph::new(search_text)
@@ -44,7 +51,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     f.render_widget(search, chunks[1]);
 
     let items: Vec<ListItem> = app
-        .filtered_generations
+        .generation_browser.filtered_generations
         .iter()
         .map(|gen| {
             ListItem::new(format!("Episode {}", gen.number))
@@ -54,8 +61,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let list_title = format!(
         "Episodes ({}/{})",
-        app.filtered_generations.len(),
-        app.generations.len()
+        app.generation_browser.filtered_generations.len(),
+        app.generation_browser.generations.len()
     );
 
     let list = List::new(items)
@@ -68,9 +75,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         )
         .highlight_symbol(">> ");
 
-    app.list_area = chunks[2];
-    let mut list_state = app.list_state.clone();
-    f.render_stateful_widget(list, chunks[2], &mut list_state);
+    app.generation_browser.list_area = chunks[2];
+    f.render_stateful_widget(list, chunks[2], &mut app.generation_browser.list_state);
 
     let help = Paragraph::new(vec![
         Line::from(vec![

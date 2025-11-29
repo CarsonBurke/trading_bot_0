@@ -12,7 +12,8 @@ use super::base::BaseDialog;
 pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
     let inner = BaseDialog::new(" Run Inference ")
         .width(70)
-        .height(40)
+        .min_height(18)
+        .max_height(22)
         .render(f);
 
     let chunks = Layout::default()

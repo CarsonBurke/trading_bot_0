@@ -5,7 +5,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::{theme, utils::layout::centered_rect};
+use crate::{theme, utils::layout::centered_dialog};
 
 /// Dialog style variants for different contexts
 #[derive(Clone, Copy)]
@@ -23,7 +23,8 @@ pub enum DialogStyle {
 pub struct BaseDialog<'a> {
     title: &'a str,
     width_percent: u16,
-    height_percent: u16,
+    min_height: u16,
+    max_height: u16,
     style: DialogStyle,
 }
 
@@ -32,7 +33,8 @@ impl<'a> BaseDialog<'a> {
         Self {
             title,
             width_percent: 60,
-            height_percent: 30,
+            min_height: 12,
+            max_height: 20,
             style: DialogStyle::Info,
         }
     }
@@ -42,8 +44,13 @@ impl<'a> BaseDialog<'a> {
         self
     }
 
-    pub fn height(mut self, percent: u16) -> Self {
-        self.height_percent = percent;
+    pub fn min_height(mut self, rows: u16) -> Self {
+        self.min_height = rows;
+        self
+    }
+
+    pub fn max_height(mut self, rows: u16) -> Self {
+        self.max_height = rows;
         self
     }
 
@@ -54,7 +61,7 @@ impl<'a> BaseDialog<'a> {
 
     /// Renders the dialog frame and returns the inner area for content
     pub fn render(&self, f: &mut Frame) -> Rect {
-        let area = centered_rect(self.width_percent, self.height_percent, f.area());
+        let area = centered_dialog(self.width_percent, self.min_height, self.max_height, f.area());
 
         // Soft backdrop overlay
         let backdrop = Block::default().style(Style::default().bg(theme::CRUST));

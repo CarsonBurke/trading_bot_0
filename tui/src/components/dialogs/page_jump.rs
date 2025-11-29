@@ -12,7 +12,8 @@ use super::base::BaseDialog;
 pub fn render(f: &mut Frame, selected: usize, current_mode: AppMode) {
     let inner = BaseDialog::new(" Go to Page ")
         .width(40)
-        .height(35)
+        .min_height(12)
+        .max_height(16)
         .render(f);
 
     let chunks = Layout::default()

@@ -20,7 +20,8 @@ pub fn render(f: &mut Frame, title: &str, message: &str) {
 
     let inner = BaseDialog::new(dialog_title)
         .width(55)
-        .height(25)
+        .min_height(10)
+        .max_height(14)
         .style(DialogStyle::Warning)
         .render(f);
 

@@ -6,26 +6,26 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::Rect,
-    widgets::ListState,
     Frame, Terminal,
 };
 use shared::paths::WEIGHTS_PATH;
 use std::{
     io,
     path::PathBuf,
-    process::{Child, Command},
     time::{Duration, Instant},
 };
-use walkdir::WalkDir;
 
 mod chart_viewer;
 mod components;
 mod pages;
+mod state;
 mod theme;
 mod utils;
 
 use chart_viewer::ChartViewer;
+use state::{
+    GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
@@ -57,44 +57,17 @@ pub struct App {
     pub mode: AppMode,
     pub previous_mode: AppMode,
     pub dialog_mode: DialogMode,
-    pub inference_process: Option<Child>,
-    pub training_process: Option<Child>,
-    pub training_output: Vec<String>,
-    pub generations: Vec<GenerationInfo>,
-    pub filtered_generations: Vec<GenerationInfo>,
-    pub selected_generation: Option<usize>,
-    pub list_state: ListState,
-    pub inferences: Vec<InferenceInfo>,
-    pub filtered_inferences: Vec<InferenceInfo>,
-    pub selected_inference: Option<usize>,
-    pub inference_list_state: ListState,
     pub chart_viewer: ChartViewer,
     pub input: String,
     pub ticker_input: String,
     pub episodes_input: String,
-    pub search_input: String,
-    pub inference_search_input: String,
     pub weights_path: Option<String>,
-    pub searching: bool,
-    pub inference_searching: bool,
-    pub list_area: Rect,
-    pub inference_list_area: Rect,
     pub latest_meta_charts: Vec<PathBuf>,
-    pub logs_list_state: ListState,
-    pub logs_list_area: Rect,
     last_refresh: Instant,
-}
-
-#[derive(Debug, Clone)]
-pub struct GenerationInfo {
-    pub number: usize,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct InferenceInfo {
-    pub number: usize,
-    pub path: PathBuf,
+    pub generation_browser: GenerationBrowserState,
+    pub inference_browser: InferenceBrowserState,
+    pub logs_page: LogsPageState,
+    pub process_manager: ProcessManagerState,
 }
 
 impl App {
@@ -111,39 +84,29 @@ impl App {
     }
 
     fn new() -> Result<Self> {
+        let mut generation_browser = GenerationBrowserState::new();
+        generation_browser.load_generations()?;
+
+        let mut inference_browser = InferenceBrowserState::new();
+        inference_browser.load_inferences()?;
+
         let mut app = App {
             mode: AppMode::Main,
             previous_mode: AppMode::Main,
             dialog_mode: DialogMode::None,
-            inference_process: None,
-            training_process: None,
-            training_output: Vec::new(),
-            generations: Vec::new(),
-            filtered_generations: Vec::new(),
-            selected_generation: None,
-            list_state: ListState::default(),
-            inferences: Vec::new(),
-            filtered_inferences: Vec::new(),
-            selected_inference: None,
-            inference_list_state: ListState::default(),
             chart_viewer: ChartViewer::new(),
             input: String::new(),
             ticker_input: String::new(),
             episodes_input: String::new(),
-            search_input: String::new(),
-            inference_search_input: String::new(),
             weights_path: None,
-            searching: false,
-            inference_searching: false,
-            list_area: Rect::default(),
-            inference_list_area: Rect::default(),
             latest_meta_charts: Vec::new(),
-            logs_list_state: ListState::default(),
-            logs_list_area: Rect::default(),
             last_refresh: Instant::now(),
+            generation_browser,
+            inference_browser,
+            logs_page: LogsPageState::new(),
+            process_manager: ProcessManagerState::new(),
         };
-        app.load_generations()?;
-        app.load_inferences()?;
+
         app.load_latest_meta_charts()?;
         Ok(app)
     }
@@ -160,16 +123,21 @@ impl App {
             return Ok(());
         }
 
-        // Meta chart base names (without extension) - these are the "namespaces"
+        // Meta chart base names (episode-level charts without ticker)
         let meta_chart_bases = vec![
             "final_assets", "cum_reward", "outperformance", "loss",
             "assets", "reward", "total_commissions"
         ];
 
+        // Ticker-specific chart base names
+        let ticker_chart_bases = vec![
+            "assets", "buy_sell", "hold_action", "raw_action"
+        ];
+
         // Track the latest file for each chart type: base_name -> (modified_time, path)
         let mut latest_per_type: HashMap<String, (SystemTime, PathBuf)> = HashMap::new();
 
-        // Scan all generation directories for meta charts
+        // Scan all generation directories
         if let Ok(entries) = fs::read_dir(&gens_path) {
             for entry in entries.filter_map(|e| e.ok()) {
                 if !entry.file_type().ok().map(|ft| ft.is_dir()).unwrap_or(false) {
@@ -183,33 +151,75 @@ impl App {
                 }
 
                 let gen_path = entry.path();
-                if let Ok(files) = fs::read_dir(&gen_path) {
-                    for file in files.filter_map(|e| e.ok()) {
-                        let file_path = file.path();
-                        let ext = file_path.extension().and_then(|s| s.to_str());
-                        if ext != Some("png") && ext != Some("webp") {
-                            continue;
-                        }
 
-                        let file_name = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                // Single scan for both episode-level charts and ticker subdirectories
+                if let Ok(items) = fs::read_dir(&gen_path) {
+                    for item in items.filter_map(|e| e.ok()) {
+                        let item_path = item.path();
+                        let is_file = item.file_type().ok().map(|ft| ft.is_file()).unwrap_or(false);
+                        let is_dir = item.file_type().ok().map(|ft| ft.is_dir()).unwrap_or(false);
 
-                        // Check if this file matches any of our meta chart types
-                        for base in &meta_chart_bases {
-                            if file_name == *base {
-                                if let Ok(metadata) = file.metadata() {
-                                    if let Ok(modified) = metadata.modified() {
-                                        let key = base.to_string();
-                                        let should_update = latest_per_type
-                                            .get(&key)
-                                            .map(|(t, _)| modified > *t)
-                                            .unwrap_or(true);
+                        if is_file {
+                            // Process episode-level meta charts
+                            let ext = item_path.extension().and_then(|s| s.to_str());
+                            if ext != Some("png") && ext != Some("webp") {
+                                continue;
+                            }
 
-                                        if should_update {
-                                            latest_per_type.insert(key, (modified, file_path.clone()));
+                            let file_name = item_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+                            // Check if this file matches any of our meta chart types
+                            for base in &meta_chart_bases {
+                                if file_name == *base {
+                                    if let Ok(metadata) = item.metadata() {
+                                        if let Ok(modified) = metadata.modified() {
+                                            let key = format!("meta_{}", base);
+                                            if latest_per_type
+                                                .get(&key)
+                                                .map(|(t, _)| modified > *t)
+                                                .unwrap_or(true)
+                                            {
+                                                latest_per_type.insert(key, (modified, item_path.clone()));
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        } else if is_dir {
+                            // Process ticker-specific charts in subdirectories
+                            let ticker_name = item.file_name();
+                            let ticker_str = ticker_name.to_str().unwrap_or("");
+
+                            if let Ok(ticker_files) = fs::read_dir(&item_path) {
+                                for file in ticker_files.filter_map(|e| e.ok()) {
+                                    let file_path = file.path();
+                                    let ext = file_path.extension().and_then(|s| s.to_str());
+                                    if ext != Some("png") && ext != Some("webp") {
+                                        continue;
+                                    }
+
+                                    let file_name = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+                                    // Check if this file matches any ticker chart types
+                                    for base in &ticker_chart_bases {
+                                        if file_name == *base {
+                                            if let Ok(metadata) = file.metadata() {
+                                                if let Ok(modified) = metadata.modified() {
+                                                    let key = format!("{}_{}", ticker_str, base);
+                                                    if latest_per_type
+                                                        .get(&key)
+                                                        .map(|(t, _)| modified > *t)
+                                                        .unwrap_or(true)
+                                                    {
+                                                        latest_per_type.insert(key, (modified, file_path.clone()));
+                                                    }
+                                                }
+                                            }
+                                            break;
                                         }
                                     }
                                 }
-                                break;
                             }
                         }
                     }
@@ -228,427 +238,88 @@ impl App {
         Ok(())
     }
 
-    fn is_anything_running(&self) -> bool {
-        self.is_training_running() || self.inference_process.is_some()
+    pub fn is_training_running(&mut self) -> bool {
+        self.process_manager.is_training_running()
     }
 
-    pub fn is_training_running(&self) -> bool {
-        // First check our own child process
-        if self.training_process.is_some() {
-            return true;
-        }
+    fn is_anything_running(&mut self) -> bool {
+        self.process_manager.is_anything_running()
+    }
 
-        // Check if training was started externally
-        if let Ok(output) = Command::new("pgrep")
-            .args(["-f", "trading.*train"])
-            .output()
-        {
-            if !output.stdout.is_empty() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for pid in stdout.lines() {
-                    if let Ok(pid_num) = pid.trim().parse::<u32>() {
-                        if let Ok(cmdline_output) = Command::new("ps")
-                            .args(["-p", &pid_num.to_string(), "-o", "args="])
-                            .output()
-                        {
-                            let cmdline = String::from_utf8_lossy(&cmdline_output.stdout);
-                            if cmdline.contains("train") && !cmdline.contains("tui") {
-                                return true;
-                            }
+    pub fn get_current_episode(&self) -> Option<usize> {
+        for line in self.logs_page.training_output.iter().rev() {
+            // Look for actual episode completion logs: "Episode N - Total Assets..."
+            // Skip PPO progress logs: "[Ep N] Episodes: ..."
+            if line.contains("Episode") && line.contains("Total Assets") && !line.starts_with("[Ep") {
+                if let Some(ep_str) = line.split("Episode").nth(1) {
+                    if let Some(num_str) = ep_str.trim().split_whitespace().next() {
+                        // Strip ANSI codes if present
+                        let clean_num = num_str.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+                        if let Ok(ep) = clean_num.parse::<usize>() {
+                            return Some(ep);
                         }
                     }
                 }
             }
         }
-
-        false
-    }
-
-    fn load_generations(&mut self) -> Result<()> {
-        self.generations.clear();
-        let training_path = PathBuf::from("../training/gens");
-
-        if !training_path.exists() {
-            return Ok(());
-        }
-
-        for entry in WalkDir::new(&training_path)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Ok(num) = name.parse::<usize>() {
-                        self.generations.push(GenerationInfo {
-                            number: num,
-                            path: entry.path().to_path_buf(),
-                        });
-                    }
-                }
-            }
-        }
-
-        self.generations.sort_by_key(|g| g.number);
-        self.filter_generations();
-        Ok(())
-    }
-
-    fn filter_generations(&mut self) {
-        if self.search_input.is_empty() {
-            self.filtered_generations = self.generations.clone();
-        } else {
-            self.filtered_generations = self
-                .generations
-                .iter()
-                .filter(|g| g.number.to_string().contains(&self.search_input))
-                .cloned()
-                .collect();
-        }
-
-        // Reset selection if filtered list is shorter
-        if let Some(selected) = self.list_state.selected() {
-            if selected >= self.filtered_generations.len() && !self.filtered_generations.is_empty() {
-                self.list_state.select(Some(0));
-                self.center_list(0);
-            } else if !self.filtered_generations.is_empty() {
-                self.center_list(selected);
-            }
-        } else if !self.filtered_generations.is_empty() {
-            self.list_state.select(Some(0));
-            self.center_list(0);
-        }
-    }
-
-    fn load_inferences(&mut self) -> Result<()> {
-        self.inferences.clear();
-        let inference_path = PathBuf::from("../infer");
-
-        if !inference_path.exists() {
-            return Ok(());
-        }
-
-        for entry in WalkDir::new(&inference_path)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Ok(num) = name.parse::<usize>() {
-                        self.inferences.push(InferenceInfo {
-                            number: num,
-                            path: entry.path().to_path_buf(),
-                        });
-                    }
-                }
-            }
-        }
-
-        self.inferences.sort_by(|a, b| b.number.cmp(&a.number));  // Sort descending (newest first)
-        self.filter_inferences();
-        Ok(())
-    }
-
-    fn filter_inferences(&mut self) {
-        if self.inference_search_input.is_empty() {
-            self.filtered_inferences = self.inferences.clone();
-        } else {
-            self.filtered_inferences = self
-                .inferences
-                .iter()
-                .filter(|i| i.number.to_string().contains(&self.inference_search_input))
-                .cloned()
-                .collect();
-        }
-
-        if let Some(selected) = self.inference_list_state.selected() {
-            if selected >= self.filtered_inferences.len() && !self.filtered_inferences.is_empty() {
-                self.inference_list_state.select(Some(0));
-                self.center_inference_list(0);
-            } else if !self.filtered_inferences.is_empty() {
-                self.center_inference_list(selected);
-            }
-        } else if !self.filtered_inferences.is_empty() {
-            self.inference_list_state.select(Some(0));
-            self.center_inference_list(0);
-        }
-    }
-
-    fn center_inference_list(&mut self, selected: usize) {
-        let visible_height = self.inference_list_area.height.saturating_sub(2) as usize;
-        let center = visible_height / 2;
-
-        let offset = if selected >= center {
-            selected.saturating_sub(center)
-        } else {
-            0
-        };
-
-        self.inference_list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
-    }
-
-    fn next_inference(&mut self) {
-        if self.filtered_inferences.is_empty() {
-            return;
-        }
-        let i = match self.inference_list_state.selected() {
-            Some(i) => {
-                if i >= self.filtered_inferences.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
-        self.inference_list_state.select(Some(i));
-        self.center_inference_list(i);
-    }
-
-    fn previous_inference(&mut self) {
-        if self.filtered_inferences.is_empty() {
-            return;
-        }
-        let i = match self.inference_list_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.filtered_inferences.len() - 1
-                } else {
-                    i - 1
-                }
-            }
-            None => 0,
-        };
-        self.inference_list_state.select(Some(i));
-        self.center_inference_list(i);
-    }
-
-    fn scroll_inference_up(&mut self, amount: usize) {
-        for _ in 0..amount {
-            self.previous_inference();
-        }
-    }
-
-    fn scroll_inference_down(&mut self, amount: usize) {
-        for _ in 0..amount {
-            self.next_inference();
-        }
-    }
-
-    fn scroll_up(&mut self, amount: usize) {
-        for _ in 0..amount {
-            self.previous_generation();
-        }
-    }
-
-    fn scroll_down(&mut self, amount: usize) {
-        for _ in 0..amount {
-            self.next_generation();
-        }
+        None
     }
 
     fn maybe_refresh(&mut self) -> Result<()> {
         let now = Instant::now();
         if now.duration_since(self.last_refresh) >= Duration::from_secs(1) {
-            self.load_generations()?;
-            self.load_inferences()?;
+            self.generation_browser.load_generations()?;
+            self.inference_browser.load_inferences()?;
             self.load_latest_meta_charts()?;
+            self.logs_page.poll_training_output();
             self.last_refresh = now;
         }
         Ok(())
     }
 
-    fn poll_training_output(&mut self) {
-        use std::fs;
-
-        // Check if our child process has exited
-        if let Some(ref mut child) = self.training_process {
-            if let Ok(Some(_status)) = child.try_wait() {
-                self.training_process = None;
-            }
-        }
-
-        // Read from log file (works whether training was started by TUI or externally)
-        let log_path = "../training/training.log";
-        if let Ok(content) = fs::read_to_string(log_path) {
-            let new_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-
-            // Check if we were at the bottom before update
-            let was_at_bottom = self.logs_list_state.selected()
-                .map(|s| s >= self.training_output.len().saturating_sub(1))
-                .unwrap_or(true);
-
-            // Only update if there are new lines
-            if new_lines.len() > self.training_output.len() || new_lines != self.training_output {
-                self.training_output = new_lines;
-
-                // Keep only last 1000 lines
-                if self.training_output.len() > 1000 {
-                    self.training_output.drain(0..self.training_output.len() - 1000);
-                }
-
-                // Auto-scroll to bottom if we were at the bottom, or if first time
-                if was_at_bottom && !self.training_output.is_empty() {
-                    self.center_logs_list(self.training_output.len().saturating_sub(1));
-                }
-            }
-        }
-    }
-
     fn start_training(&mut self, weights_file: Option<String>) -> Result<()> {
-        if self.is_training_running() {
-            return Ok(());
-        }
-
-        use std::fs::OpenOptions;
-        use std::process::Stdio;
-
-        let log_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open("../training/training.log")?;
-
-        let log_file_stderr = log_file.try_clone()?;
-
-        let mut cmd = Command::new("cargo");
-        cmd.arg("run")
-            .arg("--release")
-            .arg("--")
-            .arg("train")
-            .current_dir("../trading_bots")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_stderr));
-
-        if let Some(weights) = weights_file {
-            let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
-                weights
+        let weights = weights_file.map(|w| {
+            if w.starts_with('/') || w.starts_with("..") {
+                w
             } else {
-                format!("{}/{}", WEIGHTS_PATH, weights)
-            };
-            cmd.arg("-w").arg(weights_path);
-        }
-
-        let child = cmd.spawn()?;
-        self.training_process = Some(child);
-        Ok(())
+                format!("{}/{}", WEIGHTS_PATH, w)
+            }
+        });
+        self.process_manager.start_training(weights)
     }
 
     fn start_inference(&mut self, weights_file: Option<String>, ticker: Option<String>, episodes: Option<usize>) -> Result<()> {
-        if self.inference_process.is_some() {
-            return Ok(());
-        }
-
-        let mut cmd = Command::new("cargo");
-        cmd.arg("run")
-            .arg("--release")
-            .arg("--")
-            .arg("infer")
-            .current_dir("../trading_bots");
-
         let weights = weights_file.unwrap_or_else(|| "infer.ot".to_string());
         let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
             weights
         } else {
             format!("{}/{}", WEIGHTS_PATH, weights)
         };
-        cmd.arg("-w").arg(weights_path);
-
-        if let Some(ticker_override) = ticker {
-            cmd.env("TICKER_OVERRIDE", ticker_override);
-        }
-
-        if let Some(ep) = episodes {
-            cmd.arg("-e").arg(ep.to_string());
-        }
-
-        let child = cmd.spawn()?;
-        self.inference_process = Some(child);
-        Ok(())
+        self.process_manager.start_inference(weights_path, ticker, episodes.unwrap_or(10))
     }
 
     fn stop_training(&mut self) -> Result<()> {
-        if let Some(mut child) = self.training_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        Ok(())
-    }
-
-    fn center_list(&mut self, selected: usize) {
-        // Calculate visible height (subtract borders and title)
-        let visible_height = self.list_area.height.saturating_sub(2) as usize;
-        let center = visible_height / 2;
-
-        let offset = if selected >= center {
-            selected.saturating_sub(center)
-        } else {
-            0
-        };
-
-        self.list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
-    }
-
-    fn next_generation(&mut self) {
-        if self.filtered_generations.is_empty() {
-            return;
-        }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i >= self.filtered_generations.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
-        self.list_state.select(Some(i));
-        self.center_list(i);
-    }
-
-    fn previous_generation(&mut self) {
-        if self.filtered_generations.is_empty() {
-            return;
-        }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.filtered_generations.len() - 1
-                } else {
-                    i - 1
-                }
-            }
-            None => 0,
-        };
-        self.list_state.select(Some(i));
-        self.center_list(i);
+        self.process_manager.stop_training()
     }
 
     fn select_generation(&mut self) -> Result<()> {
-        if let Some(idx) = self.list_state.selected() {
-            if idx < self.filtered_generations.len() {
-                self.selected_generation = Some(idx);
-                self.chart_viewer.load_generation(&self.filtered_generations[idx].path)?;
-                self.previous_mode = self.mode;
-                self.mode = AppMode::ChartViewer;
-            }
+        if let Some(gen) = self.generation_browser.get_selected() {
+            let path = gen.path.clone();
+            self.generation_browser.selected_generation = self.generation_browser.list_state.selected();
+            self.chart_viewer.load_generation(&path)?;
+            self.previous_mode = self.mode;
+            self.mode = AppMode::ChartViewer;
         }
         Ok(())
     }
 
     fn select_inference(&mut self) -> Result<()> {
-        if let Some(idx) = self.inference_list_state.selected() {
-            if idx < self.filtered_inferences.len() {
-                self.selected_inference = Some(idx);
-                self.chart_viewer.load_inference(&self.filtered_inferences[idx].path)?;
-                self.previous_mode = self.mode;
-                self.mode = AppMode::ChartViewer;
-            }
+        if let Some(inf) = self.inference_browser.get_selected() {
+            let path = inf.path.clone();
+            self.inference_browser.selected_inference = self.inference_browser.list_state.selected();
+            self.chart_viewer.load_inference(&path)?;
+            self.previous_mode = self.mode;
+            self.mode = AppMode::ChartViewer;
         }
         Ok(())
     }
@@ -663,79 +334,24 @@ impl App {
     }
 
     fn handle_generation_click(&mut self, row: u16) -> Result<()> {
-        // Adjust for border (1) and title (1)
         let adjusted_row = row.saturating_sub(2);
-
-        // Account for current offset
-        let current_offset = self.list_state.offset();
+        let current_offset = self.generation_browser.list_state.offset();
         let actual_index = current_offset + adjusted_row as usize;
 
-        if actual_index < self.filtered_generations.len() {
-            self.center_list(actual_index);
+        if actual_index < self.generation_browser.filtered_generations.len() {
+            self.generation_browser.center_list(actual_index);
         }
         Ok(())
     }
 
-    fn center_logs_list(&mut self, selected: usize) {
-        let visible_height = self.logs_list_area.height.saturating_sub(2) as usize;
-        let center = visible_height / 2;
-
-        let offset = if selected >= center {
-            selected.saturating_sub(center)
-        } else {
-            0
-        };
-
-        self.logs_list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
-    }
-
     fn next_log_line(&mut self) {
-        if self.training_output.is_empty() {
-            return;
-        }
-        let i = match self.logs_list_state.selected() {
-            Some(i) => {
-                if i >= self.training_output.len() - 1 {
-                    self.training_output.len() - 1
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
-        self.logs_list_state.select(Some(i));
-        self.center_logs_list(i);
+        self.logs_page.next();
     }
 
     fn previous_log_line(&mut self) {
-        if self.training_output.is_empty() {
-            return;
-        }
-        let i = match self.logs_list_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    0
-                } else {
-                    i - 1
-                }
-            }
-            None => 0,
-        };
-        self.logs_list_state.select(Some(i));
-        self.center_logs_list(i);
+        self.logs_page.previous();
     }
 
-    fn scroll_logs_up(&mut self, amount: usize) {
-        for _ in 0..amount {
-            self.previous_log_line();
-        }
-    }
-
-    fn scroll_logs_down(&mut self, amount: usize) {
-        for _ in 0..amount {
-            self.next_log_line();
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -770,7 +386,7 @@ fn run_app<B: ratatui::backend::Backend>(
         terminal.draw(|f| ui(f, app))?;
 
         app.maybe_refresh()?;
-        app.poll_training_output();
+        app.logs_page.poll_training_output();
 
         // Wait for event, then drain all pending events before redrawing
         if event::poll(Duration::from_millis(16))? {  // ~60fps
@@ -915,18 +531,18 @@ fn run_app<B: ratatui::backend::Backend>(
                                     match selected {
                                         0 => app.mode = AppMode::Main,
                                         1 => {
-                                            app.load_generations()?;
-                                            if !app.filtered_generations.is_empty() && app.list_state.selected().is_none() {
-                                                app.list_state.select(Some(0));
-                                                app.center_list(0);
+                                            app.generation_browser.load_generations()?;
+                                            if !app.generation_browser.filtered_generations.is_empty() && app.generation_browser.list_state.selected().is_none() {
+                                                app.generation_browser.list_state.select(Some(0));
+                                                app.generation_browser.center_list(0);
                                             }
                                             app.mode = AppMode::GenerationBrowser;
                                         }
                                         2 => {
-                                            app.load_inferences()?;
-                                            if !app.filtered_inferences.is_empty() && app.inference_list_state.selected().is_none() {
-                                                app.inference_list_state.select(Some(0));
-                                                app.center_inference_list(0);
+                                            app.inference_browser.load_inferences()?;
+                                            if !app.inference_browser.filtered_inferences.is_empty() && app.inference_browser.list_state.selected().is_none() {
+                                                app.inference_browser.list_state.select(Some(0));
+                                                app.inference_browser.center_list(0);
                                             }
                                             app.mode = AppMode::InferenceBrowser;
                                         }
@@ -943,19 +559,19 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('2') => {
                                     app.dialog_mode = DialogMode::None;
-                                    app.load_generations()?;
-                                    if !app.filtered_generations.is_empty() && app.list_state.selected().is_none() {
-                                        app.list_state.select(Some(0));
-                                        app.center_list(0);
+                                    app.generation_browser.load_generations()?;
+                                    if !app.generation_browser.filtered_generations.is_empty() && app.generation_browser.list_state.selected().is_none() {
+                                        app.generation_browser.list_state.select(Some(0));
+                                        app.generation_browser.center_list(0);
                                     }
                                     app.mode = AppMode::GenerationBrowser;
                                 }
                                 KeyCode::Char('3') => {
                                     app.dialog_mode = DialogMode::None;
-                                    app.load_inferences()?;
-                                    if !app.filtered_inferences.is_empty() && app.inference_list_state.selected().is_none() {
-                                        app.inference_list_state.select(Some(0));
-                                        app.center_inference_list(0);
+                                    app.inference_browser.load_inferences()?;
+                                    if !app.inference_browser.filtered_inferences.is_empty() && app.inference_browser.list_state.selected().is_none() {
+                                        app.inference_browser.list_state.select(Some(0));
+                                        app.inference_browser.center_list(0);
                                     }
                                     app.mode = AppMode::InferenceBrowser;
                                 }
@@ -981,7 +597,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('o') => {
                                     // Don't open page jump when searching
-                                    if !app.searching && !app.inference_searching {
+                                    if !app.generation_browser.searching && !app.inference_browser.searching {
                                         app.dialog_mode = DialogMode::PageJump { selected: 0 };
                                     }
                                 }
@@ -1009,20 +625,20 @@ fn run_app<B: ratatui::backend::Backend>(
                                     }
                                 }
                                 KeyCode::Char('e') => {
-                                    app.load_generations()?;
+                                    app.generation_browser.load_generations()?;
                                     // Auto-select latest generation (first in list) only if no selection exists
-                                    if !app.filtered_generations.is_empty() && app.list_state.selected().is_none() {
-                                        app.list_state.select(Some(0));
-                                        app.center_list(0);
+                                    if !app.generation_browser.filtered_generations.is_empty() && app.generation_browser.list_state.selected().is_none() {
+                                        app.generation_browser.list_state.select(Some(0));
+                                        app.generation_browser.center_list(0);
                                     }
                                     app.mode = AppMode::GenerationBrowser;
                                 }
                                 KeyCode::Char('i') => {
-                                    app.load_inferences()?;
+                                    app.inference_browser.load_inferences()?;
                                     // Auto-select latest inference (first in list) only if no selection exists
-                                    if !app.filtered_inferences.is_empty() && app.inference_list_state.selected().is_none() {
-                                        app.inference_list_state.select(Some(0));
-                                        app.center_inference_list(0);
+                                    if !app.inference_browser.filtered_inferences.is_empty() && app.inference_browser.list_state.selected().is_none() {
+                                        app.inference_browser.list_state.select(Some(0));
+                                        app.inference_browser.center_list(0);
                                     }
                                     app.mode = AppMode::InferenceBrowser;
                                 }
@@ -1035,23 +651,23 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             },
                     AppMode::GenerationBrowser => {
-                        if app.searching {
+                        if app.generation_browser.searching {
                             match key.code {
                                 KeyCode::Esc => {
-                                    app.searching = false;
-                                    app.search_input.clear();
-                                    app.filter_generations();
+                                    app.generation_browser.searching = false;
+                                    app.generation_browser.search_input.clear();
+                                    app.generation_browser.filter_generations();
                                 }
                                 KeyCode::Enter => {
-                                    app.searching = false;
+                                    app.generation_browser.searching = false;
                                 }
                                 KeyCode::Char(c) => {
-                                    app.search_input.push(c);
-                                    app.filter_generations();
+                                    app.generation_browser.search_input.push(c);
+                                    app.generation_browser.filter_generations();
                                 }
                                 KeyCode::Backspace => {
-                                    app.search_input.pop();
-                                    app.filter_generations();
+                                    app.generation_browser.search_input.pop();
+                                    app.generation_browser.filter_generations();
                                 }
                                 _ => {}
                             }
@@ -1061,42 +677,48 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.mode = AppMode::Main;
                                 }
                                 KeyCode::Char('/') => {
-                                    app.searching = true;
+                                    app.generation_browser.searching = true;
+                                }
+                                KeyCode::Down if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                    app.generation_browser.scroll_down(5);
+                                }
+                                KeyCode::Up if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                    app.generation_browser.scroll_up(5);
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    app.next_generation();
+                                    app.generation_browser.next();
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    app.previous_generation();
+                                    app.generation_browser.previous();
                                 }
                                 KeyCode::Enter => {
                                     app.select_generation()?;
                                 }
                                 KeyCode::Char('r') => {
-                                    app.load_generations()?;
+                                    app.generation_browser.load_generations()?;
                                 }
                                 _ => {}
                             }
                         }
                     }
                     AppMode::InferenceBrowser => {
-                        if app.inference_searching {
+                        if app.inference_browser.searching {
                             match key.code {
                                 KeyCode::Esc => {
-                                    app.inference_searching = false;
-                                    app.inference_search_input.clear();
-                                    app.filter_inferences();
+                                    app.inference_browser.searching = false;
+                                    app.inference_browser.search_input.clear();
+                                    app.inference_browser.filter_inferences();
                                 }
                                 KeyCode::Enter => {
-                                    app.inference_searching = false;
+                                    app.inference_browser.searching = false;
                                 }
                                 KeyCode::Char(c) => {
-                                    app.inference_search_input.push(c);
-                                    app.filter_inferences();
+                                    app.inference_browser.search_input.push(c);
+                                    app.inference_browser.filter_inferences();
                                 }
                                 KeyCode::Backspace => {
-                                    app.inference_search_input.pop();
-                                    app.filter_inferences();
+                                    app.inference_browser.search_input.pop();
+                                    app.inference_browser.filter_inferences();
                                 }
                                 _ => {}
                             }
@@ -1109,16 +731,22 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.select_inference()?;
                                 }
                                 KeyCode::Char('/') => {
-                                    app.inference_searching = true;
+                                    app.inference_browser.searching = true;
+                                }
+                                KeyCode::Down if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                    app.inference_browser.scroll_down(5);
+                                }
+                                KeyCode::Up if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                    app.inference_browser.scroll_up(5);
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    app.next_inference();
+                                    app.inference_browser.next();
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    app.previous_inference();
+                                    app.inference_browser.previous();
                                 }
                                 KeyCode::Char('r') => {
-                                    app.load_inferences()?;
+                                    app.inference_browser.load_inferences()?;
                                 }
                                 _ => {}
                             }
@@ -1137,6 +765,12 @@ fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Enter => {
                             app.chart_viewer.toggle_expand();
                         }
+                        KeyCode::Char('r') => {
+                            if app.chart_viewer.is_viewing_meta_charts() {
+                                app.load_latest_meta_charts()?;
+                                app.chart_viewer.load_charts(&app.latest_meta_charts)?;
+                            }
+                        }
                         _ => {}
                     },
                     AppMode::Logs => match key.code {
@@ -1144,8 +778,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             app.mode = AppMode::Main;
                         }
                         KeyCode::Char('c') => {
-                            app.training_output.clear();
-                            app.logs_list_state = ListState::default();
+                            app.logs_page.clear_logs();
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.previous_log_line();
@@ -1154,20 +787,16 @@ fn run_app<B: ratatui::backend::Backend>(
                             app.next_log_line();
                         }
                         KeyCode::PageUp => {
-                            app.scroll_logs_up(10);
+                            for _ in 0..10 { app.logs_page.previous(); };
                         }
                         KeyCode::PageDown => {
-                            app.scroll_logs_down(10);
+                            for _ in 0..10 { app.logs_page.next(); };
                         }
                         KeyCode::Home => {
-                            if !app.training_output.is_empty() {
-                                app.center_logs_list(0);
-                            }
+                            app.logs_page.jump_to_top();
                         }
                         KeyCode::End => {
-                            if !app.training_output.is_empty() {
-                                app.center_logs_list(app.training_output.len().saturating_sub(1));
-                            }
+                            app.logs_page.jump_to_bottom();
                         }
                         _ => {}
                     },
@@ -1177,27 +806,28 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => match app.mode {
-                        AppMode::GenerationBrowser => app.scroll_up(3),
-                        AppMode::InferenceBrowser => app.scroll_inference_up(3),
+                        AppMode::GenerationBrowser => app.generation_browser.scroll_up(3),
+                        AppMode::InferenceBrowser => app.inference_browser.scroll_up(3),
                         AppMode::ChartViewer => app.chart_viewer.scroll_up(3),
-                        AppMode::Logs => app.scroll_logs_up(3),
+                        AppMode::Logs => for _ in 0..3 { app.logs_page.previous(); },
                         _ => {}
                     },
                     MouseEventKind::ScrollDown => match app.mode {
-                        AppMode::GenerationBrowser => app.scroll_down(3),
-                        AppMode::InferenceBrowser => app.scroll_inference_down(3),
+                        AppMode::GenerationBrowser => app.generation_browser.scroll_down(3),
+                        AppMode::InferenceBrowser => app.inference_browser.scroll_down(3),
                         AppMode::ChartViewer => app.chart_viewer.scroll_down(3),
-                        AppMode::Logs => app.scroll_logs_down(3),
+                        AppMode::Logs => for _ in 0..3 { app.logs_page.next(); },
                         _ => {}
                     },
                     MouseEventKind::Down(MouseButton::Left) => {
                         if app.mode == AppMode::GenerationBrowser {
-                            if mouse.column >= app.list_area.x
-                                && mouse.column < app.list_area.x + app.list_area.width
-                                && mouse.row >= app.list_area.y
-                                && mouse.row < app.list_area.y + app.list_area.height
+                            let list_area = app.generation_browser.list_area;
+                            if mouse.column >= list_area.x
+                                && mouse.column < list_area.x + list_area.width
+                                && mouse.row >= list_area.y
+                                && mouse.row < list_area.y + list_area.height
                             {
-                                let _ = app.handle_generation_click(mouse.row - app.list_area.y);
+                                let _ = app.handle_generation_click(mouse.row - list_area.y);
                             }
                         }
                     }
@@ -1214,7 +844,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         AppMode::Main => pages::main_page::render(f, app),
         AppMode::GenerationBrowser => pages::generation_browser::render(f, app),
         AppMode::InferenceBrowser => pages::inference_browser::render(f, app),
-        AppMode::ChartViewer => app.chart_viewer.render(f),
+        AppMode::ChartViewer => {
+            let is_training = app.is_training_running();
+            let current_episode = app.get_current_episode();
+            app.chart_viewer.render(f, is_training, current_episode);
+        }
         AppMode::Logs => pages::logs_page::render(f, app),
     }
 
