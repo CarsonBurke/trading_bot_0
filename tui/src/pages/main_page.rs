@@ -59,7 +59,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Span::styled("i", Style::default().fg(Color::Cyan)),
             Span::raw(": View Inferences  "),
             Span::styled("m", Style::default().fg(Color::Magenta)),
-            Span::raw(": View Meta Charts"),
+            Span::raw(": View Meta Charts  "),
+            Span::styled("v", Style::default().fg(Color::Magenta)),
+            Span::raw(": Model Observations"),
         ]),
     ];
 

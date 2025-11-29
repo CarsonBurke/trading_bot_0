@@ -34,6 +34,7 @@ pub enum AppMode {
     InferenceBrowser,
     ChartViewer,
     Logs,
+    ModelObservations,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -648,6 +649,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('l') => {
                                     app.mode = AppMode::Logs;
                                 }
+                                KeyCode::Char('v') => {
+                                    app.mode = AppMode::ModelObservations;
+                                }
                                 _ => {}
                             },
                     AppMode::GenerationBrowser => {
@@ -780,23 +784,29 @@ fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Char('c') => {
                             app.logs_page.clear_logs();
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.previous_log_line();
-                        }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            app.next_log_line();
+                            app.logs_page.next();
                         }
-                        KeyCode::PageUp => {
-                            for _ in 0..10 { app.logs_page.previous(); };
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.logs_page.previous();
                         }
                         KeyCode::PageDown => {
-                            for _ in 0..10 { app.logs_page.next(); };
+                            app.logs_page.page_down();
+                        }
+                        KeyCode::PageUp => {
+                            app.logs_page.page_up();
                         }
                         KeyCode::Home => {
                             app.logs_page.jump_to_top();
                         }
                         KeyCode::End => {
                             app.logs_page.jump_to_bottom();
+                        }
+                        _ => {}
+                    },
+                    AppMode::ModelObservations => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            app.mode = AppMode::Main;
                         }
                         _ => {}
                     },
@@ -850,6 +860,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             app.chart_viewer.render(f, is_training, current_episode);
         }
         AppMode::Logs => pages::logs_page::render(f, app),
+        AppMode::ModelObservations => pages::model_observations_page::render(f, app),
     }
 
     // Render dialog on top if active
