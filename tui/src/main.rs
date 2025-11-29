@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -80,7 +80,8 @@ pub struct App {
     pub list_area: Rect,
     pub inference_list_area: Rect,
     pub latest_meta_charts: Vec<PathBuf>,
-    pub logs_scroll: usize,
+    pub logs_list_state: ListState,
+    pub logs_list_area: Rect,
     last_refresh: Instant,
 }
 
@@ -137,7 +138,8 @@ impl App {
             list_area: Rect::default(),
             inference_list_area: Rect::default(),
             latest_meta_charts: Vec::new(),
-            logs_scroll: 0,
+            logs_list_state: ListState::default(),
+            logs_list_area: Rect::default(),
             last_refresh: Instant::now(),
         };
         app.load_generations()?;
@@ -321,7 +323,7 @@ impl App {
 
     fn load_inferences(&mut self) -> Result<()> {
         self.inferences.clear();
-        let inference_path = PathBuf::from("../training/inferences");
+        let inference_path = PathBuf::from("../infer");
 
         if !inference_path.exists() {
             return Ok(());
@@ -345,7 +347,7 @@ impl App {
             }
         }
 
-        self.inferences.sort_by_key(|i| i.number);
+        self.inferences.sort_by(|a, b| b.number.cmp(&a.number));  // Sort descending (newest first)
         self.filter_inferences();
         Ok(())
     }
@@ -474,6 +476,11 @@ impl App {
         if let Ok(content) = fs::read_to_string(log_path) {
             let new_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
+            // Check if we were at the bottom before update
+            let was_at_bottom = self.logs_list_state.selected()
+                .map(|s| s >= self.training_output.len().saturating_sub(1))
+                .unwrap_or(true);
+
             // Only update if there are new lines
             if new_lines.len() > self.training_output.len() || new_lines != self.training_output {
                 self.training_output = new_lines;
@@ -481,6 +488,11 @@ impl App {
                 // Keep only last 1000 lines
                 if self.training_output.len() > 1000 {
                     self.training_output.drain(0..self.training_output.len() - 1000);
+                }
+
+                // Auto-scroll to bottom if we were at the bottom, or if first time
+                if was_at_bottom && !self.training_output.is_empty() {
+                    self.center_logs_list(self.training_output.len().saturating_sub(1));
                 }
             }
         }
@@ -496,7 +508,8 @@ impl App {
 
         let log_file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open("../training/training.log")?;
 
         let log_file_stderr = log_file.try_clone()?;
@@ -628,6 +641,18 @@ impl App {
         Ok(())
     }
 
+    fn select_inference(&mut self) -> Result<()> {
+        if let Some(idx) = self.inference_list_state.selected() {
+            if idx < self.filtered_inferences.len() {
+                self.selected_inference = Some(idx);
+                self.chart_viewer.load_inference(&self.filtered_inferences[idx].path)?;
+                self.previous_mode = self.mode;
+                self.mode = AppMode::ChartViewer;
+            }
+        }
+        Ok(())
+    }
+
     fn view_meta_charts(&mut self) -> Result<()> {
         if !self.latest_meta_charts.is_empty() {
             self.chart_viewer.load_charts(&self.latest_meta_charts)?;
@@ -650,12 +675,73 @@ impl App {
         }
         Ok(())
     }
+
+    fn center_logs_list(&mut self, selected: usize) {
+        let visible_height = self.logs_list_area.height.saturating_sub(2) as usize;
+        let center = visible_height / 2;
+
+        let offset = if selected >= center {
+            selected.saturating_sub(center)
+        } else {
+            0
+        };
+
+        self.logs_list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
+    }
+
+    fn next_log_line(&mut self) {
+        if self.training_output.is_empty() {
+            return;
+        }
+        let i = match self.logs_list_state.selected() {
+            Some(i) => {
+                if i >= self.training_output.len() - 1 {
+                    self.training_output.len() - 1
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.logs_list_state.select(Some(i));
+        self.center_logs_list(i);
+    }
+
+    fn previous_log_line(&mut self) {
+        if self.training_output.is_empty() {
+            return;
+        }
+        let i = match self.logs_list_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    0
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.logs_list_state.select(Some(i));
+        self.center_logs_list(i);
+    }
+
+    fn scroll_logs_up(&mut self, amount: usize) {
+        for _ in 0..amount {
+            self.previous_log_line();
+        }
+    }
+
+    fn scroll_logs_down(&mut self, amount: usize) {
+        for _ in 0..amount {
+            self.next_log_line();
+        }
+    }
 }
 
 fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -665,8 +751,7 @@ fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
 
@@ -687,7 +772,8 @@ fn run_app<B: ratatui::backend::Backend>(
         app.maybe_refresh()?;
         app.poll_training_output();
 
-        if event::poll(Duration::from_millis(250))? {
+        // Wait for event, then drain all pending events before redrawing
+        if event::poll(Duration::from_millis(16))? {  // ~60fps
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Handle dialogs first (they take priority)
@@ -790,20 +876,20 @@ fn run_app<B: ratatui::backend::Backend>(
                             _ => {}
                         }
                         DialogMode::ConfirmQuit => match key.code {
-                            KeyCode::Char('y') | KeyCode::Enter => {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 return Ok(());
                             }
-                            KeyCode::Char('n') | KeyCode::Esc => {
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                                 app.dialog_mode = DialogMode::None;
                             }
                             _ => {}
                         }
                         DialogMode::ConfirmStopTraining => match key.code {
-                            KeyCode::Char('y') | KeyCode::Enter => {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 app.stop_training()?;
                                 app.dialog_mode = DialogMode::None;
                             }
-                            KeyCode::Char('n') | KeyCode::Esc => {
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                                 app.dialog_mode = DialogMode::None;
                             }
                             _ => {}
@@ -830,7 +916,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                         0 => app.mode = AppMode::Main,
                                         1 => {
                                             app.load_generations()?;
-                                            if !app.filtered_generations.is_empty() {
+                                            if !app.filtered_generations.is_empty() && app.list_state.selected().is_none() {
                                                 app.list_state.select(Some(0));
                                                 app.center_list(0);
                                             }
@@ -838,6 +924,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                         2 => {
                                             app.load_inferences()?;
+                                            if !app.filtered_inferences.is_empty() && app.inference_list_state.selected().is_none() {
+                                                app.inference_list_state.select(Some(0));
+                                                app.center_inference_list(0);
+                                            }
                                             app.mode = AppMode::InferenceBrowser;
                                         }
                                         3 => {
@@ -854,7 +944,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('2') => {
                                     app.dialog_mode = DialogMode::None;
                                     app.load_generations()?;
-                                    if !app.filtered_generations.is_empty() {
+                                    if !app.filtered_generations.is_empty() && app.list_state.selected().is_none() {
                                         app.list_state.select(Some(0));
                                         app.center_list(0);
                                     }
@@ -863,6 +953,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('3') => {
                                     app.dialog_mode = DialogMode::None;
                                     app.load_inferences()?;
+                                    if !app.filtered_inferences.is_empty() && app.inference_list_state.selected().is_none() {
+                                        app.inference_list_state.select(Some(0));
+                                        app.center_inference_list(0);
+                                    }
                                     app.mode = AppMode::InferenceBrowser;
                                 }
                                 KeyCode::Char('4') => {
@@ -916,8 +1010,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('e') => {
                                     app.load_generations()?;
-                                    // Auto-select latest generation (first in list)
-                                    if !app.filtered_generations.is_empty() {
+                                    // Auto-select latest generation (first in list) only if no selection exists
+                                    if !app.filtered_generations.is_empty() && app.list_state.selected().is_none() {
                                         app.list_state.select(Some(0));
                                         app.center_list(0);
                                     }
@@ -925,6 +1019,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('i') => {
                                     app.load_inferences()?;
+                                    // Auto-select latest inference (first in list) only if no selection exists
+                                    if !app.filtered_inferences.is_empty() && app.inference_list_state.selected().is_none() {
+                                        app.inference_list_state.select(Some(0));
+                                        app.center_inference_list(0);
+                                    }
                                     app.mode = AppMode::InferenceBrowser;
                                 }
                                 KeyCode::Char('m') => {
@@ -1006,6 +1105,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Esc | KeyCode::Char('q') => {
                                     app.mode = AppMode::Main;
                                 }
+                                KeyCode::Enter => {
+                                    app.select_inference()?;
+                                }
                                 KeyCode::Char('/') => {
                                     app.inference_searching = true;
                                 }
@@ -1043,29 +1145,29 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         KeyCode::Char('c') => {
                             app.training_output.clear();
-                            app.logs_scroll = 0;
+                            app.logs_list_state = ListState::default();
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            app.logs_scroll = app.logs_scroll.saturating_sub(1);
+                            app.previous_log_line();
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            if !app.training_output.is_empty() {
-                                app.logs_scroll = (app.logs_scroll + 1).min(app.training_output.len().saturating_sub(1));
-                            }
+                            app.next_log_line();
                         }
                         KeyCode::PageUp => {
-                            app.logs_scroll = app.logs_scroll.saturating_sub(10);
+                            app.scroll_logs_up(10);
                         }
                         KeyCode::PageDown => {
-                            if !app.training_output.is_empty() {
-                                app.logs_scroll = (app.logs_scroll + 10).min(app.training_output.len().saturating_sub(1));
-                            }
+                            app.scroll_logs_down(10);
                         }
                         KeyCode::Home => {
-                            app.logs_scroll = 0;
+                            if !app.training_output.is_empty() {
+                                app.center_logs_list(0);
+                            }
                         }
                         KeyCode::End => {
-                            app.logs_scroll = app.training_output.len().saturating_sub(1);
+                            if !app.training_output.is_empty() {
+                                app.center_logs_list(app.training_output.len().saturating_sub(1));
+                            }
                         }
                         _ => {}
                     },
@@ -1078,20 +1180,14 @@ fn run_app<B: ratatui::backend::Backend>(
                         AppMode::GenerationBrowser => app.scroll_up(3),
                         AppMode::InferenceBrowser => app.scroll_inference_up(3),
                         AppMode::ChartViewer => app.chart_viewer.scroll_up(3),
-                        AppMode::Logs => {
-                            app.logs_scroll = app.logs_scroll.saturating_sub(3);
-                        }
+                        AppMode::Logs => app.scroll_logs_up(3),
                         _ => {}
                     },
                     MouseEventKind::ScrollDown => match app.mode {
                         AppMode::GenerationBrowser => app.scroll_down(3),
                         AppMode::InferenceBrowser => app.scroll_inference_down(3),
                         AppMode::ChartViewer => app.chart_viewer.scroll_down(3),
-                        AppMode::Logs => {
-                            if !app.training_output.is_empty() {
-                                app.logs_scroll = (app.logs_scroll + 3).min(app.training_output.len().saturating_sub(1));
-                            }
-                        }
+                        AppMode::Logs => app.scroll_logs_down(3),
                         _ => {}
                     },
                     MouseEventKind::Down(MouseButton::Left) => {

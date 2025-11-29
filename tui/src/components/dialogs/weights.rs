@@ -78,7 +78,7 @@ pub fn render(f: &mut Frame, app: &App, for_training: bool, for_inference: bool)
     // Help bar
     let help = Paragraph::new(vec![Line::from(vec![
         Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
-        Span::styled("Confirm", Style::default().fg(theme::SUBTEXT1)),
+        Span::styled("Start Training", Style::default().fg(theme::SUBTEXT1)),
         Span::raw("   "),
         Span::styled(" Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
         Span::styled("Cancel", Style::default().fg(theme::SUBTEXT1)),

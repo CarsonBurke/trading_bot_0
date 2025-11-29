@@ -110,12 +110,12 @@ pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
     f.render_widget(episodes_widget, chunks[5]);
 
     // Bottom help bar
-    let bottom_help = Paragraph::new(vec![Line::from(vec![
-        Span::styled(" Enter ", Style::default().fg(theme::GREEN).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
-        Span::styled("  Start Inference", Style::default().fg(theme::SUBTEXT1)),
-        Span::raw("     "),
-        Span::styled(" Esc ", Style::default().fg(theme::RED).bg(theme::SURFACE1).add_modifier(Modifier::BOLD)),
-        Span::styled("  Cancel", Style::default().fg(theme::SUBTEXT1)),
+    let help = Paragraph::new(vec![Line::from(vec![
+        Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled("Start Inference", Style::default().fg(theme::SUBTEXT1)),
+        Span::raw("   "),
+        Span::styled(" Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled("Cancel", Style::default().fg(theme::SUBTEXT1)),
     ])])
     .style(Style::default().fg(theme::TEXT).bg(theme::BASE))
     .block(
@@ -123,5 +123,5 @@ pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::SURFACE2)),
     );
-    f.render_widget(bottom_help, chunks[7]);
+    f.render_widget(help, chunks[7]);
 }

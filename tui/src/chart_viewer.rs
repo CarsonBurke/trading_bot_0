@@ -59,6 +59,11 @@ impl ChartViewer {
         Ok(())
     }
 
+    pub fn load_inference(&mut self, infer_path: &PathBuf) -> Result<()> {
+        // Inferences use the same structure as generations
+        self.load_generation(infer_path)
+    }
+
     pub fn load_charts(&mut self, chart_paths: &[PathBuf]) -> Result<()> {
         self.nodes.clear();
         self.root_indices.clear();
@@ -94,6 +99,8 @@ impl ChartViewer {
     }
 
     fn build_tree(&mut self, path: &PathBuf) -> Result<()> {
+        use std::time::SystemTime;
+
         let mut folders = Vec::new();
         let mut charts = Vec::new();
 
@@ -138,6 +145,13 @@ impl ChartViewer {
                     }
                 }
 
+                // Get modification time for sorting
+                let modified = entry
+                    .path()
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+
                 let folder_idx = self.nodes.len();
                 self.nodes.push(ChartNode::Folder {
                     name: name.clone(),
@@ -145,7 +159,7 @@ impl ChartViewer {
                     children,
                 });
                 self.expanded.push(false);
-                folders.push(folder_idx);
+                folders.push((folder_idx, modified));
             } else {
                 let ext = entry.path().extension().and_then(|s| s.to_str());
                 if entry.file_type().is_file() && (ext == Some("png") || ext == Some("webp")) {
@@ -160,8 +174,11 @@ impl ChartViewer {
             }
         }
 
+        // Sort folders by modification time (most recent first)
+        folders.sort_by(|a, b| b.1.cmp(&a.1));
+
         self.root_indices.extend(charts);
-        self.root_indices.extend(folders);
+        self.root_indices.extend(folders.into_iter().map(|(idx, _)| idx));
 
         Ok(())
     }

@@ -23,7 +23,7 @@ use crate::{
 const REWARD_SCALE: f64 = 1.0; // Scale rewards for better gradient signal
 const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
-const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 2.0;
+const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 1.5;
 
 pub struct Env {
     pub step: usize,
@@ -47,11 +47,11 @@ impl Env {
 
     pub fn new(random_start: bool) -> Self {
         let tickers = vec![
-            "TSLA".to_string(),
-            "AAPL".to_string(),
-            "AMD".to_string(),
-            "INTC".to_string(),
-            "MSFT".to_string(),
+            // "TSLA".to_string(),
+            // "AAPL".to_string(),
+            // "AMD".to_string(),
+            // "INTC".to_string(),
+            // "MSFT".to_string(),
             "NVDA".to_string(),
         ];
 
@@ -108,9 +108,9 @@ impl Env {
             let (buy_sell_actions, hold_actions) = actions.split_at(TICKERS_COUNT as usize);
 
             // Execute trade based on current observations (only use buy/sell actions)
-            self.trade(buy_sell_actions, absolute_step);
+            let commissions = self.trade(buy_sell_actions, absolute_step);
 
-            let reward = self.get_risk_adjusted_benchmarked_reward(absolute_step);
+            let reward = self.get_risk_adjusted_reward(absolute_step, commissions);
 
             let is_done = self.get_is_done();
 
@@ -297,7 +297,7 @@ impl Env {
         }
     }
 
-    fn get_risk_adjusted_benchmarked_reward(&self, absolute_step: usize) -> f64 {
+    fn get_risk_adjusted_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
 
@@ -310,26 +310,25 @@ impl Env {
                 + self.account.cash;
             let step_return = (total_assets_after_trade / self.account.total_assets).ln();
 
-            // First ticker as benchmark
-            let price_curr = self.prices[0][absolute_step];
-            let price_next = self.prices[0][next_absolute_step];
-            let benchmark_return = (price_next / price_curr).ln();
-
-            let excess_return = step_return - benchmark_return;
-
-            let downside = if excess_return < 0.0 {
-                -excess_return
+            let downside = if step_return < 0.0 {
+                -step_return
             } else {
                 0.0
             };
-            let rar = excess_return - RISK_ADJUSTED_REWARD_LAMBDA * downside;
-            rar * REWARD_SCALE
+            let rar = step_return - RISK_ADJUSTED_REWARD_LAMBDA * downside;
+            
+            let commissions_relative = commissions / self.account.total_assets;
+            let commisions_penalty = -commissions_relative * RISK_ADJUSTED_REWARD_LAMBDA;
+            let reward = commisions_penalty + rar;
+            
+            reward * REWARD_SCALE
         } else {
             0.0
         }
     }
 
-    fn trade(&mut self, actions: &[f64], absolute_step: usize) {
+    fn trade(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
+        let mut total_commissions = 0.0;
 
         for (ticker_index, action) in actions.iter().enumerate() {
 
@@ -355,6 +354,8 @@ impl Env {
                 if total_cost > self.account.cash {
                     continue;
                 }
+                
+                total_commissions += commission;
 
                 self.account.cash -= total_cost;
                 self.account.positions[ticker_index].add(price, quantity);
@@ -374,6 +375,8 @@ impl Env {
 
                 let quantity = trade_value / price;
                 let commission = quantity * COMMISSION_RATE;
+                
+                total_commissions += commission;
 
                 self.account.cash += trade_value - commission;
                 self.account.positions[ticker_index].quantity -= quantity;
@@ -382,6 +385,8 @@ impl Env {
                 self.episode_history.sells[ticker_index].insert(absolute_step, (price, quantity));
             }
         }
+        
+        total_commissions
     }
 
     fn get_is_done(&self) -> f32 {

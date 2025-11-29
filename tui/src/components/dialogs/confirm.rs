@@ -47,39 +47,11 @@ pub fn render(f: &mut Frame, title: &str, message: &str) {
 
     // Help bar
     let help = Paragraph::new(vec![Line::from(vec![
-        Span::styled(
-            " y ",
-            Style::default()
-                .fg(theme::GREEN)
-                .bg(theme::SURFACE1)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" / "),
-        Span::styled(
-            " Enter ",
-            Style::default()
-                .fg(theme::GREEN)
-                .bg(theme::SURFACE1)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  Yes", Style::default().fg(theme::SUBTEXT1)),
-        Span::raw("     "),
-        Span::styled(
-            " n ",
-            Style::default()
-                .fg(theme::RED)
-                .bg(theme::SURFACE1)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" / "),
-        Span::styled(
-            " Esc ",
-            Style::default()
-                .fg(theme::RED)
-                .bg(theme::SURFACE1)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  No", Style::default().fg(theme::SUBTEXT1)),
+        Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled("Confirm", Style::default().fg(theme::SUBTEXT1)),
+        Span::raw("   "),
+        Span::styled(" Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled("Cancel", Style::default().fg(theme::SUBTEXT1)),
     ])])
     .style(Style::default().fg(theme::TEXT).bg(theme::BASE))
     .block(

@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ibapi::{
-    accounts::{AccountSummaries, AccountSummaryTags, PositionUpdate},
+    accounts::{types::AccountGroup, AccountSummaryResult, AccountSummaryTags, PositionUpdate},
     contracts::Contract,
-    market_data::realtime::{BarSize, WhatToShow},
-    orders::{order_builder, Action, PlaceOrder},
+    market_data::{realtime::{BarSize, WhatToShow}, TradingHours},
     Client,
 };
 
@@ -128,11 +127,11 @@ fn sync_account_from_ibkr(
     symbols: &[String],
     account: &mut Account,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let account_subscription = client.account_summary("All", AccountSummaryTags::ALL)?;
+    let account_subscription = client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
 
     for update in &account_subscription {
         match update {
-            AccountSummaries::Summary(summary) => {
+            AccountSummaryResult::Summary(summary) => {
                 if summary.tag == "TotalCashValue" {
                     account.cash = summary.value.parse::<f64>()
                         .unwrap_or_else(|_| {
@@ -148,7 +147,7 @@ fn sync_account_from_ibkr(
                     break;
                 }
             }
-            AccountSummaries::End => {
+            AccountSummaryResult::End => {
                 account_subscription.cancel();
                 break;
             }
@@ -167,7 +166,7 @@ fn sync_account_from_ibkr(
     for position in &positions_subscription {
         match position {
             PositionUpdate::Position(pos) => {
-                if let Some(ticker_idx) = symbols.iter().position(|s| s == &pos.contract.symbol) {
+                if let Some(ticker_idx) = symbols.iter().position(|s| s == pos.contract.symbol.as_str()) {
                     account.positions[ticker_idx].quantity = pos.position;
                     account.positions[ticker_idx].avg_price = pos.average_cost;
                 }
@@ -198,12 +197,12 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     let client = Client::connect(api::CONNECTION_URL, 100)?;
     println!("Connected to IBKR");
 
-    let account_subscription = client.account_summary("All", AccountSummaryTags::ALL)?;
+    let account_subscription = client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
 
     let mut starting_cash = 0.0;
     for update in &account_subscription {
         match update {
-            AccountSummaries::Summary(summary) => {
+            AccountSummaryResult::Summary(summary) => {
                 if summary.tag == "TotalCashValue" {
                     starting_cash = summary.value.parse::<f64>()
                         .unwrap_or_else(|_| {
@@ -222,7 +221,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                     break;
                 }
             }
-            AccountSummaries::End => {
+            AccountSummaryResult::End => {
                 account_subscription.cancel();
                 break;
             }
@@ -244,7 +243,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     let client_arc = Arc::new(client);
 
     for (ticker_idx, symbol) in symbols.iter().enumerate() {
-        let contract = Contract::stock(symbol);
+        let contract = Contract::stock(symbol).build();
         let client_clone = Arc::clone(&client_arc);
         let state_clone = Arc::clone(&state);
         let symbol_clone = symbol.clone();
@@ -254,7 +253,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 &contract,
                 BarSize::Sec5,
                 WhatToShow::Trades,
-                false,
+                TradingHours::Regular,
             ) {
                 Ok(sub) => sub,
                 Err(e) => {

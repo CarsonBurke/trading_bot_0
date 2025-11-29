@@ -5,7 +5,9 @@ use crate::torch::constants::{
     PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT
 };
 
-// Temporal length after all conv layers: 4400 -> 2197 -> 1099 -> 550 -> 550 -> 550
+// Temporal length after all conv layers: 
+// 3400 -> 1697 -> 849 -> 425 -> 425 -> 425
+// 4400 -> 2197 -> 1099 -> 550 -> 550 -> 550
 const CONV_TEMPORAL_LEN: i64 = 550;
 
 // Model returns (critic_value, (action_mean, action_log_std))
