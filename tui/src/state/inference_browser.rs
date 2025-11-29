@@ -34,7 +34,7 @@ impl InferenceBrowserState {
 
     pub fn load_inferences(&mut self) -> Result<()> {
         self.inferences.clear();
-        let inference_path = PathBuf::from("../training/inferences");
+        let inference_path = PathBuf::from("../infer");
 
         if !inference_path.exists() {
             return Ok(());
@@ -58,7 +58,7 @@ impl InferenceBrowserState {
             }
         }
 
-        self.inferences.sort_by(|a, b| b.number.cmp(&a.number));
+        self.inferences.sort_by(|a, b| a.number.cmp(&b.number));
         self.filter_inferences();
         Ok(())
     }

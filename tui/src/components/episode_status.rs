@@ -8,7 +8,11 @@ use crate::theme;
 /// Creates spans for displaying training status and episode info
 pub fn episode_status_spans(is_training: bool, current_episode: Option<usize>) -> Vec<Span<'static>> {
     let (status_text, status_icon) = if is_training {
-        ("Training", "●")
+        if current_episode.is_some() {
+            ("Training", "●")
+        } else {
+            ("Starting", "●")
+        }
     } else {
         ("Inactive", "○")
     };

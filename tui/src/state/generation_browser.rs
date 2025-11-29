@@ -58,7 +58,7 @@ impl GenerationBrowserState {
             }
         }
 
-        self.generations.sort_by(|a, b| b.number.cmp(&a.number));
+        self.generations.sort_by(|a, b| a.number.cmp(&b.number));
         self.filter_generations();
         Ok(())
     }
