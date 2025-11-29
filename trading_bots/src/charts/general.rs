@@ -141,7 +141,7 @@ pub fn simple_chart(
         * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption(name, ("sans-serif", 20))
+        .caption(name, ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
