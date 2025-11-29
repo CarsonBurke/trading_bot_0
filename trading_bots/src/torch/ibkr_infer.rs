@@ -100,6 +100,19 @@ impl LiveMarketState {
             static_obs.push(pos_pct as f32);
         }
 
+        // Time-weighted returns (simplified for live trading without lot tracking)
+        for (i, position) in self.account.positions.iter().enumerate() {
+            let time_weighted_return = if position.quantity > 0.0 && position.avg_price > 0.0 {
+                let current_price = current_prices[i];
+                let return_pct = (current_price - position.avg_price) / position.avg_price;
+                let hold_time = (self.step_count.max(1)) as f64;
+                return_pct / hold_time.sqrt()
+            } else {
+                0.0
+            };
+            static_obs.push(time_weighted_return as f32);
+        }
+
         for i in 0..ACTION_HISTORY_LEN {
             if i < self.action_history.len() {
                 let action_idx = self.action_history.len() - 1 - i;

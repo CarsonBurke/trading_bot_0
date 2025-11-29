@@ -8,7 +8,7 @@ use crate::torch::constants::{
 // Temporal length after all conv layers: 
 // 3400 -> 1697 -> 849 -> 425 -> 425 -> 425
 // 4400 -> 2197 -> 1099 -> 550 -> 550 -> 550
-const CONV_TEMPORAL_LEN: i64 = 550;
+const CONV_TEMPORAL_LEN: i64 = 425;
 
 // Model returns (critic_value, (action_mean, action_log_std), static_attn_weights)
 pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor)>;
@@ -206,7 +206,7 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         // Gaussian distribution parameters (before sigmoid squashing)
         let action_mean = actor_features.apply(&actor_mean);
 
-        let action_log_std = log_std_param.tanh() * 2.0 - 1.5;
+        let action_log_std = log_std_param.tanh() * 4.0 - 1.5;
 
         (critic_value, (action_mean, action_log_std), static_attn_weights)
     })

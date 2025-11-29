@@ -2,8 +2,8 @@ use std::time::Instant;
 use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::constants::{
-    OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE,
-    TICKERS_COUNT,
+    OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, RETROACTIVE_BUY_REWARD, STATIC_OBSERVATIONS,
+    STEPS_PER_EPISODE, TICKERS_COUNT,
 };
 use crate::torch::model::model;
 use crate::torch::step::Env;
@@ -136,7 +136,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step {
             env.step = step;
 
-            let (critic, (action_mean, action_log_std), _attn_weights) = tch::no_grad(|| {
+            let (critic, (action_mean, action_log_std), attn_weights) = tch::no_grad(|| {
                 // Move price deltas from CPU to GPU (FP32)
                 let price_deltas_gpu = s_price_deltas.get(s).to_device(device);
                 let static_obs = s_static_obs.get(s);
@@ -182,6 +182,14 @@ pub fn train(weights_path: Option<&str>) {
 
             let step_state = env.step(actions_vec);
 
+            // Record static observations and attention weights for TUI visualization (last 100 steps only)
+            if step >= env.max_step.saturating_sub(100) {
+                let static_obs_vec = Vec::<f32>::try_from(s_static_obs.get(s).flatten(0, -1)).unwrap_or_default();
+                let attn_weights_vec = Vec::<f32>::try_from(attn_weights.flatten(0, -1)).unwrap_or_default();
+                env.episode_history.static_observations.push(static_obs_vec);
+                env.episode_history.attention_weights.push(attn_weights_vec);
+            }
+
             // println!("Step reward: {:?}", step_state.reward);
 
             let reward = step_state.reward.to_device(device);
@@ -216,8 +224,9 @@ pub fn train(weights_path: Option<&str>) {
 
         println!("episode rewards: {}", episode_reward);
 
-        // Apply retroactive buy rewards that were calculated during sells back to buy steps
-        env.apply_retroactive_rewards(&s_rewards);
+        if RETROACTIVE_BUY_REWARD {
+            env.apply_retroactive_rewards(&s_rewards);
+        }
 
         let price_deltas_batch = s_price_deltas
             .narrow(0, 0, n_steps)

@@ -58,6 +58,7 @@ impl EpisodeHistory {
                 &total_assets,
                 &cash_indexes,
                 Some(positioned_assets),
+                None,
             );
         }
     }

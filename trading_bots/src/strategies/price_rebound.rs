@@ -292,7 +292,7 @@ pub fn basic(
         let base_dir = format!("{TRAINING_PATH}/gens/{}", charts_config.generation);
         create_folder_if_not_exists(&base_dir);
 
-        let _ = assets_chart(&base_dir, &total_assets, &cash_graph, None);
+        let _ = assets_chart(&base_dir, &total_assets, &cash_graph, None, None);
 
         for (ticker, bars) in mapped_data.iter().enumerate() {
             let ticker_name = TICKERS[ticker].to_string();
@@ -338,6 +338,7 @@ pub fn basic(
                 &total_assets,
                 &cash_graph,
                 Some(&positioned_assets),
+                None,
             );
         }
     }

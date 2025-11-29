@@ -31,6 +31,7 @@ rand = "0.9.1"
 ringbuffer = "0.16.0"
 rust_neural_network = "0.18.0"
 serde = "1.0.228"
+serde_json = "1.0"
 tch = { version = "0.22.0", features = ["rl-python", "download-libtorch"] }
 time = "0.3.36"
 tokio = { version = "1.47.0", features = ["full"] }

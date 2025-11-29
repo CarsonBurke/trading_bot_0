@@ -6,7 +6,7 @@ use plotters::{
     data,
     prelude::{BitMapBackend, CandleStick, Circle, EmptyElement, IntoDrawingArea, Text},
     series::{AreaSeries, LineSeries, PointSeries},
-    style::Color,
+    style::{Color, ShapeStyle},
 };
 use shared::theme::plotters_colors as theme;
 use time::OffsetDateTime;
@@ -315,16 +315,26 @@ pub fn assets_chart(
     assets: &Data,
     cash: &Data,
     positioned: Option<&Data>,
+    benchmark: Option<&Data>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/assets.{}", CHART_IMAGE_FORMAT);
     let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
-    let y_max = *assets
+    let mut max_val = *assets
         .iter()
         .max_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap() as f32
-        * 1.1;
+        .unwrap();
+
+    if let Some(bench) = benchmark {
+        let bench_max = *bench
+            .iter()
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+        max_val = max_val.max(bench_max);
+    }
+
+    let y_max = max_val as f32 * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
         .caption("Assets: Total; Positioned; Cash", ("sans-serif", 20, &theme::TEXT))
@@ -381,6 +391,15 @@ pub fn assets_chart(
         )
         .border_style(&theme::GREEN),
     )?;
+
+    if let Some(bench) = benchmark {
+        chart.draw_series(LineSeries::new(
+            bench.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value as f32)),
+            ShapeStyle::from(&theme::YELLOW).stroke_width(2),
+        ))?;
+    }
 
     root.present()
         .expect("unable to write chart to file, perhaps there is no directory");

@@ -1,4 +1,6 @@
 use hashbrown::HashMap;
+use std::fs::File;
+use std::io::Write;
 
 use crate::{
     charts::general::{assets_chart, buy_sell_chart, buy_sell_chart_vec, hold_action_chart, raw_action_chart, reward_chart},
@@ -14,9 +16,11 @@ pub struct EpisodeHistory {
     pub positioned: Vec<Vec<f64>>,
     pub cash: Vec<f64>,
     pub rewards: Vec<f64>,
-    pub hold_actions: Vec<Vec<f64>>,  // Hold action value for each ticker at each step
-    pub raw_actions: Vec<Vec<f64>>,   // Raw buy/sell action outputs for each ticker at each step
+    pub hold_actions: Vec<Vec<f64>>,
+    pub raw_actions: Vec<Vec<f64>>,
     pub total_commissions: f64,
+    pub static_observations: Vec<Vec<f32>>,
+    pub attention_weights: Vec<Vec<f32>>,
 }
 
 impl EpisodeHistory {
@@ -30,6 +34,8 @@ impl EpisodeHistory {
             hold_actions: vec![vec![]; ticker_count],
             raw_actions: vec![vec![]; ticker_count],
             total_commissions: 0.0,
+            static_observations: Vec::new(),
+            attention_weights: Vec::new(),
         }
     }
 
@@ -62,11 +68,25 @@ impl EpisodeHistory {
                 .map(|(positioned, cash)| positioned + cash)
                 .collect::<Vec<f64>>();
 
+            let benchmark = if !prices.is_empty() && !total_assets.is_empty() {
+                let initial_account_value = total_assets[0];
+                let initial_price = prices[0];
+                Some(
+                    prices[..total_assets.len()]
+                        .iter()
+                        .map(|&current_price| initial_account_value * current_price / initial_price)
+                        .collect()
+                )
+            } else {
+                None
+            };
+
             let _ = assets_chart(
                 &ticker_dir,
                 &total_assets,
                 &self.cash,
                 Some(positioned_assets),
+                benchmark.as_ref(),
             );
 
             let _ = hold_action_chart(
@@ -99,9 +119,22 @@ impl EpisodeHistory {
             &total_assets,
             &self.cash,
             Some(&positioned_assets_per_step),
+            None,
         );
 
         let _ = reward_chart(&episode_dir, &self.rewards);
+
+        // Write static observations and attention weights
+        if !self.static_observations.is_empty() && !self.attention_weights.is_empty() {
+            let observations_path = format!("{}/observations.json", episode_dir);
+            if let Ok(mut file) = File::create(&observations_path) {
+                let json_data = serde_json::json!({
+                    "static_observations": self.static_observations,
+                    "attention_weights": self.attention_weights,
+                });
+                let _ = file.write_all(json_data.to_string().as_bytes());
+            }
+        }
     }
 
     pub fn final_assets(&self) -> f64 {

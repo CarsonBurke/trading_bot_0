@@ -283,7 +283,7 @@ pub fn basic_nn(
                 let base_dir = format!("{TRAINING_PATH}/gens/{}", charts_config.generation);
                 create_folder_if_not_exists(&base_dir);
 
-                let _ = assets_chart(&base_dir, &total_assets, &cash_graph, None);
+                let _ = assets_chart(&base_dir, &total_assets, &cash_graph, None, None);
 
                 for ticker_index_bor in tickers_slice {
                     let ticker_index = *ticker_index_bor;
@@ -320,6 +320,7 @@ pub fn basic_nn(
                         &total_assets,
                         &cash_graph,
                         Some(positioned_assets),
+                        None,
                     );
                 }
             }
