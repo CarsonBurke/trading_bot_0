@@ -10,7 +10,7 @@ use crate::torch::ppo::TANH_SQUASHING_DIVISOR;
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: tch::Device,
-) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor))>), Box<dyn std::error::Error>> {
+) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor)>), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
     let model_fn = model(&vs.root(), TICKERS_COUNT * 2);
     vs.load(weight_path)?;
@@ -19,13 +19,13 @@ pub fn load_model<P: AsRef<Path>>(
 }
 
 pub fn sample_actions(
-    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor)),
+    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor),
     price_deltas: &Tensor,
     static_obs: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let (_critic, (action_mean, action_log_std)) = tch::no_grad(|| {
+    let (_critic, (action_mean, action_log_std), _attn_weights) = tch::no_grad(|| {
         model(price_deltas, static_obs, false)
     });
 

@@ -1,5 +1,5 @@
 use rand::Rng;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use colored::Colorize;
@@ -23,7 +23,14 @@ use crate::{
 const REWARD_SCALE: f64 = 1.0; // Scale rewards for better gradient signal
 const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
-const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 1.5;
+const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 0.01;
+
+#[derive(Debug, Clone)]
+struct BuyLot {
+    step: usize,
+    price: f64,
+    quantity: f64,
+}
 
 pub struct Env {
     pub step: usize,
@@ -40,6 +47,8 @@ pub struct Env {
     episode_start_offset: usize,
     total_data_length: usize,
     random_start: bool,
+    buy_lots: Vec<VecDeque<BuyLot>>,
+    retroactive_rewards: HashMap<usize, f64>,
 }
 
 impl Env {
@@ -69,13 +78,14 @@ impl Env {
 
         let total_data_length = prices[0].len();
 
+        let num_tickers = tickers.len();
         Self {
             step: 0,
             max_step: total_data_length - 2,
             prices,
             price_deltas,
             account: Account::default(),
-            episode_history: EpisodeHistory::new(tickers.len()),
+            episode_history: EpisodeHistory::new(num_tickers),
             meta_history: MetaHistory::default(),
             tickers,
             episode: 0,
@@ -84,6 +94,8 @@ impl Env {
             episode_start_offset: 0,
             total_data_length,
             random_start,
+            buy_lots: vec![VecDeque::new(); num_tickers],
+            retroactive_rewards: HashMap::new(),
         }
     }
 
@@ -107,10 +119,7 @@ impl Env {
 
             let (buy_sell_actions, hold_actions) = actions.split_at(TICKERS_COUNT as usize);
 
-            // Execute trade based on current observations (only use buy/sell actions)
-            let commissions = self.trade(buy_sell_actions, absolute_step);
-
-            let reward = self.get_risk_adjusted_reward(absolute_step, commissions);
+            let reward = self.trade_by_delta_percent_with_hold(buy_sell_actions, hold_actions, absolute_step);
 
             let is_done = self.get_is_done();
 
@@ -327,7 +336,7 @@ impl Env {
         }
     }
 
-    fn trade(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
+    fn trade_buy_sell_to(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let mut total_commissions = 0.0;
 
         for (ticker_index, action) in actions.iter().enumerate() {
@@ -388,6 +397,226 @@ impl Env {
         
         total_commissions
     }
+    
+    /// Trade using percentage deltas with hold action scaling and retroactive reward tracking.
+    /// - buy_sell near 0 = hold
+    /// - buy_sell = 0.1 = buy 10% of total_assets worth of stock
+    /// - buy_sell = -0.1 = sell 10% of current position value
+    /// - hold > 0 amplifies trades (up to 2x), hold < 0 suppresses (down to 0.1x)
+    /// Returns the realized sell reward
+    fn trade_by_delta_percent_with_hold(&mut self, buy_sell_actions: &[f64], hold_actions: &[f64], absolute_step: usize) -> f64 {
+        let mut sell_reward = 0.0;
+
+        for (ticker_index, &buy_sell) in buy_sell_actions.iter().enumerate() {
+            if buy_sell.abs() < ACTION_THRESHOLD {
+                continue;
+            }
+
+            let hold = hold_actions[ticker_index];
+            let action = buy_sell * (1.0 + hold * 0.5).clamp(0.5, 1.5);
+
+            let price = self.prices[ticker_index][absolute_step];
+            let current_value = self.account.positions[ticker_index].value_with_price(price);
+
+            if action > 0.0 {
+                let buy_amount = action * self.account.total_assets;
+
+                if buy_amount <= 0.0 {
+                    continue;
+                }
+
+                let quantity = buy_amount / price;
+                let commission = quantity * COMMISSION_RATE;
+                let total_cost = buy_amount + commission;
+
+                if total_cost > self.account.cash {
+                    continue;
+                }
+
+                self.account.cash -= total_cost;
+                self.account.positions[ticker_index].add(price, quantity);
+                self.episode_history.total_commissions += commission;
+                self.episode_history.buys[ticker_index].insert(absolute_step, (price, quantity));
+
+                self.buy_lots[ticker_index].push_back(BuyLot {
+                    step: absolute_step,
+                    price,
+                    quantity,
+                });
+            } else {
+                let sell_pct = -action;
+                let sell_amount = sell_pct * current_value;
+
+                if sell_amount <= 0.0 || current_value <= 0.0 {
+                    continue;
+                }
+
+                let quantity = sell_amount / price;
+                let commission = quantity * COMMISSION_RATE;
+
+                self.account.cash += sell_amount - commission;
+                self.account.positions[ticker_index].quantity -= quantity;
+                self.episode_history.total_commissions += commission;
+                self.episode_history.sells[ticker_index].insert(absolute_step, (price, quantity));
+
+                sell_reward += self.calculate_retroactive_rewards(ticker_index, absolute_step, price, quantity);
+            }
+        }
+
+        sell_reward
+    }
+
+    /// Calculate retroactive rewards using FIFO lot matching.
+    /// Rewards sells based on time-weighted return and retroactively rewards
+    /// the buys that contributed to profitable sells.
+    /// Returns the immediate sell reward (50%), stores buy rewards (50%) retroactively.
+    fn calculate_retroactive_rewards(&mut self, ticker_index: usize, sell_step: usize, sell_price: f64, mut sell_quantity: f64) -> f64 {
+        let lots = &mut self.buy_lots[ticker_index];
+        let mut total_sell_reward = 0.0;
+
+        while sell_quantity > 1e-8 && !lots.is_empty() {
+            let lot = lots.front_mut().unwrap();
+            let take_qty = sell_quantity.min(lot.quantity);
+
+            let return_pct = (sell_price - lot.price) / lot.price;
+            let hold_time = (sell_step - lot.step).max(1) as f64;
+            let time_weighted_return = return_pct / hold_time.sqrt();
+
+            let sell_reward = time_weighted_return * take_qty * lot.price;
+            let immediate_sell_reward = sell_reward * 0.5;
+            total_sell_reward += immediate_sell_reward;
+
+            let buy_contribution = sell_reward * 0.5;
+            *self.retroactive_rewards.entry(lot.step).or_insert(0.0) += buy_contribution;
+
+            sell_quantity -= take_qty;
+            lot.quantity -= take_qty;
+
+            if lot.quantity < 1e-8 {
+                lots.pop_front();
+            }
+        }
+
+        total_sell_reward
+    }
+
+    pub fn get_retroactive_reward(&self, step: usize) -> f64 {
+        self.retroactive_rewards.get(&step).copied().unwrap_or(0.0)
+    }
+
+    pub fn apply_retroactive_rewards(&self, rewards_tensor: &Tensor) {
+        for (&step, &reward) in &self.retroactive_rewards {
+            let relative_step = step.saturating_sub(self.episode_start_offset);
+            if (relative_step as i64) < rewards_tensor.size()[0] {
+                let step_tensor = rewards_tensor.get(relative_step as i64);
+                let current = f64::try_from(step_tensor.get(0)).unwrap_or(0.0);
+                step_tensor.get(0).copy_(&Tensor::from(current + reward));
+            }
+        }
+    }
+
+    fn trade_by_delta(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
+        let n_tickers = self.tickers.len();
+        let mut total_commissions = 0.0;
+    
+        let total_assets = self.account.total_assets;
+        if total_assets <= 0.0 {
+            return 0.0;
+        }
+    
+        // ---- 1. Build logits for N assets + 1 cash slot ----
+        // actions are unconstrained-ish; we just treat them as logits
+        let mut logits = Vec::with_capacity(n_tickers + 1);
+        logits.extend_from_slice(actions);              // N tickers
+        logits.push(0.0);                               // cash logit baseline
+    
+        // Softmax for weights in [0,1] that sum to 1
+        let max_logit = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = logits.iter().map(|&x| (x - max_logit).exp()).collect();
+        let sum_exps: f64 = exps.iter().sum();
+        let weights: Vec<f64> = exps.iter().map(|e| e / sum_exps).collect();
+    
+        // weights[0..N] = asset weights, weights[N] = cash weight
+    
+        // ---- 2. Compute current position values ----
+        let mut current_values = Vec::with_capacity(n_tickers);
+        for ticker_index in 0..n_tickers {
+            let price = self.prices[ticker_index][absolute_step];
+            current_values.push(self.account.positions[ticker_index].value_with_price(price));
+        }
+    
+        // ---- 3. Compute target dollar values for each ticker ----
+        let rebalance_rate: f64 = 1.0;
+        let min_trade_frac: f64 = 0.005; // skip trades < 0.05% of total assets
+        let min_trade_notional = min_trade_frac * total_assets;
+    
+        for ticker_index in 0..n_tickers {
+            let price = self.prices[ticker_index][absolute_step];
+    
+            let target_value = weights[ticker_index] * total_assets;
+            let current_value = current_values[ticker_index];
+    
+            // desired full delta
+            let full_delta = target_value - current_value;
+    
+            // partial move toward target
+            let desired_delta = full_delta * rebalance_rate;
+    
+            // Hysteresis: ignore very small trades
+            if desired_delta.abs() < min_trade_notional {
+                continue;
+            }
+    
+            if desired_delta > 0.0 {
+                // BUY
+                let trade_value = desired_delta.min(self.account.cash); // no leverage
+                if trade_value <= 0.0 {
+                    continue;
+                }
+    
+                let quantity = trade_value / price;
+                let commission = quantity * COMMISSION_RATE;
+                let total_cost = trade_value + commission;
+    
+                if total_cost > self.account.cash {
+                    continue;
+                }
+    
+                total_commissions += commission;
+    
+                self.account.cash -= total_cost;
+                self.account.positions[ticker_index].add(price, quantity);
+                self.episode_history.total_commissions += commission;
+                self.episode_history
+                    .buys[ticker_index]
+                    .insert(absolute_step, (price, quantity));
+            } else {
+                // SELL
+                let desired_sell_value = -desired_delta;
+                let position_value = current_value;
+                let trade_value = desired_sell_value.min(position_value);
+    
+                if trade_value <= 0.0 {
+                    continue;
+                }
+    
+                let quantity = trade_value / price;
+                let commission = quantity * COMMISSION_RATE;
+    
+                total_commissions += commission;
+    
+                self.account.cash += trade_value - commission;
+                self.account.positions[ticker_index].quantity -= quantity;
+                self.episode_history.total_commissions += commission;
+                self.episode_history
+                    .sells[ticker_index]
+                    .insert(absolute_step, (price, quantity));
+            }
+        }
+    
+        total_commissions
+    }
+
 
     fn get_is_done(&self) -> f32 {
         if self.step + 2 > self.max_step {
@@ -484,6 +713,11 @@ impl Env {
         self.episode_history = EpisodeHistory::new(self.tickers.len());
 
         self.action_history.clear();
+
+        for lot_queue in &mut self.buy_lots {
+            lot_queue.clear();
+        }
+        self.retroactive_rewards.clear();
 
         // Return initial observation as two separate tensors
         let (price_deltas, static_obs) = self.get_next_obs();

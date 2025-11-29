@@ -80,12 +80,15 @@ impl EpisodeHistory {
             );
         }
 
-        let positioned_assets = &self
-            .positioned
-            .iter()
-            .map(|positioned| positioned.iter().sum())
-            .collect::<Vec<f64>>();
-        let total_assets = positioned_assets
+        let num_steps = self.cash.len();
+        let mut positioned_assets_per_step = vec![0.0; num_steps];
+        for ticker_positioned in &self.positioned {
+            for (step, &value) in ticker_positioned.iter().enumerate() {
+                positioned_assets_per_step[step] += value;
+            }
+        }
+
+        let total_assets = positioned_assets_per_step
             .iter()
             .zip(self.cash.iter())
             .map(|(positioned, cash)| positioned + cash)
@@ -95,7 +98,7 @@ impl EpisodeHistory {
             &episode_dir,
             &total_assets,
             &self.cash,
-            Some(positioned_assets),
+            Some(&positioned_assets_per_step),
         );
 
         let _ = reward_chart(&episode_dir, &self.rewards);

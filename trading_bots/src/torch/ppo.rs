@@ -136,7 +136,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step {
             env.step = step;
 
-            let (critic, (action_mean, action_log_std)) = tch::no_grad(|| {
+            let (critic, (action_mean, action_log_std), _attn_weights) = tch::no_grad(|| {
                 // Move price deltas from CPU to GPU (FP32)
                 let price_deltas_gpu = s_price_deltas.get(s).to_device(device);
                 let static_obs = s_static_obs.get(s);
@@ -216,6 +216,9 @@ pub fn train(weights_path: Option<&str>) {
 
         println!("episode rewards: {}", episode_reward);
 
+        // Apply retroactive buy rewards that were calculated during sells back to buy steps
+        env.apply_retroactive_rewards(&s_rewards);
+
         let price_deltas_batch = s_price_deltas
             .narrow(0, 0, n_steps)
             .view([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
@@ -231,9 +234,8 @@ pub fn train(weights_path: Option<&str>) {
             let next_value = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(-1).to_device(device);
                 let static_obs = s_static_obs.get(-1);
-                model(&price_deltas_gpu, &static_obs, false)
-                    .0
-                    .view([NPROCS])
+                let (critic, _, _) = model(&price_deltas_gpu, &static_obs, false);
+                critic.view([NPROCS])
             });
 
             // Compute GAE backwards
@@ -311,8 +313,8 @@ pub fn train(weights_path: Option<&str>) {
                 let advantages_sample = advantages.index_select(0, &batch_indexes);
                 let old_log_probs_sample = old_log_probs.index_select(0, &batch_indexes);
 
-                let (critic, (action_mean, action_log_std)) =
-                    model(&price_deltas_sample, &static_obs_sample, true); // train mode during optimization
+                let (critic, (action_mean, action_log_std), _attn_weights) =
+                    model(&price_deltas_sample, &static_obs_sample, true);
                                                                            // All outputs in FP32
 
                 // Recover the unsquashed Gaussian samples z from actions
@@ -440,7 +442,7 @@ pub fn train(weights_path: Option<&str>) {
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
-            let (_, (debug_mean, debug_log_std)) = tch::no_grad(|| {
+            let (_, (debug_mean, debug_log_std), _attn_weights) = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
                 let static_obs = s_static_obs.get(0);
                 model(&price_deltas_gpu, &static_obs, false)

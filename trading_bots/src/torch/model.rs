@@ -10,9 +10,8 @@ use crate::torch::constants::{
 // 4400 -> 2197 -> 1099 -> 550 -> 550 -> 550
 const CONV_TEMPORAL_LEN: i64 = 550;
 
-// Model returns (critic_value, (action_mean, action_log_std))
-// Actions are sampled from Gaussian then sigmoid-squashed to approximately [-1, 1]
-pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor))>;
+// Model returns (critic_value, (action_mean, action_log_std), static_attn_weights)
+pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor)>;
 
 /// # Returns
 /// A boxed function that takes (price_deltas, static_obs, train) and returns (critic_value, (action_mean, action_log_std))
@@ -57,8 +56,10 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
     let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
 
-    // FC layers: conv features + static observations
-    // After attention: [batch, TICKERS, 256] -> [batch, TICKERS*256]
+    // Feature-wise attention for interpretability
+    let static_attn_fc = nn::linear(p / "static_attn", STATIC_OBSERVATIONS as i64, STATIC_OBSERVATIONS as i64, Default::default());
+
+    // FC layers: conv features + attended static observations
     let conv_output_size = TICKERS_COUNT * 256;
     let fc1_input_size = conv_output_size + STATIC_OBSERVATIONS as i64;
 
@@ -104,7 +105,6 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     };
     let actor_mean = nn::linear(p / "al_mean", 256, nact, actor_mean_cfg);
 
-    // State-independent log_std parameter for more stable exploration
     let log_std_param = p.var("log_std", &[nact], Init::Const(0.0));
 
     // Learnable positional embedding for temporal dimension before GAP
@@ -178,7 +178,9 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         // Flatten ticker features: [batch, TICKERS, 256] -> [batch, TICKERS*256]
         let conv_features = ticker_features.view([batch_size, -1]);
 
-        // Concatenate conv features with static observations
+        // Feature-wise attention for visualization (don't apply to actual features)
+        let static_attn_weights = static_features.apply(&static_attn_fc).softmax(-1, static_features.kind());
+
         let combined = Tensor::cat(&[conv_features, static_features], 1);
 
         // Shared FC1 layer with Pre-LayerNorm
@@ -204,11 +206,8 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         // Gaussian distribution parameters (before sigmoid squashing)
         let action_mean = actor_features.apply(&actor_mean);
 
-        // State-independent log_std with smooth bounded range via tanh
-        // tanh gives range [-2.0, 2.0], so std in [0.135, 7.39]
-        // Smoother gradients than clamp, no dead zones
-        let action_log_std = log_std_param.tanh() * 2.0;
+        let action_log_std = log_std_param.tanh() * 2.0 - 1.5;
 
-        (critic_value, (action_mean, action_log_std))
+        (critic_value, (action_mean, action_log_std), static_attn_weights)
     })
 }
