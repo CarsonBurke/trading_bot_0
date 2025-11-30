@@ -10,8 +10,10 @@ pub mod constants {
     pub const ACTION_HISTORY_LEN: usize = 20;
     pub const PRICE_DELTAS_PER_TICKER: usize = 3400;
 
-    pub const GLOBAL_STATIC_OBS: usize = 6;
-    pub const PER_TICKER_STATIC_OBS: usize = 3 + (ACTION_HISTORY_LEN * 2);
+    // Global: step_progress, cash_percent, pnl, drawdown, commissions, last_reward, last_fill_ratio
+    pub const GLOBAL_STATIC_OBS: usize = 7;
+    // Per-ticker: position_pct, unrealized_pnl, momentum, steps_since_traded, action_history
+    pub const PER_TICKER_STATIC_OBS: usize = 4 + (ACTION_HISTORY_LEN * 2);
     pub const STATIC_OBSERVATIONS: usize = GLOBAL_STATIC_OBS + (TICKERS_COUNT * PER_TICKER_STATIC_OBS);
     pub const OBSERVATION_SPACE: usize = (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
 

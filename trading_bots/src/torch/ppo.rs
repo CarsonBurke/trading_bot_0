@@ -6,7 +6,7 @@ use crate::torch::constants::{
     STEPS_PER_EPISODE, TICKERS_COUNT,
 };
 use crate::torch::model::model;
-use crate::torch::step::Env;
+use crate::torch::env::Env;
 
 pub const NPROCS: i64 = 1; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
@@ -295,6 +295,12 @@ pub fn train(weights_path: Option<&str>) {
         let adv_std = advantages.std(false);
         let advantages = ((&advantages - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
 
+        // Normalize returns and old values to prevent huge value loss early in training
+        let ret_mean = returns.mean(Kind::Float);
+        let ret_std = returns.std(false) + 1e-8;
+        let returns = (&returns - &ret_mean) / &ret_std;
+        let s_values = (&s_values - &ret_mean) / &ret_std; // normalize old values with same stats
+
         let opt_start = Instant::now();
         let mut early_stopped = false;
         let mut total_kl = 0.0;
@@ -371,12 +377,15 @@ pub fn train(weights_path: Option<&str>) {
                     .view([memory_size, 1])
                     .index_select(0, &batch_indexes);
 
+                // Normalize critic to match normalized returns
+                let critic_normalized = (&critic - &ret_mean) / &ret_std;
+
                 // Clipped value prediction
                 let value_pred_clipped = &values_old_sample
-                    + (&critic - &values_old_sample).clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
+                    + (&critic_normalized - &values_old_sample).clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
 
                 // Unclipped and clipped MSE vs returns
-                let value_loss_unclipped = (&critic - &returns_sample).pow_tensor_scalar(2);
+                let value_loss_unclipped = (&critic_normalized - &returns_sample).pow_tensor_scalar(2);
                 let value_loss_clipped =
                     (&value_pred_clipped - &returns_sample).pow_tensor_scalar(2);
 

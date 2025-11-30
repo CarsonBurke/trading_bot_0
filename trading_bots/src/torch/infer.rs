@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::torch::constants::{STEPS_PER_EPISODE, TICKERS_COUNT};
 use crate::torch::model::model;
-use crate::torch::step::Env;
+use crate::torch::env::Env;
 use crate::torch::ppo::TANH_SQUASHING_DIVISOR;
 
 pub fn load_model<P: AsRef<Path>>(

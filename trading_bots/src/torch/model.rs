@@ -122,7 +122,7 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let batch_size = price_deltas.size()[0];
 
         // === Parse static features into global and per-ticker ===
-        // Format: [global (6), per_ticker_0 (43), per_ticker_1 (43), ...]
+        // Format: [global (7), per_ticker_0 (44), per_ticker_1 (44), ...]
         let global_static = static_features.narrow(1, 0, GLOBAL_STATIC_OBS as i64);
         let per_ticker_static = static_features
             .narrow(1, GLOBAL_STATIC_OBS as i64, TICKERS_COUNT * PER_TICKER_STATIC_OBS as i64)
@@ -151,10 +151,10 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let conv_features = gap_output.view([batch_size, TICKERS_COUNT, 256]);
 
         // === Combine conv features with per-ticker static features ===
-        // [batch, TICKERS, 256] + [batch, TICKERS, 43] -> [batch, TICKERS, 299]
+        // [batch, TICKERS, 256] + [batch, TICKERS, 44] -> [batch, TICKERS, 300]
         let combined_ticker = Tensor::cat(&[conv_features, per_ticker_static], 2);
 
-        // Project back to 256 dims: [batch, TICKERS, 299] -> [batch, TICKERS, 256]
+        // Project back to 256 dims: [batch, TICKERS, 300] -> [batch, TICKERS, 256]
         let combined_ticker = combined_ticker
             .view([batch_size * TICKERS_COUNT, 256 + PER_TICKER_STATIC_OBS as i64])
             .apply(&static_proj)

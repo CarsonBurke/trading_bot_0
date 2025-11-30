@@ -28,6 +28,8 @@ struct LiveMarketState {
     account: Account,
     action_history: VecDeque<Vec<f64>>,
     step_count: usize,
+    last_fill_ratio: f64,
+    last_traded_step: Vec<usize>,
 }
 
 impl LiveMarketState {
@@ -38,6 +40,8 @@ impl LiveMarketState {
             account: Account::new(starting_cash, ticker_count),
             action_history: VecDeque::with_capacity(ACTION_HISTORY_LEN),
             step_count: 0,
+            last_fill_ratio: 1.0,
+            last_traded_step: vec![0; ticker_count],
         }
     }
 
@@ -100,13 +104,14 @@ impl LiveMarketState {
 
         let mut static_obs = Vec::with_capacity(STATIC_OBSERVATIONS);
 
-        // === Global observations (GLOBAL_STATIC_OBS = 6) ===
+        // === Global observations (GLOBAL_STATIC_OBS = 7) ===
         static_obs.push(1.0f32); // step progress (live = always 1.0)
         static_obs.push((self.account.cash / self.account.total_assets) as f32); // cash_percent
         static_obs.push(0.0f32); // pnl (not tracked in live)
         static_obs.push(0.0f32); // drawdown (not tracked in live)
         static_obs.push(0.0f32); // commissions (not tracked in live)
         static_obs.push(0.0f32); // last_reward (not applicable in live)
+        static_obs.push(self.last_fill_ratio as f32); // last_fill_ratio
         debug_assert_eq!(static_obs.len(), GLOBAL_STATIC_OBS);
 
         // === Per-ticker observations (ticker-major format) ===
@@ -129,6 +134,10 @@ impl LiveMarketState {
                 0.0f32
             };
             static_obs.push(momentum);
+
+            // Steps since last traded (normalized, use 0.0 for live as approximation)
+            let steps_since = self.step_count.saturating_sub(self.last_traded_step[ticker_idx]);
+            static_obs.push((steps_since as f32 / 1000.0).min(1.0));
 
             // Action history for this ticker (most recent first)
             for i in 0..ACTION_HISTORY_LEN {
