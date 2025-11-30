@@ -808,6 +808,8 @@ fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Esc | KeyCode::Char('q') => {
                             app.mode = AppMode::Main;
                         }
+                        KeyCode::Char('r') => {
+                        }
                         _ => {}
                     },
                             }

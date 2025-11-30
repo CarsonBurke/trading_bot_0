@@ -2,11 +2,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Sparkline},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use std::fs;
 use serde_json::Value;
+use shared::constants::{GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, TICKERS_COUNT};
 
 use crate::{components::episode_status, theme, App};
 
@@ -23,8 +24,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
+            Constraint::Percentage(35),
+            Constraint::Percentage(65),
         ])
         .split(main_chunks[1]);
 
@@ -50,12 +51,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let left_block = Block::default()
         .borders(Borders::ALL)
-        .title("Current Step")
+        .title("Global Observations")
         .border_style(Style::default().fg(theme::SURFACE2));
 
     let right_block = Block::default()
         .borders(Borders::ALL)
-        .title("Temporal Evolution (Last 100 Steps)")
+        .title("Per-Ticker Observations")
         .border_style(Style::default().fg(theme::SURFACE2));
 
     if let Some(gen) = latest_episode {
@@ -64,163 +65,133 @@ pub fn render(f: &mut Frame, app: &mut App) {
         if let Ok(contents) = fs::read_to_string(&obs_path) {
             if let Ok(json) = serde_json::from_str::<Value>(&contents) {
                 let static_obs = json["static_observations"].as_array();
-                let attn_weights = json["attention_weights"].as_array();
 
-                if let (Some(obs_arr), Some(attn_arr)) = (static_obs, attn_weights) {
+                if let Some(obs_arr) = static_obs {
                     let last_step_idx = obs_arr.len().saturating_sub(1);
 
                     if last_step_idx < obs_arr.len() {
                         let last_obs = &obs_arr[last_step_idx];
-                        let last_attn = &attn_arr[last_step_idx];
-
-                        let mut lines = vec![];
-                        lines.push(Line::from(vec![
-                            Span::styled("Latest Step Observations ", Style::default().fg(theme::SKY).add_modifier(Modifier::BOLD)),
-                            Span::styled(format!("(Step {}/{})", last_step_idx + 1, obs_arr.len()), Style::default().fg(theme::SUBTEXT0)),
-                        ]));
-                        lines.push(Line::from(""));
 
                         if let Some(obs_vec) = last_obs.as_array() {
-                            if let Some(attn_vec) = last_attn.as_array() {
-                                lines.push(Line::from(Span::styled("Static Observations:", Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD))));
+                            let mut left_lines = vec![];
+                            left_lines.push(Line::from(vec![
+                                Span::styled("Step ", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+                                Span::styled(format!("{}/{}", last_step_idx + 1, obs_arr.len()), Style::default().fg(theme::SUBTEXT0)),
+                            ]));
+                            left_lines.push(Line::from(""));
 
-                                let obs_labels = [
-                                    "Step Progress",
-                                    "Cash %",
-                                    "Position %",
-                                    "Time-Wtd Return",
-                                ];
+                            let global_labels = [
+                                "Step Progress",
+                                "Cash %",
+                                "PnL",
+                                "Drawdown",
+                                "Commissions",
+                                "Last Reward",
+                            ];
 
-                                for (i, label) in obs_labels.iter().enumerate() {
-                                    if i < obs_vec.len() {
-                                        let val = obs_vec[i].as_f64().unwrap_or(0.0);
-                                        let attn = if i < attn_vec.len() {
-                                            attn_vec[i].as_f64().unwrap_or(0.0)
-                                        } else {
-                                            0.0
-                                        };
+                            for (i, label) in global_labels.iter().enumerate() {
+                                if i < obs_vec.len() {
+                                    let val = obs_vec[i].as_f64().unwrap_or(0.0);
+                                    let color = match i {
+                                        0 => theme::BLUE,
+                                        1 => theme::GREEN,
+                                        2 => if val >= 0.0 { theme::GREEN } else { theme::RED },
+                                        3 => if val >= 0.0 { theme::GREEN } else { theme::RED },
+                                        4 => theme::YELLOW,
+                                        5 => if val >= 0.0 { theme::GREEN } else { theme::RED },
+                                        _ => theme::TEXT,
+                                    };
 
-                                        let bar_width = (attn * 30.0) as usize;
-                                        let bar = "█".repeat(bar_width);
+                                    let display_val = match i {
+                                        0 | 1 => format!("{:6.2}%", val * 100.0),
+                                        2 | 3 => format!("{:+7.2}%", val * 100.0),
+                                        4 | 5 => format!("{:8.4}", val),
+                                        _ => format!("{:8.4}", val),
+                                    };
 
-                                        lines.push(Line::from(vec![
-                                            Span::styled(format!("{:18}: ", label), Style::default().fg(theme::TEXT)),
-                                            Span::styled(format!("{:8.4} ", val), Style::default().fg(theme::GREEN)),
-                                            Span::styled(format!("Attn: {:5.3} ", attn), Style::default().fg(theme::PEACH)),
-                                            Span::styled(bar, Style::default().fg(theme::MAUVE)),
-                                        ]));
-                                    }
-                                }
-
-                                lines.push(Line::from(""));
-                                lines.push(Line::from(Span::styled("Action History (most recent 5):", Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD))));
-
-                                let action_start = 4;
-                                let actions_per_step = 2;
-                                let history_len = 5;
-
-                                for hist_idx in 0..history_len {
-                                    let base_idx = action_start + (hist_idx * actions_per_step);
-                                    if base_idx + 1 < obs_vec.len() {
-                                        let buy_sell = obs_vec[base_idx].as_f64().unwrap_or(0.0);
-                                        let hold = obs_vec[base_idx + 1].as_f64().unwrap_or(0.0);
-
-                                        let buy_sell_attn = if base_idx < attn_vec.len() {
-                                            attn_vec[base_idx].as_f64().unwrap_or(0.0)
-                                        } else {
-                                            0.0
-                                        };
-                                        let hold_attn = if base_idx + 1 < attn_vec.len() {
-                                            attn_vec[base_idx + 1].as_f64().unwrap_or(0.0)
-                                        } else {
-                                            0.0
-                                        };
-
-                                        let buy_sell_bar_width = (buy_sell_attn * 20.0) as usize;
-                                        let hold_bar_width = (hold_attn * 20.0) as usize;
-                                        let buy_sell_bar = "█".repeat(buy_sell_bar_width);
-                                        let hold_bar = "█".repeat(hold_bar_width);
-
-                                        lines.push(Line::from(vec![
-                                            Span::styled(format!("  T-{}: ", hist_idx), Style::default().fg(theme::SUBTEXT0)),
-                                            Span::styled(format!("B/S={:6.3} ", buy_sell), Style::default().fg(theme::SKY)),
-                                            Span::styled(format!("[{:4.2}]", buy_sell_attn), Style::default().fg(theme::PEACH)),
-                                            Span::styled(format!("{:5} ", buy_sell_bar), Style::default().fg(theme::BLUE)),
-                                            Span::styled(format!("H={:6.3} ", hold), Style::default().fg(theme::LAVENDER)),
-                                            Span::styled(format!("[{:4.2}]", hold_attn), Style::default().fg(theme::PEACH)),
-                                            Span::styled(hold_bar, Style::default().fg(theme::MAUVE)),
-                                        ]));
-                                    }
+                                    left_lines.push(Line::from(vec![
+                                        Span::styled(format!("{:14}: ", label), Style::default().fg(theme::SUBTEXT1)),
+                                        Span::styled(display_val, Style::default().fg(color)),
+                                    ]));
                                 }
                             }
-                        }
 
-                        let paragraph = Paragraph::new(lines).block(left_block);
-                        f.render_widget(paragraph, content_chunks[0]);
+                            let left_paragraph = Paragraph::new(left_lines).block(left_block);
+                            f.render_widget(left_paragraph, content_chunks[0]);
 
-                        // Render temporal charts in right panel
-                        let mut temporal_lines = vec![];
-                        temporal_lines.push(Line::from(Span::styled("Key Metrics Over Time", Style::default().fg(theme::SKY).add_modifier(Modifier::BOLD))));
-                        temporal_lines.push(Line::from(""));
+                            let mut right_lines = vec![];
+                            right_lines.push(Line::from(Span::styled("Ticker Data", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD))));
+                            right_lines.push(Line::from(""));
 
-                        // Extract time series for cash%
-                        let cash_series: Vec<u64> = obs_arr.iter()
-                            .filter_map(|step| step.as_array())
-                            .filter_map(|obs_vec| obs_vec.get(1))
-                            .filter_map(|val| val.as_f64())
-                            .map(|v| (v * 100.0) as u64)
-                            .collect();
+                            let ticker_names = ["TSLA", "AAPL", "AMD", "INTC", "MSFT", "NVDA"];
 
-                        if !cash_series.is_empty() {
-                            let cash_sparkline = Sparkline::default()
-                                .block(Block::default().title("Cash %").borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE1)))
-                                .data(&cash_series)
-                                .style(Style::default().fg(theme::GREEN));
+                            for ticker_idx in 0..TICKERS_COUNT {
+                                let base_idx = GLOBAL_STATIC_OBS + (ticker_idx * PER_TICKER_STATIC_OBS);
 
-                            temporal_lines.push(Line::from(""));
-                            temporal_lines.push(Line::from(format!("Cash: {:.2}% (min: {}, max: {})",
-                                cash_series.last().unwrap_or(&0),
-                                cash_series.iter().min().unwrap_or(&0),
-                                cash_series.iter().max().unwrap_or(&0))));
-                        }
+                                if base_idx + 2 < obs_vec.len() {
+                                    let position_pct = obs_vec[base_idx].as_f64().unwrap_or(0.0);
+                                    let unrealized_pnl = obs_vec[base_idx + 1].as_f64().unwrap_or(0.0);
+                                    let momentum = obs_vec[base_idx + 2].as_f64().unwrap_or(0.0);
 
-                        // Extract time series for position%
-                        let pos_series: Vec<u64> = obs_arr.iter()
-                            .filter_map(|step| step.as_array())
-                            .filter_map(|obs_vec| obs_vec.get(2))
-                            .filter_map(|val| val.as_f64())
-                            .map(|v| (v * 100.0) as u64)
-                            .collect();
+                                    right_lines.push(Line::from(vec![
+                                        Span::styled(format!("{:5} ", ticker_names[ticker_idx]), Style::default().fg(theme::MAUVE)),
+                                        Span::styled(format!("Pos:{:5.1}% ", position_pct * 100.0),
+                                            Style::default().fg(if position_pct > 0.01 { theme::SKY } else { theme::SURFACE2 })),
+                                        Span::styled(format!("PnL:{:+6.2}% ", unrealized_pnl * 100.0),
+                                            Style::default().fg(if unrealized_pnl >= 0.0 { theme::GREEN } else { theme::RED })),
+                                        Span::styled(format!("Mom:{:+6.2}%", momentum * 100.0),
+                                            Style::default().fg(if momentum >= 0.0 { theme::GREEN } else { theme::RED })),
+                                    ]));
 
-                        if !pos_series.is_empty() {
-                            temporal_lines.push(Line::from(""));
-                            temporal_lines.push(Line::from(format!("Position: {:.2}% (min: {}, max: {})",
-                                pos_series.last().unwrap_or(&0),
-                                pos_series.iter().min().unwrap_or(&0),
-                                pos_series.iter().max().unwrap_or(&0))));
-                        }
+                                    let action_start = base_idx + 3;
+                                    let recent_actions = 3;
+                                    let mut action_line_parts = vec![Span::styled("  ", Style::default())];
 
-                        // Extract attention weights for static obs (first 4)
-                        temporal_lines.push(Line::from(""));
-                        temporal_lines.push(Line::from(Span::styled("Attention Evolution:", Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD))));
+                                    for hist_idx in 0..recent_actions {
+                                        let buy_sell_idx = action_start + (hist_idx * 2);
+                                        let hold_idx = buy_sell_idx + 1;
 
-                        for obs_idx in 0..4 {
-                            let attn_series: Vec<u64> = attn_arr.iter()
-                                .filter_map(|step| step.as_array())
-                                .filter_map(|attn_vec| attn_vec.get(obs_idx))
-                                .filter_map(|val| val.as_f64())
-                                .map(|v| (v * 1000.0) as u64)
-                                .collect();
+                                        if hold_idx < obs_vec.len() {
+                                            let buy_sell = obs_vec[buy_sell_idx].as_f64().unwrap_or(0.0);
+                                            let hold = obs_vec[hold_idx].as_f64().unwrap_or(0.0);
 
-                            if !attn_series.is_empty() {
-                                let labels = ["Step Prog", "Cash %", "Position %", "TWR"];
-                                let avg = attn_series.iter().sum::<u64>() as f64 / attn_series.len() as f64 / 1000.0;
-                                temporal_lines.push(Line::from(format!("  {}: avg={:.3}", labels[obs_idx], avg)));
+                                            let bs_color = if buy_sell.abs() < 0.01 {
+                                                theme::SURFACE2
+                                            } else if buy_sell > 0.0 {
+                                                theme::GREEN
+                                            } else {
+                                                theme::RED
+                                            };
+
+                                            action_line_parts.push(Span::styled(
+                                                format!("T-{}: ", hist_idx),
+                                                Style::default().fg(theme::OVERLAY0)
+                                            ));
+                                            action_line_parts.push(Span::styled(
+                                                format!("{:+.2}", buy_sell),
+                                                Style::default().fg(bs_color)
+                                            ));
+                                            action_line_parts.push(Span::styled(
+                                                format!("/{:+.2} ", hold),
+                                                Style::default().fg(theme::OVERLAY1)
+                                            ));
+                                        }
+                                    }
+
+                                    right_lines.push(Line::from(action_line_parts));
+                                    right_lines.push(Line::from(""));
+                                }
                             }
-                        }
 
-                        let temporal_paragraph = Paragraph::new(temporal_lines).block(right_block);
-                        f.render_widget(temporal_paragraph, content_chunks[1]);
+                            let right_paragraph = Paragraph::new(right_lines).block(right_block);
+                            f.render_widget(right_paragraph, content_chunks[1]);
+                        } else {
+                            let msg = Paragraph::new("No observation data in step")
+                                .block(left_block)
+                                .style(Style::default().fg(theme::SUBTEXT0));
+                            f.render_widget(msg, content_chunks[0]);
+                            f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[1]);
+                        }
                     } else {
                         let msg = Paragraph::new("No observations data available")
                             .block(left_block)
@@ -257,7 +228,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[1]);
     }
 
-    let help_text = " ESC: Back to Main ";
+    let help_text = " ESC: Back to Main | R: Refresh ";
     let help = Paragraph::new(help_text)
         .block(Block::default().borders(Borders::ALL).title(" Controls "));
     f.render_widget(help, chunks[2]);
