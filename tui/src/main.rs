@@ -127,7 +127,7 @@ impl App {
         // Meta chart base names (episode-level charts without ticker)
         let meta_chart_bases = vec![
             "final_assets", "cum_reward", "outperformance", "loss",
-            "assets", "reward", "total_commissions"
+            "assets", "reward", "total_commissions", "mean_std"
         ];
 
         // Ticker-specific chart base names

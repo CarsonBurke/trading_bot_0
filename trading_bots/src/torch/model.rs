@@ -5,10 +5,14 @@ use crate::torch::constants::{
     GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
 
-// Temporal length after all conv layers: 
-// 3400 -> 1697 -> 849 -> 425 -> 425 -> 425
-// 4400 -> 2197 -> 1099 -> 550 -> 550 -> 550
-const CONV_TEMPORAL_LEN: i64 = 425;
+// Temporal length after conv layers (8x downsample from stem):
+// floor((floor((floor((L - 8) / 2 + 1) - 5) / 2 + 1) - 3) / 2 + 1)
+const fn calc_conv_temporal_len(input_len: i64) -> i64 {
+    let after_c1 = (input_len - 8) / 2 + 1;  // k=8, s=2
+    let after_c2 = (after_c1 - 5 + 4) / 2 + 1;  // k=5, s=2, p=2
+    (after_c2 - 3 + 2) / 2 + 1  // k=3, s=2, p=1
+}
+const CONV_TEMPORAL_LEN: i64 = calc_conv_temporal_len(PRICE_DELTAS_PER_TICKER as i64);
 
 // Model returns (critic_value, (action_mean, action_log_std), static_attn_weights)
 pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor)>;
@@ -16,37 +20,58 @@ pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor)
 /// # Returns
 /// A boxed function that takes (price_deltas, static_obs, train) and returns (critic_value, (action_mean, action_log_std))
 pub fn model(p: &nn::Path, nact: i64) -> Model {
-    let stride = |s| nn::ConvConfig {
-        stride: s,
-        ..Default::default()
-    };
+    // Multi-scale temporal conv with 3 parallel dilated branches (TimesNet-inspired)
+    // Each branch: shared stem -> dilated depthwise convs -> concat -> project
+    // Dilations: d=1 (local), d=4 (medium ~weekly), d=16 (long ~monthly)
 
-    // ConvNeXt-style architecture: depthwise conv + pointwise (1x1) expansion/contraction
-    // Pre-norm: GroupNorm applied BEFORE conv, no running stats, more stable than BatchNorm
+    // Shared stem: 1 -> 64 channels with stride 2
+    let c1 = nn::conv1d(p / "c1", 1, 64, 8, nn::ConvConfig { stride: 2, ..Default::default() });
 
-    // Initial stem: regular conv to expand from 1 -> 64 channels (can't do depthwise with 1 channel)
-    // No GroupNorm on input - preserves price delta scale information
-    let c1 = nn::conv1d(p / "c1", 1, 64, 8, stride(2));  // Regular conv for stem
-
-    // Block 2: 64 -> 128 channels (depthwise + pointwise)
+    // Shared block 2: 64 -> 64 channels, stride 2
     let gn2 = nn::group_norm(p / "gn2", 8, 64, Default::default());
-    let c2_dw = nn::conv1d(p / "c2_dw", 64, 64, 5, nn::ConvConfig { stride: 2, padding: 2, groups: 64, ..Default::default() });  // Depthwise
-    let c2_pw = nn::conv1d(p / "c2_pw", 64, 128, 1, Default::default());  // Pointwise 1x1 to expand
+    let c2_dw = nn::conv1d(p / "c2_dw", 64, 64, 5, nn::ConvConfig { stride: 2, padding: 2, groups: 64, ..Default::default() });
+    let c2_pw = nn::conv1d(p / "c2_pw", 64, 64, 1, Default::default());
 
-    // Block 3: 128 -> 256 channels (depthwise + pointwise)
-    let gn3 = nn::group_norm(p / "gn3", 8, 128, Default::default());
-    let c3_dw = nn::conv1d(p / "c3_dw", 128, 128, 3, nn::ConvConfig { stride: 2, padding: 1, groups: 128, ..Default::default() });  // Depthwise
-    let c3_pw = nn::conv1d(p / "c3_pw", 128, 256, 1, Default::default());  // Pointwise 1x1 to expand
+    // Shared block 3: 64 -> 64 channels, stride 2 (total downsample: 8x)
+    let gn3 = nn::group_norm(p / "gn3", 8, 64, Default::default());
+    let c3_dw = nn::conv1d(p / "c3_dw", 64, 64, 3, nn::ConvConfig { stride: 2, padding: 1, groups: 64, ..Default::default() });
+    let c3_pw = nn::conv1d(p / "c3_pw", 64, 64, 1, Default::default());
 
-    // Block 4: 256 -> 256 channels (depthwise + pointwise)
-    let gn4 = nn::group_norm(p / "gn4", 8, 256, Default::default());
-    let c4_dw = nn::conv1d(p / "c4_dw", 256, 256, 3, nn::ConvConfig { stride: 1, padding: 1, groups: 256, ..Default::default() });  // Depthwise
-    let c4_pw = nn::conv1d(p / "c4_pw", 256, 256, 1, Default::default());  // Pointwise 1x1 (maintain)
+    // Branch A: dilation=1 (local patterns, ~1-8 steps)
+    let gn_a = nn::group_norm(p / "gn_a", 8, 64, Default::default());
+    let ca_dw = nn::conv1d(p / "ca_dw", 64, 64, 3, nn::ConvConfig { padding: 1, groups: 64, ..Default::default() });
+    let ca_pw = nn::conv1d(p / "ca_pw", 64, 64, 1, Default::default());
 
-    // Block 5: 256 -> 256 channels (depthwise + pointwise) with residual
-    let gn5 = nn::group_norm(p / "gn5", 8, 256, Default::default());
-    let c5_dw = nn::conv1d(p / "c5_dw", 256, 256, 3, nn::ConvConfig { stride: 1, padding: 1, groups: 256, ..Default::default() });  // Depthwise
-    let c5_pw = nn::conv1d(p / "c5_pw", 256, 256, 1, Default::default());  // Pointwise 1x1 (maintain)
+    // Branch B: dilation=4 (medium patterns, ~4-32 steps)
+    let gn_b = nn::group_norm(p / "gn_b", 8, 64, Default::default());
+    let cb_dw = nn::conv1d(p / "cb_dw", 64, 64, 3, nn::ConvConfig { padding: 4, dilation: 4, groups: 64, ..Default::default() });
+    let cb_pw = nn::conv1d(p / "cb_pw", 64, 64, 1, Default::default());
+
+    // Branch C: dilation=16 (long patterns, ~16-128 steps)
+    let gn_c = nn::group_norm(p / "gn_c", 8, 64, Default::default());
+    let cc_dw = nn::conv1d(p / "cc_dw", 64, 64, 3, nn::ConvConfig { padding: 16, dilation: 16, groups: 64, ..Default::default() });
+    let cc_pw = nn::conv1d(p / "cc_pw", 64, 64, 1, Default::default());
+
+    // Fuse branches: 192 -> 256 channels
+    let gn_fuse = nn::group_norm(p / "gn_fuse", 8, 192, Default::default());
+    let c_fuse = nn::conv1d(p / "c_fuse", 192, 256, 1, Default::default());
+
+    // Gated residual: interpolate between stem (direct) and branches (multi-scale)
+    // gate = sigmoid(conv(concat(stem_proj, branches))) per-channel per-timestep
+    // output = gate * branches + (1 - gate) * stem_proj
+    let stem_proj = nn::conv1d(p / "stem_proj", 64, 256, 1, Default::default());
+    // Gate takes concatenated [stem_256, branches_256] -> 256 gate values
+    let gate_conv = nn::conv1d(
+        p / "gate_conv",
+        512,
+        256,
+        1,
+        nn::ConvConfig {
+            // Initialize bias negative so gate starts near 0 (prefer stem early in training)
+            bs_init: Init::Const(-2.0),
+            ..Default::default()
+        },
+    );
 
     // Projection to combine conv features (256) with per-ticker static features
     let static_proj = nn::linear(
@@ -112,7 +137,10 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     };
     let actor_mean = nn::linear(p / "al_mean", 256, nact, actor_mean_cfg);
 
-    // Actor log_std: state-dependent, initialized to output ~0 (std ~1)
+    // Actor log_std: state-dependent via softplus for smooth gradients
+    // std = softplus(x) * STD_SCALE + STD_MIN, then log
+    // Network outputs x centered at 0, softplus(0) ≈ 0.69
+    // Initial std ≈ 0.69 * 0.25 + 0.02 ≈ 0.19
     let actor_log_std_cfg = nn::LinearConfig {
         ws_init: Init::Uniform { lo: -0.01, up: 0.01 },
         bs_init: Some(Init::Const(0.0)),
@@ -136,7 +164,7 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     let temporal_pool_3 = nn::linear(p / "temporal_pool_3", 128, 1, Default::default());
 
     let device = p.device();
-    Box::new(move |price_deltas: &Tensor, static_features: &Tensor, train: bool| {
+    Box::new(move |price_deltas: &Tensor, static_features: &Tensor, _train: bool| {
         let price_deltas = price_deltas.to_device(device);
         let static_features = static_features.to_device(device);
         let batch_size = price_deltas.size()[0];
@@ -153,14 +181,29 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
             .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
             .view([batch_size * TICKERS_COUNT, 1, PRICE_DELTAS_PER_TICKER as i64]);
 
+        // Shared stem: downsample 8x
         let x = price_deltas_reshaped.apply(&c1).silu();
         let x = x.apply(&gn2).apply(&c2_dw).apply(&c2_pw).silu();
-        let x = x.apply(&gn3).apply(&c3_dw).apply(&c3_pw).silu();
-        let x = x.apply(&gn4).apply(&c4_dw).apply(&c4_pw).silu();
+        let x_stem = x.apply(&gn3).apply(&c3_dw).apply(&c3_pw).silu(); // [B*T, 64, L]
 
-        let x5_input = x.shallow_clone();
-        let x = x.apply(&gn5).apply(&c5_dw).apply(&c5_pw);
-        let x = (x + x5_input).silu();
+        // Parallel dilated branches
+        let branch_a = x_stem.apply(&gn_a).apply(&ca_dw).apply(&ca_pw).silu();
+        let branch_b = x_stem.apply(&gn_b).apply(&cb_dw).apply(&cb_pw).silu();
+        let branch_c = x_stem.apply(&gn_c).apply(&cc_dw).apply(&cc_pw).silu();
+
+        // Fuse branches: [B*T, 192, L] -> [B*T, 256, L]
+        let x_branches = Tensor::cat(&[branch_a, branch_b, branch_c], 1);
+        let x_branches = x_branches.apply(&gn_fuse).apply(&c_fuse); // no activation yet
+
+        // Project stem to 256 channels
+        let x_stem_proj = x_stem.apply(&stem_proj); // [B*T, 256, L]
+
+        // Gated residual: learn to interpolate between stem and branches
+        // gate ∈ [0,1]: 0 = pure stem, 1 = pure branches
+        let gate_input = Tensor::cat(&[&x_stem_proj, &x_branches], 1); // [B*T, 512, L]
+        let gate = gate_input.apply(&gate_conv).sigmoid(); // [B*T, 256, L]
+        let x_gated: Tensor = &gate * &x_branches + (1.0 - &gate) * &x_stem_proj;
+        let x = x_gated.silu();
 
         let x = x + &pos_embedding;
         let temporal_len = x.size()[2];
@@ -272,7 +315,7 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
         // Residual + LayerNorm, then flatten
         let pma_out_final = (seeds_expanded + pma_attn_out).apply(&ln_pma);
-        let pooled_features = pma_out_final.reshape([batch_size, pma_num_seeds * 256]); // [batch, 512]
+        let pooled_features = pma_out_final.reshape([batch_size, pma_num_seeds * 256]); // [batch, 1024]
 
         // Shared FC1 layer with Pre-LayerNorm
         let fc1_out = pooled_features.apply(&fc1);
@@ -297,8 +340,14 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         // Gaussian distribution parameters (before sigmoid squashing)
         let action_mean = actor_features.apply(&actor_mean);
 
-        // State-dependent log_std, clamped to [-4, 1] for std in [0.018, 2.7]
-        let action_log_std = actor_features.apply(&actor_log_std).clamp(-4.0, 1.0);
+        // State-dependent log_std via softplus: std = softplus(x) * scale + min
+        // Min std = 0.02 allows ~90% hold when mean≈0 (given tanh squashing with divisor 4)
+        // softplus(x) ∈ (0, ∞), so std ∈ (0.02, ∞) with soft upper bound from network capacity
+        const STD_MIN: f64 = 0.02;
+        const STD_SCALE: f64 = 0.25;
+        let raw_std = actor_features.apply(&actor_log_std);
+        let action_std = raw_std.softplus() * STD_SCALE + STD_MIN;
+        let action_log_std = action_std.log();
 
         (critic_value, (action_mean, action_log_std), temporal_attn_avg)
     })

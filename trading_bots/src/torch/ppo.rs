@@ -11,7 +11,7 @@ use crate::torch::env::Env;
 
 pub const NPROCS: i64 = 1; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
-const OPTIM_MINIBATCH: i64 = 512; // Mini-batch size for GPU processing (avoids OOM)
+const OPTIM_MINIBATCH: i64 = 256; // Mini-batch size for GPU processing (avoids OOM)
 const OPTIM_EPOCHS: i64 = 4;
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
@@ -29,7 +29,7 @@ const TARGET_KL: f64 = 0.03; // Target KL divergence for early stopping
 const KL_STOP_MULTIPLIER: f64 = 5.0; // stop episode's epochs if KL divergence exceeds this multiplier of target KL
 const KL_LR_FACTOR: f64 = 0.5; // KL effect on learning rate
 const MAX_KL_LR_DELTA: f64 = 0.1; // Max bounded change in learning rate due to KL divergence per episode
-const LEARNING_RATE: f64 = 1e-4; // Learning rate for optimizer
+const LEARNING_RATE: f64 = 2e-5; // Learning rate for optimizer
 const LR_MIN: f64 = 1e-6;
 const LR_MAX: f64 = 2e-4;
 
@@ -454,18 +454,19 @@ pub fn train(weights_path: Option<&str>) {
             }
         }
 
-        // Record mean loss for this episode
-        let mean_loss = total_loss / num_loss_samples as f64;
-        env.meta_history.record_loss(mean_loss);
+        // Record mean loss and std every 5 episodes (matches chart frequency)
+        if episode % 5 == 0 {
+            let mean_loss = total_loss / num_loss_samples as f64;
+            env.meta_history.record_loss(mean_loss);
 
-        // Record mean action std (exploration level)
-        let mean_std = tch::no_grad(|| {
-            let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
-            let static_obs = s_static_obs.get(0);
-            let (_, (_, action_log_std), _) = model(&price_deltas_gpu, &static_obs, false);
-            f64::try_from(action_log_std.exp().mean(Kind::Float)).unwrap_or(0.0)
-        });
-        env.meta_history.record_mean_std(mean_std);
+            let mean_std = tch::no_grad(|| {
+                let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
+                let static_obs = s_static_obs.get(0);
+                let (_, (_, action_log_std), _) = model(&price_deltas_gpu, &static_obs, false);
+                f64::try_from(action_log_std.exp().mean(Kind::Float)).unwrap_or(0.0)
+            });
+            env.meta_history.record_mean_std(mean_std);
+        }
 
         if early_stopped {
             println!("Training stopped early due to high KL divergence");
