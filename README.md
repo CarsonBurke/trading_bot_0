@@ -51,7 +51,7 @@ Multi-asset trading bot using deep RL (PPO) and historical price data.
 |                             Training Visualizations in Custom TUI                              |
 | :--------------------------------------------------------------------------------------------: |
 |                      ![](assets/6_ticker_ep51_assets_benchmarked_tui.png)                      |
-| 6 ticker assets (red) cash (green) combined total assets (blue) benchmarked over time (yellow) |
+| 6 ticker assets (red) cash (green) combined total assets (blue) benchmarked by "index" of tickers being traded (yellow); shown here outperforming the index by 11.79% |
 |                             ![](assets/msft_ep51_buy_sell_tui.png)                             |
 |      buy (red) and sell (yellow) locations on randomly selected active region of trading       |
 |                        ![](assets/msft_ep51_assets_benchmarked_tui.png)                        |
