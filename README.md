@@ -31,11 +31,11 @@ Multi-asset trading bot using deep RL (PPO) and historical price data.
 - drastically outperforms the programmatic strategies with comparable training time
 - Performs exceptionally well when trained sufficiently (thousands of epochs)
 
-### Architecture
+### Notable Architecture Implementations
 
 - Continuous action space for position sizing [-1, 1] implicit sell/buy/hold and direction (short term memory/goal setting) for each ticker
-- ConvNeXt-inspired Conv layers, depthwise-separable blocks for price delta % inputs
-- 4-head self-attention learn inter-asset correlations
+- Timesnet-inspired Conv layers for price delta % observations
+- self-attention layers for weighting time, static inputs, and cross-ticker
 - Separate FC paths after shared conv features for actor and critic independent policy/value optimization
 - Inputs price delta %s from current and previous time steps, intention to support more inputs such as news and social sentiment scores per-ticker and for economy
 
