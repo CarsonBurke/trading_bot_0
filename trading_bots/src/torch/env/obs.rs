@@ -10,7 +10,9 @@ impl Env {
         let mut price_deltas = Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER);
         let absolute_step = self.episode_start_offset + self.step;
 
-        for ticker_price_deltas in self.price_deltas.iter() {
+        // Use permuted order for price deltas
+        for &real_idx in &self.ticker_perm {
+            let ticker_price_deltas = &self.price_deltas[real_idx];
             let start_idx = absolute_step.saturating_sub(PRICE_DELTAS_PER_TICKER - 1);
             let end_idx = (absolute_step + 1).min(ticker_price_deltas.len());
             let slice = &ticker_price_deltas[start_idx..end_idx];
@@ -39,38 +41,38 @@ impl Env {
         static_obs.push(self.last_fill_ratio as f32); // last_fill_ratio
         debug_assert_eq!(static_obs.len(), GLOBAL_STATIC_OBS);
 
-        // === Per-ticker observations (ticker-major format) ===
+        // === Per-ticker observations (ticker-major format, permuted order) ===
         let position_percents = self.account.position_percents(&self.prices, absolute_step);
 
-        for ticker_index in 0..TICKERS_COUNT as usize {
-            let current_price = self.prices[ticker_index][absolute_step];
+        for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
+            let current_price = self.prices[real_idx][absolute_step];
 
             // Position percent
-            static_obs.push(position_percents[ticker_index] as f32);
+            static_obs.push(position_percents[real_idx] as f32);
 
             // Unrealized P&L %
             static_obs.push(
-                self.account.positions[ticker_index]
+                self.account.positions[real_idx]
                     .appreciation(current_price) as f32,
             );
 
             // Momentum (20-step lookback)
             let past_step = absolute_step.saturating_sub(20);
-            let past_price = self.prices[ticker_index][past_step];
+            let past_price = self.prices[real_idx][past_step];
             static_obs.push(((current_price / past_price) - 1.0) as f32);
 
             // Trade activity EMA (0 = inactive, higher = more frequent trading)
-            static_obs.push(self.trade_activity_ema[ticker_index] as f32);
+            static_obs.push(self.trade_activity_ema[real_idx] as f32);
 
             // Action history for this ticker (most recent first)
             for i in 0..ACTION_HISTORY_LEN {
                 if i < self.action_history.len() {
                     let action_idx = self.action_history.len() - 1 - i;
-                    // buy_sell action for this ticker
-                    static_obs.push(self.action_history[action_idx][ticker_index] as f32);
+                    // buy_sell action for this ticker (stored in real order, need to look up)
+                    static_obs.push(self.action_history[action_idx][real_idx] as f32);
                     // hold action for this ticker
                     static_obs.push(
-                        self.action_history[action_idx][TICKERS_COUNT as usize + ticker_index]
+                        self.action_history[action_idx][TICKERS_COUNT as usize + real_idx]
                             as f32,
                     );
                 } else {
@@ -80,7 +82,7 @@ impl Env {
             }
             debug_assert_eq!(
                 static_obs.len(),
-                GLOBAL_STATIC_OBS + (ticker_index + 1) * PER_TICKER_STATIC_OBS
+                GLOBAL_STATIC_OBS + (perm_idx + 1) * PER_TICKER_STATIC_OBS
             );
         }
 

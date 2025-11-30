@@ -512,7 +512,7 @@ pub fn train(weights_path: Option<&str>) {
             total_rewards = 0.;
             total_episodes = 0.;
         }
-        if episode > 0 && episode % 100 == 0 {
+        if episode > 0 && episode % 50 == 0 {
             std::fs::create_dir_all("weights").ok();
             if let Err(err) = vs.save(format!("weights/ppo_ep{}.ot", episode)) {
                 println!("Error while saving weights: {}", err)
