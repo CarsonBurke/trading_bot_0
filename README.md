@@ -48,11 +48,18 @@ Multi-asset trading bot using deep RL (PPO) and historical price data.
 
 ### Single ticker (NVDA) training results
 
-| NVDA Performance                                                     |
-|:--------------------------------------------------------------------:|
-| ![PPO Gen 305 Final Assets](assets/ppo_gen305_nvda_final_assets.png) |
-| ![PPO Gen 305 NVDA Assets](assets/ppo_gen305_nvda_assets.png)        |
-| ![PPO Gen 305 NVDA Assets](assets/ppo_gen305_nvda_buy_sell.png)      |
+|                             Training Visualizations in Custom TUI                              |
+| :--------------------------------------------------------------------------------------------: |
+|                      ![](assets/6_ticker_ep51_assets_benchmarked_tui.png)                      |
+| 6 ticker assets (red) cash (green) combined total assets (blue) benchmarked over time (yellow) |
+|                             ![](assets/msft_ep51_buy_sell_tui.png)                             |
+|      buy (red) and sell (yellow) locations on randomly selected active region of trading       |
+|                        ![](assets/msft_ep51_assets_benchmarked_tui.png)                        |
+|                    assets and benchmark as before, but Microosoft specific                     |
+|                             ![](assets/intc_ep51_buy_sell_tui.png)                             |
+|                                buy and sell locations for intel                                |
+|                        ![](assets/intc_ep51_assets_benchmarked_tui.png)                        |
+|                       assets and benchmark as before, but Intel specific                       |
 
 ## Programmatic Strategies with Genetic Algorithm Optimization
 
@@ -63,8 +70,8 @@ This was the original project, but was effectively superseded by the RL models. 
 
 ### Single ticker (NVDA) training results
 
-| ![Screenshot From 2024-11-27 21-38-01](https://github.com/user-attachments/assets/b7d867be-14d1-4f08-9c2f-ca6bc66d830a)          |
-|:--------------------------------------------------------------------------------------------------------------------------------:|
-| *Total assets doubling from $10,000 -> $20,000 over the course of a year using one of the optimized strategic trading algorithms* |
+|      ![Screenshot From 2024-11-27 21-38-01](https://github.com/user-attachments/assets/b7d867be-14d1-4f08-9c2f-ca6bc66d830a)      |
+| :-------------------------------------------------------------------------------------------------------------------------------: |
+| _Total assets doubling from $10,000 -> $20,000 over the course of a year using one of the optimized strategic trading algorithms_ |
 
 Thanks to [rust-ibapi](https://github.com/wboayue/rust-ibapi) and its contributors for making this possible
