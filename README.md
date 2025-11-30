@@ -55,11 +55,11 @@ Multi-asset trading bot using deep RL (PPO) and historical price data.
 |                             ![](assets/msft_ep51_buy_sell_tui.png)                             |
 |      buy (red) and sell (yellow) locations on randomly selected active region of trading       |
 |                        ![](assets/msft_ep51_assets_benchmarked_tui.png)                        |
-|                    assets and benchmark as before, but Microosoft specific                     |
+|                    assets and benchmark as before, but MSFT specific                     |
 |                             ![](assets/intc_ep51_buy_sell_tui.png)                             |
 |                                buy and sell locations for intel                                |
 |                        ![](assets/intc_ep51_assets_benchmarked_tui.png)                        |
-|                       assets and benchmark as before, but Intel specific                       |
+|                       assets and benchmark as before, but INTC specific                       |
 
 ## Programmatic Strategies with Genetic Algorithm Optimization
 
