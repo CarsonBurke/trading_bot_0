@@ -46,8 +46,10 @@ pub struct Env {
     pub(super) peak_assets: f64,
     pub(super) last_reward: f64,
     pub(super) last_fill_ratio: f64,
-    pub(super) last_traded_step: Vec<usize>,
+    pub(super) trade_activity_ema: Vec<f64>,
 }
+
+pub(super) const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
 
 impl Env {
     pub(super) const STARTING_CASH: f64 = 10_000.0;
@@ -97,7 +99,7 @@ impl Env {
             peak_assets: Self::STARTING_CASH,
             last_reward: 0.0,
             last_fill_ratio: 1.0,
-            last_traded_step: vec![0; num_tickers],
+            trade_activity_ema: vec![0.0; num_tickers],
         }
     }
 
@@ -110,6 +112,11 @@ impl Env {
         for actions in all_actions.iter() {
             let absolute_step = self.episode_start_offset + self.step;
             self.account.update_total(&self.prices, absolute_step);
+
+            // Decay trade activity EMAs (trades will add TRADE_EMA_ALPHA back)
+            for ema in &mut self.trade_activity_ema {
+                *ema *= 1.0 - TRADE_EMA_ALPHA;
+            }
 
             self.action_history.push_back(actions.clone());
             if self.action_history.len() > ACTION_HISTORY_LEN {
@@ -270,7 +277,7 @@ impl Env {
         self.peak_assets = Self::STARTING_CASH;
         self.last_reward = 0.0;
         self.last_fill_ratio = 1.0;
-        self.last_traded_step.fill(self.episode_start_offset);
+        self.trade_activity_ema.fill(0.0);
 
         let (price_deltas, static_obs) = self.get_next_obs();
         let price_deltas_tensor = Tensor::from_slice(&price_deltas)

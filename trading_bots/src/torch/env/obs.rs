@@ -59,9 +59,8 @@ impl Env {
             let past_price = self.prices[ticker_index][past_step];
             static_obs.push(((current_price / past_price) - 1.0) as f32);
 
-            // Steps since last traded (normalized by max_step)
-            let steps_since = absolute_step.saturating_sub(self.last_traded_step[ticker_index]);
-            static_obs.push((steps_since as f32 / self.max_step as f32).min(1.0));
+            // Trade activity EMA (0 = inactive, higher = more frequent trading)
+            static_obs.push(self.trade_activity_ema[ticker_index] as f32);
 
             // Action history for this ticker (most recent first)
             for i in 0..ACTION_HISTORY_LEN {

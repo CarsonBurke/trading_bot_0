@@ -85,7 +85,8 @@ impl ProcessManagerState {
             cmd.arg("--weights").arg(w);
         }
 
-        cmd.stdin(Stdio::null())
+        cmd.env("CLICOLOR_FORCE", "1")
+            .stdin(Stdio::null())
             .stdout(log_file.try_clone()?)
             .stderr(log_file);
 

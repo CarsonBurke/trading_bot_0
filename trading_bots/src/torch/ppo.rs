@@ -239,10 +239,10 @@ pub fn train(weights_path: Option<&str>) {
 
         let price_deltas_batch = s_price_deltas
             .narrow(0, 0, n_steps)
-            .view([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
+            .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
         let static_obs_batch = s_static_obs
             .narrow(0, 0, n_steps)
-            .view([memory_size, STATIC_OBSERVATIONS as i64]);
+            .reshape([memory_size, STATIC_OBSERVATIONS as i64]);
 
         let (advantages, returns) = {
             let gae = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Float, device));
@@ -374,7 +374,7 @@ pub fn train(weights_path: Option<&str>) {
 
                 // Old predictions from buffer
                 let values_old_sample = s_values
-                    .view([memory_size, 1])
+                    .reshape([memory_size, 1])
                     .index_select(0, &batch_indexes);
 
                 // Normalize critic to match normalized returns

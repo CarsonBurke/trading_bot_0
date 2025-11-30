@@ -2,7 +2,7 @@ use tch::Tensor;
 
 use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE, RETROACTIVE_BUY_REWARD};
 
-use super::env::{BuyLot, Env};
+use super::env::{BuyLot, Env, TRADE_EMA_ALPHA};
 
 impl Env {
     pub(super) fn trade_by_delta_percent_with_hold(
@@ -49,7 +49,7 @@ impl Env {
             self.account.positions[ticker_index].quantity -= quantity;
             self.episode_history.total_commissions += commission;
             self.episode_history.sells[ticker_index].insert(absolute_step, (price, quantity));
-            self.last_traded_step[ticker_index] = absolute_step;
+            self.trade_activity_ema[ticker_index] += TRADE_EMA_ALPHA;
 
             if RETROACTIVE_BUY_REWARD {
                 sell_reward +=
@@ -112,7 +112,7 @@ impl Env {
             self.episode_history.total_commissions += commission;
             self.episode_history.buys[intent.ticker_index]
                 .insert(absolute_step, (intent.price, quantity));
-            self.last_traded_step[intent.ticker_index] = absolute_step;
+            self.trade_activity_ema[intent.ticker_index] += TRADE_EMA_ALPHA;
 
             if RETROACTIVE_BUY_REWARD {
                 self.buy_lots[intent.ticker_index].push_back(BuyLot {

@@ -24,8 +24,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(35),
-            Constraint::Percentage(65),
+            Constraint::Percentage(30),
+            Constraint::Percentage(45),
+            Constraint::Percentage(25),
         ])
         .split(main_chunks[1]);
 
@@ -87,6 +88,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                 "Drawdown",
                                 "Commissions",
                                 "Last Reward",
+                                "Fill Ratio",
                             ];
 
                             for (i, label) in global_labels.iter().enumerate() {
@@ -99,11 +101,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                         3 => if val >= 0.0 { theme::GREEN } else { theme::RED },
                                         4 => theme::YELLOW,
                                         5 => if val >= 0.0 { theme::GREEN } else { theme::RED },
+                                        6 => if val >= 0.9 { theme::GREEN } else { theme::YELLOW },
                                         _ => theme::TEXT,
                                     };
 
                                     let display_val = match i {
-                                        0 | 1 => format!("{:6.2}%", val * 100.0),
+                                        0 | 1 | 6 => format!("{:6.2}%", val * 100.0),
                                         2 | 3 => format!("{:+7.2}%", val * 100.0),
                                         4 | 5 => format!("{:8.4}", val),
                                         _ => format!("{:8.4}", val),
@@ -185,12 +188,86 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                             let right_paragraph = Paragraph::new(right_lines).block(right_block);
                             f.render_widget(right_paragraph, content_chunks[1]);
+
+                            // Temporal attention panel
+                            let temporal_block = Block::default()
+                                .borders(Borders::ALL)
+                                .title("Temporal Attention")
+                                .border_style(Style::default().fg(theme::SURFACE2));
+
+                            let attn_weights = json["attention_weights"].as_array();
+                            let mut temporal_lines = vec![];
+
+                            if let Some(attn_arr) = attn_weights {
+                                if let Some(last_attn) = attn_arr.last() {
+                                    if let Some(weights) = last_attn.as_array() {
+                                        let weights_f: Vec<f64> = weights.iter()
+                                            .filter_map(|v| v.as_f64())
+                                            .collect();
+
+                                        if !weights_f.is_empty() {
+                                            let len = weights_f.len();
+                                            let max_val = weights_f.iter().cloned().fold(0.0_f64, f64::max);
+                                            let max_idx = weights_f.iter().position(|&x| x == max_val).unwrap_or(0);
+                                            let peak_pct = (max_idx as f64 / len as f64) * 100.0;
+
+                                            // Entropy: -sum(p * ln(p))
+                                            let entropy: f64 = weights_f.iter()
+                                                .filter(|&&p| p > 1e-10)
+                                                .map(|&p| -p * p.ln())
+                                                .sum();
+                                            let max_entropy = (len as f64).ln();
+                                            let norm_entropy = entropy / max_entropy;
+
+                                            temporal_lines.push(Line::from(vec![
+                                                Span::styled("Peak: ", Style::default().fg(theme::SUBTEXT1)),
+                                                Span::styled(format!("{:.1}%", peak_pct), Style::default().fg(theme::PEACH)),
+                                                Span::styled(" of seq", Style::default().fg(theme::SUBTEXT0)),
+                                            ]));
+                                            temporal_lines.push(Line::from(vec![
+                                                Span::styled("Focus: ", Style::default().fg(theme::SUBTEXT1)),
+                                                Span::styled(format!("{:.1}%", (1.0 - norm_entropy) * 100.0),
+                                                    Style::default().fg(if norm_entropy < 0.5 { theme::GREEN } else { theme::YELLOW })),
+                                            ]));
+                                            temporal_lines.push(Line::from(""));
+
+                                            // Sparkline: divide into 10 buckets
+                                            let buckets = 10;
+                                            let bucket_size = len / buckets;
+                                            let mut bucket_sums: Vec<f64> = Vec::with_capacity(buckets);
+                                            for i in 0..buckets {
+                                                let start = i * bucket_size;
+                                                let end = if i == buckets - 1 { len } else { (i + 1) * bucket_size };
+                                                let sum: f64 = weights_f[start..end].iter().sum();
+                                                bucket_sums.push(sum);
+                                            }
+                                            let bucket_max = bucket_sums.iter().cloned().fold(0.0_f64, f64::max);
+
+                                            temporal_lines.push(Line::from(Span::styled("Old -> Recent", Style::default().fg(theme::SUBTEXT0))));
+                                            let bars = ["_", ".", "-", "=", "#"];
+                                            let bar_line: String = bucket_sums.iter().map(|&v| {
+                                                let level = ((v / bucket_max) * 4.0).round() as usize;
+                                                bars[level.min(4)]
+                                            }).collect();
+                                            temporal_lines.push(Line::from(Span::styled(format!("[{}]", bar_line), Style::default().fg(theme::SKY))));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if temporal_lines.is_empty() {
+                                temporal_lines.push(Line::from(Span::styled("No attention data", Style::default().fg(theme::SUBTEXT0))));
+                            }
+
+                            let temporal_paragraph = Paragraph::new(temporal_lines).block(temporal_block);
+                            f.render_widget(temporal_paragraph, content_chunks[2]);
                         } else {
                             let msg = Paragraph::new("No observation data in step")
                                 .block(left_block)
                                 .style(Style::default().fg(theme::SUBTEXT0));
                             f.render_widget(msg, content_chunks[0]);
                             f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[1]);
+                            f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[2]);
                         }
                     } else {
                         let msg = Paragraph::new("No observations data available")
@@ -198,6 +275,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             .style(Style::default().fg(theme::SUBTEXT0));
                         f.render_widget(msg, content_chunks[0]);
                         f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[1]);
+                        f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[2]);
                     }
                 } else {
                     let msg = Paragraph::new("Invalid observations format")
@@ -205,6 +283,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         .style(Style::default().fg(theme::RED));
                     f.render_widget(msg, content_chunks[0]);
                     f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[1]);
+                    f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[2]);
                 }
             } else {
                 let msg = Paragraph::new("Failed to parse observations JSON")
@@ -212,6 +291,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .style(Style::default().fg(theme::RED));
                 f.render_widget(msg, content_chunks[0]);
                 f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[1]);
+                f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[2]);
             }
         } else {
             let msg = Paragraph::new(format!("No observations file found at {}", obs_path))
@@ -219,6 +299,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .style(Style::default().fg(theme::SUBTEXT0));
             f.render_widget(msg, content_chunks[0]);
             f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[1]);
+            f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[2]);
         }
     } else {
         let msg = Paragraph::new("No episodes found. Train a model first.")
@@ -226,6 +307,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .style(Style::default().fg(theme::SUBTEXT0));
         f.render_widget(msg, content_chunks[0]);
         f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[1]);
+        f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::SURFACE2)), content_chunks[2]);
     }
 
     let help_text = " ESC: Back to Main | R: Refresh ";

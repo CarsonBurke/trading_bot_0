@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
@@ -38,9 +38,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let items: Vec<ListItem> = app.logs_page.training_output
         .iter()
         .map(|line| {
-            let stripped = strip_ansi(line);
-            let style = style_from_content(&stripped);
-            ListItem::new(stripped).style(style)
+            let parsed_line = parse_ansi_line(line);
+            ListItem::new(parsed_line)
         })
         .collect();
 
@@ -77,58 +76,81 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 
-fn strip_ansi(line: &str) -> String {
-    let mut result = String::new();
+fn parse_ansi_line(line: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut current_text = String::new();
+    let mut current_style = Style::default().fg(theme::TEXT);
     let bytes = line.as_bytes();
     let mut i = 0;
 
     while i < bytes.len() {
         if bytes[i] == b'\x1b' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            // Skip ANSI escape sequence
+            // Save current text if any
+            if !current_text.is_empty() {
+                spans.push(Span::styled(current_text.clone(), current_style));
+                current_text.clear();
+            }
+
+            // Parse ANSI escape sequence
             i += 2;
+            let mut code_str = String::new();
             while i < bytes.len() && bytes[i] != b'm' {
+                code_str.push(bytes[i] as char);
                 i += 1;
             }
             if i < bytes.len() {
                 i += 1; // Skip 'm'
             }
+
+            // Apply ANSI code to current style
+            current_style = apply_ansi_code(&code_str, current_style);
         } else {
-            result.push(bytes[i] as char);
+            current_text.push(bytes[i] as char);
             i += 1;
         }
     }
 
-    result
+    // Add remaining text
+    if !current_text.is_empty() {
+        spans.push(Span::styled(current_text, current_style));
+    }
+
+    // If no spans were created, add a default empty span
+    if spans.is_empty() {
+        spans.push(Span::raw(""));
+    }
+
+    Line::from(spans)
 }
 
-fn style_from_content(line: &str) -> Style {
-    let lower = line.to_lowercase();
-
-    // Error patterns
-    if lower.contains("error") || lower.contains("failed") || lower.contains("panic") {
-        return Style::default().fg(theme::RED);
+fn apply_ansi_code(code: &str, mut style: Style) -> Style {
+    for part in code.split(';') {
+        match part.trim() {
+            "0" => style = Style::default().fg(theme::TEXT), // Reset
+            "1" => style = style.add_modifier(Modifier::BOLD),
+            "4" => style = style.add_modifier(Modifier::UNDERLINED),
+            "22" => style = style.remove_modifier(Modifier::BOLD),
+            "24" => style = style.remove_modifier(Modifier::UNDERLINED),
+            // Foreground colors (30-37, 90-97)
+            "30" => style = style.fg(Color::Black),
+            "31" => style = style.fg(Color::Red),
+            "32" => style = style.fg(Color::Green),
+            "33" => style = style.fg(Color::Yellow),
+            "34" => style = style.fg(Color::Blue),
+            "35" => style = style.fg(Color::Magenta),
+            "36" => style = style.fg(Color::Cyan),
+            "37" => style = style.fg(Color::White),
+            "90" => style = style.fg(Color::DarkGray),
+            "91" => style = style.fg(Color::LightRed),
+            "92" => style = style.fg(Color::LightGreen),
+            "93" => style = style.fg(Color::LightYellow),
+            "94" => style = style.fg(Color::LightBlue),
+            "95" => style = style.fg(Color::LightMagenta),
+            "96" => style = style.fg(Color::LightCyan),
+            "97" => style = style.fg(Color::Gray),
+            "39" => style = style.fg(theme::TEXT), // Default foreground
+            _ => {}
+        }
     }
-
-    // Warning patterns
-    if lower.contains("warn") || lower.contains("warning") {
-        return Style::default().fg(theme::PEACH);
-    }
-
-    // Episode/training progress
-    if lower.contains("episode") {
-        return Style::default().fg(theme::BLUE);
-    }
-
-    // Success patterns
-    if lower.contains("finished") || lower.contains("completed") || lower.contains("success") {
-        return Style::default().fg(theme::GREEN);
-    }
-
-    // Compiling messages
-    if lower.contains("compiling") || lower.contains("checking") {
-        return Style::default().fg(theme::LAVENDER);
-    }
-
-    // Default
-    Style::default().fg(theme::TEXT)
+    style
 }

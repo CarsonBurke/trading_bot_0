@@ -64,11 +64,20 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
     let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
 
-    // FC layers: pooled conv features (mean+max = 512) + global static obs
-    let fc1_input_size = 512 + GLOBAL_STATIC_OBS as i64;
+    // PMA (Pooling by Multihead Attention) - permutation-invariant set pooling
+    let pma_num_seeds = 2;
+    let pma_seeds = p.var("pma_seeds", &[pma_num_seeds, 256], Init::Uniform { lo: -0.1, up: 0.1 });
+    let pma_kv = nn::linear(p / "pma_kv", 256, 256 * 2, Default::default()); // K, V for ticker features
+    let pma_q = nn::linear(p / "pma_q", 256, 256, Default::default()); // Q for seeds
+    let pma_out = nn::linear(p / "pma_out", 256, 256, Default::default());
+    let ln_pma = nn::layer_norm(p / "ln_pma", vec![256], Default::default());
 
-    // More efficient compression with GAP - dramatically reduced parameter count
-    // GAP reduces conv features from 37,888 to 256, so fc1 goes from ~39M to ~153K params
+    // (B) Condition PMA seeds on global static features
+    let global_to_seed = nn::linear(p / "global_to_seed", GLOBAL_STATIC_OBS as i64, 256, Default::default());
+
+    // FC layers: PMA output (2 seeds * 256 = 512)
+    // Global static now flows through PMA seed conditioning, no need to concat here
+    let fc1_input_size = 512;
     let fc1 = nn::linear(p / "l1", fc1_input_size, 512, Default::default());
     let ln_fc1 = nn::layer_norm(p / "ln_fc1", vec![512], Default::default());
 
@@ -111,9 +120,20 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
     let log_std_param = p.var("log_std", &[nact], Init::Const(0.0));
 
-    // Learnable positional embedding for temporal dimension before GAP
-    // Allows model to weight recent vs old patterns differently
+    // Learnable positional embedding for temporal dimension
     let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
+
+    // (A) Condition temporal pooling on per-ticker statics
+    // Project per-ticker statics to 64 dims to modulate temporal attention
+    let static_to_temporal = nn::linear(p / "static_to_temporal", PER_TICKER_STATIC_OBS as i64, 64, Default::default());
+    let ln_static_temporal = nn::layer_norm(p / "ln_static_temporal", vec![64], Default::default());
+
+    // Channel-grouped temporal attention pooling (4 groups of 64 channels)
+    // Each group: concat [64 conv channels, 64 static proj] = 128 -> 1
+    let temporal_pool_0 = nn::linear(p / "temporal_pool_0", 128, 1, Default::default());
+    let temporal_pool_1 = nn::linear(p / "temporal_pool_1", 128, 1, Default::default());
+    let temporal_pool_2 = nn::linear(p / "temporal_pool_2", 128, 1, Default::default());
+    let temporal_pool_3 = nn::linear(p / "temporal_pool_3", 128, 1, Default::default());
 
     let device = p.device();
     Box::new(move |price_deltas: &Tensor, static_features: &Tensor, train: bool| {
@@ -126,12 +146,12 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let global_static = static_features.narrow(1, 0, GLOBAL_STATIC_OBS as i64);
         let per_ticker_static = static_features
             .narrow(1, GLOBAL_STATIC_OBS as i64, TICKERS_COUNT * PER_TICKER_STATIC_OBS as i64)
-            .view([batch_size, TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64]);
+            .reshape([batch_size, TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64]);
 
         // === Conv processing (shared weights across tickers) ===
         let price_deltas_reshaped = price_deltas
-            .reshape(&[batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
-            .reshape(&[batch_size * TICKERS_COUNT, 1, PRICE_DELTAS_PER_TICKER as i64]);
+            .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
+            .view([batch_size * TICKERS_COUNT, 1, PRICE_DELTAS_PER_TICKER as i64]);
 
         let x = price_deltas_reshaped.apply(&c1).silu();
         let x = x.apply(&gn2).apply(&c2_dw).apply(&c2_pw).silu();
@@ -143,12 +163,50 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let x = (x + x5_input).silu();
 
         let x = x + &pos_embedding;
+        let temporal_len = x.size()[2];
 
-        // GAP: [batch*TICKERS, 256, T] -> [batch*TICKERS, 256]
-        let gap_output = x.adaptive_avg_pool1d(1).squeeze_dim(2);
+        // (A) Project per-ticker statics to condition temporal attention
+        // per_ticker_static: [batch, TICKERS, S] -> [batch*TICKERS, 64]
+        let static_temporal_proj = per_ticker_static
+            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
+            .apply(&static_to_temporal)
+            .apply(&ln_static_temporal);
+        // Broadcast over time: [batch*TICKERS, 64] -> [batch*TICKERS, 64, T]
+        let static_temporal_broadcast = static_temporal_proj
+            .unsqueeze(2)
+            .expand(&[-1, -1, temporal_len], false);
+
+        // Channel-grouped attention pooling: [batch*TICKERS, 256, T] -> [batch*TICKERS, 256]
+        // Each group concats [64 conv, 64 static] = 128 before scoring
+        let x_groups = x.chunk(4, 1); // 4 x [batch*TICKERS, 64, T]
+        let temporal_pools = [&temporal_pool_0, &temporal_pool_1, &temporal_pool_2, &temporal_pool_3];
+
+        let mut pooled_groups = Vec::with_capacity(4);
+        let mut attn_sum = Tensor::zeros(&[batch_size * TICKERS_COUNT, temporal_len], (x.kind(), x.device()));
+
+        for (group, pool) in x_groups.iter().zip(temporal_pools.iter()) {
+            // Concat conv features with static projection: [batch*TICKERS, 128, T]
+            let group_with_static = Tensor::cat(&[group.shallow_clone(), static_temporal_broadcast.shallow_clone()], 1);
+            let logits = group_with_static
+                .permute(&[0, 2, 1])    // [batch*TICKERS, T, 128]
+                .apply(*pool)           // [batch*TICKERS, T, 1]
+                .squeeze_dim(-1);       // [batch*TICKERS, T]
+            let attn = logits.softmax(-1, logits.kind());
+            attn_sum = attn_sum + &attn;
+            // Pool original conv features (not the concat)
+            let pooled_group = group.bmm(&attn.unsqueeze(-1)).squeeze_dim(-1); // [batch*TICKERS, 64]
+            pooled_groups.push(pooled_group);
+        }
+
+        let pooled = Tensor::cat(&pooled_groups, 1); // [batch*TICKERS, 256]
+
+        // Average temporal attention across groups and tickers for visualization
+        let temporal_attn_avg = (attn_sum / 4.0)
+            .reshape([batch_size, TICKERS_COUNT, -1])
+            .mean_dim(1, false, x.kind());
 
         // Reshape: [batch*TICKERS, 256] -> [batch, TICKERS, 256]
-        let conv_features = gap_output.view([batch_size, TICKERS_COUNT, 256]);
+        let conv_features = pooled.view([batch_size, TICKERS_COUNT, 256]);
 
         // === Combine conv features with per-ticker static features ===
         // [batch, TICKERS, 256] + [batch, TICKERS, 44] -> [batch, TICKERS, 300]
@@ -156,15 +214,15 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
         // Project back to 256 dims: [batch, TICKERS, 300] -> [batch, TICKERS, 256]
         let combined_ticker = combined_ticker
-            .view([batch_size * TICKERS_COUNT, 256 + PER_TICKER_STATIC_OBS as i64])
+            .reshape([batch_size * TICKERS_COUNT, 256 + PER_TICKER_STATIC_OBS as i64])
             .apply(&static_proj)
             .apply(&ln_static_proj)
             .silu()
-            .view([batch_size, TICKERS_COUNT, 256]);
+            .reshape([batch_size, TICKERS_COUNT, 256]);
 
         // === Cross-ticker attention ===
         let qkv = combined_ticker.apply(&attn_qkv);
-        let qkv = qkv.view([batch_size, TICKERS_COUNT, 3, num_heads, head_dim]);
+        let qkv = qkv.reshape([batch_size, TICKERS_COUNT, 3, num_heads, head_dim]);
         let qkv = qkv.permute(&[2, 0, 3, 1, 4]);
 
         let q = qkv.get(0);
@@ -182,21 +240,42 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
         let ticker_features = (combined_ticker + attn_output).apply(&ln_attn);
 
-        // === Mean + Max pooling (permutation-invariant) ===
-        // [batch, TICKERS, 256] -> [batch, 256] each
-        let mean_pool = ticker_features.mean_dim(1, false, ticker_features.kind());
-        let max_pool = ticker_features.amax(&[1], false);
-        // [batch, 512]
-        let pooled_features = Tensor::cat(&[mean_pool, max_pool], 1);
+        // === PMA: Pooling by Multihead Attention ===
+        // (B) Condition seeds on global static features
+        // global_static: [batch, G] -> [batch, 256] -> [batch, 1, 256]
+        let global_seed_bias = global_static.apply(&global_to_seed).unsqueeze(1);
+        // Seeds: [num_seeds, 256] + global bias -> [batch, num_seeds, 256]
+        let seeds_expanded = pma_seeds.unsqueeze(0) + global_seed_bias;
 
-        // Dummy attention weights for compatibility (no longer meaningful)
-        let static_attn_weights = global_static.softmax(-1, global_static.kind());
+        // Project seeds to Q, ticker_features to K,V
+        let pma_q_proj = seeds_expanded.apply(&pma_q); // [batch, num_seeds, 256]
+        let pma_kv_proj = ticker_features.apply(&pma_kv); // [batch, TICKERS, 512]
+        let pma_kv_split = pma_kv_proj.chunk(2, 2);
+        let pma_k = &pma_kv_split[0]; // [batch, TICKERS, 256]
+        let pma_v = &pma_kv_split[1]; // [batch, TICKERS, 256]
 
-        // === Combine with global static features ===
-        let combined = Tensor::cat(&[pooled_features, global_static], 1);
+        // Reshape for multi-head attention: [batch, seq, 256] -> [batch, heads, seq, head_dim]
+        let pma_q_heads = pma_q_proj.reshape([batch_size, pma_num_seeds, num_heads, head_dim]).permute(&[0, 2, 1, 3]);
+        let pma_k_heads = pma_k.reshape([batch_size, TICKERS_COUNT, num_heads, head_dim]).permute(&[0, 2, 1, 3]);
+        let pma_v_heads = pma_v.reshape([batch_size, TICKERS_COUNT, num_heads, head_dim]).permute(&[0, 2, 1, 3]);
+
+        // Scaled dot-product attention: seeds attend to tickers
+        let pma_scale = (head_dim as f64).sqrt();
+        let pma_scores = pma_q_heads.matmul(&pma_k_heads.transpose(-2, -1)) / pma_scale;
+        let pma_weights = pma_scores.softmax(-1, pma_scores.kind());
+        let pma_attn_out = pma_weights.matmul(&pma_v_heads); // [batch, heads, num_seeds, head_dim]
+
+        // Reshape back and project
+        let pma_attn_out = pma_attn_out.permute(&[0, 2, 1, 3]).contiguous();
+        let pma_attn_out = pma_attn_out.view([batch_size, pma_num_seeds, 256]);
+        let pma_attn_out = pma_attn_out.apply(&pma_out);
+
+        // Residual + LayerNorm, then flatten
+        let pma_out_final = (seeds_expanded + pma_attn_out).apply(&ln_pma);
+        let pooled_features = pma_out_final.reshape([batch_size, pma_num_seeds * 256]); // [batch, 512]
 
         // Shared FC1 layer with Pre-LayerNorm
-        let fc1_out = combined.apply(&fc1);
+        let fc1_out = pooled_features.apply(&fc1);
         let fc1_norm = fc1_out.apply(&ln_fc1).silu();
 
         // Split into separate actor and critic paths at FC2
@@ -220,6 +299,6 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
         let action_log_std = log_std_param.tanh() * 4.0 - 1.5;
 
-        (critic_value, (action_mean, action_log_std), static_attn_weights)
+        (critic_value, (action_mean, action_log_std), temporal_attn_avg)
     })
 }
