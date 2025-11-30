@@ -20,6 +20,72 @@ pub fn create_data_analysis_charts(
     Ok(())
 }
 
+pub fn create_index_chart(
+    tickers: &[String],
+    all_prices: &[Vec<f64>],
+    base_dir: &str,
+) -> Result<(), Box<dyn Error>> {
+    if all_prices.is_empty() || all_prices[0].is_empty() {
+        return Ok(());
+    }
+
+    let num_steps = all_prices[0].len();
+    let mut index_values = vec![100.0];
+
+    for step in 1..num_steps {
+        let mut step_return = 0.0;
+        for prices in all_prices {
+            if step < prices.len() {
+                step_return += prices[step] / prices[step - 1];
+            }
+        }
+        step_return /= all_prices.len() as f64;
+
+        let new_value = index_values.last().unwrap() * step_return;
+        index_values.push(new_value);
+    }
+
+    let path = format!("{}/index.{}", base_dir, CHART_IMAGE_FORMAT);
+    let root = BitMapBackend::new(&path, (2560, 800)).into_drawing_area();
+    root.fill(&theme::BASE)?;
+
+    let max_val = index_values
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_val = index_values
+        .iter()
+        .cloned()
+        .fold(f64::INFINITY, f64::min);
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(
+            format!("Equal-Weighted Index ({})", tickers.join(", ")),
+            ("sans-serif", 30, &theme::TEXT),
+        )
+        .margin(10)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d(0..index_values.len(), min_val * 0.95..max_val * 1.05)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("Time Step")
+        .y_desc("Index Value (Base 100)")
+        .label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0)
+        .draw()?;
+
+    chart.draw_series(LineSeries::new(
+        index_values.iter().enumerate().map(|(i, v)| (i, *v)),
+        ShapeStyle::from(&theme::BLUE).stroke_width(2),
+    ))?;
+
+    root.present()?;
+    Ok(())
+}
+
 fn volatility_chart(
     dir: &str,
     ticker: &str,

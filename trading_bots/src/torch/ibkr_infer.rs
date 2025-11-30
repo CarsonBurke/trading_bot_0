@@ -13,9 +13,12 @@ use ibapi::{
 };
 
 use crate::constants::api;
-use crate::torch::constants::{ACTION_HISTORY_LEN, ACTION_THRESHOLD, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
+use crate::torch::constants::{
+    ACTION_HISTORY_LEN, ACTION_THRESHOLD, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS,
+    PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
+};
 use crate::torch::infer::{load_model, sample_actions};
-use crate::types::{Account, Position};
+use crate::types::Account;
 
 const MAX_ACCOUNT_VALUE: Option<f64> = Some(10_000.0);
 
@@ -78,7 +81,8 @@ impl LiveMarketState {
             return None;
         }
 
-        let mut price_deltas_flat = Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER);
+        let mut price_deltas_flat =
+            Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER);
         for ticker_deltas in &self.price_deltas {
             for &delta in ticker_deltas.iter().rev().take(PRICE_DELTAS_PER_TICKER) {
                 price_deltas_flat.push(delta as f32);
@@ -86,50 +90,71 @@ impl LiveMarketState {
         }
 
         let current_prices = self.get_current_prices();
-        let position_percents: Vec<f64> = self.account.positions
+        let position_percents: Vec<f64> = self
+            .account
+            .positions
             .iter()
             .enumerate()
             .map(|(i, p)| p.value_with_price(current_prices[i]) / self.account.total_assets)
             .collect();
 
         let mut static_obs = Vec::with_capacity(STATIC_OBSERVATIONS);
-        static_obs.push(1.0f32);
-        static_obs.push((self.account.cash / self.account.total_assets) as f32);
 
-        for &pos_pct in &position_percents {
-            static_obs.push(pos_pct as f32);
-        }
+        // === Global observations (GLOBAL_STATIC_OBS = 6) ===
+        static_obs.push(1.0f32); // step progress (live = always 1.0)
+        static_obs.push((self.account.cash / self.account.total_assets) as f32); // cash_percent
+        static_obs.push(0.0f32); // pnl (not tracked in live)
+        static_obs.push(0.0f32); // drawdown (not tracked in live)
+        static_obs.push(0.0f32); // commissions (not tracked in live)
+        static_obs.push(0.0f32); // last_reward (not applicable in live)
+        debug_assert_eq!(static_obs.len(), GLOBAL_STATIC_OBS);
 
-        // Time-weighted returns (simplified for live trading without lot tracking)
-        for (i, position) in self.account.positions.iter().enumerate() {
-            let time_weighted_return = if position.quantity > 0.0 && position.avg_price > 0.0 {
-                let current_price = current_prices[i];
-                let return_pct = (current_price - position.avg_price) / position.avg_price;
-                let hold_time = (self.step_count.max(1)) as f64;
-                return_pct / hold_time.sqrt()
+        // === Per-ticker observations (ticker-major format) ===
+        for ticker_idx in 0..TICKERS_COUNT as usize {
+            let position = &self.account.positions[ticker_idx];
+            let current_price = current_prices[ticker_idx];
+
+            // Position percent
+            static_obs.push(position_percents[ticker_idx] as f32);
+
+            // Unrealized P&L % (matches step.rs appreciation calculation)
+            static_obs.push(position.appreciation(current_price) as f32);
+
+            // Momentum (20-step lookback)
+            let momentum = if self.prices[ticker_idx].len() >= 20 {
+                let past_price = self.prices[ticker_idx]
+                    [self.prices[ticker_idx].len().saturating_sub(20)];
+                (current_price / past_price - 1.0) as f32
             } else {
-                0.0
+                0.0f32
             };
-            static_obs.push(time_weighted_return as f32);
-        }
+            static_obs.push(momentum);
 
-        for i in 0..ACTION_HISTORY_LEN {
-            if i < self.action_history.len() {
-                let action_idx = self.action_history.len() - 1 - i;
-                for &action in &self.action_history[action_idx] {
-                    static_obs.push(action as f32);
-                }
-            } else {
-                for _ in 0..(TICKERS_COUNT * 2) {
-                    static_obs.push(0.0f32);
+            // Action history for this ticker (most recent first)
+            for i in 0..ACTION_HISTORY_LEN {
+                if i < self.action_history.len() {
+                    let action_idx = self.action_history.len() - 1 - i;
+                    // buy_sell action for this ticker
+                    static_obs.push(self.action_history[action_idx][ticker_idx] as f32);
+                    // hold action for this ticker
+                    static_obs.push(
+                        self.action_history[action_idx][TICKERS_COUNT as usize + ticker_idx] as f32,
+                    );
+                } else {
+                    static_obs.push(0.0f32); // buy_sell padding
+                    static_obs.push(0.0f32); // hold padding
                 }
             }
+            debug_assert_eq!(
+                static_obs.len(),
+                GLOBAL_STATIC_OBS + (ticker_idx + 1) * PER_TICKER_STATIC_OBS
+            );
         }
 
         let price_deltas_tensor = Tensor::from_slice(&price_deltas_flat)
             .view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
-        let static_obs_tensor = Tensor::from_slice(&static_obs)
-            .view([1, STATIC_OBSERVATIONS as i64]);
+        let static_obs_tensor =
+            Tensor::from_slice(&static_obs).view([1, STATIC_OBSERVATIONS as i64]);
 
         Some((price_deltas_tensor, static_obs_tensor))
     }

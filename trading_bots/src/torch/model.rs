@@ -2,7 +2,7 @@ use tch::nn::Init;
 use tch::{nn, Tensor};
 
 use crate::torch::constants::{
-    PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT
+    GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
 
 // Temporal length after all conv layers: 
@@ -48,20 +48,24 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     let c5_dw = nn::conv1d(p / "c5_dw", 256, 256, 3, nn::ConvConfig { stride: 1, padding: 1, groups: 256, ..Default::default() });  // Depthwise
     let c5_pw = nn::conv1d(p / "c5_pw", 256, 256, 1, Default::default());  // Pointwise 1x1 (maintain)
 
+    // Projection to combine conv features (256) with per-ticker static features
+    let static_proj = nn::linear(
+        p / "static_proj",
+        256 + PER_TICKER_STATIC_OBS as i64,
+        256,
+        Default::default(),
+    );
+    let ln_static_proj = nn::layer_norm(p / "ln_static_proj", vec![256], Default::default());
+
     // Cross-ticker attention for learning inter-asset relationships
-    // Simple multi-head self-attention over ticker dimension
     let num_heads = 4;
-    let head_dim = 64;  // 256 / 4
+    let head_dim = 64; // 256 / 4
     let attn_qkv = nn::linear(p / "attn_qkv", 256, 256 * 3, Default::default());
     let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
     let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
 
-    // Feature-wise attention for interpretability
-    let static_attn_fc = nn::linear(p / "static_attn", STATIC_OBSERVATIONS as i64, STATIC_OBSERVATIONS as i64, Default::default());
-
-    // FC layers: conv features + attended static observations
-    let conv_output_size = TICKERS_COUNT * 256;
-    let fc1_input_size = conv_output_size + STATIC_OBSERVATIONS as i64;
+    // FC layers: pooled conv features (mean+max = 512) + global static obs
+    let fc1_input_size = 512 + GLOBAL_STATIC_OBS as i64;
 
     // More efficient compression with GAP - dramatically reduced parameter count
     // GAP reduces conv features from 37,888 to 256, so fc1 goes from ~39M to ~153K params
@@ -117,71 +121,79 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let static_features = static_features.to_device(device);
         let batch_size = price_deltas.size()[0];
 
-        // Reshape price deltas for conv: [batch, TICKERS * PRICE_DELTAS] -> [batch*TICKERS, 1, PRICE_DELTAS]
+        // === Parse static features into global and per-ticker ===
+        // Format: [global (6), per_ticker_0 (43), per_ticker_1 (43), ...]
+        let global_static = static_features.narrow(1, 0, GLOBAL_STATIC_OBS as i64);
+        let per_ticker_static = static_features
+            .narrow(1, GLOBAL_STATIC_OBS as i64, TICKERS_COUNT * PER_TICKER_STATIC_OBS as i64)
+            .view([batch_size, TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64]);
+
+        // === Conv processing (shared weights across tickers) ===
         let price_deltas_reshaped = price_deltas
             .reshape(&[batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
             .reshape(&[batch_size * TICKERS_COUNT, 1, PRICE_DELTAS_PER_TICKER as i64]);
 
-        // Apply ConvNeXt-style blocks with depthwise-pointwise convolutions
-        // One SiLU per block after pointwise conv
-
-        // Block 1: Regular Conv stem (no pre-norm to preserve input scale)
         let x = price_deltas_reshaped.apply(&c1).silu();
-
-        // Block 2: Pre-GN → Depthwise → Pointwise → SiLU
         let x = x.apply(&gn2).apply(&c2_dw).apply(&c2_pw).silu();
-
-        // Block 3: Pre-GN → Depthwise → Pointwise → SiLU
         let x = x.apply(&gn3).apply(&c3_dw).apply(&c3_pw).silu();
-
-        // Block 4: Pre-GN → Depthwise → Pointwise → SiLU
         let x = x.apply(&gn4).apply(&c4_dw).apply(&c4_pw).silu();
 
-        // Block 5: Pre-GN → Depthwise → Pointwise → SiLU + Residual
-        let x5_input = x.shallow_clone();  // Save for residual
+        let x5_input = x.shallow_clone();
         let x = x.apply(&gn5).apply(&c5_dw).apply(&c5_pw);
-        let x = (x + x5_input).silu();  // Residual connection + activation
+        let x = (x + x5_input).silu();
 
-        // Add positional embedding before GAP to preserve recency information
         let x = x + &pos_embedding;
 
-        // Apply Global Average Pooling per ticker using adaptive pooling
-        // Shape-agnostic: [batch*TICKERS, 256, T] -> [batch*TICKERS, 256, 1] -> [batch*TICKERS, 256]
+        // GAP: [batch*TICKERS, 256, T] -> [batch*TICKERS, 256]
         let gap_output = x.adaptive_avg_pool1d(1).squeeze_dim(2);
 
-        // Reshape for cross-ticker attention: [batch*TICKERS, 256] -> [batch, TICKERS, 256]
-        let ticker_features = gap_output.view([batch_size, TICKERS_COUNT, 256]);
+        // Reshape: [batch*TICKERS, 256] -> [batch, TICKERS, 256]
+        let conv_features = gap_output.view([batch_size, TICKERS_COUNT, 256]);
 
-        // Multi-head self-attention over tickers
-        let qkv = ticker_features.apply(&attn_qkv);  // [batch, TICKERS, 768]
+        // === Combine conv features with per-ticker static features ===
+        // [batch, TICKERS, 256] + [batch, TICKERS, 43] -> [batch, TICKERS, 299]
+        let combined_ticker = Tensor::cat(&[conv_features, per_ticker_static], 2);
+
+        // Project back to 256 dims: [batch, TICKERS, 299] -> [batch, TICKERS, 256]
+        let combined_ticker = combined_ticker
+            .view([batch_size * TICKERS_COUNT, 256 + PER_TICKER_STATIC_OBS as i64])
+            .apply(&static_proj)
+            .apply(&ln_static_proj)
+            .silu()
+            .view([batch_size, TICKERS_COUNT, 256]);
+
+        // === Cross-ticker attention ===
+        let qkv = combined_ticker.apply(&attn_qkv);
         let qkv = qkv.view([batch_size, TICKERS_COUNT, 3, num_heads, head_dim]);
-        let qkv = qkv.permute(&[2, 0, 3, 1, 4]);  // [3, batch, heads, TICKERS, head_dim]
+        let qkv = qkv.permute(&[2, 0, 3, 1, 4]);
 
-        let q = qkv.get(0);  // [batch, heads, TICKERS, head_dim]
+        let q = qkv.get(0);
         let k = qkv.get(1);
         let v = qkv.get(2);
 
-        // Scaled dot-product attention
         let scale = (head_dim as f64).sqrt();
-        let attn_scores = q.matmul(&k.transpose(-2, -1)) / scale;  // [batch, heads, TICKERS, TICKERS]
+        let attn_scores = q.matmul(&k.transpose(-2, -1)) / scale;
         let attn_weights = attn_scores.softmax(-1, attn_scores.kind());
-        let attn_output = attn_weights.matmul(&v);  // [batch, heads, TICKERS, head_dim]
+        let attn_output = attn_weights.matmul(&v);
 
-        // Reshape and project back
         let attn_output = attn_output.permute(&[0, 2, 1, 3]).contiguous();
         let attn_output = attn_output.view([batch_size, TICKERS_COUNT, 256]);
         let attn_output = attn_output.apply(&attn_out);
 
-        // Residual connection + LayerNorm
-        let ticker_features = (ticker_features + attn_output).apply(&ln_attn);
+        let ticker_features = (combined_ticker + attn_output).apply(&ln_attn);
 
-        // Flatten ticker features: [batch, TICKERS, 256] -> [batch, TICKERS*256]
-        let conv_features = ticker_features.view([batch_size, -1]);
+        // === Mean + Max pooling (permutation-invariant) ===
+        // [batch, TICKERS, 256] -> [batch, 256] each
+        let mean_pool = ticker_features.mean_dim(1, false, ticker_features.kind());
+        let max_pool = ticker_features.amax(&[1], false);
+        // [batch, 512]
+        let pooled_features = Tensor::cat(&[mean_pool, max_pool], 1);
 
-        // Feature-wise attention for visualization (don't apply to actual features)
-        let static_attn_weights = static_features.apply(&static_attn_fc).softmax(-1, static_features.kind());
+        // Dummy attention weights for compatibility (no longer meaningful)
+        let static_attn_weights = global_static.softmax(-1, global_static.kind());
 
-        let combined = Tensor::cat(&[conv_features, static_features], 1);
+        // === Combine with global static features ===
+        let combined = Tensor::cat(&[pooled_features, global_static], 1);
 
         // Shared FC1 layer with Pre-LayerNorm
         let fc1_out = combined.apply(&fc1);

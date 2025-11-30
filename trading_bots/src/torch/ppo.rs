@@ -47,6 +47,15 @@ pub fn train(weights_path: Option<&str>) {
             eprintln!("Warning: Failed to create data analysis charts for {}: {}", ticker, e);
         }
     }
+
+    if let Err(e) = crate::charts::data_analysis::create_index_chart(
+        &env.tickers,
+        &env.prices,
+        data_dir,
+    ) {
+        eprintln!("Warning: Failed to create index chart: {}", e);
+    }
+
     println!("Data analysis charts generated in {}/", data_dir);
 
     // n_steps is the episode length - use constant since all episodes are same length

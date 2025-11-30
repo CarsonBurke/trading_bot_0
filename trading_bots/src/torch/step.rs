@@ -10,8 +10,9 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_HISTORY_LEN, ACTION_THRESHOLD, COMMISSION_RATE, PRICE_DELTAS_PER_TICKER,
-            RETROACTIVE_BUY_REWARD, STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
+            ACTION_HISTORY_LEN, ACTION_THRESHOLD, COMMISSION_RATE, GLOBAL_STATIC_OBS,
+            PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, RETROACTIVE_BUY_REWARD,
+            STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
         },
         ppo::NPROCS,
     },
@@ -20,7 +21,7 @@ use crate::{
 };
 
 // Reward scaling factors
-const REWARD_SCALE: f64 = 1.0; // Scale rewards for better gradient signal
+const REWARD_SCALE: f64 = 20.0;
 const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
 const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 0.01;
@@ -50,6 +51,8 @@ pub struct Env {
     random_start: bool,
     buy_lots: Vec<VecDeque<BuyLot>>,
     retroactive_rewards: HashMap<usize, f64>,
+    peak_assets: f64,
+    last_reward: f64,
 }
 
 impl Env {
@@ -97,6 +100,8 @@ impl Env {
             random_start,
             buy_lots: vec![VecDeque::new(); num_tickers],
             retroactive_rewards: HashMap::new(),
+            peak_assets: Self::STARTING_CASH,
+            last_reward: 0.0,
         }
     }
 
@@ -123,6 +128,11 @@ impl Env {
             let (total_commission, trade_sell_reward) = self.trade_by_delta_percent_with_hold(buy_sell_actions, hold_actions, absolute_step);
             let reward = self.get_index_benchmark_pnl_reward(absolute_step, total_commission)
                 + if RETROACTIVE_BUY_REWARD { trade_sell_reward } else { 0.0 };
+
+            self.last_reward = reward;
+            if self.account.total_assets > self.peak_assets {
+                self.peak_assets = self.account.total_assets;
+            }
 
             let is_done = self.get_is_done();
 
@@ -186,7 +196,7 @@ impl Env {
                 );
 
                 self.episode_history
-                    .record(self.episode, &self.tickers, &self.prices);
+                    .record(self.episode, &self.tickers, &self.prices, self.episode_start_offset);
                 self.meta_history
                     .record(&self.episode_history, outperformance);
 
@@ -699,65 +709,80 @@ impl Env {
 
     fn get_next_obs(&self) -> (Vec<f32>, Vec<f32>) {
         // Return two separate vectors: (price_deltas, static_obs)
+        // Static obs format: [global_obs (6), per_ticker_obs for each ticker]
+        // This ticker-major format enables ticker-agnostic processing in the model
 
-        // Part 1: Price deltas for all tickers (will go through convolutions)
         let mut price_deltas = Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER);
-
         let absolute_step = self.episode_start_offset + self.step;
 
         for ticker_price_deltas in self.price_deltas.iter() {
-            // Get historical price deltas (using absolute position in data)
             let start_idx = absolute_step.saturating_sub(PRICE_DELTAS_PER_TICKER - 1);
             let end_idx = (absolute_step + 1).min(ticker_price_deltas.len());
             let slice = &ticker_price_deltas[start_idx..end_idx];
             let to_take = slice.len().min(PRICE_DELTAS_PER_TICKER);
 
-            // Pad with zeros if not enough historical data
             let padding_needed = PRICE_DELTAS_PER_TICKER - to_take;
             if padding_needed > 0 {
                 price_deltas.extend(std::iter::repeat(0.0f32).take(padding_needed));
             }
-
-            // Add price deltas (reversed to get most recent first)
             price_deltas.extend(slice.iter().rev().take(to_take).map(|&x| x as f32));
         }
 
-        // Part 2: Static observations (will bypass convolutions)
         let mut static_obs = Vec::with_capacity(STATIC_OBSERVATIONS);
 
-        let cash_percent = (self.account.cash / self.account.total_assets) as f32;
+        // === Global observations (GLOBAL_STATIC_OBS = 6) ===
+        static_obs.push(1.0 - (self.step as f32 / (self.max_step - 1).max(1) as f32)); // step progress
+        static_obs.push((self.account.cash / self.account.total_assets) as f32); // cash_percent
+        static_obs.push(((self.account.total_assets / Self::STARTING_CASH) - 1.0) as f32); // pnl
+        static_obs.push(if self.peak_assets > 0.0 {
+            ((self.account.total_assets / self.peak_assets) - 1.0) as f32
+        } else {
+            0.0
+        }); // drawdown
+        static_obs.push((self.episode_history.total_commissions / Self::STARTING_CASH) as f32); // commissions
+        static_obs.push(self.last_reward as f32); // last_reward
+        debug_assert_eq!(static_obs.len(), GLOBAL_STATIC_OBS);
+
+        // === Per-ticker observations (ticker-major format) ===
         let position_percents = self.account.position_percents(&self.prices, absolute_step);
 
-        // Step progress (1.0 at start, 0.0 at end)
-        static_obs.push(1.0 - (self.step as f32 / (self.max_step - 1).max(1) as f32));
-
-        // Cash percent
-        static_obs.push(cash_percent);
-
-        // Position percents for each ticker
-        for position_percent in position_percents {
-            static_obs.push(position_percent as f32);
-        }
-
-        // Time-weighted returns for each ticker
         for ticker_index in 0..TICKERS_COUNT as usize {
-            let time_weighted_return = self.calculate_position_time_weighted_return(ticker_index, absolute_step);
-            static_obs.push(time_weighted_return as f32);
-        }
+            let current_price = self.prices[ticker_index][absolute_step];
 
-        // Action history, padded with zeros if needed
-        for i in 0..ACTION_HISTORY_LEN {
-            if i < self.action_history.len() {
-                let action_idx = self.action_history.len() - 1 - i; // Most recent first
-                for &action in &self.action_history[action_idx] {
-                    static_obs.push(action as f32);
-                }
-            } else {
-                // Pad with zeros if we don't have ACTION_HISTORY_LEN actions yet
-                for _ in 0..(TICKERS_COUNT * 2) {
-                    static_obs.push(0.0f32);
+            // Position percent
+            static_obs.push(position_percents[ticker_index] as f32);
+
+            // Unrealized P&L %
+            static_obs.push(
+                self.account.positions[ticker_index]
+                    .appreciation(current_price) as f32,
+            );
+
+            // Momentum (20-step lookback)
+            let past_step = absolute_step.saturating_sub(20);
+            let past_price = self.prices[ticker_index][past_step];
+            static_obs.push(((current_price / past_price) - 1.0) as f32);
+
+            // Action history for this ticker (most recent first)
+            for i in 0..ACTION_HISTORY_LEN {
+                if i < self.action_history.len() {
+                    let action_idx = self.action_history.len() - 1 - i;
+                    // buy_sell action for this ticker
+                    static_obs.push(self.action_history[action_idx][ticker_index] as f32);
+                    // hold action for this ticker
+                    static_obs.push(
+                        self.action_history[action_idx][TICKERS_COUNT as usize + ticker_index]
+                            as f32,
+                    );
+                } else {
+                    static_obs.push(0.0f32); // buy_sell padding
+                    static_obs.push(0.0f32); // hold padding
                 }
             }
+            debug_assert_eq!(
+                static_obs.len(),
+                GLOBAL_STATIC_OBS + (ticker_index + 1) * PER_TICKER_STATIC_OBS
+            );
         }
 
         (price_deltas, static_obs)
@@ -795,6 +820,9 @@ impl Env {
         }
         self.retroactive_rewards.clear();
 
+        self.peak_assets = Self::STARTING_CASH;
+        self.last_reward = 0.0;
+
         // Return initial observation as two separate tensors
         let (price_deltas, static_obs) = self.get_next_obs();
         let price_deltas_tensor = Tensor::from_slice(&price_deltas)
@@ -810,7 +838,7 @@ impl Env {
         create_folder_if_not_exists(&infer_dir.to_string());
 
         self.episode_history
-            .record_to_path(infer_dir, episode, &self.tickers, &self.prices);
+            .record_to_path(infer_dir, episode, &self.tickers, &self.prices, self.episode_start_offset);
     }
 }
 

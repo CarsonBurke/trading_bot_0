@@ -39,15 +39,49 @@ impl EpisodeHistory {
         }
     }
 
-    pub fn record(&self, episode: usize, tickers: &[String], prices: &[Vec<f64>]) {
-        self.record_to_path(&format!("{TRAINING_PATH}/gens"), episode, tickers, prices);
+    pub fn record(&self, episode: usize, tickers: &[String], prices: &[Vec<f64>], start_offset: usize) {
+        self.record_to_path(&format!("{TRAINING_PATH}/gens"), episode, tickers, prices, start_offset);
     }
 
-    pub fn record_to_path(&self, base_path: &str, episode: usize, tickers: &[String], prices: &[Vec<f64>]) {
+    pub fn record_to_path(&self, base_path: &str, episode: usize, tickers: &[String], prices: &[Vec<f64>], start_offset: usize) {
         let episode_dir = format!("{}/{}", base_path, episode);
         create_folder_if_not_exists(&episode_dir);
 
-        for (ticker_index, prices) in prices.iter().enumerate() {
+        let num_steps = self.cash.len();
+        let mut total_assets_per_step = vec![0.0; num_steps];
+        for ticker_positioned in &self.positioned {
+            for (step, &value) in ticker_positioned.iter().enumerate() {
+                total_assets_per_step[step] += value;
+            }
+        }
+        for (step, &cash) in self.cash.iter().enumerate() {
+            total_assets_per_step[step] += cash;
+        }
+
+        let index_benchmark = if !prices.is_empty() && num_steps > 0 {
+            let initial_value = total_assets_per_step[0];
+            let mut benchmark = vec![initial_value];
+
+            for step in 1..num_steps {
+                let abs_step = start_offset + step;
+                let prev_abs_step = start_offset + step - 1;
+                let mut step_return = 0.0;
+                for ticker_prices in prices {
+                    if abs_step < ticker_prices.len() {
+                        step_return += ticker_prices[abs_step] / ticker_prices[prev_abs_step];
+                    }
+                }
+                step_return /= prices.len() as f64;
+
+                let new_value = benchmark.last().unwrap() * step_return;
+                benchmark.push(new_value);
+            }
+            Some(benchmark)
+        } else {
+            None
+        };
+
+        for (ticker_index, ticker_prices) in prices.iter().enumerate() {
             let ticker = &tickers[ticker_index];
             let ticker_dir = format!("{}/{}/{ticker}", base_path, episode);
             create_folder_if_not_exists(&ticker_dir);
@@ -56,25 +90,21 @@ impl EpisodeHistory {
             let ticker_sell_indexes = &self.sells[ticker_index];
             let _ = buy_sell_chart(
                 &ticker_dir,
-                &prices,
+                &ticker_prices,
                 ticker_buy_indexes,
                 ticker_sell_indexes,
             );
 
             let positioned_assets = &self.positioned[ticker_index];
-            let total_assets = positioned_assets
-                .iter()
-                .zip(self.cash.iter())
-                .map(|(positioned, cash)| positioned + cash)
-                .collect::<Vec<f64>>();
 
-            let benchmark = if !prices.is_empty() && !total_assets.is_empty() {
-                let initial_account_value = total_assets[0];
-                let initial_price = prices[0];
+            let ticker_benchmark = if !ticker_prices.is_empty() && num_steps > 0 && start_offset < ticker_prices.len() {
+                let initial_value = total_assets_per_step[0];
+                let initial_price = ticker_prices[start_offset];
+                let end_idx = (start_offset + num_steps).min(ticker_prices.len());
                 Some(
-                    prices[..total_assets.len()]
+                    ticker_prices[start_offset..end_idx]
                         .iter()
-                        .map(|&current_price| initial_account_value * current_price / initial_price)
+                        .map(|&current_price| initial_value * current_price / initial_price)
                         .collect()
                 )
             } else {
@@ -83,10 +113,10 @@ impl EpisodeHistory {
 
             let _ = assets_chart(
                 &ticker_dir,
-                &total_assets,
+                &total_assets_per_step,
                 &self.cash,
                 Some(positioned_assets),
-                benchmark.as_ref(),
+                ticker_benchmark.as_ref(),
             );
 
             let _ = hold_action_chart(
@@ -100,7 +130,6 @@ impl EpisodeHistory {
             );
         }
 
-        let num_steps = self.cash.len();
         let mut positioned_assets_per_step = vec![0.0; num_steps];
         for ticker_positioned in &self.positioned {
             for (step, &value) in ticker_positioned.iter().enumerate() {
@@ -108,18 +137,12 @@ impl EpisodeHistory {
             }
         }
 
-        let total_assets = positioned_assets_per_step
-            .iter()
-            .zip(self.cash.iter())
-            .map(|(positioned, cash)| positioned + cash)
-            .collect::<Vec<f64>>();
-
         let _ = assets_chart(
             &episode_dir,
-            &total_assets,
+            &total_assets_per_step,
             &self.cash,
             Some(&positioned_assets_per_step),
-            None,
+            index_benchmark.as_ref(),
         );
 
         let _ = reward_chart(&episode_dir, &self.rewards);
