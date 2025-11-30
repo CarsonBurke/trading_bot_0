@@ -3,9 +3,8 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::{
-    charts::general::{assets_chart, buy_sell_chart, buy_sell_chart_vec, hold_action_chart, raw_action_chart, reward_chart},
-    constants::{files::TRAINING_PATH, TICKERS},
-    types::MappedHistorical,
+    charts::general::{assets_chart, buy_sell_chart, raw_action_chart, reward_chart},
+    constants::files::TRAINING_PATH,
     utils::create_folder_if_not_exists,
 };
 
@@ -16,7 +15,6 @@ pub struct EpisodeHistory {
     pub positioned: Vec<Vec<f64>>,
     pub cash: Vec<f64>,
     pub rewards: Vec<f64>,
-    pub hold_actions: Vec<Vec<f64>>,
     pub raw_actions: Vec<Vec<f64>>,
     pub total_commissions: f64,
     pub static_observations: Vec<Vec<f32>>,
@@ -31,7 +29,6 @@ impl EpisodeHistory {
             positioned: vec![vec![]; ticker_count],
             cash: Vec::new(),
             rewards: Vec::new(),
-            hold_actions: vec![vec![]; ticker_count],
             raw_actions: vec![vec![]; ticker_count],
             total_commissions: 0.0,
             static_observations: Vec::new(),
@@ -117,11 +114,6 @@ impl EpisodeHistory {
                 &self.cash,
                 Some(positioned_assets),
                 ticker_benchmark.as_ref(),
-            );
-
-            let _ = hold_action_chart(
-                &ticker_dir,
-                &self.hold_actions[ticker_index],
             );
 
             let _ = raw_action_chart(

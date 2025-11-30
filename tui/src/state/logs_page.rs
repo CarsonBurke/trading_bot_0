@@ -1,6 +1,8 @@
 use ratatui::{layout::Rect, widgets::ListState};
 use std::fs;
 
+const MAX_LOGS: usize = 1000;
+
 pub struct LogsPageState {
     pub training_output: Vec<String>,
     pub logs_list_state: ListState,
@@ -20,7 +22,7 @@ impl LogsPageState {
         let log_path = "../training/training.log";
         if let Ok(content) = fs::read_to_string(log_path) {
             let new_lines: Vec<String> = content.lines().collect::<Vec<_>>()
-                .into_iter().rev().take(100).rev().map(|s| s.to_string()).collect();
+                .into_iter().rev().take(MAX_LOGS).rev().map(|s| s.to_string()).collect();
 
             if new_lines != self.training_output {
                 self.training_output = new_lines;

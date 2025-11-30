@@ -425,12 +425,28 @@ fn price_statistics_chart(
     .label("Price")
     .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &theme::BLUE));
 
-    // Mean line
+    // Moving average line
+    let window = (prices.len() / 10).max(5).min(50);
+    let mut ma = Vec::with_capacity(prices.len());
+    let mut sum: f64 = prices[..window.min(prices.len())].iter().sum();
+    for _ in 0..window.saturating_sub(1) {
+        ma.push(f64::NAN);
+    }
+    if prices.len() >= window {
+        ma.push(sum / window as f64);
+        for i in window..prices.len() {
+            sum += prices[i] - prices[i - window];
+            ma.push(sum / window as f64);
+        }
+    }
     chart.draw_series(LineSeries::new(
-        (0..prices.len()).map(|i| (i, mean_price)),
+        ma.iter()
+            .enumerate()
+            .filter(|(_, v)| !v.is_nan())
+            .map(|(i, v)| (i, *v)),
         theme::GREEN.stroke_width(2),
     ))?
-    .label(format!("Mean: ${:.2}", mean_price))
+    .label(format!("MA({})", window))
     .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], theme::GREEN));
 
     // Add text with statistics

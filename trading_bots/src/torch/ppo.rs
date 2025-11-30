@@ -1,4 +1,5 @@
 use std::time::Instant;
+use shared::paths::WEIGHTS_PATH;
 use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::constants::{
@@ -62,10 +63,7 @@ pub fn train(weights_path: Option<&str>) {
     // Episodes are capped at 1500 steps, minus 2 for buffer = 1498
     let n_steps = STEPS_PER_EPISODE as i64;
     let memory_size = n_steps * NPROCS;
-    println!(
-        "action space: {} (2 actions per ticker: buy/sell + hold)",
-        TICKERS_COUNT * 2
-    );
+    println!("action space: {} (buy/sell per ticker)", TICKERS_COUNT);
     println!("observation space: {:?}", OBSERVATION_SPACE);
 
     println!("CUDA available: {}", tch::Cuda::is_available());
@@ -76,7 +74,7 @@ pub fn train(weights_path: Option<&str>) {
     println!("Using device {:?}", device);
 
     let mut vs = nn::VarStore::new(device);
-    let model = model(&vs.root(), TICKERS_COUNT * 2); // 2 actions per ticker
+    let model = model(&vs.root(), TICKERS_COUNT);
 
     if let Some(path) = weights_path {
         println!("Loading weights from: {}", path);
@@ -126,7 +124,7 @@ pub fn train(weights_path: Option<&str>) {
 
         let s_values = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
         let s_rewards = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
-        let s_actions = Tensor::zeros([n_steps, NPROCS, TICKERS_COUNT * 2], (Kind::Float, device));
+        let s_actions = Tensor::zeros([n_steps, NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let s_masks = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
         let s_log_probs = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
 
@@ -180,10 +178,9 @@ pub fn train(weights_path: Option<&str>) {
             let action_log_prob =
                 (log_prob_z - log_jacobian).sum_dim_intlist(-1, false, Kind::Float);
 
-            // Flatten the actions tensor [NPROCS, TICKERS_COUNT] to 1D before converting
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let actions_vec: Vec<Vec<f64>> = actions_flat
-                .chunks(TICKERS_COUNT as usize * 2)
+                .chunks(TICKERS_COUNT as usize)
                 .map(|chunk| chunk.to_vec())
                 .collect();
 
@@ -287,7 +284,7 @@ pub fn train(weights_path: Option<&str>) {
                 returns.narrow(0, 0, n_steps).view([memory_size, 1]),
             )
         };
-        let actions = s_actions.view([memory_size, TICKERS_COUNT * 2]);
+        let actions = s_actions.view([memory_size, TICKERS_COUNT]);
         let old_log_probs = s_log_probs.view([memory_size]);
 
         // Normalize advantages globally (not per-minibatch) for consistent policy gradients
@@ -461,6 +458,15 @@ pub fn train(weights_path: Option<&str>) {
         let mean_loss = total_loss / num_loss_samples as f64;
         env.meta_history.record_loss(mean_loss);
 
+        // Record mean action std (exploration level)
+        let mean_std = tch::no_grad(|| {
+            let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
+            let static_obs = s_static_obs.get(0);
+            let (_, (_, action_log_std), _) = model(&price_deltas_gpu, &static_obs, false);
+            f64::try_from(action_log_std.exp().mean(Kind::Float)).unwrap_or(0.0)
+        });
+        env.meta_history.record_mean_std(mean_std);
+
         if early_stopped {
             println!("Training stopped early due to high KL divergence");
         }
@@ -514,10 +520,10 @@ pub fn train(weights_path: Option<&str>) {
         }
         if episode > 0 && episode % 50 == 0 {
             std::fs::create_dir_all("weights").ok();
-            if let Err(err) = vs.save(format!("weights/ppo_ep{}.ot", episode)) {
+            if let Err(err) = vs.save(format!("{WEIGHTS_PATH}/ppo_ep{}.ot", episode)) {
                 println!("Error while saving weights: {}", err)
             } else {
-                println!("Saved model weights: weights/ppo_ep{}.ot", episode);
+                println!("Saved model weights: {WEIGHTS_PATH}/ppo_ep{}.ot", episode);
             }
         }
     }

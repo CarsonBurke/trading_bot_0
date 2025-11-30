@@ -5,39 +5,30 @@ use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE, RETROACTIVE_BUY
 use super::env::{BuyLot, Env, TRADE_EMA_ALPHA};
 
 impl Env {
-    pub(super) fn trade_by_delta_percent_with_hold(
+    pub(super) fn trade_by_delta_percent(
         &mut self,
-        buy_sell_actions: &[f64],
-        hold_actions: &[f64],
+        actions: &[f64],
         absolute_step: usize,
     ) -> (f64, f64) {
         let mut total_commission = 0.0;
         let mut sell_reward = 0.0;
 
-        let actions: Vec<f64> = buy_sell_actions
-            .iter()
-            .zip(hold_actions.iter())
-            .map(|(&buy_sell, &hold)| {
-                if buy_sell.abs() < ACTION_THRESHOLD {
-                    0.0
-                } else {
-                    buy_sell * (1.0 + hold * 0.5).clamp(0.5, 1.5)
-                }
-            })
-            .collect();
-
         // === PASS 1: Execute all SELLS first (frees up cash) ===
         for (ticker_index, &action) in actions.iter().enumerate() {
-            if action >= 0.0 {
+            if action >= -ACTION_THRESHOLD {
                 continue;
             }
 
             let price = self.prices[ticker_index][absolute_step];
             let current_value = self.account.positions[ticker_index].value_with_price(price);
+            if current_value <= 0.0 {
+                continue;
+            }
+            
             let sell_pct = -action;
             let sell_amount = sell_pct * current_value;
 
-            if sell_amount <= 0.0 || current_value <= 0.0 {
+            if sell_amount <= 0.0 {
                 continue;
             }
 
@@ -50,6 +41,10 @@ impl Env {
             self.episode_history.total_commissions += commission;
             self.episode_history.sells[ticker_index].insert(absolute_step, (price, quantity));
             self.trade_activity_ema[ticker_index] += TRADE_EMA_ALPHA;
+            self.steps_since_trade[ticker_index] = 0;
+            if self.account.positions[ticker_index].quantity < 1e-8 {
+                self.position_open_step[ticker_index] = None;
+            }
 
             if RETROACTIVE_BUY_REWARD {
                 sell_reward +=
@@ -68,7 +63,7 @@ impl Env {
         let mut total_buy_demand = 0.0;
 
         for (ticker_index, &action) in actions.iter().enumerate() {
-            if action <= 0.0 {
+            if action <= ACTION_THRESHOLD {
                 continue;
             }
 
@@ -108,11 +103,16 @@ impl Env {
 
             total_commission += commission;
             self.account.cash -= total_cost;
+            let was_empty = self.account.positions[intent.ticker_index].quantity < 1e-8;
             self.account.positions[intent.ticker_index].add(intent.price, quantity);
             self.episode_history.total_commissions += commission;
             self.episode_history.buys[intent.ticker_index]
                 .insert(absolute_step, (intent.price, quantity));
             self.trade_activity_ema[intent.ticker_index] += TRADE_EMA_ALPHA;
+            self.steps_since_trade[intent.ticker_index] = 0;
+            if was_empty {
+                self.position_open_step[intent.ticker_index] = Some(absolute_step);
+            }
 
             if RETROACTIVE_BUY_REWARD {
                 self.buy_lots[intent.ticker_index].push_back(BuyLot {

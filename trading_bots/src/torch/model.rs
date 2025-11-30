@@ -65,7 +65,7 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
 
     // PMA (Pooling by Multihead Attention) - permutation-invariant set pooling
-    let pma_num_seeds = 2;
+    let pma_num_seeds = 4;
     let pma_seeds = p.var("pma_seeds", &[pma_num_seeds, 256], Init::Uniform { lo: -0.1, up: 0.1 });
     let pma_kv = nn::linear(p / "pma_kv", 256, 256 * 2, Default::default()); // K, V for ticker features
     let pma_q = nn::linear(p / "pma_q", 256, 256, Default::default()); // Q for seeds
@@ -75,19 +75,18 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     // (B) Condition PMA seeds on global static features
     let global_to_seed = nn::linear(p / "global_to_seed", GLOBAL_STATIC_OBS as i64, 256, Default::default());
 
-    // FC layers: PMA output (2 seeds * 256 = 512)
-    // Global static now flows through PMA seed conditioning, no need to concat here
-    let fc1_input_size = 512;
+    // FC layers: PMA output (4 seeds * 256 = 1024)
+    let fc1_input_size = 1024;
     let fc1 = nn::linear(p / "l1", fc1_input_size, 512, Default::default());
     let ln_fc1 = nn::layer_norm(p / "ln_fc1", vec![512], Default::default());
 
-    // Split actor/critic paths early (at FC2) for better specialization
+    // Split actor/critic paths at FC2
     let fc2_actor = nn::linear(p / "l2_actor", 512, 256, Default::default());
     let ln_fc2_actor = nn::layer_norm(p / "ln_fc2_actor", vec![256], Default::default());
     let fc2_critic = nn::linear(p / "l2_critic", 512, 256, Default::default());
     let ln_fc2_critic = nn::layer_norm(p / "ln_fc2_critic", vec![256], Default::default());
 
-    // Final FC layers for actor and critic with scaled-down init
+    // FC3 layers with residual connections
     let fc3_actor_cfg = nn::LinearConfig {
         ws_init: Init::Uniform { lo: -0.02, up: 0.02 },
         ..Default::default()
@@ -105,20 +104,21 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     };
     let critic = nn::linear(p / "cl", 256, 1, critic_cfg);
 
-    // Actor outputs mean and log_std for a Gaussian distribution
-    // Actions will be sigmoid-squashed: action = 2 * sigmoid(z) - 1 where z ~ N(mean, std)
-    // Initialize mean with small weights for moderate initial actions (around 0 after squashing)
+    // Actor mean: small weights for moderate initial actions (sigmoid(0) = 0.5, so action = 0)
     let actor_mean_cfg = nn::LinearConfig {
-        ws_init: Init::Uniform {
-            lo: -0.01,
-            up: 0.01,
-        },
-        bs_init: Some(Init::Const(0.0)), // sigmoid(0) = 0.5, so action = 0
+        ws_init: Init::Uniform { lo: -0.01, up: 0.01 },
+        bs_init: Some(Init::Const(0.0)),
         bias: true,
     };
     let actor_mean = nn::linear(p / "al_mean", 256, nact, actor_mean_cfg);
 
-    let log_std_param = p.var("log_std", &[nact], Init::Const(0.0));
+    // Actor log_std: state-dependent, initialized to output ~0 (std ~1)
+    let actor_log_std_cfg = nn::LinearConfig {
+        ws_init: Init::Uniform { lo: -0.01, up: 0.01 },
+        bs_init: Some(Init::Const(0.0)),
+        bias: true,
+    };
+    let actor_log_std = nn::linear(p / "al_log_std", 256, nact, actor_log_std_cfg);
 
     // Learnable positional embedding for temporal dimension
     let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
@@ -285,7 +285,7 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let fc2_critic_out = fc1_norm.apply(&fc2_critic);
         let critic_fc2_norm = fc2_critic_out.apply(&ln_fc2_critic).silu();
 
-        // Final actor and critic layers with residual connections
+        // FC3 with residual connections
         let actor_out = actor_fc2_norm.apply(&fc3_actor);
         let actor_features = (&actor_out + &actor_fc2_norm).apply(&ln_fc3_actor).silu();
 
@@ -297,7 +297,8 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         // Gaussian distribution parameters (before sigmoid squashing)
         let action_mean = actor_features.apply(&actor_mean);
 
-        let action_log_std = log_std_param.tanh() * 4.0 - 1.5;
+        // State-dependent log_std, clamped to [-4, 1] for std in [0.018, 2.7]
+        let action_log_std = actor_features.apply(&actor_log_std).clamp(-4.0, 1.0);
 
         (critic_value, (action_mean, action_log_std), temporal_attn_avg)
     })

@@ -132,7 +132,7 @@ impl App {
 
         // Ticker-specific chart base names
         let ticker_chart_bases = vec![
-            "assets", "buy_sell", "hold_action", "raw_action"
+            "assets", "buy_sell", "raw_action"
         ];
 
         // Track the latest file for each chart type: base_name -> (modified_time, path)

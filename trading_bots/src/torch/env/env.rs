@@ -48,6 +48,8 @@ pub struct Env {
     pub(super) last_reward: f64,
     pub(super) last_fill_ratio: f64,
     pub(super) trade_activity_ema: Vec<f64>,
+    pub(super) steps_since_trade: Vec<usize>,
+    pub(super) position_open_step: Vec<Option<usize>>,
     /// Maps permuted index -> real ticker index (shuffled each episode)
     pub(super) ticker_perm: Vec<usize>,
 }
@@ -103,6 +105,8 @@ impl Env {
             last_reward: 0.0,
             last_fill_ratio: 1.0,
             trade_activity_ema: vec![0.0; num_tickers],
+            steps_since_trade: vec![0; num_tickers],
+            position_open_step: vec![None; num_tickers],
             ticker_perm: (0..num_tickers).collect(),
         }
     }
@@ -121,26 +125,23 @@ impl Env {
             for ema in &mut self.trade_activity_ema {
                 *ema *= 1.0 - TRADE_EMA_ALPHA;
             }
-
-            // Actions come in permuted order - map back to real ticker order
-            let (perm_buy_sell, perm_hold) = actions.split_at(TICKERS_COUNT as usize);
-            let mut real_buy_sell = vec![0.0; TICKERS_COUNT as usize];
-            let mut real_hold = vec![0.0; TICKERS_COUNT as usize];
-            for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
-                real_buy_sell[real_idx] = perm_buy_sell[perm_idx];
-                real_hold[real_idx] = perm_hold[perm_idx];
+            for steps in &mut self.steps_since_trade {
+                *steps += 1;
             }
 
-            // Store action history in real ticker order
-            let mut real_actions = real_buy_sell.clone();
-            real_actions.extend(&real_hold);
-            self.action_history.push_back(real_actions);
+            // Actions come in permuted order - map back to real ticker order
+            let mut real_actions = vec![0.0; TICKERS_COUNT as usize];
+            for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
+                real_actions[real_idx] = actions[perm_idx];
+            }
+
+            self.action_history.push_back(real_actions.clone());
             if self.action_history.len() > ACTION_HISTORY_LEN {
                 self.action_history.pop_front();
             }
 
             let (total_commission, trade_sell_reward) =
-                self.trade_by_delta_percent_with_hold(&real_buy_sell, &real_hold, absolute_step);
+                self.trade_by_delta_percent(&real_actions, absolute_step);
             let reward = self.get_index_benchmark_pnl_reward(absolute_step, total_commission)
                 + if RETROACTIVE_BUY_REWARD {
                     trade_sell_reward
@@ -160,8 +161,7 @@ impl Env {
                     self.account.positions[index]
                         .value_with_price(self.prices[index][absolute_step]),
                 );
-                self.episode_history.hold_actions[index].push(real_hold[index]);
-                self.episode_history.raw_actions[index].push(real_buy_sell[index]);
+                self.episode_history.raw_actions[index].push(real_actions[index]);
             }
             self.episode_history.cash.push(self.account.cash);
             self.episode_history.rewards.push(reward);
@@ -292,6 +292,8 @@ impl Env {
         self.last_reward = 0.0;
         self.last_fill_ratio = 1.0;
         self.trade_activity_ema.fill(0.0);
+        self.steps_since_trade.fill(0);
+        self.position_open_step.fill(None);
 
         // Shuffle ticker permutation for this episode
         let mut rng = rand::rng();

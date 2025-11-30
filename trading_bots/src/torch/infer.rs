@@ -12,7 +12,7 @@ pub fn load_model<P: AsRef<Path>>(
     device: tch::Device,
 ) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor)>), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
-    let model_fn = model(&vs.root(), TICKERS_COUNT * 2);
+    let model_fn = model(&vs.root(), TICKERS_COUNT);
     vs.load(weight_path)?;
     println!("Model loaded on {:?}", device);
     Ok((vs, model_fn))
@@ -82,7 +82,7 @@ pub fn run_inference<P: AsRef<Path>>(
 
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let actions_vec: Vec<Vec<f64>> = actions_flat
-                .chunks(TICKERS_COUNT as usize * 2)
+                .chunks(TICKERS_COUNT as usize)
                 .map(|chunk| chunk.to_vec())
                 .collect();
 

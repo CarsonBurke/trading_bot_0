@@ -29,7 +29,9 @@ struct LiveMarketState {
     action_history: VecDeque<Vec<f64>>,
     step_count: usize,
     last_fill_ratio: f64,
-    last_traded_step: Vec<usize>,
+    steps_since_trade: Vec<usize>,
+    position_open_step: Vec<Option<usize>>,
+    trade_activity_ema: Vec<f64>,
 }
 
 impl LiveMarketState {
@@ -41,7 +43,9 @@ impl LiveMarketState {
             action_history: VecDeque::with_capacity(ACTION_HISTORY_LEN),
             step_count: 0,
             last_fill_ratio: 1.0,
-            last_traded_step: vec![0; ticker_count],
+            steps_since_trade: vec![0; ticker_count],
+            position_open_step: vec![None; ticker_count],
+            trade_activity_ema: vec![0.0; ticker_count],
         }
     }
 
@@ -135,23 +139,27 @@ impl LiveMarketState {
             };
             static_obs.push(momentum);
 
-            // Steps since last traded (normalized, use 0.0 for live as approximation)
-            let steps_since = self.step_count.saturating_sub(self.last_traded_step[ticker_idx]);
-            static_obs.push((steps_since as f32 / 1000.0).min(1.0));
+            // Trade activity EMA
+            static_obs.push(self.trade_activity_ema[ticker_idx] as f32);
+
+            // Steps since last trade (normalized: 1.0 = just traded, decays toward 0)
+            let steps_since = self.steps_since_trade[ticker_idx] as f64;
+            static_obs.push((1.0 / (1.0 + steps_since / 50.0)) as f32);
+
+            // Position age (normalized: 0 = no position, higher = longer held)
+            let position_age = match self.position_open_step[ticker_idx] {
+                Some(open_step) => (self.step_count.saturating_sub(open_step) as f64 / 500.0).min(1.0),
+                None => 0.0,
+            };
+            static_obs.push(position_age as f32);
 
             // Action history for this ticker (most recent first)
             for i in 0..ACTION_HISTORY_LEN {
                 if i < self.action_history.len() {
                     let action_idx = self.action_history.len() - 1 - i;
-                    // buy_sell action for this ticker
                     static_obs.push(self.action_history[action_idx][ticker_idx] as f32);
-                    // hold action for this ticker
-                    static_obs.push(
-                        self.action_history[action_idx][TICKERS_COUNT as usize + ticker_idx] as f32,
-                    );
                 } else {
-                    static_obs.push(0.0f32); // buy_sell padding
-                    static_obs.push(0.0f32); // hold padding
+                    static_obs.push(0.0f32);
                 }
             }
             debug_assert_eq!(
@@ -353,13 +361,12 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 state_guard.action_history.pop_front();
             }
 
-            let (buy_sell_actions, _hold_actions) = actions_vec.split_at(TICKERS_COUNT as usize);
             let current_prices = state_guard.get_current_prices();
 
             execute_trades(
                 &client_arc,
                 &symbols,
-                buy_sell_actions,
+                &actions_vec,
                 &current_prices,
                 &state_guard.account,
             )?;

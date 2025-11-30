@@ -22,7 +22,7 @@ impl Env {
             if padding_needed > 0 {
                 price_deltas.extend(std::iter::repeat(0.0f32).take(padding_needed));
             }
-            price_deltas.extend(slice.iter().rev().take(to_take).map(|&x| x as f32));
+            price_deltas.extend(slice.iter().take(to_take).map(|&x| x as f32));
         }
 
         let mut static_obs = Vec::with_capacity(STATIC_OBSERVATIONS);
@@ -64,20 +64,24 @@ impl Env {
             // Trade activity EMA (0 = inactive, higher = more frequent trading)
             static_obs.push(self.trade_activity_ema[real_idx] as f32);
 
+            // Steps since last trade (normalized: 1.0 = just traded, decays toward 0)
+            let steps_since = self.steps_since_trade[real_idx] as f64;
+            static_obs.push((1.0 / (1.0 + steps_since / 50.0)) as f32);
+
+            // Position age (normalized: 0 = no position, higher = longer held)
+            let position_age = match self.position_open_step[real_idx] {
+                Some(open_step) => (absolute_step.saturating_sub(open_step) as f64 / 500.0).min(1.0),
+                None => 0.0,
+            };
+            static_obs.push(position_age as f32);
+
             // Action history for this ticker (most recent first)
             for i in 0..ACTION_HISTORY_LEN {
                 if i < self.action_history.len() {
                     let action_idx = self.action_history.len() - 1 - i;
-                    // buy_sell action for this ticker (stored in real order, need to look up)
                     static_obs.push(self.action_history[action_idx][real_idx] as f32);
-                    // hold action for this ticker
-                    static_obs.push(
-                        self.action_history[action_idx][TICKERS_COUNT as usize + real_idx]
-                            as f32,
-                    );
                 } else {
-                    static_obs.push(0.0f32); // buy_sell padding
-                    static_obs.push(0.0f32); // hold padding
+                    static_obs.push(0.0f32);
                 }
             }
             debug_assert_eq!(
