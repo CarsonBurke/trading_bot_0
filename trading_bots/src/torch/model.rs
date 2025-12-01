@@ -14,8 +14,8 @@ const fn calc_conv_temporal_len(input_len: i64) -> i64 {
 }
 const CONV_TEMPORAL_LEN: i64 = calc_conv_temporal_len(PRICE_DELTAS_PER_TICKER as i64);
 
-// Model returns (critic_value, (action_mean, action_log_std), static_attn_weights)
-pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor)>;
+// Model returns (critic_value, (action_mean, action_log_std, divisor), temporal_attn_weights)
+pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor, Tensor), Tensor)>;
 
 /// # Returns
 /// A boxed function that takes (price_deltas, static_obs, train) and returns (critic_value, (action_mean, action_log_std))
@@ -137,16 +137,14 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     };
     let actor_mean = nn::linear(p / "al_mean", 256, nact, actor_mean_cfg);
 
-    // Actor log_std: state-dependent via softplus for smooth gradients
-    // std = softplus(x) * STD_SCALE + STD_MIN, then log
-    // Network outputs x centered at 0, softplus(0) ≈ 0.69
-    // Initial std ≈ 0.69 * 0.25 + 0.02 ≈ 0.19
-    let actor_log_std_cfg = nn::LinearConfig {
-        ws_init: Init::Uniform { lo: -0.01, up: 0.01 },
-        bs_init: Some(Init::Const(0.0)),
-        bias: true,
-    };
-    let actor_log_std = nn::linear(p / "al_log_std", 256, nact, actor_log_std_cfg);
+    // Global log_std: learnable per-action, not state-dependent (prevents overfitting)
+    // Centered at 0, with offset -2.3 in forward pass so std ≈ 0.1 at init
+    let log_std_param = p.var("log_std", &[nact], Init::Const(0.0));
+
+    // Learnable softsign divisor: d = softplus(log_d_raw) + eps
+    // Initial d ≈ 3.0 (softplus(1.1) ≈ 1.4, + 1.6 = 3.0)
+    // Per-action, not state-dependent
+    let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(1.1));
 
     // Learnable positional embedding for temporal dimension
     let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
@@ -337,18 +335,19 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
         let critic_value = critic_features.apply(&critic);
 
-        // Gaussian distribution parameters (before sigmoid squashing)
+        // Gaussian distribution parameters
         let action_mean = actor_features.apply(&actor_mean);
 
-        // State-dependent log_std via softplus: std = softplus(x) * scale + min
-        // Min std = 0.02 allows ~90% hold when mean≈0 (given tanh squashing with divisor 4)
-        // softplus(x) ∈ (0, ∞), so std ∈ (0.02, ∞) with soft upper bound from network capacity
-        const STD_MIN: f64 = 0.02;
-        const STD_SCALE: f64 = 0.25;
-        let raw_std = actor_features.apply(&actor_log_std);
-        let action_std = raw_std.softplus() * STD_SCALE + STD_MIN;
-        let action_log_std = action_std.log();
+        // Global log_std (not state-dependent, prevents overfitting)
+        // Offset -2.3 so param=0 gives std≈0.1, clamp for std ∈ [0.02, 1.0]
+        const LOG_STD_OFFSET: f64 = -2.3;
+        let action_log_std = (&log_std_param + LOG_STD_OFFSET).clamp(-4.0, 0.0);
 
-        (critic_value, (action_mean, action_log_std), temporal_attn_avg)
+        // Learnable softsign divisor: d = softplus(log_d_raw) + eps
+        // eps = 1.6 ensures d >= 1.6 even if softplus -> 0
+        const DIVISOR_EPS: f64 = 1.6;
+        let divisor = log_d_raw.softplus() + DIVISOR_EPS;
+
+        (critic_value, (action_mean, action_log_std, divisor), temporal_attn_avg)
     })
 }

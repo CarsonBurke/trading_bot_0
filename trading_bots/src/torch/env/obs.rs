@@ -75,6 +75,9 @@ impl Env {
             };
             static_obs.push(position_age as f32);
 
+            // Target weight for this ticker
+            static_obs.push(self.target_weights[real_idx] as f32);
+
             // Action history for this ticker (most recent first)
             for i in 0..ACTION_HISTORY_LEN {
                 if i < self.action_history.len() {

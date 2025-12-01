@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::{
-    charts::general::{assets_chart, buy_sell_chart, raw_action_chart, reward_chart},
+    charts::general::{assets_chart, buy_sell_chart, multi_line_chart, raw_action_chart, reward_chart, simple_chart},
     constants::files::TRAINING_PATH,
     utils::create_folder_if_not_exists,
 };
@@ -19,6 +19,8 @@ pub struct EpisodeHistory {
     pub total_commissions: f64,
     pub static_observations: Vec<Vec<f32>>,
     pub attention_weights: Vec<Vec<f32>>,
+    pub target_weights: Vec<Vec<f64>>,
+    pub cash_weight: Vec<f64>,
 }
 
 impl EpisodeHistory {
@@ -33,6 +35,8 @@ impl EpisodeHistory {
             total_commissions: 0.0,
             static_observations: Vec::new(),
             attention_weights: Vec::new(),
+            target_weights: vec![vec![]; ticker_count],
+            cash_weight: Vec::new(),
         }
     }
 
@@ -138,6 +142,18 @@ impl EpisodeHistory {
         );
 
         let _ = reward_chart(&episode_dir, &self.rewards);
+
+        // Combined target weights chart (all tickers + cash)
+        if !self.cash_weight.is_empty() && self.target_weights.iter().any(|w| !w.is_empty()) {
+            let mut series: Vec<(&str, &Vec<f64>)> = Vec::new();
+            for (ticker_index, ticker) in tickers.iter().enumerate() {
+                if !self.target_weights[ticker_index].is_empty() {
+                    series.push((ticker.as_str(), &self.target_weights[ticker_index]));
+                }
+            }
+            series.push(("cash", &self.cash_weight));
+            let _ = multi_line_chart(&episode_dir, "target_weights", &series, 1, "Step");
+        }
 
         // Write static observations and attention weights
         if !self.static_observations.is_empty() && !self.attention_weights.is_empty() {

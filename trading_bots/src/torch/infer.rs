@@ -2,40 +2,41 @@ use tch::{nn, Device, Tensor};
 use std::path::Path;
 use std::time::Instant;
 
-use crate::torch::constants::{STEPS_PER_EPISODE, TICKERS_COUNT};
+use crate::torch::constants::ACTION_COUNT;
 use crate::torch::model::model;
 use crate::torch::env::Env;
-use crate::torch::ppo::TANH_SQUASHING_DIVISOR;
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: tch::Device,
-) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor)>), Box<dyn std::error::Error>> {
+) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor, Tensor), Tensor)>), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
-    let model_fn = model(&vs.root(), TICKERS_COUNT);
+    let model_fn = model(&vs.root(), ACTION_COUNT);
     vs.load(weight_path)?;
     println!("Model loaded on {:?}", device);
     Ok((vs, model_fn))
 }
 
 pub fn sample_actions(
-    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor), Tensor),
+    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor, Tensor), Tensor),
     price_deltas: &Tensor,
     static_obs: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let (_critic, (action_mean, action_log_std), _attn_weights) = tch::no_grad(|| {
+    let (_critic, (action_mean, action_log_std, divisor), _attn_weights) = tch::no_grad(|| {
         model(price_deltas, static_obs, false)
     });
 
     if deterministic || temperature == 0.0 {
-        (&action_mean / TANH_SQUASHING_DIVISOR).tanh()
+        // Softsign: a = z / (d + |z|), with z = mean for deterministic
+        &action_mean / (&divisor + action_mean.abs())
     } else {
         let action_std = action_log_std.exp() * temperature;
         let noise = Tensor::randn_like(&action_mean);
         let z = &action_mean + &action_std * noise;
-        (&z / TANH_SQUASHING_DIVISOR).tanh()
+        // Softsign: a = z / (d + |z|)
+        &z / (&divisor + z.abs())
     }
 }
 
@@ -82,7 +83,7 @@ pub fn run_inference<P: AsRef<Path>>(
 
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let actions_vec: Vec<Vec<f64>> = actions_flat
-                .chunks(TICKERS_COUNT as usize)
+                .chunks(ACTION_COUNT as usize)
                 .map(|chunk| chunk.to_vec())
                 .collect();
 

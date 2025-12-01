@@ -11,7 +11,7 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, RETROACTIVE_BUY_REWARD,
+            ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, RETROACTIVE_BUY_REWARD,
             STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
         },
         ppo::NPROCS,
@@ -52,6 +52,8 @@ pub struct Env {
     pub(super) position_open_step: Vec<Option<usize>>,
     /// Maps permuted index -> real ticker index (shuffled each episode)
     pub(super) ticker_perm: Vec<usize>,
+    /// Target portfolio weights for weight-delta trading (0-1 per ticker)
+    pub(super) target_weights: Vec<f64>,
 }
 
 pub(super) const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
@@ -108,6 +110,7 @@ impl Env {
             steps_since_trade: vec![0; num_tickers],
             position_open_step: vec![None; num_tickers],
             ticker_perm: (0..num_tickers).collect(),
+            target_weights: vec![0.0; num_tickers + 1], // +1 for cash
         }
     }
 
@@ -130,10 +133,12 @@ impl Env {
             }
 
             // Actions come in permuted order - map back to real ticker order
-            let mut real_actions = vec![0.0; TICKERS_COUNT as usize];
+            // Last action (cash) is not permuted
+            let mut real_actions = vec![0.0; ACTION_COUNT as usize];
             for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
                 real_actions[real_idx] = actions[perm_idx];
             }
+            real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize]; // cash
 
             self.action_history.push_back(real_actions.clone());
             if self.action_history.len() > ACTION_HISTORY_LEN {
@@ -141,7 +146,7 @@ impl Env {
             }
 
             let (total_commission, trade_sell_reward) =
-                self.trade_by_delta_percent(&real_actions, absolute_step);
+                self.trade_by_weight_delta(&real_actions, absolute_step);
             let reward = self.get_index_benchmark_pnl_reward(absolute_step, total_commission)
                 + if RETROACTIVE_BUY_REWARD {
                     trade_sell_reward
@@ -162,9 +167,16 @@ impl Env {
                         .value_with_price(self.prices[index][absolute_step]),
                 );
                 self.episode_history.raw_actions[index].push(real_actions[index]);
+                self.episode_history.target_weights[index].push(self.target_weights[index]);
             }
             self.episode_history.cash.push(self.account.cash);
             self.episode_history.rewards.push(reward);
+            let cash_weight = if self.account.total_assets > 0.0 {
+                self.account.cash / self.account.total_assets
+            } else {
+                1.0
+            };
+            self.episode_history.cash_weight.push(cash_weight);
 
             if is_done == 1.0 {
                 self.handle_episode_end(absolute_step);
@@ -294,6 +306,7 @@ impl Env {
         self.trade_activity_ema.fill(0.0);
         self.steps_since_trade.fill(0);
         self.position_open_step.fill(None);
+        self.target_weights = vec![0.0; self.tickers.len() + 1];
 
         // Shuffle ticker permutation for this episode
         let mut rng = rand::rng();
