@@ -142,9 +142,9 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     let log_std_param = p.var("log_std", &[nact], Init::Const(0.0));
 
     // Learnable softsign divisor: d = softplus(log_d_raw) + eps
-    // Initial d ≈ 3.0 (softplus(1.1) ≈ 1.4, + 1.6 = 3.0)
-    // Per-action, not state-dependent
-    let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(1.1));
+    // Initial d ≈ 0.3 (softplus(-1.5) ≈ 0.2, + 0.1 = 0.3)
+    // Smaller divisor means action_mean maps more directly to actions
+    let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-1.5));
 
     // Learnable positional embedding for temporal dimension
     let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
@@ -339,13 +339,13 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let action_mean = actor_features.apply(&actor_mean);
 
         // Global log_std (not state-dependent, prevents overfitting)
-        // Offset -2.3 so param=0 gives std≈0.1, clamp for std ∈ [0.02, 1.0]
-        const LOG_STD_OFFSET: f64 = -2.3;
-        let action_log_std = (&log_std_param + LOG_STD_OFFSET).clamp(-4.0, 0.0);
+        // Offset -4.6 so param=0 gives std≈0.01, clamp for std ∈ [0.002, 0.1]
+        const LOG_STD_OFFSET: f64 = -4.6;
+        let action_log_std = (&log_std_param + LOG_STD_OFFSET).clamp(-6.0, -2.3);
 
         // Learnable softsign divisor: d = softplus(log_d_raw) + eps
-        // eps = 1.6 ensures d >= 1.6 even if softplus -> 0
-        const DIVISOR_EPS: f64 = 1.6;
+        // Lower eps allows smaller z to produce larger actions (z=0.1 → action≈0.5)
+        const DIVISOR_EPS: f64 = 0.1;
         let divisor = log_d_raw.softplus() + DIVISOR_EPS;
 
         (critic_value, (action_mean, action_log_std, divisor), temporal_attn_avg)
