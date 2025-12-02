@@ -174,9 +174,9 @@ impl Env {
         }
     }
 
-    /// Weight-based trading: actions directly set target portfolio weights.
-    /// Actions: [ticker_0, ..., ticker_n, cash] mapped from (-1,1) to (0,1) then normalized.
-    /// Last action controls cash allocation.
+    /// Weight-based trading: actions = base_weight + delta, then normalized.
+    /// action=0 → equal allocation, action=±0.1 → ±0.1 weight change (before normalization)
+    #[allow(dead_code)]
     pub(super) fn trade_by_weight_delta(
         &mut self,
         actions: &[f64],
@@ -279,6 +279,146 @@ impl Env {
         }
 
         // 5. Execute buys with proportional scaling if insufficient cash
+        let total_buy_demand: f64 = buy_intents
+            .iter()
+            .map(|i| i.delta_value * (1.0 + COMMISSION_RATE))
+            .sum();
+        let available_cash = self.account.cash;
+        let fill_ratio = if total_buy_demand > 0.0 {
+            (available_cash / total_buy_demand).min(1.0)
+        } else {
+            1.0
+        };
+        self.last_fill_ratio = fill_ratio;
+
+        for intent in buy_intents {
+            let scaled_amount = intent.delta_value * fill_ratio;
+            let quantity = scaled_amount / intent.price;
+            let commission = quantity * COMMISSION_RATE;
+            let total_cost = scaled_amount + commission;
+
+            if total_cost > self.account.cash || total_cost <= 0.0 {
+                continue;
+            }
+
+            total_commission += commission;
+            self.account.cash -= total_cost;
+            let was_empty = self.account.positions[intent.ticker_index].quantity < 1e-8;
+            self.account.positions[intent.ticker_index].add(intent.price, quantity);
+            self.episode_history.total_commissions += commission;
+            self.episode_history.buys[intent.ticker_index]
+                .insert(absolute_step, (intent.price, quantity));
+            self.trade_activity_ema[intent.ticker_index] += TRADE_EMA_ALPHA;
+            self.steps_since_trade[intent.ticker_index] = 0;
+
+            if was_empty {
+                self.position_open_step[intent.ticker_index] = Some(absolute_step);
+            }
+
+            if RETROACTIVE_BUY_REWARD {
+                self.buy_lots[intent.ticker_index].push_back(BuyLot {
+                    step: absolute_step,
+                    price: intent.price,
+                    quantity,
+                });
+            }
+        }
+
+        (total_commission, sell_reward)
+    }
+
+    /// Weight-based trading: actions ARE the target weights (mapped from (-1,1) to (0,1)).
+    /// Actions: [ticker_0, ..., ticker_n, cash] - normalized to sum to 1.0.
+    pub(super) fn trade_by_target_weights(
+        &mut self,
+        actions: &[f64],
+        absolute_step: usize,
+    ) -> (f64, f64) {
+        let n_tickers = self.tickers.len();
+        let min_trade_frac = 0.005;
+
+        let mut total_commission = 0.0;
+        let mut sell_reward = 0.0;
+
+        // 1. Map actions (-1, 1) directly to weights (0, 1), then normalize
+        for (i, &action) in actions.iter().enumerate() {
+            self.target_weights[i] = (action + 1.0) / 2.0;
+        }
+        let weight_sum: f64 = self.target_weights.iter().sum();
+        if weight_sum > 1e-8 {
+            for w in &mut self.target_weights {
+                *w /= weight_sum;
+            }
+        }
+
+        // 2. Calculate target deltas and execute trades
+        let total_assets = self.account.total_assets;
+        if total_assets <= 0.0 {
+            return (0.0, 0.0);
+        }
+
+        struct TradeIntent {
+            ticker_index: usize,
+            price: f64,
+            delta_value: f64,
+        }
+        let mut sell_intents: Vec<TradeIntent> = Vec::new();
+        let mut buy_intents: Vec<TradeIntent> = Vec::new();
+
+        for ticker_index in 0..n_tickers {
+            let price = self.prices[ticker_index][absolute_step];
+            let current_value = self.account.positions[ticker_index].value_with_price(price);
+            let target_value = self.target_weights[ticker_index] * total_assets;
+            let delta_value = target_value - current_value;
+
+            let min_trade_notional = min_trade_frac * target_value.max(current_value);
+            if delta_value.abs() < min_trade_notional {
+                continue;
+            }
+
+            if delta_value < 0.0 {
+                sell_intents.push(TradeIntent { ticker_index, price, delta_value });
+            } else {
+                buy_intents.push(TradeIntent { ticker_index, price, delta_value });
+            }
+        }
+
+        // 3. Execute sells first
+        for intent in sell_intents {
+            let sell_value = (-intent.delta_value).min(
+                self.account.positions[intent.ticker_index].value_with_price(intent.price),
+            );
+            if sell_value <= 0.0 {
+                continue;
+            }
+
+            let quantity = sell_value / intent.price;
+            let commission = quantity * COMMISSION_RATE;
+
+            total_commission += commission;
+            self.account.cash += sell_value - commission;
+            self.account.positions[intent.ticker_index].quantity -= quantity;
+            self.episode_history.total_commissions += commission;
+            self.episode_history.sells[intent.ticker_index]
+                .insert(absolute_step, (intent.price, quantity));
+            self.trade_activity_ema[intent.ticker_index] += TRADE_EMA_ALPHA;
+            self.steps_since_trade[intent.ticker_index] = 0;
+
+            if self.account.positions[intent.ticker_index].quantity < 1e-8 {
+                self.position_open_step[intent.ticker_index] = None;
+            }
+
+            if RETROACTIVE_BUY_REWARD {
+                sell_reward += self.calculate_retroactive_rewards(
+                    intent.ticker_index,
+                    absolute_step,
+                    intent.price,
+                    quantity,
+                );
+            }
+        }
+
+        // 4. Execute buys with proportional scaling if insufficient cash
         let total_buy_demand: f64 = buy_intents
             .iter()
             .map(|i| i.delta_value * (1.0 + COMMISSION_RATE))

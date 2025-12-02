@@ -143,8 +143,8 @@ impl EpisodeHistory {
 
         let _ = reward_chart(&episode_dir, &self.rewards);
 
-        // Combined target weights chart (all tickers + cash)
-        if !self.cash_weight.is_empty() && self.target_weights.iter().any(|w| !w.is_empty()) {
+        // Combined target weights chart (all tickers + cash) - every 5 episodes like meta charts
+        if episode % 5 == 0 && !self.cash_weight.is_empty() && self.target_weights.iter().any(|w| !w.is_empty()) {
             let mut series: Vec<(&str, &Vec<f64>)> = Vec::new();
             for (ticker_index, ticker) in tickers.iter().enumerate() {
                 if !self.target_weights[ticker_index].is_empty() {

@@ -146,7 +146,7 @@ impl Env {
             }
 
             let (total_commission, trade_sell_reward) =
-                self.trade_by_weight_delta(&real_actions, absolute_step);
+                self.trade_by_target_weights(&real_actions, absolute_step);
             let reward = self.get_index_benchmark_pnl_reward(absolute_step, total_commission)
                 + if RETROACTIVE_BUY_REWARD {
                     trade_sell_reward
