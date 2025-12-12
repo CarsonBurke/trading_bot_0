@@ -131,7 +131,7 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
 
     // Actor mean: small weights for moderate initial actions (sigmoid(0) = 0.5, so action = 0)
     let actor_mean_cfg = nn::LinearConfig {
-        ws_init: Init::Uniform { lo: -0.01, up: 0.01 },
+        ws_init: Init::Uniform { lo: -0.1, up: 0.1 },
         bs_init: Some(Init::Const(0.0)),
         bias: true,
     };
