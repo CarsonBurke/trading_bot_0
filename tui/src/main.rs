@@ -775,6 +775,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.chart_viewer.load_charts(&app.latest_meta_charts)?;
                             }
                         }
+                        KeyCode::Char('c') => {
+                            let _ = app.chart_viewer.copy_current_image();
+                        }
                         _ => {}
                     },
                     AppMode::Logs => match key.code {

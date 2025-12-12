@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use crate::components::episode_status;
+use crate::utils::clipboard;
 
 #[derive(Debug, Clone)]
 pub enum ChartNode {
@@ -453,6 +454,18 @@ impl ChartViewer {
         }
     }
 
+    pub fn copy_current_image(&self) -> Result<()> {
+        if let Some(i) = self.list_state.selected() {
+            if i < self.flattened.len() {
+                let (node_idx, _) = self.flattened[i];
+                if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
+                    clipboard::copy_image_to_clipboard(path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_viewing_meta_charts(&self) -> bool {
         self.viewing_mode == ViewingMode::MetaCharts
     }
@@ -540,6 +553,8 @@ impl ChartViewer {
                 Span::raw(": Down  "),
                 Span::styled("Enter", Style::default().fg(Color::Green)),
                 Span::raw(": Expand/Collapse  "),
+                Span::styled("c", Style::default().fg(Color::Magenta)),
+                Span::raw(": Copy  "),
                 Span::styled("r", Style::default().fg(Color::Yellow)),
                 Span::raw(": Refresh  "),
                 Span::styled("q/Esc", Style::default().fg(Color::Red)),
@@ -553,6 +568,8 @@ impl ChartViewer {
                 Span::raw(": Down  "),
                 Span::styled("Enter", Style::default().fg(Color::Green)),
                 Span::raw(": Expand/Collapse  "),
+                Span::styled("c", Style::default().fg(Color::Magenta)),
+                Span::raw(": Copy  "),
                 Span::styled("q/Esc", Style::default().fg(Color::Red)),
                 Span::raw(": Back"),
             ])
