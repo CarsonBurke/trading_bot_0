@@ -339,9 +339,10 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         let action_mean = actor_features.apply(&actor_mean);
 
         // Global log_std (not state-dependent, prevents overfitting)
-        // Offset -4.6 so param=0 gives std≈0.01, clamp for std ∈ [0.002, 0.1]
-        const LOG_STD_OFFSET: f64 = -4.6;
-        let action_log_std = (&log_std_param + LOG_STD_OFFSET).clamp(-6.0, -2.3);
+        // Offset -2.3 so param=0 gives std≈0.1, clamp for std ∈ [0.02, 0.3]
+        // Balance: enough exploration (10x original) but mean still dominates
+        const LOG_STD_OFFSET: f64 = -2.3;
+        let action_log_std = (&log_std_param + LOG_STD_OFFSET).clamp(-4.0, -1.2);
 
         // Learnable softsign divisor: d = softplus(log_d_raw) + eps
         // Lower eps allows smaller z to produce larger actions (z=0.1 → action≈0.5)
