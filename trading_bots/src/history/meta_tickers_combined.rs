@@ -9,6 +9,7 @@ pub struct MetaHistory {
     pub cumulative_reward: Vec<f64>,
     pub outperformance: Vec<f64>,
     pub loss: Vec<f64>,
+    pub grad_norm: Vec<f64>,
     pub total_commissions: Vec<f64>,
     pub mean_std: Vec<f64>,
     pub min_std: Vec<f64>,
@@ -29,6 +30,10 @@ impl MetaHistory {
 
     pub fn record_loss(&mut self, loss: f64) {
         self.loss.push(loss);
+    }
+
+    pub fn record_grad_norm(&mut self, grad_norm: f64) {
+        self.grad_norm.push(grad_norm);
     }
 
     pub fn record_std_stats(&mut self, mean_std: f64, min_std: f64, max_std: f64) {
@@ -54,13 +59,16 @@ impl MetaHistory {
             let _ = simple_chart(&base_dir, "final_assets", &self.final_assets);
         }
         if !self.cumulative_reward.is_empty() {
-            let _ = simple_chart(&base_dir, "cum_reward", &self.cumulative_reward);
+            let _ = simple_chart(&base_dir, "cumulative_reward", &self.cumulative_reward);
         }
         if !self.outperformance.is_empty() {
             let _ = simple_chart(&base_dir, "outperformance", &self.outperformance);
         }
         if !self.loss.is_empty() {
             let _ = simple_chart_log(&base_dir, "loss (log scale)", &self.loss, "Episode");
+        }
+        if !self.grad_norm.is_empty() {
+            let _ = simple_chart_log(&base_dir, "grad_norm (log scale)", &self.grad_norm, "Episode");
         }
         if !self.total_commissions.is_empty() {
             let _ = simple_chart(&base_dir, "total_commissions", &self.total_commissions);

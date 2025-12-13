@@ -160,7 +160,7 @@ impl EpisodeHistory {
         }
 
         // Write static observations and attention weights
-        if !self.static_observations.is_empty() && !self.attention_weights.is_empty() {
+        if episode & 5 == 0 && !self.static_observations.is_empty() && !self.attention_weights.is_empty() {
             let observations_path = format!("{}/observations.json", episode_dir);
             if let Ok(mut file) = File::create(&observations_path) {
                 let json_data = serde_json::json!({

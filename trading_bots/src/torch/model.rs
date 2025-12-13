@@ -137,14 +137,21 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
     };
     let actor_mean = nn::linear(p / "al_mean", 256, nact, actor_mean_cfg);
 
-    // Global log_std: learnable per-action, not state-dependent (prevents overfitting)
-    // Centered at 0, with offset -2.3 in forward pass so std ≈ 0.1 at init
-    let log_std_param = p.var("log_std", &[nact], Init::Const(0.0));
+    // gSDE (generalized State Dependent Exploration):
+    // Learn a log_std *matrix* and combine it with a state-dependent latent to produce
+    // per-state, per-action std. This allows exploration to vary with regime/state.
+    const SDE_LATENT_DIM: i64 = 64;
+    let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
+    let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
+    // Shape: [latent_dim, action_dim]
+    let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact], Init::Const(0.0));
 
-    // Learnable softsign divisor: d = softplus(log_d_raw) + eps
-    // Initial d ≈ 0.3 (softplus(-1.5) ≈ 0.2, + 0.1 = 0.3)
-    // Smaller divisor means action_mean maps more directly to actions
-    let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-1.5));
+    // Learnable softsign divisor: d = softplus(log_d_raw * scale) + eps
+    // `scale` increases gradient magnitude wrt log_d_raw (faster learning) without changing d's range.
+    const LOG_D_RAW_SCALE: f64 = 5.0;
+    // Keep initial d ≈ 0.3: softplus(-1.5) ≈ 0.2, + 0.1 = 0.3
+    // => initialize log_d_raw such that log_d_raw * scale ≈ -1.5
+    let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-1.5 / LOG_D_RAW_SCALE));
 
     // Learnable positional embedding for temporal dimension
     let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
@@ -338,16 +345,27 @@ pub fn model(p: &nn::Path, nact: i64) -> Model {
         // Gaussian distribution parameters
         let action_mean = actor_features.apply(&actor_mean);
 
-        // Global log_std (not state-dependent, prevents overfitting)
-        // Offset -2.3 so param=0 gives std≈0.1, clamp for std ∈ [0.02, 0.3]
-        // Balance: enough exploration (10x original) but mean still dominates
-        const LOG_STD_OFFSET: f64 = -2.3;
-        let action_log_std = (&log_std_param + LOG_STD_OFFSET).clamp(-4.0, -1.2);
+        // gSDE: build per-state std from a state-dependent latent.
+        // Variance per action: var(a_j|s) = Σ_k latent_k(s)^2 * std_{k,j}^2
+        // This keeps a diagonal Gaussian while making its scale state-dependent.
+        const LOG_STD_OFFSET: f64 = -2.3; // param=0 => std≈0.1 at init
+        let latent_sde = actor_features
+            .apply(&sde_fc)
+            .apply(&ln_sde)
+            .tanh(); // bounded to stabilize early training
 
-        // Learnable softsign divisor: d = softplus(log_d_raw) + eps
+        let log_std_matrix = (&log_std_param + LOG_STD_OFFSET).clamp(-4.0, -1.2);
+        let std_matrix = log_std_matrix.exp();
+        let variance = latent_sde
+            .pow_tensor_scalar(2)
+            .matmul(&std_matrix.pow_tensor_scalar(2));
+        let action_std = (variance + 1e-6).sqrt();
+        let action_log_std = action_std.log();
+
+        // Learnable softsign divisor: d = softplus(log_d_raw * scale) + eps
         // Lower eps allows smaller z to produce larger actions (z=0.1 → action≈0.5)
         const DIVISOR_EPS: f64 = 0.1;
-        let divisor = log_d_raw.softplus() + DIVISOR_EPS;
+        let divisor = log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + DIVISOR_EPS;
 
         (critic_value, (action_mean, action_log_std, divisor), temporal_attn_avg)
     })

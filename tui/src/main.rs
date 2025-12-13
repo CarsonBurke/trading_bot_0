@@ -75,9 +75,9 @@ impl App {
     fn coerce_weights_filename(input: &str) -> String {
         let trimmed = input.trim();
 
-        // If it's just a number, expand to ppo_ep{N}.ot
+        // If it's just a number, expand to ppo_ep{N}.pt
         if trimmed.parse::<u32>().is_ok() {
-            return format!("ppo_ep{}.ot", trimmed);
+            return format!("ppo_ep{}.pt", trimmed);
         }
 
         // If it already has the pattern, use as-is
@@ -126,8 +126,8 @@ impl App {
 
         // Meta chart base names (episode-level charts without ticker)
         let meta_chart_bases = vec![
-            "final_assets", "cum_reward", "outperformance", "loss (log scale)",
-            "assets", "reward", "total_commissions", "std_stats", "advantage_stats", "divisor", "target_weights"
+            "final_assets", "cumulative_reward", "outperformance", "loss (log scale)",
+            "assets", "reward", "total_commissions", "std_stats", "advantage_stats", "divisor", "target_weights", "grad_norm (log scale)"
         ];
 
         // Ticker-specific chart base names
@@ -290,7 +290,7 @@ impl App {
     }
 
     fn start_inference(&mut self, weights_file: Option<String>, ticker: Option<String>, episodes: Option<usize>) -> Result<()> {
-        let weights = weights_file.unwrap_or_else(|| "infer.ot".to_string());
+        let weights = weights_file.unwrap_or_else(|| "infer.pt".to_string());
         let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
             weights
         } else {

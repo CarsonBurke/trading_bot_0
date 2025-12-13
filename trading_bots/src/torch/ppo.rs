@@ -18,17 +18,63 @@ const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
 const GAMMA: f64 = 0.995;
 const GAE_LAMBDA: f64 = 0.98;
 
+// gSDE: resample exploration noise every N env steps (temporally correlated exploration).
+// This matches the common SB3-style behavior while keeping per-step log-prob computation unchanged.
+const SDE_SAMPLE_FREQ: usize = 4;
+
 // PPO hyperparameters
 const PPO_CLIP_RATIO: f64 = 0.2; // Clip range for policy ratio (the trust region)
 const VALUE_CLIP_RANGE: f64 = 0.2; // Clip range for value function
-const ENTROPY_COEF: f64 = 0.001; // Entropy bonus (reduced - exploration from std is enough)
+const ENTROPY_COEF: f64 = 0.0; // Entropy bonus (reduced - exploration from std is enough)
 const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
 const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
-// KL is monitored for diagnostics only - PPO clip handles trust region
+// Conservative KL early stopping (SB3-style)
+const TARGET_KL: f64 = 0.03;
+const KL_STOP_MULTIPLIER: f64 = 1.5;
 const LEARNING_RATE: f64 = 2e-5;
+
+// Reward normalization (VecNormalize-style): normalize rewards by running RMS of discounted returns.
+const REWARD_NORM_EPS: f64 = 1e-8;
+const REWARD_CLIP: f64 = 10.0;
+
+#[derive(Debug, Clone)]
+struct RunningMeanStd {
+    mean: f64,
+    var: f64,
+    count: f64,
+}
+
+impl RunningMeanStd {
+    fn new() -> Self {
+        Self {
+            mean: 0.0,
+            var: 1.0,
+            count: 1e-4,
+        }
+    }
+
+    fn update_from_moments(&mut self, batch_mean: f64, batch_var: f64, batch_count: f64) {
+        if !batch_mean.is_finite() || !batch_var.is_finite() || batch_count <= 0.0 {
+            return;
+        }
+        let delta = batch_mean - self.mean;
+        let total_count = self.count + batch_count;
+        let new_mean = self.mean + delta * batch_count / total_count;
+
+        let m_a = self.var * self.count;
+        let m_b = batch_var * batch_count;
+        let m2 = m_a + m_b + delta * delta * self.count * batch_count / total_count;
+        let new_var = (m2 / total_count).max(1e-12);
+
+        self.mean = new_mean;
+        self.var = new_var;
+        self.count = total_count;
+    }
+}
 
 pub fn train(weights_path: Option<&str>) {
     let mut env = Env::new(true);
+    let mut reward_rms = RunningMeanStd::new();
 
     // Generate data analysis charts for training data
     println!("Generating data analysis charts...");
@@ -116,7 +162,7 @@ pub fn train(weights_path: Option<&str>) {
         let mut episode_reward = 0.0;
 
         let s_values = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
-        let s_rewards = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
+        let mut s_rewards = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
         let s_actions = Tensor::zeros([n_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
         let s_masks = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
         let s_log_probs = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
@@ -133,10 +179,11 @@ pub fn train(weights_path: Option<&str>) {
         // Use a separate index (s) for tensor storage, starting from 0
         // Loop through the episode using relative steps (0 to max_step)
         let mut s: i64 = 0;
+        let mut sde_noise: Option<Tensor> = None;
         for step in 0..env.max_step {
             env.step = step;
 
-            let (critic, (action_mean, action_log_std, divisor), attn_weights) = tch::no_grad(|| {
+            let (critic, (action_mean, action_log_std, _divisor), attn_weights) = tch::no_grad(|| {
                 // Move price deltas from CPU to GPU (FP32)
                 let price_deltas_gpu = s_price_deltas.get(s).to_device(device);
                 let static_obs = s_static_obs.get(s);
@@ -147,9 +194,12 @@ pub fn train(weights_path: Option<&str>) {
                 )
             });
 
-            // Sample from Gaussian distribution
+            // Sample from Gaussian distribution (gSDE-style: reuse noise for a few steps)
             let action_std = action_log_std.exp();
-            let noise = Tensor::randn_like(&action_mean);
+            if sde_noise.is_none() || (step % SDE_SAMPLE_FREQ == 0) {
+                sde_noise = Some(Tensor::randn_like(&action_mean));
+            }
+            let noise = sde_noise.as_ref().unwrap();
             let z = &action_mean + &action_std * noise;
 
             // Compute log probability for the sampled z
@@ -158,16 +208,11 @@ pub fn train(weights_path: Option<&str>) {
             let two_log_std = &action_log_std * 2.0;
             let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
 
-            // Softsign squashing: action = (z/d) / (1 + |z/d|) = z / (d + |z|)
-            let z_abs = z.abs();
-            let actions = &z / (&divisor + &z_abs);
+            // Softmax to get portfolio weights (sum to 1, all in [0,1])
+            let actions = z.softmax(-1, Kind::Float);
 
-            // Log Jacobian for softsign: log|da/dz| = log(d) - 2*log(d + |z|)
-            let log_jacobian = divisor.log() - (&divisor + &z_abs).log() * 2.0;
-
-            // Final log probability
-            let action_log_prob =
-                (log_prob_z - log_jacobian).sum_dim_intlist(-1, false, Kind::Float);
+            // Log probability of z under Gaussian (softmax is deterministic transform)
+            let action_log_prob = log_prob_z.sum_dim_intlist(-1, false, Kind::Float);
 
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let actions_vec: Vec<Vec<f64>> = actions_flat
@@ -205,7 +250,7 @@ pub fn train(weights_path: Option<&str>) {
             let masks = Tensor::from(1f32).to_device(device) - &is_done;
             sum_rewards *= &masks;
 
-            s_actions.get(s).copy_(&actions);
+            s_actions.get(s).copy_(&z);  // Store z (pre-softmax) for training
             s_values.get(s).copy_(&critic.squeeze_dim(-1));
             s_log_probs.get(s).copy_(&action_log_prob);
             s_price_deltas.get(s + 1).copy_(&price_deltas);
@@ -222,6 +267,31 @@ pub fn train(weights_path: Option<&str>) {
         if RETROACTIVE_BUY_REWARD {
             env.apply_retroactive_rewards(&s_rewards);
         }
+
+        // === Reward normalization (SB3 VecNormalize-style) ===
+        // Update running RMS of discounted returns, then normalize rewards in-place
+        // before computing GAE/value targets.
+        let discounted_returns = {
+            let mut ret = Tensor::zeros([NPROCS], (Kind::Float, device));
+            let returns = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
+            for t in (0..n_steps).rev() {
+                let r_t = s_rewards.get(t);
+                let mask_t = s_masks.get(t);
+                let new_ret = r_t + GAMMA * &ret * &mask_t;
+                ret.copy_(&new_ret);
+                returns.get(t).copy_(&new_ret);
+            }
+            returns
+        };
+        let ret_mean_val = f64::try_from(discounted_returns.mean(Kind::Float)).unwrap_or(0.0);
+        let ret_var_val = f64::try_from(discounted_returns.var(false)).unwrap_or(1.0);
+        reward_rms.update_from_moments(ret_mean_val, ret_var_val, memory_size as f64);
+
+        let reward_scale = 1.0 / (reward_rms.var + REWARD_NORM_EPS).sqrt();
+        let rewards_scaled = (&s_rewards)
+            .g_mul_scalar(reward_scale)
+            .clamp(-REWARD_CLIP, REWARD_CLIP);
+        s_rewards.copy_(&rewards_scaled);
 
         let price_deltas_batch = s_price_deltas
             .narrow(0, 0, n_steps)
@@ -293,11 +363,13 @@ pub fn train(weights_path: Option<&str>) {
         let returns = (&returns - &ret_mean) / &ret_std;
         let s_values = (&s_values - &ret_mean) / &ret_std; // normalize old values with same stats
 
-        let opt_start = Instant::now();
-        let mut total_kl = 0.0;
-        let mut num_kl_samples = 0;
-        let mut total_loss = 0.0;
-        let mut num_loss_samples = 0;
+	        let opt_start = Instant::now();
+	        let mut total_kl = 0.0;
+	        let mut num_kl_samples = 0;
+	        let mut total_loss = 0.0;
+	        let mut num_loss_samples = 0;
+	        let mut grad_norm_sum = 0.0;
+	        let mut grad_norm_count = 0.0;
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             let mut epoch_kl_sum = 0.0;
@@ -327,15 +399,11 @@ pub fn train(weights_path: Option<&str>) {
                 let returns_sample = returns.index_select(0, &batch_indexes);
                 let advantages_sample = advantages.index_select(0, &batch_indexes);
                 let old_log_probs_sample = old_log_probs.index_select(0, &batch_indexes);
-                let (critic, (action_mean, action_log_std, divisor), _attn_weights) =
+                let (critic, (action_mean, action_log_std, _divisor), _attn_weights) =
                     model(&price_deltas_sample, &static_obs_sample, true);
 
-                // Recover z from softsign actions: a = z / (d + |z|)
-                // Solving for z: z = a * d / (1 - |a|)
-                // Clamp actions to prevent division by zero at |a| = 1
-                let eps = 1e-6;
-                let actions_clamped = actions_sample.clamp(-1.0 + eps, 1.0 - eps);
-                let z = &actions_clamped * &divisor / (1.0 - actions_clamped.abs());
+                // z is stored directly in actions_sample (pre-softmax values)
+                let z = actions_sample;
 
                 // Compute log probability of z under Gaussian N(action_mean, action_std)
                 let action_std = action_log_std.exp();
@@ -344,13 +412,8 @@ pub fn train(weights_path: Option<&str>) {
                 let two_log_std = &action_log_std * 2.0;
                 let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
 
-                // Log Jacobian for softsign: log|da/dz| = log(d) - 2*log(d + |z|)
-                let z_abs = z.abs();
-                let log_jacobian = divisor.log() - (&divisor + &z_abs).log() * 2.0;
-
-                // Final log probability: log p(action) = log p(z) - log|da/dz|
-                let action_log_probs =
-                    (log_prob_z - log_jacobian).sum_dim_intlist(-1, false, Kind::Float);
+                // Log probability of z (softmax is deterministic, no Jacobian needed)
+                let action_log_probs = log_prob_z.sum_dim_intlist(-1, false, Kind::Float);
 
                 // Entropy approximation: Use base Gaussian entropy
                 let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * action_log_std;
@@ -404,22 +467,55 @@ pub fn train(weights_path: Option<&str>) {
                 total_loss += loss_value;
                 num_loss_samples += 1;
 
-                opt.backward_step_clip_norm(&loss, MAX_GRAD_NORM);
-            }
+	                // Manual step so we can log grad norm (SB3-style).
+	                opt.zero_grad();
+	                loss.backward();
+
+	                let grad_norm = tch::no_grad(|| {
+	                    let vars = opt.trainable_variables();
+	                    let mut norms = Vec::new();
+	                    for v in vars {
+	                        let g = v.grad();
+	                        if g.defined() {
+	                            norms.push(g.norm());
+	                        }
+	                    }
+	                    if norms.is_empty() {
+	                        0.0
+	                    } else {
+	                        f64::try_from(Tensor::stack(&norms, 0).norm()).unwrap_or(0.0)
+	                    }
+	                });
+	                if grad_norm.is_finite() && grad_norm >= 0.0 {
+	                    grad_norm_sum += grad_norm;
+	                    grad_norm_count += 1.0;
+	                }
+
+	                opt.clip_grad_norm(MAX_GRAD_NORM);
+	                opt.step();
+	            }
 
             // Monitor KL divergence (diagnostic only - PPO clip handles trust region)
             let mean_epoch_kl = epoch_kl_sum / epoch_kl_count as f64;
             total_kl += mean_epoch_kl;
             num_kl_samples += 1;
 
-            // Safety check: stop only if something is catastrophically wrong
-            if mean_epoch_kl > 50.0 {
-                println!("Epoch {}/{}: KL {:.1} (catastrophic), stopping epochs", _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl);
-                break 'epoch_loop;
-            }
-            
-            println!("Epoch {}/{}: KL {:.1}", _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl);
-        }
+	            // Conservative early stopping (SB3-style)
+	            if mean_epoch_kl.is_finite() && mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
+	                println!(
+	                    "Epoch {}/{}: KL {:.4} > {:.4} (target {:.4} × {:.1}), stopping epochs",
+	                    _epoch + 1,
+	                    OPTIM_EPOCHS,
+	                    mean_epoch_kl,
+	                    TARGET_KL * KL_STOP_MULTIPLIER,
+	                    TARGET_KL,
+	                    KL_STOP_MULTIPLIER
+	                );
+	                break 'epoch_loop;
+	            }
+	            
+	            println!("Epoch {}/{}: KL {:.4}", _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl);
+	        }
 
         // Record std and divisor stats every episode
         let (mean_std, min_std, max_std, mean_div) = tch::no_grad(|| {
@@ -437,27 +533,33 @@ pub fn train(weights_path: Option<&str>) {
         env.meta_history.record_std_stats(mean_std, min_std, max_std);
         env.meta_history.record_divisor(mean_div);
 
-        // Record mean loss every episode
-        let mean_loss = total_loss / num_loss_samples as f64;
-        env.meta_history.record_loss(mean_loss);
+	        // Record mean loss every episode
+	        let mean_loss = total_loss / num_loss_samples as f64;
+	        env.meta_history.record_loss(mean_loss);
+	        let mean_grad_norm = if grad_norm_count > 0.0 {
+	            grad_norm_sum / grad_norm_count
+	        } else {
+	            0.0
+	        };
+	        env.meta_history.record_grad_norm(mean_grad_norm);
 
         let opt_end = Instant::now();
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
-            let (_, (debug_mean, debug_log_std, debug_divisor), _attn_weights) = tch::no_grad(|| {
+            let (_, (debug_mean, debug_log_std, _debug_divisor), _attn_weights) = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
                 let static_obs = s_static_obs.get(0);
                 model(&price_deltas_gpu, &static_obs, false)
             });
 
-            // Show actual squashed actions using softsign
-            let debug_actions = &debug_mean / (&debug_divisor + debug_mean.abs());
-            let mean_squashed_action = f64::try_from(debug_actions.mean(Kind::Float)).unwrap();
+            // Show softmax weights from mean
+            let debug_actions = debug_mean.softmax(-1, Kind::Float);
+            let mean_weight = f64::try_from(debug_actions.mean(Kind::Float)).unwrap();
+            let max_weight = f64::try_from(debug_actions.max()).unwrap();
             let mean_raw_action = f64::try_from(debug_mean.mean(Kind::Float)).unwrap();
             let mean_std = f64::try_from(debug_log_std.exp().mean(Kind::Float)).unwrap();
             let max_raw_action = f64::try_from(debug_mean.abs().max()).unwrap();
-            let mean_divisor = f64::try_from(debug_divisor.mean(Kind::Float)).unwrap();
 
             let avg_kl = if num_kl_samples > 0 {
                 total_kl / num_kl_samples as f64
@@ -466,17 +568,17 @@ pub fn train(weights_path: Option<&str>) {
             };
 
             println!(
-                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, Avg KL: {:.4}, Action (squashed): {:.3}, Action (raw): {:.1}, Max |raw|: {:.1}, Std: {:.4}, Div: {:.2}",
+                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, Avg KL: {:.4}, Mean weight: {:.3}, Max weight: {:.3}, Mean logit: {:.1}, Max |logit|: {:.1}, Std: {:.4}",
                 episode,
                 total_episodes,
                 total_rewards / total_episodes,
                 opt_end.duration_since(opt_start).as_secs_f32(),
                 avg_kl,
-                mean_squashed_action,
+                mean_weight,
+                max_weight,
                 mean_raw_action,
                 max_raw_action,
-                mean_std,
-                mean_divisor
+                mean_std
             );
 
             // Warn if network is diverging
@@ -492,10 +594,10 @@ pub fn train(weights_path: Option<&str>) {
         }
         if episode > 0 && episode % 50 == 0 {
             std::fs::create_dir_all("weights").ok();
-            if let Err(err) = vs.save(format!("{WEIGHTS_PATH}/ppo_ep{}.ot", episode)) {
+            if let Err(err) = vs.save(format!("{WEIGHTS_PATH}/ppo_ep{}.pt", episode)) {
                 println!("Error while saving weights: {}", err)
             } else {
-                println!("Saved model weights: {WEIGHTS_PATH}/ppo_ep{}.ot", episode);
+                println!("Saved model weights: {WEIGHTS_PATH}/ppo_ep{}.pt", episode);
             }
         }
     }

@@ -19,7 +19,7 @@ pub fn render(f: &mut Frame, app: &App, for_training: bool, for_inference: bool)
     };
 
     let default_text = if for_inference {
-        "infer.ot"
+        "infer.pt"
     } else {
         "none (train from scratch)"
     };
@@ -43,7 +43,7 @@ pub fn render(f: &mut Frame, app: &App, for_training: bool, for_inference: bool)
     // Hint text
     let prompt_text = vec![Line::from(vec![
         Span::styled("Shorthand: ", Style::default().fg(theme::SUBTEXT0)),
-        Span::styled("'400' -> 'ppo_ep400.ot'", Style::default().fg(theme::TEAL)),
+        Span::styled("'400' -> 'ppo_ep400.pt'", Style::default().fg(theme::TEAL)),
         Span::raw("  |  "),
         Span::styled("Default: ", Style::default().fg(theme::SUBTEXT0)),
         Span::styled(default_text, Style::default().fg(theme::GREEN)),

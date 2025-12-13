@@ -350,20 +350,13 @@ impl Env {
         absolute_step: usize,
     ) -> (f64, f64) {
         let n_tickers = self.tickers.len();
-        let min_trade_frac = 0.005;
 
         let mut total_commission = 0.0;
         let mut sell_reward = 0.0;
 
-        // 1. Map actions (-1, 1) directly to weights (0, 1), then normalize
+        // Actions are softmax weights (already sum to 1, all in [0,1])
         for (i, &action) in actions.iter().enumerate() {
-            self.target_weights[i] = (action + 1.0) / 2.0;
-        }
-        let weight_sum: f64 = self.target_weights.iter().sum();
-        if weight_sum > 1e-8 {
-            for w in &mut self.target_weights {
-                *w /= weight_sum;
-            }
+            self.target_weights[i] = action;
         }
 
         // 2. Calculate target deltas and execute trades
@@ -386,7 +379,7 @@ impl Env {
             let target_value = self.target_weights[ticker_index] * total_assets;
             let delta_value = target_value - current_value;
 
-            let min_trade_notional = min_trade_frac * target_value.max(current_value);
+            let min_trade_notional = ACTION_THRESHOLD * target_value.max(current_value);
             if delta_value.abs() < min_trade_notional {
                 continue;
             }

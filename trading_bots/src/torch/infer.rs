@@ -24,19 +24,19 @@ pub fn sample_actions(
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let (_critic, (action_mean, action_log_std, divisor), _attn_weights) = tch::no_grad(|| {
+    let (_critic, (action_mean, action_log_std, _divisor), _attn_weights) = tch::no_grad(|| {
         model(price_deltas, static_obs, false)
     });
 
     if deterministic || temperature == 0.0 {
-        // Softsign: a = z / (d + |z|), with z = mean for deterministic
-        &action_mean / (&divisor + action_mean.abs())
+        // Softmax on mean for deterministic portfolio weights
+        action_mean.softmax(-1, tch::Kind::Float)
     } else {
         let action_std = action_log_std.exp() * temperature;
         let noise = Tensor::randn_like(&action_mean);
         let z = &action_mean + &action_std * noise;
-        // Softsign: a = z / (d + |z|)
-        &z / (&divisor + z.abs())
+        // Softmax to get portfolio weights
+        z.softmax(-1, tch::Kind::Float)
     }
 }
 
