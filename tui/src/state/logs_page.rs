@@ -7,6 +7,7 @@ pub struct LogsPageState {
     pub training_output: Vec<String>,
     pub logs_list_state: ListState,
     pub logs_list_area: Rect,
+    first_view: bool,
 }
 
 impl LogsPageState {
@@ -15,6 +16,7 @@ impl LogsPageState {
             training_output: Vec::new(),
             logs_list_state: ListState::default(),
             logs_list_area: Rect::default(),
+            first_view: true,
         }
     }
 
@@ -98,6 +100,13 @@ impl LogsPageState {
             let last = self.training_output.len() - 1;
             self.logs_list_state.select(Some(last));
             self.set_logs_position(last);
+        }
+    }
+
+    pub fn enter(&mut self) {
+        if self.first_view {
+            self.first_view = false;
+            self.jump_to_bottom();
         }
     }
 

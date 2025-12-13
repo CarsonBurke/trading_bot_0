@@ -6,15 +6,15 @@ pub mod paths {
 }
 
 pub mod constants {
-    pub const TICKERS_COUNT: usize = 6;
+    pub const TICKERS_COUNT: usize = 1 ;
     pub const ACTION_COUNT: usize = TICKERS_COUNT + 1; // +1 for cash weight
-    pub const ACTION_HISTORY_LEN: usize = 20;
+    pub const ACTION_HISTORY_LEN: usize = 0;
     pub const PRICE_DELTAS_PER_TICKER: usize = 3400;
 
     // Global: step_progress, cash_percent, pnl, drawdown, commissions, last_reward, last_fill_ratio
     pub const GLOBAL_STATIC_OBS: usize = 7;
-    // Per-ticker: position_pct, unrealized_pnl, momentum, trade_activity_ema, steps_since_trade, position_age, target_weight, action_history
-    pub const PER_TICKER_STATIC_OBS: usize = 7 + ACTION_HISTORY_LEN;
+    // Per-ticker: position_pct, unrealized_pnl, momentum, trade_activity_ema, steps_since_trade, position_age, target_weight
+    pub const PER_TICKER_STATIC_OBS: usize = 7;
     pub const STATIC_OBSERVATIONS: usize = GLOBAL_STATIC_OBS + (TICKERS_COUNT * PER_TICKER_STATIC_OBS);
     pub const OBSERVATION_SPACE: usize = (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
 

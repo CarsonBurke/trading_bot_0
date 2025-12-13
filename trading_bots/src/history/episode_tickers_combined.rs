@@ -21,6 +21,8 @@ pub struct EpisodeHistory {
     pub attention_weights: Vec<Vec<f32>>,
     pub target_weights: Vec<Vec<f64>>,
     pub cash_weight: Vec<f64>,
+    pub action_step0: Option<Vec<f64>>,
+    pub action_final: Option<Vec<f64>>,
 }
 
 impl EpisodeHistory {
@@ -37,6 +39,8 @@ impl EpisodeHistory {
             attention_weights: Vec::new(),
             target_weights: vec![vec![]; ticker_count],
             cash_weight: Vec::new(),
+            action_step0: None,
+            action_final: None,
         }
     }
 
@@ -162,6 +166,8 @@ impl EpisodeHistory {
                 let json_data = serde_json::json!({
                     "static_observations": self.static_observations,
                     "attention_weights": self.attention_weights,
+                    "action_step0": self.action_step0,
+                    "action_final": self.action_final,
                 });
                 let _ = file.write_all(json_data.to_string().as_bytes());
             }

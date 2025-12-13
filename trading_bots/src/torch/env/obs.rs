@@ -1,6 +1,6 @@
 use crate::torch::constants::{
-    ACTION_HISTORY_LEN, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER,
-    STATIC_OBSERVATIONS, TICKERS_COUNT,
+    GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS,
+    TICKERS_COUNT,
 };
 
 use super::env::Env;
@@ -48,21 +48,37 @@ impl Env {
             let current_price = self.prices[real_idx][absolute_step];
 
             // Position percent
-            static_obs.push(position_percents[real_idx] as f32);
+            static_obs.push(if position_percents[real_idx].is_finite() {
+                position_percents[real_idx] as f32
+            } else {
+                0.0
+            });
 
             // Unrealized P&L %
-            static_obs.push(
-                self.account.positions[real_idx]
-                    .appreciation(current_price) as f32,
-            );
+            let unrealized = self.account.positions[real_idx].appreciation(current_price);
+            static_obs.push(if unrealized.is_finite() {
+                unrealized as f32
+            } else {
+                0.0
+            });
 
             // Momentum (20-step lookback)
             let past_step = absolute_step.saturating_sub(20);
             let past_price = self.prices[real_idx][past_step];
-            static_obs.push(((current_price / past_price) - 1.0) as f32);
+            let momentum = if past_price > 0.0 && current_price.is_finite() && past_price.is_finite()
+            {
+                (current_price / past_price) - 1.0
+            } else {
+                0.0
+            };
+            static_obs.push(momentum as f32);
 
             // Trade activity EMA (0 = inactive, higher = more frequent trading)
-            static_obs.push(self.trade_activity_ema[real_idx] as f32);
+            static_obs.push(if self.trade_activity_ema[real_idx].is_finite() {
+                self.trade_activity_ema[real_idx] as f32
+            } else {
+                0.0
+            });
 
             // Steps since last trade (normalized: 1.0 = just traded, decays toward 0)
             let steps_since = self.steps_since_trade[real_idx] as f64;
@@ -76,17 +92,12 @@ impl Env {
             static_obs.push(position_age as f32);
 
             // Target weight for this ticker
-            static_obs.push(self.target_weights[real_idx] as f32);
+            static_obs.push(if self.target_weights[real_idx].is_finite() {
+                self.target_weights[real_idx] as f32
+            } else {
+                0.0
+            });
 
-            // Action history for this ticker (most recent first)
-            for i in 0..ACTION_HISTORY_LEN {
-                if i < self.action_history.len() {
-                    let action_idx = self.action_history.len() - 1 - i;
-                    static_obs.push(self.action_history[action_idx][real_idx] as f32);
-                } else {
-                    static_obs.push(0.0f32);
-                }
-            }
             debug_assert_eq!(
                 static_obs.len(),
                 GLOBAL_STATIC_OBS + (perm_idx + 1) * PER_TICKER_STATIC_OBS

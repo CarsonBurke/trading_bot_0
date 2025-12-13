@@ -66,6 +66,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         if let Ok(contents) = fs::read_to_string(&obs_path) {
             if let Ok(json) = serde_json::from_str::<Value>(&contents) {
                 let static_obs = json["static_observations"].as_array();
+                let action_step0 = json["action_step0"].as_array();
+                let action_final = json["action_final"].as_array();
 
                 if let Some(obs_arr) = static_obs {
                     let last_step_idx = obs_arr.len().saturating_sub(1);
@@ -189,6 +191,57 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             let right_paragraph = Paragraph::new(right_lines).block(right_block);
                             f.render_widget(right_paragraph, content_chunks[1]);
 
+                            // Side panel split: actions + temporal attention
+                            let side_chunks = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Length(10), Constraint::Min(0)])
+                                .split(content_chunks[2]);
+
+                            // Action snapshots
+                            let action_block = Block::default()
+                                .borders(Borders::ALL)
+                                .title("Actions (Step 0 / Final)")
+                                .border_style(Style::default().fg(theme::SURFACE2));
+
+                            let ticker_names = ["TSLA", "AAPL", "AMD", "INTC", "MSFT", "NVDA", "CASH"];
+                            let step0_vals: Vec<f64> = action_step0
+                                .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+                                .unwrap_or_default();
+                            let final_vals: Vec<f64> = action_final
+                                .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+                                .unwrap_or_default();
+
+                            let mut action_lines = vec![Line::from(Span::styled(
+                                "Target weights at episode boundaries",
+                                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+                            ))];
+                            action_lines.push(Line::from(""));
+
+                            if step0_vals.is_empty() && final_vals.is_empty() {
+                                action_lines.push(Line::from(Span::styled(
+                                    "No action snapshots recorded",
+                                    Style::default().fg(theme::SUBTEXT0),
+                                )));
+                            } else {
+                                for (idx, name) in ticker_names.iter().enumerate() {
+                                    let s0 = step0_vals.get(idx).cloned();
+                                    let sf = final_vals.get(idx).cloned();
+
+                                    let s0_str = s0.map(|v| format!("{:+.3}", v)).unwrap_or_else(|| "  n/a".to_string());
+                                    let sf_str = sf.map(|v| format!("{:+.3}", v)).unwrap_or_else(|| "  n/a".to_string());
+                                    let sf_color = sf.map(|v| if v >= 0.0 { theme::GREEN } else { theme::RED }).unwrap_or(theme::SUBTEXT0);
+
+                                    action_lines.push(Line::from(vec![
+                                        Span::styled(format!("{:>4} ", name), Style::default().fg(theme::MAUVE)),
+                                        Span::styled(format!("0:{:>7} ", s0_str), Style::default().fg(theme::SUBTEXT1)),
+                                        Span::styled(format!("F:{:>7}", sf_str), Style::default().fg(sf_color)),
+                                    ]));
+                                }
+                            }
+
+                            let action_paragraph = Paragraph::new(action_lines).block(action_block);
+                            f.render_widget(action_paragraph, side_chunks[0]);
+
                             // Temporal attention panel
                             let temporal_block = Block::default()
                                 .borders(Borders::ALL)
@@ -260,7 +313,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             }
 
                             let temporal_paragraph = Paragraph::new(temporal_lines).block(temporal_block);
-                            f.render_widget(temporal_paragraph, content_chunks[2]);
+                            f.render_widget(temporal_paragraph, side_chunks[1]);
                         } else {
                             let msg = Paragraph::new("No observation data in step")
                                 .block(left_block)

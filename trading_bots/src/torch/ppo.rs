@@ -19,19 +19,13 @@ const GAMMA: f64 = 0.995;
 const GAE_LAMBDA: f64 = 0.98;
 
 // PPO hyperparameters
-const PPO_CLIP_RATIO: f64 = 0.15; // Clip range for policy ratio (typically 0.1-0.3)
+const PPO_CLIP_RATIO: f64 = 0.2; // Clip range for policy ratio (the trust region)
 const VALUE_CLIP_RANGE: f64 = 0.2; // Clip range for value function
-// const ENTROPY_COEF: f64 = 0.005; // Entropy bonus coefficient
-const ENTROPY_COEF: f64 = 0.025; // Trying 0 to see if log_std as learnable is sufficient - not liking the tendency for log_std to increase
+const ENTROPY_COEF: f64 = 0.001; // Entropy bonus (reduced - exploration from std is enough)
 const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
 const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
-const TARGET_KL: f64 = 0.03; // Target KL divergence for early stopping
-const KL_STOP_MULTIPLIER: f64 = 5.0; // stop episode's epochs if KL divergence exceeds this multiplier of target KL
-const KL_LR_FACTOR: f64 = 0.5; // KL effect on learning rate
-const MAX_KL_LR_DELTA: f64 = 0.1; // Max bounded change in learning rate due to KL divergence per episode
-const LEARNING_RATE: f64 = 2e-5; // Learning rate for optimizer
-const LR_MIN: f64 = 1e-6;
-const LR_MAX: f64 = 2e-4;
+// KL is monitored for diagnostics only - PPO clip handles trust region
+const LEARNING_RATE: f64 = 2e-5;
 
 pub fn train(weights_path: Option<&str>) {
     let mut env = Env::new(true);
@@ -85,7 +79,6 @@ pub fn train(weights_path: Option<&str>) {
     }
 
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
-    let mut current_lr = LEARNING_RATE;
 
     // Disabled FP16 - with GAP reducing params from 39M to 284K, FP32 easily fits in VRAM
     // FP16 causes NaN issues in tch-rs, especially with complex architectures
@@ -226,8 +219,6 @@ pub fn train(weights_path: Option<&str>) {
             s += 1; // Increment storage index
         }
 
-        println!("episode rewards: {}", episode_reward);
-
         if RETROACTIVE_BUY_REWARD {
             env.apply_retroactive_rewards(&s_rewards);
         }
@@ -303,7 +294,6 @@ pub fn train(weights_path: Option<&str>) {
         let s_values = (&s_values - &ret_mean) / &ret_std; // normalize old values with same stats
 
         let opt_start = Instant::now();
-        let mut early_stopped = false;
         let mut total_kl = 0.0;
         let mut num_kl_samples = 0;
         let mut total_loss = 0.0;
@@ -337,7 +327,6 @@ pub fn train(weights_path: Option<&str>) {
                 let returns_sample = returns.index_select(0, &batch_indexes);
                 let advantages_sample = advantages.index_select(0, &batch_indexes);
                 let old_log_probs_sample = old_log_probs.index_select(0, &batch_indexes);
-
                 let (critic, (action_mean, action_log_std, divisor), _attn_weights) =
                     model(&price_deltas_sample, &static_obs_sample, true);
 
@@ -418,41 +407,18 @@ pub fn train(weights_path: Option<&str>) {
                 opt.backward_step_clip_norm(&loss, MAX_GRAD_NORM);
             }
 
-            // Adaptive learning rate based on mean KL divergence per epoch
+            // Monitor KL divergence (diagnostic only - PPO clip handles trust region)
             let mean_epoch_kl = epoch_kl_sum / epoch_kl_count as f64;
             total_kl += mean_epoch_kl;
             num_kl_samples += 1;
 
-            // Adjust learning rate proportionally to target
-            if mean_epoch_kl.is_finite() && mean_epoch_kl > 0.0 {
-                let kl_ratio = mean_epoch_kl / TARGET_KL;
-                
-                let lr_factor = (-KL_LR_FACTOR * (kl_ratio - 1.0)).exp();
-                let lr_bounded = lr_factor.clamp(1.0 - MAX_KL_LR_DELTA, 1.0 + MAX_KL_LR_DELTA);
-                let new_lr = (current_lr * lr_bounded).clamp(LR_MIN, LR_MAX);
-                
-                opt.set_lr(new_lr);
-
-                println!(
-                    "Epoch {}/{}: KL {:.4} vs target {:.4} (ratio: {:.3}): Changing LR from {:.12} to {:.12}",
-                    _epoch + 1,
-                    OPTIM_EPOCHS,
-                    mean_epoch_kl,
-                    TARGET_KL,
-                    kl_ratio,
-                    current_lr,
-                    new_lr
-                );
-                
-                current_lr = new_lr;
-
-                // Early stop if KL is very high
-                if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
-                    println!("Early stopping: KL divergence too high");
-                    early_stopped = true;
-                    break 'epoch_loop;
-                }
+            // Safety check: stop only if something is catastrophically wrong
+            if mean_epoch_kl > 50.0 {
+                println!("Epoch {}/{}: KL {:.1} (catastrophic), stopping epochs", _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl);
+                break 'epoch_loop;
             }
+            
+            println!("Epoch {}/{}: KL {:.1}", _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl);
         }
 
         // Record std and divisor stats every episode
@@ -474,10 +440,6 @@ pub fn train(weights_path: Option<&str>) {
         // Record mean loss every episode
         let mean_loss = total_loss / num_loss_samples as f64;
         env.meta_history.record_loss(mean_loss);
-
-        if early_stopped {
-            println!("Training stopped early due to high KL divergence");
-        }
 
         let opt_end = Instant::now();
 

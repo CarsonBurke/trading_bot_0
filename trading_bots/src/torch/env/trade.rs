@@ -174,32 +174,47 @@ impl Env {
         }
     }
 
-    /// Weight-based trading: actions = base_weight + delta, then normalized.
-    /// action=0 → equal allocation, action=±0.1 → ±0.1 weight change (before normalization)
-    #[allow(dead_code)]
+    /// Weight-based trading with dead zone. Full control outside dead zone.
+    /// |action| <= threshold = hold. Otherwise adds action directly to target weight.
     pub(super) fn trade_by_weight_delta(
         &mut self,
         actions: &[f64],
         absolute_step: usize,
     ) -> (f64, f64) {
         let n_tickers = self.tickers.len();
-        let n_actions = actions.len();
         let min_trade_frac = 0.005;
 
         let mut total_commission = 0.0;
         let mut sell_reward = 0.0;
 
-        // 1. Convert actions to weights: base allocation + action delta, then normalize
-        // action=0 → equal allocation, action=±0.1 → ±0.1 weight change (before normalization)
-        let base_weight = 1.0 / n_actions as f64;
-        for (i, &action) in actions.iter().enumerate() {
-            self.target_weights[i] = (base_weight + action).max(0.0);
-        }
-        let weight_sum: f64 = self.target_weights.iter().sum();
-        if weight_sum > 1e-8 {
-            for w in &mut self.target_weights {
-                *w /= weight_sum;
+        // Apply delta with dead zone to ticker weights only.
+        // Cash is computed as residual (1 - sum(ticker_weights)).
+        for (i, &z) in actions.iter().take(n_tickers).enumerate() {
+            if z.is_finite() && z.abs() > ACTION_THRESHOLD {
+                self.target_weights[i] = (self.target_weights[i] + z).clamp(0.0, 1.0);
             }
+        }
+
+        // Enforce invariants and normalize tickers if needed.
+        for w in self.target_weights.iter_mut().take(n_tickers) {
+            if !w.is_finite() {
+                *w = 0.0;
+            } else {
+                *w = w.clamp(0.0, 1.0);
+            }
+        }
+
+        let mut ticker_sum: f64 = self.target_weights.iter().take(n_tickers).sum();
+        if ticker_sum > 1.0 {
+            for w in self.target_weights.iter_mut().take(n_tickers) {
+                *w /= ticker_sum;
+            }
+            ticker_sum = 1.0;
+        }
+
+        // Residual cash weight (always in [0,1]).
+        if self.target_weights.len() > n_tickers {
+            self.target_weights[n_tickers] = (1.0 - ticker_sum).clamp(0.0, 1.0);
         }
 
         // 3. Calculate current portfolio weights and target deltas

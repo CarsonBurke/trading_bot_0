@@ -710,14 +710,19 @@ pub fn raw_action_chart(
     let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
+    if raw_actions.is_empty() {
+        return Ok(());
+    }
     let y_min = raw_actions
         .iter()
-        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .filter(|x| x.is_finite())
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(&-1.0)
         * 1.1;
     let y_max = raw_actions
         .iter()
-        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .filter(|x| x.is_finite())
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(&1.0)
         * 1.1;
 

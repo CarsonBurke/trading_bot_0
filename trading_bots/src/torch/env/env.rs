@@ -63,11 +63,11 @@ impl Env {
 
     pub fn new(random_start: bool) -> Self {
         let tickers = vec![
-            "TSLA".to_string(),
-            "AAPL".to_string(),
-            "AMD".to_string(),
-            "INTC".to_string(),
-            "MSFT".to_string(),
+            // "TSLA".to_string(),
+            // "AAPL".to_string(),
+            // "AMD".to_string(),
+            // "INTC".to_string(),
+            // "MSFT".to_string(),
             "NVDA".to_string(),
         ];
 
@@ -97,7 +97,7 @@ impl Env {
             tickers,
             episode: 0,
             episode_start: Instant::now(),
-            action_history: VecDeque::with_capacity(5),
+            action_history: VecDeque::with_capacity(ACTION_HISTORY_LEN),
             episode_start_offset: 0,
             total_data_length,
             random_start,
@@ -136,14 +136,18 @@ impl Env {
             // Last action (cash) is not permuted
             let mut real_actions = vec![0.0; ACTION_COUNT as usize];
             for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
-                real_actions[real_idx] = actions[perm_idx];
-            }
-            real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize]; // cash
+            real_actions[real_idx] = actions[perm_idx];
+        }
+        real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize]; // cash
 
-            self.action_history.push_back(real_actions.clone());
-            if self.action_history.len() > ACTION_HISTORY_LEN {
-                self.action_history.pop_front();
-            }
+        if self.step == 0 {
+            self.episode_history.action_step0 = Some(real_actions.clone());
+        }
+
+        self.action_history.push_back(real_actions.clone());
+        if self.action_history.len() > ACTION_HISTORY_LEN {
+            self.action_history.pop_front();
+        }
 
             let (total_commission, trade_sell_reward) =
                 self.trade_by_target_weights(&real_actions, absolute_step);
@@ -162,16 +166,16 @@ impl Env {
             let is_done = self.get_is_done();
 
             for (index, _) in self.tickers.iter().enumerate() {
-                self.episode_history.positioned[index].push(
-                    self.account.positions[index]
-                        .value_with_price(self.prices[index][absolute_step]),
-                );
-                self.episode_history.raw_actions[index].push(real_actions[index]);
-                self.episode_history.target_weights[index].push(self.target_weights[index]);
-            }
-            self.episode_history.cash.push(self.account.cash);
-            self.episode_history.rewards.push(reward);
-            let cash_weight = if self.account.total_assets > 0.0 {
+            self.episode_history.positioned[index].push(
+                self.account.positions[index]
+                    .value_with_price(self.prices[index][absolute_step]),
+            );
+            self.episode_history.raw_actions[index].push(real_actions[index]);
+            self.episode_history.target_weights[index].push(self.target_weights[index]);
+        }
+        self.episode_history.cash.push(self.account.cash);
+        self.episode_history.rewards.push(reward);
+        let cash_weight = if self.account.total_assets > 0.0 {
                 self.account.cash / self.account.total_assets
             } else {
                 1.0
@@ -180,6 +184,7 @@ impl Env {
 
             if is_done == 1.0 {
                 self.handle_episode_end(absolute_step);
+                self.episode_history.action_final = Some(real_actions.clone());
             }
 
             rewards.push(reward);
@@ -306,7 +311,13 @@ impl Env {
         self.trade_activity_ema.fill(0.0);
         self.steps_since_trade.fill(0);
         self.position_open_step.fill(None);
-        self.target_weights = vec![0.0; self.tickers.len() + 1];
+        let n = self.tickers.len();
+        // self.target_weights = vec![1.0 / n as f64; n + 1];
+        // self.target_weights[n] = 0.0; // cash starts at 0
+        
+        // Initialize to 100% cash, 0% tickers.
+        self.target_weights = vec![0.0; n + 1];
+        self.target_weights[n] = 1.0;
 
         // Shuffle ticker permutation for this episode
         let mut rng = rand::rng();

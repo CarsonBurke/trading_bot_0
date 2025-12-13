@@ -550,7 +550,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                         3 => {
                                             app.view_meta_charts()?;
                                         }
-                                        4 => app.mode = AppMode::Logs,
+                                        4 => {
+                                            app.logs_page.enter();
+                                            app.mode = AppMode::Logs;
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -582,6 +585,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('5') => {
                                     app.dialog_mode = DialogMode::None;
+                                    app.logs_page.enter();
                                     app.mode = AppMode::Logs;
                                 }
                                 _ => {}
@@ -647,6 +651,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.view_meta_charts()?;
                                 }
                                 KeyCode::Char('l') => {
+                                    app.logs_page.enter();
                                     app.mode = AppMode::Logs;
                                 }
                                 KeyCode::Char('v') => {
