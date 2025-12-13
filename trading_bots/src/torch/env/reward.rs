@@ -12,13 +12,14 @@ const HINDSIGHT_COMMISSION_PENALTY: f64 = 10.0;
 impl Env {
     /// Hindsight allocation quality reward.
     ///
-    /// Measures what fraction of achievable outperformance the agent captured:
+    /// Measures what fraction of achievable return the agent captured, treating
+    /// cash as an asset with 0% return:
     /// - reward ∈ [-1, +1] based on allocation quality
-    /// - +1 = 100% in best asset, -1 = 100% in worst asset, 0 = equal weight
-    /// - Independent of market direction (up/down days don't matter)
-    /// - Only measures: "did you overweight winners and underweight losers?"
+    /// - +1 = optimal (100% in best asset or cash)
+    /// - -1 = worst (100% in worst asset or fully invested when should hold cash)
+    /// - 0 = midpoint between best and worst achievable
     ///
-    /// Eliminates market noise by normalizing by the achievable range.
+    /// Works correctly for any number of tickers including single-ticker case.
     pub(super) fn get_hindsight_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
             return 0.0;
@@ -26,79 +27,46 @@ impl Env {
 
         let next_step = absolute_step + 1;
         let n_tickers = self.tickers.len();
+        let total_assets = self.account.total_assets;
 
-        // Compute next-step returns for each ticker
-        let mut returns: Vec<f64> = Vec::with_capacity(n_tickers);
+        // Compute agent's actual return and best/worst achievable
+        // Cash is implicitly an asset with 0% return
+        let mut agent_return = 0.0;
+        let mut best_return: f64 = 0.0; // Can always hold cash
+        let mut worst_return: f64 = 0.0;
+
         for ticker_idx in 0..n_tickers {
             let current_price = self.prices[ticker_idx][absolute_step];
             let next_price = self.prices[ticker_idx][next_step];
-            returns.push((next_price / current_price) - 1.0);
+            let ticker_return = (next_price / current_price) - 1.0;
+
+            // Agent's weighted contribution from this ticker
+            let position_value = self.account.positions[ticker_idx]
+                .value_with_price(current_price);
+            let weight = position_value / total_assets;
+            agent_return += weight * ticker_return;
+
+            // Track best/worst (cash=0 is always an option)
+            best_return = best_return.max(ticker_return);
+            worst_return = worst_return.min(ticker_return);
+        }
+        // Cash weight contributes 0 to agent_return (weight * 0)
+
+        // Achievable range
+        let range = best_return - worst_return;
+        if range < 1e-10 {
+            // All returns ~equal, no meaningful allocation decision
+            let commission_penalty = -(commissions / total_assets) * HINDSIGHT_COMMISSION_PENALTY;
+            return commission_penalty * HINDSIGHT_REWARD_SCALE;
         }
 
-        // Get current portfolio weights (ticker weights only, excluding cash)
-        let total_assets = self.account.total_assets;
-        let mut weights: Vec<f64> = Vec::with_capacity(n_tickers);
-        let mut total_invested = 0.0;
-        for ticker_idx in 0..n_tickers {
-            let value = self.account.positions[ticker_idx]
-                .value_with_price(self.prices[ticker_idx][absolute_step]);
-            weights.push(value);
-            total_invested += value;
-        }
+        // Normalize: -1 at worst_return, +1 at best_return
+        let allocation_quality = (2.0 * (agent_return - worst_return) / range - 1.0).clamp(-1.0, 1.0);
 
-        // Normalize weights to sum to 1 (among invested portion only)
-        if total_invested < 1e-8 {
-            // Penalty for holding all cash - missing opportunity
-            let best_return = returns.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            return -best_return.max(0.0) * HINDSIGHT_REWARD_SCALE;
-        }
-
-        for w in &mut weights {
-            *w /= total_invested;
-        }
-
-        // Compute mean return (equal-weight benchmark)
-        let mean_return: f64 = returns.iter().sum::<f64>() / n_tickers as f64;
-
-        // Compute agent's weighted return
-        let agent_return: f64 = weights.iter().zip(returns.iter()).map(|(w, r)| w * r).sum();
-
-        // Compute best and worst possible returns (100% in single asset)
-        let best_return = returns.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let worst_return = returns.iter().cloned().fold(f64::INFINITY, f64::min);
-
-        // Active return = how much better/worse than equal weight
-        let active_return = agent_return - mean_return;
-
-        // Achievable range from mean
-        let max_upside = best_return - mean_return;
-        let max_downside = mean_return - worst_return;
-
-        // Normalize active return to [-1, +1]
-        let allocation_quality = if active_return >= 0.0 {
-            if max_upside > 1e-10 {
-                (active_return / max_upside).min(1.0)
-            } else {
-                0.0
-            }
-        } else if max_downside > 1e-10 {
-            -((-active_return) / max_downside).min(1.0)
-        } else {
-            0.0
-        };
-
-        // Commission penalty (relative to assets)
+        // Commission penalty
         let commission_penalty = -(commissions / total_assets) * HINDSIGHT_COMMISSION_PENALTY;
 
-        // Cash drag: penalize for not being fully invested when market is up
-        let cash_fraction = self.account.cash / total_assets;
-        let cash_drag = if mean_return > 0.0 {
-            -cash_fraction * mean_return * 5.0
-        } else {
-            cash_fraction * (-mean_return) * 2.0
-        };
-
-        (allocation_quality + commission_penalty + cash_drag) * HINDSIGHT_REWARD_SCALE
+        (allocation_quality + commission_penalty) * HINDSIGHT_REWARD_SCALE
     }
 
     #[allow(dead_code)]

@@ -20,6 +20,92 @@ use crate::{
     utils::{create_folder_if_not_exists, get_mapped_price_deltas},
 };
 
+/// Precomputed momentum indicators (SOTA for trend prediction)
+pub(super) struct MomentumIndicators {
+    pub rsi: Vec<f64>,           // RSI 14-period [0,1]
+    pub mom_5: Vec<f64>,         // 5-step momentum
+    pub mom_60: Vec<f64>,        // 60-step momentum
+    pub mom_120: Vec<f64>,       // 120-step momentum
+    pub mom_accel: Vec<f64>,     // Momentum acceleration
+    pub vol_adj_mom: Vec<f64>,   // Volatility-adjusted momentum
+    pub range_pos: Vec<f64>,     // Position in high-low range [-1,1]
+    pub zscore: Vec<f64>,        // Z-score from mean [-3,3]
+    pub efficiency: Vec<f64>,    // Efficiency ratio [0,1]
+    pub macd: Vec<f64>,          // MACD normalized
+    pub stoch_k: Vec<f64>,       // Stochastic %K [0,1]
+    pub trend_strength: Vec<f64>,// Trend consistency [0,1]
+}
+
+impl MomentumIndicators {
+    pub fn compute(prices: &[f64]) -> Self {
+        let n = prices.len();
+        let mut rsi = vec![0.5; n];
+        let mut mom_5 = vec![0.0; n];
+        let mut mom_60 = vec![0.0; n];
+        let mut mom_120 = vec![0.0; n];
+        let mut mom_accel = vec![0.0; n];
+        let mut vol_adj_mom = vec![0.0; n];
+        let mut range_pos = vec![0.0; n];
+        let mut zscore = vec![0.0; n];
+        let mut efficiency = vec![0.0; n];
+        let mut macd = vec![0.0; n];
+        let mut stoch_k = vec![0.5; n];
+        let mut trend_strength = vec![0.0; n];
+
+        let mut ema_12 = prices.first().copied().unwrap_or(1.0);
+        let mut ema_26 = ema_12;
+
+        for i in 1..n {
+            let p = prices[i];
+
+            if i >= 5 { mom_5[i] = (p / prices[i - 5] - 1.0).clamp(-0.5, 0.5); }
+            if i >= 60 { mom_60[i] = (p / prices[i - 60] - 1.0).clamp(-1.0, 1.0); }
+            if i >= 120 { mom_120[i] = (p / prices[i - 120] - 1.0).clamp(-2.0, 2.0); }
+            if i >= 10 { mom_accel[i] = (mom_5[i] - mom_5[i - 5]).clamp(-0.2, 0.2); }
+
+            if i >= 14 {
+                let (mut gains, mut losses) = (0.0, 0.0);
+                for j in (i - 13)..=i {
+                    let chg = prices[j] - prices[j - 1];
+                    if chg > 0.0 { gains += chg; } else { losses -= chg; }
+                }
+                rsi[i] = (100.0 - 100.0 / (1.0 + gains / losses.max(1e-10))) / 100.0;
+
+                let (mut up, mut down) = (0, 0);
+                for j in (i - 13)..=i {
+                    if prices[j] > prices[j - 1] { up += 1; }
+                    else if prices[j] < prices[j - 1] { down += 1; }
+                }
+                trend_strength[i] = up.max(down) as f64 / 14.0;
+            }
+
+            if i >= 20 {
+                let w = &prices[i - 19..=i];
+                let high = w.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let low = w.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mean: f64 = w.iter().sum::<f64>() / 20.0;
+                let std = (w.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / 20.0).sqrt().max(1e-10);
+                let range = (high - low).max(1e-10);
+
+                range_pos[i] = ((p - low) / range * 2.0 - 1.0).clamp(-1.0, 1.0);
+                stoch_k[i] = ((p - low) / range).clamp(0.0, 1.0);
+                zscore[i] = ((p - mean) / std).clamp(-3.0, 3.0);
+                vol_adj_mom[i] = ((p / prices[i - 20] - 1.0) / (std / mean)).clamp(-5.0, 5.0);
+
+                let net = (p - prices[i - 20]).abs();
+                let total: f64 = (i - 19..=i).map(|j| (prices[j] - prices[j - 1]).abs()).sum();
+                efficiency[i] = (net / total.max(1e-10)).clamp(0.0, 1.0);
+            }
+
+            ema_12 = 2.0 / 13.0 * p + (1.0 - 2.0 / 13.0) * ema_12;
+            ema_26 = 2.0 / 27.0 * p + (1.0 - 2.0 / 27.0) * ema_26;
+            macd[i] = ((ema_12 - ema_26) / p.max(1e-10) * 100.0).clamp(-5.0, 5.0);
+        }
+
+        Self { rsi, mom_5, mom_60, mom_120, mom_accel, vol_adj_mom, range_pos, zscore, efficiency, macd, stoch_k, trend_strength }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct BuyLot {
     pub step: usize,
@@ -50,10 +136,10 @@ pub struct Env {
     pub(super) trade_activity_ema: Vec<f64>,
     pub(super) steps_since_trade: Vec<usize>,
     pub(super) position_open_step: Vec<Option<usize>>,
-    /// Maps permuted index -> real ticker index (shuffled each episode)
     pub(super) ticker_perm: Vec<usize>,
-    /// Target portfolio weights for weight-delta trading (0-1 per ticker)
     pub(super) target_weights: Vec<f64>,
+    /// Precomputed momentum indicators per ticker
+    pub(super) momentum: Vec<MomentumIndicators>,
 }
 
 pub(super) const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
@@ -83,6 +169,11 @@ impl Env {
             .collect();
         let price_deltas = get_mapped_price_deltas(&mapped_bars);
 
+        // Precompute momentum indicators for all tickers
+        let momentum: Vec<MomentumIndicators> = prices.iter()
+            .map(|p| MomentumIndicators::compute(p))
+            .collect();
+
         let total_data_length = prices[0].len();
 
         let num_tickers = tickers.len();
@@ -110,7 +201,8 @@ impl Env {
             steps_since_trade: vec![0; num_tickers],
             position_open_step: vec![None; num_tickers],
             ticker_perm: (0..num_tickers).collect(),
-            target_weights: vec![0.0; num_tickers + 1], // +1 for cash
+            target_weights: vec![0.0; num_tickers + 1],
+            momentum,
         }
     }
 
@@ -332,6 +424,113 @@ impl Env {
         (price_deltas_tensor, static_obs_tensor)
     }
 
+    /// Reset for VecEnv - returns raw vectors instead of tensors
+    pub fn reset_single(&mut self) -> (Vec<f32>, Vec<f32>) {
+        let max_start = self
+            .total_data_length
+            .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
+
+        self.episode_start_offset = if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
+            let mut rng = rand::rng();
+            rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
+        } else {
+            PRICE_DELTAS_PER_TICKER
+        };
+
+        self.step = 0;
+        self.max_step =
+            (self.total_data_length - self.episode_start_offset).min(STEPS_PER_EPISODE) - 2;
+
+        self.account = Account::new(Self::STARTING_CASH, self.tickers.len());
+        self.episode_start = Instant::now();
+        self.episode_history = EpisodeHistory::new(self.tickers.len());
+        self.action_history.clear();
+
+        for lot_queue in &mut self.buy_lots {
+            lot_queue.clear();
+        }
+        self.retroactive_rewards.clear();
+
+        self.peak_assets = Self::STARTING_CASH;
+        self.last_reward = 0.0;
+        self.last_fill_ratio = 1.0;
+        self.trade_activity_ema.fill(0.0);
+        self.steps_since_trade.fill(0);
+        self.position_open_step.fill(None);
+        let n = self.tickers.len();
+        self.target_weights = vec![0.0; n + 1];
+        self.target_weights[n] = 1.0;
+
+        let mut rng = rand::rng();
+        self.ticker_perm.shuffle(&mut rng);
+
+        self.get_next_obs()
+    }
+
+    /// Single-environment step for VecEnv
+    pub fn step_single(&mut self, actions: Vec<f64>) -> SingleStep {
+        let absolute_step = self.episode_start_offset + self.step;
+        self.account.update_total(&self.prices, absolute_step);
+
+        for ema in &mut self.trade_activity_ema {
+            *ema *= 1.0 - TRADE_EMA_ALPHA;
+        }
+        for steps in &mut self.steps_since_trade {
+            *steps += 1;
+        }
+
+        let mut real_actions = vec![0.0; ACTION_COUNT as usize];
+        for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
+            real_actions[real_idx] = actions[perm_idx];
+        }
+        real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize];
+
+        if self.step == 0 {
+            self.episode_history.action_step0 = Some(real_actions.clone());
+        }
+
+        self.action_history.push_back(real_actions.clone());
+        if self.action_history.len() > ACTION_HISTORY_LEN {
+            self.action_history.pop_front();
+        }
+
+        let (total_commission, trade_sell_reward) =
+            self.trade_by_target_weights(&real_actions, absolute_step);
+        let reward = self.get_hindsight_reward(absolute_step, total_commission)
+            + if RETROACTIVE_BUY_REWARD { trade_sell_reward } else { 0.0 };
+
+        self.last_reward = reward;
+        if self.account.total_assets > self.peak_assets {
+            self.peak_assets = self.account.total_assets;
+        }
+
+        let is_done = self.get_is_done();
+
+        for (index, _) in self.tickers.iter().enumerate() {
+            self.episode_history.positioned[index].push(
+                self.account.positions[index].value_with_price(self.prices[index][absolute_step]),
+            );
+            self.episode_history.raw_actions[index].push(real_actions[index]);
+            self.episode_history.target_weights[index].push(self.target_weights[index]);
+        }
+        self.episode_history.cash.push(self.account.cash);
+        self.episode_history.rewards.push(reward);
+        let cash_weight = if self.account.total_assets > 0.0 {
+            self.account.cash / self.account.total_assets
+        } else {
+            1.0
+        };
+        self.episode_history.cash_weight.push(cash_weight);
+
+        if is_done == 1.0 {
+            self.handle_episode_end(absolute_step);
+            self.episode_history.action_final = Some(real_actions.clone());
+        }
+
+        let (price_deltas, static_obs) = self.get_next_obs();
+        SingleStep { reward, price_deltas, static_obs, is_done }
+    }
+
     pub fn record_inference(&self, episode: usize) {
         let infer_dir = "../infer";
         create_folder_if_not_exists(&infer_dir.to_string());
@@ -346,4 +545,12 @@ pub struct Step {
     pub price_deltas: Tensor,
     pub static_obs: Tensor,
     pub is_done: Tensor,
+}
+
+/// Single-environment step result with raw values (for VecEnv)
+pub struct SingleStep {
+    pub reward: f64,
+    pub price_deltas: Vec<f32>,
+    pub static_obs: Vec<f32>,
+    pub is_done: f32,
 }

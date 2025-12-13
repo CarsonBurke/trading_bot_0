@@ -6,10 +6,10 @@ use crate::torch::constants::{
     ACTION_COUNT, OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, RETROACTIVE_BUY_REWARD,
     STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
 };
-use crate::torch::model::model;
-use crate::torch::env::Env;
+use crate::torch::model::TradingModel;
+use crate::torch::env::VecEnv;
 
-pub const NPROCS: i64 = 1; // Parallel environments for better GPU utilization
+pub const NPROCS: i64 = 4; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
 const OPTIM_MINIBATCH: i64 = 256; // Mini-batch size for GPU processing (avoids OOM)
 const OPTIM_EPOCHS: i64 = 4;
@@ -17,6 +17,15 @@ const OPTIM_EPOCHS: i64 = 4;
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
 const GAMMA: f64 = 0.995;
 const GAE_LAMBDA: f64 = 0.98;
+
+// Symlog transform (from Dreamer-v3): handles diverse reward scales gracefully
+fn symlog(x: &Tensor) -> Tensor {
+    x.sign() * (x.abs() + 1.0).log()
+}
+
+fn symexp(x: &Tensor) -> Tensor {
+    x.sign() * (x.abs().exp() - 1.0)
+}
 
 // gSDE: resample exploration noise every N env steps (temporally correlated exploration).
 // This matches the common SB3-style behavior while keeping per-step log-prob computation unchanged.
@@ -33,56 +42,66 @@ const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const LEARNING_RATE: f64 = 2e-5;
 
-// Reward normalization (VecNormalize-style): normalize rewards by running RMS of discounted returns.
+// Reward normalization using percentile EMA (robust to outliers, from Dreamer-v3)
 const REWARD_NORM_EPS: f64 = 1e-8;
 const REWARD_CLIP: f64 = 10.0;
+const PERCENTILE_ALPHA: f64 = 0.02; // EMA decay rate for percentile tracking
 
 #[derive(Debug, Clone)]
-struct RunningMeanStd {
-    mean: f64,
-    var: f64,
-    count: f64,
+struct RewardPercentileEMA {
+    q05: f64, // 5th percentile
+    q95: f64, // 95th percentile
+    initialized: bool,
 }
 
-impl RunningMeanStd {
+impl RewardPercentileEMA {
     fn new() -> Self {
         Self {
-            mean: 0.0,
-            var: 1.0,
-            count: 1e-4,
+            q05: 0.0,
+            q95: 1.0,
+            initialized: false,
         }
     }
 
-    fn update_from_moments(&mut self, batch_mean: f64, batch_var: f64, batch_count: f64) {
-        if !batch_mean.is_finite() || !batch_var.is_finite() || batch_count <= 0.0 {
+    fn update(&mut self, values: &Tensor) {
+        let flat = values.flatten(0, -1);
+        let q05_new = f64::try_from(flat.quantile_scalar(0.05, None, false, "linear")).unwrap_or(0.0);
+        let q95_new = f64::try_from(flat.quantile_scalar(0.95, None, false, "linear")).unwrap_or(1.0);
+
+        if !q05_new.is_finite() || !q95_new.is_finite() {
             return;
         }
-        let delta = batch_mean - self.mean;
-        let total_count = self.count + batch_count;
-        let new_mean = self.mean + delta * batch_count / total_count;
 
-        let m_a = self.var * self.count;
-        let m_b = batch_var * batch_count;
-        let m2 = m_a + m_b + delta * delta * self.count * batch_count / total_count;
-        let new_var = (m2 / total_count).max(1e-12);
+        if !self.initialized {
+            self.q05 = q05_new;
+            self.q95 = q95_new;
+            self.initialized = true;
+        } else {
+            self.q05 = PERCENTILE_ALPHA * q05_new + (1.0 - PERCENTILE_ALPHA) * self.q05;
+            self.q95 = PERCENTILE_ALPHA * q95_new + (1.0 - PERCENTILE_ALPHA) * self.q95;
+        }
+    }
 
-        self.mean = new_mean;
-        self.var = new_var;
-        self.count = total_count;
+    fn scale(&self) -> f64 {
+        (self.q95 - self.q05).max(1.0)
+    }
+
+    fn offset(&self) -> f64 {
+        self.q05
     }
 }
 
 pub fn train(weights_path: Option<&str>) {
-    let mut env = Env::new(true);
-    let mut reward_rms = RunningMeanStd::new();
+    let mut env = VecEnv::new(true);
+    let mut reward_ema = RewardPercentileEMA::new();
 
     // Generate data analysis charts for training data
     println!("Generating data analysis charts...");
     let data_dir = "../training/data";
-    for (ticker_idx, ticker) in env.tickers.iter().enumerate() {
+    for (ticker_idx, ticker) in env.tickers().iter().enumerate() {
         if let Err(e) = crate::charts::data_analysis::create_data_analysis_charts(
             ticker,
-            &env.prices[ticker_idx],
+            &env.prices()[ticker_idx],
             data_dir,
         ) {
             eprintln!("Warning: Failed to create data analysis charts for {}: {}", ticker, e);
@@ -90,8 +109,8 @@ pub fn train(weights_path: Option<&str>) {
     }
 
     if let Err(e) = crate::charts::data_analysis::create_index_chart(
-        &env.tickers,
-        &env.prices,
+        env.tickers(),
+        env.prices(),
         data_dir,
     ) {
         eprintln!("Warning: Failed to create index chart: {}", e);
@@ -114,7 +133,7 @@ pub fn train(weights_path: Option<&str>) {
     println!("Using device {:?}", device);
 
     let mut vs = nn::VarStore::new(device);
-    let model = model(&vs.root(), ACTION_COUNT);
+    let trading_model = TradingModel::new(&vs.root(), ACTION_COUNT);
 
     if let Some(path) = weights_path {
         println!("Loading weights from: {}", path);
@@ -123,6 +142,9 @@ pub fn train(weights_path: Option<&str>) {
     } else {
         println!("Starting training from scratch");
     }
+
+    // Recurrent state for rollout collection (maintains SSM memory across steps)
+    let mut stream_state = trading_model.init_stream_state_batched(NPROCS);
 
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
@@ -171,7 +193,10 @@ pub fn train(weights_path: Option<&str>) {
         let (price_deltas_reset, static_obs_reset) = env.reset();
         current_price_deltas = price_deltas_reset; // Keep in FP32
         current_static_obs = static_obs_reset.to_device(device); // Keep in FP32
-        env.episode = episode as usize;
+        env.set_episode(episode as usize);
+
+        // Reset recurrent state at episode boundary
+        stream_state.reset();
 
         s_price_deltas.get(0).copy_(&current_price_deltas); // CPU to CPU (FP32)
         s_static_obs.get(0).copy_(&current_static_obs);
@@ -180,17 +205,18 @@ pub fn train(weights_path: Option<&str>) {
         // Loop through the episode using relative steps (0 to max_step)
         let mut s: i64 = 0;
         let mut sde_noise: Option<Tensor> = None;
-        for step in 0..env.max_step {
-            env.step = step;
+        for step in 0..env.max_step() {
+            env.set_step(step);
 
             let (critic, (action_mean, action_log_std, _divisor), attn_weights) = tch::no_grad(|| {
                 // Move price deltas from CPU to GPU (FP32)
                 let price_deltas_gpu = s_price_deltas.get(s).to_device(device);
                 let static_obs = s_static_obs.get(s);
-                model(
+                // Use recurrent forward with SSM state for memory across steps
+                trading_model.forward_with_state(
                     &price_deltas_gpu,
                     &static_obs,
-                    false, // eval mode during rollout for stable observations
+                    &mut stream_state,
                 )
             });
 
@@ -225,11 +251,11 @@ pub fn train(weights_path: Option<&str>) {
             let step_state = env.step(actions_vec);
 
             // Record static observations and attention weights for TUI visualization (last 100 steps only)
-            if step >= env.max_step.saturating_sub(100) {
+            if step >= env.max_step().saturating_sub(100) {
                 let static_obs_vec = Vec::<f32>::try_from(s_static_obs.get(s).flatten(0, -1)).unwrap_or_default();
                 let attn_weights_vec = Vec::<f32>::try_from(attn_weights.flatten(0, -1)).unwrap_or_default();
-                env.episode_history.static_observations.push(static_obs_vec);
-                env.episode_history.attention_weights.push(attn_weights_vec);
+                env.primary_mut().episode_history.static_observations.push(static_obs_vec);
+                env.primary_mut().episode_history.attention_weights.push(attn_weights_vec);
             }
 
             // println!("Step reward: {:?}", step_state.reward);
@@ -268,34 +294,21 @@ pub fn train(weights_path: Option<&str>) {
             env.apply_retroactive_rewards(&s_rewards);
         }
 
-        // === Reward normalization (SB3 VecNormalize-style) ===
-        // Update running RMS of discounted returns, then normalize rewards in-place
-        // before computing GAE/value targets.
-        let discounted_returns = {
-            let mut ret = Tensor::zeros([NPROCS], (Kind::Float, device));
-            let returns = Tensor::zeros([n_steps, NPROCS], (Kind::Float, device));
-            for t in (0..n_steps).rev() {
-                let r_t = s_rewards.get(t);
-                let mask_t = s_masks.get(t);
-                let new_ret = r_t + GAMMA * &ret * &mask_t;
-                ret.copy_(&new_ret);
-                returns.get(t).copy_(&new_ret);
-            }
-            returns
-        };
-        let ret_mean_val = f64::try_from(discounted_returns.mean(Kind::Float)).unwrap_or(0.0);
-        let ret_var_val = f64::try_from(discounted_returns.var(false)).unwrap_or(1.0);
-        reward_rms.update_from_moments(ret_mean_val, ret_var_val, memory_size as f64);
-
-        let reward_scale = 1.0 / (reward_rms.var + REWARD_NORM_EPS).sqrt();
-        let rewards_scaled = (&s_rewards)
-            .g_mul_scalar(reward_scale)
+        // === Reward normalization (Percentile EMA + symlog) ===
+        // Use 5th/95th percentile EMA for robust scaling, then symlog for diverse scales
+        reward_ema.update(&s_rewards);
+        let reward_scale = 1.0 / (reward_ema.scale() + REWARD_NORM_EPS);
+        let reward_offset = reward_ema.offset();
+        let rewards_centered = &s_rewards - reward_offset;
+        let rewards_scaled = symlog(&(rewards_centered.g_mul_scalar(reward_scale)))
             .clamp(-REWARD_CLIP, REWARD_CLIP);
         s_rewards.copy_(&rewards_scaled);
 
+        // Move price_deltas to GPU ONCE before epoch loop (not per-minibatch)
         let price_deltas_batch = s_price_deltas
             .narrow(0, 0, n_steps)
-            .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
+            .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64])
+            .to_device(device);
         let static_obs_batch = s_static_obs
             .narrow(0, 0, n_steps)
             .reshape([memory_size, STATIC_OBSERVATIONS as i64]);
@@ -308,7 +321,7 @@ pub fn train(weights_path: Option<&str>) {
             let next_value = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(-1).to_device(device);
                 let static_obs = s_static_obs.get(-1);
-                let (critic, _, _) = model(&price_deltas_gpu, &static_obs, false);
+                let (critic, _, _) = trading_model.forward(&price_deltas_gpu, &static_obs, false);
                 critic.view([NPROCS])
             });
 
@@ -350,7 +363,7 @@ pub fn train(weights_path: Option<&str>) {
         let adv_mean_val = f64::try_from(advantages.mean(Kind::Float)).unwrap_or(0.0);
         let adv_min_val = f64::try_from(advantages.min()).unwrap_or(0.0);
         let adv_max_val = f64::try_from(advantages.max()).unwrap_or(0.0);
-        env.meta_history.record_advantage_stats(adv_mean_val, adv_min_val, adv_max_val);
+        env.primary_mut().meta_history.record_advantage_stats(adv_mean_val, adv_min_val, adv_max_val);
 
         // Normalize advantages globally (not per-minibatch) for consistent policy gradients
         let adv_mean = advantages.mean(Kind::Float);
@@ -361,19 +374,19 @@ pub fn train(weights_path: Option<&str>) {
         let ret_mean = returns.mean(Kind::Float);
         let ret_std = returns.std(false) + 1e-8;
         let returns = (&returns - &ret_mean) / &ret_std;
-        let s_values = (&s_values - &ret_mean) / &ret_std; // normalize old values with same stats
+        let s_values = ((&s_values - &ret_mean) / &ret_std).reshape([memory_size, 1]); // normalize and reshape once
 
 	        let opt_start = Instant::now();
-	        let mut total_kl = 0.0;
-	        let mut num_kl_samples = 0;
-	        let mut total_loss = 0.0;
-	        let mut num_loss_samples = 0;
-	        let mut grad_norm_sum = 0.0;
-	        let mut grad_norm_count = 0.0;
+	        // Accumulate on GPU - only sync once at end of all epochs
+	        let mut total_kl_gpu = Tensor::zeros([], (Kind::Float, device));
+	        let mut total_loss_gpu = Tensor::zeros([], (Kind::Float, device));
+	        let mut num_samples = 0i64;
+	        let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
+	        let mut grad_norm_count = 0i64;
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
-            let mut epoch_kl_sum = 0.0;
-            let mut epoch_kl_count = 0;
+            let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
+            let mut epoch_kl_count = 0i64;
 
             // Shuffle indices for this epoch
             let shuffled_indices = Tensor::randperm(memory_size, int64_kind);
@@ -386,21 +399,16 @@ pub fn train(weights_path: Option<&str>) {
                 let end_idx = (start_idx + OPTIM_MINIBATCH).min(memory_size);
                 let minibatch_size = end_idx - start_idx;
 
-                // Get indices for this mini-batch
+                // Get indices for this mini-batch (all on GPU now)
                 let batch_indexes = shuffled_indices.narrow(0, start_idx, minibatch_size);
-                let batch_indexes_cpu = batch_indexes.to_device(tch::Device::Cpu);
-
-                // Move only mini-batch to GPU (in FP32)
-                let price_deltas_sample = price_deltas_batch
-                    .index_select(0, &batch_indexes_cpu)
-                    .to_device(device);
+                let price_deltas_sample = price_deltas_batch.index_select(0, &batch_indexes);
                 let static_obs_sample = static_obs_batch.index_select(0, &batch_indexes);
                 let actions_sample = actions.index_select(0, &batch_indexes);
                 let returns_sample = returns.index_select(0, &batch_indexes);
                 let advantages_sample = advantages.index_select(0, &batch_indexes);
                 let old_log_probs_sample = old_log_probs.index_select(0, &batch_indexes);
                 let (critic, (action_mean, action_log_std, _divisor), _attn_weights) =
-                    model(&price_deltas_sample, &static_obs_sample, true);
+                    trading_model.forward(&price_deltas_sample, &static_obs_sample, true);
 
                 // z is stored directly in actions_sample (pre-softmax values)
                 let z = actions_sample;
@@ -422,10 +430,8 @@ pub fn train(weights_path: Option<&str>) {
                     .sum_dim_intlist(-1, false, Kind::Float)
                     .mean(Kind::Float);
 
-                // Old predictions from buffer
-                let values_old_sample = s_values
-                    .reshape([memory_size, 1])
-                    .index_select(0, &batch_indexes);
+                // Old predictions from buffer (s_values pre-reshaped)
+                let values_old_sample = s_values.index_select(0, &batch_indexes);
 
                 // Normalize critic to match normalized returns
                 let critic_normalized = (&critic - &ret_mean) / &ret_std;
@@ -454,66 +460,48 @@ pub fn train(weights_path: Option<&str>) {
                 let action_loss =
                     -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
 
-                // Compute approximate KL divergence for early stopping
-                // KL ≈ (ratio - 1) - log(ratio)
+                // Compute approximate KL divergence (accumulate on GPU)
                 let approx_kl = (&old_log_probs_sample - &action_log_probs).mean(Kind::Float);
-                let approx_kl_value = f64::try_from(approx_kl).unwrap();
-
-                epoch_kl_sum += approx_kl_value;
+                epoch_kl_gpu += &approx_kl;
                 epoch_kl_count += 1;
 
                 let loss = value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
-                let loss_value = f64::try_from(loss.shallow_clone()).unwrap();
-                total_loss += loss_value;
-                num_loss_samples += 1;
+                total_loss_gpu += &loss;
+                total_kl_gpu += &approx_kl;
+                num_samples += 1;
 
-	                // Manual step so we can log grad norm (SB3-style).
 	                opt.zero_grad();
 	                loss.backward();
 
-	                let grad_norm = tch::no_grad(|| {
-	                    let vars = opt.trainable_variables();
-	                    let mut norms = Vec::new();
-	                    for v in vars {
+	                // Efficient grad norm on GPU: sum(g^2) then sqrt, no Vec/stack
+	                let batch_grad_norm = tch::no_grad(|| {
+	                    let mut norm_sq = Tensor::zeros([], (Kind::Float, device));
+	                    for v in opt.trainable_variables() {
 	                        let g = v.grad();
 	                        if g.defined() {
-	                            norms.push(g.norm());
+	                            norm_sq += g.pow_tensor_scalar(2).sum(Kind::Float);
 	                        }
 	                    }
-	                    if norms.is_empty() {
-	                        0.0
-	                    } else {
-	                        f64::try_from(Tensor::stack(&norms, 0).norm()).unwrap_or(0.0)
-	                    }
+	                    norm_sq.sqrt()
 	                });
-	                if grad_norm.is_finite() && grad_norm >= 0.0 {
-	                    grad_norm_sum += grad_norm;
-	                    grad_norm_count += 1.0;
-	                }
+	                grad_norm_sum += &batch_grad_norm;
+	                grad_norm_count += 1;
 
 	                opt.clip_grad_norm(MAX_GRAD_NORM);
 	                opt.step();
 	            }
 
-            // Monitor KL divergence (diagnostic only - PPO clip handles trust region)
-            let mean_epoch_kl = epoch_kl_sum / epoch_kl_count as f64;
-            total_kl += mean_epoch_kl;
-            num_kl_samples += 1;
+            // Single GPU->CPU sync per epoch for KL early stopping check
+            let mean_epoch_kl = f64::try_from(&epoch_kl_gpu / epoch_kl_count as f64).unwrap_or(0.0);
 
-	            // Conservative early stopping (SB3-style)
 	            if mean_epoch_kl.is_finite() && mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
 	                println!(
-	                    "Epoch {}/{}: KL {:.4} > {:.4} (target {:.4} × {:.1}), stopping epochs",
-	                    _epoch + 1,
-	                    OPTIM_EPOCHS,
-	                    mean_epoch_kl,
-	                    TARGET_KL * KL_STOP_MULTIPLIER,
-	                    TARGET_KL,
-	                    KL_STOP_MULTIPLIER
+	                    "Epoch {}/{}: KL {:.4} > {:.4}, stopping",
+	                    _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl, TARGET_KL * KL_STOP_MULTIPLIER
 	                );
 	                break 'epoch_loop;
 	            }
-	            
+
 	            println!("Epoch {}/{}: KL {:.4}", _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl);
 	        }
 
@@ -521,7 +509,7 @@ pub fn train(weights_path: Option<&str>) {
         let (mean_std, min_std, max_std, mean_div) = tch::no_grad(|| {
             let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
             let static_obs = s_static_obs.get(0);
-            let (_, (_, action_log_std, divisor), _) = model(&price_deltas_gpu, &static_obs, false);
+            let (_, (_, action_log_std, divisor), _) = trading_model.forward(&price_deltas_gpu, &static_obs, false);
             let std = action_log_std.exp();
             (
                 f64::try_from(std.mean(Kind::Float)).unwrap_or(0.0),
@@ -530,18 +518,18 @@ pub fn train(weights_path: Option<&str>) {
                 f64::try_from(divisor.mean(Kind::Float)).unwrap_or(0.0),
             )
         });
-        env.meta_history.record_std_stats(mean_std, min_std, max_std);
-        env.meta_history.record_divisor(mean_div);
+        env.primary_mut().meta_history.record_std_stats(mean_std, min_std, max_std);
+        env.primary_mut().meta_history.record_divisor(mean_div);
 
-	        // Record mean loss every episode
-	        let mean_loss = total_loss / num_loss_samples as f64;
-	        env.meta_history.record_loss(mean_loss);
-	        let mean_grad_norm = if grad_norm_count > 0.0 {
-	            grad_norm_sum / grad_norm_count
-	        } else {
-	            0.0
-	        };
-	        env.meta_history.record_grad_norm(mean_grad_norm);
+	        // Single GPU->CPU sync for loss and grad norm at end of all epochs
+	        let mean_loss = if num_samples > 0 {
+	            f64::try_from(&total_loss_gpu / num_samples as f64).unwrap_or(0.0)
+	        } else { 0.0 };
+	        env.primary_mut().meta_history.record_loss(mean_loss);
+	        let mean_grad_norm = if grad_norm_count > 0 {
+	            f64::try_from(&grad_norm_sum / grad_norm_count as f64).unwrap_or(0.0)
+	        } else { 0.0 };
+	        env.primary_mut().meta_history.record_grad_norm(mean_grad_norm);
 
         let opt_end = Instant::now();
 
@@ -550,7 +538,7 @@ pub fn train(weights_path: Option<&str>) {
             let (_, (debug_mean, debug_log_std, _debug_divisor), _attn_weights) = tch::no_grad(|| {
                 let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
                 let static_obs = s_static_obs.get(0);
-                model(&price_deltas_gpu, &static_obs, false)
+                trading_model.forward(&price_deltas_gpu, &static_obs, false)
             });
 
             // Show softmax weights from mean
@@ -561,8 +549,8 @@ pub fn train(weights_path: Option<&str>) {
             let mean_std = f64::try_from(debug_log_std.exp().mean(Kind::Float)).unwrap();
             let max_raw_action = f64::try_from(debug_mean.abs().max()).unwrap();
 
-            let avg_kl = if num_kl_samples > 0 {
-                total_kl / num_kl_samples as f64
+            let avg_kl = if num_samples > 0 {
+                f64::try_from(&total_kl_gpu / num_samples as f64).unwrap_or(0.0)
             } else {
                 0.0
             };

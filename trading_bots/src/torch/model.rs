@@ -1,372 +1,413 @@
 use tch::nn::Init;
-use tch::{nn, Tensor};
+use tch::{nn, Kind, Tensor};
 
 use crate::torch::constants::{
     GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
+use crate::torch::ssm::{stateful_mamba_block, Mamba2State, StatefulMamba};
 
-// Temporal length after conv layers (8x downsample from stem):
-// floor((floor((floor((L - 8) / 2 + 1) - 5) / 2 + 1) - 3) / 2 + 1)
-const fn calc_conv_temporal_len(input_len: i64) -> i64 {
-    let after_c1 = (input_len - 8) / 2 + 1;  // k=8, s=2
-    let after_c2 = (after_c1 - 5 + 4) / 2 + 1;  // k=5, s=2, p=2
-    (after_c2 - 3 + 2) / 2 + 1  // k=3, s=2, p=1
+fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
+    let denoms = (in_features + out_features) as f64 / 2.0;
+    let std = (1.0 / denoms).sqrt() / 0.8796;
+    Init::Randn { mean: 0.0, stdev: std }
 }
+
+const fn calc_conv_temporal_len(input_len: i64) -> i64 {
+    let after_c1 = (input_len - 8) / 2 + 1;
+    let after_c2 = (after_c1 - 5 + 4) / 2 + 1;
+    (after_c2 - 3 + 2) / 2 + 1
+}
+
 const CONV_TEMPORAL_LEN: i64 = calc_conv_temporal_len(PRICE_DELTAS_PER_TICKER as i64);
+const SSM_DIM: i64 = 64;
+const INPUT_BUFFER_SIZE: i64 = 8;
 
-// Model returns (critic_value, (action_mean, action_log_std, divisor), temporal_attn_weights)
-pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor, Tensor), Tensor)>;
+pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
 
-/// # Returns
-/// A boxed function that takes (price_deltas, static_obs, train) and returns (critic_value, (action_mean, action_log_std))
-pub fn model(p: &nn::Path, nact: i64) -> Model {
-    // Multi-scale temporal conv with 3 parallel dilated branches (TimesNet-inspired)
-    // Each branch: shared stem -> dilated depthwise convs -> concat -> project
-    // Dilations: d=1 (local), d=4 (medium ~weekly), d=16 (long ~monthly)
+/// Streaming state for O(1) inference and training rollouts with memory
+pub struct StreamState {
+    pub input_buffer: Tensor,
+    pub buffer_pos: i64,
+    /// Per-ticker states for O(1) step inference
+    pub ssm_states: Vec<Mamba2State>,
+    /// Batched state for GPU-efficient forward_with_state (training rollouts)
+    pub ssm_state_batched: Mamba2State,
+    pub last_output: Option<ModelOutput>,
+}
 
-    // Shared stem: 1 -> 64 channels with stride 2
-    let c1 = nn::conv1d(p / "c1", 1, 64, 8, nn::ConvConfig { stride: 2, ..Default::default() });
+impl StreamState {
+    pub fn reset(&mut self) {
+        let _ = self.input_buffer.zero_();
+        self.buffer_pos = 0;
+        for s in &mut self.ssm_states {
+            s.reset();
+        }
+        self.ssm_state_batched.reset();
+        self.last_output = None;
+    }
+}
 
-    // Shared block 2: 64 -> 64 channels, stride 2
-    let gn2 = nn::group_norm(p / "gn2", 8, 64, Default::default());
-    let c2_dw = nn::conv1d(p / "c2_dw", 64, 64, 5, nn::ConvConfig { stride: 2, padding: 2, groups: 64, ..Default::default() });
-    let c2_pw = nn::conv1d(p / "c2_pw", 64, 64, 1, Default::default());
+pub struct TradingModel {
+    c1: nn::Conv1D,
+    gn2: nn::GroupNorm,
+    c2_dw: nn::Conv1D,
+    c2_pw: nn::Conv1D,
+    gn3: nn::GroupNorm,
+    c3_dw: nn::Conv1D,
+    c3_pw: nn::Conv1D,
+    ssm: StatefulMamba,
+    ssm_proj: nn::Conv1D,
+    pos_embedding: Tensor,
+    static_to_temporal: nn::Linear,
+    ln_static_temporal: nn::LayerNorm,
+    temporal_pools: [nn::Linear; 4],
+    static_proj: nn::Linear,
+    ln_static_proj: nn::LayerNorm,
+    attn_qkv: nn::Linear,
+    attn_out: nn::Linear,
+    ln_attn: nn::LayerNorm,
+    pma_seeds: Tensor,
+    pma_kv: nn::Linear,
+    pma_q: nn::Linear,
+    pma_out: nn::Linear,
+    ln_pma: nn::LayerNorm,
+    global_to_seed: nn::Linear,
+    fc1: nn::Linear,
+    ln_fc1: nn::LayerNorm,
+    fc2_actor: nn::Linear,
+    ln_fc2_actor: nn::LayerNorm,
+    fc2_critic: nn::Linear,
+    ln_fc2_critic: nn::LayerNorm,
+    fc3_actor: nn::Linear,
+    ln_fc3_actor: nn::LayerNorm,
+    fc3_critic: nn::Linear,
+    ln_fc3_critic: nn::LayerNorm,
+    critic: nn::Linear,
+    bucket_centers: Tensor,
+    actor_mean: nn::Linear,
+    sde_fc: nn::Linear,
+    ln_sde: nn::LayerNorm,
+    log_std_param: Tensor,
+    log_d_raw: Tensor,
+    device: tch::Device,
+    num_heads: i64,
+    head_dim: i64,
+    pma_num_seeds: i64,
+}
 
-    // Shared block 3: 64 -> 64 channels, stride 2 (total downsample: 8x)
-    let gn3 = nn::group_norm(p / "gn3", 8, 64, Default::default());
-    let c3_dw = nn::conv1d(p / "c3_dw", 64, 64, 3, nn::ConvConfig { stride: 2, padding: 1, groups: 64, ..Default::default() });
-    let c3_pw = nn::conv1d(p / "c3_pw", 64, 64, 1, Default::default());
+impl TradingModel {
+    pub fn new(p: &nn::Path, nact: i64) -> Self {
+        let c1 = nn::conv1d(p / "c1", 1, 64, 8, nn::ConvConfig { stride: 2, ..Default::default() });
+        let gn2 = nn::group_norm(p / "gn2", 8, 64, Default::default());
+        let c2_dw = nn::conv1d(p / "c2_dw", 64, 64, 5, nn::ConvConfig { stride: 2, padding: 2, groups: 64, ..Default::default() });
+        let c2_pw = nn::conv1d(p / "c2_pw", 64, 64, 1, Default::default());
+        let gn3 = nn::group_norm(p / "gn3", 8, 64, Default::default());
+        let c3_dw = nn::conv1d(p / "c3_dw", 64, 64, 3, nn::ConvConfig { stride: 2, padding: 1, groups: 64, ..Default::default() });
+        let c3_pw = nn::conv1d(p / "c3_pw", 64, 64, 1, Default::default());
 
-    // Branch A: dilation=1 (local patterns, ~1-8 steps)
-    let gn_a = nn::group_norm(p / "gn_a", 8, 64, Default::default());
-    let ca_dw = nn::conv1d(p / "ca_dw", 64, 64, 3, nn::ConvConfig { padding: 1, groups: 64, ..Default::default() });
-    let ca_pw = nn::conv1d(p / "ca_pw", 64, 64, 1, Default::default());
+        let ssm = stateful_mamba_block(&(p / "ssm"), SSM_DIM);
+        let ssm_proj = nn::conv1d(p / "ssm_proj", SSM_DIM, 256, 1, Default::default());
+        let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
 
-    // Branch B: dilation=4 (medium patterns, ~4-32 steps)
-    let gn_b = nn::group_norm(p / "gn_b", 8, 64, Default::default());
-    let cb_dw = nn::conv1d(p / "cb_dw", 64, 64, 3, nn::ConvConfig { padding: 4, dilation: 4, groups: 64, ..Default::default() });
-    let cb_pw = nn::conv1d(p / "cb_pw", 64, 64, 1, Default::default());
+        let static_to_temporal = nn::linear(p / "static_to_temporal", PER_TICKER_STATIC_OBS as i64, 64, Default::default());
+        let ln_static_temporal = nn::layer_norm(p / "ln_static_temporal", vec![64], Default::default());
+        let temporal_pools = [
+            nn::linear(p / "temporal_pool_0", 128, 1, Default::default()),
+            nn::linear(p / "temporal_pool_1", 128, 1, Default::default()),
+            nn::linear(p / "temporal_pool_2", 128, 1, Default::default()),
+            nn::linear(p / "temporal_pool_3", 128, 1, Default::default()),
+        ];
 
-    // Branch C: dilation=16 (long patterns, ~16-128 steps)
-    let gn_c = nn::group_norm(p / "gn_c", 8, 64, Default::default());
-    let cc_dw = nn::conv1d(p / "cc_dw", 64, 64, 3, nn::ConvConfig { padding: 16, dilation: 16, groups: 64, ..Default::default() });
-    let cc_pw = nn::conv1d(p / "cc_pw", 64, 64, 1, Default::default());
+        let static_proj = nn::linear(p / "static_proj", 256 + PER_TICKER_STATIC_OBS as i64, 256, Default::default());
+        let ln_static_proj = nn::layer_norm(p / "ln_static_proj", vec![256], Default::default());
 
-    // Fuse branches: 192 -> 256 channels
-    let gn_fuse = nn::group_norm(p / "gn_fuse", 8, 192, Default::default());
-    let c_fuse = nn::conv1d(p / "c_fuse", 192, 256, 1, Default::default());
+        let num_heads = 4i64;
+        let head_dim = 64i64;
+        let attn_qkv = nn::linear(p / "attn_qkv", 256, 256 * 3, Default::default());
+        let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
+        let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
 
-    // Gated residual: interpolate between stem (direct) and branches (multi-scale)
-    // gate = sigmoid(conv(concat(stem_proj, branches))) per-channel per-timestep
-    // output = gate * branches + (1 - gate) * stem_proj
-    let stem_proj = nn::conv1d(p / "stem_proj", 64, 256, 1, Default::default());
-    // Gate takes concatenated [stem_256, branches_256] -> 256 gate values
-    let gate_conv = nn::conv1d(
-        p / "gate_conv",
-        512,
-        256,
-        1,
-        nn::ConvConfig {
-            // Initialize bias negative so gate starts near 0 (prefer stem early in training)
-            bs_init: Init::Const(-2.0),
-            ..Default::default()
-        },
-    );
+        let pma_num_seeds = 4i64;
+        let pma_seeds = p.var("pma_seeds", &[pma_num_seeds, 256], Init::Uniform { lo: -0.1, up: 0.1 });
+        let pma_kv = nn::linear(p / "pma_kv", 256, 256 * 2, Default::default());
+        let pma_q = nn::linear(p / "pma_q", 256, 256, Default::default());
+        let pma_out = nn::linear(p / "pma_out", 256, 256, Default::default());
+        let ln_pma = nn::layer_norm(p / "ln_pma", vec![256], Default::default());
+        let global_to_seed = nn::linear(p / "global_to_seed", GLOBAL_STATIC_OBS as i64, 256, Default::default());
 
-    // Projection to combine conv features (256) with per-ticker static features
-    let static_proj = nn::linear(
-        p / "static_proj",
-        256 + PER_TICKER_STATIC_OBS as i64,
-        256,
-        Default::default(),
-    );
-    let ln_static_proj = nn::layer_norm(p / "ln_static_proj", vec![256], Default::default());
+        let fc1 = nn::linear(p / "l1", 1024, 512, nn::LinearConfig {
+            ws_init: truncated_normal_init(1024, 512), ..Default::default()
+        });
+        let ln_fc1 = nn::layer_norm(p / "ln_fc1", vec![512], Default::default());
+        let fc2_actor = nn::linear(p / "l2_actor", 512, 256, nn::LinearConfig {
+            ws_init: truncated_normal_init(512, 256), ..Default::default()
+        });
+        let ln_fc2_actor = nn::layer_norm(p / "ln_fc2_actor", vec![256], Default::default());
+        let fc2_critic = nn::linear(p / "l2_critic", 512, 256, nn::LinearConfig {
+            ws_init: truncated_normal_init(512, 256), ..Default::default()
+        });
+        let ln_fc2_critic = nn::layer_norm(p / "ln_fc2_critic", vec![256], Default::default());
+        let fc3_actor = nn::linear(p / "l3_actor", 256, 256, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 256), ..Default::default()
+        });
+        let ln_fc3_actor = nn::layer_norm(p / "ln_fc3_actor", vec![256], Default::default());
+        let fc3_critic = nn::linear(p / "l3_critic", 256, 256, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 256), ..Default::default()
+        });
+        let ln_fc3_critic = nn::layer_norm(p / "ln_fc3_critic", vec![256], Default::default());
 
-    // Cross-ticker attention for learning inter-asset relationships
-    let num_heads = 4;
-    let head_dim = 64; // 256 / 4
-    let attn_qkv = nn::linear(p / "attn_qkv", 256, 256 * 3, Default::default());
-    let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
-    let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
+        const NUM_VALUE_BUCKETS: i64 = 255;
+        let critic = nn::linear(p / "cl", 256, NUM_VALUE_BUCKETS, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, NUM_VALUE_BUCKETS),
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
+        });
+        let bucket_centers = Tensor::linspace(-20.0, 20.0, NUM_VALUE_BUCKETS, (Kind::Float, p.device()));
 
-    // PMA (Pooling by Multihead Attention) - permutation-invariant set pooling
-    let pma_num_seeds = 4;
-    let pma_seeds = p.var("pma_seeds", &[pma_num_seeds, 256], Init::Uniform { lo: -0.1, up: 0.1 });
-    let pma_kv = nn::linear(p / "pma_kv", 256, 256 * 2, Default::default()); // K, V for ticker features
-    let pma_q = nn::linear(p / "pma_q", 256, 256, Default::default()); // Q for seeds
-    let pma_out = nn::linear(p / "pma_out", 256, 256, Default::default());
-    let ln_pma = nn::layer_norm(p / "ln_pma", vec![256], Default::default());
+        let actor_mean = nn::linear(p / "al_mean", 256, nact, nn::LinearConfig {
+            ws_init: Init::Uniform { lo: -0.1, up: 0.1 },
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
+        });
 
-    // (B) Condition PMA seeds on global static features
-    let global_to_seed = nn::linear(p / "global_to_seed", GLOBAL_STATIC_OBS as i64, 256, Default::default());
+        const SDE_LATENT_DIM: i64 = 64;
+        let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
+        let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
+        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact], Init::Const(0.0));
+        let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
 
-    // FC layers: PMA output (4 seeds * 256 = 1024)
-    let fc1_input_size = 1024;
-    let fc1 = nn::linear(p / "l1", fc1_input_size, 512, Default::default());
-    let ln_fc1 = nn::layer_norm(p / "ln_fc1", vec![512], Default::default());
+        Self {
+            c1, gn2, c2_dw, c2_pw, gn3, c3_dw, c3_pw,
+            ssm, ssm_proj, pos_embedding,
+            static_to_temporal, ln_static_temporal, temporal_pools,
+            static_proj, ln_static_proj,
+            attn_qkv, attn_out, ln_attn,
+            pma_seeds, pma_kv, pma_q, pma_out, ln_pma, global_to_seed,
+            fc1, ln_fc1, fc2_actor, ln_fc2_actor, fc2_critic, ln_fc2_critic,
+            fc3_actor, ln_fc3_actor, fc3_critic, ln_fc3_critic,
+            critic, bucket_centers, actor_mean, sde_fc, ln_sde, log_std_param, log_d_raw,
+            device: p.device(),
+            num_heads, head_dim, pma_num_seeds,
+        }
+    }
 
-    // Split actor/critic paths at FC2
-    let fc2_actor = nn::linear(p / "l2_actor", 512, 256, Default::default());
-    let ln_fc2_actor = nn::layer_norm(p / "ln_fc2_actor", vec![256], Default::default());
-    let fc2_critic = nn::linear(p / "l2_critic", 512, 256, Default::default());
-    let ln_fc2_critic = nn::layer_norm(p / "ln_fc2_critic", vec![256], Default::default());
-
-    // FC3 layers with residual connections
-    let fc3_actor_cfg = nn::LinearConfig {
-        ws_init: Init::Uniform { lo: -0.02, up: 0.02 },
-        ..Default::default()
-    };
-    let fc3_actor = nn::linear(p / "l3_actor", 256, 256, fc3_actor_cfg);
-    let ln_fc3_actor = nn::layer_norm(p / "ln_fc3_actor", vec![256], Default::default());
-    let fc3_critic = nn::linear(p / "l3_critic", 256, 256, Default::default());
-    let ln_fc3_critic = nn::layer_norm(p / "ln_fc3_critic", vec![256], Default::default());
-
-    // Critic head: small weights, zero bias for initial values near 0
-    let critic_cfg = nn::LinearConfig {
-        ws_init: Init::Uniform { lo: -0.01, up: 0.01 },
-        bs_init: Some(Init::Const(0.0)),
-        bias: true,
-    };
-    let critic = nn::linear(p / "cl", 256, 1, critic_cfg);
-
-    // Actor mean: small weights for moderate initial actions (sigmoid(0) = 0.5, so action = 0)
-    let actor_mean_cfg = nn::LinearConfig {
-        ws_init: Init::Uniform { lo: -0.1, up: 0.1 },
-        bs_init: Some(Init::Const(0.0)),
-        bias: true,
-    };
-    let actor_mean = nn::linear(p / "al_mean", 256, nact, actor_mean_cfg);
-
-    // gSDE (generalized State Dependent Exploration):
-    // Learn a log_std *matrix* and combine it with a state-dependent latent to produce
-    // per-state, per-action std. This allows exploration to vary with regime/state.
-    const SDE_LATENT_DIM: i64 = 64;
-    let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
-    let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
-    // Shape: [latent_dim, action_dim]
-    let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact], Init::Const(0.0));
-
-    // Learnable softsign divisor: d = softplus(log_d_raw * scale) + eps
-    // `scale` increases gradient magnitude wrt log_d_raw (faster learning) without changing d's range.
-    const LOG_D_RAW_SCALE: f64 = 5.0;
-    // Keep initial d ≈ 0.3: softplus(-1.5) ≈ 0.2, + 0.1 = 0.3
-    // => initialize log_d_raw such that log_d_raw * scale ≈ -1.5
-    let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-1.5 / LOG_D_RAW_SCALE));
-
-    // Learnable positional embedding for temporal dimension
-    let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
-
-    // (A) Condition temporal pooling on per-ticker statics
-    // Project per-ticker statics to 64 dims to modulate temporal attention
-    let static_to_temporal = nn::linear(p / "static_to_temporal", PER_TICKER_STATIC_OBS as i64, 64, Default::default());
-    let ln_static_temporal = nn::layer_norm(p / "ln_static_temporal", vec![64], Default::default());
-
-    // Channel-grouped temporal attention pooling (4 groups of 64 channels)
-    // Each group: concat [64 conv channels, 64 static proj] = 128 -> 1
-    let temporal_pool_0 = nn::linear(p / "temporal_pool_0", 128, 1, Default::default());
-    let temporal_pool_1 = nn::linear(p / "temporal_pool_1", 128, 1, Default::default());
-    let temporal_pool_2 = nn::linear(p / "temporal_pool_2", 128, 1, Default::default());
-    let temporal_pool_3 = nn::linear(p / "temporal_pool_3", 128, 1, Default::default());
-
-    let device = p.device();
-    Box::new(move |price_deltas: &Tensor, static_features: &Tensor, _train: bool| {
-        let price_deltas = price_deltas.to_device(device);
-        let static_features = static_features.to_device(device);
+    /// Batch forward for training (parallel SSM scan)
+    pub fn forward(&self, price_deltas: &Tensor, static_features: &Tensor, train: bool) -> ModelOutput {
+        let price_deltas = price_deltas.to_device(self.device);
+        let static_features = static_features.to_device(self.device);
         let batch_size = price_deltas.size()[0];
 
-        // === Parse static features into global and per-ticker ===
-        // Format: [global (7), per_ticker_0 (44), per_ticker_1 (44), ...]
-        let global_static = static_features.narrow(1, 0, GLOBAL_STATIC_OBS as i64);
-        let per_ticker_static = static_features
+        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
+        let x_stem = self.conv_stem(&price_deltas, batch_size);
+
+        let x_for_ssm = x_stem.permute([0, 2, 1]);
+        let x_ssm = self.ssm.forward(&x_for_ssm, train);
+        let x_ssm = x_ssm.permute([0, 2, 1]);
+
+        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
+    }
+
+    /// Forward with recurrent SSM state - GPU efficient for training rollouts with memory
+    pub fn forward_with_state(&self, price_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
+        let price_deltas = price_deltas.to_device(self.device);
+        let static_features = static_features.to_device(self.device);
+        let batch_size = price_deltas.size()[0];
+
+        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
+        let x_stem = self.conv_stem(&price_deltas, batch_size);
+
+        // GPU-efficient SSM with batched state - chunked parallel scan
+        let x_for_ssm = x_stem.permute([0, 2, 1]); // [B*T, L, C]
+        let x_ssm = self.ssm.forward_with_state(&x_for_ssm, &mut state.ssm_state_batched);
+        let x_ssm = x_ssm.permute([0, 2, 1]); // [B*T, C, L]
+
+        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
+    }
+
+    /// Initialize streaming state for O(1) inference (batch_size=1)
+    pub fn init_stream_state(&self) -> StreamState {
+        self.init_stream_state_batched(1)
+    }
+
+    /// Initialize streaming state with specific batch size for training rollouts
+    pub fn init_stream_state_batched(&self, batch_size: i64) -> StreamState {
+        StreamState {
+            input_buffer: Tensor::zeros(&[TICKERS_COUNT, INPUT_BUFFER_SIZE], (Kind::Float, self.device)),
+            buffer_pos: 0,
+            ssm_states: (0..TICKERS_COUNT).map(|_| self.ssm.init_state(1, self.device)).collect(),
+            ssm_state_batched: self.ssm.init_state(batch_size * TICKERS_COUNT, self.device),
+            last_output: None,
+        }
+    }
+
+    /// Streaming step for O(1) inference. Returns (ready, output).
+    pub fn step(&self, new_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> (bool, ModelOutput) {
+        let new_deltas = new_deltas.to_device(self.device);
+        let static_features = static_features.to_device(self.device);
+
+        let _ = state.input_buffer.narrow(1, state.buffer_pos, 1).copy_(&new_deltas.unsqueeze(1));
+        state.buffer_pos += 1;
+
+        if state.buffer_pos < INPUT_BUFFER_SIZE {
+            let output = state.last_output.as_ref().map(Self::clone_output).unwrap_or_else(|| self.zero_output());
+            return (false, output);
+        }
+
+        state.buffer_pos = 0;
+        let buffer = state.input_buffer.shallow_clone();
+        let output = self.process_stream_buffer(&buffer, &static_features, state);
+        state.last_output = Some(Self::clone_output(&output));
+        (true, output)
+    }
+
+    fn clone_output(o: &ModelOutput) -> ModelOutput {
+        (o.0.shallow_clone(), (o.1.0.shallow_clone(), o.1.1.shallow_clone(), o.1.2.shallow_clone()), o.2.shallow_clone())
+    }
+
+    fn zero_output(&self) -> ModelOutput {
+        let z_c = Tensor::zeros(&[1], (Kind::Float, self.device));
+        let z_m = Tensor::zeros(&[1, TICKERS_COUNT + 1], (Kind::Float, self.device));
+        let z_s = Tensor::zeros(&[1, TICKERS_COUNT + 1], (Kind::Float, self.device));
+        let z_d = Tensor::ones(&[TICKERS_COUNT + 1], (Kind::Float, self.device));
+        let z_a = Tensor::zeros(&[1, 1], (Kind::Float, self.device));
+        (z_c, (z_m, z_s, z_d), z_a)
+    }
+
+    fn process_stream_buffer(&self, buffer: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
+        let batch_size = 1i64;
+        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
+
+        let x = buffer.unsqueeze(1);
+        let x = x.apply(&self.c1).silu();
+        let x = x.apply(&self.gn2).apply(&self.c2_dw).apply(&self.c2_pw).silu();
+        let x = x.apply(&self.gn3).apply(&self.c3_dw).apply(&self.c3_pw).silu();
+
+        let x_in = x.squeeze_dim(2);
+        let mut ssm_outs = Vec::with_capacity(TICKERS_COUNT as usize);
+        for t in 0..TICKERS_COUNT as usize {
+            let out = self.ssm.step(&x_in.narrow(0, t as i64, 1), &mut state.ssm_states[t]);
+            ssm_outs.push(out);
+        }
+        let x_ssm = Tensor::cat(&ssm_outs, 0);
+
+        // ssm_proj is Conv1D(64, 256, kernel=1) which is equivalent to Linear
+        // weights: [256, 64, 1] -> squeeze to [256, 64] -> transpose to [64, 256]
+        let w = self.ssm_proj.ws.squeeze_dim(2).tr();
+        let conv_features = x_ssm.matmul(&w);
+        let conv_features = match &self.ssm_proj.bs {
+            Some(b) => conv_features + b,
+            None => conv_features,
+        };
+        let conv_features = conv_features.view([batch_size, TICKERS_COUNT, 256]);
+
+        self.head_no_temporal_pool(&conv_features, &global_static, &per_ticker_static, batch_size)
+    }
+
+    fn parse_static(&self, static_features: &Tensor, batch_size: i64) -> (Tensor, Tensor) {
+        let global = static_features.narrow(1, 0, GLOBAL_STATIC_OBS as i64);
+        let per_ticker = static_features
             .narrow(1, GLOBAL_STATIC_OBS as i64, TICKERS_COUNT * PER_TICKER_STATIC_OBS as i64)
             .reshape([batch_size, TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64]);
+        (global, per_ticker)
+    }
 
-        // === Conv processing (shared weights across tickers) ===
-        let price_deltas_reshaped = price_deltas
+    fn conv_stem(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
+        let x = price_deltas
             .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
             .view([batch_size * TICKERS_COUNT, 1, PRICE_DELTAS_PER_TICKER as i64]);
+        let x = x.apply(&self.c1).silu();
+        let x = x.apply(&self.gn2).apply(&self.c2_dw).apply(&self.c2_pw).silu();
+        x.apply(&self.gn3).apply(&self.c3_dw).apply(&self.c3_pw).silu()
+    }
 
-        // Shared stem: downsample 8x
-        let x = price_deltas_reshaped.apply(&c1).silu();
-        let x = x.apply(&gn2).apply(&c2_dw).apply(&c2_pw).silu();
-        let x_stem = x.apply(&gn3).apply(&c3_dw).apply(&c3_pw).silu(); // [B*T, 64, L]
-
-        // Parallel dilated branches
-        let branch_a = x_stem.apply(&gn_a).apply(&ca_dw).apply(&ca_pw).silu();
-        let branch_b = x_stem.apply(&gn_b).apply(&cb_dw).apply(&cb_pw).silu();
-        let branch_c = x_stem.apply(&gn_c).apply(&cc_dw).apply(&cc_pw).silu();
-
-        // Fuse branches: [B*T, 192, L] -> [B*T, 256, L]
-        let x_branches = Tensor::cat(&[branch_a, branch_b, branch_c], 1);
-        let x_branches = x_branches.apply(&gn_fuse).apply(&c_fuse); // no activation yet
-
-        // Project stem to 256 channels
-        let x_stem_proj = x_stem.apply(&stem_proj); // [B*T, 256, L]
-
-        // Gated residual: learn to interpolate between stem and branches
-        // gate ∈ [0,1]: 0 = pure stem, 1 = pure branches
-        let gate_input = Tensor::cat(&[&x_stem_proj, &x_branches], 1); // [B*T, 512, L]
-        let gate = gate_input.apply(&gate_conv).sigmoid(); // [B*T, 256, L]
-        let x_gated: Tensor = &gate * &x_branches + (1.0 - &gate) * &x_stem_proj;
-        let x = x_gated.silu();
-
-        let x = x + &pos_embedding;
+    fn head_with_temporal_pool(&self, x_ssm: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64) -> ModelOutput {
+        let x = x_ssm.apply(&self.ssm_proj) + &self.pos_embedding;
         let temporal_len = x.size()[2];
 
-        // (A) Project per-ticker statics to condition temporal attention
-        // per_ticker_static: [batch, TICKERS, S] -> [batch*TICKERS, 64]
-        let static_temporal_proj = per_ticker_static
+        let static_proj = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&static_to_temporal)
-            .apply(&ln_static_temporal);
-        // Broadcast over time: [batch*TICKERS, 64] -> [batch*TICKERS, 64, T]
-        let static_temporal_broadcast = static_temporal_proj
+            .apply(&self.static_to_temporal)
+            .apply(&self.ln_static_temporal)
             .unsqueeze(2)
             .expand(&[-1, -1, temporal_len], false);
 
-        // Channel-grouped attention pooling: [batch*TICKERS, 256, T] -> [batch*TICKERS, 256]
-        // Each group concats [64 conv, 64 static] = 128 before scoring
-        let x_groups = x.chunk(4, 1); // 4 x [batch*TICKERS, 64, T]
-        let temporal_pools = [&temporal_pool_0, &temporal_pool_1, &temporal_pool_2, &temporal_pool_3];
-
+        let x_groups = x.chunk(4, 1);
         let mut pooled_groups = Vec::with_capacity(4);
         let mut attn_sum = Tensor::zeros(&[batch_size * TICKERS_COUNT, temporal_len], (x.kind(), x.device()));
 
-        for (group, pool) in x_groups.iter().zip(temporal_pools.iter()) {
-            // Concat conv features with static projection: [batch*TICKERS, 128, T]
-            let group_with_static = Tensor::cat(&[group.shallow_clone(), static_temporal_broadcast.shallow_clone()], 1);
-            let logits = group_with_static
-                .permute(&[0, 2, 1])    // [batch*TICKERS, T, 128]
-                .apply(*pool)           // [batch*TICKERS, T, 1]
-                .squeeze_dim(-1);       // [batch*TICKERS, T]
+        for (group, pool) in x_groups.iter().zip(self.temporal_pools.iter()) {
+            let combined = Tensor::cat(&[group.shallow_clone(), static_proj.shallow_clone()], 1);
+            let logits = combined.permute([0, 2, 1]).apply(pool).squeeze_dim(-1);
             let attn = logits.softmax(-1, logits.kind());
             attn_sum = attn_sum + &attn;
-            // Pool original conv features (not the concat)
-            let pooled_group = group.bmm(&attn.unsqueeze(-1)).squeeze_dim(-1); // [batch*TICKERS, 64]
-            pooled_groups.push(pooled_group);
+            pooled_groups.push(group.bmm(&attn.unsqueeze(-1)).squeeze_dim(-1));
         }
 
-        let pooled = Tensor::cat(&pooled_groups, 1); // [batch*TICKERS, 256]
-
-        // Average temporal attention across groups and tickers for visualization
-        let temporal_attn_avg = (attn_sum / 4.0)
-            .reshape([batch_size, TICKERS_COUNT, -1])
-            .mean_dim(1, false, x.kind());
-
-        // Reshape: [batch*TICKERS, 256] -> [batch, TICKERS, 256]
+        let pooled = Tensor::cat(&pooled_groups, 1);
+        let attn_avg = (attn_sum / 4.0).reshape([batch_size, TICKERS_COUNT, -1]).mean_dim(1, false, x.kind());
         let conv_features = pooled.view([batch_size, TICKERS_COUNT, 256]);
 
-        // === Combine conv features with per-ticker static features ===
-        // [batch, TICKERS, 256] + [batch, TICKERS, 44] -> [batch, TICKERS, 300]
-        let combined_ticker = Tensor::cat(&[conv_features, per_ticker_static], 2);
+        self.head_common(&conv_features, global_static, per_ticker_static, batch_size, attn_avg)
+    }
 
-        // Project back to 256 dims: [batch, TICKERS, 300] -> [batch, TICKERS, 256]
-        let combined_ticker = combined_ticker
+    fn head_no_temporal_pool(&self, conv_features: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64) -> ModelOutput {
+        let dummy_attn = Tensor::zeros(&[batch_size, 1], (Kind::Float, self.device));
+        self.head_common(conv_features, global_static, per_ticker_static, batch_size, dummy_attn)
+    }
+
+    fn head_common(&self, conv_features: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64, attn_out_vis: Tensor) -> ModelOutput {
+        let combined = Tensor::cat(&[conv_features.shallow_clone(), per_ticker_static.shallow_clone()], 2)
             .reshape([batch_size * TICKERS_COUNT, 256 + PER_TICKER_STATIC_OBS as i64])
-            .apply(&static_proj)
-            .apply(&ln_static_proj)
+            .apply(&self.static_proj)
+            .apply(&self.ln_static_proj)
             .silu()
             .reshape([batch_size, TICKERS_COUNT, 256]);
 
-        // === Cross-ticker attention ===
-        let qkv = combined_ticker.apply(&attn_qkv);
-        let qkv = qkv.reshape([batch_size, TICKERS_COUNT, 3, num_heads, head_dim]);
-        let qkv = qkv.permute(&[2, 0, 3, 1, 4]);
+        let qkv = combined.apply(&self.attn_qkv).reshape([batch_size, TICKERS_COUNT, 3, self.num_heads, self.head_dim]).permute([2, 0, 3, 1, 4]);
+        let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
+        let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
+        let attn_out = attn.matmul(&v).permute([0, 2, 1, 3]).contiguous().view([batch_size, TICKERS_COUNT, 256]).apply(&self.attn_out);
+        let ticker_features = (combined + attn_out).apply(&self.ln_attn);
 
-        let q = qkv.get(0);
-        let k = qkv.get(1);
-        let v = qkv.get(2);
+        let seeds = self.pma_seeds.unsqueeze(0) + global_static.apply(&self.global_to_seed).unsqueeze(1);
+        let pma_q = seeds.apply(&self.pma_q);
+        let pma_kv = ticker_features.apply(&self.pma_kv).chunk(2, 2);
+        let (pma_k, pma_v) = (&pma_kv[0], &pma_kv[1]);
 
-        let scale = (head_dim as f64).sqrt();
-        let attn_scores = q.matmul(&k.transpose(-2, -1)) / scale;
-        let attn_weights = attn_scores.softmax(-1, attn_scores.kind());
-        let attn_output = attn_weights.matmul(&v);
+        let q_h = pma_q.reshape([batch_size, self.pma_num_seeds, self.num_heads, self.head_dim]).permute([0, 2, 1, 3]);
+        let k_h = pma_k.reshape([batch_size, TICKERS_COUNT, self.num_heads, self.head_dim]).permute([0, 2, 1, 3]);
+        let v_h = pma_v.reshape([batch_size, TICKERS_COUNT, self.num_heads, self.head_dim]).permute([0, 2, 1, 3]);
+        let pma_attn = (q_h.matmul(&k_h.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q_h.kind());
+        let pma_out = pma_attn.matmul(&v_h).permute([0, 2, 1, 3]).contiguous().view([batch_size, self.pma_num_seeds, 256]).apply(&self.pma_out);
+        let pooled = (seeds + pma_out).apply(&self.ln_pma).reshape([batch_size, self.pma_num_seeds * 256]);
 
-        let attn_output = attn_output.permute(&[0, 2, 1, 3]).contiguous();
-        let attn_output = attn_output.view([batch_size, TICKERS_COUNT, 256]);
-        let attn_output = attn_output.apply(&attn_out);
+        let fc1 = pooled.apply(&self.fc1).apply(&self.ln_fc1).silu();
+        let actor_fc2 = fc1.apply(&self.fc2_actor).apply(&self.ln_fc2_actor).silu();
+        let critic_fc2 = fc1.apply(&self.fc2_critic).apply(&self.ln_fc2_critic).silu();
+        let actor_feat = (actor_fc2.apply(&self.fc3_actor) + &actor_fc2).apply(&self.ln_fc3_actor).silu();
+        let critic_feat = (critic_fc2.apply(&self.fc3_critic) + &critic_fc2).apply(&self.ln_fc3_critic).silu();
 
-        let ticker_features = (combined_ticker + attn_output).apply(&ln_attn);
+        let critic_probs = critic_feat.apply(&self.critic).softmax(-1, Kind::Float);
+        let critic_symlog = critic_probs.matmul(&self.bucket_centers);
+        let critic_value = critic_symlog.sign() * (critic_symlog.abs().exp() - 1.0);
 
-        // === PMA: Pooling by Multihead Attention ===
-        // (B) Condition seeds on global static features
-        // global_static: [batch, G] -> [batch, 256] -> [batch, 1, 256]
-        let global_seed_bias = global_static.apply(&global_to_seed).unsqueeze(1);
-        // Seeds: [num_seeds, 256] + global bias -> [batch, num_seeds, 256]
-        let seeds_expanded = pma_seeds.unsqueeze(0) + global_seed_bias;
+        let action_mean = actor_feat.apply(&self.actor_mean);
+        const LOG_STD_OFFSET: f64 = -4.0;
+        let latent = actor_feat.apply(&self.sde_fc).apply(&self.ln_sde).tanh();
+        let log_std = (&self.log_std_param + LOG_STD_OFFSET).clamp(-5.0, -2.0);
+        let variance = latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
+        let action_log_std = (variance + 1e-6).sqrt().log();
 
-        // Project seeds to Q, ticker_features to K,V
-        let pma_q_proj = seeds_expanded.apply(&pma_q); // [batch, num_seeds, 256]
-        let pma_kv_proj = ticker_features.apply(&pma_kv); // [batch, TICKERS, 512]
-        let pma_kv_split = pma_kv_proj.chunk(2, 2);
-        let pma_k = &pma_kv_split[0]; // [batch, TICKERS, 256]
-        let pma_v = &pma_kv_split[1]; // [batch, TICKERS, 256]
+        const LOG_D_RAW_SCALE: f64 = 5.0;
+        let divisor = self.log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + 0.1;
 
-        // Reshape for multi-head attention: [batch, seq, 256] -> [batch, heads, seq, head_dim]
-        let pma_q_heads = pma_q_proj.reshape([batch_size, pma_num_seeds, num_heads, head_dim]).permute(&[0, 2, 1, 3]);
-        let pma_k_heads = pma_k.reshape([batch_size, TICKERS_COUNT, num_heads, head_dim]).permute(&[0, 2, 1, 3]);
-        let pma_v_heads = pma_v.reshape([batch_size, TICKERS_COUNT, num_heads, head_dim]).permute(&[0, 2, 1, 3]);
+        (critic_value, (action_mean, action_log_std, divisor), attn_out_vis)
+    }
+}
 
-        // Scaled dot-product attention: seeds attend to tickers
-        let pma_scale = (head_dim as f64).sqrt();
-        let pma_scores = pma_q_heads.matmul(&pma_k_heads.transpose(-2, -1)) / pma_scale;
-        let pma_weights = pma_scores.softmax(-1, pma_scores.kind());
-        let pma_attn_out = pma_weights.matmul(&pma_v_heads); // [batch, heads, num_seeds, head_dim]
+pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> ModelOutput>;
 
-        // Reshape back and project
-        let pma_attn_out = pma_attn_out.permute(&[0, 2, 1, 3]).contiguous();
-        let pma_attn_out = pma_attn_out.view([batch_size, pma_num_seeds, 256]);
-        let pma_attn_out = pma_attn_out.apply(&pma_out);
-
-        // Residual + LayerNorm, then flatten
-        let pma_out_final = (seeds_expanded + pma_attn_out).apply(&ln_pma);
-        let pooled_features = pma_out_final.reshape([batch_size, pma_num_seeds * 256]); // [batch, 1024]
-
-        // Shared FC1 layer with Pre-LayerNorm
-        let fc1_out = pooled_features.apply(&fc1);
-        let fc1_norm = fc1_out.apply(&ln_fc1).silu();
-
-        // Split into separate actor and critic paths at FC2
-        let fc2_actor_out = fc1_norm.apply(&fc2_actor);
-        let actor_fc2_norm = fc2_actor_out.apply(&ln_fc2_actor).silu();
-
-        let fc2_critic_out = fc1_norm.apply(&fc2_critic);
-        let critic_fc2_norm = fc2_critic_out.apply(&ln_fc2_critic).silu();
-
-        // FC3 with residual connections
-        let actor_out = actor_fc2_norm.apply(&fc3_actor);
-        let actor_features = (&actor_out + &actor_fc2_norm).apply(&ln_fc3_actor).silu();
-
-        let critic_out = critic_fc2_norm.apply(&fc3_critic);
-        let critic_features = (&critic_out + &critic_fc2_norm).apply(&ln_fc3_critic).silu();
-
-        let critic_value = critic_features.apply(&critic);
-
-        // Gaussian distribution parameters
-        let action_mean = actor_features.apply(&actor_mean);
-
-        // gSDE: build per-state std from a state-dependent latent.
-        // Variance per action: var(a_j|s) = Σ_k latent_k(s)^2 * std_{k,j}^2
-        // This keeps a diagonal Gaussian while making its scale state-dependent.
-        const LOG_STD_OFFSET: f64 = -2.3; // param=0 => std≈0.1 at init
-        let latent_sde = actor_features
-            .apply(&sde_fc)
-            .apply(&ln_sde)
-            .tanh(); // bounded to stabilize early training
-
-        let log_std_matrix = (&log_std_param + LOG_STD_OFFSET).clamp(-4.0, -1.2);
-        let std_matrix = log_std_matrix.exp();
-        let variance = latent_sde
-            .pow_tensor_scalar(2)
-            .matmul(&std_matrix.pow_tensor_scalar(2));
-        let action_std = (variance + 1e-6).sqrt();
-        let action_log_std = action_std.log();
-
-        // Learnable softsign divisor: d = softplus(log_d_raw * scale) + eps
-        // Lower eps allows smaller z to produce larger actions (z=0.1 → action≈0.5)
-        const DIVISOR_EPS: f64 = 0.1;
-        let divisor = log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + DIVISOR_EPS;
-
-        (critic_value, (action_mean, action_log_std, divisor), temporal_attn_avg)
-    })
+pub fn model(p: &nn::Path, nact: i64) -> Model {
+    let m = TradingModel::new(p, nact);
+    Box::new(move |price_deltas, static_features, train| m.forward(price_deltas, static_features, train))
 }
