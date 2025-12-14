@@ -11,7 +11,7 @@ use rand::{
 use rust_neural_network::neural_network::NeuralNetwork;
 
 use crate::{
-    charts::general::simple_chart,
+    charts::simple_chart,
     constants::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
         files::TRAINING_PATH,

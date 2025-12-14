@@ -7,3 +7,4 @@ long_data
 burn_custom/
 ai_*.md
 CLAUDE.md
+.env

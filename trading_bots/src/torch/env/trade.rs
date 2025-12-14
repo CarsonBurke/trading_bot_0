@@ -127,38 +127,52 @@ impl Env {
         (total_commission, sell_reward)
     }
 
+    /// Proportional attribution: sell rewards distributed across all buy lots
+    /// based on their contribution to the total position, not FIFO.
     fn calculate_retroactive_rewards(
         &mut self,
         ticker_index: usize,
         sell_step: usize,
         sell_price: f64,
-        mut sell_quantity: f64,
+        sell_quantity: f64,
     ) -> f64 {
         let lots = &mut self.buy_lots[ticker_index];
+        if lots.is_empty() {
+            return 0.0;
+        }
+
+        let total_lot_qty: f64 = lots.iter().map(|l| l.quantity).sum();
+        if total_lot_qty < 1e-8 {
+            return 0.0;
+        }
+
+        let total_assets = self.account.total_assets.max(1.0);
         let mut total_sell_reward = 0.0;
 
-        while sell_quantity > 1e-8 && !lots.is_empty() {
-            let lot = lots.front_mut().unwrap();
-            let take_qty = sell_quantity.min(lot.quantity);
+        // Attribute sell proportionally to each lot's contribution
+        for lot in lots.iter_mut() {
+            let lot_fraction = lot.quantity / total_lot_qty;
+            let attributed_qty = sell_quantity * lot_fraction;
 
-            let return_pct = (sell_price - lot.price) / lot.price;
+            // Time-weighted log return
+            let log_return = (sell_price / lot.price).ln();
             let hold_time = (sell_step - lot.step).max(1) as f64;
-            let time_weighted_return = return_pct / hold_time.sqrt();
+            let time_weighted_return = log_return / hold_time.sqrt();
 
-            let sell_reward = time_weighted_return * take_qty * lot.price;
-            let immediate_sell_reward = sell_reward * 0.5;
-            total_sell_reward += immediate_sell_reward;
+            // Portfolio-normalized reward
+            let lot_weight = (attributed_qty * lot.price) / total_assets;
+            let reward = time_weighted_return * lot_weight * 100.0;
 
-            let buy_contribution = sell_reward * 0.5;
-            *self.retroactive_rewards.entry(lot.step).or_insert(0.0) += buy_contribution;
+            // Split 50/50 between sell and buy
+            total_sell_reward += reward * 0.5;
+            *self.retroactive_rewards.entry(lot.step).or_insert(0.0) += reward * 0.5;
 
-            sell_quantity -= take_qty;
-            lot.quantity -= take_qty;
-
-            if lot.quantity < 1e-8 {
-                lots.pop_front();
-            }
+            // Reduce lot quantity proportionally
+            lot.quantity -= attributed_qty;
         }
+
+        // Clean up empty lots
+        lots.retain(|l| l.quantity > 1e-8);
 
         total_sell_reward
     }
@@ -167,9 +181,9 @@ impl Env {
         for (&step, &reward) in &self.retroactive_rewards {
             let relative_step = step.saturating_sub(self.episode_start_offset);
             if (relative_step as i64) < rewards_tensor.size()[0] {
-                let step_tensor = rewards_tensor.get(relative_step as i64);
-                let current = f64::try_from(step_tensor.get(0)).unwrap_or(0.0);
-                step_tensor.get(0).copy_(&Tensor::from(current + reward));
+                // rewards_tensor is 1D [n_steps], get returns a scalar
+                let current = f64::try_from(rewards_tensor.get(relative_step as i64)).unwrap_or(0.0);
+                let _ = rewards_tensor.get(relative_step as i64).fill_(current + reward);
             }
         }
     }

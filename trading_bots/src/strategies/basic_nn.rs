@@ -6,7 +6,7 @@ use rand::seq::index::sample;
 use rust_neural_network::neural_network::{NeuralNetwork};
 
 use crate::{
-    charts::general::{assets_chart, buy_sell_chart, simple_chart, want_chart},
+    charts::{assets_chart, buy_sell_chart, simple_chart, want_chart},
     constants::{
         self, agent::STARTING_CASH, files::TRAINING_PATH, neural_net::{BUY_INDEX, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, SELL_INDEX, TICKER_SETS}, TICKERS
     },

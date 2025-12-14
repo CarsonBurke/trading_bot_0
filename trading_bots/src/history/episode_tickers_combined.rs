@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::{
-    charts::general::{assets_chart, buy_sell_chart, multi_line_chart, raw_action_chart, reward_chart, simple_chart},
+    charts::{assets_chart, buy_sell_chart, multi_line_chart, raw_action_chart, reward_chart, simple_chart},
     constants::files::TRAINING_PATH,
     utils::create_folder_if_not_exists,
 };

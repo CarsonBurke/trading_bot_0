@@ -11,7 +11,7 @@ use time::convert::Week;
 
 use crate::{
     agent::{self, Agent, Weight},
-    charts::general::{assets_chart, buy_sell_chart, candle_chart, simple_chart},
+    charts::{assets_chart, buy_sell_chart, candle_chart, simple_chart},
     constants::{self, files::TRAINING_PATH, rsi, MAX_VALUE_PER_TICKER, TICKERS},
     types::{Account, MakeCharts, MappedHistorical, Position},
     utils::{convert_historical, create_folder_if_not_exists, ema, get_price_deltas, get_rsi_values, is_min_transaction, percent_diff, percent_diff_abs, round_to_stock, round_to_stock_fractional},

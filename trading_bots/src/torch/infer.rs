@@ -9,7 +9,7 @@ use crate::torch::env::Env;
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: tch::Device,
-) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor, Tensor), Tensor)>), Box<dyn std::error::Error>> {
+) -> Result<(nn::VarStore, Box<dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor)>), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
     let model_fn = model(&vs.root(), ACTION_COUNT);
     vs.load(weight_path)?;
@@ -18,13 +18,13 @@ pub fn load_model<P: AsRef<Path>>(
 }
 
 pub fn sample_actions(
-    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, (Tensor, Tensor, Tensor), Tensor),
+    model: &dyn Fn(&Tensor, &Tensor, bool) -> (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor),
     price_deltas: &Tensor,
     static_obs: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let (_critic, (action_mean, action_log_std, _divisor), _attn_weights) = tch::no_grad(|| {
+    let (_critic, _critic_logits, (action_mean, action_log_std, _divisor), _attn_weights) = tch::no_grad(|| {
         model(price_deltas, static_obs, false)
     });
 
@@ -168,7 +168,7 @@ pub fn run_inference_streaming<P: AsRef<Path>>(
             env.step = step;
 
             let price_deltas_gpu = current_price_deltas.to_device(device);
-            let (ready, (_, (action_mean, action_log_std, _), _)) = tch::no_grad(|| {
+            let (ready, (_, _, (action_mean, action_log_std, _), _)) = tch::no_grad(|| {
                 model.step(&price_deltas_gpu.squeeze(), &current_static_obs, &mut state)
             });
 

@@ -75,9 +75,9 @@ impl App {
     fn coerce_weights_filename(input: &str) -> String {
         let trimmed = input.trim();
 
-        // If it's just a number, expand to ppo_ep{N}.pt
+        // If it's just a number, expand to ppo_ep{N}.safetensors
         if trimmed.parse::<u32>().is_ok() {
-            return format!("ppo_ep{}.pt", trimmed);
+            return format!("ppo_ep{}.safetensors", trimmed);
         }
 
         // If it already has the pattern, use as-is
@@ -290,7 +290,7 @@ impl App {
     }
 
     fn start_inference(&mut self, weights_file: Option<String>, ticker: Option<String>, episodes: Option<usize>) -> Result<()> {
-        let weights = weights_file.unwrap_or_else(|| "infer.pt".to_string());
+        let weights = weights_file.unwrap_or_else(|| "infer.safetensors".to_string());
         let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
             weights
         } else {

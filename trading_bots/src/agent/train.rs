@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     agent::Agent,
-    charts::general::assets_chart,
+    charts::assets_chart,
     constants::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
         files::{TRAINING_PATH, WEIGHTS_PATH}, TICKERS,

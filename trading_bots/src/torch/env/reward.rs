@@ -1,5 +1,18 @@
 use super::env::Env;
 
+// === Action-outcome reward ===
+// Rewards the model based on how well its allocation decisions aligned with
+// subsequent price movements. Unlike hindsight reward (which compares to optimal),
+// this rewards the model for its actual bets paying off.
+const ACTION_OUTCOME_SCALE: f64 = 100.0;
+const ACTION_OUTCOME_COMMISSION_PENALTY: f64 = 5.0;
+// Conviction bonus: rewards concentrated bets that pay off.
+// Conviction = how far from uniform allocation (measured by max weight deviation).
+// Only applies when portfolio return is positive - wrong conviction is already
+// penalized by negative base return.
+const CONVICTION_BONUS: f64 = 1.0;
+
+// === Legacy reward constants ===
 const REWARD_SCALE: f64 = 20.0;
 const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
@@ -8,18 +21,21 @@ const COMMISSIONS_PENALTY_LAMBDA: f64 = 0.01;
 
 const HINDSIGHT_REWARD_SCALE: f64 = 1.0;
 const HINDSIGHT_COMMISSION_PENALTY: f64 = 10.0;
+// Asymmetric scaling: in bull markets (best_return > 0), scale negative
+// allocation_quality more harshly. This breaks the symmetry where bear market
+// protection (+1) dominates over bull market opportunity cost (-1).
+// 1.0 = symmetric (original), >1.0 = penalize missing upside more
+const BULL_DOWNSIDE_SCALE: f64 = 1.5;
 
 impl Env {
-    /// Hindsight allocation quality reward.
+    /// Hindsight allocation quality reward with asymmetric upside penalty.
     ///
     /// Measures what fraction of achievable return the agent captured, treating
-    /// cash as an asset with 0% return:
-    /// - reward ∈ [-1, +1] based on allocation quality
-    /// - +1 = optimal (100% in best asset or cash)
-    /// - -1 = worst (100% in worst asset or fully invested when should hold cash)
-    /// - 0 = midpoint between best and worst achievable
+    /// cash as an asset with 0% return. Applies extra penalty for missing upside
+    /// in bull markets to prevent cash-hoarding local optima.
     ///
-    /// Works correctly for any number of tickers including single-ticker case.
+    /// - Base reward ∈ [-1, +1] based on allocation quality
+    /// - Additional penalty when best_return > 0 and agent missed it
     pub(super) fn get_hindsight_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
             return 0.0;
@@ -29,10 +45,8 @@ impl Env {
         let n_tickers = self.tickers.len();
         let total_assets = self.account.total_assets;
 
-        // Compute agent's actual return and best/worst achievable
-        // Cash is implicitly an asset with 0% return
         let mut agent_return = 0.0;
-        let mut best_return: f64 = 0.0; // Can always hold cash
+        let mut best_return: f64 = 0.0;
         let mut worst_return: f64 = 0.0;
 
         for ticker_idx in 0..n_tickers {
@@ -40,33 +54,114 @@ impl Env {
             let next_price = self.prices[ticker_idx][next_step];
             let ticker_return = (next_price / current_price) - 1.0;
 
-            // Agent's weighted contribution from this ticker
             let position_value = self.account.positions[ticker_idx]
                 .value_with_price(current_price);
             let weight = position_value / total_assets;
             agent_return += weight * ticker_return;
 
-            // Track best/worst (cash=0 is always an option)
             best_return = best_return.max(ticker_return);
             worst_return = worst_return.min(ticker_return);
         }
-        // Cash weight contributes 0 to agent_return (weight * 0)
 
-        // Achievable range
         let range = best_return - worst_return;
         if range < 1e-10 {
-            // All returns ~equal, no meaningful allocation decision
             let commission_penalty = -(commissions / total_assets) * HINDSIGHT_COMMISSION_PENALTY;
             return commission_penalty * HINDSIGHT_REWARD_SCALE;
         }
 
-        // Normalize: -1 at worst_return, +1 at best_return
+        // Base allocation quality: [-1, +1]
         let allocation_quality = (2.0 * (agent_return - worst_return) / range - 1.0).clamp(-1.0, 1.0);
 
-        // Commission penalty
+        // Asymmetric scaling: in bull markets, amplify negative allocation quality
+        // This makes missing upside hurt more than capturing downside protection helps
+        // Reward remains in [-1.5, +1] range instead of [-1, +1]
+        let scaled_quality = if best_return > 0.0 && allocation_quality < 0.0 {
+            allocation_quality * BULL_DOWNSIDE_SCALE
+        } else {
+            allocation_quality
+        };
+
         let commission_penalty = -(commissions / total_assets) * HINDSIGHT_COMMISSION_PENALTY;
 
-        (allocation_quality + commission_penalty) * HINDSIGHT_REWARD_SCALE
+        (scaled_quality + commission_penalty) * HINDSIGHT_REWARD_SCALE
+    }
+
+    /// Action-outcome reward: rewards based on how the model's allocation performed.
+    ///
+    /// Key differences from hindsight reward:
+    /// - Hindsight compares to optimal allocation (what you should have done)
+    /// - Action-outcome rewards actual portfolio return (what your bets earned)
+    ///
+    /// This creates a direct link between allocation decisions and outcomes:
+    /// - Positive weight on rising asset → positive reward
+    /// - Positive weight on falling asset → negative reward
+    /// - Cash position → zero contribution (neutral, not rewarded or penalized)
+    ///
+    /// The reward is the weighted sum of per-asset returns, scaled and with
+    /// commission penalty. Dense signal at every step.
+    pub(super) fn get_action_outcome_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
+        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+            return 0.0;
+        }
+
+        let next_step = absolute_step + 1;
+        let total_assets = self.account.total_assets;
+        let n_tickers = self.tickers.len();
+
+        // Portfolio return based on current positions
+        let mut portfolio_return = 0.0;
+        for ticker_idx in 0..n_tickers {
+            let current_price = self.prices[ticker_idx][absolute_step];
+            let next_price = self.prices[ticker_idx][next_step];
+            let ticker_return = (next_price / current_price) - 1.0;
+
+            let position_value = self.account.positions[ticker_idx]
+                .value_with_price(current_price);
+            let weight = position_value / total_assets;
+            portfolio_return += weight * ticker_return;
+        }
+        // Cash contributes 0 return (weight * 0)
+
+        // Log-return: better for compounding, symmetric around zero
+        // Guard against extreme values that could cause NaN
+        let clamped_return = portfolio_return.clamp(-0.5, 0.5);
+        let log_return = (1.0 + clamped_return).ln();
+        let base_reward = log_return * ACTION_OUTCOME_SCALE;
+
+        // Conviction: deviation from uniform allocation
+        // For N tickers + cash, uniform = 1/(N+1) each
+        // Measured as sum of squared deviations from uniform (Herfindahl-style)
+        let n_assets = (n_tickers + 1) as f64;
+        let uniform_weight = 1.0 / n_assets;
+        let cash_weight = (self.account.cash / total_assets).clamp(0.0, 1.0);
+
+        let mut concentration = 0.0;
+        for ticker_idx in 0..n_tickers {
+            let w = (self.account.positions[ticker_idx].value_with_price(
+                self.prices[ticker_idx][absolute_step]
+            ) / total_assets).clamp(0.0, 1.0);
+            concentration += (w - uniform_weight).powi(2);
+        }
+        concentration += (cash_weight - uniform_weight).powi(2);
+
+        // Normalize: max possible is (n-1)/n when all in one asset
+        let max_concentration = (n_assets - 1.0) / n_assets;
+        let conviction = if max_concentration > 1e-6 {
+            (concentration / max_concentration).sqrt().min(1.0)
+        } else {
+            0.0
+        };
+
+        // Conviction bonus only when profitable - amplifies good concentrated bets
+        let conviction_bonus = if portfolio_return > 0.0 {
+            conviction * log_return.abs() * ACTION_OUTCOME_SCALE * CONVICTION_BONUS
+        } else {
+            0.0
+        };
+
+        let commission_penalty = -(commissions / total_assets) * ACTION_OUTCOME_COMMISSION_PENALTY;
+
+        base_reward + conviction_bonus + commission_penalty
     }
 
     #[allow(dead_code)]

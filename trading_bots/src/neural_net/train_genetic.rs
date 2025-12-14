@@ -8,7 +8,7 @@ use rand::{seq::{index::sample, SliceRandom}, Rng};
 use rust_neural_network::neural_network::NeuralNetwork;
 
 use crate::{
-    charts::general::simple_chart, constants::{
+    charts::simple_chart, constants::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
     }, data::historical::get_historical_data, neural_net::{create::create_mapped_indicators, Replay}, strategies::basic_nn::basic_nn, types::{Account, MakeCharts}, utils::{create_folder_if_not_exists, get_mapped_price_deltas}
 };

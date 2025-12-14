@@ -1,4 +1,4 @@
-use crate::charts::general::{simple_chart, simple_chart_log, multi_line_chart};
+use crate::charts::{simple_chart, simple_chart_log, multi_line_chart};
 use crate::history::episode_tickers_combined::EpisodeHistory;
 use crate::constants::files::TRAINING_PATH;
 use crate::utils::create_folder_if_not_exists;

@@ -364,8 +364,7 @@ impl Env {
 
             let (total_commission, trade_sell_reward) =
                 self.trade_by_target_weights(&real_actions, absolute_step);
-            let reward = self.get_hindsight_reward(absolute_step, total_commission)
-                + if RETROACTIVE_BUY_REWARD {
+            let reward = if RETROACTIVE_BUY_REWARD {
                     trade_sell_reward
                 } else {
                     0.0
@@ -388,12 +387,8 @@ impl Env {
         }
         self.episode_history.cash.push(self.account.cash);
         self.episode_history.rewards.push(reward);
-        let cash_weight = if self.account.total_assets > 0.0 {
-                self.account.cash / self.account.total_assets
-            } else {
-                1.0
-            };
-            self.episode_history.cash_weight.push(cash_weight);
+        // Use target cash weight (last element) for consistent charting with ticker target weights
+        self.episode_history.cash_weight.push(self.target_weights[self.tickers.len()]);
 
             if is_done == 1.0 {
                 self.handle_episode_end(absolute_step);
@@ -614,10 +609,9 @@ impl Env {
             self.action_history.pop_front();
         }
 
-        let (total_commission, trade_sell_reward) =
+        let (commissions, trade_sell_reward) =
             self.trade_by_target_weights(&real_actions, absolute_step);
-        let reward = self.get_hindsight_reward(absolute_step, total_commission)
-            + if RETROACTIVE_BUY_REWARD { trade_sell_reward } else { 0.0 };
+        let reward = self.get_action_outcome_reward(absolute_step, commissions) + if RETROACTIVE_BUY_REWARD { trade_sell_reward } else { 0.0 };
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -635,12 +629,7 @@ impl Env {
         }
         self.episode_history.cash.push(self.account.cash);
         self.episode_history.rewards.push(reward);
-        let cash_weight = if self.account.total_assets > 0.0 {
-            self.account.cash / self.account.total_assets
-        } else {
-            1.0
-        };
-        self.episode_history.cash_weight.push(cash_weight);
+        self.episode_history.cash_weight.push(self.target_weights[self.tickers.len()]);
 
         if is_done == 1.0 {
             self.handle_episode_end(absolute_step);

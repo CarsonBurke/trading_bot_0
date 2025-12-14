@@ -22,7 +22,8 @@ const CONV_TEMPORAL_LEN: i64 = calc_conv_temporal_len(PRICE_DELTAS_PER_TICKER as
 const SSM_DIM: i64 = 64;
 const INPUT_BUFFER_SIZE: i64 = 8;
 
-pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
+// (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_weights)
+pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor);
 
 /// Streaming state for O(1) inference and training rollouts with memory
 pub struct StreamState {
@@ -84,6 +85,7 @@ pub struct TradingModel {
     ln_fc3_critic: nn::LayerNorm,
     critic: nn::Linear,
     bucket_centers: Tensor,
+    symlog_centers: Tensor, // For two-hot target computation
     actor_mean: nn::Linear,
     sde_fc: nn::Linear,
     ln_sde: nn::LayerNorm,
@@ -162,7 +164,11 @@ impl TradingModel {
             bs_init: Some(Init::Const(0.0)),
             bias: true,
         });
-        let bucket_centers = Tensor::linspace(-20.0, 20.0, NUM_VALUE_BUCKETS, (Kind::Float, p.device()));
+        // Distributional critic with bins uniform in symlog space [-20, 20]
+        // Critic expectation computed in symlog space for consistency with symlog'd returns
+        let symlog_centers = Tensor::linspace(-20.0, 20.0, NUM_VALUE_BUCKETS, (Kind::Float, p.device()));
+        // bucket_centers in raw space (symexp of symlog) - kept for potential raw value conversion
+        let bucket_centers = &symlog_centers.sign() * (&symlog_centers.abs().exp() - 1.0);
 
         // Logistic-normal: output K-1 unconstrained dims, append 0 before softmax
         let actor_mean = nn::linear(p / "al_mean", 256, nact - 1, nn::LinearConfig {
@@ -186,10 +192,15 @@ impl TradingModel {
             pma_seeds, pma_kv, pma_q, pma_out, ln_pma, global_to_seed,
             fc1, ln_fc1, fc2_actor, ln_fc2_actor, fc2_critic, ln_fc2_critic,
             fc3_actor, ln_fc3_actor, fc3_critic, ln_fc3_critic,
-            critic, bucket_centers, actor_mean, sde_fc, ln_sde, log_std_param, log_d_raw,
+            critic, bucket_centers, symlog_centers, actor_mean, sde_fc, ln_sde, log_std_param, log_d_raw,
             device: p.device(),
             num_heads, head_dim, pma_num_seeds,
         }
+    }
+
+    /// Get symlog bucket centers for two-hot target computation
+    pub fn symlog_centers(&self) -> &Tensor {
+        &self.symlog_centers
     }
 
     /// Batch forward for training (parallel SSM scan)
@@ -223,6 +234,57 @@ impl TradingModel {
         let x_ssm = x_ssm.permute([0, 2, 1]); // [B*T, C, L]
 
         self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
+    }
+
+    /// Batched forward for multiple timesteps - parallelizes conv and head, sequential SSM
+    /// price_deltas: [seq_len, batch, features]
+    /// static_features: [seq_len, batch, features]
+    /// Returns: (critics, action_means, action_log_stds) each [seq_len * batch, ...]
+    pub fn forward_sequence_with_state(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        let seq_len = price_deltas.size()[0];
+        let batch_size = price_deltas.size()[1];
+        let total_samples = seq_len * batch_size;
+
+        // Flatten seq and batch for parallel conv
+        let price_deltas_flat = price_deltas.reshape([total_samples, -1]).to_device(self.device);
+        let static_features_flat = static_features.reshape([total_samples, -1]).to_device(self.device);
+
+        let (global_static, per_ticker_static) = self.parse_static(&static_features_flat, total_samples);
+
+        // Parallel conv for all samples
+        let x_stem = self.conv_stem(&price_deltas_flat, total_samples);
+        // x_stem: [total_samples * TICKERS, channels, temporal_len]
+
+        let temporal_len = x_stem.size()[2];
+        let channels = x_stem.size()[1];
+
+        // Reshape for sequential SSM: [batch * TICKERS, seq_len, temporal_len, channels]
+        // SSM state is [batch * TICKERS, ...], so we process seq_len steps sequentially
+        let x_stem_seq = x_stem
+            .view([seq_len, batch_size * TICKERS_COUNT, channels, temporal_len])
+            .permute([1, 0, 3, 2]); // [batch*T, seq, temporal, channels]
+
+        // Process each timestep through SSM sequentially (SSM handles temporal_len in parallel)
+        let mut ssm_outputs = Vec::with_capacity(seq_len as usize);
+        for t in 0..seq_len {
+            let x_t = x_stem_seq.select(1, t); // [batch*T, temporal, channels]
+            let y_t = self.ssm.forward_with_state(&x_t, &mut state.ssm_state_batched);
+            ssm_outputs.push(y_t);
+        }
+        let x_ssm = Tensor::stack(&ssm_outputs, 1); // [batch*T, seq, temporal, channels]
+
+        // Reshape back: [total_samples * TICKERS, channels, temporal]
+        let x_ssm = x_ssm
+            .permute([0, 1, 3, 2]) // [batch*T, seq, channels, temporal]
+            .reshape([total_samples * TICKERS_COUNT, channels, temporal_len]);
+
+        // Parallel head for all samples
+        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, total_samples)
     }
 
     /// Initialize streaming state for O(1) inference (batch_size=1)
@@ -262,17 +324,18 @@ impl TradingModel {
     }
 
     fn clone_output(o: &ModelOutput) -> ModelOutput {
-        (o.0.shallow_clone(), (o.1.0.shallow_clone(), o.1.1.shallow_clone(), o.1.2.shallow_clone()), o.2.shallow_clone())
+        (o.0.shallow_clone(), o.1.shallow_clone(), (o.2.0.shallow_clone(), o.2.1.shallow_clone(), o.2.2.shallow_clone()), o.3.shallow_clone())
     }
 
     fn zero_output(&self) -> ModelOutput {
         let z_c = Tensor::zeros(&[1], (Kind::Float, self.device));
+        let z_logits = Tensor::zeros(&[1, 255], (Kind::Float, self.device));
         // K-1 dims for logistic-normal
         let z_m = Tensor::zeros(&[1, TICKERS_COUNT], (Kind::Float, self.device));
         let z_s = Tensor::zeros(&[1, TICKERS_COUNT], (Kind::Float, self.device));
         let z_d = Tensor::ones(&[TICKERS_COUNT + 1], (Kind::Float, self.device));
         let z_a = Tensor::zeros(&[1, 1], (Kind::Float, self.device));
-        (z_c, (z_m, z_s, z_d), z_a)
+        (z_c, z_logits, (z_m, z_s, z_d), z_a)
     }
 
     fn process_stream_buffer(&self, buffer: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
@@ -389,9 +452,10 @@ impl TradingModel {
         let actor_feat = (actor_fc2.apply(&self.fc3_actor) + &actor_fc2).apply(&self.ln_fc3_actor).silu();
         let critic_feat = (critic_fc2.apply(&self.fc3_critic) + &critic_fc2).apply(&self.ln_fc3_critic).silu();
 
-        let critic_probs = critic_feat.apply(&self.critic).softmax(-1, Kind::Float);
-        let critic_symlog = critic_probs.mv(&self.bucket_centers);
-        let critic_value = critic_symlog.sign() * (critic_symlog.abs().exp() - 1.0);
+        let critic_logits = critic_feat.apply(&self.critic);
+        let critic_probs = critic_logits.softmax(-1, Kind::Float);
+        // Expectation in symlog space (matches two-hot targets in training)
+        let critic_value = critic_probs.mv(&self.symlog_centers);
 
         let action_mean = actor_feat.apply(&self.actor_mean);
         const LOG_STD_OFFSET: f64 = -4.0;
@@ -403,7 +467,7 @@ impl TradingModel {
         const LOG_D_RAW_SCALE: f64 = 5.0;
         let divisor = self.log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + 0.1;
 
-        (critic_value, (action_mean, action_log_std, divisor), attn_out_vis)
+        (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_out_vis)
     }
 }
 

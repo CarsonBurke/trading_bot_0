@@ -10,7 +10,7 @@ use crate::{
         constants::OBSERVATION_SIZE,
         obs_state::ObservationState,
     },
-    charts::general::simple_chart,
+    charts::simple_chart,
     constants::TICKERS,
     data::historical::get_historical_data,
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},

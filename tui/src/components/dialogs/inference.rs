@@ -39,7 +39,7 @@ pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
         Span::styled("Esc", Style::default().fg(theme::RED)),
         Span::styled(": Cancel  ", Style::default().fg(theme::SUBTEXT1)),
         Span::styled("Tip: ", Style::default().fg(theme::SUBTEXT0)),
-        Span::styled("'400' -> 'ppo_ep400.pt'", Style::default().fg(theme::TEAL)),
+        Span::styled("'400' -> 'ppo_ep400.safetensors'", Style::default().fg(theme::TEAL)),
     ])])
     .style(Style::default().bg(theme::BASE));
     f.render_widget(help, chunks[0]);
@@ -48,7 +48,7 @@ pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
     let weights_focused = focused == InferenceField::Weights;
     let weights_border = if weights_focused { theme::BLUE } else { theme::SURFACE2 };
     let weights_line = if app.input.is_empty() {
-        Line::from(vec![Span::styled(" infer.pt (default)", Style::default().fg(theme::OVERLAY0))])
+        Line::from(vec![Span::styled(" infer.safetensors (default)", Style::default().fg(theme::OVERLAY0))])
     } else {
         Line::from(vec![Span::styled(
             format!(" {}{}", app.input, if weights_focused { "" } else { "" }),
