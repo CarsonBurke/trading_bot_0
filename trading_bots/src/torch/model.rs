@@ -164,7 +164,8 @@ impl TradingModel {
         });
         let bucket_centers = Tensor::linspace(-20.0, 20.0, NUM_VALUE_BUCKETS, (Kind::Float, p.device()));
 
-        let actor_mean = nn::linear(p / "al_mean", 256, nact, nn::LinearConfig {
+        // Logistic-normal: output K-1 unconstrained dims, append 0 before softmax
+        let actor_mean = nn::linear(p / "al_mean", 256, nact - 1, nn::LinearConfig {
             ws_init: Init::Uniform { lo: -0.1, up: 0.1 },
             bs_init: Some(Init::Const(0.0)),
             bias: true,
@@ -173,7 +174,7 @@ impl TradingModel {
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
-        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact], Init::Const(0.0));
+        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact - 1], Init::Const(0.0));
         let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
 
         Self {
@@ -266,8 +267,9 @@ impl TradingModel {
 
     fn zero_output(&self) -> ModelOutput {
         let z_c = Tensor::zeros(&[1], (Kind::Float, self.device));
-        let z_m = Tensor::zeros(&[1, TICKERS_COUNT + 1], (Kind::Float, self.device));
-        let z_s = Tensor::zeros(&[1, TICKERS_COUNT + 1], (Kind::Float, self.device));
+        // K-1 dims for logistic-normal
+        let z_m = Tensor::zeros(&[1, TICKERS_COUNT], (Kind::Float, self.device));
+        let z_s = Tensor::zeros(&[1, TICKERS_COUNT], (Kind::Float, self.device));
         let z_d = Tensor::ones(&[TICKERS_COUNT + 1], (Kind::Float, self.device));
         let z_a = Tensor::zeros(&[1, 1], (Kind::Float, self.device));
         (z_c, (z_m, z_s, z_d), z_a)

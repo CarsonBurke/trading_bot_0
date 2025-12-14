@@ -47,7 +47,7 @@ impl EarningsIndicators {
     /// bar_dates: date strings "YYYY-MM-DD" for each bar
     /// prices: closing prices for EPS normalization
     pub fn compute(
-        reports: &[crate::data::earnings::EarningsReport],
+        reports: &[crate::data::EarningsReport],
         bar_dates: &[String],
         prices: &[f64],
     ) -> Self {
@@ -287,7 +287,7 @@ impl Env {
             .iter()
             .enumerate()
             .map(|(i, ticker)| {
-                let reports = crate::data::earnings::get_earnings_data(ticker, None);
+                let reports = crate::data::get_earnings_data_any(ticker);
                 if reports.is_empty() {
                     EarningsIndicators::empty(prices[i].len())
                 } else {

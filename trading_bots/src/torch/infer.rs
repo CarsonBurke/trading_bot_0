@@ -28,15 +28,19 @@ pub fn sample_actions(
         model(price_deltas, static_obs, false)
     });
 
+    // Logistic-normal: model outputs K-1 dims, append 0 before softmax
+    let batch_size = action_mean.size()[0];
+    let zeros = Tensor::zeros([batch_size, 1], (tch::Kind::Float, action_mean.device()));
+
     if deterministic || temperature == 0.0 {
-        // Softmax on mean for deterministic portfolio weights
-        action_mean.softmax(-1, tch::Kind::Float)
+        let u_ext = Tensor::cat(&[action_mean, zeros], 1);
+        u_ext.softmax(-1, tch::Kind::Float)
     } else {
         let action_std = action_log_std.exp() * temperature;
         let noise = Tensor::randn_like(&action_mean);
-        let z = &action_mean + &action_std * noise;
-        // Softmax to get portfolio weights
-        z.softmax(-1, tch::Kind::Float)
+        let u = &action_mean + &action_std * noise;
+        let u_ext = Tensor::cat(&[u, zeros], 1);
+        u_ext.softmax(-1, tch::Kind::Float)
     }
 }
 
@@ -168,12 +172,18 @@ pub fn run_inference_streaming<P: AsRef<Path>>(
                 model.step(&price_deltas_gpu.squeeze(), &current_static_obs, &mut state)
             });
 
+            // Logistic-normal: append 0 before softmax
+            let batch_size = action_mean.size()[0];
+            let zeros = Tensor::zeros([batch_size, 1], (tch::Kind::Float, action_mean.device()));
             let actions = if deterministic || temperature == 0.0 {
-                action_mean.softmax(-1, tch::Kind::Float)
+                let u_ext = Tensor::cat(&[action_mean, zeros], 1);
+                u_ext.softmax(-1, tch::Kind::Float)
             } else {
                 let action_std = action_log_std.exp() * temperature;
                 let noise = Tensor::randn_like(&action_mean);
-                (&action_mean + &action_std * noise).softmax(-1, tch::Kind::Float)
+                let u = &action_mean + &action_std * noise;
+                let u_ext = Tensor::cat(&[u, zeros], 1);
+                u_ext.softmax(-1, tch::Kind::Float)
             };
 
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
