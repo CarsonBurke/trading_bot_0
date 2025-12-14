@@ -182,16 +182,14 @@ pub fn train(weights_path: Option<&str>) {
     let mut current_price_deltas = current_price_deltas_init;
     let mut current_static_obs = current_static_obs_init.to_device(device);
 
-    // Separate storage for price deltas and static observations
-    // Store price deltas on CPU to save VRAM (2400 deltas × 12000 steps is large)
-    // Only move to GPU during training batches
+    // Store price deltas on GPU - ~122MB is negligible and avoids CPU-GPU transfers
     let s_price_deltas = Tensor::zeros(
         [
             n_steps + 1,
             NPROCS,
             TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         ],
-        (Kind::Float, Device::Cpu), // Store on CPU in FP32
+        (Kind::Float, device),
     );
     let s_static_obs = Tensor::zeros(
         [n_steps + 1, NPROCS, STATIC_OBSERVATIONS as i64],
@@ -235,12 +233,10 @@ pub fn train(weights_path: Option<&str>) {
 
             let (critic, (action_mean, action_log_std, _divisor), attn_weights) =
                 tch::no_grad(|| {
-                    // Move price deltas from CPU to GPU (FP32)
-                    let price_deltas_gpu = s_price_deltas.get(s).to_device(device);
+                    let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
-                    // Use recurrent forward with SSM state for memory across steps
                     trading_model.forward_with_state(
-                        &price_deltas_gpu,
+                        &price_deltas_step,
                         &static_obs,
                         &mut stream_state,
                     )
@@ -348,8 +344,7 @@ pub fn train(weights_path: Option<&str>) {
             symlog(&(rewards_centered.g_mul_scalar(reward_scale))).clamp(-REWARD_CLIP, REWARD_CLIP);
         s_rewards.copy_(&rewards_scaled);
 
-        // Keep price_deltas on CPU, move per-chunk to save VRAM
-        let price_deltas_cpu = s_price_deltas
+        let price_deltas_batch = s_price_deltas
             .narrow(0, 0, n_steps)
             .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
         let static_obs_batch = s_static_obs
@@ -373,10 +368,10 @@ pub fn train(weights_path: Option<&str>) {
                     .ssm_state_batched
                     .ssm_state
                     .copy_(&end_state.ssm_state);
-                let price_deltas_gpu = s_price_deltas.get(n_steps).to_device(device);
+                let price_deltas_step = s_price_deltas.get(n_steps);
                 let static_obs = s_static_obs.get(n_steps);
                 let (critic, _, _) = trading_model.forward_with_state(
-                    &price_deltas_gpu,
+                    &price_deltas_step,
                     &static_obs,
                     &mut stream_state,
                 );
@@ -455,6 +450,10 @@ pub fn train(weights_path: Option<&str>) {
         let mut total_clipped = 0i64;
         let mut total_ratio_samples = 0i64;
 
+        // Pre-allocate zeros for logistic-normal (max size: MINI_BATCH_STEPS * NPROCS)
+        const MINI_BATCH_STEPS: i64 = 16;
+        let zeros_max = Tensor::zeros([MINI_BATCH_STEPS * NPROCS, 1], (Kind::Float, device));
+
         // Shuffle chunk order for gradient diversity (but maintain temporal order within chunks)
         let mut chunk_order: Vec<usize> = (0..chunk_ssm_states.len()).collect();
 
@@ -479,10 +478,8 @@ pub fn train(weights_path: Option<&str>) {
                 let chunk_sample_count = chunk_len * NPROCS;
                 let chunk_sample_start = chunk_start_step * NPROCS;
 
-                // Move this chunk's price deltas to GPU
-                let price_deltas_chunk = price_deltas_cpu
-                    .narrow(0, chunk_sample_start, chunk_sample_count)
-                    .to_device(device);
+                let price_deltas_chunk =
+                    price_deltas_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 // Restore SSM state from saved chunk boundary
                 stream_state
@@ -494,8 +491,6 @@ pub fn train(weights_path: Option<&str>) {
                     .ssm_state
                     .copy_(&chunk_ssm_states[chunk_idx].ssm_state);
 
-                // Process chunk in mini-batches to reduce VRAM (16 steps for longer TBPTT)
-                const MINI_BATCH_STEPS: i64 = 16;
                 let mut mini_batch_start = 0i64;
 
                 while mini_batch_start < chunk_len {
@@ -549,7 +544,7 @@ pub fn train(weights_path: Option<&str>) {
 
                     // Logistic-normal log-prob with Jacobian
                     let u = actions_mb;
-                    let zeros = Tensor::zeros([mini_batch_samples, 1], (Kind::Float, device));
+                    let zeros = zeros_max.narrow(0, 0, mini_batch_samples);
                     let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
 
                     // log N(u; μ, σ)
@@ -676,10 +671,10 @@ pub fn train(weights_path: Option<&str>) {
 
         // Record std and divisor stats every episode
         let (mean_std, min_std, max_std, mean_div) = tch::no_grad(|| {
-            let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
+            let price_deltas_step = s_price_deltas.get(0);
             let static_obs = s_static_obs.get(0);
             let (_, (_, action_log_std, divisor), _) =
-                trading_model.forward(&price_deltas_gpu, &static_obs, false);
+                trading_model.forward(&price_deltas_step, &static_obs, false);
             let std = action_log_std.exp();
             (
                 f64::try_from(std.mean(Kind::Float)).unwrap_or(0.0),
@@ -713,9 +708,9 @@ pub fn train(weights_path: Option<&str>) {
             // Debug: Check if exploration has collapsed or network diverged
             let (_, (debug_mean, debug_log_std, _debug_divisor), _attn_weights) =
                 tch::no_grad(|| {
-                    let price_deltas_gpu = s_price_deltas.get(0).to_device(device);
+                    let price_deltas_step = s_price_deltas.get(0);
                     let static_obs = s_static_obs.get(0);
-                    trading_model.forward(&price_deltas_gpu, &static_obs, false)
+                    trading_model.forward(&price_deltas_step, &static_obs, false)
                 });
 
             let mean_std = f64::try_from(debug_log_std.exp().mean(Kind::Float)).unwrap();
