@@ -20,6 +20,100 @@ use crate::{
     utils::{create_folder_if_not_exists, get_mapped_price_deltas},
 };
 
+/// Precomputed earnings indicators per step (from cached quarterly reports)
+pub(super) struct EarningsIndicators {
+    pub steps_to_next: Vec<f64>,      // Steps until next earnings [-1,1] normalized
+    pub revenue_growth: Vec<f64>,     // QoQ revenue growth [-1,1]
+    pub opex_growth: Vec<f64>,        // QoQ operating expenses growth [-1,1]
+    pub net_profit_growth: Vec<f64>,  // QoQ net profit growth [-1,1]
+    pub eps: Vec<f64>,                // EPS normalized by price
+    pub eps_surprise: Vec<f64>,       // Last earnings surprise % [-1,1]
+}
+
+impl EarningsIndicators {
+    pub fn empty(n: usize) -> Self {
+        Self {
+            steps_to_next: vec![0.0; n],
+            revenue_growth: vec![0.0; n],
+            opex_growth: vec![0.0; n],
+            net_profit_growth: vec![0.0; n],
+            eps: vec![0.0; n],
+            eps_surprise: vec![0.0; n],
+        }
+    }
+
+    /// Compute earnings indicators aligned to bar timestamps
+    /// reports: quarterly earnings sorted oldest-first
+    /// bar_dates: date strings "YYYY-MM-DD" for each bar
+    /// prices: closing prices for EPS normalization
+    pub fn compute(
+        reports: &[crate::data::earnings::EarningsReport],
+        bar_dates: &[String],
+        prices: &[f64],
+    ) -> Self {
+        let n = bar_dates.len();
+        if reports.is_empty() {
+            return Self::empty(n);
+        }
+
+        let mut steps_to_next = vec![0.0; n];
+        let mut revenue_growth = vec![0.0; n];
+        let mut opex_growth = vec![0.0; n];
+        let mut net_profit_growth = vec![0.0; n];
+        let mut eps = vec![0.0; n];
+        let mut eps_surprise = vec![0.0; n];
+
+        // Find report index for each bar (most recent report before bar date)
+        let mut report_idx = 0;
+        for (i, bar_date) in bar_dates.iter().enumerate() {
+            // Advance to most recent report before this bar
+            while report_idx + 1 < reports.len() && reports[report_idx + 1].date <= *bar_date {
+                report_idx += 1;
+            }
+
+            let report = &reports[report_idx];
+
+            // Steps to next earnings (normalized: 0 = just happened, 1 = ~90 days away)
+            // ~78 trading 5-min bars per day * 63 trading days per quarter ≈ 4914 steps
+            if report_idx + 1 < reports.len() {
+                let next_date = &reports[report_idx + 1].date;
+                let days_to_next = date_diff_days(bar_date, next_date).max(0) as f64;
+                steps_to_next[i] = (days_to_next / 90.0).clamp(0.0, 1.0);
+            }
+
+            revenue_growth[i] = report.revenue_growth.unwrap_or(0.0).clamp(-1.0, 1.0);
+            opex_growth[i] = report.opex_growth.unwrap_or(0.0).clamp(-1.0, 1.0);
+            net_profit_growth[i] = report.net_income_growth.unwrap_or(0.0).clamp(-1.0, 1.0);
+
+            // EPS normalized by current price (yield-like)
+            if let Some(e) = report.eps {
+                let price = prices[i].max(1.0);
+                eps[i] = (e / price * 4.0).clamp(-0.5, 0.5); // annualized, clamped
+            }
+
+            eps_surprise[i] = report.eps_surprise.unwrap_or(0.0).clamp(-1.0, 1.0);
+        }
+
+        Self { steps_to_next, revenue_growth, opex_growth, net_profit_growth, eps, eps_surprise }
+    }
+}
+
+fn date_diff_days(from: &str, to: &str) -> i32 {
+    // Simple date diff: "YYYY-MM-DD" format
+    let parse = |s: &str| -> Option<i32> {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 { return None; }
+        let y: i32 = parts[0].parse().ok()?;
+        let m: i32 = parts[1].parse().ok()?;
+        let d: i32 = parts[2].parse().ok()?;
+        Some(y * 365 + m * 30 + d) // approximate
+    };
+    match (parse(from), parse(to)) {
+        (Some(f), Some(t)) => t - f,
+        _ => 0,
+    }
+}
+
 /// Precomputed momentum indicators (SOTA for trend prediction)
 pub(super) struct MomentumIndicators {
     pub rsi: Vec<f64>,           // RSI 14-period [0,1]
@@ -140,6 +234,8 @@ pub struct Env {
     pub(super) target_weights: Vec<f64>,
     /// Precomputed momentum indicators per ticker
     pub(super) momentum: Vec<MomentumIndicators>,
+    /// Precomputed earnings indicators per ticker
+    pub(super) earnings: Vec<EarningsIndicators>,
 }
 
 pub(super) const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
@@ -176,6 +272,30 @@ impl Env {
 
         let total_data_length = prices[0].len();
 
+        // Extract bar dates for earnings alignment
+        let bar_dates: Vec<Vec<String>> = mapped_bars
+            .iter()
+            .map(|bars| {
+                bars.iter()
+                    .map(|b| format!("{:04}-{:02}-{:02}", b.date.year(), b.date.month() as u8, b.date.day()))
+                    .collect()
+            })
+            .collect();
+
+        // Precompute earnings indicators from cached/fetched data
+        let earnings: Vec<EarningsIndicators> = tickers
+            .iter()
+            .enumerate()
+            .map(|(i, ticker)| {
+                let reports = crate::data::earnings::get_earnings_data(ticker, None);
+                if reports.is_empty() {
+                    EarningsIndicators::empty(prices[i].len())
+                } else {
+                    EarningsIndicators::compute(&reports, &bar_dates[i], &prices[i])
+                }
+            })
+            .collect();
+
         let num_tickers = tickers.len();
         Self {
             step: 0,
@@ -203,6 +323,7 @@ impl Env {
             ticker_perm: (0..num_tickers).collect(),
             target_weights: vec![0.0; num_tickers + 1],
             momentum,
+            earnings,
         }
     }
 

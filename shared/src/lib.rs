@@ -13,13 +13,15 @@ pub mod constants {
 
     // Global: step_progress, cash_percent, pnl, drawdown, commissions, last_reward, last_fill_ratio
     pub const GLOBAL_STATIC_OBS: usize = 7;
-    // Per-ticker (19 total):
+    // Per-ticker (25 total):
     // Portfolio (6): position_pct, unrealized_pnl, trade_ema, steps_since, position_age, target_weight
     // Multi-scale momentum (4): mom_5, mom_20, mom_60, mom_120
     // Momentum quality (4): acceleration, vol_adjusted, efficiency, trend_strength
     // Oscillators (4): rsi, range_pos, stoch_k, zscore
     // Trend (1): macd
-    pub const PER_TICKER_STATIC_OBS: usize = 19;
+    // Earnings (6): steps_to_next, revenue_growth, opex_growth, net_profit_growth, eps, eps_surprise
+    pub const PER_TICKER_EARNINGS_OBS: usize = 6;
+    pub const PER_TICKER_STATIC_OBS: usize = 19 + PER_TICKER_EARNINGS_OBS;
     pub const STATIC_OBSERVATIONS: usize = GLOBAL_STATIC_OBS + (TICKERS_COUNT * PER_TICKER_STATIC_OBS);
     pub const OBSERVATION_SPACE: usize = (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
 

@@ -50,7 +50,7 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const LEARNING_RATE: f64 = 2e-5;
-const GRAD_ACCUM_STEPS: usize = 4; // Accumulate gradients over k chunks before stepping
+const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
 
 // Reward normalization using percentile EMA (robust to outliers, from Dreamer-v3)
 const REWARD_NORM_EPS: f64 = 1e-8;
@@ -444,24 +444,23 @@ pub fn train(weights_path: Option<&str>) {
                 stream_state.ssm_state_batched.conv_state.copy_(&chunk_ssm_states[chunk_idx].conv_state);
                 stream_state.ssm_state_batched.ssm_state.copy_(&chunk_ssm_states[chunk_idx].ssm_state);
 
-                // Process chunk in mini-batches to reduce VRAM (8 steps at a time)
-                const MINI_BATCH_STEPS: i64 = 8;
+                // Process chunk in mini-batches to reduce VRAM (16 steps for longer TBPTT)
+                const MINI_BATCH_STEPS: i64 = 16;
                 let mut mini_batch_start = 0i64;
 
                 while mini_batch_start < chunk_len {
                     let mini_batch_len = MINI_BATCH_STEPS.min(chunk_len - mini_batch_start);
                     let mini_batch_samples = mini_batch_len * NPROCS;
 
-                    // Pre-allocate output tensors for mini-batch
-                    let mut critics = Tensor::zeros([mini_batch_samples, 1], (Kind::Float, device));
-                    let mut action_means = Tensor::zeros([mini_batch_samples, ACTION_COUNT], (Kind::Float, device));
-                    let mut action_log_stds = Tensor::zeros([mini_batch_samples, ACTION_COUNT], (Kind::Float, device));
+                    // Accumulate outputs in Vec to preserve gradient graph (don't use copy_!)
+                    let mut critic_vec: Vec<Tensor> = Vec::with_capacity(mini_batch_len as usize);
+                    let mut action_mean_vec: Vec<Tensor> = Vec::with_capacity(mini_batch_len as usize);
+                    let mut action_log_std_vec: Vec<Tensor> = Vec::with_capacity(mini_batch_len as usize);
 
                     // Forward passes for this mini-batch (sequential due to SSM state dependency)
                     for step_offset in 0..mini_batch_len {
                         let global_step = chunk_start_step + mini_batch_start + step_offset;
                         let chunk_local_start = (mini_batch_start + step_offset) * NPROCS;
-                        let out_start = step_offset * NPROCS;
                         let global_sample_start = global_step * NPROCS;
 
                         let price_deltas_step = price_deltas_chunk.narrow(0, chunk_local_start, NPROCS);
@@ -470,10 +469,15 @@ pub fn train(weights_path: Option<&str>) {
                         let (critic, (action_mean, action_log_std, _), _) =
                             trading_model.forward_with_state(&price_deltas_step, &static_obs_step, &mut stream_state);
 
-                        critics.narrow(0, out_start, NPROCS).copy_(&critic.view([NPROCS, 1]));
-                        action_means.narrow(0, out_start, NPROCS).copy_(&action_mean);
-                        action_log_stds.narrow(0, out_start, NPROCS).copy_(&action_log_std);
+                        critic_vec.push(critic.view([NPROCS, 1]));
+                        action_mean_vec.push(action_mean);
+                        action_log_std_vec.push(action_log_std);
                     }
+
+                    // Stack preserves gradient graph (unlike copy_)
+                    let critics = Tensor::cat(&critic_vec, 0);
+                    let action_means = Tensor::cat(&action_mean_vec, 0);
+                    let action_log_stds = Tensor::cat(&action_log_std_vec, 0);
 
                     // Get stored data for this mini-batch
                     let mb_sample_start = (chunk_start_step + mini_batch_start) * NPROCS;
