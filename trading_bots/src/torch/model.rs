@@ -388,7 +388,7 @@ impl TradingModel {
         let critic_feat = (critic_fc2.apply(&self.fc3_critic) + &critic_fc2).apply(&self.ln_fc3_critic).silu();
 
         let critic_probs = critic_feat.apply(&self.critic).softmax(-1, Kind::Float);
-        let critic_symlog = critic_probs.matmul(&self.bucket_centers);
+        let critic_symlog = critic_probs.mv(&self.bucket_centers);
         let critic_value = critic_symlog.sign() * (critic_symlog.abs().exp() - 1.0);
 
         let action_mean = actor_feat.apply(&self.actor_mean);

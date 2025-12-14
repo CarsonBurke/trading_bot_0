@@ -364,7 +364,6 @@ impl Env {
 
     fn get_is_done(&self) -> f32 {
         if self.step + 2 > self.max_step {
-            println!("is done");
             1.0
         } else {
             0.0

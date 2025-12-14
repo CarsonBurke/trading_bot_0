@@ -56,7 +56,11 @@ impl VecEnv {
     }
 
     pub fn max_step(&self) -> usize {
-        self.envs[0].max_step
+        let first = self.envs[0].max_step;
+        for (i, env) in self.envs.iter().enumerate().skip(1) {
+            assert_eq!(env.max_step, first, "VecEnv desync: env[{}].max_step={} != env[0].max_step={}", i, env.max_step, first);
+        }
+        first
     }
 
     pub fn set_episode(&mut self, episode: usize) {

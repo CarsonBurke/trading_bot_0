@@ -8,11 +8,12 @@ use crate::torch::constants::{
 };
 use crate::torch::model::TradingModel;
 use crate::torch::env::VecEnv;
+use crate::torch::ssm::Mamba2State;
 
-pub const NPROCS: i64 = 4; // Parallel environments for better GPU utilization
+pub const NPROCS: i64 = 6; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
-const OPTIM_MINIBATCH: i64 = 256; // Mini-batch size for GPU processing (avoids OOM)
 const OPTIM_EPOCHS: i64 = 4;
+const CHUNK_SIZE: i64 = 64; // Steps per chunk for sequence-aware PPO with SSM state restoration
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
 const GAMMA: f64 = 0.995;
@@ -25,6 +26,14 @@ fn symlog(x: &Tensor) -> Tensor {
 
 fn symexp(x: &Tensor) -> Tensor {
     x.sign() * (x.abs().exp() - 1.0)
+}
+
+fn clone_state_deep(s: &Mamba2State) -> Mamba2State {
+    let mut conv = Tensor::zeros_like(&s.conv_state);
+    let mut ssm = Tensor::zeros_like(&s.ssm_state);
+    let _ = conv.copy_(&s.conv_state.detach());
+    let _ = ssm.copy_(&s.ssm_state.detach());
+    Mamba2State { conv_state: conv, ssm_state: ssm }
 }
 
 // gSDE: resample exploration noise every N env steps (temporally correlated exploration).
@@ -41,6 +50,7 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const LEARNING_RATE: f64 = 2e-5;
+const GRAD_ACCUM_STEPS: usize = 4; // Accumulate gradients over k chunks before stepping
 
 // Reward normalization using percentile EMA (robust to outliers, from Dreamer-v3)
 const REWARD_NORM_EPS: f64 = 1e-8;
@@ -154,7 +164,6 @@ pub fn train(weights_path: Option<&str>) {
 
     // Create device-specific kind
     let float_kind = (Kind::Float, device);
-    let int64_kind = (Kind::Int64, device);
 
     let mut sum_rewards = Tensor::zeros([NPROCS], float_kind);
     let mut total_rewards = 0f64;
@@ -201,12 +210,21 @@ pub fn train(weights_path: Option<&str>) {
         s_price_deltas.get(0).copy_(&current_price_deltas); // CPU to CPU (FP32)
         s_static_obs.get(0).copy_(&current_static_obs);
 
+        // Store SSM states at chunk boundaries for sequence-aware training
+        let num_chunks = (n_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let mut chunk_ssm_states: Vec<Mamba2State> = Vec::with_capacity(num_chunks as usize);
+
         // Use a separate index (s) for tensor storage, starting from 0
         // Loop through the episode using relative steps (0 to max_step)
         let mut s: i64 = 0;
         let mut sde_noise: Option<Tensor> = None;
         for step in 0..env.max_step() {
             env.set_step(step);
+
+            // Save SSM state at chunk boundaries BEFORE processing (deep copy via allocate + copy_)
+            if s % CHUNK_SIZE == 0 {
+                chunk_ssm_states.push(clone_state_deep(&stream_state.ssm_state_batched));
+            }
 
             let (critic, (action_mean, action_log_std, _divisor), attn_weights) = tch::no_grad(|| {
                 // Move price deltas from CPU to GPU (FP32)
@@ -304,24 +322,28 @@ pub fn train(weights_path: Option<&str>) {
             .clamp(-REWARD_CLIP, REWARD_CLIP);
         s_rewards.copy_(&rewards_scaled);
 
-        // Move price_deltas to GPU ONCE before epoch loop (not per-minibatch)
-        let price_deltas_batch = s_price_deltas
+        // Keep price_deltas on CPU, move per-chunk to save VRAM
+        let price_deltas_cpu = s_price_deltas
             .narrow(0, 0, n_steps)
-            .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64])
-            .to_device(device);
+            .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
         let static_obs_batch = s_static_obs
             .narrow(0, 0, n_steps)
             .reshape([memory_size, STATIC_OBSERVATIONS as i64]);
+
+        // Snapshot end-of-rollout state for bootstrap (before we mutate stream_state)
+        let end_state = clone_state_deep(&stream_state.ssm_state_batched);
 
         let (advantages, returns) = {
             let gae = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Float, device));
             let returns = Tensor::zeros([n_steps + 1, NPROCS], (Kind::Float, device));
 
-            // Bootstrap value for next state
+            // Bootstrap value for next state (restore end state to avoid mutation)
             let next_value = tch::no_grad(|| {
-                let price_deltas_gpu = s_price_deltas.get(-1).to_device(device);
-                let static_obs = s_static_obs.get(-1);
-                let (critic, _, _) = trading_model.forward(&price_deltas_gpu, &static_obs, false);
+                stream_state.ssm_state_batched.conv_state.copy_(&end_state.conv_state);
+                stream_state.ssm_state_batched.ssm_state.copy_(&end_state.ssm_state);
+                let price_deltas_gpu = s_price_deltas.get(n_steps).to_device(device);
+                let static_obs = s_static_obs.get(n_steps);
+                let (critic, _, _) = trading_model.forward_with_state(&price_deltas_gpu, &static_obs, &mut stream_state);
                 critic.view([NPROCS])
             });
 
@@ -366,130 +388,189 @@ pub fn train(weights_path: Option<&str>) {
         env.primary_mut().meta_history.record_advantage_stats(adv_mean_val, adv_min_val, adv_max_val);
 
         // Normalize advantages globally (not per-minibatch) for consistent policy gradients
+        // Detach to prevent backprop through GAE computation
         let adv_mean = advantages.mean(Kind::Float);
         let adv_std = advantages.std(false);
-        let advantages = ((&advantages - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1);
+        let advantages = ((&advantages - adv_mean) / (adv_std + 1e-8)).squeeze_dim(-1).detach();
 
         // Normalize returns and old values to prevent huge value loss early in training
-        let ret_mean = returns.mean(Kind::Float);
-        let ret_std = returns.std(false) + 1e-8;
-        let returns = (&returns - &ret_mean) / &ret_std;
-        let s_values = ((&s_values - &ret_mean) / &ret_std).reshape([memory_size, 1]); // normalize and reshape once
+        // Extract as f64 scalars to avoid any graph connections
+        let ret_mean = f64::try_from(returns.mean(Kind::Float)).unwrap_or(0.0);
+        let ret_std = f64::try_from(returns.std(false)).unwrap_or(1.0) + 1e-8;
+        let returns = ((&returns - ret_mean) / ret_std).detach();
+        let s_values = ((&s_values - ret_mean) / ret_std).reshape([memory_size, 1]).detach();
 
-	        let opt_start = Instant::now();
-	        // Accumulate on GPU - only sync once at end of all epochs
-	        let mut total_kl_gpu = Tensor::zeros([], (Kind::Float, device));
-	        let mut total_loss_gpu = Tensor::zeros([], (Kind::Float, device));
-	        let mut num_samples = 0i64;
-	        let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
-	        let mut grad_norm_count = 0i64;
+        let opt_start = Instant::now();
+        // Accumulate on GPU - only sync once at end of all epochs (weighted by samples)
+        let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
+        let mut total_loss_weighted = Tensor::zeros([], (Kind::Float, device));
+        let mut total_sample_count = 0i64;
+        let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
+        let mut grad_norm_count = 0i64;
+        // Clip fraction diagnostic
+        let mut total_clipped = 0i64;
+        let mut total_ratio_samples = 0i64;
+
+        // Shuffle chunk order for gradient diversity (but maintain temporal order within chunks)
+        let mut chunk_order: Vec<usize> = (0..chunk_ssm_states.len()).collect();
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
 
-            // Shuffle indices for this epoch
-            let shuffled_indices = Tensor::randperm(memory_size, int64_kind);
+            // Shuffle chunk order each epoch
+            use rand::seq::SliceRandom;
+            chunk_order.shuffle(&mut rand::rng());
 
-            // Process in mini-batches to avoid VRAM overflow
-            let num_minibatches = (memory_size + OPTIM_MINIBATCH - 1) / OPTIM_MINIBATCH;
+            // Process chunks with gradient accumulation (backward per chunk to free graph, step every k)
+            opt.zero_grad();
+            let mut accum_samples = 0i64;
+            let total_epoch_samples = n_steps * NPROCS;
+            let samples_per_accum = (CHUNK_SIZE * NPROCS * GRAD_ACCUM_STEPS as i64).min(total_epoch_samples);
 
-            for minibatch_idx in 0..num_minibatches {
-                let start_idx = minibatch_idx * OPTIM_MINIBATCH;
-                let end_idx = (start_idx + OPTIM_MINIBATCH).min(memory_size);
-                let minibatch_size = end_idx - start_idx;
+            for (chunk_i, &chunk_idx) in chunk_order.iter().enumerate() {
+                let chunk_start_step = (chunk_idx as i64) * CHUNK_SIZE;
+                let chunk_end_step = ((chunk_idx as i64 + 1) * CHUNK_SIZE).min(n_steps);
+                let chunk_len = chunk_end_step - chunk_start_step;
+                let chunk_sample_count = chunk_len * NPROCS;
+                let chunk_sample_start = chunk_start_step * NPROCS;
 
-                // Get indices for this mini-batch (all on GPU now)
-                let batch_indexes = shuffled_indices.narrow(0, start_idx, minibatch_size);
-                let price_deltas_sample = price_deltas_batch.index_select(0, &batch_indexes);
-                let static_obs_sample = static_obs_batch.index_select(0, &batch_indexes);
-                let actions_sample = actions.index_select(0, &batch_indexes);
-                let returns_sample = returns.index_select(0, &batch_indexes);
-                let advantages_sample = advantages.index_select(0, &batch_indexes);
-                let old_log_probs_sample = old_log_probs.index_select(0, &batch_indexes);
-                let (critic, (action_mean, action_log_std, _divisor), _attn_weights) =
-                    trading_model.forward(&price_deltas_sample, &static_obs_sample, true);
+                // Move this chunk's price deltas to GPU
+                let price_deltas_chunk = price_deltas_cpu
+                    .narrow(0, chunk_sample_start, chunk_sample_count)
+                    .to_device(device);
 
-                // z is stored directly in actions_sample (pre-softmax values)
-                let z = actions_sample;
+                // Restore SSM state from saved chunk boundary
+                stream_state.ssm_state_batched.conv_state.copy_(&chunk_ssm_states[chunk_idx].conv_state);
+                stream_state.ssm_state_batched.ssm_state.copy_(&chunk_ssm_states[chunk_idx].ssm_state);
 
-                // Compute log probability of z under Gaussian N(action_mean, action_std)
-                let action_std = action_log_std.exp();
-                let z_normalized = (&z - &action_mean) / &action_std;
-                let z_squared = z_normalized.pow_tensor_scalar(2);
-                let two_log_std = &action_log_std * 2.0;
-                let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
+                // Process chunk in mini-batches to reduce VRAM (8 steps at a time)
+                const MINI_BATCH_STEPS: i64 = 8;
+                let mut mini_batch_start = 0i64;
 
-                // Log probability of z (softmax is deterministic, no Jacobian needed)
-                let action_log_probs = log_prob_z.sum_dim_intlist(-1, false, Kind::Float);
+                while mini_batch_start < chunk_len {
+                    let mini_batch_len = MINI_BATCH_STEPS.min(chunk_len - mini_batch_start);
+                    let mini_batch_samples = mini_batch_len * NPROCS;
 
-                // Entropy approximation: Use base Gaussian entropy
-                let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * action_log_std;
-                let dist_entropy = entropy_components
-                    .g_mul_scalar(0.5)
-                    .sum_dim_intlist(-1, false, Kind::Float)
-                    .mean(Kind::Float);
+                    // Pre-allocate output tensors for mini-batch
+                    let mut critics = Tensor::zeros([mini_batch_samples, 1], (Kind::Float, device));
+                    let mut action_means = Tensor::zeros([mini_batch_samples, ACTION_COUNT], (Kind::Float, device));
+                    let mut action_log_stds = Tensor::zeros([mini_batch_samples, ACTION_COUNT], (Kind::Float, device));
 
-                // Old predictions from buffer (s_values pre-reshaped)
-                let values_old_sample = s_values.index_select(0, &batch_indexes);
+                    // Forward passes for this mini-batch (sequential due to SSM state dependency)
+                    for step_offset in 0..mini_batch_len {
+                        let global_step = chunk_start_step + mini_batch_start + step_offset;
+                        let chunk_local_start = (mini_batch_start + step_offset) * NPROCS;
+                        let out_start = step_offset * NPROCS;
+                        let global_sample_start = global_step * NPROCS;
 
-                // Normalize critic to match normalized returns
-                let critic_normalized = (&critic - &ret_mean) / &ret_std;
+                        let price_deltas_step = price_deltas_chunk.narrow(0, chunk_local_start, NPROCS);
+                        let static_obs_step = static_obs_batch.narrow(0, global_sample_start, NPROCS);
 
-                // Clipped value prediction
-                let value_pred_clipped = &values_old_sample
-                    + (&critic_normalized - &values_old_sample).clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
+                        let (critic, (action_mean, action_log_std, _), _) =
+                            trading_model.forward_with_state(&price_deltas_step, &static_obs_step, &mut stream_state);
 
-                // Unclipped and clipped MSE vs returns
-                let value_loss_unclipped = (&critic_normalized - &returns_sample).pow_tensor_scalar(2);
-                let value_loss_clipped =
-                    (&value_pred_clipped - &returns_sample).pow_tensor_scalar(2);
+                        critics.narrow(0, out_start, NPROCS).copy_(&critic.view([NPROCS, 1]));
+                        action_means.narrow(0, out_start, NPROCS).copy_(&action_mean);
+                        action_log_stds.narrow(0, out_start, NPROCS).copy_(&action_log_std);
+                    }
 
-                // Final value loss
-                let value_loss = value_loss_unclipped
-                    .max_other(&value_loss_clipped)
-                    .mean(Kind::Float);
+                    // Get stored data for this mini-batch
+                    let mb_sample_start = (chunk_start_step + mini_batch_start) * NPROCS;
 
-                // PPO clipped objective with pre-computed GAE advantages (globally normalized)
-                let ratio = (&action_log_probs - &old_log_probs_sample).exp();
-                let unclipped_obj = &ratio * &advantages_sample;
+                    let actions_mb = actions.narrow(0, mb_sample_start, mini_batch_samples);
+                    let returns_mb = returns.narrow(0, mb_sample_start, mini_batch_samples);
+                    let advantages_mb = advantages.narrow(0, mb_sample_start, mini_batch_samples);
+                    let old_log_probs_mb = old_log_probs.narrow(0, mb_sample_start, mini_batch_samples);
+                    let values_old_mb = s_values.narrow(0, mb_sample_start, mini_batch_samples);
 
-                let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
-                let clipped_obj = ratio_clipped * &advantages_sample;
+                    // Compute log probability of stored z under current policy
+                    let z = actions_mb;
+                    let action_std = action_log_stds.exp();
+                    let z_normalized = (&z - &action_means) / &action_std;
+                    let z_squared = z_normalized.pow_tensor_scalar(2);
+                    let two_log_std = &action_log_stds * 2.0;
+                    let log_prob_z = (&z_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
+                    let action_log_probs = log_prob_z.sum_dim_intlist(-1, false, Kind::Float);
 
-                let action_loss =
-                    -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
+                    // Entropy
+                    let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
+                    let dist_entropy = entropy_components
+                        .g_mul_scalar(0.5)
+                        .sum_dim_intlist(-1, false, Kind::Float)
+                        .mean(Kind::Float);
 
-                // Compute approximate KL divergence (accumulate on GPU)
-                let approx_kl = (&old_log_probs_sample - &action_log_probs).mean(Kind::Float);
-                epoch_kl_gpu += &approx_kl;
-                epoch_kl_count += 1;
+                    // Value loss with clipping
+                    let critic_normalized = (&critics - ret_mean) / ret_std;
+                    let value_pred_clipped = &values_old_mb
+                        + (&critic_normalized - &values_old_mb).clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
+                    let value_loss_unclipped = (&critic_normalized - &returns_mb).pow_tensor_scalar(2);
+                    let value_loss_clipped = (&value_pred_clipped - &returns_mb).pow_tensor_scalar(2);
+                    let value_loss = value_loss_unclipped.max_other(&value_loss_clipped).mean(Kind::Float);
 
-                let loss = value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
-                total_loss_gpu += &loss;
-                total_kl_gpu += &approx_kl;
-                num_samples += 1;
+                    // PPO clipped objective
+                    let ratio = (&action_log_probs - &old_log_probs_mb).exp();
 
-	                opt.zero_grad();
-	                loss.backward();
+                    // Clip fraction diagnostic
+                    let clipped_count = tch::no_grad(|| {
+                        let deviation = (&ratio - 1.0).abs();
+                        i64::try_from(deviation.gt(PPO_CLIP_RATIO).sum(Kind::Int64)).unwrap_or(0)
+                    });
+                    total_clipped += clipped_count;
+                    total_ratio_samples += mini_batch_samples;
 
-	                // Efficient grad norm on GPU: sum(g^2) then sqrt, no Vec/stack
-	                let batch_grad_norm = tch::no_grad(|| {
-	                    let mut norm_sq = Tensor::zeros([], (Kind::Float, device));
-	                    for v in opt.trainable_variables() {
-	                        let g = v.grad();
-	                        if g.defined() {
-	                            norm_sq += g.pow_tensor_scalar(2).sum(Kind::Float);
-	                        }
-	                    }
-	                    norm_sq.sqrt()
-	                });
-	                grad_norm_sum += &batch_grad_norm;
-	                grad_norm_count += 1;
+                    let unclipped_obj = &ratio * &advantages_mb;
+                    let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
+                    let clipped_obj = ratio_clipped * &advantages_mb;
+                    let action_loss = -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
 
-	                opt.clip_grad_norm(MAX_GRAD_NORM);
-	                opt.step();
-	            }
+                    // KL and loss for metrics (extract before backward frees graph)
+                    let approx_kl_val = tch::no_grad(|| {
+                        (&old_log_probs_mb - &action_log_probs).mean(Kind::Float)
+                    });
+                    let loss = value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
+                    let loss_val = tch::no_grad(|| loss.shallow_clone());
+
+                    // Backward immediately (frees graph, accumulates grads)
+                    let scaled_loss = &loss * (mini_batch_samples as f64 / samples_per_accum as f64);
+                    scaled_loss.backward();
+                    accum_samples += mini_batch_samples;
+
+                    // Detach SSM state after backward to break graph for next mini-batch (TBPTT)
+                    stream_state.ssm_state_batched.conv_state = stream_state.ssm_state_batched.conv_state.detach();
+                    stream_state.ssm_state_batched.ssm_state = stream_state.ssm_state_batched.ssm_state.detach();
+
+                    // Accumulate metrics on GPU
+                    let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * mini_batch_samples as f64));
+                    let _ = total_loss_weighted.g_add_(&(&loss_val * mini_batch_samples as f64));
+                    let _ = total_kl_weighted.g_add_(&(&approx_kl_val * mini_batch_samples as f64));
+                    epoch_kl_count += mini_batch_samples;
+                    total_sample_count += mini_batch_samples;
+
+                    mini_batch_start += mini_batch_len;
+                }
+
+                // Step optimizer after accumulating k chunks
+                if (chunk_i + 1) % GRAD_ACCUM_STEPS == 0 || chunk_i == chunk_order.len() - 1 {
+                    let batch_grad_norm = tch::no_grad(|| {
+                        let mut norm_sq = Tensor::zeros([], (Kind::Float, device));
+                        for v in opt.trainable_variables() {
+                            let g = v.grad();
+                            if g.defined() {
+                                norm_sq += g.pow_tensor_scalar(2).sum(Kind::Float);
+                            }
+                        }
+                        norm_sq.sqrt()
+                    });
+                    grad_norm_sum += &batch_grad_norm;
+                    grad_norm_count += 1;
+
+                    opt.clip_grad_norm(MAX_GRAD_NORM);
+                    opt.step();
+                    opt.zero_grad();
+                    accum_samples = 0;
+                }
+            }
 
             // Single GPU->CPU sync per epoch for KL early stopping check
             let mean_epoch_kl = f64::try_from(&epoch_kl_gpu / epoch_kl_count as f64).unwrap_or(0.0);
@@ -521,17 +602,22 @@ pub fn train(weights_path: Option<&str>) {
         env.primary_mut().meta_history.record_std_stats(mean_std, min_std, max_std);
         env.primary_mut().meta_history.record_divisor(mean_div);
 
-	        // Single GPU->CPU sync for loss and grad norm at end of all epochs
-	        let mean_loss = if num_samples > 0 {
-	            f64::try_from(&total_loss_gpu / num_samples as f64).unwrap_or(0.0)
-	        } else { 0.0 };
-	        env.primary_mut().meta_history.record_loss(mean_loss);
-	        let mean_grad_norm = if grad_norm_count > 0 {
-	            f64::try_from(&grad_norm_sum / grad_norm_count as f64).unwrap_or(0.0)
-	        } else { 0.0 };
-	        env.primary_mut().meta_history.record_grad_norm(mean_grad_norm);
+        // Single GPU->CPU sync for loss and grad norm at end of all epochs
+        let mean_loss = if total_sample_count > 0 {
+            f64::try_from(&total_loss_weighted / total_sample_count as f64).unwrap_or(0.0)
+        } else { 0.0 };
+        env.primary_mut().meta_history.record_loss(mean_loss);
+        let mean_grad_norm = if grad_norm_count > 0 {
+            f64::try_from(&grad_norm_sum / grad_norm_count as f64).unwrap_or(0.0)
+        } else { 0.0 };
+        env.primary_mut().meta_history.record_grad_norm(mean_grad_norm);
 
         let opt_end = Instant::now();
+
+        // Compute clip fraction
+        let clip_frac = if total_ratio_samples > 0 {
+            total_clipped as f64 / total_ratio_samples as f64
+        } else { 0.0 };
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
@@ -541,31 +627,26 @@ pub fn train(weights_path: Option<&str>) {
                 trading_model.forward(&price_deltas_gpu, &static_obs, false)
             });
 
-            // Show softmax weights from mean
-            let debug_actions = debug_mean.softmax(-1, Kind::Float);
-            let mean_weight = f64::try_from(debug_actions.mean(Kind::Float)).unwrap();
-            let max_weight = f64::try_from(debug_actions.max()).unwrap();
-            let mean_raw_action = f64::try_from(debug_mean.mean(Kind::Float)).unwrap();
             let mean_std = f64::try_from(debug_log_std.exp().mean(Kind::Float)).unwrap();
             let max_raw_action = f64::try_from(debug_mean.abs().max()).unwrap();
 
-            let avg_kl = if num_samples > 0 {
-                f64::try_from(&total_kl_gpu / num_samples as f64).unwrap_or(0.0)
+            let avg_kl = if total_sample_count > 0 {
+                f64::try_from(&total_kl_weighted / total_sample_count as f64).unwrap_or(0.0)
             } else {
                 0.0
             };
+            // Per-dimension KL for comparison (total KL scales with ACTION_COUNT)
+            let kl_per_dim = avg_kl / ACTION_COUNT as f64;
 
             println!(
-                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, Avg KL: {:.4}, Mean weight: {:.3}, Max weight: {:.3}, Mean logit: {:.1}, Max |logit|: {:.1}, Std: {:.4}",
+                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, KL: {:.4} ({:.4}/dim), Clip: {:.1}%, Std: {:.4}",
                 episode,
                 total_episodes,
                 total_rewards / total_episodes,
                 opt_end.duration_since(opt_start).as_secs_f32(),
                 avg_kl,
-                mean_weight,
-                max_weight,
-                mean_raw_action,
-                max_raw_action,
+                kl_per_dim,
+                clip_frac * 100.0,
                 mean_std
             );
 
@@ -574,6 +655,13 @@ pub fn train(weights_path: Option<&str>) {
                 println!(
                     "WARNING: Network may be diverging! Raw action magnitude: {:.1}",
                     max_raw_action
+                );
+            }
+            // Warn if clip fraction is too high (policy changing too fast)
+            if clip_frac > 0.3 {
+                println!(
+                    "WARNING: High clip fraction ({:.1}%)",
+                    clip_frac * 100.0
                 );
             }
 
