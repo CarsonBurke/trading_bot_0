@@ -26,7 +26,7 @@ pub fn buy_sell_chart(
     let y_max = y_max + y_range * 0.05;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Buy Sell Chart", ("sans-serif", 20, &theme::TEXT))
+        .caption("Buy Sell", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
@@ -93,7 +93,7 @@ pub fn buy_sell_chart_vec(
     let y_max = y_max + y_range * 0.05;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Buy Sell Chart Vec", ("sans-serif", 20, &theme::TEXT))
+        .caption("Buy Sell Vec", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
@@ -168,10 +168,7 @@ pub fn assets_chart(
     let y_max = max_val as f32 * 1.1;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption(
-            "Assets: Total; Positioned; Cash",
-            ("sans-serif", 20, &theme::TEXT),
-        )
+        .caption("Assets", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
@@ -267,7 +264,7 @@ pub fn want_chart(
     let y_max = y_max + y_range * 0.05;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Want Chart", ("sans-serif", 20, &theme::TEXT))
+        .caption("Want", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)

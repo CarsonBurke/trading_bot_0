@@ -77,40 +77,49 @@ pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn
     Ok(())
 }
 
+fn symlog(x: f64) -> f64 {
+    x.signum() * (1.0 + x.abs()).ln()
+}
+
+fn symlog_inv(y: f64) -> f64 {
+    y.signum() * (y.abs().exp() - 1.0)
+}
+
 pub fn simple_chart_log(
     dir: &String,
     name: &str,
     data: &Data,
     x_label: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use plotters::coord::combinators::IntoLogRange;
-
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
     let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
-    let y_min = data
+    let finite_data: Vec<f64> = data.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite_data.is_empty() {
+        return Ok(());
+    }
+
+    let y_min = finite_data
         .iter()
-        .filter(|v| **v > 0.0)
         .min_by(|a, b| a.partial_cmp(b).unwrap())
         .copied()
-        .unwrap_or(1e-10)
-        .max(1e-10);
-
-    let y_max = data
+        .unwrap_or(0.0);
+    let y_max = finite_data
         .iter()
-        .filter(|v| v.is_finite())
         .max_by(|a, b| a.partial_cmp(b).unwrap())
         .copied()
-        .unwrap_or(1.0)
-        * 1.1;
+        .unwrap_or(1.0);
+    let y_range = y_max - y_min;
+    let y_min_t = symlog(y_min - y_range * 0.05);
+    let y_max_t = symlog(y_max + y_range * 0.05);
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
         .caption(name, ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(70)
-        .build_cartesian_2d(0..data.len() as u32, (y_min..y_max).log_scale())?;
+        .build_cartesian_2d(0..data.len() as u32, y_min_t..y_max_t)?;
 
     chart
         .configure_mesh()
@@ -118,14 +127,14 @@ pub fn simple_chart_log(
         .axis_style(&theme::SURFACE1)
         .light_line_style(&theme::SURFACE0)
         .x_desc(x_label)
-        .y_label_formatter(&|v| format!("{:.2}", v))
+        .y_label_formatter(&|v| format!("{:.2e}", symlog_inv(*v)))
         .draw()?;
 
     chart.draw_series(LineSeries::new(
         data.iter()
             .enumerate()
-            .filter(|(_, v)| **v > 0.0)
-            .map(|(index, value)| (index as u32, *value)),
+            .filter(|(_, v)| v.is_finite())
+            .map(|(index, value)| (index as u32, symlog(*value))),
         ShapeStyle::from(&theme::BLUE).stroke_width(1),
     ))?;
 
@@ -134,8 +143,8 @@ pub fn simple_chart_log(
     chart.draw_series(LineSeries::new(
         ma.iter()
             .enumerate()
-            .filter(|(_, v)| !v.is_nan() && **v > 0.0)
-            .map(|(i, v)| (i as u32, *v)),
+            .filter(|(_, v)| !v.is_nan())
+            .map(|(i, v)| (i as u32, symlog(*v))),
         ShapeStyle::from(&theme::YELLOW).stroke_width(1),
     ))?;
 

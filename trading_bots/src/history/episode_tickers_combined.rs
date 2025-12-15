@@ -156,7 +156,7 @@ impl EpisodeHistory {
                 }
             }
             series.push(("cash", &self.cash_weight));
-            let _ = multi_line_chart(&episode_dir, "target_weights", &series, 1, "Step");
+            let _ = multi_line_chart(&episode_dir, "Target Weights", &series, 1, "Step");
         }
 
         // Write static observations and attention weights

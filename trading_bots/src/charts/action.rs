@@ -68,10 +68,7 @@ pub fn hold_action_chart(
     let y_max = y_max + y_range * 0.05;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption(
-            "Hold Action (range: -1 to 1)",
-            ("sans-serif", 20, &theme::TEXT),
-        )
+        .caption("Hold Action", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
@@ -110,25 +107,24 @@ pub fn raw_action_chart(
         return Ok(());
     }
 
-    let y_min = raw_actions
+    let data_min = raw_actions
         .iter()
         .filter(|x| x.is_finite())
         .cloned()
         .fold(f64::INFINITY, f64::min);
-    let y_max = raw_actions
+    let data_max = raw_actions
         .iter()
         .filter(|x| x.is_finite())
         .cloned()
         .fold(f64::NEG_INFINITY, f64::max);
+    let y_min = data_min.min(0.0);
+    let y_max = data_max.max(1.0);
     let y_range = (y_max - y_min).max(0.01);
     let y_min = y_min - y_range * 0.05;
     let y_max = y_max + y_range * 0.05;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption(
-            "Raw Buy/Sell Action Output",
-            ("sans-serif", 20, &theme::TEXT),
-        )
+        .caption("Raw Action", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)

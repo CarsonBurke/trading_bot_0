@@ -1,4 +1,4 @@
-use crate::charts::{simple_chart, simple_chart_log, multi_line_chart};
+use crate::charts::{simple_chart, simple_chart_log, multi_line_chart, multi_line_chart_log};
 use crate::history::episode_tickers_combined::EpisodeHistory;
 use crate::constants::files::TRAINING_PATH;
 use crate::utils::create_folder_if_not_exists;
@@ -56,27 +56,27 @@ impl MetaHistory {
         let base_dir = format!("{TRAINING_PATH}/gens/{}", episode);
         create_folder_if_not_exists(&base_dir);
         if !self.final_assets.is_empty() {
-            let _ = simple_chart(&base_dir, "final_assets", &self.final_assets);
+            let _ = simple_chart(&base_dir, "Final Assets", &self.final_assets);
         }
         if !self.cumulative_reward.is_empty() {
-            let _ = simple_chart(&base_dir, "cumulative_reward", &self.cumulative_reward);
+            let _ = simple_chart(&base_dir, "Cumulative Reward", &self.cumulative_reward);
         }
         if !self.outperformance.is_empty() {
-            let _ = simple_chart(&base_dir, "outperformance", &self.outperformance);
+            let _ = simple_chart(&base_dir, "Outperformance", &self.outperformance);
         }
         if !self.loss.is_empty() {
-            let _ = simple_chart_log(&base_dir, "loss (log scale)", &self.loss, "Episode");
+            let _ = simple_chart_log(&base_dir, "Loss (Log)", &self.loss, "Episode");
         }
         if !self.grad_norm.is_empty() {
-            let _ = simple_chart_log(&base_dir, "grad_norm (log scale)", &self.grad_norm, "Episode");
+            let _ = simple_chart_log(&base_dir, "Grad Norm (Log)", &self.grad_norm, "Episode");
         }
         if !self.total_commissions.is_empty() {
-            let _ = simple_chart(&base_dir, "total_commissions", &self.total_commissions);
+            let _ = simple_chart(&base_dir, "Total Commissions", &self.total_commissions);
         }
         if !self.mean_std.is_empty() {
             let _ = multi_line_chart(
                 &base_dir,
-                "std_stats",
+                "Std Stats",
                 &[
                     ("mean", &self.mean_std),
                     ("min", &self.min_std),
@@ -87,9 +87,9 @@ impl MetaHistory {
             );
         }
         if !self.mean_advantage.is_empty() {
-            let _ = multi_line_chart(
+            let _ = multi_line_chart_log(
                 &base_dir,
-                "advantage_stats",
+                "Advantage Stats (Log)",
                 &[
                     ("mean", &self.mean_advantage),
                     ("min", &self.min_advantage),
@@ -100,7 +100,7 @@ impl MetaHistory {
             );
         }
         if !self.mean_divisor.is_empty() {
-            let _ = simple_chart(&base_dir, "divisor", &self.mean_divisor);
+            let _ = simple_chart(&base_dir, "Divisor", &self.mean_divisor);
         }
     }
 }

@@ -23,7 +23,7 @@ pub fn chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap() as f32;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Chart", ("sans-serif", 20, &theme::TEXT))
+        .caption("Price", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(30)
@@ -92,7 +92,7 @@ pub fn candle_chart(
     }
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
-        .caption("Candle Chart", ("sans-serif", 20, &theme::TEXT))
+        .caption("Candles", ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)

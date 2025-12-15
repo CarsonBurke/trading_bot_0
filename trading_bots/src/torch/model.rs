@@ -12,15 +12,18 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
     Init::Randn { mean: 0.0, stdev: std }
 }
 
-const fn calc_conv_temporal_len(input_len: i64) -> i64 {
-    let after_c1 = (input_len - 8) / 2 + 1;
-    let after_c2 = (after_c1 - 5 + 4) / 2 + 1;
-    (after_c2 - 3 + 2) / 2 + 1
-}
-
-const CONV_TEMPORAL_LEN: i64 = calc_conv_temporal_len(PRICE_DELTAS_PER_TICKER as i64);
 const SSM_DIM: i64 = 64;
-const INPUT_BUFFER_SIZE: i64 = 8;
+const PATCH_SIZE: i64 = 8;
+const PATCHES_PER_TICKER: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
+const COARSE_LATENTS: i64 = 32;
+const MID_LATENTS: i64 = 64;
+const MID_RAW_STEPS: i64 = 1024;
+const MID_PATCHES: i64 = MID_RAW_STEPS / PATCH_SIZE;
+const TAIL_PATCHES: i64 = 32;
+const STEM_SEQ_LEN: i64 = COARSE_LATENTS + MID_LATENTS + TAIL_PATCHES;
+const INPUT_BUFFER_SIZE: i64 = PATCH_SIZE;
+const COARSE_DECAY: f64 = 0.9975;
+const MID_DECAY: f64 = 0.9922;
 
 // (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_weights)
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor);
@@ -29,6 +32,11 @@ pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor);
 pub struct StreamState {
     pub input_buffer: Tensor,
     pub buffer_pos: i64,
+    pub stream_mem_initialized: bool,
+    pub tail_pos: i64,
+    pub coarse_rp: Tensor,
+    pub mid_rp: Tensor,
+    pub tail_tokens: Tensor,
     /// Per-ticker states for O(1) step inference
     pub ssm_states: Vec<Mamba2State>,
     /// Batched state for GPU-efficient forward_with_state (training rollouts)
@@ -40,6 +48,11 @@ impl StreamState {
     pub fn reset(&mut self) {
         let _ = self.input_buffer.zero_();
         self.buffer_pos = 0;
+        self.stream_mem_initialized = false;
+        self.tail_pos = 0;
+        let _ = self.coarse_rp.zero_();
+        let _ = self.mid_rp.zero_();
+        let _ = self.tail_tokens.zero_();
         for s in &mut self.ssm_states {
             s.reset();
         }
@@ -48,14 +61,164 @@ impl StreamState {
     }
 }
 
+struct LatentPool {
+    ln_tokens: nn::LayerNorm,
+    ln_latents: nn::LayerNorm,
+    latent_tokens: Tensor,
+    q_proj: nn::Linear,
+    k_proj: nn::Linear,
+    v_proj: nn::Linear,
+    out_proj: nn::Linear,
+}
+
+impl LatentPool {
+    fn new(p: &nn::Path, d_model: i64, num_latents: i64) -> Self {
+        let ln_tokens = nn::layer_norm(p / "ln_tokens", vec![d_model], Default::default());
+        let ln_latents = nn::layer_norm(p / "ln_latents", vec![d_model], Default::default());
+        let latent_tokens =
+            p.var("latent_tokens", &[num_latents, d_model], Init::Uniform { lo: -0.1, up: 0.1 });
+        let q_proj = nn::linear(p / "q", d_model, d_model, Default::default());
+        let k_proj = nn::linear(p / "k", d_model, d_model, Default::default());
+        let v_proj = nn::linear(p / "v", d_model, d_model, Default::default());
+        let out_proj = nn::linear(p / "out", d_model, d_model, Default::default());
+        Self {
+            ln_tokens,
+            ln_latents,
+            latent_tokens,
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+        }
+    }
+
+    fn forward_impl(&self, tokens: &Tensor, freeze_k: bool, freeze_v: bool) -> Tensor {
+        debug_assert_eq!(tokens.dim(), 3);
+        let batch = tokens.size()[0];
+        let tokens = tokens.apply(&self.ln_tokens);
+        let latents = self
+            .latent_tokens
+            .unsqueeze(0)
+            .expand(&[batch, -1, -1], false)
+            .apply(&self.ln_latents);
+
+        let q = latents.apply(&self.q_proj);
+        let k = if freeze_k {
+            let ws = self.k_proj.ws.detach();
+            let bs = self.k_proj.bs.as_ref().map(|b| b.detach());
+            match &bs {
+                Some(b) => tokens.linear(&ws, Some(b)),
+                None => tokens.linear(&ws, None::<&Tensor>),
+            }
+        } else {
+            tokens.apply(&self.k_proj)
+        };
+        let v = if freeze_v {
+            let ws = self.v_proj.ws.detach();
+            let bs = self.v_proj.bs.as_ref().map(|b| b.detach());
+            match &bs {
+                Some(b) => tokens.linear(&ws, Some(b)),
+                None => tokens.linear(&ws, None::<&Tensor>),
+            }
+        } else {
+            tokens.apply(&self.v_proj)
+        };
+
+        let scale = (q.size()[2] as f64).sqrt();
+        let attn = (q.matmul(&k.transpose(-2, -1)) / scale).softmax(-1, Kind::Float);
+        attn.matmul(&v).apply(&self.out_proj)
+    }
+
+    fn forward(&self, tokens: &Tensor) -> Tensor {
+        self.forward_impl(tokens, false, false)
+    }
+
+    fn forward_random_proj(&self, tokens: &Tensor, freeze_v: bool) -> Tensor {
+        self.forward_impl(tokens, true, freeze_v)
+    }
+}
+
+struct TwoStageLatentPool {
+    random_proj: LatentPool,
+    pool: LatentPool,
+    freeze_rp_v: bool,
+}
+
+impl TwoStageLatentPool {
+    fn new(p: &nn::Path, d_model: i64, num_latents: i64, freeze_rp_v: bool) -> Self {
+        Self {
+            random_proj: LatentPool::new(&(p / "rp"), d_model, num_latents),
+            pool: LatentPool::new(&(p / "pool"), d_model, num_latents),
+            freeze_rp_v,
+        }
+    }
+
+    fn forward(&self, tokens: &Tensor) -> Tensor {
+        let rp_latents = self.random_proj.forward_random_proj(tokens, self.freeze_rp_v);
+        self.pool.forward(&rp_latents)
+    }
+
+    fn init_rp_values(&self, batch: i64) -> Tensor {
+        self.random_proj
+            .latent_tokens
+            .detach()
+            .unsqueeze(0)
+            .expand(&[batch, -1, -1], false)
+            .contiguous()
+    }
+
+    fn update_rp_values(&self, rp_values: &Tensor, token: &Tensor, decay: f64) -> Tensor {
+        debug_assert_eq!(rp_values.dim(), 3);
+        debug_assert_eq!(token.dim(), 2);
+        debug_assert_eq!(rp_values.size()[0], token.size()[0]);
+
+        let q = token.apply(&self.random_proj.q_proj).to_kind(Kind::Float); // [B, D]
+        let k_frozen = self.random_proj.latent_tokens.detach().to_kind(Kind::Float); // [M, D]
+        let scores = q.matmul(&k_frozen.transpose(0, 1)) / (q.size()[1] as f64).sqrt(); // [B, M]
+        let attn = scores.softmax(-1, Kind::Float);
+
+        let token_v = if self.freeze_rp_v {
+            let ws = self.random_proj.v_proj.ws.detach();
+            let bs = self.random_proj.v_proj.bs.as_ref().map(|b| b.detach());
+            match &bs {
+                Some(b) => token.linear(&ws, Some(b)),
+                None => token.linear(&ws, None::<&Tensor>),
+            }
+        } else {
+            token.apply(&self.random_proj.v_proj)
+        };
+        let token_v = token_v.to_kind(Kind::Float);
+
+        let updated = rp_values.to_kind(Kind::Float) * decay + attn.unsqueeze(-1) * token_v.unsqueeze(1);
+        updated.apply(&self.random_proj.ln_latents).to_kind(rp_values.kind())
+    }
+
+    fn forward_from_rp_values(&self, rp_values: &Tensor) -> Tensor {
+        self.pool.forward(rp_values)
+    }
+}
+
+struct MultiBankLatentPool {
+    coarse: TwoStageLatentPool,
+    mid: TwoStageLatentPool,
+}
+
+impl MultiBankLatentPool {
+    fn new(p: &nn::Path, d_model: i64, freeze_rp_v: bool) -> Self {
+        assert_eq!(MID_RAW_STEPS % PATCH_SIZE, 0);
+        Self {
+            coarse: TwoStageLatentPool::new(&(p / "coarse"), d_model, COARSE_LATENTS, freeze_rp_v),
+            mid: TwoStageLatentPool::new(&(p / "mid"), d_model, MID_LATENTS, freeze_rp_v),
+        }
+    }
+}
+
 pub struct TradingModel {
-    c1: nn::Conv1D,
-    gn2: nn::GroupNorm,
-    c2_dw: nn::Conv1D,
-    c2_pw: nn::Conv1D,
-    gn3: nn::GroupNorm,
-    c3_dw: nn::Conv1D,
-    c3_pw: nn::Conv1D,
+    patch_embed: nn::Linear,
+    ln_patch: nn::LayerNorm,
+    latent_pool: MultiBankLatentPool,
+    stem_pos_emb: Tensor,
+    stem_type_emb: Tensor,
     ssm: StatefulMamba,
     ssm_proj: nn::Conv1D,
     pos_embedding: Tensor,
@@ -99,17 +262,30 @@ pub struct TradingModel {
 
 impl TradingModel {
     pub fn new(p: &nn::Path, nact: i64) -> Self {
-        let c1 = nn::conv1d(p / "c1", 1, 64, 8, nn::ConvConfig { stride: 2, ..Default::default() });
-        let gn2 = nn::group_norm(p / "gn2", 8, 64, Default::default());
-        let c2_dw = nn::conv1d(p / "c2_dw", 64, 64, 5, nn::ConvConfig { stride: 2, padding: 2, groups: 64, ..Default::default() });
-        let c2_pw = nn::conv1d(p / "c2_pw", 64, 64, 1, Default::default());
-        let gn3 = nn::group_norm(p / "gn3", 8, 64, Default::default());
-        let c3_dw = nn::conv1d(p / "c3_dw", 64, 64, 3, nn::ConvConfig { stride: 2, padding: 1, groups: 64, ..Default::default() });
-        let c3_pw = nn::conv1d(p / "c3_pw", 64, 64, 1, Default::default());
+        assert_eq!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE, 0);
+        assert!(TAIL_PATCHES <= PATCHES_PER_TICKER);
+        assert!(MID_PATCHES <= PATCHES_PER_TICKER - TAIL_PATCHES);
+        let patch_embed = nn::linear(p / "patch_embed", PATCH_SIZE, SSM_DIM, Default::default());
+        let ln_patch = nn::layer_norm(p / "ln_patch", vec![SSM_DIM], Default::default());
+        let latent_pool = MultiBankLatentPool::new(&(p / "latent_pool"), SSM_DIM, false);
+        let stem_pos_emb = p.var(
+            "stem_pos_emb",
+            &[1, STEM_SEQ_LEN, SSM_DIM],
+            Init::Uniform { lo: -0.01, up: 0.01 },
+        );
+        let stem_type_emb = p.var(
+            "stem_type_emb",
+            &[3, SSM_DIM],
+            Init::Uniform { lo: -0.01, up: 0.01 },
+        );
 
         let ssm = stateful_mamba_block(&(p / "ssm"), SSM_DIM);
         let ssm_proj = nn::conv1d(p / "ssm_proj", SSM_DIM, 256, 1, Default::default());
-        let pos_embedding = p.var("pos_emb", &[1, 256, CONV_TEMPORAL_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
+        let pos_embedding = p.var(
+            "pos_emb",
+            &[1, 256, STEM_SEQ_LEN],
+            Init::Uniform { lo: -0.01, up: 0.01 },
+        );
 
         let static_to_temporal = nn::linear(p / "static_to_temporal", PER_TICKER_STATIC_OBS as i64, 64, Default::default());
         let ln_static_temporal = nn::layer_norm(p / "ln_static_temporal", vec![64], Default::default());
@@ -164,10 +340,11 @@ impl TradingModel {
             bs_init: Some(Init::Const(0.0)),
             bias: true,
         });
-        // Distributional critic with bins uniform in symlog space [-20, 20]
-        // Critic expectation computed in symlog space for consistency with symlog'd returns
-        let symlog_centers = Tensor::linspace(-20.0, 20.0, NUM_VALUE_BUCKETS, (Kind::Float, p.device()));
-        // bucket_centers in raw space (symexp of symlog) - kept for potential raw value conversion
+        // Distributional critic bins uniform in symlog space [-symlog(REWARD_RANGE), +symlog(REWARD_RANGE)]
+        let symlog_clip = shared::symlog_target_clip();
+        let symlog_centers =
+            Tensor::linspace(-symlog_clip, symlog_clip, NUM_VALUE_BUCKETS, (Kind::Float, p.device()));
+        // bucket_centers in raw space (symexp of symlog) for raw value expectation
         let bucket_centers = &symlog_centers.sign() * (&symlog_centers.abs().exp() - 1.0);
 
         // Logistic-normal: output K-1 unconstrained dims, append 0 before softmax
@@ -184,7 +361,11 @@ impl TradingModel {
         let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
 
         Self {
-            c1, gn2, c2_dw, c2_pw, gn3, c3_dw, c3_pw,
+            patch_embed,
+            ln_patch,
+            latent_pool,
+            stem_pos_emb,
+            stem_type_emb,
             ssm, ssm_proj, pos_embedding,
             static_to_temporal, ln_static_temporal, temporal_pools,
             static_proj, ln_static_proj,
@@ -210,7 +391,7 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let x_stem = self.conv_stem(&price_deltas, batch_size);
+        let x_stem = self.patch_latent_stem(&price_deltas, batch_size);
 
         let x_for_ssm = x_stem.permute([0, 2, 1]);
         let x_ssm = self.ssm.forward(&x_for_ssm, train);
@@ -220,17 +401,16 @@ impl TradingModel {
     }
 
     /// Forward with recurrent SSM state - GPU efficient for training rollouts with memory
-    pub fn forward_with_state(&self, price_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
+    pub fn forward_with_state(&self, price_deltas: &Tensor, static_features: &Tensor, _state: &mut StreamState) -> ModelOutput {
         let price_deltas = price_deltas.to_device(self.device);
         let static_features = static_features.to_device(self.device);
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let x_stem = self.conv_stem(&price_deltas, batch_size);
+        let x_stem = self.patch_latent_stem(&price_deltas, batch_size);
 
-        // GPU-efficient SSM with batched state - chunked parallel scan
         let x_for_ssm = x_stem.permute([0, 2, 1]); // [B*T, L, C]
-        let x_ssm = self.ssm.forward_with_state(&x_for_ssm, &mut state.ssm_state_batched);
+        let x_ssm = self.ssm.forward(&x_for_ssm, false);
         let x_ssm = x_ssm.permute([0, 2, 1]); // [B*T, C, L]
 
         self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
@@ -244,47 +424,15 @@ impl TradingModel {
         &self,
         price_deltas: &Tensor,
         static_features: &Tensor,
-        state: &mut StreamState,
+        _state: &mut StreamState,
     ) -> ModelOutput {
         let seq_len = price_deltas.size()[0];
         let batch_size = price_deltas.size()[1];
         let total_samples = seq_len * batch_size;
 
-        // Flatten seq and batch for parallel conv
-        let price_deltas_flat = price_deltas.reshape([total_samples, -1]).to_device(self.device);
-        let static_features_flat = static_features.reshape([total_samples, -1]).to_device(self.device);
-
-        let (global_static, per_ticker_static) = self.parse_static(&static_features_flat, total_samples);
-
-        // Parallel conv for all samples
-        let x_stem = self.conv_stem(&price_deltas_flat, total_samples);
-        // x_stem: [total_samples * TICKERS, channels, temporal_len]
-
-        let temporal_len = x_stem.size()[2];
-        let channels = x_stem.size()[1];
-
-        // Reshape for sequential SSM: [batch * TICKERS, seq_len, temporal_len, channels]
-        // SSM state is [batch * TICKERS, ...], so we process seq_len steps sequentially
-        let x_stem_seq = x_stem
-            .view([seq_len, batch_size * TICKERS_COUNT, channels, temporal_len])
-            .permute([1, 0, 3, 2]); // [batch*T, seq, temporal, channels]
-
-        // Process each timestep through SSM sequentially (SSM handles temporal_len in parallel)
-        let mut ssm_outputs = Vec::with_capacity(seq_len as usize);
-        for t in 0..seq_len {
-            let x_t = x_stem_seq.select(1, t); // [batch*T, temporal, channels]
-            let y_t = self.ssm.forward_with_state(&x_t, &mut state.ssm_state_batched);
-            ssm_outputs.push(y_t);
-        }
-        let x_ssm = Tensor::stack(&ssm_outputs, 1); // [batch*T, seq, temporal, channels]
-
-        // Reshape back: [total_samples * TICKERS, channels, temporal]
-        let x_ssm = x_ssm
-            .permute([0, 1, 3, 2]) // [batch*T, seq, channels, temporal]
-            .reshape([total_samples * TICKERS_COUNT, channels, temporal_len]);
-
-        // Parallel head for all samples
-        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, total_samples)
+        let price_deltas_flat = price_deltas.reshape([total_samples, -1]);
+        let static_features_flat = static_features.reshape([total_samples, -1]);
+        self.forward(&price_deltas_flat, &static_features_flat, true)
     }
 
     /// Initialize streaming state for O(1) inference (batch_size=1)
@@ -297,6 +445,11 @@ impl TradingModel {
         StreamState {
             input_buffer: Tensor::zeros(&[TICKERS_COUNT, INPUT_BUFFER_SIZE], (Kind::Float, self.device)),
             buffer_pos: 0,
+            stream_mem_initialized: false,
+            tail_pos: 0,
+            coarse_rp: Tensor::zeros(&[TICKERS_COUNT, COARSE_LATENTS, SSM_DIM], (Kind::Float, self.device)),
+            mid_rp: Tensor::zeros(&[TICKERS_COUNT, MID_LATENTS, SSM_DIM], (Kind::Float, self.device)),
+            tail_tokens: Tensor::zeros(&[TICKERS_COUNT, TAIL_PATCHES, SSM_DIM], (Kind::Float, self.device)),
             ssm_states: (0..TICKERS_COUNT).map(|_| self.ssm.init_state(1, self.device)).collect(),
             ssm_state_batched: self.ssm.init_state(batch_size * TICKERS_COUNT, self.device),
             last_output: None,
@@ -307,6 +460,17 @@ impl TradingModel {
     pub fn step(&self, new_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> (bool, ModelOutput) {
         let new_deltas = new_deltas.to_device(self.device);
         let static_features = static_features.to_device(self.device);
+
+        let full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
+        if (new_deltas.dim() == 1 && new_deltas.size()[0] == full_obs)
+            || (new_deltas.dim() == 2 && new_deltas.size()[0] == 1 && new_deltas.size()[1] == full_obs)
+        {
+            let price = if new_deltas.dim() == 1 { new_deltas.unsqueeze(0) } else { new_deltas };
+            let static_features = if static_features.dim() == 1 { static_features.unsqueeze(0) } else { static_features };
+            let output = self.forward_with_state(&price, &static_features, state);
+            state.last_output = Some(Self::clone_output(&output));
+            return (true, output);
+        }
 
         let _ = state.input_buffer.narrow(1, state.buffer_pos, 1).copy_(&new_deltas.unsqueeze(1));
         state.buffer_pos += 1;
@@ -339,33 +503,91 @@ impl TradingModel {
     }
 
     fn process_stream_buffer(&self, buffer: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
+        self.ensure_stream_mem_initialized(state);
+
+        let token = buffer.apply(&self.patch_embed).apply(&self.ln_patch).silu(); // [T, D]
+        self.update_stream_mem(state, &token);
+        self.stream_forward_from_mem(static_features, state)
+    }
+
+    fn ensure_stream_mem_initialized(&self, state: &mut StreamState) {
+        if state.stream_mem_initialized {
+            return;
+        }
+        state.coarse_rp = self
+            .latent_pool
+            .coarse
+            .init_rp_values(TICKERS_COUNT)
+            .to_device(self.device)
+            .to_kind(Kind::Float);
+        state.mid_rp = self
+            .latent_pool
+            .mid
+            .init_rp_values(TICKERS_COUNT)
+            .to_device(self.device)
+            .to_kind(Kind::Float);
+        let _ = state.tail_tokens.zero_();
+        state.tail_pos = 0;
+        state.stream_mem_initialized = true;
+    }
+
+    fn update_stream_mem(&self, state: &mut StreamState, token: &Tensor) {
+        state.coarse_rp = self
+            .latent_pool
+            .coarse
+            .update_rp_values(&state.coarse_rp, token, COARSE_DECAY);
+        state.mid_rp = self
+            .latent_pool
+            .mid
+            .update_rp_values(&state.mid_rp, token, MID_DECAY);
+
+        let _ = state
+            .tail_tokens
+            .narrow(1, state.tail_pos, 1)
+            .copy_(&token.unsqueeze(1));
+        state.tail_pos = (state.tail_pos + 1) % TAIL_PATCHES;
+    }
+
+    fn ordered_tail_tokens(&self, state: &StreamState) -> Tensor {
+        if state.tail_pos == 0 {
+            state.tail_tokens.shallow_clone()
+        } else {
+            let a = state.tail_tokens.narrow(1, state.tail_pos, TAIL_PATCHES - state.tail_pos);
+            let b = state.tail_tokens.narrow(1, 0, state.tail_pos);
+            Tensor::cat(&[a, b], 1)
+        }
+    }
+
+    fn stream_forward_from_mem(&self, static_features: &Tensor, state: &StreamState) -> ModelOutput {
         let batch_size = 1i64;
         let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
 
-        let x = buffer.unsqueeze(1);
-        let x = x.apply(&self.c1).silu();
-        let x = x.apply(&self.gn2).apply(&self.c2_dw).apply(&self.c2_pw).silu();
-        let x = x.apply(&self.gn3).apply(&self.c3_dw).apply(&self.c3_pw).silu();
+        let coarse = self.latent_pool.coarse.forward_from_rp_values(&state.coarse_rp);
+        let mid = self.latent_pool.mid.forward_from_rp_values(&state.mid_rp);
+        let tail = self.ordered_tail_tokens(state);
 
-        let x_in = x.squeeze_dim(2);
-        let mut ssm_outs = Vec::with_capacity(TICKERS_COUNT as usize);
-        for t in 0..TICKERS_COUNT as usize {
-            let out = self.ssm.step(&x_in.narrow(0, t as i64, 1), &mut state.ssm_states[t]);
-            ssm_outs.push(out);
-        }
-        let x_ssm = Tensor::cat(&ssm_outs, 0);
+        let batch_tokens = TICKERS_COUNT;
+        let type_coarse = self
+            .stem_type_emb
+            .get(0)
+            .view([1, 1, SSM_DIM])
+            .expand(&[batch_tokens, COARSE_LATENTS, SSM_DIM], false);
+        let type_mid = self
+            .stem_type_emb
+            .get(1)
+            .view([1, 1, SSM_DIM])
+            .expand(&[batch_tokens, MID_LATENTS, SSM_DIM], false);
+        let type_tail = self
+            .stem_type_emb
+            .get(2)
+            .view([1, 1, SSM_DIM])
+            .expand(&[batch_tokens, TAIL_PATCHES, SSM_DIM], false);
+        let type_emb = Tensor::cat(&[type_coarse, type_mid, type_tail], 1);
+        let pos_emb = self.stem_pos_emb.expand(&[batch_tokens, STEM_SEQ_LEN, SSM_DIM], false);
 
-        // ssm_proj is Conv1D(64, 256, kernel=1) which is equivalent to Linear
-        // weights: [256, 64, 1] -> squeeze to [256, 64] -> transpose to [64, 256]
-        let w = self.ssm_proj.ws.squeeze_dim(2).tr();
-        let conv_features = x_ssm.matmul(&w);
-        let conv_features = match &self.ssm_proj.bs {
-            Some(b) => conv_features + b,
-            None => conv_features,
-        };
-        let conv_features = conv_features.view([batch_size, TICKERS_COUNT, 256]);
-
-        self.head_no_temporal_pool(&conv_features, &global_static, &per_ticker_static, batch_size)
+        let stem_tokens = Tensor::cat(&[coarse, mid, tail], 1) + type_emb + pos_emb; // [T, L, D]
+        let x_ssm = self.ssm.forward(&stem_tokens, false).permute([0, 2, 1]); // [T, D, L]
+        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
     }
 
     fn parse_static(&self, static_features: &Tensor, batch_size: i64) -> (Tensor, Tensor) {
@@ -376,13 +598,42 @@ impl TradingModel {
         (global, per_ticker)
     }
 
-    fn conv_stem(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
+    fn patch_latent_stem(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
         let x = price_deltas
             .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
-            .view([batch_size * TICKERS_COUNT, 1, PRICE_DELTAS_PER_TICKER as i64]);
-        let x = x.apply(&self.c1).silu();
-        let x = x.apply(&self.gn2).apply(&self.c2_dw).apply(&self.c2_pw).silu();
-        x.apply(&self.gn3).apply(&self.c3_dw).apply(&self.c3_pw).silu()
+            .view([batch_size * TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
+            .view([batch_size * TICKERS_COUNT, PATCHES_PER_TICKER, PATCH_SIZE])
+            .apply(&self.patch_embed)
+            .apply(&self.ln_patch)
+            .silu();
+
+        let tail_start = PATCHES_PER_TICKER - TAIL_PATCHES;
+        let past_all = x.narrow(1, 0, tail_start);
+        let mid_start = tail_start - MID_PATCHES;
+        let past_mid = x.narrow(1, mid_start, MID_PATCHES);
+        let tail = x.narrow(1, tail_start, TAIL_PATCHES);
+
+        let coarse_latents = self.latent_pool.coarse.forward(&past_all);
+        let mid_latents = self.latent_pool.mid.forward(&past_mid);
+        let batch_tokens = batch_size * TICKERS_COUNT;
+        let type_latent = self
+            .stem_type_emb
+            .get(0)
+            .view([1, 1, SSM_DIM])
+            .expand(&[batch_tokens, COARSE_LATENTS, SSM_DIM], false);
+        let type_mid = self
+            .stem_type_emb
+            .get(1)
+            .view([1, 1, SSM_DIM])
+            .expand(&[batch_tokens, MID_LATENTS, SSM_DIM], false);
+        let type_tail = self
+            .stem_type_emb
+            .get(2)
+            .view([1, 1, SSM_DIM])
+            .expand(&[batch_tokens, TAIL_PATCHES, SSM_DIM], false);
+        let type_emb = Tensor::cat(&[type_latent, type_mid, type_tail], 1);
+        let pos_emb = self.stem_pos_emb.expand(&[batch_tokens, STEM_SEQ_LEN, SSM_DIM], false);
+        (Tensor::cat(&[coarse_latents, mid_latents, tail], 1) + type_emb + pos_emb).permute([0, 2, 1])
     }
 
     fn head_with_temporal_pool(&self, x_ssm: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64) -> ModelOutput {
@@ -454,15 +705,15 @@ impl TradingModel {
 
         let critic_logits = critic_feat.apply(&self.critic);
         let critic_probs = critic_logits.softmax(-1, Kind::Float);
-        // Expectation in symlog space (matches two-hot targets in training)
-        let critic_value = critic_probs.mv(&self.symlog_centers);
+        // Expectation in raw space (bins are uniform in symlog space for stability)
+        let critic_value = critic_probs.mv(&self.bucket_centers);
 
         let action_mean = actor_feat.apply(&self.actor_mean);
-        const LOG_STD_OFFSET: f64 = -4.0;
+        const LOG_STD_OFFSET: f64 = -3.8;
         let latent = actor_feat.apply(&self.sde_fc).apply(&self.ln_sde).tanh();
-        let log_std = (&self.log_std_param + LOG_STD_OFFSET).clamp(-5.0, -2.0);
+        let log_std = (&self.log_std_param + LOG_STD_OFFSET).clamp(-4.0, -1.0);
         let variance = latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
-        let action_log_std = (variance + 1e-6).sqrt().log();
+        let action_log_std = (variance + 1e-6).sqrt().log().clamp(-10.0, 2.0);
 
         const LOG_D_RAW_SCALE: f64 = 5.0;
         let divisor = self.log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + 0.1;

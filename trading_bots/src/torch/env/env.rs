@@ -21,13 +21,14 @@ use crate::{
 };
 
 /// Precomputed earnings indicators per step (from cached quarterly reports)
+#[derive(Debug)]
 pub(super) struct EarningsIndicators {
-    pub steps_to_next: Vec<f64>,      // Steps until next earnings [-1,1] normalized
-    pub revenue_growth: Vec<f64>,     // QoQ revenue growth [-1,1]
-    pub opex_growth: Vec<f64>,        // QoQ operating expenses growth [-1,1]
-    pub net_profit_growth: Vec<f64>,  // QoQ net profit growth [-1,1]
-    pub eps: Vec<f64>,                // EPS normalized by price
-    pub eps_surprise: Vec<f64>,       // Last earnings surprise % [-1,1]
+    pub steps_to_next: Vec<f64>, // Steps until next earnings [-1,1] normalized
+    pub revenue_growth: Vec<f64>, // QoQ revenue growth [-1,1]
+    pub opex_growth: Vec<f64>,   // QoQ operating expenses growth [-1,1]
+    pub net_profit_growth: Vec<f64>, // QoQ net profit growth [-1,1]
+    pub eps: Vec<f64>,           // EPS normalized by price
+    pub eps_surprise: Vec<f64>,  // Last earnings surprise % [-1,1]
 }
 
 impl EarningsIndicators {
@@ -94,7 +95,14 @@ impl EarningsIndicators {
             eps_surprise[i] = report.eps_surprise.unwrap_or(0.0).clamp(-1.0, 1.0);
         }
 
-        Self { steps_to_next, revenue_growth, opex_growth, net_profit_growth, eps, eps_surprise }
+        Self {
+            steps_to_next,
+            revenue_growth,
+            opex_growth,
+            net_profit_growth,
+            eps,
+            eps_surprise,
+        }
     }
 }
 
@@ -102,7 +110,9 @@ fn date_diff_days(from: &str, to: &str) -> i32 {
     // Simple date diff: "YYYY-MM-DD" format
     let parse = |s: &str| -> Option<i32> {
         let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 3 { return None; }
+        if parts.len() != 3 {
+            return None;
+        }
         let y: i32 = parts[0].parse().ok()?;
         let m: i32 = parts[1].parse().ok()?;
         let d: i32 = parts[2].parse().ok()?;
@@ -116,18 +126,18 @@ fn date_diff_days(from: &str, to: &str) -> i32 {
 
 /// Precomputed momentum indicators (SOTA for trend prediction)
 pub(super) struct MomentumIndicators {
-    pub rsi: Vec<f64>,           // RSI 14-period [0,1]
-    pub mom_5: Vec<f64>,         // 5-step momentum
-    pub mom_60: Vec<f64>,        // 60-step momentum
-    pub mom_120: Vec<f64>,       // 120-step momentum
-    pub mom_accel: Vec<f64>,     // Momentum acceleration
-    pub vol_adj_mom: Vec<f64>,   // Volatility-adjusted momentum
-    pub range_pos: Vec<f64>,     // Position in high-low range [-1,1]
-    pub zscore: Vec<f64>,        // Z-score from mean [-3,3]
-    pub efficiency: Vec<f64>,    // Efficiency ratio [0,1]
-    pub macd: Vec<f64>,          // MACD normalized
-    pub stoch_k: Vec<f64>,       // Stochastic %K [0,1]
-    pub trend_strength: Vec<f64>,// Trend consistency [0,1]
+    pub rsi: Vec<f64>,            // RSI 14-period [0,1]
+    pub mom_5: Vec<f64>,          // 5-step momentum
+    pub mom_60: Vec<f64>,         // 60-step momentum
+    pub mom_120: Vec<f64>,        // 120-step momentum
+    pub mom_accel: Vec<f64>,      // Momentum acceleration
+    pub vol_adj_mom: Vec<f64>,    // Volatility-adjusted momentum
+    pub range_pos: Vec<f64>,      // Position in high-low range [-1,1]
+    pub zscore: Vec<f64>,         // Z-score from mean [-3,3]
+    pub efficiency: Vec<f64>,     // Efficiency ratio [0,1]
+    pub macd: Vec<f64>,           // MACD normalized
+    pub stoch_k: Vec<f64>,        // Stochastic %K [0,1]
+    pub trend_strength: Vec<f64>, // Trend consistency [0,1]
 }
 
 impl MomentumIndicators {
@@ -152,23 +162,38 @@ impl MomentumIndicators {
         for i in 1..n {
             let p = prices[i];
 
-            if i >= 5 { mom_5[i] = (p / prices[i - 5] - 1.0).clamp(-0.5, 0.5); }
-            if i >= 60 { mom_60[i] = (p / prices[i - 60] - 1.0).clamp(-1.0, 1.0); }
-            if i >= 120 { mom_120[i] = (p / prices[i - 120] - 1.0).clamp(-2.0, 2.0); }
-            if i >= 10 { mom_accel[i] = (mom_5[i] - mom_5[i - 5]).clamp(-0.2, 0.2); }
+            if i >= 5 {
+                mom_5[i] = (p / prices[i - 5] - 1.0).clamp(-0.5, 0.5);
+            }
+            if i >= 60 {
+                mom_60[i] = (p / prices[i - 60] - 1.0).clamp(-1.0, 1.0);
+            }
+            if i >= 120 {
+                mom_120[i] = (p / prices[i - 120] - 1.0).clamp(-2.0, 2.0);
+            }
+            if i >= 10 {
+                mom_accel[i] = (mom_5[i] - mom_5[i - 5]).clamp(-0.2, 0.2);
+            }
 
             if i >= 14 {
                 let (mut gains, mut losses) = (0.0, 0.0);
                 for j in (i - 13)..=i {
                     let chg = prices[j] - prices[j - 1];
-                    if chg > 0.0 { gains += chg; } else { losses -= chg; }
+                    if chg > 0.0 {
+                        gains += chg;
+                    } else {
+                        losses -= chg;
+                    }
                 }
                 rsi[i] = (100.0 - 100.0 / (1.0 + gains / losses.max(1e-10))) / 100.0;
 
                 let (mut up, mut down) = (0, 0);
                 for j in (i - 13)..=i {
-                    if prices[j] > prices[j - 1] { up += 1; }
-                    else if prices[j] < prices[j - 1] { down += 1; }
+                    if prices[j] > prices[j - 1] {
+                        up += 1;
+                    } else if prices[j] < prices[j - 1] {
+                        down += 1;
+                    }
                 }
                 trend_strength[i] = up.max(down) as f64 / 14.0;
             }
@@ -178,7 +203,9 @@ impl MomentumIndicators {
                 let high = w.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let low = w.iter().cloned().fold(f64::INFINITY, f64::min);
                 let mean: f64 = w.iter().sum::<f64>() / 20.0;
-                let std = (w.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / 20.0).sqrt().max(1e-10);
+                let std = (w.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / 20.0)
+                    .sqrt()
+                    .max(1e-10);
                 let range = (high - low).max(1e-10);
 
                 range_pos[i] = ((p - low) / range * 2.0 - 1.0).clamp(-1.0, 1.0);
@@ -187,7 +214,9 @@ impl MomentumIndicators {
                 vol_adj_mom[i] = ((p / prices[i - 20] - 1.0) / (std / mean)).clamp(-5.0, 5.0);
 
                 let net = (p - prices[i - 20]).abs();
-                let total: f64 = (i - 19..=i).map(|j| (prices[j] - prices[j - 1]).abs()).sum();
+                let total: f64 = (i - 19..=i)
+                    .map(|j| (prices[j] - prices[j - 1]).abs())
+                    .sum();
                 efficiency[i] = (net / total.max(1e-10)).clamp(0.0, 1.0);
             }
 
@@ -196,7 +225,20 @@ impl MomentumIndicators {
             macd[i] = ((ema_12 - ema_26) / p.max(1e-10) * 100.0).clamp(-5.0, 5.0);
         }
 
-        Self { rsi, mom_5, mom_60, mom_120, mom_accel, vol_adj_mom, range_pos, zscore, efficiency, macd, stoch_k, trend_strength }
+        Self {
+            rsi,
+            mom_5,
+            mom_60,
+            mom_120,
+            mom_accel,
+            vol_adj_mom,
+            range_pos,
+            zscore,
+            efficiency,
+            macd,
+            stoch_k,
+            trend_strength,
+        }
     }
 }
 
@@ -208,6 +250,7 @@ pub(super) struct BuyLot {
 }
 
 pub struct Env {
+    pub(super) env_id: usize,
     pub step: usize,
     pub max_step: usize,
     pub tickers: Vec<String>,
@@ -236,6 +279,7 @@ pub struct Env {
     pub(super) momentum: Vec<MomentumIndicators>,
     /// Precomputed earnings indicators per ticker
     pub(super) earnings: Vec<EarningsIndicators>,
+    record_history_io: bool,
 }
 
 pub(super) const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
@@ -244,6 +288,10 @@ impl Env {
     pub(super) const STARTING_CASH: f64 = 10_000.0;
 
     pub fn new(random_start: bool) -> Self {
+        Self::new_with_recording(random_start, true)
+    }
+
+    pub fn new_with_recording(random_start: bool, record_history_io: bool) -> Self {
         let tickers = vec![
             // "TSLA".to_string(),
             // "AAPL".to_string(),
@@ -266,7 +314,8 @@ impl Env {
         let price_deltas = get_mapped_price_deltas(&mapped_bars);
 
         // Precompute momentum indicators for all tickers
-        let momentum: Vec<MomentumIndicators> = prices.iter()
+        let momentum: Vec<MomentumIndicators> = prices
+            .iter()
             .map(|p| MomentumIndicators::compute(p))
             .collect();
 
@@ -277,7 +326,14 @@ impl Env {
             .iter()
             .map(|bars| {
                 bars.iter()
-                    .map(|b| format!("{:04}-{:02}-{:02}", b.date.year(), b.date.month() as u8, b.date.day()))
+                    .map(|b| {
+                        format!(
+                            "{:04}-{:02}-{:02}",
+                            b.date.year(),
+                            b.date.month() as u8,
+                            b.date.day()
+                        )
+                    })
                     .collect()
             })
             .collect();
@@ -298,6 +354,7 @@ impl Env {
 
         let num_tickers = tickers.len();
         Self {
+            env_id: 0,
             step: 0,
             max_step: total_data_length - 2,
             prices,
@@ -324,6 +381,7 @@ impl Env {
             target_weights: vec![0.0; num_tickers + 1],
             momentum,
             earnings,
+            record_history_io,
         }
     }
 
@@ -349,22 +407,23 @@ impl Env {
             // Last action (cash) is not permuted
             let mut real_actions = vec![0.0; ACTION_COUNT as usize];
             for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
-            real_actions[real_idx] = actions[perm_idx];
-        }
-        real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize]; // cash
+                real_actions[real_idx] = actions[perm_idx];
+            }
+            real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize]; // cash
 
-        if self.step == 0 {
-            self.episode_history.action_step0 = Some(real_actions.clone());
-        }
+            if self.step == 0 {
+                self.episode_history.action_step0 = Some(real_actions.clone());
+            }
 
-        self.action_history.push_back(real_actions.clone());
-        if self.action_history.len() > ACTION_HISTORY_LEN {
-            self.action_history.pop_front();
-        }
+            self.action_history.push_back(real_actions.clone());
+            if self.action_history.len() > ACTION_HISTORY_LEN {
+                self.action_history.pop_front();
+            }
 
             let (total_commission, trade_sell_reward) =
                 self.trade_by_target_weights(&real_actions, absolute_step);
-            let reward = if RETROACTIVE_BUY_REWARD {
+            let reward = self.get_unrealized_pnl_reward(absolute_step, total_commission)
+                + if RETROACTIVE_BUY_REWARD {
                     trade_sell_reward
                 } else {
                     0.0
@@ -378,17 +437,19 @@ impl Env {
             let is_done = self.get_is_done();
 
             for (index, _) in self.tickers.iter().enumerate() {
-            self.episode_history.positioned[index].push(
-                self.account.positions[index]
-                    .value_with_price(self.prices[index][absolute_step]),
-            );
-            self.episode_history.raw_actions[index].push(real_actions[index]);
-            self.episode_history.target_weights[index].push(self.target_weights[index]);
-        }
-        self.episode_history.cash.push(self.account.cash);
-        self.episode_history.rewards.push(reward);
-        // Use target cash weight (last element) for consistent charting with ticker target weights
-        self.episode_history.cash_weight.push(self.target_weights[self.tickers.len()]);
+                self.episode_history.positioned[index].push(
+                    self.account.positions[index]
+                        .value_with_price(self.prices[index][absolute_step]),
+                );
+                self.episode_history.raw_actions[index].push(real_actions[index]);
+                self.episode_history.target_weights[index].push(self.target_weights[index]);
+            }
+            self.episode_history.cash.push(self.account.cash);
+            self.episode_history.rewards.push(reward);
+            // Use target cash weight (last element) for consistent charting with ticker target weights
+            self.episode_history
+                .cash_weight
+                .push(self.target_weights[self.tickers.len()]);
 
             if is_done == 1.0 {
                 self.handle_episode_end(absolute_step);
@@ -452,9 +513,10 @@ impl Env {
         };
 
         println!(
-            "{} {} - Total Assets: {} ({}) cumulative reward {:.2} | Index: {} | Outperformance: {} | Commissions: {} | tickers {:?} time {:.2}s",
+            "{} {} [{}] - Total Assets: {} ({}) cumulative reward {:.2} | Index: {} | Outperformance: {} | Commissions: {} | tickers {:?} time {:.2}s",
             "Episode".bright_blue(),
             self.episode.to_string().bright_blue().bold(),
+            format!("Env {}", self.env_id).bright_blue(),
             format!("${:.2}", self.account.total_assets).bright_white().bold(),
             strategy_str,
             self.episode_history.rewards.iter().sum::<f64>(),
@@ -465,13 +527,19 @@ impl Env {
             Instant::now().duration_since(self.episode_start).as_secs_f32()
         );
 
-        self.episode_history
-            .record(self.episode, &self.tickers, &self.prices, self.episode_start_offset);
-        self.meta_history
-            .record(&self.episode_history, outperformance);
+        if self.record_history_io {
+            self.episode_history.record(
+                self.episode,
+                &self.tickers,
+                &self.prices,
+                self.episode_start_offset,
+            );
+            self.meta_history
+                .record(&self.episode_history, outperformance);
 
-        if self.episode % 5 == 0 {
-            self.meta_history.chart(self.episode);
+            if self.episode % 5 == 0 {
+                self.meta_history.chart(self.episode);
+            }
         }
 
         self.episode_start = Instant::now();
@@ -521,7 +589,7 @@ impl Env {
         let n = self.tickers.len();
         // self.target_weights = vec![1.0 / n as f64; n + 1];
         // self.target_weights[n] = 0.0; // cash starts at 0
-        
+
         // Initialize to 100% cash, 0% tickers.
         self.target_weights = vec![0.0; n + 1];
         self.target_weights[n] = 1.0;
@@ -611,7 +679,12 @@ impl Env {
 
         let (commissions, trade_sell_reward) =
             self.trade_by_target_weights(&real_actions, absolute_step);
-        let reward = self.get_action_outcome_reward(absolute_step, commissions) + if RETROACTIVE_BUY_REWARD { trade_sell_reward } else { 0.0 };
+        let reward = self.get_unrealized_pnl_reward(absolute_step, commissions)
+            + if RETROACTIVE_BUY_REWARD {
+                trade_sell_reward
+            } else {
+                0.0
+            };
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -629,7 +702,9 @@ impl Env {
         }
         self.episode_history.cash.push(self.account.cash);
         self.episode_history.rewards.push(reward);
-        self.episode_history.cash_weight.push(self.target_weights[self.tickers.len()]);
+        self.episode_history
+            .cash_weight
+            .push(self.target_weights[self.tickers.len()]);
 
         if is_done == 1.0 {
             self.handle_episode_end(absolute_step);
@@ -637,15 +712,25 @@ impl Env {
         }
 
         let (price_deltas, static_obs) = self.get_next_obs();
-        SingleStep { reward, price_deltas, static_obs, is_done }
+        SingleStep {
+            reward,
+            price_deltas,
+            static_obs,
+            is_done,
+        }
     }
 
     pub fn record_inference(&self, episode: usize) {
         let infer_dir = "../infer";
         create_folder_if_not_exists(&infer_dir.to_string());
 
-        self.episode_history
-            .record_to_path(infer_dir, episode, &self.tickers, &self.prices, self.episode_start_offset);
+        self.episode_history.record_to_path(
+            infer_dir,
+            episode,
+            &self.tickers,
+            &self.prices,
+            self.episode_start_offset,
+        );
     }
 }
 

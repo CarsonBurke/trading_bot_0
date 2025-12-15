@@ -1,5 +1,3 @@
-#![feature(slice_as_array)]
-
 // For burn Wgpu
 #![recursion_limit = "256"]
 #![feature(f16)]

@@ -10,6 +10,7 @@ pub mod constants {
     pub const ACTION_COUNT: usize = TICKERS_COUNT + 1; // +1 for cash weight
     pub const ACTION_HISTORY_LEN: usize = 0;
     pub const PRICE_DELTAS_PER_TICKER: usize = 3400;
+    pub const REWARD_RANGE: f64 = 100.0;
 
     // Global: step_progress, cash_percent, pnl, drawdown, commissions, last_reward, last_fill_ratio
     pub const GLOBAL_STATIC_OBS: usize = 7;
@@ -29,6 +30,10 @@ pub mod constants {
     pub const ACTION_THRESHOLD: f64 = 0.001;
     pub const COMMISSION_RATE: f64 = 0.005;
     pub const RETROACTIVE_BUY_REWARD: bool = false;
+}
+
+pub fn symlog_target_clip() -> f64 {
+    (constants::REWARD_RANGE + 1.0).ln()
 }
 
 pub mod theme;

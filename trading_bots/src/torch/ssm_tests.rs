@@ -156,6 +156,63 @@ mod tests {
     }
 
     #[test]
+    fn test_mamba2_step_sequence_multi_chunk() {
+        // Exercises multi-chunk correctness in the SSD-style scan path.
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let d_conv = 4i64;
+        let chunk_size = 16i64;
+        let config = Mamba2Config {
+            d_model: 32,
+            headdim: 16,
+            d_state: 8,
+            d_conv,
+            chunk_size,
+            ..Default::default()
+        };
+        let mamba = Mamba2::new(&vs.root(), config);
+
+        let seq_len = 80;
+        assert!(seq_len > chunk_size);
+        let x_seq = Tensor::randn(&[1, seq_len, 32], (Kind::Float, tch::Device::Cpu));
+
+        let y_forward = mamba.forward(&x_seq, false);
+
+        let mut state = mamba.init_state(1, tch::Device::Cpu);
+        let mut y_steps = Vec::new();
+        for t in 0..seq_len {
+            let x_t = x_seq.narrow(1, t, 1).squeeze_dim(1);
+            let y_t = mamba.step(&x_t, &mut state);
+            y_steps.push(y_t);
+        }
+        let y_stepped = Tensor::stack(&y_steps, 1);
+
+        assert_eq!(y_forward.size(), y_stepped.size());
+
+        let y_fwd_tail = y_forward.narrow(1, d_conv, seq_len - d_conv);
+        let y_step_tail = y_stepped.narrow(1, d_conv, seq_len - d_conv);
+        let diff = (&y_fwd_tail - &y_step_tail).abs().max();
+        let max_diff: f64 = diff.double_value(&[]);
+        assert!(max_diff < 1e-4, "Max diff {} too large", max_diff);
+    }
+
+    #[test]
+    fn test_mamba2_d_ssm_split_shapes() {
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let config = Mamba2Config {
+            d_model: 64,
+            headdim: 32,
+            d_state: 16,
+            d_ssm: Some(64),
+            ..Default::default()
+        };
+        let mamba = mamba_block_cfg(&vs.root(), config);
+
+        let x = Tensor::randn(&[2, 100, 64], (Kind::Float, tch::Device::Cpu));
+        let y = mamba(&x, false);
+        assert_eq!(y.size(), vec![2, 100, 64]);
+    }
+
+    #[test]
     fn test_mamba2_state_reset() {
         let vs = nn::VarStore::new(tch::Device::Cpu);
         let config = Mamba2Config {
@@ -180,5 +237,35 @@ mod tests {
         state.reset();
         let ssm_sum_after: f64 = state.ssm_state.abs().sum(Kind::Float).double_value(&[]);
         assert_eq!(ssm_sum_after, 0.0);
+    }
+
+    #[test]
+    fn test_mamba2_default_standard_hyperparams_compile() {
+        // Ensures default config uses standard Mamba2-ish hyperparams and remains valid
+        // even when nheads < requested ngroups (ngroups is clamped internally).
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let mamba = Mamba2::new(&vs.root(), Mamba2Config::new(64));
+        let x = Tensor::randn(&[2, 33, 64], (Kind::Float, tch::Device::Cpu));
+        let y = mamba.forward(&x, false);
+        assert_eq!(y.size(), vec![2, 33, 64]);
+    }
+
+    #[test]
+    fn test_mamba2_standard_groups_nheads8() {
+        // Typical Mamba2 setting: nheads=8, ngroups=8.
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let config = Mamba2Config {
+            d_model: 256,
+            expand: 2,
+            headdim: 64, // d_inner=512 => nheads=8
+            d_state: 128,
+            ngroups: 8,
+            chunk_size: 256,
+            ..Default::default()
+        };
+        let mamba = Mamba2::new(&vs.root(), config);
+        let x = Tensor::randn(&[1, 300, 256], (Kind::Float, tch::Device::Cpu));
+        let y = mamba.forward(&x, false);
+        assert_eq!(y.size(), vec![1, 300, 256]);
     }
 }
