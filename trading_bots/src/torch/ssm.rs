@@ -20,6 +20,7 @@ const DT_MIN: f64 = 0.001;
 const DT_MAX: f64 = 0.1;
 const DT_INIT_FLOOR: f64 = 1e-4;
 
+#[derive(Clone, Debug)]
 pub struct Mamba2Config {
     pub d_model: i64,
     pub d_state: i64,
@@ -548,7 +549,9 @@ impl Mamba2 {
         output
     }
 
-    /// Chunked SSM scan with external state - GPU efficient with memory across calls
+    /// Chunked SSM scan with external state - SSD algorithm from Mamba2 paper
+    /// Uses attention-like within-chunk computation: Y = (L ◦ CB^T) @ X
+    /// Avoids materializing [B,H,L,N,P] outer product tensors
     fn chunked_ssm_scan_with_state(
         &self,
         x: &Tensor,  // [batch, seq, nheads, headdim]
@@ -567,7 +570,7 @@ impl Mamba2 {
         let device = x.device();
         let x_kind = x.kind();
 
-        let log_da = (dt.to_kind(Kind::Float) * a.view([1, 1, nheads])).to_kind(Kind::Float);
+        let log_da = dt.to_kind(Kind::Float) * a.view([1, 1, nheads]);
         let dt_f = dt.to_kind(Kind::Float);
         let x_f = x.to_kind(Kind::Float);
 
@@ -589,95 +592,75 @@ impl Mamba2 {
         }
         .to_kind(Kind::Float);
 
-        let state0 = initial_state.to_device(device).to_kind(Kind::Float);
-        let mut y_diag_chunks: Vec<Tensor> = Vec::new();
-        let mut c_t_chunks: Vec<Tensor> = Vec::new();
-        let mut decay_out_chunks: Vec<Tensor> = Vec::new();
-        let mut a_last_chunks: Vec<Tensor> = Vec::new();
-        let mut state_add_chunks: Vec<Tensor> = Vec::new();
-
+        let mut state = initial_state.to_device(device).to_kind(Kind::Float);
         let num_chunks = (seqlen + chunk_size - 1) / chunk_size;
+        let mut outputs: Vec<Tensor> = Vec::with_capacity(num_chunks as usize);
+
         for chunk_idx in 0..num_chunks {
             let start = chunk_idx * chunk_size;
             let end = (start + chunk_size).min(seqlen);
             let chunk_len = end - start;
 
-            let x_chunk = x_f.narrow(1, start, chunk_len); // [B, L, H, P]
-            let dt_chunk = dt_f.narrow(1, start, chunk_len); // [B, L, H]
-            let log_da_chunk = log_da.narrow(1, start, chunk_len); // [B, L, H]
-            let b_chunk = b_exp.narrow(1, start, chunk_len); // [B, L, H, N]
-            let c_chunk = c_exp.narrow(1, start, chunk_len); // [B, L, H, N]
+            let x_chunk = x_f.narrow(1, start, chunk_len);
+            let dt_chunk = dt_f.narrow(1, start, chunk_len);
+            let log_da_chunk = log_da.narrow(1, start, chunk_len);
+            let b_chunk = b_exp.narrow(1, start, chunk_len);
+            let c_chunk = c_exp.narrow(1, start, chunk_len);
 
-            let x_dt = x_chunk * dt_chunk.unsqueeze(-1); // [B, L, H, P]
+            // Scale x by dt: [B, L, H, P]
+            let x_dt = &x_chunk * dt_chunk.unsqueeze(-1);
 
-            let a_t = log_da_chunk.permute([0, 2, 1]); // [B, H, L]
-            let a_cumsum = a_t.cumsum(-1, Kind::Float); // [B, H, L]
-
-            let segsum = segsum_stable(&a_t); // [B, H, L, L]
-            let l_mat = segsum.exp(); // [B, H, L, L]
-
+            // Transpose to [B, H, L, *] for matmuls (strided ok for matmul)
+            let x_t = x_dt.permute([0, 2, 1, 3]);  // [B, H, L, P]
             let b_t = b_chunk.permute([0, 2, 1, 3]); // [B, H, L, N]
             let c_t = c_chunk.permute([0, 2, 1, 3]); // [B, H, L, N]
-            let x_t = x_dt.permute([0, 2, 1, 3]); // [B, H, L, P]
+            let log_da_t = log_da_chunk.permute([0, 2, 1]); // [B, H, L]
 
-            let bx = b_t.unsqueeze(-1) * x_t.unsqueeze(-2); // [B, H, L, N, P]
-            let bx_flat = bx.reshape([batch * nheads, chunk_len, d_state * headdim]);
-            let l_batched = l_mat.reshape([batch * nheads, chunk_len, chunk_len]);
-            let y_tmp = l_batched.bmm(&bx_flat); // [B*H, L, N*P]
-            let y_tmp = y_tmp.reshape([batch, nheads, chunk_len, d_state, headdim]);
-            let y_diag = (y_tmp * c_t.unsqueeze(-1)).sum_dim_intlist(3, false, Kind::Float); // [B, H, L, P]
-            let y_diag = y_diag.permute([0, 2, 1, 3]); // [B, L, H, P]
+            // Cumulative log(A) for decay computations
+            let a_cumsum = log_da_t.cumsum(-1, Kind::Float); // [B, H, L]
 
+            // === Within-chunk: SSD attention-like form ===
+            // Y_diag = (L ◦ C @ B^T) @ X  where L_ij = exp(cumsum_i - cumsum_j) for i >= j
+            // Compute via: for each head, attention scores = C @ B^T, masked by L
+
+            // L matrix: segsum gives log(L), exp for L
+            let l_mat = segsum_stable(&log_da_t).exp(); // [B, H, L, L]
+
+            // SSD quadratic form: scores = C @ B^T, then (L ◦ scores) @ X
+            // scores: [B, H, L, L] via [B, H, L, N] @ [B, H, N, L]
+            let scores = c_t.matmul(&b_t.transpose(-1, -2)); // [B, H, L, L]
+            let masked_scores = &l_mat * &scores; // [B, H, L, L]
+
+            // y_diag = masked_scores @ x: [B, H, L, L] @ [B, H, L, P] -> [B, H, L, P]
+            let y_diag = masked_scores.matmul(&x_t); // [B, H, L, P]
+
+            // === Cross-chunk: contribution from previous state ===
+            // y_off = decay * (state @ C^T)
+            // state: [B, H, P, N], C: [B, H, L, N] -> [B, H, L, P]
+            let decay = a_cumsum.exp().unsqueeze(-1); // [B, H, L, 1]
+            // state @ C^T: [B, H, P, N] @ [B, H, N, L] -> [B, H, P, L] -> transpose -> [B, H, L, P]
+            let state_contrib = state.matmul(&c_t.transpose(-1, -2)).transpose(-1, -2); // [B, H, L, P]
+            let y_off = &decay * &state_contrib; // [B, H, L, P]
+
+            let y_chunk = (&y_diag + &y_off).permute([0, 2, 1, 3]); // [B, L, H, P]
+            outputs.push(y_chunk);
+
+            // === Update state for next chunk ===
+            // state_new = decay_total * state + sum_t(decay_from_t * B_t * x_t)
             let a_last = a_cumsum.select(-1, chunk_len - 1); // [B, H]
-            let decay_out = a_cumsum.exp(); // [B, H, L]
+            let decay_total = a_last.unsqueeze(-1).unsqueeze(-1).exp(); // [B, H, 1, 1]
 
+            // Decay from each position to end of chunk
             let decay_states = (a_last.unsqueeze(-1) - &a_cumsum).exp(); // [B, H, L]
-            let b_decay = b_t * decay_states.unsqueeze(-1); // [B, H, L, N]
-            let x_bmm = x_t.reshape([batch * nheads, chunk_len, headdim]).transpose(1, 2); // [B*H, P, L]
-            let b_bmm = b_decay.reshape([batch * nheads, chunk_len, d_state]); // [B*H, L, N]
-            let state_add = x_bmm.bmm(&b_bmm).reshape([batch, nheads, headdim, d_state]); // [B, H, P, N]
+            // B weighted by decay: [B, H, L, N] * [B, H, L, 1]
+            let b_decay = &b_t * decay_states.unsqueeze(-1); // [B, H, L, N]
+            // state_add = X^T @ B_decay: [B, H, P, L] @ [B, H, L, N] -> [B, H, P, N]
+            let state_add = x_t.transpose(-1, -2).matmul(&b_decay); // [B, H, P, N]
 
-            y_diag_chunks.push(y_diag);
-            c_t_chunks.push(c_t);
-            decay_out_chunks.push(decay_out);
-            a_last_chunks.push(a_last);
-            state_add_chunks.push(state_add);
+            state = &decay_total * &state + state_add;
         }
 
-        let a_last = Tensor::stack(&a_last_chunks, -1); // [B, H, C]
-        let state_add = Tensor::stack(&state_add_chunks, 2); // [B, H, C, P, N]
-
-        let log_cum_a = a_last.cumsum(-1, Kind::Float); // [B, H, C]
-        let log_cum_a_exp = log_cum_a.unsqueeze(-1).unsqueeze(-1); // [B, H, C, 1, 1]
-        let cum_a = log_cum_a_exp.exp(); // [B, H, C, 1, 1]
-        let inv_cum_a = (-log_cum_a_exp).exp(); // [B, H, C, 1, 1]
-
-        let scaled_add = &state_add * &inv_cum_a; // [B, H, C, P, N]
-        let cumsum_scaled_add = scaled_add.cumsum(2, Kind::Float); // [B, H, C, P, N]
-        let state0_exp = state0.unsqueeze(2); // [B, H, 1, P, N]
-        let state_end = &cum_a * (&state0_exp + &cumsum_scaled_add); // [B, H, C, P, N]
-
-        let state_in = if num_chunks == 1 {
-            state0_exp.shallow_clone()
-        } else {
-            Tensor::cat(&[state0_exp, state_end.narrow(2, 0, num_chunks - 1)], 2)
-        }; // [B, H, C, P, N]
-
-        let mut outputs: Vec<Tensor> = Vec::new();
-        for chunk_idx in 0..num_chunks {
-            let state = state_in.select(2, chunk_idx); // [B, H, P, N]
-            let decay_out = &decay_out_chunks[chunk_idx as usize]; // [B, H, L]
-            let c_t = &c_t_chunks[chunk_idx as usize]; // [B, H, L, N]
-
-            let state_t = state.unsqueeze(2) * decay_out.unsqueeze(-1).unsqueeze(-1); // [B, H, L, P, N]
-            let y_off = (state_t * c_t.unsqueeze(3)).sum_dim_intlist(-1, false, Kind::Float); // [B, H, L, P]
-            let y_off = y_off.permute([0, 2, 1, 3]); // [B, L, H, P]
-
-            outputs.push(&y_diag_chunks[chunk_idx as usize] + y_off);
-        }
-
-        let new_state = state_end.select(2, num_chunks - 1); // [B, H, P, N]
-        (Tensor::cat(&outputs, 1).to_kind(x_kind), new_state.to_kind(x_kind))
+        (Tensor::cat(&outputs, 1).to_kind(x_kind), state.to_kind(x_kind))
     }
 
     /// Forward with external state - GPU efficient chunked scan with state carry
@@ -762,47 +745,92 @@ impl Mamba2 {
 
         y_out.apply(&self.out_proj)
     }
-}
 
-/// Parallel scan within a chunk using cumsum trick
-/// h_t = cum_a[t] * (h_0 + cumsum(B*x / cum_a)[t])
-fn parallel_scan_chunk(
-    x: &Tensor,       // [batch, chunk, nheads, headdim]
-    log_da: &Tensor,  // [batch, chunk, nheads]
-    db: &Tensor,      // [batch, chunk, nheads, d_state]
-    c: &Tensor,       // [batch, chunk, nheads, d_state]
-    h0: &Tensor,      // [batch, nheads, headdim, d_state]
-    chunk_len: i64,
-) -> (Tensor, Tensor) {
-    // Cumulative log(A) for parallel scan: [batch, chunk, nheads]
-    let log_cum_a = log_da.cumsum(1, Kind::Float);
+    /// Batched forward with initial states - processes multiple sequences in parallel
+    /// Each sequence can have its own initial state, enabling efficient BPTT
+    /// u: [batch, seq, d_model]
+    /// initial_states: [batch, nheads, headdim, d_state]
+    /// Returns: (output [batch, seq, d_model], final_states [batch, nheads, headdim, d_state])
+    pub fn forward_batched_init(&self, u: &Tensor, initial_states: &Tensor) -> (Tensor, Tensor) {
+        let (batch, seqlen, _) = u.size3().unwrap();
+        let d_inner = self.d_inner;
+        let d_ssm = self.d_ssm;
+        let d_mlp = d_inner - d_ssm;
+        let nheads = self.nheads;
+        let headdim = self.config.headdim;
+        let d_state = self.config.d_state;
+        let ngroups = self.config.ngroups;
 
-    // Compute cum_a and inv_cum_a together, expanded for broadcasting
-    // [batch, chunk, nheads, 1, 1]
-    let log_cum_a_exp = log_cum_a.unsqueeze(-1).unsqueeze(-1);
-    let cum_a = log_cum_a_exp.exp();
-    let inv_cum_a = (-&log_cum_a_exp).exp();
+        let zxbcdt = u.apply(&self.in_proj);
 
-    // B*x scaled by inv_cum_a, then cumsum: [batch, chunk, nheads, headdim, d_state]
-    let scaled_bx = (db.unsqueeze(3) * x.unsqueeze(-1)) * &inv_cum_a;
-    let cumsum_scaled = scaled_bx.cumsum(1, Kind::Float);
+        let z0_dim = d_mlp;
+        let x0_dim = d_mlp;
+        let z_dim = d_ssm;
+        let xbc_dim = d_ssm + 2 * ngroups * d_state;
+        let b_dim = ngroups * d_state;
+        let c_dim = ngroups * d_state;
 
-    // h0: [batch, nheads, headdim, d_state] -> [batch, 1, nheads, headdim, d_state]
-    let h0_exp = h0.unsqueeze(1);
+        let z0 = if d_mlp > 0 {
+            zxbcdt.narrow(-1, 0, z0_dim)
+        } else {
+            Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
+        };
+        let x0 = if d_mlp > 0 {
+            zxbcdt.narrow(-1, z0_dim, x0_dim)
+        } else {
+            Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
+        };
+        let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
+        let xbc = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, xbc_dim);
+        let dt_raw = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim + xbc_dim, nheads);
+        let xbc_conv = xbc
+            .transpose(1, 2)
+            .apply(&self.conv1d)
+            .narrow(2, 0, seqlen)
+            .transpose(1, 2)
+            .silu();
 
-    // c: [batch, chunk, nheads, d_state] -> [batch, chunk, nheads, 1, d_state]
-    let c_exp = c.unsqueeze(3);
+        let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
+        let b = xbc_conv.narrow(-1, d_ssm, b_dim);
+        let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
 
-    // Fused: y = sum(cum_a * (h0 + cumsum_scaled) * C, dim=-1)
-    // Avoids materializing full h tensor separately
-    let y = (&cum_a * (&h0_exp + &cumsum_scaled) * &c_exp).sum_dim_intlist(-1, false, Kind::Float);
+        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias)
+            .softplus()
+            .clamp(self.config.dt_min, self.config.dt_max)
+            .clamp(self.config.dt_limit.0, self.config.dt_limit.1);
+        let a = self.a_log.to_kind(Kind::Float).exp().neg();
 
-    // h_final from last timestep only: [batch, nheads, headdim, d_state]
-    let cumsum_last = cumsum_scaled.select(1, chunk_len - 1);
-    let cum_a_last = cum_a.select(1, chunk_len - 1).squeeze_dim(1);
-    let h_final = cum_a_last * (h0 + cumsum_last);
+        let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
+        let b_groups = b.view([batch, seqlen, ngroups, d_state]);
+        let c_groups = c.view([batch, seqlen, ngroups, d_state]);
 
-    (y, h_final)
+        let (y, final_states) = self.chunked_ssm_scan_with_state(&x_heads, &dt, &a, &b_groups, &c_groups, initial_states);
+
+        let y_skip = if self.config.d_has_hdim {
+            let d_expanded = self.d_param.view([1, 1, nheads, headdim]);
+            &y + &x_heads * d_expanded
+        } else {
+            let d_expanded = self.d_param.view([1, 1, nheads, 1]);
+            &y + &x_heads * d_expanded
+        };
+
+        let y_flat = y_skip.view([batch, seqlen, d_ssm]);
+
+        let mut y_out = match &self.norm {
+            Some(norm) => {
+                let z_for_gate = z.view([batch, seqlen, d_ssm]);
+                norm.forward(&y_flat, Some(&z_for_gate))
+            }
+            None => &y_flat * z.silu(),
+        };
+
+        if d_mlp > 0 {
+            let mlp = &x0 * z0.silu();
+            y_out = Tensor::cat(&[mlp, y_out], -1);
+        }
+
+        (y_out.apply(&self.out_proj), final_states)
+    }
 }
 
 fn segsum_stable(a: &Tensor) -> Tensor {
@@ -850,6 +878,13 @@ impl StatefulMamba {
     /// Single step inference - O(1) per step
     pub fn step(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
         self.mamba.step(x, state)
+    }
+
+    /// Batched forward with initial states for efficient BPTT
+    /// x: [batch, seq, d_model], initial_states: [batch, nheads, headdim, d_state]
+    /// Returns: (output, final_states)
+    pub fn forward_batched_init(&self, x: &Tensor, initial_states: &Tensor) -> (Tensor, Tensor) {
+        self.mamba.forward_batched_init(x, initial_states)
     }
 }
 

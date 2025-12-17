@@ -69,6 +69,23 @@ impl VecEnv {
         (step_deltas, static_obs)
     }
 
+    pub fn reset_incremental(&mut self) -> (Vec<Vec<f32>>, Tensor) {
+        assert_eq!(self.envs.len(), NPROCS as usize);
+        let mut all_deltas_per_env: Vec<Vec<f32>> = Vec::with_capacity(NPROCS as usize);
+        let mut all_static_obs = Vec::new();
+
+        for env in &mut self.envs {
+            let (pd, so) = env.reset_single();
+            all_deltas_per_env.push(pd);
+            all_static_obs.extend(so);
+        }
+
+        let static_obs = Tensor::from_slice(&all_static_obs)
+            .view([NPROCS, STATIC_OBSERVATIONS as i64]);
+
+        (all_deltas_per_env, static_obs)
+    }
+
     pub fn step(&mut self, all_actions: Vec<Vec<f64>>) -> Step {
         assert_eq!(
             all_actions.len(),
@@ -176,6 +193,37 @@ impl VecEnv {
         let is_done = Tensor::from_slice(&is_dones);
 
         (reward, is_done)
+    }
+
+    pub fn step_incremental(
+        &mut self,
+        all_actions: &[Vec<f64>],
+        out_static_obs: &mut Tensor,
+    ) -> (Tensor, Tensor, Tensor) {
+        debug_assert_eq!(all_actions.len(), self.envs.len());
+
+        let mut rewards = [0f32; NPROCS as usize];
+        let mut is_dones = [0f32; NPROCS as usize];
+        let mut all_step_deltas = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
+        let mut all_static_obs = Vec::with_capacity(NPROCS as usize * STATIC_OBSERVATIONS);
+
+        for (i, env) in self.envs.iter_mut().enumerate() {
+            let step = env.step_step_single(all_actions[i].clone());
+            rewards[i] = step.reward as f32;
+            is_dones[i] = step.is_done;
+            all_step_deltas.extend(step.step_deltas);
+            all_static_obs.extend(step.static_obs);
+        }
+
+        let so_cpu = Tensor::from_slice(&all_static_obs)
+            .view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        out_static_obs.copy_(&so_cpu);
+
+        let reward = Tensor::from_slice(&rewards);
+        let is_done = Tensor::from_slice(&is_dones);
+        let step_deltas = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
+
+        (reward, is_done, step_deltas)
     }
 
     pub fn max_step(&self) -> usize {

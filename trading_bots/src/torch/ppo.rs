@@ -8,9 +8,69 @@ use crate::torch::constants::{
 };
 use crate::torch::env::VecEnv;
 use crate::torch::model::TradingModel;
-use crate::torch::ssm::Mamba2State;
 
-pub const NPROCS: i64 = 24; // Parallel environments for better GPU utilization
+struct GpuRollingBuffer {
+    buffer: Tensor,
+    pos: i64,
+}
+
+impl GpuRollingBuffer {
+    fn new(device: Device) -> Self {
+        Self {
+            buffer: Tensor::zeros(
+                [NPROCS, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64],
+                (Kind::Float, device),
+            ),
+            pos: 0,
+        }
+    }
+
+    fn init_from_vecs(&mut self, all_deltas: &[Vec<f32>]) {
+        for (i, deltas) in all_deltas.iter().enumerate() {
+            let t = Tensor::from_slice(deltas)
+                .view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
+            self.buffer.get(i as i64).copy_(&t);
+        }
+        self.pos = 0;
+    }
+
+    fn push(&mut self, new_deltas: &Tensor, is_done: &Tensor, reset_deltas: Option<&[Vec<f32>]>) {
+        self.buffer
+            .narrow(2, self.pos, 1)
+            .copy_(&new_deltas.unsqueeze(-1));
+        self.pos = (self.pos + 1) % PRICE_DELTAS_PER_TICKER as i64;
+
+        if let Some(resets) = reset_deltas {
+            let done_mask = Vec::<f32>::try_from(is_done.flatten(0, -1)).unwrap_or_default();
+            for (i, (&done, deltas)) in done_mask.iter().zip(resets.iter()).enumerate() {
+                if done > 0.5 {
+                    let t = Tensor::from_slice(deltas)
+                        .view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
+                    self.buffer.get(i as i64).copy_(&t);
+                }
+            }
+        }
+    }
+
+    fn get_flat(&self) -> Tensor {
+        let ordered = if self.pos == 0 {
+            self.buffer.shallow_clone()
+        } else {
+            let len = PRICE_DELTAS_PER_TICKER as i64;
+            let older = self.buffer.narrow(2, self.pos, len - self.pos);
+            let newer = self.buffer.narrow(2, 0, self.pos);
+            Tensor::cat(&[older, newer], 2)
+        };
+        ordered.view([NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64])
+    }
+
+    fn reset(&mut self) {
+        let _ = self.buffer.zero_();
+        self.pos = 0;
+    }
+}
+
+pub const NPROCS: i64 = 16; // Parallel environments for better GPU utilization
 const UPDATES: i64 = 1000000;
 const OPTIM_EPOCHS: i64 = 4;
 const CHUNK_SIZE: i64 = 64; // Steps per chunk for sequence-aware PPO with SSM state restoration
@@ -66,17 +126,6 @@ fn twohot_encode(values: &Tensor, bin_centers: &Tensor) -> Tensor {
     let _ = twohot.scatter_add_(-1, &idx_high.unsqueeze(-1), &weight_high.unsqueeze(-1));
 
     twohot
-}
-
-fn clone_state_deep(s: &Mamba2State) -> Mamba2State {
-    let mut conv = Tensor::zeros_like(&s.conv_state);
-    let mut ssm = Tensor::zeros_like(&s.ssm_state);
-    let _ = conv.copy_(&s.conv_state.detach());
-    let _ = ssm.copy_(&s.ssm_state.detach());
-    Mamba2State {
-        conv_state: conv,
-        ssm_state: ssm,
-    }
 }
 
 // gSDE: resample exploration noise every N env steps (temporally correlated exploration).
@@ -170,27 +219,25 @@ pub fn train(weights_path: Option<&str>) {
     let mut total_rewards = 0f64;
     let mut total_episodes = 0f64;
 
-    // Initial reset (values will be overwritten per episode)
     let _ = env.reset();
 
-    // Store price deltas on GPU - ~122MB is negligible and avoids CPU-GPU transfers
+    let mut rolling_buffer = GpuRollingBuffer::new(device);
     let s_price_deltas = Tensor::zeros(
-        [
-            max_steps + 1,
-            NPROCS,
-            TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
-        ],
+        [max_steps + 1, NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
         (Kind::Float, device),
     );
     let s_static_obs = Tensor::zeros(
         [max_steps + 1, NPROCS, STATIC_OBSERVATIONS as i64],
-        (Kind::Float, device), // Keep static obs on GPU in FP32
+        (Kind::Float, device),
     );
 
     for episode in 0..UPDATES {
-        // Reset envs and copy initial observations directly to GPU
-        let (price_deltas_reset, static_obs_reset) = env.reset();
+        let (init_deltas, static_obs_reset) = env.reset_incremental();
         env.set_episode(episode as usize);
+
+        rolling_buffer.init_from_vecs(&init_deltas);
+        s_price_deltas.get(0).copy_(&rolling_buffer.get_flat());
+        s_static_obs.get(0).copy_(&static_obs_reset);
 
         let rollout_steps = env.max_step() as i64;
         let memory_size = rollout_steps * NPROCS;
@@ -202,16 +249,8 @@ pub fn train(weights_path: Option<&str>) {
         let s_masks = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
         let s_log_probs = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
 
-        // Reset recurrent state at episode boundary
         stream_state.reset();
 
-        // Copy initial observations to GPU buffer
-        s_price_deltas.get(0).copy_(&price_deltas_reset);
-        s_static_obs.get(0).copy_(&static_obs_reset);
-
-        // Store SSM states at chunk boundaries for sequence-aware training
-        let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let mut chunk_ssm_states: Vec<Mamba2State> = Vec::with_capacity(num_chunks as usize);
 
         // Use a separate index (s) for tensor storage, starting from 0
         // Loop through the episode using relative steps (0 to max_step)
@@ -219,11 +258,6 @@ pub fn train(weights_path: Option<&str>) {
         let mut sde_noise: Option<Tensor> = None;
         for step in 0..env.max_step() {
             env.set_step(step);
-
-            // Save SSM state at chunk boundaries BEFORE processing (deep copy via allocate + copy_)
-            if s % CHUNK_SIZE == 0 {
-                chunk_ssm_states.push(clone_state_deep(&stream_state.ssm_state_batched));
-            }
 
             let (critic, _critic_logits, (action_mean, action_log_std, _divisor), attn_weights) =
                 tch::no_grad(|| {
@@ -265,17 +299,18 @@ pub fn train(weights_path: Option<&str>) {
                 .sum_dim_intlist(-1, false, Kind::Float);
             let action_log_prob = log_prob_gaussian - log_jacobian;
 
-            // Convert actions GPU→CPU in batch (single transfer)
             let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let actions_vec: Vec<Vec<f64>> = actions_flat
                 .chunks(ACTION_COUNT as usize)
                 .map(|chunk| chunk.to_vec())
                 .collect();
 
-            // Step envs and write directly to pre-allocated GPU tensors
-            let mut out_pd = s_price_deltas.get(s + 1);
             let mut out_so = s_static_obs.get(s + 1);
-            let (reward, is_done) = env.step_into(&actions_vec, &mut out_pd, &mut out_so);
+            let (reward, is_done, step_deltas) = env.step_incremental(&actions_vec, &mut out_so);
+
+            let step_deltas_gpu = step_deltas.to_device(device);
+            rolling_buffer.push(&step_deltas_gpu, &is_done, None);
+            s_price_deltas.get(s + 1).copy_(&rolling_buffer.get_flat());
 
             // Record static observations and attention weights for TUI visualization (last 100 steps only)
             if step >= env.max_step().saturating_sub(100) {
@@ -329,25 +364,14 @@ pub fn train(weights_path: Option<&str>) {
             .narrow(0, 0, rollout_steps)
             .reshape([memory_size, STATIC_OBSERVATIONS as i64]);
 
-        // Snapshot end-of-rollout state for bootstrap (before we mutate stream_state)
-        let end_state = clone_state_deep(&stream_state.ssm_state_batched);
-
         // Critic outputs values in raw space (expectation over bins).
 
         let (advantages, returns) = {
             let gae = Tensor::zeros([rollout_steps + 1, NPROCS], (Kind::Float, device));
             let returns = Tensor::zeros([rollout_steps + 1, NPROCS], (Kind::Float, device));
 
-            // Bootstrap value for next state (restore end state to avoid mutation)
+            // Bootstrap value for next state (SSM state is already at end-of-rollout)
             let next_value = tch::no_grad(|| {
-                stream_state
-                    .ssm_state_batched
-                    .conv_state
-                    .copy_(&end_state.conv_state);
-                stream_state
-                    .ssm_state_batched
-                    .ssm_state
-                    .copy_(&end_state.ssm_state);
                 let price_deltas_step = s_price_deltas.get(rollout_steps);
                 let static_obs = s_static_obs.get(rollout_steps);
                 let (critic, _, _, _) = trading_model.forward_with_state(
@@ -426,18 +450,17 @@ pub fn train(weights_path: Option<&str>) {
         const MINI_BATCH_STEPS: i64 = 16;
         let zeros_max = Tensor::zeros([MINI_BATCH_STEPS * NPROCS, 1], (Kind::Float, device));
 
-        // Shuffle chunk order for gradient diversity (but maintain temporal order within chunks)
-        let mut chunk_order: Vec<usize> = (0..chunk_ssm_states.len()).collect();
+        let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
 
-            // Shuffle chunk order each epoch
+            // Shuffle chunk order each epoch for gradient diversity
             use rand::seq::SliceRandom;
             chunk_order.shuffle(&mut rand::rng());
 
-            // Process chunks with gradient accumulation (backward per chunk to free graph, step every k)
             opt.zero_grad();
             let total_epoch_samples = rollout_steps * NPROCS;
             let samples_per_accum =
@@ -452,16 +475,6 @@ pub fn train(weights_path: Option<&str>) {
 
                 let price_deltas_chunk =
                     price_deltas_batch.narrow(0, chunk_sample_start, chunk_sample_count);
-
-                // Restore SSM state from saved chunk boundary
-                stream_state
-                    .ssm_state_batched
-                    .conv_state
-                    .copy_(&chunk_ssm_states[chunk_idx].conv_state);
-                stream_state
-                    .ssm_state_batched
-                    .ssm_state
-                    .copy_(&chunk_ssm_states[chunk_idx].ssm_state);
 
                 let mut mini_batch_start = 0i64;
 
@@ -525,7 +538,6 @@ pub fn train(weights_path: Option<&str>) {
                         .mean(Kind::Float);
 
                     // Value loss: CE for distributional head + clipped MSE on expectation.
-                    // Two-hot targets are in symlog space, expectation loss is in raw space.
                     let symlog_clip = shared::symlog_target_clip();
                     let returns_symlog = symlog(&returns_mb).clamp(-symlog_clip, symlog_clip);
                     let target_twohot = twohot_encode(&returns_symlog, trading_model.symlog_centers());
@@ -573,12 +585,6 @@ pub fn train(weights_path: Option<&str>) {
                     let scaled_loss =
                         &loss * (mini_batch_samples as f64 / samples_per_accum as f64);
                     scaled_loss.backward();
-
-                    // Detach SSM state after backward to break graph for next mini-batch (TBPTT)
-                    stream_state.ssm_state_batched.conv_state =
-                        stream_state.ssm_state_batched.conv_state.detach();
-                    stream_state.ssm_state_batched.ssm_state =
-                        stream_state.ssm_state_batched.ssm_state.detach();
 
                     // Accumulate metrics on GPU
                     let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * mini_batch_samples as f64));
