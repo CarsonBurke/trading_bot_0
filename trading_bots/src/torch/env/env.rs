@@ -650,6 +650,48 @@ impl Env {
         self.get_next_obs()
     }
 
+    pub fn reset_step_single(&mut self) -> (Vec<f32>, Vec<f32>) {
+        let max_start = self
+            .total_data_length
+            .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
+
+        self.episode_start_offset = if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
+            let mut rng = rand::rng();
+            rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
+        } else {
+            PRICE_DELTAS_PER_TICKER
+        };
+
+        self.step = 0;
+        self.max_step =
+            (self.total_data_length - self.episode_start_offset).min(STEPS_PER_EPISODE) - 2;
+
+        self.account = Account::new(Self::STARTING_CASH, self.tickers.len());
+        self.episode_start = Instant::now();
+        self.episode_history = EpisodeHistory::new(self.tickers.len());
+        self.action_history.clear();
+
+        for lot_queue in &mut self.buy_lots {
+            lot_queue.clear();
+        }
+        self.retroactive_rewards.clear();
+
+        self.peak_assets = Self::STARTING_CASH;
+        self.last_reward = 0.0;
+        self.last_fill_ratio = 1.0;
+        self.trade_activity_ema.fill(0.0);
+        self.steps_since_trade.fill(0);
+        self.position_open_step.fill(None);
+        let n = self.tickers.len();
+        self.target_weights = vec![0.0; n + 1];
+        self.target_weights[n] = 1.0;
+
+        let mut rng = rand::rng();
+        self.ticker_perm.shuffle(&mut rng);
+
+        self.get_next_step_obs()
+    }
+
     /// Single-environment step for VecEnv
     pub fn step_single(&mut self, actions: Vec<f64>) -> SingleStep {
         let absolute_step = self.episode_start_offset + self.step;
@@ -720,6 +762,75 @@ impl Env {
         }
     }
 
+    pub fn step_step_single(&mut self, actions: Vec<f64>) -> SingleStepStep {
+        let absolute_step = self.episode_start_offset + self.step;
+        self.account.update_total(&self.prices, absolute_step);
+
+        for ema in &mut self.trade_activity_ema {
+            *ema *= 1.0 - TRADE_EMA_ALPHA;
+        }
+        for steps in &mut self.steps_since_trade {
+            *steps += 1;
+        }
+
+        let mut real_actions = vec![0.0; ACTION_COUNT as usize];
+        for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
+            real_actions[real_idx] = actions[perm_idx];
+        }
+        real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize];
+
+        if self.step == 0 {
+            self.episode_history.action_step0 = Some(real_actions.clone());
+        }
+
+        self.action_history.push_back(real_actions.clone());
+        if self.action_history.len() > ACTION_HISTORY_LEN {
+            self.action_history.pop_front();
+        }
+
+        let (commissions, trade_sell_reward) =
+            self.trade_by_target_weights(&real_actions, absolute_step);
+        let reward = self.get_unrealized_pnl_reward(absolute_step, commissions)
+            + if RETROACTIVE_BUY_REWARD {
+                trade_sell_reward
+            } else {
+                0.0
+            };
+
+        self.last_reward = reward;
+        if self.account.total_assets > self.peak_assets {
+            self.peak_assets = self.account.total_assets;
+        }
+
+        let is_done = self.get_is_done();
+
+        for (index, _) in self.tickers.iter().enumerate() {
+            self.episode_history.positioned[index].push(
+                self.account.positions[index].value_with_price(self.prices[index][absolute_step]),
+            );
+            self.episode_history.raw_actions[index].push(real_actions[index]);
+            self.episode_history.target_weights[index].push(self.target_weights[index]);
+        }
+        self.episode_history.cash.push(self.account.cash);
+        self.episode_history.rewards.push(reward);
+        self.episode_history
+            .cash_weight
+            .push(self.target_weights[self.tickers.len()]);
+
+        if is_done == 1.0 {
+            self.handle_episode_end(absolute_step);
+            self.episode_history.action_final = Some(real_actions.clone());
+        }
+
+        let (step_deltas, static_obs) = self.get_next_step_obs();
+        SingleStepStep {
+            reward,
+            step_deltas,
+            static_obs,
+            is_done,
+        }
+    }
+
     pub fn record_inference(&self, episode: usize) {
         let infer_dir = "../infer";
         create_folder_if_not_exists(&infer_dir.to_string());
@@ -745,6 +856,13 @@ pub struct Step {
 pub struct SingleStep {
     pub reward: f64,
     pub price_deltas: Vec<f32>,
+    pub static_obs: Vec<f32>,
+    pub is_done: f32,
+}
+
+pub struct SingleStepStep {
+    pub reward: f64,
+    pub step_deltas: Vec<f32>,
     pub static_obs: Vec<f32>,
     pub is_done: f32,
 }
