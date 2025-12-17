@@ -14,7 +14,7 @@ const D_STATE: i64 = 128;
 const D_CONV: i64 = 4;
 const EXPAND: i64 = 2;
 const HEADDIM: i64 = 64;
-const NGROUPS: i64 = 8;
+const NGROUPS: i64 = 1;
 const CHUNK_SIZE: i64 = 256;
 const DT_MIN: f64 = 0.001;
 const DT_MAX: f64 = 0.1;
@@ -222,9 +222,8 @@ impl Mamba2 {
         let dt_bias = p.var_copy("dt_bias", &inv_dt);
 
         // A: per-head scalar
-        let a_init =
-            Tensor::empty(&[nheads], (Kind::Float, p.device())).uniform_(1.0_f64.ln(), 16.0_f64.ln());
-        let a_log = p.var_copy("A_log", &a_init);
+        let a = Tensor::empty(&[nheads], (Kind::Float, p.device())).uniform_(1.0, 16.0);
+        let a_log = p.var_copy("A_log", &a.log());
 
         // D: skip connection - per-head or per-channel depending on d_has_hdim
         let d_param = if config.d_has_hdim {
@@ -271,7 +270,13 @@ impl Mamba2 {
         }
     }
 
+    /// Forward pass with optional dt_scale for variable patch sizes
+    /// dt_scale: [1, seq, 1] or None - multiplies dt to account for patch size
     pub fn forward(&self, u: &Tensor, _train: bool) -> Tensor {
+        self.forward_with_dt_scale(u, None)
+    }
+
+    pub fn forward_with_dt_scale(&self, u: &Tensor, dt_scale: Option<&Tensor>) -> Tensor {
         let (batch, seqlen, _) = u.size3().unwrap();
         let d_inner = self.d_inner;
         let d_ssm = self.d_ssm;
@@ -281,7 +286,6 @@ impl Mamba2 {
         let ngroups = self.config.ngroups;
         let d_mlp = d_inner - d_ssm;
 
-        // Project: [z, x, B, C, dt]
         let zxbcdt = u.apply(&self.in_proj);
 
         let z0_dim = d_mlp;
@@ -306,7 +310,6 @@ impl Mamba2 {
         let xbc = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, xbc_dim);
         let dt_raw = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim + xbc_dim, dt_dim);
 
-        // Causal conv1d
         let xbc_conv = xbc
             .transpose(1, 2)
             .apply(&self.conv1d)
@@ -314,31 +317,28 @@ impl Mamba2 {
             .transpose(1, 2)
             .silu();
 
-        // Split back
         let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
         let b = xbc_conv.narrow(-1, d_ssm, b_dim);
         let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
 
-        // dt: add bias and softplus
-        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias)
-            .softplus()
-            .clamp(self.config.dt_min, self.config.dt_max)
-            .clamp(self.config.dt_limit.0, self.config.dt_limit.1);
+        // dt: bias + softplus, then scale by patch_size if provided
+        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
+        let dt = match dt_scale {
+            Some(scale) => &dt * scale,
+            None => dt,
+        };
+        let dt = if self.config.dt_limit == (0.0, f64::INFINITY) {
+            dt
+        } else {
+            dt.clamp(self.config.dt_limit.0, self.config.dt_limit.1)
+        };
 
-        // A: negative exp for stability
         let a = self.a_log.to_kind(Kind::Float).exp().neg();
 
-        // Reshape for multi-head SSM
-        // x: [batch, seq, nheads, headdim]
         let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
-        // B: [batch, seq, ngroups, d_state]
         let b_groups = b.view([batch, seqlen, ngroups, d_state]);
-        // C: [batch, seq, ngroups, d_state]
         let c_groups = c.view([batch, seqlen, ngroups, d_state]);
-        // dt: [batch, seq, nheads]
-        // A: [nheads]
 
-        // Run chunked SSM scan
         let y = self.chunked_ssm_scan(&x_heads, &dt, &a, &b_groups, &c_groups);
 
         // Add skip connection with D: [batch, seq, nheads, headdim]
@@ -453,10 +453,12 @@ impl Mamba2 {
         let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
 
         // dt: add bias and softplus
-        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias)
-            .softplus()
-            .clamp(self.config.dt_min, self.config.dt_max)
-            .clamp(self.config.dt_limit.0, self.config.dt_limit.1);
+        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
+        let dt = if self.config.dt_limit == (0.0, f64::INFINITY) {
+            dt
+        } else {
+            dt.clamp(self.config.dt_limit.0, self.config.dt_limit.1)
+        };
 
         // A: negative exp for stability
         let a = self.a_log.to_kind(Kind::Float).exp().neg(); // [nheads]
@@ -665,6 +667,10 @@ impl Mamba2 {
 
     /// Forward with external state - GPU efficient chunked scan with state carry
     pub fn forward_with_state(&self, u: &Tensor, state: &mut Mamba2State) -> Tensor {
+        self.forward_with_state_dt_scale(u, state, None)
+    }
+
+    pub fn forward_with_state_dt_scale(&self, u: &Tensor, state: &mut Mamba2State, dt_scale: Option<&Tensor>) -> Tensor {
         let (batch, seqlen, _) = u.size3().unwrap();
         let d_inner = self.d_inner;
         let d_ssm = self.d_ssm;
@@ -707,10 +713,16 @@ impl Mamba2 {
         let b = xbc_conv.narrow(-1, d_ssm, b_dim);
         let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
 
-        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias)
-            .softplus()
-            .clamp(self.config.dt_min, self.config.dt_max)
-            .clamp(self.config.dt_limit.0, self.config.dt_limit.1);
+        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
+        let dt = match dt_scale {
+            Some(scale) => &dt * scale,
+            None => dt,
+        };
+        let dt = if self.config.dt_limit == (0.0, f64::INFINITY) {
+            dt
+        } else {
+            dt.clamp(self.config.dt_limit.0, self.config.dt_limit.1)
+        };
         let a = self.a_log.to_kind(Kind::Float).exp().neg();
 
         let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
@@ -747,11 +759,11 @@ impl Mamba2 {
     }
 
     /// Batched forward with initial states - processes multiple sequences in parallel
-    /// Each sequence can have its own initial state, enabling efficient BPTT
-    /// u: [batch, seq, d_model]
-    /// initial_states: [batch, nheads, headdim, d_state]
-    /// Returns: (output [batch, seq, d_model], final_states [batch, nheads, headdim, d_state])
     pub fn forward_batched_init(&self, u: &Tensor, initial_states: &Tensor) -> (Tensor, Tensor) {
+        self.forward_batched_init_dt_scale(u, initial_states, None)
+    }
+
+    pub fn forward_batched_init_dt_scale(&self, u: &Tensor, initial_states: &Tensor, dt_scale: Option<&Tensor>) -> (Tensor, Tensor) {
         let (batch, seqlen, _) = u.size3().unwrap();
         let d_inner = self.d_inner;
         let d_ssm = self.d_ssm;
@@ -794,8 +806,12 @@ impl Mamba2 {
         let b = xbc_conv.narrow(-1, d_ssm, b_dim);
         let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
 
-        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias)
-            .softplus()
+        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
+        let dt = match dt_scale {
+            Some(scale) => &dt * scale,
+            None => dt,
+        };
+        let dt = dt
             .clamp(self.config.dt_min, self.config.dt_max)
             .clamp(self.config.dt_limit.0, self.config.dt_limit.1);
         let a = self.a_log.to_kind(Kind::Float).exp().neg();
@@ -860,31 +876,36 @@ impl StatefulMamba {
         Self { mamba: Mamba2::new(p, config) }
     }
 
-    /// Batch forward pass (for training)
     pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
         self.mamba.forward(x, train)
     }
 
-    /// GPU-efficient forward with state carry - uses chunked parallel scan
+    pub fn forward_with_dt_scale(&self, x: &Tensor, dt_scale: Option<&Tensor>) -> Tensor {
+        self.mamba.forward_with_dt_scale(x, dt_scale)
+    }
+
     pub fn forward_with_state(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
         self.mamba.forward_with_state(x, state)
     }
 
-    /// Initialize state for streaming inference
+    pub fn forward_with_state_dt_scale(&self, x: &Tensor, state: &mut Mamba2State, dt_scale: Option<&Tensor>) -> Tensor {
+        self.mamba.forward_with_state_dt_scale(x, state, dt_scale)
+    }
+
     pub fn init_state(&self, batch_size: i64, device: tch::Device) -> Mamba2State {
         self.mamba.init_state(batch_size, device)
     }
 
-    /// Single step inference - O(1) per step
     pub fn step(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
         self.mamba.step(x, state)
     }
 
-    /// Batched forward with initial states for efficient BPTT
-    /// x: [batch, seq, d_model], initial_states: [batch, nheads, headdim, d_state]
-    /// Returns: (output, final_states)
     pub fn forward_batched_init(&self, x: &Tensor, initial_states: &Tensor) -> (Tensor, Tensor) {
         self.mamba.forward_batched_init(x, initial_states)
+    }
+
+    pub fn forward_batched_init_dt_scale(&self, x: &Tensor, initial_states: &Tensor, dt_scale: Option<&Tensor>) -> (Tensor, Tensor) {
+        self.mamba.forward_batched_init_dt_scale(x, initial_states, dt_scale)
     }
 }
 
