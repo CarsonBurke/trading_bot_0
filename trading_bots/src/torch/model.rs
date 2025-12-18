@@ -6,6 +6,8 @@ use crate::torch::constants::{
 };
 use crate::torch::ssm::{stateful_mamba_block, Mamba2State, StatefulMamba};
 
+pub use shared::constants::GLOBAL_MACRO_OBS;
+
 fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
     let denoms = (in_features + out_features) as f64 / 2.0;
     let std = (1.0 / denoms).sqrt() / 0.8796;
@@ -42,49 +44,21 @@ const fn compute_patch_totals() -> (i64, i64) {
 }
 
 const PATCH_TOTALS: (i64, i64) = compute_patch_totals();
-const STEM_SEQ_LEN: i64 = PATCH_TOTALS.1; // 364 tokens
-const FINEST_PATCH_SIZE: i64 = PATCH_CONFIGS[PATCH_CONFIGS.len() - 1].1;
+const STEM_SEQ_LEN: i64 = PATCH_TOTALS.1;
 
 const _: () = assert!(PATCH_TOTALS.0 == PRICE_DELTAS_PER_TICKER as i64, "PATCH_CONFIGS days must equal PRICE_DELTAS_PER_TICKER");
 
 // (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_weights)
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor);
 
-/// Streaming state for incremental inference
-/// - Maintains ring buffer of price deltas
-/// - SSM state carries compressed history across steps
-/// - Only processes new patch when PATCH_SIZE deltas accumulated
+/// SSM state for recurrent inference (carries compressed history across steps)
 pub struct StreamState {
-    /// Ring buffer of raw price deltas: [TICKERS_COUNT, PRICE_DELTAS_PER_TICKER]
-    pub delta_buffer: Tensor,
-    /// Current write position in delta buffer (oldest delta to overwrite)
-    pub delta_pos: i64,
-    /// Buffer for accumulating deltas until full patch: [TICKERS_COUNT, PATCH_SIZE]
-    pub patch_buffer: Tensor,
-    /// Position within current patch being built
-    pub patch_pos: i64,
-    /// SSM states for streaming (one per ticker for O(1) step)
-    pub ssm_states: Vec<Mamba2State>,
-    /// Batched SSM state for training rollouts
-    pub ssm_state_batched: Mamba2State,
-    /// Cached output from last full forward (used when patch not ready)
-    pub last_output: Option<ModelOutput>,
-    /// Whether we've processed at least one full sequence
-    pub initialized: bool,
+    pub ssm_state: Mamba2State,
 }
 
 impl StreamState {
     pub fn reset(&mut self) {
-        let _ = self.delta_buffer.zero_();
-        self.delta_pos = 0;
-        let _ = self.patch_buffer.zero_();
-        self.patch_pos = 0;
-        for s in &mut self.ssm_states {
-            s.reset();
-        }
-        self.ssm_state_batched.reset();
-        self.last_output = None;
-        self.initialized = false;
+        self.ssm_state.reset();
     }
 }
 
@@ -330,28 +304,6 @@ impl TradingModel {
         let price_deltas_flat = price_deltas.reshape([total_samples, -1]);
         let static_features_flat = static_features.reshape([total_samples, -1]);
         self.forward(&price_deltas_flat, &static_features_flat, true)
-    }
-
-    /// Batched forward with initial SSM states for efficient BPTT
-    pub fn forward_with_ssm_states(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        ssm_initial_states: &Tensor,
-    ) -> (ModelOutput, Tensor) {
-        let price_deltas = price_deltas.to_device(self.device);
-        let static_features = static_features.to_device(self.device);
-        let batch_size = price_deltas.size()[0];
-
-        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale) = self.patch_latent_stem(&price_deltas, batch_size);
-
-        let x_for_ssm = x_stem.permute([0, 2, 1]);
-        let (x_ssm_out, final_states) = self.ssm.forward_batched_init_dt_scale(&x_for_ssm, ssm_initial_states, Some(&dt_scale));
-        let x_ssm = x_ssm_out.permute([0, 2, 1]);
-
-        let output = self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size);
-        (output, final_states)
     }
 
     /// Initialize streaming state for O(1) inference (batch_size=1)
@@ -637,11 +589,4 @@ impl TradingModel {
 
         (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_out_vis)
     }
-}
-
-pub type Model = Box<dyn Fn(&Tensor, &Tensor, bool) -> ModelOutput>;
-
-pub fn model(p: &nn::Path, nact: i64) -> Model {
-    let m = TradingModel::new(p, nact);
-    Box::new(move |price_deltas, static_features, train| m.forward(price_deltas, static_features, train))
 }

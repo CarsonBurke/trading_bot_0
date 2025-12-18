@@ -6,7 +6,5 @@ pub mod ensemble;
 pub mod ssm;
 #[cfg(test)]
 mod ssm_tests;
-mod vec_gym_env;
-mod gym_env;
 pub mod constants;
 pub mod env;

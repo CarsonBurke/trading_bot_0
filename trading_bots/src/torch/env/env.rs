@@ -6,6 +6,9 @@ use std::time::Instant;
 use colored::Colorize;
 use tch::Tensor;
 
+use super::earnings::EarningsIndicators;
+use super::macro_ind::MacroIndicators;
+use super::momentum::MomentumIndicators;
 use crate::{
     data::historical::get_historical_data,
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
@@ -19,228 +22,6 @@ use crate::{
     types::Account,
     utils::{create_folder_if_not_exists, get_mapped_price_deltas},
 };
-
-/// Precomputed earnings indicators per step (from cached quarterly reports)
-#[derive(Debug)]
-pub(super) struct EarningsIndicators {
-    pub steps_to_next: Vec<f64>, // Steps until next earnings [-1,1] normalized
-    pub revenue_growth: Vec<f64>, // QoQ revenue growth [-1,1]
-    pub opex_growth: Vec<f64>,   // QoQ operating expenses growth [-1,1]
-    pub net_profit_growth: Vec<f64>, // QoQ net profit growth [-1,1]
-    pub eps: Vec<f64>,           // EPS normalized by price
-    pub eps_surprise: Vec<f64>,  // Last earnings surprise % [-1,1]
-}
-
-impl EarningsIndicators {
-    pub fn empty(n: usize) -> Self {
-        Self {
-            steps_to_next: vec![0.0; n],
-            revenue_growth: vec![0.0; n],
-            opex_growth: vec![0.0; n],
-            net_profit_growth: vec![0.0; n],
-            eps: vec![0.0; n],
-            eps_surprise: vec![0.0; n],
-        }
-    }
-
-    /// Compute earnings indicators aligned to bar timestamps
-    /// reports: quarterly earnings sorted oldest-first
-    /// bar_dates: date strings "YYYY-MM-DD" for each bar
-    /// prices: closing prices for EPS normalization
-    pub fn compute(
-        reports: &[crate::data::EarningsReport],
-        bar_dates: &[String],
-        prices: &[f64],
-    ) -> Self {
-        let n = bar_dates.len();
-        if reports.is_empty() {
-            return Self::empty(n);
-        }
-
-        let mut steps_to_next = vec![0.0; n];
-        let mut revenue_growth = vec![0.0; n];
-        let mut opex_growth = vec![0.0; n];
-        let mut net_profit_growth = vec![0.0; n];
-        let mut eps = vec![0.0; n];
-        let mut eps_surprise = vec![0.0; n];
-
-        // Find report index for each bar (most recent report before bar date)
-        let mut report_idx = 0;
-        for (i, bar_date) in bar_dates.iter().enumerate() {
-            // Advance to most recent report before this bar
-            while report_idx + 1 < reports.len() && reports[report_idx + 1].date <= *bar_date {
-                report_idx += 1;
-            }
-
-            let report = &reports[report_idx];
-
-            // Steps to next earnings (normalized: 0 = just happened, 1 = ~90 days away)
-            // ~78 trading 5-min bars per day * 63 trading days per quarter ≈ 4914 steps
-            if report_idx + 1 < reports.len() {
-                let next_date = &reports[report_idx + 1].date;
-                let days_to_next = date_diff_days(bar_date, next_date).max(0) as f64;
-                steps_to_next[i] = (days_to_next / 90.0).clamp(0.0, 1.0);
-            }
-
-            revenue_growth[i] = report.revenue_growth.unwrap_or(0.0).clamp(-1.0, 1.0);
-            opex_growth[i] = report.opex_growth.unwrap_or(0.0).clamp(-1.0, 1.0);
-            net_profit_growth[i] = report.net_income_growth.unwrap_or(0.0).clamp(-1.0, 1.0);
-
-            // EPS normalized by current price (yield-like)
-            if let Some(e) = report.eps {
-                let price = prices[i].max(1.0);
-                eps[i] = (e / price * 4.0).clamp(-0.5, 0.5); // annualized, clamped
-            }
-
-            eps_surprise[i] = report.eps_surprise.unwrap_or(0.0).clamp(-1.0, 1.0);
-        }
-
-        Self {
-            steps_to_next,
-            revenue_growth,
-            opex_growth,
-            net_profit_growth,
-            eps,
-            eps_surprise,
-        }
-    }
-}
-
-fn date_diff_days(from: &str, to: &str) -> i32 {
-    // Simple date diff: "YYYY-MM-DD" format
-    let parse = |s: &str| -> Option<i32> {
-        let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 3 {
-            return None;
-        }
-        let y: i32 = parts[0].parse().ok()?;
-        let m: i32 = parts[1].parse().ok()?;
-        let d: i32 = parts[2].parse().ok()?;
-        Some(y * 365 + m * 30 + d) // approximate
-    };
-    match (parse(from), parse(to)) {
-        (Some(f), Some(t)) => t - f,
-        _ => 0,
-    }
-}
-
-/// Precomputed momentum indicators (SOTA for trend prediction)
-pub(super) struct MomentumIndicators {
-    pub rsi: Vec<f64>,            // RSI 14-period [0,1]
-    pub mom_5: Vec<f64>,          // 5-step momentum
-    pub mom_60: Vec<f64>,         // 60-step momentum
-    pub mom_120: Vec<f64>,        // 120-step momentum
-    pub mom_accel: Vec<f64>,      // Momentum acceleration
-    pub vol_adj_mom: Vec<f64>,    // Volatility-adjusted momentum
-    pub range_pos: Vec<f64>,      // Position in high-low range [-1,1]
-    pub zscore: Vec<f64>,         // Z-score from mean [-3,3]
-    pub efficiency: Vec<f64>,     // Efficiency ratio [0,1]
-    pub macd: Vec<f64>,           // MACD normalized
-    pub stoch_k: Vec<f64>,        // Stochastic %K [0,1]
-    pub trend_strength: Vec<f64>, // Trend consistency [0,1]
-}
-
-impl MomentumIndicators {
-    pub fn compute(prices: &[f64]) -> Self {
-        let n = prices.len();
-        let mut rsi = vec![0.5; n];
-        let mut mom_5 = vec![0.0; n];
-        let mut mom_60 = vec![0.0; n];
-        let mut mom_120 = vec![0.0; n];
-        let mut mom_accel = vec![0.0; n];
-        let mut vol_adj_mom = vec![0.0; n];
-        let mut range_pos = vec![0.0; n];
-        let mut zscore = vec![0.0; n];
-        let mut efficiency = vec![0.0; n];
-        let mut macd = vec![0.0; n];
-        let mut stoch_k = vec![0.5; n];
-        let mut trend_strength = vec![0.0; n];
-
-        let mut ema_12 = prices.first().copied().unwrap_or(1.0);
-        let mut ema_26 = ema_12;
-
-        for i in 1..n {
-            let p = prices[i];
-
-            if i >= 5 {
-                mom_5[i] = (p / prices[i - 5] - 1.0).clamp(-0.5, 0.5);
-            }
-            if i >= 60 {
-                mom_60[i] = (p / prices[i - 60] - 1.0).clamp(-1.0, 1.0);
-            }
-            if i >= 120 {
-                mom_120[i] = (p / prices[i - 120] - 1.0).clamp(-2.0, 2.0);
-            }
-            if i >= 10 {
-                mom_accel[i] = (mom_5[i] - mom_5[i - 5]).clamp(-0.2, 0.2);
-            }
-
-            if i >= 14 {
-                let (mut gains, mut losses) = (0.0, 0.0);
-                for j in (i - 13)..=i {
-                    let chg = prices[j] - prices[j - 1];
-                    if chg > 0.0 {
-                        gains += chg;
-                    } else {
-                        losses -= chg;
-                    }
-                }
-                rsi[i] = (100.0 - 100.0 / (1.0 + gains / losses.max(1e-10))) / 100.0;
-
-                let (mut up, mut down) = (0, 0);
-                for j in (i - 13)..=i {
-                    if prices[j] > prices[j - 1] {
-                        up += 1;
-                    } else if prices[j] < prices[j - 1] {
-                        down += 1;
-                    }
-                }
-                trend_strength[i] = up.max(down) as f64 / 14.0;
-            }
-
-            if i >= 20 {
-                let w = &prices[i - 19..=i];
-                let high = w.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let low = w.iter().cloned().fold(f64::INFINITY, f64::min);
-                let mean: f64 = w.iter().sum::<f64>() / 20.0;
-                let std = (w.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / 20.0)
-                    .sqrt()
-                    .max(1e-10);
-                let range = (high - low).max(1e-10);
-
-                range_pos[i] = ((p - low) / range * 2.0 - 1.0).clamp(-1.0, 1.0);
-                stoch_k[i] = ((p - low) / range).clamp(0.0, 1.0);
-                zscore[i] = ((p - mean) / std).clamp(-3.0, 3.0);
-                vol_adj_mom[i] = ((p / prices[i - 20] - 1.0) / (std / mean)).clamp(-5.0, 5.0);
-
-                let net = (p - prices[i - 20]).abs();
-                let total: f64 = (i - 19..=i)
-                    .map(|j| (prices[j] - prices[j - 1]).abs())
-                    .sum();
-                efficiency[i] = (net / total.max(1e-10)).clamp(0.0, 1.0);
-            }
-
-            ema_12 = 2.0 / 13.0 * p + (1.0 - 2.0 / 13.0) * ema_12;
-            ema_26 = 2.0 / 27.0 * p + (1.0 - 2.0 / 27.0) * ema_26;
-            macd[i] = ((ema_12 - ema_26) / p.max(1e-10) * 100.0).clamp(-5.0, 5.0);
-        }
-
-        Self {
-            rsi,
-            mom_5,
-            mom_60,
-            mom_120,
-            mom_accel,
-            vol_adj_mom,
-            range_pos,
-            zscore,
-            efficiency,
-            macd,
-            stoch_k,
-            trend_strength,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(super) struct BuyLot {
@@ -279,6 +60,8 @@ pub struct Env {
     pub(super) momentum: Vec<MomentumIndicators>,
     /// Precomputed earnings indicators per ticker
     pub(super) earnings: Vec<EarningsIndicators>,
+    /// Precomputed macro indicators (global, not per-ticker)
+    pub(super) macro_ind: MacroIndicators,
     record_history_io: bool,
 }
 
@@ -357,6 +140,9 @@ impl Env {
             })
             .collect();
 
+        // Precompute macro indicators (use first ticker's dates - they should all align)
+        let macro_ind = MacroIndicators::compute(&bar_dates[0]);
+
         let num_tickers = tickers.len();
         Self {
             env_id: 0,
@@ -386,6 +172,7 @@ impl Env {
             target_weights: vec![0.0; num_tickers + 1],
             momentum,
             earnings,
+            macro_ind,
             record_history_io,
         }
     }

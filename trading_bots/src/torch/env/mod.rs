@@ -1,4 +1,7 @@
+mod earnings;
 mod env;
+mod macro_ind;
+mod momentum;
 mod obs;
 mod reward;
 mod trade;

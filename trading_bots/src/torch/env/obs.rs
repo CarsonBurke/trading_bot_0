@@ -20,6 +20,24 @@ impl Env {
         static_obs.push((self.episode_history.total_commissions / Self::STARTING_CASH) as f32);
         static_obs.push(self.last_reward as f32);
         static_obs.push(self.last_fill_ratio as f32);
+
+        // Macro indicators
+        let macro_ind = &self.macro_ind;
+        static_obs.push(macro_ind.gdp_growth[absolute_step] as f32);
+        static_obs.push(macro_ind.unemployment[absolute_step] as f32);
+        static_obs.push(macro_ind.jobs_growth[absolute_step] as f32);
+        static_obs.push(macro_ind.cpi_yoy[absolute_step] as f32);
+        static_obs.push(macro_ind.core_cpi_yoy[absolute_step] as f32);
+        static_obs.push(macro_ind.fed_funds[absolute_step] as f32);
+        static_obs.push(macro_ind.treasury_10y[absolute_step] as f32);
+        static_obs.push(macro_ind.yield_spread[absolute_step] as f32);
+        static_obs.push(macro_ind.consumer_sentiment[absolute_step] as f32);
+        static_obs.push(macro_ind.initial_claims[absolute_step] as f32);
+        static_obs.push(macro_ind.steps_to_jobs[absolute_step] as f32);
+        static_obs.push(macro_ind.steps_to_cpi[absolute_step] as f32);
+        static_obs.push(macro_ind.steps_to_fomc[absolute_step] as f32);
+        static_obs.push(macro_ind.steps_to_gdp[absolute_step] as f32);
+
         debug_assert_eq!(static_obs.len(), GLOBAL_STATIC_OBS);
 
         let position_percents = self.account.position_percents(&self.prices, absolute_step);
