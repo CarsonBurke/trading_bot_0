@@ -47,6 +47,12 @@ enum Commands {
 
         #[arg(short, long, default_value_t = 1.0)]
         temperature: f64,
+
+        #[arg(long, value_delimiter = ',')]
+        tickers: Option<Vec<String>>,
+
+        #[arg(short, long, default_value_t = true)]
+        random_start: bool,
     },
     Paper {
         #[arg(short, long, default_value = "weights/ppo_ep1000.safetensors")]
@@ -76,8 +82,8 @@ async fn main() {
         Some(Commands::Train { weights }) => {
             torch::ppo::train(weights.as_deref());
         }
-        Some(Commands::Infer { weights, episodes, deterministic, temperature }) => {
-            torch::infer::run_inference(weights, *episodes, *deterministic, *temperature)
+        Some(Commands::Infer { weights, episodes, deterministic, temperature, tickers, random_start }) => {
+            torch::infer::run_inference(weights, *episodes, *deterministic, *temperature, tickers.clone(), *random_start)
                 .expect("inference failed");
         }
         Some(Commands::Paper { weights, symbols, interval, max_steps, temperature }) => {

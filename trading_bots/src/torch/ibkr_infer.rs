@@ -17,7 +17,7 @@ use crate::torch::constants::{
     ACTION_HISTORY_LEN, ACTION_THRESHOLD, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS,
     PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
-use crate::torch::infer::{load_model, sample_actions};
+use crate::torch::infer::{load_model, sample_actions_from_dist};
 use crate::types::Account;
 
 const MAX_ACCOUNT_VALUE: Option<f64> = Some(10_000.0);
@@ -291,6 +291,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 
     let device = Device::cuda_if_available();
     let (_vs, model) = load_model(weight_path, device)?;
+    let mut stream_state = model.init_stream_state();
 
     let ticker_count = symbols.len();
     let state = Arc::new(Mutex::new(LiveMarketState::new(ticker_count, starting_cash)));
@@ -346,12 +347,16 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
             let price_deltas_gpu = price_deltas_tensor.to_device(device);
             let static_obs_gpu = static_obs_tensor.to_device(device);
 
-            let actions = sample_actions(
-                model.as_ref(),
-                &price_deltas_gpu,
-                &static_obs_gpu,
+            let (_, _, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
+                model.forward_with_state(&price_deltas_gpu, &static_obs_gpu, &mut stream_state)
+            });
+
+            let actions = sample_actions_from_dist(
+                &action_mean,
+                &action_log_std,
                 false,
                 temperature,
+                device,
             );
 
             let actions_vec = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();

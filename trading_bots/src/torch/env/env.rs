@@ -291,15 +291,20 @@ impl Env {
         Self::new_with_recording(random_start, true)
     }
 
+    pub fn new_with_tickers(tickers: Vec<String>, random_start: bool) -> Self {
+        Self::new_with_tickers_and_recording(tickers, random_start, true)
+    }
+
     pub fn new_with_recording(random_start: bool, record_history_io: bool) -> Self {
-        let tickers = vec![
-            // "TSLA".to_string(),
-            // "AAPL".to_string(),
-            // "AMD".to_string(),
-            // "INTC".to_string(),
-            // "MSFT".to_string(),
-            "NVDA".to_string(),
-        ];
+        let tickers = vec!["NVDA".to_string()];
+        Self::new_with_tickers_and_recording(tickers, random_start, record_history_io)
+    }
+
+    pub fn new_with_tickers_and_recording(
+        tickers: Vec<String>,
+        random_start: bool,
+        record_history_io: bool,
+    ) -> Self {
 
         let mapped_bars = get_historical_data(Some(
             &tickers
