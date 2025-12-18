@@ -32,6 +32,10 @@ struct LiveMarketState {
     steps_since_trade: Vec<usize>,
     position_open_step: Vec<Option<usize>>,
     trade_activity_ema: Vec<f64>,
+    /// Track latest delta per ticker for streaming inference
+    latest_deltas: Vec<f64>,
+    /// Whether model has been initialized with full observation
+    model_initialized: bool,
 }
 
 impl LiveMarketState {
@@ -46,6 +50,8 @@ impl LiveMarketState {
             steps_since_trade: vec![0; ticker_count],
             position_open_step: vec![None; ticker_count],
             trade_activity_ema: vec![0.0; ticker_count],
+            latest_deltas: vec![0.0; ticker_count],
+            model_initialized: false,
         }
     }
 
@@ -64,6 +70,8 @@ impl LiveMarketState {
             if self.price_deltas[ticker_idx].len() > PRICE_DELTAS_PER_TICKER {
                 self.price_deltas[ticker_idx].pop_front();
             }
+
+            self.latest_deltas[ticker_idx] = delta;
         }
     }
 
@@ -174,6 +182,12 @@ impl LiveMarketState {
             Tensor::from_slice(&static_obs).view([1, STATIC_OBSERVATIONS as i64]);
 
         Some((price_deltas_tensor, static_obs_tensor))
+    }
+
+    /// Get step deltas for streaming inference (single delta per ticker)
+    fn get_step_deltas(&self) -> Tensor {
+        let step_deltas: Vec<f32> = self.latest_deltas.iter().map(|&d| d as f32).collect();
+        Tensor::from_slice(&step_deltas)
     }
 }
 
@@ -344,11 +358,19 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
         state_guard.update_account_total();
 
         if let Some((price_deltas_tensor, static_obs_tensor)) = state_guard.build_observation() {
-            let price_deltas_gpu = price_deltas_tensor.to_device(device);
             let static_obs_gpu = static_obs_tensor.to_device(device);
 
+            // First step: use full observation to initialize streaming state
+            // Subsequent steps: use single delta per ticker for O(1) inference
+            let price_deltas_gpu = if !state_guard.model_initialized {
+                state_guard.model_initialized = true;
+                price_deltas_tensor.to_device(device)
+            } else {
+                state_guard.get_step_deltas().to_device(device)
+            };
+
             let (_, _, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
-                model.forward_with_state(&price_deltas_gpu, &static_obs_gpu, &mut stream_state)
+                model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state)
             });
 
             let actions = sample_actions_from_dist(

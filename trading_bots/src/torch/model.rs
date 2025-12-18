@@ -16,57 +16,55 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 
 const SSM_DIM: i64 = 64;
 
-// Variable patch sizes: fine resolution for recent, coarse for old (oldest first in array)
-// Processed in order: oldest (coarse) → newest (fine)
-// Each (days, patch_size) must have days % patch_size == 0
-const PATCH_CONFIGS: [(i64, i64); 7] = [
-    (1600, 64), // oldest 1600 days, patch_size=64 → 25 tokens
-    (1024, 32), // 1024 days, patch_size=32 → 32 tokens
-    (512, 16),  // 512 days, patch_size=16 → 32 tokens
-    (128, 8),   // 128 days, patch_size=8 → 16 tokens
-    (64, 4),    // 64 days, patch_size=4 → 16 tokens
-    (32, 2),    // 32 days, patch_size=2 → 16 tokens
-    (40, 1),    // newest 40 days, patch_size=1 → 40 tokens
-]; // Total: 1600+1024+512+128+64+32+40 = 3400, Tokens: 25+32+32+16+16+16+40 = 177
+// Uniform patch size for proper streaming support
+// 3400 deltas / 20 = 170 tokens
+const PATCH_SIZE: i64 = 20;
+const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
-const fn compute_patch_totals() -> (i64, i64) {
-    let mut total_days = 0i64;
-    let mut total_tokens = 0i64;
-    let mut i = 0;
-    while i < PATCH_CONFIGS.len() {
-        let (days, patch_size) = PATCH_CONFIGS[i];
-        assert!(days % patch_size == 0, "days must be divisible by patch_size");
-        total_days += days;
-        total_tokens += days / patch_size;
-        i += 1;
-    }
-    (total_days, total_tokens)
-}
-
-const PATCH_TOTALS: (i64, i64) = compute_patch_totals();
-const STEM_SEQ_LEN: i64 = PATCH_TOTALS.1;
-
-const _: () = assert!(PATCH_TOTALS.0 == PRICE_DELTAS_PER_TICKER as i64, "PATCH_CONFIGS days must equal PRICE_DELTAS_PER_TICKER");
+const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_DELTAS must be divisible by PATCH_SIZE");
 
 // (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_weights)
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor);
 
-/// SSM state for recurrent inference (carries compressed history across steps)
+/// Streaming state for O(1) inference per step
+/// - Ring buffer holds full delta history for head computation
+/// - Patch buffer accumulates deltas until full patch ready
+/// - SSM state carries compressed history (only process new token each patch)
 pub struct StreamState {
-    pub ssm_state: Mamba2State,
+    /// Ring buffer: [TICKERS_COUNT, PRICE_DELTAS_PER_TICKER]
+    pub delta_ring: Tensor,
+    /// Write position in ring buffer
+    pub ring_pos: i64,
+    /// Patch accumulator: [TICKERS_COUNT, PATCH_SIZE]
+    pub patch_buf: Tensor,
+    /// Position within current patch
+    pub patch_pos: i64,
+    /// SSM hidden state per ticker
+    pub ssm_states: Vec<Mamba2State>,
+    /// Cached SSM output sequence: [TICKERS_COUNT, SSM_DIM, SEQ_LEN]
+    pub ssm_cache: Tensor,
+    /// Whether initialized with full sequence
+    pub initialized: bool,
 }
 
 impl StreamState {
     pub fn reset(&mut self) {
-        self.ssm_state.reset();
+        let _ = self.delta_ring.zero_();
+        self.ring_pos = 0;
+        let _ = self.patch_buf.zero_();
+        self.patch_pos = 0;
+        for s in &mut self.ssm_states {
+            s.reset();
+        }
+        let _ = self.ssm_cache.zero_();
+        self.initialized = false;
     }
 }
 
 pub struct TradingModel {
-    patch_embeds: Vec<nn::Linear>,
-    patch_lns: Vec<nn::LayerNorm>,
-    stem_pos_emb: Tensor,
-    dt_scale: Tensor, // [1, STEM_SEQ_LEN, 1] - patch_size per position for dt scaling
+    patch_embed: nn::Linear,
+    patch_ln: nn::LayerNorm,
+    pos_emb: Tensor,
     ssm: StatefulMamba,
     ssm_proj: nn::Conv1D,
     pos_embedding: Tensor,
@@ -110,49 +108,13 @@ pub struct TradingModel {
 
 impl TradingModel {
     pub fn new(p: &nn::Path, nact: i64) -> Self {
-        let mut patch_embeds = Vec::new();
-        let mut patch_lns = Vec::new();
-        for (i, &(_, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
-            patch_embeds.push(nn::linear(
-                p / format!("patch_embed_{}", i),
-                patch_size,
-                SSM_DIM,
-                Default::default(),
-            ));
-            patch_lns.push(nn::layer_norm(
-                p / format!("patch_ln_{}", i),
-                vec![SSM_DIM],
-                Default::default(),
-            ));
-        }
-
-        let stem_pos_emb = p.var(
-            "stem_pos_emb",
-            &[1, STEM_SEQ_LEN, SSM_DIM],
-            Init::Uniform { lo: -0.01, up: 0.01 },
-        );
-
-        // dt_scale: patch_size per position [1, L, 1] - used to scale dt in SSM
-        let dt_scale = {
-            let mut scales = Vec::with_capacity(STEM_SEQ_LEN as usize);
-            for &(days, patch_size) in &PATCH_CONFIGS {
-                let n_patches = days / patch_size;
-                for _ in 0..n_patches {
-                    scales.push(patch_size as f32);
-                }
-            }
-            Tensor::from_slice(&scales)
-                .view([1, STEM_SEQ_LEN, 1])
-                .to_device(p.device())
-        };
+        let patch_embed = nn::linear(p / "patch_embed", PATCH_SIZE, SSM_DIM, Default::default());
+        let patch_ln = nn::layer_norm(p / "patch_ln", vec![SSM_DIM], Default::default());
+        let pos_emb = p.var("pos_emb_stem", &[1, SEQ_LEN, SSM_DIM], Init::Uniform { lo: -0.01, up: 0.01 });
 
         let ssm = stateful_mamba_block(&(p / "ssm"), SSM_DIM);
         let ssm_proj = nn::conv1d(p / "ssm_proj", SSM_DIM, 256, 1, Default::default());
-        let pos_embedding = p.var(
-            "pos_emb",
-            &[1, 256, STEM_SEQ_LEN],
-            Init::Uniform { lo: -0.01, up: 0.01 },
-        );
+        let pos_embedding = p.var("pos_emb", &[1, 256, SEQ_LEN], Init::Uniform { lo: -0.01, up: 0.01 });
 
         let static_to_temporal = nn::linear(p / "static_to_temporal", PER_TICKER_STATIC_OBS as i64, 64, Default::default());
         let ln_static_temporal = nn::layer_norm(p / "ln_static_temporal", vec![64], Default::default());
@@ -228,10 +190,7 @@ impl TradingModel {
         let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
 
         Self {
-            patch_embeds,
-            patch_lns,
-            stem_pos_emb,
-            dt_scale,
+            patch_embed, patch_ln, pos_emb,
             ssm, ssm_proj, pos_embedding,
             static_to_temporal, ln_static_temporal, temporal_pools,
             static_proj, ln_static_proj,
@@ -257,40 +216,16 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale) = self.patch_latent_stem(&price_deltas, batch_size);
+        let x_stem = self.patch_embed_all(&price_deltas, batch_size);
 
         let x_for_ssm = x_stem.permute([0, 2, 1]);
-        let x_ssm = self.ssm.forward_with_dt_scale(&x_for_ssm, Some(&dt_scale));
+        let x_ssm = self.ssm.forward(&x_for_ssm, false);
         let x_ssm = x_ssm.permute([0, 2, 1]);
 
         self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
     }
 
-    /// Forward with recurrent SSM state - GPU efficient for training rollouts with memory
-    pub fn forward_with_state(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        state: &mut StreamState,
-    ) -> ModelOutput {
-        let price_deltas = price_deltas.to_device(self.device);
-        let static_features = static_features.to_device(self.device);
-        let batch_size = price_deltas.size()[0];
-
-        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale) = self.patch_latent_stem(&price_deltas, batch_size);
-
-        let x_for_ssm = x_stem.permute([0, 2, 1]);
-        let x_ssm = self.ssm.forward_with_state_dt_scale(&x_for_ssm, &mut state.ssm_state_batched, Some(&dt_scale));
-        let x_ssm = x_ssm.permute([0, 2, 1]);
-
-        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
-    }
-
-    /// Batched forward for multiple timesteps (no state carry - each sample independent)
-    /// price_deltas: [seq_len, batch, features]
-    /// static_features: [seq_len, batch, features]
-    /// Returns: (critics, action_means, action_log_stds) each [seq_len * batch, ...]
+    /// Batched forward for multiple timesteps (each sample independent, parallel SSM)
     pub fn forward_sequence_with_state(
         &self,
         price_deltas: &Tensor,
@@ -306,166 +241,132 @@ impl TradingModel {
         self.forward(&price_deltas_flat, &static_features_flat, true)
     }
 
-    /// Initialize streaming state for O(1) inference (batch_size=1)
+    /// Initialize streaming state (single batch)
     pub fn init_stream_state(&self) -> StreamState {
-        self.init_stream_state_batched(1)
-    }
-
-    /// Initialize streaming state with specific batch size for training rollouts
-    pub fn init_stream_state_batched(&self, batch_size: i64) -> StreamState {
         StreamState {
-            delta_buffer: Tensor::zeros(&[TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64], (Kind::Float, self.device)),
-            delta_pos: 0,
-            patch_buffer: Tensor::zeros(&[TICKERS_COUNT, FINEST_PATCH_SIZE], (Kind::Float, self.device)),
+            delta_ring: Tensor::zeros(&[TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64], (Kind::Float, self.device)),
+            ring_pos: 0,
+            patch_buf: Tensor::zeros(&[TICKERS_COUNT, PATCH_SIZE], (Kind::Float, self.device)),
             patch_pos: 0,
             ssm_states: (0..TICKERS_COUNT).map(|_| self.ssm.init_state(1, self.device)).collect(),
-            ssm_state_batched: self.ssm.init_state(batch_size * TICKERS_COUNT, self.device),
-            last_output: None,
+            ssm_cache: Tensor::zeros(&[TICKERS_COUNT, SSM_DIM, SEQ_LEN], (Kind::Float, self.device)),
             initialized: false,
         }
     }
 
-    /// Streaming step for O(1) inference.
-    /// Input: new_deltas [TICKERS_COUNT] - one new delta per ticker
-    /// Returns (ready, output) where ready=true when a new patch was processed
-    pub fn step(&self, new_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> (bool, ModelOutput) {
+    /// Initialize batched streaming state for PPO rollout collection
+    /// Note: For training with full observations at each step, state tracking is minimal
+    pub fn init_stream_state_batched(&self, batch_size: i64) -> StreamState {
+        StreamState {
+            delta_ring: Tensor::zeros(&[batch_size * TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64], (Kind::Float, self.device)),
+            ring_pos: 0,
+            patch_buf: Tensor::zeros(&[batch_size * TICKERS_COUNT, PATCH_SIZE], (Kind::Float, self.device)),
+            patch_pos: 0,
+            ssm_states: (0..(batch_size * TICKERS_COUNT) as usize).map(|_| self.ssm.init_state(1, self.device)).collect(),
+            ssm_cache: Tensor::zeros(&[batch_size * TICKERS_COUNT, SSM_DIM, SEQ_LEN], (Kind::Float, self.device)),
+            initialized: false,
+        }
+    }
+
+    /// Forward with state for rollout collection (uses full observation, state unused)
+    pub fn forward_with_state(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        _state: &mut StreamState,
+    ) -> ModelOutput {
+        self.forward(price_deltas, static_features, false)
+    }
+
+    /// Streaming inference step - O(1) per delta when patch not ready, O(SEQ_LEN) when patch ready
+    /// First call with full observation initializes state, subsequent calls stream one delta at a time
+    pub fn step(&self, new_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
         let new_deltas = new_deltas.to_device(self.device);
         let static_features = static_features.to_device(self.device);
 
-        // Handle full observation for initialization
+        // Full observation: initialize streaming state
         let full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
-        if (new_deltas.dim() == 1 && new_deltas.size()[0] == full_obs)
-            || (new_deltas.dim() == 2 && new_deltas.size()[0] == 1 && new_deltas.size()[1] == full_obs)
-        {
-            return self.init_stream_from_full(new_deltas, static_features, state);
+        let is_full = (new_deltas.dim() == 1 && new_deltas.size()[0] == full_obs)
+            || (new_deltas.dim() == 2 && new_deltas.size()[1] == full_obs);
+
+        if is_full {
+            return self.init_from_full(&new_deltas, &static_features, state);
         }
 
         // Streaming: add one delta per ticker
-        // new_deltas shape: [TICKERS_COUNT]
         let new_deltas = if new_deltas.dim() == 1 { new_deltas } else { new_deltas.squeeze_dim(0) };
 
-        // Update ring buffer at current position
+        // Update ring buffer
         for t in 0..TICKERS_COUNT {
-            let _ = state.delta_buffer.get(t).narrow(0, state.delta_pos, 1)
+            let _ = state.delta_ring.get(t).narrow(0, state.ring_pos, 1)
                 .copy_(&new_deltas.get(t).unsqueeze(0));
         }
-        state.delta_pos = (state.delta_pos + 1) % PRICE_DELTAS_PER_TICKER as i64;
+        state.ring_pos = (state.ring_pos + 1) % PRICE_DELTAS_PER_TICKER as i64;
 
         // Accumulate in patch buffer
-        let _ = state.patch_buffer.narrow(1, state.patch_pos, 1)
+        let _ = state.patch_buf.narrow(1, state.patch_pos, 1)
             .copy_(&new_deltas.unsqueeze(1));
         state.patch_pos += 1;
 
-        // Not enough deltas for a patch yet
-        if state.patch_pos < FINEST_PATCH_SIZE {
-            let output = state.last_output.as_ref().map(Self::clone_output).unwrap_or_else(|| self.zero_output());
-            return (false, output);
+        // Patch complete: process new token through SSM
+        if state.patch_pos >= PATCH_SIZE {
+            state.patch_pos = 0;
+            self.process_new_patch(state);
+            let _ = state.patch_buf.zero_();
         }
 
-        // Patch ready - process it
-        state.patch_pos = 0;
-        let patch = state.patch_buffer.shallow_clone();
-        let output = self.process_single_patch(&patch, &static_features, state);
-        state.last_output = Some(Self::clone_output(&output));
-        let _ = state.patch_buffer.zero_();
-        (true, output)
-    }
-
-    fn init_stream_from_full(&self, new_deltas: Tensor, static_features: Tensor, state: &mut StreamState) -> (bool, ModelOutput) {
-        let price = if new_deltas.dim() == 1 { new_deltas.unsqueeze(0) } else { new_deltas };
+        // Head uses cached SSM output + current static features
         let static_features = if static_features.dim() == 1 { static_features.unsqueeze(0) } else { static_features };
-
-        // Fill delta buffer with the full sequence
-        let reshaped = price.view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
-        let _ = state.delta_buffer.copy_(&reshaped);
-        state.delta_pos = 0;
-        state.patch_pos = 0;
-        let _ = state.patch_buffer.zero_();
-
-        // Initialize SSM states by processing all patches
-        let output = self.forward_init_stream(&price, &static_features, state);
-        state.last_output = Some(Self::clone_output(&output));
-        state.initialized = true;
-        (true, output)
+        let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
+        self.head_with_temporal_pool(&state.ssm_cache, &global_static, &per_ticker_static, 1)
     }
 
-    /// Initialize streaming by processing full sequence per-ticker, capturing final SSM states
-    fn forward_init_stream(&self, price_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
-        let batch_size = price_deltas.size()[0];
-        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
-
-        let per_ticker = price_deltas.view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
-
-        let mut ssm_outputs = Vec::with_capacity(TICKERS_COUNT as usize);
-        for t in 0..TICKERS_COUNT as usize {
-            let ticker_data = per_ticker.get(0).get(t as i64).unsqueeze(0);
-            let (x_stem, dt_scale) = self.patch_single_ticker(&ticker_data);
-            let x_ssm = self.ssm.forward_with_state_dt_scale(&x_stem.permute([0, 2, 1]), &mut state.ssm_states[t], Some(&dt_scale));
-            ssm_outputs.push(x_ssm.permute([0, 2, 1]));
-        }
-
-        let x_ssm = Tensor::cat(&ssm_outputs, 0).unsqueeze(0);
-        let x_ssm = x_ssm.view([TICKERS_COUNT, SSM_DIM, STEM_SEQ_LEN]);
-
-        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
-    }
-
-    /// Returns (x_stem [1, D, L], dt_scale [1, L, 1])
-    fn patch_single_ticker(&self, ticker_data: &Tensor) -> (Tensor, Tensor) {
-        // Data arrives oldest→newest, PATCH_CONFIGS is oldest→newest
-        let mut patches = Vec::new();
-        let mut offset = 0i64;
-        for (i, &(days, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
-            let n_patches = days / patch_size;
-            let chunk = ticker_data.narrow(1, offset, days);
-            let p = chunk
-                .view([1, n_patches, patch_size])
-                .apply(&self.patch_embeds[i])
-                .apply(&self.patch_lns[i]);
-            patches.push(p);
-            offset += days;
-        }
-        let x = Tensor::cat(&patches, 1);
-        let pos_emb = self.stem_pos_emb.narrow(0, 0, 1);
-        let x_stem = (x + pos_emb).permute([0, 2, 1]);
-        (x_stem, self.dt_scale.shallow_clone())
-    }
-
-    /// Process a single delta through SSM with state carry (streaming inference)
-    /// Note: With variable patching, streaming requires buffering deltas until enough for finest patch
-    fn process_single_patch(&self, patch: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
+    /// Initialize streaming from full observation
+    fn init_from_full(&self, price_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
+        let price = if price_deltas.dim() == 1 { price_deltas.unsqueeze(0) } else { price_deltas.shallow_clone() };
         let static_features = if static_features.dim() == 1 { static_features.unsqueeze(0) } else { static_features.shallow_clone() };
+
+        // Fill ring buffer
+        let reshaped = price.view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
+        let _ = state.delta_ring.copy_(&reshaped);
+        state.ring_pos = 0;
+        state.patch_pos = 0;
+        let _ = state.patch_buf.zero_();
+
         let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
 
-        // For streaming: use finest patch size (1) embedding
-        let patch_emb = patch.apply(&self.patch_embeds[0]).apply(&self.patch_lns[0]);
+        // Process each ticker through SSM to capture final states
+        for t in 0..TICKERS_COUNT as usize {
+            let ticker_data = reshaped.get(t as i64).unsqueeze(0);
+            let x_stem = self.patch_embed_single(&ticker_data);
+            let x_ssm = self.ssm.forward_with_state(&x_stem.permute([0, 2, 1]), &mut state.ssm_states[t]);
+            let _ = state.ssm_cache.get(t as i64).copy_(&x_ssm.squeeze_dim(0).permute([1, 0]));
+        }
 
-        let mut outputs = Vec::with_capacity(TICKERS_COUNT as usize);
+        state.initialized = true;
+        self.head_with_temporal_pool(&state.ssm_cache, &global_static, &per_ticker_static, 1)
+    }
+
+    /// Process new patch through SSM, update cache by shifting and appending
+    fn process_new_patch(&self, state: &mut StreamState) {
+        // Embed the new patch: [TICKERS_COUNT, PATCH_SIZE] -> [TICKERS_COUNT, SSM_DIM]
+        let patch_emb = state.patch_buf
+            .view([TICKERS_COUNT, 1, PATCH_SIZE])
+            .apply(&self.patch_embed)
+            .apply(&self.patch_ln)
+            .squeeze_dim(1);
+
+        // Process through SSM step for each ticker
         for t in 0..TICKERS_COUNT as usize {
             let x_in = patch_emb.get(t as i64).unsqueeze(0);
             let out = self.ssm.step(&x_in, &mut state.ssm_states[t]);
-            outputs.push(out);
+
+            // Shift cache left by 1, append new output
+            let old_cache = state.ssm_cache.get(t as i64);
+            let shifted = old_cache.narrow(1, 1, SEQ_LEN - 1);
+            let _ = old_cache.narrow(1, 0, SEQ_LEN - 1).copy_(&shifted);
+            let _ = old_cache.narrow(1, SEQ_LEN - 1, 1).copy_(&out.squeeze_dim(0).unsqueeze(1));
         }
-
-        let x_ssm = Tensor::cat(&outputs, 0).unsqueeze(-1);
-
-        // Use streaming head (no temporal pooling - single token per ticker)
-        self.head_no_temporal_pool(&x_ssm, &global_static, &per_ticker_static, 1)
-    }
-
-    fn clone_output(o: &ModelOutput) -> ModelOutput {
-        (o.0.shallow_clone(), o.1.shallow_clone(), (o.2.0.shallow_clone(), o.2.1.shallow_clone(), o.2.2.shallow_clone()), o.3.shallow_clone())
-    }
-
-    fn zero_output(&self) -> ModelOutput {
-        let z_c = Tensor::zeros(&[1], (Kind::Float, self.device));
-        let z_logits = Tensor::zeros(&[1, 255], (Kind::Float, self.device));
-        // K-1 dims for logistic-normal
-        let z_m = Tensor::zeros(&[1, TICKERS_COUNT], (Kind::Float, self.device));
-        let z_s = Tensor::zeros(&[1, TICKERS_COUNT], (Kind::Float, self.device));
-        let z_d = Tensor::ones(&[TICKERS_COUNT + 1], (Kind::Float, self.device));
-        let z_a = Tensor::zeros(&[1, 1], (Kind::Float, self.device));
-        (z_c, z_logits, (z_m, z_s, z_d), z_a)
     }
 
     fn parse_static(&self, static_features: &Tensor, batch_size: i64) -> (Tensor, Tensor) {
@@ -476,31 +377,29 @@ impl TradingModel {
         (global, per_ticker)
     }
 
-    /// Returns (x_stem [B*T, D, L], dt_scale [1, L, 1])
-    fn patch_latent_stem(&self, price_deltas: &Tensor, batch_size: i64) -> (Tensor, Tensor) {
+    /// Embed single ticker data: [1, PRICE_DELTAS] -> [1, SSM_DIM, SEQ_LEN]
+    fn patch_embed_single(&self, ticker_data: &Tensor) -> Tensor {
+        let x = ticker_data
+            .view([1, SEQ_LEN, PATCH_SIZE])
+            .apply(&self.patch_embed)
+            .apply(&self.patch_ln);
+        (x + &self.pos_emb).permute([0, 2, 1])
+    }
+
+    /// Embed all tickers: [B, TICKERS*PRICE_DELTAS] -> [B*TICKERS, SSM_DIM, SEQ_LEN]
+    fn patch_embed_all(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
         let batch_tokens = batch_size * TICKERS_COUNT;
-        // Data arrives oldest→newest, PATCH_CONFIGS is oldest→newest
         let deltas = price_deltas
             .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
             .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
 
-        let mut patches = Vec::new();
-        let mut offset = 0i64;
-        for (i, &(days, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
-            let n_patches = days / patch_size;
-            let chunk = deltas.narrow(1, offset, days);
-            let p = chunk
-                .view([batch_tokens, n_patches, patch_size])
-                .apply(&self.patch_embeds[i])
-                .apply(&self.patch_lns[i]);
-            patches.push(p);
-            offset += days;
-        }
+        let x = deltas
+            .view([batch_tokens, SEQ_LEN, PATCH_SIZE])
+            .apply(&self.patch_embed)
+            .apply(&self.patch_ln);
 
-        let x = Tensor::cat(&patches, 1);
-        let pos_emb = self.stem_pos_emb.expand(&[batch_tokens, STEM_SEQ_LEN, SSM_DIM], false);
-        let x_stem = (x + pos_emb).permute([0, 2, 1]);
-        (x_stem, self.dt_scale.shallow_clone())
+        let pos_emb = self.pos_emb.expand(&[batch_tokens, SEQ_LEN, SSM_DIM], false);
+        (x + pos_emb).permute([0, 2, 1])
     }
 
     fn head_with_temporal_pool(&self, x_ssm: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64) -> ModelOutput {
@@ -533,11 +432,6 @@ impl TradingModel {
         let conv_features = pooled.view([batch_size, TICKERS_COUNT, 256]);
 
         self.head_common(&conv_features, global_static, per_ticker_static, batch_size, attn_avg)
-    }
-
-    fn head_no_temporal_pool(&self, conv_features: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64) -> ModelOutput {
-        let dummy_attn = Tensor::zeros(&[batch_size, 1], (Kind::Float, self.device));
-        self.head_common(conv_features, global_static, per_ticker_static, batch_size, dummy_attn)
     }
 
     fn head_common(&self, conv_features: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64, attn_out_vis: Tensor) -> ModelOutput {

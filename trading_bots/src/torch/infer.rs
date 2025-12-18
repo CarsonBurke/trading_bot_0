@@ -76,12 +76,10 @@ pub fn run_inference<P: AsRef<Path>>(
         for step in 0..env.max_step {
             env.step = step;
 
+            // First call: model.step detects full obs and initializes stream state
+            // Subsequent calls: model.step processes single delta per ticker
             let (_, _, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
-                model.forward_with_state(
-                    &current_price_deltas.unsqueeze(0),
-                    &current_static_obs.unsqueeze(0),
-                    &mut stream_state,
-                )
+                model.step(&current_price_deltas, &current_static_obs, &mut stream_state)
             });
 
             let actions = sample_actions_from_dist(
@@ -93,11 +91,10 @@ pub fn run_inference<P: AsRef<Path>>(
             );
 
             let actions_vec: Vec<f64> = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
-            let step_result = env.step_single(actions_vec);
-
+            let step_result = env.step_step_single(actions_vec);
             episode_reward += step_result.reward;
 
-            current_price_deltas = Tensor::from_slice(&step_result.price_deltas).to_device(device);
+            current_price_deltas = Tensor::from_slice(&step_result.step_deltas).to_device(device);
             current_static_obs = Tensor::from_slice(&step_result.static_obs).to_device(device);
 
             if step_result.is_done > 0.5 {
