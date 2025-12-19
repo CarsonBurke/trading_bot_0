@@ -17,8 +17,8 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 const SSM_DIM: i64 = 64;
 
 // Uniform patch size for proper streaming support
-// 3400 deltas / 20 = 170 tokens
-const PATCH_SIZE: i64 = 20;
+// 3400 deltas / 34 = 100 tokens
+const PATCH_SIZE: i64 = 34;
 const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
 const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_DELTAS must be divisible by PATCH_SIZE");
@@ -186,7 +186,7 @@ impl TradingModel {
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
-        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact - 1], Init::Const(0.0));
+        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact - 1], Init::Const(-1.0));
         let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
 
         Self {
@@ -472,11 +472,14 @@ impl TradingModel {
         let critic_value = critic_probs.mv(&self.bucket_centers);
 
         let action_mean = actor_feat.apply(&self.actor_mean);
-        const LOG_STD_OFFSET: f64 = -2.0;
+        // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
+        const LOG_STD_MIN: f64 = -5.0;
+        const LOG_STD_MAX: f64 = 0.5; // std range [0.007, 1.65]
         let latent = actor_feat.apply(&self.sde_fc).apply(&self.ln_sde).tanh();
-        let log_std = (&self.log_std_param + LOG_STD_OFFSET).clamp(-3.0, -0.5);
+        let log_std_raw = self.log_std_param.tanh();
+        let log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
         let variance = latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
-        let action_log_std = (variance + 1e-6).sqrt().log().clamp(-10.0, 2.0);
+        let action_log_std = (variance + 1e-6).sqrt().log().clamp(LOG_STD_MIN, LOG_STD_MAX);
 
         const LOG_D_RAW_SCALE: f64 = 5.0;
         let divisor = self.log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + 0.1;

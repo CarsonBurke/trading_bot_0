@@ -1,3 +1,13 @@
+use std::sync::{Arc, OnceLock, Mutex};
+use std::collections::HashMap;
+
+/// Global cache for momentum indicators (ticker -> indicators)
+static MOMENTUM_CACHE: OnceLock<Mutex<HashMap<String, Arc<MomentumIndicators>>>> = OnceLock::new();
+
+fn get_cache() -> &'static Mutex<HashMap<String, Arc<MomentumIndicators>>> {
+    MOMENTUM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Precomputed momentum indicators
 pub struct MomentumIndicators {
     pub rsi: Vec<f64>,
@@ -15,6 +25,22 @@ pub struct MomentumIndicators {
 }
 
 impl MomentumIndicators {
+    /// Get cached momentum indicators or compute if not present
+    pub fn get_or_compute(ticker: &str, prices: &[f64]) -> Arc<MomentumIndicators> {
+        let cache = get_cache();
+        {
+            let locked = cache.lock().unwrap();
+            if let Some(cached) = locked.get(ticker) {
+                if cached.rsi.len() == prices.len() {
+                    return cached.clone();
+                }
+            }
+        }
+        let computed = Arc::new(Self::compute(prices));
+        cache.lock().unwrap().insert(ticker.to_string(), computed.clone());
+        computed
+    }
+
     pub fn compute(prices: &[f64]) -> Self {
         let n = prices.len();
         let mut rsi = vec![0.5; n];

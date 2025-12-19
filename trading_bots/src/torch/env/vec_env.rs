@@ -1,4 +1,5 @@
 use tch::Tensor;
+use rand::seq::SliceRandom;
 use super::env::{Env, Step};
 use crate::torch::ppo::NPROCS;
 use crate::torch::constants::{TICKERS_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS};
@@ -7,12 +8,24 @@ pub struct VecEnv {
     pub envs: Vec<Env>,
 }
 
+/// Available tickers for random selection
+const AVAILABLE_TICKERS: &[&str] = &["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD"];
+
 impl VecEnv {
     pub fn new(random_start: bool) -> Self {
+        // Select random tickers ONCE, share across all envs
+        let count = TICKERS_COUNT as usize;
+        let mut available: Vec<String> = AVAILABLE_TICKERS.iter().map(|s| s.to_string()).collect();
+        available.shuffle(&mut rand::rng());
+        let tickers: Vec<String> = available.into_iter().take(count).collect();
+        eprintln!("VecEnv using tickers: {:?}", tickers);
+
         let mut envs = Vec::with_capacity(NPROCS as usize);
-        envs.push(Env::new_with_recording(random_start, true));
-        for _ in 1..(NPROCS as usize) {
-            envs.push(Env::new_with_recording(random_start, false));
+        envs.push(Env::new_with_tickers_and_recording(tickers.clone(), random_start, true));
+        eprintln!("first env");
+        for i in 1..(NPROCS as usize) {
+            envs.push(Env::new_with_tickers_and_recording(tickers.clone(), random_start, false));
+            eprintln!("env {}", i);
         }
         for (i, env) in envs.iter_mut().enumerate() {
             env.env_id = i;

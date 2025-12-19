@@ -135,7 +135,7 @@ const SDE_SAMPLE_FREQ: usize = 1;
 // PPO hyperparameters
 const PPO_CLIP_RATIO: f64 = 0.2; // Clip range for policy ratio (the trust region)
 const VALUE_CLIP_RANGE: f64 = 0.2; // Clip range for value function
-const ENTROPY_COEF: f64 = 0.01;
+const ENTROPY_COEF: f64 = 0.0;
 const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
 const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
                                 // Conservative KL early stopping (SB3-style)
@@ -250,7 +250,6 @@ pub fn train(weights_path: Option<&str>) {
         let s_log_probs = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
 
         stream_state.reset();
-
 
         // Use a separate index (s) for tensor storage, starting from 0
         // Loop through the episode using relative steps (0 to max_step)

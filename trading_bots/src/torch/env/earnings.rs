@@ -1,4 +1,13 @@
+use std::sync::{Arc, OnceLock, Mutex};
+use std::collections::HashMap;
 use crate::data::EarningsReport;
+
+/// Global cache for earnings indicators (ticker -> indicators)
+static EARNINGS_CACHE: OnceLock<Mutex<HashMap<String, Arc<EarningsIndicators>>>> = OnceLock::new();
+
+fn get_cache() -> &'static Mutex<HashMap<String, Arc<EarningsIndicators>>> {
+    EARNINGS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Precomputed earnings indicators per step (from cached quarterly reports)
 #[derive(Debug)]
@@ -12,6 +21,31 @@ pub struct EarningsIndicators {
 }
 
 impl EarningsIndicators {
+    /// Get cached earnings indicators or compute if not present
+    pub fn get_or_compute(
+        ticker: &str,
+        reports: &[EarningsReport],
+        bar_dates: &[String],
+        prices: &[f64],
+    ) -> Arc<EarningsIndicators> {
+        let cache = get_cache();
+        {
+            let locked = cache.lock().unwrap();
+            if let Some(cached) = locked.get(ticker) {
+                if cached.eps.len() == prices.len() {
+                    return cached.clone();
+                }
+            }
+        }
+        let computed = if reports.is_empty() {
+            Arc::new(Self::empty(prices.len()))
+        } else {
+            Arc::new(Self::compute(reports, bar_dates, prices))
+        };
+        cache.lock().unwrap().insert(ticker.to_string(), computed.clone());
+        computed
+    }
+
     pub fn empty(n: usize) -> Self {
         Self {
             steps_to_next: vec![0.0; n],
