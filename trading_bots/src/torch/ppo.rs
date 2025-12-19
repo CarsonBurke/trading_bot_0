@@ -258,7 +258,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step() {
             env.set_step(step);
 
-            let (critic, _critic_logits, (action_mean, action_log_std, _divisor), attn_weights) =
+            let (critic, _critic_logits, (action_mean, action_log_std, _divisor, _rpo_alpha), attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
@@ -492,7 +492,7 @@ pub fn train(weights_path: Option<&str>) {
                         .narrow(0, mb_global_start * NPROCS, mini_batch_samples)
                         .view([mini_batch_len, NPROCS, -1]);
 
-                    let (critics, critic_logits, (action_means, action_log_stds, _), _) =
+                    let (critics, critic_logits, (action_means, action_log_stds, _, rpo_alpha), _) =
                         trading_model.forward_sequence_with_state(
                             &price_deltas_seq,
                             &static_obs_seq,
@@ -515,9 +515,13 @@ pub fn train(weights_path: Option<&str>) {
                     let zeros = zeros_max.narrow(0, 0, mini_batch_samples);
                     let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
 
-                    // log N(u; μ, σ)
+                    // RPO: perturb action means during update for robustness
+                    let rpo_noise = Tensor::empty_like(&action_means).uniform_(-1.0, 1.0) * &rpo_alpha;
+                    let action_means_perturbed = &action_means + rpo_noise;
+
+                    // log N(u; μ_perturbed, σ)
                     let action_std = action_log_stds.exp();
-                    let u_normalized = (&u - &action_means) / &action_std;
+                    let u_normalized = (&u - &action_means_perturbed) / &action_std;
                     let u_squared = u_normalized.pow_tensor_scalar(2);
                     let two_log_std = &action_log_stds * 2.0;
                     let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
@@ -642,7 +646,7 @@ pub fn train(weights_path: Option<&str>) {
         let (mean_std, min_std, max_std, mean_div) = tch::no_grad(|| {
             let price_deltas_step = s_price_deltas.get(0);
             let static_obs = s_static_obs.get(0);
-            let (_, _, (_, action_log_std, divisor), _) =
+            let (_, _, (_, action_log_std, divisor, _), _) =
                 trading_model.forward(&price_deltas_step, &static_obs, false);
             let std = action_log_std.exp();
             (
@@ -675,7 +679,7 @@ pub fn train(weights_path: Option<&str>) {
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
-            let (_, _, (debug_mean, debug_log_std, _debug_divisor), _attn_weights) =
+            let (_, _, (debug_mean, debug_log_std, _debug_divisor, _), _attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(0);
                     let static_obs = s_static_obs.get(0);

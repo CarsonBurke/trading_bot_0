@@ -78,7 +78,7 @@ pub fn run_inference<P: AsRef<Path>>(
 
             // First call: model.step detects full obs and initializes stream state
             // Subsequent calls: model.step processes single delta per ticker
-            let (_, _, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
+            let (_, _, (action_mean, action_log_std, _, _), _) = tch::no_grad(|| {
                 model.step(&current_price_deltas, &current_static_obs, &mut stream_state)
             });
 
