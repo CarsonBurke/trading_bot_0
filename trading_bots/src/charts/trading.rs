@@ -1,11 +1,12 @@
 use hashbrown::HashMap;
 use plotters::{
-    prelude::{BitMapBackend, Circle, EmptyElement, IntoDrawingArea, SeriesLabelPosition},
+    prelude::{BitMapBackend, Circle, EmptyElement, IntoDrawingArea},
     series::{AreaSeries, LineSeries, PointSeries},
     style::{Color, ShapeStyle},
 };
 use shared::theme::plotters_colors as theme;
 
+use super::utils::{legend_rect, LegendConfig, CHART_DIMS};
 use crate::constants::CHART_IMAGE_FORMAT;
 use crate::types::Data;
 
@@ -16,7 +17,7 @@ pub fn buy_sell_chart(
     sell_indexes: &HashMap<usize, (f64, f64)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/buy_sell.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = data.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -83,7 +84,7 @@ pub fn buy_sell_chart_vec(
     sell_indexes: &[f64],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/buy_sell_vec.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = data.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -155,7 +156,7 @@ pub fn assets_chart(
     benchmark: Option<&Data>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/assets.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let mut max_val = assets.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -181,19 +182,20 @@ pub fn assets_chart(
         .light_line_style(&theme::SURFACE0)
         .draw()?;
 
-    chart.draw_series(
-        AreaSeries::new(
-            assets
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value as f32)),
-            0.0,
-            theme::BLUE.mix(0.2),
-        )
-        .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
-    )?
-    .label("total")
-    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::BLUE.mix(0.8).filled()));
+    chart
+        .draw_series(
+            AreaSeries::new(
+                assets
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (index as u32, *value as f32)),
+                0.0,
+                theme::BLUE.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
+        )?
+        .label("total")
+        .legend(legend_rect(&theme::BLUE));
 
     let positioned = {
         if let Some(positioned) = positioned {
@@ -207,51 +209,54 @@ pub fn assets_chart(
         }
     };
 
-    chart.draw_series(
-        AreaSeries::new(
-            positioned
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value as f32)),
-            0.0,
-            theme::RED.mix(0.2),
-        )
-        .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
-    )?
-    .label("positioned")
-    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::RED.mix(0.8).filled()));
+    chart
+        .draw_series(
+            AreaSeries::new(
+                positioned
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (index as u32, *value as f32)),
+                0.0,
+                theme::RED.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
+        )?
+        .label("positioned")
+        .legend(legend_rect(&theme::RED));
 
-    chart.draw_series(
-        AreaSeries::new(
-            cash.iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value as f32)),
-            0.0,
-            theme::GREEN.mix(0.2),
-        )
-        .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
-    )?
-    .label("cash")
-    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::GREEN.mix(0.8).filled()));
+    chart
+        .draw_series(
+            AreaSeries::new(
+                cash.iter()
+                    .enumerate()
+                    .map(|(index, value)| (index as u32, *value as f32)),
+                0.0,
+                theme::GREEN.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
+        )?
+        .label("cash")
+        .legend(legend_rect(&theme::GREEN));
 
     if let Some(bench) = benchmark {
-        chart.draw_series(LineSeries::new(
-            bench
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value as f32)),
-            ShapeStyle::from(&theme::YELLOW).stroke_width(1),
-        ))?
-        .label("benchmark")
-        .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::YELLOW.mix(0.8).filled()));
+        chart
+            .draw_series(LineSeries::new(
+                bench
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (index as u32, *value as f32)),
+                ShapeStyle::from(&theme::YELLOW).stroke_width(1),
+            ))?
+            .label("benchmark")
+            .legend(legend_rect(&theme::YELLOW));
     }
 
     chart
         .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .background_style(theme::SURFACE0.mix(0.7))
-        .border_style(&theme::SURFACE1)
-        .label_font(("sans-serif", 14, &theme::TEXT))
+        .position(LegendConfig::position())
+        .background_style(LegendConfig::background())
+        .border_style(LegendConfig::border())
+        .label_font(LegendConfig::font())
         .draw()?;
 
     root.present()
@@ -266,7 +271,7 @@ pub fn want_chart(
     wants: &HashMap<usize, f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/want.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let smoothed_wants = (0..data.len())

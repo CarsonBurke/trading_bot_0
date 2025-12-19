@@ -4,6 +4,7 @@ pub mod data_analysis;
 pub mod multi_line;
 pub mod simple;
 pub mod trading;
+mod utils;
 
 pub use action::{hold_action_chart, raw_action_chart, reward_chart};
 pub use candle::{candle_chart, chart};

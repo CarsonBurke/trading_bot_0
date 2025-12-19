@@ -1,10 +1,11 @@
 use plotters::{
-    prelude::{BitMapBackend, IntoDrawingArea, SeriesLabelPosition},
+    prelude::{BitMapBackend, IntoDrawingArea},
     series::LineSeries,
     style::{Color, ShapeStyle},
 };
 use shared::theme::plotters_colors as theme;
 
+use super::utils::{legend_rect, LegendConfig, CHART_DIMS};
 use crate::constants::CHART_IMAGE_FORMAT;
 use crate::types::Data;
 
@@ -27,7 +28,7 @@ pub fn multi_line_chart_with_labels(
     y_label: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let colors = [
@@ -78,26 +79,24 @@ pub fn multi_line_chart_with_labels(
     mesh.draw()?;
 
     for (i, (label, data)) in series.iter().enumerate() {
-        let color = colors[i % colors.len()].mix(0.8);
+        let color = colors[i % colors.len()];
         chart
             .draw_series(LineSeries::new(
                 data.iter()
                     .enumerate()
                     .map(|(idx, v)| (idx as u32 * x_scale, *v)),
-                ShapeStyle::from(&color).stroke_width(1),
+                ShapeStyle::from(&color.mix(0.8)).stroke_width(1),
             ))?
             .label(*label)
-            .legend(move |(x, y)| {
-                plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], color.filled())
-            });
+            .legend(legend_rect(color));
     }
 
     chart
         .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .background_style(theme::SURFACE0.mix(0.7))
-        .border_style(&theme::SURFACE1)
-        .label_font(("sans-serif", 14, &theme::TEXT))
+        .position(LegendConfig::position())
+        .background_style(LegendConfig::background())
+        .border_style(LegendConfig::border())
+        .label_font(LegendConfig::font())
         .draw()?;
 
     root.present()
@@ -133,7 +132,7 @@ pub fn multi_line_chart_log_with_labels(
     y_label: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let colors = [
@@ -194,27 +193,25 @@ pub fn multi_line_chart_log_with_labels(
     mesh.draw()?;
 
     for (i, (label, data)) in series.iter().enumerate() {
-        let color = colors[i % colors.len()].mix(0.8);
+        let color = colors[i % colors.len()];
         chart
             .draw_series(LineSeries::new(
                 data.iter()
                     .enumerate()
                     .filter(|(_, v)| v.is_finite())
                     .map(|(idx, v)| (idx as u32 * x_scale, symlog(*v))),
-                ShapeStyle::from(&color).stroke_width(1),
+                ShapeStyle::from(&color.mix(0.8)).stroke_width(1),
             ))?
             .label(*label)
-            .legend(move |(x, y)| {
-                plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], color.filled())
-            });
+            .legend(legend_rect(color));
     }
 
     chart
         .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .background_style(theme::SURFACE0.mix(0.7))
-        .border_style(&theme::SURFACE1)
-        .label_font(("sans-serif", 14, &theme::TEXT))
+        .position(LegendConfig::position())
+        .background_style(LegendConfig::background())
+        .border_style(LegendConfig::border())
+        .label_font(LegendConfig::font())
         .draw()?;
 
     root.present()

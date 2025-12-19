@@ -5,11 +5,12 @@ use plotters::{
 };
 use shared::theme::plotters_colors as theme;
 
+use super::utils::CHART_DIMS;
 use crate::constants::CHART_IMAGE_FORMAT;
 
 pub fn reward_chart(dir: &String, rewards: &Vec<f64>) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/reward.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = rewards.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -55,7 +56,7 @@ pub fn hold_action_chart(
     hold_actions: &Vec<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/hold_action.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = hold_actions.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -100,7 +101,7 @@ pub fn raw_action_chart(
     raw_actions: &Vec<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/raw_action.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     if raw_actions.is_empty() {

@@ -1,10 +1,11 @@
 use plotters::{
-    prelude::{BitMapBackend, IntoDrawingArea, SeriesLabelPosition},
+    prelude::{BitMapBackend, IntoDrawingArea},
     series::{AreaSeries, LineSeries},
     style::{Color, ShapeStyle},
 };
 use shared::theme::plotters_colors as theme;
 
+use super::utils::{legend_rect, LegendConfig, CHART_DIMS};
 use crate::constants::CHART_IMAGE_FORMAT;
 use crate::types::Data;
 
@@ -37,7 +38,7 @@ pub fn simple_chart_with_labels(
     y_label: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = data.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -65,37 +66,39 @@ pub fn simple_chart_with_labels(
     }
     mesh.draw()?;
 
-    chart.draw_series(
-        AreaSeries::new(
-            data.iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value)),
-            0.0,
-            theme::BLUE.mix(0.2),
-        )
-        .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
-    )?
-    .label("value")
-    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::BLUE.mix(0.8).filled()));
+    chart
+        .draw_series(
+            AreaSeries::new(
+                data.iter()
+                    .enumerate()
+                    .map(|(index, value)| (index as u32, *value)),
+                0.0,
+                theme::BLUE.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
+        )?
+        .label("value")
+        .legend(legend_rect(&theme::BLUE));
 
     let window = (data.len() / 10).max(5).min(50);
     let ma = compute_moving_avg(data, window);
-    chart.draw_series(LineSeries::new(
-        ma.iter()
-            .enumerate()
-            .filter(|(_, v)| !v.is_nan())
-            .map(|(i, v)| (i as u32, *v)),
-        ShapeStyle::from(&theme::YELLOW).stroke_width(1),
-    ))?
-    .label("MA")
-    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::YELLOW.mix(0.8).filled()));
+    chart
+        .draw_series(LineSeries::new(
+            ma.iter()
+                .enumerate()
+                .filter(|(_, v)| !v.is_nan())
+                .map(|(i, v)| (i as u32, *v)),
+            ShapeStyle::from(&theme::YELLOW).stroke_width(1),
+        ))?
+        .label("MA")
+        .legend(legend_rect(&theme::YELLOW));
 
     chart
         .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .background_style(theme::SURFACE0.mix(0.7))
-        .border_style(&theme::SURFACE1)
-        .label_font(("sans-serif", 14, &theme::TEXT))
+        .position(LegendConfig::position())
+        .background_style(LegendConfig::background())
+        .border_style(LegendConfig::border())
+        .label_font(LegendConfig::font())
         .draw()?;
 
     root.present()
@@ -129,7 +132,7 @@ pub fn simple_chart_log_with_labels(
     y_label: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), CHART_DIMS).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let finite_data: Vec<f64> = data.iter().copied().filter(|v| v.is_finite()).collect();
@@ -171,34 +174,36 @@ pub fn simple_chart_log_with_labels(
     }
     mesh.draw()?;
 
-    chart.draw_series(LineSeries::new(
-        data.iter()
-            .enumerate()
-            .filter(|(_, v)| v.is_finite())
-            .map(|(index, value)| (index as u32, symlog(*value))),
-        ShapeStyle::from(&theme::BLUE).stroke_width(1),
-    ))?
-    .label("value")
-    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::BLUE.mix(0.8).filled()));
+    chart
+        .draw_series(LineSeries::new(
+            data.iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .map(|(index, value)| (index as u32, symlog(*value))),
+            ShapeStyle::from(&theme::BLUE).stroke_width(1),
+        ))?
+        .label("value")
+        .legend(legend_rect(&theme::BLUE));
 
     let window = (data.len() / 10).max(5).min(50);
     let ma = compute_moving_avg(data, window);
-    chart.draw_series(LineSeries::new(
-        ma.iter()
-            .enumerate()
-            .filter(|(_, v)| !v.is_nan())
-            .map(|(i, v)| (i as u32, symlog(*v))),
-        ShapeStyle::from(&theme::YELLOW).stroke_width(1),
-    ))?
-    .label("MA")
-    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::YELLOW.mix(0.8).filled()));
+    chart
+        .draw_series(LineSeries::new(
+            ma.iter()
+                .enumerate()
+                .filter(|(_, v)| !v.is_nan())
+                .map(|(i, v)| (i as u32, symlog(*v))),
+            ShapeStyle::from(&theme::YELLOW).stroke_width(1),
+        ))?
+        .label("MA")
+        .legend(legend_rect(&theme::YELLOW));
 
     chart
         .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .background_style(theme::SURFACE0.mix(0.7))
-        .border_style(&theme::SURFACE1)
-        .label_font(("sans-serif", 14, &theme::TEXT))
+        .position(LegendConfig::position())
+        .background_style(LegendConfig::background())
+        .border_style(LegendConfig::border())
+        .label_font(LegendConfig::font())
         .draw()?;
 
     root.present()
