@@ -16,7 +16,7 @@ pub fn buy_sell_chart(
     sell_indexes: &HashMap<usize, (f64, f64)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/buy_sell.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = data.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -83,7 +83,7 @@ pub fn buy_sell_chart_vec(
     sell_indexes: &[f64],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/buy_sell_vec.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = data.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -155,7 +155,7 @@ pub fn assets_chart(
     benchmark: Option<&Data>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/assets.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let mut max_val = assets.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -249,7 +249,7 @@ pub fn assets_chart(
     chart
         .configure_series_labels()
         .position(SeriesLabelPosition::UpperRight)
-        .background_style(&theme::SURFACE0)
+        .background_style(theme::SURFACE0.mix(0.7))
         .border_style(&theme::SURFACE1)
         .label_font(("sans-serif", 14, &theme::TEXT))
         .draw()?;
@@ -266,7 +266,7 @@ pub fn want_chart(
     wants: &HashMap<usize, f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/want.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let smoothed_wants = (0..data.len())

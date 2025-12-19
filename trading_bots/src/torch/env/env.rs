@@ -312,7 +312,7 @@ impl Env {
         };
 
         println!(
-            "{} {} [{}] - Total Assets: {} ({}) cumulative reward {:.2} | Index: {} | Outperformance: {} | Commissions: {} | tickers {:?} time {:.2}s",
+            "{} {} [{}] - Total Assets: {} ({}) cumulative reward {:.2} | Index: {} | Outperformance: {} | Commissions: {} | tickers {:?} time {:.2}s {}",
             "Episode".bright_blue(),
             self.episode.to_string().bright_blue().bold(),
             format!("Env {}", self.env_id).bright_blue(),
@@ -323,7 +323,11 @@ impl Env {
             outperf_str,
             format!("${:.2}", self.episode_history.total_commissions).yellow(),
             self.tickers,
-            Instant::now().duration_since(self.episode_start).as_secs_f32()
+            Instant::now().duration_since(self.episode_start).as_secs_f32(),
+            match self.record_history_io {
+                true => "| recorded history",
+                false => "",
+            }
         );
 
         if self.record_history_io {

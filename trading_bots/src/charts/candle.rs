@@ -10,7 +10,7 @@ use crate::types::Data;
 
 pub fn chart(data: &Data) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("charts/chart.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = *data
@@ -59,7 +59,7 @@ pub fn candle_chart(
     dir: &String,
     bars: &[historical::Bar],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dimensions = (2560, 800);
+    let dimensions = (2560, 780);
     let path = format!("{dir}/candle.{}", CHART_IMAGE_FORMAT);
     let root = BitMapBackend::new(path.as_str(), dimensions).into_drawing_area();
     root.fill(&theme::BASE)?;

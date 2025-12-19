@@ -15,8 +15,19 @@ pub fn multi_line_chart(
     x_scale: u32,
     x_label: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    multi_line_chart_with_labels(dir, name, series, x_scale, Some(x_label), None)
+}
+
+pub fn multi_line_chart_with_labels(
+    dir: &String,
+    name: &str,
+    series: &[(&str, &Data)],
+    x_scale: u32,
+    x_label: Option<&str>,
+    y_label: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let colors = [
@@ -54,13 +65,17 @@ pub fn multi_line_chart(
         .y_label_area_size(50)
         .build_cartesian_2d(0..x_max, y_min..y_max)?;
 
-    chart
-        .configure_mesh()
-        .label_style(("sans-serif", 15, &theme::TEXT))
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
         .axis_style(&theme::SURFACE1)
-        .light_line_style(&theme::SURFACE0)
-        .x_desc(x_label)
-        .draw()?;
+        .light_line_style(&theme::SURFACE0);
+    if let Some(x) = x_label {
+        mesh.x_desc(x);
+    }
+    if let Some(y) = y_label {
+        mesh.y_desc(y);
+    }
+    mesh.draw()?;
 
     for (i, (label, data)) in series.iter().enumerate() {
         let color = colors[i % colors.len()].mix(0.8);
@@ -80,7 +95,7 @@ pub fn multi_line_chart(
     chart
         .configure_series_labels()
         .position(SeriesLabelPosition::UpperRight)
-        .background_style(&theme::SURFACE0)
+        .background_style(theme::SURFACE0.mix(0.7))
         .border_style(&theme::SURFACE1)
         .label_font(("sans-serif", 14, &theme::TEXT))
         .draw()?;
@@ -106,8 +121,19 @@ pub fn multi_line_chart_log(
     x_scale: u32,
     x_label: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    multi_line_chart_log_with_labels(dir, name, series, x_scale, Some(x_label), None)
+}
+
+pub fn multi_line_chart_log_with_labels(
+    dir: &String,
+    name: &str,
+    series: &[(&str, &Data)],
+    x_scale: u32,
+    x_label: Option<&str>,
+    y_label: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let colors = [
@@ -154,14 +180,18 @@ pub fn multi_line_chart_log(
         .y_label_area_size(70)
         .build_cartesian_2d(0..x_max, y_min_t..y_max_t)?;
 
-    chart
-        .configure_mesh()
-        .label_style(("sans-serif", 15, &theme::TEXT))
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
         .axis_style(&theme::SURFACE1)
         .light_line_style(&theme::SURFACE0)
-        .x_desc(x_label)
-        .y_label_formatter(&|v| format!("{:.2e}", symlog_inv(*v)))
-        .draw()?;
+        .y_label_formatter(&|v| format!("{:.2e}", symlog_inv(*v)));
+    if let Some(x) = x_label {
+        mesh.x_desc(x);
+    }
+    if let Some(y) = y_label {
+        mesh.y_desc(y);
+    }
+    mesh.draw()?;
 
     for (i, (label, data)) in series.iter().enumerate() {
         let color = colors[i % colors.len()].mix(0.8);
@@ -182,7 +212,7 @@ pub fn multi_line_chart_log(
     chart
         .configure_series_labels()
         .position(SeriesLabelPosition::UpperRight)
-        .background_style(&theme::SURFACE0)
+        .background_style(theme::SURFACE0.mix(0.7))
         .border_style(&theme::SURFACE1)
         .label_font(("sans-serif", 14, &theme::TEXT))
         .draw()?;

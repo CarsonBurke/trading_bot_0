@@ -26,8 +26,18 @@ pub(crate) fn compute_moving_avg(data: &[f64], window: usize) -> Vec<f64> {
 }
 
 pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn std::error::Error>> {
+    simple_chart_with_labels(dir, name, data, None, None)
+}
+
+pub fn simple_chart_with_labels(
+    dir: &String,
+    name: &str,
+    data: &Data,
+    x_label: Option<&str>,
+    y_label: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let y_min = data.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -43,12 +53,17 @@ pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn
         .y_label_area_size(50)
         .build_cartesian_2d(0..data.len() as u32, y_min..y_max)?;
 
-    chart
-        .configure_mesh()
-        .label_style(("sans-serif", 15, &theme::TEXT))
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
         .axis_style(&theme::SURFACE1)
-        .light_line_style(&theme::SURFACE0)
-        .draw()?;
+        .light_line_style(&theme::SURFACE0);
+    if let Some(x) = x_label {
+        mesh.x_desc(x);
+    }
+    if let Some(y) = y_label {
+        mesh.y_desc(y);
+    }
+    mesh.draw()?;
 
     chart.draw_series(
         AreaSeries::new(
@@ -78,7 +93,7 @@ pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn
     chart
         .configure_series_labels()
         .position(SeriesLabelPosition::UpperRight)
-        .background_style(&theme::SURFACE0)
+        .background_style(theme::SURFACE0.mix(0.7))
         .border_style(&theme::SURFACE1)
         .label_font(("sans-serif", 14, &theme::TEXT))
         .draw()?;
@@ -103,8 +118,18 @@ pub fn simple_chart_log(
     data: &Data,
     x_label: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    simple_chart_log_with_labels(dir, name, data, Some(x_label), None)
+}
+
+pub fn simple_chart_log_with_labels(
+    dir: &String,
+    name: &str,
+    data: &Data,
+    x_label: Option<&str>,
+    y_label: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("{dir}/{name}.{}", CHART_IMAGE_FORMAT);
-    let root = BitMapBackend::new(path.as_str(), (2560, 800)).into_drawing_area();
+    let root = BitMapBackend::new(path.as_str(), (2560, 780)).into_drawing_area();
     root.fill(&theme::BASE)?;
 
     let finite_data: Vec<f64> = data.iter().copied().filter(|v| v.is_finite()).collect();
@@ -133,14 +158,18 @@ pub fn simple_chart_log(
         .y_label_area_size(70)
         .build_cartesian_2d(0..data.len() as u32, y_min_t..y_max_t)?;
 
-    chart
-        .configure_mesh()
-        .label_style(("sans-serif", 15, &theme::TEXT))
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
         .axis_style(&theme::SURFACE1)
         .light_line_style(&theme::SURFACE0)
-        .x_desc(x_label)
-        .y_label_formatter(&|v| format!("{:.2e}", symlog_inv(*v)))
-        .draw()?;
+        .y_label_formatter(&|v| format!("{:.2e}", symlog_inv(*v)));
+    if let Some(x) = x_label {
+        mesh.x_desc(x);
+    }
+    if let Some(y) = y_label {
+        mesh.y_desc(y);
+    }
+    mesh.draw()?;
 
     chart.draw_series(LineSeries::new(
         data.iter()
@@ -167,7 +196,7 @@ pub fn simple_chart_log(
     chart
         .configure_series_labels()
         .position(SeriesLabelPosition::UpperRight)
-        .background_style(&theme::SURFACE0)
+        .background_style(theme::SURFACE0.mix(0.7))
         .border_style(&theme::SURFACE1)
         .label_font(("sans-serif", 14, &theme::TEXT))
         .draw()?;
