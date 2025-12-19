@@ -14,6 +14,7 @@ pub struct MetaHistory {
     pub mean_std: Vec<f64>,
     pub min_std: Vec<f64>,
     pub max_std: Vec<f64>,
+    pub rpo_alpha: Vec<f64>,
     pub mean_advantage: Vec<f64>,
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
@@ -36,10 +37,11 @@ impl MetaHistory {
         self.grad_norm.push(grad_norm);
     }
 
-    pub fn record_std_stats(&mut self, mean_std: f64, min_std: f64, max_std: f64) {
+    pub fn record_std_stats(&mut self, mean_std: f64, min_std: f64, max_std: f64, rpo_alpha: f64) {
         self.mean_std.push(mean_std);
         self.min_std.push(min_std);
         self.max_std.push(max_std);
+        self.rpo_alpha.push(rpo_alpha);
     }
 
     pub fn record_advantage_stats(&mut self, mean: f64, min: f64, max: f64) {
@@ -81,6 +83,7 @@ impl MetaHistory {
                     ("mean", &self.mean_std),
                     ("min", &self.min_std),
                     ("max", &self.max_std),
+                    ("rpo_alpha", &self.rpo_alpha),
                 ],
                 1,
                 "Episode",

@@ -142,6 +142,13 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const LEARNING_RATE: f64 = 2e-4;
+
+// RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
+const RPO_ALPHA_MIN: f64 = 0.01;
+const RPO_ALPHA_MAX: f64 = 0.5;
+const RPO_TARGET_KL: f64 = 0.015; // Total induced KL target (formula already includes d)
+const RPO_ALPHA_INIT: f64 = 0.15;
+const ALPHA_LOSS_COEF: f64 = 0.1;
 const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
 
 pub fn train(weights_path: Option<&str>) {
@@ -219,6 +226,14 @@ pub fn train(weights_path: Option<&str>) {
     let mut total_rewards = 0f64;
     let mut total_episodes = 0f64;
 
+    // RPO alpha: sigmoid parameterization for smooth gradients
+    // rho -> alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
+    // Compute init rho from desired alpha: rho = logit((alpha - min) / (max - min))
+    let p_init = (RPO_ALPHA_INIT - RPO_ALPHA_MIN) / (RPO_ALPHA_MAX - RPO_ALPHA_MIN);
+    let rho_init = (p_init / (1.0 - p_init)).ln(); // logit
+    let mut rpo_rho = vs.root().var("rpo_alpha_rho", &[1], nn::Init::Const(rho_init));
+    // Note: rpo_rho is in main VarStore, so it will be saved/loaded with model weights
+
     let _ = env.reset();
 
     let mut rolling_buffer = GpuRollingBuffer::new(device);
@@ -258,7 +273,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step() {
             env.set_step(step);
 
-            let (critic, _critic_logits, (action_mean, action_log_std, _divisor, _rpo_alpha), attn_weights) =
+            let (critic, _critic_logits, (action_mean, action_log_std, _divisor), attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
@@ -271,7 +286,9 @@ pub fn train(weights_path: Option<&str>) {
 
             // Logistic-normal sampling: model outputs K-1 dims, we append 0 for reference
             // u ~ N(μ, σ), u_ext = [u, 0], y = softmax(u_ext)
-            let action_std = action_log_std.exp();
+            let action_log_std_clamped = action_log_std.clamp(-20.0, 5.0);
+            let action_std = action_log_std_clamped.exp();
+
             if sde_noise.is_none() || (step % SDE_SAMPLE_FREQ == 0) {
                 sde_noise = Some(Tensor::randn_like(&action_mean));
             }
@@ -288,7 +305,7 @@ pub fn train(weights_path: Option<&str>) {
             // Log-prob with Jacobian: log π(y) = log N(u; μ, σ) - Σ log(y_i)
             let u_normalized = (&u - &action_mean) / &action_std;
             let u_squared = u_normalized.pow_tensor_scalar(2);
-            let two_log_std = &action_log_std * 2.0;
+            let two_log_std = &action_log_std_clamped * 2.0;
             let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
             let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float); // sum over K-1 dims
 
@@ -492,7 +509,7 @@ pub fn train(weights_path: Option<&str>) {
                         .narrow(0, mb_global_start * NPROCS, mini_batch_samples)
                         .view([mini_batch_len, NPROCS, -1]);
 
-                    let (critics, critic_logits, (action_means, action_log_stds, _, rpo_alpha), _) =
+                    let (critics, critic_logits, (action_means, action_log_stds, _), _) =
                         trading_model.forward_sequence_with_state(
                             &price_deltas_seq,
                             &static_obs_seq,
@@ -515,15 +532,21 @@ pub fn train(weights_path: Option<&str>) {
                     let zeros = zeros_max.narrow(0, 0, mini_batch_samples);
                     let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
 
-                    // RPO: perturb action means during update for robustness
-                    let rpo_noise = Tensor::empty_like(&action_means).uniform_(-1.0, 1.0) * &rpo_alpha;
+                    // RPO alpha: sigmoid parameterization for smooth gradients everywhere
+                    let rpo_alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
+
+                    // For PPO loss: detach alpha so policy gradients don't flow through it
+                    let rpo_alpha_detached = rpo_alpha.detach();
+                    let rpo_noise = Tensor::empty_like(&action_means).uniform_(-1.0, 1.0) * &rpo_alpha_detached;
                     let action_means_perturbed = &action_means + rpo_noise;
 
                     // log N(u; μ_perturbed, σ)
-                    let action_std = action_log_stds.exp();
+                    let action_log_stds_clamped = action_log_stds.clamp(-20.0, 5.0);
+                    let action_std = action_log_stds_clamped.exp();
+                    let two_log_std = &action_log_stds_clamped * 2.0;
+
                     let u_normalized = (&u - &action_means_perturbed) / &action_std;
                     let u_squared = u_normalized.pow_tensor_scalar(2);
-                    let two_log_std = &action_log_stds * 2.0;
                     let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                     let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
 
@@ -580,14 +603,26 @@ pub fn train(weights_path: Option<&str>) {
                     // KL and loss for metrics (extract before backward frees graph)
                     let approx_kl_val =
                         tch::no_grad(|| (&old_log_probs_mb - &action_log_probs).mean(Kind::Float));
-                    let loss =
+                    let ppo_loss =
                         value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
-                    let loss_val = tch::no_grad(|| loss.shallow_clone());
+                    let loss_val = tch::no_grad(|| ppo_loss.shallow_clone());
 
-                    // Backward immediately (frees graph, accumulates grads)
-                    let scaled_loss =
-                        &loss * (mini_batch_samples as f64 / samples_per_accum as f64);
-                    scaled_loss.backward();
+                    // Backward PPO loss (alpha detached, so no alpha gradients here)
+                    let scaled_ppo_loss =
+                        &ppo_loss * (mini_batch_samples as f64 / samples_per_accum as f64);
+                    scaled_ppo_loss.backward();
+
+                    // Alpha loss: target induced KL using detached network outputs
+                    // For diagonal Gaussian with z_i ~ U(-alpha, alpha):
+                    // E[KL] = sum_i E[z_i^2] / (2*sigma_i^2) = sum_i (alpha^2/3) / (2*sigma_i^2)
+                    //       = d * (alpha^2/6) * mean(1/sigma^2)  where d = ACTION_COUNT - 1
+                    let action_std_detached = action_log_stds.detach().clamp(-20.0, 5.0).exp();
+                    let var = action_std_detached.pow_tensor_scalar(2);
+                    let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
+                    let d = (ACTION_COUNT - 1) as f64;
+                    let induced_kl: Tensor = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
+                    let alpha_loss = (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0);
+                    (alpha_loss * ALPHA_LOSS_COEF).backward();
 
                     // Accumulate metrics on GPU
                     let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * mini_batch_samples as f64));
@@ -615,7 +650,22 @@ pub fn train(weights_path: Option<&str>) {
                     grad_norm_count += 1;
 
                     opt.clip_grad_norm(MAX_GRAD_NORM);
-                    opt.step();
+
+                    // Clamp delta rho on GPU (conservative bound for delta alpha)
+                    // Max sigmoid slope is 0.25, so |Δα| <= range * 0.25 * |Δρ|
+                    // Thus |Δρ| <= MAX_DELTA_ALPHA / (0.25 * range) ensures |Δα| <= MAX_DELTA_ALPHA
+                    const MAX_DELTA_ALPHA: f64 = 0.02;
+                    let range = RPO_ALPHA_MAX - RPO_ALPHA_MIN;
+                    let max_delta_rho = MAX_DELTA_ALPHA / (0.25 * range);
+
+                    tch::no_grad(|| {
+                        let rho_before = rpo_rho.detach();
+                        opt.step();
+                        let delta_rho = &rpo_rho - &rho_before;
+                        let delta_rho_clamped = delta_rho.clamp(-max_delta_rho, max_delta_rho);
+                        let rho_new = rho_before + delta_rho_clamped;
+                        let _ = rpo_rho.copy_(&rho_new);
+                    });
                     opt.zero_grad();
                 }
             }
@@ -642,11 +692,17 @@ pub fn train(weights_path: Option<&str>) {
             );
         }
 
+        // Get current alpha value for logging/charting
+        let rpo_alpha = tch::no_grad(|| {
+            let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
+            f64::try_from(alpha).unwrap_or(0.15)
+        });
+
         // Record std and divisor stats every episode
         let (mean_std, min_std, max_std, mean_div) = tch::no_grad(|| {
             let price_deltas_step = s_price_deltas.get(0);
             let static_obs = s_static_obs.get(0);
-            let (_, _, (_, action_log_std, divisor, _), _) =
+            let (_, _, (_, action_log_std, divisor), _) =
                 trading_model.forward(&price_deltas_step, &static_obs, false);
             let std = action_log_std.exp();
             (
@@ -658,7 +714,7 @@ pub fn train(weights_path: Option<&str>) {
         });
         env.primary_mut()
             .meta_history
-            .record_std_stats(mean_std, min_std, max_std);
+            .record_std_stats(mean_std, min_std, max_std, rpo_alpha);
         env.primary_mut().meta_history.record_divisor(mean_div);
 
         // Single GPU->CPU sync for loss and grad norm at end of all epochs
@@ -679,7 +735,7 @@ pub fn train(weights_path: Option<&str>) {
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
-            let (_, _, (debug_mean, debug_log_std, _debug_divisor, _), _attn_weights) =
+            let (_, _, (debug_mean, debug_log_std, _debug_divisor), _attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(0);
                     let static_obs = s_static_obs.get(0);
@@ -707,7 +763,7 @@ pub fn train(weights_path: Option<&str>) {
             };
 
             println!(
-                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, KL: {:.4} ({:.4}/dim), Clip: {:.1}%, Std: {:.4}",
+                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, KL: {:.4} ({:.4}/dim), Clip: {:.1}%, Std: {:.4}, RPO: {:.3}",
                 episode,
                 total_episodes,
                 total_rewards / total_episodes,
@@ -715,7 +771,8 @@ pub fn train(weights_path: Option<&str>) {
                 avg_kl,
                 kl_per_dim,
                 clip_frac * 100.0,
-                mean_std
+                mean_std,
+                rpo_alpha
             );
 
             // Warn if network is diverging

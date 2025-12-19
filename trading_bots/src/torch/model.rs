@@ -23,8 +23,8 @@ const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
 const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_DELTAS must be divisible by PATCH_SIZE");
 
-// (critic_value, critic_logits, (action_mean, action_log_std, divisor, rpo_alpha), attn_weights)
-pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor, Tensor, Tensor), Tensor);
+// (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_weights)
+pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor);
 
 /// Streaming state for O(1) inference per step
 /// - Ring buffer holds full delta history for head computation
@@ -99,7 +99,6 @@ pub struct TradingModel {
     sde_fc: nn::Linear,
     ln_sde: nn::LayerNorm,
     log_std_param: Tensor,
-    rpo_alpha_raw: Tensor,
     log_d_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
@@ -187,9 +186,7 @@ impl TradingModel {
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
-        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact - 1], Init::Const(-1.0));
-        // RPO: learned perturbation magnitude, softplus(raw) maps to [0, ~0.5] for robustness
-        let rpo_alpha_raw = p.var("rpo_alpha", &[1], Init::Const(-2.0)); // softplus(-2) ≈ 0.13
+        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact - 1], Init::Const(0.0));
         let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
 
         Self {
@@ -201,7 +198,7 @@ impl TradingModel {
             pma_seeds, pma_kv, pma_q, pma_out, ln_pma, global_to_seed,
             fc1, ln_fc1, fc2_actor, ln_fc2_actor, fc2_critic, ln_fc2_critic,
             fc3_actor, ln_fc3_actor, fc3_critic, ln_fc3_critic,
-            critic, bucket_centers, symlog_centers, actor_mean, sde_fc, ln_sde, log_std_param, rpo_alpha_raw, log_d_raw,
+            critic, bucket_centers, symlog_centers, actor_mean, sde_fc, ln_sde, log_std_param, log_d_raw,
             device: p.device(),
             num_heads, head_dim, pma_num_seeds,
         }
@@ -487,9 +484,6 @@ impl TradingModel {
         const LOG_D_RAW_SCALE: f64 = 5.0;
         let divisor = self.log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + 0.1;
 
-        // RPO alpha: softplus for positivity, clamped to reasonable range [0.01, 0.6]
-        let rpo_alpha = self.rpo_alpha_raw.softplus().clamp(0.01, 0.6);
-
-        (critic_value, critic_logits, (action_mean, action_log_std, divisor, rpo_alpha), attn_out_vis)
+        (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_out_vis)
     }
 }

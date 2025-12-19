@@ -1,5 +1,5 @@
 use plotters::{
-    prelude::{BitMapBackend, IntoDrawingArea},
+    prelude::{BitMapBackend, IntoDrawingArea, SeriesLabelPosition},
     series::LineSeries,
     style::{Color, ShapeStyle},
 };
@@ -79,6 +79,7 @@ pub fn multi_line_chart(
 
     chart
         .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
         .background_style(&theme::SURFACE0)
         .border_style(&theme::SURFACE1)
         .label_font(("sans-serif", 14, &theme::TEXT))
@@ -180,6 +181,7 @@ pub fn multi_line_chart_log(
 
     chart
         .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
         .background_style(&theme::SURFACE0)
         .border_style(&theme::SURFACE1)
         .label_font(("sans-serif", 14, &theme::TEXT))

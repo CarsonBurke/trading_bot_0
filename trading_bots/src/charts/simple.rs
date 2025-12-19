@@ -1,5 +1,5 @@
 use plotters::{
-    prelude::{BitMapBackend, IntoDrawingArea},
+    prelude::{BitMapBackend, IntoDrawingArea, SeriesLabelPosition},
     series::{AreaSeries, LineSeries},
     style::{Color, ShapeStyle},
 };
@@ -59,7 +59,9 @@ pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn
             theme::BLUE.mix(0.2),
         )
         .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
-    )?;
+    )?
+    .label("value")
+    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::BLUE.mix(0.8).filled()));
 
     let window = (data.len() / 10).max(5).min(50);
     let ma = compute_moving_avg(data, window);
@@ -69,7 +71,17 @@ pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn
             .filter(|(_, v)| !v.is_nan())
             .map(|(i, v)| (i as u32, *v)),
         ShapeStyle::from(&theme::YELLOW).stroke_width(1),
-    ))?;
+    ))?
+    .label("MA")
+    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::YELLOW.mix(0.8).filled()));
+
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
+        .background_style(&theme::SURFACE0)
+        .border_style(&theme::SURFACE1)
+        .label_font(("sans-serif", 14, &theme::TEXT))
+        .draw()?;
 
     root.present()
         .expect("unable to write chart to file, perhaps there is no directory");
@@ -136,7 +148,9 @@ pub fn simple_chart_log(
             .filter(|(_, v)| v.is_finite())
             .map(|(index, value)| (index as u32, symlog(*value))),
         ShapeStyle::from(&theme::BLUE).stroke_width(1),
-    ))?;
+    ))?
+    .label("value")
+    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::BLUE.mix(0.8).filled()));
 
     let window = (data.len() / 10).max(5).min(50);
     let ma = compute_moving_avg(data, window);
@@ -146,7 +160,17 @@ pub fn simple_chart_log(
             .filter(|(_, v)| !v.is_nan())
             .map(|(i, v)| (i as u32, symlog(*v))),
         ShapeStyle::from(&theme::YELLOW).stroke_width(1),
-    ))?;
+    ))?
+    .label("MA")
+    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::YELLOW.mix(0.8).filled()));
+
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
+        .background_style(&theme::SURFACE0)
+        .border_style(&theme::SURFACE1)
+        .label_font(("sans-serif", 14, &theme::TEXT))
+        .draw()?;
 
     root.present()
         .expect("unable to write chart to file, perhaps there is no directory");

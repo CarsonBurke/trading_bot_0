@@ -1,6 +1,6 @@
 use hashbrown::HashMap;
 use plotters::{
-    prelude::{BitMapBackend, Circle, EmptyElement, IntoDrawingArea},
+    prelude::{BitMapBackend, Circle, EmptyElement, IntoDrawingArea, SeriesLabelPosition},
     series::{AreaSeries, LineSeries, PointSeries},
     style::{Color, ShapeStyle},
 };
@@ -191,7 +191,9 @@ pub fn assets_chart(
             theme::BLUE.mix(0.2),
         )
         .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
-    )?;
+    )?
+    .label("total")
+    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::BLUE.mix(0.8).filled()));
 
     let positioned = {
         if let Some(positioned) = positioned {
@@ -215,7 +217,9 @@ pub fn assets_chart(
             theme::RED.mix(0.2),
         )
         .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
-    )?;
+    )?
+    .label("positioned")
+    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::RED.mix(0.8).filled()));
 
     chart.draw_series(
         AreaSeries::new(
@@ -226,7 +230,9 @@ pub fn assets_chart(
             theme::GREEN.mix(0.2),
         )
         .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
-    )?;
+    )?
+    .label("cash")
+    .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::GREEN.mix(0.8).filled()));
 
     if let Some(bench) = benchmark {
         chart.draw_series(LineSeries::new(
@@ -235,8 +241,18 @@ pub fn assets_chart(
                 .enumerate()
                 .map(|(index, value)| (index as u32, *value as f32)),
             ShapeStyle::from(&theme::YELLOW).stroke_width(1),
-        ))?;
+        ))?
+        .label("benchmark")
+        .legend(|(x, y)| plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], theme::YELLOW.mix(0.8).filled()));
     }
+
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
+        .background_style(&theme::SURFACE0)
+        .border_style(&theme::SURFACE1)
+        .label_font(("sans-serif", 14, &theme::TEXT))
+        .draw()?;
 
     root.present()
         .expect("unable to write chart to file, perhaps there is no directory");
