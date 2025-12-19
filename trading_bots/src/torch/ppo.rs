@@ -144,10 +144,10 @@ const KL_STOP_MULTIPLIER: f64 = 1.5;
 const LEARNING_RATE: f64 = 2e-4;
 
 // RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
-const RPO_ALPHA_MIN: f64 = 0.01;
+const RPO_ALPHA_MIN: f64 = 0.05;
 const RPO_ALPHA_MAX: f64 = 0.5;
-const RPO_TARGET_KL: f64 = 0.015; // Total induced KL target (formula already includes d)
-const RPO_ALPHA_INIT: f64 = 0.15;
+const RPO_TARGET_KL: f64 = 0.018;
+const RPO_ALPHA_INIT: f64 = 0.3;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
 
