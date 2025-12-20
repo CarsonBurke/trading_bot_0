@@ -78,26 +78,23 @@ pub struct TradingModel {
     attn_qkv: nn::Linear,
     attn_out: nn::Linear,
     ln_attn: nn::LayerNorm,
-    pma_seeds: Tensor,
-    pma_kv: nn::Linear,
-    pma_q: nn::Linear,
-    pma_out: nn::Linear,
-    ln_pma: nn::LayerNorm,
-    global_to_seed: nn::Linear,
-    fc1: nn::Linear,
-    ln_fc1: nn::LayerNorm,
-    fc2_actor: nn::Linear,
-    ln_fc2_actor: nn::LayerNorm,
-    fc2_critic: nn::Linear,
-    ln_fc2_critic: nn::LayerNorm,
-    fc3_actor: nn::Linear,
-    ln_fc3_actor: nn::LayerNorm,
-    fc3_critic: nn::Linear,
-    ln_fc3_critic: nn::LayerNorm,
+    global_to_ticker: nn::Linear,
+    ticker_ff1: nn::Linear,
+    ticker_ff2: nn::Linear,
+    ln_ticker_ff: nn::LayerNorm,
+    actor_fc1: nn::Linear,
+    ln_actor_fc1: nn::LayerNorm,
+    actor_fc2: nn::Linear,
+    ln_actor_fc2: nn::LayerNorm,
+    actor_out: nn::Linear,
+    pool_scorer: nn::Linear,
+    critic_fc1: nn::Linear,
+    ln_critic_fc1: nn::LayerNorm,
+    critic_fc2: nn::Linear,
+    ln_critic_fc2: nn::LayerNorm,
     critic: nn::Linear,
     bucket_centers: Tensor,
     symlog_centers: Tensor, // For two-hot target computation
-    actor_mean: nn::Linear,
     sde_fc: nn::Linear,
     ln_sde: nn::LayerNorm,
     log_std_param: Tensor,
@@ -105,7 +102,6 @@ pub struct TradingModel {
     device: tch::Device,
     num_heads: i64,
     head_dim: i64,
-    pma_num_seeds: i64,
 }
 
 impl TradingModel {
@@ -138,34 +134,36 @@ impl TradingModel {
         let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
         let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
 
-        let pma_num_seeds = 4i64;
-        let pma_seeds = p.var("pma_seeds", &[pma_num_seeds, 256], Init::Uniform { lo: -0.1, up: 0.1 });
-        let pma_kv = nn::linear(p / "pma_kv", 256, 256 * 2, Default::default());
-        let pma_q = nn::linear(p / "pma_q", 256, 256, Default::default());
-        let pma_out = nn::linear(p / "pma_out", 256, 256, Default::default());
-        let ln_pma = nn::layer_norm(p / "ln_pma", vec![256], Default::default());
-        let global_to_seed = nn::linear(p / "global_to_seed", GLOBAL_STATIC_OBS as i64, 256, Default::default());
-
-        let fc1 = nn::linear(p / "l1", 1024, 512, nn::LinearConfig {
-            ws_init: truncated_normal_init(1024, 512), ..Default::default()
-        });
-        let ln_fc1 = nn::layer_norm(p / "ln_fc1", vec![512], Default::default());
-        let fc2_actor = nn::linear(p / "l2_actor", 512, 256, nn::LinearConfig {
-            ws_init: truncated_normal_init(512, 256), ..Default::default()
-        });
-        let ln_fc2_actor = nn::layer_norm(p / "ln_fc2_actor", vec![256], Default::default());
-        let fc2_critic = nn::linear(p / "l2_critic", 512, 256, nn::LinearConfig {
-            ws_init: truncated_normal_init(512, 256), ..Default::default()
-        });
-        let ln_fc2_critic = nn::layer_norm(p / "ln_fc2_critic", vec![256], Default::default());
-        let fc3_actor = nn::linear(p / "l3_actor", 256, 256, nn::LinearConfig {
+        let global_to_ticker = nn::linear(p / "global_to_ticker", GLOBAL_STATIC_OBS as i64, 256, Default::default());
+        let ticker_ff1 = nn::linear(p / "ticker_ff1", 256, 256, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 256), ..Default::default()
         });
-        let ln_fc3_actor = nn::layer_norm(p / "ln_fc3_actor", vec![256], Default::default());
-        let fc3_critic = nn::linear(p / "l3_critic", 256, 256, nn::LinearConfig {
+        let ticker_ff2 = nn::linear(p / "ticker_ff2", 256, 256, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 256), ..Default::default()
         });
-        let ln_fc3_critic = nn::layer_norm(p / "ln_fc3_critic", vec![256], Default::default());
+        let ln_ticker_ff = nn::layer_norm(p / "ln_ticker_ff", vec![256], Default::default());
+        let actor_fc1 = nn::linear(p / "actor_fc1", 256, 256, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 256), ..Default::default()
+        });
+        let ln_actor_fc1 = nn::layer_norm(p / "ln_actor_fc1", vec![256], Default::default());
+        let actor_fc2 = nn::linear(p / "actor_fc2", 256, 256, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 256), ..Default::default()
+        });
+        let ln_actor_fc2 = nn::layer_norm(p / "ln_actor_fc2", vec![256], Default::default());
+        let actor_out = nn::linear(p / "actor_out", 256, 1, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 1), ..Default::default()
+        });
+        let pool_scorer = nn::linear(p / "pool_scorer", 256, 1, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 1), ..Default::default()
+        });
+        let critic_fc1 = nn::linear(p / "critic_fc1", 256 * 4, 256, nn::LinearConfig {
+            ws_init: truncated_normal_init(256 * 4, 256), ..Default::default()
+        });
+        let ln_critic_fc1 = nn::layer_norm(p / "ln_critic_fc1", vec![256], Default::default());
+        let critic_fc2 = nn::linear(p / "critic_fc2", 256, 256, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 256), ..Default::default()
+        });
+        let ln_critic_fc2 = nn::layer_norm(p / "ln_critic_fc2", vec![256], Default::default());
 
         const NUM_VALUE_BUCKETS: i64 = 255;
         let critic = nn::linear(p / "cl", 256, NUM_VALUE_BUCKETS, nn::LinearConfig {
@@ -181,16 +179,10 @@ impl TradingModel {
         let bucket_centers = &symlog_centers.sign() * (&symlog_centers.abs().exp() - 1.0);
 
         // Logistic-normal: output K-1 unconstrained dims, append 0 before softmax
-        let actor_mean = nn::linear(p / "al_mean", 256, nact - 1, nn::LinearConfig {
-            ws_init: Init::Uniform { lo: -0.1, up: 0.1 },
-            bs_init: Some(Init::Const(0.0)),
-            bias: true,
-        });
-
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
-        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, nact - 1], Init::Const(0.0));
+        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, 1], Init::Const(0.0));
         let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
 
         Self {
@@ -200,12 +192,13 @@ impl TradingModel {
             static_to_temporal, ln_static_temporal, temporal_pools,
             static_proj, ln_static_proj,
             attn_qkv, attn_out, ln_attn,
-            pma_seeds, pma_kv, pma_q, pma_out, ln_pma, global_to_seed,
-            fc1, ln_fc1, fc2_actor, ln_fc2_actor, fc2_critic, ln_fc2_critic,
-            fc3_actor, ln_fc3_actor, fc3_critic, ln_fc3_critic,
-            critic, bucket_centers, symlog_centers, actor_mean, sde_fc, ln_sde, log_std_param, log_d_raw,
+            global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
+            actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out,
+            pool_scorer,
+            critic_fc1, ln_critic_fc1, critic_fc2, ln_critic_fc2,
+            critic, bucket_centers, symlog_centers, sde_fc, ln_sde, log_std_param, log_d_raw,
             device: p.device(),
-            num_heads, head_dim, pma_num_seeds,
+            num_heads, head_dim,
         }
     }
 
@@ -468,38 +461,78 @@ impl TradingModel {
         let attn_out = attn.matmul(&v).permute([0, 2, 1, 3]).contiguous().view([batch_size, TICKERS_COUNT, 256]).apply(&self.attn_out);
         let ticker_features = (combined + attn_out).apply(&self.ln_attn);
 
-        let seeds = self.pma_seeds.unsqueeze(0) + global_static.apply(&self.global_to_seed).unsqueeze(1);
-        let pma_q = seeds.apply(&self.pma_q);
-        let pma_kv = ticker_features.apply(&self.pma_kv).chunk(2, 2);
-        let (pma_k, pma_v) = (&pma_kv[0], &pma_kv[1]);
+        let global_ctx = global_static.apply(&self.global_to_ticker).unsqueeze(1);
+        let enriched = &ticker_features + global_ctx;
+        let enriched_ff = enriched
+            .shallow_clone()
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.ticker_ff1)
+            .silu()
+            .apply(&self.ticker_ff2)
+            .reshape([batch_size, TICKERS_COUNT, 256]);
+        let enriched = (enriched_ff + &enriched)
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.ln_ticker_ff)
+            .reshape([batch_size, TICKERS_COUNT, 256]);
 
-        let q_h = pma_q.reshape([batch_size, self.pma_num_seeds, self.num_heads, self.head_dim]).permute([0, 2, 1, 3]);
-        let k_h = pma_k.reshape([batch_size, TICKERS_COUNT, self.num_heads, self.head_dim]).permute([0, 2, 1, 3]);
-        let v_h = pma_v.reshape([batch_size, TICKERS_COUNT, self.num_heads, self.head_dim]).permute([0, 2, 1, 3]);
-        let pma_attn = (q_h.matmul(&k_h.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q_h.kind());
-        let pma_out = pma_attn.matmul(&v_h).permute([0, 2, 1, 3]).contiguous().view([batch_size, self.pma_num_seeds, 256]).apply(&self.pma_out);
-        let pooled = (seeds + pma_out).apply(&self.ln_pma).reshape([batch_size, self.pma_num_seeds * 256]);
+        let pool_logits = enriched
+            .shallow_clone()
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.pool_scorer)
+            .reshape([batch_size, TICKERS_COUNT, 1]);
+        let pool_weights = pool_logits.softmax(1, Kind::Float);
+        let pool_summary = (&enriched * &pool_weights).sum_dim_intlist(1, false, Kind::Float);
+        let pooled_mean = enriched.shallow_clone().mean_dim(1, false, Kind::Float);
+        let pooled_var = (enriched.shallow_clone() - pooled_mean.unsqueeze(1))
+            .pow_tensor_scalar(2)
+            .mean_dim(1, false, Kind::Float);
+        let pooled_std = pooled_var.sqrt();
+        let pooled_max = enriched.max_dim(1, false).0;
 
-        let fc1 = pooled.apply(&self.fc1).apply(&self.ln_fc1).silu();
-        let actor_fc2 = fc1.apply(&self.fc2_actor).apply(&self.ln_fc2_actor).silu();
-        let critic_fc2 = fc1.apply(&self.fc2_critic).apply(&self.ln_fc2_critic).silu();
-        let actor_feat = (actor_fc2.apply(&self.fc3_actor) + &actor_fc2).apply(&self.ln_fc3_actor).silu();
-        let critic_feat = (critic_fc2.apply(&self.fc3_critic) + &critic_fc2).apply(&self.ln_fc3_critic).silu();
+        let actor_hidden = enriched
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.actor_fc1)
+            .apply(&self.ln_actor_fc1)
+            .silu()
+            .reshape([batch_size, TICKERS_COUNT, 256]);
+        let actor_residual = actor_hidden
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.actor_fc2)
+            .reshape([batch_size, TICKERS_COUNT, 256]);
+        let actor_feat = (actor_residual + &actor_hidden)
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.ln_actor_fc2)
+            .silu()
+            .reshape([batch_size, TICKERS_COUNT, 256]);
+
+        let critic_input = Tensor::cat(&[pool_summary.shallow_clone(), pooled_mean, pooled_std, pooled_max], 1);
+        let critic_hidden = critic_input
+            .apply(&self.critic_fc1)
+            .apply(&self.ln_critic_fc1)
+            .silu();
+        let critic_feat = (critic_hidden.apply(&self.critic_fc2) + &critic_hidden)
+            .apply(&self.ln_critic_fc2)
+            .silu();
 
         let critic_logits = critic_feat.apply(&self.critic);
         let critic_probs = critic_logits.softmax(-1, Kind::Float);
         // Expectation in raw space (bins are uniform in symlog space for stability)
         let critic_value = critic_probs.mv(&self.bucket_centers);
 
-        let action_mean = actor_feat.apply(&self.actor_mean);
+        let action_mean = actor_feat.apply(&self.actor_out).squeeze_dim(-1);
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
-        const LOG_STD_MIN: f64 = -5.0;
-        const LOG_STD_MAX: f64 = 0.5; // std range [0.007, 1.65]
-        let latent = actor_feat.apply(&self.sde_fc).apply(&self.ln_sde).tanh();
+        const LOG_STD_MIN: f64 = -5.0; // std = 0.007
+        const LOG_STD_MAX: f64 = -0.22; // std = 0.8
+        let latent = (&enriched + pool_summary.unsqueeze(1))
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.sde_fc)
+            .apply(&self.ln_sde)
+            .tanh()
+            .reshape([batch_size, TICKERS_COUNT, -1]);
         let log_std_raw = self.log_std_param.tanh();
         let log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
         let variance = latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
-        let action_log_std = (variance + 1e-6).sqrt().log().clamp(LOG_STD_MIN, LOG_STD_MAX);
+        let action_log_std = (variance + 1e-6).sqrt().log().clamp(LOG_STD_MIN, LOG_STD_MAX).squeeze_dim(-1);
 
         const LOG_D_RAW_SCALE: f64 = 5.0;
         let divisor = self.log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + 0.1;

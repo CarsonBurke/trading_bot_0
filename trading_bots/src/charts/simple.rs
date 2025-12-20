@@ -9,19 +9,15 @@ use super::utils::{legend_rect, LegendConfig, CHART_DIMS};
 use crate::constants::CHART_IMAGE_FORMAT;
 use crate::types::Data;
 
-pub(crate) fn compute_moving_avg(data: &[f64], window: usize) -> Vec<f64> {
-    if data.len() < window {
-        return data.to_vec();
+pub(crate) fn compute_ema(data: &[f64], alpha: f64) -> Vec<f64> {
+    if data.is_empty() {
+        return vec![];
     }
     let mut result = Vec::with_capacity(data.len());
-    let mut sum: f64 = data[..window].iter().sum();
-    for _ in 0..window - 1 {
-        result.push(f64::NAN);
-    }
-    result.push(sum / window as f64);
-    for i in window..data.len() {
-        sum += data[i] - data[i - window];
-        result.push(sum / window as f64);
+    let mut ema = data[0];
+    for &v in data {
+        ema = alpha * v + (1.0 - alpha) * ema;
+        result.push(ema);
     }
     result
 }
@@ -80,17 +76,16 @@ pub fn simple_chart_with_labels(
         .label("value")
         .legend(legend_rect(&theme::BLUE));
 
-    let window = (data.len() / 10).max(5).min(50);
-    let ma = compute_moving_avg(data, window);
+    let alpha = 0.05;
+    let ema = compute_ema(data, alpha);
     chart
         .draw_series(LineSeries::new(
-            ma.iter()
+            ema.iter()
                 .enumerate()
-                .filter(|(_, v)| !v.is_nan())
                 .map(|(i, v)| (i as u32, *v)),
             ShapeStyle::from(&theme::YELLOW).stroke_width(1),
         ))?
-        .label("MA")
+        .label("EMA")
         .legend(legend_rect(&theme::YELLOW));
 
     chart
@@ -185,17 +180,17 @@ pub fn simple_chart_log_with_labels(
         .label("value")
         .legend(legend_rect(&theme::BLUE));
 
-    let window = (data.len() / 10).max(5).min(50);
-    let ma = compute_moving_avg(data, window);
+    let alpha = 0.05;
+    let ema = compute_ema(data, alpha);
     chart
         .draw_series(LineSeries::new(
-            ma.iter()
+            ema.iter()
                 .enumerate()
-                .filter(|(_, v)| !v.is_nan())
+                .filter(|(_, v)| v.is_finite())
                 .map(|(i, v)| (i as u32, symlog(*v))),
             ShapeStyle::from(&theme::YELLOW).stroke_width(1),
         ))?
-        .label("MA")
+        .label("EMA")
         .legend(legend_rect(&theme::YELLOW));
 
     chart

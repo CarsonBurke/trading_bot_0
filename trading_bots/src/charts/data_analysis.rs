@@ -425,28 +425,14 @@ fn price_statistics_chart(
     .label("Price")
     .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &theme::BLUE));
 
-    // Moving average line
-    let window = (prices.len() / 10).max(5).min(50);
-    let mut ma = Vec::with_capacity(prices.len());
-    let mut sum: f64 = prices[..window.min(prices.len())].iter().sum();
-    for _ in 0..window.saturating_sub(1) {
-        ma.push(f64::NAN);
-    }
-    if prices.len() >= window {
-        ma.push(sum / window as f64);
-        for i in window..prices.len() {
-            sum += prices[i] - prices[i - window];
-            ma.push(sum / window as f64);
-        }
-    }
+    // EMA line
+    let alpha = 0.05;
+    let ema = super::simple::compute_ema(prices, alpha);
     chart.draw_series(LineSeries::new(
-        ma.iter()
-            .enumerate()
-            .filter(|(_, v)| !v.is_nan())
-            .map(|(i, v)| (i, *v)),
+        ema.iter().enumerate().map(|(i, v)| (i, *v)),
         theme::GREEN.stroke_width(2),
     ))?
-    .label(format!("MA({})", window))
+    .label("EMA")
     .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], theme::GREEN));
 
     // Add text with statistics
