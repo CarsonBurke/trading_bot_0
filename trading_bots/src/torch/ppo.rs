@@ -224,7 +224,7 @@ pub fn train(weights_path: Option<&str>) {
         let mut s_rewards =
             Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
         let s_actions =
-            Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
+            Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT - 1], (Kind::Float, device));
         let s_masks = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
         let s_log_probs =
             Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
@@ -249,7 +249,7 @@ pub fn train(weights_path: Option<&str>) {
                     )
                 });
 
-            // Tanh-squashed Gaussian per ticker (factorized policy)
+            // Logistic-normal with softmax simplex projection
             let action_log_std_clamped = action_log_std.clamp(-20.0, 5.0);
             let action_std = action_log_std_clamped.exp();
 
@@ -257,19 +257,22 @@ pub fn train(weights_path: Option<&str>) {
                 sde_noise = Some(Tensor::randn_like(&action_mean));
             }
             let noise = sde_noise.as_ref().unwrap();
-            let u = &action_mean + &action_std * noise; // [batch, K+1]
-            let actions_tanh = u.tanh();
-            let actions = (&actions_tanh + 1.0) * 0.5;
+            let u = &action_mean + &action_std * noise; // [batch, K-1]
+            let zeros = Tensor::zeros([NPROCS, 1], (Kind::Float, device));
+            let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
+            let actions = u_ext.softmax(-1, Kind::Float);
 
-            // Log-prob with tanh Jacobian per ticker
+            // Log-prob with softmax Jacobian
             let u_normalized = (&u - &action_mean) / &action_std;
             let u_squared = u_normalized.pow_tensor_scalar(2);
             let two_log_std = &action_log_std_clamped * 2.0;
             let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
-            let log_det = (Tensor::ones_like(&actions_tanh) - actions_tanh.pow_tensor_scalar(2))
-                .clamp_min(1e-6)
-                .log();
-            let action_log_prob = log_prob_u - log_det;
+            let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
+            let log_jacobian = u_ext
+                .log_softmax(-1, Kind::Float)
+                .sum_dim_intlist(-1, false, Kind::Float);
+            let action_log_prob = log_prob_gaussian - log_jacobian;
+            let action_log_prob = action_log_prob.unsqueeze(-1).expand(&[-1, ACTION_COUNT], true);
 
             let mut out_so = s_static_obs.get(s + 1);
             let (reward, reward_per_ticker, is_done, step_deltas) =
@@ -307,7 +310,7 @@ pub fn train(weights_path: Option<&str>) {
             let masks = Tensor::from(1f32).to_device(device) - &is_done;
             sum_rewards *= &masks;
 
-            s_actions.get(s).copy_(&u); // Store pre-tanh u for training
+            s_actions.get(s).copy_(&u); // Store pre-softmax u for training
             s_values.get(s).copy_(&values);
             s_log_probs.get(s).copy_(&action_log_prob);
             s_rewards.get(s).copy_(&reward_per_ticker);
@@ -372,7 +375,7 @@ pub fn train(weights_path: Option<&str>) {
                     .view([memory_size, ACTION_COUNT]),
             )
         };
-        let actions = s_actions.view([memory_size, ACTION_COUNT]);
+        let actions = s_actions.view([memory_size, ACTION_COUNT - 1]);
         let old_log_probs = s_log_probs.view([memory_size, ACTION_COUNT]);
         let s_values_flat = s_values.view([memory_size, ACTION_COUNT]).detach();
 
@@ -386,11 +389,14 @@ pub fn train(weights_path: Option<&str>) {
             adv_max_val,
         );
 
-        // Normalize advantages globally (not per-minibatch) for consistent policy gradients
+        // Normalize advantages per ticker across batch/time for consistent gradients as K grows
         // Detach to prevent backprop through GAE computation
-        let adv_mean = advantages.mean(Kind::Float);
-        let adv_std = advantages.std(false).clamp_min(1e-4);
-        let advantages = ((&advantages - adv_mean) / &adv_std).detach();
+        let adv_mean = advantages.mean_dim(0, true, Kind::Float);
+        let adv_var = (&advantages - &adv_mean)
+            .pow_tensor_scalar(2.0)
+            .mean_dim(0, true, Kind::Float);
+        let adv_std = adv_var.sqrt().clamp_min(1e-4);
+        let advantages = ((&advantages - adv_mean) / adv_std).detach();
 
         // Returns are raw, just detach
         let returns = returns.detach();
@@ -471,7 +477,8 @@ pub fn train(weights_path: Option<&str>) {
                         old_log_probs.narrow(0, mb_sample_start, mini_batch_samples);
 
                     let u = actions_mb;
-                    let actions_tanh = u.tanh();
+                    let zeros = Tensor::zeros([mini_batch_samples, 1], (Kind::Float, device));
+                    let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
 
                     // RPO alpha: sigmoid parameterization for smooth gradients everywhere
                     let rpo_alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
@@ -489,10 +496,14 @@ pub fn train(weights_path: Option<&str>) {
                     let u_normalized = (&u - &action_means_perturbed) / &action_std;
                     let u_squared = u_normalized.pow_tensor_scalar(2);
                     let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
-                    let log_det = (Tensor::ones_like(&actions_tanh) - actions_tanh.pow_tensor_scalar(2))
-                        .clamp_min(1e-6)
-                        .log();
-                    let action_log_probs = log_prob_u - log_det;
+                    let log_prob_gaussian =
+                        log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
+                    let log_jacobian = u_ext
+                        .log_softmax(-1, Kind::Float)
+                        .sum_dim_intlist(-1, false, Kind::Float);
+                    let action_log_probs = log_prob_gaussian - log_jacobian;
+                    let action_log_probs =
+                        action_log_probs.unsqueeze(-1).expand(&[-1, ACTION_COUNT], true);
 
                     // Entropy of Gaussian (per ticker)
                     let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;

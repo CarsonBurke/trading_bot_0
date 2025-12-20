@@ -1,4 +1,4 @@
-use tch::{nn, Device, Tensor};
+use tch::{nn, Device, Kind, Tensor};
 use std::path::Path;
 use std::time::Instant;
 
@@ -23,14 +23,17 @@ pub fn sample_actions_from_dist(
     temperature: f64,
     device: Device,
 ) -> Tensor {
-    if deterministic || temperature == 0.0 {
-        (action_mean.tanh() + 1.0) * 0.5
+    let u = if deterministic || temperature == 0.0 {
+        action_mean.shallow_clone()
     } else {
         let action_std = action_log_std.exp() * temperature;
         let noise = Tensor::randn_like(action_mean);
-        let u = action_mean + &action_std * noise;
-        (u.tanh() + 1.0) * 0.5
-    }
+        action_mean + &action_std * noise
+    };
+    let batch = u.size()[0];
+    let zeros = Tensor::zeros([batch, 1], (Kind::Float, device));
+    let u_ext = Tensor::cat(&[u, zeros], 1);
+    u_ext.softmax(-1, Kind::Float)
 }
 
 pub fn run_inference<P: AsRef<Path>>(

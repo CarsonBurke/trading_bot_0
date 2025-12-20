@@ -18,7 +18,7 @@ pub const LEARNING_RATE: f64 = 1e-4;
 pub const GAMMA: f64 = 0.99;
 pub const EPSILON: f64 = 0.2;
 pub const VALUE_COEF: f64 = 0.5;
-pub const ENTROPY_COEF: f64 = 0.01;
+pub const ENTROPY_COEF: f64 = 0.0; // SDE-only like cleanrl's PPO
 
 #[derive(PartialEq, Eq)]
 pub struct ActionIndex;

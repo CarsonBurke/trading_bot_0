@@ -276,28 +276,19 @@ impl Env {
 
         let mut total_commission = 0.0;
 
+        for ticker_index in 0..n_tickers {
+            let weight = actions
+                .get(ticker_index)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            self.target_weights[ticker_index] = weight;
+        }
         let cash_weight = actions
             .get(n_tickers)
             .copied()
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
-        let mut ticker_sum = 0.0;
-        for (i, &action) in actions.iter().take(n_tickers).enumerate() {
-            let clamped = action.clamp(0.0, 1.0);
-            self.target_weights[i] = clamped;
-            ticker_sum += clamped;
-        }
-        let target_ticker_total = (1.0 - cash_weight).clamp(0.0, 1.0);
-        if ticker_sum > 0.0 {
-            let scale = target_ticker_total / ticker_sum;
-            for w in self.target_weights.iter_mut().take(n_tickers) {
-                *w = (*w * scale).clamp(0.0, 1.0);
-            }
-        } else {
-            for w in self.target_weights.iter_mut().take(n_tickers) {
-                *w = 0.0;
-            }
-        }
         self.target_weights[n_tickers] = cash_weight;
 
         // 2. Calculate target deltas and execute trades
