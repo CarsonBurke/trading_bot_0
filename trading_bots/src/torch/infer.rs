@@ -1,4 +1,4 @@
-use tch::{nn, Device, Kind, Tensor};
+use tch::{nn, Device, Tensor};
 use std::path::Path;
 use std::time::Instant;
 
@@ -23,18 +23,13 @@ pub fn sample_actions_from_dist(
     temperature: f64,
     device: Device,
 ) -> Tensor {
-    let batch_size = action_mean.size()[0];
-    let zeros = Tensor::zeros([batch_size, 1], (Kind::Float, device));
-
     if deterministic || temperature == 0.0 {
-        let u_ext = Tensor::cat(&[action_mean.shallow_clone(), zeros], 1);
-        u_ext.softmax(-1, Kind::Float)
+        (action_mean.tanh() + 1.0) * 0.5
     } else {
         let action_std = action_log_std.exp() * temperature;
         let noise = Tensor::randn_like(action_mean);
         let u = action_mean + &action_std * noise;
-        let u_ext = Tensor::cat(&[u, zeros], 1);
-        u_ext.softmax(-1, Kind::Float)
+        (u.tanh() + 1.0) * 0.5
     }
 }
 
@@ -78,7 +73,7 @@ pub fn run_inference<P: AsRef<Path>>(
 
             // First call: model.step detects full obs and initializes stream state
             // Subsequent calls: model.step processes single delta per ticker
-            let (_, _, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
+            let (_, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
                 model.step(&current_price_deltas, &current_static_obs, &mut stream_state)
             });
 
@@ -119,4 +114,3 @@ pub fn run_inference<P: AsRef<Path>>(
 
     Ok(())
 }
-

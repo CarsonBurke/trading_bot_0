@@ -1,8 +1,8 @@
-use tch::Tensor;
+use tch::{Device, Tensor};
 use rand::seq::SliceRandom;
 use super::env::{Env, Step};
 use crate::torch::ppo::NPROCS;
-use crate::torch::constants::{TICKERS_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS};
+use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS};
 
 pub struct VecEnv {
     pub envs: Vec<Env>,
@@ -108,6 +108,7 @@ impl VecEnv {
             self.envs.len()
         );
         let mut rewards = Vec::with_capacity(NPROCS as usize);
+        let mut rewards_per_ticker = Vec::new();
         let mut is_dones = Vec::with_capacity(NPROCS as usize);
         let mut all_price_deltas = Vec::new();
         let mut all_static_obs = Vec::new();
@@ -115,6 +116,7 @@ impl VecEnv {
         for (i, env) in self.envs.iter_mut().enumerate() {
             let step = env.step_single(all_actions[i].clone());
             rewards.push(step.reward);
+            rewards_per_ticker.extend(step.reward_per_ticker);
             is_dones.push(step.is_done);
             all_price_deltas.extend(step.price_deltas);
             all_static_obs.extend(step.static_obs);
@@ -122,6 +124,8 @@ impl VecEnv {
 
         Step {
             reward: Tensor::from_slice(&rewards),
+            reward_per_ticker: Tensor::from_slice(&rewards_per_ticker)
+                .view([NPROCS, ACTION_COUNT]),
             is_done: Tensor::from_slice(&is_dones),
             price_deltas: Tensor::from_slice(&all_price_deltas)
                 .view([NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]),
@@ -212,10 +216,11 @@ impl VecEnv {
         &mut self,
         all_actions: &[Vec<f64>],
         out_static_obs: &mut Tensor,
-    ) -> (Tensor, Tensor, Tensor) {
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
         debug_assert_eq!(all_actions.len(), self.envs.len());
 
         let mut rewards = [0f32; NPROCS as usize];
+        let mut rewards_per_ticker = Vec::with_capacity(NPROCS as usize * ACTION_COUNT as usize);
         let mut is_dones = [0f32; NPROCS as usize];
         let mut all_step_deltas = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
         let mut all_static_obs = Vec::with_capacity(NPROCS as usize * STATIC_OBSERVATIONS);
@@ -223,6 +228,7 @@ impl VecEnv {
         for (i, env) in self.envs.iter_mut().enumerate() {
             let step = env.step_step_single(all_actions[i].clone());
             rewards[i] = step.reward as f32;
+            rewards_per_ticker.extend(step.reward_per_ticker);
             is_dones[i] = step.is_done;
             all_step_deltas.extend(step.step_deltas);
             all_static_obs.extend(step.static_obs);
@@ -233,10 +239,26 @@ impl VecEnv {
         out_static_obs.copy_(&so_cpu);
 
         let reward = Tensor::from_slice(&rewards);
+        let reward_per_ticker =
+            Tensor::from_slice(&rewards_per_ticker).view([NPROCS, ACTION_COUNT]);
         let is_done = Tensor::from_slice(&is_dones);
         let step_deltas = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
 
-        (reward, is_done, step_deltas)
+        (reward, reward_per_ticker, is_done, step_deltas)
+    }
+
+    pub fn step_incremental_tensor(
+        &mut self,
+        actions: &Tensor,
+        out_static_obs: &mut Tensor,
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
+        let actions_cpu = actions.to_device(Device::Cpu);
+        let actions_flat = Vec::<f64>::try_from(actions_cpu.flatten(0, -1)).unwrap();
+        let all_actions: Vec<Vec<f64>> = actions_flat
+            .chunks(ACTION_COUNT as usize)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        self.step_incremental(&all_actions, out_static_obs)
     }
 
     pub fn max_step(&self) -> usize {
@@ -275,9 +297,4 @@ impl VecEnv {
         &self.envs[0].prices
     }
 
-    pub fn apply_retroactive_rewards(&mut self, rewards: &Tensor) {
-        for (i, env) in self.envs.iter_mut().enumerate() {
-            env.apply_retroactive_rewards(&rewards.select(1, i as i64));
-        }
-    }
 }

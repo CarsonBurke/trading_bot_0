@@ -23,8 +23,8 @@ const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
 const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_DELTAS must be divisible by PATCH_SIZE");
 
-// (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_weights)
-pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor, Tensor), Tensor);
+// (values, (action_mean, action_log_std, divisor), attn_weights)
+pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
 
 /// Streaming state for O(1) inference per step
 /// - Ring buffer holds full delta history for head computation
@@ -87,15 +87,12 @@ pub struct TradingModel {
     actor_fc2: nn::Linear,
     ln_actor_fc2: nn::LayerNorm,
     actor_out: nn::Linear,
+    actor_cash_out: nn::Linear,
     pool_scorer: nn::Linear,
-    critic_fc1: nn::Linear,
-    ln_critic_fc1: nn::LayerNorm,
-    critic_fc2: nn::Linear,
-    ln_critic_fc2: nn::LayerNorm,
-    critic: nn::Linear,
-    bucket_centers: Tensor,
-    symlog_centers: Tensor, // For two-hot target computation
+    value_ticker_out: nn::Linear,
+    value_cash_out: nn::Linear,
     sde_fc: nn::Linear,
+    sde_cash_fc: nn::Linear,
     ln_sde: nn::LayerNorm,
     log_std_param: Tensor,
     log_d_raw: Tensor,
@@ -153,34 +150,23 @@ impl TradingModel {
         let actor_out = nn::linear(p / "actor_out", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
+        let actor_cash_out = nn::linear(p / "actor_cash_out", 256, 1, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 1), ..Default::default()
+        });
         let pool_scorer = nn::linear(p / "pool_scorer", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
-        let critic_fc1 = nn::linear(p / "critic_fc1", 256 * 4, 256, nn::LinearConfig {
-            ws_init: truncated_normal_init(256 * 4, 256), ..Default::default()
+        let value_ticker_out = nn::linear(p / "value_ticker_out", 256, 1, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
-        let ln_critic_fc1 = nn::layer_norm(p / "ln_critic_fc1", vec![256], Default::default());
-        let critic_fc2 = nn::linear(p / "critic_fc2", 256, 256, nn::LinearConfig {
-            ws_init: truncated_normal_init(256, 256), ..Default::default()
+        let value_cash_out = nn::linear(p / "value_cash_out", 256, 1, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
-        let ln_critic_fc2 = nn::layer_norm(p / "ln_critic_fc2", vec![256], Default::default());
-
-        const NUM_VALUE_BUCKETS: i64 = 255;
-        let critic = nn::linear(p / "cl", 256, NUM_VALUE_BUCKETS, nn::LinearConfig {
-            ws_init: truncated_normal_init(256, NUM_VALUE_BUCKETS),
-            bs_init: Some(Init::Const(0.0)),
-            bias: true,
-        });
-        // Distributional critic bins uniform in symlog space [-symlog(REWARD_RANGE), +symlog(REWARD_RANGE)]
-        let symlog_clip = shared::symlog_target_clip();
-        let symlog_centers =
-            Tensor::linspace(-symlog_clip, symlog_clip, NUM_VALUE_BUCKETS, (Kind::Float, p.device()));
-        // bucket_centers in raw space (symexp of symlog) for raw value expectation
-        let bucket_centers = &symlog_centers.sign() * (&symlog_centers.abs().exp() - 1.0);
 
         // Logistic-normal: output K-1 unconstrained dims, append 0 before softmax
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
+        let sde_cash_fc = nn::linear(p / "sde_cash_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
         let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, 1], Init::Const(0.0));
         let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
@@ -193,18 +179,12 @@ impl TradingModel {
             static_proj, ln_static_proj,
             attn_qkv, attn_out, ln_attn,
             global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
-            actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out,
-            pool_scorer,
-            critic_fc1, ln_critic_fc1, critic_fc2, ln_critic_fc2,
-            critic, bucket_centers, symlog_centers, sde_fc, ln_sde, log_std_param, log_d_raw,
+            actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out, actor_cash_out,
+            pool_scorer, value_ticker_out, value_cash_out,
+            sde_fc, sde_cash_fc, ln_sde, log_std_param, log_d_raw,
             device: p.device(),
             num_heads, head_dim,
         }
-    }
-
-    /// Get symlog bucket centers for two-hot target computation
-    pub fn symlog_centers(&self) -> &Tensor {
-        &self.symlog_centers
     }
 
     /// Batch forward for training (parallel SSM scan)
@@ -482,12 +462,6 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, 1]);
         let pool_weights = pool_logits.softmax(1, Kind::Float);
         let pool_summary = (&enriched * &pool_weights).sum_dim_intlist(1, false, Kind::Float);
-        let pooled_mean = enriched.shallow_clone().mean_dim(1, false, Kind::Float);
-        let pooled_var = (enriched.shallow_clone() - pooled_mean.unsqueeze(1))
-            .pow_tensor_scalar(2)
-            .mean_dim(1, false, Kind::Float);
-        let pooled_std = pooled_var.sqrt();
-        let pooled_max = enriched.max_dim(1, false).0;
 
         let actor_hidden = enriched
             .reshape([batch_size * TICKERS_COUNT, 256])
@@ -505,21 +479,17 @@ impl TradingModel {
             .silu()
             .reshape([batch_size, TICKERS_COUNT, 256]);
 
-        let critic_input = Tensor::cat(&[pool_summary.shallow_clone(), pooled_mean, pooled_std, pooled_max], 1);
-        let critic_hidden = critic_input
-            .apply(&self.critic_fc1)
-            .apply(&self.ln_critic_fc1)
-            .silu();
-        let critic_feat = (critic_hidden.apply(&self.critic_fc2) + &critic_hidden)
-            .apply(&self.ln_critic_fc2)
-            .silu();
+        let ticker_values = enriched
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.value_ticker_out)
+            .reshape([batch_size, TICKERS_COUNT]);
+        let cash_value = pool_summary.apply(&self.value_cash_out);
+        let values = Tensor::cat(&[ticker_values.shallow_clone(), cash_value], 1);
 
-        let critic_logits = critic_feat.apply(&self.critic);
-        let critic_probs = critic_logits.softmax(-1, Kind::Float);
-        // Expectation in raw space (bins are uniform in symlog space for stability)
-        let critic_value = critic_probs.mv(&self.bucket_centers);
-
-        let action_mean = actor_feat.apply(&self.actor_out).squeeze_dim(-1);
+        const MEAN_SCALE: f64 = 0.5;
+        let action_mean = actor_feat.apply(&self.actor_out).squeeze_dim(-1).tanh() * MEAN_SCALE;
+        let cash_mean = pool_summary.apply(&self.actor_cash_out).tanh() * MEAN_SCALE;
+        let action_mean = Tensor::cat(&[action_mean, cash_mean], 1);
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
         const LOG_STD_MIN: f64 = -5.0; // std = 0.007
         const LOG_STD_MAX: f64 = -0.22; // std = 0.8
@@ -529,14 +499,24 @@ impl TradingModel {
             .apply(&self.ln_sde)
             .tanh()
             .reshape([batch_size, TICKERS_COUNT, -1]);
+        let cash_latent = pool_summary
+            .apply(&self.sde_cash_fc)
+            .apply(&self.ln_sde)
+            .tanh();
         let log_std_raw = self.log_std_param.tanh();
         let log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
         let variance = latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
         let action_log_std = (variance + 1e-6).sqrt().log().clamp(LOG_STD_MIN, LOG_STD_MAX).squeeze_dim(-1);
+        let cash_variance = cash_latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
+        let cash_log_std = (cash_variance + 1e-6)
+            .sqrt()
+            .log()
+            .clamp(LOG_STD_MIN, LOG_STD_MAX);
+        let action_log_std = Tensor::cat(&[action_log_std, cash_log_std], 1);
 
         const LOG_D_RAW_SCALE: f64 = 5.0;
         let divisor = self.log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + 0.1;
 
-        (critic_value, critic_logits, (action_mean, action_log_std, divisor), attn_out_vis)
+        (values, (action_mean, action_log_std, divisor), attn_out_vis)
     }
 }

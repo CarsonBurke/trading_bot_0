@@ -369,7 +369,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 state_guard.get_step_deltas().to_device(device)
             };
 
-            let (_, _, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
+            let (_, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
                 model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state)
             });
 
@@ -430,7 +430,7 @@ fn execute_trades(
     current_prices: &[f64],
     account: &Account,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for (ticker_idx, &action) in actions.iter().enumerate() {
+    for (ticker_idx, &action) in actions.iter().take(TICKERS_COUNT as usize).enumerate() {
         if action.abs() < ACTION_THRESHOLD {
             continue;
         }

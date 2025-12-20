@@ -1,7 +1,7 @@
 use rand::seq::{IndexedRandom, SliceRandom};
 use rand::Rng;
 use shared::constants::AVAILABLE_TICKERS_COUNT;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use colored::Colorize;
@@ -16,7 +16,7 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::{
         constants::{
-            ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, RETROACTIVE_BUY_REWARD,
+            ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER,
             STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
         },
         ppo::NPROCS,
@@ -26,13 +26,6 @@ use crate::{
 };
 
 const AVAILABLE_TICKERS: [&str; AVAILABLE_TICKERS_COUNT] = ["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD", "ADBE", "GOOG", "META", "NKE", "DELL", "CMCSA", "FDX"];
-
-#[derive(Debug, Clone)]
-pub(super) struct BuyLot {
-    pub step: usize,
-    pub price: f64,
-    pub quantity: f64,
-}
 
 pub struct Env {
     pub(super) env_id: usize,
@@ -50,8 +43,6 @@ pub struct Env {
     pub(super) episode_start_offset: usize,
     total_data_length: usize,
     random_start: bool,
-    pub(super) buy_lots: Vec<VecDeque<BuyLot>>,
-    pub(super) retroactive_rewards: HashMap<usize, f64>,
     pub(super) peak_assets: f64,
     pub(super) last_reward: f64,
     pub(super) last_fill_ratio: f64,
@@ -167,8 +158,6 @@ impl Env {
             episode_start_offset: 0,
             total_data_length,
             random_start,
-            buy_lots: vec![VecDeque::new(); num_tickers],
-            retroactive_rewards: HashMap::new(),
             peak_assets: Self::STARTING_CASH,
             last_reward: 0.0,
             last_fill_ratio: 1.0,
@@ -186,6 +175,7 @@ impl Env {
 
     pub fn step(&mut self, all_actions: Vec<Vec<f64>>) -> Step {
         let mut rewards = Vec::with_capacity(NPROCS as usize);
+        let mut rewards_per_ticker = Vec::new();
         let mut is_dones = Vec::with_capacity(NPROCS as usize);
         let mut all_price_deltas = Vec::new();
         let mut all_static_obs = Vec::new();
@@ -203,12 +193,12 @@ impl Env {
             }
 
             // Actions come in permuted order - map back to real ticker order
-            // Last action (cash) is not permuted
+            // Last action is cash (not permuted)
             let mut real_actions = vec![0.0; ACTION_COUNT as usize];
             for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
                 real_actions[real_idx] = actions[perm_idx];
             }
-            real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize]; // cash
+            real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize];
 
             if self.step == 0 {
                 self.episode_history.action_step0 = Some(real_actions.clone());
@@ -219,14 +209,10 @@ impl Env {
                 self.action_history.pop_front();
             }
 
-            let (total_commission, trade_sell_reward) =
-                self.trade_by_target_weights(&real_actions, absolute_step);
-            let reward = self.get_unrealized_pnl_reward(absolute_step, total_commission)
-                + if RETROACTIVE_BUY_REWARD {
-                    trade_sell_reward
-                } else {
-                    0.0
-                };
+            let total_commission = self.trade_by_target_weights(&real_actions, absolute_step);
+            let (reward, mut reward_per_ticker) =
+                self.get_unrealized_pnl_reward_breakdown(absolute_step, total_commission);
+            reward_per_ticker.push(0.0);
 
             self.last_reward = reward;
             if self.account.total_assets > self.peak_assets {
@@ -256,6 +242,7 @@ impl Env {
             }
 
             rewards.push(reward);
+            rewards_per_ticker.extend(reward_per_ticker.iter().map(|v| *v as f32));
             is_dones.push(is_done);
 
             let (price_deltas, static_obs) = self.get_next_obs();
@@ -273,6 +260,8 @@ impl Env {
 
         Step {
             reward: Tensor::from_slice(&rewards),
+            reward_per_ticker: Tensor::from_slice(&rewards_per_ticker)
+                .view([NPROCS, ACTION_COUNT]),
             is_done: Tensor::from_slice(&is_dones),
             price_deltas: price_deltas_tensor,
             static_obs: static_obs_tensor,
@@ -378,11 +367,6 @@ impl Env {
         self.episode_history = EpisodeHistory::new(self.tickers.len());
         self.action_history.clear();
 
-        for lot_queue in &mut self.buy_lots {
-            lot_queue.clear();
-        }
-        self.retroactive_rewards.clear();
-
         self.peak_assets = Self::STARTING_CASH;
         self.last_reward = 0.0;
         self.last_fill_ratio = 1.0;
@@ -461,11 +445,6 @@ impl Env {
         self.episode_history = EpisodeHistory::new(self.tickers.len());
         self.action_history.clear();
 
-        for lot_queue in &mut self.buy_lots {
-            lot_queue.clear();
-        }
-        self.retroactive_rewards.clear();
-
         self.peak_assets = Self::STARTING_CASH;
         self.last_reward = 0.0;
         self.last_fill_ratio = 1.0;
@@ -502,11 +481,6 @@ impl Env {
         self.episode_start = Instant::now();
         self.episode_history = EpisodeHistory::new(self.tickers.len());
         self.action_history.clear();
-
-        for lot_queue in &mut self.buy_lots {
-            lot_queue.clear();
-        }
-        self.retroactive_rewards.clear();
 
         self.peak_assets = Self::STARTING_CASH;
         self.last_reward = 0.0;
@@ -551,14 +525,10 @@ impl Env {
             self.action_history.pop_front();
         }
 
-        let (commissions, trade_sell_reward) =
-            self.trade_by_target_weights(&real_actions, absolute_step);
-        let reward = self.get_unrealized_pnl_reward(absolute_step, commissions)
-            + if RETROACTIVE_BUY_REWARD {
-                trade_sell_reward
-            } else {
-                0.0
-            };
+        let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
+        let (reward, mut reward_per_ticker) =
+            self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
+        reward_per_ticker.push(0.0);
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -588,6 +558,7 @@ impl Env {
         let (price_deltas, static_obs) = self.get_next_obs();
         SingleStep {
             reward,
+            reward_per_ticker: reward_per_ticker.iter().map(|v| *v as f32).collect(),
             price_deltas,
             static_obs,
             is_done,
@@ -620,14 +591,10 @@ impl Env {
             self.action_history.pop_front();
         }
 
-        let (commissions, trade_sell_reward) =
-            self.trade_by_target_weights(&real_actions, absolute_step);
-        let reward = self.get_unrealized_pnl_reward(absolute_step, commissions)
-            + if RETROACTIVE_BUY_REWARD {
-                trade_sell_reward
-            } else {
-                0.0
-            };
+        let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
+        let (reward, mut reward_per_ticker) =
+            self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
+        reward_per_ticker.push(0.0);
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -657,6 +624,7 @@ impl Env {
         let (step_deltas, static_obs) = self.get_next_step_obs();
         SingleStepStep {
             reward,
+            reward_per_ticker: reward_per_ticker.iter().map(|v| *v as f32).collect(),
             step_deltas,
             static_obs,
             is_done,
@@ -679,6 +647,7 @@ impl Env {
 
 pub struct Step {
     pub reward: Tensor,
+    pub reward_per_ticker: Tensor,
     pub price_deltas: Tensor,
     pub static_obs: Tensor,
     pub is_done: Tensor,
@@ -687,6 +656,7 @@ pub struct Step {
 /// Single-environment step result with raw values (for VecEnv)
 pub struct SingleStep {
     pub reward: f64,
+    pub reward_per_ticker: Vec<f32>,
     pub price_deltas: Vec<f32>,
     pub static_obs: Vec<f32>,
     pub is_done: f32,
@@ -694,6 +664,7 @@ pub struct SingleStep {
 
 pub struct SingleStepStep {
     pub reward: f64,
+    pub reward_per_ticker: Vec<f32>,
     pub step_deltas: Vec<f32>,
     pub static_obs: Vec<f32>,
     pub is_done: f32,

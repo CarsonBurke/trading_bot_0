@@ -3,7 +3,7 @@ use std::time::Instant;
 use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::constants::{
-    ACTION_COUNT, OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER, RETROACTIVE_BUY_REWARD,
+    ACTION_COUNT, OBSERVATION_SPACE, PRICE_DELTAS_PER_TICKER,
     STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
@@ -79,12 +79,6 @@ const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
 const GAMMA: f64 = 0.995;
 const GAE_LAMBDA: f64 = 0.98;
 
-// Symlog transform (from Dreamer-v3): handles diverse reward scales gracefully
-// symlog compresses large values while preserving sign: symlog(x) = sign(x) * ln(|x| + 1)
-fn symlog(x: &Tensor) -> Tensor {
-    x.sign() * (x.abs() + 1.0).log()
-}
-
 fn huber_elementwise(err: &Tensor, delta: f64) -> Tensor {
     let abs_err = err.abs();
     let quad = err.pow_tensor_scalar(2).g_mul_scalar(0.5);
@@ -93,39 +87,8 @@ fn huber_elementwise(err: &Tensor, delta: f64) -> Tensor {
     quad.where_self(&mask, &lin)
 }
 
-/// Two-hot encode values into bucket distribution
-/// Both values and bin_centers are in symlog space (Scheme B: everything symlog)
-/// bin_centers are uniformly spaced in symlog space [-20, 20]
-fn twohot_encode(values: &Tensor, bin_centers: &Tensor) -> Tensor {
-    let num_bins = bin_centers.size()[0];
-    let values_flat = values.flatten(0, -1);
-    let batch_size = values_flat.size()[0];
-
-    // Get bin range using tensor ops (avoid CPU sync)
-    let bin_min = bin_centers.min();
-    let bin_max = bin_centers.max();
-    let bin_range = (&bin_max - &bin_min).clamp_min(1e-8);
-
-    // Clamp values to bin range
-    let values_clamped = values_flat.maximum(&bin_min).minimum(&bin_max);
-
-    // Compute fractional bin index: (value - min) / range * (num_bins - 1)
-    let frac_idx = (&values_clamped - &bin_min) / &bin_range * (num_bins - 1) as f64;
-
-    // Get lower and upper bin indices
-    let idx_low = frac_idx.floor().clamp(0.0, (num_bins - 2) as f64).to_kind(Kind::Int64);
-    let idx_high = (&idx_low + 1).clamp(0, num_bins - 1);
-
-    // Weight for upper bin is the fractional part
-    let weight_high = (&frac_idx - frac_idx.floor()).clamp(0.0, 1.0);
-    let weight_low: Tensor = 1.0 - &weight_high;
-
-    // Build two-hot distribution using scatter_add (accumulates correctly)
-    let mut twohot = Tensor::zeros([batch_size, num_bins], (Kind::Float, values.device()));
-    let _ = twohot.scatter_add_(-1, &idx_low.unsqueeze(-1), &weight_low.unsqueeze(-1));
-    let _ = twohot.scatter_add_(-1, &idx_high.unsqueeze(-1), &weight_high.unsqueeze(-1));
-
-    twohot
+fn symlog(x: &Tensor) -> Tensor {
+    x.sign() * (x.abs() + 1.0).log()
 }
 
 // gSDE: resample exploration noise every N env steps (temporally correlated exploration).
@@ -257,12 +220,14 @@ pub fn train(weights_path: Option<&str>) {
         let rollout_steps = env.max_step() as i64;
         let memory_size = rollout_steps * NPROCS;
 
-        let s_values = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
-        let mut s_rewards = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
+        let s_values = Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
+        let mut s_rewards =
+            Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
         let s_actions =
-            Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT - 1], (Kind::Float, device));
+            Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
         let s_masks = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
-        let s_log_probs = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
+        let s_log_probs =
+            Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
 
         stream_state.reset();
 
@@ -273,7 +238,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step() {
             env.set_step(step);
 
-            let (critic, _critic_logits, (action_mean, action_log_std, _divisor), attn_weights) =
+            let (values, (action_mean, action_log_std, _divisor), attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
@@ -284,8 +249,7 @@ pub fn train(weights_path: Option<&str>) {
                     )
                 });
 
-            // Logistic-normal sampling: model outputs K-1 dims, we append 0 for reference
-            // u ~ N(μ, σ), u_ext = [u, 0], y = softmax(u_ext)
+            // Tanh-squashed Gaussian per ticker (factorized policy)
             let action_log_std_clamped = action_log_std.clamp(-20.0, 5.0);
             let action_std = action_log_std_clamped.exp();
 
@@ -293,36 +257,23 @@ pub fn train(weights_path: Option<&str>) {
                 sde_noise = Some(Tensor::randn_like(&action_mean));
             }
             let noise = sde_noise.as_ref().unwrap();
-            let u = &action_mean + &action_std * noise; // [batch, K-1]
+            let u = &action_mean + &action_std * noise; // [batch, K+1]
+            let actions_tanh = u.tanh();
+            let actions = (&actions_tanh + 1.0) * 0.5;
 
-            // Append 0 as reference category: u_ext = [u, 0]
-            let zeros = Tensor::zeros([NPROCS, 1], (Kind::Float, device));
-            let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1); // [batch, K]
-
-            // Softmax to get portfolio weights on simplex
-            let actions = u_ext.softmax(-1, Kind::Float); // [batch, K]
-
-            // Log-prob with Jacobian: log π(y) = log N(u; μ, σ) - Σ log(y_i)
+            // Log-prob with tanh Jacobian per ticker
             let u_normalized = (&u - &action_mean) / &action_std;
             let u_squared = u_normalized.pow_tensor_scalar(2);
             let two_log_std = &action_log_std_clamped * 2.0;
             let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
-            let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float); // sum over K-1 dims
-
-            // Jacobian correction: -Σ log(y_i) for all K dims (use log_softmax for stability)
-            let log_jacobian = u_ext
-                .log_softmax(-1, Kind::Float)
-                .sum_dim_intlist(-1, false, Kind::Float);
-            let action_log_prob = log_prob_gaussian - log_jacobian;
-
-            let actions_flat = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
-            let actions_vec: Vec<Vec<f64>> = actions_flat
-                .chunks(ACTION_COUNT as usize)
-                .map(|chunk| chunk.to_vec())
-                .collect();
+            let log_det = (Tensor::ones_like(&actions_tanh) - actions_tanh.pow_tensor_scalar(2))
+                .clamp_min(1e-6)
+                .log();
+            let action_log_prob = log_prob_u - log_det;
 
             let mut out_so = s_static_obs.get(s + 1);
-            let (reward, is_done, step_deltas) = env.step_incremental(&actions_vec, &mut out_so);
+            let (reward, reward_per_ticker, is_done, step_deltas) =
+                env.step_incremental_tensor(&actions, &mut out_so);
 
             let step_deltas_gpu = step_deltas.to_device(device);
             rolling_buffer.push(&step_deltas_gpu, &is_done, None);
@@ -345,32 +296,24 @@ pub fn train(weights_path: Option<&str>) {
             }
 
             let reward = reward.to_device(device);
+            let reward_per_ticker = symlog(&reward_per_ticker);
             let is_done = is_done.to_device(device);
 
             sum_rewards += &reward;
-            if !RETROACTIVE_BUY_REWARD {
-                let reward_float = f64::try_from((&sum_rewards * &is_done).sum(Kind::Float)).unwrap();
-                total_rewards += reward_float;
-                total_episodes += f64::try_from(is_done.sum(Kind::Float)).unwrap();
-            }
+            let reward_float = f64::try_from((&sum_rewards * &is_done).sum(Kind::Float)).unwrap();
+            total_rewards += reward_float;
+            total_episodes += f64::try_from(is_done.sum(Kind::Float)).unwrap();
 
             let masks = Tensor::from(1f32).to_device(device) - &is_done;
             sum_rewards *= &masks;
 
-            s_actions.get(s).copy_(&u); // Store u (K-1 dims) for training
-            s_values.get(s).copy_(&critic.squeeze_dim(-1));
+            s_actions.get(s).copy_(&u); // Store pre-tanh u for training
+            s_values.get(s).copy_(&values);
             s_log_probs.get(s).copy_(&action_log_prob);
-            s_rewards.get(s).copy_(&reward);
+            s_rewards.get(s).copy_(&reward_per_ticker);
             s_masks.get(s).copy_(&masks);
 
             s += 1; // Increment storage index
-        }
-
-        if RETROACTIVE_BUY_REWARD {
-            env.apply_retroactive_rewards(&s_rewards);
-            let episode_returns = s_rewards.sum_dim_intlist(0, false, Kind::Float);
-            total_rewards += f64::try_from(episode_returns.sum(Kind::Float)).unwrap_or(0.0);
-            total_episodes += NPROCS as f64;
         }
 
         let price_deltas_batch = s_price_deltas
@@ -380,24 +323,24 @@ pub fn train(weights_path: Option<&str>) {
             .narrow(0, 0, rollout_steps)
             .reshape([memory_size, STATIC_OBSERVATIONS as i64]);
 
-        // Critic outputs values in raw space (expectation over bins).
-
         let (advantages, returns) = {
-            let gae = Tensor::zeros([rollout_steps + 1, NPROCS], (Kind::Float, device));
-            let returns = Tensor::zeros([rollout_steps + 1, NPROCS], (Kind::Float, device));
+            let gae =
+                Tensor::zeros([rollout_steps + 1, NPROCS, ACTION_COUNT], (Kind::Float, device));
+            let returns =
+                Tensor::zeros([rollout_steps + 1, NPROCS, ACTION_COUNT], (Kind::Float, device));
 
             // Bootstrap value for next state (SSM state is already at end-of-rollout)
             let next_value = tch::no_grad(|| {
                 let price_deltas_step = s_price_deltas.get(rollout_steps);
                 let static_obs = s_static_obs.get(rollout_steps);
-                let (critic, _, _, _) = trading_model.forward_with_state(
+                let (values, _, _) = trading_model.forward_with_state(
                     &price_deltas_step,
                     &static_obs,
                     &mut stream_state,
                 );
-                critic.view([NPROCS])
+                values
             });
-            // Compute GAE backwards in raw space.
+            // Compute GAE backwards per ticker.
             for s in (0..rollout_steps).rev() {
                 let value_t = s_values.get(s);
                 let value_next = if s == rollout_steps - 1 {
@@ -406,7 +349,8 @@ pub fn train(weights_path: Option<&str>) {
                     s_values.get(s + 1)
                 };
 
-                let delta = s_rewards.get(s) + GAMMA * &value_next * s_masks.get(s) - &value_t;
+                let mask = s_masks.get(s).unsqueeze(-1);
+                let delta = s_rewards.get(s) + GAMMA * &value_next * &mask - &value_t;
 
                 // GAE: A_t = δ_t + γ * λ * mask * A_{t+1}
                 let gae_next = if s == rollout_steps - 1 {
@@ -414,7 +358,7 @@ pub fn train(weights_path: Option<&str>) {
                 } else {
                     gae.get(s + 1)
                 };
-                let gae_t = delta + GAMMA * GAE_LAMBDA * s_masks.get(s) * gae_next;
+                let gae_t = delta + GAMMA * GAE_LAMBDA * &mask * gae_next;
                 gae.get(s).copy_(&gae_t);
 
                 let return_t = &gae_t + &value_t;
@@ -422,13 +366,15 @@ pub fn train(weights_path: Option<&str>) {
             }
 
             (
-                gae.narrow(0, 0, rollout_steps).view([memory_size, 1]),
-                returns.narrow(0, 0, rollout_steps).view([memory_size, 1]),
+                gae.narrow(0, 0, rollout_steps).view([memory_size, ACTION_COUNT]),
+                returns
+                    .narrow(0, 0, rollout_steps)
+                    .view([memory_size, ACTION_COUNT]),
             )
         };
-        let actions = s_actions.view([memory_size, ACTION_COUNT - 1]);
-        let old_log_probs = s_log_probs.view([memory_size]);
-        let s_values_flat = s_values.view([memory_size]).detach();
+        let actions = s_actions.view([memory_size, ACTION_COUNT]);
+        let old_log_probs = s_log_probs.view([memory_size, ACTION_COUNT]);
+        let s_values_flat = s_values.view([memory_size, ACTION_COUNT]).detach();
 
         // Record advantage stats before normalization
         let adv_mean_val = f64::try_from(advantages.mean(Kind::Float)).unwrap_or(0.0);
@@ -444,9 +390,7 @@ pub fn train(weights_path: Option<&str>) {
         // Detach to prevent backprop through GAE computation
         let adv_mean = advantages.mean(Kind::Float);
         let adv_std = advantages.std(false).clamp_min(1e-4);
-        let advantages = ((&advantages - adv_mean) / &adv_std)
-            .squeeze_dim(-1)
-            .detach();
+        let advantages = ((&advantages - adv_mean) / &adv_std).detach();
 
         // Returns are raw, just detach
         let returns = returns.detach();
@@ -459,12 +403,10 @@ pub fn train(weights_path: Option<&str>) {
         let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut grad_norm_count = 0i64;
         // Clip fraction diagnostic
-        let mut total_clipped = 0i64;
+        let mut total_clipped = Tensor::zeros([], (Kind::Float, device));
         let mut total_ratio_samples = 0i64;
 
-        // Pre-allocate zeros for logistic-normal (max size: MINI_BATCH_STEPS * NPROCS)
         const MINI_BATCH_STEPS: i64 = 16;
-        let zeros_max = Tensor::zeros([MINI_BATCH_STEPS * NPROCS, 1], (Kind::Float, device));
 
         let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
@@ -509,28 +451,27 @@ pub fn train(weights_path: Option<&str>) {
                         .narrow(0, mb_global_start * NPROCS, mini_batch_samples)
                         .view([mini_batch_len, NPROCS, -1]);
 
-                    let (critics, critic_logits, (action_means, action_log_stds, _), _) =
+                    let (values, (action_means, action_log_stds, _), _) =
                         trading_model.forward_sequence_with_state(
                             &price_deltas_seq,
                             &static_obs_seq,
                             &mut stream_state,
                         );
-                    let critics = critics.view([mini_batch_samples, 1]);
-                    let critic_logits = critic_logits.view([mini_batch_samples, 255]);
+                    let values = values.view([mini_batch_samples, ACTION_COUNT]);
 
                     // Get stored data for this mini-batch
                     let mb_sample_start = (chunk_start_step + mini_batch_start) * NPROCS;
 
                     let actions_mb = actions.narrow(0, mb_sample_start, mini_batch_samples);
-                    let returns_mb = returns.narrow(0, mb_sample_start, mini_batch_samples);
-                    let advantages_mb = advantages.narrow(0, mb_sample_start, mini_batch_samples);
+                    let returns_mb =
+                        returns.narrow(0, mb_sample_start, mini_batch_samples);
+                    let advantages_mb =
+                        advantages.narrow(0, mb_sample_start, mini_batch_samples);
                     let old_log_probs_mb =
                         old_log_probs.narrow(0, mb_sample_start, mini_batch_samples);
 
-                    // Logistic-normal log-prob with Jacobian
                     let u = actions_mb;
-                    let zeros = zeros_max.narrow(0, 0, mini_batch_samples);
-                    let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
+                    let actions_tanh = u.tanh();
 
                     // RPO alpha: sigmoid parameterization for smooth gradients everywhere
                     let rpo_alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
@@ -548,40 +489,35 @@ pub fn train(weights_path: Option<&str>) {
                     let u_normalized = (&u - &action_means_perturbed) / &action_std;
                     let u_squared = u_normalized.pow_tensor_scalar(2);
                     let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
-                    let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
+                    let log_det = (Tensor::ones_like(&actions_tanh) - actions_tanh.pow_tensor_scalar(2))
+                        .clamp_min(1e-6)
+                        .log();
+                    let action_log_probs = log_prob_u - log_det;
 
-                    // Jacobian: -Σ log(y_i) = -Σ log_softmax(u_ext)_i (numerically stable)
-                    let log_jacobian = u_ext
-                        .log_softmax(-1, Kind::Float)
-                        .sum_dim_intlist(-1, false, Kind::Float);
-                    let action_log_probs = log_prob_gaussian - log_jacobian;
-
-                    // Entropy of Gaussian (K-1 dims)
+                    // Entropy of Gaussian (per ticker)
                     let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
                     let dist_entropy = entropy_components
                         .g_mul_scalar(0.5)
-                        .sum_dim_intlist(-1, false, Kind::Float)
                         .mean(Kind::Float);
 
-                    // Value loss: CE for distributional head + clipped MSE on expectation.
-                    let symlog_clip = shared::symlog_target_clip();
-                    let returns_symlog = symlog(&returns_mb).clamp(-symlog_clip, symlog_clip);
-                    let target_twohot = twohot_encode(&returns_symlog, trading_model.symlog_centers());
-                    let log_probs = critic_logits.log_softmax(-1, Kind::Float);
-                    let ce_loss = -(target_twohot * log_probs).sum_dim_intlist(-1, false, Kind::Float).mean(Kind::Float);
-
-                    // PPO-style clipped MSE on expected value (raw space)
-                    let old_values_mb = s_values_flat.narrow(0, mb_sample_start, mini_batch_samples);
-                    let values_pred = critics.squeeze_dim(-1);
-                    let returns_t = returns_mb.squeeze_dim(-1);
-                    let values_clipped = &old_values_mb + (&values_pred - &old_values_mb).clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
+                    // PPO-style clipped MSE on per-ticker values (raw space)
+                    let old_values_mb =
+                        s_values_flat.narrow(0, mb_sample_start, mini_batch_samples);
+                    let values_pred = values;
+                    let returns_t = returns_mb;
+                    let values_clipped =
+                        &old_values_mb + (&values_pred - &old_values_mb)
+                            .clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
 
                     const HUBER_DELTA: f64 = 1.0;
-                    let v_loss_unclipped = huber_elementwise(&(&values_pred - &returns_t), HUBER_DELTA);
-                    let v_loss_clipped = huber_elementwise(&(&values_clipped - &returns_t), HUBER_DELTA);
-                    let v_loss_clip = Tensor::max_other(&v_loss_unclipped, &v_loss_clipped).mean(Kind::Float);
+                    let v_loss_unclipped =
+                        huber_elementwise(&(&values_pred - &returns_t), HUBER_DELTA);
+                    let v_loss_clipped =
+                        huber_elementwise(&(&values_clipped - &returns_t), HUBER_DELTA);
+                    let v_loss_clip =
+                        Tensor::max_other(&v_loss_unclipped, &v_loss_clipped).mean(Kind::Float);
 
-                    let value_loss: Tensor = ce_loss + 0.1 * v_loss_clip;
+                    let value_loss: Tensor = v_loss_clip;
 
                     // PPO clipped objective
                     let ratio = (&action_log_probs - &old_log_probs_mb).exp();
@@ -589,20 +525,23 @@ pub fn train(weights_path: Option<&str>) {
                     // Clip fraction diagnostic
                     let clipped_count = tch::no_grad(|| {
                         let deviation = (&ratio - 1.0).abs();
-                        i64::try_from(deviation.gt(PPO_CLIP_RATIO).sum(Kind::Int64)).unwrap_or(0)
+                        deviation.gt(PPO_CLIP_RATIO).to_kind(Kind::Float).sum(Kind::Float)
                     });
-                    total_clipped += clipped_count;
-                    total_ratio_samples += mini_batch_samples;
+                    let _ = total_clipped.g_add_(&clipped_count);
+                    total_ratio_samples += mini_batch_samples * ACTION_COUNT;
 
                     let unclipped_obj = &ratio * &advantages_mb;
-                    let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
+                    let ratio_clipped =
+                        ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
                     let clipped_obj = ratio_clipped * &advantages_mb;
                     let action_loss =
-                        -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
+                        -Tensor::min_other(&unclipped_obj, &clipped_obj)
+                            .mean(Kind::Float);
 
                     // KL and loss for metrics (extract before backward frees graph)
                     let approx_kl_val =
-                        tch::no_grad(|| (&old_log_probs_mb - &action_log_probs).mean(Kind::Float));
+                        tch::no_grad(|| (&old_log_probs_mb - &action_log_probs)
+                            .mean(Kind::Float));
                     let ppo_loss =
                         value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
                     let loss_val = tch::no_grad(|| ppo_loss.shallow_clone());
@@ -615,11 +554,11 @@ pub fn train(weights_path: Option<&str>) {
                     // Alpha loss: target induced KL using detached network outputs
                     // For diagonal Gaussian with z_i ~ U(-alpha, alpha):
                     // E[KL] = sum_i E[z_i^2] / (2*sigma_i^2) = sum_i (alpha^2/3) / (2*sigma_i^2)
-                    //       = d * (alpha^2/6) * mean(1/sigma^2)  where d = ACTION_COUNT - 1
+                    //       = d * (alpha^2/6) * mean(1/sigma^2)  where d = ACTION_COUNT
                     let action_std_detached = action_log_stds.detach().clamp(-20.0, 5.0).exp();
                     let var = action_std_detached.pow_tensor_scalar(2);
                     let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                    let d = (ACTION_COUNT - 1) as f64;
+                    let d = ACTION_COUNT as f64;
                     let induced_kl: Tensor = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                     let alpha_loss = (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0);
                     (alpha_loss * ALPHA_LOSS_COEF).backward();
@@ -702,7 +641,7 @@ pub fn train(weights_path: Option<&str>) {
         let (mean_std, min_std, max_std, mean_div) = tch::no_grad(|| {
             let price_deltas_step = s_price_deltas.get(0);
             let static_obs = s_static_obs.get(0);
-            let (_, _, (_, action_log_std, divisor), _) =
+            let (_, (_, action_log_std, divisor), _) =
                 trading_model.forward(&price_deltas_step, &static_obs, false);
             let std = action_log_std.exp();
             (
@@ -735,7 +674,7 @@ pub fn train(weights_path: Option<&str>) {
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
-            let (_, _, (debug_mean, debug_log_std, _debug_divisor), _attn_weights) =
+            let (_, (debug_mean, debug_log_std, _debug_divisor), _attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(0);
                     let static_obs = s_static_obs.get(0);
@@ -757,7 +696,8 @@ pub fn train(weights_path: Option<&str>) {
 
             // Compute clip fraction
             let clip_frac = if total_ratio_samples > 0 {
-                total_clipped as f64 / total_ratio_samples as f64
+                let total_clipped_val = f64::try_from(&total_clipped).unwrap_or(0.0);
+                total_clipped_val / total_ratio_samples as f64
             } else {
                 0.0
             };

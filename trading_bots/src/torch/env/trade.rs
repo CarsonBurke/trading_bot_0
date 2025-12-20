@@ -1,8 +1,6 @@
-use tch::Tensor;
+use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE};
 
-use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE, RETROACTIVE_BUY_REWARD};
-
-use super::env::{BuyLot, Env, TRADE_EMA_ALPHA};
+use super::env::{Env, TRADE_EMA_ALPHA};
 
 impl Env {
     #[allow(dead_code)]
@@ -10,9 +8,8 @@ impl Env {
         &mut self,
         actions: &[f64],
         absolute_step: usize,
-    ) -> (f64, f64) {
+    ) -> f64 {
         let mut total_commission = 0.0;
-        let mut sell_reward = 0.0;
 
         // === PASS 1: Execute all SELLS first (frees up cash) ===
         for (ticker_index, &action) in actions.iter().enumerate() {
@@ -47,10 +44,6 @@ impl Env {
                 self.position_open_step[ticker_index] = None;
             }
 
-            if RETROACTIVE_BUY_REWARD {
-                sell_reward +=
-                    self.calculate_retroactive_rewards_net_pnl(ticker_index, absolute_step, price, quantity);
-            }
         }
 
         // === PASS 2: Collect buy intents and compute proportional fill ===
@@ -115,16 +108,9 @@ impl Env {
                 self.position_open_step[intent.ticker_index] = Some(absolute_step);
             }
 
-            if RETROACTIVE_BUY_REWARD {
-                self.buy_lots[intent.ticker_index].push_back(BuyLot {
-                    step: absolute_step,
-                    price: intent.price,
-                    quantity,
-                });
-            }
         }
 
-        (total_commission, sell_reward)
+        total_commission
     }
 
     /// Weight-based trading with dead zone. Full control outside dead zone.
@@ -133,12 +119,11 @@ impl Env {
         &mut self,
         actions: &[f64],
         absolute_step: usize,
-    ) -> (f64, f64) {
+    ) -> f64 {
         let n_tickers = self.tickers.len();
         let min_trade_frac = 0.005;
 
         let mut total_commission = 0.0;
-        let mut sell_reward = 0.0;
 
         // Apply delta with dead zone to ticker weights only.
         // Cash is computed as residual (1 - sum(ticker_weights)).
@@ -173,7 +158,7 @@ impl Env {
         // 3. Calculate current portfolio weights and target deltas
         let total_assets = self.account.total_assets;
         if total_assets <= 0.0 {
-            return (0.0, 0.0);
+            return 0.0;
         }
 
         // Collect sell and buy intents
@@ -236,14 +221,6 @@ impl Env {
                 self.position_open_step[intent.ticker_index] = None;
             }
 
-            if RETROACTIVE_BUY_REWARD {
-                sell_reward += self.calculate_retroactive_rewards_net_pnl(
-                    intent.ticker_index,
-                    absolute_step,
-                    intent.price,
-                    quantity,
-                );
-            }
         }
 
         // 5. Execute buys with proportional scaling if insufficient cash
@@ -283,39 +260,50 @@ impl Env {
                 self.position_open_step[intent.ticker_index] = Some(absolute_step);
             }
 
-            if RETROACTIVE_BUY_REWARD {
-                self.buy_lots[intent.ticker_index].push_back(BuyLot {
-                    step: absolute_step,
-                    price: intent.price,
-                    quantity,
-                });
-            }
         }
 
-        (total_commission, sell_reward)
+        total_commission
     }
 
-    /// Weight-based trading: actions ARE the target weights (mapped from (-1,1) to (0,1)).
-    /// Actions: [ticker_0, ..., ticker_n, cash] - normalized to sum to 1.0.
+    /// Weight-based trading: actions are target weights in [0,1].
+    /// Actions: [ticker_0, ..., ticker_n, cash] with cash explicitly set.
     pub(super) fn trade_by_target_weights(
         &mut self,
         actions: &[f64],
         absolute_step: usize,
-    ) -> (f64, f64) {
+    ) -> f64 {
         let n_tickers = self.tickers.len();
 
         let mut total_commission = 0.0;
-        let mut sell_reward = 0.0;
 
-        // Actions are softmax weights (already sum to 1, all in [0,1])
-        for (i, &action) in actions.iter().enumerate() {
-            self.target_weights[i] = action;
+        let cash_weight = actions
+            .get(n_tickers)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let mut ticker_sum = 0.0;
+        for (i, &action) in actions.iter().take(n_tickers).enumerate() {
+            let clamped = action.clamp(0.0, 1.0);
+            self.target_weights[i] = clamped;
+            ticker_sum += clamped;
         }
+        let target_ticker_total = (1.0 - cash_weight).clamp(0.0, 1.0);
+        if ticker_sum > 0.0 {
+            let scale = target_ticker_total / ticker_sum;
+            for w in self.target_weights.iter_mut().take(n_tickers) {
+                *w = (*w * scale).clamp(0.0, 1.0);
+            }
+        } else {
+            for w in self.target_weights.iter_mut().take(n_tickers) {
+                *w = 0.0;
+            }
+        }
+        self.target_weights[n_tickers] = cash_weight;
 
         // 2. Calculate target deltas and execute trades
         let total_assets = self.account.total_assets;
         if total_assets <= 0.0 {
-            return (0.0, 0.0);
+            return 0.0;
         }
 
         struct TradeIntent {
@@ -369,14 +357,6 @@ impl Env {
                 self.position_open_step[intent.ticker_index] = None;
             }
 
-            if RETROACTIVE_BUY_REWARD {
-                sell_reward += self.calculate_retroactive_rewards_net_pnl(
-                    intent.ticker_index,
-                    absolute_step,
-                    intent.price,
-                    quantity,
-                );
-            }
         }
 
         // 4. Execute buys with proportional scaling if insufficient cash
@@ -416,42 +396,9 @@ impl Env {
                 self.position_open_step[intent.ticker_index] = Some(absolute_step);
             }
 
-            if RETROACTIVE_BUY_REWARD {
-                self.buy_lots[intent.ticker_index].push_back(BuyLot {
-                    step: absolute_step,
-                    price: intent.price,
-                    quantity,
-                });
-            }
         }
 
-        (total_commission, sell_reward)
-    }
-
-    #[allow(dead_code)]
-    fn calculate_position_time_weighted_return(&self, ticker_index: usize, current_step: usize) -> f64 {
-        if self.buy_lots[ticker_index].is_empty() {
-            return 0.0;
-        }
-
-        let current_price = self.prices[ticker_index][current_step];
-        let mut total_weighted_return = 0.0;
-        let mut total_quantity = 0.0;
-
-        for lot in &self.buy_lots[ticker_index] {
-            let return_pct = (current_price - lot.price) / lot.price;
-            let hold_time = (current_step - lot.step).max(1) as f64;
-            let time_weighted_return = return_pct / hold_time.sqrt();
-
-            total_weighted_return += time_weighted_return * lot.quantity;
-            total_quantity += lot.quantity;
-        }
-
-        if total_quantity > 0.0 {
-            total_weighted_return / total_quantity
-        } else {
-            0.0
-        }
+        total_commission
     }
 
     #[allow(dead_code)]

@@ -1,13 +1,4 @@
-use tch::Tensor;
-
-use crate::torch::constants::COMMISSION_RATE;
-
 use super::env::Env;
-
-const RETROACTIVE_REWARD_SCALE: f64 = 10.0;
-const RETROACTIVE_REWARD_CLIP_FRAC: f64 = 0.25;
-const RETROACTIVE_BUY_FRACTION: f64 = 0.7;
-const RETROACTIVE_TIME_LOG_COEF: f64 = 0.05;
 
 // === Action-outcome reward ===
 // Rewards the model based on how well its allocation decisions aligned with
@@ -37,79 +28,42 @@ const HINDSIGHT_COMMISSION_PENALTY: f64 = 10.0;
 const BULL_DOWNSIDE_SCALE: f64 = 1.5;
 
 impl Env {
-    pub(super) fn calculate_retroactive_rewards_net_pnl(
-        &mut self,
-        ticker_index: usize,
-        sell_step: usize,
-        sell_price: f64,
-        sell_quantity: f64,
-    ) -> f64 {
-        let lots = &mut self.buy_lots[ticker_index];
-        if lots.is_empty() {
-            return 0.0;
+    pub(super) fn get_unrealized_pnl_reward_breakdown(
+        &self,
+        absolute_step: usize,
+        _commissions: f64,
+    ) -> (f64, Vec<f64>) {
+        let n_tickers = self.tickers.len();
+        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+            return (0.0, vec![0.0; n_tickers]);
         }
 
-        let total_lot_qty: f64 = lots.iter().map(|l| l.quantity).sum();
-        if total_lot_qty < 1e-8 {
-            return 0.0;
+        let next_absolute_step = absolute_step + 1;
+        let total_assets = self.account.total_assets;
+        let mut contributions = vec![0.0; n_tickers];
+        let mut total_assets_next = self.account.cash;
+
+        for ticker_idx in 0..n_tickers {
+            let current_price = self.prices[ticker_idx][absolute_step];
+            let next_price = self.prices[ticker_idx][next_absolute_step];
+            let current_value = self.account.positions[ticker_idx].value_with_price(current_price);
+            let next_value = self.account.positions[ticker_idx].value_with_price(next_price);
+            total_assets_next += next_value;
+            contributions[ticker_idx] = (next_value - current_value) / total_assets;
         }
 
-        let total_assets = self.account.total_assets.max(1.0);
-        let mut sell_reward_total = 0.0;
+        let portfolio_return = (total_assets_next - total_assets) / total_assets;
+        let pnl_reward = (total_assets_next / total_assets).ln() * REWARD_SCALE;
 
-        for lot in lots.iter_mut() {
-            let lot_fraction = lot.quantity / total_lot_qty;
-            let attributed_qty = sell_quantity * lot_fraction;
-            if attributed_qty <= 0.0 {
-                continue;
-            }
-
-            let gross_pnl = attributed_qty * (sell_price - lot.price);
-            let commission_cost = 2.0 * attributed_qty * COMMISSION_RATE;
-            let net_pnl = gross_pnl - commission_cost;
-
-            let hold_steps = (sell_step - lot.step).max(1) as f64;
-            let time_factor = 1.0 + hold_steps.ln_1p() * RETROACTIVE_TIME_LOG_COEF;
-
-            let frac = (net_pnl / total_assets).clamp(
-                -RETROACTIVE_REWARD_CLIP_FRAC,
-                RETROACTIVE_REWARD_CLIP_FRAC,
-            );
-            let reward = frac * RETROACTIVE_REWARD_SCALE * time_factor;
-
-            let buy_reward = reward * RETROACTIVE_BUY_FRACTION;
-            let sell_reward = reward - buy_reward;
-            sell_reward_total += sell_reward;
-
-            *self.retroactive_rewards.entry(lot.step).or_insert(0.0) += buy_reward;
-            if lot.step >= self.episode_start_offset {
-                let relative_step = lot.step - self.episode_start_offset;
-                if relative_step < self.episode_history.rewards.len() {
-                    self.episode_history.rewards[relative_step] += buy_reward;
-                }
-            }
-
-            lot.quantity -= attributed_qty;
+        if portfolio_return.abs() < 1e-8 {
+            return (pnl_reward, vec![0.0; n_tickers]);
         }
 
-        lots.retain(|l| l.quantity > 1e-8);
-        sell_reward_total
-    }
-
-    pub fn apply_retroactive_rewards(&self, rewards_tensor: &Tensor) {
-        for (&step, &reward) in &self.retroactive_rewards {
-            if step < self.episode_start_offset {
-                continue;
-            }
-            let relative_step = step - self.episode_start_offset;
-            if (relative_step as i64) < rewards_tensor.size()[0] {
-                let current =
-                    f64::try_from(rewards_tensor.get(relative_step as i64)).unwrap_or(0.0);
-                let _ = rewards_tensor
-                    .get(relative_step as i64)
-                    .fill_(current + reward);
-            }
-        }
+        let per_ticker_rewards: Vec<f64> = contributions
+            .iter()
+            .map(|c| pnl_reward * (c / portfolio_return))
+            .collect();
+        (pnl_reward, per_ticker_rewards)
     }
 
     /// Hindsight allocation quality reward with asymmetric upside penalty.
