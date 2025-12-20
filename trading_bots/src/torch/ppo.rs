@@ -117,29 +117,6 @@ const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before 
 pub fn train(weights_path: Option<&str>) {
     let mut env = VecEnv::new(true);
 
-    println!("Generating data analysis charts...");
-    let data_dir = "../training/data";
-    for (ticker_idx, ticker) in env.tickers().iter().enumerate() {
-        if let Err(e) = crate::charts::data_analysis::create_data_analysis_charts(
-            ticker,
-            &env.prices()[ticker_idx],
-            data_dir,
-        ) {
-            eprintln!(
-                "Warning: Failed to create data analysis charts for {}: {}",
-                ticker, e
-            );
-        }
-    }
-
-    if let Err(e) =
-        crate::charts::data_analysis::create_index_chart(env.tickers(), env.prices(), data_dir)
-    {
-        eprintln!("Warning: Failed to create index chart: {}", e);
-    }
-
-    println!("Data analysis charts generated in {}/", data_dir);
-
     let max_steps = STEPS_PER_EPISODE as i64;
     println!(
         "action space: {} ({} tickers + cash)",

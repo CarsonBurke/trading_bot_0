@@ -1,0 +1,483 @@
+use anyhow::{anyhow, Result};
+use image::{DynamicImage, RgbImage};
+use plotters::coord::Shift;
+use plotters::prelude::*;
+use shared::report::{Report, ReportKind, ReportSeries, ScaleKind, TradePoint};
+use shared::theme::plotters_colors as theme;
+
+const CHART_DIMS: (u32, u32) = (2560, 780);
+
+pub fn render_report(report: &Report) -> Result<DynamicImage> {
+    let mut buffer = vec![0u8; (CHART_DIMS.0 * CHART_DIMS.1 * 3) as usize];
+    {
+        let root = BitMapBackend::with_buffer(&mut buffer, CHART_DIMS).into_drawing_area();
+        root.fill(&theme::BASE)?;
+
+        match &report.kind {
+            ReportKind::Simple { values, ema_alpha } => {
+                render_simple(&root, report, values, *ema_alpha)?;
+            }
+            ReportKind::MultiLine { series } => {
+                render_multi_line(&root, report, series)?;
+            }
+            ReportKind::Assets {
+                total,
+                cash,
+                positioned,
+                benchmark,
+            } => {
+                render_assets(&root, report, total, cash, positioned.as_ref(), benchmark.as_ref())?;
+            }
+            ReportKind::BuySell {
+                prices,
+                buys,
+                sells,
+            } => {
+                render_buy_sell(&root, report, prices, buys, sells)?;
+            }
+            ReportKind::Observations { .. } => {
+                return Err(anyhow!("report type not renderable"));
+            }
+        }
+
+        root.present()?;
+    }
+
+    let image = RgbImage::from_raw(CHART_DIMS.0, CHART_DIMS.1, buffer)
+        .ok_or_else(|| anyhow!("failed to build image"))?;
+    Ok(DynamicImage::ImageRgb8(image))
+}
+
+fn render_simple(
+    root: &DrawingArea<BitMapBackend, Shift>,
+    report: &Report,
+    values: &[f64],
+    ema_alpha: Option<f64>,
+) -> Result<()> {
+    if values.is_empty() {
+        return Ok(());
+    }
+
+    let scale = report.scale;
+    let (y_min, y_max) = range_for(values, scale == ScaleKind::Symlog)?;
+    let title = normalize_title(&report.title);
+    let mut chart = plotters::chart::ChartBuilder::on(root)
+        .caption(title.as_str(), ("sans-serif", 20, &theme::TEXT))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..values.len() as u32, y_min..y_max)?;
+
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0);
+    if let Some(label) = report.x_label.as_deref() {
+        mesh.x_desc(label);
+    }
+    if let Some(label) = report.y_label.as_deref() {
+        mesh.y_desc(label);
+    }
+    if scale == ScaleKind::Symlog {
+        mesh.y_label_formatter(&|v| format!("{:.2e}", symlog_inv(*v)));
+    }
+    mesh.draw()?;
+
+    let mapped = values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .map(|(idx, v)| (idx as u32, map_value(*v, scale)));
+
+    if scale == ScaleKind::Symlog {
+        chart
+            .draw_series(LineSeries::new(
+                mapped,
+                ShapeStyle::from(&theme::BLUE).stroke_width(1),
+            ))?
+            .label("value")
+            .legend(legend_rect(&theme::BLUE));
+    } else {
+        chart
+            .draw_series(
+                AreaSeries::new(mapped, 0.0, theme::BLUE.mix(0.2))
+                    .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
+            )?
+            .label("value")
+            .legend(legend_rect(&theme::BLUE));
+    }
+
+    if let Some(alpha) = ema_alpha {
+        let ema = compute_ema(values, alpha);
+        let ema_series = ema
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_finite())
+            .map(|(idx, v)| (idx as u32, map_value(*v, scale)));
+        chart
+            .draw_series(LineSeries::new(
+                ema_series,
+                ShapeStyle::from(&theme::YELLOW).stroke_width(1),
+            ))?
+            .label("EMA")
+            .legend(legend_rect(&theme::YELLOW));
+    }
+
+    chart
+        .configure_series_labels()
+        .position(LegendConfig::position())
+        .background_style(LegendConfig::background())
+        .border_style(LegendConfig::border())
+        .label_font(LegendConfig::font())
+        .draw()?;
+
+    Ok(())
+}
+
+fn render_multi_line(
+    root: &DrawingArea<BitMapBackend, Shift>,
+    report: &Report,
+    series: &[ReportSeries],
+) -> Result<()> {
+    let all_values: Vec<f64> = series.iter().flat_map(|s| s.values.iter()).copied().collect();
+    if all_values.is_empty() {
+        return Ok(());
+    }
+
+    let scale = report.scale;
+    let (y_min, y_max) = range_for(&all_values, scale == ScaleKind::Symlog)?;
+    let x_max = series
+        .iter()
+        .map(|s| s.values.len())
+        .max()
+        .unwrap_or(1) as u32;
+
+    let title = normalize_title(&report.title);
+    let mut chart = plotters::chart::ChartBuilder::on(root)
+        .caption(title.as_str(), ("sans-serif", 20, &theme::TEXT))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..x_max, y_min..y_max)?;
+
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0);
+    if let Some(label) = report.x_label.as_deref() {
+        mesh.x_desc(label);
+    }
+    if let Some(label) = report.y_label.as_deref() {
+        mesh.y_desc(label);
+    }
+    if scale == ScaleKind::Symlog {
+        mesh.y_label_formatter(&|v| format!("{:.2e}", symlog_inv(*v)));
+    }
+    mesh.draw()?;
+
+    let colors = [
+        &theme::BLUE,
+        &theme::GREEN,
+        &theme::RED,
+        &theme::YELLOW,
+        &theme::MAUVE,
+    ];
+
+    for (i, series) in series.iter().enumerate() {
+        let color = colors[i % colors.len()];
+        let mapped = series
+            .values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_finite())
+            .map(|(idx, v)| (idx as u32, map_value(*v, scale)));
+        chart
+            .draw_series(LineSeries::new(
+                mapped,
+                ShapeStyle::from(&color.mix(0.8)).stroke_width(1),
+            ))?
+            .label(series.label.as_str())
+            .legend(legend_rect(color));
+    }
+
+    chart
+        .configure_series_labels()
+        .position(LegendConfig::position())
+        .background_style(LegendConfig::background())
+        .border_style(LegendConfig::border())
+        .label_font(LegendConfig::font())
+        .draw()?;
+
+    Ok(())
+}
+
+fn render_assets(
+    root: &DrawingArea<BitMapBackend, Shift>,
+    report: &Report,
+    total: &[f64],
+    cash: &[f64],
+    positioned: Option<&Vec<f64>>,
+    benchmark: Option<&Vec<f64>>,
+) -> Result<()> {
+    if total.is_empty() {
+        return Ok(());
+    }
+
+    let mut max_val = total.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if let Some(bench) = benchmark {
+        let bench_max = bench.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        max_val = max_val.max(bench_max);
+    }
+
+    let y_max = max_val as f32 * 1.1;
+
+    let title = normalize_title(&report.title);
+    let mut chart = plotters::chart::ChartBuilder::on(root)
+        .caption(title.as_str(), ("sans-serif", 20, &theme::TEXT))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..total.len() as u32, 0.0..y_max)?;
+
+    chart
+        .configure_mesh()
+        .label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0)
+        .draw()?;
+
+    chart
+        .draw_series(
+        AreaSeries::new(
+            total
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value as f32)),
+            0.0,
+            theme::BLUE.mix(0.2),
+        )
+        .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
+    )?
+        .label("total")
+        .legend(legend_rect(&theme::BLUE));
+
+    let positioned = positioned.map(|p| p.as_slice()).unwrap_or(&[]);
+    if !positioned.is_empty() {
+        chart
+            .draw_series(
+            AreaSeries::new(
+                positioned
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (index as u32, *value as f32)),
+                0.0,
+                theme::RED.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
+        )?
+            .label("positioned")
+            .legend(legend_rect(&theme::RED));
+    }
+
+    chart
+        .draw_series(
+        AreaSeries::new(
+            cash.iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value as f32)),
+            0.0,
+            theme::GREEN.mix(0.2),
+        )
+        .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
+    )?
+        .label("cash")
+        .legend(legend_rect(&theme::GREEN));
+
+    if let Some(bench) = benchmark {
+        chart
+            .draw_series(LineSeries::new(
+            bench
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value as f32)),
+            ShapeStyle::from(&theme::MAUVE).stroke_width(1),
+        ))?
+            .label("benchmark")
+            .legend(legend_rect(&theme::MAUVE));
+    }
+
+    chart
+        .configure_series_labels()
+        .position(LegendConfig::position())
+        .background_style(LegendConfig::background())
+        .border_style(LegendConfig::border())
+        .label_font(LegendConfig::font())
+        .draw()?;
+
+    Ok(())
+}
+
+fn render_buy_sell(
+    root: &DrawingArea<BitMapBackend, Shift>,
+    report: &Report,
+    prices: &[f64],
+    buys: &[TradePoint],
+    sells: &[TradePoint],
+) -> Result<()> {
+    if prices.is_empty() {
+        return Ok(());
+    }
+
+    let y_min = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+    let y_max = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let y_range = (y_max - y_min).max(0.01);
+    let y_min = y_min - y_range * 0.05;
+    let y_max = y_max + y_range * 0.05;
+
+    let title = normalize_title(&report.title);
+    let mut chart = plotters::chart::ChartBuilder::on(root)
+        .caption(title.as_str(), ("sans-serif", 20, &theme::TEXT))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0..prices.len() as u32, y_min..y_max)?;
+
+    chart
+        .configure_mesh()
+        .label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0)
+        .draw()?;
+
+    chart.draw_series(
+        AreaSeries::new(
+            prices
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index as u32, *value)),
+            0.0,
+            theme::BLUE.mix(0.2),
+        )
+        .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
+    )?;
+
+    let point_size = 3;
+    chart.draw_series(PointSeries::of_element(
+        sells.iter().map(|p| (p.index as u32, p.price)),
+        point_size,
+        theme::YELLOW.mix(0.9).filled(),
+        &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
+    ))?;
+
+    chart.draw_series(PointSeries::of_element(
+        buys.iter().map(|p| (p.index as u32, p.price)),
+        point_size,
+        theme::RED.mix(0.9).filled(),
+        &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
+    ))?;
+
+    Ok(())
+}
+
+fn compute_ema(data: &[f64], alpha: f64) -> Vec<f64> {
+    if data.is_empty() {
+        return vec![];
+    }
+    let mut result = Vec::with_capacity(data.len());
+    let mut ema = data[0];
+    for &v in data {
+        ema = alpha * v + (1.0 - alpha) * ema;
+        result.push(ema);
+    }
+    result
+}
+
+fn symlog(x: f64) -> f64 {
+    x.signum() * (1.0 + x.abs()).ln()
+}
+
+fn symlog_inv(y: f64) -> f64 {
+    y.signum() * (y.abs().exp() - 1.0)
+}
+
+fn map_value(value: f64, scale: ScaleKind) -> f64 {
+    match scale {
+        ScaleKind::Linear => value,
+        ScaleKind::Symlog => symlog(value),
+    }
+}
+
+fn range_for(values: &[f64], is_symlog: bool) -> Result<(f64, f64)> {
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return Err(anyhow!("no finite values"));
+    }
+
+    let y_min = finite
+        .iter()
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .copied()
+        .unwrap_or(0.0);
+    let y_max = finite
+        .iter()
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .copied()
+        .unwrap_or(1.0);
+    let y_range = (y_max - y_min).max(0.01);
+
+    if is_symlog {
+        Ok((
+            symlog(y_min - y_range * 0.05),
+            symlog(y_max + y_range * 0.05),
+        ))
+    } else {
+        Ok((y_min - y_range * 0.05, y_max + y_range * 0.05))
+    }
+}
+
+fn normalize_title(name: &str) -> String {
+    let mut parts = Vec::new();
+    for word in name.split_whitespace() {
+        if word.eq_ignore_ascii_case("log") {
+            parts.push("(Log)".to_string());
+            continue;
+        }
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            let rest = chars.as_str().to_ascii_lowercase();
+            let mut word_out = String::new();
+            word_out.push(first.to_ascii_uppercase());
+            word_out.push_str(&rest);
+            parts.push(word_out);
+        }
+    }
+    parts.join(" ")
+}
+
+struct LegendConfig;
+
+impl LegendConfig {
+    fn position() -> SeriesLabelPosition {
+        SeriesLabelPosition::UpperRight
+    }
+
+    fn background() -> RGBAColor {
+        theme::SURFACE0.mix(0.5)
+    }
+
+    fn border() -> &'static RGBColor {
+        &theme::SURFACE1
+    }
+
+    fn font() -> (&'static str, i32, &'static RGBColor) {
+        ("sans-serif", 14, &theme::TEXT)
+    }
+}
+
+fn legend_rect(
+    color: &impl Color,
+) -> impl Fn((i32, i32)) -> plotters::element::Rectangle<(i32, i32)> + '_ {
+    move |(x, y)| {
+        plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], color.mix(0.8).filled())
+    }
+}

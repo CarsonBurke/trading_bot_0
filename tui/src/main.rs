@@ -18,6 +18,7 @@ use std::{
 mod chart_viewer;
 mod components;
 mod pages;
+mod report_renderer;
 mod state;
 mod theme;
 mod utils;
@@ -126,8 +127,18 @@ impl App {
 
         // Meta chart base names (episode-level charts without ticker)
         let meta_chart_bases = vec![
-            "Final Assets", "Cumulative Reward", "Outperformance", "Loss (Log)",
-            "Total Commissions", "Std Stats", "Advantage Stats (Log)", "Divisor", "Target Weights", "Grad Norm (Log)"
+            "assets",
+            "reward",
+            "final_assets",
+            "cumulative_reward",
+            "outperformance",
+            "loss_log",
+            "total_commissions",
+            "std_stats",
+            "advantage_stats_log",
+            "divisor",
+            "grad_norm_log",
+            "target_weights",
         ];
 
         // Ticker-specific chart base names
@@ -153,72 +164,51 @@ impl App {
 
                 let gen_path = entry.path();
 
-                // Single scan for both episode-level charts and ticker subdirectories
+                // Process episode-level meta charts
+                for base in &meta_chart_bases {
+                    let report_path = gen_path.join(format!("{base}.report.bin"));
+                    if !report_path.exists() {
+                        continue;
+                    }
+                    if let Ok(metadata) = fs::metadata(&report_path) {
+                        if let Ok(modified) = metadata.modified() {
+                            let key = format!("meta_{}", base);
+                            if latest_per_type
+                                .get(&key)
+                                .map(|(t, _)| modified > *t)
+                                .unwrap_or(true)
+                            {
+                                latest_per_type.insert(key, (modified, report_path));
+                            }
+                        }
+                    }
+                }
+
+
+                // Process ticker-specific charts in subdirectories
                 if let Ok(items) = fs::read_dir(&gen_path) {
                     for item in items.filter_map(|e| e.ok()) {
                         let item_path = item.path();
-                        let is_file = item.file_type().ok().map(|ft| ft.is_file()).unwrap_or(false);
-                        let is_dir = item.file_type().ok().map(|ft| ft.is_dir()).unwrap_or(false);
+                        if !item.file_type().ok().map(|ft| ft.is_dir()).unwrap_or(false) {
+                            continue;
+                        }
+                        let ticker_name = item.file_name();
+                        let ticker_str = ticker_name.to_str().unwrap_or("");
 
-                        if is_file {
-                            // Process episode-level meta charts
-                            let ext = item_path.extension().and_then(|s| s.to_str());
-                            if ext != Some("png") && ext != Some("webp") {
+                        for base in &ticker_chart_bases {
+                            let report_path = item_path.join(format!("{base}.report.bin"));
+                            if !report_path.exists() {
                                 continue;
                             }
-
-                            let file_name = item_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-
-                            // Check if this file matches any of our meta chart types
-                            for base in &meta_chart_bases {
-                                if file_name == *base {
-                                    if let Ok(metadata) = item.metadata() {
-                                        if let Ok(modified) = metadata.modified() {
-                                            let key = format!("meta_{}", base);
-                                            if latest_per_type
-                                                .get(&key)
-                                                .map(|(t, _)| modified > *t)
-                                                .unwrap_or(true)
-                                            {
-                                                latest_per_type.insert(key, (modified, item_path.clone()));
-                                            }
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        } else if is_dir {
-                            // Process ticker-specific charts in subdirectories
-                            let ticker_name = item.file_name();
-                            let ticker_str = ticker_name.to_str().unwrap_or("");
-
-                            if let Ok(ticker_files) = fs::read_dir(&item_path) {
-                                for file in ticker_files.filter_map(|e| e.ok()) {
-                                    let file_path = file.path();
-                                    let ext = file_path.extension().and_then(|s| s.to_str());
-                                    if ext != Some("png") && ext != Some("webp") {
-                                        continue;
-                                    }
-
-                                    let file_name = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-
-                                    // Check if this file matches any ticker chart types
-                                    for base in &ticker_chart_bases {
-                                        if file_name == *base {
-                                            if let Ok(metadata) = file.metadata() {
-                                                if let Ok(modified) = metadata.modified() {
-                                                    let key = format!("{}_{}", ticker_str, base);
-                                                    if latest_per_type
-                                                        .get(&key)
-                                                        .map(|(t, _)| modified > *t)
-                                                        .unwrap_or(true)
-                                                    {
-                                                        latest_per_type.insert(key, (modified, file_path.clone()));
-                                                    }
-                                                }
-                                            }
-                                            break;
-                                        }
+                            if let Ok(metadata) = fs::metadata(&report_path) {
+                                if let Ok(modified) = metadata.modified() {
+                                    let key = format!("{}_{}", ticker_str, base);
+                                    if latest_per_type
+                                        .get(&key)
+                                        .map(|(t, _)| modified > *t)
+                                        .unwrap_or(true)
+                                    {
+                                        latest_per_type.insert(key, (modified, report_path));
                                     }
                                 }
                             }
@@ -893,4 +883,3 @@ fn ui(f: &mut Frame, app: &mut App) {
         DialogMode::None => {}
     }
 }
-

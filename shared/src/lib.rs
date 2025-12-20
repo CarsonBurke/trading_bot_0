@@ -41,3 +41,4 @@ pub fn symlog_target_clip() -> f64 {
 }
 
 pub mod theme;
+pub mod report;

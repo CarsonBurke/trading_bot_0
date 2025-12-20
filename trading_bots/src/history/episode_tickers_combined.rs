@@ -1,12 +1,8 @@
 use hashbrown::HashMap;
-use std::fs::File;
-use std::io::Write;
 
-use crate::{
-    charts::{assets_chart, buy_sell_chart, multi_line_chart, raw_action_chart, reward_chart, simple_chart},
-    constants::files::TRAINING_PATH,
-    utils::create_folder_if_not_exists,
-};
+use crate::constants::files::TRAINING_PATH;
+use crate::history::report::{write_report, Report, ReportKind, ReportSeries, ScaleKind, TradePoint};
+use crate::utils::create_folder_if_not_exists;
 
 #[derive(Debug)]
 pub struct EpisodeHistory {
@@ -93,12 +89,34 @@ impl EpisodeHistory {
 
             let ticker_buy_indexes = &self.buys[ticker_index];
             let ticker_sell_indexes = &self.sells[ticker_index];
-            let _ = buy_sell_chart(
-                &ticker_dir,
-                &ticker_prices,
-                ticker_buy_indexes,
-                ticker_sell_indexes,
-            );
+            let buys: Vec<TradePoint> = ticker_buy_indexes
+                .iter()
+                .map(|(index, (price, quantity))| TradePoint {
+                    index: *index,
+                    price: *price,
+                    quantity: *quantity,
+                })
+                .collect();
+            let sells: Vec<TradePoint> = ticker_sell_indexes
+                .iter()
+                .map(|(index, (price, quantity))| TradePoint {
+                    index: *index,
+                    price: *price,
+                    quantity: *quantity,
+                })
+                .collect();
+            let report = Report {
+                title: "Buy Sell".to_string(),
+                x_label: Some("Step".to_string()),
+                y_label: Some("Price".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::BuySell {
+                    prices: ticker_prices.clone(),
+                    buys,
+                    sells,
+                },
+            };
+            let _ = write_report(&format!("{ticker_dir}/buy_sell.report.bin"), &report);
 
             let positioned_assets = &self.positioned[ticker_index];
 
@@ -116,18 +134,31 @@ impl EpisodeHistory {
                 None
             };
 
-            let _ = assets_chart(
-                &ticker_dir,
-                &total_assets_per_step,
-                &self.cash,
-                Some(positioned_assets),
-                ticker_benchmark.as_ref(),
-            );
+            let report = Report {
+                title: "Assets".to_string(),
+                x_label: Some("Step".to_string()),
+                y_label: Some("Assets".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Assets {
+                    total: total_assets_per_step.clone(),
+                    cash: self.cash.clone(),
+                    positioned: Some(positioned_assets.clone()),
+                    benchmark: ticker_benchmark,
+                },
+            };
+            let _ = write_report(&format!("{ticker_dir}/assets.report.bin"), &report);
 
-            let _ = raw_action_chart(
-                &ticker_dir,
-                &self.raw_actions[ticker_index],
-            );
+            let report = Report {
+                title: "Raw Action".to_string(),
+                x_label: Some("Step".to_string()),
+                y_label: None,
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: self.raw_actions[ticker_index].clone(),
+                    ema_alpha: None,
+                },
+            };
+            let _ = write_report(&format!("{ticker_dir}/raw_action.report.bin"), &report);
         }
 
         let mut positioned_assets_per_step = vec![0.0; num_steps];
@@ -137,40 +168,72 @@ impl EpisodeHistory {
             }
         }
 
-        let _ = assets_chart(
-            &episode_dir,
-            &total_assets_per_step,
-            &self.cash,
-            Some(&positioned_assets_per_step),
-            index_benchmark.as_ref(),
-        );
+        let report = Report {
+            title: "Assets".to_string(),
+            x_label: Some("Step".to_string()),
+            y_label: Some("Assets".to_string()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::Assets {
+                total: total_assets_per_step.clone(),
+                cash: self.cash.clone(),
+                positioned: Some(positioned_assets_per_step),
+                benchmark: index_benchmark,
+            },
+        };
+        let _ = write_report(&format!("{episode_dir}/assets.report.bin"), &report);
 
-        let _ = reward_chart(&episode_dir, &self.rewards);
+        let report = Report {
+            title: "Rewards".to_string(),
+            x_label: Some("Step".to_string()),
+            y_label: Some("Reward".to_string()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::Simple {
+                values: self.rewards.clone(),
+                ema_alpha: None,
+            },
+        };
+        let _ = write_report(&format!("{episode_dir}/reward.report.bin"), &report);
 
         // Combined target weights chart (all tickers + cash) - every 5 episodes like meta charts
         if episode % 5 == 0 && !self.cash_weight.is_empty() && self.target_weights.iter().any(|w| !w.is_empty()) {
-            let mut series: Vec<(&str, &Vec<f64>)> = Vec::new();
+            let mut series: Vec<ReportSeries> = Vec::new();
             for (ticker_index, ticker) in tickers.iter().enumerate() {
                 if !self.target_weights[ticker_index].is_empty() {
-                    series.push((ticker.as_str(), &self.target_weights[ticker_index]));
+                    series.push(ReportSeries {
+                        label: ticker.to_string(),
+                        values: self.target_weights[ticker_index].clone(),
+                    });
                 }
             }
-            series.push(("cash", &self.cash_weight));
-            let _ = multi_line_chart(&episode_dir, "Target Weights", &series, 1, "Step");
+            series.push(ReportSeries {
+                label: "cash".to_string(),
+                values: self.cash_weight.clone(),
+            });
+            let report = Report {
+                title: "Target Weights".to_string(),
+                x_label: Some("Step".to_string()),
+                y_label: None,
+                scale: ScaleKind::Linear,
+                kind: ReportKind::MultiLine { series },
+            };
+            let _ = write_report(&format!("{episode_dir}/target_weights.report.bin"), &report);
         }
 
         // Write static observations and attention weights
         if episode & 5 == 0 && !self.static_observations.is_empty() && !self.attention_weights.is_empty() {
-            let observations_path = format!("{}/observations.json", episode_dir);
-            if let Ok(mut file) = File::create(&observations_path) {
-                let json_data = serde_json::json!({
-                    "static_observations": self.static_observations,
-                    "attention_weights": self.attention_weights,
-                    "action_step0": self.action_step0,
-                    "action_final": self.action_final,
-                });
-                let _ = file.write_all(json_data.to_string().as_bytes());
-            }
+            let report = Report {
+                title: "Observations".to_string(),
+                x_label: None,
+                y_label: None,
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Observations {
+                    static_observations: self.static_observations.clone(),
+                    attention_weights: self.attention_weights.clone(),
+                    action_step0: self.action_step0.clone(),
+                    action_final: self.action_final.clone(),
+                },
+            };
+            let _ = write_report(&format!("{episode_dir}/observations.report.bin"), &report);
         }
     }
 

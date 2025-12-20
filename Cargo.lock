@@ -3479,6 +3479,7 @@ version = "0.1.0"
 dependencies = [
  "plotters",
  "ratatui",
+ "serde",
 ]
 
 [[package]]
@@ -4029,6 +4030,8 @@ dependencies = [
  "anyhow",
  "crossterm",
  "image 0.25.9",
+ "plotters",
+ "postcard",
  "ratatui",
  "ratatui-image",
  "serde",

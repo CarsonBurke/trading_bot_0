@@ -330,7 +330,7 @@ impl Env {
                 .record(&self.episode_history, outperformance);
 
             if self.episode % 5 == 0 {
-                self.meta_history.chart(self.episode);
+                self.meta_history.write_reports(self.episode);
             }
         }
 

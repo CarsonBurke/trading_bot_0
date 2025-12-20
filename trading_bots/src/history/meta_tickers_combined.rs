@@ -1,6 +1,6 @@
-use crate::charts::{simple_chart, simple_chart_log, multi_line_chart, multi_line_chart_log};
-use crate::history::episode_tickers_combined::EpisodeHistory;
 use crate::constants::files::TRAINING_PATH;
+use crate::history::episode_tickers_combined::EpisodeHistory;
+use crate::history::report::{write_report, Report, ReportKind, ReportSeries, ScaleKind};
 use crate::utils::create_folder_if_not_exists;
 
 #[derive(Default, Debug)]
@@ -54,56 +54,153 @@ impl MetaHistory {
         self.mean_divisor.push(mean_divisor);
     }
 
-    pub fn chart(&self, episode: usize) {
+    pub fn write_reports(&self, episode: usize) {
         let base_dir = format!("{TRAINING_PATH}/gens/{}", episode);
         create_folder_if_not_exists(&base_dir);
         if !self.final_assets.is_empty() {
-            let _ = simple_chart(&base_dir, "Final Assets", &self.final_assets);
+            let report = Report {
+                title: "Final Assets".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Assets".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: self.final_assets.clone(),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/final_assets.report.bin"), &report);
         }
         if !self.cumulative_reward.is_empty() {
-            let _ = simple_chart(&base_dir, "Cumulative Reward", &self.cumulative_reward);
+            let report = Report {
+                title: "Cumulative Reward".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Reward".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: self.cumulative_reward.clone(),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/cumulative_reward.report.bin"), &report);
         }
         if !self.outperformance.is_empty() {
-            let _ = simple_chart(&base_dir, "Outperformance", &self.outperformance);
+            let report = Report {
+                title: "Outperformance".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Outperformance".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: self.outperformance.clone(),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/outperformance.report.bin"), &report);
         }
         if !self.loss.is_empty() {
-            let _ = simple_chart_log(&base_dir, "Loss (Log)", &self.loss, "Episode");
+            let report = Report {
+                title: "Loss (Log)".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Loss".to_string()),
+                scale: ScaleKind::Symlog,
+                kind: ReportKind::Simple {
+                    values: self.loss.clone(),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/loss_log.report.bin"), &report);
         }
         if !self.grad_norm.is_empty() {
-            let _ = simple_chart_log(&base_dir, "Grad Norm (Log)", &self.grad_norm, "Episode");
+            let report = Report {
+                title: "Grad Norm (Log)".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Grad Norm".to_string()),
+                scale: ScaleKind::Symlog,
+                kind: ReportKind::Simple {
+                    values: self.grad_norm.clone(),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/grad_norm_log.report.bin"), &report);
         }
         if !self.total_commissions.is_empty() {
-            let _ = simple_chart(&base_dir, "Total Commissions", &self.total_commissions);
+            let report = Report {
+                title: "Total Commissions".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Commissions".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: self.total_commissions.clone(),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/total_commissions.report.bin"), &report);
         }
         if !self.mean_std.is_empty() {
-            let _ = multi_line_chart(
-                &base_dir,
-                "Std Stats",
-                &[
-                    ("mean", &self.mean_std),
-                    ("min", &self.min_std),
-                    ("max", &self.max_std),
-                    ("rpo_alpha", &self.rpo_alpha),
-                ],
-                1,
-                "Episode",
-            );
+            let report = Report {
+                title: "Std Stats".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: None,
+                scale: ScaleKind::Linear,
+                kind: ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "mean".to_string(),
+                            values: self.mean_std.clone(),
+                        },
+                        ReportSeries {
+                            label: "min".to_string(),
+                            values: self.min_std.clone(),
+                        },
+                        ReportSeries {
+                            label: "max".to_string(),
+                            values: self.max_std.clone(),
+                        },
+                        ReportSeries {
+                            label: "rpo_alpha".to_string(),
+                            values: self.rpo_alpha.clone(),
+                        },
+                    ],
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/std_stats.report.bin"), &report);
         }
         if !self.mean_advantage.is_empty() {
-            let _ = multi_line_chart_log(
-                &base_dir,
-                "Advantage Stats (Log)",
-                &[
-                    ("mean", &self.mean_advantage),
-                    ("min", &self.min_advantage),
-                    ("max", &self.max_advantage),
-                ],
-                1,
-                "Episode",
-            );
+            let report = Report {
+                title: "Advantage Stats (Log)".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: None,
+                scale: ScaleKind::Symlog,
+                kind: ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "mean".to_string(),
+                            values: self.mean_advantage.clone(),
+                        },
+                        ReportSeries {
+                            label: "min".to_string(),
+                            values: self.min_advantage.clone(),
+                        },
+                        ReportSeries {
+                            label: "max".to_string(),
+                            values: self.max_advantage.clone(),
+                        },
+                    ],
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/advantage_stats_log.report.bin"), &report);
         }
         if !self.mean_divisor.is_empty() {
-            let _ = simple_chart(&base_dir, "Divisor", &self.mean_divisor);
+            let report = Report {
+                title: "Divisor".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: None,
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: self.mean_divisor.clone(),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/divisor.report.bin"), &report);
         }
     }
 }

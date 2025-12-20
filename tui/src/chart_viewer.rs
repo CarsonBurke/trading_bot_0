@@ -7,10 +7,13 @@ use ratatui::{
     Frame,
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
+use shared::report::Report;
+use std::fs;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use crate::components::episode_status;
+use crate::report_renderer::render_report;
 use crate::utils::clipboard;
 
 #[derive(Debug, Clone)]
@@ -115,8 +118,8 @@ impl ChartViewer {
         self.viewing_mode = ViewingMode::MetaCharts;
 
         // Group charts by ticker (None for episode-level charts)
-        // Store (path, episode_num, modified_time)
-        let mut ticker_groups: HashMap<Option<String>, Vec<(PathBuf, Option<usize>, SystemTime)>> = HashMap::new();
+        // Store (path, chart_name, episode_num, modified_time)
+        let mut ticker_groups: HashMap<Option<String>, Vec<(PathBuf, String, Option<usize>, SystemTime)>> = HashMap::new();
 
         for path in chart_paths {
             if path.exists() {
@@ -126,25 +129,35 @@ impl ChartViewer {
                     .and_then(|m| m.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
 
-                // Extract episode number and ticker from path
+                // Extract episode number, ticker, and chart name from report path
+                // Expected: gens/123/chart.report.bin or gens/123/TICKER/chart.report.bin
                 let parent = path.parent();
-                let grandparent = parent.and_then(|p| p.parent());
+                let chart_name = report_title_from_path(path)
+                    .unwrap_or_else(|| chart_name_from_path(path));
+                let chart_name = normalize_title(&chart_name);
 
-                // Check if this is a ticker-specific chart (path like: gens/123/NVDA/assets.png)
                 let (episode_num, ticker) = if let Some(parent) = parent {
-                    if let Some(ticker_str) = parent.file_name().and_then(|n| n.to_str()) {
-                        // Check if parent is a ticker folder (not numeric)
-                        if ticker_str.parse::<usize>().is_err() {
-                            // This is a ticker folder, get episode from grandparent
-                            let ep = grandparent
-                                .and_then(|gp| gp.file_name())
-                                .and_then(|n| n.to_str())
-                                .and_then(|s| s.parse::<usize>().ok());
-                            (ep, Some(ticker_str.to_string()))
+                    if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
+                        if let Ok(ep) = parent_name.parse::<usize>() {
+                            (Some(ep), None)
+                        } else if is_ticker_name(parent_name) {
+                            let chart_parent = parent.parent();
+                            if let Some(chart_parent) = chart_parent {
+                                if let Some(ep_name) = chart_parent.file_name().and_then(|n| n.to_str())
+                                {
+                                    if let Ok(ep) = ep_name.parse::<usize>() {
+                                        (Some(ep), Some(parent_name.to_string()))
+                                    } else {
+                                        (None, None)
+                                    }
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                (None, None)
+                            }
                         } else {
-                            // This is an episode folder (meta chart)
-                            let ep_num = ticker_str.parse::<usize>().ok();
-                            (ep_num, None)
+                            (None, None)
                         }
                     } else {
                         (None, None)
@@ -153,27 +166,26 @@ impl ChartViewer {
                     (None, None)
                 };
 
+                if episode_num.is_none() && ticker.is_none() {
+                    continue;
+                }
+
                 ticker_groups.entry(ticker)
                     .or_insert_with(Vec::new)
-                    .push((path.clone(), episode_num, modified));
+                    .push((path.clone(), chart_name, episode_num, modified));
             }
         }
 
         // Add episode-level charts first (no ticker)
         if let Some(mut episode_charts) = ticker_groups.remove(&None) {
             // Sort by modification time (most recent first)
-            episode_charts.sort_by(|a, b| b.2.cmp(&a.2));
+            episode_charts.sort_by(|a, b| b.3.cmp(&a.3));
 
-            for (path, episode_num, _) in episode_charts {
-                let base_name = path
-                    .file_stem()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
-
+            for (path, chart_name, episode_num, _) in episode_charts {
                 let name = if let Some(ep) = episode_num {
-                    format!("{} (ep {})", base_name, ep)
+                    format!("{} (ep {})", chart_name, ep)
                 } else {
-                    base_name.to_string()
+                    chart_name
                 };
 
                 let chart_idx = self.nodes.len();
@@ -194,7 +206,7 @@ impl ChartViewer {
                     // Get the most recent modification time for this ticker
                     let most_recent = charts
                         .iter()
-                        .map(|(_, _, modified)| *modified)
+                        .map(|(_, _, _, modified)| *modified)
                         .max()
                         .unwrap_or(SystemTime::UNIX_EPOCH);
                     (ticker.clone(), most_recent)
@@ -210,19 +222,14 @@ impl ChartViewer {
                 let mut children = Vec::new();
 
                 // Sort charts within ticker by modification time (most recent first)
-                charts.sort_by(|a, b| b.2.cmp(&a.2));
+                charts.sort_by(|a, b| b.3.cmp(&a.3));
 
                 // Add all charts for this ticker
-                for (path, episode_num, _) in charts {
-                    let base_name = path
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-
+                for (path, chart_name, episode_num, _) in charts {
                     let name = if let Some(ep) = episode_num {
-                        format!("{} (ep {})", base_name, ep)
+                        format!("{} (ep {})", chart_name, ep)
                     } else {
-                        base_name.to_string()
+                        chart_name
                     };
 
                     let chart_idx = self.nodes.len();
@@ -277,30 +284,26 @@ impl ChartViewer {
 
             if entry.file_type().is_dir() {
                 let mut children = Vec::new();
-
                 for sub_entry in WalkDir::new(&entry_path)
                     .min_depth(1)
                     .max_depth(1)
                     .into_iter()
                     .filter_map(|e| e.ok())
                 {
-                    let ext = sub_entry.path().extension().and_then(|s| s.to_str());
-                    if sub_entry.file_type().is_file()
-                        && (ext == Some("png") || ext == Some("webp"))
-                    {
-                        let chart_name = sub_entry
-                            .file_name()
-                            .to_str()
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let chart_idx = self.nodes.len();
-                        self.nodes.push(ChartNode::Chart {
-                            name: chart_name,
-                            path: sub_entry.path().to_path_buf(),
-                        });
-                        children.push(chart_idx);
-                        self.expanded.push(false);
+                    if !sub_entry.file_type().is_file() {
+                        continue;
                     }
+                    let file_name = sub_entry.file_name().to_str().unwrap_or("unknown");
+                    if !file_name.ends_with(".report.bin") {
+                        continue;
+                    }
+                    let chart_idx = self.nodes.len();
+                    self.nodes.push(ChartNode::Chart {
+                        name: report_display_name(file_name),
+                        path: sub_entry.path().to_path_buf(),
+                    });
+                    children.push(chart_idx);
+                    self.expanded.push(false);
                 }
 
                 // Get modification time for sorting
@@ -318,17 +321,14 @@ impl ChartViewer {
                 });
                 self.expanded.push(false);
                 folders.push((folder_idx, modified));
-            } else {
-                let ext = entry.path().extension().and_then(|s| s.to_str());
-                if entry.file_type().is_file() && (ext == Some("png") || ext == Some("webp")) {
-                    let chart_idx = self.nodes.len();
-                    self.nodes.push(ChartNode::Chart {
-                        name,
-                        path: entry_path,
-                    });
-                    self.expanded.push(false);
-                    charts.push(chart_idx);
-                }
+            } else if entry.file_type().is_file() && name.ends_with(".report.bin") {
+                let chart_idx = self.nodes.len();
+                self.nodes.push(ChartNode::Chart {
+                    name: report_display_name(&name),
+                    path: entry_path,
+                });
+                self.expanded.push(false);
+                charts.push(chart_idx);
             }
         }
 
@@ -384,10 +384,11 @@ impl ChartViewer {
             if i < self.flattened.len() {
                 let (node_idx, _) = self.flattened[i];
                 if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
-                    if let Ok(img) = image::open(path) {
-                        // Use original image size, picker will handle fitting to terminal
-                        let protocol = self.picker.new_resize_protocol(img);
-                        self.current_image = Some(protocol);
+                    if let Ok(report) = load_report(path) {
+                        if let Ok(img) = render_report(&report) {
+                            let protocol = self.picker.new_resize_protocol(img);
+                            self.current_image = Some(protocol);
+                        }
                     }
                 }
             }
@@ -609,4 +610,60 @@ impl ChartViewer {
             f.render_widget(no_preview, inner);
         }
     }
+}
+
+fn load_report(path: &PathBuf) -> Result<Report> {
+    let bytes = fs::read(path)?;
+    let report = postcard::from_bytes(&bytes)?;
+    Ok(report)
+}
+
+fn report_display_name(name: &str) -> String {
+    let trimmed = name.strip_suffix(".report.bin").unwrap_or(name);
+    normalize_title(&trimmed.replace('_', " "))
+}
+
+fn chart_name_from_path(path: &PathBuf) -> String {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    report_display_name(file_name)
+}
+
+fn normalize_title(name: &str) -> String {
+    let mut parts = Vec::new();
+    for word in name.split_whitespace() {
+        if word.eq_ignore_ascii_case("log") {
+            parts.push("(Log)".to_string());
+            continue;
+        }
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            let rest = chars.as_str().to_ascii_lowercase();
+            let mut word_out = String::new();
+            word_out.push(first.to_ascii_uppercase());
+            word_out.push_str(&rest);
+            parts.push(word_out);
+        }
+    }
+    parts.join(" ")
+}
+
+fn is_ticker_name(name: &str) -> bool {
+    let mut has_alpha = false;
+    for c in name.chars() {
+        if c.is_ascii_alphabetic() {
+            has_alpha = true;
+            if !c.is_ascii_uppercase() {
+                return false;
+            }
+        } else if !c.is_ascii_digit() {
+            return false;
+        }
+    }
+    has_alpha
+}
+
+fn report_title_from_path(path: &PathBuf) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let report: Report = postcard::from_bytes(&bytes).ok()?;
+    Some(report.title)
 }
