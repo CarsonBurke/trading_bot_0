@@ -226,8 +226,7 @@ pub fn train(weights_path: Option<&str>) {
         let s_actions =
             Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT - 1], (Kind::Float, device));
         let s_masks = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
-        let s_log_probs =
-            Tensor::zeros([rollout_steps, NPROCS, ACTION_COUNT], (Kind::Float, device));
+        let s_log_probs = Tensor::zeros([rollout_steps, NPROCS], (Kind::Float, device));
 
         stream_state.reset();
 
@@ -272,7 +271,6 @@ pub fn train(weights_path: Option<&str>) {
                 .log_softmax(-1, Kind::Float)
                 .sum_dim_intlist(-1, false, Kind::Float);
             let action_log_prob = log_prob_gaussian - log_jacobian;
-            let action_log_prob = action_log_prob.unsqueeze(-1).expand(&[-1, ACTION_COUNT], true);
 
             let mut out_so = s_static_obs.get(s + 1);
             let (reward, reward_per_ticker, is_done, step_deltas) =
@@ -376,7 +374,7 @@ pub fn train(weights_path: Option<&str>) {
             )
         };
         let actions = s_actions.view([memory_size, ACTION_COUNT - 1]);
-        let old_log_probs = s_log_probs.view([memory_size, ACTION_COUNT]);
+        let old_log_probs = s_log_probs.view([memory_size]);
         let s_values_flat = s_values.view([memory_size, ACTION_COUNT]).detach();
 
         // Record advantage stats before normalization
@@ -396,7 +394,9 @@ pub fn train(weights_path: Option<&str>) {
             .pow_tensor_scalar(2.0)
             .mean_dim(0, true, Kind::Float);
         let adv_std = adv_var.sqrt().clamp_min(1e-4);
-        let advantages = ((&advantages - adv_mean) / adv_std).detach();
+        let advantages = ((&advantages - adv_mean) / adv_std)
+            .clamp(-3.0, 3.0)
+            .detach();
 
         // Returns are raw, just detach
         let returns = returns.detach();
@@ -502,8 +502,6 @@ pub fn train(weights_path: Option<&str>) {
                         .log_softmax(-1, Kind::Float)
                         .sum_dim_intlist(-1, false, Kind::Float);
                     let action_log_probs = log_prob_gaussian - log_jacobian;
-                    let action_log_probs =
-                        action_log_probs.unsqueeze(-1).expand(&[-1, ACTION_COUNT], true);
 
                     // Entropy of Gaussian (per ticker)
                     let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
@@ -539,12 +537,14 @@ pub fn train(weights_path: Option<&str>) {
                         deviation.gt(PPO_CLIP_RATIO).to_kind(Kind::Float).sum(Kind::Float)
                     });
                     let _ = total_clipped.g_add_(&clipped_count);
-                    total_ratio_samples += mini_batch_samples * ACTION_COUNT;
+                    total_ratio_samples += mini_batch_samples;
 
-                    let unclipped_obj = &ratio * &advantages_mb;
+                    let advantages_mean =
+                        advantages_mb.mean_dim(-1, false, Kind::Float);
+                    let unclipped_obj = &ratio * &advantages_mean;
                     let ratio_clipped =
                         ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
-                    let clipped_obj = ratio_clipped * &advantages_mb;
+                    let clipped_obj = ratio_clipped * &advantages_mean;
                     let action_loss =
                         -Tensor::min_other(&unclipped_obj, &clipped_obj)
                             .mean(Kind::Float);
