@@ -162,7 +162,7 @@ impl TradingModel {
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
-        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, 1], Init::Const(0.0));
+        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, 1], Init::Const(-3.0));
         let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
 
         Self {
@@ -484,7 +484,7 @@ impl TradingModel {
         let action_mean = actor_feat.apply(&self.actor_out).squeeze_dim(-1).tanh() * MEAN_SCALE;
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
         const LOG_STD_MIN: f64 = -5.0; // std = 0.007
-        const LOG_STD_MAX: f64 = -0.22; // std = 0.8
+        const LOG_STD_MAX: f64 = -0.693; // std = 0.5
         let latent = (&enriched + pool_summary.unsqueeze(1))
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.sde_fc)

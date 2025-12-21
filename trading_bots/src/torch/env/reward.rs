@@ -12,8 +12,9 @@ const ACTION_OUTCOME_COMMISSION_PENALTY: f64 = 5.0;
 // penalized by negative base return.
 const CONVICTION_BONUS: f64 = 1.0;
 
-// === Legacy reward constants ===
 const REWARD_SCALE: f64 = 20.0;
+const CASH_INFLATION_RATE: f64 = 0.002;
+const COMMISSION_PENALTY_SCALE: f64 = 5.0;
 const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
 const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 0.01;
@@ -31,17 +32,18 @@ impl Env {
     pub(super) fn get_unrealized_pnl_reward_breakdown(
         &self,
         absolute_step: usize,
-        _commissions: f64,
+        commissions: f64,
     ) -> (f64, Vec<f64>) {
         let n_tickers = self.tickers.len();
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
-            return (0.0, vec![0.0; n_tickers]);
+            return (0.0, vec![0.0; n_tickers + 1]);
         }
 
         let next_absolute_step = absolute_step + 1;
         let total_assets = self.account.total_assets;
         let mut contributions = vec![0.0; n_tickers];
         let mut total_assets_next = self.account.cash;
+        let mut index_log_return = 0.0;
 
         for ticker_idx in 0..n_tickers {
             let current_price = self.prices[ticker_idx][absolute_step];
@@ -50,20 +52,37 @@ impl Env {
             let next_value = self.account.positions[ticker_idx].value_with_price(next_price);
             total_assets_next += next_value;
             contributions[ticker_idx] = (next_value - current_value) / total_assets;
+            index_log_return += (next_price / current_price).ln();
         }
 
+        index_log_return /= n_tickers as f64;
+
         let portfolio_return = (total_assets_next - total_assets) / total_assets;
-        let pnl_reward = (total_assets_next / total_assets).ln() * REWARD_SCALE;
+        let strategy_log_return = (total_assets_next / total_assets).ln();
+        let pnl_reward = strategy_log_return * REWARD_SCALE;
+        let reward_base = (strategy_log_return - index_log_return) * REWARD_SCALE;
+        let commission_penalty = -(commissions / total_assets)
+            * COMMISSION_PENALTY_SCALE
+            * pnl_reward.abs();
+        let cash_weight = (self.account.cash / total_assets).clamp(0.0, 1.0);
+        let cash_penalty = -cash_weight * CASH_INFLATION_RATE * REWARD_SCALE;
+        let reward = reward_base + commission_penalty + cash_penalty;
 
         if portfolio_return.abs() < 1e-8 {
-            return (pnl_reward, vec![0.0; n_tickers]);
+            let mut rewards = vec![0.0; n_tickers];
+            rewards.push(reward);
+            return (reward, rewards);
         }
 
         let per_ticker_rewards: Vec<f64> = contributions
             .iter()
             .map(|c| pnl_reward * (c / portfolio_return))
             .collect();
-        (pnl_reward, per_ticker_rewards)
+        let sum_per_ticker: f64 = per_ticker_rewards.iter().sum();
+        let cash_reward = reward - sum_per_ticker;
+        let mut rewards = per_ticker_rewards;
+        rewards.push(cash_reward);
+        (reward, rewards)
     }
 
     /// Hindsight allocation quality reward with asymmetric upside penalty.

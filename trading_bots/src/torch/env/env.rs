@@ -210,9 +210,8 @@ impl Env {
             }
 
             let total_commission = self.trade_by_target_weights(&real_actions, absolute_step);
-            let (reward, mut reward_per_ticker) =
+            let (reward, reward_per_ticker) =
                 self.get_unrealized_pnl_reward_breakdown(absolute_step, total_commission);
-            reward_per_ticker.push(0.0);
 
             self.last_reward = reward;
             if self.account.total_assets > self.peak_assets {
@@ -526,9 +525,8 @@ impl Env {
         }
 
         let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        let (reward, mut reward_per_ticker) =
+        let (reward, reward_per_ticker) =
             self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
-        reward_per_ticker.push(0.0);
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -592,9 +590,8 @@ impl Env {
         }
 
         let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        let (reward, mut reward_per_ticker) =
+        let (reward, reward_per_ticker) =
             self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
-        reward_per_ticker.push(0.0);
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {

@@ -104,13 +104,13 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
                                 // Conservative KL early stopping (SB3-style)
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
-const LEARNING_RATE: f64 = 2e-4;
+const LEARNING_RATE: f64 = 4e-5;
 
 // RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
 const RPO_ALPHA_MIN: f64 = 0.05;
 const RPO_ALPHA_MAX: f64 = 0.5;
 const RPO_TARGET_KL: f64 = 0.018;
-const RPO_ALPHA_INIT: f64 = 0.3;
+const RPO_ALPHA_INIT: f64 = 0.1;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
 
@@ -575,10 +575,12 @@ pub fn train(weights_path: Option<&str>) {
                     let _ = total_clipped.g_add_(&clipped_count);
                     total_ratio_samples += mini_batch_samples;
 
-                    let advantages_mean = advantages_mb.mean_dim(-1, false, Kind::Float);
-                    let unclipped_obj = &ratio * &advantages_mean;
+                    let action_weights = u_ext.softmax(-1, Kind::Float);
+                    let advantages_weighted =
+                        (advantages_mb * action_weights).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+                    let unclipped_obj = &ratio * &advantages_weighted;
                     let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
-                    let clipped_obj = ratio_clipped * &advantages_mean;
+                    let clipped_obj = ratio_clipped * &advantages_weighted;
                     let action_loss =
                         -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
 
