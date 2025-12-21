@@ -460,7 +460,12 @@ impl ChartViewer {
             if i < self.flattened.len() {
                 let (node_idx, _) = self.flattened[i];
                 if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
-                    clipboard::copy_image_to_clipboard(path)?;
+                    if let Ok(report) = load_report(path) {
+                        let temp_path = render_report_to_temp(&report)?;
+                        clipboard::copy_image_to_clipboard(&temp_path)?;
+                    } else {
+                        clipboard::copy_image_to_clipboard(path)?;
+                    }
                 }
             }
         }
@@ -666,4 +671,16 @@ fn report_title_from_path(path: &PathBuf) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     let report: Report = postcard::from_bytes(&bytes).ok()?;
     Some(report.title)
+}
+
+fn render_report_to_temp(report: &Report) -> Result<PathBuf> {
+    let image = render_report(report)?;
+    let mut path = std::env::temp_dir();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    path.push(format!("report_chart_{stamp}.png"));
+    image.save(&path)?;
+    Ok(path)
 }

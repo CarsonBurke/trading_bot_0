@@ -51,7 +51,7 @@ pub fn render_report(report: &Report) -> Result<DynamicImage> {
 fn render_simple(
     root: &DrawingArea<BitMapBackend, Shift>,
     report: &Report,
-    values: &[f64],
+    values: &[f32],
     ema_alpha: Option<f64>,
 ) -> Result<()> {
     if values.is_empty() {
@@ -87,7 +87,7 @@ fn render_simple(
         .iter()
         .enumerate()
         .filter(|(_, v)| v.is_finite())
-        .map(|(idx, v)| (idx as u32, map_value(*v, scale)));
+        .map(|(idx, v)| (idx as u32, map_value(*v as f64, scale)));
 
     if scale == ScaleKind::Symlog {
         chart
@@ -113,7 +113,7 @@ fn render_simple(
             .iter()
             .enumerate()
             .filter(|(_, v)| v.is_finite())
-            .map(|(idx, v)| (idx as u32, map_value(*v, scale)));
+            .map(|(idx, v)| (idx as u32, map_value(*v as f64, scale)));
         chart
             .draw_series(LineSeries::new(
                 ema_series,
@@ -139,7 +139,7 @@ fn render_multi_line(
     report: &Report,
     series: &[ReportSeries],
 ) -> Result<()> {
-    let all_values: Vec<f64> = series.iter().flat_map(|s| s.values.iter()).copied().collect();
+    let all_values: Vec<f32> = series.iter().flat_map(|s| s.values.iter()).copied().collect();
     if all_values.is_empty() {
         return Ok(());
     }
@@ -190,7 +190,7 @@ fn render_multi_line(
             .iter()
             .enumerate()
             .filter(|(_, v)| v.is_finite())
-            .map(|(idx, v)| (idx as u32, map_value(*v, scale)));
+            .map(|(idx, v)| (idx as u32, map_value(*v as f64, scale)));
         chart
             .draw_series(LineSeries::new(
                 mapped,
@@ -214,18 +214,24 @@ fn render_multi_line(
 fn render_assets(
     root: &DrawingArea<BitMapBackend, Shift>,
     report: &Report,
-    total: &[f64],
-    cash: &[f64],
-    positioned: Option<&Vec<f64>>,
-    benchmark: Option<&Vec<f64>>,
+    total: &[f32],
+    cash: &[f32],
+    positioned: Option<&Vec<f32>>,
+    benchmark: Option<&Vec<f32>>,
 ) -> Result<()> {
     if total.is_empty() {
         return Ok(());
     }
 
-    let mut max_val = total.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mut max_val = total
+        .iter()
+        .map(|v| *v as f64)
+        .fold(f64::NEG_INFINITY, f64::max);
     if let Some(bench) = benchmark {
-        let bench_max = bench.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let bench_max = bench
+            .iter()
+            .map(|v| *v as f64)
+            .fold(f64::NEG_INFINITY, f64::max);
         max_val = max_val.max(bench_max);
     }
 
@@ -320,7 +326,7 @@ fn render_assets(
 fn render_buy_sell(
     root: &DrawingArea<BitMapBackend, Shift>,
     report: &Report,
-    prices: &[f64],
+    prices: &[f32],
     buys: &[TradePoint],
     sells: &[TradePoint],
 ) -> Result<()> {
@@ -328,8 +334,14 @@ fn render_buy_sell(
         return Ok(());
     }
 
-    let y_min = prices.iter().cloned().fold(f64::INFINITY, f64::min);
-    let y_max = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let y_min = prices
+        .iter()
+        .map(|v| *v as f64)
+        .fold(f64::INFINITY, f64::min);
+    let y_max = prices
+        .iter()
+        .map(|v| *v as f64)
+        .fold(f64::NEG_INFINITY, f64::max);
     let y_range = (y_max - y_min).max(0.01);
     let y_min = y_min - y_range * 0.05;
     let y_max = y_max + y_range * 0.05;
@@ -354,8 +366,8 @@ fn render_buy_sell(
             prices
                 .iter()
                 .enumerate()
-                .map(|(index, value)| (index as u32, *value)),
-            0.0,
+                .map(|(index, value)| (index as u32, *value as f64)),
+            0.0f64,
             theme::BLUE.mix(0.2),
         )
         .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
@@ -363,14 +375,18 @@ fn render_buy_sell(
 
     let point_size = 3;
     chart.draw_series(PointSeries::of_element(
-        sells.iter().map(|p| (p.index as u32, p.price)),
+        sells
+            .iter()
+            .map(|p| (p.index as u32, prices.get(p.index as usize).copied().unwrap_or(0.0) as f64)),
         point_size,
         theme::YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
     chart.draw_series(PointSeries::of_element(
-        buys.iter().map(|p| (p.index as u32, p.price)),
+        buys
+            .iter()
+            .map(|p| (p.index as u32, prices.get(p.index as usize).copied().unwrap_or(0.0) as f64)),
         point_size,
         theme::RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
@@ -379,15 +395,15 @@ fn render_buy_sell(
     Ok(())
 }
 
-fn compute_ema(data: &[f64], alpha: f64) -> Vec<f64> {
+fn compute_ema(data: &[f32], alpha: f64) -> Vec<f32> {
     if data.is_empty() {
         return vec![];
     }
     let mut result = Vec::with_capacity(data.len());
-    let mut ema = data[0];
+    let mut ema = data[0] as f64;
     for &v in data {
-        ema = alpha * v + (1.0 - alpha) * ema;
-        result.push(ema);
+        ema = alpha * v as f64 + (1.0 - alpha) * ema;
+        result.push(ema as f32);
     }
     result
 }
@@ -407,8 +423,13 @@ fn map_value(value: f64, scale: ScaleKind) -> f64 {
     }
 }
 
-fn range_for(values: &[f64], is_symlog: bool) -> Result<(f64, f64)> {
-    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+fn range_for(values: &[f32], is_symlog: bool) -> Result<(f64, f64)> {
+    let finite: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .map(|v| v as f64)
+        .collect();
     if finite.is_empty() {
         return Err(anyhow!("no finite values"));
     }

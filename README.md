@@ -5,6 +5,7 @@
 - `trading_bots/` the various trading bots, most notably the `torch/` RL model
 - `tui/` control and data viewing for training and inference, designed for the torch RL model
 - `shared/` shared code between the members
+- `report_cli/` CLI for debugging training and inference results
 
 ## Usage
 
@@ -19,9 +20,9 @@ cd tui && cargo run --release
 - `src/torch/` high-performance high-results torch RL model
 - `src/agents/` and `src/strategies/` programmatic strategies with genetic algorithm training
 - `src/burn/` burn model, abandoned due to poor performance
-- `training/` training episodes (`gens/`) and metadata (`data/`)
+- `training/` training episode reports (`gens/`) and metadata (`data/`)
 - `weights/` trained or partially trained model schemas
-- `infer/` inference results and metadata
+- `infer/` inference reports and metadata
 
 ## PPO Trading Agent
 

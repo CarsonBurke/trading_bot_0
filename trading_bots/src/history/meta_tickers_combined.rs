@@ -64,7 +64,7 @@ impl MetaHistory {
                 y_label: Some("Assets".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Simple {
-                    values: self.final_assets.clone(),
+                    values: f64_to_f32(&self.final_assets),
                     ema_alpha: Some(0.05),
                 },
             };
@@ -77,7 +77,7 @@ impl MetaHistory {
                 y_label: Some("Reward".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Simple {
-                    values: self.cumulative_reward.clone(),
+                    values: f64_to_f32(&self.cumulative_reward),
                     ema_alpha: Some(0.05),
                 },
             };
@@ -90,7 +90,7 @@ impl MetaHistory {
                 y_label: Some("Outperformance".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Simple {
-                    values: self.outperformance.clone(),
+                    values: f64_to_f32(&self.outperformance),
                     ema_alpha: Some(0.05),
                 },
             };
@@ -103,7 +103,7 @@ impl MetaHistory {
                 y_label: Some("Loss".to_string()),
                 scale: ScaleKind::Symlog,
                 kind: ReportKind::Simple {
-                    values: self.loss.clone(),
+                    values: f64_to_f32(&self.loss),
                     ema_alpha: Some(0.05),
                 },
             };
@@ -116,7 +116,7 @@ impl MetaHistory {
                 y_label: Some("Grad Norm".to_string()),
                 scale: ScaleKind::Symlog,
                 kind: ReportKind::Simple {
-                    values: self.grad_norm.clone(),
+                    values: f64_to_f32(&self.grad_norm),
                     ema_alpha: Some(0.05),
                 },
             };
@@ -129,7 +129,7 @@ impl MetaHistory {
                 y_label: Some("Commissions".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Simple {
-                    values: self.total_commissions.clone(),
+                    values: f64_to_f32(&self.total_commissions),
                     ema_alpha: Some(0.05),
                 },
             };
@@ -145,19 +145,19 @@ impl MetaHistory {
                     series: vec![
                         ReportSeries {
                             label: "mean".to_string(),
-                            values: self.mean_std.clone(),
+                            values: f64_to_f32(&self.mean_std),
                         },
                         ReportSeries {
                             label: "min".to_string(),
-                            values: self.min_std.clone(),
+                            values: f64_to_f32(&self.min_std),
                         },
                         ReportSeries {
                             label: "max".to_string(),
-                            values: self.max_std.clone(),
+                            values: f64_to_f32(&self.max_std),
                         },
                         ReportSeries {
                             label: "rpo_alpha".to_string(),
-                            values: self.rpo_alpha.clone(),
+                            values: f64_to_f32(&self.rpo_alpha),
                         },
                     ],
                 },
@@ -174,15 +174,15 @@ impl MetaHistory {
                     series: vec![
                         ReportSeries {
                             label: "mean".to_string(),
-                            values: self.mean_advantage.clone(),
+                            values: f64_to_f32(&self.mean_advantage),
                         },
                         ReportSeries {
                             label: "min".to_string(),
-                            values: self.min_advantage.clone(),
+                            values: f64_to_f32(&self.min_advantage),
                         },
                         ReportSeries {
                             label: "max".to_string(),
-                            values: self.max_advantage.clone(),
+                            values: f64_to_f32(&self.max_advantage),
                         },
                     ],
                 },
@@ -196,11 +196,15 @@ impl MetaHistory {
                 y_label: None,
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Simple {
-                    values: self.mean_divisor.clone(),
+                    values: f64_to_f32(&self.mean_divisor),
                     ema_alpha: Some(0.05),
                 },
             };
             let _ = write_report(&format!("{base_dir}/divisor.report.bin"), &report);
         }
     }
+}
+
+fn f64_to_f32(values: &[f64]) -> Vec<f32> {
+    values.iter().map(|v| *v as f32).collect()
 }

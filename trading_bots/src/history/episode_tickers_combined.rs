@@ -90,19 +90,15 @@ impl EpisodeHistory {
             let ticker_buy_indexes = &self.buys[ticker_index];
             let ticker_sell_indexes = &self.sells[ticker_index];
             let buys: Vec<TradePoint> = ticker_buy_indexes
-                .iter()
-                .map(|(index, (price, quantity))| TradePoint {
-                    index: *index,
-                    price: *price,
-                    quantity: *quantity,
+                .keys()
+                .map(|index| TradePoint {
+                    index: *index as u32,
                 })
                 .collect();
             let sells: Vec<TradePoint> = ticker_sell_indexes
-                .iter()
-                .map(|(index, (price, quantity))| TradePoint {
-                    index: *index,
-                    price: *price,
-                    quantity: *quantity,
+                .keys()
+                .map(|index| TradePoint {
+                    index: *index as u32,
                 })
                 .collect();
             let report = Report {
@@ -111,7 +107,7 @@ impl EpisodeHistory {
                 y_label: Some("Price".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::BuySell {
-                    prices: ticker_prices.clone(),
+                    prices: f64_to_f32(ticker_prices),
                     buys,
                     sells,
                 },
@@ -128,7 +124,7 @@ impl EpisodeHistory {
                     ticker_prices[start_offset..end_idx]
                         .iter()
                         .map(|&current_price| initial_value * current_price / initial_price)
-                        .collect()
+                        .collect::<Vec<f64>>()
                 )
             } else {
                 None
@@ -140,10 +136,10 @@ impl EpisodeHistory {
                 y_label: Some("Assets".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Assets {
-                    total: total_assets_per_step.clone(),
-                    cash: self.cash.clone(),
-                    positioned: Some(positioned_assets.clone()),
-                    benchmark: ticker_benchmark,
+                    total: f64_to_f32(&total_assets_per_step),
+                    cash: f64_to_f32(&self.cash),
+                    positioned: Some(f64_to_f32(positioned_assets)),
+                    benchmark: ticker_benchmark.as_ref().map(|b| f64_to_f32(b)),
                 },
             };
             let _ = write_report(&format!("{ticker_dir}/assets.report.bin"), &report);
@@ -154,7 +150,7 @@ impl EpisodeHistory {
                 y_label: None,
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Simple {
-                    values: self.raw_actions[ticker_index].clone(),
+                    values: f64_to_f32(&self.raw_actions[ticker_index]),
                     ema_alpha: None,
                 },
             };
@@ -174,10 +170,10 @@ impl EpisodeHistory {
             y_label: Some("Assets".to_string()),
             scale: ScaleKind::Linear,
             kind: ReportKind::Assets {
-                total: total_assets_per_step.clone(),
-                cash: self.cash.clone(),
-                positioned: Some(positioned_assets_per_step),
-                benchmark: index_benchmark,
+                total: f64_to_f32(&total_assets_per_step),
+                cash: f64_to_f32(&self.cash),
+                positioned: Some(f64_to_f32(&positioned_assets_per_step)),
+                benchmark: index_benchmark.as_ref().map(|b| f64_to_f32(b)),
             },
         };
         let _ = write_report(&format!("{episode_dir}/assets.report.bin"), &report);
@@ -188,7 +184,7 @@ impl EpisodeHistory {
             y_label: Some("Reward".to_string()),
             scale: ScaleKind::Linear,
             kind: ReportKind::Simple {
-                values: self.rewards.clone(),
+                values: f64_to_f32(&self.rewards),
                 ema_alpha: None,
             },
         };
@@ -201,13 +197,13 @@ impl EpisodeHistory {
                 if !self.target_weights[ticker_index].is_empty() {
                     series.push(ReportSeries {
                         label: ticker.to_string(),
-                        values: self.target_weights[ticker_index].clone(),
+                        values: f64_to_f32(&self.target_weights[ticker_index]),
                     });
                 }
             }
             series.push(ReportSeries {
                 label: "cash".to_string(),
-                values: self.cash_weight.clone(),
+                values: f64_to_f32(&self.cash_weight),
             });
             let report = Report {
                 title: "Target Weights".to_string(),
@@ -229,8 +225,8 @@ impl EpisodeHistory {
                 kind: ReportKind::Observations {
                     static_observations: self.static_observations.clone(),
                     attention_weights: self.attention_weights.clone(),
-                    action_step0: self.action_step0.clone(),
-                    action_final: self.action_final.clone(),
+                    action_step0: self.action_step0.as_ref().map(|v| f64_to_f32(v)),
+                    action_final: self.action_final.as_ref().map(|v| f64_to_f32(v)),
                 },
             };
             let _ = write_report(&format!("{episode_dir}/observations.report.bin"), &report);
@@ -241,4 +237,8 @@ impl EpisodeHistory {
         let positioned = self.positioned.iter().map(|p| p.last().unwrap()).sum::<f64>();
         positioned + self.cash.last().unwrap()
     }
+}
+
+fn f64_to_f32(values: &[f64]) -> Vec<f32> {
+    values.iter().map(|v| *v as f32).collect()
 }

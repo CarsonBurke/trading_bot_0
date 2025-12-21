@@ -4,4 +4,5 @@ members = [
     "trading_bots",
     "tui",
     "shared",
+    "report_cli",
 ]
