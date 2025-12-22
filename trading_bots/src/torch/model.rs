@@ -149,7 +149,9 @@ impl TradingModel {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
         let actor_cash_out = nn::linear(p / "actor_cash_out", 256, 1, nn::LinearConfig {
-            ws_init: truncated_normal_init(256, 1), ..Default::default()
+            ws_init: Init::Const(0.0),
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
         });
         let pool_scorer = nn::linear(p / "pool_scorer", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
@@ -474,6 +476,12 @@ impl TradingModel {
             .apply(&self.ln_actor_fc2)
             .silu()
             .reshape([batch_size, TICKERS_COUNT, 256]);
+        let cash_hidden = pool_summary
+            .apply(&self.actor_fc1)
+            .apply(&self.ln_actor_fc1)
+            .silu();
+        let cash_residual = cash_hidden.apply(&self.actor_fc2);
+        let cash_feat = (cash_residual + &cash_hidden).apply(&self.ln_actor_fc2).silu();
 
         let ticker_values = enriched
             .reshape([batch_size * TICKERS_COUNT, 256])
@@ -483,7 +491,7 @@ impl TradingModel {
         let values = Tensor::cat(&[ticker_values.shallow_clone(), cash_value], 1);
 
         let ticker_logits = actor_feat.apply(&self.actor_out).squeeze_dim(-1);
-        let cash_logit = pool_summary.apply(&self.actor_cash_out);
+        let cash_logit = cash_feat.apply(&self.actor_cash_out);
         let action_mean = ticker_logits - cash_logit;
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
         const LOG_STD_MIN: f64 = -5.0; // std = 0.007
