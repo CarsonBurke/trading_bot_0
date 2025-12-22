@@ -29,7 +29,10 @@ pub fn sample_actions_from_dist(
         let noise = Tensor::randn_like(action_mean);
         action_mean + &action_std * noise
     };
-    u.softmax(-1, Kind::Float)
+    let batch = u.size()[0];
+    let zeros = Tensor::zeros([batch, 1], (Kind::Float, u.device()));
+    let u_ext = Tensor::cat(&[u, zeros], 1);
+    u_ext.softmax(-1, Kind::Float)
 }
 
 pub fn run_inference<P: AsRef<Path>>(

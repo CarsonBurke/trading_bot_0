@@ -378,7 +378,6 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 &action_log_std,
                 false,
                 temperature,
-                device,
             );
 
             let actions_vec = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();

@@ -235,7 +235,7 @@ pub fn train(weights_path: Option<&str>) {
         );
         let s_actions = get_buf(
             &mut s_actions_buf,
-            &[rollout_steps, NPROCS, ACTION_COUNT],
+            &[rollout_steps, NPROCS, ACTION_COUNT - 1],
             float_kind,
         );
         let s_masks = get_buf(&mut s_masks_buf, &[rollout_steps, NPROCS], float_kind);
@@ -243,6 +243,7 @@ pub fn train(weights_path: Option<&str>) {
 
         let _ = total_rewards_gpu.zero_();
         let _ = total_episodes_gpu.zero_();
+        let zeros_rollout = Tensor::zeros([NPROCS, 1], float_kind);
 
         // Use a separate index (s) for tensor storage, starting from 0
         // Loop through the episode using relative steps (0 to max_step)
@@ -268,8 +269,9 @@ pub fn train(weights_path: Option<&str>) {
                 sde_noise = Some(Tensor::randn_like(&action_mean));
             }
             let noise = sde_noise.as_ref().unwrap();
-            let u = &action_mean + &action_std * noise; // [batch, K]
-            let actions = u.softmax(-1, Kind::Float);
+            let u = &action_mean + &action_std * noise; // [batch, K-1]
+            let u_ext = Tensor::cat(&[u.shallow_clone(), zeros_rollout.shallow_clone()], 1);
+            let actions = u_ext.softmax(-1, Kind::Float);
 
             // Log-prob with softmax Jacobian
             let u_normalized = (&u - &action_mean) / &action_std;
@@ -277,7 +279,7 @@ pub fn train(weights_path: Option<&str>) {
             let two_log_std = &action_log_std_clamped * 2.0;
             let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
             let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-            let log_jacobian = u
+            let log_jacobian = u_ext
                 .log_softmax(-1, Kind::Float)
                 .sum_dim_intlist(-1, false, Kind::Float);
             let action_log_prob = log_prob_gaussian - log_jacobian;
@@ -387,7 +389,7 @@ pub fn train(weights_path: Option<&str>) {
                     .view([memory_size, ACTION_COUNT]),
             )
         };
-        let actions = s_actions.view([memory_size, ACTION_COUNT]);
+        let actions = s_actions.view([memory_size, ACTION_COUNT - 1]);
         let old_log_probs = s_log_probs.view([memory_size]);
         let s_values_flat = s_values.view([memory_size, ACTION_COUNT]).detach();
 
@@ -429,6 +431,7 @@ pub fn train(weights_path: Option<&str>) {
 
         let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
+        let zeros_mb = Tensor::zeros([CHUNK_SIZE * NPROCS, 1], float_kind);
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
@@ -466,6 +469,8 @@ pub fn train(weights_path: Option<&str>) {
                     old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let u = actions_mb;
+                let zeros = zeros_mb.narrow(0, 0, chunk_sample_count);
+                let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
 
                 // RPO alpha: sigmoid parameterization for smooth gradients everywhere
                 let rpo_alpha =
@@ -486,7 +491,7 @@ pub fn train(weights_path: Option<&str>) {
                 let u_squared = u_normalized.pow_tensor_scalar(2);
                 let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-                let log_jacobian = u
+                let log_jacobian = u_ext
                     .log_softmax(-1, Kind::Float)
                     .sum_dim_intlist(-1, false, Kind::Float);
                 let action_log_probs = log_prob_gaussian - log_jacobian;
@@ -528,7 +533,7 @@ pub fn train(weights_path: Option<&str>) {
                 let _ = total_clipped.g_add_(&clipped_count);
                 total_ratio_samples += chunk_sample_count;
 
-                let action_weights = u.softmax(-1, Kind::Float);
+                let action_weights = u_ext.softmax(-1, Kind::Float);
                 let advantages_weighted = (advantages_mb * action_weights)
                     .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
                 let unclipped_obj = &ratio * &advantages_weighted;

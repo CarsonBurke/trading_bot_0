@@ -161,7 +161,7 @@ impl TradingModel {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
 
-        // Logistic-normal: output K+1 logits (tickers + cash) for softmax
+        // Logistic-normal: output K-1 relative logits (tickers vs cash)
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
@@ -484,7 +484,7 @@ impl TradingModel {
 
         let ticker_logits = actor_feat.apply(&self.actor_out).squeeze_dim(-1);
         let cash_logit = pool_summary.apply(&self.actor_cash_out);
-        let action_mean = Tensor::cat(&[ticker_logits, cash_logit], 1);
+        let action_mean = ticker_logits - cash_logit;
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
         const LOG_STD_MIN: f64 = -5.0; // std = 0.007
         const LOG_STD_MAX: f64 = -0.693; // std = 0.5
@@ -497,18 +497,11 @@ impl TradingModel {
         let log_std_raw = self.log_std_param.tanh();
         let log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
         let variance = latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
-        let action_log_std_tickers = (variance + 1e-6)
+        let action_log_std = (variance + 1e-6)
             .sqrt()
             .log()
             .clamp(LOG_STD_MIN, LOG_STD_MAX)
             .squeeze_dim(-1);
-        let cash_latent = pool_summary
-            .apply(&self.sde_fc)
-            .apply(&self.ln_sde)
-            .tanh();
-        let cash_variance = cash_latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
-        let action_log_std_cash = (cash_variance + 1e-6).sqrt().log().clamp(LOG_STD_MIN, LOG_STD_MAX);
-        let action_log_std = Tensor::cat(&[action_log_std_tickers, action_log_std_cash], 1);
 
         (values, (action_mean, action_log_std), attn_out_vis)
     }
