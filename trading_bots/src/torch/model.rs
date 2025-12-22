@@ -149,9 +149,7 @@ impl TradingModel {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
         let actor_cash_out = nn::linear(p / "actor_cash_out", 256, 1, nn::LinearConfig {
-            ws_init: Init::Const(0.0),
-            bs_init: Some(Init::Const(0.0)),
-            bias: true,
+            ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
         let pool_scorer = nn::linear(p / "pool_scorer", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
@@ -495,7 +493,7 @@ impl TradingModel {
         let action_mean = ticker_logits - cash_logit;
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
         const LOG_STD_MIN: f64 = -5.0; // std = 0.007
-        const LOG_STD_MAX: f64 = -0.693; // std = 0.5
+        const LOG_STD_MAX: f64 = 0.0; // std = 1.0
         let latent = (&enriched + pool_summary.unsqueeze(1))
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.sde_fc)
