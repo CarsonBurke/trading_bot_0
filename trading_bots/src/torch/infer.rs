@@ -2,7 +2,7 @@ use tch::{nn, Device, Kind, Tensor};
 use std::path::Path;
 use std::time::Instant;
 
-use crate::torch::constants::ACTION_COUNT;
+use crate::torch::load::load_var_store_partial;
 use crate::torch::model::TradingModel;
 use crate::torch::env::Env;
 
@@ -12,7 +12,7 @@ pub fn load_model<P: AsRef<Path>>(
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
     let model = TradingModel::new(&vs.root());
-    vs.load(weight_path)?;
+    let _ = load_var_store_partial(&mut vs, weight_path)?;
     Ok((vs, model))
 }
 
@@ -21,7 +21,6 @@ pub fn sample_actions_from_dist(
     action_log_std: &Tensor,
     deterministic: bool,
     temperature: f64,
-    device: Device,
 ) -> Tensor {
     let u = if deterministic || temperature == 0.0 {
         action_mean.shallow_clone()
@@ -30,10 +29,7 @@ pub fn sample_actions_from_dist(
         let noise = Tensor::randn_like(action_mean);
         action_mean + &action_std * noise
     };
-    let batch = u.size()[0];
-    let zeros = Tensor::zeros([batch, 1], (Kind::Float, device));
-    let u_ext = Tensor::cat(&[u, zeros], 1);
-    u_ext.softmax(-1, Kind::Float)
+    u.softmax(-1, Kind::Float)
 }
 
 pub fn run_inference<P: AsRef<Path>>(
@@ -85,7 +81,6 @@ pub fn run_inference<P: AsRef<Path>>(
                 &action_log_std,
                 deterministic,
                 temperature,
-                device,
             );
 
             let actions_vec: Vec<f64> = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();

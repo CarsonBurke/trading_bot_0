@@ -2,6 +2,7 @@ pub mod ppo;
 pub mod infer;
 pub mod ibkr_infer;
 pub mod model;
+pub mod load;
 pub mod ensemble;
 pub mod ssm;
 #[cfg(test)]
