@@ -729,7 +729,8 @@ impl Mamba2 {
         let b_groups = b.view([batch, seqlen, ngroups, d_state]);
         let c_groups = c.view([batch, seqlen, ngroups, d_state]);
 
-        let (y, new_ssm_state) = self.chunked_ssm_scan_with_state(&x_heads, &dt, &a, &b_groups, &c_groups, &state.ssm_state);
+        let (y, new_ssm_state) =
+            self.chunked_ssm_scan_with_state(&x_heads, &dt, &a, &b_groups, &c_groups, &state.ssm_state);
         state.ssm_state.copy_(&new_ssm_state);
 
         let y_skip = if self.config.d_has_hdim {

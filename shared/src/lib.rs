@@ -6,7 +6,7 @@ pub mod paths {
 }
 
 pub mod constants {
-    pub const TICKERS_COUNT: usize = 3;
+    pub const TICKERS_COUNT: usize = 1;
     pub const AVAILABLE_TICKERS_COUNT: usize = 13;
     pub const ACTION_COUNT: usize = TICKERS_COUNT + 1; // +1 for cash weight
     pub const ACTION_HISTORY_LEN: usize = 0;

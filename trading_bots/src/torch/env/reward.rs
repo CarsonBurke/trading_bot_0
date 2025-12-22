@@ -13,8 +13,7 @@ const ACTION_OUTCOME_COMMISSION_PENALTY: f64 = 5.0;
 const CONVICTION_BONUS: f64 = 1.0;
 
 const REWARD_SCALE: f64 = 20.0;
-const CASH_INFLATION_RATE: f64 = 0.002;
-const COMMISSION_PENALTY_SCALE: f64 = 5.0;
+const CASH_INFLATION_RATE: f64 = 0.0002;
 const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
 const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 0.01;
@@ -61,12 +60,9 @@ impl Env {
         let strategy_log_return = (total_assets_next / total_assets).ln();
         let pnl_reward = strategy_log_return * REWARD_SCALE;
         let reward_base = (strategy_log_return - index_log_return) * REWARD_SCALE;
-        let commission_penalty = -(commissions / total_assets)
-            * COMMISSION_PENALTY_SCALE
-            * pnl_reward.abs();
         let cash_weight = (self.account.cash / total_assets).clamp(0.0, 1.0);
         let cash_penalty = -cash_weight * CASH_INFLATION_RATE * REWARD_SCALE;
-        let reward = reward_base + commission_penalty + cash_penalty;
+        let reward = reward_base + cash_penalty;
 
         if portfolio_return.abs() < 1e-8 {
             let mut rewards = vec![0.0; n_tickers];

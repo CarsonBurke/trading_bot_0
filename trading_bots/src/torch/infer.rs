@@ -11,7 +11,7 @@ pub fn load_model<P: AsRef<Path>>(
     device: Device,
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
-    let model = TradingModel::new(&vs.root(), ACTION_COUNT);
+    let model = TradingModel::new(&vs.root());
     vs.load(weight_path)?;
     Ok((vs, model))
 }
@@ -76,7 +76,7 @@ pub fn run_inference<P: AsRef<Path>>(
 
             // First call: model.step detects full obs and initializes stream state
             // Subsequent calls: model.step processes single delta per ticker
-            let (_, (action_mean, action_log_std, _), _) = tch::no_grad(|| {
+            let (_, (action_mean, action_log_std), _) = tch::no_grad(|| {
                 model.step(&current_price_deltas, &current_static_obs, &mut stream_state)
             });
 

@@ -18,7 +18,6 @@ pub struct MetaHistory {
     pub mean_advantage: Vec<f64>,
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
-    pub mean_divisor: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -48,10 +47,6 @@ impl MetaHistory {
         self.mean_advantage.push(mean);
         self.min_advantage.push(min);
         self.max_advantage.push(max);
-    }
-
-    pub fn record_divisor(&mut self, mean_divisor: f64) {
-        self.mean_divisor.push(mean_divisor);
     }
 
     pub fn write_reports(&self, episode: usize) {
@@ -188,19 +183,6 @@ impl MetaHistory {
                 },
             };
             let _ = write_report(&format!("{base_dir}/advantage_stats_log.report.bin"), &report);
-        }
-        if !self.mean_divisor.is_empty() {
-            let report = Report {
-                title: "Divisor".to_string(),
-                x_label: Some("Episode".to_string()),
-                y_label: None,
-                scale: ScaleKind::Linear,
-                kind: ReportKind::Simple {
-                    values: f64_to_f32(&self.mean_divisor),
-                    ema_alpha: Some(0.05),
-                },
-            };
-            let _ = write_report(&format!("{base_dir}/divisor.report.bin"), &report);
         }
     }
 }

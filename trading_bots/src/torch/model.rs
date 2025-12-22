@@ -23,8 +23,8 @@ const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
 const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_DELTAS must be divisible by PATCH_SIZE");
 
-// (values, (action_mean, action_log_std, divisor), attn_weights)
-pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
+// (values, (action_mean, action_log_std), attn_weights)
+pub type ModelOutput = (Tensor, (Tensor, Tensor), Tensor);
 
 /// Streaming state for O(1) inference per step
 /// - Ring buffer holds full delta history for head computation
@@ -93,14 +93,13 @@ pub struct TradingModel {
     sde_fc: nn::Linear,
     ln_sde: nn::LayerNorm,
     log_std_param: Tensor,
-    log_d_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
     head_dim: i64,
 }
 
 impl TradingModel {
-    pub fn new(p: &nn::Path, nact: i64) -> Self {
+    pub fn new(p: &nn::Path) -> Self {
         let patch_embed = nn::linear(p / "patch_embed", PATCH_SIZE, SSM_DIM, Default::default());
         let patch_ln = nn::layer_norm(p / "patch_ln", vec![SSM_DIM], Default::default());
         let pos_emb = p.var("pos_emb_stem", &[1, SEQ_LEN, SSM_DIM], Init::Uniform { lo: -0.01, up: 0.01 });
@@ -162,8 +161,7 @@ impl TradingModel {
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
-        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, 1], Init::Const(-3.0));
-        let log_d_raw = p.var("log_d_raw", &[nact], Init::Const(-0.3));
+        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, 1], Init::Const(0.0));
 
         Self {
             patch_embed, patch_ln, pos_emb,
@@ -175,7 +173,7 @@ impl TradingModel {
             global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
             actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out,
             pool_scorer, value_ticker_out, value_cash_out,
-            sde_fc, ln_sde, log_std_param, log_d_raw,
+            sde_fc, ln_sde, log_std_param,
             device: p.device(),
             num_heads, head_dim,
         }
@@ -480,8 +478,9 @@ impl TradingModel {
         let cash_value = pool_summary.apply(&self.value_cash_out);
         let values = Tensor::cat(&[ticker_values.shallow_clone(), cash_value], 1);
 
-        const MEAN_SCALE: f64 = 0.5;
-        let action_mean = actor_feat.apply(&self.actor_out).squeeze_dim(-1).tanh() * MEAN_SCALE;
+        let action_mean = actor_feat
+            .apply(&self.actor_out)
+            .squeeze_dim(-1);
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
         const LOG_STD_MIN: f64 = -5.0; // std = 0.007
         const LOG_STD_MAX: f64 = -0.693; // std = 0.5
@@ -496,9 +495,6 @@ impl TradingModel {
         let variance = latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
         let action_log_std = (variance + 1e-6).sqrt().log().clamp(LOG_STD_MIN, LOG_STD_MAX).squeeze_dim(-1);
 
-        const LOG_D_RAW_SCALE: f64 = 5.0;
-        let divisor = self.log_d_raw.g_mul_scalar(LOG_D_RAW_SCALE).softplus() + 0.1;
-
-        (values, (action_mean, action_log_std, divisor), attn_out_vis)
+        (values, (action_mean, action_log_std), attn_out_vis)
     }
 }
