@@ -2,7 +2,7 @@ use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
 use crate::torch::constants::{
-    GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
+    ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
 use crate::torch::ssm::{stateful_mamba_block, Mamba2State, StatefulMamba};
 
@@ -15,6 +15,8 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 }
 
 const SSM_DIM: i64 = 64;
+const LOGIT_SCALE_INIT: f64 = 0.3;
+pub const LOGIT_SCALE_GROUP: usize = 1;
 
 // Uniform patch size for proper streaming support
 // 3400 deltas / 34 = 100 tokens
@@ -23,8 +25,8 @@ const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
 const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_DELTAS must be divisible by PATCH_SIZE");
 
-// (values, (action_mean, action_log_std), attn_weights)
-pub type ModelOutput = (Tensor, (Tensor, Tensor), Tensor);
+// (values, (action_mean, action_log_std, sde_latent), attn_weights)
+pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
 
 /// Streaming state for O(1) inference per step
 /// - Ring buffer holds full delta history for head computation
@@ -94,12 +96,17 @@ pub struct TradingModel {
     sde_fc: nn::Linear,
     ln_sde: nn::LayerNorm,
     log_std_param: Tensor,
+    logit_scale_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
     head_dim: i64,
 }
 
 impl TradingModel {
+    pub fn logit_scale(&self) -> Tensor {
+        self.logit_scale_raw.exp()
+    }
+
     pub fn new(p: &nn::Path) -> Self {
         let patch_embed = nn::linear(p / "patch_embed", PATCH_SIZE, SSM_DIM, Default::default());
         let patch_ln = nn::layer_norm(p / "patch_ln", vec![SSM_DIM], Default::default());
@@ -165,7 +172,9 @@ impl TradingModel {
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
-        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, 1], Init::Const(0.0));
+        let log_std_param = p.var("log_std", &[ACTION_COUNT - 1], Init::Const(0.0));
+        let logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP)
+            .var("logit_scale_raw", &[1], Init::Const(LOGIT_SCALE_INIT.ln()));
 
         Self {
             patch_embed, patch_ln, pos_emb,
@@ -177,7 +186,7 @@ impl TradingModel {
             global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
             actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out, actor_cash_out,
             pool_scorer, value_ticker_out, value_cash_out,
-            sde_fc, ln_sde, log_std_param,
+            sde_fc, ln_sde, log_std_param, logit_scale_raw,
             device: p.device(),
             num_heads, head_dim,
         }
@@ -490,25 +499,29 @@ impl TradingModel {
 
         let ticker_logits = actor_feat.apply(&self.actor_out).squeeze_dim(-1);
         let cash_logit = cash_feat.apply(&self.actor_cash_out);
-        let action_mean = ticker_logits - cash_logit;
+        let logit_scale = self.logit_scale_raw.exp();
+        let action_mean = (ticker_logits - cash_logit) * logit_scale;
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
         const LOG_STD_MIN: f64 = -5.0; // std = 0.007
         const LOG_STD_MAX: f64 = 0.0; // std = 1.0
-        let latent = (&enriched + pool_summary.unsqueeze(1))
+        let sde_latent = actor_feat
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.sde_fc)
             .apply(&self.ln_sde)
             .tanh()
             .reshape([batch_size, TICKERS_COUNT, -1]);
+        let latent_norm = sde_latent
+            .pow_tensor_scalar(2)
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+            .clamp_min(1e-6);
         let log_std_raw = self.log_std_param.tanh();
-        let log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
-        let variance = latent.pow_tensor_scalar(2).matmul(&log_std.exp().pow_tensor_scalar(2));
-        let action_log_std = (variance + 1e-6)
-            .sqrt()
-            .log()
-            .clamp(LOG_STD_MIN, LOG_STD_MAX)
-            .squeeze_dim(-1);
+        let log_std_base = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
+        let log_std: Tensor = log_std_base
+            .unsqueeze(0)
+            .expand(&[batch_size, TICKERS_COUNT], false)
+            + 0.5 * latent_norm.log();
+        let action_log_std = log_std.clamp(LOG_STD_MIN, LOG_STD_MAX);
 
-        (values, (action_mean, action_log_std), attn_out_vis)
+        (values, (action_mean, action_log_std, sde_latent), attn_out_vis)
     }
 }

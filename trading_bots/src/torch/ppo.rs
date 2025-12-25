@@ -7,7 +7,7 @@ use crate::torch::constants::{
     STEPS_PER_EPISODE, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::TradingModel;
+use crate::torch::model::{TradingModel, LOGIT_SCALE_GROUP};
 use crate::torch::load::load_var_store_partial;
 
 struct GpuRollingBuffer {
@@ -106,6 +106,7 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const LEARNING_RATE: f64 = 4e-5;
+const LOGIT_SCALE_LR_MULT: f64 = 10.0;
 
 // RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
 const RPO_ALPHA_MIN: f64 = 0.005;
@@ -146,6 +147,7 @@ pub fn train(weights_path: Option<&str>) {
     }
 
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
+    opt.set_lr_group(LOGIT_SCALE_GROUP, LEARNING_RATE * LOGIT_SCALE_LR_MULT);
 
     // Disabled FP16 - with GAP reducing params from 39M to 284K, FP32 easily fits in VRAM
     // FP16 causes NaN issues in tch-rs, especially with complex architectures
@@ -253,7 +255,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step() {
             env.set_step(step);
 
-            let (values, (action_mean, action_log_std), attn_weights) =
+            let (values, (action_mean, action_log_std, sde_latent), attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
@@ -264,12 +266,19 @@ pub fn train(weights_path: Option<&str>) {
             // Logistic-normal with softmax simplex projection
             let action_log_std_clamped = action_log_std.clamp(-20.0, 5.0);
             let action_std = action_log_std_clamped.exp();
+            let latent_norm = sde_latent
+                .pow_tensor_scalar(2)
+                .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+                .sqrt()
+                .clamp_min(1e-6);
 
             if sde_noise.is_none() || (step % SDE_SAMPLE_FREQ == 0) {
-                sde_noise = Some(Tensor::randn_like(&action_mean));
+                sde_noise = Some(Tensor::randn_like(&sde_latent));
             }
             let noise = sde_noise.as_ref().unwrap();
-            let u = &action_mean + &action_std * noise; // [batch, K-1]
+            let noise_raw = (&sde_latent * noise).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+            let noise_scaled = &noise_raw * &action_std / &latent_norm;
+            let u = &action_mean + noise_scaled; // [batch, K-1]
             let u_ext = Tensor::cat(&[u.shallow_clone(), zeros_rollout.shallow_clone()], 1);
             let actions = u_ext.softmax(-1, Kind::Float);
 
@@ -458,7 +467,7 @@ pub fn train(weights_path: Option<&str>) {
                 let static_obs_chunk =
                     static_obs_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
-                let (values, (action_means, action_log_stds), _) = trading_model
+                let (values, (action_means, action_log_stds, _), _) = trading_model
                     .forward(&price_deltas_chunk, &static_obs_chunk, true);
                 let values = values.view([chunk_sample_count, ACTION_COUNT]);
 
@@ -639,21 +648,23 @@ pub fn train(weights_path: Option<&str>) {
         });
 
         // Record std stats every episode
-        let (mean_std, min_std, max_std) = tch::no_grad(|| {
+        let (mean_std, min_std, max_std, logit_scale) = tch::no_grad(|| {
             let price_deltas_step = s_price_deltas.get(0);
             let static_obs = s_static_obs.get(0);
-            let (_, (_, action_log_std), _) =
+            let (_, (_, action_log_std, _), _) =
                 trading_model.forward(&price_deltas_step, &static_obs, false);
             let std = action_log_std.exp();
             (
                 f64::try_from(std.mean(Kind::Float)).unwrap_or(0.0),
                 f64::try_from(std.min()).unwrap_or(0.0),
                 f64::try_from(std.max()).unwrap_or(0.0),
+                f64::try_from(trading_model.logit_scale()).unwrap_or(1.0),
             )
         });
         env.primary_mut()
             .meta_history
             .record_std_stats(mean_std, min_std, max_std, rpo_alpha);
+        env.primary_mut().meta_history.record_logit_scale(logit_scale);
 
         // Single GPU->CPU sync for loss and grad norm at end of all epochs
         let mean_loss = if total_sample_count > 0 {
@@ -673,7 +684,7 @@ pub fn train(weights_path: Option<&str>) {
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
-            let (_, (debug_mean, debug_log_std), _attn_weights) =
+            let (_, (debug_mean, debug_log_std, _), _attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(0);
                     let static_obs = s_static_obs.get(0);

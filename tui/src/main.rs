@@ -4,10 +4,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    Frame, Terminal,
-};
+use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use shared::paths::WEIGHTS_PATH;
 use std::{
     io,
@@ -24,9 +21,7 @@ mod theme;
 mod utils;
 
 use chart_viewer::ChartViewer;
-use state::{
-    GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState,
-};
+use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
@@ -41,11 +36,18 @@ pub enum AppMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DialogMode {
     None,
-    WeightsInput { for_training: bool, for_inference: bool },
-    InferenceInput { focused_field: InferenceField },
+    WeightsInput {
+        for_training: bool,
+        for_inference: bool,
+    },
+    InferenceInput {
+        focused_field: InferenceField,
+    },
     ConfirmQuit,
     ConfirmStopTraining,
-    PageJump { selected: usize },
+    PageJump {
+        selected: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -133,18 +135,16 @@ impl App {
             "cumulative_reward",
             "outperformance",
             "loss_log",
+            "advantage_stats_log",
             "total_commissions",
             "std_stats",
-            "advantage_stats_log",
-            "divisor",
+            "logit_scale",
             "grad_norm_log",
             "target_weights",
         ];
 
         // Ticker-specific chart base names
-        let ticker_chart_bases = vec![
-            "assets", "buy_sell", "raw_action"
-        ];
+        let ticker_chart_bases = vec!["assets", "buy_sell", "raw_action"];
 
         // Track the latest file for each chart type: base_name -> (modified_time, path)
         let mut latest_per_type: HashMap<String, (SystemTime, PathBuf)> = HashMap::new();
@@ -152,7 +152,12 @@ impl App {
         // Scan all generation directories
         if let Ok(entries) = fs::read_dir(&gens_path) {
             for entry in entries.filter_map(|e| e.ok()) {
-                if !entry.file_type().ok().map(|ft| ft.is_dir()).unwrap_or(false) {
+                if !entry
+                    .file_type()
+                    .ok()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false)
+                {
                     continue;
                 }
                 // Only process numeric directories (generation folders)
@@ -183,7 +188,6 @@ impl App {
                         }
                     }
                 }
-
 
                 // Process ticker-specific charts in subdirectories
                 if let Ok(items) = fs::read_dir(&gen_path) {
@@ -241,11 +245,15 @@ impl App {
         for line in self.logs_page.training_output.iter().rev() {
             // Look for actual episode completion logs: "Episode N - Total Assets..."
             // Skip PPO progress logs: "[Ep N] Episodes: ..."
-            if line.contains("Episode") && line.contains("Total Assets") && !line.starts_with("[Ep") {
+            if line.contains("Episode") && line.contains("Total Assets") && !line.starts_with("[Ep")
+            {
                 if let Some(ep_str) = line.split("Episode").nth(1) {
                     if let Some(num_str) = ep_str.trim().split_whitespace().next() {
                         // Strip ANSI codes if present
-                        let clean_num = num_str.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+                        let clean_num = num_str
+                            .chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .collect::<String>();
                         if let Ok(ep) = clean_num.parse::<usize>() {
                             return Some(ep);
                         }
@@ -279,14 +287,20 @@ impl App {
         self.process_manager.start_training(weights)
     }
 
-    fn start_inference(&mut self, weights_file: Option<String>, ticker: Option<String>, episodes: Option<usize>) -> Result<()> {
+    fn start_inference(
+        &mut self,
+        weights_file: Option<String>,
+        ticker: Option<String>,
+        episodes: Option<usize>,
+    ) -> Result<()> {
         let weights = weights_file.unwrap_or_else(|| "infer.safetensors".to_string());
         let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
             weights
         } else {
             format!("{}/{}", WEIGHTS_PATH, weights)
         };
-        self.process_manager.start_inference(weights_path, ticker, episodes.unwrap_or(10))
+        self.process_manager
+            .start_inference(weights_path, ticker, episodes.unwrap_or(10))
     }
 
     fn stop_training(&mut self) -> Result<()> {
@@ -296,7 +310,8 @@ impl App {
     fn select_generation(&mut self) -> Result<()> {
         if let Some(gen) = self.generation_browser.get_selected() {
             let path = gen.path.clone();
-            self.generation_browser.selected_generation = self.generation_browser.list_state.selected();
+            self.generation_browser.selected_generation =
+                self.generation_browser.list_state.selected();
             self.chart_viewer.load_generation(&path)?;
             self.previous_mode = self.mode;
             self.mode = AppMode::ChartViewer;
@@ -307,7 +322,8 @@ impl App {
     fn select_inference(&mut self) -> Result<()> {
         if let Some(inf) = self.inference_browser.get_selected() {
             let path = inf.path.clone();
-            self.inference_browser.selected_inference = self.inference_browser.list_state.selected();
+            self.inference_browser.selected_inference =
+                self.inference_browser.list_state.selected();
             self.chart_viewer.load_inference(&path)?;
             self.previous_mode = self.mode;
             self.mode = AppMode::ChartViewer;
@@ -342,7 +358,6 @@ impl App {
     fn previous_log_line(&mut self) {
         self.logs_page.previous();
     }
-
 }
 
 fn main() -> Result<()> {
@@ -356,10 +371,7 @@ fn main() -> Result<()> {
     let res = run_app(&mut terminal, &mut app);
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(err) = res {
@@ -369,10 +381,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_app<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-) -> Result<()> {
+fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
 
@@ -380,12 +389,16 @@ fn run_app<B: ratatui::backend::Backend>(
         app.logs_page.poll_training_output();
 
         // Wait for event, then drain all pending events before redrawing
-        if event::poll(Duration::from_millis(16))? {  // ~60fps
+        if event::poll(Duration::from_millis(16))? {
+            // ~60fps
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Handle dialogs first (they take priority)
                     match app.dialog_mode {
-                        DialogMode::WeightsInput { for_training, for_inference } => match key.code {
+                        DialogMode::WeightsInput {
+                            for_training,
+                            for_inference,
+                        } => match key.code {
                             KeyCode::Esc => {
                                 app.dialog_mode = DialogMode::None;
                                 app.input.clear();
@@ -412,7 +425,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.input.pop();
                             }
                             _ => {}
-                        }
+                        },
                         DialogMode::InferenceInput { focused_field } => match key.code {
                             KeyCode::Esc => {
                                 app.dialog_mode = DialogMode::None;
@@ -426,7 +439,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                         InferenceField::Weights => InferenceField::Ticker,
                                         InferenceField::Ticker => InferenceField::Episodes,
                                         InferenceField::Episodes => InferenceField::Weights,
-                                    }
+                                    },
                                 };
                             }
                             KeyCode::BackTab => {
@@ -435,7 +448,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                         InferenceField::Weights => InferenceField::Episodes,
                                         InferenceField::Ticker => InferenceField::Weights,
                                         InferenceField::Episodes => InferenceField::Ticker,
-                                    }
+                                    },
                                 };
                             }
                             KeyCode::Enter => {
@@ -462,26 +475,28 @@ fn run_app<B: ratatui::backend::Backend>(
 
                                 app.start_inference(weights, ticker, episodes)?;
                             }
-                            KeyCode::Char(c) => {
-                                match focused_field {
-                                    InferenceField::Weights => app.input.push(c),
-                                    InferenceField::Ticker => app.ticker_input.push(c),
-                                    InferenceField::Episodes => {
-                                        if c.is_numeric() {
-                                            app.episodes_input.push(c);
-                                        }
+                            KeyCode::Char(c) => match focused_field {
+                                InferenceField::Weights => app.input.push(c),
+                                InferenceField::Ticker => app.ticker_input.push(c),
+                                InferenceField::Episodes => {
+                                    if c.is_numeric() {
+                                        app.episodes_input.push(c);
                                     }
                                 }
-                            }
-                            KeyCode::Backspace => {
-                                match focused_field {
-                                    InferenceField::Weights => { app.input.pop(); }
-                                    InferenceField::Ticker => { app.ticker_input.pop(); }
-                                    InferenceField::Episodes => { app.episodes_input.pop(); }
+                            },
+                            KeyCode::Backspace => match focused_field {
+                                InferenceField::Weights => {
+                                    app.input.pop();
                                 }
-                            }
+                                InferenceField::Ticker => {
+                                    app.ticker_input.pop();
+                                }
+                                InferenceField::Episodes => {
+                                    app.episodes_input.pop();
+                                }
+                            },
                             _ => {}
-                        }
+                        },
                         DialogMode::ConfirmQuit => match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 return Ok(());
@@ -490,7 +505,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.dialog_mode = DialogMode::None;
                             }
                             _ => {}
-                        }
+                        },
                         DialogMode::ConfirmStopTraining => match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 app.stop_training()?;
@@ -500,7 +515,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.dialog_mode = DialogMode::None;
                             }
                             _ => {}
-                        }
+                        },
                         DialogMode::PageJump { selected } => {
                             const PAGE_COUNT: usize = 5;
                             match key.code {
@@ -514,7 +529,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('k') | KeyCode::Up => {
                                     app.dialog_mode = DialogMode::PageJump {
-                                        selected: if selected == 0 { PAGE_COUNT - 1 } else { selected - 1 },
+                                        selected: if selected == 0 {
+                                            PAGE_COUNT - 1
+                                        } else {
+                                            selected - 1
+                                        },
                                     };
                                 }
                                 KeyCode::Enter => {
@@ -523,7 +542,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                         0 => app.mode = AppMode::Main,
                                         1 => {
                                             app.generation_browser.load_generations()?;
-                                            if !app.generation_browser.filtered_generations.is_empty() && app.generation_browser.list_state.selected().is_none() {
+                                            if !app
+                                                .generation_browser
+                                                .filtered_generations
+                                                .is_empty()
+                                                && app
+                                                    .generation_browser
+                                                    .list_state
+                                                    .selected()
+                                                    .is_none()
+                                            {
                                                 app.generation_browser.list_state.select(Some(0));
                                                 app.generation_browser.center_list(0);
                                             }
@@ -531,7 +559,13 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                         2 => {
                                             app.inference_browser.load_inferences()?;
-                                            if !app.inference_browser.filtered_inferences.is_empty() && app.inference_browser.list_state.selected().is_none() {
+                                            if !app.inference_browser.filtered_inferences.is_empty()
+                                                && app
+                                                    .inference_browser
+                                                    .list_state
+                                                    .selected()
+                                                    .is_none()
+                                            {
                                                 app.inference_browser.list_state.select(Some(0));
                                                 app.inference_browser.center_list(0);
                                             }
@@ -554,7 +588,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('2') => {
                                     app.dialog_mode = DialogMode::None;
                                     app.generation_browser.load_generations()?;
-                                    if !app.generation_browser.filtered_generations.is_empty() && app.generation_browser.list_state.selected().is_none() {
+                                    if !app.generation_browser.filtered_generations.is_empty()
+                                        && app.generation_browser.list_state.selected().is_none()
+                                    {
                                         app.generation_browser.list_state.select(Some(0));
                                         app.generation_browser.center_list(0);
                                     }
@@ -563,7 +599,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('3') => {
                                     app.dialog_mode = DialogMode::None;
                                     app.inference_browser.load_inferences()?;
-                                    if !app.inference_browser.filtered_inferences.is_empty() && app.inference_browser.list_state.selected().is_none() {
+                                    if !app.inference_browser.filtered_inferences.is_empty()
+                                        && app.inference_browser.list_state.selected().is_none()
+                                    {
                                         app.inference_browser.list_state.select(Some(0));
                                         app.inference_browser.center_list(0);
                                     }
@@ -584,15 +622,25 @@ fn run_app<B: ratatui::backend::Backend>(
                         DialogMode::None => {
                             // Global keybindings (work in all modes when no dialog is open)
                             match key.code {
-                                KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                KeyCode::Char('c')
+                                    if key
+                                        .modifiers
+                                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                                {
                                     app.dialog_mode = DialogMode::ConfirmQuit;
                                 }
-                                KeyCode::Char('d') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                KeyCode::Char('d')
+                                    if key
+                                        .modifiers
+                                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                                {
                                     app.dialog_mode = DialogMode::ConfirmQuit;
                                 }
                                 KeyCode::Char('o') => {
                                     // Don't open page jump when searching
-                                    if !app.generation_browser.searching && !app.inference_browser.searching {
+                                    if !app.generation_browser.searching
+                                        && !app.inference_browser.searching
+                                    {
                                         app.dialog_mode = DialogMode::PageJump { selected: 0 };
                                     }
                                 }
@@ -600,216 +648,245 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
 
                             match app.mode {
-                            AppMode::Main => match key.code {
-                                KeyCode::Char('q') => {
-                                    app.dialog_mode = DialogMode::ConfirmQuit;
-                                }
-                                KeyCode::Char('s') => {
-                                    if !app.is_training_running() {
-                                        app.dialog_mode = DialogMode::WeightsInput { for_training: true, for_inference: false };
+                                AppMode::Main => match key.code {
+                                    KeyCode::Char('q') => {
+                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                    }
+                                    KeyCode::Char('s') => {
+                                        if !app.is_training_running() {
+                                            app.dialog_mode = DialogMode::WeightsInput {
+                                                for_training: true,
+                                                for_inference: false,
+                                            };
+                                        }
+                                    }
+                                    KeyCode::Char('f') => {
+                                        if !app.is_anything_running() {
+                                            app.dialog_mode = DialogMode::InferenceInput {
+                                                focused_field: InferenceField::Weights,
+                                            };
+                                        }
+                                    }
+                                    KeyCode::Char('x') => {
+                                        if app.is_training_running() {
+                                            app.dialog_mode = DialogMode::ConfirmStopTraining;
+                                        }
+                                    }
+                                    KeyCode::Char('e') => {
+                                        app.generation_browser.load_generations()?;
+                                        // Auto-select latest generation (first in list) only if no selection exists
+                                        if !app.generation_browser.filtered_generations.is_empty()
+                                            && app
+                                                .generation_browser
+                                                .list_state
+                                                .selected()
+                                                .is_none()
+                                        {
+                                            app.generation_browser.list_state.select(Some(0));
+                                            app.generation_browser.center_list(0);
+                                        }
+                                        app.mode = AppMode::GenerationBrowser;
+                                    }
+                                    KeyCode::Char('i') => {
+                                        app.inference_browser.load_inferences()?;
+                                        // Auto-select latest inference (first in list) only if no selection exists
+                                        if !app.inference_browser.filtered_inferences.is_empty()
+                                            && app.inference_browser.list_state.selected().is_none()
+                                        {
+                                            app.inference_browser.list_state.select(Some(0));
+                                            app.inference_browser.center_list(0);
+                                        }
+                                        app.mode = AppMode::InferenceBrowser;
+                                    }
+                                    KeyCode::Char('m') => {
+                                        app.view_meta_charts()?;
+                                    }
+                                    KeyCode::Char('l') => {
+                                        app.logs_page.enter();
+                                        app.mode = AppMode::Logs;
+                                    }
+                                    KeyCode::Char('v') => {
+                                        app.mode = AppMode::ModelObservations;
+                                    }
+                                    _ => {}
+                                },
+                                AppMode::GenerationBrowser => {
+                                    if app.generation_browser.searching {
+                                        match key.code {
+                                            KeyCode::Esc => {
+                                                app.generation_browser.searching = false;
+                                                app.generation_browser.search_input.clear();
+                                                app.generation_browser.filter_generations();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.generation_browser.searching = false;
+                                            }
+                                            KeyCode::Char(c) => {
+                                                app.generation_browser.search_input.push(c);
+                                                app.generation_browser.filter_generations();
+                                            }
+                                            KeyCode::Backspace => {
+                                                app.generation_browser.search_input.pop();
+                                                app.generation_browser.filter_generations();
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::Char('q') => {
+                                                app.mode = AppMode::Main;
+                                            }
+                                            KeyCode::Char('/') => {
+                                                app.generation_browser.searching = true;
+                                            }
+                                            KeyCode::Down
+                                                if key.modifiers.contains(
+                                                    crossterm::event::KeyModifiers::CONTROL,
+                                                ) =>
+                                            {
+                                                app.generation_browser.scroll_down(5);
+                                            }
+                                            KeyCode::Up
+                                                if key.modifiers.contains(
+                                                    crossterm::event::KeyModifiers::CONTROL,
+                                                ) =>
+                                            {
+                                                app.generation_browser.scroll_up(5);
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.generation_browser.next();
+                                            }
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.generation_browser.previous();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.select_generation()?;
+                                            }
+                                            KeyCode::Char('r') => {
+                                                app.generation_browser.load_generations()?;
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
-                                KeyCode::Char('f') => {
-                                    if !app.is_anything_running() {
-                                        app.dialog_mode = DialogMode::InferenceInput { focused_field: InferenceField::Weights };
+                                AppMode::InferenceBrowser => {
+                                    if app.inference_browser.searching {
+                                        match key.code {
+                                            KeyCode::Esc => {
+                                                app.inference_browser.searching = false;
+                                                app.inference_browser.search_input.clear();
+                                                app.inference_browser.filter_inferences();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.inference_browser.searching = false;
+                                            }
+                                            KeyCode::Char(c) => {
+                                                app.inference_browser.search_input.push(c);
+                                                app.inference_browser.filter_inferences();
+                                            }
+                                            KeyCode::Backspace => {
+                                                app.inference_browser.search_input.pop();
+                                                app.inference_browser.filter_inferences();
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::Char('q') => {
+                                                app.mode = AppMode::Main;
+                                            }
+                                            KeyCode::Enter => {
+                                                app.select_inference()?;
+                                            }
+                                            KeyCode::Char('/') => {
+                                                app.inference_browser.searching = true;
+                                            }
+                                            KeyCode::Down
+                                                if key.modifiers.contains(
+                                                    crossterm::event::KeyModifiers::CONTROL,
+                                                ) =>
+                                            {
+                                                app.inference_browser.scroll_down(5);
+                                            }
+                                            KeyCode::Up
+                                                if key.modifiers.contains(
+                                                    crossterm::event::KeyModifiers::CONTROL,
+                                                ) =>
+                                            {
+                                                app.inference_browser.scroll_up(5);
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.inference_browser.next();
+                                            }
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.inference_browser.previous();
+                                            }
+                                            KeyCode::Char('r') => {
+                                                app.inference_browser.load_inferences()?;
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
-                                KeyCode::Char('x') => {
-                                    if app.is_training_running() {
-                                        app.dialog_mode = DialogMode::ConfirmStopTraining;
+                                AppMode::ChartViewer => match key.code {
+                                    KeyCode::Esc | KeyCode::Char('q') => {
+                                        app.mode = app.previous_mode;
                                     }
-                                }
-                                KeyCode::Char('e') => {
-                                    app.generation_browser.load_generations()?;
-                                    // Auto-select latest generation (first in list) only if no selection exists
-                                    if !app.generation_browser.filtered_generations.is_empty() && app.generation_browser.list_state.selected().is_none() {
-                                        app.generation_browser.list_state.select(Some(0));
-                                        app.generation_browser.center_list(0);
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        app.chart_viewer.next();
                                     }
-                                    app.mode = AppMode::GenerationBrowser;
-                                }
-                                KeyCode::Char('i') => {
-                                    app.inference_browser.load_inferences()?;
-                                    // Auto-select latest inference (first in list) only if no selection exists
-                                    if !app.inference_browser.filtered_inferences.is_empty() && app.inference_browser.list_state.selected().is_none() {
-                                        app.inference_browser.list_state.select(Some(0));
-                                        app.inference_browser.center_list(0);
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        app.chart_viewer.previous();
                                     }
-                                    app.mode = AppMode::InferenceBrowser;
-                                }
-                                KeyCode::Char('m') => {
-                                    app.view_meta_charts()?;
-                                }
-                                KeyCode::Char('l') => {
-                                    app.logs_page.enter();
-                                    app.mode = AppMode::Logs;
-                                }
-                                KeyCode::Char('v') => {
-                                    app.mode = AppMode::ModelObservations;
-                                }
-                                _ => {}
-                            },
-                    AppMode::GenerationBrowser => {
-                        if app.generation_browser.searching {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    app.generation_browser.searching = false;
-                                    app.generation_browser.search_input.clear();
-                                    app.generation_browser.filter_generations();
-                                }
-                                KeyCode::Enter => {
-                                    app.generation_browser.searching = false;
-                                }
-                                KeyCode::Char(c) => {
-                                    app.generation_browser.search_input.push(c);
-                                    app.generation_browser.filter_generations();
-                                }
-                                KeyCode::Backspace => {
-                                    app.generation_browser.search_input.pop();
-                                    app.generation_browser.filter_generations();
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    app.mode = AppMode::Main;
-                                }
-                                KeyCode::Char('/') => {
-                                    app.generation_browser.searching = true;
-                                }
-                                KeyCode::Down if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                                    app.generation_browser.scroll_down(5);
-                                }
-                                KeyCode::Up if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                                    app.generation_browser.scroll_up(5);
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    app.generation_browser.next();
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    app.generation_browser.previous();
-                                }
-                                KeyCode::Enter => {
-                                    app.select_generation()?;
-                                }
-                                KeyCode::Char('r') => {
-                                    app.generation_browser.load_generations()?;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    AppMode::InferenceBrowser => {
-                        if app.inference_browser.searching {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    app.inference_browser.searching = false;
-                                    app.inference_browser.search_input.clear();
-                                    app.inference_browser.filter_inferences();
-                                }
-                                KeyCode::Enter => {
-                                    app.inference_browser.searching = false;
-                                }
-                                KeyCode::Char(c) => {
-                                    app.inference_browser.search_input.push(c);
-                                    app.inference_browser.filter_inferences();
-                                }
-                                KeyCode::Backspace => {
-                                    app.inference_browser.search_input.pop();
-                                    app.inference_browser.filter_inferences();
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    app.mode = AppMode::Main;
-                                }
-                                KeyCode::Enter => {
-                                    app.select_inference()?;
-                                }
-                                KeyCode::Char('/') => {
-                                    app.inference_browser.searching = true;
-                                }
-                                KeyCode::Down if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                                    app.inference_browser.scroll_down(5);
-                                }
-                                KeyCode::Up if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                                    app.inference_browser.scroll_up(5);
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    app.inference_browser.next();
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    app.inference_browser.previous();
-                                }
-                                KeyCode::Char('r') => {
-                                    app.inference_browser.load_inferences()?;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    AppMode::ChartViewer => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            app.mode = app.previous_mode;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.chart_viewer.next();
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.chart_viewer.previous();
-                        }
-                        KeyCode::Enter => {
-                            app.chart_viewer.toggle_expand();
-                        }
-                        KeyCode::Char('r') => {
-                            if app.chart_viewer.is_viewing_meta_charts() {
-                                app.load_latest_meta_charts()?;
-                                app.chart_viewer.load_charts(&app.latest_meta_charts)?;
-                            }
-                        }
-                        KeyCode::Char('c') => {
-                            let _ = app.chart_viewer.copy_current_image();
-                        }
-                        _ => {}
-                    },
-                    AppMode::Logs => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            app.mode = AppMode::Main;
-                        }
-                        KeyCode::Char('c') => {
-                            app.logs_page.clear_logs();
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.logs_page.next();
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.logs_page.previous();
-                        }
-                        KeyCode::PageDown => {
-                            app.logs_page.page_down();
-                        }
-                        KeyCode::PageUp => {
-                            app.logs_page.page_up();
-                        }
-                        KeyCode::Home => {
-                            app.logs_page.jump_to_top();
-                        }
-                        KeyCode::End => {
-                            app.logs_page.jump_to_bottom();
-                        }
-                        _ => {}
-                    },
-                    AppMode::ModelObservations => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            app.mode = AppMode::Main;
-                        }
-                        KeyCode::Char('r') => {
-                        }
-                        _ => {}
-                    },
+                                    KeyCode::Enter => {
+                                        app.chart_viewer.toggle_expand();
+                                    }
+                                    KeyCode::Char('r') => {
+                                        if app.chart_viewer.is_viewing_meta_charts() {
+                                            app.load_latest_meta_charts()?;
+                                            app.chart_viewer
+                                                .load_charts(&app.latest_meta_charts)?;
+                                        }
+                                    }
+                                    KeyCode::Char('c') => {
+                                        let _ = app.chart_viewer.copy_current_image();
+                                    }
+                                    _ => {}
+                                },
+                                AppMode::Logs => match key.code {
+                                    KeyCode::Esc | KeyCode::Char('q') => {
+                                        app.mode = AppMode::Main;
+                                    }
+                                    KeyCode::Char('c') => {
+                                        app.logs_page.clear_logs();
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        app.logs_page.next();
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        app.logs_page.previous();
+                                    }
+                                    KeyCode::PageDown => {
+                                        app.logs_page.page_down();
+                                    }
+                                    KeyCode::PageUp => {
+                                        app.logs_page.page_up();
+                                    }
+                                    KeyCode::Home => {
+                                        app.logs_page.jump_to_top();
+                                    }
+                                    KeyCode::End => {
+                                        app.logs_page.jump_to_bottom();
+                                    }
+                                    _ => {}
+                                },
+                                AppMode::ModelObservations => match key.code {
+                                    KeyCode::Esc | KeyCode::Char('q') => {
+                                        app.mode = AppMode::Main;
+                                    }
+                                    KeyCode::Char('r') => {}
+                                    _ => {}
+                                },
                             }
                         }
                     }
@@ -819,14 +896,22 @@ fn run_app<B: ratatui::backend::Backend>(
                         AppMode::GenerationBrowser => app.generation_browser.scroll_up(3),
                         AppMode::InferenceBrowser => app.inference_browser.scroll_up(3),
                         AppMode::ChartViewer => app.chart_viewer.scroll_up(3),
-                        AppMode::Logs => for _ in 0..3 { app.logs_page.previous(); },
+                        AppMode::Logs => {
+                            for _ in 0..3 {
+                                app.logs_page.previous();
+                            }
+                        }
                         _ => {}
                     },
                     MouseEventKind::ScrollDown => match app.mode {
                         AppMode::GenerationBrowser => app.generation_browser.scroll_down(3),
                         AppMode::InferenceBrowser => app.inference_browser.scroll_down(3),
                         AppMode::ChartViewer => app.chart_viewer.scroll_down(3),
-                        AppMode::Logs => for _ in 0..3 { app.logs_page.next(); },
+                        AppMode::Logs => {
+                            for _ in 0..3 {
+                                app.logs_page.next();
+                            }
+                        }
                         _ => {}
                     },
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -865,17 +950,28 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // Render dialog on top if active
     match app.dialog_mode {
-        DialogMode::WeightsInput { for_training, for_inference } => {
+        DialogMode::WeightsInput {
+            for_training,
+            for_inference,
+        } => {
             components::dialogs::weights::render(f, app, for_training, for_inference);
         }
         DialogMode::InferenceInput { focused_field } => {
             components::dialogs::inference::render(f, app, focused_field);
         }
         DialogMode::ConfirmQuit => {
-            components::dialogs::confirm::render(f, "Quit?", "Training processes will continue running in background.");
+            components::dialogs::confirm::render(
+                f,
+                "Quit?",
+                "Training processes will continue running in background.",
+            );
         }
         DialogMode::ConfirmStopTraining => {
-            components::dialogs::confirm::render(f, "Stop Training?", "This will terminate the training process.");
+            components::dialogs::confirm::render(
+                f,
+                "Stop Training?",
+                "This will terminate the training process.",
+            );
         }
         DialogMode::PageJump { selected } => {
             components::dialogs::page_jump::render(f, selected, app.mode);

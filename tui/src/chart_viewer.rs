@@ -18,8 +18,15 @@ use crate::utils::clipboard;
 
 #[derive(Debug, Clone)]
 pub enum ChartNode {
-    Folder { name: String, path: PathBuf, children: Vec<usize> },
-    Chart { name: String, path: PathBuf },
+    Folder {
+        name: String,
+        path: PathBuf,
+        children: Vec<usize>,
+    },
+    Chart {
+        name: String,
+        path: PathBuf,
+    },
 }
 
 pub struct ChartViewer {
@@ -35,9 +42,9 @@ pub struct ChartViewer {
 
 #[derive(Debug, Clone, PartialEq)]
 enum ViewingMode {
-    Generation(usize),  // Episode number
-    Inference(usize),   // Inference number
-    MetaCharts,         // Meta charts from various episodes
+    Generation(usize), // Episode number
+    Inference(usize),  // Inference number
+    MetaCharts,        // Meta charts from various episodes
 }
 
 impl ChartViewer {
@@ -119,7 +126,10 @@ impl ChartViewer {
 
         // Group charts by ticker (None for episode-level charts)
         // Store (path, chart_name, episode_num, modified_time)
-        let mut ticker_groups: HashMap<Option<String>, Vec<(PathBuf, String, Option<usize>, SystemTime)>> = HashMap::new();
+        let mut ticker_groups: HashMap<
+            Option<String>,
+            Vec<(PathBuf, String, Option<usize>, SystemTime)>,
+        > = HashMap::new();
 
         for path in chart_paths {
             if path.exists() {
@@ -132,8 +142,8 @@ impl ChartViewer {
                 // Extract episode number, ticker, and chart name from report path
                 // Expected: gens/123/chart.report.bin or gens/123/TICKER/chart.report.bin
                 let parent = path.parent();
-                let chart_name = report_title_from_path(path)
-                    .unwrap_or_else(|| chart_name_from_path(path));
+                let chart_name =
+                    report_title_from_path(path).unwrap_or_else(|| chart_name_from_path(path));
                 let chart_name = normalize_title(&chart_name);
 
                 let (episode_num, ticker) = if let Some(parent) = parent {
@@ -143,7 +153,8 @@ impl ChartViewer {
                         } else if is_ticker_name(parent_name) {
                             let chart_parent = parent.parent();
                             if let Some(chart_parent) = chart_parent {
-                                if let Some(ep_name) = chart_parent.file_name().and_then(|n| n.to_str())
+                                if let Some(ep_name) =
+                                    chart_parent.file_name().and_then(|n| n.to_str())
                                 {
                                     if let Ok(ep) = ep_name.parse::<usize>() {
                                         (Some(ep), Some(parent_name.to_string()))
@@ -170,9 +181,12 @@ impl ChartViewer {
                     continue;
                 }
 
-                ticker_groups.entry(ticker)
-                    .or_insert_with(Vec::new)
-                    .push((path.clone(), chart_name, episode_num, modified));
+                ticker_groups.entry(ticker).or_insert_with(Vec::new).push((
+                    path.clone(),
+                    chart_name,
+                    episode_num,
+                    modified,
+                ));
             }
         }
 
@@ -276,11 +290,7 @@ impl ChartViewer {
             .filter_map(|e| e.ok())
         {
             let entry_path = entry.path().to_path_buf();
-            let name = entry
-                .file_name()
-                .to_str()
-                .unwrap_or("unknown")
-                .to_string();
+            let name = entry.file_name().to_str().unwrap_or("unknown").to_string();
 
             if entry.file_type().is_dir() {
                 let mut children = Vec::new();
@@ -336,7 +346,8 @@ impl ChartViewer {
         folders.sort_by(|a, b| b.1.cmp(&a.1));
 
         self.root_indices.extend(charts);
-        self.root_indices.extend(folders.into_iter().map(|(idx, _)| idx));
+        self.root_indices
+            .extend(folders.into_iter().map(|(idx, _)| idx));
 
         Ok(())
     }
@@ -355,7 +366,8 @@ impl ChartViewer {
         self.flattened.push((idx, depth));
 
         // Check if we should expand children
-        let should_expand = matches!(&self.nodes[idx], ChartNode::Folder { .. }) && self.expanded[idx];
+        let should_expand =
+            matches!(&self.nodes[idx], ChartNode::Folder { .. }) && self.expanded[idx];
 
         if should_expand {
             // Get children count first to avoid borrow issues
@@ -486,32 +498,60 @@ impl ChartViewer {
         self.render_preview(f, chunks[1]);
     }
 
-    fn render_list(&mut self, f: &mut Frame, area: Rect, is_training: bool, current_episode: Option<usize>) {
+    fn render_list(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        is_training: bool,
+        current_episode: Option<usize>,
+    ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ])
             .split(area);
 
         let title = match &self.viewing_mode {
             ViewingMode::Generation(ep) => {
-                let mut title_spans = vec![
-                    Span::styled(format!(" Episode {} Charts ", ep), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                ];
-                title_spans.extend(episode_status::episode_status_spans(is_training, current_episode));
+                let mut title_spans = vec![Span::styled(
+                    format!(" Episode {} Charts ", ep),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                title_spans.extend(episode_status::episode_status_spans(
+                    is_training,
+                    current_episode,
+                ));
                 Paragraph::new(Line::from(title_spans))
             }
             ViewingMode::Inference(num) => {
-                let mut title_spans = vec![
-                    Span::styled(format!(" Inference {} Charts ", num), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                ];
-                title_spans.extend(episode_status::episode_status_spans(is_training, current_episode));
+                let mut title_spans = vec![Span::styled(
+                    format!(" Inference {} Charts ", num),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                title_spans.extend(episode_status::episode_status_spans(
+                    is_training,
+                    current_episode,
+                ));
                 Paragraph::new(Line::from(title_spans))
             }
             ViewingMode::MetaCharts => {
-                let mut title_spans = vec![
-                    Span::styled(" Meta Charts ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                ];
-                title_spans.extend(episode_status::episode_status_spans(is_training, current_episode));
+                let mut title_spans = vec![Span::styled(
+                    " Meta Charts ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                title_spans.extend(episode_status::episode_status_spans(
+                    is_training,
+                    current_episode,
+                ));
                 Paragraph::new(Line::from(title_spans))
             }
         };
@@ -526,9 +566,19 @@ impl ChartViewer {
                 let indent = "  ".repeat(*depth);
                 let (text, style) = match &self.nodes[*node_idx] {
                     ChartNode::Folder { name, children, .. } => {
-                        let icon = if self.expanded[*node_idx] { "▼" } else { "▶" };
-                        let label = format!("{}{} {} ({} items)", indent, icon, name, children.len());
-                        (label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                        let icon = if self.expanded[*node_idx] {
+                            "▼"
+                        } else {
+                            "▶"
+                        };
+                        let label =
+                            format!("{}{} {} ({} items)", indent, icon, name, children.len());
+                        (
+                            label,
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
                     }
                     ChartNode::Chart { name, .. } => {
                         let label = format!("{}  {}", indent, name);
@@ -595,14 +645,18 @@ impl ChartViewer {
             let image = StatefulImage::new(None);
             f.render_stateful_widget(image, inner, protocol);
         } else {
-            let selected_is_folder = self.list_state.selected().and_then(|i| {
-                if i < self.flattened.len() {
-                    let (node_idx, _) = self.flattened[i];
-                    Some(matches!(self.nodes[node_idx], ChartNode::Folder { .. }))
-                } else {
-                    None
-                }
-            }).unwrap_or(false);
+            let selected_is_folder = self
+                .list_state
+                .selected()
+                .and_then(|i| {
+                    if i < self.flattened.len() {
+                        let (node_idx, _) = self.flattened[i];
+                        Some(matches!(self.nodes[node_idx], ChartNode::Folder { .. }))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
 
             let msg = if selected_is_folder {
                 "Folders cannot be previewed - expand to view charts"
@@ -610,8 +664,7 @@ impl ChartViewer {
                 "Select a chart to preview"
             };
 
-            let no_preview = Paragraph::new(msg)
-                .style(Style::default().fg(Color::DarkGray));
+            let no_preview = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
             f.render_widget(no_preview, inner);
         }
     }
@@ -629,7 +682,10 @@ fn report_display_name(name: &str) -> String {
 }
 
 fn chart_name_from_path(path: &PathBuf) -> String {
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
     report_display_name(file_name)
 }
 

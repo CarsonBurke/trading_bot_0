@@ -18,6 +18,7 @@ pub struct MetaHistory {
     pub mean_advantage: Vec<f64>,
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
+    pub logit_scale: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -47,6 +48,10 @@ impl MetaHistory {
         self.mean_advantage.push(mean);
         self.min_advantage.push(min);
         self.max_advantage.push(max);
+    }
+
+    pub fn record_logit_scale(&mut self, logit_scale: f64) {
+        self.logit_scale.push(logit_scale);
     }
 
     pub fn write_reports(&self, episode: usize) {
@@ -183,6 +188,19 @@ impl MetaHistory {
                 },
             };
             let _ = write_report(&format!("{base_dir}/advantage_stats_log.report.bin"), &report);
+        }
+        if !self.logit_scale.is_empty() {
+            let report = Report {
+                title: "Logit Scale".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Scale".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: f64_to_f32(&self.logit_scale),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &report);
         }
     }
 }
