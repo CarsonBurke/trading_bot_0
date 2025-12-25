@@ -28,39 +28,39 @@ use crate::{
 const AVAILABLE_TICKERS: [&str; AVAILABLE_TICKERS_COUNT] = ["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD", "ADBE", "GOOG", "META", "NKE", "DELL", "CMCSA", "FDX"];
 
 pub struct Env {
-    pub(super) env_id: usize,
+    pub env_id: usize,
     pub step: usize,
     pub max_step: usize,
     pub tickers: Vec<String>,
     pub prices: Vec<Vec<f64>>,
-    pub(super) price_deltas: Vec<Vec<f64>>,
-    pub(super) account: Account,
+    pub price_deltas: Vec<Vec<f64>>,
+    pub account: Account,
     pub episode_history: EpisodeHistory,
     pub meta_history: MetaHistory,
     episode_start: Instant,
     pub episode: usize,
-    pub(super) action_history: VecDeque<Vec<f64>>,
-    pub(super) episode_start_offset: usize,
+    pub action_history: VecDeque<Vec<f64>>,
+    pub episode_start_offset: usize,
     total_data_length: usize,
     random_start: bool,
-    pub(super) peak_assets: f64,
-    pub(super) last_reward: f64,
-    pub(super) last_fill_ratio: f64,
-    pub(super) trade_activity_ema: Vec<f64>,
-    pub(super) steps_since_trade: Vec<usize>,
-    pub(super) position_open_step: Vec<Option<usize>>,
-    pub(super) ticker_perm: Vec<usize>,
-    pub(super) target_weights: Vec<f64>,
-    pub(super) momentum: Vec<Arc<MomentumIndicators>>,
-    pub(super) earnings: Vec<Arc<EarningsIndicators>>,
-    pub(super) macro_ind: Arc<MacroIndicators>,
+    pub peak_assets: f64,
+    pub last_reward: f64,
+    pub last_fill_ratio: f64,
+    pub trade_activity_ema: Vec<f64>,
+    pub steps_since_trade: Vec<usize>,
+    pub position_open_step: Vec<Option<usize>>,
+    pub ticker_perm: Vec<usize>,
+    pub target_weights: Vec<f64>,
+    pub momentum: Vec<Arc<MomentumIndicators>>,
+    pub earnings: Vec<Arc<EarningsIndicators>>,
+    pub macro_ind: Arc<MacroIndicators>,
     record_history_io: bool,
 }
 
-pub(super) const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
+pub const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
 
 impl Env {
-    pub(super) const STARTING_CASH: f64 = 10_000.0;
+    pub const STARTING_CASH: f64 = 10_000.0;
 
     pub fn new(random_start: bool) -> Self {
         Self::new_with_recording(random_start, true)

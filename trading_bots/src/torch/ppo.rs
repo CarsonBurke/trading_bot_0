@@ -403,9 +403,18 @@ pub fn train(weights_path: Option<&str>) {
         let s_values_flat = s_values.view([memory_size, ACTION_COUNT]).detach();
 
         // Record advantage stats before normalization
-        let adv_mean_val = f64::try_from(advantages.mean(Kind::Float)).unwrap_or(0.0);
-        let adv_min_val = f64::try_from(advantages.min()).unwrap_or(0.0);
-        let adv_max_val = f64::try_from(advantages.max()).unwrap_or(0.0);
+        let adv_stats = Tensor::stack(
+            &[
+                advantages.mean(Kind::Float),
+                advantages.min(),
+                advantages.max(),
+            ],
+            0,
+        );
+        let adv_stats_vec = Vec::<f64>::try_from(adv_stats).unwrap_or_default();
+        let adv_mean_val = *adv_stats_vec.get(0).unwrap_or(&0.0);
+        let adv_min_val = *adv_stats_vec.get(1).unwrap_or(&0.0);
+        let adv_max_val = *adv_stats_vec.get(2).unwrap_or(&0.0);
         env.primary_mut().meta_history.record_advantage_stats(
             adv_mean_val,
             adv_min_val,
@@ -431,6 +440,8 @@ pub fn train(weights_path: Option<&str>) {
         // Accumulate on GPU - only sync once at end of all epochs (weighted by samples)
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_loss_weighted = Tensor::zeros([], (Kind::Float, device));
+        let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
+        let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_sample_count = 0i64;
         let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut grad_norm_count = 0i64;
@@ -554,9 +565,12 @@ pub fn train(weights_path: Option<&str>) {
                 // KL and loss for metrics (extract before backward frees graph)
                 let approx_kl_val =
                     tch::no_grad(|| (&old_log_probs_mb - &action_log_probs).mean(Kind::Float));
-                let ppo_loss =
-                    value_loss * VALUE_LOSS_COEF + action_loss - dist_entropy * ENTROPY_COEF;
+                let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
+                    + action_loss.shallow_clone()
+                    - dist_entropy * ENTROPY_COEF;
                 let loss_val = tch::no_grad(|| ppo_loss.shallow_clone());
+                let policy_loss_val = tch::no_grad(|| action_loss.shallow_clone());
+                let value_loss_val = tch::no_grad(|| value_loss.shallow_clone());
 
                 // Backward PPO loss (alpha detached, so no alpha gradients here)
                 let scaled_ppo_loss =
@@ -579,6 +593,8 @@ pub fn train(weights_path: Option<&str>) {
                 // Accumulate metrics on GPU
                 let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 let _ = total_loss_weighted.g_add_(&(&loss_val * chunk_sample_count as f64));
+                let _ = total_policy_loss_weighted.g_add_(&(&policy_loss_val * chunk_sample_count as f64));
+                let _ = total_value_loss_weighted.g_add_(&(&value_loss_val * chunk_sample_count as f64));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 epoch_kl_count += chunk_sample_count;
                 total_sample_count += chunk_sample_count;
@@ -642,42 +658,69 @@ pub fn train(weights_path: Option<&str>) {
         }
 
         // Get current alpha value for logging/charting
-        let rpo_alpha = tch::no_grad(|| {
-            let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
-            f64::try_from(alpha).unwrap_or(0.15)
-        });
-
         // Record std stats every episode
-        let (mean_std, min_std, max_std, logit_scale) = tch::no_grad(|| {
+        let stats_tensor = tch::no_grad(|| {
             let price_deltas_step = s_price_deltas.get(0);
             let static_obs = s_static_obs.get(0);
             let (_, (_, action_log_std, _), _) =
                 trading_model.forward(&price_deltas_step, &static_obs, false);
             let std = action_log_std.exp();
-            (
-                f64::try_from(std.mean(Kind::Float)).unwrap_or(0.0),
-                f64::try_from(std.min()).unwrap_or(0.0),
-                f64::try_from(std.max()).unwrap_or(0.0),
-                f64::try_from(trading_model.logit_scale()).unwrap_or(1.0),
+            let rpo_alpha =
+                (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze();
+            let logit_scale = trading_model.logit_scale().squeeze();
+            Tensor::stack(
+                &[
+                    std.mean(Kind::Float),
+                    std.min(),
+                    std.max(),
+                    rpo_alpha,
+                    logit_scale,
+                ],
+                0,
             )
         });
+        let stats_vec = Vec::<f64>::try_from(stats_tensor).unwrap_or_default();
+        let mean_std = *stats_vec.get(0).unwrap_or(&0.0);
+        let min_std = *stats_vec.get(1).unwrap_or(&0.0);
+        let max_std = *stats_vec.get(2).unwrap_or(&0.0);
+        let rpo_alpha = *stats_vec.get(3).unwrap_or(&0.15);
+        let logit_scale = *stats_vec.get(4).unwrap_or(&1.0);
         env.primary_mut()
             .meta_history
             .record_std_stats(mean_std, min_std, max_std, rpo_alpha);
         env.primary_mut().meta_history.record_logit_scale(logit_scale);
 
         // Single GPU->CPU sync for loss and grad norm at end of all epochs
-        let mean_loss = if total_sample_count > 0 {
-            f64::try_from(&total_loss_weighted / total_sample_count as f64).unwrap_or(0.0)
+        let mean_losses = if total_sample_count > 0 {
+            Tensor::stack(
+                &[
+                    &total_loss_weighted,
+                    &total_policy_loss_weighted,
+                    &total_value_loss_weighted,
+                ],
+                0,
+            ) / (total_sample_count as f64)
         } else {
-            0.0
+            Tensor::zeros([3], (Kind::Float, device))
         };
-        env.primary_mut().meta_history.record_loss(mean_loss);
         let mean_grad_norm = if grad_norm_count > 0 {
-            f64::try_from(&grad_norm_sum / grad_norm_count as f64).unwrap_or(0.0)
+            &grad_norm_sum / (grad_norm_count as f64)
         } else {
-            0.0
+            Tensor::zeros([], (Kind::Float, device))
         };
+        let mean_all = Tensor::cat(&[mean_losses, mean_grad_norm.unsqueeze(0)], 0);
+        let mean_all_vec = Vec::<f64>::try_from(mean_all).unwrap_or_default();
+        let mean_loss = *mean_all_vec.get(0).unwrap_or(&0.0);
+        let mean_policy_loss = *mean_all_vec.get(1).unwrap_or(&0.0);
+        let mean_value_loss = *mean_all_vec.get(2).unwrap_or(&0.0);
+        let mean_grad_norm = *mean_all_vec.get(3).unwrap_or(&0.0);
+        env.primary_mut().meta_history.record_loss(mean_loss);
+        env.primary_mut()
+            .meta_history
+            .record_policy_loss(mean_policy_loss);
+        env.primary_mut()
+            .meta_history
+            .record_value_loss(mean_value_loss);
         env.primary_mut()
             .meta_history
             .record_grad_norm(mean_grad_norm);

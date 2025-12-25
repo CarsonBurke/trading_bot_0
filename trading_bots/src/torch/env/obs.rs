@@ -94,7 +94,7 @@ impl Env {
         static_obs
     }
 
-    pub(super) fn get_next_obs(&self) -> (Vec<f32>, Vec<f32>) {
+    pub fn get_next_obs(&self) -> (Vec<f32>, Vec<f32>) {
         let mut price_deltas = Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER);
         let absolute_step = self.episode_start_offset + self.step;
 
@@ -117,7 +117,7 @@ impl Env {
         (price_deltas, static_obs)
     }
 
-    pub(super) fn get_next_step_obs(&self) -> (Vec<f32>, Vec<f32>) {
+    pub fn get_next_step_obs(&self) -> (Vec<f32>, Vec<f32>) {
         let absolute_step = self.episode_start_offset + self.step;
         let mut step_deltas = Vec::with_capacity(TICKERS_COUNT as usize);
 

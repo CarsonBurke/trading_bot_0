@@ -4,7 +4,7 @@ use super::env::{Env, TRADE_EMA_ALPHA};
 
 impl Env {
     #[allow(dead_code)]
-    pub(super) fn trade_by_delta_percent(
+    pub fn trade_by_delta_percent(
         &mut self,
         actions: &[f64],
         absolute_step: usize,
@@ -115,7 +115,7 @@ impl Env {
 
     /// Weight-based trading with dead zone. Full control outside dead zone.
     /// |action| <= threshold = hold. Otherwise adds action directly to target weight.
-    pub(super) fn trade_by_weight_delta(
+    pub fn trade_by_weight_delta(
         &mut self,
         actions: &[f64],
         absolute_step: usize,
@@ -267,7 +267,7 @@ impl Env {
 
     /// Weight-based trading: actions are target weights in [0,1].
     /// Actions: [ticker_0, ..., ticker_n, cash] with cash explicitly set.
-    pub(super) fn trade_by_target_weights(
+    pub fn trade_by_target_weights(
         &mut self,
         actions: &[f64],
         absolute_step: usize,

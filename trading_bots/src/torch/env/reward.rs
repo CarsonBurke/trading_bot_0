@@ -13,7 +13,6 @@ const ACTION_OUTCOME_COMMISSION_PENALTY: f64 = 5.0;
 const CONVICTION_BONUS: f64 = 1.0;
 
 const REWARD_SCALE: f64 = 20.0;
-const CASH_INFLATION_RATE: f64 = 0.0002;
 const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
 const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 0.01;
@@ -28,10 +27,10 @@ const HINDSIGHT_COMMISSION_PENALTY: f64 = 10.0;
 const BULL_DOWNSIDE_SCALE: f64 = 1.5;
 
 impl Env {
-    pub(super) fn get_unrealized_pnl_reward_breakdown(
+    pub fn get_unrealized_pnl_reward_breakdown(
         &self,
         absolute_step: usize,
-        commissions: f64,
+        _: f64,
     ) -> (f64, Vec<f64>) {
         let n_tickers = self.tickers.len();
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
@@ -42,7 +41,6 @@ impl Env {
         let total_assets = self.account.total_assets;
         let mut contributions = vec![0.0; n_tickers];
         let mut total_assets_next = self.account.cash;
-        let mut index_log_return = 0.0;
 
         for ticker_idx in 0..n_tickers {
             let current_price = self.prices[ticker_idx][absolute_step];
@@ -51,34 +49,25 @@ impl Env {
             let next_value = self.account.positions[ticker_idx].value_with_price(next_price);
             total_assets_next += next_value;
             contributions[ticker_idx] = (next_value - current_value) / total_assets;
-            index_log_return += (next_price / current_price).ln();
         }
 
-        index_log_return /= n_tickers as f64;
-
-        let portfolio_return = (total_assets_next - total_assets) / total_assets;
+        let portfolio_return: f64 = contributions.iter().sum();
         let strategy_log_return = (total_assets_next / total_assets).ln();
         let pnl_reward = strategy_log_return * REWARD_SCALE;
-        let reward_base = (strategy_log_return - index_log_return) * REWARD_SCALE;
-        let cash_weight = (self.account.cash / total_assets).clamp(0.0, 1.0);
-        let cash_penalty = -cash_weight * CASH_INFLATION_RATE * REWARD_SCALE;
-        let reward = reward_base + cash_penalty;
 
-        if portfolio_return.abs() < 1e-8 {
-            let mut rewards = vec![0.0; n_tickers];
-            rewards.push(reward);
-            return (reward, rewards);
-        }
-
-        let per_ticker_rewards: Vec<f64> = contributions
-            .iter()
-            .map(|c| pnl_reward * (c / portfolio_return))
-            .collect();
-        let sum_per_ticker: f64 = per_ticker_rewards.iter().sum();
-        let cash_reward = reward - sum_per_ticker;
+        let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
+            vec![0.0; n_tickers]
+        } else {
+            contributions
+                .iter()
+                .map(|c| pnl_reward * (c / portfolio_return))
+                .collect()
+        };
         let mut rewards = per_ticker_rewards;
-        rewards.push(cash_reward);
-        (reward, rewards)
+        // Neutral cash reward
+        rewards.push(0.0);
+
+        (pnl_reward, rewards)
     }
 
     /// Hindsight allocation quality reward with asymmetric upside penalty.
@@ -89,7 +78,7 @@ impl Env {
     ///
     /// - Base reward ∈ [-1, +1] based on allocation quality
     /// - Additional penalty when best_return > 0 and agent missed it
-    pub(super) fn get_hindsight_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
+    pub fn get_hindsight_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
             return 0.0;
         }
@@ -107,8 +96,7 @@ impl Env {
             let next_price = self.prices[ticker_idx][next_step];
             let ticker_return = (next_price / current_price) - 1.0;
 
-            let position_value = self.account.positions[ticker_idx]
-                .value_with_price(current_price);
+            let position_value = self.account.positions[ticker_idx].value_with_price(current_price);
             let weight = position_value / total_assets;
             agent_return += weight * ticker_return;
 
@@ -123,7 +111,8 @@ impl Env {
         }
 
         // Base allocation quality: [-1, +1]
-        let allocation_quality = (2.0 * (agent_return - worst_return) / range - 1.0).clamp(-1.0, 1.0);
+        let allocation_quality =
+            (2.0 * (agent_return - worst_return) / range - 1.0).clamp(-1.0, 1.0);
 
         // Asymmetric scaling: in bull markets, amplify negative allocation quality
         // This makes missing upside hurt more than capturing downside protection helps
@@ -152,7 +141,7 @@ impl Env {
     ///
     /// The reward is the weighted sum of per-asset returns, scaled and with
     /// commission penalty. Dense signal at every step.
-    pub(super) fn get_action_outcome_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
+    pub fn get_action_outcome_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
             return 0.0;
         }
@@ -168,8 +157,7 @@ impl Env {
             let next_price = self.prices[ticker_idx][next_step];
             let ticker_return = (next_price / current_price) - 1.0;
 
-            let position_value = self.account.positions[ticker_idx]
-                .value_with_price(current_price);
+            let position_value = self.account.positions[ticker_idx].value_with_price(current_price);
             let weight = position_value / total_assets;
             portfolio_return += weight * ticker_return;
         }
@@ -190,9 +178,10 @@ impl Env {
 
         let mut concentration = 0.0;
         for ticker_idx in 0..n_tickers {
-            let w = (self.account.positions[ticker_idx].value_with_price(
-                self.prices[ticker_idx][absolute_step]
-            ) / total_assets).clamp(0.0, 1.0);
+            let w = (self.account.positions[ticker_idx]
+                .value_with_price(self.prices[ticker_idx][absolute_step])
+                / total_assets)
+                .clamp(0.0, 1.0);
             concentration += (w - uniform_weight).powi(2);
         }
         concentration += (cash_weight - uniform_weight).powi(2);
@@ -218,7 +207,7 @@ impl Env {
     }
 
     #[allow(dead_code)]
-    pub(super) fn get_unrealized_pnl_reward(&self, absolute_step: usize, _commissions: f64) -> f64 {
+    pub fn get_unrealized_pnl_reward(&self, absolute_step: usize, _commissions: f64) -> f64 {
         if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
             let total_assets_after_trade = self
@@ -236,7 +225,11 @@ impl Env {
     }
 
     #[allow(dead_code)]
-    pub(super) fn get_index_benchmark_pnl_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
+    pub fn get_index_benchmark_pnl_reward(
+        &self,
+        absolute_step: usize,
+        commissions: f64,
+    ) -> f64 {
         if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
 
@@ -349,11 +342,7 @@ impl Env {
                 + self.account.cash;
             let step_return = (total_assets_after_trade / self.account.total_assets).ln();
 
-            let downside = if step_return < 0.0 {
-                -step_return
-            } else {
-                0.0
-            };
+            let downside = if step_return < 0.0 { -step_return } else { 0.0 };
             let rar = step_return - RISK_ADJUSTED_REWARD_LAMBDA * downside;
 
             let commissions_relative = commissions / self.account.total_assets;

@@ -9,6 +9,8 @@ pub struct MetaHistory {
     pub cumulative_reward: Vec<f64>,
     pub outperformance: Vec<f64>,
     pub loss: Vec<f64>,
+    pub policy_loss: Vec<f64>,
+    pub value_loss: Vec<f64>,
     pub grad_norm: Vec<f64>,
     pub total_commissions: Vec<f64>,
     pub mean_std: Vec<f64>,
@@ -31,6 +33,14 @@ impl MetaHistory {
 
     pub fn record_loss(&mut self, loss: f64) {
         self.loss.push(loss);
+    }
+
+    pub fn record_policy_loss(&mut self, loss: f64) {
+        self.policy_loss.push(loss);
+    }
+
+    pub fn record_value_loss(&mut self, loss: f64) {
+        self.value_loss.push(loss);
     }
 
     pub fn record_grad_norm(&mut self, grad_norm: f64) {
@@ -102,9 +112,21 @@ impl MetaHistory {
                 x_label: Some("Episode".to_string()),
                 y_label: Some("Loss".to_string()),
                 scale: ScaleKind::Symlog,
-                kind: ReportKind::Simple {
-                    values: f64_to_f32(&self.loss),
-                    ema_alpha: Some(0.05),
+                kind: ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "total".to_string(),
+                            values: f64_to_f32(&self.loss),
+                        },
+                        ReportSeries {
+                            label: "policy".to_string(),
+                            values: f64_to_f32(&self.policy_loss),
+                        },
+                        ReportSeries {
+                            label: "value".to_string(),
+                            values: f64_to_f32(&self.value_loss),
+                        },
+                    ],
                 },
             };
             let _ = write_report(&format!("{base_dir}/loss_log.report.bin"), &report);
