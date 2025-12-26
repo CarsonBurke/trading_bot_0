@@ -77,16 +77,8 @@ const OPTIM_EPOCHS: i64 = 4;
 const CHUNK_SIZE: i64 = 64; // Steps per chunk for PPO updates
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
-const GAMMA: f64 = 0.995;
-const GAE_LAMBDA: f64 = 0.98;
-
-fn huber_elementwise(err: &Tensor, delta: f64) -> Tensor {
-    let abs_err = err.abs();
-    let quad = err.pow_tensor_scalar(2).g_mul_scalar(0.5);
-    let lin = (&abs_err - 0.5 * delta).g_mul_scalar(delta);
-    let mask = abs_err.le(delta).to_kind(Kind::Bool);
-    quad.where_self(&mask, &lin)
-}
+const GAMMA: f64 = 0.99;
+const GAE_LAMBDA: f64 = 0.95;
 
 fn symlog(x: &Tensor) -> Tensor {
     x.sign() * (x.abs() + 1.0).log()
@@ -98,7 +90,7 @@ const SDE_SAMPLE_FREQ: usize = 1;
 
 // PPO hyperparameters
 const PPO_CLIP_RATIO: f64 = 0.2; // Clip range for policy ratio (the trust region)
-const VALUE_CLIP_RANGE: f64 = 0.2; // Clip range for value function
+const VALUE_CLIP_RANGE: f64 = 0.0; // 0.0 disables value clipping
 const ENTROPY_COEF: f64 = 0.0;
 const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
 const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
@@ -278,7 +270,8 @@ pub fn train(weights_path: Option<&str>) {
             let noise = sde_noise.as_ref().unwrap();
             let noise_raw = (&sde_latent * noise).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
             let noise_scaled = &noise_raw * &action_std / &latent_norm;
-            let u = &action_mean + noise_scaled; // [batch, K-1]
+            let action_mean_noisy = &action_mean + &noise_scaled;
+            let u = action_mean_noisy.shallow_clone(); // [batch, K-1]
             let u_ext = Tensor::cat(&[u.shallow_clone(), zeros_rollout.shallow_clone()], 1);
             let actions = u_ext.softmax(-1, Kind::Float);
 
@@ -492,22 +485,19 @@ pub fn train(weights_path: Option<&str>) {
                 let zeros = zeros_mb.narrow(0, 0, chunk_sample_count);
                 let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
 
-                // RPO alpha: sigmoid parameterization for smooth gradients everywhere
-                let rpo_alpha =
-                    RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
-
-                // For PPO loss: detach alpha so policy gradients don't flow through it
-                let rpo_alpha_detached = rpo_alpha.detach();
-                let rpo_noise =
-                    Tensor::empty_like(&action_means).uniform_(-1.0, 1.0) * &rpo_alpha_detached;
-                let action_means_perturbed = &action_means + rpo_noise;
-
                 // log N(u; μ_perturbed, σ)
                 let action_log_stds_clamped = action_log_stds.clamp(-20.0, 5.0);
                 let action_std = action_log_stds_clamped.exp();
                 let two_log_std = &action_log_stds_clamped * 2.0;
+                // RPO alpha: sigmoid parameterization for smooth gradients everywhere
+                let rpo_alpha =
+                    RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
+                let rpo_alpha_detached = rpo_alpha.detach();
+                let rpo_noise =
+                    Tensor::empty_like(&action_means).uniform_(-1.0, 1.0) * &rpo_alpha_detached;
+                let action_means_noisy = &action_means + &rpo_noise;
 
-                let u_normalized = (&u - &action_means_perturbed) / &action_std;
+                let u_normalized = (&u - &action_means_noisy) / &action_std;
                 let u_squared = u_normalized.pow_tensor_scalar(2);
                 let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
@@ -529,15 +519,13 @@ pub fn train(weights_path: Option<&str>) {
                     + (&values_pred - &old_values_mb)
                         .clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
 
-                const HUBER_DELTA: f64 = 1.0;
-                let v_loss_unclipped =
-                    huber_elementwise(&(&values_pred - &returns_t), HUBER_DELTA);
-                let v_loss_clipped =
-                    huber_elementwise(&(&values_clipped - &returns_t), HUBER_DELTA);
-                let v_loss_clip =
-                    Tensor::max_other(&v_loss_unclipped, &v_loss_clipped).mean(Kind::Float);
-
-                let value_loss: Tensor = v_loss_clip;
+                let v_loss_unclipped = (&values_pred - &returns_t).pow_tensor_scalar(2.0);
+                let value_loss = if VALUE_CLIP_RANGE > 0.0 {
+                    let v_loss_clipped = (&values_clipped - &returns_t).pow_tensor_scalar(2.0);
+                    Tensor::max_other(&v_loss_unclipped, &v_loss_clipped).mean(Kind::Float)
+                } else {
+                    v_loss_unclipped.mean(Kind::Float)
+                };
 
                 // PPO clipped objective
                 let ratio = (&action_log_probs - &old_log_probs_mb).exp();
@@ -553,12 +541,18 @@ pub fn train(weights_path: Option<&str>) {
                 let _ = total_clipped.g_add_(&clipped_count);
                 total_ratio_samples += chunk_sample_count;
 
-                let action_weights = u_ext.softmax(-1, Kind::Float);
-                let advantages_weighted = (advantages_mb * action_weights)
-                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-                let unclipped_obj = &ratio * &advantages_weighted;
+                let ticker_adv = advantages_mb.narrow(1, 0, ACTION_COUNT - 1);
+                let ticker_sum =
+                    ticker_adv.sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+                let cash_adv = advantages_mb
+                    .narrow(1, ACTION_COUNT - 1, 1)
+                    .squeeze_dim(-1);
+                let cash_weight = 0.25;
+                let denom = (ACTION_COUNT - 1) as f64 + cash_weight;
+                let advantages_reduced = (ticker_sum + cash_adv * cash_weight) / denom;
+                let unclipped_obj = &ratio * &advantages_reduced;
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
-                let clipped_obj = ratio_clipped * &advantages_weighted;
+                let clipped_obj = ratio_clipped * &advantages_reduced;
                 let action_loss =
                     -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
 
