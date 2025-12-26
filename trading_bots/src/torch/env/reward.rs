@@ -17,7 +17,6 @@ const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
 const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 0.01;
 const COMMISSIONS_PENALTY_LAMBDA: f64 = 0.01;
-const CASH_INDEX_LAMBDA: f64 = 1.0;
 
 const HINDSIGHT_REWARD_SCALE: f64 = 1.0;
 const HINDSIGHT_COMMISSION_PENALTY: f64 = 10.0;
@@ -35,19 +34,17 @@ impl Env {
     ) -> (f64, Vec<f64>) {
         let n_tickers = self.tickers.len();
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
-            return (0.0, vec![0.0; n_tickers + 1]);
+            return (0.0, vec![0.0; n_tickers]);
         }
 
         let next_absolute_step = absolute_step + 1;
         let total_assets = self.account.total_assets;
         let mut contributions = vec![0.0; n_tickers];
-        let mut index_log_return = 0.0;
         let mut total_assets_next = self.account.cash;
 
         for ticker_idx in 0..n_tickers {
             let current_price = self.prices[ticker_idx][absolute_step];
             let next_price = self.prices[ticker_idx][next_absolute_step];
-            index_log_return += (next_price / current_price).ln();
             let current_value = self.account.positions[ticker_idx].value_with_price(current_price);
             let next_value = self.account.positions[ticker_idx].value_with_price(next_price);
             total_assets_next += next_value;
@@ -55,14 +52,8 @@ impl Env {
         }
 
         let portfolio_return: f64 = contributions.iter().sum();
-        if n_tickers > 0 {
-            index_log_return /= n_tickers as f64;
-        }
         let strategy_log_return = (total_assets_next / total_assets).ln();
         let pnl_reward = strategy_log_return * REWARD_SCALE;
-        let cash_weight = (self.account.cash / total_assets).clamp(0.0, 1.0);
-        let cash_reward = -index_log_return * REWARD_SCALE * cash_weight * CASH_INDEX_LAMBDA;
-        let reward = pnl_reward + cash_reward;
 
         let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
             vec![0.0; n_tickers]
@@ -72,10 +63,7 @@ impl Env {
                 .map(|c| pnl_reward * (c / portfolio_return))
                 .collect()
         };
-        let mut rewards = per_ticker_rewards;
-        rewards.push(cash_reward);
-
-        (reward, rewards)
+        (pnl_reward, per_ticker_rewards)
     }
 
     /// Hindsight allocation quality reward with asymmetric upside penalty.

@@ -108,7 +108,7 @@ impl VecEnv {
             self.envs.len()
         );
         let mut rewards = Vec::with_capacity(NPROCS as usize);
-        let mut rewards_per_ticker = Vec::new();
+        let mut rewards_per_ticker = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
         let mut is_dones = Vec::with_capacity(NPROCS as usize);
         let mut all_price_deltas = Vec::new();
         let mut all_static_obs = Vec::new();
@@ -125,7 +125,7 @@ impl VecEnv {
         Step {
             reward: Tensor::from_slice(&rewards),
             reward_per_ticker: Tensor::from_slice(&rewards_per_ticker)
-                .view([NPROCS, ACTION_COUNT]),
+                .view([NPROCS, TICKERS_COUNT]),
             is_done: Tensor::from_slice(&is_dones),
             price_deltas: Tensor::from_slice(&all_price_deltas)
                 .view([NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]),
@@ -220,7 +220,7 @@ impl VecEnv {
         debug_assert_eq!(all_actions.len(), self.envs.len());
 
         let mut rewards = [0f32; NPROCS as usize];
-        let mut rewards_per_ticker = Vec::with_capacity(NPROCS as usize * ACTION_COUNT as usize);
+        let mut rewards_per_ticker = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
         let mut is_dones = [0f32; NPROCS as usize];
         let mut all_step_deltas = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
         let mut all_static_obs = Vec::with_capacity(NPROCS as usize * STATIC_OBSERVATIONS);
@@ -240,7 +240,7 @@ impl VecEnv {
 
         let reward = Tensor::from_slice(&rewards);
         let reward_per_ticker =
-            Tensor::from_slice(&rewards_per_ticker).view([NPROCS, ACTION_COUNT]);
+            Tensor::from_slice(&rewards_per_ticker).view([NPROCS, TICKERS_COUNT]);
         let is_done = Tensor::from_slice(&is_dones);
         let step_deltas = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
 

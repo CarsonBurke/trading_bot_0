@@ -157,6 +157,7 @@ pub fn train(weights_path: Option<&str>) {
     let mut s_values_buf: Option<Tensor> = None;
     let mut s_rewards_buf: Option<Tensor> = None;
     let mut s_actions_buf: Option<Tensor> = None;
+    let mut s_invest_buf: Option<Tensor> = None;
     let mut s_masks_buf: Option<Tensor> = None;
     let mut s_log_probs_buf: Option<Tensor> = None;
 
@@ -219,12 +220,12 @@ pub fn train(weights_path: Option<&str>) {
 
         let s_values = get_buf(
             &mut s_values_buf,
-            &[rollout_steps, NPROCS, ACTION_COUNT],
+            &[rollout_steps, NPROCS, TICKERS_COUNT],
             float_kind,
         );
         let mut s_rewards = get_buf(
             &mut s_rewards_buf,
-            &[rollout_steps, NPROCS, ACTION_COUNT],
+            &[rollout_steps, NPROCS, TICKERS_COUNT],
             float_kind,
         );
         let s_actions = get_buf(
@@ -232,12 +233,12 @@ pub fn train(weights_path: Option<&str>) {
             &[rollout_steps, NPROCS, ACTION_COUNT - 1],
             float_kind,
         );
+        let s_invest = get_buf(&mut s_invest_buf, &[rollout_steps, NPROCS, 1], float_kind);
         let s_masks = get_buf(&mut s_masks_buf, &[rollout_steps, NPROCS], float_kind);
         let s_log_probs = get_buf(&mut s_log_probs_buf, &[rollout_steps, NPROCS], float_kind);
 
         let _ = total_rewards_gpu.zero_();
         let _ = total_episodes_gpu.zero_();
-        let zeros_rollout = Tensor::zeros([NPROCS, 1], float_kind);
 
         // Use a separate index (s) for tensor storage, starting from 0
         // Loop through the episode using relative steps (0 to max_step)
@@ -247,7 +248,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step() {
             env.set_step(step);
 
-            let (values, (action_mean, action_log_std, sde_latent), attn_weights) =
+            let (values, (action_mean, action_log_std, sde_latent, invest_mean, invest_log_std), attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
@@ -271,9 +272,14 @@ pub fn train(weights_path: Option<&str>) {
             let noise_raw = (&sde_latent * noise).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
             let noise_scaled = &noise_raw * &action_std / &latent_norm;
             let action_mean_noisy = &action_mean + &noise_scaled;
-            let u = action_mean_noisy.shallow_clone(); // [batch, K-1]
-            let u_ext = Tensor::cat(&[u.shallow_clone(), zeros_rollout.shallow_clone()], 1);
-            let actions = u_ext.softmax(-1, Kind::Float);
+            let u = action_mean_noisy.shallow_clone(); // [batch, K]
+            let invest_std = invest_log_std.exp();
+            let invest_noise = Tensor::randn_like(&invest_mean);
+            let invest_z = &invest_mean + &invest_std * invest_noise;
+            let invest_fraction = invest_z.sigmoid();
+            let ticker_weights = u.softmax(-1, Kind::Float);
+            let cash_weight = 1.0 - &invest_fraction;
+            let actions = Tensor::cat(&[ticker_weights * &invest_fraction, cash_weight], 1);
 
             // Log-prob with softmax Jacobian
             let u_normalized = (&u - &action_mean) / &action_std;
@@ -281,10 +287,26 @@ pub fn train(weights_path: Option<&str>) {
             let two_log_std = &action_log_std_clamped * 2.0;
             let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
             let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-            let log_jacobian = u_ext
+            let log_jacobian = u
                 .log_softmax(-1, Kind::Float)
                 .sum_dim_intlist(-1, false, Kind::Float);
-            let action_log_prob = log_prob_gaussian - log_jacobian;
+            let log_prob_ticker = log_prob_gaussian - log_jacobian;
+            let invest_normalized = (&invest_z - &invest_mean) / &invest_std;
+            let invest_squared = invest_normalized.pow_tensor_scalar(2);
+            let invest_two_log_std = &invest_log_std * 2.0;
+            let log_prob_invest = (&invest_squared + invest_two_log_std + LOG_2PI)
+                .g_mul_scalar(-0.5)
+                .squeeze_dim(-1);
+            let invest_clamped = invest_fraction.clamp(1e-6, 1.0 - 1e-6);
+            let log_jacobian_invest = invest_clamped.log()
+                + (Tensor::ones_like(&invest_clamped) - &invest_clamped).log();
+            let invest_scale_penalty = invest_clamped
+                .log()
+                .squeeze_dim(-1)
+                .g_mul_scalar(TICKERS_COUNT as f64);
+            let action_log_prob = log_prob_ticker + log_prob_invest
+                - log_jacobian_invest.squeeze_dim(-1)
+                - invest_scale_penalty;
 
             let mut out_so = s_static_obs.get(s + 1);
             let (reward, reward_per_ticker, is_done, step_deltas) =
@@ -308,6 +330,7 @@ pub fn train(weights_path: Option<&str>) {
             sum_rewards *= &masks;
 
             s_actions.get(s).copy_(&u); // Store pre-softmax u for training
+            s_invest.get(s).copy_(&invest_z);
             s_values.get(s).copy_(&values);
             s_log_probs.get(s).copy_(&action_log_prob);
             s_rewards.get(s).copy_(&reward_per_ticker);
@@ -343,11 +366,11 @@ pub fn train(weights_path: Option<&str>) {
 
         let (advantages, returns) = {
             let gae = Tensor::zeros(
-                [rollout_steps + 1, NPROCS, ACTION_COUNT],
+                [rollout_steps + 1, NPROCS, TICKERS_COUNT],
                 (Kind::Float, device),
             );
             let returns = Tensor::zeros(
-                [rollout_steps + 1, NPROCS, ACTION_COUNT],
+                [rollout_steps + 1, NPROCS, TICKERS_COUNT],
                 (Kind::Float, device),
             );
 
@@ -385,15 +408,16 @@ pub fn train(weights_path: Option<&str>) {
 
             (
                 gae.narrow(0, 0, rollout_steps)
-                    .view([memory_size, ACTION_COUNT]),
+                    .view([memory_size, TICKERS_COUNT]),
                 returns
                     .narrow(0, 0, rollout_steps)
-                    .view([memory_size, ACTION_COUNT]),
+                    .view([memory_size, TICKERS_COUNT]),
             )
         };
         let actions = s_actions.view([memory_size, ACTION_COUNT - 1]);
+        let invest_z = s_invest.view([memory_size, 1]);
         let old_log_probs = s_log_probs.view([memory_size]);
-        let s_values_flat = s_values.view([memory_size, ACTION_COUNT]).detach();
+        let s_values_flat = s_values.view([memory_size, TICKERS_COUNT]).detach();
 
         // Record advantage stats before normalization
         let adv_stats = Tensor::stack(
@@ -444,7 +468,6 @@ pub fn train(weights_path: Option<&str>) {
 
         let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
-        let zeros_mb = Tensor::zeros([CHUNK_SIZE * NPROCS, 1], float_kind);
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
@@ -471,19 +494,18 @@ pub fn train(weights_path: Option<&str>) {
                 let static_obs_chunk =
                     static_obs_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
-                let (values, (action_means, action_log_stds, _), _) = trading_model
+                let (values, (action_means, action_log_stds, _, invest_means, invest_log_stds), _) = trading_model
                     .forward(&price_deltas_chunk, &static_obs_chunk, true);
-                let values = values.view([chunk_sample_count, ACTION_COUNT]);
+                let values = values.view([chunk_sample_count, TICKERS_COUNT]);
 
                 let actions_mb = actions.narrow(0, chunk_sample_start, chunk_sample_count);
+                let invest_z_mb = invest_z.narrow(0, chunk_sample_start, chunk_sample_count);
                 let returns_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
                 let advantages_mb = advantages.narrow(0, chunk_sample_start, chunk_sample_count);
                 let old_log_probs_mb =
                     old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let u = actions_mb;
-                let zeros = zeros_mb.narrow(0, 0, chunk_sample_count);
-                let u_ext = Tensor::cat(&[u.shallow_clone(), zeros], 1);
 
                 // log N(u; μ_perturbed, σ)
                 let action_log_stds_clamped = action_log_stds.clamp(-20.0, 5.0);
@@ -501,14 +523,36 @@ pub fn train(weights_path: Option<&str>) {
                 let u_squared = u_normalized.pow_tensor_scalar(2);
                 let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-                let log_jacobian = u_ext
+                let log_jacobian = u
                     .log_softmax(-1, Kind::Float)
                     .sum_dim_intlist(-1, false, Kind::Float);
-                let action_log_probs = log_prob_gaussian - log_jacobian;
+                let log_prob_ticker = log_prob_gaussian - log_jacobian;
+                let invest_log_stds_clamped = invest_log_stds.clamp(-20.0, 5.0);
+                let invest_std = invest_log_stds_clamped.exp();
+                let invest_normalized = (&invest_z_mb - &invest_means) / &invest_std;
+                let invest_squared = invest_normalized.pow_tensor_scalar(2);
+                let invest_two_log_std = &invest_log_stds_clamped * 2.0;
+                let log_prob_invest = (&invest_squared + invest_two_log_std + LOG_2PI)
+                    .g_mul_scalar(-0.5)
+                    .squeeze_dim(-1);
+                let invest_fraction = invest_z_mb.sigmoid().clamp(1e-6, 1.0 - 1e-6);
+                let log_jacobian_invest = invest_fraction.log()
+                    + (Tensor::ones_like(&invest_fraction) - &invest_fraction).log();
+                let invest_scale_penalty = invest_fraction
+                    .log()
+                    .squeeze_dim(-1)
+                    .g_mul_scalar(TICKERS_COUNT as f64);
+                let action_log_probs = log_prob_ticker + log_prob_invest
+                    - log_jacobian_invest.squeeze_dim(-1)
+                    - invest_scale_penalty;
 
                 // Entropy of Gaussian (per ticker)
                 let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
                 let dist_entropy = entropy_components.g_mul_scalar(0.5).mean(Kind::Float);
+                let invest_entropy_components: Tensor =
+                    1.0 + LOG_2PI + 2.0 * &invest_log_stds;
+                let invest_entropy = invest_entropy_components.g_mul_scalar(0.5).mean(Kind::Float);
+                let dist_entropy = dist_entropy + invest_entropy;
 
                 // PPO-style clipped MSE on per-ticker values (raw space)
                 let old_values_mb =
@@ -541,15 +585,8 @@ pub fn train(weights_path: Option<&str>) {
                 let _ = total_clipped.g_add_(&clipped_count);
                 total_ratio_samples += chunk_sample_count;
 
-                let ticker_adv = advantages_mb.narrow(1, 0, ACTION_COUNT - 1);
-                let ticker_sum =
-                    ticker_adv.sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-                let cash_adv = advantages_mb
-                    .narrow(1, ACTION_COUNT - 1, 1)
-                    .squeeze_dim(-1);
-                let cash_weight = 0.25;
-                let denom = (ACTION_COUNT - 1) as f64 + cash_weight;
-                let advantages_reduced = (ticker_sum + cash_adv * cash_weight) / denom;
+                let advantages_reduced =
+                    advantages_mb.mean_dim([-1].as_slice(), false, Kind::Float);
                 let unclipped_obj = &ratio * &advantages_reduced;
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
                 let clipped_obj = ratio_clipped * &advantages_reduced;
@@ -574,11 +611,11 @@ pub fn train(weights_path: Option<&str>) {
                 // Alpha loss: target induced KL using detached network outputs
                 // For diagonal Gaussian with z_i ~ U(-alpha, alpha):
                 // E[KL] = sum_i E[z_i^2] / (2*sigma_i^2) = sum_i (alpha^2/3) / (2*sigma_i^2)
-                //       = d * (alpha^2/6) * mean(1/sigma^2)  where d = ACTION_COUNT
+                //       = d * (alpha^2/6) * mean(1/sigma^2)  where d = TICKERS_COUNT
                 let action_std_detached = action_log_stds.detach().clamp(-20.0, 5.0).exp();
                 let var = action_std_detached.pow_tensor_scalar(2);
                 let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                let d = ACTION_COUNT as f64;
+                let d = TICKERS_COUNT as f64;
                 let induced_kl: Tensor =
                     rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                 let alpha_loss = (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0);
@@ -656,7 +693,7 @@ pub fn train(weights_path: Option<&str>) {
         let stats_tensor = tch::no_grad(|| {
             let price_deltas_step = s_price_deltas.get(0);
             let static_obs = s_static_obs.get(0);
-            let (_, (_, action_log_std, _), _) =
+            let (_, (_, action_log_std, _, _, _), _) =
                 trading_model.forward(&price_deltas_step, &static_obs, false);
             let std = action_log_std.exp();
             let rpo_alpha =
@@ -721,7 +758,7 @@ pub fn train(weights_path: Option<&str>) {
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
-            let (_, (debug_mean, debug_log_std, _), _attn_weights) =
+            let (_, (debug_mean, debug_log_std, _, _, _), _attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(0);
                     let static_obs = s_static_obs.get(0);
@@ -736,8 +773,8 @@ pub fn train(weights_path: Option<&str>) {
             } else {
                 0.0
             };
-            // Per-dimension KL for comparison (total KL scales with ACTION_COUNT)
-            let kl_per_dim = avg_kl / ACTION_COUNT as f64;
+            // Per-dimension KL for comparison (total KL scales with ticker + invest dims)
+            let kl_per_dim = avg_kl / (TICKERS_COUNT as f64 + 1.0);
 
             let opt_end = Instant::now();
 

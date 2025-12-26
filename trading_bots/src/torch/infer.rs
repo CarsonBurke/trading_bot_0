@@ -20,6 +20,8 @@ pub fn sample_actions_from_dist(
     action_mean: &Tensor,
     action_log_std: &Tensor,
     sde_latent: &Tensor,
+    invest_mean: &Tensor,
+    invest_log_std: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
@@ -37,10 +39,17 @@ pub fn sample_actions_from_dist(
         let noise_scaled = noise_raw * action_std / latent_norm;
         action_mean + noise_scaled
     };
-    let batch = u.size()[0];
-    let zeros = Tensor::zeros([batch, 1], (Kind::Float, u.device()));
-    let u_ext = Tensor::cat(&[u, zeros], 1);
-    u_ext.softmax(-1, Kind::Float)
+    let invest_z = if deterministic || temperature == 0.0 {
+        invest_mean.shallow_clone()
+    } else {
+        let invest_std = invest_log_std.exp() * temperature;
+        let invest_noise = Tensor::randn_like(invest_mean);
+        invest_mean + invest_std * invest_noise
+    };
+    let invest_fraction = invest_z.sigmoid();
+    let ticker_weights = u.softmax(-1, Kind::Float);
+    let cash_weight = 1.0 - &invest_fraction;
+    Tensor::cat(&[ticker_weights * invest_fraction, cash_weight], 1)
 }
 
 pub fn run_inference<P: AsRef<Path>>(
@@ -83,7 +92,7 @@ pub fn run_inference<P: AsRef<Path>>(
 
             // First call: model.step detects full obs and initializes stream state
             // Subsequent calls: model.step processes single delta per ticker
-            let (_, (action_mean, action_log_std, sde_latent), _) = tch::no_grad(|| {
+            let (_, (action_mean, action_log_std, sde_latent, invest_mean, invest_log_std), _) = tch::no_grad(|| {
                 model.step(&current_price_deltas, &current_static_obs, &mut stream_state)
             });
 
@@ -91,6 +100,8 @@ pub fn run_inference<P: AsRef<Path>>(
                 &action_mean,
                 &action_log_std,
                 &sde_latent,
+                &invest_mean,
+                &invest_log_std,
                 deterministic,
                 temperature,
             );

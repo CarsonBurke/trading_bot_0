@@ -25,8 +25,8 @@ const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
 const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_DELTAS must be divisible by PATCH_SIZE");
 
-// (values, (action_mean, action_log_std, sde_latent), attn_weights)
-pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
+// (values, (ticker_mean, ticker_log_std, sde_latent, invest_mean, invest_log_std), attn_weights)
+pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor, Tensor, Tensor), Tensor);
 
 /// Streaming state for O(1) inference per step
 /// - Ring buffer holds full delta history for head computation
@@ -89,10 +89,10 @@ pub struct TradingModel {
     actor_fc2: nn::Linear,
     ln_actor_fc2: nn::LayerNorm,
     actor_out: nn::Linear,
-    actor_cash_out: nn::Linear,
+    invest_out: nn::Linear,
+    invest_log_std_out: nn::Linear,
     pool_scorer: nn::Linear,
     value_ticker_out: nn::Linear,
-    value_cash_out: nn::Linear,
     sde_fc: nn::Linear,
     ln_sde: nn::LayerNorm,
     log_std_param: Tensor,
@@ -155,20 +155,18 @@ impl TradingModel {
         let actor_out = nn::linear(p / "actor_out", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
-        let actor_cash_out = nn::linear(p / "actor_cash_out", 256, 1, nn::LinearConfig {
-            ws_init: truncated_normal_init(256, 1), ..Default::default()
-        });
         let pool_scorer = nn::linear(p / "pool_scorer", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
+        let invest_out = nn::linear(p / "invest_out", 256, 1, nn::LinearConfig {
+            ws_init: truncated_normal_init(256, 1), ..Default::default()
+        });
+        let invest_log_std_out = nn::linear(p / "invest_log_std_out", 256, 1, Default::default());
         let value_ticker_out = nn::linear(p / "value_ticker_out", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
-        let value_cash_out = nn::linear(p / "value_cash_out", 256, 1, nn::LinearConfig {
-            ws_init: truncated_normal_init(256, 1), ..Default::default()
-        });
 
-        // Logistic-normal: output K-1 relative logits (tickers vs cash)
+        // Logistic-normal: output K logits for ticker allocation
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = nn::layer_norm(p / "ln_sde", vec![SDE_LATENT_DIM], Default::default());
@@ -184,8 +182,9 @@ impl TradingModel {
             static_proj, ln_static_proj,
             attn_qkv, attn_out, ln_attn,
             global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
-            actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out, actor_cash_out,
-            pool_scorer, value_ticker_out, value_cash_out,
+            actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out,
+            invest_out, invest_log_std_out,
+            pool_scorer, value_ticker_out,
             sde_fc, ln_sde, log_std_param, logit_scale_raw,
             device: p.device(),
             num_heads, head_dim,
@@ -483,24 +482,21 @@ impl TradingModel {
             .apply(&self.ln_actor_fc2)
             .silu()
             .reshape([batch_size, TICKERS_COUNT, 256]);
-        let cash_hidden = pool_summary
+        let invest_hidden = pool_summary
             .apply(&self.actor_fc1)
             .apply(&self.ln_actor_fc1)
             .silu();
-        let cash_residual = cash_hidden.apply(&self.actor_fc2);
-        let cash_feat = (cash_residual + &cash_hidden).apply(&self.ln_actor_fc2).silu();
+        let invest_residual = invest_hidden.apply(&self.actor_fc2);
+        let invest_feat = (invest_residual + &invest_hidden).apply(&self.ln_actor_fc2).silu();
 
-        let ticker_values = enriched
+        let values = enriched
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.value_ticker_out)
             .reshape([batch_size, TICKERS_COUNT]);
-        let cash_value = pool_summary.apply(&self.value_cash_out);
-        let values = Tensor::cat(&[ticker_values.shallow_clone(), cash_value], 1);
 
         let ticker_logits = actor_feat.apply(&self.actor_out).squeeze_dim(-1);
-        let cash_logit = cash_feat.apply(&self.actor_cash_out);
         let logit_scale = self.logit_scale_raw.exp();
-        let action_mean = (ticker_logits - cash_logit) * logit_scale;
+        let action_mean = ticker_logits * logit_scale;
         // Soft bounds via tanh: log_std ∈ [LOG_STD_MIN, LOG_STD_MAX] with smooth gradients
         const LOG_STD_MIN: f64 = -5.0; // std = 0.007
         const LOG_STD_MAX: f64 = 0.0; // std = 1.0
@@ -522,6 +518,17 @@ impl TradingModel {
             + 0.5 * latent_norm.log();
         let action_log_std = log_std.clamp(LOG_STD_MIN, LOG_STD_MAX);
 
-        (values, (action_mean, action_log_std, sde_latent), attn_out_vis)
+        const INVEST_LOG_STD_MIN: f64 = -5.0;
+        const INVEST_LOG_STD_MAX: f64 = 0.0;
+        let invest_mean = invest_feat.apply(&self.invest_out);
+        let invest_log_std_raw = invest_feat.apply(&self.invest_log_std_out).tanh();
+        let invest_log_std = INVEST_LOG_STD_MIN
+            + 0.5 * (INVEST_LOG_STD_MAX - INVEST_LOG_STD_MIN) * (invest_log_std_raw + 1.0);
+
+        (
+            values,
+            (action_mean, action_log_std, sde_latent, invest_mean, invest_log_std),
+            attn_out_vis,
+        )
     }
 }

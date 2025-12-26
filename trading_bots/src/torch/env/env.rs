@@ -175,7 +175,7 @@ impl Env {
 
     pub fn step(&mut self, all_actions: Vec<Vec<f64>>) -> Step {
         let mut rewards = Vec::with_capacity(NPROCS as usize);
-        let mut rewards_per_ticker = Vec::new();
+        let mut rewards_per_ticker = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
         let mut is_dones = Vec::with_capacity(NPROCS as usize);
         let mut all_price_deltas = Vec::new();
         let mut all_static_obs = Vec::new();
@@ -260,7 +260,7 @@ impl Env {
         Step {
             reward: Tensor::from_slice(&rewards),
             reward_per_ticker: Tensor::from_slice(&rewards_per_ticker)
-                .view([NPROCS, ACTION_COUNT]),
+                .view([NPROCS, TICKERS_COUNT]),
             is_done: Tensor::from_slice(&is_dones),
             price_deltas: price_deltas_tensor,
             static_obs: static_obs_tensor,
