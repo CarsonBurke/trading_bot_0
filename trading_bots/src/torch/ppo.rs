@@ -80,10 +80,6 @@ const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
 const GAMMA: f64 = 0.99;
 const GAE_LAMBDA: f64 = 0.95;
 
-fn symlog(x: &Tensor) -> Tensor {
-    x.sign() * (x.abs() + 1.0).log()
-}
-
 // gSDE: resample exploration noise every N env steps (temporally correlated exploration).
 // This matches the common SB3-style behavior while keeping per-step log-prob computation unchanged.
 const SDE_SAMPLE_FREQ: usize = 1;
@@ -317,7 +313,7 @@ pub fn train(weights_path: Option<&str>) {
             s_price_deltas.get(s + 1).copy_(&rolling_buffer.get_flat());
 
             let reward = reward.to_device(device);
-            let reward_per_ticker = symlog(&reward_per_ticker);
+            let reward_per_ticker = reward_per_ticker;
             let is_done = is_done.to_device(device);
 
             sum_rewards += &reward;

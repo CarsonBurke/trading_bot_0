@@ -36,9 +36,5 @@ pub mod constants {
     pub const RETROACTIVE_BUY_REWARD: bool = false;
 }
 
-pub fn symlog_target_clip() -> f64 {
-    (constants::REWARD_RANGE + 1.0).ln()
-}
-
 pub mod theme;
 pub mod report;
