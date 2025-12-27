@@ -93,7 +93,7 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
                                 // Conservative KL early stopping (SB3-style)
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
-const LEARNING_RATE: f64 = 4e-5;
+const LEARNING_RATE: f64 = 1e-4;
 const LOGIT_SCALE_LR_MULT: f64 = 10.0;
 
 // RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
@@ -332,10 +332,12 @@ pub fn train(weights_path: Option<&str>) {
 
         let price_deltas_batch = s_price_deltas
             .narrow(0, 0, rollout_steps)
-            .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
+            .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64])
+            .detach();
         let static_obs_batch = s_static_obs
             .narrow(0, 0, rollout_steps)
-            .reshape([memory_size, STATIC_OBSERVATIONS as i64]);
+            .reshape([memory_size, STATIC_OBSERVATIONS as i64])
+            .detach();
 
         let (advantages, returns) = {
             let gae = Tensor::zeros(
@@ -387,8 +389,8 @@ pub fn train(weights_path: Option<&str>) {
                     .view([memory_size, TICKERS_COUNT]),
             )
         };
-        let actions = s_actions.view([memory_size, ACTION_COUNT - 1]);
-        let old_log_probs = s_log_probs.view([memory_size]);
+        let actions = s_actions.view([memory_size, ACTION_COUNT - 1]).detach();
+        let old_log_probs = s_log_probs.view([memory_size]).detach();
         let s_values_flat = s_values.view([memory_size, TICKERS_COUNT]).detach();
 
         // Record advantage stats before normalization
@@ -553,11 +555,6 @@ pub fn train(weights_path: Option<&str>) {
                 let policy_loss_val = tch::no_grad(|| action_loss.shallow_clone());
                 let value_loss_val = tch::no_grad(|| value_loss.shallow_clone());
 
-                // Backward PPO loss (alpha detached, so no alpha gradients here)
-                let scaled_ppo_loss =
-                    &ppo_loss * (chunk_sample_count as f64 / samples_per_accum as f64);
-                scaled_ppo_loss.backward();
-
                 // Alpha loss: target induced KL using detached network outputs
                 // For diagonal Gaussian with z_i ~ U(-alpha, alpha):
                 // E[KL] = sum_i E[z_i^2] / (2*sigma_i^2) = sum_i (alpha^2/3) / (2*sigma_i^2)
@@ -569,7 +566,10 @@ pub fn train(weights_path: Option<&str>) {
                 let induced_kl: Tensor =
                     rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                 let alpha_loss = (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0);
-                (alpha_loss * ALPHA_LOSS_COEF).backward();
+
+                let scaled_ppo_loss =
+                    &ppo_loss * (chunk_sample_count as f64 / samples_per_accum as f64);
+                (&scaled_ppo_loss + alpha_loss * ALPHA_LOSS_COEF).backward();
 
                 // Accumulate metrics on GPU
                 let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * chunk_sample_count as f64));

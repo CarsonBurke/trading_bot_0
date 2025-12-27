@@ -72,9 +72,6 @@ pub struct TradingModel {
     pos_embedding: Tensor,
     static_to_ssm: nn::Linear,
     ln_static_ssm: nn::LayerNorm,
-    static_to_temporal: nn::Linear,
-    ln_static_temporal: nn::LayerNorm,
-    temporal_pools: [nn::Linear; 4],
     static_proj: nn::Linear,
     ln_static_proj: nn::LayerNorm,
     time_attn_qkv: nn::Linear,
@@ -96,6 +93,14 @@ pub struct TradingModel {
     time_pos_proj: nn::Linear,
     time_global_ctx: nn::Linear,
     time_ticker_ctx: nn::Linear,
+    cls_token: Tensor,
+    temporal_pos_emb: Tensor,
+    ln_temporal_attn: nn::LayerNorm,
+    temporal_attn_qkv: nn::Linear,
+    temporal_attn_out: nn::Linear,
+    temporal_attn_scale_raw: Tensor,
+    cls_global_ctx: nn::Linear,
+    cls_ticker_ctx: nn::Linear,
     global_to_ticker: nn::Linear,
     ticker_ff1: nn::Linear,
     ticker_ff2: nn::Linear,
@@ -137,14 +142,6 @@ impl TradingModel {
 
         let static_to_ssm = nn::linear(p / "static_to_ssm", PER_TICKER_STATIC_OBS as i64, SSM_DIM, Default::default());
         let ln_static_ssm = nn::layer_norm(p / "ln_static_ssm", vec![SSM_DIM], Default::default());
-        let static_to_temporal = nn::linear(p / "static_to_temporal", PER_TICKER_STATIC_OBS as i64, 64, Default::default());
-        let ln_static_temporal = nn::layer_norm(p / "ln_static_temporal", vec![64], Default::default());
-        let temporal_pools = [
-            nn::linear(p / "temporal_pool_0", 320, 1, Default::default()),
-            nn::linear(p / "temporal_pool_1", 320, 1, Default::default()),
-            nn::linear(p / "temporal_pool_2", 320, 1, Default::default()),
-            nn::linear(p / "temporal_pool_3", 320, 1, Default::default()),
-        ];
 
         let static_proj = nn::linear(p / "static_proj", 256 + PER_TICKER_STATIC_OBS as i64, 256, Default::default());
         let ln_static_proj = nn::layer_norm(p / "ln_static_proj", vec![256], Default::default());
@@ -170,6 +167,14 @@ impl TradingModel {
         let time_pos_proj = nn::linear(p / "time_pos_proj", 4, 256, Default::default());
         let time_global_ctx = nn::linear(p / "time_global_ctx", GLOBAL_STATIC_OBS as i64, 256, Default::default());
         let time_ticker_ctx = nn::linear(p / "time_ticker_ctx", PER_TICKER_STATIC_OBS as i64, 256, Default::default());
+        let cls_token = p.var("cls_token", &[1, 1, 256], Init::Uniform { lo: -0.01, up: 0.01 });
+        let temporal_pos_emb = p.var("temporal_pos_emb", &[1, SEQ_LEN + 1, 256], Init::Uniform { lo: -0.01, up: 0.01 });
+        let ln_temporal_attn = nn::layer_norm(p / "ln_temporal_attn", vec![256], Default::default());
+        let temporal_attn_qkv = nn::linear(p / "temporal_attn_qkv", 256, 256 * 3, Default::default());
+        let temporal_attn_out = nn::linear(p / "temporal_attn_out", 256, 256, Default::default());
+        let temporal_attn_scale_raw = p.var("temporal_attn_scale_raw", &[1], Init::Const(0.0));
+        let cls_global_ctx = nn::linear(p / "cls_global_ctx", GLOBAL_STATIC_OBS as i64, 256, Default::default());
+        let cls_ticker_ctx = nn::linear(p / "cls_ticker_ctx", PER_TICKER_STATIC_OBS as i64, 256, Default::default());
 
         let global_to_ticker = nn::linear(p / "global_to_ticker", GLOBAL_STATIC_OBS as i64, 256, Default::default());
         let ticker_ff1 = nn::linear(p / "ticker_ff1", 256, 256, nn::LinearConfig {
@@ -209,7 +214,6 @@ impl TradingModel {
             patch_embed, patch_ln, pos_emb,
             ssm, ssm_proj, pos_embedding,
             static_to_ssm, ln_static_ssm,
-            static_to_temporal, ln_static_temporal, temporal_pools,
             static_proj, ln_static_proj,
             time_attn_qkv, time_attn_out, ln_time_attn,
             time_mlp_fc1, time_mlp_fc2, ln_time_mlp,
@@ -218,6 +222,8 @@ impl TradingModel {
             time2_mlp_fc1, time2_mlp_fc2, ln_time2_mlp,
             time2_attn_scale_raw, time2_mlp_scale_raw,
             time_pos_proj, time_global_ctx, time_ticker_ctx,
+            cls_token, temporal_pos_emb, ln_temporal_attn, temporal_attn_qkv,
+            temporal_attn_out, temporal_attn_scale_raw, cls_global_ctx, cls_ticker_ctx,
             global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
             actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out,
             pool_scorer, value_ticker_out,
@@ -469,10 +475,12 @@ impl TradingModel {
             .reshape([batch_size, temporal_len, TICKERS_COUNT, 3, self.num_heads, self.head_dim])
             .permute([3, 0, 1, 4, 2, 5]);
         let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
-        let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
         let time_attn_scale = self.time_attn_scale_raw.tanh();
-        let time_attn_out = attn
-            .matmul(&v)
+        let q = q.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+        let k = k.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+        let v = v.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+        let time_attn_out = Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
+            .reshape([batch_size, temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim])
             .permute([0, 1, 3, 2, 4])
             .contiguous()
             .view([batch_size, temporal_len, TICKERS_COUNT, 256])
@@ -506,10 +514,12 @@ impl TradingModel {
             .reshape([batch_size, temporal_len, TICKERS_COUNT, 3, self.num_heads, self.head_dim])
             .permute([3, 0, 1, 4, 2, 5]);
         let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
-        let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
         let time2_attn_scale = self.time2_attn_scale_raw.tanh();
-        let time2_attn_out = attn
-            .matmul(&v)
+        let q = q.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+        let k = k.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+        let v = v.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+        let time2_attn_out = Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
+            .reshape([batch_size, temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim])
             .permute([0, 1, 3, 2, 4])
             .contiguous()
             .view([batch_size, temporal_len, TICKERS_COUNT, 256])
@@ -536,30 +546,45 @@ impl TradingModel {
             .reshape([batch_size * TICKERS_COUNT, temporal_len, 256])
             .permute([0, 2, 1]);
 
-        let static_proj = per_ticker_static
+        let x_time = x_time.permute([0, 2, 1]); // [B*T, L, 256]
+        let global_ctx = global_static.apply(&self.cls_global_ctx)
+            .unsqueeze(1)
+            .expand(&[batch_size, TICKERS_COUNT, 256], false);
+        let ticker_ctx = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&self.static_to_temporal)
-            .apply(&self.ln_static_temporal)
-            .unsqueeze(2)
-            .expand(&[-1, -1, temporal_len], false);
-
-        let x_groups = x_time.chunk(4, 1);
-        let mut pooled_groups = Vec::with_capacity(4);
-        let mut attn_sum = Tensor::zeros(&[batch_size * TICKERS_COUNT, temporal_len], (x.kind(), x.device()));
-
-        // Combine full x (256) with static (64) for attention logits = 320
-        let combined_full = Tensor::cat(&[x_time.shallow_clone(), static_proj.shallow_clone()], 1);
-
-        for (group, pool) in x_groups.iter().zip(self.temporal_pools.iter()) {
-            let logits = combined_full.permute([0, 2, 1]).apply(pool).squeeze_dim(-1);
-            let attn = logits.softmax(-1, logits.kind());
-            attn_sum = attn_sum + &attn;
-            pooled_groups.push(group.bmm(&attn.unsqueeze(-1)).squeeze_dim(-1));
-        }
-
-        let pooled = Tensor::cat(&pooled_groups, 1);
-        let attn_avg = (attn_sum / 4.0).reshape([batch_size, TICKERS_COUNT, -1]).mean_dim(1, false, x.kind());
-        let conv_features = pooled.view([batch_size, TICKERS_COUNT, 256]);
+            .apply(&self.cls_ticker_ctx)
+            .reshape([batch_size, TICKERS_COUNT, 256]);
+        let cls_base = self.cls_token
+            .expand(&[batch_size, TICKERS_COUNT, 256], false);
+        let cls = (cls_base + global_ctx + ticker_ctx)
+            .reshape([batch_size * TICKERS_COUNT, 1, 256]);
+        let x_time = Tensor::cat(&[cls, x_time], 1) + &self.temporal_pos_emb;
+        let normed = x_time.apply(&self.ln_temporal_attn);
+        let qkv = normed
+            .apply(&self.temporal_attn_qkv)
+            .reshape([batch_size * TICKERS_COUNT, temporal_len + 1, 3, self.num_heads, self.head_dim])
+            .permute([2, 0, 3, 1, 4]);
+        let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
+        let temporal_attn_scale = self.temporal_attn_scale_raw.tanh();
+        let temporal_attn_out = Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
+            .permute([0, 2, 1, 3])
+            .contiguous()
+            .view([batch_size * TICKERS_COUNT, temporal_len + 1, 256])
+            .apply(&self.temporal_attn_out);
+        let x_time = x_time + temporal_attn_out * &temporal_attn_scale;
+        let attn_cls = tch::no_grad(|| {
+            (q.narrow(2, 0, 1).matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt())
+                .softmax(-1, q.kind())
+                .squeeze_dim(2)
+        });
+        let attn_avg = attn_cls
+            .mean_dim(1, false, x.kind())
+            .reshape([batch_size, TICKERS_COUNT, temporal_len + 1])
+            .mean_dim(1, false, x.kind());
+        let conv_features = x_time
+            .narrow(1, 0, 1)
+            .squeeze_dim(1)
+            .reshape([batch_size, TICKERS_COUNT, 256]);
 
         self.head_common(&conv_features, global_static, per_ticker_static, batch_size, attn_avg)
     }
