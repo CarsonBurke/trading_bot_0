@@ -16,7 +16,6 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 
 const SSM_DIM: i64 = 64;
 const LOGIT_SCALE_INIT: f64 = 0.3;
-const INVEST_LOGIT_SCALE_INIT: f64 = 0.3;
 pub const LOGIT_SCALE_GROUP: usize = 1;
 
 // Uniform patch size for proper streaming support
@@ -26,8 +25,8 @@ const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
 const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_DELTAS must be divisible by PATCH_SIZE");
 
-// (values, (ticker_mean, ticker_log_std, sde_latent, invest_mean, invest_log_std), attn_weights)
-pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor, Tensor, Tensor), Tensor);
+// (values, (ticker_mean, ticker_log_std, sde_latent), attn_weights)
+pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
 
 /// Streaming state for O(1) inference per step
 /// - Ring buffer holds full delta history for head computation
@@ -78,12 +77,25 @@ pub struct TradingModel {
     temporal_pools: [nn::Linear; 4],
     static_proj: nn::Linear,
     ln_static_proj: nn::LayerNorm,
-    attn_qkv: nn::Linear,
-    attn_out: nn::Linear,
-    ln_attn: nn::LayerNorm,
     time_attn_qkv: nn::Linear,
     time_attn_out: nn::Linear,
     ln_time_attn: nn::LayerNorm,
+    time_mlp_fc1: nn::Linear,
+    time_mlp_fc2: nn::Linear,
+    ln_time_mlp: nn::LayerNorm,
+    time_attn_scale_raw: Tensor,
+    time_mlp_scale_raw: Tensor,
+    time2_attn_qkv: nn::Linear,
+    time2_attn_out: nn::Linear,
+    ln_time2_attn: nn::LayerNorm,
+    time2_mlp_fc1: nn::Linear,
+    time2_mlp_fc2: nn::Linear,
+    ln_time2_mlp: nn::LayerNorm,
+    time2_attn_scale_raw: Tensor,
+    time2_mlp_scale_raw: Tensor,
+    time_pos_proj: nn::Linear,
+    time_global_ctx: nn::Linear,
+    time_ticker_ctx: nn::Linear,
     global_to_ticker: nn::Linear,
     ticker_ff1: nn::Linear,
     ticker_ff2: nn::Linear,
@@ -93,15 +105,13 @@ pub struct TradingModel {
     actor_fc2: nn::Linear,
     ln_actor_fc2: nn::LayerNorm,
     actor_out: nn::Linear,
-    invest_out: nn::Linear,
-    invest_log_std_out: nn::Linear,
     pool_scorer: nn::Linear,
     value_ticker_out: nn::Linear,
     sde_fc: nn::Linear,
     ln_sde: nn::LayerNorm,
     log_std_param: Tensor,
     logit_scale_raw: Tensor,
-    invest_logit_scale_raw: Tensor,
+    cash_logit_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
     head_dim: i64,
@@ -112,8 +122,8 @@ impl TradingModel {
         self.logit_scale_raw.exp()
     }
 
-    pub fn invest_logit_scale(&self) -> Tensor {
-        self.invest_logit_scale_raw.exp()
+    pub fn cash_logit(&self) -> Tensor {
+        &self.cash_logit_raw * self.logit_scale_raw.exp()
     }
 
     pub fn new(p: &nn::Path) -> Self {
@@ -141,12 +151,25 @@ impl TradingModel {
 
         let num_heads = 4i64;
         let head_dim = 64i64;
-        let attn_qkv = nn::linear(p / "attn_qkv", 256, 256 * 3, Default::default());
-        let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
-        let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
         let time_attn_qkv = nn::linear(p / "time_attn_qkv", 256, 256 * 3, Default::default());
         let time_attn_out = nn::linear(p / "time_attn_out", 256, 256, Default::default());
         let ln_time_attn = nn::layer_norm(p / "ln_time_attn", vec![256], Default::default());
+        let time_mlp_fc1 = nn::linear(p / "time_mlp_fc1", 256, 1024, Default::default());
+        let time_mlp_fc2 = nn::linear(p / "time_mlp_fc2", 1024, 256, Default::default());
+        let ln_time_mlp = nn::layer_norm(p / "ln_time_mlp", vec![256], Default::default());
+        let time_attn_scale_raw = p.var("time_attn_scale_raw", &[1], Init::Const(0.0));
+        let time_mlp_scale_raw = p.var("time_mlp_scale_raw", &[1], Init::Const(0.0));
+        let time2_attn_qkv = nn::linear(p / "time2_attn_qkv", 256, 256 * 3, Default::default());
+        let time2_attn_out = nn::linear(p / "time2_attn_out", 256, 256, Default::default());
+        let ln_time2_attn = nn::layer_norm(p / "ln_time2_attn", vec![256], Default::default());
+        let time2_mlp_fc1 = nn::linear(p / "time2_mlp_fc1", 256, 1024, Default::default());
+        let time2_mlp_fc2 = nn::linear(p / "time2_mlp_fc2", 1024, 256, Default::default());
+        let ln_time2_mlp = nn::layer_norm(p / "ln_time2_mlp", vec![256], Default::default());
+        let time2_attn_scale_raw = p.var("time2_attn_scale_raw", &[1], Init::Const(0.0));
+        let time2_mlp_scale_raw = p.var("time2_mlp_scale_raw", &[1], Init::Const(0.0));
+        let time_pos_proj = nn::linear(p / "time_pos_proj", 4, 256, Default::default());
+        let time_global_ctx = nn::linear(p / "time_global_ctx", GLOBAL_STATIC_OBS as i64, 256, Default::default());
+        let time_ticker_ctx = nn::linear(p / "time_ticker_ctx", PER_TICKER_STATIC_OBS as i64, 256, Default::default());
 
         let global_to_ticker = nn::linear(p / "global_to_ticker", GLOBAL_STATIC_OBS as i64, 256, Default::default());
         let ticker_ff1 = nn::linear(p / "ticker_ff1", 256, 256, nn::LinearConfig {
@@ -170,10 +193,6 @@ impl TradingModel {
         let pool_scorer = nn::linear(p / "pool_scorer", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
-        let invest_out = nn::linear(p / "invest_out", 256, 1, nn::LinearConfig {
-            ws_init: truncated_normal_init(256, 1), ..Default::default()
-        });
-        let invest_log_std_out = nn::linear(p / "invest_log_std_out", 256, 1, Default::default());
         let value_ticker_out = nn::linear(p / "value_ticker_out", 256, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(256, 1), ..Default::default()
         });
@@ -185,27 +204,25 @@ impl TradingModel {
         let log_std_param = p.var("log_std", &[ACTION_COUNT - 1], Init::Const(0.0));
         let logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP)
             .var("logit_scale_raw", &[1], Init::Const(LOGIT_SCALE_INIT.ln()));
-        let invest_logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP)
-            .var(
-                "invest_logit_scale_raw",
-                &[1],
-                Init::Const(INVEST_LOGIT_SCALE_INIT.ln()),
-            );
-
+        let cash_logit_raw = p.var("cash_logit_raw", &[1], Init::Const(0.0));
         Self {
             patch_embed, patch_ln, pos_emb,
             ssm, ssm_proj, pos_embedding,
             static_to_ssm, ln_static_ssm,
             static_to_temporal, ln_static_temporal, temporal_pools,
             static_proj, ln_static_proj,
-            attn_qkv, attn_out, ln_attn,
             time_attn_qkv, time_attn_out, ln_time_attn,
+            time_mlp_fc1, time_mlp_fc2, ln_time_mlp,
+            time_attn_scale_raw, time_mlp_scale_raw,
+            time2_attn_qkv, time2_attn_out, ln_time2_attn,
+            time2_mlp_fc1, time2_mlp_fc2, ln_time2_mlp,
+            time2_attn_scale_raw, time2_mlp_scale_raw,
+            time_pos_proj, time_global_ctx, time_ticker_ctx,
             global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
             actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out,
-            invest_out, invest_log_std_out,
             pool_scorer, value_ticker_out,
             sde_fc, ln_sde, log_std_param, logit_scale_raw,
-            invest_logit_scale_raw,
+            cash_logit_raw,
             device: p.device(),
             num_heads, head_dim,
         }
@@ -426,24 +443,98 @@ impl TradingModel {
         let x_time = x
             .view([batch_size, TICKERS_COUNT, 256, temporal_len])
             .permute([0, 3, 1, 2]);
+        let global_ctx = global_static
+            .apply(&self.time_global_ctx)
+            .unsqueeze(1)
+            .unsqueeze(1);
+        let ticker_ctx = per_ticker_static
+            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
+            .apply(&self.time_ticker_ctx)
+            .reshape([batch_size, TICKERS_COUNT, 256])
+            .unsqueeze(1);
+        let step_progress = global_static.narrow(1, 0, 1);
+        let angle1 = &step_progress * (2.0 * std::f64::consts::PI);
+        let angle2 = &step_progress * (4.0 * std::f64::consts::PI);
+        let time_feats = Tensor::cat(
+            &[angle1.sin(), angle1.cos(), angle2.sin(), angle2.cos()],
+            1,
+        );
+        let time_pos = time_feats
+            .apply(&self.time_pos_proj)
+            .unsqueeze(1)
+            .unsqueeze(1);
+        let x_time = x_time + global_ctx + ticker_ctx + time_pos;
         let qkv = x_time
             .apply(&self.time_attn_qkv)
             .reshape([batch_size, temporal_len, TICKERS_COUNT, 3, self.num_heads, self.head_dim])
             .permute([3, 0, 1, 4, 2, 5]);
         let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
         let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
+        let time_attn_scale = self.time_attn_scale_raw.tanh();
         let time_attn_out = attn
             .matmul(&v)
             .permute([0, 1, 3, 2, 4])
             .contiguous()
             .view([batch_size, temporal_len, TICKERS_COUNT, 256])
             .apply(&self.time_attn_out);
-        let x_time = (x_time + time_attn_out)
+        let x_time = (x_time + time_attn_out * &time_attn_scale)
             .reshape([batch_size * temporal_len * TICKERS_COUNT, 256])
             .apply(&self.ln_time_attn)
             .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
             .permute([0, 2, 3, 1])
             .reshape([batch_size * TICKERS_COUNT, 256, temporal_len]);
+        let time_mlp_scale = self.time_mlp_scale_raw.tanh();
+        let time_mlp = x_time
+            .permute([0, 2, 1])
+            .reshape([batch_size * TICKERS_COUNT * temporal_len, 256])
+            .apply(&self.time_mlp_fc1)
+            .silu()
+            .apply(&self.time_mlp_fc2)
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, 256])
+            .permute([0, 2, 1]);
+        let x_time = (x_time + time_mlp * &time_mlp_scale)
+            .permute([0, 2, 1])
+            .reshape([batch_size * TICKERS_COUNT * temporal_len, 256])
+            .apply(&self.ln_time_mlp)
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, 256])
+            .permute([0, 2, 1]);
+        let x_time_2 = x_time
+            .reshape([batch_size, TICKERS_COUNT, 256, temporal_len])
+            .permute([0, 3, 1, 2]);
+        let qkv = x_time_2
+            .apply(&self.time2_attn_qkv)
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, 3, self.num_heads, self.head_dim])
+            .permute([3, 0, 1, 4, 2, 5]);
+        let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
+        let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
+        let time2_attn_scale = self.time2_attn_scale_raw.tanh();
+        let time2_attn_out = attn
+            .matmul(&v)
+            .permute([0, 1, 3, 2, 4])
+            .contiguous()
+            .view([batch_size, temporal_len, TICKERS_COUNT, 256])
+            .apply(&self.time2_attn_out);
+        let x_time = (x_time_2 + time2_attn_out * &time2_attn_scale)
+            .reshape([batch_size * temporal_len * TICKERS_COUNT, 256])
+            .apply(&self.ln_time2_attn)
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
+            .permute([0, 2, 3, 1])
+            .reshape([batch_size * TICKERS_COUNT, 256, temporal_len]);
+        let time2_mlp_scale = self.time2_mlp_scale_raw.tanh();
+        let time2_mlp = x_time
+            .permute([0, 2, 1])
+            .reshape([batch_size * TICKERS_COUNT * temporal_len, 256])
+            .apply(&self.time2_mlp_fc1)
+            .silu()
+            .apply(&self.time2_mlp_fc2)
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, 256])
+            .permute([0, 2, 1]);
+        let x_time = (x_time + time2_mlp * &time2_mlp_scale)
+            .permute([0, 2, 1])
+            .reshape([batch_size * TICKERS_COUNT * temporal_len, 256])
+            .apply(&self.ln_time2_mlp)
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, 256])
+            .permute([0, 2, 1]);
 
         let static_proj = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
@@ -481,14 +572,8 @@ impl TradingModel {
             .silu()
             .reshape([batch_size, TICKERS_COUNT, 256]);
 
-        let qkv = combined.apply(&self.attn_qkv).reshape([batch_size, TICKERS_COUNT, 3, self.num_heads, self.head_dim]).permute([2, 0, 3, 1, 4]);
-        let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
-        let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
-        let attn_out = attn.matmul(&v).permute([0, 2, 1, 3]).contiguous().view([batch_size, TICKERS_COUNT, 256]).apply(&self.attn_out);
-        let ticker_features = (combined + attn_out).apply(&self.ln_attn);
-
         let global_ctx = global_static.apply(&self.global_to_ticker).unsqueeze(1);
-        let enriched = &ticker_features + global_ctx;
+        let enriched = &combined + global_ctx;
         let enriched_ff = enriched
             .shallow_clone()
             .reshape([batch_size * TICKERS_COUNT, 256])
@@ -524,13 +609,6 @@ impl TradingModel {
             .apply(&self.ln_actor_fc2)
             .silu()
             .reshape([batch_size, TICKERS_COUNT, 256]);
-        let invest_hidden = pool_summary
-            .apply(&self.actor_fc1)
-            .apply(&self.ln_actor_fc1)
-            .silu();
-        let invest_residual = invest_hidden.apply(&self.actor_fc2);
-        let invest_feat = (invest_residual + &invest_hidden).apply(&self.ln_actor_fc2).silu();
-
         let values = enriched
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.value_ticker_out)
@@ -560,17 +638,9 @@ impl TradingModel {
             + 0.5 * latent_norm.log();
         let action_log_std = log_std.clamp(LOG_STD_MIN, LOG_STD_MAX);
 
-        const INVEST_LOG_STD_MIN: f64 = -7.0;
-        const INVEST_LOG_STD_MAX: f64 = 0.0;
-        let invest_logit_scale = self.invest_logit_scale_raw.exp();
-        let invest_mean = invest_feat.apply(&self.invest_out) * invest_logit_scale;
-        let invest_log_std_raw = invest_feat.apply(&self.invest_log_std_out).tanh();
-        let invest_log_std = INVEST_LOG_STD_MIN
-            + 0.5 * (INVEST_LOG_STD_MAX - INVEST_LOG_STD_MIN) * (invest_log_std_raw + 1.0);
-
         (
             values,
-            (action_mean, action_log_std, sde_latent, invest_mean, invest_log_std),
+            (action_mean, action_log_std, sde_latent),
             attn_out_vis,
         )
     }

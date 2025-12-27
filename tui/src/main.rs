@@ -139,7 +139,6 @@ impl App {
             "total_commissions",
             "std_stats",
             "logit_scale",
-            "invest_logit_scale",
             "grad_norm_log",
             "target_weights",
         ];
