@@ -140,18 +140,21 @@ pub fn train(weights_path: Option<&str>) {
     }
 
     let train_kind = Kind::BFloat16;
+    vs.bfloat16();
+    println!("Using dtype bf16 for model forward");
 
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
     opt.set_lr_group(LOGIT_SCALE_GROUP, LEARNING_RATE * LOGIT_SCALE_LR_MULT);
 
     // Create device-specific kind
-    let float_kind = (train_kind, device);
+    let model_kind = (train_kind, device);
+    let stats_kind = (Kind::Float, device);
 
-    let mut sum_rewards = Tensor::zeros([NPROCS], float_kind);
+    let mut sum_rewards = Tensor::zeros([NPROCS], stats_kind);
     let mut total_rewards = 0f64;
     let mut total_episodes = 0f64;
-    let mut total_rewards_gpu = Tensor::zeros([], float_kind);
-    let mut total_episodes_gpu = Tensor::zeros([], float_kind);
+    let mut total_rewards_gpu = Tensor::zeros([], stats_kind);
+    let mut total_episodes_gpu = Tensor::zeros([], stats_kind);
 
     let mut s_values_buf: Option<Tensor> = None;
     let mut s_rewards_buf: Option<Tensor> = None;
@@ -178,11 +181,11 @@ pub fn train(weights_path: Option<&str>) {
             NPROCS,
             TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         ],
-        float_kind,
+        model_kind,
     );
     let s_static_obs = Tensor::zeros(
         [max_steps + 1, NPROCS, STATIC_OBSERVATIONS as i64],
-        float_kind,
+        stats_kind,
     );
 
     for episode in 0..UPDATES {
@@ -219,20 +222,20 @@ pub fn train(weights_path: Option<&str>) {
         let s_values = get_buf(
             &mut s_values_buf,
             &[rollout_steps, NPROCS, TICKERS_COUNT],
-            float_kind,
+            stats_kind,
         );
         let mut s_rewards = get_buf(
             &mut s_rewards_buf,
             &[rollout_steps, NPROCS, TICKERS_COUNT],
-            float_kind,
+            stats_kind,
         );
         let s_actions = get_buf(
             &mut s_actions_buf,
             &[rollout_steps, NPROCS, ACTION_COUNT - 1],
-            float_kind,
+            stats_kind,
         );
-        let s_masks = get_buf(&mut s_masks_buf, &[rollout_steps, NPROCS], float_kind);
-        let s_log_probs = get_buf(&mut s_log_probs_buf, &[rollout_steps, NPROCS], float_kind);
+        let s_masks = get_buf(&mut s_masks_buf, &[rollout_steps, NPROCS], stats_kind);
+        let s_log_probs = get_buf(&mut s_log_probs_buf, &[rollout_steps, NPROCS], stats_kind);
 
         let _ = total_rewards_gpu.zero_();
         let _ = total_episodes_gpu.zero_();
@@ -251,6 +254,10 @@ pub fn train(weights_path: Option<&str>) {
                     let static_obs = s_static_obs.get(s);
                     trading_model.forward(&price_deltas_step, &static_obs, false)
                 });
+            let values = values.to_kind(Kind::Float);
+            let action_mean = action_mean.to_kind(Kind::Float);
+            let action_log_std = action_log_std.to_kind(Kind::Float);
+            let sde_latent = sde_latent.to_kind(Kind::Float);
             last_attn_weights = Some(attn_weights.shallow_clone());
 
             // Logistic-normal with softmax simplex projection
@@ -270,7 +277,7 @@ pub fn train(weights_path: Option<&str>) {
             let noise_scaled = &noise_raw * &action_std / &latent_norm;
             let action_mean_noisy = &action_mean + &noise_scaled;
             let u = action_mean_noisy.shallow_clone(); // [batch, K-1]
-            let cash_logit = trading_model.cash_logit();
+            let cash_logit = trading_model.cash_logit().to_kind(Kind::Float);
             let cash_logit = cash_logit.expand(&[u.size()[0], 1], false);
             let logits_with_cash = Tensor::cat(&[u.shallow_clone(), cash_logit], 1);
             let actions = logits_with_cash.softmax(-1, Kind::Float);
@@ -293,8 +300,8 @@ pub fn train(weights_path: Option<&str>) {
             rolling_buffer.push(&step_deltas_gpu, &is_done, None);
             s_price_deltas.get(s + 1).copy_(&rolling_buffer.get_flat());
 
-            let reward = reward.to_device(device);
-            let reward_per_ticker = reward_per_ticker;
+            let reward = reward.to_device(device).to_kind(Kind::Float);
+            let reward_per_ticker = reward_per_ticker.to_kind(Kind::Float);
             let is_done = is_done.to_device(device);
 
             sum_rewards += &reward;
@@ -357,7 +364,7 @@ pub fn train(weights_path: Option<&str>) {
                 let price_deltas_step = s_price_deltas.get(rollout_steps);
                 let static_obs = s_static_obs.get(rollout_steps);
                 let (values, _, _) = trading_model.forward(&price_deltas_step, &static_obs, false);
-                values
+                values.to_kind(Kind::Float)
             });
             // Compute GAE backwards per ticker.
             for s in (0..rollout_steps).rev() {
@@ -432,22 +439,22 @@ pub fn train(weights_path: Option<&str>) {
 
         let opt_start = Instant::now();
         // Accumulate on GPU - only sync once at end of all epochs (weighted by samples)
-        let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut total_loss_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
+        let mut total_kl_weighted = Tensor::zeros([], stats_kind);
+        let mut total_loss_weighted = Tensor::zeros([], stats_kind);
+        let mut total_policy_loss_weighted = Tensor::zeros([], stats_kind);
+        let mut total_value_loss_weighted = Tensor::zeros([], stats_kind);
         let mut total_sample_count = 0i64;
-        let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
+        let mut grad_norm_sum = Tensor::zeros([], stats_kind);
         let mut grad_norm_count = 0i64;
         // Clip fraction diagnostic
-        let mut total_clipped = Tensor::zeros([], (Kind::Float, device));
+        let mut total_clipped = Tensor::zeros([], stats_kind);
         let mut total_ratio_samples = 0i64;
 
         let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
-            let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
+            let mut epoch_kl_gpu = Tensor::zeros([], stats_kind);
             let mut epoch_kl_count = 0i64;
 
             // Shuffle chunk order each epoch for gradient diversity
@@ -473,7 +480,11 @@ pub fn train(weights_path: Option<&str>) {
 
                 let (values, (action_means, action_log_stds, _), _) = trading_model
                     .forward(&price_deltas_chunk, &static_obs_chunk, true);
-                let values = values.view([chunk_sample_count, TICKERS_COUNT]);
+                let values = values
+                    .to_kind(Kind::Float)
+                    .view([chunk_sample_count, TICKERS_COUNT]);
+                let action_means = action_means.to_kind(Kind::Float);
+                let action_log_stds = action_log_stds.to_kind(Kind::Float);
 
                 let actions_mb = actions.narrow(0, chunk_sample_start, chunk_sample_count);
                 let returns_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
@@ -499,7 +510,7 @@ pub fn train(weights_path: Option<&str>) {
                 let u_squared = u_normalized.pow_tensor_scalar(2);
                 let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-                let cash_logit = trading_model.cash_logit();
+                let cash_logit = trading_model.cash_logit().to_kind(Kind::Float);
                 let cash_logit = cash_logit.expand(&[chunk_sample_count, 1], false);
                 let logits_with_cash = Tensor::cat(&[u.shallow_clone(), cash_logit], 1);
                 let log_weights = logits_with_cash.log_softmax(-1, Kind::Float);
