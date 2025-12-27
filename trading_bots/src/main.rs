@@ -12,7 +12,6 @@ mod constants;
 mod data;
 mod neural_net;
 mod strategies;
-mod custom_rl;
 mod torch;
 mod candle;
 // mod burn;

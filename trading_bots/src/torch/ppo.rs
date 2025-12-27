@@ -156,6 +156,8 @@ pub fn train(weights_path: Option<&str>) {
     let mut s_invest_buf: Option<Tensor> = None;
     let mut s_masks_buf: Option<Tensor> = None;
     let mut s_log_probs_buf: Option<Tensor> = None;
+    let mut s_log_probs_ticker_buf: Option<Tensor> = None;
+    let mut s_log_probs_invest_buf: Option<Tensor> = None;
 
     // RPO alpha: sigmoid parameterization for smooth gradients
     // rho -> alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
@@ -232,6 +234,13 @@ pub fn train(weights_path: Option<&str>) {
         let s_invest = get_buf(&mut s_invest_buf, &[rollout_steps, NPROCS, 1], float_kind);
         let s_masks = get_buf(&mut s_masks_buf, &[rollout_steps, NPROCS], float_kind);
         let s_log_probs = get_buf(&mut s_log_probs_buf, &[rollout_steps, NPROCS], float_kind);
+        let s_log_probs_ticker = get_buf(
+            &mut s_log_probs_ticker_buf,
+            &[rollout_steps, NPROCS, TICKERS_COUNT],
+            float_kind,
+        );
+        let s_log_probs_invest =
+            get_buf(&mut s_log_probs_invest_buf, &[rollout_steps, NPROCS], float_kind);
 
         let _ = total_rewards_gpu.zero_();
         let _ = total_episodes_gpu.zero_();
@@ -283,9 +292,9 @@ pub fn train(weights_path: Option<&str>) {
             let two_log_std = &action_log_std_clamped * 2.0;
             let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
             let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-            let log_jacobian = u
-                .log_softmax(-1, Kind::Float)
-                .sum_dim_intlist(-1, false, Kind::Float);
+            let log_softmax = u.log_softmax(-1, Kind::Float);
+            let log_jacobian = log_softmax.sum_dim_intlist(-1, false, Kind::Float);
+            let log_prob_ticker_per = &log_prob_u - &log_softmax;
             let log_prob_ticker = log_prob_gaussian - log_jacobian;
             let invest_normalized = (&invest_z - &invest_mean) / &invest_std;
             let invest_squared = invest_normalized.pow_tensor_scalar(2);
@@ -300,9 +309,10 @@ pub fn train(weights_path: Option<&str>) {
                 .log()
                 .squeeze_dim(-1)
                 .g_mul_scalar(TICKERS_COUNT as f64);
-            let action_log_prob = log_prob_ticker + log_prob_invest
+            let invest_log_prob_total = log_prob_invest
                 - log_jacobian_invest.squeeze_dim(-1)
                 - invest_scale_penalty;
+            let action_log_prob = log_prob_ticker + &invest_log_prob_total;
 
             let mut out_so = s_static_obs.get(s + 1);
             let (reward, reward_per_ticker, is_done, step_deltas) =
@@ -329,6 +339,8 @@ pub fn train(weights_path: Option<&str>) {
             s_invest.get(s).copy_(&invest_z);
             s_values.get(s).copy_(&values);
             s_log_probs.get(s).copy_(&action_log_prob);
+            s_log_probs_ticker.get(s).copy_(&log_prob_ticker_per);
+            s_log_probs_invest.get(s).copy_(&invest_log_prob_total);
             s_rewards.get(s).copy_(&reward_per_ticker);
             s_masks.get(s).copy_(&masks);
 
@@ -413,6 +425,8 @@ pub fn train(weights_path: Option<&str>) {
         let actions = s_actions.view([memory_size, ACTION_COUNT - 1]);
         let invest_z = s_invest.view([memory_size, 1]);
         let old_log_probs = s_log_probs.view([memory_size]);
+        let old_log_probs_ticker = s_log_probs_ticker.view([memory_size, TICKERS_COUNT]);
+        let old_log_probs_invest = s_log_probs_invest.view([memory_size]);
         let s_values_flat = s_values.view([memory_size, TICKERS_COUNT]).detach();
 
         // Record advantage stats before normalization
@@ -519,9 +533,9 @@ pub fn train(weights_path: Option<&str>) {
                 let u_squared = u_normalized.pow_tensor_scalar(2);
                 let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-                let log_jacobian = u
-                    .log_softmax(-1, Kind::Float)
-                    .sum_dim_intlist(-1, false, Kind::Float);
+                let log_softmax = u.log_softmax(-1, Kind::Float);
+                let log_jacobian = log_softmax.sum_dim_intlist(-1, false, Kind::Float);
+                let log_prob_ticker_per = &log_prob_u - &log_softmax;
                 let log_prob_ticker = log_prob_gaussian - log_jacobian;
                 let invest_log_stds_clamped = invest_log_stds.clamp(-20.0, 5.0);
                 let invest_std = invest_log_stds_clamped.exp();
@@ -538,9 +552,10 @@ pub fn train(weights_path: Option<&str>) {
                     .log()
                     .squeeze_dim(-1)
                     .g_mul_scalar(TICKERS_COUNT as f64);
-                let action_log_probs = log_prob_ticker + log_prob_invest
+                let invest_log_prob_total = log_prob_invest
                     - log_jacobian_invest.squeeze_dim(-1)
                     - invest_scale_penalty;
+                let action_log_probs = log_prob_ticker + &invest_log_prob_total;
 
                 // Entropy of Gaussian (per ticker)
                 let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
@@ -567,27 +582,48 @@ pub fn train(weights_path: Option<&str>) {
                     v_loss_unclipped.mean(Kind::Float)
                 };
 
-                // PPO clipped objective
-                let ratio = (&action_log_probs - &old_log_probs_mb).exp();
+                let old_log_probs_ticker_mb =
+                    old_log_probs_ticker.narrow(0, chunk_sample_start, chunk_sample_count);
+                let old_log_probs_invest_mb =
+                    old_log_probs_invest.narrow(0, chunk_sample_start, chunk_sample_count);
+
+                // PPO clipped objective (per ticker + invest)
+                let ratio_ticker = (&log_prob_ticker_per - &old_log_probs_ticker_mb).exp();
+                let ratio_ticker_clipped =
+                    ratio_ticker.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
+                let unclipped_obj_ticker = &ratio_ticker * &advantages_mb;
+                let clipped_obj_ticker = &ratio_ticker_clipped * &advantages_mb;
+                let action_loss_ticker = -Tensor::min_other(&unclipped_obj_ticker, &clipped_obj_ticker)
+                    .mean(Kind::Float);
+
+                let ratio_invest = (&invest_log_prob_total - &old_log_probs_invest_mb).exp();
+                let ratio_invest_clipped =
+                    ratio_invest.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
+                let advantages_invest =
+                    advantages_mb.mean_dim([-1].as_slice(), false, Kind::Float);
+                let unclipped_obj_invest = &ratio_invest * &advantages_invest;
+                let clipped_obj_invest = &ratio_invest_clipped * &advantages_invest;
+                let action_loss_invest = -Tensor::min_other(&unclipped_obj_invest, &clipped_obj_invest)
+                    .mean(Kind::Float);
+
+                let action_loss = action_loss_ticker + action_loss_invest;
 
                 // Clip fraction diagnostic
                 let clipped_count = tch::no_grad(|| {
-                    let deviation = (&ratio - 1.0).abs();
-                    deviation
+                    let deviation_ticker = (&ratio_ticker - 1.0).abs();
+                    let deviation_invest = (&ratio_invest - 1.0).abs();
+                    let clipped_ticker = deviation_ticker
                         .gt(PPO_CLIP_RATIO)
                         .to_kind(Kind::Float)
-                        .sum(Kind::Float)
+                        .sum(Kind::Float);
+                    let clipped_invest = deviation_invest
+                        .gt(PPO_CLIP_RATIO)
+                        .to_kind(Kind::Float)
+                        .sum(Kind::Float);
+                    clipped_ticker + clipped_invest
                 });
                 let _ = total_clipped.g_add_(&clipped_count);
-                total_ratio_samples += chunk_sample_count;
-
-                let advantages_reduced =
-                    advantages_mb.mean_dim([-1].as_slice(), false, Kind::Float);
-                let unclipped_obj = &ratio * &advantages_reduced;
-                let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
-                let clipped_obj = ratio_clipped * &advantages_reduced;
-                let action_loss =
-                    -Tensor::min_other(&unclipped_obj, &clipped_obj).mean(Kind::Float);
+                total_ratio_samples += chunk_sample_count * (TICKERS_COUNT + 1);
 
                 // KL and loss for metrics (extract before backward frees graph)
                 let approx_kl_val =

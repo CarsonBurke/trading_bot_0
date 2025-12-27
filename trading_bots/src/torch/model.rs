@@ -81,6 +81,9 @@ pub struct TradingModel {
     attn_qkv: nn::Linear,
     attn_out: nn::Linear,
     ln_attn: nn::LayerNorm,
+    time_attn_qkv: nn::Linear,
+    time_attn_out: nn::Linear,
+    ln_time_attn: nn::LayerNorm,
     global_to_ticker: nn::Linear,
     ticker_ff1: nn::Linear,
     ticker_ff2: nn::Linear,
@@ -141,6 +144,9 @@ impl TradingModel {
         let attn_qkv = nn::linear(p / "attn_qkv", 256, 256 * 3, Default::default());
         let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
         let ln_attn = nn::layer_norm(p / "ln_attn", vec![256], Default::default());
+        let time_attn_qkv = nn::linear(p / "time_attn_qkv", 256, 256 * 3, Default::default());
+        let time_attn_out = nn::linear(p / "time_attn_out", 256, 256, Default::default());
+        let ln_time_attn = nn::layer_norm(p / "ln_time_attn", vec![256], Default::default());
 
         let global_to_ticker = nn::linear(p / "global_to_ticker", GLOBAL_STATIC_OBS as i64, 256, Default::default());
         let ticker_ff1 = nn::linear(p / "ticker_ff1", 256, 256, nn::LinearConfig {
@@ -193,6 +199,7 @@ impl TradingModel {
             static_to_temporal, ln_static_temporal, temporal_pools,
             static_proj, ln_static_proj,
             attn_qkv, attn_out, ln_attn,
+            time_attn_qkv, time_attn_out, ln_time_attn,
             global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
             actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out,
             invest_out, invest_log_std_out,
@@ -416,6 +423,28 @@ impl TradingModel {
         let x = x_ssm.apply(&self.ssm_proj) + &self.pos_embedding;
         let temporal_len = x.size()[2];
 
+        let x_time = x
+            .view([batch_size, TICKERS_COUNT, 256, temporal_len])
+            .permute([0, 3, 1, 2]);
+        let qkv = x_time
+            .apply(&self.time_attn_qkv)
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, 3, self.num_heads, self.head_dim])
+            .permute([3, 0, 1, 4, 2, 5]);
+        let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
+        let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
+        let time_attn_out = attn
+            .matmul(&v)
+            .permute([0, 1, 3, 2, 4])
+            .contiguous()
+            .view([batch_size, temporal_len, TICKERS_COUNT, 256])
+            .apply(&self.time_attn_out);
+        let x_time = (x_time + time_attn_out)
+            .reshape([batch_size * temporal_len * TICKERS_COUNT, 256])
+            .apply(&self.ln_time_attn)
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
+            .permute([0, 2, 3, 1])
+            .reshape([batch_size * TICKERS_COUNT, 256, temporal_len]);
+
         let static_proj = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
             .apply(&self.static_to_temporal)
@@ -423,12 +452,12 @@ impl TradingModel {
             .unsqueeze(2)
             .expand(&[-1, -1, temporal_len], false);
 
-        let x_groups = x.chunk(4, 1);
+        let x_groups = x_time.chunk(4, 1);
         let mut pooled_groups = Vec::with_capacity(4);
         let mut attn_sum = Tensor::zeros(&[batch_size * TICKERS_COUNT, temporal_len], (x.kind(), x.device()));
 
         // Combine full x (256) with static (64) for attention logits = 320
-        let combined_full = Tensor::cat(&[x.shallow_clone(), static_proj.shallow_clone()], 1);
+        let combined_full = Tensor::cat(&[x_time.shallow_clone(), static_proj.shallow_clone()], 1);
 
         for (group, pool) in x_groups.iter().zip(self.temporal_pools.iter()) {
             let logits = combined_full.permute([0, 2, 1]).apply(pool).squeeze_dim(-1);
