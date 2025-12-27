@@ -169,6 +169,24 @@ pub struct Mamba2 {
     nheads: i64,
 }
 
+struct RMSNormSimple {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RMSNormSimple {
+    fn new(p: &nn::Path, dim: i64, eps: f64) -> Self {
+        let weight = p.var("weight", &[dim], Init::Const(1.0));
+        Self { weight, eps }
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let x_f32 = x.to_kind(Kind::Float);
+        let rms = (x_f32.pow_tensor_scalar(2).mean_dim(-1, true, Kind::Float) + self.eps).sqrt();
+        (x_f32 / rms * &self.weight).to_kind(x.kind())
+    }
+}
+
 impl Mamba2 {
     pub fn new(p: &nn::Path, config: Mamba2Config) -> Self {
         let mut config = config;
@@ -957,11 +975,7 @@ pub fn mamba_stack_cfg(p: &nn::Path, config: Mamba2Config, n_layers: i64) -> Mam
             };
             (
                 Mamba2::new(&(p / format!("layer_{}", i)), cfg),
-                nn::layer_norm(
-                    p / format!("ln_{}", i),
-                    vec![config.d_model],
-                    Default::default(),
-                ),
+                RMSNormSimple::new(&(p / format!("ln_{}", i)), config.d_model, 1e-5),
             )
         })
         .collect();
@@ -969,7 +983,7 @@ pub fn mamba_stack_cfg(p: &nn::Path, config: Mamba2Config, n_layers: i64) -> Mam
     Box::new(move |x: &Tensor, train: bool| {
         let mut out = x.shallow_clone();
         for (mamba, ln) in &layers {
-            let normed = out.apply(ln);
+            let normed = ln.forward(&out);
             out = &out + mamba.forward(&normed, train);
         }
         out
