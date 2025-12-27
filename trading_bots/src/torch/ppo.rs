@@ -695,6 +695,7 @@ pub fn train(weights_path: Option<&str>) {
             let rpo_alpha =
                 (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze();
             let logit_scale = trading_model.logit_scale().squeeze();
+            let invest_logit_scale = trading_model.invest_logit_scale().squeeze();
             Tensor::stack(
                 &[
                     std.mean(Kind::Float),
@@ -702,6 +703,7 @@ pub fn train(weights_path: Option<&str>) {
                     std.max(),
                     rpo_alpha,
                     logit_scale,
+                    invest_logit_scale,
                 ],
                 0,
             )
@@ -712,10 +714,14 @@ pub fn train(weights_path: Option<&str>) {
         let max_std = *stats_vec.get(2).unwrap_or(&0.0);
         let rpo_alpha = *stats_vec.get(3).unwrap_or(&0.15);
         let logit_scale = *stats_vec.get(4).unwrap_or(&1.0);
+        let invest_logit_scale = *stats_vec.get(5).unwrap_or(&1.0);
         env.primary_mut()
             .meta_history
             .record_std_stats(mean_std, min_std, max_std, rpo_alpha);
         env.primary_mut().meta_history.record_logit_scale(logit_scale);
+        env.primary_mut()
+            .meta_history
+            .record_invest_logit_scale(invest_logit_scale);
 
         // Single GPU->CPU sync for loss and grad norm at end of all epochs
         let mean_losses = if total_sample_count > 0 {

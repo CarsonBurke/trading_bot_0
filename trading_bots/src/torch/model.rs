@@ -16,6 +16,7 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 
 const SSM_DIM: i64 = 64;
 const LOGIT_SCALE_INIT: f64 = 0.3;
+const INVEST_LOGIT_SCALE_INIT: f64 = 0.3;
 pub const LOGIT_SCALE_GROUP: usize = 1;
 
 // Uniform patch size for proper streaming support
@@ -97,6 +98,7 @@ pub struct TradingModel {
     ln_sde: nn::LayerNorm,
     log_std_param: Tensor,
     logit_scale_raw: Tensor,
+    invest_logit_scale_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
     head_dim: i64,
@@ -105,6 +107,10 @@ pub struct TradingModel {
 impl TradingModel {
     pub fn logit_scale(&self) -> Tensor {
         self.logit_scale_raw.exp()
+    }
+
+    pub fn invest_logit_scale(&self) -> Tensor {
+        self.invest_logit_scale_raw.exp()
     }
 
     pub fn new(p: &nn::Path) -> Self {
@@ -173,6 +179,12 @@ impl TradingModel {
         let log_std_param = p.var("log_std", &[ACTION_COUNT - 1], Init::Const(0.0));
         let logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP)
             .var("logit_scale_raw", &[1], Init::Const(LOGIT_SCALE_INIT.ln()));
+        let invest_logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP)
+            .var(
+                "invest_logit_scale_raw",
+                &[1],
+                Init::Const(INVEST_LOGIT_SCALE_INIT.ln()),
+            );
 
         Self {
             patch_embed, patch_ln, pos_emb,
@@ -186,6 +198,7 @@ impl TradingModel {
             invest_out, invest_log_std_out,
             pool_scorer, value_ticker_out,
             sde_fc, ln_sde, log_std_param, logit_scale_raw,
+            invest_logit_scale_raw,
             device: p.device(),
             num_heads, head_dim,
         }
@@ -518,9 +531,10 @@ impl TradingModel {
             + 0.5 * latent_norm.log();
         let action_log_std = log_std.clamp(LOG_STD_MIN, LOG_STD_MAX);
 
-        const INVEST_LOG_STD_MIN: f64 = -5.0;
+        const INVEST_LOG_STD_MIN: f64 = -7.0;
         const INVEST_LOG_STD_MAX: f64 = 0.0;
-        let invest_mean = invest_feat.apply(&self.invest_out);
+        let invest_logit_scale = self.invest_logit_scale_raw.exp();
+        let invest_mean = invest_feat.apply(&self.invest_out) * invest_logit_scale;
         let invest_log_std_raw = invest_feat.apply(&self.invest_log_std_out).tanh();
         let invest_log_std = INVEST_LOG_STD_MIN
             + 0.5 * (INVEST_LOG_STD_MAX - INVEST_LOG_STD_MIN) * (invest_log_std_raw + 1.0);
