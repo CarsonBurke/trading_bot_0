@@ -21,11 +21,13 @@ pub struct MetaHistory {
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
     pub logit_scale: Vec<f64>,
-    pub time_attn_scale: Vec<f64>,
-    pub time2_attn_scale: Vec<f64>,
-    pub temporal_attn_scale: Vec<f64>,
-    pub cls_feat_mean: Vec<f64>,
-    pub cls_feat_std: Vec<f64>,
+    pub time_alpha_attn_mean: Vec<f64>,
+    pub time_alpha_mlp_mean: Vec<f64>,
+    pub cross_alpha_attn_mean: Vec<f64>,
+    pub cross_alpha_mlp_mean: Vec<f64>,
+    pub temporal_tau: Vec<f64>,
+    pub temporal_attn_entropy: Vec<f64>,
+    pub cross_ticker_embed_norm: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -71,17 +73,21 @@ impl MetaHistory {
 
     pub fn record_temporal_debug(
         &mut self,
-        time_attn_scale: f64,
-        time2_attn_scale: f64,
-        temporal_attn_scale: f64,
-        cls_feat_mean: f64,
-        cls_feat_std: f64,
+        time_alpha_attn_mean: f64,
+        time_alpha_mlp_mean: f64,
+        cross_alpha_attn_mean: f64,
+        cross_alpha_mlp_mean: f64,
+        temporal_tau: f64,
+        temporal_attn_entropy: f64,
+        cross_ticker_embed_norm: f64,
     ) {
-        self.time_attn_scale.push(time_attn_scale);
-        self.time2_attn_scale.push(time2_attn_scale);
-        self.temporal_attn_scale.push(temporal_attn_scale);
-        self.cls_feat_mean.push(cls_feat_mean);
-        self.cls_feat_std.push(cls_feat_std);
+        self.time_alpha_attn_mean.push(time_alpha_attn_mean);
+        self.time_alpha_mlp_mean.push(time_alpha_mlp_mean);
+        self.cross_alpha_attn_mean.push(cross_alpha_attn_mean);
+        self.cross_alpha_mlp_mean.push(cross_alpha_mlp_mean);
+        self.temporal_tau.push(temporal_tau);
+        self.temporal_attn_entropy.push(temporal_attn_entropy);
+        self.cross_ticker_embed_norm.push(cross_ticker_embed_norm);
     }
 
     pub fn write_reports(&self, episode: usize) {
@@ -244,51 +250,59 @@ impl MetaHistory {
             };
             let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &report);
         }
-        if !self.temporal_attn_scale.is_empty() {
+        if !self.time_alpha_attn_mean.is_empty() {
             let report = Report {
-                title: "Temporal Attention Scales".to_string(),
+                title: "Time/Cross Alpha Means".to_string(),
                 x_label: Some("Episode".to_string()),
-                y_label: Some("Scale".to_string()),
+                y_label: Some("Alpha".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::MultiLine {
                     series: vec![
                         ReportSeries {
-                            label: "time".to_string(),
-                            values: f64_to_f32(&self.time_attn_scale),
+                            label: "time_attn".to_string(),
+                            values: f64_to_f32(&self.time_alpha_attn_mean),
                         },
                         ReportSeries {
-                            label: "time2".to_string(),
-                            values: f64_to_f32(&self.time2_attn_scale),
+                            label: "time_mlp".to_string(),
+                            values: f64_to_f32(&self.time_alpha_mlp_mean),
                         },
                         ReportSeries {
-                            label: "temporal".to_string(),
-                            values: f64_to_f32(&self.temporal_attn_scale),
+                            label: "cross_attn".to_string(),
+                            values: f64_to_f32(&self.cross_alpha_attn_mean),
+                        },
+                        ReportSeries {
+                            label: "cross_mlp".to_string(),
+                            values: f64_to_f32(&self.cross_alpha_mlp_mean),
                         },
                     ],
                 },
             };
-            let _ = write_report(&format!("{base_dir}/temporal_attn_scales.report.bin"), &report);
+            let _ = write_report(&format!("{base_dir}/time_cross_alpha_means.report.bin"), &report);
         }
-        if !self.cls_feat_mean.is_empty() {
+        if !self.temporal_tau.is_empty() {
             let report = Report {
-                title: "CLS Feature Stats".to_string(),
+                title: "Temporal/Embed Debug".to_string(),
                 x_label: Some("Episode".to_string()),
                 y_label: None,
                 scale: ScaleKind::Linear,
                 kind: ReportKind::MultiLine {
                     series: vec![
                         ReportSeries {
-                            label: "mean".to_string(),
-                            values: f64_to_f32(&self.cls_feat_mean),
+                            label: "temporal_tau".to_string(),
+                            values: f64_to_f32(&self.temporal_tau),
                         },
                         ReportSeries {
-                            label: "std".to_string(),
-                            values: f64_to_f32(&self.cls_feat_std),
+                            label: "temporal_entropy".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_entropy),
+                        },
+                        ReportSeries {
+                            label: "cross_embed_norm".to_string(),
+                            values: f64_to_f32(&self.cross_ticker_embed_norm),
                         },
                     ],
                 },
             };
-            let _ = write_report(&format!("{base_dir}/cls_feature_stats.report.bin"), &report);
+            let _ = write_report(&format!("{base_dir}/temporal_embed_debug.report.bin"), &report);
         }
     }
 }

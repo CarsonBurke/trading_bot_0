@@ -40,16 +40,25 @@ impl TradingModel {
             .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
             .permute([0, 2, 1, 3])
             .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
-        let cross_ticker_embed = per_ticker_static
+        let cross_ticker_embed_base = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
             .apply(&self.cross_ticker_embed)
-            .reshape([batch_size, TICKERS_COUNT, 256])
+            .reshape([batch_size, TICKERS_COUNT, 256]);
+        let cross_ticker_embed = cross_ticker_embed_base
             .unsqueeze(1)
             .expand(&[batch_size, temporal_len, TICKERS_COUNT, 256], false);
+        let mut time_alpha_attn_sum = 0.0;
+        let mut time_alpha_mlp_sum = 0.0;
+        let mut cross_alpha_attn_sum = 0.0;
+        let mut cross_alpha_mlp_sum = 0.0;
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
         for block in &self.time_cross_blocks {
             let alpha_time_attn = block.alpha_time_attn.sigmoid() * alpha_scale;
             let alpha_time_mlp = block.alpha_time_mlp.sigmoid() * alpha_scale;
+            if debug {
+                time_alpha_attn_sum += f64::try_from(&alpha_time_attn).unwrap_or(0.0);
+                time_alpha_mlp_sum += f64::try_from(&alpha_time_mlp).unwrap_or(0.0);
+            }
             let x_time_norm = block
                 .ln_time
                 .forward(&x_seq.reshape([batch_size * TICKERS_COUNT * temporal_len, 256]))
@@ -93,6 +102,10 @@ impl TradingModel {
 
             let alpha_cross_attn = block.alpha_cross_attn.sigmoid() * alpha_scale;
             let alpha_cross_mlp = block.alpha_cross_mlp.sigmoid() * alpha_scale;
+            if debug {
+                cross_alpha_attn_sum += f64::try_from(&alpha_cross_attn).unwrap_or(0.0);
+                cross_alpha_mlp_sum += f64::try_from(&alpha_cross_mlp).unwrap_or(0.0);
+            }
             let x_cross = x_seq
                 .reshape([batch_size, TICKERS_COUNT, temporal_len, 256])
                 .permute([0, 2, 1, 3]);
@@ -198,6 +211,11 @@ impl TradingModel {
             ])
             .permute([0, 2, 1, 3]);
         let tau = self.temporal_tau_raw.exp().clamp(0.5, 4.0);
+        let temporal_tau = if debug {
+            f64::try_from(&tau).unwrap_or(0.0)
+        } else {
+            0.0
+        };
         let q_pool = q_pool * tau;
         let mut temporal_attn_cache: Option<Tensor> = None;
         let temporal_attn_out = if self.use_sdpa(temporal_len) {
@@ -239,23 +257,29 @@ impl TradingModel {
                 .mean_dim(1, false, x.kind())
         });
         let debug_metrics = if debug {
-            let (cls_mean, cls_std) = tch::no_grad(|| {
-                let mean = conv_features.mean(Kind::Float);
-                let var = (&conv_features - &mean)
-                    .pow_tensor_scalar(2)
+            let (temporal_attn_entropy, cross_ticker_embed_norm) = tch::no_grad(|| {
+                let attn = self.attn_softmax_fp32(&q_pool, &k_pool);
+                let attn = attn.squeeze_dim(2);
+                let entropy = -(attn.clamp_min(1e-9) * attn.clamp_min(1e-9).log())
+                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
                     .mean(Kind::Float);
-                let std = var.sqrt();
+                let embed_norm = cross_ticker_embed_base
+                    .pow_tensor_scalar(2)
+                    .mean(Kind::Float)
+                    .sqrt();
                 (
-                    f64::try_from(&mean).unwrap_or(0.0),
-                    f64::try_from(&std).unwrap_or(0.0),
+                    f64::try_from(&entropy).unwrap_or(0.0),
+                    f64::try_from(&embed_norm).unwrap_or(0.0),
                 )
             });
             Some(DebugMetrics {
-                time_attn_scale: 1.0,
-                time2_attn_scale: 1.0,
-                temporal_attn_scale: 1.0,
-                cls_feat_mean: cls_mean,
-                cls_feat_std: cls_std,
+                time_alpha_attn_mean: time_alpha_attn_sum / TIME_CROSS_LAYERS as f64,
+                time_alpha_mlp_mean: time_alpha_mlp_sum / TIME_CROSS_LAYERS as f64,
+                cross_alpha_attn_mean: cross_alpha_attn_sum / TIME_CROSS_LAYERS as f64,
+                cross_alpha_mlp_mean: cross_alpha_mlp_sum / TIME_CROSS_LAYERS as f64,
+                temporal_tau,
+                temporal_attn_entropy,
+                cross_ticker_embed_norm,
             })
         } else {
             None

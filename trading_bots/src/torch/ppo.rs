@@ -98,7 +98,7 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
                                 // Conservative KL early stopping (SB3-style)
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
-const LEARNING_RATE: f64 = 2e-4;
+const LEARNING_RATE: f64 = 3e-4;
 const LOGIT_SCALE_LR_MULT: f64 = 10.0;
 
 // RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
@@ -727,11 +727,13 @@ pub fn train(weights_path: Option<&str>) {
                 trading_model.forward_with_debug(&price_deltas_step, &static_obs, false)
             });
             env.primary_mut().meta_history.record_temporal_debug(
-                debug.time_attn_scale,
-                debug.time2_attn_scale,
-                debug.temporal_attn_scale,
-                debug.cls_feat_mean,
-                debug.cls_feat_std,
+                debug.time_alpha_attn_mean,
+                debug.time_alpha_mlp_mean,
+                debug.cross_alpha_attn_mean,
+                debug.cross_alpha_mlp_mean,
+                debug.temporal_tau,
+                debug.temporal_attn_entropy,
+                debug.cross_ticker_embed_norm,
             );
         }
 

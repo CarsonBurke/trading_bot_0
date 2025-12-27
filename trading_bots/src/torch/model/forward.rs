@@ -59,11 +59,13 @@ impl TradingModel {
         (
             out,
             debug.unwrap_or(DebugMetrics {
-                time_attn_scale: 0.0,
-                time2_attn_scale: 0.0,
-                temporal_attn_scale: 0.0,
-                cls_feat_mean: 0.0,
-                cls_feat_std: 0.0,
+                time_alpha_attn_mean: 0.0,
+                time_alpha_mlp_mean: 0.0,
+                cross_alpha_attn_mean: 0.0,
+                cross_alpha_mlp_mean: 0.0,
+                temporal_tau: 0.0,
+                temporal_attn_entropy: 0.0,
+                cross_ticker_embed_norm: 0.0,
             }),
         )
     }

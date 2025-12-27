@@ -100,11 +100,13 @@ const _: () = assert!(
 pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
 
 pub struct DebugMetrics {
-    pub time_attn_scale: f64,
-    pub time2_attn_scale: f64,
-    pub temporal_attn_scale: f64,
-    pub cls_feat_mean: f64,
-    pub cls_feat_std: f64,
+    pub time_alpha_attn_mean: f64,
+    pub time_alpha_mlp_mean: f64,
+    pub cross_alpha_attn_mean: f64,
+    pub cross_alpha_mlp_mean: f64,
+    pub temporal_tau: f64,
+    pub temporal_attn_entropy: f64,
+    pub cross_ticker_embed_norm: f64,
 }
 
 /// Streaming state for O(1) inference per step
