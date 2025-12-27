@@ -13,23 +13,27 @@ use crate::torch::load::load_var_store_partial;
 struct GpuRollingBuffer {
     buffer: Tensor,
     pos: i64,
+    kind: Kind,
 }
 
 impl GpuRollingBuffer {
-    fn new(device: Device) -> Self {
+    fn new(device: Device, kind: Kind) -> Self {
         Self {
             buffer: Tensor::zeros(
                 [NPROCS, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64],
-                (Kind::Float, device),
+                (kind, device),
             ),
             pos: 0,
+            kind,
         }
     }
 
     fn init_from_vecs(&mut self, all_deltas: &[Vec<f32>]) {
         for (i, deltas) in all_deltas.iter().enumerate() {
             let t =
-                Tensor::from_slice(deltas).view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
+                Tensor::from_slice(deltas)
+                    .to_kind(self.kind)
+                    .view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
             self.buffer.get(i as i64).copy_(&t);
         }
         self.pos = 0;
@@ -46,6 +50,7 @@ impl GpuRollingBuffer {
             for (i, (&done, deltas)) in done_mask.iter().zip(resets.iter()).enumerate() {
                 if done > 0.5 {
                     let t = Tensor::from_slice(deltas)
+                        .to_kind(self.kind)
                         .view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
                     self.buffer.get(i as i64).copy_(&t);
                 }
@@ -93,7 +98,7 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
                                 // Conservative KL early stopping (SB3-style)
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
-const LEARNING_RATE: f64 = 1e-4;
+const LEARNING_RATE: f64 = 2e-4;
 const LOGIT_SCALE_LR_MULT: f64 = 10.0;
 
 // RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
@@ -134,15 +139,13 @@ pub fn train(weights_path: Option<&str>) {
         println!("Starting training from scratch");
     }
 
+    let train_kind = Kind::BFloat16;
+
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
     opt.set_lr_group(LOGIT_SCALE_GROUP, LEARNING_RATE * LOGIT_SCALE_LR_MULT);
 
-    // Disabled FP16 - with GAP reducing params from 39M to 284K, FP32 easily fits in VRAM
-    // FP16 causes NaN issues in tch-rs, especially with complex architectures
-    // vs.half();
-
     // Create device-specific kind
-    let float_kind = (Kind::Float, device);
+    let float_kind = (train_kind, device);
 
     let mut sum_rewards = Tensor::zeros([NPROCS], float_kind);
     let mut total_rewards = 0f64;
@@ -168,18 +171,18 @@ pub fn train(weights_path: Option<&str>) {
 
     let _ = env.reset();
 
-    let mut rolling_buffer = GpuRollingBuffer::new(device);
+    let mut rolling_buffer = GpuRollingBuffer::new(device, train_kind);
     let s_price_deltas = Tensor::zeros(
         [
             max_steps + 1,
             NPROCS,
             TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         ],
-        (Kind::Float, device),
+        float_kind,
     );
     let s_static_obs = Tensor::zeros(
         [max_steps + 1, NPROCS, STATIC_OBSERVATIONS as i64],
-        (Kind::Float, device),
+        float_kind,
     );
 
     for episode in 0..UPDATES {

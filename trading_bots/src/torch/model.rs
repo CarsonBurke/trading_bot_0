@@ -17,6 +17,8 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 const SSM_DIM: i64 = 64;
 const LOGIT_SCALE_INIT: f64 = 0.3;
 pub const LOGIT_SCALE_GROUP: usize = 1;
+const USE_SDPA: bool = true;
+const SDPA_MIN_LEN: i64 = 64;
 
 // Uniform patch size for proper streaming support
 // 3400 deltas / 34 = 100 tokens
@@ -123,6 +125,22 @@ pub struct TradingModel {
 }
 
 impl TradingModel {
+    fn use_sdpa(&self, seq_len: i64) -> bool {
+        if !USE_SDPA {
+            return false;
+        }
+        seq_len >= SDPA_MIN_LEN
+    }
+
+    fn cast_inputs(&self, input: &Tensor) -> Tensor {
+        let target_kind = self.logit_scale_raw.kind();
+        if input.kind() == target_kind {
+            input.shallow_clone()
+        } else {
+            input.to_kind(target_kind)
+        }
+    }
+
     pub fn logit_scale(&self) -> Tensor {
         self.logit_scale_raw.exp()
     }
@@ -236,8 +254,8 @@ impl TradingModel {
 
     /// Batch forward for training (parallel SSM scan)
     pub fn forward(&self, price_deltas: &Tensor, static_features: &Tensor, _train: bool) -> ModelOutput {
-        let price_deltas = price_deltas.to_device(self.device);
-        let static_features = static_features.to_device(self.device);
+        let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
+        let static_features = self.cast_inputs(&static_features.to_device(self.device));
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
@@ -306,8 +324,8 @@ impl TradingModel {
     /// Streaming inference step - O(1) per delta when patch not ready, O(SEQ_LEN) when patch ready
     /// First call with full observation initializes state, subsequent calls stream one delta at a time
     pub fn step(&self, new_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
-        let new_deltas = new_deltas.to_device(self.device);
-        let static_features = static_features.to_device(self.device);
+        let new_deltas = self.cast_inputs(&new_deltas.to_device(self.device));
+        let static_features = self.cast_inputs(&static_features.to_device(self.device));
 
         // Full observation: initialize streaming state
         let full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
@@ -352,6 +370,8 @@ impl TradingModel {
     fn init_from_full(&self, price_deltas: &Tensor, static_features: &Tensor, state: &mut StreamState) -> ModelOutput {
         let price = if price_deltas.dim() == 1 { price_deltas.unsqueeze(0) } else { price_deltas.shallow_clone() };
         let static_features = if static_features.dim() == 1 { static_features.unsqueeze(0) } else { static_features.shallow_clone() };
+        let price = self.cast_inputs(&price);
+        let static_features = self.cast_inputs(&static_features);
 
         // Fill ring buffer
         let reshaped = price.view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
@@ -476,15 +496,24 @@ impl TradingModel {
             .permute([3, 0, 1, 4, 2, 5]);
         let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
         let time_attn_scale = self.time_attn_scale_raw.tanh();
-        let q = q.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-        let k = k.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-        let v = v.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-        let time_attn_out = Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
-            .reshape([batch_size, temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim])
-            .permute([0, 1, 3, 2, 4])
-            .contiguous()
-            .view([batch_size, temporal_len, TICKERS_COUNT, 256])
-            .apply(&self.time_attn_out);
+        let time_attn_out = if self.use_sdpa(TICKERS_COUNT as i64) {
+            let q = q.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+            let k = k.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+            let v = v.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+            Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
+                .reshape([batch_size, temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim])
+                .permute([0, 1, 3, 2, 4])
+                .contiguous()
+                .view([batch_size, temporal_len, TICKERS_COUNT, 256])
+                .apply(&self.time_attn_out)
+        } else {
+            let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
+            attn.matmul(&v)
+                .permute([0, 1, 3, 2, 4])
+                .contiguous()
+                .view([batch_size, temporal_len, TICKERS_COUNT, 256])
+                .apply(&self.time_attn_out)
+        };
         let x_time = (x_time + time_attn_out * &time_attn_scale)
             .reshape([batch_size * temporal_len * TICKERS_COUNT, 256])
             .apply(&self.ln_time_attn)
@@ -515,15 +544,24 @@ impl TradingModel {
             .permute([3, 0, 1, 4, 2, 5]);
         let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
         let time2_attn_scale = self.time2_attn_scale_raw.tanh();
-        let q = q.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-        let k = k.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-        let v = v.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-        let time2_attn_out = Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
-            .reshape([batch_size, temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim])
-            .permute([0, 1, 3, 2, 4])
-            .contiguous()
-            .view([batch_size, temporal_len, TICKERS_COUNT, 256])
-            .apply(&self.time2_attn_out);
+        let time2_attn_out = if self.use_sdpa(TICKERS_COUNT as i64) {
+            let q = q.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+            let k = k.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+            let v = v.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
+            Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
+                .reshape([batch_size, temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim])
+                .permute([0, 1, 3, 2, 4])
+                .contiguous()
+                .view([batch_size, temporal_len, TICKERS_COUNT, 256])
+                .apply(&self.time2_attn_out)
+        } else {
+            let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
+            attn.matmul(&v)
+                .permute([0, 1, 3, 2, 4])
+                .contiguous()
+                .view([batch_size, temporal_len, TICKERS_COUNT, 256])
+                .apply(&self.time2_attn_out)
+        };
         let x_time = (x_time_2 + time2_attn_out * &time2_attn_scale)
             .reshape([batch_size * temporal_len * TICKERS_COUNT, 256])
             .apply(&self.ln_time2_attn)
@@ -566,11 +604,20 @@ impl TradingModel {
             .permute([2, 0, 3, 1, 4]);
         let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
         let temporal_attn_scale = self.temporal_attn_scale_raw.tanh();
-        let temporal_attn_out = Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
-            .permute([0, 2, 1, 3])
-            .contiguous()
-            .view([batch_size * TICKERS_COUNT, temporal_len + 1, 256])
-            .apply(&self.temporal_attn_out);
+        let temporal_attn_out = if self.use_sdpa(temporal_len + 1) {
+            Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
+                .permute([0, 2, 1, 3])
+                .contiguous()
+                .view([batch_size * TICKERS_COUNT, temporal_len + 1, 256])
+                .apply(&self.temporal_attn_out)
+        } else {
+            let attn = (q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt()).softmax(-1, q.kind());
+            attn.matmul(&v)
+                .permute([0, 2, 1, 3])
+                .contiguous()
+                .view([batch_size * TICKERS_COUNT, temporal_len + 1, 256])
+                .apply(&self.temporal_attn_out)
+        };
         let x_time = x_time + temporal_attn_out * &temporal_attn_scale;
         let attn_cls = tch::no_grad(|| {
             (q.narrow(2, 0, 1).matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt())
