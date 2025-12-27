@@ -21,6 +21,11 @@ pub struct MetaHistory {
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
     pub logit_scale: Vec<f64>,
+    pub time_attn_scale: Vec<f64>,
+    pub time2_attn_scale: Vec<f64>,
+    pub temporal_attn_scale: Vec<f64>,
+    pub cls_feat_mean: Vec<f64>,
+    pub cls_feat_std: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -62,6 +67,21 @@ impl MetaHistory {
 
     pub fn record_logit_scale(&mut self, logit_scale: f64) {
         self.logit_scale.push(logit_scale);
+    }
+
+    pub fn record_temporal_debug(
+        &mut self,
+        time_attn_scale: f64,
+        time2_attn_scale: f64,
+        temporal_attn_scale: f64,
+        cls_feat_mean: f64,
+        cls_feat_std: f64,
+    ) {
+        self.time_attn_scale.push(time_attn_scale);
+        self.time2_attn_scale.push(time2_attn_scale);
+        self.temporal_attn_scale.push(temporal_attn_scale);
+        self.cls_feat_mean.push(cls_feat_mean);
+        self.cls_feat_std.push(cls_feat_std);
     }
 
     pub fn write_reports(&self, episode: usize) {
@@ -223,6 +243,52 @@ impl MetaHistory {
                 },
             };
             let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &report);
+        }
+        if !self.temporal_attn_scale.is_empty() {
+            let report = Report {
+                title: "Temporal Attention Scales".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Scale".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "time".to_string(),
+                            values: f64_to_f32(&self.time_attn_scale),
+                        },
+                        ReportSeries {
+                            label: "time2".to_string(),
+                            values: f64_to_f32(&self.time2_attn_scale),
+                        },
+                        ReportSeries {
+                            label: "temporal".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_scale),
+                        },
+                    ],
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/temporal_attn_scales.report.bin"), &report);
+        }
+        if !self.cls_feat_mean.is_empty() {
+            let report = Report {
+                title: "CLS Feature Stats".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: None,
+                scale: ScaleKind::Linear,
+                kind: ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "mean".to_string(),
+                            values: f64_to_f32(&self.cls_feat_mean),
+                        },
+                        ReportSeries {
+                            label: "std".to_string(),
+                            values: f64_to_f32(&self.cls_feat_std),
+                        },
+                    ],
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/cls_feature_stats.report.bin"), &report);
         }
     }
 }

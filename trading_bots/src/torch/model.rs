@@ -30,6 +30,14 @@ const _: () = assert!(PRICE_DELTAS_PER_TICKER as i64 % PATCH_SIZE == 0, "PRICE_D
 // (values, (ticker_mean, ticker_log_std, sde_latent), attn_weights)
 pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
 
+pub struct DebugMetrics {
+    pub time_attn_scale: f64,
+    pub time2_attn_scale: f64,
+    pub temporal_attn_scale: f64,
+    pub cls_feat_mean: f64,
+    pub cls_feat_std: f64,
+}
+
 /// Streaming state for O(1) inference per step
 /// - Ring buffer holds full delta history for head computation
 /// - Patch buffer accumulates deltas until full patch ready
@@ -100,7 +108,6 @@ pub struct TradingModel {
     ln_temporal_attn: nn::LayerNorm,
     temporal_attn_qkv: nn::Linear,
     temporal_attn_out: nn::Linear,
-    temporal_attn_scale_raw: Tensor,
     cls_global_ctx: nn::Linear,
     cls_ticker_ctx: nn::Linear,
     global_to_ticker: nn::Linear,
@@ -190,7 +197,6 @@ impl TradingModel {
         let ln_temporal_attn = nn::layer_norm(p / "ln_temporal_attn", vec![256], Default::default());
         let temporal_attn_qkv = nn::linear(p / "temporal_attn_qkv", 256, 256 * 3, Default::default());
         let temporal_attn_out = nn::linear(p / "temporal_attn_out", 256, 256, Default::default());
-        let temporal_attn_scale_raw = p.var("temporal_attn_scale_raw", &[1], Init::Const(0.0));
         let cls_global_ctx = nn::linear(p / "cls_global_ctx", GLOBAL_STATIC_OBS as i64, 256, Default::default());
         let cls_ticker_ctx = nn::linear(p / "cls_ticker_ctx", PER_TICKER_STATIC_OBS as i64, 256, Default::default());
 
@@ -241,7 +247,7 @@ impl TradingModel {
             time2_attn_scale_raw, time2_mlp_scale_raw,
             time_pos_proj, time_global_ctx, time_ticker_ctx,
             cls_token, temporal_pos_emb, ln_temporal_attn, temporal_attn_qkv,
-            temporal_attn_out, temporal_attn_scale_raw, cls_global_ctx, cls_ticker_ctx,
+            temporal_attn_out, cls_global_ctx, cls_ticker_ctx,
             global_to_ticker, ticker_ff1, ticker_ff2, ln_ticker_ff,
             actor_fc1, ln_actor_fc1, actor_fc2, ln_actor_fc2, actor_out,
             pool_scorer, value_ticker_out,
@@ -265,7 +271,34 @@ impl TradingModel {
         let x_ssm = self.ssm.forward(&x_for_ssm, false);
         let x_ssm = x_ssm.permute([0, 2, 1]);
 
-        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size)
+        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size, false).0
+    }
+
+    pub fn forward_with_debug(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        _train: bool,
+    ) -> (ModelOutput, DebugMetrics) {
+        let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
+        let static_features = self.cast_inputs(&static_features.to_device(self.device));
+        let batch_size = price_deltas.size()[0];
+
+        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
+        let x_stem = self.patch_embed_all_with_static(&price_deltas, &per_ticker_static, batch_size);
+
+        let x_for_ssm = x_stem.permute([0, 2, 1]);
+        let x_ssm = self.ssm.forward(&x_for_ssm, false);
+        let x_ssm = x_ssm.permute([0, 2, 1]);
+
+        let (out, debug) = self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, batch_size, true);
+        (out, debug.unwrap_or(DebugMetrics {
+            time_attn_scale: 0.0,
+            time2_attn_scale: 0.0,
+            temporal_attn_scale: 0.0,
+            cls_feat_mean: 0.0,
+            cls_feat_std: 0.0,
+        }))
     }
 
     /// Batched forward for multiple timesteps (each sample independent, parallel SSM)
@@ -363,7 +396,7 @@ impl TradingModel {
         }
 
         // Head uses cached SSM output + current static features
-        self.head_with_temporal_pool(&state.ssm_cache, &global_static, &per_ticker_static, 1)
+        self.head_with_temporal_pool(&state.ssm_cache, &global_static, &per_ticker_static, 1, false).0
     }
 
     /// Initialize streaming from full observation
@@ -392,7 +425,7 @@ impl TradingModel {
         }
 
         state.initialized = true;
-        self.head_with_temporal_pool(&state.ssm_cache, &global_static, &per_ticker_static, 1)
+        self.head_with_temporal_pool(&state.ssm_cache, &global_static, &per_ticker_static, 1, false).0
     }
 
     /// Process new patch through SSM, update cache by shifting and appending
@@ -462,7 +495,14 @@ impl TradingModel {
         (x + pos_emb + static_ssm).permute([0, 2, 1])
     }
 
-    fn head_with_temporal_pool(&self, x_ssm: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64) -> ModelOutput {
+    fn head_with_temporal_pool(
+        &self,
+        x_ssm: &Tensor,
+        global_static: &Tensor,
+        per_ticker_static: &Tensor,
+        batch_size: i64,
+        debug: bool,
+    ) -> (ModelOutput, Option<DebugMetrics>) {
         let x = x_ssm.apply(&self.ssm_proj) + &self.pos_embedding;
         let temporal_len = x.size()[2];
 
@@ -603,7 +643,6 @@ impl TradingModel {
             .reshape([batch_size * TICKERS_COUNT, temporal_len + 1, 3, self.num_heads, self.head_dim])
             .permute([2, 0, 3, 1, 4]);
         let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
-        let temporal_attn_scale = self.temporal_attn_scale_raw.tanh();
         let temporal_attn_out = if self.use_sdpa(temporal_len + 1) {
             Tensor::scaled_dot_product_attention(&q, &k, &v, Option::<Tensor>::None, 0.0, false, None, false)
                 .permute([0, 2, 1, 3])
@@ -618,7 +657,7 @@ impl TradingModel {
                 .view([batch_size * TICKERS_COUNT, temporal_len + 1, 256])
                 .apply(&self.temporal_attn_out)
         };
-        let x_time = x_time + temporal_attn_out * &temporal_attn_scale;
+        let x_time = x_time + temporal_attn_out;
         let attn_cls = tch::no_grad(|| {
             (q.narrow(2, 0, 1).matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt())
                 .softmax(-1, q.kind())
@@ -633,7 +672,31 @@ impl TradingModel {
             .squeeze_dim(1)
             .reshape([batch_size, TICKERS_COUNT, 256]);
 
-        self.head_common(&conv_features, global_static, per_ticker_static, batch_size, attn_avg)
+        let debug_metrics = if debug {
+            let (cls_mean, cls_std) = tch::no_grad(|| {
+                let mean = conv_features.mean(Kind::Float);
+                let var = (&conv_features - &mean).pow_tensor_scalar(2).mean(Kind::Float);
+                let std = var.sqrt();
+                (
+                    f64::try_from(&mean).unwrap_or(0.0),
+                    f64::try_from(&std).unwrap_or(0.0),
+                )
+            });
+            Some(DebugMetrics {
+                time_attn_scale: f64::try_from(&time_attn_scale).unwrap_or(0.0),
+                time2_attn_scale: f64::try_from(&time2_attn_scale).unwrap_or(0.0),
+                temporal_attn_scale: 1.0,
+                cls_feat_mean: cls_mean,
+                cls_feat_std: cls_std,
+            })
+        } else {
+            None
+        };
+
+        (
+            self.head_common(&conv_features, global_static, per_ticker_static, batch_size, attn_avg),
+            debug_metrics,
+        )
     }
 
     fn head_common(&self, conv_features: &Tensor, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64, attn_out_vis: Tensor) -> ModelOutput {

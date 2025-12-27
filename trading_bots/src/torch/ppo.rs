@@ -108,6 +108,7 @@ const RPO_TARGET_KL: f64 = 0.018;
 const RPO_ALPHA_INIT: f64 = 0.1;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
+const DEBUG_TEMPORAL_REPORTS: bool = true;
 
 pub fn train(weights_path: Option<&str>) {
     let mut env = VecEnv::new(true);
@@ -719,6 +720,20 @@ pub fn train(weights_path: Option<&str>) {
         env.primary_mut()
             .meta_history
             .record_grad_norm(mean_grad_norm);
+        if DEBUG_TEMPORAL_REPORTS {
+            let ( _out, debug) = tch::no_grad(|| {
+                let price_deltas_step = s_price_deltas.get(0);
+                let static_obs = s_static_obs.get(0);
+                trading_model.forward_with_debug(&price_deltas_step, &static_obs, false)
+            });
+            env.primary_mut().meta_history.record_temporal_debug(
+                debug.time_attn_scale,
+                debug.time2_attn_scale,
+                debug.temporal_attn_scale,
+                debug.cls_feat_mean,
+                debug.cls_feat_std,
+            );
+        }
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged

@@ -141,6 +141,7 @@ impl App {
             "logit_scale",
             "grad_norm_log",
             "target_weights",
+            "temporal_attn_scales",
         ];
 
         // Ticker-specific chart base names
