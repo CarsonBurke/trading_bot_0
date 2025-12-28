@@ -21,6 +21,7 @@ pub struct MetaHistory {
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
     pub logit_scale: Vec<f64>,
+    pub sde_scale: Vec<f64>,
     pub time_alpha_attn_mean: Vec<f64>,
     pub time_alpha_mlp_mean: Vec<f64>,
     pub cross_alpha_attn_mean: Vec<f64>,
@@ -69,6 +70,10 @@ impl MetaHistory {
 
     pub fn record_logit_scale(&mut self, logit_scale: f64) {
         self.logit_scale.push(logit_scale);
+    }
+
+    pub fn record_sde_scale(&mut self, sde_scale: f64) {
+        self.sde_scale.push(sde_scale);
     }
 
     pub fn record_temporal_debug(
@@ -249,6 +254,19 @@ impl MetaHistory {
                 },
             };
             let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &report);
+        }
+        if !self.sde_scale.is_empty() {
+            let report = Report {
+                title: "SDE Scale".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Scale".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: f64_to_f32(&self.sde_scale),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/sde_scale.report.bin"), &report);
         }
         if !self.time_alpha_attn_mean.is_empty() {
             let report = Report {

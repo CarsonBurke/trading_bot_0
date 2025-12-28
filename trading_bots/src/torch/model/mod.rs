@@ -86,7 +86,9 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 
 const SSM_DIM: i64 = 64;
 const LOGIT_SCALE_INIT: f64 = 0.3;
-const LOG_STD_RAW_INIT: f64 = 0.5634739437863358;
+const LOG_STD_MIN: f64 = -5.0;
+const LOG_STD_MAX: f64 = -0.5108256237659907;
+const SDE_SCALE_INIT: f64 = 1.0;
 pub const LOGIT_SCALE_GROUP: usize = 1;
 const USE_SDPA: bool = true;
 const SDPA_MIN_LEN: i64 = 64;
@@ -177,14 +179,13 @@ pub struct TradingModel {
     ln_actor_fc2: RMSNorm,
     actor_out: nn::Linear,
     cash_out: nn::Linear,
-    log_std_out: nn::Linear,
-    cash_log_std_out: nn::Linear,
     pool_scorer: nn::Linear,
     value_ticker_out: nn::Linear,
     cash_value_out: nn::Linear,
     sde_fc: nn::Linear,
     cash_sde: nn::Linear,
-    ln_sde: RMSNorm,
+    log_std_param: Tensor,
+    sde_scale_raw: Tensor,
     logit_scale_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
@@ -226,6 +227,21 @@ impl TradingModel {
 
     pub fn logit_scale(&self) -> Tensor {
         self.logit_scale_raw.exp()
+    }
+
+    pub fn sde_scale(&self) -> Tensor {
+        self.sde_scale_raw.exp()
+    }
+
+    pub fn sde_std_matrix(&self) -> Tensor {
+        let log_std_raw = self.log_std_param.tanh();
+        let log_std_base = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
+        let positive = log_std_base.gt(0.0).to_kind(Kind::Float);
+        let one = Tensor::ones_like(&positive);
+        let log_std_pos = log_std_base.clamp_min(0.0);
+        let std = log_std_base.exp() * (&one - &positive)
+            + (log_std_pos.log1p() + 1.0) * &positive;
+        std
     }
 
     pub fn new(p: &nn::Path) -> Self {
@@ -373,26 +389,6 @@ impl TradingModel {
                 ..Default::default()
             },
         );
-        let log_std_out = nn::linear(
-            p / "log_std_out",
-            256,
-            1,
-            nn::LinearConfig {
-                ws_init: Init::Const(0.0),
-                bs_init: Some(Init::Const(LOG_STD_RAW_INIT)),
-                ..Default::default()
-            },
-        );
-        let cash_log_std_out = nn::linear(
-            p / "cash_log_std_out",
-            256,
-            1,
-            nn::LinearConfig {
-                ws_init: Init::Const(0.0),
-                bs_init: Some(Init::Const(LOG_STD_RAW_INIT)),
-                ..Default::default()
-            },
-        );
         let pool_scorer = nn::linear(
             p / "pool_scorer",
             256,
@@ -424,7 +420,8 @@ impl TradingModel {
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let cash_sde = nn::linear(p / "cash_sde", 256, SDE_LATENT_DIM, Default::default());
-        let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-5);
+        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, ACTION_COUNT], Init::Const(0.0));
+        let sde_scale_raw = p.var("sde_scale_raw", &[1], Init::Const(SDE_SCALE_INIT.ln()));
         let logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP).var(
             "logit_scale_raw",
             &[1],
@@ -466,14 +463,13 @@ impl TradingModel {
             ln_actor_fc2,
             actor_out,
             cash_out,
-            log_std_out,
-            cash_log_std_out,
             pool_scorer,
             value_ticker_out,
             cash_value_out,
             sde_fc,
             cash_sde,
-            ln_sde,
+            log_std_param,
+            sde_scale_raw,
             logit_scale_raw,
             device: p.device(),
             num_heads,

@@ -18,24 +18,26 @@ pub fn load_model<P: AsRef<Path>>(
 
 pub fn sample_actions_from_dist(
     action_logits: &Tensor,
-    action_log_std: &Tensor,
     sde_latent: &Tensor,
+    std_matrix: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
     let u = if deterministic || temperature == 0.0 {
         action_logits.shallow_clone()
     } else {
-        let action_std = action_log_std.exp() * temperature;
-        let latent_norm = sde_latent
-            .pow_tensor_scalar(2)
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-            .sqrt()
-            .clamp_min(1e-6);
-        let noise = Tensor::randn_like(sde_latent);
-        let noise_raw = (sde_latent * noise).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-        let noise_scaled = noise_raw * action_std / latent_norm;
-        action_logits + noise_scaled
+        let eps = Tensor::randn(
+            &[
+                sde_latent.size()[0],
+                std_matrix.size()[0],
+                std_matrix.size()[1],
+            ],
+            (Kind::Float, sde_latent.device()),
+        );
+        let noise_mat = eps * std_matrix.unsqueeze(0);
+        let noise_raw = (sde_latent * noise_mat.permute([0, 2, 1]))
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+        action_logits + noise_raw * temperature
     };
     u.softmax(-1, Kind::Float)
 }
@@ -80,16 +82,17 @@ pub fn run_inference<P: AsRef<Path>>(
 
             // First call: model.step detects full obs and initializes stream state
             // Subsequent calls: model.step processes single delta per ticker
-            let (action_logits, action_log_std, sde_latent) = tch::no_grad(|| {
+            let (action_logits, _action_log_std, sde_latent) = tch::no_grad(|| {
                 let (_, (action_logits, action_log_std, sde_latent), _) =
                     model.step(&current_price_deltas, &current_static_obs, &mut stream_state);
                 (action_logits, action_log_std, sde_latent)
             });
 
+            let std_matrix = model.sde_std_matrix();
             let actions = sample_actions_from_dist(
                 &action_logits,
-                &action_log_std,
                 &sde_latent,
+                &std_matrix,
                 deterministic,
                 temperature,
             );

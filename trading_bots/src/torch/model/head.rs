@@ -438,34 +438,35 @@ impl TradingModel {
         let logit_scale = self.logit_scale_raw.exp();
         let cash_logit = pool_summary.apply(&self.cash_out).squeeze_dim(-1);
         let action_logits = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(1)], 1) * &logit_scale;
-        const LOG_STD_MIN: f64 = -5.0;
-        const LOG_STD_MAX: f64 = -0.5108256237659907;
+        let log_std_base = {
+            let log_std_raw = self.log_std_param.tanh();
+            super::LOG_STD_MIN
+                + 0.5 * (super::LOG_STD_MAX - super::LOG_STD_MIN) * (log_std_raw + 1.0)
+        };
         let sde_latent = actor_feat
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.sde_fc);
-        let sde_latent =
-            self.ln_sde
-                .forward(&sde_latent)
-                .tanh()
-                .reshape([batch_size, TICKERS_COUNT, -1]);
+        let sde_scale = self.sde_scale().to_kind(sde_latent.kind());
+        let sde_latent = sde_latent
+            .tanh()
+            .g_mul(&sde_scale)
+            .reshape([batch_size, TICKERS_COUNT, -1]);
         let cash_sde = pool_summary
             .apply(&self.cash_sde);
-        let cash_sde =
-            self.ln_sde
-                .forward(&cash_sde)
-                .tanh()
-                .reshape([batch_size, 1, -1]);
+        let cash_sde = cash_sde
+            .tanh()
+            .g_mul(&sde_scale)
+            .reshape([batch_size, 1, -1]);
         let sde_latent = Tensor::cat(&[sde_latent, cash_sde], 1);
-        let log_std_ticker = enriched.apply(&self.log_std_out).squeeze_dim(-1);
-        let log_std_cash = pool_summary.apply(&self.cash_log_std_out).squeeze_dim(-1);
-        let log_std_raw = Tensor::cat(&[log_std_ticker, log_std_cash.unsqueeze(1)], 1).tanh();
-        let log_std_base = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
-        let positive = log_std_base.gt(0.0).to_kind(Kind::Float);
-        let one = Tensor::ones_like(&positive);
-        let log_std_pos = log_std_base.clamp_min(0.0);
-        let std = log_std_base.exp() * (&one - &positive)
-            + (log_std_pos.log1p() + 1.0) * &positive;
-        let action_log_std = std.log().clamp(LOG_STD_MIN, LOG_STD_MAX);
+        let std = self.sde_std_matrix();
+        let std_sq = std.pow_tensor_scalar(2).transpose(0, 1);
+        let variance =
+            (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
+                .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+        let action_log_std = (variance + 1e-6)
+            .sqrt()
+            .log()
+            .clamp(super::LOG_STD_MIN, super::LOG_STD_MAX);
 
         (
             values,
