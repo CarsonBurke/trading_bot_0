@@ -16,7 +16,8 @@ pub use shared::constants::GLOBAL_MACRO_OBS;
 use rmsnorm::RMSNorm;
 
 struct TimeCrossBlock {
-    time_attn_qkv: nn::Linear,
+    time_attn_q: nn::Linear,
+    time_attn_kv: nn::Linear,
     time_attn_out: nn::Linear,
     ln_time: RMSNorm,
     time_mlp_fc1: nn::Linear,
@@ -33,8 +34,14 @@ struct TimeCrossBlock {
 }
 
 impl TimeCrossBlock {
-    fn new(p: &nn::Path) -> Self {
-        let time_attn_qkv = nn::linear(p / "time_attn_qkv", 256, 256 * 3, Default::default());
+    fn new(p: &nn::Path, kv_heads: i64, head_dim: i64) -> Self {
+        let time_attn_q = nn::linear(p / "time_attn_q", 256, 256, Default::default());
+        let time_attn_kv = nn::linear(
+            p / "time_attn_kv",
+            256,
+            2 * kv_heads * head_dim,
+            Default::default(),
+        );
         let time_attn_out = nn::linear(p / "time_attn_out", 256, 256, Default::default());
         let ln_time = RMSNorm::new(&(p / "ln_time"), 256, 1e-5);
         let time_mlp_fc1 = nn::linear(p / "time_mlp_fc1", 256, 2 * FF_DIM, Default::default());
@@ -49,7 +56,8 @@ impl TimeCrossBlock {
         let alpha_cross_attn = p.var("alpha_cross_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         let alpha_cross_mlp = p.var("alpha_cross_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
-            time_attn_qkv,
+            time_attn_q,
+            time_attn_kv,
             time_attn_out,
             ln_time,
             time_mlp_fc1,
@@ -85,6 +93,7 @@ const TIME_CROSS_LAYERS: usize = 2;
 const FF_DIM: i64 = 512;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -2.0;
+const ROPE_BASE: f64 = 10000.0;
 
 // Uniform patch size for proper streaming support
 // 3400 deltas / 34 = 100 tokens
@@ -147,11 +156,11 @@ pub struct TradingModel {
     time_ticker_ctx: nn::Linear,
     cross_ticker_embed: nn::Linear,
     cls_token: Tensor,
-    temporal_pos_emb: Tensor,
     ln_temporal_q: RMSNorm,
     ln_temporal_kv: RMSNorm,
     temporal_q: nn::Linear,
     temporal_k: nn::Linear,
+    temporal_v: nn::Linear,
     temporal_last: nn::Linear,
     temporal_gate: nn::Linear,
     temporal_attn_out: nn::Linear,
@@ -175,6 +184,7 @@ pub struct TradingModel {
     logit_scale_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
+    kv_heads: i64,
     head_dim: i64,
 }
 
@@ -247,10 +257,16 @@ impl TradingModel {
         let ln_static_proj = RMSNorm::new(&(p / "ln_static_proj"), 256, 1e-5);
 
         let num_heads = 4i64;
+        let kv_heads = 2i64;
         let head_dim = 64i64;
+        assert!(num_heads % kv_heads == 0, "num_heads must be divisible by kv_heads");
         let mut time_cross_blocks = Vec::with_capacity(TIME_CROSS_LAYERS);
         for i in 0..TIME_CROSS_LAYERS {
-            time_cross_blocks.push(TimeCrossBlock::new(&(p / format!("time_cross_{}", i))));
+            time_cross_blocks.push(TimeCrossBlock::new(
+                &(p / format!("time_cross_{}", i)),
+                kv_heads,
+                head_dim,
+            ));
         }
         let time_pos_proj = nn::linear(p / "time_pos_proj", 4, 256, Default::default());
         let time_global_ctx = nn::linear(
@@ -279,18 +295,11 @@ impl TradingModel {
                 up: 0.01,
             },
         );
-        let temporal_pos_emb = p.var(
-            "temporal_pos_emb",
-            &[1, SEQ_LEN + 1, 256],
-            Init::Uniform {
-                lo: -0.01,
-                up: 0.01,
-            },
-        );
         let ln_temporal_q = RMSNorm::new(&(p / "ln_temporal_q"), 256, 1e-5);
         let ln_temporal_kv = RMSNorm::new(&(p / "ln_temporal_kv"), 256, 1e-5);
         let temporal_q = nn::linear(p / "temporal_q", 256, 256, Default::default());
-        let temporal_k = nn::linear(p / "temporal_k", 256, 256, Default::default());
+        let temporal_k = nn::linear(p / "temporal_k", 256, kv_heads * head_dim, Default::default());
+        let temporal_v = nn::linear(p / "temporal_v", 256, kv_heads * head_dim, Default::default());
         let temporal_last = nn::linear(p / "temporal_last", 256, 256, Default::default());
         let temporal_gate = nn::linear(p / "temporal_gate", 256, 256, Default::default());
         let temporal_attn_out = nn::linear(p / "temporal_attn_out", 256, 256, Default::default());
@@ -407,11 +416,11 @@ impl TradingModel {
             time_ticker_ctx,
             cross_ticker_embed,
             cls_token,
-            temporal_pos_emb,
             ln_temporal_q,
             ln_temporal_kv,
             temporal_q,
             temporal_k,
+            temporal_v,
             temporal_last,
             temporal_gate,
             temporal_attn_out,
@@ -435,8 +444,39 @@ impl TradingModel {
             logit_scale_raw,
             device: p.device(),
             num_heads,
+            kv_heads,
             head_dim,
         }
+    }
+
+    fn rope_cos_sin(&self, positions: &Tensor, kind: Kind, device: tch::Device) -> (Tensor, Tensor) {
+        let half = self.head_dim / 2;
+        let idx = Tensor::arange(half, (Kind::Float, device));
+        let inv_freq = (-(idx * 2.0 / self.head_dim as f64) * ROPE_BASE.ln()).exp();
+        let freqs = positions.to_kind(Kind::Float).unsqueeze(1) * inv_freq.unsqueeze(0);
+        let cos = freqs.cos().to_kind(kind);
+        let sin = freqs.sin().to_kind(kind);
+        (cos, sin)
+    }
+
+    fn apply_rope_single(&self, x: &Tensor, positions: &Tensor) -> Tensor {
+        let sizes = x.size();
+        let (b, h, s, d) = (sizes[0], sizes[1], sizes[2], sizes[3]);
+        let half = self.head_dim / 2;
+        let (cos, sin) = self.rope_cos_sin(positions, x.kind(), x.device());
+        let cos = cos.unsqueeze(0).unsqueeze(0);
+        let sin = sin.unsqueeze(0).unsqueeze(0);
+        let x = x.view([b, h, s, half, 2]);
+        let x_even = x.select(-1, 0);
+        let x_odd = x.select(-1, 1);
+        let rot = Tensor::stack(
+            &[
+                &x_even * &cos - &x_odd * &sin,
+                &x_even * &sin + &x_odd * &cos,
+            ],
+            -1,
+        );
+        rot.view([b, h, s, d])
     }
 
     fn parse_static(&self, static_features: &Tensor, batch_size: i64) -> (Tensor, Tensor) {

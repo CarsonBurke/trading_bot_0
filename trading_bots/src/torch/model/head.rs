@@ -63,11 +63,27 @@ impl TradingModel {
                 .ln_time
                 .forward(&x_seq.reshape([batch_size * TICKERS_COUNT * temporal_len, 256]))
                 .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
-            let qkv = x_time_norm
-                .apply(&block.time_attn_qkv)
-                .reshape([batch_size * TICKERS_COUNT, temporal_len, 3, self.num_heads, self.head_dim])
+            let q = x_time_norm
+                .apply(&block.time_attn_q)
+                .reshape([batch_size * TICKERS_COUNT, temporal_len, self.num_heads, self.head_dim])
+                .permute([0, 2, 1, 3]);
+            let kv = x_time_norm
+                .apply(&block.time_attn_kv)
+                .reshape([
+                    batch_size * TICKERS_COUNT,
+                    temporal_len,
+                    2,
+                    self.kv_heads,
+                    self.head_dim,
+                ])
                 .permute([2, 0, 3, 1, 4]);
-            let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
+            let (k, v) = (kv.get(0), kv.get(1));
+            let pos = Tensor::arange(temporal_len, (Kind::Float, x.device()));
+            let q = self.apply_rope_single(&q, &pos);
+            let k = self.apply_rope_single(&k, &pos);
+            let kv_repeat = self.num_heads / self.kv_heads;
+            let k = k.repeat(&[1, kv_repeat, 1, 1]);
+            let v = v.repeat(&[1, kv_repeat, 1, 1]);
             let time_attn_out = if self.use_sdpa(temporal_len) {
                 Tensor::scaled_dot_product_attention(
                     &q,
@@ -173,8 +189,6 @@ impl TradingModel {
             .expand(&[batch_size, TICKERS_COUNT, 256], false);
         let q_base =
             (cls_base + global_ctx + ticker_ctx).reshape([batch_size * TICKERS_COUNT, 256]);
-        let seq_pos = self.temporal_pos_emb.narrow(1, 1, temporal_len);
-        let x_time = x_time + seq_pos;
         let q_base_norm = self
             .ln_temporal_q
             .forward(&q_base)
@@ -198,18 +212,26 @@ impl TradingModel {
             .reshape([
                 batch_size * TICKERS_COUNT,
                 temporal_len,
-                self.num_heads,
+                self.kv_heads,
                 self.head_dim,
             ])
             .permute([0, 2, 1, 3]);
         let v_pool = x_time_norm
+            .apply(&self.temporal_v)
             .reshape([
                 batch_size * TICKERS_COUNT,
                 temporal_len,
-                self.num_heads,
+                self.kv_heads,
                 self.head_dim,
             ])
             .permute([0, 2, 1, 3]);
+        let pos = Tensor::arange(temporal_len, (Kind::Float, x.device()));
+        let q_pos = Tensor::from_slice(&[(temporal_len - 1) as f64]).to_device(x.device());
+        let q_pool = self.apply_rope_single(&q_pool, &q_pos);
+        let k_pool = self.apply_rope_single(&k_pool, &pos);
+        let kv_repeat = self.num_heads / self.kv_heads;
+        let k_pool = k_pool.repeat(&[1, kv_repeat, 1, 1]);
+        let v_pool = v_pool.repeat(&[1, kv_repeat, 1, 1]);
         let tau = self.temporal_tau_raw.exp().clamp(0.5, 4.0);
         let temporal_tau = if debug {
             f64::try_from(&tau).unwrap_or(0.0)
