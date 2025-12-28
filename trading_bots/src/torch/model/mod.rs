@@ -86,9 +86,11 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 
 const SSM_DIM: i64 = 64;
 const LOGIT_SCALE_INIT: f64 = 0.3;
+const LOG_STD_RAW_INIT: f64 = 0.5634739437863358;
 pub const LOGIT_SCALE_GROUP: usize = 1;
 const USE_SDPA: bool = true;
 const SDPA_MIN_LEN: i64 = 64;
+const SDPA_MIN_LEN_CROSS: i64 = 1;
 const TIME_CROSS_LAYERS: usize = 2;
 const FF_DIM: i64 = 512;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
@@ -105,8 +107,8 @@ const _: () = assert!(
     "PRICE_DELTAS must be divisible by PATCH_SIZE"
 );
 
-// (values, (ticker_mean, ticker_log_std, sde_latent, cash_logit), attn_weights)
-pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor, Tensor), Tensor);
+// (values, (action_logits, action_log_std, sde_latent), attn_weights)
+pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
 
 pub struct DebugMetrics {
     pub time_alpha_attn_mean: f64,
@@ -175,12 +177,14 @@ pub struct TradingModel {
     ln_actor_fc2: RMSNorm,
     actor_out: nn::Linear,
     cash_out: nn::Linear,
+    log_std_out: nn::Linear,
+    cash_log_std_out: nn::Linear,
     pool_scorer: nn::Linear,
     value_ticker_out: nn::Linear,
     cash_value_out: nn::Linear,
     sde_fc: nn::Linear,
+    cash_sde: nn::Linear,
     ln_sde: RMSNorm,
-    log_std_param: Tensor,
     logit_scale_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
@@ -194,6 +198,13 @@ impl TradingModel {
             return false;
         }
         seq_len >= SDPA_MIN_LEN
+    }
+
+    fn use_sdpa_cross(&self, seq_len: i64) -> bool {
+        if !USE_SDPA {
+            return false;
+        }
+        seq_len >= SDPA_MIN_LEN_CROSS
     }
 
     fn attn_softmax_fp32(&self, q: &Tensor, k: &Tensor) -> Tensor {
@@ -362,6 +373,26 @@ impl TradingModel {
                 ..Default::default()
             },
         );
+        let log_std_out = nn::linear(
+            p / "log_std_out",
+            256,
+            1,
+            nn::LinearConfig {
+                ws_init: Init::Const(0.0),
+                bs_init: Some(Init::Const(LOG_STD_RAW_INIT)),
+                ..Default::default()
+            },
+        );
+        let cash_log_std_out = nn::linear(
+            p / "cash_log_std_out",
+            256,
+            1,
+            nn::LinearConfig {
+                ws_init: Init::Const(0.0),
+                bs_init: Some(Init::Const(LOG_STD_RAW_INIT)),
+                ..Default::default()
+            },
+        );
         let pool_scorer = nn::linear(
             p / "pool_scorer",
             256,
@@ -392,8 +423,8 @@ impl TradingModel {
 
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
+        let cash_sde = nn::linear(p / "cash_sde", 256, SDE_LATENT_DIM, Default::default());
         let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-5);
-        let log_std_param = p.var("log_std", &[ACTION_COUNT - 1], Init::Const(0.0));
         let logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP).var(
             "logit_scale_raw",
             &[1],
@@ -435,12 +466,14 @@ impl TradingModel {
             ln_actor_fc2,
             actor_out,
             cash_out,
+            log_std_out,
+            cash_log_std_out,
             pool_scorer,
             value_ticker_out,
             cash_value_out,
             sde_fc,
+            cash_sde,
             ln_sde,
-            log_std_param,
             logit_scale_raw,
             device: p.device(),
             num_heads,
@@ -459,11 +492,10 @@ impl TradingModel {
         (cos, sin)
     }
 
-    fn apply_rope_single(&self, x: &Tensor, positions: &Tensor) -> Tensor {
+    fn apply_rope_cached(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
         let sizes = x.size();
         let (b, h, s, d) = (sizes[0], sizes[1], sizes[2], sizes[3]);
         let half = self.head_dim / 2;
-        let (cos, sin) = self.rope_cos_sin(positions, x.kind(), x.device());
         let cos = cos.unsqueeze(0).unsqueeze(0);
         let sin = sin.unsqueeze(0).unsqueeze(0);
         let x = x.view([b, h, s, half, 2]);
@@ -477,6 +509,11 @@ impl TradingModel {
             -1,
         );
         rot.view([b, h, s, d])
+    }
+
+    fn apply_rope_single(&self, x: &Tensor, positions: &Tensor) -> Tensor {
+        let (cos, sin) = self.rope_cos_sin(positions, x.kind(), x.device());
+        self.apply_rope_cached(x, &cos, &sin)
     }
 
     fn parse_static(&self, static_features: &Tensor, batch_size: i64) -> (Tensor, Tensor) {

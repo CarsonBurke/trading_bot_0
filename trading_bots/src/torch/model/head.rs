@@ -1,7 +1,7 @@
 use tch::{Kind, Tensor};
 
 use super::{DebugMetrics, ModelOutput, TradingModel, FF_DIM, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS};
-use crate::torch::constants::{PER_TICKER_STATIC_OBS, TICKERS_COUNT};
+use crate::torch::constants::{ACTION_COUNT, PER_TICKER_STATIC_OBS, TICKERS_COUNT};
 
 impl TradingModel {
     pub(super) fn head_with_temporal_pool(
@@ -40,6 +40,8 @@ impl TradingModel {
             .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
             .permute([0, 2, 1, 3])
             .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
+        let pos = Tensor::arange(temporal_len, (Kind::Float, x.device()));
+        let (rope_cos, rope_sin) = self.rope_cos_sin(&pos, x.kind(), x.device());
         let cross_ticker_embed_base = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
             .apply(&self.cross_ticker_embed)
@@ -78,12 +80,35 @@ impl TradingModel {
                 ])
                 .permute([2, 0, 3, 1, 4]);
             let (k, v) = (kv.get(0), kv.get(1));
-            let pos = Tensor::arange(temporal_len, (Kind::Float, x.device()));
-            let q = self.apply_rope_single(&q, &pos);
-            let k = self.apply_rope_single(&k, &pos);
+            let q = self.apply_rope_cached(&q, &rope_cos, &rope_sin);
+            let k = self.apply_rope_cached(&k, &rope_cos, &rope_sin);
             let kv_repeat = self.num_heads / self.kv_heads;
-            let k = k.repeat(&[1, kv_repeat, 1, 1]);
-            let v = v.repeat(&[1, kv_repeat, 1, 1]);
+            let k = k
+                .unsqueeze(2)
+                .expand(
+                    &[
+                        batch_size * TICKERS_COUNT,
+                        self.kv_heads,
+                        kv_repeat,
+                        temporal_len,
+                        self.head_dim,
+                    ],
+                    false,
+                )
+                .reshape([batch_size * TICKERS_COUNT, self.num_heads, temporal_len, self.head_dim]);
+            let v = v
+                .unsqueeze(2)
+                .expand(
+                    &[
+                        batch_size * TICKERS_COUNT,
+                        self.kv_heads,
+                        kv_repeat,
+                        temporal_len,
+                        self.head_dim,
+                    ],
+                    false,
+                )
+                .reshape([batch_size * TICKERS_COUNT, self.num_heads, temporal_len, self.head_dim]);
             let time_attn_out = if self.use_sdpa(temporal_len) {
                 Tensor::scaled_dot_product_attention(
                     &q,
@@ -138,7 +163,7 @@ impl TradingModel {
             let q = q.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
             let k = k.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
             let v = v.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-            let cross_attn_out = if self.use_sdpa(TICKERS_COUNT as i64) {
+            let cross_attn_out = if self.use_sdpa_cross(TICKERS_COUNT as i64) {
                 Tensor::scaled_dot_product_attention(
                     &q,
                     &k,
@@ -225,13 +250,37 @@ impl TradingModel {
                 self.head_dim,
             ])
             .permute([0, 2, 1, 3]);
-        let pos = Tensor::arange(temporal_len, (Kind::Float, x.device()));
-        let q_pos = Tensor::from_slice(&[(temporal_len - 1) as f64]).to_device(x.device());
-        let q_pool = self.apply_rope_single(&q_pool, &q_pos);
-        let k_pool = self.apply_rope_single(&k_pool, &pos);
+        let cos_last = rope_cos.narrow(0, temporal_len - 1, 1);
+        let sin_last = rope_sin.narrow(0, temporal_len - 1, 1);
+        let q_pool = self.apply_rope_cached(&q_pool, &cos_last, &sin_last);
+        let k_pool = self.apply_rope_cached(&k_pool, &rope_cos, &rope_sin);
         let kv_repeat = self.num_heads / self.kv_heads;
-        let k_pool = k_pool.repeat(&[1, kv_repeat, 1, 1]);
-        let v_pool = v_pool.repeat(&[1, kv_repeat, 1, 1]);
+        let k_pool = k_pool
+            .unsqueeze(2)
+            .expand(
+                &[
+                    batch_size * TICKERS_COUNT,
+                    self.kv_heads,
+                    kv_repeat,
+                    temporal_len,
+                    self.head_dim,
+                ],
+                false,
+            )
+            .reshape([batch_size * TICKERS_COUNT, self.num_heads, temporal_len, self.head_dim]);
+        let v_pool = v_pool
+            .unsqueeze(2)
+            .expand(
+                &[
+                    batch_size * TICKERS_COUNT,
+                    self.kv_heads,
+                    kv_repeat,
+                    temporal_len,
+                    self.head_dim,
+                ],
+                false,
+            )
+            .reshape([batch_size * TICKERS_COUNT, self.num_heads, temporal_len, self.head_dim]);
         let tau = self.temporal_tau_raw.exp().clamp(0.5, 4.0);
         let temporal_tau = if debug {
             f64::try_from(&tau).unwrap_or(0.0)
@@ -387,10 +436,10 @@ impl TradingModel {
 
         let ticker_logits = actor_feat.apply(&self.actor_out).squeeze_dim(-1);
         let logit_scale = self.logit_scale_raw.exp();
-        let action_mean = ticker_logits * &logit_scale;
-        let cash_logit = pool_summary.apply(&self.cash_out) * logit_scale;
+        let cash_logit = pool_summary.apply(&self.cash_out).squeeze_dim(-1);
+        let action_logits = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(1)], 1) * &logit_scale;
         const LOG_STD_MIN: f64 = -5.0;
-        const LOG_STD_MAX: f64 = 0.0;
+        const LOG_STD_MAX: f64 = -0.5108256237659907;
         let sde_latent = actor_feat
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.sde_fc);
@@ -399,21 +448,28 @@ impl TradingModel {
                 .forward(&sde_latent)
                 .tanh()
                 .reshape([batch_size, TICKERS_COUNT, -1]);
-        let latent_norm = sde_latent
-            .pow_tensor_scalar(2)
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-            .clamp_min(1e-6);
-        let log_std_raw = self.log_std_param.tanh();
+        let cash_sde = pool_summary
+            .apply(&self.cash_sde);
+        let cash_sde =
+            self.ln_sde
+                .forward(&cash_sde)
+                .tanh()
+                .reshape([batch_size, 1, -1]);
+        let sde_latent = Tensor::cat(&[sde_latent, cash_sde], 1);
+        let log_std_ticker = enriched.apply(&self.log_std_out).squeeze_dim(-1);
+        let log_std_cash = pool_summary.apply(&self.cash_log_std_out).squeeze_dim(-1);
+        let log_std_raw = Tensor::cat(&[log_std_ticker, log_std_cash.unsqueeze(1)], 1).tanh();
         let log_std_base = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
-        let log_std: Tensor = log_std_base
-            .unsqueeze(0)
-            .expand(&[batch_size, TICKERS_COUNT], false)
-            + 0.5 * latent_norm.log();
-        let action_log_std = log_std.clamp(LOG_STD_MIN, LOG_STD_MAX);
+        let positive = log_std_base.gt(0.0).to_kind(Kind::Float);
+        let one = Tensor::ones_like(&positive);
+        let log_std_pos = log_std_base.clamp_min(0.0);
+        let std = log_std_base.exp() * (&one - &positive)
+            + (log_std_pos.log1p() + 1.0) * &positive;
+        let action_log_std = std.log().clamp(LOG_STD_MIN, LOG_STD_MAX);
 
         (
             values,
-            (action_mean, action_log_std, sde_latent, cash_logit),
+            (action_logits, action_log_std, sde_latent),
             attn_out_vis,
         )
     }
