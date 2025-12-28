@@ -266,18 +266,11 @@ pub fn train(weights_path: Option<&str>) {
             // Logistic-normal with softmax simplex projection
             let action_log_std_clamped = action_log_std.clamp(-20.0, 5.0);
             let action_std = action_log_std_clamped.exp();
-            let latent_norm = sde_latent
-                .pow_tensor_scalar(2)
-                .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-                .sqrt()
-                .clamp_min(1e-6);
-
             if sde_noise.is_none() || (step % SDE_SAMPLE_FREQ == 0) {
-                sde_noise = Some(Tensor::randn_like(&sde_latent));
+                sde_noise = Some(Tensor::randn_like(&action_logits));
             }
             let noise = sde_noise.as_ref().unwrap();
-            let noise_raw = (&sde_latent * noise).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-            let noise_scaled = &noise_raw * &action_std / &latent_norm;
+            let noise_scaled = noise * &action_std;
             let action_logits_noisy = &action_logits + &noise_scaled;
             let u = action_logits_noisy.shallow_clone();
             let actions = u.softmax(-1, Kind::Float);
