@@ -333,6 +333,7 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, 1]);
         let pool_weights = pool_logits.softmax(1, Kind::Float);
         let pool_summary = (&enriched * &pool_weights).sum_dim_intlist(1, false, Kind::Float);
+        let pool_summary = pool_summary.to_kind(enriched.kind());
 
         let actor_hidden = enriched
             .reshape([batch_size * TICKERS_COUNT, 256])
@@ -353,14 +354,19 @@ impl TradingModel {
                 .forward(&actor_feat)
                 .silu()
                 .reshape([batch_size, TICKERS_COUNT, 256]);
-        let values = enriched
+        let values_ticker = enriched
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.value_ticker_out)
             .reshape([batch_size, TICKERS_COUNT]);
+        let value_cash = pool_summary
+            .apply(&self.cash_value_out)
+            .reshape([batch_size, 1]);
+        let values = Tensor::cat(&[values_ticker, value_cash], 1);
 
         let ticker_logits = actor_feat.apply(&self.actor_out).squeeze_dim(-1);
         let logit_scale = self.logit_scale_raw.exp();
-        let action_mean = ticker_logits * logit_scale;
+        let action_mean = ticker_logits * &logit_scale;
+        let cash_logit = pool_summary.apply(&self.cash_out) * logit_scale;
         const LOG_STD_MIN: f64 = -5.0;
         const LOG_STD_MAX: f64 = 0.0;
         let sde_latent = actor_feat
@@ -385,7 +391,7 @@ impl TradingModel {
 
         (
             values,
-            (action_mean, action_log_std, sde_latent),
+            (action_mean, action_log_std, sde_latent, cash_logit),
             attn_out_vis,
         )
     }

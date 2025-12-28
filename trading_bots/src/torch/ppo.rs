@@ -98,7 +98,7 @@ const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
                                 // Conservative KL early stopping (SB3-style)
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
-const LEARNING_RATE: f64 = 3e-4;
+const LEARNING_RATE: f64 = 2e-4;
 const LOGIT_SCALE_LR_MULT: f64 = 10.0;
 
 // RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
@@ -107,6 +107,7 @@ const RPO_ALPHA_MAX: f64 = 0.5;
 const RPO_TARGET_KL: f64 = 0.018;
 const RPO_ALPHA_INIT: f64 = 0.1;
 const ALPHA_LOSS_COEF: f64 = 0.1;
+const ADV_MIXED_WEIGHT: f64 = 0.5;
 const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
 const DEBUG_TEMPORAL_REPORTS: bool = true;
 
@@ -162,6 +163,7 @@ pub fn train(weights_path: Option<&str>) {
     let mut s_actions_buf: Option<Tensor> = None;
     let mut s_masks_buf: Option<Tensor> = None;
     let mut s_log_probs_buf: Option<Tensor> = None;
+    let mut s_cash_logit_buf: Option<Tensor> = None;
 
     // RPO alpha: sigmoid parameterization for smooth gradients
     // rho -> alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
@@ -222,12 +224,12 @@ pub fn train(weights_path: Option<&str>) {
 
         let s_values = get_buf(
             &mut s_values_buf,
-            &[rollout_steps, NPROCS, TICKERS_COUNT],
+            &[rollout_steps, NPROCS, TICKERS_COUNT + 1],
             stats_kind,
         );
         let mut s_rewards = get_buf(
             &mut s_rewards_buf,
-            &[rollout_steps, NPROCS, TICKERS_COUNT],
+            &[rollout_steps, NPROCS, TICKERS_COUNT + 1],
             stats_kind,
         );
         let s_actions = get_buf(
@@ -237,6 +239,7 @@ pub fn train(weights_path: Option<&str>) {
         );
         let s_masks = get_buf(&mut s_masks_buf, &[rollout_steps, NPROCS], stats_kind);
         let s_log_probs = get_buf(&mut s_log_probs_buf, &[rollout_steps, NPROCS], stats_kind);
+        let s_cash_logit = get_buf(&mut s_cash_logit_buf, &[rollout_steps, NPROCS], stats_kind);
 
         let _ = total_rewards_gpu.zero_();
         let _ = total_episodes_gpu.zero_();
@@ -249,7 +252,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step() {
             env.set_step(step);
 
-            let (values, (action_mean, action_log_std, sde_latent), attn_weights) =
+            let (values, (action_mean, action_log_std, sde_latent, cash_logit), attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
@@ -259,6 +262,7 @@ pub fn train(weights_path: Option<&str>) {
             let action_mean = action_mean.to_kind(Kind::Float);
             let action_log_std = action_log_std.to_kind(Kind::Float);
             let sde_latent = sde_latent.to_kind(Kind::Float);
+            let cash_logit = cash_logit.to_kind(Kind::Float);
             last_attn_weights = Some(attn_weights.shallow_clone());
 
             // Logistic-normal with softmax simplex projection
@@ -278,9 +282,9 @@ pub fn train(weights_path: Option<&str>) {
             let noise_scaled = &noise_raw * &action_std / &latent_norm;
             let action_mean_noisy = &action_mean + &noise_scaled;
             let u = action_mean_noisy.shallow_clone(); // [batch, K-1]
-            let cash_logit = trading_model.cash_logit().to_kind(Kind::Float);
-            let cash_logit = cash_logit.expand(&[u.size()[0], 1], false);
-            let logits_with_cash = Tensor::cat(&[u.shallow_clone(), cash_logit], 1);
+            let cash_logit_expanded = cash_logit.expand(&[u.size()[0], 1], false);
+            let logits_with_cash =
+                Tensor::cat(&[u.shallow_clone(), cash_logit_expanded.shallow_clone()], 1);
             let actions = logits_with_cash.softmax(-1, Kind::Float);
 
             // Log-prob with softmax Jacobian
@@ -302,7 +306,7 @@ pub fn train(weights_path: Option<&str>) {
             s_price_deltas.get(s + 1).copy_(&rolling_buffer.get_flat());
 
             let reward = reward.to_device(device).to_kind(Kind::Float);
-            let reward_per_ticker = reward_per_ticker.to_kind(Kind::Float);
+            let reward_per_ticker = reward_per_ticker.to_device(device).to_kind(Kind::Float);
             let is_done = is_done.to_device(device);
 
             sum_rewards += &reward;
@@ -317,7 +321,14 @@ pub fn train(weights_path: Option<&str>) {
             s_actions.get(s).copy_(&u); // Store pre-softmax u for training
             s_values.get(s).copy_(&values);
             s_log_probs.get(s).copy_(&action_log_prob);
-            s_rewards.get(s).copy_(&reward_per_ticker);
+            let rewards_full = Tensor::zeros([NPROCS, TICKERS_COUNT + 1], stats_kind);
+            rewards_full
+                .narrow(1, 0, TICKERS_COUNT)
+                .copy_(&reward_per_ticker);
+            s_rewards.get(s).copy_(&rewards_full);
+            s_cash_logit
+                .get(s)
+                .copy_(&cash_logit.squeeze_dim(-1));
             s_masks.get(s).copy_(&masks);
 
             s += 1; // Increment storage index
@@ -352,11 +363,11 @@ pub fn train(weights_path: Option<&str>) {
 
         let (advantages, returns) = {
             let gae = Tensor::zeros(
-                [rollout_steps + 1, NPROCS, TICKERS_COUNT],
+                [rollout_steps + 1, NPROCS, TICKERS_COUNT + 1],
                 (Kind::Float, device),
             );
             let returns = Tensor::zeros(
-                [rollout_steps + 1, NPROCS, TICKERS_COUNT],
+                [rollout_steps + 1, NPROCS, TICKERS_COUNT + 1],
                 (Kind::Float, device),
             );
 
@@ -394,15 +405,16 @@ pub fn train(weights_path: Option<&str>) {
 
             (
                 gae.narrow(0, 0, rollout_steps)
-                    .view([memory_size, TICKERS_COUNT]),
+                    .view([memory_size, TICKERS_COUNT + 1]),
                 returns
                     .narrow(0, 0, rollout_steps)
-                    .view([memory_size, TICKERS_COUNT]),
+                    .view([memory_size, TICKERS_COUNT + 1]),
             )
         };
         let actions = s_actions.view([memory_size, ACTION_COUNT - 1]).detach();
         let old_log_probs = s_log_probs.view([memory_size]).detach();
-        let s_values_flat = s_values.view([memory_size, TICKERS_COUNT]).detach();
+        let s_values_flat = s_values.view([memory_size, TICKERS_COUNT + 1]).detach();
+        let s_cash_logit_flat = s_cash_logit.view([memory_size]).detach();
 
         // Record advantage stats before normalization
         let adv_stats = Tensor::stack(
@@ -479,13 +491,14 @@ pub fn train(weights_path: Option<&str>) {
                 let static_obs_chunk =
                     static_obs_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
-                let (values, (action_means, action_log_stds, _), _) = trading_model
+                let (values, (action_means, action_log_stds, _, cash_logit), _) = trading_model
                     .forward(&price_deltas_chunk, &static_obs_chunk, true);
                 let values = values
                     .to_kind(Kind::Float)
-                    .view([chunk_sample_count, TICKERS_COUNT]);
+                    .view([chunk_sample_count, TICKERS_COUNT + 1]);
                 let action_means = action_means.to_kind(Kind::Float);
                 let action_log_stds = action_log_stds.to_kind(Kind::Float);
+                let cash_logit = cash_logit.to_kind(Kind::Float);
 
                 let actions_mb = actions.narrow(0, chunk_sample_start, chunk_sample_count);
                 let returns_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
@@ -511,7 +524,6 @@ pub fn train(weights_path: Option<&str>) {
                 let u_squared = u_normalized.pow_tensor_scalar(2);
                 let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-                let cash_logit = trading_model.cash_logit().to_kind(Kind::Float);
                 let cash_logit = cash_logit.expand(&[chunk_sample_count, 1], false);
                 let logits_with_cash = Tensor::cat(&[u.shallow_clone(), cash_logit], 1);
                 let log_weights = logits_with_cash.log_softmax(-1, Kind::Float);
@@ -542,8 +554,16 @@ pub fn train(weights_path: Option<&str>) {
                 // PPO clipped objective (joint, weighted advantage)
                 let ratio = (&action_log_probs - &old_log_probs_mb).exp();
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
+                let cash_logit_mb = s_cash_logit_flat
+                    .narrow(0, chunk_sample_start, chunk_sample_count)
+                    .unsqueeze(1);
+                let logits_with_cash_old = Tensor::cat(&[u.shallow_clone(), cash_logit_mb], 1);
+                let action_weights = logits_with_cash_old.softmax(-1, Kind::Float).detach();
+                let adv_mean = advantages_mb.mean_dim([-1].as_slice(), false, Kind::Float);
+                let adv_weighted =
+                    (&advantages_mb * &action_weights).sum_dim_intlist(-1, false, Kind::Float);
                 let advantages_reduced =
-                    advantages_mb.mean_dim([-1].as_slice(), false, Kind::Float);
+                    adv_mean + adv_weighted * ADV_MIXED_WEIGHT;
                 let unclipped_obj = &ratio * &advantages_reduced;
                 let clipped_obj = ratio_clipped * &advantages_reduced;
                 let action_loss =
@@ -561,8 +581,10 @@ pub fn train(weights_path: Option<&str>) {
                 total_ratio_samples += chunk_sample_count;
 
                 // KL and loss for metrics (extract before backward frees graph)
-                let approx_kl_val =
-                    tch::no_grad(|| (&old_log_probs_mb - &action_log_probs).mean(Kind::Float));
+                let approx_kl_val = tch::no_grad(|| {
+                    let delta = &action_log_probs - &old_log_probs_mb;
+                    (delta.exp() - 1.0 - delta).mean(Kind::Float)
+                });
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
                     + action_loss.shallow_clone()
                     - dist_entropy * ENTROPY_COEF;
@@ -658,7 +680,7 @@ pub fn train(weights_path: Option<&str>) {
         let stats_tensor = tch::no_grad(|| {
             let price_deltas_step = s_price_deltas.get(0);
             let static_obs = s_static_obs.get(0);
-            let (_, (_, action_log_std, _), _) =
+            let (_, (_, action_log_std, _, _), _) =
                 trading_model.forward(&price_deltas_step, &static_obs, false);
             let std = action_log_std.exp();
             let rpo_alpha =
@@ -739,7 +761,7 @@ pub fn train(weights_path: Option<&str>) {
 
         if episode > 0 && episode % 25 == 0 {
             // Debug: Check if exploration has collapsed or network diverged
-            let (_, (debug_mean, debug_log_std, _), _attn_weights) =
+            let (_, (debug_mean, debug_log_std, _, _), _attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(0);
                     let static_obs = s_static_obs.get(0);

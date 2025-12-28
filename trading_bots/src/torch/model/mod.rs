@@ -96,8 +96,8 @@ const _: () = assert!(
     "PRICE_DELTAS must be divisible by PATCH_SIZE"
 );
 
-// (values, (ticker_mean, ticker_log_std, sde_latent), attn_weights)
-pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
+// (values, (ticker_mean, ticker_log_std, sde_latent, cash_logit), attn_weights)
+pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor, Tensor), Tensor);
 
 pub struct DebugMetrics {
     pub time_alpha_attn_mean: f64,
@@ -165,13 +165,14 @@ pub struct TradingModel {
     actor_fc2: nn::Linear,
     ln_actor_fc2: RMSNorm,
     actor_out: nn::Linear,
+    cash_out: nn::Linear,
     pool_scorer: nn::Linear,
     value_ticker_out: nn::Linear,
+    cash_value_out: nn::Linear,
     sde_fc: nn::Linear,
     ln_sde: RMSNorm,
     log_std_param: Tensor,
     logit_scale_raw: Tensor,
-    cash_logit_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
     head_dim: i64,
@@ -204,10 +205,6 @@ impl TradingModel {
 
     pub fn logit_scale(&self) -> Tensor {
         self.logit_scale_raw.exp()
-    }
-
-    pub fn cash_logit(&self) -> Tensor {
-        &self.cash_logit_raw * self.logit_scale_raw.exp()
     }
 
     pub fn new(p: &nn::Path) -> Self {
@@ -347,6 +344,15 @@ impl TradingModel {
                 ..Default::default()
             },
         );
+        let cash_out = nn::linear(
+            p / "cash_out",
+            256,
+            1,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(256, 1),
+                ..Default::default()
+            },
+        );
         let pool_scorer = nn::linear(
             p / "pool_scorer",
             256,
@@ -365,6 +371,15 @@ impl TradingModel {
                 ..Default::default()
             },
         );
+        let cash_value_out = nn::linear(
+            p / "cash_value_out",
+            256,
+            1,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(256, 1),
+                ..Default::default()
+            },
+        );
 
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
@@ -375,7 +390,6 @@ impl TradingModel {
             &[1],
             Init::Const(LOGIT_SCALE_INIT.ln()),
         );
-        let cash_logit_raw = p.var("cash_logit_raw", &[1], Init::Const(0.0));
         Self {
             patch_embed,
             patch_ln,
@@ -411,13 +425,14 @@ impl TradingModel {
             actor_fc2,
             ln_actor_fc2,
             actor_out,
+            cash_out,
             pool_scorer,
             value_ticker_out,
+            cash_value_out,
             sde_fc,
             ln_sde,
             log_std_param,
             logit_scale_raw,
-            cash_logit_raw,
             device: p.device(),
             num_heads,
             head_dim,

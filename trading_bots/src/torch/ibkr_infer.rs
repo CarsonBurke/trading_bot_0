@@ -370,9 +370,8 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
             };
 
             let (action_mean, action_log_std, sde_latent, cash_logit) = tch::no_grad(|| {
-                let (_, (action_mean, action_log_std, sde_latent), _) =
+                let (_, (action_mean, action_log_std, sde_latent, cash_logit), _) =
                     model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state);
-                let cash_logit = model.cash_logit();
                 (action_mean, action_log_std, sde_latent, cash_logit)
             });
 
