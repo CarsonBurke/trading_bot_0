@@ -36,10 +36,6 @@ impl TradingModel {
             .unsqueeze(1)
             .unsqueeze(1);
         let x_time = x_time + global_ctx + ticker_ctx + time_pos;
-        let mut x_seq = x_time
-            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
-            .permute([0, 2, 1, 3])
-            .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
         let pos = Tensor::arange(temporal_len, (Kind::Float, x.device()));
         let (rope_cos, rope_sin) = self.rope_cos_sin(&pos, x.kind(), x.device());
         let cross_ticker_embed_base = per_ticker_static
@@ -51,156 +47,141 @@ impl TradingModel {
             .expand(&[batch_size, temporal_len, TICKERS_COUNT, 256], false);
         let mut time_alpha_attn_sum = 0.0;
         let mut time_alpha_mlp_sum = 0.0;
-        let mut cross_alpha_attn_sum = 0.0;
-        let mut cross_alpha_mlp_sum = 0.0;
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
-        for block in &self.time_cross_blocks {
-            let alpha_time_attn = block.alpha_time_attn.sigmoid() * alpha_scale;
-            let alpha_time_mlp = block.alpha_time_mlp.sigmoid() * alpha_scale;
-            if debug {
-                time_alpha_attn_sum += f64::try_from(&alpha_time_attn).unwrap_or(0.0);
-                time_alpha_mlp_sum += f64::try_from(&alpha_time_mlp).unwrap_or(0.0);
-            }
-            let x_time_norm = block
-                .ln_time
-                .forward(&x_seq.reshape([batch_size * TICKERS_COUNT * temporal_len, 256]))
-                .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
-            let q = x_time_norm
-                .apply(&block.time_attn_q)
-                .reshape([batch_size * TICKERS_COUNT, temporal_len, self.num_heads, self.head_dim])
-                .permute([0, 2, 1, 3]);
-            let kv = x_time_norm
-                .apply(&block.time_attn_kv)
-                .reshape([
-                    batch_size * TICKERS_COUNT,
-                    temporal_len,
-                    2,
-                    self.kv_heads,
-                    self.head_dim,
-                ])
-                .permute([2, 0, 3, 1, 4]);
-            let (k, v) = (kv.get(0), kv.get(1));
-            let q = self.apply_rope_cached(&q, &rope_cos, &rope_sin);
-            let k = self.apply_rope_cached(&k, &rope_cos, &rope_sin);
+        let block = &self.time_cross_block;
+        let alpha_attn = block.alpha_attn.sigmoid() * alpha_scale;
+        let alpha_mlp = block.alpha_mlp.sigmoid() * alpha_scale;
+        if debug {
+            time_alpha_attn_sum += f64::try_from(&alpha_attn).unwrap_or(0.0);
+            time_alpha_mlp_sum += f64::try_from(&alpha_mlp).unwrap_or(0.0);
+        }
+        let mut x_2d = x_time + &cross_ticker_embed;
+        let x_norm = block
+            .ln
+            .forward(&x_2d.reshape([batch_size * temporal_len * TICKERS_COUNT, 256]))
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256]);
+        let q = x_norm
+            .apply(&block.attn_q)
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, self.num_heads, self.head_dim]);
+        let kv = x_norm
+            .apply(&block.attn_kv)
+            .reshape([
+                batch_size,
+                temporal_len,
+                TICKERS_COUNT,
+                2,
+                self.kv_heads,
+                self.head_dim,
+            ])
+            .permute([3, 0, 1, 2, 4, 5]);
+        let (k, v) = (kv.get(0), kv.get(1));
+        let q = q
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, self.num_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+        let k = k
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, self.kv_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+        let q = self.apply_rope_cached(&q, &rope_cos, &rope_sin);
+        let k = self.apply_rope_cached(&k, &rope_cos, &rope_sin);
+        let q = q
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size, TICKERS_COUNT, temporal_len, self.num_heads, self.head_dim])
+            .permute([0, 3, 1, 2, 4])
+            .reshape([
+                batch_size,
+                self.num_heads,
+                TICKERS_COUNT * temporal_len,
+                self.head_dim,
+            ]);
+        let k = k
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size, TICKERS_COUNT, temporal_len, self.kv_heads, self.head_dim])
+            .permute([0, 3, 1, 2, 4])
+            .reshape([
+                batch_size,
+                self.kv_heads,
+                TICKERS_COUNT * temporal_len,
+                self.head_dim,
+            ]);
+        let v = v
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, self.kv_heads, self.head_dim])
+            .permute([0, 3, 2, 1, 4])
+            .reshape([
+                batch_size,
+                self.kv_heads,
+                TICKERS_COUNT * temporal_len,
+                self.head_dim,
+            ]);
+        let total_len = TICKERS_COUNT as i64 * temporal_len;
+        let attn_out = if self.use_sdpa(total_len) {
+            Tensor::scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                Option::<Tensor>::None,
+                0.0,
+                false,
+                None,
+                true,
+            )
+        } else {
             let kv_repeat = self.num_heads / self.kv_heads;
             let k = k
                 .unsqueeze(2)
                 .expand(
                     &[
-                        batch_size * TICKERS_COUNT,
+                        batch_size,
                         self.kv_heads,
                         kv_repeat,
-                        temporal_len,
+                        TICKERS_COUNT * temporal_len,
                         self.head_dim,
                     ],
                     false,
                 )
-                .reshape([batch_size * TICKERS_COUNT, self.num_heads, temporal_len, self.head_dim]);
+                .reshape([
+                    batch_size,
+                    self.num_heads,
+                    TICKERS_COUNT * temporal_len,
+                    self.head_dim,
+                ]);
             let v = v
                 .unsqueeze(2)
                 .expand(
                     &[
-                        batch_size * TICKERS_COUNT,
+                        batch_size,
                         self.kv_heads,
                         kv_repeat,
-                        temporal_len,
+                        TICKERS_COUNT * temporal_len,
                         self.head_dim,
                     ],
                     false,
                 )
-                .reshape([batch_size * TICKERS_COUNT, self.num_heads, temporal_len, self.head_dim]);
-            let time_attn_out = if self.use_sdpa(temporal_len) {
-                Tensor::scaled_dot_product_attention(
-                    &q,
-                    &k,
-                    &v,
-                    Option::<Tensor>::None,
-                    0.0,
-                    false,
-                    None,
-                    false,
-                )
-                .permute([0, 2, 1, 3])
-                .contiguous()
-                .view([batch_size * TICKERS_COUNT, temporal_len, 256])
-                .apply(&block.time_attn_out)
-            } else {
-                let attn = self.attn_softmax_fp32(&q, &k);
-                attn.matmul(&v)
-                    .permute([0, 2, 1, 3])
-                    .contiguous()
-                    .view([batch_size * TICKERS_COUNT, temporal_len, 256])
-                    .apply(&block.time_attn_out)
-            };
-            let time_mlp_in =
-                x_time_norm.reshape([batch_size * TICKERS_COUNT * temporal_len, 256]);
-            let time_mlp_proj = time_mlp_in.apply(&block.time_mlp_fc1);
-            let time_mlp_parts = time_mlp_proj.split(FF_DIM, -1);
-            let time_mlp = (time_mlp_parts[0].silu() * &time_mlp_parts[1])
-                .apply(&block.time_mlp_fc2)
-                .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
-            x_seq = x_seq + &time_attn_out * &alpha_time_attn + &time_mlp * &alpha_time_mlp;
-
-            let alpha_cross_attn = block.alpha_cross_attn.sigmoid() * alpha_scale;
-            let alpha_cross_mlp = block.alpha_cross_mlp.sigmoid() * alpha_scale;
-            if debug {
-                cross_alpha_attn_sum += f64::try_from(&alpha_cross_attn).unwrap_or(0.0);
-                cross_alpha_mlp_sum += f64::try_from(&alpha_cross_mlp).unwrap_or(0.0);
-            }
-            let x_cross = x_seq
-                .reshape([batch_size, TICKERS_COUNT, temporal_len, 256])
-                .permute([0, 2, 1, 3]);
-            let x_cross_norm = block
-                .ln_cross
-                .forward(&x_cross.reshape([batch_size * temporal_len * TICKERS_COUNT, 256]))
-                .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
-                + &cross_ticker_embed;
-            let qkv = x_cross_norm
-                .apply(&block.cross_attn_qkv)
-                .reshape([batch_size, temporal_len, TICKERS_COUNT, 3, self.num_heads, self.head_dim])
-                .permute([3, 0, 1, 4, 2, 5]);
-            let (q, k, v) = (qkv.get(0), qkv.get(1), qkv.get(2));
-            let q = q.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-            let k = k.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-            let v = v.reshape([batch_size * temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim]);
-            let cross_attn_out = if self.use_sdpa_cross(TICKERS_COUNT as i64) {
-                Tensor::scaled_dot_product_attention(
-                    &q,
-                    &k,
-                    &v,
-                    Option::<Tensor>::None,
-                    0.0,
-                    false,
-                    None,
-                    false,
-                )
-                .reshape([batch_size, temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim])
-                .permute([0, 1, 3, 2, 4])
-                .contiguous()
-                .view([batch_size, temporal_len, TICKERS_COUNT, 256])
-                .apply(&block.cross_attn_out)
-            } else {
-                let attn = self.attn_softmax_fp32(&q, &k);
-                attn.matmul(&v)
-                    .reshape([batch_size, temporal_len, self.num_heads, TICKERS_COUNT, self.head_dim])
-                    .permute([0, 1, 3, 2, 4])
-                    .contiguous()
-                    .view([batch_size, temporal_len, TICKERS_COUNT, 256])
-                    .apply(&block.cross_attn_out)
-            };
-            let cross_mlp_in =
-                x_cross_norm.reshape([batch_size * temporal_len * TICKERS_COUNT, 256]);
-            let cross_mlp_proj = cross_mlp_in.apply(&block.cross_mlp_fc1);
-            let cross_mlp_parts = cross_mlp_proj.split(FF_DIM, -1);
-            let cross_mlp = (cross_mlp_parts[0].silu() * &cross_mlp_parts[1])
-                .apply(&block.cross_mlp_fc2)
-                .reshape([batch_size, temporal_len, TICKERS_COUNT, 256]);
-            let x_cross = x_cross + &cross_attn_out * &alpha_cross_attn + &cross_mlp * &alpha_cross_mlp;
-            x_seq = x_cross
-                .permute([0, 2, 1, 3])
-                .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
-        }
-        let x_time = x_seq;
+                .reshape([
+                    batch_size,
+                    self.num_heads,
+                    TICKERS_COUNT * temporal_len,
+                    self.head_dim,
+                ]);
+            let attn = self.attn_softmax_fp32(&q, &k);
+            attn.matmul(&v)
+        };
+        let attn_out = attn_out
+            .permute([0, 2, 1, 3])
+            .contiguous()
+            .view([batch_size, total_len, 256])
+            .apply(&block.attn_out)
+            .reshape([batch_size, TICKERS_COUNT, temporal_len, 256])
+            .permute([0, 2, 1, 3]);
+        let mlp_in = x_norm.reshape([batch_size * temporal_len * TICKERS_COUNT, 256]);
+        let mlp_proj = mlp_in.apply(&block.mlp_fc1);
+        let mlp_parts = mlp_proj.split(FF_DIM, -1);
+        let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
+            .apply(&block.mlp_fc2)
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256]);
+        x_2d = x_2d + &attn_out * &alpha_attn + &mlp * &alpha_mlp;
+        let x_time = x_2d
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
         let global_ctx = global_static
             .apply(&self.cls_global_ctx)
             .unsqueeze(1)
@@ -346,8 +327,8 @@ impl TradingModel {
             Some(DebugMetrics {
                 time_alpha_attn_mean: time_alpha_attn_sum / TIME_CROSS_LAYERS as f64,
                 time_alpha_mlp_mean: time_alpha_mlp_sum / TIME_CROSS_LAYERS as f64,
-                cross_alpha_attn_mean: cross_alpha_attn_sum / TIME_CROSS_LAYERS as f64,
-                cross_alpha_mlp_mean: cross_alpha_mlp_sum / TIME_CROSS_LAYERS as f64,
+                cross_alpha_attn_mean: 0.0,
+                cross_alpha_mlp_mean: 0.0,
                 temporal_tau,
                 temporal_attn_entropy,
                 cross_ticker_embed_norm,

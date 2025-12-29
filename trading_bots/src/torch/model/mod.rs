@@ -15,62 +15,41 @@ pub use shared::constants::GLOBAL_MACRO_OBS;
 
 use rmsnorm::RMSNorm;
 
-struct TimeCrossBlock {
-    time_attn_q: nn::Linear,
-    time_attn_kv: nn::Linear,
-    time_attn_out: nn::Linear,
-    ln_time: RMSNorm,
-    time_mlp_fc1: nn::Linear,
-    time_mlp_fc2: nn::Linear,
-    alpha_time_attn: Tensor,
-    alpha_time_mlp: Tensor,
-    cross_attn_qkv: nn::Linear,
-    cross_attn_out: nn::Linear,
-    ln_cross: RMSNorm,
-    cross_mlp_fc1: nn::Linear,
-    cross_mlp_fc2: nn::Linear,
-    alpha_cross_attn: Tensor,
-    alpha_cross_mlp: Tensor,
+struct TimeCrossBlock2d {
+    attn_q: nn::Linear,
+    attn_kv: nn::Linear,
+    attn_out: nn::Linear,
+    ln: RMSNorm,
+    mlp_fc1: nn::Linear,
+    mlp_fc2: nn::Linear,
+    alpha_attn: Tensor,
+    alpha_mlp: Tensor,
 }
 
-impl TimeCrossBlock {
+impl TimeCrossBlock2d {
     fn new(p: &nn::Path, kv_heads: i64, head_dim: i64) -> Self {
-        let time_attn_q = nn::linear(p / "time_attn_q", 256, 256, Default::default());
-        let time_attn_kv = nn::linear(
-            p / "time_attn_kv",
+        let attn_q = nn::linear(p / "attn_q", 256, 256, Default::default());
+        let attn_kv = nn::linear(
+            p / "attn_kv",
             256,
             2 * kv_heads * head_dim,
             Default::default(),
         );
-        let time_attn_out = nn::linear(p / "time_attn_out", 256, 256, Default::default());
-        let ln_time = RMSNorm::new(&(p / "ln_time"), 256, 1e-5);
-        let time_mlp_fc1 = nn::linear(p / "time_mlp_fc1", 256, 2 * FF_DIM, Default::default());
-        let time_mlp_fc2 = nn::linear(p / "time_mlp_fc2", FF_DIM, 256, Default::default());
-        let alpha_time_attn = p.var("alpha_time_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
-        let alpha_time_mlp = p.var("alpha_time_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
-        let cross_attn_qkv = nn::linear(p / "cross_attn_qkv", 256, 256 * 3, Default::default());
-        let cross_attn_out = nn::linear(p / "cross_attn_out", 256, 256, Default::default());
-        let ln_cross = RMSNorm::new(&(p / "ln_cross"), 256, 1e-5);
-        let cross_mlp_fc1 = nn::linear(p / "cross_mlp_fc1", 256, 2 * FF_DIM, Default::default());
-        let cross_mlp_fc2 = nn::linear(p / "cross_mlp_fc2", FF_DIM, 256, Default::default());
-        let alpha_cross_attn = p.var("alpha_cross_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
-        let alpha_cross_mlp = p.var("alpha_cross_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
+        let attn_out = nn::linear(p / "attn_out", 256, 256, Default::default());
+        let ln = RMSNorm::new(&(p / "ln"), 256, 1e-5);
+        let mlp_fc1 = nn::linear(p / "mlp_fc1", 256, 2 * FF_DIM, Default::default());
+        let mlp_fc2 = nn::linear(p / "mlp_fc2", FF_DIM, 256, Default::default());
+        let alpha_attn = p.var("alpha_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
+        let alpha_mlp = p.var("alpha_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
-            time_attn_q,
-            time_attn_kv,
-            time_attn_out,
-            ln_time,
-            time_mlp_fc1,
-            time_mlp_fc2,
-            alpha_time_attn,
-            alpha_time_mlp,
-            cross_attn_qkv,
-            cross_attn_out,
-            ln_cross,
-            cross_mlp_fc1,
-            cross_mlp_fc2,
-            alpha_cross_attn,
-            alpha_cross_mlp,
+            attn_q,
+            attn_kv,
+            attn_out,
+            ln,
+            mlp_fc1,
+            mlp_fc2,
+            alpha_attn,
+            alpha_mlp,
         }
     }
 }
@@ -93,7 +72,7 @@ pub const LOGIT_SCALE_GROUP: usize = 1;
 const USE_SDPA: bool = true;
 const SDPA_MIN_LEN: i64 = 64;
 const SDPA_MIN_LEN_CROSS: i64 = 1;
-const TIME_CROSS_LAYERS: usize = 2;
+const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -2.0;
@@ -154,7 +133,7 @@ pub struct TradingModel {
     ln_static_ssm: RMSNorm,
     static_proj: nn::Linear,
     ln_static_proj: RMSNorm,
-    time_cross_blocks: Vec<TimeCrossBlock>,
+    time_cross_block: TimeCrossBlock2d,
     time_pos_proj: nn::Linear,
     time_global_ctx: nn::Linear,
     time_ticker_ctx: nn::Linear,
@@ -287,14 +266,7 @@ impl TradingModel {
         let kv_heads = 2i64;
         let head_dim = 64i64;
         assert!(num_heads % kv_heads == 0, "num_heads must be divisible by kv_heads");
-        let mut time_cross_blocks = Vec::with_capacity(TIME_CROSS_LAYERS);
-        for i in 0..TIME_CROSS_LAYERS {
-            time_cross_blocks.push(TimeCrossBlock::new(
-                &(p / format!("time_cross_{}", i)),
-                kv_heads,
-                head_dim,
-            ));
-        }
+        let time_cross_block = TimeCrossBlock2d::new(&(p / "time_cross_0"), kv_heads, head_dim);
         let time_pos_proj = nn::linear(p / "time_pos_proj", 4, 256, Default::default());
         let time_global_ctx = nn::linear(
             p / "time_global_ctx",
@@ -438,7 +410,7 @@ impl TradingModel {
             ln_static_ssm,
             static_proj,
             ln_static_proj,
-            time_cross_blocks,
+            time_cross_block,
             time_pos_proj,
             time_global_ctx,
             time_ticker_ctx,
