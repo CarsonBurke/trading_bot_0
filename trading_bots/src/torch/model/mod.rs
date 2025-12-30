@@ -179,6 +179,8 @@ pub struct TradingModel {
     cash_value_out: nn::Linear,
     sde_fc: nn::Linear,
     cash_sde: nn::Linear,
+    sde_scale_ticker: nn::Linear,
+    sde_scale_cash: nn::Linear,
     log_std_param: Tensor,
     sde_scale_raw: Tensor,
     logit_scale_raw: Tensor,
@@ -432,6 +434,8 @@ impl TradingModel {
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
         let cash_sde = nn::linear(p / "cash_sde", 256, SDE_LATENT_DIM, Default::default());
+        let sde_scale_ticker = nn::linear(p / "sde_scale_ticker", 256, 1, Default::default());
+        let sde_scale_cash = nn::linear(p / "sde_scale_cash", 256, 1, Default::default());
         let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, ACTION_COUNT], Init::Const(0.0));
         let sde_scale_raw = p.var("sde_scale_raw", &[1], Init::Const(SDE_SCALE_INIT.ln()));
         let logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP).var(
@@ -481,6 +485,8 @@ impl TradingModel {
             cash_value_out,
             sde_fc,
             cash_sde,
+            sde_scale_ticker,
+            sde_scale_cash,
             log_std_param,
             sde_scale_raw,
             logit_scale_raw,

@@ -308,8 +308,7 @@ pub fn train(weights_path: Option<&str>) {
             let sde_latent = sde_latent.to_kind(Kind::Float);
 
             // Logistic-normal with softmax simplex projection
-            let action_log_std_clamped = action_log_std.clamp(-20.0, 5.0);
-            let action_std = action_log_std_clamped.exp();
+            let action_std = action_log_std.exp();
             if sde_noise.is_none() || (step % SDE_SAMPLE_FREQ == 0) {
                 let std_matrix = trading_model.sde_std_matrix().to_kind(Kind::Float);
                 let eps = Tensor::randn(
@@ -333,7 +332,7 @@ pub fn train(weights_path: Option<&str>) {
             // Log-prob with softmax Jacobian
             let u_normalized = (&u - &action_logits) / &action_std;
             let u_squared = u_normalized.pow_tensor_scalar(2);
-            let two_log_std = &action_log_std_clamped * 2.0;
+            let two_log_std = &action_log_std * 2.0;
             let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
             let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
             let log_weights = u.log_softmax(-1, Kind::Float);
@@ -539,9 +538,8 @@ pub fn train(weights_path: Option<&str>) {
                 let u = actions_mb;
 
                 // log N(u; μ_perturbed, σ)
-                let action_log_stds_clamped = action_log_stds.clamp(-20.0, 5.0);
-                let action_std = action_log_stds_clamped.exp();
-                let two_log_std = &action_log_stds_clamped * 2.0;
+                let action_std = action_log_stds.exp();
+                let two_log_std = &action_log_stds * 2.0;
                 // RPO alpha: sigmoid parameterization for smooth gradients everywhere
                 let rpo_alpha =
                     RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
@@ -620,7 +618,7 @@ pub fn train(weights_path: Option<&str>) {
                 // For diagonal Gaussian with z_i ~ U(-alpha, alpha):
                 // E[KL] = sum_i E[z_i^2] / (2*sigma_i^2) = sum_i (alpha^2/3) / (2*sigma_i^2)
                 //       = d * (alpha^2/6) * mean(1/sigma^2)  where d = TICKERS_COUNT
-                let action_std_detached = action_log_stds.detach().clamp(-20.0, 5.0).exp();
+                let action_std_detached = action_log_stds.detach().exp();
                 let var = action_std_detached.pow_tensor_scalar(2);
                 let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
                 let d = TICKERS_COUNT as f64;
