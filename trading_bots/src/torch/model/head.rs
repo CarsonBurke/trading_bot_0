@@ -56,31 +56,24 @@ impl TradingModel {
             time_alpha_mlp_sum += f64::try_from(&alpha_mlp).unwrap_or(0.0);
         }
         let mut x_2d = x_time + &cross_ticker_embed;
+        // Permute to [batch, tickers, temporal, 256] and merge batch*tickers before projections.
+        // This avoids separate copies for Q, K, V by doing one reshape early.
         let x_norm = block
             .ln
             .forward(&x_2d.reshape([batch_size * temporal_len * TICKERS_COUNT, 256]))
-            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256]);
+            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
         let q = x_norm
             .apply(&block.attn_q)
-            .reshape([batch_size, temporal_len, TICKERS_COUNT, self.num_heads, self.head_dim]);
-        let kv = x_norm
-            .apply(&block.attn_kv)
-            .reshape([
-                batch_size,
-                temporal_len,
-                TICKERS_COUNT,
-                2,
-                self.kv_heads,
-                self.head_dim,
-            ])
-            .permute([3, 0, 1, 2, 4, 5]);
-        let (k, v) = (kv.get(0), kv.get(1));
-        let q = q
             .reshape([batch_size * TICKERS_COUNT, temporal_len, self.num_heads, self.head_dim])
             .permute([0, 2, 1, 3]);
-        let k = k
-            .reshape([batch_size * TICKERS_COUNT, temporal_len, self.kv_heads, self.head_dim])
-            .permute([0, 2, 1, 3]);
+        let kv = x_norm
+            .apply(&block.attn_kv)
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, 2, self.kv_heads, self.head_dim])
+            .permute([2, 0, 1, 3, 4]);
+        let (k, v) = (kv.get(0), kv.get(1));
+        let k = k.permute([0, 2, 1, 3]);
         let q = self.apply_rope_cached(&q, &rope_cos, &rope_sin);
         let k = self.apply_rope_cached(&k, &rope_cos, &rope_sin);
         let q = q
@@ -104,8 +97,9 @@ impl TradingModel {
                 self.head_dim,
             ]);
         let v = v
-            .reshape([batch_size, temporal_len, TICKERS_COUNT, self.kv_heads, self.head_dim])
-            .permute([0, 3, 2, 1, 4])
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size, TICKERS_COUNT, temporal_len, self.kv_heads, self.head_dim])
+            .permute([0, 3, 1, 2, 4])
             .reshape([
                 batch_size,
                 self.kv_heads,
@@ -172,12 +166,13 @@ impl TradingModel {
             .apply(&block.attn_out)
             .reshape([batch_size, TICKERS_COUNT, temporal_len, 256])
             .permute([0, 2, 1, 3]);
-        let mlp_in = x_norm.reshape([batch_size * temporal_len * TICKERS_COUNT, 256]);
+        let mlp_in = x_norm.reshape([batch_size * TICKERS_COUNT * temporal_len, 256]);
         let mlp_proj = mlp_in.apply(&block.mlp_fc1);
         let mlp_parts = mlp_proj.split(FF_DIM, -1);
         let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
             .apply(&block.mlp_fc2)
-            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256]);
+            .reshape([batch_size, TICKERS_COUNT, temporal_len, 256])
+            .permute([0, 2, 1, 3]);
         x_2d = x_2d + &attn_out * &alpha_attn + &mlp * &alpha_mlp;
         let x_time = x_2d
             .permute([0, 2, 1, 3])
@@ -309,18 +304,37 @@ impl TradingModel {
                 .mean_dim(1, false, x.kind())
         });
         let debug_metrics = if debug {
-            let (temporal_attn_entropy, cross_ticker_embed_norm) = tch::no_grad(|| {
-                let attn = self.attn_softmax_fp32(&q_pool, &k_pool);
-                let attn = attn.squeeze_dim(2);
+            let (
+                temporal_attn_entropy,
+                temporal_attn_max,
+                temporal_attn_eff_len,
+                temporal_attn_center,
+                temporal_attn_last_weight,
+                cross_ticker_embed_norm,
+            ) = tch::no_grad(|| {
+                let attn = self.attn_softmax_fp32(&q_pool, &k_pool).squeeze_dim(2);
                 let entropy = -(attn.clamp_min(1e-9) * attn.clamp_min(1e-9).log())
                     .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
                     .mean(Kind::Float);
+                let attn_mean = attn.mean_dim([0, 1].as_slice(), false, Kind::Float);
+                let attn_sum = attn_mean.sum(Kind::Float).clamp_min(1e-9);
+                let attn_norm = &attn_mean / &attn_sum;
+                let attn_max = attn_norm.max();
+                let eff_len =
+                    attn_norm.pow_tensor_scalar(2).sum(Kind::Float).clamp_min(1e-9).reciprocal();
+                let positions = Tensor::arange(temporal_len, (Kind::Float, attn.device()));
+                let center = (&attn_norm * &positions).sum(Kind::Float);
+                let last_weight = attn_norm.narrow(0, temporal_len - 1, 1).squeeze();
                 let embed_norm = cross_ticker_embed_base
                     .pow_tensor_scalar(2)
                     .mean(Kind::Float)
                     .sqrt();
                 (
                     f64::try_from(&entropy).unwrap_or(0.0),
+                    f64::try_from(&attn_max).unwrap_or(0.0),
+                    f64::try_from(&eff_len).unwrap_or(0.0),
+                    f64::try_from(&center).unwrap_or(0.0),
+                    f64::try_from(&last_weight).unwrap_or(0.0),
                     f64::try_from(&embed_norm).unwrap_or(0.0),
                 )
             });
@@ -331,6 +345,10 @@ impl TradingModel {
                 cross_alpha_mlp_mean: 0.0,
                 temporal_tau,
                 temporal_attn_entropy,
+                temporal_attn_max,
+                temporal_attn_eff_len,
+                temporal_attn_center,
+                temporal_attn_last_weight,
                 cross_ticker_embed_norm,
             })
         } else {

@@ -65,6 +65,10 @@ impl TradingModel {
                 cross_alpha_mlp_mean: 0.0,
                 temporal_tau: 0.0,
                 temporal_attn_entropy: 0.0,
+                temporal_attn_max: 0.0,
+                temporal_attn_eff_len: 0.0,
+                temporal_attn_center: 0.0,
+                temporal_attn_last_weight: 0.0,
                 cross_ticker_embed_norm: 0.0,
             }),
         )

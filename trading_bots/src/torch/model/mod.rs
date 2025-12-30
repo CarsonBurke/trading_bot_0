@@ -98,6 +98,10 @@ pub struct DebugMetrics {
     pub cross_alpha_mlp_mean: f64,
     pub temporal_tau: f64,
     pub temporal_attn_entropy: f64,
+    pub temporal_attn_max: f64,
+    pub temporal_attn_eff_len: f64,
+    pub temporal_attn_center: f64,
+    pub temporal_attn_last_weight: f64,
     pub cross_ticker_embed_norm: f64,
 }
 

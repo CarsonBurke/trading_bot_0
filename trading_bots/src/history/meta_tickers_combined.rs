@@ -28,6 +28,10 @@ pub struct MetaHistory {
     pub cross_alpha_mlp_mean: Vec<f64>,
     pub temporal_tau: Vec<f64>,
     pub temporal_attn_entropy: Vec<f64>,
+    pub temporal_attn_max: Vec<f64>,
+    pub temporal_attn_eff_len: Vec<f64>,
+    pub temporal_attn_center: Vec<f64>,
+    pub temporal_attn_last_weight: Vec<f64>,
     pub cross_ticker_embed_norm: Vec<f64>,
 }
 
@@ -84,6 +88,10 @@ impl MetaHistory {
         cross_alpha_mlp_mean: f64,
         temporal_tau: f64,
         temporal_attn_entropy: f64,
+        temporal_attn_max: f64,
+        temporal_attn_eff_len: f64,
+        temporal_attn_center: f64,
+        temporal_attn_last_weight: f64,
         cross_ticker_embed_norm: f64,
     ) {
         self.time_alpha_attn_mean.push(time_alpha_attn_mean);
@@ -92,6 +100,10 @@ impl MetaHistory {
         self.cross_alpha_mlp_mean.push(cross_alpha_mlp_mean);
         self.temporal_tau.push(temporal_tau);
         self.temporal_attn_entropy.push(temporal_attn_entropy);
+        self.temporal_attn_max.push(temporal_attn_max);
+        self.temporal_attn_eff_len.push(temporal_attn_eff_len);
+        self.temporal_attn_center.push(temporal_attn_center);
+        self.temporal_attn_last_weight.push(temporal_attn_last_weight);
         self.cross_ticker_embed_norm.push(cross_ticker_embed_norm);
     }
 
@@ -312,6 +324,22 @@ impl MetaHistory {
                         ReportSeries {
                             label: "temporal_entropy".to_string(),
                             values: f64_to_f32(&self.temporal_attn_entropy),
+                        },
+                        ReportSeries {
+                            label: "temporal_attn_max".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_max),
+                        },
+                        ReportSeries {
+                            label: "temporal_eff_len".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_eff_len),
+                        },
+                        ReportSeries {
+                            label: "temporal_attn_center".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_center),
+                        },
+                        ReportSeries {
+                            label: "temporal_attn_last".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_last_weight),
                         },
                         ReportSeries {
                             label: "cross_embed_norm".to_string(),

@@ -9,6 +9,11 @@ use crate::torch::constants::{
 use crate::torch::env::VecEnv;
 use crate::torch::model::{TradingModel, LOGIT_SCALE_GROUP};
 use crate::torch::load::load_var_store_partial;
+use std::fs;
+use std::process;
+use std::sync::OnceLock;
+use nvml_wrapper::Nvml;
+use nvml_wrapper::enums::device::UsedGpuMemory;
 
 struct GpuRollingBuffer {
     buffer: Tensor,
@@ -110,6 +115,44 @@ const ALPHA_LOSS_COEF: f64 = 0.1;
 const ADV_MIXED_WEIGHT: f64 = 0.5;
 const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
 const DEBUG_TEMPORAL_REPORTS: bool = true;
+const DEBUG_MEMORY_REPORTS: bool = true;
+
+fn read_rss_kb() -> Option<u64> {
+    let statm = fs::read_to_string("/proc/self/statm").ok()?;
+    let mut parts = statm.split_whitespace();
+    let _ = parts.next()?;
+    let rss_pages: u64 = parts.next()?.parse().ok()?;
+    let page_kb = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64) / 1024;
+    Some(rss_pages * page_kb)
+}
+
+fn nvml_handle() -> Option<&'static Nvml> {
+    static NVML: OnceLock<Nvml> = OnceLock::new();
+    if NVML.get().is_none() {
+        if let Ok(nvml) = Nvml::init() {
+            let _ = NVML.set(nvml);
+        } else {
+            return None;
+        }
+    }
+    NVML.get()
+}
+
+fn read_gpu_mem_mb() -> Option<u64> {
+    let nvml = nvml_handle()?;
+    let device = nvml.device_by_index(0).ok()?;
+    let pid = process::id();
+    let processes = device.running_compute_processes().ok()?;
+    for proc in processes {
+        if proc.pid == pid {
+            return match proc.used_gpu_memory {
+                UsedGpuMemory::Used(bytes) => Some(bytes / (1024 * 1024)),
+                UsedGpuMemory::Unavailable => None,
+            };
+        }
+    }
+    None
+}
 
 pub fn train(weights_path: Option<&str>) {
     let mut env = VecEnv::new(true);
@@ -247,11 +290,10 @@ pub fn train(weights_path: Option<&str>) {
         // Loop through the episode using relative steps (0 to max_step)
         let mut s: i64 = 0;
         let mut sde_noise: Option<Tensor> = None;
-        let mut last_attn_weights: Option<Tensor> = None;
         for step in 0..env.max_step() {
             env.set_step(step);
 
-            let (values, (action_logits, action_log_std, sde_latent), attn_weights) =
+            let (values, (action_logits, action_log_std, sde_latent), _attn_weights) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
@@ -261,7 +303,6 @@ pub fn train(weights_path: Option<&str>) {
             let action_logits = action_logits.to_kind(Kind::Float);
             let action_log_std = action_log_std.to_kind(Kind::Float);
             let sde_latent = sde_latent.to_kind(Kind::Float);
-            last_attn_weights = Some(attn_weights.shallow_clone());
 
             // Logistic-normal with softmax simplex projection
             let action_log_std_clamped = action_log_std.clamp(-20.0, 5.0);
@@ -330,20 +371,13 @@ pub fn train(weights_path: Option<&str>) {
             s += 1; // Increment storage index
         }
 
-        if let Some(attn) = last_attn_weights.take() {
-            let static_obs_vec =
-                Vec::<f32>::try_from(s_static_obs.get(rollout_steps - 1).flatten(0, -1))
-                    .unwrap_or_default();
-            let attn_weights_vec = Vec::<f32>::try_from(attn.flatten(0, -1)).unwrap_or_default();
-            env.primary_mut()
-                .episode_history
-                .static_observations
-                .push(static_obs_vec);
-            env.primary_mut()
-                .episode_history
-                .attention_weights
-                .push(attn_weights_vec);
-        }
+        let static_obs_vec =
+            Vec::<f32>::try_from(s_static_obs.get(rollout_steps - 1).flatten(0, -1))
+                .unwrap_or_default();
+        env.primary_mut()
+            .episode_history
+            .static_observations
+            .push(static_obs_vec);
 
         total_rewards += f64::try_from(&total_rewards_gpu).unwrap_or(0.0);
         total_episodes += f64::try_from(&total_episodes_gpu).unwrap_or(0.0);
@@ -747,7 +781,19 @@ pub fn train(weights_path: Option<&str>) {
                 debug.cross_alpha_mlp_mean,
                 debug.temporal_tau,
                 debug.temporal_attn_entropy,
+                debug.temporal_attn_max,
+                debug.temporal_attn_eff_len,
+                debug.temporal_attn_center,
+                debug.temporal_attn_last_weight,
                 debug.cross_ticker_embed_norm,
+            );
+        }
+        if DEBUG_MEMORY_REPORTS {
+            let rss_kb = read_rss_kb().unwrap_or(0);
+            let cuda_mb = read_gpu_mem_mb().unwrap_or(0);
+            println!(
+                "[Ep {:6}] mem rss={}KB cuda_proc={}MB",
+                episode, rss_kb, cuda_mb
             );
         }
 
