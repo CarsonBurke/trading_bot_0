@@ -66,7 +66,7 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 const SSM_DIM: i64 = 64;
 const LOGIT_SCALE_INIT: f64 = 0.3;
 const LOG_STD_MIN: f64 = -5.0;
-const LOG_STD_MAX: f64 = -0.5108256237659907;
+const LOG_STD_MAX: f64 = -0.2; // ~0.818
 const SDE_SCALE_INIT: f64 = 1.0;
 pub const LOGIT_SCALE_GROUP: usize = 1;
 const USE_SDPA: bool = true;
