@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::torch::load::load_var_store_partial;
-use crate::torch::model::TradingModel;
+use crate::torch::model::{TradingModel, TradingModelConfig};
 use crate::torch::env::Env;
 
 pub fn load_model<P: AsRef<Path>>(
@@ -11,7 +11,7 @@ pub fn load_model<P: AsRef<Path>>(
     device: Device,
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
-    let model = TradingModel::new(&vs.root());
+    let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
     let _ = load_var_store_partial(&mut vs, weight_path)?;
     Ok((vs, model))
 }

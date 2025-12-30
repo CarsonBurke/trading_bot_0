@@ -551,6 +551,120 @@ impl Mamba2 {
         y_out.apply(&self.out_proj)
     }
 
+    pub fn step_with_dt_scale(&self, u: &Tensor, state: &mut Mamba2State, dt_scale: f64) -> Tensor {
+        let u = if u.dim() == 2 { u.unsqueeze(1) } else { u.shallow_clone() };
+        let batch = u.size()[0];
+        let d_inner = self.d_inner;
+        let d_ssm = self.d_ssm;
+        let nheads = self.nheads;
+        let headdim = self.config.headdim;
+        let d_state = self.config.d_state;
+        let ngroups = self.config.ngroups;
+        let heads_per_group = nheads / ngroups;
+        let d_mlp = d_inner - d_ssm;
+
+        let zxbcdt = u.squeeze_dim(1).apply(&self.in_proj);
+
+        let z0_dim = d_mlp;
+        let x0_dim = d_mlp;
+        let z_dim = d_ssm;
+        let b_dim = ngroups * d_state;
+        let c_dim = ngroups * d_state;
+
+        let z0 = if d_mlp > 0 {
+            zxbcdt.narrow(-1, 0, z0_dim)
+        } else {
+            Tensor::zeros(&[batch, 0], (zxbcdt.kind(), zxbcdt.device()))
+        };
+        let x0 = if d_mlp > 0 {
+            zxbcdt.narrow(-1, z0_dim, x0_dim)
+        } else {
+            Tensor::zeros(&[batch, 0], (zxbcdt.kind(), zxbcdt.device()))
+        };
+        let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
+        let xbc_in = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, d_ssm + 2 * ngroups * d_state);
+        let dt_raw = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim + d_ssm + 2 * ngroups * d_state, nheads);
+
+        let xbc = xbc_in;
+
+        let _ = state
+            .conv_state
+            .narrow(2, 0, self.config.d_conv - 1)
+            .copy_(&state.conv_state.narrow(2, 1, self.config.d_conv - 1));
+        let _ = state
+            .conv_state
+            .narrow(2, self.config.d_conv - 1, 1)
+            .copy_(&xbc.unsqueeze(-1));
+
+        let conv_weight = self.conv1d.ws.squeeze_dim(1);
+        let xbc_conv = (&state.conv_state * &conv_weight).sum_dim_intlist(-1, false, Kind::Float);
+        let xbc_conv = match &self.conv1d.bs {
+            Some(bias) => (&xbc_conv + bias).silu(),
+            None => xbc_conv.silu(),
+        };
+
+        let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
+        let b = xbc_conv.narrow(-1, d_ssm, b_dim);
+        let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
+
+        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus() * dt_scale;
+        let dt = if self.config.dt_limit == (0.0, f64::INFINITY) {
+            dt
+        } else {
+            dt.clamp(self.config.dt_limit.0, self.config.dt_limit.1)
+        };
+
+        let a = self.a_log.to_kind(Kind::Float).exp().neg();
+        let da = (dt.unsqueeze(-1) * a.view([1, nheads, 1])).exp();
+        let x_heads = x_conv.view([batch, nheads, headdim]);
+
+        let b_heads = if ngroups == 1 {
+            b.view([batch, 1, d_state]).expand([batch, nheads, d_state], false)
+        } else {
+            b.view([batch, ngroups, 1, d_state])
+                .expand([batch, ngroups, heads_per_group, d_state], false)
+                .reshape([batch, nheads, d_state])
+        };
+
+        let c_heads = if ngroups == 1 {
+            c.view([batch, 1, d_state]).expand([batch, nheads, d_state], false)
+        } else {
+            c.view([batch, ngroups, 1, d_state])
+                .expand([batch, ngroups, heads_per_group, d_state], false)
+                .reshape([batch, nheads, d_state])
+        };
+
+        let db = dt.unsqueeze(-1) * &b_heads;
+        let dbx = x_heads.unsqueeze(-1) * db.unsqueeze(2);
+        let new_ssm = &state.ssm_state * da.unsqueeze(2) + dbx;
+        state.ssm_state.copy_(&new_ssm);
+
+        let y = (&state.ssm_state * c_heads.unsqueeze(2)).sum_dim_intlist(-1, false, Kind::Float);
+        let y_skip = if self.config.d_has_hdim {
+            let d_expanded = self.d_param.view([1, nheads, headdim]);
+            &y + &x_heads * d_expanded
+        } else {
+            let d_expanded = self.d_param.view([1, nheads, 1]);
+            &y + &x_heads * d_expanded
+        };
+
+        let y_flat = y_skip.view([batch, d_ssm]);
+        let mut y_out = match &self.norm {
+            Some(norm) => {
+                let z_for_gate = z.view([batch, d_ssm]);
+                norm.forward(&y_flat.unsqueeze(1), Some(&z_for_gate.unsqueeze(1))).squeeze_dim(1)
+            }
+            None => &y_flat * z.silu(),
+        };
+
+        if d_mlp > 0 {
+            let mlp = x0 * z0.silu();
+            y_out = Tensor::cat(&[mlp, y_out], -1);
+        }
+
+        y_out.apply(&self.out_proj)
+    }
+
     /// Chunked SSM scan - parallel within chunks, sequential across chunks
     fn chunked_ssm_scan(
         &self,
@@ -917,6 +1031,10 @@ impl StatefulMamba {
 
     pub fn step(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
         self.mamba.step(x, state)
+    }
+
+    pub fn step_with_dt_scale(&self, x: &Tensor, state: &mut Mamba2State, dt_scale: f64) -> Tensor {
+        self.mamba.step_with_dt_scale(x, state, dt_scale)
     }
 
     pub fn forward_batched_init(&self, x: &Tensor, initial_states: &Tensor) -> (Tensor, Tensor) {

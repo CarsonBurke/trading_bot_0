@@ -27,8 +27,8 @@ impl TradingModel {
             ring_pos: 0,
             patch_buf: Tensor::zeros(&[TICKERS_COUNT, PATCH_SIZE], (Kind::Float, self.device)),
             patch_pos: 0,
-            ssm_states: (0..TICKERS_COUNT)
-                .map(|_| self.ssm.init_state(1, self.device))
+            ssm_states: (0..(TICKERS_COUNT * self.ssm_layers.len() as i64))
+                .map(|_| self.ssm_layers[0].init_state(1, self.device))
                 .collect(),
             ssm_cache: Tensor::zeros(
                 &[TICKERS_COUNT, SSM_DIM, SEQ_LEN],
@@ -50,8 +50,8 @@ impl TradingModel {
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
-            ssm_states: (0..(batch_size * TICKERS_COUNT) as usize)
-                .map(|_| self.ssm.init_state(1, self.device))
+            ssm_states: (0..(batch_size * TICKERS_COUNT * self.ssm_layers.len() as i64) as usize)
+                .map(|_| self.ssm_layers[0].init_state(1, self.device))
                 .collect(),
             ssm_cache: Tensor::zeros(
                 &[batch_size * TICKERS_COUNT, SSM_DIM, SEQ_LEN],
@@ -150,17 +150,32 @@ impl TradingModel {
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
         let static_ssm = self.per_ticker_static_ssm(&per_ticker_static, 1);
+        let dt_scale = Tensor::full(
+            &[1, SEQ_LEN, 1],
+            PATCH_SIZE as f64,
+            (Kind::Float, self.device),
+        );
 
         for t in 0..TICKERS_COUNT as usize {
             let ticker_data = reshaped.get(t as i64).unsqueeze(0);
             let x_stem = self.patch_embed_single(&ticker_data, &static_ssm.get(t as i64));
-            let x_ssm = self
-                .ssm
-                .forward_with_state(&x_stem.permute([0, 2, 1]), &mut state.ssm_states[t]);
+            let mut x = x_stem.permute([0, 2, 1]);
+            for (layer, (ssm, norm)) in
+                self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
+            {
+                let state_idx = layer * TICKERS_COUNT as usize + t;
+                let normed = norm.forward(&x);
+                let out = ssm.forward_with_state_dt_scale(
+                    &normed,
+                    &mut state.ssm_states[state_idx],
+                    Some(&dt_scale),
+                );
+                x = x + out;
+            }
             let _ = state
                 .ssm_cache
                 .get(t as i64)
-                .copy_(&x_ssm.squeeze_dim(0).permute([1, 0]));
+                .copy_(&x.squeeze_dim(0).permute([1, 0]));
         }
 
         state.initialized = true;
@@ -180,17 +195,25 @@ impl TradingModel {
             .view([TICKERS_COUNT, 1, PATCH_SIZE])
             .apply(&self.patch_embed);
         let patch_emb = self.patch_ln.forward(&patch_emb).squeeze_dim(1) + static_ssm;
+        let dt_scale = PATCH_SIZE as f64;
 
         for t in 0..TICKERS_COUNT as usize {
-            let x_in = patch_emb.get(t as i64).unsqueeze(0);
-            let out = self.ssm.step(&x_in, &mut state.ssm_states[t]);
+            let mut x_in = patch_emb.get(t as i64).unsqueeze(0);
+            for (layer, (ssm, norm)) in
+                self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
+            {
+                let state_idx = layer * TICKERS_COUNT as usize + t;
+                let normed = norm.forward(&x_in);
+                let out = ssm.step_with_dt_scale(&normed, &mut state.ssm_states[state_idx], dt_scale);
+                x_in = x_in + out;
+            }
 
             let old_cache = state.ssm_cache.get(t as i64);
             let shifted = old_cache.narrow(1, 1, SEQ_LEN - 1);
             let _ = old_cache.narrow(1, 0, SEQ_LEN - 1).copy_(&shifted);
             let _ = old_cache
                 .narrow(1, SEQ_LEN - 1, 1)
-                .copy_(&out.squeeze_dim(0).unsqueeze(1));
+                .copy_(&x_in.squeeze_dim(0).unsqueeze(1));
         }
     }
 }

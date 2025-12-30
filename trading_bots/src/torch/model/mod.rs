@@ -9,7 +9,7 @@ use tch::{nn, Kind, Tensor};
 use crate::torch::constants::{
     ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
-use crate::torch::ssm::{stateful_mamba_block, Mamba2State, StatefulMamba};
+use crate::torch::ssm::{stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMamba};
 
 pub use shared::constants::GLOBAL_MACRO_OBS;
 
@@ -105,6 +105,17 @@ pub struct DebugMetrics {
     pub cross_ticker_embed_norm: f64,
 }
 
+#[derive(Clone, Copy)]
+pub struct TradingModelConfig {
+    pub ssm_layers: usize,
+}
+
+impl Default for TradingModelConfig {
+    fn default() -> Self {
+        Self { ssm_layers: 2 }
+    }
+}
+
 /// Streaming state for O(1) inference per step
 /// - Ring buffer holds full delta history for head computation
 /// - Patch buffer accumulates deltas until full patch ready
@@ -118,7 +129,7 @@ pub struct StreamState {
     pub patch_buf: Tensor,
     /// Position within current patch
     pub patch_pos: i64,
-    /// SSM hidden state per ticker
+    /// SSM hidden state per ticker per layer
     pub ssm_states: Vec<Mamba2State>,
     /// Cached SSM output sequence: [TICKERS_COUNT, SSM_DIM, SEQ_LEN]
     pub ssm_cache: Tensor,
@@ -130,7 +141,8 @@ pub struct TradingModel {
     patch_embed: nn::Linear,
     patch_ln: RMSNorm,
     pos_emb: Tensor,
-    ssm: StatefulMamba,
+    ssm_layers: Vec<StatefulMamba>,
+    ssm_norms: Vec<RMSNorm>,
     ssm_proj: nn::Conv1D,
     pos_embedding: Tensor,
     static_to_ssm: nn::Linear,
@@ -142,7 +154,7 @@ pub struct TradingModel {
     time_global_ctx: nn::Linear,
     time_ticker_ctx: nn::Linear,
     cross_ticker_embed: nn::Linear,
-    cls_token: Tensor,
+    pool_queries: Tensor,
     ln_temporal_q: RMSNorm,
     ln_temporal_kv: RMSNorm,
     temporal_q: nn::Linear,
@@ -181,14 +193,16 @@ impl TradingModel {
         if !USE_SDPA {
             return false;
         }
-        seq_len >= SDPA_MIN_LEN
+        let _ = seq_len;
+        true
     }
 
     fn use_sdpa_cross(&self, seq_len: i64) -> bool {
         if !USE_SDPA {
             return false;
         }
-        seq_len >= SDPA_MIN_LEN_CROSS
+        let _ = seq_len;
+        true
     }
 
     fn attn_softmax_fp32(&self, q: &Tensor, k: &Tensor) -> Tensor {
@@ -228,6 +242,10 @@ impl TradingModel {
     }
 
     pub fn new(p: &nn::Path) -> Self {
+        Self::new_with_config(p, TradingModelConfig::default())
+    }
+
+    pub fn new_with_config(p: &nn::Path, config: TradingModelConfig) -> Self {
         let patch_embed = nn::linear(p / "patch_embed", PATCH_SIZE, SSM_DIM, Default::default());
         let patch_ln = RMSNorm::new(&(p / "patch_ln"), SSM_DIM, 1e-5);
         let pos_emb = p.var(
@@ -239,7 +257,17 @@ impl TradingModel {
             },
         );
 
-        let ssm = stateful_mamba_block(&(p / "ssm"), SSM_DIM);
+        let ssm_cfg = Mamba2Config {
+            d_model: SSM_DIM,
+            d_ssm: Some(SSM_DIM),
+            ..Mamba2Config::default()
+        };
+        let ssm_layers = (0..config.ssm_layers)
+            .map(|i| stateful_mamba_block_cfg(&(p / format!("ssm_{}", i)), ssm_cfg.clone()))
+            .collect::<Vec<_>>();
+        let ssm_norms = (0..config.ssm_layers)
+            .map(|i| RMSNorm::new(&(p / format!("ssm_norm_{}", i)), SSM_DIM, 1e-5))
+            .collect::<Vec<_>>();
         let ssm_proj = nn::conv1d(p / "ssm_proj", SSM_DIM, 256, 1, Default::default());
         let pos_embedding = p.var(
             "pos_emb",
@@ -290,9 +318,10 @@ impl TradingModel {
             256,
             Default::default(),
         );
-        let cls_token = p.var(
-            "cls_token",
-            &[1, 1, 256],
+        // GQA-style pooling: kv_heads separate query groups, each attends independently
+        let pool_queries = p.var(
+            "pool_queries",
+            &[kv_heads, 256],
             Init::Uniform {
                 lo: -0.01,
                 up: 0.01,
@@ -300,12 +329,19 @@ impl TradingModel {
         );
         let ln_temporal_q = RMSNorm::new(&(p / "ln_temporal_q"), 256, 1e-5);
         let ln_temporal_kv = RMSNorm::new(&(p / "ln_temporal_kv"), 256, 1e-5);
-        let temporal_q = nn::linear(p / "temporal_q", 256, 256, Default::default());
+        // Each query group outputs one head, K/V stay grouped per kv_head
+        let temporal_q = nn::linear(p / "temporal_q", 256, head_dim, Default::default());
         let temporal_k = nn::linear(p / "temporal_k", 256, kv_heads * head_dim, Default::default());
         let temporal_v = nn::linear(p / "temporal_v", 256, kv_heads * head_dim, Default::default());
         let temporal_last = nn::linear(p / "temporal_last", 256, 256, Default::default());
         let temporal_gate = nn::linear(p / "temporal_gate", 256, 256, Default::default());
-        let temporal_attn_out = nn::linear(p / "temporal_attn_out", 256, 256, Default::default());
+        // Output from kv_heads * head_dim to 256
+        let temporal_attn_out = nn::linear(
+            p / "temporal_attn_out",
+            kv_heads * head_dim,
+            256,
+            Default::default(),
+        );
         let temporal_tau_raw = p.var("temporal_tau_raw", &[1], Init::Const(0.0));
         let ln_pool_out = RMSNorm::new(&(p / "ln_pool_out"), 256, 1e-5);
         let cls_global_ctx = nn::linear(
@@ -407,7 +443,8 @@ impl TradingModel {
             patch_embed,
             patch_ln,
             pos_emb,
-            ssm,
+            ssm_layers,
+            ssm_norms,
             ssm_proj,
             pos_embedding,
             static_to_ssm,
@@ -419,7 +456,7 @@ impl TradingModel {
             time_global_ctx,
             time_ticker_ctx,
             cross_ticker_embed,
-            cls_token,
+            pool_queries,
             ln_temporal_q,
             ln_temporal_kv,
             temporal_q,

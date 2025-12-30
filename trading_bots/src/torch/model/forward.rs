@@ -1,6 +1,6 @@
-use tch::Tensor;
+use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, StreamState, TradingModel};
+use super::{DebugMetrics, ModelOutput, StreamState, TradingModel, PATCH_SIZE};
 
 impl TradingModel {
     pub fn forward(
@@ -17,9 +17,18 @@ impl TradingModel {
         let x_stem =
             self.patch_embed_all_with_static(&price_deltas, &per_ticker_static, batch_size);
 
-        let x_for_ssm = x_stem.permute([0, 2, 1]);
-        let x_ssm = self.ssm.forward(&x_for_ssm, false);
-        let x_ssm = x_ssm.permute([0, 2, 1]);
+        let mut x_for_ssm = x_stem.permute([0, 2, 1]);
+        let dt_scale = Tensor::full(
+            &[1, x_for_ssm.size()[1], 1],
+            PATCH_SIZE as f64,
+            (Kind::Float, x_for_ssm.device()),
+        );
+        for (layer, norm) in self.ssm_layers.iter().zip(self.ssm_norms.iter()) {
+            let normed = norm.forward(&x_for_ssm);
+            let out = layer.forward_with_dt_scale(&normed, Some(&dt_scale));
+            x_for_ssm = x_for_ssm + out;
+        }
+        let x_ssm = x_for_ssm.permute([0, 2, 1]);
 
         self.head_with_temporal_pool(
             &x_ssm,
@@ -45,9 +54,18 @@ impl TradingModel {
         let x_stem =
             self.patch_embed_all_with_static(&price_deltas, &per_ticker_static, batch_size);
 
-        let x_for_ssm = x_stem.permute([0, 2, 1]);
-        let x_ssm = self.ssm.forward(&x_for_ssm, false);
-        let x_ssm = x_ssm.permute([0, 2, 1]);
+        let mut x_for_ssm = x_stem.permute([0, 2, 1]);
+        let dt_scale = Tensor::full(
+            &[1, x_for_ssm.size()[1], 1],
+            PATCH_SIZE as f64,
+            (Kind::Float, x_for_ssm.device()),
+        );
+        for (layer, norm) in self.ssm_layers.iter().zip(self.ssm_norms.iter()) {
+            let normed = norm.forward(&x_for_ssm);
+            let out = layer.forward_with_dt_scale(&normed, Some(&dt_scale));
+            x_for_ssm = x_for_ssm + out;
+        }
+        let x_ssm = x_for_ssm.permute([0, 2, 1]);
 
         let (out, debug) = self.head_with_temporal_pool(
             &x_ssm,

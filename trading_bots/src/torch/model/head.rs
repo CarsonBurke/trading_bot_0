@@ -18,6 +18,7 @@ impl TradingModel {
         let x_time = x
             .view([batch_size, TICKERS_COUNT, 256, temporal_len])
             .permute([0, 3, 1, 2]);
+        let x_time = x_time;
         let global_ctx = global_static
             .apply(&self.time_global_ctx)
             .unsqueeze(1)
@@ -177,86 +178,54 @@ impl TradingModel {
         let x_time = x_2d
             .permute([0, 2, 1, 3])
             .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
+        // GQA-style pooling: kv_heads query groups, no expansion needed
+        // pool_queries: [kv_heads, 256] - separate learnable query per group
+        let pool_queries = self.pool_queries.unsqueeze(0);
         let global_ctx = global_static
             .apply(&self.cls_global_ctx)
             .unsqueeze(1)
-            .expand(&[batch_size, TICKERS_COUNT, 256], false);
+            .expand(&[batch_size * TICKERS_COUNT, 1, 256], false);
         let ticker_ctx = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
             .apply(&self.cls_ticker_ctx)
-            .reshape([batch_size, TICKERS_COUNT, 256]);
-        let cls_base = self
-            .cls_token
-            .expand(&[batch_size, TICKERS_COUNT, 256], false);
-        let q_base =
-            (cls_base + global_ctx + ticker_ctx).reshape([batch_size * TICKERS_COUNT, 256]);
+            .unsqueeze(1)
+            .expand(&[batch_size * TICKERS_COUNT, 1, 256], false);
+        let q_base = pool_queries + global_ctx + ticker_ctx;
         let q_base_norm = self
             .ln_temporal_q
-            .forward(&q_base)
-            .reshape([batch_size * TICKERS_COUNT, 256]);
+            .forward(&q_base.reshape([batch_size * TICKERS_COUNT * self.kv_heads, 256]))
+            .reshape([batch_size * TICKERS_COUNT, self.kv_heads, 256]);
         let x_time_norm = self
             .ln_temporal_kv
             .forward(&x_time.reshape([batch_size * TICKERS_COUNT * temporal_len, 256]))
             .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
-        let last_token = x_time_norm.narrow(1, temporal_len - 1, 1).squeeze_dim(1);
+        // Gate each query group with last token
+        let last_token = x_time_norm.narrow(1, temporal_len - 1, 1);
+        let last_proj = last_token
+            .reshape([batch_size * TICKERS_COUNT, 256])
+            .apply(&self.temporal_last)
+            .unsqueeze(1)
+            .expand(&[batch_size * TICKERS_COUNT, self.kv_heads, 256], false);
         let gate = q_base_norm
+            .reshape([batch_size * TICKERS_COUNT * self.kv_heads, 256])
             .apply(&self.temporal_gate)
-            .sigmoid();
-        let last_proj = last_token.apply(&self.temporal_last);
+            .sigmoid()
+            .reshape([batch_size * TICKERS_COUNT, self.kv_heads, 256]);
         let query_base = &q_base_norm + gate * last_proj;
+        // Q: [b*t, kv_heads, head_dim] - one head per query group
         let q_pool = query_base
+            .reshape([batch_size * TICKERS_COUNT * self.kv_heads, 256])
             .apply(&self.temporal_q)
-            .reshape([batch_size * TICKERS_COUNT, 1, self.num_heads, self.head_dim])
-            .permute([0, 2, 1, 3]);
+            .reshape([batch_size * TICKERS_COUNT, self.kv_heads, 1, self.head_dim]);
+        // K, V: [b*t, kv_heads, temporal, head_dim] - distinct per group
         let k_pool = x_time_norm
             .apply(&self.temporal_k)
-            .reshape([
-                batch_size * TICKERS_COUNT,
-                temporal_len,
-                self.kv_heads,
-                self.head_dim,
-            ])
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, self.kv_heads, self.head_dim])
             .permute([0, 2, 1, 3]);
         let v_pool = x_time_norm
             .apply(&self.temporal_v)
-            .reshape([
-                batch_size * TICKERS_COUNT,
-                temporal_len,
-                self.kv_heads,
-                self.head_dim,
-            ])
+            .reshape([batch_size * TICKERS_COUNT, temporal_len, self.kv_heads, self.head_dim])
             .permute([0, 2, 1, 3]);
-        let cos_last = rope_cos.narrow(0, temporal_len - 1, 1);
-        let sin_last = rope_sin.narrow(0, temporal_len - 1, 1);
-        let q_pool = self.apply_rope_cached(&q_pool, &cos_last, &sin_last);
-        let k_pool = self.apply_rope_cached(&k_pool, &rope_cos, &rope_sin);
-        let kv_repeat = self.num_heads / self.kv_heads;
-        let k_pool = k_pool
-            .unsqueeze(2)
-            .expand(
-                &[
-                    batch_size * TICKERS_COUNT,
-                    self.kv_heads,
-                    kv_repeat,
-                    temporal_len,
-                    self.head_dim,
-                ],
-                false,
-            )
-            .reshape([batch_size * TICKERS_COUNT, self.num_heads, temporal_len, self.head_dim]);
-        let v_pool = v_pool
-            .unsqueeze(2)
-            .expand(
-                &[
-                    batch_size * TICKERS_COUNT,
-                    self.kv_heads,
-                    kv_repeat,
-                    temporal_len,
-                    self.head_dim,
-                ],
-                false,
-            )
-            .reshape([batch_size * TICKERS_COUNT, self.num_heads, temporal_len, self.head_dim]);
         let tau = self.temporal_tau_raw.exp().clamp(0.5, 4.0);
         let temporal_tau = if debug {
             f64::try_from(&tau).unwrap_or(0.0)
@@ -264,6 +233,7 @@ impl TradingModel {
             0.0
         };
         let q_pool = q_pool * tau;
+        // Attention: [b*t, kv_heads, 1, head_dim] @ [b*t, kv_heads, head_dim, temporal]
         let mut temporal_attn_cache: Option<Tensor> = None;
         let temporal_attn_out = if self.use_sdpa(temporal_len) {
             Tensor::scaled_dot_product_attention(
@@ -274,31 +244,33 @@ impl TradingModel {
                 0.0,
                 false,
                 None,
-                false,
+                true,
             )
-            .permute([0, 2, 1, 3])
-            .contiguous()
-            .view([batch_size * TICKERS_COUNT, 1, 256])
+            .squeeze_dim(2)
+            .reshape([batch_size * TICKERS_COUNT, self.kv_heads * self.head_dim])
             .apply(&self.temporal_attn_out)
         } else {
             let attn = self.attn_softmax_fp32(&q_pool, &k_pool);
             temporal_attn_cache = Some(attn.shallow_clone());
             attn.matmul(&v_pool)
-                .permute([0, 2, 1, 3])
-                .contiguous()
-                .view([batch_size * TICKERS_COUNT, 1, 256])
+                .squeeze_dim(2)
+                .reshape([batch_size * TICKERS_COUNT, self.kv_heads * self.head_dim])
                 .apply(&self.temporal_attn_out)
         };
-        let pooled = temporal_attn_out.squeeze_dim(1);
-        let conv_features = self.ln_pool_out.forward(&(pooled + query_base)).reshape([
+        let pooled = temporal_attn_out;
+        // Aggregate query groups for residual: mean over kv_heads dimension
+        let query_base_agg = query_base.mean_dim(1, false, query_base.kind());
+        let conv_features = self.ln_pool_out.forward(&(pooled + query_base_agg)).reshape([
             batch_size,
             TICKERS_COUNT,
             256,
         ]);
+        let conv_features = conv_features;
+        // Attention shape: [b*t, kv_heads, 1, temporal] -> average over heads for visualization
         let attn_avg = tch::no_grad(|| {
             let attn =
                 temporal_attn_cache.unwrap_or_else(|| self.attn_softmax_fp32(&q_pool, &k_pool));
-            attn.select(2, 0)
+            attn.squeeze_dim(2)
                 .mean_dim(1, false, x.kind())
                 .reshape([batch_size, TICKERS_COUNT, temporal_len])
                 .mean_dim(1, false, x.kind())
@@ -313,6 +285,7 @@ impl TradingModel {
                 cross_ticker_embed_norm,
             ) = tch::no_grad(|| {
                 let attn = self.attn_softmax_fp32(&q_pool, &k_pool).squeeze_dim(2);
+                // attn: [b*t, kv_heads, temporal]
                 let entropy = -(attn.clamp_min(1e-9) * attn.clamp_min(1e-9).log())
                     .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
                     .mean(Kind::Float);
@@ -356,13 +329,7 @@ impl TradingModel {
         };
 
         (
-            self.head_common(
-                &conv_features,
-                global_static,
-                per_ticker_static,
-                batch_size,
-                attn_avg,
-            ),
+            self.head_common(&conv_features, global_static, per_ticker_static, batch_size, attn_avg),
             debug_metrics,
         )
     }

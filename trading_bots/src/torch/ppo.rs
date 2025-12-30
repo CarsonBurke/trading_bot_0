@@ -7,7 +7,7 @@ use crate::torch::constants::{
     STEPS_PER_EPISODE, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{TradingModel, LOGIT_SCALE_GROUP};
+use crate::torch::model::{TradingModel, TradingModelConfig, LOGIT_SCALE_GROUP};
 use crate::torch::load::load_var_store_partial;
 use std::fs;
 use std::process;
@@ -155,6 +155,9 @@ fn read_gpu_mem_mb() -> Option<u64> {
 }
 
 pub fn train(weights_path: Option<&str>) {
+    if std::env::var("PYTORCH_ALLOC_CONF").is_err() {
+        std::env::set_var("PYTORCH_ALLOC_CONF", "expandable_segments:True");
+    }
     let mut env = VecEnv::new(true);
 
     let max_steps = STEPS_PER_EPISODE as i64;
@@ -177,7 +180,7 @@ pub fn train(weights_path: Option<&str>) {
     vs.bfloat16();
     println!("Using dtype bf16 for model forward");
     
-    let trading_model = TradingModel::new(&vs.root());
+    let trading_model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
 
     if let Some(path) = weights_path {
         println!("Loading weights from: {}", path);
@@ -514,7 +517,6 @@ pub fn train(weights_path: Option<&str>) {
                 let chunk_len = chunk_end_step - chunk_start_step;
                 let chunk_sample_count = chunk_len * NPROCS;
                 let chunk_sample_start = chunk_start_step * NPROCS;
-
                 let price_deltas_chunk =
                     price_deltas_batch.narrow(0, chunk_sample_start, chunk_sample_count);
                 let static_obs_chunk =
