@@ -55,6 +55,17 @@ impl Env {
         let strategy_log_return = (total_assets_next / total_assets).ln();
         let pnl_reward = strategy_log_return * REWARD_SCALE;
 
+        let mut benchmark_log_return = 0.0;
+        for ticker_idx in 0..n_tickers {
+            let current_price = self.prices[ticker_idx][absolute_step];
+            let next_price = self.prices[ticker_idx][next_absolute_step];
+            benchmark_log_return += (next_price / current_price).ln();
+        }
+        benchmark_log_return /= n_tickers as f64;
+        let cash_weight = (self.account.cash / total_assets).clamp(0.0, 1.0);
+        let cash_penalty = -cash_weight * benchmark_log_return * REWARD_SCALE;
+        let pnl_reward = pnl_reward + cash_penalty;
+
         let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
             vec![0.0; n_tickers]
         } else {

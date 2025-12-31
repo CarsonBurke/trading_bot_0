@@ -95,15 +95,15 @@ const GAE_LAMBDA: f64 = 0.95;
 const SDE_SAMPLE_FREQ: usize = 0;
 
 // PPO hyperparameters
-const PPO_CLIP_RATIO: f64 = 0.2; // Clip range for policy ratio (the trust region)
-const VALUE_CLIP_RANGE: f64 = 0.0; // 0.0 disables value clipping
+const PPO_CLIP_RATIO: f64 = 0.2; // Clip for trust region
+const VALUE_CLIP_RANGE: f64 = 0.1;
 const ENTROPY_COEF: f64 = 0.0;
 const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
 const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
                                 // Conservative KL early stopping (SB3-style)
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
-const LEARNING_RATE: f64 = 1e-4;
+const LEARNING_RATE: f64 = 3e-5;
 const LOGIT_SCALE_LR_MULT: f64 = 10.0;
 
 // RPO: adaptive alpha targeting induced KL (total KL, not per-dim)
@@ -228,8 +228,6 @@ pub fn train(weights_path: Option<&str>) {
     let stats_kind = (Kind::Float, device);
 
     let mut sum_rewards = Tensor::zeros([NPROCS], stats_kind);
-    let mut total_rewards = 0f64;
-    let mut total_episodes = 0f64;
     let mut total_rewards_gpu = Tensor::zeros([], stats_kind);
     let mut total_episodes_gpu = Tensor::zeros([], stats_kind);
 
@@ -432,9 +430,6 @@ pub fn train(weights_path: Option<&str>) {
             .episode_history
             .static_observations
             .push(static_obs_vec);
-
-        total_rewards += f64::try_from(&total_rewards_gpu).unwrap_or(0.0);
-        total_episodes += f64::try_from(&total_episodes_gpu).unwrap_or(0.0);
 
         let price_deltas_batch = s_price_deltas
             .narrow(0, 0, rollout_steps)
