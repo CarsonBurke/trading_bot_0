@@ -13,15 +13,15 @@ pub struct MetaHistory {
     pub value_loss: Vec<f64>,
     pub grad_norm: Vec<f64>,
     pub total_commissions: Vec<f64>,
-    pub mean_std: Vec<f64>,
-    pub min_std: Vec<f64>,
-    pub max_std: Vec<f64>,
+    pub logit_noise_mean: Vec<f64>,
+    pub logit_noise_min: Vec<f64>,
+    pub logit_noise_max: Vec<f64>,
     pub rpo_alpha: Vec<f64>,
     pub mean_advantage: Vec<f64>,
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
     pub logit_scale: Vec<f64>,
-    pub sde_scale: Vec<f64>,
+    pub clip_fraction: Vec<f64>,
     pub time_alpha_attn_mean: Vec<f64>,
     pub time_alpha_mlp_mean: Vec<f64>,
     pub cross_alpha_attn_mean: Vec<f64>,
@@ -59,10 +59,10 @@ impl MetaHistory {
         self.grad_norm.push(grad_norm);
     }
 
-    pub fn record_std_stats(&mut self, mean_std: f64, min_std: f64, max_std: f64, rpo_alpha: f64) {
-        self.mean_std.push(mean_std);
-        self.min_std.push(min_std);
-        self.max_std.push(max_std);
+    pub fn record_logit_noise_stats(&mut self, mean: f64, min: f64, max: f64, rpo_alpha: f64) {
+        self.logit_noise_mean.push(mean);
+        self.logit_noise_min.push(min);
+        self.logit_noise_max.push(max);
         self.rpo_alpha.push(rpo_alpha);
     }
 
@@ -76,8 +76,8 @@ impl MetaHistory {
         self.logit_scale.push(logit_scale);
     }
 
-    pub fn record_sde_scale(&mut self, sde_scale: f64) {
-        self.sde_scale.push(sde_scale);
+    pub fn record_clip_fraction(&mut self, clip_fraction: f64) {
+        self.clip_fraction.push(clip_fraction);
     }
 
     pub fn record_temporal_debug(
@@ -200,9 +200,9 @@ impl MetaHistory {
             };
             let _ = write_report(&format!("{base_dir}/total_commissions.report.bin"), &report);
         }
-        if !self.mean_std.is_empty() {
+        if !self.logit_noise_mean.is_empty() {
             let report = Report {
-                title: "Std Stats".to_string(),
+                title: "Logit Noise".to_string(),
                 x_label: Some("Episode".to_string()),
                 y_label: None,
                 scale: ScaleKind::Linear,
@@ -210,15 +210,15 @@ impl MetaHistory {
                     series: vec![
                         ReportSeries {
                             label: "mean".to_string(),
-                            values: f64_to_f32(&self.mean_std),
+                            values: f64_to_f32(&self.logit_noise_mean),
                         },
                         ReportSeries {
                             label: "min".to_string(),
-                            values: f64_to_f32(&self.min_std),
+                            values: f64_to_f32(&self.logit_noise_min),
                         },
                         ReportSeries {
                             label: "max".to_string(),
-                            values: f64_to_f32(&self.max_std),
+                            values: f64_to_f32(&self.logit_noise_max),
                         },
                         ReportSeries {
                             label: "rpo_alpha".to_string(),
@@ -227,7 +227,7 @@ impl MetaHistory {
                     ],
                 },
             };
-            let _ = write_report(&format!("{base_dir}/std_stats.report.bin"), &report);
+            let _ = write_report(&format!("{base_dir}/logit_noise.report.bin"), &report);
         }
         if !self.mean_advantage.is_empty() {
             let report = Report {
@@ -267,18 +267,18 @@ impl MetaHistory {
             };
             let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &report);
         }
-        if !self.sde_scale.is_empty() {
+        if !self.clip_fraction.is_empty() {
             let report = Report {
-                title: "SDE Scale".to_string(),
+                title: "Clip Fraction".to_string(),
                 x_label: Some("Episode".to_string()),
-                y_label: Some("Scale".to_string()),
+                y_label: Some("Fraction".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Simple {
-                    values: f64_to_f32(&self.sde_scale),
+                    values: f64_to_f32(&self.clip_fraction),
                     ema_alpha: Some(0.05),
                 },
             };
-            let _ = write_report(&format!("{base_dir}/sde_scale.report.bin"), &report);
+            let _ = write_report(&format!("{base_dir}/clip_fraction.report.bin"), &report);
         }
         if !self.time_alpha_attn_mean.is_empty() {
             let report = Report {

@@ -404,33 +404,42 @@ impl TradingModel {
         let logit_scale = self.logit_scale_raw.exp();
         let cash_logit = pool_summary.apply(&self.cash_out).squeeze_dim(-1);
         let action_logits = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(1)], 1) * &logit_scale;
-        let log_std_base = {
-            let log_std_raw = self.log_std_param.tanh();
-            super::LOG_STD_MIN
-                + 0.5 * (super::LOG_STD_MAX - super::LOG_STD_MIN) * (log_std_raw + 1.0)
+        let sde_input = actor_feat.reshape([batch_size * TICKERS_COUNT, 256]);
+        let sde_input = if super::SDE_LEARN_FEATURES {
+            sde_input
+        } else {
+            sde_input.detach()
         };
-        let sde_latent = enriched
-            .reshape([batch_size * TICKERS_COUNT, 256])
-            .apply(&self.sde_fc);
-        let sde_scale = self.sde_scale().to_kind(sde_latent.kind());
-        let sde_scale_ticker = enriched
+        let sde_latent = sde_input.apply(&self.sde_fc);
+        let sde_scale_input = if super::SDE_LEARN_FEATURES {
+            enriched.shallow_clone()
+        } else {
+            enriched.detach()
+        };
+        let sde_scale_ticker = sde_scale_input
             .reshape([batch_size * TICKERS_COUNT, 256])
             .apply(&self.sde_scale_ticker)
             .sigmoid()
             .reshape([batch_size, TICKERS_COUNT, 1]);
         let sde_latent = sde_latent
-            .tanh()
             .reshape([batch_size, TICKERS_COUNT, -1])
-            .g_mul(&sde_scale)
             .g_mul(&sde_scale_ticker);
-        let cash_sde = pool_summary.apply(&self.cash_sde);
-        let sde_scale_cash = pool_summary
+        let cash_input = if super::SDE_LEARN_FEATURES {
+            pool_summary.shallow_clone()
+        } else {
+            pool_summary.detach()
+        };
+        let cash_sde = cash_input.apply(&self.cash_sde).reshape([batch_size, 1, -1]);
+        let sde_scale_cash_input = if super::SDE_LEARN_FEATURES {
+            pool_summary.shallow_clone()
+        } else {
+            pool_summary.detach()
+        };
+        let sde_scale_cash = sde_scale_cash_input
             .apply(&self.sde_scale_cash)
             .sigmoid()
             .reshape([batch_size, 1, 1]);
         let cash_sde = cash_sde
-            .tanh()
-            .g_mul(&sde_scale)
             .g_mul(&sde_scale_cash)
             .reshape([batch_size, 1, -1]);
         let sde_latent = Tensor::cat(&[sde_latent, cash_sde], 1);
@@ -439,9 +448,7 @@ impl TradingModel {
         let variance =
             (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
                 .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-        let log_std_raw = (variance + 1e-6).sqrt().log();
-        let action_log_std = super::LOG_STD_MIN
-            + 0.5 * (super::LOG_STD_MAX - super::LOG_STD_MIN) * (log_std_raw.tanh() + 1.0);
+        let action_log_std = (variance + super::SDE_EPS).sqrt().log();
 
         (
             values,

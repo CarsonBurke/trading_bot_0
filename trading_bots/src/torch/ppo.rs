@@ -92,7 +92,7 @@ const GAE_LAMBDA: f64 = 0.95;
 
 // gSDE: resample exploration noise every N env steps (temporally correlated exploration).
 // This matches the common SB3-style behavior while keeping per-step log-prob computation unchanged.
-const SDE_SAMPLE_FREQ: usize = 1;
+const SDE_SAMPLE_FREQ: usize = 0;
 
 // PPO hyperparameters
 const PPO_CLIP_RATIO: f64 = 0.2; // Clip range for policy ratio (the trust region)
@@ -115,7 +115,35 @@ const ALPHA_LOSS_COEF: f64 = 0.1;
 const ADV_MIXED_WEIGHT: f64 = 0.5;
 const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
 const DEBUG_TEMPORAL_REPORTS: bool = true;
-const DEBUG_MEMORY_REPORTS: bool = true;
+const DEBUG_MEMORY_REPORTS: bool = false;
+const DEBUG_NUMERICS: bool = true;
+
+fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
+    let has_nan = t.isnan().any().int64_value(&[]) != 0;
+    let has_inf = t.isinf().any().int64_value(&[]) != 0;
+    if has_nan || has_inf {
+        let mean = f64::try_from(t.mean(Kind::Float)).unwrap_or(f64::NAN);
+        let min = f64::try_from(t.min()).unwrap_or(f64::NAN);
+        let max = f64::try_from(t.max()).unwrap_or(f64::NAN);
+        println!(
+            "Non-finite in {} at ep {} step {} nan={} inf={} mean={:.6} min={:.6} max={:.6}",
+            name, episode, step, has_nan, has_inf, mean, min, max
+        );
+        return false;
+    }
+    true
+}
+
+fn log_tensor_summary(name: &str, t: &Tensor) {
+    let mean = f64::try_from(t.mean(Kind::Float)).unwrap_or(f64::NAN);
+    let min = f64::try_from(t.min()).unwrap_or(f64::NAN);
+    let max = f64::try_from(t.max()).unwrap_or(f64::NAN);
+    let abs_max = f64::try_from(t.abs().max()).unwrap_or(f64::NAN);
+    println!(
+        "  {}: mean={:.6} min={:.6} max={:.6} abs_max={:.6}",
+        name, mean, min, max, abs_max
+    );
+}
 
 fn read_rss_kb() -> Option<u64> {
     let statm = fs::read_to_string("/proc/self/statm").ok()?;
@@ -293,6 +321,10 @@ pub fn train(weights_path: Option<&str>) {
         // Loop through the episode using relative steps (0 to max_step)
         let mut s: i64 = 0;
         let mut sde_noise: Option<Tensor> = None;
+        let mut logit_noise_sum = Tensor::zeros([], stats_kind);
+        let mut logit_noise_min = Tensor::full([], 1e9, stats_kind);
+        let mut logit_noise_max = Tensor::full([], -1e9, stats_kind);
+        let mut logit_noise_count: i64 = 0;
         for step in 0..env.max_step() {
             env.set_step(step);
 
@@ -309,7 +341,7 @@ pub fn train(weights_path: Option<&str>) {
 
             // Logistic-normal with softmax simplex projection
             let action_std = action_log_std.exp();
-            if sde_noise.is_none() || (step % SDE_SAMPLE_FREQ == 0) {
+            if sde_noise.is_none() || (SDE_SAMPLE_FREQ > 0 && step % SDE_SAMPLE_FREQ == 0) {
                 let std_matrix = trading_model.sde_std_matrix().to_kind(Kind::Float);
                 let eps = Tensor::randn(
                     &[
@@ -328,6 +360,13 @@ pub fn train(weights_path: Option<&str>) {
             let action_logits_noisy = &action_logits + &noise_raw;
             let u = action_logits_noisy.shallow_clone();
             let actions = u.softmax(-1, Kind::Float);
+            let step_noise_mean = noise_raw.mean(Kind::Float);
+            let step_noise_min = noise_raw.min();
+            let step_noise_max = noise_raw.max();
+            let _ = logit_noise_sum.g_add_(&step_noise_mean);
+            logit_noise_min = Tensor::min_other(&logit_noise_min, &step_noise_min);
+            logit_noise_max = Tensor::max_other(&logit_noise_max, &step_noise_max);
+            logit_noise_count += 1;
 
             // Log-prob with softmax Jacobian
             let u_normalized = (&u - &action_logits) / &action_std;
@@ -337,7 +376,20 @@ pub fn train(weights_path: Option<&str>) {
             let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
             let log_weights = u.log_softmax(-1, Kind::Float);
             let log_det = log_weights.sum_dim_intlist(-1, false, Kind::Float);
-            let action_log_prob = log_prob_gaussian - log_det;
+            let action_log_prob = &log_prob_gaussian - &log_det;
+
+            if DEBUG_NUMERICS {
+                let ok = debug_tensor_stats("action_logits", &action_logits, episode, step)
+                    && debug_tensor_stats("action_log_std", &action_log_std, episode, step)
+                    && debug_tensor_stats("sde_latent", &sde_latent, episode, step)
+                    && debug_tensor_stats("noise_raw", &noise_raw, episode, step)
+                    && debug_tensor_stats("u", &u, episode, step)
+                    && debug_tensor_stats("log_det", &log_det, episode, step)
+                    && debug_tensor_stats("action_log_prob", &action_log_prob, episode, step);
+                if !ok {
+                    return;
+                }
+            }
 
             let mut out_so = s_static_obs.get(s + 1);
             let (reward, reward_per_ticker, is_done, step_deltas) =
@@ -554,7 +606,7 @@ pub fn train(weights_path: Option<&str>) {
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
                 let log_weights = u.log_softmax(-1, Kind::Float);
                 let log_det = log_weights.sum_dim_intlist(-1, false, Kind::Float);
-                let action_log_probs = log_prob_gaussian - log_det;
+                let action_log_probs = (log_prob_gaussian - log_det).nan_to_num(0.0, 0.0, 0.0);
 
                 // Entropy of Gaussian (per ticker)
                 let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
@@ -578,7 +630,30 @@ pub fn train(weights_path: Option<&str>) {
                 };
 
                 // PPO clipped objective (joint, weighted advantage)
-                let ratio = (&action_log_probs - &old_log_probs_mb).exp();
+                let old_log_probs_mb = old_log_probs_mb.nan_to_num(0.0, 0.0, 0.0);
+                let log_ratio_raw = &action_log_probs - &old_log_probs_mb;
+                let log_ratio = log_ratio_raw.tanh() * 0.3;
+                if DEBUG_NUMERICS {
+                    let lr_nan = log_ratio.isnan().any().int64_value(&[]) != 0;
+                    let lr_inf = log_ratio.isinf().any().int64_value(&[]) != 0;
+                    if lr_nan || lr_inf {
+                        println!(
+                            "Non-finite log_ratio at ep {} chunk {} nan={} inf={}",
+                            episode, chunk_idx, lr_nan, lr_inf
+                        );
+                        log_tensor_summary("log_ratio_raw", &log_ratio_raw);
+                        log_tensor_summary("log_ratio", &log_ratio);
+                        log_tensor_summary("action_log_probs", &action_log_probs);
+                        log_tensor_summary("old_log_probs", &old_log_probs_mb);
+                        log_tensor_summary("action_logits", &action_logits);
+                        log_tensor_summary("action_logits_noisy", &action_logits_noisy);
+                        log_tensor_summary("action_log_stds", &action_log_stds);
+                        let rpo_alpha_val = f64::try_from(&rpo_alpha).unwrap_or(f64::NAN);
+                        println!("  rpo_alpha: {:.6}", rpo_alpha_val);
+                        return;
+                    }
+                }
+                let ratio = log_ratio.exp();
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
                 let action_weights = u.softmax(-1, Kind::Float).detach();
                 let adv_mean = advantages_mb.mean_dim([-1].as_slice(), false, Kind::Float);
@@ -603,10 +678,29 @@ pub fn train(weights_path: Option<&str>) {
                 total_ratio_samples += chunk_sample_count;
 
                 // KL and loss for metrics (extract before backward frees graph)
-                let approx_kl_val = tch::no_grad(|| {
-                    let delta = &action_log_probs - &old_log_probs_mb;
-                    (delta.exp() - 1.0 - delta).mean(Kind::Float)
-                });
+                let approx_kl_val =
+                    tch::no_grad(|| (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float));
+                if DEBUG_NUMERICS {
+                    let kl_nan = approx_kl_val.isnan().int64_value(&[]) != 0;
+                    let kl_inf = approx_kl_val.isinf().int64_value(&[]) != 0;
+                    if kl_nan || kl_inf {
+                        let kl_val = f64::try_from(&approx_kl_val).unwrap_or(f64::NAN);
+                        println!(
+                            "Non-finite approx_kl at ep {} chunk {} val={:.6} nan={} inf={}",
+                            episode, chunk_idx, kl_val, kl_nan, kl_inf
+                        );
+                        log_tensor_summary("log_ratio_raw", &log_ratio_raw);
+                        log_tensor_summary("log_ratio", &log_ratio);
+                        log_tensor_summary("action_log_probs", &action_log_probs);
+                        log_tensor_summary("old_log_probs", &old_log_probs_mb);
+                        log_tensor_summary("action_logits", &action_logits);
+                        log_tensor_summary("action_logits_noisy", &action_logits_noisy);
+                        log_tensor_summary("action_log_stds", &action_log_stds);
+                        let rpo_alpha_val = f64::try_from(&rpo_alpha).unwrap_or(f64::NAN);
+                        println!("  rpo_alpha: {:.6}", rpo_alpha_val);
+                        return;
+                    }
+                }
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
                     + action_loss.shallow_clone()
                     - dist_entropy * ENTROPY_COEF;
@@ -617,11 +711,11 @@ pub fn train(weights_path: Option<&str>) {
                 // Alpha loss: target induced KL using detached network outputs
                 // For diagonal Gaussian with z_i ~ U(-alpha, alpha):
                 // E[KL] = sum_i E[z_i^2] / (2*sigma_i^2) = sum_i (alpha^2/3) / (2*sigma_i^2)
-                //       = d * (alpha^2/6) * mean(1/sigma^2)  where d = TICKERS_COUNT
+                //       = d * (alpha^2/6) * mean(1/sigma^2)  where d = ACTION_COUNT
                 let action_std_detached = action_log_stds.detach().exp();
                 let var = action_std_detached.pow_tensor_scalar(2);
                 let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                let d = TICKERS_COUNT as f64;
+                let d = ACTION_COUNT as f64;
                 let induced_kl: Tensor =
                     rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                 let alpha_loss = (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0);
@@ -700,39 +794,42 @@ pub fn train(weights_path: Option<&str>) {
         // Get current alpha value for logging/charting
         // Record std stats every episode
         let stats_tensor = tch::no_grad(|| {
-            let price_deltas_step = s_price_deltas.get(0);
-            let static_obs = s_static_obs.get(0);
-            let (_, (_, action_log_std, _), _) =
-                trading_model.forward(&price_deltas_step, &static_obs, false);
-            let std = action_log_std.exp();
+            let logit_noise_mean = if logit_noise_count > 0 {
+                &logit_noise_sum / (logit_noise_count as f64)
+            } else {
+                Tensor::zeros([], stats_kind)
+            };
+            let logit_scale = trading_model.logit_scale().squeeze();
             let rpo_alpha =
                 (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze();
-            let logit_scale = trading_model.logit_scale().squeeze();
-            let sde_scale = trading_model.sde_scale().squeeze();
             Tensor::stack(
                 &[
-                    std.mean(Kind::Float),
-                    std.min(),
-                    std.max(),
-                    rpo_alpha,
+                    logit_noise_mean,
+                    logit_noise_min,
+                    logit_noise_max,
                     logit_scale,
-                    sde_scale,
+                    rpo_alpha,
                 ],
                 0,
             )
         });
         let stats_vec = Vec::<f64>::try_from(stats_tensor).unwrap_or_default();
-        let mean_std = *stats_vec.get(0).unwrap_or(&0.0);
-        let min_std = *stats_vec.get(1).unwrap_or(&0.0);
-        let max_std = *stats_vec.get(2).unwrap_or(&0.0);
-        let rpo_alpha = *stats_vec.get(3).unwrap_or(&0.15);
-        let logit_scale = *stats_vec.get(4).unwrap_or(&1.0);
-        let sde_scale = *stats_vec.get(5).unwrap_or(&1.0);
+        let logit_noise_mean = *stats_vec.get(0).unwrap_or(&0.0);
+        let logit_noise_min = *stats_vec.get(1).unwrap_or(&0.0);
+        let logit_noise_max = *stats_vec.get(2).unwrap_or(&0.0);
+        let logit_scale = *stats_vec.get(3).unwrap_or(&1.0);
+        let rpo_alpha = *stats_vec.get(4).unwrap_or(&0.0);
         env.primary_mut()
             .meta_history
-            .record_std_stats(mean_std, min_std, max_std, rpo_alpha);
+            .record_logit_noise_stats(logit_noise_mean, logit_noise_min, logit_noise_max, rpo_alpha);
         env.primary_mut().meta_history.record_logit_scale(logit_scale);
-        env.primary_mut().meta_history.record_sde_scale(sde_scale);
+        let clip_frac = if total_ratio_samples > 0 {
+            let total_clipped_val = f64::try_from(&total_clipped).unwrap_or(0.0);
+            total_clipped_val / total_ratio_samples as f64
+        } else {
+            0.0
+        };
+        env.primary_mut().meta_history.record_clip_fraction(clip_frac);
 
         // Single GPU->CPU sync for loss and grad norm at end of all epochs
         let mean_losses = if total_sample_count > 0 {
@@ -796,65 +893,7 @@ pub fn train(weights_path: Option<&str>) {
                 episode, rss_kb, cuda_mb
             );
         }
-
-        if episode > 0 && episode % 25 == 0 {
-            // Debug: Check if exploration has collapsed or network diverged
-            let (_, (debug_logits, debug_log_std, _), _attn_weights) =
-                tch::no_grad(|| {
-                    let price_deltas_step = s_price_deltas.get(0);
-                    let static_obs = s_static_obs.get(0);
-                    trading_model.forward(&price_deltas_step, &static_obs, false)
-                });
-
-            let mean_std = f64::try_from(debug_log_std.exp().mean(Kind::Float)).unwrap();
-            let max_raw_action = f64::try_from(debug_logits.abs().max()).unwrap();
-
-            let avg_kl = if total_sample_count > 0 {
-                f64::try_from(&total_kl_weighted / total_sample_count as f64).unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            // Per-dimension KL for comparison (total KL scales with ticker dims)
-            let kl_per_dim = avg_kl / (TICKERS_COUNT as f64);
-
-            let opt_end = Instant::now();
-
-            // Compute clip fraction
-            let clip_frac = if total_ratio_samples > 0 {
-                let total_clipped_val = f64::try_from(&total_clipped).unwrap_or(0.0);
-                total_clipped_val / total_ratio_samples as f64
-            } else {
-                0.0
-            };
-
-            println!(
-                "[Ep {:6}] Episodes: {:.0}, Avg reward: {:.4}, Opt time: {:.2}s, KL: {:.4} ({:.4}/dim), Clip: {:.1}%, Std: {:.4}, RPO: {:.3}",
-                episode,
-                total_episodes,
-                total_rewards / total_episodes,
-                opt_end.duration_since(opt_start).as_secs_f32(),
-                avg_kl,
-                kl_per_dim,
-                clip_frac * 100.0,
-                mean_std,
-                rpo_alpha
-            );
-
-            // Warn if network is diverging
-            if max_raw_action > 100.0 {
-                println!(
-                    "WARNING: Network may be diverging! Raw action magnitude: {:.1}",
-                    max_raw_action
-                );
-            }
-            // Warn if clip fraction is too high (policy changing too fast)
-            if clip_frac > 0.3 {
-                println!("WARNING: High clip fraction ({:.1}%)", clip_frac * 100.0);
-            }
-
-            total_rewards = 0.;
-            total_episodes = 0.;
-        }
+        
         if episode > 0 && episode % 50 == 0 {
             std::fs::create_dir_all("weights").ok();
             if let Err(err) = vs.save(format!("{WEIGHTS_PATH}/ppo_ep{}.safetensors", episode)) {

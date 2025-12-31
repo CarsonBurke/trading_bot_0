@@ -344,6 +344,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 
     let mut step = 0;
     let start_time = Instant::now();
+    let mut sde_noise: Option<Tensor> = None;
 
     loop {
         if step >= max_steps {
@@ -380,8 +381,10 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 &action_logits,
                 &sde_latent,
                 &std_matrix,
-                false,
-                temperature,
+                true,
+                0.0,
+                &mut sde_noise,
+                step,
             );
 
             let actions_vec = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();

@@ -6,6 +6,8 @@ use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{TradingModel, TradingModelConfig};
 use crate::torch::env::Env;
 
+const SDE_SAMPLE_FREQ: usize = 0;
+
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: Device,
@@ -22,19 +24,25 @@ pub fn sample_actions_from_dist(
     std_matrix: &Tensor,
     deterministic: bool,
     temperature: f64,
+    sde_noise: &mut Option<Tensor>,
+    step: usize,
 ) -> Tensor {
     let u = if deterministic || temperature == 0.0 {
         action_logits.shallow_clone()
     } else {
-        let eps = Tensor::randn(
-            &[
-                sde_latent.size()[0],
-                std_matrix.size()[0],
-                std_matrix.size()[1],
-            ],
-            (Kind::Float, sde_latent.device()),
-        );
-        let noise_mat = eps * std_matrix.unsqueeze(0);
+        if sde_noise.is_none() || (SDE_SAMPLE_FREQ > 0 && step % SDE_SAMPLE_FREQ == 0) {
+            let eps = Tensor::randn(
+                &[
+                    sde_latent.size()[0],
+                    std_matrix.size()[0],
+                    std_matrix.size()[1],
+                ],
+                (Kind::Float, sde_latent.device()),
+            );
+            let noise_mat = eps * std_matrix.unsqueeze(0);
+            *sde_noise = Some(noise_mat);
+        }
+        let noise_mat = sde_noise.as_ref().unwrap();
         let noise_raw = (sde_latent * noise_mat.permute([0, 2, 1]))
             .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
         action_logits + noise_raw * temperature
@@ -56,6 +64,9 @@ pub fn run_inference<P: AsRef<Path>>(
     let device = Device::cuda_if_available();
     println!("Using device: {:?}", device);
 
+    let deterministic = true;
+    let temperature = 0.0;
+
     let (_vs, model) = load_model(&weight_path, device)?;
 
     let mut env = match tickers {
@@ -70,6 +81,7 @@ pub fn run_inference<P: AsRef<Path>>(
         let episode_start = Instant::now();
         let mut episode_reward = 0.0;
         let mut stream_state = model.init_stream_state();
+        let mut sde_noise: Option<Tensor> = None;
 
         let (price_deltas, static_obs) = env.reset_single();
         let mut current_price_deltas = Tensor::from_slice(&price_deltas).to_device(device);
@@ -95,6 +107,8 @@ pub fn run_inference<P: AsRef<Path>>(
                 &std_matrix,
                 deterministic,
                 temperature,
+                &mut sde_noise,
+                step,
             );
 
             let actions_vec: Vec<f64> = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();

@@ -65,9 +65,9 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 
 const SSM_DIM: i64 = 64;
 const LOGIT_SCALE_INIT: f64 = 0.3;
-const LOG_STD_MIN: f64 = -5.0;
-const LOG_STD_MAX: f64 = -0.2; // ~0.818
-const SDE_SCALE_INIT: f64 = 1.0;
+const LOG_STD_INIT: f64 = -2.0;
+const SDE_EPS: f64 = 1e-6;
+const SDE_LEARN_FEATURES: bool = false;
 pub const LOGIT_SCALE_GROUP: usize = 1;
 const USE_SDPA: bool = true;
 const SDPA_MIN_LEN: i64 = 64;
@@ -182,7 +182,6 @@ pub struct TradingModel {
     sde_scale_ticker: nn::Linear,
     sde_scale_cash: nn::Linear,
     log_std_param: Tensor,
-    sde_scale_raw: Tensor,
     logit_scale_raw: Tensor,
     device: tch::Device,
     num_heads: i64,
@@ -228,19 +227,8 @@ impl TradingModel {
         self.logit_scale_raw.exp()
     }
 
-    pub fn sde_scale(&self) -> Tensor {
-        self.sde_scale_raw.exp()
-    }
-
     pub fn sde_std_matrix(&self) -> Tensor {
-        let log_std_raw = self.log_std_param.tanh();
-        let log_std_base = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std_raw + 1.0);
-        let positive = log_std_base.gt(0.0).to_kind(Kind::Float);
-        let one = Tensor::ones_like(&positive);
-        let log_std_pos = log_std_base.clamp_min(0.0);
-        let std = log_std_base.exp() * (&one - &positive)
-            + (log_std_pos.log1p() + 1.0) * &positive;
-        std
+        sde_std_from_log_std(&self.log_std_param)
     }
 
     pub fn new(p: &nn::Path) -> Self {
@@ -436,8 +424,11 @@ impl TradingModel {
         let cash_sde = nn::linear(p / "cash_sde", 256, SDE_LATENT_DIM, Default::default());
         let sde_scale_ticker = nn::linear(p / "sde_scale_ticker", 256, 1, Default::default());
         let sde_scale_cash = nn::linear(p / "sde_scale_cash", 256, 1, Default::default());
-        let log_std_param = p.var("log_std", &[SDE_LATENT_DIM, ACTION_COUNT], Init::Const(0.0));
-        let sde_scale_raw = p.var("sde_scale_raw", &[1], Init::Const(SDE_SCALE_INIT.ln()));
+        let log_std_param = p.var(
+            "log_std",
+            &[SDE_LATENT_DIM, ACTION_COUNT],
+            Init::Const(LOG_STD_INIT),
+        );
         let logit_scale_raw = p.set_group(LOGIT_SCALE_GROUP).var(
             "logit_scale_raw",
             &[1],
@@ -488,7 +479,6 @@ impl TradingModel {
             sde_scale_ticker,
             sde_scale_cash,
             log_std_param,
-            sde_scale_raw,
             logit_scale_raw,
             device: p.device(),
             num_heads,
@@ -586,4 +576,13 @@ impl TradingModel {
             .expand(&[batch_tokens, SEQ_LEN, SSM_DIM], false);
         (x + pos_emb + static_ssm).permute([0, 2, 1])
     }
+}
+
+pub(crate) fn sde_std_from_log_std(log_std: &Tensor) -> Tensor {
+    let positive = log_std.gt(0.0).to_kind(Kind::Float);
+    let non_positive = log_std.le(0.0).to_kind(Kind::Float);
+    let below = log_std.exp() * &non_positive;
+    let safe_log_std = log_std * &positive + SDE_EPS;
+    let above = (safe_log_std.log1p() + 1.0) * &positive;
+    below + above
 }

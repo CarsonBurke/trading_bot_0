@@ -137,7 +137,7 @@ impl App {
             "loss_log",
             "advantage_stats_log",
             "total_commissions",
-            "std_stats",
+            "logit_noise",
             "logit_scale",
             "grad_norm_log",
             "target_weights",
