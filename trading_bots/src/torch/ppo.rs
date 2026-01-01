@@ -98,6 +98,7 @@ const SDE_SAMPLE_FREQ: usize = 0;
 const PPO_CLIP_RATIO: f64 = 0.2; // Clip for trust region
 const VALUE_CLIP_RANGE: f64 = 0.1;
 const ENTROPY_COEF: f64 = 0.0;
+const ATTENTION_ENTROPY_COEF: f64 = 0.002;
 const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
 const MAX_GRAD_NORM: f64 = 0.5; // Gradient clipping norm
                                 // Conservative KL early stopping (SB3-style)
@@ -114,7 +115,6 @@ const RPO_ALPHA_INIT: f64 = 0.1;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const ADV_MIXED_WEIGHT: f64 = 0.5;
 const GRAD_ACCUM_STEPS: usize = 2; // Accumulate gradients over k chunks before stepping (was 4, reduced for more updates)
-const DEBUG_TEMPORAL_REPORTS: bool = true;
 const DEBUG_MEMORY_REPORTS: bool = false;
 const DEBUG_NUMERICS: bool = true;
 
@@ -326,7 +326,7 @@ pub fn train(weights_path: Option<&str>) {
         for step in 0..env.max_step() {
             env.set_step(step);
 
-            let (values, (action_logits, action_log_std, sde_latent), _attn_weights) =
+            let (values, (action_logits, action_log_std, sde_latent), _attn_weights, _attn_entropy) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
@@ -454,7 +454,8 @@ pub fn train(weights_path: Option<&str>) {
             let next_value = tch::no_grad(|| {
                 let price_deltas_step = s_price_deltas.get(rollout_steps);
                 let static_obs = s_static_obs.get(rollout_steps);
-                let (values, _, _) = trading_model.forward(&price_deltas_step, &static_obs, false);
+                let (values, _, _, _) =
+                    trading_model.forward(&price_deltas_step, &static_obs, false);
                 values.to_kind(Kind::Float)
             });
             // Compute GAE backwards per ticker.
@@ -568,13 +569,14 @@ pub fn train(weights_path: Option<&str>) {
                 let static_obs_chunk =
                     static_obs_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
-                let (values, (action_logits, action_log_stds, _), _) = trading_model
+                let (values, (action_logits, action_log_stds, _), _, attn_entropy) = trading_model
                     .forward(&price_deltas_chunk, &static_obs_chunk, true);
                 let values = values
                     .to_kind(Kind::Float)
                     .view([chunk_sample_count, TICKERS_COUNT + 1]);
                 let action_logits = action_logits.to_kind(Kind::Float);
                 let action_log_stds = action_log_stds.to_kind(Kind::Float);
+                let attn_entropy = attn_entropy.to_kind(Kind::Float);
 
                 let actions_mb = actions.narrow(0, chunk_sample_start, chunk_sample_count);
                 let returns_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
@@ -606,6 +608,7 @@ pub fn train(weights_path: Option<&str>) {
                 // Entropy of Gaussian (per ticker)
                 let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
                 let dist_entropy = entropy_components.g_mul_scalar(0.5).mean(Kind::Float);
+                let attn_entropy_mean = attn_entropy.mean(Kind::Float);
 
                 // PPO-style clipped MSE on per-ticker values (raw space)
                 let old_values_mb =
@@ -698,7 +701,8 @@ pub fn train(weights_path: Option<&str>) {
                 }
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
                     + action_loss.shallow_clone()
-                    - dist_entropy * ENTROPY_COEF;
+                    - dist_entropy * ENTROPY_COEF
+                    - attn_entropy_mean * ATTENTION_ENTROPY_COEF;
                 let loss_val = tch::no_grad(|| ppo_loss.shallow_clone());
                 let policy_loss_val = tch::no_grad(|| action_loss.shallow_clone());
                 let value_loss_val = tch::no_grad(|| value_loss.shallow_clone());
@@ -860,26 +864,6 @@ pub fn train(weights_path: Option<&str>) {
         env.primary_mut()
             .meta_history
             .record_grad_norm(mean_grad_norm);
-        if DEBUG_TEMPORAL_REPORTS {
-            let ( _out, debug) = tch::no_grad(|| {
-                let price_deltas_step = s_price_deltas.get(0);
-                let static_obs = s_static_obs.get(0);
-                trading_model.forward_with_debug(&price_deltas_step, &static_obs, false)
-            });
-            env.primary_mut().meta_history.record_temporal_debug(
-                debug.time_alpha_attn_mean,
-                debug.time_alpha_mlp_mean,
-                debug.cross_alpha_attn_mean,
-                debug.cross_alpha_mlp_mean,
-                debug.temporal_tau,
-                debug.temporal_attn_entropy,
-                debug.temporal_attn_max,
-                debug.temporal_attn_eff_len,
-                debug.temporal_attn_center,
-                debug.temporal_attn_last_weight,
-                debug.cross_ticker_embed_norm,
-            );
-        }
         if DEBUG_MEMORY_REPORTS {
             let rss_kb = read_rss_kb().unwrap_or(0);
             let cuda_mb = read_gpu_mem_mb().unwrap_or(0);

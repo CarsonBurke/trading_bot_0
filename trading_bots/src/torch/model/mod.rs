@@ -74,13 +74,16 @@ const SDPA_MIN_LEN: i64 = 64;
 const SDPA_MIN_LEN_CROSS: i64 = 1;
 const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
+const HEAD_HIDDEN: i64 = 192;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -2.0;
 const ROPE_BASE: f64 = 10000.0;
+const DEFAULT_CASH_POOL_QUERIES: i64 = 4;
+const DEFAULT_TICKER_POOL_QUERIES: i64 = 4;
 
 // Uniform patch size for proper streaming support
-// 3400 deltas / 34 = 100 tokens
-const PATCH_SIZE: i64 = 34;
+// 3400 deltas / 17 = 200 tokens
+const PATCH_SIZE: i64 = 17;
 const SEQ_LEN: i64 = PRICE_DELTAS_PER_TICKER as i64 / PATCH_SIZE;
 
 const _: () = assert!(
@@ -88,8 +91,8 @@ const _: () = assert!(
     "PRICE_DELTAS must be divisible by PATCH_SIZE"
 );
 
-// (values, (action_logits, action_log_std, sde_latent), attn_weights)
-pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor);
+// (values, (action_logits, action_log_std, sde_latent), attn_weights, attn_entropy)
+pub type ModelOutput = (Tensor, (Tensor, Tensor, Tensor), Tensor, Tensor);
 
 pub struct DebugMetrics {
     pub time_alpha_attn_mean: f64,
@@ -108,11 +111,17 @@ pub struct DebugMetrics {
 #[derive(Clone, Copy)]
 pub struct TradingModelConfig {
     pub ssm_layers: usize,
+    pub cash_pool_queries: i64,
+    pub ticker_pool_queries: i64,
 }
 
 impl Default for TradingModelConfig {
     fn default() -> Self {
-        Self { ssm_layers: 2 }
+        Self {
+            ssm_layers: 2,
+            cash_pool_queries: DEFAULT_CASH_POOL_QUERIES,
+            ticker_pool_queries: DEFAULT_TICKER_POOL_QUERIES,
+        }
     }
 }
 
@@ -154,29 +163,32 @@ pub struct TradingModel {
     time_global_ctx: nn::Linear,
     time_ticker_ctx: nn::Linear,
     cross_ticker_embed: nn::Linear,
-    pool_queries: Tensor,
-    ln_temporal_q: RMSNorm,
-    ln_temporal_kv: RMSNorm,
-    temporal_q: nn::Linear,
-    temporal_k: nn::Linear,
-    temporal_v: nn::Linear,
-    temporal_last: nn::Linear,
-    temporal_gate: nn::Linear,
-    temporal_attn_out: nn::Linear,
-    temporal_tau_raw: Tensor,
-    ln_pool_out: RMSNorm,
-    cls_global_ctx: nn::Linear,
-    cls_ticker_ctx: nn::Linear,
+    ticker_queries: Tensor,
+    ticker_q_proj: nn::Linear,
+    ticker_k_proj: nn::Linear,
+    ticker_v_proj: nn::Linear,
+    ticker_merge: nn::Linear,
+    ticker_ctx_proj: nn::Linear,
+    ticker_recent_proj: nn::Linear,
+    ticker_recent_gate: nn::Linear,
+    ticker_recent_slope_raw: Tensor,
+    ticker_attn_temp_raw: Tensor,
     global_to_ticker: nn::Linear,
-    actor_fc1: nn::Linear,
-    ln_actor_fc1: RMSNorm,
-    actor_fc2: nn::Linear,
-    ln_actor_fc2: RMSNorm,
+    head_proj: nn::Linear,
+    head_ln: RMSNorm,
     actor_out: nn::Linear,
     cash_out: nn::Linear,
-    pool_scorer: nn::Linear,
     value_ticker_out: nn::Linear,
     cash_value_out: nn::Linear,
+    cash_queries: Tensor,
+    cash_q_proj: nn::Linear,
+    cash_k_proj: nn::Linear,
+    cash_v_proj: nn::Linear,
+    cash_merge: nn::Linear,
+    cash_recent_proj: nn::Linear,
+    cash_recent_gate: nn::Linear,
+    cash_recent_slope_raw: Tensor,
+    cash_attn_temp_raw: Tensor,
     sde_fc: nn::Linear,
     cash_sde: nn::Linear,
     sde_scale_ticker: nn::Linear,
@@ -187,6 +199,10 @@ pub struct TradingModel {
     num_heads: i64,
     kv_heads: i64,
     head_dim: i64,
+    cash_pool_queries: i64,
+    ticker_pool_queries: i64,
+    decay_positions: Tensor,
+    decay_ones: Tensor,
 }
 
 impl TradingModel {
@@ -288,6 +304,11 @@ impl TradingModel {
         let kv_heads = 2i64;
         let head_dim = 64i64;
         assert!(num_heads % kv_heads == 0, "num_heads must be divisible by kv_heads");
+        assert!(config.cash_pool_queries > 0, "cash_pool_queries must be > 0");
+        assert!(
+            config.ticker_pool_queries > 0,
+            "ticker_pool_queries must be > 0"
+        );
         let time_cross_block = TimeCrossBlock2d::new(&(p / "time_cross_0"), kv_heads, head_dim);
         let time_pos_proj = nn::linear(p / "time_pos_proj", 4, 256, Default::default());
         let time_global_ctx = nn::linear(
@@ -308,122 +329,102 @@ impl TradingModel {
             256,
             Default::default(),
         );
-        // GQA-style pooling: kv_heads separate query groups, each attends independently
-        let pool_queries = p.var(
-            "pool_queries",
-            &[kv_heads, 256],
+        let ticker_queries = p.var(
+            "ticker_queries",
+            &[config.ticker_pool_queries, 256],
             Init::Uniform {
                 lo: -0.01,
                 up: 0.01,
             },
         );
-        let ln_temporal_q = RMSNorm::new(&(p / "ln_temporal_q"), 256, 1e-5);
-        let ln_temporal_kv = RMSNorm::new(&(p / "ln_temporal_kv"), 256, 1e-5);
-        // Each query group outputs one head, K/V stay grouped per kv_head
-        let temporal_q = nn::linear(p / "temporal_q", 256, head_dim, Default::default());
-        let temporal_k = nn::linear(p / "temporal_k", 256, kv_heads * head_dim, Default::default());
-        let temporal_v = nn::linear(p / "temporal_v", 256, kv_heads * head_dim, Default::default());
-        let temporal_last = nn::linear(p / "temporal_last", 256, 256, Default::default());
-        let temporal_gate = nn::linear(p / "temporal_gate", 256, 256, Default::default());
-        // Output from kv_heads * head_dim to 256
-        let temporal_attn_out = nn::linear(
-            p / "temporal_attn_out",
-            kv_heads * head_dim,
-            256,
-            Default::default(),
-        );
-        let temporal_tau_raw = p.var("temporal_tau_raw", &[1], Init::Const(0.0));
-        let ln_pool_out = RMSNorm::new(&(p / "ln_pool_out"), 256, 1e-5);
-        let cls_global_ctx = nn::linear(
-            p / "cls_global_ctx",
-            GLOBAL_STATIC_OBS as i64,
-            256,
-            Default::default(),
-        );
-        let cls_ticker_ctx = nn::linear(
-            p / "cls_ticker_ctx",
+        let ticker_q_proj = nn::linear(p / "ticker_q_proj", 256, 256, Default::default());
+        let ticker_k_proj = nn::linear(p / "ticker_k_proj", 256, 256, Default::default());
+        let ticker_v_proj = nn::linear(p / "ticker_v_proj", 256, 256, Default::default());
+        let ticker_merge = nn::linear(p / "ticker_merge", 256, 256, Default::default());
+        let ticker_ctx_proj = nn::linear(
+            p / "ticker_ctx_proj",
             PER_TICKER_STATIC_OBS as i64,
             256,
             Default::default(),
         );
-
+        let ticker_recent_proj = nn::linear(p / "ticker_recent_proj", 256, 256, Default::default());
+        let ticker_recent_gate = nn::linear(p / "ticker_recent_gate", 256, 256, Default::default());
+        let ticker_recent_slope_raw = p.var("ticker_recent_slope_raw", &[1], Init::Const(0.0));
+        let ticker_attn_temp_raw = p.var("ticker_attn_temp_raw", &[1], Init::Const(0.0));
         let global_to_ticker = nn::linear(
             p / "global_to_ticker",
             GLOBAL_STATIC_OBS as i64,
             256,
             Default::default(),
         );
-        let actor_fc1 = nn::linear(
-            p / "actor_fc1",
+        let head_proj = nn::linear(
+            p / "head_proj",
             256,
-            256,
+            HEAD_HIDDEN,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(256, 256),
+                ws_init: truncated_normal_init(256, HEAD_HIDDEN),
                 ..Default::default()
             },
         );
-        let ln_actor_fc1 = RMSNorm::new(&(p / "ln_actor_fc1"), 256, 1e-5);
-        let actor_fc2 = nn::linear(
-            p / "actor_fc2",
-            256,
-            256,
-            nn::LinearConfig {
-                ws_init: truncated_normal_init(256, 256),
-                ..Default::default()
-            },
-        );
-        let ln_actor_fc2 = RMSNorm::new(&(p / "ln_actor_fc2"), 256, 1e-5);
+        let head_ln = RMSNorm::new(&(p / "head_ln"), HEAD_HIDDEN, 1e-5);
         let actor_out = nn::linear(
             p / "actor_out",
-            256,
+            HEAD_HIDDEN,
             1,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(256, 1),
+                ws_init: truncated_normal_init(HEAD_HIDDEN, 1),
                 ..Default::default()
             },
         );
         let cash_out = nn::linear(
             p / "cash_out",
-            256,
+            HEAD_HIDDEN,
             1,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(256, 1),
-                ..Default::default()
-            },
-        );
-        let pool_scorer = nn::linear(
-            p / "pool_scorer",
-            256,
-            1,
-            nn::LinearConfig {
-                ws_init: truncated_normal_init(256, 1),
+                ws_init: truncated_normal_init(HEAD_HIDDEN, 1),
                 ..Default::default()
             },
         );
         let value_ticker_out = nn::linear(
             p / "value_ticker_out",
-            256,
+            HEAD_HIDDEN,
             1,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(256, 1),
+                ws_init: truncated_normal_init(HEAD_HIDDEN, 1),
                 ..Default::default()
             },
         );
+        let cash_queries = p.var(
+            "cash_queries",
+            &[config.cash_pool_queries, 256],
+            Init::Uniform {
+                lo: -0.01,
+                up: 0.01,
+            },
+        );
+        let cash_q_proj = nn::linear(p / "cash_q_proj", 256, 256, Default::default());
+        let cash_k_proj = nn::linear(p / "cash_k_proj", 256, 256, Default::default());
+        let cash_v_proj = nn::linear(p / "cash_v_proj", 256, 256, Default::default());
+        let cash_merge = nn::linear(p / "cash_merge", 256, 256, Default::default());
+        let cash_recent_proj = nn::linear(p / "cash_recent_proj", 256, 256, Default::default());
+        let cash_recent_gate = nn::linear(p / "cash_recent_gate", 256, 256, Default::default());
+        let cash_recent_slope_raw = p.var("cash_recent_slope_raw", &[1], Init::Const(0.0));
+        let cash_attn_temp_raw = p.var("cash_attn_temp_raw", &[1], Init::Const(0.0));
         let cash_value_out = nn::linear(
             p / "cash_value_out",
-            256,
+            HEAD_HIDDEN,
             1,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(256, 1),
+                ws_init: truncated_normal_init(HEAD_HIDDEN, 1),
                 ..Default::default()
             },
         );
 
         const SDE_LATENT_DIM: i64 = 64;
-        let sde_fc = nn::linear(p / "sde_fc", 256, SDE_LATENT_DIM, Default::default());
-        let cash_sde = nn::linear(p / "cash_sde", 256, SDE_LATENT_DIM, Default::default());
-        let sde_scale_ticker = nn::linear(p / "sde_scale_ticker", 256, 1, Default::default());
-        let sde_scale_cash = nn::linear(p / "sde_scale_cash", 256, 1, Default::default());
+        let sde_fc = nn::linear(p / "sde_fc", HEAD_HIDDEN, SDE_LATENT_DIM, Default::default());
+        let cash_sde = nn::linear(p / "cash_sde", HEAD_HIDDEN, SDE_LATENT_DIM, Default::default());
+        let sde_scale_ticker = nn::linear(p / "sde_scale_ticker", HEAD_HIDDEN, 1, Default::default());
+        let sde_scale_cash = nn::linear(p / "sde_scale_cash", HEAD_HIDDEN, 1, Default::default());
         let log_std_param = p.var(
             "log_std",
             &[SDE_LATENT_DIM, ACTION_COUNT],
@@ -434,6 +435,8 @@ impl TradingModel {
             &[1],
             Init::Const(LOGIT_SCALE_INIT.ln()),
         );
+        let decay_positions = Tensor::arange(SEQ_LEN, (Kind::Float, p.device()));
+        let decay_ones = Tensor::ones(&[SEQ_LEN], (Kind::Float, p.device()));
         Self {
             patch_embed,
             patch_ln,
@@ -451,29 +454,32 @@ impl TradingModel {
             time_global_ctx,
             time_ticker_ctx,
             cross_ticker_embed,
-            pool_queries,
-            ln_temporal_q,
-            ln_temporal_kv,
-            temporal_q,
-            temporal_k,
-            temporal_v,
-            temporal_last,
-            temporal_gate,
-            temporal_attn_out,
-            temporal_tau_raw,
-            ln_pool_out,
-            cls_global_ctx,
-            cls_ticker_ctx,
+            ticker_queries,
+            ticker_q_proj,
+            ticker_k_proj,
+            ticker_v_proj,
+            ticker_merge,
+            ticker_ctx_proj,
+            ticker_recent_proj,
+            ticker_recent_gate,
+            ticker_recent_slope_raw,
+            ticker_attn_temp_raw,
             global_to_ticker,
-            actor_fc1,
-            ln_actor_fc1,
-            actor_fc2,
-            ln_actor_fc2,
+            head_proj,
+            head_ln,
             actor_out,
             cash_out,
-            pool_scorer,
             value_ticker_out,
             cash_value_out,
+            cash_queries,
+            cash_q_proj,
+            cash_k_proj,
+            cash_v_proj,
+            cash_merge,
+            cash_recent_proj,
+            cash_recent_gate,
+            cash_recent_slope_raw,
+            cash_attn_temp_raw,
             sde_fc,
             cash_sde,
             sde_scale_ticker,
@@ -484,6 +490,10 @@ impl TradingModel {
             num_heads,
             kv_heads,
             head_dim,
+            cash_pool_queries: config.cash_pool_queries,
+            ticker_pool_queries: config.ticker_pool_queries,
+            decay_positions,
+            decay_ones,
         }
     }
 

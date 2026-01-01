@@ -371,7 +371,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
             };
 
             let (action_logits, _action_log_std, sde_latent) = tch::no_grad(|| {
-                let (_, (action_logits, action_log_std, sde_latent), _) =
+                let (_, (action_logits, action_log_std, sde_latent), _, _) =
                     model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state);
                 (action_logits, action_log_std, sde_latent)
             });
