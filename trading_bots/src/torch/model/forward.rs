@@ -14,8 +14,7 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let x_stem =
-            self.patch_embed_all_with_static(&price_deltas, &per_ticker_static, batch_size);
+        let x_stem = self.patch_embed_all_with_static(&price_deltas, batch_size);
 
         let mut x_for_ssm = x_stem.permute([0, 2, 1]);
         let dt_scale = Tensor::full(
@@ -51,8 +50,7 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let x_stem =
-            self.patch_embed_all_with_static(&price_deltas, &per_ticker_static, batch_size);
+        let x_stem = self.patch_embed_all_with_static(&price_deltas, batch_size);
 
         let mut x_for_ssm = x_stem.permute([0, 2, 1]);
         let dt_scale = Tensor::full(

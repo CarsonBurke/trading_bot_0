@@ -1,6 +1,9 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, FF_DIM, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS};
+use super::{
+    DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM, RESIDUAL_ALPHA_MAX,
+    TIME_CROSS_LAYERS,
+};
 use crate::torch::constants::{PER_TICKER_STATIC_OBS, TICKERS_COUNT};
 
 const POOL_TEMPERATURE_MIN: f64 = 0.1;
@@ -15,22 +18,37 @@ impl TradingModel {
         batch_size: i64,
         _debug: bool,
     ) -> (ModelOutput, Option<DebugMetrics>) {
-        let x = x_ssm.apply(&self.ssm_proj) + &self.pos_embedding;
+        let x = x_ssm.permute([0, 2, 1]);
+        let x = self.post_ssm_ln.forward(&x);
+        let x = &x * x.apply(&self.ssm_gate).sigmoid();
+        let x = x.permute([0, 2, 1]);
+        let mut x = x.apply(&self.ssm_proj);
         let temporal_len = x.size()[2];
+        let pos = self
+            .patch_pos_embed
+            .narrow(0, 0, temporal_len)
+            .to_kind(x.kind())
+            .transpose(0, 1)
+            .unsqueeze(0);
+        x = x + pos;
 
         let x_time = x
-            .view([batch_size, TICKERS_COUNT, 256, temporal_len])
+            .view([batch_size, TICKERS_COUNT, MODEL_DIM, temporal_len])
             .permute([0, 3, 1, 2]);
         let x_time = x_time;
         let global_ctx = global_static
             .apply(&self.time_global_ctx)
             .unsqueeze(1)
             .unsqueeze(1);
-        let ticker_ctx = per_ticker_static
+        let exo_ticker_base = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
             .apply(&self.time_ticker_ctx)
-            .reshape([batch_size, TICKERS_COUNT, 256])
-            .unsqueeze(1);
+            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
+        let exo_ticker_embed = per_ticker_static
+            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
+            .apply(&self.cross_ticker_embed)
+            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
+        let exo_ticker = &exo_ticker_base + &exo_ticker_embed;
         let step_progress = global_static.narrow(1, 0, 1);
         let angle1 = &step_progress * (2.0 * std::f64::consts::PI);
         let angle2 = &step_progress * (4.0 * std::f64::consts::PI);
@@ -39,140 +57,137 @@ impl TradingModel {
             .apply(&self.time_pos_proj)
             .unsqueeze(1)
             .unsqueeze(1);
-        let x_time = x_time + global_ctx + ticker_ctx + time_pos;
-        let pos = Tensor::arange(temporal_len, (Kind::Float, x.device()));
-        let (rope_cos, rope_sin) = self.rope_cos_sin(&pos, x.kind(), x.device());
-        let cross_ticker_embed_base = per_ticker_static
-            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&self.cross_ticker_embed)
-            .reshape([batch_size, TICKERS_COUNT, 256]);
-        let cross_ticker_embed = cross_ticker_embed_base
+        let exo_global = global_ctx.squeeze_dim(1).squeeze_dim(1);
+        let exo_time = time_pos.squeeze_dim(1).squeeze_dim(1);
+        let exo_global = exo_global
             .unsqueeze(1)
-            .expand(&[batch_size, temporal_len, TICKERS_COUNT, 256], false);
+            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
+        let exo_time = exo_time
+            .unsqueeze(1)
+            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
+        let exo_tokens = Tensor::cat(
+            &[
+                exo_global.unsqueeze(2),
+                exo_ticker.unsqueeze(2),
+                exo_time.unsqueeze(2),
+            ],
+            2,
+        );
+        let mut global_token = self
+            .global_ticker_token
+            .unsqueeze(0)
+            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
+        global_token = global_token + &exo_ticker + &exo_global + &exo_time;
+        let global_token = global_token.unsqueeze(1);
+        let mut x_time = Tensor::cat(&[x_time, global_token], 1);
+        let temporal_len_all = temporal_len + 1;
+        let x_time_flat = x_time
+            .permute([0, 2, 1, 3])
+            .reshape([batch_size * TICKERS_COUNT, temporal_len_all, MODEL_DIM]);
+        let exo_tokens_flat =
+            exo_tokens.reshape([batch_size * TICKERS_COUNT, 3, MODEL_DIM]);
+        let q_exo = x_time_flat.apply(&self.static_cross_q);
+        let k_exo = exo_tokens_flat.apply(&self.static_cross_k);
+        let v_exo = exo_tokens_flat.apply(&self.static_cross_v);
+        let exo_scores = q_exo.matmul(&k_exo.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let exo_attn = exo_scores.softmax(-1, Kind::Float);
+        let exo_ctx = exo_attn
+            .matmul(&v_exo)
+            .apply(&self.static_cross_out)
+            .reshape([batch_size, TICKERS_COUNT, temporal_len_all, MODEL_DIM])
+            .permute([0, 2, 1, 3]);
+        x_time = x_time + exo_ctx;
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
         let block = &self.time_cross_block;
-        let alpha_attn = block.alpha_attn.sigmoid() * alpha_scale;
+        let alpha_time_attn = block.alpha_attn.sigmoid() * alpha_scale;
+        let alpha_time_rp = block.alpha_time_rp.sigmoid() * alpha_scale;
+        let alpha_ticker_rp = block.alpha_ticker_rp.sigmoid() * alpha_scale;
+        let alpha_ticker_attn = block.alpha_ticker_attn.sigmoid() * alpha_scale;
         let alpha_mlp = block.alpha_mlp.sigmoid() * alpha_scale;
-        let mut x_2d = x_time + &cross_ticker_embed;
-        // Permute to [batch, tickers, temporal, 256] and merge batch*tickers before projections.
-        // This avoids separate copies for Q, K, V by doing one reshape early.
-        let x_norm = block
+        let mut x_2d = x_time;
+        let btk = batch_size * temporal_len_all * TICKERS_COUNT;
+        let bk = batch_size * TICKERS_COUNT;
+        let bt = batch_size * temporal_len_all;
+        let x_time_norm = block
             .ln
-            .forward(&x_2d.reshape([batch_size * temporal_len * TICKERS_COUNT, 256]))
-            .reshape([batch_size, temporal_len, TICKERS_COUNT, 256])
+            .forward(&x_2d.reshape([btk, MODEL_DIM]))
+            .reshape([batch_size, temporal_len_all, TICKERS_COUNT, MODEL_DIM])
             .permute([0, 2, 1, 3])
-            .reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
-        let q = x_norm
-            .apply(&block.attn_q)
-            .reshape([batch_size * TICKERS_COUNT, temporal_len, self.num_heads, self.head_dim])
+            .reshape([bk, temporal_len_all, MODEL_DIM]);
+        let time_rp_q = x_time_norm.apply(&block.time_rp_q);
+        let time_rp_k = block.time_rp_k_frozen.to_kind(time_rp_q.kind());
+        let time_rp_scores =
+            time_rp_q.matmul(&time_rp_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let time_rp_attn = time_rp_scores.softmax(-1, Kind::Float);
+        let time_rp_v = block.time_rp_v.to_kind(time_rp_q.kind());
+        let time_rp_ctx = time_rp_attn
+            .matmul(&time_rp_v)
+            .apply(&block.time_out)
+            .reshape([batch_size, TICKERS_COUNT, temporal_len_all, MODEL_DIM])
             .permute([0, 2, 1, 3]);
-        let kv = x_norm
-            .apply(&block.attn_kv)
-            .reshape([batch_size * TICKERS_COUNT, temporal_len, 2, self.kv_heads, self.head_dim])
-            .permute([2, 0, 1, 3, 4]);
-        let (k, v) = (kv.get(0), kv.get(1));
-        let k = k.permute([0, 2, 1, 3]);
-        let q = self.apply_rope_cached(&q, &rope_cos, &rope_sin);
-        let k = self.apply_rope_cached(&k, &rope_cos, &rope_sin);
-        let q = q
+        x_2d = x_2d + &time_rp_ctx * &alpha_time_rp;
+
+        let x_time_norm = block
+            .ln
+            .forward(&x_2d.reshape([btk, MODEL_DIM]))
+            .reshape([batch_size, temporal_len_all, TICKERS_COUNT, MODEL_DIM])
             .permute([0, 2, 1, 3])
-            .reshape([batch_size, TICKERS_COUNT, temporal_len, self.num_heads, self.head_dim])
-            .permute([0, 3, 1, 2, 4])
-            .reshape([
-                batch_size,
-                self.num_heads,
-                TICKERS_COUNT * temporal_len,
-                self.head_dim,
-            ]);
-        let k = k
-            .permute([0, 2, 1, 3])
-            .reshape([batch_size, TICKERS_COUNT, temporal_len, self.kv_heads, self.head_dim])
-            .permute([0, 3, 1, 2, 4])
-            .reshape([
-                batch_size,
-                self.kv_heads,
-                TICKERS_COUNT * temporal_len,
-                self.head_dim,
-            ]);
-        let v = v
-            .permute([0, 2, 1, 3])
-            .reshape([batch_size, TICKERS_COUNT, temporal_len, self.kv_heads, self.head_dim])
-            .permute([0, 3, 1, 2, 4])
-            .reshape([
-                batch_size,
-                self.kv_heads,
-                TICKERS_COUNT * temporal_len,
-                self.head_dim,
-            ]);
-        let total_len = TICKERS_COUNT as i64 * temporal_len;
-        let attn_out = if self.use_sdpa(total_len) {
-            Tensor::scaled_dot_product_attention(
-                &q,
-                &k,
-                &v,
-                Option::<Tensor>::None,
-                0.0,
-                false,
-                None,
-                true,
-            )
-        } else {
-            let kv_repeat = self.num_heads / self.kv_heads;
-            let k = k
-                .unsqueeze(2)
-                .expand(
-                    &[
-                        batch_size,
-                        self.kv_heads,
-                        kv_repeat,
-                        TICKERS_COUNT * temporal_len,
-                        self.head_dim,
-                    ],
-                    false,
-                )
-                .reshape([
-                    batch_size,
-                    self.num_heads,
-                    TICKERS_COUNT * temporal_len,
-                    self.head_dim,
-                ]);
-            let v = v
-                .unsqueeze(2)
-                .expand(
-                    &[
-                        batch_size,
-                        self.kv_heads,
-                        kv_repeat,
-                        TICKERS_COUNT * temporal_len,
-                        self.head_dim,
-                    ],
-                    false,
-                )
-                .reshape([
-                    batch_size,
-                    self.num_heads,
-                    TICKERS_COUNT * temporal_len,
-                    self.head_dim,
-                ]);
-            let attn = self.attn_softmax_fp32(&q, &k);
-            attn.matmul(&v)
-        };
-        let attn_out = attn_out
-            .permute([0, 2, 1, 3])
-            .contiguous()
-            .view([batch_size, total_len, 256])
-            .apply(&block.attn_out)
-            .reshape([batch_size, TICKERS_COUNT, temporal_len, 256])
+            .reshape([bk, temporal_len_all, MODEL_DIM]);
+        let time_latent_q = x_time_norm.apply(&block.time_latent_q);
+        let time_latent_k = block.time_latent_k.to_kind(time_latent_q.kind());
+        let time_latent_scores =
+            time_latent_q.matmul(&time_latent_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let time_latent_attn = time_latent_scores.softmax(-1, Kind::Float);
+        let time_latent_v = block.time_latent_v.to_kind(time_latent_q.kind());
+        let time_latent_ctx = time_latent_attn
+            .matmul(&time_latent_v)
+            .apply(&block.time_out)
+            .reshape([batch_size, TICKERS_COUNT, temporal_len_all, MODEL_DIM])
             .permute([0, 2, 1, 3]);
-        let mlp_in = x_norm.reshape([batch_size * TICKERS_COUNT * temporal_len, 256]);
+        x_2d = x_2d + &time_latent_ctx * &alpha_time_attn;
+
+        let x_ticker_norm = block
+            .ticker_ln
+            .forward(&x_2d.reshape([btk, MODEL_DIM]))
+            .reshape([bt, TICKERS_COUNT, MODEL_DIM]);
+        let rp_q = x_ticker_norm.apply(&block.ticker_rp_q);
+        let rp_k = block.ticker_rp_k_frozen.to_kind(rp_q.kind());
+        let rp_scores = rp_q.matmul(&rp_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let rp_attn = rp_scores.softmax(-1, Kind::Float);
+        let rp_v = block.ticker_rp_v.to_kind(rp_q.kind());
+        let rp_ctx = rp_attn
+            .matmul(&rp_v)
+            .apply(&block.ticker_out)
+            .reshape([batch_size, temporal_len_all, TICKERS_COUNT, MODEL_DIM]);
+        x_2d = x_2d + &rp_ctx * &alpha_ticker_rp;
+
+        let x_ticker_norm = block
+            .ticker_ln
+            .forward(&x_2d.reshape([btk, MODEL_DIM]))
+            .reshape([bt, TICKERS_COUNT, MODEL_DIM]);
+        let latent_q = x_ticker_norm.apply(&block.ticker_latent_q);
+        let latent_k = block.ticker_latent_k.to_kind(latent_q.kind());
+        let latent_scores =
+            latent_q.matmul(&latent_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let latent_attn = latent_scores.softmax(-1, Kind::Float);
+        let latent_v = block.ticker_latent_v.to_kind(latent_q.kind());
+        let latent_ctx = latent_attn
+            .matmul(&latent_v)
+            .apply(&block.ticker_out)
+            .reshape([batch_size, temporal_len_all, TICKERS_COUNT, MODEL_DIM]);
+        x_2d = x_2d + &latent_ctx * &alpha_ticker_attn;
+
+        let mlp_in = block
+            .mlp_ln
+            .forward(&x_2d.reshape([btk, MODEL_DIM]));
         let mlp_proj = mlp_in.apply(&block.mlp_fc1);
         let mlp_parts = mlp_proj.split(FF_DIM, -1);
         let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
             .apply(&block.mlp_fc2)
-            .reshape([batch_size, TICKERS_COUNT, temporal_len, 256])
-            .permute([0, 2, 1, 3]);
-        x_2d = x_2d + &attn_out * &alpha_attn + &mlp * &alpha_mlp;
+            .reshape([batch_size, temporal_len_all, TICKERS_COUNT, MODEL_DIM]);
+        x_2d = x_2d + &mlp * &alpha_mlp;
         let x_time = x_2d.permute([0, 2, 1, 3]);
+        let x_time = x_time.narrow(2, 0, temporal_len);
         let per_ticker_static_expanded = per_ticker_static
             .unsqueeze(2)
             .expand(
@@ -187,30 +202,30 @@ impl TradingModel {
         let combined = Tensor::cat(&[x_time.shallow_clone(), per_ticker_static_expanded], 3)
             .reshape([
                 batch_size * TICKERS_COUNT * temporal_len,
-                256 + PER_TICKER_STATIC_OBS as i64,
+                MODEL_DIM + PER_TICKER_STATIC_OBS as i64,
             ])
             .apply(&self.static_proj);
         let combined = self
             .ln_static_proj
             .forward(&combined)
             .silu()
-            .reshape([batch_size, TICKERS_COUNT, temporal_len, 256]);
+            .reshape([batch_size, TICKERS_COUNT, temporal_len, MODEL_DIM]);
         let global_ctx = global_static
             .apply(&self.global_to_ticker)
             .unsqueeze(1)
             .unsqueeze(1);
         let enriched = combined + global_ctx;
 
-        let token_seq = enriched.reshape([batch_size * TICKERS_COUNT, temporal_len, 256]);
+        let token_seq = enriched.reshape([batch_size * TICKERS_COUNT, temporal_len, MODEL_DIM]);
         let ticker_ctx = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
             .apply(&self.ticker_ctx_proj)
-            .reshape([batch_size * TICKERS_COUNT, 1, 256]);
+            .reshape([batch_size * TICKERS_COUNT, 1, MODEL_DIM]);
         let global_ctx = global_static
             .apply(&self.global_to_ticker)
             .unsqueeze(1)
-            .expand(&[batch_size, TICKERS_COUNT, 256], false)
-            .reshape([batch_size * TICKERS_COUNT, 1, 256]);
+            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false)
+            .reshape([batch_size * TICKERS_COUNT, 1, MODEL_DIM]);
         let positions = self.decay_positions.narrow(0, 0, temporal_len);
         let distances = (temporal_len - 1) as f64 - &positions;
         let ones = self.decay_ones.narrow(0, 0, temporal_len);
@@ -232,7 +247,7 @@ impl TradingModel {
                 &[
                     batch_size * TICKERS_COUNT,
                     self.ticker_pool_queries,
-                    256,
+                    MODEL_DIM,
                 ],
                 false,
             );
@@ -244,18 +259,21 @@ impl TradingModel {
         let ticker_k = token_seq.apply(&self.ticker_k_proj);
         let ticker_v = token_seq.apply(&self.ticker_v_proj);
         let ticker_temp = self.ticker_attn_temp_raw.exp().clamp(POOL_TEMPERATURE_MIN, POOL_TEMPERATURE_MAX);
-        let ticker_scores =
-            ticker_q.matmul(&ticker_k.transpose(-2, -1)) / (256f64).sqrt() * ticker_temp;
+        let ticker_scores = ticker_q.matmul(&ticker_k.transpose(-2, -1))
+            / (MODEL_DIM as f64).sqrt()
+            * ticker_temp;
         let ticker_attn_f = ticker_scores.softmax(-1, Kind::Float);
         let ticker_ctx_out = ticker_attn_f.matmul(&ticker_v);
         let pooled_enriched = ticker_ctx_out
             .mean_dim(1, false, Kind::Float)
             .apply(&self.ticker_merge)
-            .reshape([batch_size, TICKERS_COUNT, 256])
+            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM])
             .to_kind(enriched.kind());
 
-        let head_base = pooled_enriched
-            .reshape([batch_size * TICKERS_COUNT, 256])
+        let head_base = self
+            .policy_ln
+            .forward(&pooled_enriched)
+            .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
             .apply(&self.head_proj);
         let head_base = self
             .head_ln
@@ -276,8 +294,7 @@ impl TradingModel {
             .to_kind(x.kind())
             .reshape([temporal_len]);
 
-        let token_seq =
-            enriched.reshape([batch_size, TICKERS_COUNT * temporal_len, 256]);
+        let token_seq = enriched.reshape([batch_size, TICKERS_COUNT * temporal_len, MODEL_DIM]);
         let cash_slope =
             self.cash_recent_slope_raw.sigmoid() * (2.0 / temporal_len as f64);
         let cash_decay = (&ones - &distances * &cash_slope).clamp_min(0.0);
@@ -293,21 +310,24 @@ impl TradingModel {
         let cash_q = self
             .cash_queries
             .unsqueeze(0)
-            .expand(&[batch_size, self.cash_pool_queries, 256], false)
+            .expand(&[batch_size, self.cash_pool_queries, MODEL_DIM], false)
             + (cash_recent_proj * cash_recent_gate).unsqueeze(1);
         let cash_q = cash_q
             .apply(&self.cash_q_proj);
         let cash_k = token_seq.apply(&self.cash_k_proj);
         let cash_v = token_seq.apply(&self.cash_v_proj);
         let cash_temp = self.cash_attn_temp_raw.exp().clamp(POOL_TEMPERATURE_MIN, POOL_TEMPERATURE_MAX);
-        let scores = cash_q.matmul(&cash_k.transpose(-2, -1)) / (256f64).sqrt() * cash_temp;
+        let scores =
+            cash_q.matmul(&cash_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt() * cash_temp;
         let cash_attn_f = scores.softmax(-1, Kind::Float);
         let cash_ctx = cash_attn_f.matmul(&cash_v);
         let cash_summary = cash_ctx
             .mean_dim(1, false, Kind::Float)
             .apply(&self.cash_merge)
             .to_kind(pooled_enriched.kind());
-        let cash_head = cash_summary
+        let cash_head = self
+            .policy_ln
+            .forward(&cash_summary)
             .apply(&self.head_proj)
             .to_kind(pooled_enriched.kind());
         let cash_head = self.head_ln.forward(&cash_head).silu();
@@ -331,14 +351,36 @@ impl TradingModel {
         let attn_entropy =
             (ticker_attn_entropy + cash_attn_entropy).to_kind(pooled_enriched.kind());
 
-        let values_ticker = head_base
+        let value_tokens = self
+            .value_ln
+            .forward(&pooled_enriched)
+            .apply(&self.value_mlp_fc1)
+            .silu()
+            .apply(&self.value_mlp_fc2);
+        let value_ticker = value_tokens
+            .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
+            .apply(&self.head_proj);
+        let value_ticker = self
+            .head_ln
+            .forward(&value_ticker)
+            .silu()
             .reshape([batch_size * TICKERS_COUNT, super::HEAD_HIDDEN])
             .apply(&self.value_ticker_out)
             .reshape([batch_size, TICKERS_COUNT]);
-        let value_cash = cash_head
+        let value_cash = self
+            .value_ln
+            .forward(&cash_summary)
+            .apply(&self.value_mlp_fc1)
+            .silu()
+            .apply(&self.value_mlp_fc2)
+            .apply(&self.head_proj);
+        let value_cash = self
+            .head_ln
+            .forward(&value_cash)
+            .silu()
             .apply(&self.cash_value_out)
             .reshape([batch_size, 1]);
-        let values = Tensor::cat(&[values_ticker, value_cash], 1);
+        let values = Tensor::cat(&[value_ticker, value_cash], 1);
 
         let ticker_logits = head_base.apply(&self.actor_out).squeeze_dim(-1);
         let logit_scale = self.logit_scale_raw.exp();

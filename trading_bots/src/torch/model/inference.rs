@@ -105,11 +105,10 @@ impl TradingModel {
             static_features
         };
         let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
-        let static_ssm = self.per_ticker_static_ssm(&per_ticker_static, 1);
 
         if state.patch_pos >= PATCH_SIZE {
             state.patch_pos = 0;
-            self.process_new_patch(state, &static_ssm);
+            self.process_new_patch(state);
             let _ = state.patch_buf.zero_();
         }
 
@@ -149,7 +148,6 @@ impl TradingModel {
         let _ = state.patch_buf.zero_();
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
-        let static_ssm = self.per_ticker_static_ssm(&per_ticker_static, 1);
         let dt_scale = Tensor::full(
             &[1, SEQ_LEN, 1],
             PATCH_SIZE as f64,
@@ -158,7 +156,7 @@ impl TradingModel {
 
         for t in 0..TICKERS_COUNT as usize {
             let ticker_data = reshaped.get(t as i64).unsqueeze(0);
-            let x_stem = self.patch_embed_single(&ticker_data, &static_ssm.get(t as i64));
+            let x_stem = self.patch_embed_single(&ticker_data);
             let mut x = x_stem.permute([0, 2, 1]);
             for (layer, (ssm, norm)) in
                 self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
@@ -189,12 +187,11 @@ impl TradingModel {
         .0
     }
 
-    fn process_new_patch(&self, state: &mut StreamState, static_ssm: &Tensor) {
-        let patch_emb = state
-            .patch_buf
-            .view([TICKERS_COUNT, 1, PATCH_SIZE])
-            .apply(&self.patch_embed);
-        let patch_emb = self.patch_ln.forward(&patch_emb).squeeze_dim(1) + static_ssm;
+    fn process_new_patch(&self, state: &mut StreamState) {
+        let patches = state.patch_buf.view([TICKERS_COUNT, 1, PATCH_SIZE]);
+        let patches = self.enrich_patches(&patches);
+        let patch_emb = patches.apply(&self.patch_embed);
+        let patch_emb = self.patch_ln.forward(&patch_emb).squeeze_dim(1);
         let dt_scale = PATCH_SIZE as f64;
 
         for t in 0..TICKERS_COUNT as usize {
