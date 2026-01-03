@@ -31,10 +31,10 @@ impl Env {
         &self,
         absolute_step: usize,
         _: f64,
-    ) -> (f64, Vec<f64>) {
+    ) -> (f64, Vec<f64>, f64) {
         let n_tickers = self.tickers.len();
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
-            return (0.0, vec![0.0; n_tickers]);
+            return (0.0, vec![0.0; n_tickers], 0.0);
         }
 
         let next_absolute_step = absolute_step + 1;
@@ -52,8 +52,7 @@ impl Env {
         }
 
         let portfolio_return: f64 = contributions.iter().sum();
-        let strategy_log_return = (total_assets_next / total_assets).ln();
-        let pnl_reward = strategy_log_return * REWARD_SCALE;
+        let strategy_log_return = (total_assets_next / total_assets).ln() * REWARD_SCALE;
 
         let mut benchmark_log_return = 0.0;
         for ticker_idx in 0..n_tickers {
@@ -64,17 +63,16 @@ impl Env {
         benchmark_log_return /= n_tickers as f64;
         let cash_weight = (self.account.cash / total_assets).clamp(0.0, 1.0);
         let cash_penalty = -cash_weight * benchmark_log_return * REWARD_SCALE;
-        let pnl_reward = pnl_reward + cash_penalty;
 
         let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
             vec![0.0; n_tickers]
         } else {
             contributions
                 .iter()
-                .map(|c| pnl_reward * (c / portfolio_return))
+                .map(|c| strategy_log_return * (c / portfolio_return))
                 .collect()
         };
-        (pnl_reward, per_ticker_rewards)
+        (strategy_log_return, per_ticker_rewards, cash_penalty)
     }
 
     /// Hindsight allocation quality reward with asymmetric upside penalty.

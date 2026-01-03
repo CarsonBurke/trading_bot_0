@@ -344,8 +344,6 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 
     let mut step = 0;
     let start_time = Instant::now();
-    let mut sde_noise: Option<Tensor> = None;
-
     loop {
         if step >= max_steps {
             break;
@@ -370,21 +368,16 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 state_guard.get_step_deltas().to_device(device)
             };
 
-            let (action_logits, _action_log_std, sde_latent) = tch::no_grad(|| {
-                let (_, (action_logits, action_log_std, sde_latent), _, _) =
+            let (action_mean, action_log_std) = tch::no_grad(|| {
+                let (_, _, (action_mean, action_log_std), _) =
                     model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state);
-                (action_logits, action_log_std, sde_latent)
+                (action_mean, action_log_std)
             });
-
-            let std_matrix = model.sde_std_matrix();
             let actions = sample_actions_from_dist(
-                &action_logits,
-                &sde_latent,
-                &std_matrix,
+                &action_mean,
+                &action_log_std,
                 true,
                 0.0,
-                &mut sde_noise,
-                step,
             );
 
             let actions_vec = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();

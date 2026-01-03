@@ -4,9 +4,8 @@ use std::time::Instant;
 
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{TradingModel, TradingModelConfig};
+use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::Env;
-
-const SDE_SAMPLE_FREQ: usize = 0;
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
@@ -19,33 +18,22 @@ pub fn load_model<P: AsRef<Path>>(
 }
 
 pub fn sample_actions_from_dist(
-    action_logits: &Tensor,
-    sde_latent: &Tensor,
-    std_matrix: &Tensor,
+    action_mean: &Tensor,
+    action_log_std: &Tensor,
     deterministic: bool,
     temperature: f64,
-    sde_noise: &mut Option<Tensor>,
-    step: usize,
 ) -> Tensor {
+    let batch_size = action_mean.size()[0];
+    let noise_ticker =
+        Tensor::randn([batch_size, TICKERS_COUNT], (Kind::Float, action_mean.device()));
+    let noise_cash = Tensor::zeros([batch_size, 1], (Kind::Float, action_mean.device()));
+    let noise = Tensor::cat(&[noise_ticker, noise_cash], 1);
+
     let u = if deterministic || temperature == 0.0 {
-        action_logits.shallow_clone()
+        action_mean.shallow_clone()
     } else {
-        if sde_noise.is_none() || (SDE_SAMPLE_FREQ > 0 && step % SDE_SAMPLE_FREQ == 0) {
-            let eps = Tensor::randn(
-                &[
-                    sde_latent.size()[0],
-                    std_matrix.size()[0],
-                    std_matrix.size()[1],
-                ],
-                (Kind::Float, sde_latent.device()),
-            );
-            let noise_mat = eps * std_matrix.unsqueeze(0);
-            *sde_noise = Some(noise_mat);
-        }
-        let noise_mat = sde_noise.as_ref().unwrap();
-        let noise_raw = (sde_latent * noise_mat.permute([0, 2, 1]))
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-        action_logits + noise_raw * temperature
+        let action_std = action_log_std.exp() * temperature;
+        action_mean + &action_std * noise
     };
     u.softmax(-1, Kind::Float)
 }
@@ -81,11 +69,20 @@ pub fn run_inference<P: AsRef<Path>>(
         let episode_start = Instant::now();
         let mut episode_reward = 0.0;
         let mut stream_state = model.init_stream_state();
-        let mut sde_noise: Option<Tensor> = None;
-
         let (price_deltas, static_obs) = env.reset_single();
-        let mut current_price_deltas = Tensor::from_slice(&price_deltas).to_device(device);
-        let mut current_static_obs = Tensor::from_slice(&static_obs).to_device(device);
+        let mut price_deltas_full = Tensor::zeros(
+            [TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
+            (Kind::Float, device),
+        );
+        let mut price_deltas_step =
+            Tensor::zeros([TICKERS_COUNT], (Kind::Float, device));
+        let mut static_obs_tensor = Tensor::zeros(
+            [STATIC_OBSERVATIONS as i64],
+            (Kind::Float, device),
+        );
+        price_deltas_full.copy_(&Tensor::from_slice(&price_deltas));
+        static_obs_tensor.copy_(&Tensor::from_slice(&static_obs));
+        let mut use_full = true;
 
         env.episode = episode;
 
@@ -94,29 +91,30 @@ pub fn run_inference<P: AsRef<Path>>(
 
             // First call: model.step detects full obs and initializes stream state
             // Subsequent calls: model.step processes single delta per ticker
-            let (action_logits, _action_log_std, sde_latent) = tch::no_grad(|| {
-                let (_, (action_logits, action_log_std, sde_latent), _, _) =
-                    model.step(&current_price_deltas, &current_static_obs, &mut stream_state);
-                (action_logits, action_log_std, sde_latent)
+            let (action_mean, action_log_std) = tch::no_grad(|| {
+                let price_input = if use_full {
+                    &price_deltas_full
+                } else {
+                    &price_deltas_step
+                };
+                let (_, _, (action_mean, action_log_std), _) =
+                    model.step(price_input, &static_obs_tensor, &mut stream_state);
+                (action_mean, action_log_std)
             });
-
-            let std_matrix = model.sde_std_matrix();
             let actions = sample_actions_from_dist(
-                &action_logits,
-                &sde_latent,
-                &std_matrix,
+                &action_mean,
+                &action_log_std,
                 deterministic,
                 temperature,
-                &mut sde_noise,
-                step,
             );
 
             let actions_vec: Vec<f64> = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
-            let step_result = env.step_step_single(actions_vec);
+            let step_result = env.step_step_single(&actions_vec);
             episode_reward += step_result.reward;
 
-            current_price_deltas = Tensor::from_slice(&step_result.step_deltas).to_device(device);
-            current_static_obs = Tensor::from_slice(&step_result.static_obs).to_device(device);
+            price_deltas_step.copy_(&Tensor::from_slice(&step_result.step_deltas));
+            static_obs_tensor.copy_(&Tensor::from_slice(&step_result.static_obs));
+            use_full = false;
 
             if step_result.is_done > 0.5 {
                 break;

@@ -176,6 +176,7 @@ impl Env {
     pub fn step(&mut self, all_actions: Vec<Vec<f64>>) -> Step {
         let mut rewards = Vec::with_capacity(NPROCS as usize);
         let mut rewards_per_ticker = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
+        let mut cash_rewards = Vec::with_capacity(NPROCS as usize);
         let mut is_dones = Vec::with_capacity(NPROCS as usize);
         let mut all_price_deltas = Vec::new();
         let mut all_static_obs = Vec::new();
@@ -210,7 +211,7 @@ impl Env {
             }
 
             let total_commission = self.trade_by_target_weights(&real_actions, absolute_step);
-            let (reward, reward_per_ticker) =
+            let (reward, reward_per_ticker, cash_reward) =
                 self.get_unrealized_pnl_reward_breakdown(absolute_step, total_commission);
 
             self.last_reward = reward;
@@ -243,6 +244,7 @@ impl Env {
             rewards.push(reward);
             rewards_per_ticker.extend(reward_per_ticker.iter().map(|v| *v as f32));
             is_dones.push(is_done);
+            cash_rewards.push(cash_reward as f32);
 
             let (price_deltas, static_obs) = self.get_next_obs();
             all_price_deltas.push(price_deltas);
@@ -261,6 +263,7 @@ impl Env {
             reward: Tensor::from_slice(&rewards),
             reward_per_ticker: Tensor::from_slice(&rewards_per_ticker)
                 .view([NPROCS, TICKERS_COUNT]),
+            cash_reward: Tensor::from_slice(&cash_rewards),
             is_done: Tensor::from_slice(&is_dones),
             price_deltas: price_deltas_tensor,
             static_obs: static_obs_tensor,
@@ -498,7 +501,7 @@ impl Env {
     }
 
     /// Single-environment step for VecEnv
-    pub fn step_single(&mut self, actions: Vec<f64>) -> SingleStep {
+    pub fn step_single(&mut self, actions: &[f64]) -> SingleStep {
         let absolute_step = self.episode_start_offset + self.step;
         self.account.update_total(&self.prices, absolute_step);
 
@@ -525,7 +528,7 @@ impl Env {
         }
 
         let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        let (reward, reward_per_ticker) =
+        let (reward, reward_per_ticker, cash_reward) =
             self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
 
         self.last_reward = reward;
@@ -557,13 +560,14 @@ impl Env {
         SingleStep {
             reward,
             reward_per_ticker: reward_per_ticker.iter().map(|v| *v as f32).collect(),
+            cash_reward: cash_reward as f32,
             price_deltas,
             static_obs,
             is_done,
         }
     }
 
-    pub fn step_step_single(&mut self, actions: Vec<f64>) -> SingleStepStep {
+    pub fn step_step_single(&mut self, actions: &[f64]) -> SingleStepStep {
         let absolute_step = self.episode_start_offset + self.step;
         self.account.update_total(&self.prices, absolute_step);
 
@@ -590,7 +594,7 @@ impl Env {
         }
 
         let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        let (reward, reward_per_ticker) =
+        let (reward, reward_per_ticker, cash_reward) =
             self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
 
         self.last_reward = reward;
@@ -622,6 +626,7 @@ impl Env {
         SingleStepStep {
             reward,
             reward_per_ticker: reward_per_ticker.iter().map(|v| *v as f32).collect(),
+            cash_reward: cash_reward as f32,
             step_deltas,
             static_obs,
             is_done,
@@ -645,6 +650,7 @@ impl Env {
 pub struct Step {
     pub reward: Tensor,
     pub reward_per_ticker: Tensor,
+    pub cash_reward: Tensor,
     pub price_deltas: Tensor,
     pub static_obs: Tensor,
     pub is_done: Tensor,
@@ -654,6 +660,7 @@ pub struct Step {
 pub struct SingleStep {
     pub reward: f64,
     pub reward_per_ticker: Vec<f32>,
+    pub cash_reward: f32,
     pub price_deltas: Vec<f32>,
     pub static_obs: Vec<f32>,
     pub is_done: f32,
@@ -662,6 +669,7 @@ pub struct SingleStep {
 pub struct SingleStepStep {
     pub reward: f64,
     pub reward_per_ticker: Vec<f32>,
+    pub cash_reward: f32,
     pub step_deltas: Vec<f32>,
     pub static_obs: Vec<f32>,
     pub is_done: f32,

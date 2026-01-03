@@ -1,6 +1,6 @@
-use tch::{Kind, Tensor};
+use tch::Tensor;
 
-use super::{DebugMetrics, ModelOutput, StreamState, TradingModel, PATCH_SIZE};
+use super::{DebugMetrics, ModelOutput, StreamState, TradingModel};
 
 impl TradingModel {
     pub fn forward(
@@ -14,14 +14,9 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let x_stem = self.patch_embed_all_with_static(&price_deltas, batch_size);
+        let (x_stem, dt_scale) = self.patch_latent_stem(&price_deltas, batch_size);
 
         let mut x_for_ssm = x_stem.permute([0, 2, 1]);
-        let dt_scale = Tensor::full(
-            &[1, x_for_ssm.size()[1], 1],
-            PATCH_SIZE as f64,
-            (Kind::Float, x_for_ssm.device()),
-        );
         for (layer, norm) in self.ssm_layers.iter().zip(self.ssm_norms.iter()) {
             let normed = norm.forward(&x_for_ssm);
             let out = layer.forward_with_dt_scale(&normed, Some(&dt_scale));
@@ -50,14 +45,9 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let x_stem = self.patch_embed_all_with_static(&price_deltas, batch_size);
+        let (x_stem, dt_scale) = self.patch_latent_stem(&price_deltas, batch_size);
 
         let mut x_for_ssm = x_stem.permute([0, 2, 1]);
-        let dt_scale = Tensor::full(
-            &[1, x_for_ssm.size()[1], 1],
-            PATCH_SIZE as f64,
-            (Kind::Float, x_for_ssm.device()),
-        );
         for (layer, norm) in self.ssm_layers.iter().zip(self.ssm_norms.iter()) {
             let normed = norm.forward(&x_for_ssm);
             let out = layer.forward_with_dt_scale(&normed, Some(&dt_scale));

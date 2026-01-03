@@ -9,7 +9,7 @@ use rand::thread_rng;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        bail!("usage: report_cli <generation> <report_name> [ticker] [--sample N]");
+        bail!("usage: report_cli <generation> <report_name> [ticker] [--sample N] [--min N] [--max N]");
     }
 
     let generation = args[1]
@@ -18,6 +18,8 @@ fn main() -> Result<()> {
     let report_name = normalize_report_name(&args[2]);
     let mut ticker: Option<&str> = None;
     let mut sample: Option<usize> = None;
+    let mut min: Option<usize> = None;
+    let mut max: Option<usize> = None;
     let mut i = 3;
     while i < args.len() {
         let arg = &args[i];
@@ -34,12 +36,41 @@ fn main() -> Result<()> {
             i += 1;
             continue;
         }
+        if arg == "--min" {
+            let next = args.get(i + 1).context("missing --min value")?;
+            let count = next.parse::<usize>().context("min must be an integer")?;
+            min = Some(count);
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--min=") {
+            let count = value.parse::<usize>().context("min must be an integer")?;
+            min = Some(count);
+            i += 1;
+            continue;
+        }
+        if arg == "--max" {
+            let next = args.get(i + 1).context("missing --max value")?;
+            let count = next.parse::<usize>().context("max must be an integer")?;
+            max = Some(count);
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--max=") {
+            let count = value.parse::<usize>().context("max must be an integer")?;
+            max = Some(count);
+            i += 1;
+            continue;
+        }
         if ticker.is_none() {
             ticker = Some(arg.as_str());
             i += 1;
             continue;
         }
         bail!("unexpected argument: {arg}");
+    }
+    if min.is_some() && max.is_some() {
+        bail!("--min and --max are mutually exclusive");
     }
 
     let base_path = find_training_path().unwrap_or_else(|| PathBuf::from(TRAINING_PATH));
@@ -48,7 +79,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to read report {}", report_path.display()))?;
     let report: Report = postcard::from_bytes(&bytes).context("failed to decode report")?;
 
-    let lines = report.kind.to_lines();
+    let mut lines = report.kind.to_lines();
+    if let Some(count) = min {
+        lines = select_by_value(lines, count, false);
+    } else if let Some(count) = max {
+        lines = select_by_value(lines, count, true);
+    }
     if let Some(count) = sample {
         if count >= lines.len() {
             for line in lines {
@@ -67,6 +103,66 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn select_by_value(lines: Vec<String>, count: usize, pick_max: bool) -> Vec<String> {
+    let mut scored: Vec<(f32, String)> = lines
+        .into_iter()
+        .filter_map(|line| {
+            let values = extract_values(&line);
+            if values.is_empty() {
+                None
+            } else if pick_max {
+                values
+                    .iter()
+                    .cloned()
+                    .reduce(f32::max)
+                    .map(|v| (v, line))
+            } else {
+                values
+                    .iter()
+                    .cloned()
+                    .reduce(f32::min)
+                    .map(|v| (v, line))
+            }
+        })
+        .collect();
+
+    if pick_max {
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    let take_count = count.min(scored.len());
+    scored
+        .into_iter()
+        .take(take_count)
+        .map(|(_, line)| line)
+        .collect()
+}
+
+fn extract_values(line: &str) -> Vec<f32> {
+    let mut values = Vec::new();
+    for token in line.split('\t') {
+        if let Some((_, value)) = token.split_once('=') {
+            collect_values(value, &mut values);
+            continue;
+        }
+        if token.parse::<usize>().is_ok() {
+            continue;
+        }
+        collect_values(token, &mut values);
+    }
+    values
+}
+
+fn collect_values(token: &str, values: &mut Vec<f32>) {
+    for part in token.split(',') {
+        if let Ok(value) = part.parse::<f32>() {
+            values.push(value);
+        }
+    }
 }
 
 fn normalize_report_name(raw: &str) -> String {

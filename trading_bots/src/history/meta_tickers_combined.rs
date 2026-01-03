@@ -11,6 +11,7 @@ pub struct MetaHistory {
     pub loss: Vec<f64>,
     pub policy_loss: Vec<f64>,
     pub value_loss: Vec<f64>,
+    pub value_mae: Vec<f64>,
     pub grad_norm: Vec<f64>,
     pub total_commissions: Vec<f64>,
     pub logit_noise_mean: Vec<f64>,
@@ -53,6 +54,10 @@ impl MetaHistory {
 
     pub fn record_value_loss(&mut self, loss: f64) {
         self.value_loss.push(loss);
+    }
+
+    pub fn record_value_mae(&mut self, mae: f64) {
+        self.value_mae.push(mae);
     }
 
     pub fn record_grad_norm(&mut self, grad_norm: f64) {
@@ -173,6 +178,19 @@ impl MetaHistory {
                 },
             };
             let _ = write_report(&format!("{base_dir}/loss_log.report.bin"), &report);
+        }
+        if !self.value_mae.is_empty() {
+            let report = Report {
+                title: "Value MAE".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("MAE".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: f64_to_f32(&self.value_mae),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/value_mae.report.bin"), &report);
         }
         if !self.grad_norm.is_empty() {
             let report = Report {

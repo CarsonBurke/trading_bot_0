@@ -142,7 +142,8 @@ impl App {
             "grad_norm_log",
             "target_weights",
             "temporal_embed_debug",
-            "clip_fraction"
+            "clip_fraction",
+            "value_mae"
         ];
 
         // Ticker-specific chart base names
