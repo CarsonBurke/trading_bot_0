@@ -138,10 +138,8 @@ impl App {
             "advantage_stats_log",
             "total_commissions",
             "logit_noise",
-            "logit_scale",
             "grad_norm_log",
             "target_weights",
-            "temporal_embed_debug",
             "clip_fraction",
             "value_mae"
         ];
