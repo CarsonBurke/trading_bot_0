@@ -10,6 +10,8 @@
 use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
+use crate::torch::mamba_fused;
+
 const D_STATE: i64 = 128;
 const D_CONV: i64 = 4;
 const EXPAND: i64 = 2;
@@ -310,9 +312,6 @@ impl Mamba2 {
         let x0_dim = d_mlp;
         let z_dim = d_ssm;
         let xbc_dim = d_ssm + 2 * ngroups * d_state;
-        let b_dim = ngroups * d_state;
-        let c_dim = ngroups * d_state;
-        let dt_dim = nheads;
 
         let z0 = if d_mlp > 0 {
             zxbcdt.narrow(-1, 0, z0_dim)
@@ -326,7 +325,40 @@ impl Mamba2 {
         };
         let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
         let xbc = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, xbc_dim);
-        let dt_raw = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim + xbc_dim, dt_dim);
+        let device = zxbcdt.device();
+        let kind = zxbcdt.kind();
+
+        let dt_scale_tensor = match dt_scale {
+            Some(scale) => scale.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+        let conv_w = self.conv1d.ws.squeeze_dim(1).to_kind(kind).to_device(device);
+        let conv_b = match &self.conv1d.bs {
+            Some(bias) => bias.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+        let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
+        let a_log = self.a_log.to_kind(kind).to_device(device);
+        let initial_state = Tensor::zeros(&[batch, nheads, headdim, d_state], (kind, device));
+
+        if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
+            panic!("mamba fused op requires CUDA");
+        }
+
+        let (y, _final_state) = mamba_fused::fused_conv_scan(
+            &zxbcdt,
+            &conv_w,
+            &conv_b,
+            &dt_bias,
+            &a_log,
+            &dt_scale_tensor,
+            &initial_state,
+            self.config.chunk_size,
+            ngroups,
+            headdim,
+            self.config.dt_limit.0,
+            self.config.dt_limit.1,
+        );
 
         let xbc_conv = xbc
             .transpose(1, 2)
@@ -334,30 +366,8 @@ impl Mamba2 {
             .narrow(2, 0, seqlen)
             .transpose(1, 2)
             .silu();
-
         let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
-        let b = xbc_conv.narrow(-1, d_ssm, b_dim);
-        let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
-
-        // dt: bias + softplus, then scale by patch_size if provided
-        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
-        let dt = match dt_scale {
-            Some(scale) => &dt * scale,
-            None => dt,
-        };
-        let dt = if self.config.dt_limit == (0.0, f64::INFINITY) {
-            dt
-        } else {
-            dt.clamp(self.config.dt_limit.0, self.config.dt_limit.1)
-        };
-
-        let a = self.a_log.to_kind(Kind::Float).exp().neg();
-
         let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
-        let b_groups = b.view([batch, seqlen, ngroups, d_state]);
-        let c_groups = c.view([batch, seqlen, ngroups, d_state]);
-
-        let y = self.chunked_ssm_scan(&x_heads, &dt, &a, &b_groups, &c_groups);
 
         // Add skip connection with D: [batch, seq, nheads, headdim]
         let y_skip = if self.config.d_has_hdim {
@@ -818,8 +828,6 @@ impl Mamba2 {
         let x0_dim = d_mlp;
         let z_dim = d_ssm;
         let xbc_dim = d_ssm + 2 * ngroups * d_state;
-        let b_dim = ngroups * d_state;
-        let c_dim = ngroups * d_state;
 
         let z0 = if d_mlp > 0 {
             zxbcdt.narrow(-1, 0, z0_dim)
@@ -833,37 +841,50 @@ impl Mamba2 {
         };
         let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
         let xbc = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, xbc_dim);
-        let dt_raw = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim + xbc_dim, nheads);
+        let device = zxbcdt.device();
+        let kind = zxbcdt.kind();
+
+        let dt_scale_tensor = match dt_scale {
+            Some(scale) => scale.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+        let conv_w = self.conv1d.ws.squeeze_dim(1).to_kind(kind).to_device(device);
+        let conv_b = match &self.conv1d.bs {
+            Some(bias) => bias.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+        let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
+        let a_log = self.a_log.to_kind(kind).to_device(device);
+        let initial_state = state.ssm_state.to_kind(kind).to_device(device);
+
+        if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
+            panic!("mamba fused op requires CUDA");
+        }
+
+        let (y, new_ssm_state) = mamba_fused::fused_conv_scan(
+            &zxbcdt,
+            &conv_w,
+            &conv_b,
+            &dt_bias,
+            &a_log,
+            &dt_scale_tensor,
+            &initial_state,
+            self.config.chunk_size,
+            ngroups,
+            headdim,
+            self.config.dt_limit.0,
+            self.config.dt_limit.1,
+        );
+        state.ssm_state.copy_(&new_ssm_state.to_kind(state.ssm_state.kind()));
+
         let xbc_conv = xbc
             .transpose(1, 2)
             .apply(&self.conv1d)
             .narrow(2, 0, seqlen)
             .transpose(1, 2)
             .silu();
-
         let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
-        let b = xbc_conv.narrow(-1, d_ssm, b_dim);
-        let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
-
-        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
-        let dt = match dt_scale {
-            Some(scale) => &dt * scale,
-            None => dt,
-        };
-        let dt = if self.config.dt_limit == (0.0, f64::INFINITY) {
-            dt
-        } else {
-            dt.clamp(self.config.dt_limit.0, self.config.dt_limit.1)
-        };
-        let a = self.a_log.to_kind(Kind::Float).exp().neg();
-
         let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
-        let b_groups = b.view([batch, seqlen, ngroups, d_state]);
-        let c_groups = c.view([batch, seqlen, ngroups, d_state]);
-
-        let (y, new_ssm_state) =
-            self.chunked_ssm_scan_with_state(&x_heads, &dt, &a, &b_groups, &c_groups, &state.ssm_state);
-        state.ssm_state.copy_(&new_ssm_state);
 
         let y_skip = if self.config.d_has_hdim {
             let d_expanded = self.d_param.view([1, 1, nheads, headdim]);
@@ -912,8 +933,6 @@ impl Mamba2 {
         let x0_dim = d_mlp;
         let z_dim = d_ssm;
         let xbc_dim = d_ssm + 2 * ngroups * d_state;
-        let b_dim = ngroups * d_state;
-        let c_dim = ngroups * d_state;
 
         let z0 = if d_mlp > 0 {
             zxbcdt.narrow(-1, 0, z0_dim)
@@ -927,33 +946,49 @@ impl Mamba2 {
         };
         let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
         let xbc = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, xbc_dim);
-        let dt_raw = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim + xbc_dim, nheads);
+        let device = zxbcdt.device();
+        let kind = zxbcdt.kind();
+
+        let dt_scale_tensor = match dt_scale {
+            Some(scale) => scale.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+        let conv_w = self.conv1d.ws.squeeze_dim(1).to_kind(kind).to_device(device);
+        let conv_b = match &self.conv1d.bs {
+            Some(bias) => bias.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+        let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
+        let a_log = self.a_log.to_kind(kind).to_device(device);
+        let initial_state = initial_states.to_kind(kind).to_device(device);
+
+        if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
+            panic!("mamba fused op requires CUDA");
+        }
+
+        let (y, final_states) = mamba_fused::fused_conv_scan(
+            &zxbcdt,
+            &conv_w,
+            &conv_b,
+            &dt_bias,
+            &a_log,
+            &dt_scale_tensor,
+            &initial_state,
+            self.config.chunk_size,
+            ngroups,
+            headdim,
+            self.config.dt_limit.0,
+            self.config.dt_limit.1,
+        );
+
         let xbc_conv = xbc
             .transpose(1, 2)
             .apply(&self.conv1d)
             .narrow(2, 0, seqlen)
             .transpose(1, 2)
             .silu();
-
         let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
-        let b = xbc_conv.narrow(-1, d_ssm, b_dim);
-        let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
-
-        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
-        let dt = match dt_scale {
-            Some(scale) => &dt * scale,
-            None => dt,
-        };
-        let dt = dt
-            .clamp(self.config.dt_min, self.config.dt_max)
-            .clamp(self.config.dt_limit.0, self.config.dt_limit.1);
-        let a = self.a_log.to_kind(Kind::Float).exp().neg();
-
         let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
-        let b_groups = b.view([batch, seqlen, ngroups, d_state]);
-        let c_groups = c.view([batch, seqlen, ngroups, d_state]);
-
-        let (y, final_states) = self.chunked_ssm_scan_with_state(&x_heads, &dt, &a, &b_groups, &c_groups, initial_states);
 
         let y_skip = if self.config.d_has_hdim {
             let d_expanded = self.d_param.view([1, 1, nheads, headdim]);

@@ -4090,6 +4090,7 @@ dependencies = [
  "ibapi",
  "image 0.25.9",
  "libc",
+ "libloading",
  "ndarray",
  "nvml-wrapper",
  "ordered-float",
