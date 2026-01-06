@@ -8,6 +8,7 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
     const torch::Tensor& conv_b,
     const torch::Tensor& dt_bias,
     const torch::Tensor& a_log,
+    const torch::Tensor& d_param,
     const torch::Tensor& dt_scale,
     const torch::Tensor& initial_state,
     int64_t chunk_size,
@@ -22,9 +23,11 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
     const torch::Tensor& conv_b,
     const torch::Tensor& dt_bias,
     const torch::Tensor& a_log,
+    const torch::Tensor& d_param,
     const torch::Tensor& dt_scale,
     const torch::Tensor& initial_state,
     const torch::Tensor& final_state,
+    const torch::Tensor& y,
     const torch::Tensor& grad_y,
     const torch::Tensor& grad_final_state,
     int64_t chunk_size,
@@ -41,6 +44,7 @@ struct MambaFusedFunction : public torch::autograd::Function<MambaFusedFunction>
         const torch::Tensor& conv_b,
         const torch::Tensor& dt_bias,
         const torch::Tensor& a_log,
+        const torch::Tensor& d_param,
         const torch::Tensor& dt_scale,
         const torch::Tensor& initial_state,
         int64_t chunk_size,
@@ -49,9 +53,9 @@ struct MambaFusedFunction : public torch::autograd::Function<MambaFusedFunction>
         double dt_min,
         double dt_max) {
         auto outputs = mamba_fused_forward_cuda(
-            zxbcdt, conv_w, conv_b, dt_bias, a_log, dt_scale, initial_state,
+            zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state,
             chunk_size, ngroups, headdim, dt_min, dt_max);
-        ctx->save_for_backward({zxbcdt, conv_w, conv_b, dt_bias, a_log, dt_scale, initial_state, outputs[1]});
+        ctx->save_for_backward({zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state, outputs[1], outputs[0]});
         ctx->saved_data["chunk_size"] = chunk_size;
         ctx->saved_data["ngroups"] = ngroups;
         ctx->saved_data["headdim"] = headdim;
@@ -69,9 +73,11 @@ struct MambaFusedFunction : public torch::autograd::Function<MambaFusedFunction>
         const auto& conv_b = saved[2];
         const auto& dt_bias = saved[3];
         const auto& a_log = saved[4];
-        const auto& dt_scale = saved[5];
-        const auto& initial_state = saved[6];
-        const auto& final_state = saved[7];
+        const auto& d_param = saved[5];
+        const auto& dt_scale = saved[6];
+        const auto& initial_state = saved[7];
+        const auto& final_state = saved[8];
+        const auto& y = saved[9];
 
         auto grad_y = grad_outputs.size() > 0 ? grad_outputs[0] : torch::Tensor();
         auto grad_final_state = grad_outputs.size() > 1 ? grad_outputs[1] : torch::Tensor();
@@ -87,7 +93,7 @@ struct MambaFusedFunction : public torch::autograd::Function<MambaFusedFunction>
         }
 
         auto grads = mamba_fused_backward_cuda(
-            zxbcdt, conv_w, conv_b, dt_bias, a_log, dt_scale, initial_state, final_state,
+            zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state, final_state, y,
             grad_y, grad_final_state,
             ctx->saved_data["chunk_size"].toInt(),
             ctx->saved_data["ngroups"].toInt(),
@@ -101,8 +107,9 @@ struct MambaFusedFunction : public torch::autograd::Function<MambaFusedFunction>
             grads[2],
             grads[3],
             grads[4],
-            torch::Tensor(),
             grads[5],
+            torch::Tensor(),
+            grads[6],
             torch::Tensor(),
             torch::Tensor(),
             torch::Tensor(),
@@ -118,6 +125,7 @@ std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan(
     const torch::Tensor& conv_b,
     const torch::Tensor& dt_bias,
     const torch::Tensor& a_log,
+    const torch::Tensor& d_param,
     const torch::Tensor& dt_scale,
     const torch::Tensor& initial_state,
     int64_t chunk_size,
@@ -126,15 +134,19 @@ std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan(
     double dt_min,
     double dt_max) {
     auto outputs = MambaFusedFunction::apply(
-        zxbcdt, conv_w, conv_b, dt_bias, a_log, dt_scale, initial_state,
+        zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state,
         chunk_size, ngroups, headdim, dt_min, dt_max);
     return {outputs[0], outputs[1]};
 }
 
 TORCH_LIBRARY(mamba_fused, m) {
-    m.def("fused_conv_scan(Tensor zxbcdt, Tensor conv_w, Tensor conv_b, Tensor dt_bias, Tensor a_log, Tensor dt_scale, Tensor initial_state, int chunk_size, int ngroups, int headdim, float dt_min, float dt_max) -> (Tensor, Tensor)");
+    m.def("fused_conv_scan(Tensor zxbcdt, Tensor conv_w, Tensor conv_b, Tensor dt_bias, Tensor a_log, Tensor d_param, Tensor dt_scale, Tensor initial_state, int chunk_size, int ngroups, int headdim, float dt_min, float dt_max) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(mamba_fused, CUDA, m) {
+    m.impl("fused_conv_scan", &mamba_fused_conv_scan);
+}
+
+TORCH_LIBRARY_IMPL(mamba_fused, Autograd, m) {
     m.impl("fused_conv_scan", &mamba_fused_conv_scan);
 }

@@ -7,6 +7,8 @@
 //! - Fused RMSNorm with gating
 //! - Single projection for z, x, B, C, dt
 
+use std::env;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
@@ -21,6 +23,43 @@ const CHUNK_SIZE: i64 = 256;
 const DT_MIN: f64 = 0.001;
 const DT_MAX: f64 = 0.1;
 const DT_INIT_FLOOR: f64 = 1e-4;
+
+static MAMBA_CALL_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn debug_fused(tag: &str, t: &Tensor) {
+    if env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
+        return;
+    }
+    let has_nan = t.isnan().any().int64_value(&[]) != 0;
+    let has_inf = t.isinf().any().int64_value(&[]) != 0;
+    if has_nan || has_inf {
+        eprintln!(
+            "mamba_fused_debug {} nan={} inf={} shape={:?}",
+            tag,
+            has_nan,
+            has_inf,
+            t.size()
+        );
+    }
+}
+
+fn debug_fused_call(tag: &str, call_id: usize, t: &Tensor) {
+    if env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
+        return;
+    }
+    let has_nan = t.isnan().any().int64_value(&[]) != 0;
+    let has_inf = t.isinf().any().int64_value(&[]) != 0;
+    if has_nan || has_inf {
+        eprintln!(
+            "mamba_fused_debug {}#{} nan={} inf={} shape={:?}",
+            tag,
+            call_id,
+            has_nan,
+            has_inf,
+            t.size()
+        );
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Mamba2Config {
@@ -297,6 +336,7 @@ impl Mamba2 {
     }
 
     pub fn forward_with_dt_scale(&self, u: &Tensor, dt_scale: Option<&Tensor>) -> Tensor {
+        let call_id = MAMBA_CALL_ID.fetch_add(1, Ordering::Relaxed);
         let (batch, seqlen, _) = u.size3().unwrap();
         let d_inner = self.d_inner;
         let d_ssm = self.d_ssm;
@@ -306,13 +346,14 @@ impl Mamba2 {
         let ngroups = self.config.ngroups;
         let d_mlp = d_inner - d_ssm;
 
+        debug_fused_call("mamba2_u", call_id, u);
+        debug_fused_call("mamba2_in_proj_w", call_id, &self.in_proj.ws);
         let zxbcdt = u.apply(&self.in_proj);
+        debug_fused_call("mamba2_zxbcdt", call_id, &zxbcdt);
 
         let z0_dim = d_mlp;
         let x0_dim = d_mlp;
         let z_dim = d_ssm;
-        let xbc_dim = d_ssm + 2 * ngroups * d_state;
-
         let z0 = if d_mlp > 0 {
             zxbcdt.narrow(-1, 0, z0_dim)
         } else {
@@ -324,7 +365,6 @@ impl Mamba2 {
             Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
         };
         let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
-        let xbc = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, xbc_dim);
         let device = zxbcdt.device();
         let kind = zxbcdt.kind();
 
@@ -339,6 +379,7 @@ impl Mamba2 {
         };
         let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
         let a_log = self.a_log.to_kind(kind).to_device(device);
+        let d_param = self.d_param.to_kind(kind).to_device(device);
         let initial_state = Tensor::zeros(&[batch, nheads, headdim, d_state], (kind, device));
 
         if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
@@ -351,6 +392,7 @@ impl Mamba2 {
             &conv_b,
             &dt_bias,
             &a_log,
+            &d_param,
             &dt_scale_tensor,
             &initial_state,
             self.config.chunk_size,
@@ -359,29 +401,10 @@ impl Mamba2 {
             self.config.dt_limit.0,
             self.config.dt_limit.1,
         );
-
-        let xbc_conv = xbc
-            .transpose(1, 2)
-            .apply(&self.conv1d)
-            .narrow(2, 0, seqlen)
-            .transpose(1, 2)
-            .silu();
-        let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
-        let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
-
-        // Add skip connection with D: [batch, seq, nheads, headdim]
-        let y_skip = if self.config.d_has_hdim {
-            // D is [nheads, headdim] -> [1, 1, nheads, headdim]
-            let d_expanded = self.d_param.view([1, 1, nheads, headdim]);
-            &y + &x_heads * d_expanded
-        } else {
-            // D is [nheads] -> [1, 1, nheads, 1]
-            let d_expanded = self.d_param.view([1, 1, nheads, 1]);
-            &y + &x_heads * d_expanded
-        };
+        debug_fused_call("mamba2_y", call_id, &y);
 
         // Flatten heads: [batch, seq, d_inner]
-        let y_flat = y_skip.view([batch, seqlen, d_ssm]);
+        let y_flat = y.view([batch, seqlen, d_ssm]);
 
         // Norm and gate
         let mut y_out = match &self.norm {
@@ -827,8 +850,6 @@ impl Mamba2 {
         let z0_dim = d_mlp;
         let x0_dim = d_mlp;
         let z_dim = d_ssm;
-        let xbc_dim = d_ssm + 2 * ngroups * d_state;
-
         let z0 = if d_mlp > 0 {
             zxbcdt.narrow(-1, 0, z0_dim)
         } else {
@@ -840,7 +861,6 @@ impl Mamba2 {
             Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
         };
         let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
-        let xbc = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, xbc_dim);
         let device = zxbcdt.device();
         let kind = zxbcdt.kind();
 
@@ -855,6 +875,7 @@ impl Mamba2 {
         };
         let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
         let a_log = self.a_log.to_kind(kind).to_device(device);
+        let d_param = self.d_param.to_kind(kind).to_device(device);
         let initial_state = state.ssm_state.to_kind(kind).to_device(device);
 
         if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
@@ -867,6 +888,7 @@ impl Mamba2 {
             &conv_b,
             &dt_bias,
             &a_log,
+            &d_param,
             &dt_scale_tensor,
             &initial_state,
             self.config.chunk_size,
@@ -875,26 +897,9 @@ impl Mamba2 {
             self.config.dt_limit.0,
             self.config.dt_limit.1,
         );
+        state.ssm_state.copy_(&new_ssm_state);
         state.ssm_state.copy_(&new_ssm_state.to_kind(state.ssm_state.kind()));
-
-        let xbc_conv = xbc
-            .transpose(1, 2)
-            .apply(&self.conv1d)
-            .narrow(2, 0, seqlen)
-            .transpose(1, 2)
-            .silu();
-        let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
-        let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
-
-        let y_skip = if self.config.d_has_hdim {
-            let d_expanded = self.d_param.view([1, 1, nheads, headdim]);
-            &y + &x_heads * d_expanded
-        } else {
-            let d_expanded = self.d_param.view([1, 1, nheads, 1]);
-            &y + &x_heads * d_expanded
-        };
-
-        let y_flat = y_skip.view([batch, seqlen, d_ssm]);
+        let y_flat = y.view([batch, seqlen, d_ssm]);
 
         let mut y_out = match &self.norm {
             Some(norm) => {
@@ -932,8 +937,6 @@ impl Mamba2 {
         let z0_dim = d_mlp;
         let x0_dim = d_mlp;
         let z_dim = d_ssm;
-        let xbc_dim = d_ssm + 2 * ngroups * d_state;
-
         let z0 = if d_mlp > 0 {
             zxbcdt.narrow(-1, 0, z0_dim)
         } else {
@@ -945,7 +948,6 @@ impl Mamba2 {
             Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
         };
         let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
-        let xbc = zxbcdt.narrow(-1, z0_dim + x0_dim + z_dim, xbc_dim);
         let device = zxbcdt.device();
         let kind = zxbcdt.kind();
 
@@ -960,6 +962,7 @@ impl Mamba2 {
         };
         let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
         let a_log = self.a_log.to_kind(kind).to_device(device);
+        let d_param = self.d_param.to_kind(kind).to_device(device);
         let initial_state = initial_states.to_kind(kind).to_device(device);
 
         if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
@@ -972,6 +975,7 @@ impl Mamba2 {
             &conv_b,
             &dt_bias,
             &a_log,
+            &d_param,
             &dt_scale_tensor,
             &initial_state,
             self.config.chunk_size,
@@ -980,25 +984,7 @@ impl Mamba2 {
             self.config.dt_limit.0,
             self.config.dt_limit.1,
         );
-
-        let xbc_conv = xbc
-            .transpose(1, 2)
-            .apply(&self.conv1d)
-            .narrow(2, 0, seqlen)
-            .transpose(1, 2)
-            .silu();
-        let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
-        let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
-
-        let y_skip = if self.config.d_has_hdim {
-            let d_expanded = self.d_param.view([1, 1, nheads, headdim]);
-            &y + &x_heads * d_expanded
-        } else {
-            let d_expanded = self.d_param.view([1, 1, nheads, 1]);
-            &y + &x_heads * d_expanded
-        };
-
-        let y_flat = y_skip.view([batch, seqlen, d_ssm]);
+        let y_flat = y.view([batch, seqlen, d_ssm]);
 
         let mut y_out = match &self.norm {
             Some(norm) => {

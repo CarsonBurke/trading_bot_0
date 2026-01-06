@@ -118,6 +118,16 @@ const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -2.0;
 const ROPE_BASE: f64 = 10000.0;
 const TICKER_LATENT_FACTORS: i64 = 32;
+
+pub(crate) fn symlog_tensor(t: &Tensor) -> Tensor {
+    let abs = t.abs();
+    t.sign() * (abs + 1.0).log()
+}
+
+pub(crate) fn symexp_tensor(t: &Tensor) -> Tensor {
+    let abs = t.abs();
+    t.sign() * (abs.exp() - 1.0)
+}
 const DEFAULT_CASH_POOL_QUERIES: i64 = 4;
 const TEMPORAL_POOL_GROUPS: i64 = 4;
 const PMA_QUERIES: i64 = 2;
@@ -547,9 +557,10 @@ impl TradingModel {
             Init::Const(0.0),
         );
         let value_clip = 10.0;
+        let value_clip_symlog = symlog_tensor(&Tensor::from(value_clip)).double_value(&[]);
         let value_centers = Tensor::linspace(
-            -value_clip,
-            value_clip,
+            -value_clip_symlog,
+            value_clip_symlog,
             NUM_VALUE_BUCKETS,
             (Kind::Float, p.device()),
         );

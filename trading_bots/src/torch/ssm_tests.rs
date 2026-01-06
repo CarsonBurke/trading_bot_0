@@ -240,6 +240,29 @@ mod tests {
     }
 
     #[test]
+    fn test_mamba2_fused_forward_finite_bf16() {
+        if !tch::Cuda::is_available() {
+            return;
+        }
+        let vs = nn::VarStore::new(tch::Device::Cuda(0));
+        let config = Mamba2Config {
+            d_model: 64,
+            headdim: 32,
+            d_state: 16,
+            chunk_size: 32,
+            ..Default::default()
+        };
+        let mamba = Mamba2::new(&vs.root(), config);
+
+        let x = Tensor::randn(&[2, 64, 64], (Kind::BFloat16, tch::Device::Cuda(0)));
+        let y = mamba.forward(&x, false);
+        let has_nan = y.isnan().any().int64_value(&[]) != 0;
+        let has_inf = y.isinf().any().int64_value(&[]) != 0;
+        assert!(!has_nan, "fused forward produced NaN");
+        assert!(!has_inf, "fused forward produced Inf");
+    }
+
+    #[test]
     fn test_mamba2_default_standard_hyperparams_compile() {
         // Ensures default config uses standard Mamba2-ish hyperparams and remains valid
         // even when nheads < requested ngroups (ngroups is clamped internally).

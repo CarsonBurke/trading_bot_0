@@ -7,13 +7,43 @@ use crate::torch::constants::{
     STEPS_PER_EPISODE, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{TradingModel, TradingModelConfig};
+use crate::torch::model::{symlog_tensor, TradingModel, TradingModelConfig};
 use crate::torch::load::load_var_store_partial;
 use std::fs;
 use std::process;
 use std::sync::OnceLock;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enums::device::UsedGpuMemory;
+
+#[cfg(feature = "perf_timing")]
+#[derive(Default)]
+struct PerfTimers {
+    rollout_us: u64,
+    rollout_fwd_us: u64,
+    env_step_us: u64,
+    buffer_us: u64,
+    prep_us: u64,
+    gae_us: u64,
+    update_fwd_us: u64,
+    update_bwd_us: u64,
+}
+
+#[cfg(feature = "perf_timing")]
+impl PerfTimers {
+    fn log(&self) {
+        println!(
+            "timing: rollout={:.1}ms fwd={:.1}ms env={:.1}ms buf={:.1}ms prep={:.1}ms gae={:.1}ms update_fwd={:.1}ms update_bwd={:.1}ms",
+            self.rollout_us as f64 / 1000.0,
+            self.rollout_fwd_us as f64 / 1000.0,
+            self.env_step_us as f64 / 1000.0,
+            self.buffer_us as f64 / 1000.0,
+            self.prep_us as f64 / 1000.0,
+            self.gae_us as f64 / 1000.0,
+            self.update_fwd_us as f64 / 1000.0,
+            self.update_bwd_us as f64 / 1000.0
+        );
+    }
+}
 
 struct GpuRollingBuffer {
     buffer: Tensor,
@@ -91,7 +121,7 @@ const OPTIM_EPOCHS: i64 = 4;
 const CHUNK_SIZE: i64 = 64; // Steps per chunk for PPO updates
 
 const LOG_2PI: f64 = 1.8378770664093453; // ln(2π)
-const GAMMA: f64 = 0.99;
+const GAMMA: f64 = 0.997;
 const GAE_LAMBDA: f64 = 0.95;
 
 fn huber_elementwise(err: &Tensor, delta: f64) -> Tensor {
@@ -130,7 +160,6 @@ fn twohot_encode(values: &Tensor, bin_centers: &Tensor) -> Tensor {
 
 // PPO hyperparameters
 const PPO_CLIP_RATIO: f64 = 0.2; // Clip for trust region
-const VALUE_CLIP_RANGE: f64 = 0.1;
 const ENTROPY_COEF: f64 = 0.0;
 const ATTENTION_ENTROPY_COEF: f64 = 0.002;
 const VALUE_LOSS_COEF: f64 = 0.5; // Value loss coefficient
@@ -305,6 +334,8 @@ pub fn train(weights_path: Option<&str>) {
     let mut step_deltas = Tensor::zeros([NPROCS, TICKERS_COUNT], (train_kind, device));
 
     for episode in 0..UPDATES {
+        #[cfg(feature = "perf_timing")]
+        let mut perf = PerfTimers::default();
         let mut get_buf =
             |buf: &mut Option<Tensor>, size: &[i64], kind: (Kind, Device)| -> Tensor {
                 let size_vec = size.to_vec();
@@ -359,15 +390,23 @@ pub fn train(weights_path: Option<&str>) {
         // Use a separate index (s) for tensor storage, starting from 0
         // Loop through the episode using relative steps (0 to max_step)
         let mut s: i64 = 0;
+        #[cfg(feature = "perf_timing")]
+        let rollout_start = Instant::now();
         for step in 0..env.max_step() {
             env.set_step(step);
 
+            #[cfg(feature = "perf_timing")]
+            let fwd_start = Instant::now();
             let (values, _critic_logits, (action_mean, action_log_std), _attn_entropy) =
                 tch::no_grad(|| {
                     let price_deltas_step = s_price_deltas.get(s);
                     let static_obs = s_static_obs.get(s);
                     trading_model.forward(&price_deltas_step, &static_obs, false)
                 });
+            #[cfg(feature = "perf_timing")]
+            {
+                perf.rollout_fwd_us += fwd_start.elapsed().as_micros() as u64;
+            }
             let values = values.to_kind(Kind::Float);
             let action_mean = action_mean.to_kind(Kind::Float);
             let action_log_std = action_log_std.to_kind(Kind::Float);
@@ -401,6 +440,8 @@ pub fn train(weights_path: Option<&str>) {
             }
 
             let mut out_so = s_static_obs.get(s + 1);
+            #[cfg(feature = "perf_timing")]
+            let env_start = Instant::now();
             env.step_incremental_tensor_into(
                 &actions,
                 &mut out_so,
@@ -410,9 +451,19 @@ pub fn train(weights_path: Option<&str>) {
                 &mut step_is_done,
                 &mut step_deltas,
             );
+            #[cfg(feature = "perf_timing")]
+            {
+                perf.env_step_us += env_start.elapsed().as_micros() as u64;
+            }
 
+            #[cfg(feature = "perf_timing")]
+            let buf_start = Instant::now();
             rolling_buffer.push(&step_deltas, None);
             s_price_deltas.get(s + 1).copy_(&rolling_buffer.get_flat());
+            #[cfg(feature = "perf_timing")]
+            {
+                perf.buffer_us += buf_start.elapsed().as_micros() as u64;
+            }
 
             sum_rewards += &step_reward;
             let completed_rewards = (&sum_rewards * &step_is_done).sum(Kind::Float);
@@ -438,6 +489,10 @@ pub fn train(weights_path: Option<&str>) {
 
             s += 1; // Increment storage index
         }
+        #[cfg(feature = "perf_timing")]
+        {
+            perf.rollout_us += rollout_start.elapsed().as_micros() as u64;
+        }
 
         let static_obs_vec =
             Vec::<f32>::try_from(s_static_obs.get(rollout_steps - 1).flatten(0, -1))
@@ -447,6 +502,8 @@ pub fn train(weights_path: Option<&str>) {
             .static_observations
             .push(static_obs_vec);
 
+        #[cfg(feature = "perf_timing")]
+        let prep_start = Instant::now();
         let price_deltas_batch = s_price_deltas
             .narrow(0, 0, rollout_steps)
             .reshape([memory_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64])
@@ -455,7 +512,13 @@ pub fn train(weights_path: Option<&str>) {
             .narrow(0, 0, rollout_steps)
             .reshape([memory_size, STATIC_OBSERVATIONS as i64])
             .detach();
+        #[cfg(feature = "perf_timing")]
+        {
+            perf.prep_us += prep_start.elapsed().as_micros() as u64;
+        }
 
+        #[cfg(feature = "perf_timing")]
+        let gae_start = Instant::now();
         let (advantages, returns) = {
             let gae = Tensor::zeros(
                 [rollout_steps + 1, NPROCS, TICKERS_COUNT + 1],
@@ -507,9 +570,14 @@ pub fn train(weights_path: Option<&str>) {
                     .view([memory_size, TICKERS_COUNT + 1]),
             )
         };
+        #[cfg(feature = "perf_timing")]
+        {
+            perf.gae_us += gae_start.elapsed().as_micros() as u64;
+        }
         let actions = s_actions.view([memory_size, ACTION_COUNT]).detach();
         let old_log_probs = s_log_probs.view([memory_size]).detach();
         let s_values_flat = s_values.view([memory_size, TICKERS_COUNT + 1]).detach();
+        let action_weights = actions.softmax(-1, Kind::Float).detach();
 
         // Record advantage stats before normalization
         let adv_stats = Tensor::stack(
@@ -561,6 +629,8 @@ pub fn train(weights_path: Option<&str>) {
 
         let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
+        let mut fwd_time_us = 0u64;
+        let mut bwd_time_us = 0u64;
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             let mut epoch_kl_gpu = Tensor::zeros([], stats_kind);
@@ -576,6 +646,7 @@ pub fn train(weights_path: Option<&str>) {
                 (CHUNK_SIZE * NPROCS * GRAD_ACCUM_STEPS as i64).min(total_epoch_samples);
 
             for (chunk_i, &chunk_idx) in chunk_order.iter().enumerate() {
+                let fwd_start = Instant::now();
                 let chunk_start_step = (chunk_idx as i64) * CHUNK_SIZE;
                 let chunk_end_step = ((chunk_idx as i64 + 1) * CHUNK_SIZE).min(rollout_steps);
                 let chunk_len = chunk_end_step - chunk_start_step;
@@ -591,7 +662,6 @@ pub fn train(weights_path: Option<&str>) {
                 let values = values
                     .to_kind(Kind::Float)
                     .view([chunk_sample_count, TICKERS_COUNT + 1]);
-                let critic_logits = critic_logits.to_kind(Kind::Float);
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let action_log_stds = action_log_stds.to_kind(Kind::Float);
                 let attn_entropy = attn_entropy.to_kind(Kind::Float);
@@ -634,9 +704,12 @@ pub fn train(weights_path: Option<&str>) {
                 let attn_entropy_mean = attn_entropy.mean(Kind::Float);
 
                 let returns_clipped = returns_mb.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
-                let target_twohot = twohot_encode(&returns_clipped, trading_model.value_centers())
+                let returns_symlog = symlog_tensor(&returns_clipped);
+                let target_twohot = twohot_encode(&returns_symlog, trading_model.value_centers())
                     .view([chunk_sample_count, TICKERS_COUNT + 1, -1]);
-                let log_probs = critic_logits.log_softmax(-1, Kind::Float);
+                let log_probs = critic_logits
+                    .to_kind(Kind::Float)
+                    .log_softmax(-1, Kind::Float);
                 let log_probs_ce = log_probs.shallow_clone();
                 let ce_loss = -(target_twohot * log_probs_ce)
                     .sum_dim_intlist(-1, false, Kind::Float)
@@ -646,21 +719,9 @@ pub fn train(weights_path: Option<&str>) {
                     .sum_dim_intlist(-1, false, Kind::Float)
                     .mean(Kind::Float);
 
-                let old_values_mb =
-                    s_values_flat.narrow(0, chunk_sample_start, chunk_sample_count);
                 let values_pred = values;
                 let returns_t = returns_mb;
-                let values_clipped = &old_values_mb
-                    + (&values_pred - &old_values_mb)
-                        .clamp(-VALUE_CLIP_RANGE, VALUE_CLIP_RANGE);
-
-                const HUBER_DELTA: f64 = 1.0;
-                const HUBER_WEIGHT: f64 = 0.05;
-                let v_loss_unclipped = huber_elementwise(&(&values_pred - &returns_t), HUBER_DELTA);
-                let v_loss_clipped = huber_elementwise(&(&values_clipped - &returns_t), HUBER_DELTA);
-                let v_loss_clip = Tensor::max_other(&v_loss_unclipped, &v_loss_clipped).mean(Kind::Float);
-                let value_loss: Tensor =
-                    ce_loss + HUBER_WEIGHT * v_loss_clip - CRITIC_ENTROPY_COEF * critic_entropy;
+                let value_loss: Tensor = ce_loss - CRITIC_ENTROPY_COEF * critic_entropy;
                 let value_mae = (&values_pred - &returns_t)
                     .abs()
                     .mean(Kind::Float)
@@ -692,7 +753,7 @@ pub fn train(weights_path: Option<&str>) {
                 }
                 let ratio = log_ratio.exp();
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
-                let action_weights = u.softmax(-1, Kind::Float).detach();
+                let action_weights = action_weights.narrow(0, chunk_sample_start, chunk_sample_count);
                 let adv_mean = advantages_mb.mean_dim([-1].as_slice(), false, Kind::Float);
                 let adv_weighted =
                     (&advantages_mb * &action_weights).sum_dim_intlist(-1, false, Kind::Float);
@@ -760,7 +821,10 @@ pub fn train(weights_path: Option<&str>) {
 
                 let scaled_ppo_loss =
                     &ppo_loss * (chunk_sample_count as f64 / samples_per_accum as f64);
+                fwd_time_us += fwd_start.elapsed().as_micros() as u64;
+                let bwd_start = Instant::now();
                 (&scaled_ppo_loss + alpha_loss * ALPHA_LOSS_COEF).backward();
+                bwd_time_us += bwd_start.elapsed().as_micros() as u64;
 
                 // Accumulate metrics on GPU
                 let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
@@ -828,6 +892,18 @@ pub fn train(weights_path: Option<&str>) {
                 OPTIM_EPOCHS,
                 mean_epoch_kl
             );
+        }
+
+        println!(
+            "fwd: {:.1}ms  bwd: {:.1}ms",
+            fwd_time_us as f64 / 1000.0,
+            bwd_time_us as f64 / 1000.0
+        );
+        #[cfg(feature = "perf_timing")]
+        {
+            perf.update_fwd_us = fwd_time_us;
+            perf.update_bwd_us = bwd_time_us;
+            perf.log();
         }
 
         // Record std stats every episode
