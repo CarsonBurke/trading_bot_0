@@ -21,11 +21,28 @@ fn main() {
     let cpp_src = cuda_ops_dir.join("mamba_fused_ops.cpp");
     let cu_src = cuda_ops_dir.join("mamba_fused_ops.cu");
     let wrapper_src = cuda_ops_dir.join("gen_wrapper.py");
+    let triton_dir = cuda_ops_dir.join("triton");
 
     println!("cargo:rerun-if-changed={}", cpp_src.display());
     println!("cargo:rerun-if-changed={}", cu_src.display());
     println!("cargo:rerun-if-changed={}", wrapper_src.display());
+    for file in [
+        "ssd_common.cuh",
+        "ssd_state_passing.cu",
+        "ssd_bmm.cu",
+        "ssd_chunk_state.cu",
+        "ssd_chunk_scan.cu",
+        "ssd_combined.cu",
+        "selective_state_update.cu",
+        "rmsnorm.cu",
+    ] {
+        println!("cargo:rerun-if-changed={}", triton_dir.join(file).display());
+    }
     println!("cargo:rerun-if-changed={}", manifest_dir.join("build.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/torch/mamba_fused.rs").display()
+    );
 
     let libtorch_lib = libtorch_lib_dir();
     let libtorch_root = libtorch_lib.parent().expect("Invalid libtorch lib path");
@@ -46,6 +63,7 @@ fn main() {
         .arg(cxx11_define.clone())
         .arg(format!("-I{}", include1.display()))
         .arg(format!("-I{}", include2.display()))
+        .arg("-I/opt/cuda/include")
         .arg("-c")
         .arg(&cpp_src)
         .arg("-o")

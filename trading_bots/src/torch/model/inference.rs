@@ -110,7 +110,7 @@ impl TradingModel {
         }
 
         self.head_with_temporal_pool(
-            &Tensor::zeros(&[TICKERS_COUNT, SSM_DIM, 1], (Kind::Float, self.device)),
+            &Tensor::zeros(&[TICKERS_COUNT, 1, SSM_DIM], (Kind::Float, self.device)),
             &global_static,
             &per_ticker_static,
             1,
@@ -151,7 +151,7 @@ impl TradingModel {
         for t in 0..TICKERS_COUNT as usize {
             let ticker_data = reshaped.get(t as i64).unsqueeze(0);
             let x_stem = self.patch_embed_single(&ticker_data);
-            let mut x = x_stem.permute([0, 2, 1]);
+            let mut x = x_stem;
             for (layer, (ssm, norm)) in
                 self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
             {
@@ -164,7 +164,7 @@ impl TradingModel {
                 );
                 x = x + out;
             }
-            outputs.push(x.permute([0, 2, 1]));
+            outputs.push(x);
         }
 
         state.initialized = true;
@@ -195,7 +195,7 @@ impl TradingModel {
                 let out = ssm.step_with_dt_scale(&normed, &mut state.ssm_states[state_idx], dt_scale);
                 x_in = x_in + out;
             }
-            outputs.push(x_in.unsqueeze(-1));
+            outputs.push(x_in.unsqueeze(1));
         }
         Tensor::cat(&outputs, 0)
     }

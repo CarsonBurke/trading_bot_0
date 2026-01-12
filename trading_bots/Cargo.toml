@@ -7,6 +7,7 @@ description = "A trading bot using machine learning and genetic algorithms, work
 repository = "https://github.com/CarsonBurke/trading_bot_0"
 keywords = ["trading", "finance", "deep-learning", "machine-learning"]
 categories = ["science"]
+default-run = "trading_bot_0"
 
 [dependencies]
 shared = { path = "../shared", features = ["plotters"] }

@@ -228,6 +228,7 @@ pub struct TradingModel {
     patch_dt_scale: Tensor,
     stem_pos_embed: Tensor,
     stem_scale_embeds: Vec<Tensor>,
+    patch_ends: Tensor,
     ssm_layers: Vec<StatefulMamba>,
     ssm_norms: Vec<RMSNorm>,
     post_ssm_ln: RMSNorm,
@@ -369,6 +370,20 @@ impl TradingModel {
             }
             Tensor::from_slice(&scales)
                 .view([1, SEQ_LEN, 1])
+                .to_device(p.device())
+        };
+        let patch_ends = {
+            let mut ends = Vec::with_capacity(SEQ_LEN as usize);
+            let mut offset = 0i64;
+            for &(days, patch_size) in &PATCH_CONFIGS {
+                let n_patches = days / patch_size;
+                for p_idx in 0..n_patches {
+                    ends.push(offset + (p_idx + 1) * patch_size);
+                }
+                offset += days;
+            }
+            Tensor::from_slice(&ends)
+                .to_kind(Kind::Int64)
                 .to_device(p.device())
         };
 
@@ -573,6 +588,7 @@ impl TradingModel {
             patch_dt_scale,
             stem_pos_embed,
             stem_scale_embeds,
+            patch_ends,
             ssm_layers,
             ssm_norms,
             post_ssm_ln,
@@ -695,8 +711,10 @@ impl TradingModel {
     }
 
     fn patch_embed_single(&self, ticker_data: &Tensor) -> Tensor {
-        let mut patches = Vec::with_capacity(PATCH_CONFIGS.len());
+        let kind = ticker_data.kind();
         let mut offset = 0i64;
+        let mut patch_offset = 0i64;
+        let mut out = Tensor::zeros(&[1, SEQ_LEN, SSM_DIM], (kind, ticker_data.device()));
         for (i, &(days, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
             let n_patches = days / patch_size;
             let chunk = ticker_data.narrow(1, offset, days);
@@ -704,23 +722,24 @@ impl TradingModel {
             let p = self.enrich_patches(&p);
             let p = p.apply(&self.patch_embeds[i]);
             let p = self.patch_lns[i].forward(&p);
-            let kind = p.kind();
             let p = p + self.stem_scale_embeds[i].to_kind(kind);
-            patches.push(p);
+            out.narrow(1, patch_offset, n_patches).copy_(&p);
             offset += days;
+            patch_offset += n_patches;
         }
-        let x = Tensor::cat(&patches, 1) + self.stem_pos_embed.to_kind(ticker_data.kind());
-        x.permute([0, 2, 1])
+        out + self.stem_pos_embed.to_kind(kind)
     }
 
-    fn patch_latent_stem(&self, price_deltas: &Tensor, batch_size: i64) -> (Tensor, Tensor) {
+    fn patch_latent_stem(&self, price_deltas: &Tensor, batch_size: i64) -> (Tensor, Tensor, Tensor) {
         let batch_tokens = batch_size * TICKERS_COUNT;
         let deltas = price_deltas
             .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
             .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
 
-        let mut patches = Vec::with_capacity(PATCH_CONFIGS.len());
+        let kind = deltas.kind();
         let mut offset = 0i64;
+        let mut patch_offset = 0i64;
+        let mut out = Tensor::zeros(&[batch_tokens, SEQ_LEN, SSM_DIM], (kind, deltas.device()));
         for (i, &(days, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
             let n_patches = days / patch_size;
             let chunk = deltas.narrow(1, offset, days);
@@ -728,15 +747,30 @@ impl TradingModel {
             let p = self.enrich_patches(&p);
             let p = p.apply(&self.patch_embeds[i]);
             let p = self.patch_lns[i].forward(&p);
-            let kind = p.kind();
             let p = p + self.stem_scale_embeds[i].to_kind(kind);
-            patches.push(p);
+            out.narrow(1, patch_offset, n_patches).copy_(&p);
             offset += days;
+            patch_offset += n_patches;
         }
 
-        let x = Tensor::cat(&patches, 1) + self.stem_pos_embed.to_kind(deltas.kind());
-        let x = x.permute([0, 2, 1]);
-        (x, self.patch_dt_scale.shallow_clone())
+        let x = out + self.stem_pos_embed.to_kind(kind);
+        let seq_idx = Self::build_seq_idx_from_padding(&deltas, &self.patch_ends);
+        let dt_scale = self.patch_dt_scale.to_kind(kind).clamp_min(1e-4);
+        (x, dt_scale, seq_idx)
+    }
+
+    fn build_seq_idx_from_padding(deltas: &Tensor, patch_ends: &Tensor) -> Tensor {
+        let device = deltas.device();
+        let zeros = deltas.eq(0.0).to_kind(Kind::Float);
+        let prefix = zeros.cumprod(1, Kind::Float);
+        let leading = prefix.sum_dim_intlist([1].as_slice(), false, Kind::Float).to_kind(Kind::Int64);
+        let max_leading = leading.max().int64_value(&[]);
+        if max_leading == 0 {
+            return Tensor::zeros(&[0], (Kind::Int64, device));
+        }
+        let patch_ends = patch_ends.to_device(device);
+        let mask = leading.unsqueeze(1).ge_tensor(&patch_ends);
+        mask.to_kind(Kind::Int64).neg()
     }
 
     fn enrich_patches(&self, patches: &Tensor) -> Tensor {

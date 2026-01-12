@@ -263,6 +263,68 @@ mod tests {
     }
 
     #[test]
+    fn test_mamba2_infer_fused_matches_forward() {
+        if !tch::Cuda::is_available() {
+            return;
+        }
+        let device = tch::Device::Cuda(0);
+        let vs = nn::VarStore::new(device);
+        let config = Mamba2Config {
+            d_model: 64,
+            headdim: 32,
+            d_state: 16,
+            chunk_size: 32,
+            ..Default::default()
+        };
+        let mamba = Mamba2::new(&vs.root(), config);
+        let x = Tensor::randn(&[2, 64, 64], (Kind::Float, device));
+
+        let y_forward = mamba.forward_with_dt_scale(&x, None);
+        let mut state = mamba.init_state(2, device);
+        let y_infer = mamba.forward_with_state_dt_scale(&x, &mut state, None);
+
+        let diff = (&y_forward - &y_infer).abs().max();
+        let max_diff: f64 = diff.double_value(&[]);
+        assert!(max_diff < 1e-3, "Max diff {} too large", max_diff);
+    }
+
+    #[test]
+    fn test_mamba2_step_cuda_matches_forward() {
+        if !tch::Cuda::is_available() {
+            return;
+        }
+        let device = tch::Device::Cuda(0);
+        let vs = nn::VarStore::new(device);
+        let d_conv = 4i64;
+        let config = Mamba2Config {
+            d_model: 32,
+            headdim: 16,
+            d_state: 8,
+            d_conv,
+            chunk_size: 32,
+            ..Default::default()
+        };
+        let mamba = Mamba2::new(&vs.root(), config);
+        let seq_len = 24;
+        let x_seq = Tensor::randn(&[1, seq_len, 32], (Kind::Float, device));
+        let y_forward = mamba.forward(&x_seq, false);
+
+        let mut state = mamba.init_state(1, device);
+        let mut y_steps = Vec::new();
+        for t in 0..seq_len {
+            let x_t = x_seq.narrow(1, t, 1).squeeze_dim(1);
+            let y_t = mamba.step(&x_t, &mut state);
+            y_steps.push(y_t);
+        }
+        let y_stepped = Tensor::stack(&y_steps, 1);
+        let y_fwd_tail = y_forward.narrow(1, d_conv, seq_len - d_conv);
+        let y_step_tail = y_stepped.narrow(1, d_conv, seq_len - d_conv);
+        let diff = (&y_fwd_tail - &y_step_tail).abs().max();
+        let max_diff: f64 = diff.double_value(&[]);
+        assert!(max_diff < 1e-3, "Max diff {} too large", max_diff);
+    }
+
+    #[test]
     fn test_mamba2_default_standard_hyperparams_compile() {
         // Ensures default config uses standard Mamba2-ish hyperparams and remains valid
         // even when nheads < requested ngroups (ngroups is clamped internally).

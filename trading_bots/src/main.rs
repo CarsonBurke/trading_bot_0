@@ -79,7 +79,7 @@ async fn main() {
 
     match &cli.command {
         Some(Commands::Train { weights }) => {
-            torch::ppo::train(weights.as_deref());
+            torch::ppo::train(weights.as_deref()).await;
         }
         Some(Commands::Infer { weights, episodes, deterministic, temperature, tickers, random_start }) => {
             torch::infer::run_inference(weights, *episodes, *deterministic, *temperature, tickers.clone(), *random_start)
@@ -95,7 +95,7 @@ async fn main() {
             ).expect("paper trading failed");
         }
         None => {
-            torch::ppo::train(None);
+            torch::ppo::train(None).await;
         }
     }
 

@@ -74,7 +74,7 @@ pub fn run_inference<P: AsRef<Path>>(
             [TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
             (Kind::Float, device),
         );
-        let mut price_deltas_step =
+        let mut price_deltas_incremental =
             Tensor::zeros([TICKERS_COUNT], (Kind::Float, device));
         let mut static_obs_tensor = Tensor::zeros(
             [STATIC_OBSERVATIONS as i64],
@@ -89,13 +89,12 @@ pub fn run_inference<P: AsRef<Path>>(
         for step in 0..env.max_step {
             env.step = step;
 
-            // First call: model.step detects full obs and initializes stream state
-            // Subsequent calls: model.step processes single delta per ticker
+            // First call uses full history, then we switch to incremental per-ticker deltas.
             let (action_mean, action_log_std) = tch::no_grad(|| {
                 let price_input = if use_full {
                     &price_deltas_full
                 } else {
-                    &price_deltas_step
+                    &price_deltas_incremental
                 };
                 let (_, _, (action_mean, action_log_std), _) =
                     model.step(price_input, &static_obs_tensor, &mut stream_state);
@@ -112,7 +111,7 @@ pub fn run_inference<P: AsRef<Path>>(
             let step_result = env.step_step_single(&actions_vec);
             episode_reward += step_result.reward;
 
-            price_deltas_step.copy_(&Tensor::from_slice(&step_result.step_deltas));
+            price_deltas_incremental.copy_(&Tensor::from_slice(&step_result.step_deltas));
             static_obs_tensor.copy_(&Tensor::from_slice(&step_result.static_obs));
             use_full = false;
 

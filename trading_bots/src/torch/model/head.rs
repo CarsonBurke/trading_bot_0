@@ -18,8 +18,7 @@ impl TradingModel {
         batch_size: i64,
         _debug: bool,
     ) -> (ModelOutput, Option<DebugMetrics>) {
-        let x = x_ssm.permute([0, 2, 1]);
-        let x = self.post_ssm_ln.forward(&x);
+        let x = self.post_ssm_ln.forward(x_ssm);
         let x = &x * x.apply(&self.ssm_gate).sigmoid();
         let x = x.permute([0, 2, 1]);
         let mut x = x.apply(&self.ssm_proj);

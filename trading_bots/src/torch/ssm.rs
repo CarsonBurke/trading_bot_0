@@ -27,7 +27,7 @@ const DT_INIT_FLOOR: f64 = 1e-4;
 static MAMBA_CALL_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn debug_fused(tag: &str, t: &Tensor) {
-    if env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
+    if !crate::torch::ppo::DEBUG_NUMERICS && env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
         return;
     }
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -44,7 +44,7 @@ fn debug_fused(tag: &str, t: &Tensor) {
 }
 
 fn debug_fused_call(tag: &str, call_id: usize, t: &Tensor) {
-    if env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
+    if !crate::torch::ppo::DEBUG_NUMERICS && env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
         return;
     }
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -187,12 +187,14 @@ pub struct Mamba2State {
     pub conv_state: Tensor,
     /// SSM hidden state: [batch, nheads, headdim, d_state]
     pub ssm_state: Tensor,
+    pub has_conv_state: bool,
 }
 
 impl Mamba2State {
     pub fn reset(&mut self) {
         let _ = self.conv_state.zero_();
         let _ = self.ssm_state.zero_();
+        self.has_conv_state = false;
     }
 }
 
@@ -237,10 +239,18 @@ impl Mamba2 {
         assert_eq!(d_ssm % config.headdim, 0);
         let nheads = d_ssm / config.headdim;
         let d_state = config.d_state;
-        let mut ngroups = config.ngroups.clamp(1, nheads);
-        while ngroups > 1 && (nheads % ngroups != 0) {
-            ngroups -= 1;
-        }
+        let ngroups = config.ngroups;
+        assert!(
+            ngroups >= 1 && ngroups <= nheads,
+            "ngroups must be in [1, nheads], got {}",
+            ngroups
+        );
+        assert!(
+            nheads % ngroups == 0,
+            "ngroups must divide nheads ({}), got {}",
+            nheads,
+            ngroups
+        );
         config.ngroups = ngroups;
 
         // Single projection: [z, x, B, C, dt]
@@ -330,41 +340,55 @@ impl Mamba2 {
     }
 
     /// Forward pass with optional dt_scale for variable patch sizes
-    /// dt_scale: [1, seq, 1] or None - multiplies dt to account for patch size
+    /// dt_scale: [1, seq, 1] or None - scales dt in fused path
     pub fn forward(&self, u: &Tensor, _train: bool) -> Tensor {
         self.forward_with_dt_scale(u, None)
     }
 
     pub fn forward_with_dt_scale(&self, u: &Tensor, dt_scale: Option<&Tensor>) -> Tensor {
+        self.forward_with_dt_scale_seq_idx(u, dt_scale, None)
+    }
+
+    pub fn forward_with_dt_scale_seq_idx(
+        &self,
+        u: &Tensor,
+        dt_scale: Option<&Tensor>,
+        seq_idx: Option<&Tensor>,
+    ) -> Tensor {
         let call_id = MAMBA_CALL_ID.fetch_add(1, Ordering::Relaxed);
         let (batch, seqlen, _) = u.size3().unwrap();
-        let d_inner = self.d_inner;
-        let d_ssm = self.d_ssm;
         let nheads = self.nheads;
         let headdim = self.config.headdim;
         let d_state = self.config.d_state;
         let ngroups = self.config.ngroups;
-        let d_mlp = d_inner - d_ssm;
+
+        let debug_mem = env::var("MAMBA_DEBUG_MEM").ok().as_deref() == Some("1");
+        if debug_mem {
+            let stats = mamba_fused::cuda_memory_stats();
+            eprintln!(
+                "SSM#{} pre-in_proj: alloc={}MB batch={} seqlen={}",
+                call_id,
+                stats.get(0).unwrap_or(&0) / (1024 * 1024),
+                batch,
+                seqlen
+            );
+        }
 
         debug_fused_call("mamba2_u", call_id, u);
         debug_fused_call("mamba2_in_proj_w", call_id, &self.in_proj.ws);
         let zxbcdt = u.apply(&self.in_proj);
         debug_fused_call("mamba2_zxbcdt", call_id, &zxbcdt);
 
-        let z0_dim = d_mlp;
-        let x0_dim = d_mlp;
-        let z_dim = d_ssm;
-        let z0 = if d_mlp > 0 {
-            zxbcdt.narrow(-1, 0, z0_dim)
-        } else {
-            Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
-        };
-        let x0 = if d_mlp > 0 {
-            zxbcdt.narrow(-1, z0_dim, x0_dim)
-        } else {
-            Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
-        };
-        let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
+        if debug_mem {
+            let stats = mamba_fused::cuda_memory_stats();
+            eprintln!(
+                "SSM#{} post-in_proj: alloc={}MB zxbcdt={:?}",
+                call_id,
+                stats.get(0).unwrap_or(&0) / (1024 * 1024),
+                zxbcdt.size()
+            );
+        }
+
         let device = zxbcdt.device();
         let kind = zxbcdt.kind();
 
@@ -381,51 +405,102 @@ impl Mamba2 {
         let a_log = self.a_log.to_kind(kind).to_device(device);
         let d_param = self.d_param.to_kind(kind).to_device(device);
         let initial_state = Tensor::zeros(&[batch, nheads, headdim, d_state], (kind, device));
+        let seq_idx = match seq_idx {
+            Some(idx) => idx.to_device(device),
+            None => Tensor::zeros(&[0], (Kind::Int64, device)),
+        };
+        let (rmsnorm_weight, rmsnorm_eps, norm_before_gate) = match &self.norm {
+            Some(norm) => (
+                norm.weight.to_kind(kind).to_device(device),
+                norm.eps,
+                norm.norm_before_gate,
+            ),
+            None => (Tensor::zeros(&[0], (kind, device)), 1e-5, false),
+        };
+        let outproj_w = self.out_proj.ws.to_kind(kind).to_device(device);
+        let outproj_b = match &self.out_proj.bs {
+            Some(bias) => bias.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
 
         if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
             panic!("mamba fused op requires CUDA");
         }
 
-        let (y, _final_state) = mamba_fused::fused_conv_scan(
-            &zxbcdt,
-            &conv_w,
-            &conv_b,
-            &dt_bias,
-            &a_log,
-            &d_param,
-            &dt_scale_tensor,
-            &initial_state,
-            self.config.chunk_size,
-            ngroups,
-            headdim,
-            self.config.dt_limit.0,
-            self.config.dt_limit.1,
-        );
-        debug_fused_call("mamba2_y", call_id, &y);
-
-        // Flatten heads: [batch, seq, d_inner]
-        let y_flat = y.view([batch, seqlen, d_ssm]);
-
-        // Norm and gate
-        let mut y_out = match &self.norm {
-            Some(norm) => {
-                let z_for_gate = z.view([batch, seqlen, d_ssm]);
-                norm.forward(&y_flat, Some(&z_for_gate))
-            }
-            None => &y_flat * z.silu(),
-        };
-
-        if d_mlp > 0 {
-            let mlp = &x0 * z0.silu();
-            y_out = Tensor::cat(&[mlp, y_out], -1);
+        if debug_mem {
+            let stats = mamba_fused::cuda_memory_stats();
+            eprintln!(
+                "SSM#{} pre-fused: alloc={}MB initial_state={:?}",
+                call_id,
+                stats.get(0).unwrap_or(&0) / (1024 * 1024),
+                initial_state.size()
+            );
         }
 
-        y_out.apply(&self.out_proj)
+        let use_graph = env::var("MAMBA_USE_CUDA_GRAPH").ok().as_deref() == Some("1");
+        let (y_out, _final_state) = if use_graph {
+            mamba_fused::fused_conv_scan_full_graph(
+                &zxbcdt,
+                &conv_w,
+                &conv_b,
+                &dt_bias,
+                &a_log,
+                &d_param,
+                &dt_scale_tensor,
+                &initial_state,
+                &seq_idx,
+                self.config.chunk_size,
+                ngroups,
+                headdim,
+                self.config.dt_limit.0,
+                self.config.dt_limit.1,
+                &rmsnorm_weight,
+                rmsnorm_eps,
+                norm_before_gate,
+                &outproj_w,
+                &outproj_b,
+            )
+        } else {
+            mamba_fused::fused_conv_scan_full(
+                &zxbcdt,
+                &conv_w,
+                &conv_b,
+                &dt_bias,
+                &a_log,
+                &d_param,
+                &dt_scale_tensor,
+                &initial_state,
+                &seq_idx,
+                self.config.chunk_size,
+                ngroups,
+                headdim,
+                self.config.dt_limit.0,
+                self.config.dt_limit.1,
+                &rmsnorm_weight,
+                rmsnorm_eps,
+                norm_before_gate,
+                &outproj_w,
+                &outproj_b,
+            )
+        };
+
+        if debug_mem {
+            let stats = mamba_fused::cuda_memory_stats();
+            eprintln!(
+                "SSM#{} post-fused: alloc={}MB peak={}MB y_out={:?}",
+                call_id,
+                stats.get(0).unwrap_or(&0) / (1024 * 1024),
+                stats.get(3).unwrap_or(&0) / (1024 * 1024),
+                y_out.size()
+            );
+        }
+
+        debug_fused_call("mamba2_y", call_id, &y_out);
+        y_out
     }
 
     /// Initialize inference state for a given batch size
     pub fn init_state(&self, batch_size: i64, device: tch::Device) -> Mamba2State {
-        let d_inner = self.d_inner;
         let d_ssm = self.d_ssm;
         let nheads = self.nheads;
         let headdim = self.config.headdim;
@@ -436,8 +511,9 @@ impl Mamba2 {
         let conv_dim = d_ssm + 2 * ngroups * d_state;
 
         Mamba2State {
-            conv_state: Tensor::zeros(&[batch_size, conv_dim, d_conv], (Kind::Float, device)),
+            conv_state: Tensor::zeros(&[batch_size, conv_dim, d_conv], (self.conv1d.ws.kind(), device)),
             ssm_state: Tensor::zeros(&[batch_size, nheads, headdim, d_state], (Kind::Float, device)),
+            has_conv_state: false,
         }
     }
 
@@ -488,13 +564,16 @@ impl Mamba2 {
             .copy_(&state.conv_state.narrow(2, 1, self.config.d_conv - 1));
         let _ = state.conv_state.narrow(2, self.config.d_conv - 1, 1)
             .copy_(&xbc.unsqueeze(-1));
+        state.has_conv_state = true;
 
         // Manual depthwise conv1d: sum(conv_state * weight) + bias
         // weight: [conv_dim, 1, d_conv] -> [conv_dim, d_conv]
-        let conv_weight = self.conv1d.ws.squeeze_dim(1);
-        let xbc_conv = (&state.conv_state * &conv_weight).sum_dim_intlist(-1, false, Kind::Float);
+        // Manual depthwise conv1d: sum(conv_state * weight) + bias
+        // weight: [conv_dim, 1, d_conv] -> [conv_dim, d_conv]
+        let conv_weight = self.conv1d.ws.squeeze_dim(1).to_kind(Kind::Float);
+        let xbc_conv = (state.conv_state.to_kind(Kind::Float) * &conv_weight).sum_dim_intlist(-1, false, Kind::Float);
         let xbc_conv = match &self.conv1d.bs {
-            Some(bias) => (&xbc_conv + bias).silu(),
+            Some(bias) => (&xbc_conv + &bias.to_kind(Kind::Float)).silu(),
             None => xbc_conv.silu(),
         };
 
@@ -503,8 +582,54 @@ impl Mamba2 {
         let b = xbc_conv.narrow(-1, d_ssm, b_dim);
         let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
 
+        if matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
+            let x_heads = x_conv.view([batch, nheads, headdim]);
+            let b_groups = b.view([batch, ngroups, d_state]);
+            let c_groups = c.view([batch, ngroups, d_state]);
+            let z_gate = if self.config.rmsnorm {
+                Tensor::zeros(&[0], (Kind::Float, zxbcdt.device()))
+            } else {
+                z.view([batch, nheads, headdim])
+            };
+            let apply_dt_limit = if self.config.dt_limit == (0.0, f64::INFINITY) { 0 } else { 1 };
+            let (y_heads, new_state) = mamba_fused::selective_state_update(
+                &state.ssm_state,
+                &x_heads,
+                &dt_raw,
+                &self.a_log,
+                &b_groups,
+                &c_groups,
+                &self.d_param,
+                &z_gate,
+                &self.dt_bias,
+                true,
+                self.config.dt_limit.0,
+                self.config.dt_limit.1,
+                ngroups,
+                headdim,
+                apply_dt_limit,
+            );
+            state.ssm_state.copy_(&new_state);
+            let y_flat = y_heads.to_kind(zxbcdt.kind()).view([batch, d_ssm]);
+            let mut y_out = if self.config.rmsnorm {
+                if let Some(norm) = &self.norm {
+                    let z_for_gate = z.view([batch, d_ssm]);
+                    norm.forward(&y_flat.unsqueeze(1), Some(&z_for_gate.unsqueeze(1))).squeeze_dim(1)
+                } else {
+                    y_flat
+                }
+            } else {
+                y_flat
+            };
+            if d_mlp > 0 {
+                let mlp = x0 * z0.silu();
+                y_out = Tensor::cat(&[mlp, y_out], -1);
+            }
+            return y_out.apply(&self.out_proj);
+        }
+
         // dt: add bias and softplus
-        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
+        let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias.to_kind(Kind::Float)).softplus();
         let dt = if self.config.dt_limit == (0.0, f64::INFINITY) {
             dt
         } else {
@@ -628,17 +753,65 @@ impl Mamba2 {
             .conv_state
             .narrow(2, self.config.d_conv - 1, 1)
             .copy_(&xbc.unsqueeze(-1));
+        state.has_conv_state = true;
 
-        let conv_weight = self.conv1d.ws.squeeze_dim(1);
-        let xbc_conv = (&state.conv_state * &conv_weight).sum_dim_intlist(-1, false, Kind::Float);
+        // Manual depthwise conv1d: sum(conv_state * weight) + bias
+        // weight: [conv_dim, 1, d_conv] -> [conv_dim, d_conv]
+        let conv_weight = self.conv1d.ws.squeeze_dim(1).to_kind(Kind::Float);
+        let xbc_conv = (state.conv_state.to_kind(Kind::Float) * &conv_weight).sum_dim_intlist(-1, false, Kind::Float);
         let xbc_conv = match &self.conv1d.bs {
-            Some(bias) => (&xbc_conv + bias).silu(),
+            Some(bias) => (&xbc_conv + &bias.to_kind(Kind::Float)).silu(),
             None => xbc_conv.silu(),
         };
 
         let x_conv = xbc_conv.narrow(-1, 0, d_ssm);
         let b = xbc_conv.narrow(-1, d_ssm, b_dim);
         let c = xbc_conv.narrow(-1, d_ssm + b_dim, c_dim);
+
+        if matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
+            let x_heads = x_conv.view([batch, nheads, headdim]);
+            let b_groups = b.view([batch, ngroups, d_state]);
+            let c_groups = c.view([batch, ngroups, d_state]);
+            let z_gate = if self.config.rmsnorm {
+                Tensor::zeros(&[0], (Kind::Float, zxbcdt.device()))
+            } else {
+                z.view([batch, nheads, headdim])
+            };
+            let dt_pre = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias.to_kind(Kind::Float)).softplus() * dt_scale;
+            let dt_bias = Tensor::zeros(&[nheads], (Kind::Float, zxbcdt.device()));
+            let apply_dt_limit = if self.config.dt_limit == (0.0, f64::INFINITY) { 0 } else { 1 };
+            let (y_heads, new_state) = mamba_fused::selective_state_update(
+                &state.ssm_state,
+                &x_heads,
+                &dt_pre,
+                &self.a_log,
+                &b_groups,
+                &c_groups,
+                &self.d_param,
+                &z_gate,
+                &dt_bias,
+                false,
+                self.config.dt_limit.0,
+                self.config.dt_limit.1,
+                ngroups,
+                headdim,
+                apply_dt_limit,
+            );
+            state.ssm_state.copy_(&new_state);
+            let y_flat = y_heads.to_kind(zxbcdt.kind()).view([batch, d_ssm]);
+            let mut y_out = match &self.norm {
+                Some(norm) => {
+                    let z_for_gate = z.view([batch, d_ssm]);
+                    norm.forward(&y_flat.unsqueeze(1), Some(&z_for_gate.unsqueeze(1))).squeeze_dim(1)
+                }
+                None => y_flat,
+            };
+            if d_mlp > 0 {
+                let mlp = x0 * z0.silu();
+                y_out = Tensor::cat(&[mlp, y_out], -1);
+            }
+            return y_out.apply(&self.out_proj);
+        }
 
         let dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus() * dt_scale;
         let dt = if self.config.dt_limit == (0.0, f64::INFINITY) {
@@ -836,34 +1009,15 @@ impl Mamba2 {
     }
 
     pub fn forward_with_state_dt_scale(&self, u: &Tensor, state: &mut Mamba2State, dt_scale: Option<&Tensor>) -> Tensor {
-        let (batch, seqlen, _) = u.size3().unwrap();
-        let d_inner = self.d_inner;
-        let d_ssm = self.d_ssm;
-        let d_mlp = d_inner - d_ssm;
         let nheads = self.nheads;
         let headdim = self.config.headdim;
-        let d_state = self.config.d_state;
         let ngroups = self.config.ngroups;
+        let d_ssm = self.d_ssm;
 
         let zxbcdt = u.apply(&self.in_proj);
-
-        let z0_dim = d_mlp;
-        let x0_dim = d_mlp;
-        let z_dim = d_ssm;
-        let z0 = if d_mlp > 0 {
-            zxbcdt.narrow(-1, 0, z0_dim)
-        } else {
-            Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
-        };
-        let x0 = if d_mlp > 0 {
-            zxbcdt.narrow(-1, z0_dim, x0_dim)
-        } else {
-            Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
-        };
-        let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
         let device = zxbcdt.device();
         let kind = zxbcdt.kind();
-
+        let seqlen = zxbcdt.size()[1];
         let dt_scale_tensor = match dt_scale {
             Some(scale) => scale.to_kind(kind).to_device(device),
             None => Tensor::zeros(&[0], (kind, device)),
@@ -877,129 +1031,180 @@ impl Mamba2 {
         let a_log = self.a_log.to_kind(kind).to_device(device);
         let d_param = self.d_param.to_kind(kind).to_device(device);
         let initial_state = state.ssm_state.to_kind(kind).to_device(device);
-
-        if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
-            panic!("mamba fused op requires CUDA");
-        }
-
-        let (y, new_ssm_state) = mamba_fused::fused_conv_scan(
-            &zxbcdt,
-            &conv_w,
-            &conv_b,
-            &dt_bias,
-            &a_log,
-            &d_param,
-            &dt_scale_tensor,
-            &initial_state,
-            self.config.chunk_size,
-            ngroups,
-            headdim,
-            self.config.dt_limit.0,
-            self.config.dt_limit.1,
-        );
-        state.ssm_state.copy_(&new_ssm_state);
-        state.ssm_state.copy_(&new_ssm_state.to_kind(state.ssm_state.kind()));
-        let y_flat = y.view([batch, seqlen, d_ssm]);
-
-        let mut y_out = match &self.norm {
-            Some(norm) => {
-                let z_for_gate = z.view([batch, seqlen, d_ssm]);
-                norm.forward(&y_flat, Some(&z_for_gate))
-            }
-            None => &y_flat * z.silu(),
+        let seq_idx = Tensor::zeros(&[0], (Kind::Int64, device));
+        let (rmsnorm_weight, rmsnorm_eps, norm_before_gate) = match &self.norm {
+            Some(norm) => (
+                norm.weight.to_kind(kind).to_device(device),
+                norm.eps,
+                norm.norm_before_gate,
+            ),
+            None => (Tensor::zeros(&[0], (kind, device)), 1e-5, false),
+        };
+        let outproj_w = self.out_proj.ws.to_kind(kind).to_device(device);
+        let outproj_b = match &self.out_proj.bs {
+            Some(bias) => bias.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
         };
 
-        if d_mlp > 0 {
-            let mlp = &x0 * z0.silu();
-            y_out = Tensor::cat(&[mlp, y_out], -1);
+        if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
+            return self.forward_with_state_manual(u, state, dt_scale);
         }
 
-        y_out.apply(&self.out_proj)
+        tch::no_grad(|| {
+            let conv_state = state.conv_state.to_kind(kind).to_device(device);
+            let (y_out, new_ssm_state, new_conv_state) = mamba_fused::fused_conv_scan_stateful(
+                &zxbcdt,
+                &conv_w,
+                &conv_b,
+                &dt_bias,
+                &a_log,
+                &d_param,
+                &dt_scale_tensor,
+                &initial_state,
+                &conv_state,
+                &seq_idx,
+                self.config.chunk_size,
+                ngroups,
+                headdim,
+                self.config.dt_limit.0,
+                self.config.dt_limit.1,
+                &rmsnorm_weight,
+                rmsnorm_eps,
+                norm_before_gate,
+                &outproj_w,
+                &outproj_b,
+            );
+            state.ssm_state.copy_(&new_ssm_state);
+            state.ssm_state.copy_(&new_ssm_state.to_kind(state.ssm_state.kind()));
+            state
+                .conv_state
+                .copy_(&new_conv_state.to_kind(state.conv_state.kind()));
+            state.has_conv_state = seqlen > 0;
+            y_out
+        })
     }
 
-    /// Batched forward with initial states - processes multiple sequences in parallel
-    pub fn forward_batched_init(&self, u: &Tensor, initial_states: &Tensor) -> (Tensor, Tensor) {
-        self.forward_batched_init_dt_scale(u, initial_states, None)
+    /// Batched forward with external state - processes multiple sequences in parallel
+    pub fn forward_batched_init(&self, u: &Tensor, state: &mut Mamba2State) -> Tensor {
+        self.forward_batched_init_dt_scale(u, state, None)
     }
 
-    pub fn forward_batched_init_dt_scale(&self, u: &Tensor, initial_states: &Tensor, dt_scale: Option<&Tensor>) -> (Tensor, Tensor) {
+    pub fn forward_batched_init_dt_scale(
+        &self,
+        u: &Tensor,
+        state: &mut Mamba2State,
+        dt_scale: Option<&Tensor>,
+    ) -> Tensor {
+        self.forward_with_state_dt_scale(u, state, dt_scale)
+    }
+
+    fn update_conv_state_from_xbc(&self, state: &mut Mamba2State, xbc_t: &Tensor, include_prev: bool) -> Tensor {
+        let d_conv = self.config.d_conv;
+        let conv_input = if include_prev && d_conv > 1 {
+            let prev = state
+                .conv_state
+                .narrow(2, 0, d_conv - 1)
+                .to_kind(xbc_t.kind())
+                .to_device(xbc_t.device());
+            Tensor::cat(&[prev, xbc_t.shallow_clone()], 2)
+        } else {
+            xbc_t.shallow_clone()
+        };
+        let total = conv_input.size()[2];
+        let updated = if total >= d_conv {
+            conv_input.narrow(2, total - d_conv, d_conv)
+        } else {
+            let pad = Tensor::zeros(
+                &[conv_input.size()[0], conv_input.size()[1], d_conv - total],
+                (conv_input.kind(), conv_input.device()),
+            );
+            Tensor::cat(&[pad, conv_input.shallow_clone()], 2)
+        };
+        state.conv_state.copy_(&updated);
+        state.has_conv_state = true;
+        conv_input
+    }
+
+    fn forward_with_state_manual(
+        &self,
+        u: &Tensor,
+        state: &mut Mamba2State,
+        dt_scale: Option<&Tensor>,
+    ) -> Tensor {
         let (batch, seqlen, _) = u.size3().unwrap();
         let d_inner = self.d_inner;
         let d_ssm = self.d_ssm;
-        let d_mlp = d_inner - d_ssm;
         let nheads = self.nheads;
         let headdim = self.config.headdim;
         let d_state = self.config.d_state;
         let ngroups = self.config.ngroups;
+        let d_mlp = d_inner - d_ssm;
 
         let zxbcdt = u.apply(&self.in_proj);
-
-        let z0_dim = d_mlp;
-        let x0_dim = d_mlp;
-        let z_dim = d_ssm;
         let z0 = if d_mlp > 0 {
-            zxbcdt.narrow(-1, 0, z0_dim)
+            zxbcdt.narrow(2, 0, d_mlp)
         } else {
             Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
         };
         let x0 = if d_mlp > 0 {
-            zxbcdt.narrow(-1, z0_dim, x0_dim)
+            zxbcdt.narrow(2, d_mlp, d_mlp)
         } else {
             Tensor::zeros(&[batch, seqlen, 0], (zxbcdt.kind(), zxbcdt.device()))
         };
-        let z = zxbcdt.narrow(-1, z0_dim + x0_dim, z_dim);
-        let device = zxbcdt.device();
-        let kind = zxbcdt.kind();
+        let z = zxbcdt.narrow(2, 2 * d_mlp, d_ssm);
+        let xbc_in = zxbcdt.narrow(2, 2 * d_mlp + d_ssm, d_ssm + 2 * ngroups * d_state);
+        let dt_raw = zxbcdt.narrow(2, 2 * d_mlp + d_ssm + d_ssm + 2 * ngroups * d_state, nheads);
 
-        let dt_scale_tensor = match dt_scale {
-            Some(scale) => scale.to_kind(kind).to_device(device),
-            None => Tensor::zeros(&[0], (kind, device)),
-        };
-        let conv_w = self.conv1d.ws.squeeze_dim(1).to_kind(kind).to_device(device);
-        let conv_b = match &self.conv1d.bs {
-            Some(bias) => bias.to_kind(kind).to_device(device),
-            None => Tensor::zeros(&[0], (kind, device)),
-        };
-        let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
-        let a_log = self.a_log.to_kind(kind).to_device(device);
-        let d_param = self.d_param.to_kind(kind).to_device(device);
-        let initial_state = initial_states.to_kind(kind).to_device(device);
+        let xbc_t = xbc_in.transpose(1, 2);
+        let conv_input = self.update_conv_state_from_xbc(state, &xbc_t, true);
+        let xbc_conv = conv_input
+            .conv1d(&self.conv1d.ws, self.conv1d.bs.as_ref(), 1, 0, 1, xbc_t.size()[1])
+            .transpose(1, 2)
+            .silu();
 
-        if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
-            panic!("mamba fused op requires CUDA");
+        let x_conv = xbc_conv.narrow(2, 0, d_ssm);
+        let b = xbc_conv.narrow(2, d_ssm, ngroups * d_state);
+        let c = xbc_conv.narrow(2, d_ssm + ngroups * d_state, ngroups * d_state);
+
+        let mut dt = (&dt_raw.to_kind(Kind::Float) + &self.dt_bias).softplus();
+        if let Some(scale) = dt_scale {
+            dt = dt * scale.to_kind(Kind::Float);
+        }
+        if self.config.dt_limit != (0.0, f64::INFINITY) {
+            dt = dt.clamp(self.config.dt_limit.0, self.config.dt_limit.1);
         }
 
-        let (y, final_states) = mamba_fused::fused_conv_scan(
-            &zxbcdt,
-            &conv_w,
-            &conv_b,
-            &dt_bias,
-            &a_log,
-            &d_param,
-            &dt_scale_tensor,
-            &initial_state,
-            self.config.chunk_size,
-            ngroups,
-            headdim,
-            self.config.dt_limit.0,
-            self.config.dt_limit.1,
+        let a = self.a_log.to_kind(Kind::Float).exp().neg();
+        let x_heads = x_conv.view([batch, seqlen, nheads, headdim]);
+        let b_groups = b.view([batch, seqlen, ngroups, d_state]);
+        let c_groups = c.view([batch, seqlen, ngroups, d_state]);
+        let (y, new_state) = self.chunked_ssm_scan_with_state(
+            &x_heads,
+            &dt,
+            &a,
+            &b_groups,
+            &c_groups,
+            &state.ssm_state,
         );
-        let y_flat = y.view([batch, seqlen, d_ssm]);
+        state.ssm_state.copy_(&new_state);
 
+        let y_skip = if self.config.d_has_hdim {
+            let d_expanded = self.d_param.view([1, 1, nheads, headdim]);
+            &y + &x_heads * d_expanded
+        } else {
+            let d_expanded = self.d_param.view([1, 1, nheads, 1]);
+            &y + &x_heads * d_expanded
+        };
+        let y_flat = y_skip.view([batch, seqlen, d_ssm]);
         let mut y_out = match &self.norm {
-            Some(norm) => {
-                let z_for_gate = z.view([batch, seqlen, d_ssm]);
-                norm.forward(&y_flat, Some(&z_for_gate))
-            }
+            Some(norm) => norm.forward(&y_flat, Some(&z)),
             None => &y_flat * z.silu(),
         };
-
         if d_mlp > 0 {
-            let mlp = &x0 * z0.silu();
+            let mlp = x0 * z0.silu();
             y_out = Tensor::cat(&[mlp, y_out], -1);
         }
-
-        (y_out.apply(&self.out_proj), final_states)
+        y_out.apply(&self.out_proj)
     }
 }
 
@@ -1038,6 +1243,15 @@ impl StatefulMamba {
         self.mamba.forward_with_dt_scale(x, dt_scale)
     }
 
+    pub fn forward_with_dt_scale_seq_idx(
+        &self,
+        x: &Tensor,
+        dt_scale: Option<&Tensor>,
+        seq_idx: Option<&Tensor>,
+    ) -> Tensor {
+        self.mamba.forward_with_dt_scale_seq_idx(x, dt_scale, seq_idx)
+    }
+
     pub fn forward_with_state(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
         self.mamba.forward_with_state(x, state)
     }
@@ -1058,12 +1272,17 @@ impl StatefulMamba {
         self.mamba.step_with_dt_scale(x, state, dt_scale)
     }
 
-    pub fn forward_batched_init(&self, x: &Tensor, initial_states: &Tensor) -> (Tensor, Tensor) {
-        self.mamba.forward_batched_init(x, initial_states)
+    pub fn forward_batched_init(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
+        self.mamba.forward_batched_init(x, state)
     }
 
-    pub fn forward_batched_init_dt_scale(&self, x: &Tensor, initial_states: &Tensor, dt_scale: Option<&Tensor>) -> (Tensor, Tensor) {
-        self.mamba.forward_batched_init_dt_scale(x, initial_states, dt_scale)
+    pub fn forward_batched_init_dt_scale(
+        &self,
+        x: &Tensor,
+        state: &mut Mamba2State,
+        dt_scale: Option<&Tensor>,
+    ) -> Tensor {
+        self.mamba.forward_batched_init_dt_scale(x, state, dt_scale)
     }
 }
 
