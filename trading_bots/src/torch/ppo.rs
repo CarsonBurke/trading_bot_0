@@ -4,7 +4,7 @@ use tch::{nn, Kind, Tensor, nn::OptimizerConfig};
 
 use crate::constants::TICKERS;
 use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS};
-use crate::torch::model::{TradingModel, symlog_tensor, symexp_tensor};
+use crate::torch::model::{symlog_tensor, symexp_tensor, TradingModel, PATCH_SEQ_LEN};
 use crate::torch::env::VecEnv;
 
 pub const NPROCS: i64 = 16;
@@ -155,9 +155,11 @@ pub async fn train(weights_path: Option<&str>) {
 
     let pd_dim = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
     let so_dim = STATIC_OBSERVATIONS as i64;
+    let seq_idx_dim = TICKERS_COUNT * PATCH_SEQ_LEN;
 
     let mut s_price_deltas = GpuRollingBuffer::new(memory_size, pd_dim, Kind::Float, device);
     let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, Kind::Float, device);
+    let mut s_seq_idx = GpuRollingBuffer::new(memory_size, seq_idx_dim, Kind::Int64, device);
     let mut s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
     let mut s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let mut s_rewards = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
@@ -168,11 +170,13 @@ pub async fn train(weights_path: Option<&str>) {
     let mut rpo_rho = vs.root().var("rpo_rho", &[1], nn::Init::Const(0.0));
 
     for episode in 0..1000000 {
-        let (obs_price_cpu, obs_static_cpu) = env.reset();
+        let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
         let mut obs_static = Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
+        let mut obs_seq_idx = Tensor::zeros(&[NPROCS, seq_idx_dim], (Kind::Int64, device));
         obs_price.copy_(&obs_price_cpu);
         obs_static.copy_(&obs_static_cpu);
+        obs_seq_idx.copy_(&obs_seq_idx_cpu);
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_cash_reward = Tensor::zeros(&[NPROCS], (Kind::Float, device));
@@ -184,7 +188,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         for step in 0..rollout_steps as usize {
             let (values, _, (action_mean, action_log_std), _) = tch::no_grad(|| {
-                trading_model.forward(&obs_price, &obs_static, false)
+                trading_model.forward_with_seq_idx(&obs_price, &obs_static, Some(&obs_seq_idx), false)
             });
 
             if DEBUG_NUMERICS {
@@ -224,12 +228,14 @@ pub async fn train(weights_path: Option<&str>) {
                 &mut step_reward_per_ticker,
                 &mut step_cash_reward,
                 &mut step_is_done,
+                &mut obs_seq_idx,
             );
 
             let mem_idx = step as i64 * NPROCS;
             
             s_price_deltas.push(&obs_price);
             s_static_obs.push(&obs_static);
+            s_seq_idx.push(&obs_seq_idx);
             let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&u);
             let _ = s_old_log_probs.narrow(0, mem_idx, NPROCS).copy_(&action_log_prob);
             
@@ -279,6 +285,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         let price_deltas_batch = s_price_deltas.data.shallow_clone();
         let static_obs_batch = s_static_obs.data.shallow_clone();
+        let seq_idx_batch = s_seq_idx.data.shallow_clone();
         let action_weights_batch = s_action_weights.shallow_clone();
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -313,6 +320,7 @@ pub async fn train(weights_path: Option<&str>) {
 
                 let pd_chunk = price_deltas_batch.narrow(0, chunk_sample_start, chunk_sample_count);
                 let so_chunk = static_obs_batch.narrow(0, chunk_sample_start, chunk_sample_count);
+                let seq_idx_chunk = seq_idx_batch.narrow(0, chunk_sample_start, chunk_sample_count);
                 let act_mb = s_actions.narrow(0, chunk_sample_start, chunk_sample_count);
                 let ret_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
                 let adv_mb = advantages.narrow(0, chunk_sample_start, chunk_sample_count);
@@ -321,7 +329,7 @@ pub async fn train(weights_path: Option<&str>) {
 
                 let fwd_start = Instant::now();
                 let (values, critic_logits, (action_mean, action_log_stds), attn_entropy) =
-                    trading_model.forward(&pd_chunk, &so_chunk, true);
+                    trading_model.forward_with_seq_idx(&pd_chunk, &so_chunk, Some(&seq_idx_chunk), true);
                 
                 let values = values.to_kind(Kind::Float).view([chunk_sample_count, TICKERS_COUNT + 1]);
                 let action_mean = action_mean.to_kind(Kind::Float);
@@ -465,7 +473,12 @@ pub async fn train(weights_path: Option<&str>) {
         );
 
         let logit_stats = tch::no_grad(|| {
-            let (_, _, (_, action_log_std), _) = trading_model.forward(&s_price_deltas.get(0), &s_static_obs.get(0), false);
+            let (_, _, (_, action_log_std), _) = trading_model.forward_with_seq_idx(
+                &s_price_deltas.get(0),
+                &s_static_obs.get(0),
+                Some(&s_seq_idx.get(0)),
+                false,
+            );
             let action_std = action_log_std.exp();
             let rpo_alpha = (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze();
             Tensor::stack(&[action_std.mean(Kind::Float), action_std.min(), action_std.max(), rpo_alpha], 0)

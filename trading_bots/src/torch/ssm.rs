@@ -389,100 +389,15 @@ impl Mamba2 {
             );
         }
 
-        let device = zxbcdt.device();
-        let kind = zxbcdt.kind();
-
-        let dt_scale_tensor = match dt_scale {
-            Some(scale) => scale.to_kind(kind).to_device(device),
-            None => Tensor::zeros(&[0], (kind, device)),
-        };
-        let conv_w = self.conv1d.ws.squeeze_dim(1).to_kind(kind).to_device(device);
-        let conv_b = match &self.conv1d.bs {
-            Some(bias) => bias.to_kind(kind).to_device(device),
-            None => Tensor::zeros(&[0], (kind, device)),
-        };
-        let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
-        let a_log = self.a_log.to_kind(kind).to_device(device);
-        let d_param = self.d_param.to_kind(kind).to_device(device);
-        let initial_state = Tensor::zeros(&[batch, nheads, headdim, d_state], (kind, device));
-        let seq_idx = match seq_idx {
-            Some(idx) => idx.to_device(device),
-            None => Tensor::zeros(&[0], (Kind::Int64, device)),
-        };
-        let (rmsnorm_weight, rmsnorm_eps, norm_before_gate) = match &self.norm {
-            Some(norm) => (
-                norm.weight.to_kind(kind).to_device(device),
-                norm.eps,
-                norm.norm_before_gate,
-            ),
-            None => (Tensor::zeros(&[0], (kind, device)), 1e-5, false),
-        };
-        let outproj_w = self.out_proj.ws.to_kind(kind).to_device(device);
-        let outproj_b = match &self.out_proj.bs {
-            Some(bias) => bias.to_kind(kind).to_device(device),
-            None => Tensor::zeros(&[0], (kind, device)),
-        };
-
-        if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
-            panic!("mamba fused op requires CUDA");
-        }
-
-        if debug_mem {
-            let stats = mamba_fused::cuda_memory_stats();
-            eprintln!(
-                "SSM#{} pre-fused: alloc={}MB initial_state={:?}",
-                call_id,
-                stats.get(0).unwrap_or(&0) / (1024 * 1024),
-                initial_state.size()
-            );
-        }
-
-        let use_graph = env::var("MAMBA_USE_CUDA_GRAPH").ok().as_deref() == Some("1");
-        let (y_out, _final_state) = if use_graph {
-            mamba_fused::fused_conv_scan_full_graph(
-                &zxbcdt,
-                &conv_w,
-                &conv_b,
-                &dt_bias,
-                &a_log,
-                &d_param,
-                &dt_scale_tensor,
-                &initial_state,
-                &seq_idx,
-                self.config.chunk_size,
-                ngroups,
-                headdim,
-                self.config.dt_limit.0,
-                self.config.dt_limit.1,
-                &rmsnorm_weight,
-                rmsnorm_eps,
-                norm_before_gate,
-                &outproj_w,
-                &outproj_b,
-            )
-        } else {
-            mamba_fused::fused_conv_scan_full(
-                &zxbcdt,
-                &conv_w,
-                &conv_b,
-                &dt_bias,
-                &a_log,
-                &d_param,
-                &dt_scale_tensor,
-                &initial_state,
-                &seq_idx,
-                self.config.chunk_size,
-                ngroups,
-                headdim,
-                self.config.dt_limit.0,
-                self.config.dt_limit.1,
-                &rmsnorm_weight,
-                rmsnorm_eps,
-                norm_before_gate,
-                &outproj_w,
-                &outproj_b,
-            )
-        };
+        let y_out = self.forward_fused_from_zxbcdt(
+            &zxbcdt,
+            batch,
+            seqlen,
+            dt_scale,
+            seq_idx,
+            call_id,
+            debug_mem,
+        );
 
         if debug_mem {
             let stats = mamba_fused::cuda_memory_stats();
@@ -497,6 +412,41 @@ impl Mamba2 {
 
         debug_fused_call("mamba2_y", call_id, &y_out);
         y_out
+    }
+
+    pub fn forward_with_pre_norm_seq_idx(
+        &self,
+        u: &Tensor,
+        norm_weight: &Tensor,
+        norm_eps: f64,
+        dt_scale: Option<&Tensor>,
+        seq_idx: Option<&Tensor>,
+    ) -> Tensor {
+        let call_id = MAMBA_CALL_ID.fetch_add(1, Ordering::Relaxed);
+        let (batch, seqlen, _) = u.size3().unwrap();
+        let debug_mem = env::var("MAMBA_DEBUG_MEM").ok().as_deref() == Some("1");
+        let device = u.device();
+        let kind = u.kind();
+        let zxbcdt = if matches!(device, tch::Device::Cuda(_)) {
+            let bias = match &self.in_proj.bs {
+                Some(b) => b.to_kind(kind).to_device(device),
+                None => Tensor::zeros(&[0], (kind, device)),
+            };
+            mamba_fused::rmsnorm_linear(
+                u,
+                &norm_weight.to_kind(kind).to_device(device),
+                norm_eps,
+                &self.in_proj.ws.to_kind(kind).to_device(device),
+                &bias,
+            )
+        } else {
+            let x_f32 = u.to_kind(Kind::Float);
+            let rms =
+                (x_f32.pow_tensor_scalar(2).mean_dim(-1, true, Kind::Float) + norm_eps).sqrt();
+            let normed = (x_f32 / rms * norm_weight.to_kind(Kind::Float)).to_kind(u.kind());
+            normed.apply(&self.in_proj)
+        };
+        self.forward_fused_from_zxbcdt(&zxbcdt, batch, seqlen, dt_scale, seq_idx, call_id, debug_mem)
     }
 
     /// Initialize inference state for a given batch size
@@ -1003,6 +953,130 @@ impl Mamba2 {
         (Tensor::cat(&outputs, 1).to_kind(x_kind), state.to_kind(x_kind))
     }
 
+    fn forward_fused_from_zxbcdt(
+        &self,
+        zxbcdt: &Tensor,
+        batch: i64,
+        seqlen: i64,
+        dt_scale: Option<&Tensor>,
+        seq_idx: Option<&Tensor>,
+        call_id: usize,
+        debug_mem: bool,
+    ) -> Tensor {
+        let nheads = self.nheads;
+        let headdim = self.config.headdim;
+        let d_state = self.config.d_state;
+        let ngroups = self.config.ngroups;
+        let device = zxbcdt.device();
+        let kind = zxbcdt.kind();
+
+        let dt_scale_tensor = match dt_scale {
+            Some(scale) => scale.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+        let conv_w = self.conv1d.ws.squeeze_dim(1).to_kind(kind).to_device(device);
+        let conv_b = match &self.conv1d.bs {
+            Some(bias) => bias.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+        let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
+        let a_log = self.a_log.to_kind(kind).to_device(device);
+        let d_param = self.d_param.to_kind(kind).to_device(device);
+        let initial_state = Tensor::zeros(&[batch, nheads, headdim, d_state], (kind, device));
+        let seq_idx = match seq_idx {
+            Some(idx) => idx.to_device(device),
+            None => Tensor::zeros(&[0], (Kind::Int64, device)),
+        };
+        let (rmsnorm_weight, rmsnorm_eps, norm_before_gate) = match &self.norm {
+            Some(norm) => (
+                norm.weight.to_kind(kind).to_device(device),
+                norm.eps,
+                norm.norm_before_gate,
+            ),
+            None => (Tensor::zeros(&[0], (kind, device)), 1e-5, false),
+        };
+        let outproj_w = self.out_proj.ws.to_kind(kind).to_device(device);
+        let outproj_b = match &self.out_proj.bs {
+            Some(bias) => bias.to_kind(kind).to_device(device),
+            None => Tensor::zeros(&[0], (kind, device)),
+        };
+
+        if !matches!(zxbcdt.device(), tch::Device::Cuda(_)) {
+            panic!("mamba fused op requires CUDA");
+        }
+
+        if debug_mem {
+            let stats = mamba_fused::cuda_memory_stats();
+            eprintln!(
+                "SSM#{} pre-fused: alloc={}MB initial_state={:?}",
+                call_id,
+                stats.get(0).unwrap_or(&0) / (1024 * 1024),
+                initial_state.size()
+            );
+        }
+
+        let use_graph = env::var("MAMBA_USE_CUDA_GRAPH").ok().as_deref() == Some("1")
+            && !zxbcdt.requires_grad();
+        let (y_out, _final_state) = if use_graph {
+            mamba_fused::fused_conv_scan_full_graph(
+                zxbcdt,
+                &conv_w,
+                &conv_b,
+                &dt_bias,
+                &a_log,
+                &d_param,
+                &dt_scale_tensor,
+                &initial_state,
+                &seq_idx,
+                self.config.chunk_size,
+                ngroups,
+                headdim,
+                self.config.dt_limit.0,
+                self.config.dt_limit.1,
+                &rmsnorm_weight,
+                rmsnorm_eps,
+                norm_before_gate,
+                &outproj_w,
+                &outproj_b,
+            )
+        } else {
+            mamba_fused::fused_conv_scan_full(
+                zxbcdt,
+                &conv_w,
+                &conv_b,
+                &dt_bias,
+                &a_log,
+                &d_param,
+                &dt_scale_tensor,
+                &initial_state,
+                &seq_idx,
+                self.config.chunk_size,
+                ngroups,
+                headdim,
+                self.config.dt_limit.0,
+                self.config.dt_limit.1,
+                &rmsnorm_weight,
+                rmsnorm_eps,
+                norm_before_gate,
+                &outproj_w,
+                &outproj_b,
+            )
+        };
+
+        if debug_mem {
+            let stats = mamba_fused::cuda_memory_stats();
+            eprintln!(
+                "SSM#{} post-fused: alloc={}MB peak={}MB y_out={:?}",
+                call_id,
+                stats.get(0).unwrap_or(&0) / (1024 * 1024),
+                stats.get(3).unwrap_or(&0) / (1024 * 1024),
+                y_out.size()
+            );
+        }
+
+        y_out
+    }
+
     /// Forward with external state - GPU efficient chunked scan with state carry
     pub fn forward_with_state(&self, u: &Tensor, state: &mut Mamba2State) -> Tensor {
         self.forward_with_state_dt_scale(u, state, None)
@@ -1250,6 +1324,18 @@ impl StatefulMamba {
         seq_idx: Option<&Tensor>,
     ) -> Tensor {
         self.mamba.forward_with_dt_scale_seq_idx(x, dt_scale, seq_idx)
+    }
+
+    pub fn forward_with_pre_norm_seq_idx(
+        &self,
+        x: &Tensor,
+        norm_weight: &Tensor,
+        norm_eps: f64,
+        dt_scale: Option<&Tensor>,
+        seq_idx: Option<&Tensor>,
+    ) -> Tensor {
+        self.mamba
+            .forward_with_pre_norm_seq_idx(x, norm_weight, norm_eps, dt_scale, seq_idx)
     }
 
     pub fn forward_with_state(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {

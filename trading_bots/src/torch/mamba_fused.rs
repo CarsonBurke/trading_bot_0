@@ -473,3 +473,26 @@ pub fn rmsnorm_forward(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
         .expect("mamba rmsnorm forward failed");
     out.try_into().expect("bad rmsnorm output")
 }
+
+pub fn rmsnorm_linear(
+    x: &Tensor,
+    rms_weight: &Tensor,
+    eps: f64,
+    linear_w: &Tensor,
+    linear_b: &Tensor,
+) -> Tensor {
+    let module = module_lock()
+        .lock()
+        .expect("Failed to lock mamba fused module");
+    let inputs = vec![
+        IValue::Tensor(x.shallow_clone()),
+        IValue::Tensor(rms_weight.shallow_clone()),
+        IValue::Double(eps),
+        IValue::Tensor(linear_w.shallow_clone()),
+        IValue::Tensor(linear_b.shallow_clone()),
+    ];
+    let out = module
+        .method_is("rmsnorm_linear", &inputs)
+        .expect("mamba rmsnorm linear failed");
+    out.try_into().expect("bad rmsnorm linear output")
+}

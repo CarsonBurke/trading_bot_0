@@ -11,6 +11,16 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> ModelOutput {
+        self.forward_with_seq_idx(price_deltas, static_features, None, _train)
+    }
+
+    pub fn forward_with_seq_idx(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        seq_idx: Option<&Tensor>,
+        _train: bool,
+    ) -> ModelOutput {
         let debug_mem = env::var("MAMBA_DEBUG_MEM").ok().as_deref() == Some("1");
         let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
@@ -20,7 +30,7 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale, seq_idx) = self.patch_latent_stem(&price_deltas, batch_size);
+        let (x_stem, dt_scale, seq_idx) = self.patch_latent_stem(&price_deltas, batch_size, seq_idx);
         debug_fused("model_x_stem", &x_stem);
         debug_fused("model_dt_scale", &dt_scale);
 
@@ -34,11 +44,16 @@ impl TradingModel {
         }
 
         let mut x_for_ssm = x_stem;
+        let seq_idx_ref = if seq_idx.numel() == 0 { None } else { Some(&seq_idx) };
         for (layer_idx, (layer, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate() {
             debug_fused_layer("x_for_ssm_in", layer_idx, &x_for_ssm);
-            let normed = norm.forward(&x_for_ssm);
-            debug_fused_layer("normed", layer_idx, &normed);
-            let out = layer.forward_with_dt_scale_seq_idx(&normed, Some(&dt_scale), Some(&seq_idx));
+            let out = layer.forward_with_pre_norm_seq_idx(
+                &x_for_ssm,
+                norm.weight(),
+                norm.eps(),
+                Some(&dt_scale),
+                seq_idx_ref,
+            );
             debug_fused_layer("ssm_out", layer_idx, &out);
             x_for_ssm = x_for_ssm + out;
             debug_fused_layer("x_for_ssm_out", layer_idx, &x_for_ssm);
@@ -70,6 +85,16 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> (ModelOutput, DebugMetrics) {
+        self.forward_with_debug_seq_idx(price_deltas, static_features, None, _train)
+    }
+
+    pub fn forward_with_debug_seq_idx(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        seq_idx: Option<&Tensor>,
+        _train: bool,
+    ) -> (ModelOutput, DebugMetrics) {
         let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
         debug_fused("model_price_deltas", &price_deltas);
@@ -77,16 +102,21 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale, seq_idx) = self.patch_latent_stem(&price_deltas, batch_size);
+        let (x_stem, dt_scale, seq_idx) = self.patch_latent_stem(&price_deltas, batch_size, seq_idx);
         debug_fused("model_x_stem", &x_stem);
         debug_fused("model_dt_scale", &dt_scale);
 
         let mut x_for_ssm = x_stem;
+        let seq_idx_ref = if seq_idx.numel() == 0 { None } else { Some(&seq_idx) };
         for (layer_idx, (layer, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate() {
             debug_fused_layer("x_for_ssm_in", layer_idx, &x_for_ssm);
-            let normed = norm.forward(&x_for_ssm);
-            debug_fused_layer("normed", layer_idx, &normed);
-            let out = layer.forward_with_dt_scale_seq_idx(&normed, Some(&dt_scale), Some(&seq_idx));
+            let out = layer.forward_with_pre_norm_seq_idx(
+                &x_for_ssm,
+                norm.weight(),
+                norm.eps(),
+                Some(&dt_scale),
+                seq_idx_ref,
+            );
             debug_fused_layer("ssm_out", layer_idx, &out);
             x_for_ssm = x_for_ssm + out;
             debug_fused_layer("x_for_ssm_out", layer_idx, &x_for_ssm);

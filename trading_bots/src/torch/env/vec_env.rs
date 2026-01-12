@@ -2,7 +2,10 @@ use tch::{Device, Tensor};
 use rand::seq::SliceRandom;
 use super::env::Env;
 use crate::torch::ppo::NPROCS;
-use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS};
+use crate::torch::constants::{
+    ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
+};
+use crate::torch::model::{patch_ends_cpu, PATCH_SEQ_LEN};
 
 pub struct VecEnv {
     pub envs: Vec<Env>,
@@ -15,6 +18,7 @@ pub struct VecEnv {
     is_done_buf: Vec<f32>,
     price_deltas_buf: Vec<f32>,
     static_obs_buf: Vec<f32>,
+    seq_idx_buf: Vec<i64>,
 }
 
 /// Available tickers for random selection
@@ -23,6 +27,31 @@ const AVAILABLE_TICKERS: &[&str] = &["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AM
 impl VecEnv {
     fn tensor_from_f32(&self, data: &[f32], size: &[i64]) -> Tensor {
         unsafe { Tensor::from_blob(data.as_ptr() as *const u8, size, &[], tch::Kind::Float, Device::Cpu) }
+    }
+
+    fn tensor_from_i64(&self, data: &[i64], size: &[i64]) -> Tensor {
+        unsafe { Tensor::from_blob(data.as_ptr() as *const u8, size, &[], tch::Kind::Int64, Device::Cpu) }
+    }
+
+    fn fill_seq_idx_buf(&mut self) {
+        let patch_ends = patch_ends_cpu();
+        let seq_len = patch_ends.len();
+        let rows = (NPROCS * TICKERS_COUNT) as usize;
+        let per_row = PRICE_DELTAS_PER_TICKER as usize;
+        debug_assert_eq!(seq_len as i64, PATCH_SEQ_LEN);
+        debug_assert_eq!(self.seq_idx_buf.len(), rows * seq_len);
+        for row in 0..rows {
+            let row_offset = row * per_row;
+            let mut leading = 0usize;
+            while leading < per_row && self.price_deltas_buf[row_offset + leading] == 0.0 {
+                leading += 1;
+            }
+            let leading_i64 = leading as i64;
+            let out_offset = row * seq_len;
+            for (idx, end) in patch_ends.iter().enumerate() {
+                self.seq_idx_buf[out_offset + idx] = if leading_i64 >= *end { -1 } else { 0 };
+            }
+        }
     }
 
     pub fn new(random_start: bool) -> Self {
@@ -46,6 +75,7 @@ impl VecEnv {
         let price_deltas_dim =
             NPROCS as usize * TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
         let static_obs_dim = NPROCS as usize * STATIC_OBSERVATIONS;
+        let seq_idx_dim = NPROCS as usize * TICKERS_COUNT as usize * PATCH_SEQ_LEN as usize;
         let done_mask = vec![false; NPROCS as usize];
         let last_static_obs = vec![0.0; NPROCS as usize * STATIC_OBSERVATIONS];
         let last_step_deltas = vec![0.0; NPROCS as usize * TICKERS_COUNT as usize];
@@ -60,10 +90,11 @@ impl VecEnv {
             is_done_buf: vec![0.0; NPROCS as usize],
             price_deltas_buf: vec![0.0; price_deltas_dim],
             static_obs_buf: vec![0.0; static_obs_dim],
+            seq_idx_buf: vec![0; seq_idx_dim],
         }
     }
 
-    pub fn reset(&mut self) -> (Tensor, Tensor) {
+    pub fn reset(&mut self) -> (Tensor, Tensor, Tensor) {
         assert_eq!(
             self.envs.len(),
             NPROCS as usize,
@@ -80,15 +111,25 @@ impl VecEnv {
             all_static_obs.extend(so);
         }
 
+        self.price_deltas_buf.copy_from_slice(&all_price_deltas);
+        self.static_obs_buf.copy_from_slice(&all_static_obs);
+        self.fill_seq_idx_buf();
+
         let price_deltas = Tensor::from_slice(&all_price_deltas)
             .view([NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
         let static_obs = Tensor::from_slice(&all_static_obs)
             .view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let seq_idx = self
+            .tensor_from_i64(
+                &self.seq_idx_buf,
+                &[NPROCS * TICKERS_COUNT, PATCH_SEQ_LEN],
+            )
+            .view([NPROCS, TICKERS_COUNT * PATCH_SEQ_LEN]);
 
         self.done_mask.fill(false);
         self.last_static_obs.clone_from(&all_static_obs);
 
-        (price_deltas, static_obs)
+        (price_deltas, static_obs, seq_idx)
     }
 
     pub fn reset_step(&mut self) -> (Tensor, Tensor) {
@@ -203,6 +244,7 @@ impl VecEnv {
         out_reward_per_ticker: &mut Tensor,
         out_cash_reward: &mut Tensor,
         out_is_done: &mut Tensor,
+        out_seq_idx: &mut Tensor,
     ) {
         debug_assert_eq!(all_actions.len(), self.envs.len());
 
@@ -241,6 +283,15 @@ impl VecEnv {
         let so_cpu =
             self.tensor_from_f32(&self.static_obs_buf, &[NPROCS, STATIC_OBSERVATIONS as i64]);
         out_static_obs.copy_(&so_cpu);
+
+        self.fill_seq_idx_buf();
+        let seq_idx_cpu = self
+            .tensor_from_i64(
+                &self.seq_idx_buf,
+                &[NPROCS * TICKERS_COUNT, PATCH_SEQ_LEN],
+            )
+            .view([NPROCS, TICKERS_COUNT * PATCH_SEQ_LEN]);
+        out_seq_idx.copy_(&seq_idx_cpu);
 
         let rpt_cpu =
             self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);

@@ -5,6 +5,8 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/util/Optional.h>
 #include <ATen/cuda/CUDAGraph.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <mutex>
 #include <unordered_map>
 
@@ -119,6 +121,24 @@ std::vector<torch::Tensor> rmsnorm_backward_cuda(
     const torch::Tensor& weight,
     const torch::Tensor& grad_out,
     double eps);
+torch::Tensor rmsnorm_forward_autograd(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    double eps);
+
+torch::Tensor rmsnorm_linear(
+    const torch::Tensor& x,
+    const torch::Tensor& rms_weight,
+    double eps,
+    const torch::Tensor& linear_w,
+    const torch::Tensor& linear_b) {
+    auto normed = rmsnorm_forward_autograd(x, rms_weight, eps);
+    c10::optional<torch::Tensor> bias =
+        (linear_b.defined() && linear_b.numel() > 0)
+            ? c10::optional<torch::Tensor>(linear_b)
+            : c10::nullopt;
+    return at::linear(normed, linear_w, bias);
+}
 
 void cuda_empty_cache() {
     c10::cuda::CUDACachingAllocator::emptyCache();
@@ -526,6 +546,7 @@ torch::Tensor rmsnorm_forward_autograd(
 
 struct GraphCacheEntry {
     at::cuda::CUDAGraph graph;
+    c10::optional<at::cuda::CUDAStream> stream;
     torch::Tensor zxbcdt;
     torch::Tensor conv_w;
     torch::Tensor conv_b;
@@ -549,8 +570,14 @@ std::unordered_map<std::string, GraphCacheEntry> GRAPH_CACHE;
 std::string graph_key(
     const torch::Tensor& zxbcdt,
     const torch::Tensor& conv_w,
+    const torch::Tensor& conv_b,
     const torch::Tensor& dt_bias,
     const torch::Tensor& a_log,
+    const torch::Tensor& dt_scale,
+    const torch::Tensor& seq_idx,
+    const torch::Tensor& rmsnorm_weight,
+    const torch::Tensor& outproj_w,
+    const torch::Tensor& outproj_b,
     int64_t chunk_size,
     int64_t ngroups,
     int64_t headdim) {
@@ -560,10 +587,46 @@ std::string graph_key(
     for (auto s : zxbcdt.sizes()) oss << s << ",";
     oss << "|w=";
     for (auto s : conv_w.sizes()) oss << s << ",";
+    oss << "|b=";
+    if (conv_b.defined()) {
+        for (auto s : conv_b.sizes()) oss << s << ",";
+    } else {
+        oss << "undef";
+    }
     oss << "|dt=";
     for (auto s : dt_bias.sizes()) oss << s << ",";
     oss << "|a=";
     for (auto s : a_log.sizes()) oss << s << ",";
+    oss << "|dts=";
+    if (dt_scale.defined()) {
+        for (auto s : dt_scale.sizes()) oss << s << ",";
+    } else {
+        oss << "undef";
+    }
+    oss << "|seq=";
+    if (seq_idx.defined()) {
+        for (auto s : seq_idx.sizes()) oss << s << ",";
+    } else {
+        oss << "undef";
+    }
+    oss << "|rms=";
+    if (rmsnorm_weight.defined()) {
+        for (auto s : rmsnorm_weight.sizes()) oss << s << ",";
+    } else {
+        oss << "undef";
+    }
+    oss << "|ow=";
+    if (outproj_w.defined()) {
+        for (auto s : outproj_w.sizes()) oss << s << ",";
+    } else {
+        oss << "undef";
+    }
+    oss << "|ob=";
+    if (outproj_b.defined()) {
+        for (auto s : outproj_b.sizes()) oss << s << ",";
+    } else {
+        oss << "undef";
+    }
     oss << "|c=" << chunk_size << "|g=" << ngroups << "|h=" << headdim;
     return oss.str();
 }
@@ -588,10 +651,27 @@ std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan_full_graph(
     bool norm_before_gate,
     const torch::Tensor& outproj_w,
     const torch::Tensor& outproj_b) {
-    auto key = graph_key(zxbcdt, conv_w, dt_bias, a_log, chunk_size, ngroups, headdim);
+    auto key = graph_key(
+        zxbcdt,
+        conv_w,
+        conv_b,
+        dt_bias,
+        a_log,
+        dt_scale,
+        seq_idx,
+        rmsnorm_weight,
+        outproj_w,
+        outproj_b,
+        chunk_size,
+        ngroups,
+        headdim);
     std::lock_guard<std::mutex> lock(GRAPH_MUTEX);
     auto& entry = GRAPH_CACHE[key];
     if (!entry.captured) {
+        if (!entry.stream.has_value()) {
+            entry.stream = at::cuda::getStreamFromPool();
+        }
+        c10::cuda::CUDAStreamGuard guard(*entry.stream);
         entry.zxbcdt = torch::empty_like(zxbcdt);
         entry.conv_w = torch::empty_like(conv_w);
         entry.conv_b = conv_b.defined() ? torch::empty_like(conv_b) : torch::Tensor();
@@ -644,6 +724,7 @@ std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan_full_graph(
         entry.final_state = std::get<1>(outputs);
         entry.captured = true;
     } else {
+        c10::cuda::CUDAStreamGuard guard(*entry.stream);
         entry.zxbcdt.copy_(zxbcdt);
         entry.conv_w.copy_(conv_w);
         if (conv_b.defined()) entry.conv_b.copy_(conv_b);
@@ -669,6 +750,7 @@ TORCH_LIBRARY(mamba_fused, m) {
     m.def("fused_conv_scan_stateful(Tensor zxbcdt, Tensor conv_w, Tensor conv_b, Tensor dt_bias, Tensor a_log, Tensor d_param, Tensor dt_scale, Tensor initial_state, Tensor conv_state, Tensor seq_idx, int chunk_size, int ngroups, int headdim, float dt_min, float dt_max, Tensor rmsnorm_weight, float rmsnorm_eps, bool norm_before_gate, Tensor outproj_w, Tensor outproj_b) -> (Tensor, Tensor, Tensor)");
     m.def("selective_state_update(Tensor state, Tensor x, Tensor dt, Tensor a_log, Tensor b, Tensor c, Tensor d_param, Tensor z, Tensor dt_bias, bool dt_softplus, float dt_min, float dt_max, int ngroups, int headdim, int apply_dt_limit) -> (Tensor, Tensor)");
     m.def("rmsnorm_forward(Tensor x, Tensor weight, float eps) -> Tensor");
+    m.def("rmsnorm_linear(Tensor x, Tensor rms_weight, float eps, Tensor linear_w, Tensor linear_b) -> Tensor");
     m.def("cuda_empty_cache", &cuda_empty_cache);
     m.def("cuda_memory_stats", &cuda_memory_stats);
 }
@@ -679,14 +761,17 @@ TORCH_LIBRARY_IMPL(mamba_fused, CUDA, m) {
     m.impl("fused_conv_scan_stateful", &mamba_fused_conv_scan_stateful);
     m.impl("selective_state_update", &selective_state_update);
     m.impl("rmsnorm_forward", &rmsnorm_forward);
+    m.impl("rmsnorm_linear", &rmsnorm_linear);
     m.impl("fused_conv_scan_full_graph", &mamba_fused_conv_scan_full_graph);
 }
 
 TORCH_LIBRARY_IMPL(mamba_fused, Autograd, m) {
     m.impl("fused_conv_scan", &mamba_fused_conv_scan);
+    m.impl("fused_conv_scan_full_graph", &mamba_fused_conv_scan_full);
     m.impl("rmsnorm_forward", &rmsnorm_forward_autograd);
 }
 
 TORCH_LIBRARY_IMPL(mamba_fused, CompositeImplicitAutograd, m) {
+    m.impl("rmsnorm_linear", &rmsnorm_linear);
     m.impl("fused_conv_scan_full", &mamba_fused_conv_scan_full);
 }

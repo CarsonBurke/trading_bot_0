@@ -273,5 +273,16 @@ class MambaFusedWrapper(torch.nn.Module):
     def rmsnorm_forward(self, x: torch.Tensor, weight: torch.Tensor, eps: float):
         return torch.ops.mamba_fused.rmsnorm_forward(x, weight, eps)
 
+    @export
+    def rmsnorm_linear(
+        self,
+        x: torch.Tensor,
+        rms_weight: torch.Tensor,
+        eps: float,
+        linear_w: torch.Tensor,
+        linear_b: torch.Tensor,
+    ):
+        return torch.ops.mamba_fused.rmsnorm_linear(x, rms_weight, eps, linear_w, linear_b)
+
 module = torch.jit.script(MambaFusedWrapper())
 module.save(out_path)

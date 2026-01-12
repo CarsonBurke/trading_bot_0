@@ -177,10 +177,8 @@ impl TradingModel {
         let patches = state
             .patch_buf
             .view([TICKERS_COUNT, 1, FINEST_PATCH_SIZE]);
-        let patches = self.enrich_patches(&patches);
-        let patch_emb = patches.apply(&self.patch_embeds[FINEST_PATCH_INDEX]);
-        let patch_emb = self.patch_lns[FINEST_PATCH_INDEX]
-            .forward(&patch_emb)
+        let patch_emb = self
+            .embed_patch_config(&patches, FINEST_PATCH_INDEX as i64)
             .squeeze_dim(1);
         let dt_scale = FINEST_PATCH_SIZE as f64;
 

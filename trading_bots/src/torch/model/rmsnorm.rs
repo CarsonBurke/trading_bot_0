@@ -23,4 +23,12 @@ impl RMSNorm {
         let rms = (x_f32.pow_tensor_scalar(2).mean_dim(-1, true, Kind::Float) + self.eps).sqrt();
         (x_f32 / rms * &self.weight).to_kind(x.kind())
     }
+
+    pub(super) fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    pub(super) fn eps(&self) -> f64 {
+        self.eps
+    }
 }
