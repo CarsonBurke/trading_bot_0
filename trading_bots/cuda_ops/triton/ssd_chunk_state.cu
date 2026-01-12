@@ -127,6 +127,111 @@ __global__ void conv1d_pack_kernel(
     }
 }
 
+// Version that outputs bf16 for x,b,c (matching Triton reference behavior)
+template <typename scalar_t>
+__global__ void conv1d_pack_dt_kernel_bf16out(
+    const scalar_t* zxbcdt,
+    const scalar_t* conv_w,
+    const scalar_t* conv_b,
+    const scalar_t* dt_bias,
+    const scalar_t* dt_scale,
+    const int64_t* seq_idx,
+    int64_t seq_stride,
+    at::BFloat16* x_buf,  // bf16 output
+    at::BFloat16* b_buf,  // bf16 output
+    at::BFloat16* c_buf,  // bf16 output
+    float* dt_out,        // fp32 for cumsum precision
+    int64_t batch,
+    int64_t seqlen,
+    int64_t d_in_proj,
+    int64_t conv_dim,
+    int64_t conv_kernel,
+    int64_t d_mlp,
+    int64_t d_ssm,
+    int64_t ngroups,
+    int64_t d_state,
+    int64_t chunk_size,
+    int64_t num_chunks,
+    int64_t headdim,
+    int64_t nheads,
+    bool has_conv_bias,
+    int64_t has_seq_idx,
+    float dt_min,
+    float dt_max,
+    int64_t dt_scale_stride_b,
+    int64_t dt_scale_stride_t,
+    int64_t dt_scale_batch,
+    int64_t dt_scale_seqlen,
+    bool has_dt_scale) {
+    int64_t padded_len = num_chunks * chunk_size;
+    int64_t total_channels = conv_dim + nheads;
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = batch * padded_len * total_channels;
+    if (idx >= total) return;
+
+    int64_t tmp = idx;
+    int64_t c = tmp % total_channels;
+    tmp /= total_channels;
+    int64_t t = tmp % padded_len;
+    int64_t b = tmp / padded_len;
+    int64_t chunk = t / chunk_size;
+    int64_t t_in_chunk = t - chunk * chunk_size;
+
+    if (c >= conv_dim) {
+        int64_t h = c - conv_dim;
+        float dt_val = 0.0f;
+        if (t < seqlen) {
+            int64_t offset_dt = d_in_proj - nheads;
+            float dt_raw = to_float(zxbcdt[(b * seqlen + t) * d_in_proj + offset_dt + h]);
+            float dt_pre = dt_raw + to_float(dt_bias[h]);
+            dt_val = softplus_f(dt_pre);
+            if (has_dt_scale) {
+                int64_t b_idx = dt_scale_batch == 1 ? 0 : b;
+                int64_t t_idx = dt_scale_seqlen == 1 ? 0 : t;
+                dt_val *= to_float(dt_scale[b_idx * dt_scale_stride_b + t_idx * dt_scale_stride_t]);
+            }
+            dt_val = fminf(fmaxf(dt_val, dt_min), dt_max);
+        }
+        dt_out[((b * nheads + h) * num_chunks + chunk) * chunk_size + t_in_chunk] = dt_val;
+        return;
+    }
+
+    float conv_val = 0.0f;
+    if (t < seqlen) {
+        int64_t offset_xbc = 2 * d_mlp + d_ssm;
+        int64_t seq_base = has_seq_idx ? (b * seq_stride) : 0;
+        int64_t seq_cur = has_seq_idx ? seq_idx[seq_base + t] : 0;
+        float conv_pre = 0.0f;
+        for (int64_t w = 0; w < conv_kernel; ++w) {
+            int64_t t_in = t - w;
+            if (t_in < 0 || (has_seq_idx && seq_idx[seq_base + t_in] != seq_cur)) continue;
+            conv_pre += to_float(conv_w[c * conv_kernel + w]) *
+                        to_float(zxbcdt[(b * seqlen + t_in) * d_in_proj + offset_xbc + c]);
+        }
+        if (has_conv_bias) conv_pre += to_float(conv_b[c]);
+        conv_val = silu_f(conv_pre);
+    }
+
+    // Output as bf16
+    at::BFloat16 conv_bf16 = static_cast<at::BFloat16>(conv_val);
+    if (c < d_ssm) {
+        int64_t h = c / headdim;
+        int64_t p = c - h * headdim;
+        x_buf[(((b * num_chunks + chunk) * chunk_size + t_in_chunk) * nheads + h) * headdim + p] = conv_bf16;
+    } else if (c < d_ssm + ngroups * d_state) {
+        int64_t c_off = c - d_ssm;
+        int64_t g = c_off / d_state;
+        int64_t n = c_off - g * d_state;
+        b_buf[(((b * num_chunks + chunk) * chunk_size + t_in_chunk) * ngroups + g) * d_state + n] = conv_bf16;
+    } else {
+        int64_t c_off = c - d_ssm - ngroups * d_state;
+        int64_t g = c_off / d_state;
+        int64_t n = c_off - g * d_state;
+        c_buf[(((b * num_chunks + chunk) * chunk_size + t_in_chunk) * ngroups + g) * d_state + n] = conv_bf16;
+    }
+}
+
+// Original version with fp32 output (kept for backward compatibility)
 template <typename scalar_t>
 __global__ void conv1d_pack_dt_kernel(
     const scalar_t* zxbcdt,

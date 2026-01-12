@@ -2,9 +2,20 @@
 #include <ATen/ATen.h>
 #include <c10/util/Optional.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <iostream>
 #include <unordered_map>
 #include <vector>
+
+namespace {
+cublasHandle_t get_cublas_handle() {
+    static cublasHandle_t handle = nullptr;
+    if (!handle) {
+        cublasCreate(&handle);
+    }
+    return handle;
+}
+}
 
 namespace {
 struct MambaWorkspace {
@@ -120,50 +131,52 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
   while (dt_threads < chunk_size)
     dt_threads <<= 1;
   size_t dt_shared = dt_threads * sizeof(float);
+  // Use bf16 for x,b,c buffers (matching Triton reference for bandwidth)
+  auto bf16_opts = z.options().dtype(torch::kBFloat16);
   auto x_buf = workspace_tensor(
-      ws.x_buf, {batch, num_chunks, chunk_size, nheads, headdim}, float_opts);
+      ws.x_buf, {batch, num_chunks, chunk_size, nheads, headdim}, bf16_opts);
   auto b_buf = workspace_tensor(
-      ws.b_buf, {batch, num_chunks, chunk_size, ngroups, d_state}, float_opts);
+      ws.b_buf, {batch, num_chunks, chunk_size, ngroups, d_state}, bf16_opts);
   auto c_buf = workspace_tensor(
-      ws.c_buf, {batch, num_chunks, chunk_size, ngroups, d_state}, float_opts);
+      ws.c_buf, {batch, num_chunks, chunk_size, ngroups, d_state}, bf16_opts);
   int64_t pack_total = batch * num_chunks * chunk_size * (conv_dim + nheads);
   int pack_blocks = (pack_total + threads - 1) / threads;
   switch (z.scalar_type()) {
   case at::kFloat:
-    conv1d_pack_dt_kernel<float><<<pack_blocks, threads>>>(
+    conv1d_pack_dt_kernel_bf16out<float><<<pack_blocks, threads>>>(
         z.data_ptr<float>(), w.data_ptr<float>(),
         has_conv_bias ? b.data_ptr<float>() : nullptr, dtb.data_ptr<float>(),
         has_dt_scale ? dt_scale_view.data_ptr<float>() : nullptr,
         has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-        x_buf.data_ptr<float>(), b_buf.data_ptr<float>(), c_buf.data_ptr<float>(),
-        dt_buf.data_ptr<float>(),
+        x_buf.data_ptr<at::BFloat16>(), b_buf.data_ptr<at::BFloat16>(),
+        c_buf.data_ptr<at::BFloat16>(), dt_buf.data_ptr<float>(),
         batch, seqlen, d_in_proj, conv_dim, conv_kernel, d_mlp, d_ssm, ngroups,
         d_state, chunk_size, num_chunks, headdim, nheads, has_conv_bias,
         has_seq_idx ? 1 : 0, (float)dt_min, (float)dt_max, dt_scale_stride_b,
         dt_scale_stride_t, dt_scale_batch, dt_scale_seqlen, has_dt_scale);
     break;
   case at::kHalf:
-    conv1d_pack_dt_kernel<at::Half><<<pack_blocks, threads>>>(
+    conv1d_pack_dt_kernel_bf16out<at::Half><<<pack_blocks, threads>>>(
         z.data_ptr<at::Half>(), w.data_ptr<at::Half>(),
         has_conv_bias ? b.data_ptr<at::Half>() : nullptr, dtb.data_ptr<at::Half>(),
         has_dt_scale ? dt_scale_view.data_ptr<at::Half>() : nullptr,
         has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-        x_buf.data_ptr<float>(), b_buf.data_ptr<float>(), c_buf.data_ptr<float>(),
-        dt_buf.data_ptr<float>(),
+        x_buf.data_ptr<at::BFloat16>(), b_buf.data_ptr<at::BFloat16>(),
+        c_buf.data_ptr<at::BFloat16>(), dt_buf.data_ptr<float>(),
         batch, seqlen, d_in_proj, conv_dim, conv_kernel, d_mlp, d_ssm, ngroups,
         d_state, chunk_size, num_chunks, headdim, nheads, has_conv_bias,
         has_seq_idx ? 1 : 0, (float)dt_min, (float)dt_max, dt_scale_stride_b,
         dt_scale_stride_t, dt_scale_batch, dt_scale_seqlen, has_dt_scale);
     break;
   case at::kBFloat16:
-    conv1d_pack_dt_kernel<at::BFloat16><<<pack_blocks, threads>>>(
+    conv1d_pack_dt_kernel_bf16out<at::BFloat16><<<pack_blocks, threads>>>(
         z.data_ptr<at::BFloat16>(), w.data_ptr<at::BFloat16>(),
         has_conv_bias ? b.data_ptr<at::BFloat16>() : nullptr,
         dtb.data_ptr<at::BFloat16>(),
         has_dt_scale ? dt_scale_view.data_ptr<at::BFloat16>() : nullptr,
         has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-        x_buf.data_ptr<float>(), b_buf.data_ptr<float>(), c_buf.data_ptr<float>(),
-        dt_buf.data_ptr<float>(),
+        x_buf.data_ptr<at::BFloat16>(), b_buf.data_ptr<at::BFloat16>(),
+        c_buf.data_ptr<at::BFloat16>(), dt_buf.data_ptr<float>(),
         batch, seqlen, d_in_proj, conv_dim, conv_kernel, d_mlp, d_ssm, ngroups,
         d_state, chunk_size, num_chunks, headdim, nheads, has_conv_bias,
         has_seq_idx ? 1 : 0, (float)dt_min, (float)dt_max, dt_scale_stride_b,
@@ -197,8 +210,8 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
   dim3 cs_grid((heads_per_group * headdim + 63) / 64, (d_state + 63) / 64,
                batch * num_chunks * ngroups);
   dim3 bmm_threads(16, 16);
-  bmm_kt_kn_scale_x_kernel<<<cs_grid, bmm_threads>>>(
-      b_mat.data_ptr<float>(), x_g_mat.data_ptr<float>(),
+  bmm_kt_kn_scale_x_kernel_bf16in<<<cs_grid, bmm_threads>>>(
+      b_mat.data_ptr<at::BFloat16>(), x_g_mat.data_ptr<at::BFloat16>(),
       dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
       has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
       chunk_state_mat.data_ptr<float>(), batch * num_chunks * ngroups, d_state,
@@ -218,27 +231,60 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
       has_seq_idx ? 1 : 0);
   final_state.copy_(final_state_f_kernel.to(final_state.scalar_type()));
 
-  // Precompute CB = C @ B^T with causal masking (optimized path)
+  // Precompute CB = C @ B^T with causal masking
   auto cb_buf = workspace_tensor(
       ws.cb_buf, {batch * num_chunks * ngroups, chunk_size, chunk_size}, float_opts);
-  dim3 cb_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64,
-               batch * num_chunks * ngroups);
-  dim3 cb_threads(16, 16);
-  bmm_cb_causal_kernel<<<cb_grid, cb_threads>>>(
-      c_mat.data_ptr<float>(), b_mat.data_ptr<float>(),
-      dA_buf.data_ptr<float>(),
-      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-      cb_buf.data_ptr<float>(), batch * num_chunks * ngroups, chunk_size,
-      d_state, seqlen, num_chunks, ngroups, nheads, has_seq_idx ? 1 : 0);
 
-  // Use optimized scan kernel with precomputed CB
+  if (!has_seq_idx) {
+    // Fast path: use cuBLAS with bf16 inputs, fp32 compute, fp32 output (tensor cores)
+    cublasHandle_t handle = get_cublas_handle();
+    float alpha = 1.0f, beta = 0.0f;
+    int64_t batches = batch * num_chunks * ngroups;
+
+    // C @ B^T: C is [batches, M, K], B is [batches, N, K], output is [batches, M, N]
+    // Use cublasGemmStridedBatchedEx for bf16 inputs with fp32 accumulation
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_T,  // B transposed
+        CUBLAS_OP_N,  // C not transposed
+        chunk_size,   // N (cols of result)
+        chunk_size,   // M (rows of result)
+        d_state,      // K
+        &alpha,
+        b_mat.data_ptr<at::BFloat16>(), CUDA_R_16BF, d_state, chunk_size * d_state,
+        c_mat.data_ptr<at::BFloat16>(), CUDA_R_16BF, d_state, chunk_size * d_state,
+        &beta,
+        cb_buf.data_ptr<float>(), CUDA_R_32F, chunk_size, chunk_size * chunk_size,
+        batches,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    // Apply causal mask
+    dim3 mask_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64, batches);
+    dim3 mask_threads(16, 16);
+    apply_causal_mask_simple_kernel<<<mask_grid, mask_threads>>>(
+        cb_buf.data_ptr<float>(), batches, chunk_size, seqlen, num_chunks);
+  } else {
+    // Slow path with seq_idx support
+    dim3 cb_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64,
+                 batch * num_chunks * ngroups);
+    dim3 cb_threads(16, 16);
+    bmm_cb_causal_kernel_bf16in<<<cb_grid, cb_threads>>>(
+        c_mat.data_ptr<at::BFloat16>(), b_mat.data_ptr<at::BFloat16>(),
+        dA_buf.data_ptr<float>(),
+        seq.data_ptr<int64_t>(), seq_stride,
+        cb_buf.data_ptr<float>(), batch * num_chunks * ngroups, chunk_size,
+        d_state, seqlen, num_chunks, ngroups, nheads, 1);
+  }
+
+  // Use optimized scan kernel with precomputed CB (bf16 inputs for x_buf and c_mat)
   dim3 block(16, 16);
   dim3 grid((headdim + 63) / 64, (chunk_size + 63) / 64,
             batch * num_chunks * nheads);
-  chunk_scan_fwd_kernel_v2<<<grid, block>>>(
-      cb_buf.data_ptr<float>(), x_buf.data_ptr<float>(),
+  chunk_scan_fwd_kernel_v2_bf16in<<<grid, block>>>(
+      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
       dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
-      c_mat.data_ptr<float>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
       has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
       d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
       chunk_size, nheads, headdim, d_state, ngroups, seqlen,

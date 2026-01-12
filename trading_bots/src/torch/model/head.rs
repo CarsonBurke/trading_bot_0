@@ -82,7 +82,7 @@ impl TradingModel {
         let k_exo = exo_tokens_flat.apply(&self.static_cross_k);
         let v_exo = exo_tokens_flat.apply(&self.static_cross_v);
         let exo_scores = q_exo.matmul(&k_exo.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
-        let exo_attn = exo_scores.softmax(-1, Kind::Float);
+        let exo_attn = exo_scores.softmax(-1, Kind::Float).to_kind(q_exo.kind());
         let exo_ctx = exo_attn
             .matmul(&v_exo)
             .apply(&self.static_cross_out)
@@ -110,7 +110,7 @@ impl TradingModel {
         let latent_k = block.ticker_latent_k.to_kind(latent_q.kind());
         let latent_scores =
             latent_q.matmul(&latent_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
-        let latent_attn = latent_scores.softmax(-1, Kind::Float);
+        let latent_attn = latent_scores.softmax(-1, Kind::Float).to_kind(latent_q.kind());
         let latent_v = block.ticker_latent_v.to_kind(latent_q.kind());
         let latent_ctx = latent_attn
             .matmul(&latent_v)
@@ -187,7 +187,7 @@ impl TradingModel {
             .view([bt, temporal_len, self.num_heads, self.head_dim])
             .permute([0, 2, 1, 3]);
         let scores = q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt();
-        let attn = scores.softmax(-1, Kind::Float);
+        let attn = scores.softmax(-1, Kind::Float).to_kind(q.kind());
         let ctx = attn
             .matmul(&v)
             .permute([0, 2, 1, 3])
@@ -237,7 +237,7 @@ impl TradingModel {
         let cash_temp = self.cash_attn_temp_raw.exp().clamp(POOL_TEMPERATURE_MIN, POOL_TEMPERATURE_MAX);
         let scores =
             cash_q.matmul(&cash_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt() * cash_temp;
-        let cash_attn_f = scores.softmax(-1, Kind::Float);
+        let cash_attn_f = scores.softmax(-1, Kind::Float).to_kind(cash_q.kind());
         let cash_ctx = cash_attn_f.matmul(&cash_v);
         let global_tokens = self
             .global_tokens
@@ -247,12 +247,11 @@ impl TradingModel {
                 .apply(&self.global_token_proj)
                 .unsqueeze(1);
         let global_summary = global_tokens
-            .mean_dim([1].as_slice(), false, Kind::Float)
+            .mean_dim([1].as_slice(), false, global_tokens.kind())
             .apply(&self.global_token_merge);
         let cash_summary = cash_ctx
-            .mean_dim(1, false, Kind::Float)
-            .apply(&self.cash_merge)
-            .to_kind(pooled_enriched.kind());
+            .mean_dim(1, false, cash_ctx.kind())
+            .apply(&self.cash_merge);
         let cash_summary = cash_summary + global_summary;
         let entropy_denom = (temporal_len as f64).ln().max(1.0);
         let temporal_attn = attn
@@ -291,8 +290,9 @@ impl TradingModel {
             .reshape([batch_size, 1, super::NUM_VALUE_BUCKETS]);
         let critic_logits = Tensor::cat(&[value_logits_ticker, value_cash], 1);
         let critic_probs = critic_logits.softmax(-1, Kind::Float);
+        let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
         let values_symlog = critic_probs
-            .matmul(&self.bucket_centers.unsqueeze(-1))
+            .matmul(&bucket_centers.unsqueeze(-1))
             .squeeze_dim(-1);
         let values = symexp_tensor(&values_symlog).to_kind(pooled_enriched.kind());
 

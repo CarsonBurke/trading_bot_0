@@ -315,16 +315,22 @@ __global__ void chunk_scan_fwd_kernel_v2(
         __syncthreads();
 
         // Compute with predicated accumulation (no warp divergence)
+        // Preload dA_m values for this thread's rows
+        float dA_m_vals[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            dA_m_vals[i] = dA_m[tid_m * 4 + i];
+        }
+
         #pragma unroll
         for (int k = 0; k < BK; ++k) {
             float dA_kv = dA_k[k];
             float dtv = dt_k[k];
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                int row = tid_m * 4 + i;
-                float dA_m_v = dA_m[row];
-                float scale = expf(fminf(dA_m_v - dA_kv, 0.0f)) * dtv;
-                float cbv = cb_s[row][k] * scale;
+                // Use __expf for faster single-precision exp
+                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                float cbv = cb_s[tid_m * 4 + i][k] * scale;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     acc[i][j] += cbv * x_s[k][tid_n * 4 + j];
@@ -363,17 +369,15 @@ __global__ void chunk_scan_fwd_kernel_v2(
         }
         __syncthreads();
 
-        // Precompute scales for state contribution
+        // Precompute scales for state contribution (uses __expf for speed)
         float contrib_scales[4];
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             int row = tid_m * 4 + i;
             int64_t m = row_base + row;
             contrib_scales[i] = 0.0f;
-            if (row < BM && m < chunk_len) {
-                if (!has_seq_idx || seq_idx[seq_base + m] == seq_prev) {
-                    contrib_scales[i] = expf(fminf(dA_m[row], 0.0f));
-                }
+            if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
+                contrib_scales[i] = __expf(fminf(dA_m[row], 0.0f));
             }
         }
 
@@ -403,6 +407,466 @@ __global__ void chunk_scan_fwd_kernel_v2(
                 int64_t out_idx = x_offset + m * headdim + n;
                 float d_val = d_has_hdim ? D[h * headdim + n] : D[h];
                 y[out_idx] = acc[i][j] + x[out_idx] * d_val;
+            }
+        }
+    }
+}
+
+// Fused kernel: computes CB on-the-fly, eliminating cb_buf
+// This fuses bmm_cb_causal + chunk_scan into a single kernel
+__global__ void chunk_scan_fwd_fused_kernel(
+    const at::BFloat16* B,    // [batch*chunks*groups, chunk_size, d_state]
+    const at::BFloat16* C,    // [batch*chunks*groups, chunk_size, d_state]
+    const at::BFloat16* x,    // [batch, chunks, chunk_size, nheads, headdim] reshaped
+    const float* dt,
+    const float* dA_cumsum,
+    const float* state_in,
+    const float* D,
+    const int64_t* seq_idx,
+    int64_t seq_stride,
+    int64_t d_has_hdim,
+    float* y,
+    int64_t batch,
+    int64_t num_chunks,
+    int64_t chunk_size,
+    int64_t nheads,
+    int64_t headdim,
+    int64_t d_state,
+    int64_t ngroups,
+    int64_t seqlen,
+    int64_t has_seq_idx) {
+    constexpr int BM = 64;    // Rows of output tile
+    constexpr int BN = 64;    // Cols of output tile
+    constexpr int BK = 16;    // Tile over chunk_size (k dimension of CB)
+    constexpr int BS = 32;    // Tile over d_state for CB computation
+
+    int64_t tile_n = blockIdx.x;
+    int64_t tile_m = blockIdx.y;
+    int64_t pid = blockIdx.z;
+    int64_t b_idx = pid / (num_chunks * nheads);
+    int64_t rem = pid - b_idx * num_chunks * nheads;
+    int64_t c_idx = rem / nheads;
+    int64_t h = rem - c_idx * nheads;
+    if (b_idx >= batch) return;
+
+    int64_t heads_per_group = nheads / ngroups;
+    int64_t g = h / heads_per_group;
+
+    int64_t row_base = tile_m * BM;
+    int64_t col_base = tile_n * BN;
+    int64_t tid_m = threadIdx.y;
+    int64_t tid_n = threadIdx.x;
+    int64_t m0 = row_base + tid_m * 4;
+    int64_t n0 = col_base + tid_n * 4;
+
+    int64_t bc_offset = ((b_idx * num_chunks + c_idx) * ngroups + g) * chunk_size * d_state;
+    int64_t x_offset = ((((b_idx * num_chunks + c_idx) * chunk_size) * nheads + h) * headdim);
+    int64_t state_offset = ((((b_idx * num_chunks + c_idx) * nheads + h) * headdim) * d_state);
+    int64_t dt_offset = (((b_idx * nheads + h) * num_chunks + c_idx) * chunk_size);
+    int64_t seq_base = b_idx * seq_stride + c_idx * chunk_size;
+    int64_t chunk_len = seqlen - c_idx * chunk_size;
+    if (chunk_len > chunk_size) chunk_len = chunk_size;
+    int64_t seq_prev = -1;
+    if (has_seq_idx && c_idx > 0) seq_prev = seq_idx[seq_base - 1];
+
+    // Shared memory
+    __shared__ float c_tile[BM][BS];       // C tile for CB computation
+    __shared__ float b_tile[BK][BS];       // B tile for CB computation
+    __shared__ float cb_tile[BM][BK];      // Computed CB tile
+    __shared__ float x_s[BK][BN];          // X tile
+    __shared__ float cs_tile[BM][BS];      // C tile for state contribution
+    __shared__ float st_s[BS][BN];         // State tile
+    __shared__ float dA_m[BM];
+    __shared__ float dA_k[BK];
+    __shared__ float dt_k[BK];
+
+    float acc[4][4] = {{0}};
+    int load_idx = threadIdx.y * 16 + threadIdx.x;
+
+    // Load dA_m once
+    if (load_idx < BM) {
+        int64_t m = row_base + load_idx;
+        dA_m[load_idx] = (m < chunk_size) ? dA_cumsum[dt_offset + m] : 0.0f;
+    }
+    __syncthreads();
+
+    // Part 1: Intra-chunk scan with on-the-fly CB computation
+    for (int64_t k0 = 0; k0 < chunk_size; k0 += BK) {
+        // Zero CB tile
+        for (int l = 0; l < 4; ++l) {
+            int idx = load_idx + l * 256;
+            int r = idx / BK;
+            int c = idx % BK;
+            if (r < BM) cb_tile[r][c] = 0.0f;
+        }
+        __syncthreads();
+
+        // Compute CB tile: CB[m,k] = sum_n C[m,n] * B[k,n]
+        for (int64_t s0 = 0; s0 < d_state; s0 += BS) {
+            // Load C[BM, BS]
+            for (int l = 0; l < 8; ++l) {
+                int idx = load_idx + l * 256;
+                int r = idx / BS;
+                int c = idx % BS;
+                if (r < BM && c < BS) {
+                    int64_t m = row_base + r;
+                    int64_t s = s0 + c;
+                    c_tile[r][c] = (m < chunk_size && s < d_state)
+                        ? static_cast<float>(C[bc_offset + m * d_state + s]) : 0.0f;
+                }
+            }
+            // Load B[BK, BS]
+            for (int l = 0; l < 2; ++l) {
+                int idx = load_idx + l * 256;
+                int r = idx / BS;
+                int c = idx % BS;
+                if (r < BK && c < BS) {
+                    int64_t k = k0 + r;
+                    int64_t s = s0 + c;
+                    b_tile[r][c] = (k < chunk_size && s < d_state)
+                        ? static_cast<float>(B[bc_offset + k * d_state + s]) : 0.0f;
+                }
+            }
+            __syncthreads();
+
+            // Accumulate CB = C @ B^T
+            #pragma unroll
+            for (int s = 0; s < BS; ++s) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float cv = c_tile[tid_m * 4 + i][s];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        if (tid_n * 4 + j < BK) {
+                            cb_tile[tid_m * 4 + i][tid_n * 4 + j] += cv * b_tile[tid_n * 4 + j][s];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        // Apply causal mask to CB (k <= m) - done implicitly by not using values where k > m
+
+        // Load X tile
+        for (int l = 0; l < 2; ++l) {
+            int idx = load_idx + l * 256;
+            int r = idx / BN;
+            int c = idx % BN;
+            if (r < BK) {
+                int64_t k = k0 + r;
+                int64_t n = col_base + c;
+                x_s[r][c] = (k < chunk_size && n < headdim)
+                    ? static_cast<float>(x[x_offset + k * headdim + n]) : 0.0f;
+            }
+        }
+
+        // Load dA_k and dt_k
+        if (load_idx < BK) {
+            int64_t k = k0 + load_idx;
+            dA_k[load_idx] = (k < chunk_size) ? dA_cumsum[dt_offset + k] : 0.0f;
+            dt_k[load_idx] = (k < chunk_size) ? dt[dt_offset + k] : 0.0f;
+        }
+        __syncthreads();
+
+        // Compute scan with CB and scale
+        float dA_m_vals[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            dA_m_vals[i] = dA_m[tid_m * 4 + i];
+        }
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            int64_t k_global = k0 + k;
+            float dA_kv = dA_k[k];
+            float dtv = dt_k[k];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int64_t m_global = row_base + tid_m * 4 + i;
+                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                // Apply causal mask: only use CB if k <= m
+                float cbv = (k_global <= m_global && m_global < chunk_size) ? cb_tile[tid_m * 4 + i][k] * scale : 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += cbv * x_s[k][tid_n * 4 + j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Part 2: Inter-chunk state contribution (same as before)
+    for (int64_t s0 = 0; s0 < d_state; s0 += BS) {
+        // Load C tile
+        for (int l = 0; l < 8; ++l) {
+            int idx = load_idx + l * 256;
+            int r = idx / BS;
+            int c = idx % BS;
+            if (r < BM && c < BS) {
+                int64_t m = row_base + r;
+                int64_t s = s0 + c;
+                cs_tile[r][c] = (m < chunk_size && s < d_state)
+                    ? static_cast<float>(C[bc_offset + m * d_state + s]) : 0.0f;
+            }
+        }
+
+        // Load state_in tile
+        for (int l = 0; l < 8; ++l) {
+            int idx = load_idx + l * 256;
+            int r = idx / BN;
+            int c = idx % BN;
+            if (r < BS && c < BN) {
+                int64_t s = s0 + r;
+                int64_t n = col_base + c;
+                st_s[r][c] = (s < d_state && n < headdim) ? state_in[state_offset + n * d_state + s] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        float contrib_scales[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int row = tid_m * 4 + i;
+            int64_t m = row_base + row;
+            contrib_scales[i] = 0.0f;
+            if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
+                contrib_scales[i] = __expf(fminf(dA_m[row], 0.0f));
+            }
+        }
+
+        #pragma unroll
+        for (int s = 0; s < BS; ++s) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float cv = cs_tile[tid_m * 4 + i][s] * contrib_scales[i];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += cv * st_s[s][tid_n * 4 + j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write output with D skip connection
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int64_t m = m0 + i;
+        if (m >= chunk_size) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int64_t n = n0 + j;
+            if (n < headdim) {
+                int64_t out_idx = x_offset + m * headdim + n;
+                float d_val = d_has_hdim ? D[h * headdim + n] : D[h];
+                y[out_idx] = acc[i][j] + static_cast<float>(x[out_idx]) * d_val;
+            }
+        }
+    }
+}
+
+// bf16-input version: loads bf16 x and C, accumulates fp32
+__global__ void chunk_scan_fwd_kernel_v2_bf16in(
+    const float* CB,      // Precomputed [batch*chunks*groups, chunk_size, chunk_size] (fp32)
+    const at::BFloat16* x,
+    const float* dt,
+    const float* dA_cumsum,
+    const at::BFloat16* C,
+    const float* state_in,
+    const float* D,
+    const int64_t* seq_idx,
+    int64_t seq_stride,
+    int64_t d_has_hdim,
+    float* y,
+    int64_t batch,
+    int64_t num_chunks,
+    int64_t chunk_size,
+    int64_t nheads,
+    int64_t headdim,
+    int64_t d_state,
+    int64_t ngroups,
+    int64_t seqlen,
+    int64_t has_seq_idx) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 16;
+
+    int64_t tile_n = blockIdx.x;
+    int64_t tile_m = blockIdx.y;
+    int64_t pid = blockIdx.z;
+    int64_t b = pid / (num_chunks * nheads);
+    int64_t rem = pid - b * num_chunks * nheads;
+    int64_t c = rem / nheads;
+    int64_t h = rem - c * nheads;
+    if (b >= batch) return;
+
+    int64_t heads_per_group = nheads / ngroups;
+    int64_t g = h / heads_per_group;
+
+    int64_t row_base = tile_m * BM;
+    int64_t col_base = tile_n * BN;
+    int64_t tid_m = threadIdx.y;
+    int64_t tid_n = threadIdx.x;
+    int64_t m0 = row_base + tid_m * 4;
+    int64_t n0 = col_base + tid_n * 4;
+
+    int64_t cb_offset = ((b * num_chunks + c) * ngroups + g) * chunk_size * chunk_size;
+    int64_t c_offset = ((b * num_chunks + c) * ngroups + g) * chunk_size * d_state;
+    int64_t x_offset = ((((b * num_chunks + c) * chunk_size) * nheads + h) * headdim);
+    int64_t state_offset = ((((b * num_chunks + c) * nheads + h) * headdim) * d_state);
+    int64_t dt_offset = (((b * nheads + h) * num_chunks + c) * chunk_size);
+    int64_t seq_base = b * seq_stride + c * chunk_size;
+    int64_t chunk_len = seqlen - c * chunk_size;
+    if (chunk_len > chunk_size) chunk_len = chunk_size;
+    int64_t seq_prev = -1;
+    if (has_seq_idx && c > 0) seq_prev = seq_idx[seq_base - 1];
+
+    __shared__ float cb_s[BM][BK];
+    __shared__ float x_s[BK][BN];
+    __shared__ float c_s[BM][BK];
+    __shared__ float st_s[BK][BN];
+    __shared__ float dA_m[BM];
+    __shared__ float dA_k[BK];
+    __shared__ float dt_k[BK];
+
+    float acc[4][4] = {{0}};
+
+    int load_idx_init = threadIdx.y * 16 + threadIdx.x;
+    if (load_idx_init < BM) {
+        int64_t m = row_base + load_idx_init;
+        dA_m[load_idx_init] = (m < chunk_size) ? dA_cumsum[dt_offset + m] : 0.0f;
+    }
+    __syncthreads();
+
+    // Part 1: Intra-chunk scan
+    for (int64_t k0 = 0; k0 < chunk_size; k0 += BK) {
+        int load_idx = threadIdx.y * 16 + threadIdx.x;
+
+        // Load CB tile [BM, BK] (already fp32)
+        for (int l = 0; l < 4; ++l) {
+            int idx = load_idx + l * 256;
+            int r = idx / BK;
+            int k_in = idx % BK;
+            if (r < BM) {
+                int64_t m_global = row_base + r;
+                int64_t k_global = k0 + k_in;
+                cb_s[r][k_in] = (m_global < chunk_size && k_global <= m_global) ?
+                    CB[cb_offset + m_global * chunk_size + k_global] : 0.0f;
+            }
+        }
+
+        // Load X tile (bf16 -> fp32)
+        for (int l = 0; l < 2; ++l) {
+            int idx = load_idx + l * 256;
+            int row = idx / BN;
+            int col = idx % BN;
+            if (row < BK) {
+                int64_t k = k0 + row;
+                int64_t n = col_base + col;
+                x_s[row][col] = (k < chunk_size && n < headdim)
+                    ? static_cast<float>(x[x_offset + k * headdim + n]) : 0.0f;
+            }
+        }
+
+        // Load dA_k and dt_k
+        if (load_idx < BK) {
+            int64_t k = k0 + load_idx;
+            dA_k[load_idx] = (k < chunk_size) ? dA_cumsum[dt_offset + k] : 0.0f;
+            dt_k[load_idx] = (k < chunk_size) ? dt[dt_offset + k] : 0.0f;
+        }
+        __syncthreads();
+
+        float dA_m_vals[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            dA_m_vals[i] = dA_m[tid_m * 4 + i];
+        }
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float dA_kv = dA_k[k];
+            float dtv = dt_k[k];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                float cbv = cb_s[tid_m * 4 + i][k] * scale;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += cbv * x_s[k][tid_n * 4 + j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Part 2: Inter-chunk state contribution
+    for (int64_t k0 = 0; k0 < d_state; k0 += BK) {
+        int load_idx = threadIdx.y * 16 + threadIdx.x;
+
+        // Load C tile (bf16 -> fp32)
+        for (int l = 0; l < 4; ++l) {
+            int idx = load_idx + l * 256;
+            int row = idx / BK;
+            int col = idx % BK;
+            if (row < BM) {
+                int64_t m = row_base + row;
+                int64_t k = k0 + col;
+                c_s[row][col] = (m < chunk_size && k < d_state)
+                    ? static_cast<float>(C[c_offset + m * d_state + k]) : 0.0f;
+            }
+        }
+
+        // Load state_in tile (already fp32)
+        for (int l = 0; l < 2; ++l) {
+            int idx = load_idx + l * 256;
+            int row = idx / BN;
+            int col = idx % BN;
+            if (row < BK) {
+                int64_t k = k0 + row;
+                int64_t n = col_base + col;
+                st_s[row][col] = (k < d_state && n < headdim) ? state_in[state_offset + n * d_state + k] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        float contrib_scales[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int row = tid_m * 4 + i;
+            int64_t m = row_base + row;
+            contrib_scales[i] = 0.0f;
+            if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
+                contrib_scales[i] = __expf(fminf(dA_m[row], 0.0f));
+            }
+        }
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float cv = c_s[tid_m * 4 + i][k] * contrib_scales[i];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += cv * st_s[k][tid_n * 4 + j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write output with D skip connection (x is bf16)
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int64_t m = m0 + i;
+        if (m >= chunk_size) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int64_t n = n0 + j;
+            if (n < headdim) {
+                int64_t out_idx = x_offset + m * headdim + n;
+                float d_val = d_has_hdim ? D[h * headdim + n] : D[h];
+                y[out_idx] = acc[i][j] + static_cast<float>(x[out_idx]) * d_val;
             }
         }
     }
