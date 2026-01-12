@@ -472,6 +472,131 @@ __global__ void bmm_kt_kn_scale_x_kernel(
     }
 }
 
+// Compute CB[m,k] = C[m,:] @ B[k,:]^T with causal masking (k <= m)
+// C, B: [batches, chunk_size, d_state]
+// CB: [batches, chunk_size, chunk_size]
+__global__ void bmm_cb_causal_kernel(
+    const float* C_mat,
+    const float* B_mat,
+    const float* dA_cumsum,
+    const int64_t* seq_idx,
+    int64_t seq_stride,
+    float* CB,
+    int64_t batches,
+    int64_t chunk_size,
+    int64_t d_state,
+    int64_t seqlen,
+    int64_t num_chunks,
+    int64_t ngroups,
+    int64_t nheads,
+    int64_t has_seq_idx) {
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 32;
+
+    int64_t bg = blockIdx.z;
+    int64_t tile_m = blockIdx.y;
+    int64_t tile_n = blockIdx.x;
+    int64_t row_base = tile_m * BM;
+    int64_t col_base = tile_n * BN;
+    int64_t tid_m = threadIdx.y;
+    int64_t tid_n = threadIdx.x;
+    int64_t m0 = row_base + tid_m * 4;
+    int64_t k0_out = col_base + tid_n * 4;
+
+    if (bg >= batches) return;
+
+    int64_t b = bg / (num_chunks * ngroups);
+    int64_t rem = bg - b * num_chunks * ngroups;
+    int64_t c = rem / ngroups;
+    int64_t g = rem - c * ngroups;
+    int64_t seq_base = b * seq_stride + c * chunk_size;
+    int64_t chunk_len = seqlen - c * chunk_size;
+    if (chunk_len > chunk_size) chunk_len = chunk_size;
+
+    const float* C_ptr = C_mat + bg * chunk_size * d_state;
+    const float* B_ptr = B_mat + bg * chunk_size * d_state;
+    float* CB_ptr = CB + bg * chunk_size * chunk_size;
+
+    __shared__ float C_s[BM][BK];
+    __shared__ float B_s[BN][BK];
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    for (int64_t kk = 0; kk < d_state; kk += BK) {
+        int load_idx = threadIdx.y * 16 + threadIdx.x;
+        // Load C[BM, BK]
+        for (int l = 0; l < 8; ++l) {
+            int idx = load_idx + l * 256;
+            int row = idx / BK;
+            int col = idx % BK;
+            if (row < BM && col < BK) {
+                int64_t m = row_base + row;
+                int64_t k = kk + col;
+                float val = (m < chunk_size && k < d_state) ? C_ptr[m * d_state + k] : 0.0f;
+                C_s[row][col] = val;
+            }
+        }
+        // Load B[BN, BK] (transposed access: B[k_out, n] where we want B^T)
+        for (int l = 0; l < 8; ++l) {
+            int idx = load_idx + l * 256;
+            int row = idx / BK;
+            int col = idx % BK;
+            if (row < BN && col < BK) {
+                int64_t k_out = col_base + row;
+                int64_t n = kk + col;
+                float val = (k_out < chunk_size && n < d_state) ? B_ptr[k_out * d_state + n] : 0.0f;
+                B_s[row][col] = val;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float c_val = C_s[tid_m * 4 + i][k];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += c_val * B_s[tid_n * 4 + j][k];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write with causal mask (k <= m) and seq_idx check
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int64_t m = m0 + i;
+        if (m >= chunk_size) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int64_t k = k0_out + j;
+            if (k >= chunk_size) continue;
+            float val = acc[i][j];
+            // Causal mask: k <= m
+            if (k > m) val = 0.0f;
+            // Bounds check
+            if (m >= chunk_len || k >= chunk_len) val = 0.0f;
+            // Seq idx check
+            if (has_seq_idx && val != 0.0f) {
+                if (seq_idx[seq_base + m] != seq_idx[seq_base + k]) {
+                    val = 0.0f;
+                }
+            }
+            CB_ptr[m * chunk_size + k] = val;
+        }
+    }
+}
+
 __global__ void bmm_mk_nk_kernel(
     const float* A,
     const float* B_t,

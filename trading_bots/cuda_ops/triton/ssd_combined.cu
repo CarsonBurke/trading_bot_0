@@ -14,6 +14,7 @@ struct MambaWorkspace {
   torch::Tensor x_buf;
   torch::Tensor b_buf;
   torch::Tensor c_buf;
+  torch::Tensor cb_buf;  // Precomputed C @ B^T for optimized scan
   torch::Tensor y_padded_f;
   torch::Tensor chunk_state_mat;
   torch::Tensor gy_chunk;
@@ -216,11 +217,26 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
       nheads, headdim, d_state, num_chunks, chunk_size, seqlen,
       has_seq_idx ? 1 : 0);
   final_state.copy_(final_state_f_kernel.to(final_state.scalar_type()));
+
+  // Precompute CB = C @ B^T with causal masking (optimized path)
+  auto cb_buf = workspace_tensor(
+      ws.cb_buf, {batch * num_chunks * ngroups, chunk_size, chunk_size}, float_opts);
+  dim3 cb_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64,
+               batch * num_chunks * ngroups);
+  dim3 cb_threads(16, 16);
+  bmm_cb_causal_kernel<<<cb_grid, cb_threads>>>(
+      c_mat.data_ptr<float>(), b_mat.data_ptr<float>(),
+      dA_buf.data_ptr<float>(),
+      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+      cb_buf.data_ptr<float>(), batch * num_chunks * ngroups, chunk_size,
+      d_state, seqlen, num_chunks, ngroups, nheads, has_seq_idx ? 1 : 0);
+
+  // Use optimized scan kernel with precomputed CB
   dim3 block(16, 16);
   dim3 grid((headdim + 63) / 64, (chunk_size + 63) / 64,
             batch * num_chunks * nheads);
-  chunk_scan_fwd_kernel<<<grid, block>>>(
-      b_mat.data_ptr<float>(), x_buf.data_ptr<float>(),
+  chunk_scan_fwd_kernel_v2<<<grid, block>>>(
+      cb_buf.data_ptr<float>(), x_buf.data_ptr<float>(),
       dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
       c_mat.data_ptr<float>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
       has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
