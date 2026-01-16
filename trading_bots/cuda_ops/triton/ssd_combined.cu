@@ -92,7 +92,7 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
   int64_t dt_scale_stride_b = 0, dt_scale_stride_t = 0, dt_scale_batch = 0,
           dt_scale_seqlen = 0;
   int64_t batch = z.size(0), seqlen = z.size(1), d_in_proj = z.size(2),
-          nheads = alog.size(0), d_ssm = nheads * headdim;
+          nheads = a_log.size(0), d_ssm = nheads * headdim;
   int64_t d_state = (w.size(0) - d_ssm) / (2 * ngroups);
   int64_t d_inner = (d_in_proj - 2 * ngroups * d_state - nheads) / 2,
           d_mlp = d_inner - d_ssm, conv_dim = d_ssm + 2 * ngroups * d_state,
@@ -277,11 +277,11 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
         d_state, seqlen, num_chunks, ngroups, nheads, 1);
   }
 
-  // Use optimized scan kernel with precomputed CB (bf16 inputs for x_buf and c_mat)
+  // Use v3 kernel with BK=32 for better arithmetic intensity (bf16 inputs)
   dim3 block(16, 16);
   dim3 grid((headdim + 63) / 64, (chunk_size + 63) / 64,
             batch * num_chunks * nheads);
-  chunk_scan_fwd_kernel_v2_bf16in<<<grid, block>>>(
+  chunk_scan_fwd_kernel_v3_bf16in<<<grid, block>>>(
       cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
       dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
       c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
@@ -326,7 +326,7 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
   int64_t dt_scale_stride_b = 0, dt_scale_stride_t = 0, dt_scale_batch = 0,
           dt_scale_seqlen = 0;
   int64_t batch = z.size(0), seqlen = z.size(1), d_in_proj = z.size(2),
-          nheads = alog.size(0), d_ssm = nheads * headdim;
+          nheads = a_log.size(0), d_ssm = nheads * headdim;
   int64_t d_state = (w.size(0) - d_ssm) / (2 * ngroups);
   int64_t d_inner = (d_in_proj - 2 * ngroups * d_state - nheads) / 2,
           d_mlp = d_inner - d_ssm, conv_dim = d_ssm + 2 * ngroups * d_state,
@@ -712,10 +712,12 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
     int64_t headdim, double dt_min, double dt_max) {
   at::NoGradGuard no_grad;
   auto z = zxbcdt.contiguous();
-  auto w = conv_w.contiguous();
-  auto b = conv_b.defined() ? conv_b.contiguous() : torch::Tensor();
-  auto dtb = dt_bias.contiguous();
-  auto alog = a_log.to(torch::kFloat).contiguous();
+  auto w = conv_w.to(z.scalar_type()).contiguous();
+  auto b = conv_b.defined() ? conv_b.to(z.scalar_type()).contiguous()
+                            : torch::Tensor();
+  auto dtb = dt_bias.to(z.scalar_type()).contiguous();
+  auto alog_f = a_log.to(torch::kFloat).contiguous();
+  auto alog_s = a_log.to(z.scalar_type()).contiguous();
   auto d = d_param.to(torch::kFloat).contiguous();
   bool d_has_hdim = d.dim() == 2;
   auto state0 = initial_state.contiguous();
@@ -736,12 +738,13 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
   auto gstate = grad_final_state.defined() ? grad_final_state.contiguous()
                                            : torch::zeros_like(stateN);
   int64_t batch = z.size(0), seqlen = z.size(1), d_in_proj = z.size(2),
-          nheads = alog.size(0), d_ssm = nheads * headdim;
+          nheads = a_log.size(0), d_ssm = nheads * headdim;
   int64_t d_state = (w.size(0) - d_ssm) / (2 * ngroups);
   int64_t d_inner = (d_in_proj - 2 * ngroups * d_state - nheads) / 2,
           d_mlp = d_inner - d_ssm, conv_dim = d_ssm + 2 * ngroups * d_state,
           conv_kernel = w.size(1);
   if (has_dt_scale) {
+    dt_scale_view = dt_scale_view.to(z.scalar_type()).contiguous();
     if (dt_scale_view.dim() == 3)
       dt_scale_view = dt_scale_view.squeeze(-1);
     dt_scale_stride_b = dt_scale_view.stride(0);
@@ -816,7 +819,7 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
     TORCH_CHECK(false, "unsupported dtype for backward pack");
   }
   dt_cumsum_from_dt_kernel<<<dt_grid, dt_threads, dt_shared>>>(
-      dt_buf.data_ptr<float>(), alog.data_ptr<float>(), dA_buf.data_ptr<float>(),
+      dt_buf.data_ptr<float>(), alog_f.data_ptr<float>(), dA_buf.data_ptr<float>(),
       exp_a_last.data_ptr<float>(), batch, seqlen, nheads, chunk_size);
   int64_t heads_per_group = nheads / ngroups;
   auto x_g_mat = x_buf
@@ -1032,20 +1035,20 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
   switch (z.scalar_type()) {
   case at::kFloat:
     ddA_to_dtdA_kernel<float><<<ddA_grid_n, dt_threads, dt_shared>>>(
-        ddA.data_ptr<float>(), dt_buf.data_ptr<float>(), alog.data_ptr<float>(),
+        ddA.data_ptr<float>(), dt_buf.data_ptr<float>(), alog_s.data_ptr<float>(),
         ddt.data_ptr<float>(), dA_acc.data_ptr<float>(), batch, seqlen, nheads,
         chunk_size);
     break;
   case at::kHalf:
     ddA_to_dtdA_kernel<at::Half><<<ddA_grid_n, dt_threads, dt_shared>>>(
         ddA.data_ptr<float>(), dt_buf.data_ptr<float>(),
-        alog.data_ptr<at::Half>(), ddt.data_ptr<float>(),
+        alog_s.data_ptr<at::Half>(), ddt.data_ptr<float>(),
         dA_acc.data_ptr<float>(), batch, seqlen, nheads, chunk_size);
     break;
   case at::kBFloat16:
     ddA_to_dtdA_kernel<at::BFloat16><<<ddA_grid_n, dt_threads, dt_shared>>>(
         ddA.data_ptr<float>(), dt_buf.data_ptr<float>(),
-        alog.data_ptr<at::BFloat16>(), ddt.data_ptr<float>(),
+        alog_s.data_ptr<at::BFloat16>(), ddt.data_ptr<float>(),
         dA_acc.data_ptr<float>(), batch, seqlen, nheads, chunk_size);
     break;
   default:
@@ -1140,8 +1143,8 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
   int64_t offset_dt = offset_xbc + d_ssm + 2 * ngroups * d_state;
   dzxbcdt.slice(2, offset_xbc, offset_xbc + conv_dim).copy_(d_xbc_in);
   dzxbcdt.slice(2, offset_dt, offset_dt + nheads).copy_(ddt_raw);
-  return {dzxbcdt.to(z.scalar_type()),     d_conv_w.to(w.scalar_type()),
-          d_conv_b.to(w.scalar_type()),    ddt_bias.to(dtb.scalar_type()),
-          dA_acc.to(alog.scalar_type()),   dD.to(d.scalar_type()),
+  return {dzxbcdt.to(z.scalar_type()),        d_conv_w.to(conv_w.scalar_type()),
+          d_conv_b.to(conv_b.scalar_type()),  ddt_bias.to(dt_bias.scalar_type()),
+          dA_acc.to(a_log.scalar_type()),     dD.to(d.scalar_type()),
           dstate0.to(state0.scalar_type())};
 }

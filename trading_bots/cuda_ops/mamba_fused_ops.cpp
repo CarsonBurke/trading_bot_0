@@ -2,6 +2,7 @@
 #include <torch/torch.h>
 #include <sstream>
 #include <vector>
+#include <string>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/util/Optional.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -94,7 +95,6 @@ torch::Tensor mamba_fused_post_ssm(
     double eps,
     bool norm_before_gate,
     torch::ScalarType out_type);
-
 std::tuple<torch::Tensor, torch::Tensor> selective_state_update_cuda(
     const torch::Tensor& state,
     const torch::Tensor& x,

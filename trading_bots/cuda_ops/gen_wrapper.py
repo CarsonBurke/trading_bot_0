@@ -8,6 +8,8 @@ out_path = os.environ["MAMBA_FUSED_WRAPPER_PATH"]
 torch.ops.load_library(lib_path)
 
 class MambaFusedWrapper(torch.nn.Module):
+    __annotations__ = {}  # Python 3.14 compatibility
+
     def forward(
         self,
         zxbcdt: torch.Tensor,
