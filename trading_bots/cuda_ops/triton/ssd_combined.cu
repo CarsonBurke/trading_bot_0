@@ -402,44 +402,46 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
   default:
     TORCH_CHECK(false, "unsupported dtype for forward");
   }
+  // Use bf16 buffers for tensor core acceleration (matching training path)
+  auto bf16_opts = z.options().dtype(torch::kBFloat16);
   auto x_buf = workspace_tensor(
-      ws.x_buf, {batch, num_chunks, chunk_size, nheads, headdim}, float_opts);
+      ws.x_buf, {batch, num_chunks, chunk_size, nheads, headdim}, bf16_opts);
   auto b_buf = workspace_tensor(
-      ws.b_buf, {batch, num_chunks, chunk_size, ngroups, d_state}, float_opts);
+      ws.b_buf, {batch, num_chunks, chunk_size, ngroups, d_state}, bf16_opts);
   auto c_buf = workspace_tensor(
-      ws.c_buf, {batch, num_chunks, chunk_size, ngroups, d_state}, float_opts);
+      ws.c_buf, {batch, num_chunks, chunk_size, ngroups, d_state}, bf16_opts);
   int64_t pack_total = batch * num_chunks * chunk_size * conv_dim;
   int pack_blocks = (pack_total + threads - 1) / threads;
   switch (z.scalar_type()) {
   case at::kFloat:
-    conv1d_pack_stateful_kernel<float><<<pack_blocks, threads>>>(
+    conv1d_pack_stateful_kernel_bf16out<float><<<pack_blocks, threads>>>(
         z.data_ptr<float>(), w.data_ptr<float>(),
         has_conv_bias ? b.data_ptr<float>() : nullptr,
         conv_state_in.data_ptr<float>(),
         has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-        x_buf.data_ptr<float>(), b_buf.data_ptr<float>(), c_buf.data_ptr<float>(),
+        x_buf.data_ptr<at::BFloat16>(), b_buf.data_ptr<at::BFloat16>(), c_buf.data_ptr<at::BFloat16>(),
         batch, seqlen, d_in_proj, conv_dim, conv_kernel, d_mlp, d_ssm, ngroups,
         d_state, chunk_size, num_chunks, headdim, has_conv_bias,
         has_seq_idx ? 1 : 0, has_conv_state ? 1 : 0);
     break;
   case at::kHalf:
-    conv1d_pack_stateful_kernel<at::Half><<<pack_blocks, threads>>>(
+    conv1d_pack_stateful_kernel_bf16out<at::Half><<<pack_blocks, threads>>>(
         z.data_ptr<at::Half>(), w.data_ptr<at::Half>(),
         has_conv_bias ? b.data_ptr<at::Half>() : nullptr,
         conv_state_in.data_ptr<at::Half>(),
         has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-        x_buf.data_ptr<float>(), b_buf.data_ptr<float>(), c_buf.data_ptr<float>(),
+        x_buf.data_ptr<at::BFloat16>(), b_buf.data_ptr<at::BFloat16>(), c_buf.data_ptr<at::BFloat16>(),
         batch, seqlen, d_in_proj, conv_dim, conv_kernel, d_mlp, d_ssm, ngroups,
         d_state, chunk_size, num_chunks, headdim, has_conv_bias,
         has_seq_idx ? 1 : 0, has_conv_state ? 1 : 0);
     break;
   case at::kBFloat16:
-    conv1d_pack_stateful_kernel<at::BFloat16><<<pack_blocks, threads>>>(
+    conv1d_pack_stateful_kernel_bf16out<at::BFloat16><<<pack_blocks, threads>>>(
         z.data_ptr<at::BFloat16>(), w.data_ptr<at::BFloat16>(),
         has_conv_bias ? b.data_ptr<at::BFloat16>() : nullptr,
         conv_state_in.data_ptr<at::BFloat16>(),
         has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-        x_buf.data_ptr<float>(), b_buf.data_ptr<float>(), c_buf.data_ptr<float>(),
+        x_buf.data_ptr<at::BFloat16>(), b_buf.data_ptr<at::BFloat16>(), c_buf.data_ptr<at::BFloat16>(),
         batch, seqlen, d_in_proj, conv_dim, conv_kernel, d_mlp, d_ssm, ngroups,
         d_state, chunk_size, num_chunks, headdim, has_conv_bias,
         has_seq_idx ? 1 : 0, has_conv_state ? 1 : 0);
@@ -466,11 +468,12 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
       {batch * num_chunks * ngroups, d_state, heads_per_group * headdim},
       float_opts);
   chunk_state_mat.zero_();
+  // Use cuBLAS with tensor cores for chunk_state computation
   dim3 cs_grid((heads_per_group * headdim + 63) / 64, (d_state + 63) / 64,
                batch * num_chunks * ngroups);
   dim3 bmm_threads(16, 16);
-  bmm_kt_kn_scale_x_kernel<<<cs_grid, bmm_threads>>>(
-      b_mat.data_ptr<float>(), x_g_mat.data_ptr<float>(),
+  bmm_kt_kn_scale_x_kernel_bf16in<<<cs_grid, bmm_threads>>>(
+      b_mat.data_ptr<at::BFloat16>(), x_g_mat.data_ptr<at::BFloat16>(),
       dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
       has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
       chunk_state_mat.data_ptr<float>(), batch * num_chunks * ngroups, d_state,
@@ -489,13 +492,40 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
       nheads, headdim, d_state, num_chunks, chunk_size, seqlen,
       has_seq_idx ? 1 : 0);
   final_state.copy_(final_state_f_kernel.to(final_state.scalar_type()));
+
+  // Precompute CB = C @ B^T using cuBLAS with tensor cores
+  auto cb_buf = workspace_tensor(
+      ws.cb_buf, {batch * num_chunks * ngroups, chunk_size, chunk_size}, float_opts);
+  {
+    cublasHandle_t handle = get_cublas_handle();
+    float alpha = 1.0f, beta = 0.0f;
+    int64_t batches = batch * num_chunks * ngroups;
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        chunk_size, chunk_size, d_state,
+        &alpha,
+        b_mat.data_ptr<at::BFloat16>(), CUDA_R_16BF, d_state, chunk_size * d_state,
+        c_mat.data_ptr<at::BFloat16>(), CUDA_R_16BF, d_state, chunk_size * d_state,
+        &beta,
+        cb_buf.data_ptr<float>(), CUDA_R_32F, chunk_size, chunk_size * chunk_size,
+        batches,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    dim3 mask_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64, batches);
+    dim3 mask_threads(16, 16);
+    apply_causal_mask_simple_kernel<<<mask_grid, mask_threads>>>(
+        cb_buf.data_ptr<float>(), batches, chunk_size, seqlen, num_chunks);
+  }
+
+  // Use v3_bf16in kernel with BK=32 for better arithmetic intensity
   dim3 block(16, 16);
   dim3 grid((headdim + 63) / 64, (chunk_size + 63) / 64,
             batch * num_chunks * nheads);
-  chunk_scan_fwd_kernel<<<grid, block>>>(
-      b_mat.data_ptr<float>(), x_buf.data_ptr<float>(),
+  chunk_scan_fwd_kernel_v3_bf16in<<<grid, block>>>(
+      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
       dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
-      c_mat.data_ptr<float>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
       has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
       d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
       chunk_size, nheads, headdim, d_state, ngroups, seqlen,

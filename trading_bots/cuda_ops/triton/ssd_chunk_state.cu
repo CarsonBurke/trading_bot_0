@@ -447,6 +447,90 @@ __global__ void conv1d_pack_stateful_kernel(
     }
 }
 
+// BF16 output version for tensor core acceleration
+template <typename scalar_t>
+__global__ void conv1d_pack_stateful_kernel_bf16out(
+    const scalar_t* zxbcdt,
+    const scalar_t* conv_w,
+    const scalar_t* conv_b,
+    const scalar_t* conv_state,
+    const int64_t* seq_idx,
+    int64_t seq_stride,
+    at::BFloat16* x_buf,
+    at::BFloat16* b_buf,
+    at::BFloat16* c_buf,
+    int64_t batch,
+    int64_t seqlen,
+    int64_t d_in_proj,
+    int64_t conv_dim,
+    int64_t conv_kernel,
+    int64_t d_mlp,
+    int64_t d_ssm,
+    int64_t ngroups,
+    int64_t d_state,
+    int64_t chunk_size,
+    int64_t num_chunks,
+    int64_t headdim,
+    bool has_conv_bias,
+    int64_t has_seq_idx,
+    int64_t has_conv_state) {
+    int64_t padded_len = num_chunks * chunk_size;
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = batch * padded_len * conv_dim;
+    if (idx >= total) return;
+
+    int64_t tmp = idx;
+    int64_t c = tmp % conv_dim;
+    tmp /= conv_dim;
+    int64_t t = tmp % padded_len;
+    int64_t b = tmp / padded_len;
+    int64_t chunk = t / chunk_size;
+    int64_t t_in_chunk = t - chunk * chunk_size;
+
+    float conv_val = 0.0f;
+    if (t < seqlen) {
+        int64_t offset_xbc = 2 * d_mlp + d_ssm;
+        int64_t seq_base = has_seq_idx ? (b * seq_stride) : 0;
+        int64_t seq_cur = has_seq_idx ? seq_idx[seq_base + t] : 0;
+        float conv_pre = 0.0f;
+        for (int64_t w = 0; w < conv_kernel; ++w) {
+            int64_t t_in = t - w;
+            if (t_in >= 0) {
+                if (has_seq_idx && seq_idx[seq_base + t_in] != seq_cur) continue;
+                int64_t xbc_idx = (b * seqlen + t_in) * d_in_proj + offset_xbc + c;
+                conv_pre += to_float(conv_w[c * conv_kernel + w]) * to_float(zxbcdt[xbc_idx]);
+            } else if (has_conv_state) {
+                int64_t state_idx = conv_kernel - 1 + t_in;
+                if (state_idx >= 0) {
+                    int64_t state_offset = (b * conv_dim + c) * conv_kernel + state_idx;
+                    conv_pre += to_float(conv_w[c * conv_kernel + w]) * to_float(conv_state[state_offset]);
+                }
+            }
+        }
+        if (has_conv_bias) conv_pre += to_float(conv_b[c]);
+        conv_val = silu_f(conv_pre);
+    }
+
+    int64_t nheads = d_ssm / headdim;
+    at::BFloat16 conv_bf16 = static_cast<at::BFloat16>(conv_val);
+
+    if (c < d_ssm) {
+        int64_t h = c / headdim;
+        int64_t p = c - h * headdim;
+        x_buf[(((b * num_chunks + chunk) * chunk_size + t_in_chunk) * nheads + h) * headdim + p] = conv_bf16;
+    } else if (c < d_ssm + ngroups * d_state) {
+        int64_t c_off = c - d_ssm;
+        int64_t g = c_off / d_state;
+        int64_t n = c_off - g * d_state;
+        b_buf[(((b * num_chunks + chunk) * chunk_size + t_in_chunk) * ngroups + g) * d_state + n] = conv_bf16;
+    } else {
+        int64_t c_off = c - d_ssm - ngroups * d_state;
+        int64_t g = c_off / d_state;
+        int64_t n = c_off - g * d_state;
+        c_buf[(((b * num_chunks + chunk) * chunk_size + t_in_chunk) * ngroups + g) * d_state + n] = conv_bf16;
+    }
+}
+
 template <typename scalar_t>
 __global__ void update_conv_state_kernel(
     const scalar_t* zxbcdt,
