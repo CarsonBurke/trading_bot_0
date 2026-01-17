@@ -961,17 +961,23 @@ __global__ void chunk_scan_fwd_kernel_wmma_bf16in_fused(
 
     __shared__ __half cb_half[BM][BK];
     __shared__ __half x_half[BK][BN];
-    __shared__ float c_s[BM][BK];
-    __shared__ float st_s[BK][BN];
+    __shared__ __half c_half[BM][BK];
+    __shared__ __half st_half[BK][BN];
     __shared__ float dA_m[BM];
     __shared__ float dA_k[BK];
     __shared__ float dt_k[BK];
+    __shared__ float contrib_s[BM];
     __shared__ float out_s[BM][BN];
 
     int load_idx = threadIdx.y * 16 + threadIdx.x;
     if (load_idx < BM) {
         int64_t m = row_base + load_idx;
         dA_m[load_idx] = (m < chunk_size) ? dA_cumsum[dt_offset + m] : 0.0f;
+        float scale = 0.0f;
+        if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
+            scale = __expf(fminf(dA_m[load_idx], 0.0f));
+        }
+        contrib_s[load_idx] = scale;
     }
     __syncthreads();
 
@@ -1053,22 +1059,8 @@ __global__ void chunk_scan_fwd_kernel_wmma_bf16in_fused(
         }
     }
 
-    float dA_m_vals[TM];
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        dA_m_vals[i] = dA_m[tid_m * TM + i];
-    }
-
-    float contrib_scales[TM];
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        int row = tid_m * TM + i;
-        int64_t m = row_base + row;
-        contrib_scales[i] = 0.0f;
-        if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-            contrib_scales[i] = __expf(fminf(dA_m_vals[i], 0.0f));
-        }
-    }
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag2;
+    wmma::fill_fragment(acc_frag2, 0.0f);
 
     for (int64_t k0 = 0; k0 < d_state; k0 += BK) {
         #pragma unroll
@@ -1079,8 +1071,11 @@ __global__ void chunk_scan_fwd_kernel_wmma_bf16in_fused(
             if (row < BM) {
                 int64_t m = row_base + row;
                 int64_t k = k0 + col;
-                c_s[row][col] = (m < chunk_size && k < d_state)
-                    ? static_cast<float>(C[c_offset + m * d_state + k]) : 0.0f;
+                float c_val = 0.0f;
+                if (m < chunk_size && k < d_state) {
+                    c_val = static_cast<float>(C[c_offset + m * d_state + k]) * contrib_s[row];
+                }
+                c_half[row][col] = __float2half_rn(c_val);
             }
         }
 
@@ -1092,24 +1087,44 @@ __global__ void chunk_scan_fwd_kernel_wmma_bf16in_fused(
             if (row < BK) {
                 int64_t k = k0 + row;
                 int64_t n = col_base + col;
-                st_s[row][col] = (k < d_state && n < headdim)
-                    ? state_in[state_offset + n * d_state + k] : 0.0f;
+                float st_val = 0.0f;
+                if (k < d_state && n < headdim) {
+                    st_val = state_in[state_offset + n * d_state + k];
+                }
+                st_half[row][col] = __float2half_rn(st_val);
             }
         }
         __syncthreads();
 
-        #pragma unroll
-        for (int k = 0; k < BK; ++k) {
-            #pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                float cv = c_s[tid_m * TM + i][k] * contrib_scales[i];
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    acc[i][j] += cv * st_s[k][tid_n * TN + j];
-                }
-            }
+        if (warp_id < (BM / 16) * (BN / 16)) {
+            int a_row = warp_m * 16;
+            int b_col = warp_n * 16;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag2;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag2;
+            wmma::load_matrix_sync(a_frag2, &c_half[a_row][0], BK);
+            wmma::load_matrix_sync(b_frag2, &st_half[0][b_col], BN);
+            wmma::mma_sync(acc_frag2, a_frag2, b_frag2, acc_frag2);
         }
         __syncthreads();
+    }
+
+    if (warp_id < (BM / 16) * (BN / 16)) {
+        int a_row = warp_m * 16;
+        int b_col = warp_n * 16;
+        wmma::store_matrix_sync(&out_s[a_row][b_col], acc_frag2, BN, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            int row = tid_m * TM + i;
+            int col = tid_n * TN + j;
+            if (row < BM && col < BN) {
+                acc[i][j] += out_s[row][col];
+            }
+        }
     }
 
     #pragma unroll
