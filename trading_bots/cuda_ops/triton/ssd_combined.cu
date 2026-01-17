@@ -3,6 +3,7 @@
 #include <c10/util/Optional.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cstdlib>
 #include <iostream>
 #include <unordered_map>
 #include <vector>
@@ -277,10 +278,18 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
         d_state, seqlen, num_chunks, ngroups, nheads, 1);
   }
 
-  // Use v3 kernel with BK=32 for better arithmetic intensity (bf16 inputs)
+  // Prefer WMMA kernel when aligned; fallback to v3 otherwise.
+  const char* wmma_env = std::getenv("MAMBA_WMMA");
+  bool wmma_enabled = !wmma_env || std::atoi(wmma_env) != 0;
+  bool wmma_compatible = !has_seq_idx && (headdim % 16 == 0) && (chunk_size % 16 == 0);
+  TORCH_CHECK(!wmma_enabled || wmma_compatible,
+              "WMMA enabled but incompatible shape/seq_idx; disable with MAMBA_WMMA=0");
+  bool use_wmma = wmma_enabled && wmma_compatible;
   dim3 block(16, 16);
-  dim3 grid((headdim + 63) / 64, (chunk_size + 63) / 64,
-            batch * num_chunks * nheads);
+  dim3 grid_v3((headdim + 63) / 64, (chunk_size + 63) / 64,
+               batch * num_chunks * nheads);
+  dim3 grid_wmma((headdim + 63) / 64, (chunk_size + 31) / 32,
+                 batch * num_chunks * nheads);
   
   // Prepare gating params
   int64_t z_stride_b = d_in_proj * seqlen;
@@ -291,29 +300,53 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
       AT_DISPATCH_FLOATING_TYPES_AND2(
           at::ScalarType::Half, at::ScalarType::BFloat16, z.scalar_type(),
           "chunk_scan_fwd_fused", ([&] {
-              chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, true><<<grid, block>>>(
-                  cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
-                  dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
-                  c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
-                  z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
-                  has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-                  d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
-                  chunk_size, nheads, headdim, d_state, ngroups, seqlen,
-                  has_seq_idx ? 1 : 0);
+              if (use_wmma) {
+                  chunk_scan_fwd_kernel_wmma_bf16in_fused<scalar_t, true><<<grid_wmma, block>>>(
+                      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                      z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                      has_seq_idx ? 1 : 0);
+              } else {
+                  chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, true><<<grid_v3, block>>>(
+                      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                      z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                      has_seq_idx ? 1 : 0);
+              }
           }));
   } else {
       AT_DISPATCH_FLOATING_TYPES_AND2(
           at::ScalarType::Half, at::ScalarType::BFloat16, z.scalar_type(),
           "chunk_scan_fwd_nofuse", ([&] {
-              chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, false><<<grid, block>>>(
-                  cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
-                  dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
-                  c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
-                  z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
-                  has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-                  d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
-                  chunk_size, nheads, headdim, d_state, ngroups, seqlen,
-                  has_seq_idx ? 1 : 0);
+              if (use_wmma) {
+                  chunk_scan_fwd_kernel_wmma_bf16in_fused<scalar_t, false><<<grid_wmma, block>>>(
+                      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                      z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                      has_seq_idx ? 1 : 0);
+              } else {
+                  chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, false><<<grid_v3, block>>>(
+                      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                      z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                      has_seq_idx ? 1 : 0);
+              }
           }));
   }
 
@@ -546,10 +579,18 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
         cb_buf.data_ptr<float>(), batches, chunk_size, seqlen, num_chunks);
   }
 
-  // Use v3_bf16in kernel with BK=32 for better arithmetic intensity
+  // Prefer WMMA kernel when aligned; fallback to v3 otherwise.
+  const char* wmma_env = std::getenv("MAMBA_WMMA");
+  bool wmma_enabled = !wmma_env || std::atoi(wmma_env) != 0;
+  bool wmma_compatible = !has_seq_idx && (headdim % 16 == 0) && (chunk_size % 16 == 0);
+  TORCH_CHECK(!wmma_enabled || wmma_compatible,
+              "WMMA enabled but incompatible shape/seq_idx; disable with MAMBA_WMMA=0");
+  bool use_wmma = wmma_enabled && wmma_compatible;
   dim3 block(16, 16);
-  dim3 grid((headdim + 63) / 64, (chunk_size + 63) / 64,
-            batch * num_chunks * nheads);
+  dim3 grid_v3((headdim + 63) / 64, (chunk_size + 63) / 64,
+               batch * num_chunks * nheads);
+  dim3 grid_wmma((headdim + 63) / 64, (chunk_size + 31) / 32,
+                 batch * num_chunks * nheads);
   
   // Prepare gating params
   int64_t z_stride_b = d_in_proj * seqlen;
@@ -560,29 +601,53 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
       AT_DISPATCH_FLOATING_TYPES_AND2(
           at::ScalarType::Half, at::ScalarType::BFloat16, z.scalar_type(),
           "chunk_scan_fwd_fused_stateful", ([&] {
-              chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, true><<<grid, block>>>(
-                  cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
-                  dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
-                  c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
-                  z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
-                  has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-                  d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
-                  chunk_size, nheads, headdim, d_state, ngroups, seqlen,
-                  has_seq_idx ? 1 : 0);
+              if (use_wmma) {
+                  chunk_scan_fwd_kernel_wmma_bf16in_fused<scalar_t, true><<<grid_wmma, block>>>(
+                      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                      z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                      has_seq_idx ? 1 : 0);
+              } else {
+                  chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, true><<<grid_v3, block>>>(
+                      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                      z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                      has_seq_idx ? 1 : 0);
+              }
           }));
   } else {
       AT_DISPATCH_FLOATING_TYPES_AND2(
           at::ScalarType::Half, at::ScalarType::BFloat16, z.scalar_type(),
           "chunk_scan_fwd_nofuse_stateful", ([&] {
-              chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, false><<<grid, block>>>(
-                  cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
-                  dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
-                  c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
-                  z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
-                  has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-                  d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
-                  chunk_size, nheads, headdim, d_state, ngroups, seqlen,
-                  has_seq_idx ? 1 : 0);
+              if (use_wmma) {
+                  chunk_scan_fwd_kernel_wmma_bf16in_fused<scalar_t, false><<<grid_wmma, block>>>(
+                      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                      z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                      has_seq_idx ? 1 : 0);
+              } else {
+                  chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, false><<<grid_v3, block>>>(
+                      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                      z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                      has_seq_idx ? 1 : 0);
+              }
           }));
   }
 

@@ -1,5 +1,8 @@
 // V5 kernel with 8x8 register blocking (64 accumulators per thread)
 // Trades occupancy for better ILP and register reuse
+#include <cuda_fp16.h>
+#include <mma.h>
+using namespace nvcuda;
 __global__ void chunk_scan_fwd_kernel_v5_8x8(
     const float* CB,
     const at::BFloat16* x,
@@ -868,6 +871,253 @@ __global__ void chunk_scan_fwd_kernel_v3_bf16in_fused(
         
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
+            int64_t n = n0 + j;
+            if (n < headdim) {
+                int64_t out_idx = x_offset + m * headdim + n;
+                float d_val = d_has_hdim ? D[h * headdim + n] : D[h];
+                float val = acc[i][j] + static_cast<float>(x[out_idx]) * d_val;
+
+                if (FUSE_GATE) {
+                    int64_t t = c * chunk_size + m;
+                    if (t < seqlen) {
+                        int64_t z_idx = b * z_stride_b + t * z_stride_l + z_offset + h * headdim + n;
+                        val = val * silu_f(to_float(z[z_idx]));
+                    } else {
+                        val = 0.0f;
+                    }
+                }
+
+                y[out_idx] = val;
+            }
+        }
+    }
+}
+
+// WMMA kernel: BM=32, BN=64, BK=16, bf16 inputs with optional fused Z-gating
+template <typename ZT, bool FUSE_GATE>
+__global__ void chunk_scan_fwd_kernel_wmma_bf16in_fused(
+    const float* CB,
+    const at::BFloat16* x,
+    const float* dt,
+    const float* dA_cumsum,
+    const at::BFloat16* C,
+    const float* state_in,
+    const float* D,
+    const ZT* z,
+    int64_t z_stride_b,
+    int64_t z_stride_l,
+    int64_t z_offset,
+    const int64_t* seq_idx,
+    int64_t seq_stride,
+    int64_t d_has_hdim,
+    float* y,
+    int64_t batch,
+    int64_t num_chunks,
+    int64_t chunk_size,
+    int64_t nheads,
+    int64_t headdim,
+    int64_t d_state,
+    int64_t ngroups,
+    int64_t seqlen,
+    int64_t has_seq_idx) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    return;
+#endif
+    constexpr int BM = 32;
+    constexpr int BN = 64;
+    constexpr int BK = 16;
+    constexpr int TM = 2;
+    constexpr int TN = 4;
+
+    int64_t tile_n = blockIdx.x;
+    int64_t tile_m = blockIdx.y;
+    int64_t pid = blockIdx.z;
+    int64_t b = pid / (num_chunks * nheads);
+    int64_t rem = pid - b * num_chunks * nheads;
+    int64_t c = rem / nheads;
+    int64_t h = rem - c * nheads;
+    if (b >= batch) return;
+
+    int64_t heads_per_group = nheads / ngroups;
+    int64_t g = h / heads_per_group;
+
+    int64_t row_base = tile_m * BM;
+    int64_t col_base = tile_n * BN;
+    int64_t tid_m = threadIdx.y;
+    int64_t tid_n = threadIdx.x;
+    int64_t m0 = row_base + tid_m * TM;
+    int64_t n0 = col_base + tid_n * TN;
+
+    int64_t cb_offset = ((b * num_chunks + c) * ngroups + g) * chunk_size * chunk_size;
+    int64_t c_offset = ((b * num_chunks + c) * ngroups + g) * chunk_size * d_state;
+    int64_t x_offset = ((((b * num_chunks + c) * chunk_size) * nheads + h) * headdim);
+    int64_t state_offset = ((((b * num_chunks + c) * nheads + h) * headdim) * d_state);
+    int64_t dt_offset = (((b * nheads + h) * num_chunks + c) * chunk_size);
+    int64_t seq_base = b * seq_stride + c * chunk_size;
+    int64_t chunk_len = seqlen - c * chunk_size;
+    if (chunk_len > chunk_size) chunk_len = chunk_size;
+    int64_t seq_prev = -1;
+    if (has_seq_idx && c > 0) seq_prev = seq_idx[seq_base - 1];
+
+    __shared__ __half cb_half[BM][BK];
+    __shared__ __half x_half[BK][BN];
+    __shared__ float c_s[BM][BK];
+    __shared__ float st_s[BK][BN];
+    __shared__ float dA_m[BM];
+    __shared__ float dA_k[BK];
+    __shared__ float dt_k[BK];
+    __shared__ float out_s[BM][BN];
+
+    int load_idx = threadIdx.y * 16 + threadIdx.x;
+    if (load_idx < BM) {
+        int64_t m = row_base + load_idx;
+        dA_m[load_idx] = (m < chunk_size) ? dA_cumsum[dt_offset + m] : 0.0f;
+    }
+    __syncthreads();
+
+    int warp_id = (threadIdx.y * 16 + threadIdx.x) >> 5;
+    int warp_m = warp_id / (BN / 16);
+    int warp_n = warp_id % (BN / 16);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+    wmma::fill_fragment(acc_frag, 0.0f);
+
+    for (int64_t k0 = 0; k0 < chunk_size; k0 += BK) {
+        if (load_idx < BK) {
+            int64_t k = k0 + load_idx;
+            dA_k[load_idx] = (k < chunk_size) ? dA_cumsum[dt_offset + k] : 0.0f;
+            dt_k[load_idx] = (k < chunk_size) ? dt[dt_offset + k] : 0.0f;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            int idx = load_idx + l * 256;
+            int r = idx / BK;
+            int k_in = idx % BK;
+            if (r < BM) {
+                int64_t m_global = row_base + r;
+                int64_t k_global = k0 + k_in;
+                float val = 0.0f;
+                if (m_global < chunk_size && k_global < chunk_size && k_global <= m_global) {
+                    float scale = __expf(fminf(dA_m[r] - dA_k[k_in], 0.0f)) * dt_k[k_in];
+                    val = CB[cb_offset + m_global * chunk_size + k_global] * scale;
+                }
+                cb_half[r][k_in] = __float2half_rn(val);
+            }
+        }
+
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            int idx = load_idx + l * 256;
+            int row = idx / BN;
+            int col = idx % BN;
+            if (row < BK) {
+                int64_t k = k0 + row;
+                int64_t n = col_base + col;
+                float x_val = 0.0f;
+                if (k < chunk_size && n < headdim) {
+                    x_val = static_cast<float>(x[x_offset + k * headdim + n]);
+                }
+                x_half[row][col] = __float2half_rn(x_val);
+            }
+        }
+        __syncthreads();
+
+        if (warp_id < (BM / 16) * (BN / 16)) {
+            int a_row = warp_m * 16;
+            int b_col = warp_n * 16;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+            wmma::load_matrix_sync(a_frag, &cb_half[a_row][0], BK);
+            wmma::load_matrix_sync(b_frag, &x_half[0][b_col], BN);
+            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+        }
+        __syncthreads();
+    }
+
+    if (warp_id < (BM / 16) * (BN / 16)) {
+        int a_row = warp_m * 16;
+        int b_col = warp_n * 16;
+        wmma::store_matrix_sync(&out_s[a_row][b_col], acc_frag, BN, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    float acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            int row = tid_m * TM + i;
+            int col = tid_n * TN + j;
+            acc[i][j] = (row < BM && col < BN) ? out_s[row][col] : 0.0f;
+        }
+    }
+
+    float dA_m_vals[TM];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        dA_m_vals[i] = dA_m[tid_m * TM + i];
+    }
+
+    float contrib_scales[TM];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        int row = tid_m * TM + i;
+        int64_t m = row_base + row;
+        contrib_scales[i] = 0.0f;
+        if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
+            contrib_scales[i] = __expf(fminf(dA_m_vals[i], 0.0f));
+        }
+    }
+
+    for (int64_t k0 = 0; k0 < d_state; k0 += BK) {
+        #pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            int idx = load_idx + l * 256;
+            int row = idx / BK;
+            int col = idx % BK;
+            if (row < BM) {
+                int64_t m = row_base + row;
+                int64_t k = k0 + col;
+                c_s[row][col] = (m < chunk_size && k < d_state)
+                    ? static_cast<float>(C[c_offset + m * d_state + k]) : 0.0f;
+            }
+        }
+
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            int idx = load_idx + l * 256;
+            int row = idx / BN;
+            int col = idx % BN;
+            if (row < BK) {
+                int64_t k = k0 + row;
+                int64_t n = col_base + col;
+                st_s[row][col] = (k < d_state && n < headdim)
+                    ? state_in[state_offset + n * d_state + k] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                float cv = c_s[tid_m * TM + i][k] * contrib_scales[i];
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += cv * st_s[k][tid_n * TN + j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        int64_t m = m0 + i;
+        if (m >= chunk_size) continue;
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
             int64_t n = n0 + j;
             if (n < headdim) {
                 int64_t out_idx = x_offset + m * headdim + n;
