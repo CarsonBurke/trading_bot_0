@@ -107,11 +107,20 @@ impl TradingModel {
             .forward(&x_2d.reshape([btk, MODEL_DIM]))
             .reshape([bt, TICKERS_COUNT, MODEL_DIM]);
         let latent_q = x_ticker_norm.apply(&block.ticker_latent_q);
-        let latent_k = block.ticker_latent_k.to_kind(latent_q.kind());
+        let kind = latent_q.kind();
+        let latent_k = if block.ticker_latent_k.kind() == kind {
+            block.ticker_latent_k.shallow_clone()
+        } else {
+            block.ticker_latent_k.to_kind(kind)
+        };
         let latent_scores =
             latent_q.matmul(&latent_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
-        let latent_attn = latent_scores.softmax(-1, Kind::Float).to_kind(latent_q.kind());
-        let latent_v = block.ticker_latent_v.to_kind(latent_q.kind());
+        let latent_attn = latent_scores.softmax(-1, Kind::Float).to_kind(kind);
+        let latent_v = if block.ticker_latent_v.kind() == kind {
+            block.ticker_latent_v.shallow_clone()
+        } else {
+            block.ticker_latent_v.to_kind(kind)
+        };
         let latent_ctx = latent_attn
             .matmul(&latent_v)
             .apply(&block.ticker_out)

@@ -282,8 +282,6 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
   const char* wmma_env = std::getenv("MAMBA_WMMA");
   bool wmma_enabled = !wmma_env || std::atoi(wmma_env) != 0;
   bool wmma_compatible = !has_seq_idx && (headdim % 16 == 0) && (chunk_size % 16 == 0);
-  TORCH_CHECK(!wmma_enabled || wmma_compatible,
-              "WMMA enabled but incompatible shape/seq_idx; disable with MAMBA_WMMA=0");
   bool use_wmma = wmma_enabled && wmma_compatible;
   dim3 block(16, 16);
   dim3 grid_v3((headdim + 63) / 64, (chunk_size + 63) / 64,
@@ -583,8 +581,6 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
   const char* wmma_env = std::getenv("MAMBA_WMMA");
   bool wmma_enabled = !wmma_env || std::atoi(wmma_env) != 0;
   bool wmma_compatible = !has_seq_idx && (headdim % 16 == 0) && (chunk_size % 16 == 0);
-  TORCH_CHECK(!wmma_enabled || wmma_compatible,
-              "WMMA enabled but incompatible shape/seq_idx; disable with MAMBA_WMMA=0");
   bool use_wmma = wmma_enabled && wmma_compatible;
   dim3 block(16, 16);
   dim3 grid_v3((headdim + 63) / 64, (chunk_size + 63) / 64,

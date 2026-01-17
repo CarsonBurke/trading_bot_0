@@ -37,7 +37,7 @@ struct InterTickerBlock {
 impl InterTickerBlock {
     fn new(p: &nn::Path, kv_heads: i64, head_dim: i64, ticker_latents: i64) -> Self {
         let _ = (kv_heads, head_dim);
-        let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), MODEL_DIM, 1e-5);
+        let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), MODEL_DIM, 1e-6);
         let ticker_rp_q = nn::linear(p / "ticker_rp_q", MODEL_DIM, MODEL_DIM, Default::default());
         let ticker_rp_v = p.var(
             "ticker_rp_v",
@@ -73,7 +73,7 @@ impl InterTickerBlock {
         let ticker_out = nn::linear(p / "ticker_out", MODEL_DIM, MODEL_DIM, Default::default());
         let mlp_fc1 = nn::linear(p / "mlp_fc1", MODEL_DIM, 2 * FF_DIM, Default::default());
         let mlp_fc2 = nn::linear(p / "mlp_fc2", FF_DIM, MODEL_DIM, Default::default());
-        let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), MODEL_DIM, 1e-5);
+        let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), MODEL_DIM, 1e-6);
         let alpha_ticker_rp = p.var("alpha_ticker_rp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         let alpha_ticker_attn =
             p.var("alpha_ticker_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
@@ -117,7 +117,7 @@ const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const HEAD_HIDDEN: i64 = 192;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
-const RESIDUAL_ALPHA_INIT: f64 = -2.0;
+const RESIDUAL_ALPHA_INIT: f64 = -4.0;
 const ROPE_BASE: f64 = 10000.0;
 const TICKER_LATENT_FACTORS: i64 = 32;
 
@@ -458,9 +458,9 @@ impl TradingModel {
             .map(|i| stateful_mamba_block_cfg(&(p / format!("ssm_{}", i)), ssm_cfg.clone()))
             .collect::<Vec<_>>();
         let ssm_norms = (0..config.ssm_layers)
-            .map(|i| RMSNorm::new(&(p / format!("ssm_norm_{}", i)), SSM_DIM, 1e-5))
+            .map(|i| RMSNorm::new(&(p / format!("ssm_norm_{}", i)), SSM_DIM, 1e-6))
             .collect::<Vec<_>>();
-        let post_ssm_ln = RMSNorm::new(&(p / "post_ssm_ln"), SSM_DIM, 1e-5);
+        let post_ssm_ln = RMSNorm::new(&(p / "post_ssm_ln"), SSM_DIM, 1e-6);
         let ssm_gate = nn::linear(p / "ssm_gate", SSM_DIM, SSM_DIM, Default::default());
         let ssm_proj = nn::conv1d(p / "ssm_proj", SSM_DIM, MODEL_DIM, 1, Default::default());
 
@@ -470,7 +470,7 @@ impl TradingModel {
             MODEL_DIM,
             Default::default(),
         );
-        let ln_static_proj = RMSNorm::new(&(p / "ln_static_proj"), MODEL_DIM, 1e-5);
+        let ln_static_proj = RMSNorm::new(&(p / "ln_static_proj"), MODEL_DIM, 1e-6);
         let static_to_temporal = nn::linear(
             p / "static_to_temporal",
             PER_TICKER_STATIC_OBS as i64,
@@ -478,7 +478,7 @@ impl TradingModel {
             Default::default(),
         );
         let ln_static_temporal =
-            RMSNorm::new(&(p / "ln_static_temporal"), TEMPORAL_STATIC_DIM, 1e-5);
+            RMSNorm::new(&(p / "ln_static_temporal"), TEMPORAL_STATIC_DIM, 1e-6);
         let pma_queries = p.var(
             "pma_queries",
             &[PMA_QUERIES, MODEL_DIM],
@@ -584,9 +584,9 @@ impl TradingModel {
                 ..Default::default()
             },
         );
-        let head_ln = RMSNorm::new(&(p / "head_ln"), HEAD_HIDDEN, 1e-5);
-        let policy_ln = RMSNorm::new(&(p / "policy_ln"), MODEL_DIM, 1e-5);
-        let value_ln = RMSNorm::new(&(p / "value_ln"), MODEL_DIM, 1e-5);
+        let head_ln = RMSNorm::new(&(p / "head_ln"), HEAD_HIDDEN, 1e-6);
+        let policy_ln = RMSNorm::new(&(p / "policy_ln"), MODEL_DIM, 1e-6);
+        let value_ln = RMSNorm::new(&(p / "value_ln"), MODEL_DIM, 1e-6);
         let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", MODEL_DIM, MODEL_DIM, Default::default());
         let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, Default::default());
         let actor_out = nn::linear(
@@ -627,7 +627,7 @@ impl TradingModel {
         let cash_attn_temp_raw = p.var("cash_attn_temp_raw", &[1], Init::Const(0.0));
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", HEAD_HIDDEN, SDE_LATENT_DIM, Default::default());
-        let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-5);
+        let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-6);
         let log_std_param = p.var(
             "log_std",
             &[SDE_LATENT_DIM, TICKERS_COUNT],
@@ -779,7 +779,13 @@ impl TradingModel {
 
     fn patch_embed_single(&self, ticker_data: &Tensor) -> Tensor {
         let deltas = ticker_data.to_device(self.device);
-        self.patch_embed_fused(&deltas) + self.stem_pos_embed.to_kind(deltas.kind())
+        let kind = deltas.kind();
+        let pos_embed = if self.stem_pos_embed.kind() == kind {
+            self.stem_pos_embed.shallow_clone()
+        } else {
+            self.stem_pos_embed.to_kind(kind)
+        };
+        self.patch_embed_fused(&deltas) + pos_embed
     }
 
     fn normalize_seq_idx(&self, seq_idx: &Tensor, batch_size: i64) -> Tensor {
@@ -812,7 +818,12 @@ impl TradingModel {
             .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
 
         let kind = deltas.kind();
-        let x = self.patch_embed_fused(&deltas) + self.stem_pos_embed.to_kind(kind);
+        let pos_embed = if self.stem_pos_embed.kind() == kind {
+            self.stem_pos_embed.shallow_clone()
+        } else {
+            self.stem_pos_embed.to_kind(kind)
+        };
+        let x = self.patch_embed_fused(&deltas) + pos_embed;
         let seq_idx = match seq_idx {
             Some(seq_idx) => self.normalize_seq_idx(seq_idx, batch_size),
             None => Self::build_seq_idx_from_padding(

@@ -9,3 +9,4 @@ ai_*.md
 CLAUDE.md
 .env
 bench_*.json
+.claude/

@@ -290,15 +290,15 @@ impl Mamba2 {
         let inv_dt = &dt_init + (-&dt_init).expm1().neg().log();
         let dt_bias = p.var_copy("dt_bias", &inv_dt);
 
-        // A: per-head scalar
-        let a = Tensor::empty(&[nheads], (Kind::Float, p.device())).uniform_(1.0, 16.0);
-        let a_log = p.var_copy("A_log", &a.log());
+        // A: per-head scalar (S4D-style initialization)
+        let a_log = Tensor::empty(&[nheads], (Kind::Float, p.device())).uniform_(-4.0, -1.0);
+        let a_log = p.var_copy("A_log", &a_log);
 
         // D: skip connection - per-head or per-channel depending on d_has_hdim
         let d_param = if config.d_has_hdim {
-            p.var("D", &[nheads, config.headdim], Init::Const(1.0))
+            p.var("D", &[nheads, config.headdim], Init::Const(0.1))
         } else {
-            p.var("D", &[nheads], Init::Const(1.0))
+            p.var("D", &[nheads], Init::Const(0.1))
         };
 
         // Optional RMSNorm with gating and group normalization
@@ -306,7 +306,7 @@ impl Mamba2 {
             Some(RMSNormGated::new(
                 &(p / "norm"),
                 d_ssm,
-                1e-5,
+                1e-6,
                 config.norm_before_gate,
                 ngroups,
             ))
@@ -971,33 +971,84 @@ impl Mamba2 {
         let kind = zxbcdt.kind();
 
         let dt_scale_tensor = match dt_scale {
-            Some(scale) => scale.to_kind(kind).to_device(device),
+            Some(scale) => {
+                if scale.kind() == kind && scale.device() == device {
+                    scale.shallow_clone()
+                } else {
+                    scale.to_kind(kind).to_device(device)
+                }
+            }
             None => Tensor::zeros(&[0], (kind, device)),
         };
-        let conv_w = self.conv1d.ws.squeeze_dim(1).to_kind(kind).to_device(device);
+
+        let conv_w = self.conv1d.ws.squeeze_dim(1);
+        let conv_w = if conv_w.kind() == kind && conv_w.device() == device {
+            conv_w
+        } else {
+            conv_w.to_kind(kind).to_device(device)
+        };
+
         let conv_b = match &self.conv1d.bs {
-            Some(bias) => bias.to_kind(kind).to_device(device),
+            Some(bias) => {
+                if bias.kind() == kind && bias.device() == device {
+                    bias.shallow_clone()
+                } else {
+                    bias.to_kind(kind).to_device(device)
+                }
+            }
             None => Tensor::zeros(&[0], (kind, device)),
         };
-        let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
-        let a_log = self.a_log.to_kind(kind).to_device(device);
-        let d_param = self.d_param.to_kind(kind).to_device(device);
+
+        let dt_bias = if self.dt_bias.kind() == kind && self.dt_bias.device() == device {
+            self.dt_bias.shallow_clone()
+        } else {
+            self.dt_bias.to_kind(kind).to_device(device)
+        };
+
+        let a_log = if self.a_log.kind() == kind && self.a_log.device() == device {
+            self.a_log.shallow_clone()
+        } else {
+            self.a_log.to_kind(kind).to_device(device)
+        };
+
+        let d_param = if self.d_param.kind() == kind && self.d_param.device() == device {
+            self.d_param.shallow_clone()
+        } else {
+            self.d_param.to_kind(kind).to_device(device)
+        };
+
         let initial_state = Tensor::zeros(&[batch, nheads, headdim, d_state], (kind, device));
         let seq_idx = match seq_idx {
             Some(idx) => idx.to_device(device),
             None => Tensor::zeros(&[0], (Kind::Int64, device)),
         };
+
         let (rmsnorm_weight, rmsnorm_eps, norm_before_gate) = match &self.norm {
-            Some(norm) => (
-                norm.weight.to_kind(kind).to_device(device),
-                norm.eps,
-                norm.norm_before_gate,
-            ),
-            None => (Tensor::zeros(&[0], (kind, device)), 1e-5, false),
+            Some(norm) => {
+                let weight = if norm.weight.kind() == kind && norm.weight.device() == device {
+                    norm.weight.shallow_clone()
+                } else {
+                    norm.weight.to_kind(kind).to_device(device)
+                };
+                (weight, norm.eps, norm.norm_before_gate)
+            }
+            None => (Tensor::zeros(&[0], (kind, device)), 1e-6, false),
         };
-        let outproj_w = self.out_proj.ws.to_kind(kind).to_device(device);
+
+        let outproj_w = if self.out_proj.ws.kind() == kind && self.out_proj.ws.device() == device {
+            self.out_proj.ws.shallow_clone()
+        } else {
+            self.out_proj.ws.to_kind(kind).to_device(device)
+        };
+
         let outproj_b = match &self.out_proj.bs {
-            Some(bias) => bias.to_kind(kind).to_device(device),
+            Some(bias) => {
+                if bias.kind() == kind && bias.device() == device {
+                    bias.shallow_clone()
+                } else {
+                    bias.to_kind(kind).to_device(device)
+                }
+            }
             None => Tensor::zeros(&[0], (kind, device)),
         };
 
@@ -1092,31 +1143,88 @@ impl Mamba2 {
         let device = zxbcdt.device();
         let kind = zxbcdt.kind();
         let seqlen = zxbcdt.size()[1];
+
         let dt_scale_tensor = match dt_scale {
-            Some(scale) => scale.to_kind(kind).to_device(device),
+            Some(scale) => {
+                if scale.kind() == kind && scale.device() == device {
+                    scale.shallow_clone()
+                } else {
+                    scale.to_kind(kind).to_device(device)
+                }
+            }
             None => Tensor::zeros(&[0], (kind, device)),
         };
-        let conv_w = self.conv1d.ws.squeeze_dim(1).to_kind(kind).to_device(device);
+
+        let conv_w = self.conv1d.ws.squeeze_dim(1);
+        let conv_w = if conv_w.kind() == kind && conv_w.device() == device {
+            conv_w
+        } else {
+            conv_w.to_kind(kind).to_device(device)
+        };
+
         let conv_b = match &self.conv1d.bs {
-            Some(bias) => bias.to_kind(kind).to_device(device),
+            Some(bias) => {
+                if bias.kind() == kind && bias.device() == device {
+                    bias.shallow_clone()
+                } else {
+                    bias.to_kind(kind).to_device(device)
+                }
+            }
             None => Tensor::zeros(&[0], (kind, device)),
         };
-        let dt_bias = self.dt_bias.to_kind(kind).to_device(device);
-        let a_log = self.a_log.to_kind(kind).to_device(device);
-        let d_param = self.d_param.to_kind(kind).to_device(device);
-        let initial_state = state.ssm_state.to_kind(kind).to_device(device);
-        let seq_idx = Tensor::zeros(&[0], (Kind::Int64, device));
-        let (rmsnorm_weight, rmsnorm_eps, norm_before_gate) = match &self.norm {
-            Some(norm) => (
-                norm.weight.to_kind(kind).to_device(device),
-                norm.eps,
-                norm.norm_before_gate,
-            ),
-            None => (Tensor::zeros(&[0], (kind, device)), 1e-5, false),
+
+        let dt_bias = if self.dt_bias.kind() == kind && self.dt_bias.device() == device {
+            self.dt_bias.shallow_clone()
+        } else {
+            self.dt_bias.to_kind(kind).to_device(device)
         };
-        let outproj_w = self.out_proj.ws.to_kind(kind).to_device(device);
+
+        let a_log = if self.a_log.kind() == kind && self.a_log.device() == device {
+            self.a_log.shallow_clone()
+        } else {
+            self.a_log.to_kind(kind).to_device(device)
+        };
+
+        let d_param = if self.d_param.kind() == kind && self.d_param.device() == device {
+            self.d_param.shallow_clone()
+        } else {
+            self.d_param.to_kind(kind).to_device(device)
+        };
+
+        let initial_state = if state.ssm_state.kind() == kind && state.ssm_state.device() == device {
+            state.ssm_state.shallow_clone()
+        } else {
+            state.ssm_state.to_kind(kind).to_device(device)
+        };
+
+        let seq_idx = Tensor::zeros(&[0], (Kind::Int64, device));
+
+        let (rmsnorm_weight, rmsnorm_eps, norm_before_gate) = match &self.norm {
+            Some(norm) => {
+                let weight = if norm.weight.kind() == kind && norm.weight.device() == device {
+                    norm.weight.shallow_clone()
+                } else {
+                    norm.weight.to_kind(kind).to_device(device)
+                };
+                (weight, norm.eps, norm.norm_before_gate)
+            }
+            None => (Tensor::zeros(&[0], (kind, device)), 1e-6, false),
+        };
+
+        let outproj_w = if self.out_proj.ws.kind() == kind && self.out_proj.ws.device() == device {
+            self.out_proj.ws.shallow_clone()
+        } else {
+            self.out_proj.ws.to_kind(kind).to_device(device)
+        };
+
         let outproj_b = match &self.out_proj.bs {
-            Some(bias) => bias.to_kind(kind).to_device(device),
+            Some(bias) => {
+                if bias.kind() == kind && bias.device() == device {
+                    bias.shallow_clone()
+                } else {
+                    bias.to_kind(kind).to_device(device)
+                }
+            }
             None => Tensor::zeros(&[0], (kind, device)),
         };
 
@@ -1148,7 +1256,6 @@ impl Mamba2 {
                 &outproj_w,
                 &outproj_b,
             );
-            state.ssm_state.copy_(&new_ssm_state);
             state.ssm_state.copy_(&new_ssm_state.to_kind(state.ssm_state.kind()));
             state
                 .conv_state
@@ -1419,7 +1526,7 @@ pub fn mamba_stack_cfg(p: &nn::Path, config: Mamba2Config, n_layers: i64) -> Mam
             };
             (
                 Mamba2::new(&(p / format!("layer_{}", i)), cfg),
-                RMSNormSimple::new(&(p / format!("ln_{}", i)), config.d_model, 1e-5),
+                RMSNormSimple::new(&(p / format!("ln_{}", i)), config.d_model, 1e-6),
             )
         })
         .collect();
