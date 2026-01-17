@@ -35,7 +35,7 @@ enum Commands {
         weights: Option<String>,
     },
     Infer {
-        #[arg(short, long, default_value = "weights/ppo_ep1000.safetensors")]
+        #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
         #[arg(short, long, default_value_t = 10)]
@@ -54,7 +54,7 @@ enum Commands {
         random_start: bool,
     },
     Paper {
-        #[arg(short, long, default_value = "weights/ppo_ep1000.safetensors")]
+        #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
         #[arg(short, long, value_delimiter = ',', default_value = "TSLA,AAPL")]

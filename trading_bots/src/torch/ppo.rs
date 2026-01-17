@@ -497,5 +497,15 @@ pub async fn train(weights_path: Option<&str>) {
 
         println!("  Loss: {:.4} (Policy: {:.4}, Value: {:.4}, MAE: {:.4}) GradNorm: {:.4}", 
                  mean_loss, mean_policy_loss, mean_value_loss, mean_value_mae / CRITIC_MAE_NORM, mean_grad_norm);
+
+        if episode > 0 && episode % 50 == 0 {
+            let _ = std::fs::create_dir_all("weights");
+            let path = format!("weights/ppo_ep{}.ot", episode);
+            if let Err(err) = vs.save(&path) {
+                println!("Error while saving weights: {}", err);
+            } else {
+                println!("Saved model weights: {}", path);
+            }
+        }
     }
 }

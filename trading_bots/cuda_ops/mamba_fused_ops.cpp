@@ -25,7 +25,8 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
     int64_t ngroups,
     int64_t headdim,
     double dt_min,
-    double dt_max);
+    double dt_max,
+    bool fuse_gate);
 
 std::vector<torch::Tensor> mamba_fused_backward_cuda(
     const torch::Tensor& zxbcdt,
@@ -45,7 +46,8 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
     int64_t ngroups,
     int64_t headdim,
     double dt_min,
-    double dt_max);
+    double dt_max,
+    bool fuse_gate);
 
 std::vector<torch::Tensor> mamba_fused_forward_infer_cuda(
     const torch::Tensor& zxbcdt,
@@ -83,7 +85,8 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
     int64_t ngroups,
     int64_t headdim,
     double dt_min,
-    double dt_max);
+    double dt_max,
+    bool fuse_gate);
 
 torch::Tensor mamba_fused_post_ssm(
     const torch::Tensor& y_ssm,
@@ -94,7 +97,8 @@ torch::Tensor mamba_fused_post_ssm(
     int64_t ngroups,
     double eps,
     bool norm_before_gate,
-    torch::ScalarType out_type);
+    torch::ScalarType out_type,
+    bool is_gated);
 std::tuple<torch::Tensor, torch::Tensor> selective_state_update_cuda(
     const torch::Tensor& state,
     const torch::Tensor& x,
@@ -177,16 +181,18 @@ struct MambaFusedFunction : public torch::autograd::Function<MambaFusedFunction>
         int64_t ngroups,
         int64_t headdim,
         double dt_min,
-        double dt_max) {
+        double dt_max,
+        bool fuse_gate) {
         auto outputs = mamba_fused_forward_cuda(
             zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state, seq_idx,
-            chunk_size, ngroups, headdim, dt_min, dt_max);
+            chunk_size, ngroups, headdim, dt_min, dt_max, fuse_gate);
         ctx->save_for_backward({zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state, seq_idx, outputs[1], outputs[0]});
         ctx->saved_data["chunk_size"] = chunk_size;
         ctx->saved_data["ngroups"] = ngroups;
         ctx->saved_data["headdim"] = headdim;
         ctx->saved_data["dt_min"] = dt_min;
         ctx->saved_data["dt_max"] = dt_max;
+        ctx->saved_data["fuse_gate"] = fuse_gate;
         return outputs;
     }
 
@@ -226,7 +232,8 @@ struct MambaFusedFunction : public torch::autograd::Function<MambaFusedFunction>
             ctx->saved_data["ngroups"].toInt(),
             ctx->saved_data["headdim"].toInt(),
             ctx->saved_data["dt_min"].toDouble(),
-            ctx->saved_data["dt_max"].toDouble());
+            ctx->saved_data["dt_max"].toDouble(),
+            ctx->saved_data["fuse_gate"].toBool());
 
         return {
             grads[0],
@@ -247,6 +254,28 @@ struct MambaFusedFunction : public torch::autograd::Function<MambaFusedFunction>
     }
 };
 
+std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan_autograd(
+    const torch::Tensor& zxbcdt,
+    const torch::Tensor& conv_w,
+    const torch::Tensor& conv_b,
+    const torch::Tensor& dt_bias,
+    const torch::Tensor& a_log,
+    const torch::Tensor& d_param,
+    const torch::Tensor& dt_scale,
+    const torch::Tensor& initial_state,
+    const torch::Tensor& seq_idx,
+    int64_t chunk_size,
+    int64_t ngroups,
+    int64_t headdim,
+    double dt_min,
+    double dt_max,
+    bool fuse_gate) {
+    auto outputs = MambaFusedFunction::apply(
+        zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state, seq_idx,
+        chunk_size, ngroups, headdim, dt_min, dt_max, fuse_gate);
+    return {outputs[0], outputs[1]};
+}
+
 std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan(
     const torch::Tensor& zxbcdt,
     const torch::Tensor& conv_w,
@@ -262,10 +291,9 @@ std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan(
     int64_t headdim,
     double dt_min,
     double dt_max) {
-    auto outputs = MambaFusedFunction::apply(
+    return mamba_fused_conv_scan_autograd(
         zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state, seq_idx,
-        chunk_size, ngroups, headdim, dt_min, dt_max);
-    return {outputs[0], outputs[1]};
+        chunk_size, ngroups, headdim, dt_min, dt_max, false);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan_infer(
@@ -331,7 +359,8 @@ std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan_full(
     bool norm_before_gate,
     const torch::Tensor& outproj_w,
     const torch::Tensor& outproj_b) {
-    auto outputs = mamba_fused_conv_scan(
+    bool fuse_gate = !norm_before_gate;
+    auto outputs = mamba_fused_conv_scan_autograd(
         zxbcdt,
         conv_w,
         conv_b,
@@ -345,7 +374,8 @@ std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan_full(
         ngroups,
         headdim,
         dt_min,
-        dt_max);
+        dt_max,
+        fuse_gate);
     auto y = std::get<0>(outputs);
     auto final_state = std::get<1>(outputs);
 
@@ -365,7 +395,8 @@ std::tuple<torch::Tensor, torch::Tensor> mamba_fused_conv_scan_full(
         ngroups,
         rmsnorm_eps,
         norm_before_gate,
-        outproj_w.defined() ? outproj_w.scalar_type() : zxbcdt.scalar_type());
+        outproj_w.defined() ? outproj_w.scalar_type() : zxbcdt.scalar_type(),
+        fuse_gate);
 
     torch::Tensor out;
     if (outproj_w.defined() && outproj_w.numel() > 0) {
@@ -405,6 +436,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mamba_fused_conv_scan_st
     bool norm_before_gate,
     const torch::Tensor& outproj_w,
     const torch::Tensor& outproj_b) {
+    bool fuse_gate = !norm_before_gate;
     auto outputs = mamba_fused_forward_stateful_cuda(
         zxbcdt,
         conv_w,
@@ -420,7 +452,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mamba_fused_conv_scan_st
         ngroups,
         headdim,
         dt_min,
-        dt_max);
+        dt_max,
+        fuse_gate);
     auto y = outputs[0];
     auto final_state = outputs[1];
     auto conv_state_out = outputs[2];
@@ -441,7 +474,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mamba_fused_conv_scan_st
         ngroups,
         rmsnorm_eps,
         norm_before_gate,
-        outproj_w.defined() ? outproj_w.scalar_type() : zxbcdt.scalar_type());
+        outproj_w.defined() ? outproj_w.scalar_type() : zxbcdt.scalar_type(),
+        fuse_gate);
 
     torch::Tensor out;
     if (outproj_w.defined() && outproj_w.numel() > 0) {

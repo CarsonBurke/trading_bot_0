@@ -663,8 +663,9 @@ __global__ void chunk_scan_fwd_kernel_v3(
     }
 }
 
-// V3 kernel with BK=32 and bf16 inputs for x and C
-__global__ void chunk_scan_fwd_kernel_v3_bf16in(
+// V3 kernel with BK=32 and bf16 inputs for x and C, with optional fused Z-gating
+template <typename ZT, bool FUSE_GATE>
+__global__ void chunk_scan_fwd_kernel_v3_bf16in_fused(
     const float* CB,
     const at::BFloat16* x,
     const float* dt,
@@ -672,6 +673,10 @@ __global__ void chunk_scan_fwd_kernel_v3_bf16in(
     const at::BFloat16* C,
     const float* state_in,
     const float* D,
+    const ZT* z,                // New: z tensor for gating
+    int64_t z_stride_b,         // New
+    int64_t z_stride_l,         // New
+    int64_t z_offset,           // New
     const int64_t* seq_idx,
     int64_t seq_stride,
     int64_t d_has_hdim,
@@ -860,13 +865,26 @@ __global__ void chunk_scan_fwd_kernel_v3_bf16in(
     for (int i = 0; i < 4; ++i) {
         int64_t m = m0 + i;
         if (m >= chunk_size) continue;
+        
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             int64_t n = n0 + j;
             if (n < headdim) {
                 int64_t out_idx = x_offset + m * headdim + n;
                 float d_val = d_has_hdim ? D[h * headdim + n] : D[h];
-                y[out_idx] = acc[i][j] + static_cast<float>(x[out_idx]) * d_val;
+                float val = acc[i][j] + static_cast<float>(x[out_idx]) * d_val;
+
+                if (FUSE_GATE) {
+                    int64_t t = c * chunk_size + m;
+                    if (t < seqlen) {
+                        int64_t z_idx = b * z_stride_b + t * z_stride_l + z_offset + h * headdim + n;
+                        val = val * silu_f(to_float(z[z_idx]));
+                    } else {
+                        val = 0.0f;
+                    }
+                }
+
+                y[out_idx] = val;
             }
         }
     }

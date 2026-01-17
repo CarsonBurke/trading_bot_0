@@ -72,7 +72,7 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
     const torch::Tensor &a_log, const torch::Tensor &d_param,
     const torch::Tensor &dt_scale, const torch::Tensor &initial_state,
     const torch::Tensor &seq_idx, int64_t chunk_size, int64_t ngroups,
-    int64_t headdim, double dt_min, double dt_max) {
+    int64_t headdim, double dt_min, double dt_max, bool fuse_gate = false) {
   at::NoGradGuard no_grad;
   auto z = zxbcdt.contiguous();
   auto w = conv_w.to(z.scalar_type()).contiguous();
@@ -281,14 +281,42 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
   dim3 block(16, 16);
   dim3 grid((headdim + 63) / 64, (chunk_size + 63) / 64,
             batch * num_chunks * nheads);
-  chunk_scan_fwd_kernel_v3_bf16in<<<grid, block>>>(
-      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
-      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
-      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
-      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
-      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
-      has_seq_idx ? 1 : 0);
+  
+  // Prepare gating params
+  int64_t z_stride_b = d_in_proj * seqlen;
+  int64_t z_stride_l = d_in_proj;
+  int64_t z_offset = 2 * d_mlp;
+
+  if (fuse_gate) {
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          at::ScalarType::Half, at::ScalarType::BFloat16, z.scalar_type(),
+          "chunk_scan_fwd_fused", ([&] {
+              chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, true><<<grid, block>>>(
+                  cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                  dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                  c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                  z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                  has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                  d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                  chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                  has_seq_idx ? 1 : 0);
+          }));
+  } else {
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          at::ScalarType::Half, at::ScalarType::BFloat16, z.scalar_type(),
+          "chunk_scan_fwd_nofuse", ([&] {
+              chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, false><<<grid, block>>>(
+                  cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                  dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                  c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                  z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                  has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                  d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                  chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                  has_seq_idx ? 1 : 0);
+          }));
+  }
+
   y.copy_(y_padded_f.view({batch, num_chunks * chunk_size, nheads, headdim})
               .slice(1, 0, seqlen)
               .to(y.scalar_type()));
@@ -302,7 +330,7 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
     const torch::Tensor &dt_scale, const torch::Tensor &initial_state,
     const torch::Tensor &conv_state, const torch::Tensor &seq_idx,
     int64_t chunk_size, int64_t ngroups, int64_t headdim, double dt_min,
-    double dt_max) {
+    double dt_max, bool fuse_gate = false) {
   at::NoGradGuard no_grad;
   auto z = zxbcdt.contiguous();
   auto w = conv_w.to(z.scalar_type()).contiguous();
@@ -522,14 +550,42 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
   dim3 block(16, 16);
   dim3 grid((headdim + 63) / 64, (chunk_size + 63) / 64,
             batch * num_chunks * nheads);
-  chunk_scan_fwd_kernel_v3_bf16in<<<grid, block>>>(
-      cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
-      dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
-      c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
-      has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
-      d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
-      chunk_size, nheads, headdim, d_state, ngroups, seqlen,
-      has_seq_idx ? 1 : 0);
+  
+  // Prepare gating params
+  int64_t z_stride_b = d_in_proj * seqlen;
+  int64_t z_stride_l = d_in_proj;
+  int64_t z_offset = 2 * d_mlp;
+
+  if (fuse_gate) {
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          at::ScalarType::Half, at::ScalarType::BFloat16, z.scalar_type(),
+          "chunk_scan_fwd_fused_stateful", ([&] {
+              chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, true><<<grid, block>>>(
+                  cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                  dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                  c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                  z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                  has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                  d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                  chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                  has_seq_idx ? 1 : 0);
+          }));
+  } else {
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          at::ScalarType::Half, at::ScalarType::BFloat16, z.scalar_type(),
+          "chunk_scan_fwd_nofuse_stateful", ([&] {
+              chunk_scan_fwd_kernel_v3_bf16in_fused<scalar_t, false><<<grid, block>>>(
+                  cb_buf.data_ptr<float>(), x_buf.data_ptr<at::BFloat16>(),
+                  dt_buf.data_ptr<float>(), dA_buf.data_ptr<float>(),
+                  c_mat.data_ptr<at::BFloat16>(), state_in.data_ptr<float>(), d.data_ptr<float>(),
+                  z.data_ptr<scalar_t>(), z_stride_b, z_stride_l, z_offset,
+                  has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride,
+                  d_has_hdim ? 1 : 0, y_padded_f.data_ptr<float>(), batch, num_chunks,
+                  chunk_size, nheads, headdim, d_state, ngroups, seqlen,
+                  has_seq_idx ? 1 : 0);
+          }));
+  }
+
   y.copy_(y_padded_f.view({batch, num_chunks * chunk_size, nheads, headdim})
               .slice(1, 0, seqlen)
               .to(y.scalar_type()));
@@ -570,7 +626,7 @@ fused_post_ssm_kernel(const float *y_ssm, const scalar_t *zxbcdt,
                       const float *rms_w, out_t *out, int64_t batch,
                       int64_t seqlen, int64_t d_in_proj, int64_t d_inner,
                       int64_t d_ssm, int64_t d_mlp, int64_t ngroups, float eps,
-                      bool norm_before_gate, bool has_rmsnorm) {
+                      bool norm_before_gate, bool has_rmsnorm, bool is_gated) {
   int64_t row_idx = blockIdx.x;
   if (row_idx >= batch * seqlen)
     return;
@@ -595,13 +651,18 @@ fused_post_ssm_kernel(const float *y_ssm, const scalar_t *zxbcdt,
       int64_t c = group_offset + i;
       float ys = y_ssm[(b * seqlen + l) * d_ssm + c];
       if (has_rmsnorm) {
-        if (norm_before_gate)
+        if (norm_before_gate) {
           local_sum_sq += ys * ys;
-        else {
-          float z_val =
-              to_float(zxbcdt[(b * seqlen + l) * d_in_proj + z_start + c]);
-          float val = ys * silu_f(z_val);
-          local_sum_sq += val * val;
+        } else {
+          // If is_gated, ys is already ys * silu(z)
+          if (is_gated) {
+            local_sum_sq += ys * ys;
+          } else {
+            float z_val =
+                to_float(zxbcdt[(b * seqlen + l) * d_in_proj + z_start + c]);
+            float val = ys * silu_f(z_val);
+            local_sum_sq += val * val;
+          }
         }
       }
     }
@@ -619,17 +680,32 @@ fused_post_ssm_kernel(const float *y_ssm, const scalar_t *zxbcdt,
     for (int64_t i = tid; i < group_size; i += nt) {
       int64_t c = group_offset + i;
       float ys = y_ssm[(b * seqlen + l) * d_ssm + c];
-      float z_val =
-          to_float(zxbcdt[(b * seqlen + l) * d_in_proj + z_start + c]);
       float val;
       if (has_rmsnorm) {
         float weight = rms_w[c];
-        if (norm_before_gate)
+        if (norm_before_gate) {
+          // If norm_before_gate, is_gated must be false (checked by caller or assumed)
+          float z_val =
+              to_float(zxbcdt[(b * seqlen + l) * d_in_proj + z_start + c]);
           val = (ys * group_rms) * weight * silu_f(z_val);
-        else
-          val = (ys * silu_f(z_val) * group_rms) * weight;
-      } else
-        val = ys * silu_f(z_val);
+        } else {
+          if (is_gated) {
+            val = (ys * group_rms) * weight;
+          } else {
+            float z_val =
+                to_float(zxbcdt[(b * seqlen + l) * d_in_proj + z_start + c]);
+            val = (ys * silu_f(z_val) * group_rms) * weight;
+          }
+        }
+      } else {
+        if (is_gated) {
+            val = ys;
+        } else {
+            float z_val =
+                to_float(zxbcdt[(b * seqlen + l) * d_in_proj + z_start + c]);
+            val = ys * silu_f(z_val);
+        }
+      }
       out[(b * seqlen + l) * d_inner + d_mlp + c] = from_float<out_t>(val);
     }
   }
@@ -641,7 +717,8 @@ torch::Tensor mamba_fused_post_ssm(const torch::Tensor &y_ssm,
                                    const torch::Tensor &rms_w, int64_t d_mlp,
                                    int64_t d_ssm, int64_t ngroups, double eps,
                                    bool norm_before_gate,
-                                   torch::ScalarType out_type) {
+                                   torch::ScalarType out_type,
+                                   bool is_gated = false) {
   auto y_f = y_ssm.to(torch::kFloat);
   auto rms_w_f =
       rms_w.defined() ? rms_w.to(torch::kFloat).contiguous() : torch::Tensor();
@@ -668,7 +745,7 @@ torch::Tensor mamba_fused_post_ssm(const torch::Tensor &y_ssm,
                   rms_w_f.defined() ? rms_w_f.data_ptr<float>() : nullptr,
                   reinterpret_cast<at::Half *>(out.data_ptr<at::Half>()), batch,
                   seqlen, d_in_proj, d_inner, d_ssm, d_mlp, ngroups, (float)eps,
-                  norm_before_gate, rms_w_f.defined());
+                  norm_before_gate, rms_w_f.defined(), is_gated);
         else if (out_type == at::ScalarType::BFloat16)
           fused_post_ssm_kernel<scalar_t, at::BFloat16>
               <<<total_rows, threads, shmem_size>>>(
@@ -677,7 +754,7 @@ torch::Tensor mamba_fused_post_ssm(const torch::Tensor &y_ssm,
                   reinterpret_cast<at::BFloat16 *>(
                       out.data_ptr<at::BFloat16>()),
                   batch, seqlen, d_in_proj, d_inner, d_ssm, d_mlp, ngroups,
-                  (float)eps, norm_before_gate, rms_w_f.defined());
+                  (float)eps, norm_before_gate, rms_w_f.defined(), is_gated);
         else
           fused_post_ssm_kernel<scalar_t, float>
               <<<total_rows, threads, shmem_size>>>(
@@ -685,7 +762,7 @@ torch::Tensor mamba_fused_post_ssm(const torch::Tensor &y_ssm,
                   rms_w_f.defined() ? rms_w_f.data_ptr<float>() : nullptr,
                   out.data_ptr<float>(), batch, seqlen, d_in_proj, d_inner,
                   d_ssm, d_mlp, ngroups, (float)eps, norm_before_gate,
-                  rms_w_f.defined());
+                  rms_w_f.defined(), is_gated);
       }));
   return out;
 }
@@ -700,9 +777,13 @@ std::vector<torch::Tensor> mamba_fused_forward_infer_cuda(
     const torch::Tensor &rmsnorm_weight, double rmsnorm_eps,
     bool norm_before_gate, const torch::Tensor &outproj_w,
     const torch::Tensor &outproj_b) {
+  
+  // Fuse gate if NOT norm_before_gate
+  bool fuse_gate = !norm_before_gate;
+
   auto outputs = mamba_fused_forward_cuda(
       zxbcdt, conv_w, conv_b, dt_bias, a_log, d_param, dt_scale, initial_state,
-      seq_idx, chunk_size, ngroups, headdim, dt_min, dt_max);
+      seq_idx, chunk_size, ngroups, headdim, dt_min, dt_max, fuse_gate);
   auto y = outputs[0];
   auto final_state = outputs[1];
   int64_t batch = y.size(0);
@@ -716,7 +797,8 @@ std::vector<torch::Tensor> mamba_fused_forward_infer_cuda(
   auto y_out = mamba_fused_post_ssm(
       y.view({batch, seqlen, d_ssm}), zxbcdt, rmsnorm_weight, d_mlp, d_ssm,
       ngroups, rmsnorm_eps, norm_before_gate,
-      outproj_w.defined() ? outproj_w.scalar_type() : zxbcdt.scalar_type());
+      outproj_w.defined() ? outproj_w.scalar_type() : zxbcdt.scalar_type(),
+      fuse_gate);
   torch::Tensor out;
   if (outproj_w.defined() && outproj_w.numel() > 0) {
     auto out_2d = y_out.view({batch * seqlen, d_inner});
@@ -739,7 +821,7 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
     const torch::Tensor &final_state, const torch::Tensor &y,
     const torch::Tensor &grad_y, const torch::Tensor &grad_final_state,
     const torch::Tensor &seq_idx, int64_t chunk_size, int64_t ngroups,
-    int64_t headdim, double dt_min, double dt_max) {
+    int64_t headdim, double dt_min, double dt_max, bool fuse_gate) {
   at::NoGradGuard no_grad;
   auto z = zxbcdt.contiguous();
   auto w = conv_w.to(z.scalar_type()).contiguous();
@@ -773,6 +855,20 @@ std::vector<torch::Tensor> mamba_fused_backward_cuda(
   int64_t d_inner = (d_in_proj - 2 * ngroups * d_state - nheads) / 2,
           d_mlp = d_inner - d_ssm, conv_dim = d_ssm + 2 * ngroups * d_state,
           conv_kernel = w.size(1);
+  if (fuse_gate) {
+    int64_t z_offset = 2 * d_mlp;
+    auto z = zxbcdt.narrow(2, z_offset, d_ssm).to(torch::kFloat);
+    auto z_silu = z * z.sigmoid();
+    auto z_nonzero = z_silu.ne(0);
+    auto denom = torch::where(z_nonzero, z_silu, torch::ones_like(z_silu));
+    auto y_view = y_f.view({batch, seqlen, d_ssm});
+    auto y_ungated = y_view / denom;
+    y_ungated = torch::where(z_nonzero, y_ungated, torch::zeros_like(y_ungated));
+    y_f = y_ungated.view({batch, seqlen, nheads, headdim});
+    auto z_silu_view = z_silu.view({batch, seqlen, nheads, headdim});
+    gy_f = gy_f * z_silu_view;
+    gy_input = gy_input * z_silu_view.to(gy_input.scalar_type());
+  }
   if (has_dt_scale) {
     dt_scale_view = dt_scale_view.to(z.scalar_type()).contiguous();
     if (dt_scale_view.dim() == 3)
