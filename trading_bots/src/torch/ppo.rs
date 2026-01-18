@@ -457,23 +457,26 @@ pub async fn train(weights_path: Option<&str>) {
         println!("fwd: {:.1}ms  bwd: {:.1}ms", fwd_time_us as f64 / 1000.0, bwd_time_us as f64 / 1000.0);
         
         let max_param_norm = tch::no_grad(|| {
-            let mut max_norm = 0.0f64;
-            for v in opt.trainable_variables() {
-                let norm = v.norm().double_value(&[]);
-                if norm > max_norm { max_norm = norm; }
+            let norms: Vec<Tensor> = opt.trainable_variables()
+                .iter()
+                .map(|v| v.norm())
+                .collect();
+            if norms.is_empty() {
+                0.0f64
+            } else {
+                Tensor::stack(&norms, 0).max().double_value(&[])
             }
-            max_norm
         });
         if max_param_norm > 1000.0 { println!("WARNING: Large parameter norm detected: {:.2}", max_param_norm); }
 
-        let mean_losses = if total_sample_count > 0 {
-            Tensor::stack(&[&total_loss_weighted, &total_policy_loss_weighted, &total_value_loss_weighted, &total_value_mae_weighted], 0) / (total_sample_count as f64)
-        } else { Tensor::zeros([4], (Kind::Float, device)) };
-        let mean_grad_norm = if grad_norm_count > 0 { (&grad_norm_sum / (grad_norm_count as f64)).double_value(&[]) } else { 0.0 };
-        let mean_losses_vec: Vec<f64> = Vec::try_from(mean_losses.to_device(tch::Device::Cpu)).unwrap();
-        let (mean_loss, mean_policy_loss, mean_value_loss, mean_value_mae) = (
-            mean_losses_vec[0], mean_losses_vec[1], mean_losses_vec[2], mean_losses_vec[3]
-        );
+        let (mean_losses, mean_grad_norm_t, clip_frac_t) = if total_sample_count > 0 {
+            let losses = Tensor::stack(&[&total_loss_weighted, &total_policy_loss_weighted, &total_value_loss_weighted, &total_value_mae_weighted], 0) / (total_sample_count as f64);
+            let grad_norm = if grad_norm_count > 0 { &grad_norm_sum / (grad_norm_count as f64) } else { Tensor::zeros([], (Kind::Float, device)) };
+            let clip = if total_ratio_samples > 0 { &total_clipped / (total_ratio_samples as f64) } else { Tensor::zeros([], (Kind::Float, device)) };
+            (losses, grad_norm, clip)
+        } else {
+            (Tensor::zeros([4], (Kind::Float, device)), Tensor::zeros([], (Kind::Float, device)), Tensor::zeros([], (Kind::Float, device)))
+        };
 
         let logit_stats = tch::no_grad(|| {
             let (_, _, (_, action_log_std), _) = trading_model.forward_with_seq_idx(
@@ -486,8 +489,13 @@ pub async fn train(weights_path: Option<&str>) {
             let rpo_alpha = (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze();
             Tensor::stack(&[action_std.mean(Kind::Float), action_std.min(), action_std.max(), rpo_alpha], 0)
         });
-        let stats_vec: Vec<f64> = Vec::try_from(logit_stats.to_device(tch::Device::Cpu)).unwrap_or_else(|_| vec![0.0; 4]);
-        let clip_frac = if total_ratio_samples > 0 { total_clipped.double_value(&[]) / total_ratio_samples as f64 } else { 0.0 };
+
+        let all_scalars = Tensor::cat(&[mean_losses.view([4]), mean_grad_norm_t.view([1]), clip_frac_t.view([1]), logit_stats.view([4])], 0);
+        let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu)).unwrap_or_else(|_| vec![0.0; 10]);
+        let (mean_loss, mean_policy_loss, mean_value_loss, mean_value_mae) = (all_scalars_vec[0], all_scalars_vec[1], all_scalars_vec[2], all_scalars_vec[3]);
+        let mean_grad_norm = all_scalars_vec[4];
+        let clip_frac = all_scalars_vec[5];
+        let stats_vec = &all_scalars_vec[6..10];
 
         let primary = env.primary_mut();
         primary.meta_history.record_logit_noise_stats(stats_vec[0], stats_vec[1], stats_vec[2], stats_vec[3]);
