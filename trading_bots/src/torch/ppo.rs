@@ -354,7 +354,8 @@ pub async fn train(weights_path: Option<&str>) {
                 let log_det = act_mb.log_softmax(-1, Kind::Float).sum_dim_intlist(-1, false, Kind::Float);
                 let action_log_probs = log_prob_gaussian - log_det;
 
-                let log_ratio = (&action_log_probs - &old_log_probs_mb).tanh() * 0.3;
+                let log_ratio_raw = &action_log_probs - &old_log_probs_mb;
+                let log_ratio = &log_ratio_raw / (1.0 + log_ratio_raw.abs() / 2.0) * 2.0;
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
@@ -495,7 +496,7 @@ pub async fn train(weights_path: Option<&str>) {
         primary.meta_history.record_value_mae(mean_value_mae / CRITIC_MAE_NORM);
         primary.meta_history.record_grad_norm(mean_grad_norm);
 
-        println!("  Loss: {:.4} (Policy: {:.4}, Value: {:.4}, MAE: {:.4}) GradNorm: {:.4}", 
+        println!("  Loss: {:.4} (Policy: {:.4}, Value: {:.4}, MAE: {:.4}) GradNorm: {:.4}",
                  mean_loss, mean_policy_loss, mean_value_loss, mean_value_mae / CRITIC_MAE_NORM, mean_grad_norm);
 
         if episode > 0 && episode % 50 == 0 {
