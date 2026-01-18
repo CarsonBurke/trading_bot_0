@@ -299,9 +299,9 @@ impl Mamba2 {
 
         // D: skip connection - per-head or per-channel depending on d_has_hdim
         let d_param = if config.d_has_hdim {
-            p.var("D", &[nheads, config.headdim], Init::Const(0.1))
+            p.var("D", &[nheads, config.headdim], Init::Const(1.0))
         } else {
-            p.var("D", &[nheads], Init::Const(0.1))
+            p.var("D", &[nheads], Init::Const(1.0))
         };
 
         // Optional RMSNorm with gating and group normalization
@@ -309,7 +309,7 @@ impl Mamba2 {
             Some(RMSNormGated::new(
                 &(p / "norm"),
                 d_ssm,
-                1e-6,
+                1e-5,
                 config.norm_before_gate,
                 ngroups,
             ))
@@ -864,7 +864,7 @@ impl Mamba2 {
                 };
                 (weight, norm.eps, norm.norm_before_gate)
             }
-            None => (Tensor::zeros(&[0], (kind, device)), 1e-6, false),
+            None => (Tensor::zeros(&[0], (kind, device)), 1e-5, false),
         };
 
         let outproj_w = if self.out_proj.ws.kind() == kind && self.out_proj.ws.device() == device {
@@ -1040,7 +1040,7 @@ impl Mamba2 {
                 };
                 (weight, norm.eps, norm.norm_before_gate)
             }
-            None => (Tensor::zeros(&[0], (kind, device)), 1e-6, false),
+            None => (Tensor::zeros(&[0], (kind, device)), 1e-5, false),
         };
 
         let outproj_w = if self.out_proj.ws.kind() == kind && self.out_proj.ws.device() == device {
@@ -1358,7 +1358,7 @@ pub fn mamba_stack_cfg(p: &nn::Path, config: Mamba2Config, n_layers: i64) -> Mam
             };
             (
                 Mamba2::new(&(p / format!("layer_{}", i)), cfg),
-                RMSNormSimple::new(&(p / format!("ln_{}", i)), config.d_model, 1e-6),
+                RMSNormSimple::new(&(p / format!("ln_{}", i)), config.d_model, 1e-5),
             )
         })
         .collect();
