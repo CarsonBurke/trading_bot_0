@@ -191,7 +191,7 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
         .as_slice()
 }
 
-const NUM_VALUE_BUCKETS: i64 = 255;
+const NUM_VALUE_BUCKETS: i64 = 127;
 
 // (values, critic_logits, (action_mean, action_log_std), attn_entropy)
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor), Tensor);
