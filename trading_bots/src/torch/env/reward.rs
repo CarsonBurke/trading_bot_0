@@ -83,6 +83,7 @@ impl Env {
     ///
     /// - Base reward ∈ [-1, +1] based on allocation quality
     /// - Additional penalty when best_return > 0 and agent missed it
+    #[allow(dead_code)]
     pub fn get_hindsight_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
             return 0.0;
@@ -146,6 +147,7 @@ impl Env {
     ///
     /// The reward is the weighted sum of per-asset returns, scaled and with
     /// commission penalty. Dense signal at every step.
+    #[allow(dead_code)]
     pub fn get_action_outcome_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
             return 0.0;

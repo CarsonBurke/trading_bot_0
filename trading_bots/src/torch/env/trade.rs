@@ -115,6 +115,7 @@ impl Env {
 
     /// Weight-based trading with dead zone. Full control outside dead zone.
     /// |action| <= threshold = hold. Otherwise adds action directly to target weight.
+    #[allow(dead_code)]
     pub fn trade_by_weight_delta(
         &mut self,
         actions: &[f64],

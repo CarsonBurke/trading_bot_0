@@ -18,6 +18,107 @@ fn sync_device(device: Device) {
     }
 }
 
+fn run_component_timing(mamba: &Mamba2, x: &Tensor, device: Device, iters: usize) {
+    tch::no_grad(|| {
+        let (batch, seqlen, d_model) = x.size3().unwrap();
+        let dtype = x.kind();
+
+        // Setup: create dummy tensors matching Mamba dimensions
+        let config = Mamba2Config {
+            d_model: 256,
+            headdim: 64,
+            d_state: 128,
+            chunk_size: 256,
+            ..Default::default()
+        };
+        let d_inner = config.d_inner();
+        let d_ssm = d_inner;
+        let ngroups = config.ngroups;
+        let d_state = config.d_state;
+        let nheads = d_ssm / config.headdim;
+        let d_in_proj = 2 * d_inner + 2 * ngroups * d_state + nheads;
+
+        // Time input projection (d_model -> d_in_proj)
+        let w_in = Tensor::randn(&[d_in_proj, d_model], (dtype, device));
+        let mut in_proj_time = 0.0;
+        for _ in 0..iters {
+            let start = Instant::now();
+            let _ = x.matmul(&w_in.tr());
+            sync_device(device);
+            in_proj_time += start.elapsed().as_secs_f64();
+        }
+        in_proj_time = in_proj_time * 1000.0 / iters as f64;
+
+        // Time Conv1D
+        let conv_dim = d_ssm + 2 * ngroups * d_state;
+        let xbc = Tensor::randn(&[batch, seqlen, conv_dim], (dtype, device));
+        let xbc_t = xbc.transpose(1, 2);
+        let conv_w = Tensor::randn(&[conv_dim, 1, config.d_conv], (dtype, device));
+        let conv_b = Tensor::randn(&[conv_dim], (dtype, device));
+        let mut conv_time = 0.0;
+        for _ in 0..iters {
+            let start = Instant::now();
+            let _ = xbc_t.conv1d(&conv_w, Some(&conv_b), 1, config.d_conv - 1, 1, conv_dim);
+            sync_device(device);
+            conv_time += start.elapsed().as_secs_f64();
+        }
+        conv_time = conv_time * 1000.0 / iters as f64;
+
+        // Time output projection (d_inner -> d_model)
+        let y_dummy = Tensor::randn(&[batch, seqlen, d_inner], (dtype, device));
+        let w_out = Tensor::randn(&[d_model, d_inner], (dtype, device));
+        let mut out_proj_time = 0.0;
+        for _ in 0..iters {
+            let start = Instant::now();
+            let _ = y_dummy.matmul(&w_out.tr());
+            sync_device(device);
+            out_proj_time += start.elapsed().as_secs_f64();
+        }
+        out_proj_time = out_proj_time * 1000.0 / iters as f64;
+
+        // Time RMSNorm + gating
+        let norm_w = Tensor::randn(&[d_ssm], (dtype, device));
+        let y_norm = Tensor::randn(&[batch, seqlen, d_ssm], (dtype, device));
+        let z_gate = Tensor::randn(&[batch, seqlen, d_ssm], (dtype, device));
+        let mut norm_time = 0.0;
+        for _ in 0..iters {
+            let start = Instant::now();
+            let y_f32 = y_norm.to_kind(tch::Kind::Float);
+            let rms = (y_f32.pow_tensor_scalar(2).mean_dim(-1, true, tch::Kind::Float) + 1e-6).sqrt();
+            let normed = (y_f32 / rms * &norm_w.to_kind(tch::Kind::Float)).to_kind(dtype);
+            let _ = normed * z_gate.silu();
+            sync_device(device);
+            norm_time += start.elapsed().as_secs_f64();
+        }
+        norm_time = norm_time * 1000.0 / iters as f64;
+
+        // Time the full forward pass
+        let mut fused_time = 0.0;
+        for _ in 0..iters {
+            let start = Instant::now();
+            let _ = mamba.forward_with_dt_scale(x, None);
+            sync_device(device);
+            fused_time += start.elapsed().as_secs_f64();
+        }
+        fused_time = fused_time * 1000.0 / iters as f64;
+
+        // Estimate scan time (includes the CUDA kernel for chunk scan)
+        let scan_time = fused_time - in_proj_time - conv_time - norm_time - out_proj_time;
+
+        println!("  Input Projection:        {:.3} ms/iter ({:.1}%)",
+                 in_proj_time, 100.0 * in_proj_time / fused_time);
+        println!("  Conv1D:                  {:.3} ms/iter ({:.1}%)",
+                 conv_time, 100.0 * conv_time / fused_time);
+        println!("  Chunk Scan (CUDA):       {:.3} ms/iter ({:.1}%)",
+                 scan_time, 100.0 * scan_time / fused_time);
+        println!("  RMSNorm + Gate:          {:.3} ms/iter ({:.1}%)",
+                 norm_time, 100.0 * norm_time / fused_time);
+        println!("  Output Projection:       {:.3} ms/iter ({:.1}%)",
+                 out_proj_time, 100.0 * out_proj_time / fused_time);
+        println!("  Total:                   {:.3} ms/iter", fused_time);
+    });
+}
+
 fn main() {
     let device = Device::cuda_if_available();
     if device == Device::Cpu {
@@ -64,6 +165,11 @@ fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
     }
     sync_device(device);
 
+    // Component timing breakdown
+    println!("\n  === Component Timing Breakdown ===");
+    println!("  Note: For detailed CUDA kernel profiling, use CUDA_LAUNCH_BLOCKING=1 and nvprof");
+    run_component_timing(&mamba, &x, device, 100);
+
     // Forward (Training)
     let iters = 200;
     let start = Instant::now();
@@ -72,7 +178,7 @@ fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
     }
     sync_device(device);
     let fwd_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-    println!("  Forward (Training):      {:.3} ms/iter", fwd_ms);
+    println!("\n  Forward (Training):      {:.3} ms/iter", fwd_ms);
     suite.add(BenchmarkResult::new(
         "mamba2_forward_train",
         fwd_ms,

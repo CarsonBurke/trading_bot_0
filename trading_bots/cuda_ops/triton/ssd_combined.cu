@@ -237,36 +237,26 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
       ws.cb_buf, {batch * num_chunks * ngroups, chunk_size, chunk_size}, float_opts);
 
   if (!has_seq_idx) {
-    // Fast path: use cuBLAS with bf16 inputs, fp32 compute, fp32 output (tensor cores)
-    cublasHandle_t handle = get_cublas_handle();
+    // Use cuBLAS for CB computation (faster)
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
     float alpha = 1.0f, beta = 0.0f;
-    int64_t batches = batch * num_chunks * ngroups;
-
-    // C @ B^T: C is [batches, M, K], B is [batches, N, K], output is [batches, M, N]
-    // Use cublasGemmStridedBatchedEx for bf16 inputs with fp32 accumulation
     cublasGemmStridedBatchedEx(
-        handle,
-        CUBLAS_OP_T,  // B transposed
-        CUBLAS_OP_N,  // C not transposed
-        chunk_size,   // N (cols of result)
-        chunk_size,   // M (rows of result)
-        d_state,      // K
+        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        chunk_size, chunk_size, d_state,
         &alpha,
         b_mat.data_ptr<at::BFloat16>(), CUDA_R_16BF, d_state, chunk_size * d_state,
         c_mat.data_ptr<at::BFloat16>(), CUDA_R_16BF, d_state, chunk_size * d_state,
         &beta,
         cb_buf.data_ptr<float>(), CUDA_R_32F, chunk_size, chunk_size * chunk_size,
-        batches,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        batch * num_chunks * ngroups, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 
-    // Apply causal mask
-    dim3 mask_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64, batches);
+    // Apply causal mask separately
+    dim3 mask_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64, batch * num_chunks * ngroups);
     dim3 mask_threads(16, 16);
     apply_causal_mask_simple_kernel<<<mask_grid, mask_threads>>>(
-        cb_buf.data_ptr<float>(), batches, chunk_size, seqlen, num_chunks);
+        cb_buf.data_ptr<float>(), batch * num_chunks * ngroups, chunk_size, seqlen, num_chunks);
   } else {
-    // Slow path with seq_idx support
+    // Use fused kernel only when seq_idx is present
     dim3 cb_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64,
                  batch * num_chunks * ngroups);
     dim3 cb_threads(16, 16);
@@ -288,7 +278,7 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
                batch * num_chunks * nheads);
   dim3 grid_wmma((headdim + 63) / 64, (chunk_size + 31) / 32,
                  batch * num_chunks * nheads);
-  
+
   // Prepare gating params
   int64_t z_stride_b = d_in_proj * seqlen;
   int64_t z_stride_l = d_in_proj;
@@ -552,29 +542,40 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
       has_seq_idx ? 1 : 0);
   final_state.copy_(final_state_f_kernel.to(final_state.scalar_type()));
 
-  // Precompute CB = C @ B^T using cuBLAS with tensor cores
+  // Precompute CB = C @ B^T with causal masking
   auto cb_buf = workspace_tensor(
       ws.cb_buf, {batch * num_chunks * ngroups, chunk_size, chunk_size}, float_opts);
-  {
-    cublasHandle_t handle = get_cublas_handle();
+
+  if (!has_seq_idx) {
+    // Use cuBLAS for CB computation (faster)
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
     float alpha = 1.0f, beta = 0.0f;
-    int64_t batches = batch * num_chunks * ngroups;
     cublasGemmStridedBatchedEx(
-        handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
+        handle, CUBLAS_OP_T, CUBLAS_OP_N,
         chunk_size, chunk_size, d_state,
         &alpha,
         b_mat.data_ptr<at::BFloat16>(), CUDA_R_16BF, d_state, chunk_size * d_state,
         c_mat.data_ptr<at::BFloat16>(), CUDA_R_16BF, d_state, chunk_size * d_state,
         &beta,
         cb_buf.data_ptr<float>(), CUDA_R_32F, chunk_size, chunk_size * chunk_size,
-        batches,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    dim3 mask_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64, batches);
+        batch * num_chunks * ngroups, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    // Apply causal mask separately
+    dim3 mask_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64, batch * num_chunks * ngroups);
     dim3 mask_threads(16, 16);
     apply_causal_mask_simple_kernel<<<mask_grid, mask_threads>>>(
-        cb_buf.data_ptr<float>(), batches, chunk_size, seqlen, num_chunks);
+        cb_buf.data_ptr<float>(), batch * num_chunks * ngroups, chunk_size, seqlen, num_chunks);
+  } else {
+    // Use fused kernel only when seq_idx is present
+    dim3 cb_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64,
+                 batch * num_chunks * ngroups);
+    dim3 cb_threads(16, 16);
+    bmm_cb_causal_kernel_bf16in<<<cb_grid, cb_threads>>>(
+        c_mat.data_ptr<at::BFloat16>(), b_mat.data_ptr<at::BFloat16>(),
+        dA_buf.data_ptr<float>(),
+        seq.data_ptr<int64_t>(), seq_stride,
+        cb_buf.data_ptr<float>(), batch * num_chunks * ngroups, chunk_size,
+        d_state, seqlen, num_chunks, ngroups, nheads, 1);
   }
 
   // Prefer WMMA kernel when aligned; fallback to v3 otherwise.
@@ -587,7 +588,7 @@ std::vector<torch::Tensor> mamba_fused_forward_stateful_cuda(
                batch * num_chunks * nheads);
   dim3 grid_wmma((headdim + 63) / 64, (chunk_size + 31) / 32,
                  batch * num_chunks * nheads);
-  
+
   // Prepare gating params
   int64_t z_stride_b = d_in_proj * seqlen;
   int64_t z_stride_l = d_in_proj;
