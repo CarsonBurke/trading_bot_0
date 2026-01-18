@@ -1,11 +1,11 @@
 {
-  "timestamp": "2026-01-17T23:44:34.831321861Z",
-  "git_commit": "e387b16a",
+  "timestamp": "2026-01-18T00:29:06.486930514Z",
+  "git_commit": "effa8c2f",
   "cuda_version": null,
   "results": [
     {
       "name": "mamba2_forward_train",
-      "time_ms": 1.014031495,
+      "time_ms": 1.04754575,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -14,7 +14,7 @@
     },
     {
       "name": "mamba2_fwd_bwd_train",
-      "time_ms": 1.120038645,
+      "time_ms": 1.1252088550000001,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -23,7 +23,7 @@
     },
     {
       "name": "mamba2_infer_prefill",
-      "time_ms": 1.06774705,
+      "time_ms": 1.084221245,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -32,7 +32,7 @@
     },
     {
       "name": "mamba2_infer_step",
-      "time_ms": 0.1012794755,
+      "time_ms": 0.1031419015,
       "config": {
         "batch": 4,
         "seq_len": 1,
@@ -41,7 +41,7 @@
     },
     {
       "name": "model_forward_infer_b1",
-      "time_ms": 1.3274741400000003,
+      "time_ms": 1.3321785099999999,
       "config": {
         "batch": 1,
         "seq_len": 3400,
@@ -50,7 +50,7 @@
     },
     {
       "name": "model_fwd_bwd_train_b1",
-      "time_ms": 5.2457465899999995,
+      "time_ms": 5.38921846,
       "config": {
         "batch": 1,
         "seq_len": 3400,
@@ -59,7 +59,7 @@
     },
     {
       "name": "model_forward_infer_b4",
-      "time_ms": 1.3987554899999999,
+      "time_ms": 1.35684967,
       "config": {
         "batch": 4,
         "seq_len": 3400,
@@ -68,7 +68,7 @@
     },
     {
       "name": "model_fwd_bwd_train_b4",
-      "time_ms": 5.398299789999999,
+      "time_ms": 5.17997335,
       "config": {
         "batch": 4,
         "seq_len": 3400,
@@ -77,7 +77,7 @@
     },
     {
       "name": "model_forward_infer_b8",
-      "time_ms": 1.38522362,
+      "time_ms": 1.3518875,
       "config": {
         "batch": 8,
         "seq_len": 3400,
@@ -86,7 +86,7 @@
     },
     {
       "name": "model_fwd_bwd_train_b8",
-      "time_ms": 5.08331832,
+      "time_ms": 5.37146878,
       "config": {
         "batch": 8,
         "seq_len": 3400,

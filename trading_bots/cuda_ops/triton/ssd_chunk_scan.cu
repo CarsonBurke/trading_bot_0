@@ -1,5 +1,6 @@
 // V5 kernel with 8x8 register blocking (64 accumulators per thread)
 // Trades occupancy for better ILP and register reuse
+#include "ssd_common.cuh"
 #include <cuda_fp16.h>
 #include <mma.h>
 using namespace nvcuda;
@@ -131,7 +132,7 @@ __global__ void chunk_scan_fwd_kernel_v5_8x8(
             float dtv = dt_k[k];
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
-                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                float scale = exp2f((dA_m_vals[i] - dA_kv) * kLog2e) * dtv;
                 float cbv = cb_s[tid_m * TM + i][k] * scale;
                 #pragma unroll
                 for (int j = 0; j < TN; ++j) {
@@ -150,7 +151,7 @@ __global__ void chunk_scan_fwd_kernel_v5_8x8(
         int64_t m = row_base + row;
         contrib_scales[i] = 0.0f;
         if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-            contrib_scales[i] = __expf(fminf(dA_m_vals[i], 0.0f));
+            contrib_scales[i] = exp2f(fminf(dA_m_vals[i], 0.0f) * kLog2e);
         }
     }
 
@@ -377,7 +378,7 @@ __global__ void chunk_scan_fwd_kernel_v4_async(
             float dtv = dt_k[s_curr][k];
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                float scale = exp2f((dA_m_vals[i] - dA_kv) * kLog2e) * dtv;
                 float cbv = cb_s[s_curr][tid_m * 4 + i][k] * scale;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -396,7 +397,7 @@ __global__ void chunk_scan_fwd_kernel_v4_async(
         int64_t m = row_base + row;
         contrib_scales[i] = 0.0f;
         if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-            contrib_scales[i] = __expf(fminf(dA_m_vals[i], 0.0f));
+            contrib_scales[i] = exp2f(fminf(dA_m_vals[i], 0.0f) * kLog2e);
         }
     }
 
@@ -584,7 +585,7 @@ __global__ void chunk_scan_fwd_kernel_v3(
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 int row = tid_m * 4 + i;
-                float scale = expf(fminf(dA_m[row] - dA_kv, 0.0f)) * dtv;
+                float scale = exp2f((dA_m[row] - dA_kv) * kLog2e) * dtv;
                 float cbv = cb_s[row][k] * scale;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -631,7 +632,7 @@ __global__ void chunk_scan_fwd_kernel_v3(
             int64_t m = row_base + row;
             contrib_scales[i] = 0.0f;
             if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-                contrib_scales[i] = expf(fminf(dA_m[row], 0.0f));
+                contrib_scales[i] = exp2f(fminf(dA_m[row], 0.0f) * kLog2e);
             }
         }
 
@@ -795,7 +796,7 @@ __global__ void chunk_scan_fwd_kernel_v3_bf16in_fused(
             float dtv = dt_k[k];
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                float scale = exp2f((dA_m_vals[i] - dA_kv) * kLog2e) * dtv;
                 float cbv = cb_s[tid_m * 4 + i][k] * scale;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -814,7 +815,7 @@ __global__ void chunk_scan_fwd_kernel_v3_bf16in_fused(
         int64_t m = row_base + row;
         contrib_scales[i] = 0.0f;
         if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-            contrib_scales[i] = __expf(fminf(dA_m_vals[i], 0.0f));
+            contrib_scales[i] = exp2f(fminf(dA_m_vals[i], 0.0f) * kLog2e);
         }
     }
 
@@ -975,7 +976,7 @@ __global__ void chunk_scan_fwd_kernel_wmma_bf16in_fused(
         dA_m[load_idx] = (m < chunk_size) ? dA_cumsum[dt_offset + m] : 0.0f;
         float scale = 0.0f;
         if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-            scale = __expf(fminf(dA_m[load_idx], 0.0f));
+            scale = exp2f(fminf(dA_m[load_idx], 0.0f) * kLog2e);
         }
         contrib_s[load_idx] = scale;
     }
@@ -1005,7 +1006,7 @@ __global__ void chunk_scan_fwd_kernel_wmma_bf16in_fused(
                 int64_t k_global = k0 + k_in;
                 float val = 0.0f;
                 if (m_global < chunk_size && k_global < chunk_size && k_global <= m_global) {
-                    float scale = __expf(fminf(dA_m[r] - dA_k[k_in], 0.0f)) * dt_k[k_in];
+                    float scale = exp2f((dA_m[r] - dA_k[k_in]) * kLog2e) * dt_k[k_in];
                     val = CB[cb_offset + m_global * chunk_size + k_global] * scale;
                 }
                 cb_half[r][k_in] = __float2half_rn(val);
@@ -1266,7 +1267,7 @@ __global__ void chunk_scan_fwd_kernel_v2(
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 // Use __expf for faster single-precision exp
-                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                float scale = exp2f((dA_m_vals[i] - dA_kv) * kLog2e) * dtv;
                 float cbv = cb_s[tid_m * 4 + i][k] * scale;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -1314,7 +1315,7 @@ __global__ void chunk_scan_fwd_kernel_v2(
             int64_t m = row_base + row;
             contrib_scales[i] = 0.0f;
             if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-                contrib_scales[i] = __expf(fminf(dA_m[row], 0.0f));
+                contrib_scales[i] = exp2f(fminf(dA_m[row], 0.0f) * kLog2e);
             }
         }
 
@@ -1521,7 +1522,7 @@ __global__ void chunk_scan_fwd_fused_kernel(
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 int64_t m_global = row_base + tid_m * 4 + i;
-                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                float scale = exp2f((dA_m_vals[i] - dA_kv) * kLog2e) * dtv;
                 // Apply causal mask: only use CB if k <= m
                 float cbv = (k_global <= m_global && m_global < chunk_size) ? cb_tile[tid_m * 4 + i][k] * scale : 0.0f;
                 #pragma unroll
@@ -1568,7 +1569,7 @@ __global__ void chunk_scan_fwd_fused_kernel(
             int64_t m = row_base + row;
             contrib_scales[i] = 0.0f;
             if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-                contrib_scales[i] = __expf(fminf(dA_m[row], 0.0f));
+                contrib_scales[i] = exp2f(fminf(dA_m[row], 0.0f) * kLog2e);
             }
         }
 
@@ -1726,7 +1727,7 @@ __global__ void chunk_scan_fwd_kernel_v2_bf16in(
             float dtv = dt_k[k];
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                float scale = __expf(fminf(dA_m_vals[i] - dA_kv, 0.0f)) * dtv;
+                float scale = exp2f((dA_m_vals[i] - dA_kv) * kLog2e) * dtv;
                 float cbv = cb_s[tid_m * 4 + i][k] * scale;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -1774,7 +1775,7 @@ __global__ void chunk_scan_fwd_kernel_v2_bf16in(
             int64_t m = row_base + row;
             contrib_scales[i] = 0.0f;
             if (m < chunk_len && (!has_seq_idx || seq_idx[seq_base + m] == seq_prev)) {
-                contrib_scales[i] = __expf(fminf(dA_m[row], 0.0f));
+                contrib_scales[i] = exp2f(fminf(dA_m[row], 0.0f) * kLog2e);
             }
         }
 
@@ -1959,7 +1960,7 @@ __global__ void chunk_scan_fwd_kernel(
                     int64_t m = row_base + row;
                     if ((k0 + k) > m) continue;
                     float dA_m_v = dA_m[row];
-                    float scale = expf(fminf(dA_m_v - dA_kv, 0.0f)) * dtv;
+                    float scale = exp2f((dA_m_v - dA_kv) * kLog2e) * dtv;
                     float cbv = cb_s[row][k] * scale;
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
@@ -2010,7 +2011,7 @@ __global__ void chunk_scan_fwd_kernel(
                             contrib_scales[i] = 0.0f;
                             if (row < BM) {
                                 if (!(has_seq_idx && (m >= chunk_len || seq_idx[seq_base + m] != seq_prev))) {
-                                    contrib_scales[i] = expf(fminf(dA_m[row], 0.0f));
+                                    contrib_scales[i] = exp2f(fminf(dA_m[row], 0.0f) * kLog2e);
                                 }
                             }
                         }
@@ -2116,7 +2117,7 @@ __global__ void chunk_scan_bwd_dC_dstate_kernel(
                     int64_t head_in_group = k / headdim;
                     int64_t head = g * heads_per_group + head_in_group;
                     int64_t dt_idx = ((b * nheads + head) * num_chunks + c) * chunk_size + m;
-                    float scale = expf(fminf(dA_cumsum[dt_idx], 0.0f));
+                    float scale = exp2f(fminf(dA_cumsum[dt_idx], 0.0f) * kLog2e);
                     val = dy_ptr[m * hdim + k] * scale;
                 }
                 dy_s[row][col] = val;
@@ -2215,7 +2216,7 @@ __global__ void chunk_scan_bwd_dC_dstate_kernel(
                     int64_t head_in_group = n / headdim;
                     int64_t head = g * heads_per_group + head_in_group;
                     int64_t dt_idx = ((b * nheads + head) * num_chunks + c) * chunk_size + k;
-                    float scale = expf(fminf(dA_cumsum[dt_idx], 0.0f));
+                    float scale = exp2f(fminf(dA_cumsum[dt_idx], 0.0f) * kLog2e);
                     val = dy_ptr[k * hdim + n] * scale;
                 }
                 dy2_s[row][col] = val;
@@ -2416,7 +2417,7 @@ __global__ void chunk_scan_bwd_dx_kernel(
                     float prod = val * x_val;
                     float dtv = dt[dt_offset + m];
                     float dA = dA_cumsum[dt_offset + m];
-                    float exp_neg = expf(fminf(-dA, 0.0f));
+                    float exp_neg = exp2f(fminf(-dA, 0.0f) * kLog2e);
                     atomicAdd(&sh_temp[m][head_slot], prod);
                     atomicAdd(&sh_ddt[m][head_slot], prod * exp_neg);
                     atomicAdd(&sh_ddA[m][head_slot], -prod * dtv * exp_neg);
@@ -2505,7 +2506,7 @@ __global__ void chunk_scan_bwd_dB_kernel(
                     int64_t head_in_group = k / headdim;
                     int64_t head = g * heads_per_group + head_in_group;
                     int64_t dt_idx = ((b * nheads + head) * num_chunks + c) * chunk_size + m;
-                    float scale = dt[dt_idx] * expf(fminf(-dA_cumsum[dt_idx], 0.0f));
+                    float scale = dt[dt_idx] * exp2f(fminf(-dA_cumsum[dt_idx], 0.0f) * kLog2e);
                     val = x_ptr[m * hdim + k] * scale;
                 }
                 a_s[row][col] = val;

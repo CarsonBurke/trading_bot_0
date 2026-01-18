@@ -1,3 +1,5 @@
+#include "ssd_common.cuh"
+
 namespace {
 __global__ void selective_state_update_kernel(
     const float* state_in,
@@ -44,8 +46,8 @@ __global__ void selective_state_update_kernel(
             dt_val = fminf(fmaxf(dt_val, dt_min), dt_max);
         }
     }
-    float a = -expf(a_log[h]);
-    float da = expf(fminf(dt_val * a, 0.0f));
+    float a = -exp2f(a_log[h] * kLog2e);
+    float da = exp2f(fminf(dt_val * a, 0.0f) * kLog2e);
 
     float x_val = x[(b_idx * nheads + h) * headdim + p];
     float y_val = 0.0f;

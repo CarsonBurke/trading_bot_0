@@ -294,8 +294,8 @@ impl Mamba2 {
         let dt_bias = p.var_copy("dt_bias", &inv_dt);
 
         // A: per-head scalar (S4D-style initialization)
-        let a_log = Tensor::empty(&[nheads], (Kind::Float, p.device())).uniform_(-4.0, -1.0);
-        let a_log = p.var_copy("A_log", &a_log);
+        let a_init = Tensor::empty(&[nheads], (Kind::Float, p.device())).uniform_(1.0, 16.0);
+        let a_log = p.var_copy("A_log", &a_init.log());
 
         // D: skip connection - per-head or per-channel depending on d_has_hdim
         let d_param = if config.d_has_hdim {

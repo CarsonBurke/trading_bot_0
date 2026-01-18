@@ -1,3 +1,5 @@
+#include "ssd_common.cuh"
+
 template <typename scalar_t>
 __global__ void conv1d_forward_kernel(
     const scalar_t* zxbcdt,
@@ -693,7 +695,7 @@ __global__ void x_scale_kernel(
     int64_t b = tmp / (num_chunks * chunk_size);
     int64_t dt_offset = ((b * nheads + h) * num_chunks + c) * chunk_size + t;
     float dA = dA_cumsum[dt_offset];
-    float scale = dt[dt_offset] * expf(fminf(-dA, 0.0f));
+    float scale = dt[dt_offset] * exp2f(fminf(-dA, 0.0f) * kLog2e);
     x_scaled[idx] = x[idx] * scale;
 }
 
@@ -721,7 +723,7 @@ __global__ void gy_scale_kernel(
     int64_t b = tmp / (num_chunks * chunk_size);
     int64_t dt_offset = ((b * nheads + h) * num_chunks + c) * chunk_size + t;
     float dA = dA_cumsum[dt_offset];
-    float scale = expf(fminf(dA, 0.0f));
+    float scale = exp2f(fminf(dA, 0.0f) * kLog2e);
     gy_scaled[idx] = gy[idx] * scale;
 }
 
@@ -780,9 +782,9 @@ __global__ void dt_cumsum_kernel(
         int64_t dt_idx = ((b * nheads + h) * ((seqlen + chunk_size - 1) / chunk_size) + c) * chunk_size + t;
         dt_out[dt_idx] = dt;
         float a_log_val = to_float(a_log[h]);
-        // Clamp a_log to prevent expf(a_log) from being inf
+        // Clamp a_log to prevent exp2f(a_log) from being inf
         if (a_log_val > 10.0f) a_log_val = 10.0f;
-        float a = -expf(a_log_val);
+        float a = -exp2f(a_log_val * kLog2e);
         // Clamp a to prevent 0 * inf = NaN or excessive decay
         if (a > -1e-6f) a = -1e-6f; 
         val = dt * a;
@@ -812,7 +814,7 @@ __global__ void dt_cumsum_kernel(
     }
     if (t == 0 && chunk_len > 0) {
         float last = shmem[chunk_len - 1];
-        exp_a_last[(b * nheads + h) * ((seqlen + chunk_size - 1) / chunk_size) + c] = expf(fminf(last, 0.0f));
+        exp_a_last[(b * nheads + h) * ((seqlen + chunk_size - 1) / chunk_size) + c] = exp2f(fminf(last, 0.0f) * kLog2e);
     }
 }
 
@@ -848,7 +850,7 @@ __global__ void dt_cumsum_from_dt_kernel(
         float dt = dt_in[dt_base + t];
         float a_log_val = a_log[h];
         if (a_log_val > 10.0f) a_log_val = 10.0f;
-        float a = -expf(a_log_val);
+        float a = -exp2f(a_log_val * kLog2e);
         if (a > -1e-6f) a = -1e-6f;
         val = dt * a;
     }
@@ -874,7 +876,7 @@ __global__ void dt_cumsum_from_dt_kernel(
     }
     if (t == 0 && chunk_len > 0) {
         float last = shmem[chunk_len - 1];
-        exp_a_last[(b * nheads + h) * num_chunks + c] = expf(fminf(last, 0.0f));
+        exp_a_last[(b * nheads + h) * num_chunks + c] = exp2f(fminf(last, 0.0f) * kLog2e);
     }
 }
 
@@ -931,8 +933,8 @@ __global__ void fused_scan_forward_kernel(
             int64_t t_in_chunk = t - start;
             int64_t chunk_idx = ((b * nheads + h) * num_chunks + c) * chunk_size + t_in_chunk;
             float a_cumsum = dA_cumsum[chunk_idx];
-            float exp_a = expf(fminf(a_cumsum, 0.0f));
-            float exp_neg = expf(fminf(-a_cumsum, 0.0f));
+            float exp_a = exp2f(fminf(a_cumsum, 0.0f) * kLog2e);
+            float exp_neg = exp2f(fminf(-a_cumsum, 0.0f) * kLog2e);
             float dt_val = dt[chunk_idx];
 
             int64_t x_chan = h * headdim + p;
@@ -956,7 +958,7 @@ __global__ void fused_scan_forward_kernel(
             y[y_idx] = from_float<scalar_t>(exp_a * (y_diag + y_off));
         }
 
-        float exp_a_last = expf(fminf(dA_cumsum[((b * nheads + h) * num_chunks + c) * chunk_size + (end - start - 1)], 0.0f));
+        float exp_a_last = exp2f(fminf(dA_cumsum[((b * nheads + h) * num_chunks + c) * chunk_size + (end - start - 1)], 0.0f) * kLog2e);
         for (int64_t n = 0; n < d_state; ++n) {
             state[n] = exp_a_last * state[n] + exp_a_last * prefix[n];
         }
@@ -1053,7 +1055,7 @@ __global__ void chunk_output_kernel(
     int64_t d_ssm = nheads * headdim;
 
     int64_t chunk_offset = ((b * nheads + h) * num_chunks + chunk_idx) * chunk_size;
-    float exp_a_t = expf(fminf(dA_cumsum[chunk_offset + t], 0.0f));
+    float exp_a_t = exp2f(fminf(dA_cumsum[chunk_offset + t], 0.0f) * kLog2e);
 
     float y_off = 0.0f;
     int64_t c_base = d_ssm + ngroups * d_state + group * d_state;
@@ -1069,7 +1071,7 @@ __global__ void chunk_output_kernel(
         float cb_val = cb_chunk[cb_base + s];
         float x_val = conv_out[(b * seqlen + (chunk_idx * chunk_size + s)) * conv_dim + x_chan];
         float dt_val = dt[chunk_offset + s];
-        float exp_neg_s = expf(fminf(-dA_cumsum[chunk_offset + s], 0.0f));
+        float exp_neg_s = exp2f(fminf(-dA_cumsum[chunk_offset + s], 0.0f) * kLog2e);
         y_diag += cb_val * x_val * dt_val * exp_neg_s;
     }
 
@@ -1110,7 +1112,7 @@ __global__ void chunk_state_update_kernel(
     int64_t x_chan = h * headdim + p;
 
     int64_t chunk_offset = ((b * nheads + h) * num_chunks + chunk_idx) * chunk_size;
-    float exp_a_last = expf(fminf(dA_cumsum[chunk_offset + (chunk_len - 1)], 0.0f));
+    float exp_a_last = exp2f(fminf(dA_cumsum[chunk_offset + (chunk_len - 1)], 0.0f) * kLog2e);
 
     int64_t state_base = ((b * nheads + h) * headdim + p) * d_state;
     for (int64_t n = 0; n < d_state; ++n) {
@@ -1121,7 +1123,7 @@ __global__ void chunk_state_update_kernel(
             float x_val = conv_out[(b * seqlen + s_global) * conv_dim + x_chan];
             float b_val = conv_out[(b * seqlen + s_global) * conv_dim + b_base];
             float dt_val = dt[chunk_offset + s];
-            float exp_neg_s = expf(fminf(-dA_cumsum[chunk_offset + s], 0.0f));
+            float exp_neg_s = exp2f(fminf(-dA_cumsum[chunk_offset + s], 0.0f) * kLog2e);
             acc += exp_neg_s * b_val * x_val * dt_val;
         }
         state[state_base + n] = exp_a_last * state[state_base + n] + exp_a_last * acc;
@@ -1168,8 +1170,8 @@ __global__ void dcb_kernel(
     float sum = 0.0f;
     for (int64_t h = g * heads_per_group; h < (g + 1) * heads_per_group; ++h) {
         int64_t chunk_offset = ((b * nheads + h) * num_chunks + chunk_idx) * chunk_size;
-        float exp_a_t = expf(fminf(dA_cumsum[chunk_offset + t], 0.0f));
-        float exp_neg_s = expf(fminf(-dA_cumsum[chunk_offset + s], 0.0f));
+        float exp_a_t = exp2f(fminf(dA_cumsum[chunk_offset + t], 0.0f) * kLog2e);
+        float exp_neg_s = exp2f(fminf(-dA_cumsum[chunk_offset + s], 0.0f) * kLog2e);
         float dt_s = dt[chunk_offset + s];
         for (int64_t p = 0; p < headdim; ++p) {
             float dy = grad_y[((b * seqlen + t_global) * nheads + h) * headdim + p];
@@ -1218,13 +1220,13 @@ __global__ void dstate_from_y_kernel(
     int64_t chunk_offset = ((b * nheads + h) * num_chunks + chunk_idx) * chunk_size;
     for (int64_t t = 0; t < chunk_len; ++t) {
         int64_t t_global = chunk_idx * chunk_size + t;
-        float exp_a_t = expf(fminf(dA_cumsum[chunk_offset + t], 0.0f));
+        float exp_a_t = exp2f(fminf(dA_cumsum[chunk_offset + t], 0.0f) * kLog2e);
         float dy = grad_y[((b * seqlen + t_global) * nheads + h) * headdim + p];
         float c_val = conv_out[(b * seqlen + t_global) * conv_dim + c_base + n];
         acc += dy * exp_a_t * c_val;
     }
 
-    float exp_a_last = expf(fminf(dA_cumsum[chunk_offset + (chunk_len - 1)], 0.0f));
+    float exp_a_last = exp2f(fminf(dA_cumsum[chunk_offset + (chunk_len - 1)], 0.0f) * kLog2e);
     int64_t state_idx = ((b * nheads + h) * headdim + p) * d_state + n;
     dstate_in[state_idx] = exp_a_last * dstate_out[state_idx] + acc;
 }
@@ -1278,7 +1280,7 @@ __global__ void dC_kernel(
     float acc_state = 0.0f;
     for (int64_t h = g * heads_per_group; h < (g + 1) * heads_per_group; ++h) {
         int64_t chunk_offset = ((b * nheads + h) * num_chunks + chunk_idx) * chunk_size;
-        float exp_a_t = expf(fminf(dA_cumsum[chunk_offset + t], 0.0f));
+        float exp_a_t = exp2f(fminf(dA_cumsum[chunk_offset + t], 0.0f) * kLog2e);
         for (int64_t p = 0; p < headdim; ++p) {
             float dy = grad_y[((b * seqlen + t_global) * nheads + h) * headdim + p];
             int64_t state_idx = ((b * nheads + h) * headdim + p) * d_state + n;
@@ -1337,8 +1339,8 @@ __global__ void dB_kernel(
     float acc_state = 0.0f;
     for (int64_t h = g * heads_per_group; h < (g + 1) * heads_per_group; ++h) {
         int64_t chunk_offset = ((b * nheads + h) * num_chunks + chunk_idx) * chunk_size;
-        float exp_a_last = expf(fminf(dA_cumsum[chunk_offset + (chunk_len - 1)], 0.0f));
-        float exp_neg_s = expf(fminf(-dA_cumsum[chunk_offset + s], 0.0f));
+        float exp_a_last = exp2f(fminf(dA_cumsum[chunk_offset + (chunk_len - 1)], 0.0f) * kLog2e);
+        float exp_neg_s = exp2f(fminf(-dA_cumsum[chunk_offset + s], 0.0f) * kLog2e);
         float dt_s = dt[chunk_offset + s];
         for (int64_t p = 0; p < headdim; ++p) {
             int64_t state_idx = ((b * nheads + h) * headdim + p) * d_state + n;
@@ -1391,20 +1393,20 @@ __global__ void dx_ddt_ddA_kernel(
     int64_t g = h / heads_per_group;
     int64_t s_global = chunk_idx * chunk_size + s;
     int64_t chunk_offset = ((b * nheads + h) * num_chunks + chunk_idx) * chunk_size;
-    float exp_neg_s = expf(fminf(-dA_cumsum[chunk_offset + s], 0.0f));
+    float exp_neg_s = exp2f(fminf(-dA_cumsum[chunk_offset + s], 0.0f) * kLog2e);
     float dt_s = dt[chunk_offset + s];
 
     float sum = 0.0f;
     for (int64_t t = s; t < chunk_len; ++t) {
         int64_t t_global = chunk_idx * chunk_size + t;
-        float exp_a_t = expf(fminf(dA_cumsum[chunk_offset + t], 0.0f));
+        float exp_a_t = exp2f(fminf(dA_cumsum[chunk_offset + t], 0.0f) * kLog2e);
         float dy = grad_y[((b * seqlen + t_global) * nheads + h) * headdim + p];
         float cb_val = cb[((b * ngroups + g) * chunk_size + t) * chunk_size + s];
         sum += dy * exp_a_t * cb_val;
     }
     float extra = 0.0f;
     int64_t b_base = nheads * headdim + g * d_state;
-    float exp_a_last = expf(fminf(dA_cumsum[chunk_offset + (chunk_len - 1)], 0.0f));
+    float exp_a_last = exp2f(fminf(dA_cumsum[chunk_offset + (chunk_len - 1)], 0.0f) * kLog2e);
     int64_t state_base = ((b * nheads + h) * headdim + p) * d_state;
     for (int64_t n = 0; n < d_state; ++n) {
         float b_val = conv_out[(b * seqlen + s_global) * conv_dim + b_base + n];
@@ -1519,7 +1521,7 @@ __global__ void ddA_to_dtdA_kernel(
     }
 
     if (t < chunk_len) {
-        float a = -expf(to_float(a_log[h]));
+        float a = -exp2f(to_float(a_log[h]) * kLog2e);
         float acc = shmem[t];
         int64_t idx_global = start + t;
         int64_t num_chunks = (seqlen + chunk_size - 1) / chunk_size;
@@ -1636,7 +1638,7 @@ __global__ void fused_conv_scan_backward_kernel(
         gstate[n] = grad_final_state ? to_float(grad_final_state[s_idx]) : 0.0f;
     }
 
-    float a = -expf(to_float(a_log[h]));
+    float a = -exp2f(to_float(a_log[h]) * kLog2e);
 
     int64_t offset_xbc = 2 * d_mlp + d_ssm;
     int64_t offset_dt = offset_xbc + d_ssm + 2 * ngroups * d_state;
@@ -1650,7 +1652,7 @@ __global__ void fused_conv_scan_backward_kernel(
             dt = fminf(fmaxf(dt, dt_min), dt_max);
             clamp = true;
         }
-        float da = expf(dt * a);
+        float da = exp2f(dt * a * kLog2e);
 
         int64_t x_chan = h * headdim + p;
         float x_conv = 0.0f;

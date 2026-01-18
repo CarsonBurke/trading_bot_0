@@ -5,6 +5,7 @@
 #include <iostream>
 
 constexpr int kMaxDState = 256;
+constexpr float kLog2e = 1.4426950408889634f;
 
 __device__ inline float sigmoid_f(float x) {
     return 1.0f / (1.0f + expf(-x));

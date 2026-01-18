@@ -1,3 +1,5 @@
+#include "ssd_common.cuh"
+
 // Apply causal mask (zero upper triangle) to CB matrix - simplified version without seq_idx
 __global__ void apply_causal_mask_simple_kernel(
     float* CB,
@@ -513,7 +515,7 @@ __global__ void bmm_kt_kn_scale_x_kernel(
                     int64_t chunk_base_idx = ((b * nheads + head) * num_chunks + c) * chunk_size;
                     int64_t dt_idx = chunk_base_idx + k;
                     float dA_L = dA_cumsum[chunk_base_idx + chunk_len - 1];
-                    float scale = dt[dt_idx] * expf(fminf(dA_L - dA_cumsum[dt_idx], 0.0f));
+                    float scale = dt[dt_idx] * exp2f((dA_L - dA_cumsum[dt_idx]) * kLog2e);
                     if (k >= chunk_len) {
                         scale = 0.0f;
                     }
@@ -656,7 +658,7 @@ __global__ void bmm_kt_kn_scale_x_kernel_bf16in(
                     int64_t chunk_base_idx = ((b * nheads + head) * num_chunks + c) * chunk_size;
                     int64_t dt_idx = chunk_base_idx + k;
                     float dA_L = dA_cumsum[chunk_base_idx + chunk_len - 1];
-                    float scale = dt[dt_idx] * __expf(fminf(dA_L - dA_cumsum[dt_idx], 0.0f));
+                    float scale = dt[dt_idx] * exp2f((dA_L - dA_cumsum[dt_idx]) * kLog2e);
                     if (k >= chunk_len) {
                         scale = 0.0f;
                     }
