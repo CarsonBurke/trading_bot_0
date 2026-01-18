@@ -137,14 +137,15 @@ const TEMPORAL_STATIC_DIM: i64 = 64;
 const GLOBAL_TOKEN_COUNT: i64 = 4;
 
 const PATCH_CONFIGS: [(i64, i64); 7] = [
-    (1600, 64),
-    (1024, 32),
-    (512, 16),
-    (128, 8),
-    (64, 4),
-    (32, 2),
-    (40, 1),
+    (4608, 128),  // 36 tokens - ~16 days
+    (2048, 64),   // 32 tokens - ~7.1 days
+    (1024, 32),   // 32 tokens - ~3.6 days
+    (512, 16),    // 32 tokens - ~1.8 days
+    (256, 8),     // 32 tokens - ~21 hrs
+    (128, 4),     // 32 tokens - ~10.7 hrs
+    (60, 1),      // 60 tokens - ~5 hrs (finest)
 ];
+// Total: 8636 segments (~30 days), 256 tokens
 
 const fn compute_patch_totals() -> (i64, i64) {
     let mut total_days = 0i64;

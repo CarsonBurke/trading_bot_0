@@ -197,16 +197,16 @@ pub fn get_price_deltas(data: &[Bar]) -> Vec<f64> {
     let mut diff = Vec::with_capacity(data.len());
 
     for (index, value) in data.iter().enumerate() {
-        let previous = {
-            let (previous_index, overflowed) = index.overflowing_sub(1);
+        let (previous_index, overflowed) = index.overflowing_sub(1);
 
-            if overflowed {
-                100.
-            } else {
-                data[previous_index].close
-            }
-        };
-        diff.push((value.close - previous) / previous)
+        if overflowed {
+            // First element: ln(1) = 0
+            diff.push(0.0);
+        } else {
+            let previous = data[previous_index].close;
+            // Log return: ln(price / previous)
+            diff.push((value.close / previous).ln());
+        }
     }
 
     diff

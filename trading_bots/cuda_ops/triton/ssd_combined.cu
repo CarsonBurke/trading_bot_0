@@ -8,6 +8,19 @@
 #include <unordered_map>
 #include <vector>
 
+// Debug helper: check tensor for NaN/Inf and report
+inline void debug_check_nan(const torch::Tensor& t, const char* name) {
+    static const char* env = std::getenv("MAMBA_NAN_DEBUG");
+    if (!env || std::atoi(env) != 1) return;
+    cudaDeviceSynchronize();
+    auto has_nan = t.isnan().any().item<bool>();
+    auto has_inf = t.isinf().any().item<bool>();
+    if (has_nan || has_inf) {
+        std::cerr << "NAN_DEBUG " << name << " has_nan=" << has_nan << " has_inf=" << has_inf
+                  << " shape=" << t.sizes() << "\n";
+    }
+}
+
 namespace {
 cublasHandle_t get_cublas_handle() {
     static cublasHandle_t handle = nullptr;
@@ -186,9 +199,15 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
   default:
     TORCH_CHECK(false, "unsupported dtype for conv1d_pack_dt_kernel");
   }
+  debug_check_nan(x_buf, "x_buf after conv1d_pack");
+  debug_check_nan(b_buf, "b_buf after conv1d_pack");
+  debug_check_nan(c_buf, "c_buf after conv1d_pack");
+  debug_check_nan(dt_buf, "dt_buf after conv1d_pack");
   dt_cumsum_from_dt_kernel<<<dt_grid, dt_threads, dt_shared>>>(
       dt_buf.data_ptr<float>(), alog.data_ptr<float>(), dA_buf.data_ptr<float>(),
       exp_a_last.data_ptr<float>(), batch, seqlen, nheads, chunk_size);
+  debug_check_nan(dA_buf, "dA_buf after dt_cumsum");
+  debug_check_nan(exp_a_last, "exp_a_last after dt_cumsum");
   int64_t heads_per_group = nheads / ngroups;
   auto x_g_mat = x_buf
                      .view({batch, num_chunks, chunk_size, ngroups,
@@ -218,6 +237,7 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
       chunk_state_mat.data_ptr<float>(), batch * num_chunks * ngroups, d_state,
       chunk_size, heads_per_group * headdim, seqlen, num_chunks, ngroups,
       nheads, headdim, chunk_size, has_seq_idx ? 1 : 0);
+  debug_check_nan(chunk_state_mat, "fwd:chunk_state_mat after bmm");
   auto chunk_state = chunk_state_mat.transpose(1, 2).contiguous().view(
       {batch, num_chunks, nheads, headdim, d_state});
   auto state_in = torch::zeros_like(chunk_state);
@@ -230,6 +250,7 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
       has_seq_idx ? seq.data_ptr<int64_t>() : nullptr, seq_stride, batch,
       nheads, headdim, d_state, num_chunks, chunk_size, seqlen,
       has_seq_idx ? 1 : 0);
+  debug_check_nan(state_in, "fwd:state_in after state_passing");
   final_state.copy_(final_state_f_kernel.to(final_state.scalar_type()));
 
   // Precompute CB = C @ B^T with causal masking
@@ -249,6 +270,7 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
         &beta,
         cb_buf.data_ptr<float>(), CUDA_R_32F, chunk_size, chunk_size * chunk_size,
         batch * num_chunks * ngroups, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    debug_check_nan(cb_buf, "fwd:cb_buf after cuBLAS GEMM (pre-mask)");
 
     // Apply causal mask separately
     dim3 mask_grid((chunk_size + 63) / 64, (chunk_size + 63) / 64, batch * num_chunks * ngroups);
@@ -337,6 +359,7 @@ std::vector<torch::Tensor> mamba_fused_forward_cuda(
               }
           }));
   }
+  debug_check_nan(y_padded_f, "fwd:y_padded_f after chunk_scan");
 
   y.copy_(y_padded_f.view({batch, num_chunks * chunk_size, nheads, headdim})
               .slice(1, 0, seqlen)

@@ -46,7 +46,8 @@ __global__ void selective_state_update_kernel(
             dt_val = fminf(fmaxf(dt_val, dt_min), dt_max);
         }
     }
-    float a = -exp2f(a_log[h] * kLog2e);
+    float a_log_val = a_log[h];
+    float a = -exp2f(a_log_val * kLog2e);
     float da = exp2f(fminf(dt_val * a, 0.0f) * kLog2e);
 
     float x_val = x[(b_idx * nheads + h) * headdim + p];

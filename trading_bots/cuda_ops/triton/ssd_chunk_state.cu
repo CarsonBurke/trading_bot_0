@@ -653,11 +653,7 @@ __global__ void dt_cumsum_kernel(
         int64_t dt_idx = ((b * nheads + h) * ((seqlen + chunk_size - 1) / chunk_size) + c) * chunk_size + t;
         dt_out[dt_idx] = dt;
         float a_log_val = to_float(a_log[h]);
-        // Clamp a_log to prevent exp2f(a_log) from being inf
-        if (a_log_val > 10.0f) a_log_val = 10.0f;
         float a = -exp2f(a_log_val * kLog2e);
-        // Clamp a to prevent 0 * inf = NaN or excessive decay
-        if (a > -1e-6f) a = -1e-6f; 
         val = dt * a;
     }
     shmem[t] = val;
@@ -672,8 +668,6 @@ __global__ void dt_cumsum_kernel(
         shmem[t] += add;
         __syncthreads();
     }
-    
-    if (shmem[t] < -100.0f) shmem[t] = -100.0f;
 
     if (t < chunk_len) {
         int64_t da_idx = ((b * nheads + h) * ((seqlen + chunk_size - 1) / chunk_size) + c) * chunk_size + t;
@@ -720,9 +714,7 @@ __global__ void dt_cumsum_from_dt_kernel(
     if (t < chunk_len) {
         float dt = dt_in[dt_base + t];
         float a_log_val = a_log[h];
-        if (a_log_val > 10.0f) a_log_val = 10.0f;
         float a = -exp2f(a_log_val * kLog2e);
-        if (a > -1e-6f) a = -1e-6f;
         val = dt * a;
     }
     shmem[t] = val;
@@ -737,8 +729,6 @@ __global__ void dt_cumsum_from_dt_kernel(
         shmem[t] += add;
         __syncthreads();
     }
-
-    if (shmem[t] < -100.0f) shmem[t] = -100.0f;
 
     if (t < chunk_len) {
         dA_cumsum[dt_base + t] = shmem[t];
@@ -793,7 +783,8 @@ __global__ void ddA_to_dtdA_kernel(
     }
 
     if (t < chunk_len) {
-        float a = -exp2f(to_float(a_log[h]) * kLog2e);
+        float a_log_val = to_float(a_log[h]);
+        float a = -exp2f(a_log_val * kLog2e);
         float acc = shmem[t];
         int64_t idx_global = start + t;
         int64_t num_chunks = (seqlen + chunk_size - 1) / chunk_size;

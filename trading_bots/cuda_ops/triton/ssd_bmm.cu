@@ -128,16 +128,13 @@ __global__ void bmm_kt_kn_scale_x_kernel(
                 int64_t k = k0 + row;
                 int64_t n = col_base + col;
                 float val = 0.0f;
-                if (k < K && n < N) {
+                if (k < K && n < N && k < chunk_len) {
                     int64_t head_in_group = n / headdim;
                     int64_t head = g * heads_per_group + head_in_group;
                     int64_t chunk_base_idx = ((b * nheads + head) * num_chunks + c) * chunk_size;
                     int64_t dt_idx = chunk_base_idx + k;
                     float dA_L = dA_cumsum[chunk_base_idx + chunk_len - 1];
-                    float scale = dt[dt_idx] * exp2f((dA_L - dA_cumsum[dt_idx]) * kLog2e);
-                    if (k >= chunk_len) {
-                        scale = 0.0f;
-                    }
+                    float scale = dt[dt_idx] * exp2f(fminf(dA_L - dA_cumsum[dt_idx], 0.0f) * kLog2e);
                     if (has_seq_idx) {
                         int64_t seq_k = seq_idx[seq_base + k];
                         int64_t seq_last = seq_idx[seq_base + (chunk_len - 1)];
@@ -271,16 +268,13 @@ __global__ void bmm_kt_kn_scale_x_kernel_bf16in(
                 int64_t k = k0 + row;
                 int64_t n = col_base + col;
                 float val = 0.0f;
-                if (k < K && n < N) {
+                if (k < K && n < N && k < chunk_len) {
                     int64_t head_in_group = n / headdim;
                     int64_t head = g * heads_per_group + head_in_group;
                     int64_t chunk_base_idx = ((b * nheads + head) * num_chunks + c) * chunk_size;
                     int64_t dt_idx = chunk_base_idx + k;
                     float dA_L = dA_cumsum[chunk_base_idx + chunk_len - 1];
-                    float scale = dt[dt_idx] * exp2f((dA_L - dA_cumsum[dt_idx]) * kLog2e);
-                    if (k >= chunk_len) {
-                        scale = 0.0f;
-                    }
+                    float scale = dt[dt_idx] * exp2f(fminf(dA_L - dA_cumsum[dt_idx], 0.0f) * kLog2e);
                     if (has_seq_idx) {
                         int64_t seq_k = seq_idx[seq_base + k];
                         int64_t seq_last = seq_idx[seq_base + (chunk_len - 1)];

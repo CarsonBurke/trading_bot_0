@@ -26,41 +26,6 @@ const DT_INIT_FLOOR: f64 = 1e-4;
 
 static MAMBA_CALL_ID: AtomicUsize = AtomicUsize::new(0);
 
-fn debug_fused(tag: &str, t: &Tensor) {
-    if !crate::torch::ppo::DEBUG_NUMERICS && env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
-        return;
-    }
-    let has_nan = t.isnan().any().int64_value(&[]) != 0;
-    let has_inf = t.isinf().any().int64_value(&[]) != 0;
-    if has_nan || has_inf {
-        eprintln!(
-            "mamba_fused_debug {} nan={} inf={} shape={:?}",
-            tag,
-            has_nan,
-            has_inf,
-            t.size()
-        );
-    }
-}
-
-fn debug_fused_call(tag: &str, call_id: usize, t: &Tensor) {
-    if !crate::torch::ppo::DEBUG_NUMERICS && env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
-        return;
-    }
-    let has_nan = t.isnan().any().int64_value(&[]) != 0;
-    let has_inf = t.isinf().any().int64_value(&[]) != 0;
-    if has_nan || has_inf {
-        eprintln!(
-            "mamba_fused_debug {}#{} nan={} inf={} shape={:?}",
-            tag,
-            call_id,
-            has_nan,
-            has_inf,
-            t.size()
-        );
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Mamba2Config {
     pub d_model: i64,
@@ -293,8 +258,10 @@ impl Mamba2 {
         let inv_dt = &dt_init + (-&dt_init).expm1().neg().log();
         let dt_bias = p.var_copy("dt_bias", &inv_dt);
 
-        // A: per-head scalar (S4D-style initialization)
-        let a_init = Tensor::empty(&[nheads], (Kind::Float, p.device())).uniform_(1.0, 16.0);
+        // A: per-head scalar (Mamba2-style initialization)
+        // a_log = log(uniform(1, 8)), so a_log in [0, ~2.08]
+        // Then A = -exp(a_log) in [-8, -1] for moderate-to-fast decay
+        let a_init = Tensor::empty(&[nheads], (Kind::Float, p.device())).uniform_(1.0, 8.0);
         let a_log = p.var_copy("A_log", &a_init.log());
 
         // D: skip connection - per-head or per-channel depending on d_has_hdim
@@ -387,10 +354,7 @@ impl Mamba2 {
             );
         }
 
-        debug_fused_call("mamba2_u", call_id, u);
-        debug_fused_call("mamba2_in_proj_w", call_id, &self.in_proj.ws);
         let zxbcdt = u.apply(&self.in_proj);
-        debug_fused_call("mamba2_zxbcdt", call_id, &zxbcdt);
 
         if debug_mem {
             let stats = mamba_fused::cuda_memory_stats();
@@ -423,7 +387,6 @@ impl Mamba2 {
             );
         }
 
-        debug_fused_call("mamba2_y", call_id, &y_out);
         y_out
     }
 
@@ -440,6 +403,7 @@ impl Mamba2 {
         let debug_mem = env::var("MAMBA_DEBUG_MEM").ok().as_deref() == Some("1");
         let device = u.device();
         let kind = u.kind();
+
         let zxbcdt = if matches!(device, tch::Device::Cuda(_)) {
             let bias = match &self.in_proj.bs {
                 Some(b) => b.to_kind(kind).to_device(device),
@@ -459,7 +423,10 @@ impl Mamba2 {
             let normed = (x_f32 / rms * norm_weight.to_kind(Kind::Float)).to_kind(u.kind());
             normed.apply(&self.in_proj)
         };
-        self.forward_fused_from_zxbcdt(&zxbcdt, batch, seqlen, dt_scale, seq_idx, call_id, debug_mem)
+
+        let y_out = self.forward_fused_from_zxbcdt(&zxbcdt, batch, seqlen, dt_scale, seq_idx, call_id, debug_mem);
+
+        y_out
     }
 
     /// Initialize inference state for a given batch size

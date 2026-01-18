@@ -7,6 +7,7 @@ use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT, PRICE_DELTAS_PER_TICK
 use crate::torch::model::{symlog_tensor, symexp_tensor, TradingModel, PATCH_SEQ_LEN};
 use crate::torch::env::VecEnv;
 
+const LEARNING_RATE: f64 = 3e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
@@ -15,7 +16,7 @@ const PPO_CLIP_RATIO: f64 = 0.2;
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
-const ENTROPY_COEF: f64 = 0.01;
+const ENTROPY_COEF: f64 = 0.0;
 const ATTENTION_ENTROPY_COEF: f64 = 0.001;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_GRAD_NORM: f64 = 0.5;
@@ -138,7 +139,8 @@ pub async fn train(weights_path: Option<&str>) {
 
     let mut vs = nn::VarStore::new(device);
     let trading_model = TradingModel::new(&vs.root());
-    
+
+
     if let Some(path) = weights_path {
         println!("Loading weights from {}", path);
         vs.load(path).unwrap();
@@ -146,7 +148,7 @@ pub async fn train(weights_path: Option<&str>) {
         println!("Starting training from scratch");
     }
     
-    let mut opt = nn::Adam::default().build(&vs, 2e-4).unwrap();
+    let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
     let mut env = VecEnv::new(true);
 

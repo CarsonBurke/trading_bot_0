@@ -21,7 +21,6 @@ impl TradingModel {
         seq_idx: Option<&Tensor>,
         _train: bool,
     ) -> ModelOutput {
-        let debug_mem = env::var("MAMBA_DEBUG_MEM").ok().as_deref() == Some("1");
         let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
 
@@ -33,15 +32,6 @@ impl TradingModel {
         let (x_stem, dt_scale, seq_idx) = self.patch_latent_stem(&price_deltas, batch_size, seq_idx);
         debug_fused("model_x_stem", &x_stem);
         debug_fused("model_dt_scale", &dt_scale);
-
-        if debug_mem {
-            let stats = mamba_fused::cuda_memory_stats();
-            eprintln!(
-                "MODEL after patch_stem: alloc={}MB x_stem={:?}",
-                stats.get(0).unwrap_or(&0) / (1024 * 1024),
-                x_stem.size()
-            );
-        }
 
         let mut x_for_ssm = x_stem;
         let seq_idx_ref = if seq_idx.numel() == 0 { None } else { Some(&seq_idx) };
@@ -55,19 +45,11 @@ impl TradingModel {
                 seq_idx_ref,
             );
             debug_fused_layer("ssm_out", layer_idx, &out);
+
             x_for_ssm = x_for_ssm + out;
             debug_fused_layer("x_for_ssm_out", layer_idx, &x_for_ssm);
         }
         debug_fused("model_x_for_ssm", &x_for_ssm);
-
-        if debug_mem {
-            let stats = mamba_fused::cuda_memory_stats();
-            eprintln!(
-                "MODEL after SSM layers: alloc={}MB peak={}MB",
-                stats.get(0).unwrap_or(&0) / (1024 * 1024),
-                stats.get(3).unwrap_or(&0) / (1024 * 1024)
-            );
-        }
 
         self.head_with_temporal_pool(
             &x_for_ssm,
@@ -173,8 +155,25 @@ impl TradingModel {
     }
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+static DEBUG_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn is_debug_enabled() -> bool {
+    if !DEBUG_INITIALIZED.load(Ordering::Relaxed) {
+        let enabled = crate::torch::ppo::DEBUG_NUMERICS
+            || env::var("MAMBA_FUSED_DEBUG").ok().as_deref() == Some("1");
+        DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+        DEBUG_INITIALIZED.store(true, Ordering::Relaxed);
+    }
+    DEBUG_ENABLED.load(Ordering::Relaxed)
+}
+
+#[inline]
 fn debug_fused(tag: &str, t: &Tensor) {
-    if !crate::torch::ppo::DEBUG_NUMERICS && env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
+    if !is_debug_enabled() {
         return;
     }
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -190,8 +189,9 @@ fn debug_fused(tag: &str, t: &Tensor) {
     }
 }
 
+#[inline]
 fn debug_fused_layer(tag: &str, layer_idx: usize, t: &Tensor) {
-    if !crate::torch::ppo::DEBUG_NUMERICS && env::var("MAMBA_FUSED_DEBUG").ok().as_deref() != Some("1") {
+    if !is_debug_enabled() {
         return;
     }
     let has_nan = t.isnan().any().int64_value(&[]) != 0;

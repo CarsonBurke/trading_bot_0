@@ -97,10 +97,13 @@ fn main() {
         .arg("-lcudart"));
 
     let wrapper_path = out_dir.join("mamba_fused_wrapper.pt");
-    run(Command::new("python")
-        .arg(cuda_ops_dir.join("gen_wrapper.py"))
-        .env("MAMBA_FUSED_LIB_PATH", &so_path)
-        .env("MAMBA_FUSED_WRAPPER_PATH", &wrapper_path));
+    // Only regenerate wrapper if it doesn't exist (python3.14 compatibility workaround)
+    if !wrapper_path.exists() {
+        run(Command::new("python")
+            .arg(cuda_ops_dir.join("gen_wrapper.py"))
+            .env("MAMBA_FUSED_LIB_PATH", &so_path)
+            .env("MAMBA_FUSED_WRAPPER_PATH", &wrapper_path));
+    }
 
     println!("cargo:rustc-env=MAMBA_FUSED_LIB_PATH={}", so_path.display());
     println!("cargo:rustc-env=MAMBA_FUSED_WRAPPER_PATH={}", wrapper_path.display());

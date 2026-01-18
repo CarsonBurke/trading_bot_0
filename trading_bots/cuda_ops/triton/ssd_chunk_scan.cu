@@ -129,11 +129,17 @@ __global__ void chunk_scan_fwd_kernel_v3_bf16in_fused(
 
         #pragma unroll
         for (int k = 0; k < BK; ++k) {
+            int64_t k_global = k0 + k;
+            if (k_global >= chunk_len) break;
             float dA_kv = dA_k[k];
             float dtv = dt_k[k];
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                float scale = exp2f((dA_m_vals[i] - dA_kv) * kLog2e) * dtv;
+                int64_t m_global = row_base + tid_m * 4 + i;
+                float scale = 0.0f;
+                if (m_global < chunk_len) {
+                    scale = exp2f(fminf(dA_m_vals[i] - dA_kv, 0.0f) * kLog2e) * dtv;
+                }
                 float cbv = cb_s[tid_m * 4 + i][k] * scale;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -342,8 +348,8 @@ __global__ void chunk_scan_fwd_kernel_wmma_bf16in_fused(
                 int64_t m_global = row_base + r;
                 int64_t k_global = k0 + k_in;
                 float val = 0.0f;
-                if (m_global < chunk_size && k_global < chunk_size && k_global <= m_global) {
-                    float scale = exp2f((dA_m[r] - dA_k[k_in]) * kLog2e) * dt_k[k_in];
+                if (m_global < chunk_len && k_global < chunk_len && k_global <= m_global) {
+                    float scale = exp2f(fminf(dA_m[r] - dA_k[k_in], 0.0f) * kLog2e) * dt_k[k_in];
                     val = CB[cb_offset + m_global * chunk_size + k_global] * scale;
                 }
                 cb_half[r][k_in] = __float2half_rn(val);
