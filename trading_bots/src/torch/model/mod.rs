@@ -11,6 +11,7 @@ use tch::{nn, Kind, Tensor};
 use crate::torch::constants::{
     GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
+use crate::torch::ppo::VALUE_LOG_CLIP;
 use crate::torch::ssm::{stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMamba};
 
 pub use shared::constants::GLOBAL_MACRO_OBS;
@@ -634,8 +635,7 @@ impl TradingModel {
             &[SDE_LATENT_DIM, TICKERS_COUNT],
             Init::Const(0.0),
         );
-        let value_clip = 10.0;
-        let value_clip_symlog = symlog_tensor(&Tensor::from(value_clip)).double_value(&[]);
+        let value_clip_symlog = symlog_tensor(&Tensor::from(VALUE_LOG_CLIP)).double_value(&[]);
         let value_centers = Tensor::linspace(
             -value_clip_symlog,
             value_clip_symlog,
