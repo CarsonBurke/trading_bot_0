@@ -12,7 +12,7 @@ const ACTION_OUTCOME_COMMISSION_PENALTY: f64 = 5.0;
 // penalized by negative base return.
 const CONVICTION_BONUS: f64 = 1.0;
 
-const REWARD_SCALE: f64 = 20.0;
+const REWARD_SCALE: f64 = 10.0;
 const SHARPE_LAMBDA: f64 = 100.0;
 const SORTINO_LAMBDA: f64 = 100.0;
 const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 0.01;
