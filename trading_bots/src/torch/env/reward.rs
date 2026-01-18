@@ -1,6 +1,6 @@
 use super::env::Env;
 
-const REWARD_SCALE: f64 = 5.0;
+const REWARD_SCALE: f64 = 10.0;
 
 impl Env {
     pub fn get_unrealized_pnl_reward_breakdown(
