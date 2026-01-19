@@ -16,8 +16,7 @@ const PPO_CLIP_RATIO: f64 = 0.2;
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
-const ENTROPY_COEF: f64 = 0.0;
-const ATTENTION_ENTROPY_COEF: f64 = 0.001;
+const ENTROPY_COEF: f64 = 0.0; // SDE and RPO make this effectively unecessary
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_GRAD_NORM: f64 = 0.5;
 const RPO_ALPHA_MIN: f64 = 0.01;
@@ -25,7 +24,6 @@ const RPO_ALPHA_MAX: f64 = 0.1;
 const RPO_TARGET_KL: f64 = 0.018;
 pub const VALUE_LOG_CLIP: f64 = 8.0;
 const CRITIC_ENTROPY_COEF: f64 = 0.01;
-const CRITIC_MAE_NORM: f64 = 100.0;
 const LOG_2PI: f64 = 1.8378770664093453;
 const ADV_MIXED_WEIGHT: f64 = 0.5;
 const GRAD_ACCUM_STEPS: usize = 2;
@@ -356,8 +354,7 @@ pub async fn train(weights_path: Option<&str>) {
                 let log_det = act_mb.log_softmax(-1, Kind::Float).sum_dim_intlist(-1, false, Kind::Float);
                 let action_log_probs = log_prob_gaussian - log_det;
 
-                let log_ratio_raw = &action_log_probs - &old_log_probs_mb;
-                let log_ratio = &log_ratio_raw / (1.0 + log_ratio_raw.abs() / 2.0) * 2.0;
+                let log_ratio = &action_log_probs - &old_log_probs_mb;
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
@@ -385,7 +382,7 @@ pub async fn train(weights_path: Option<&str>) {
 
                 let dist_entropy = (&action_log_stds * 2.0 + (1.0 + LOG_2PI)).g_mul_scalar(0.5).mean(Kind::Float);
                 
-                let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF + action_loss.shallow_clone() - dist_entropy * ENTROPY_COEF - attn_entropy.mean(Kind::Float) * ATTENTION_ENTROPY_COEF;
+                let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF + action_loss.shallow_clone() - dist_entropy * ENTROPY_COEF;
                 
                 let inv_var_mean = action_log_stds.detach().exp().pow_tensor_scalar(2).clamp_min(1e-4).reciprocal().mean(Kind::Float);
                 let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (ACTION_COUNT as f64 / 6.0) * inv_var_mean;
@@ -503,11 +500,11 @@ pub async fn train(weights_path: Option<&str>) {
         primary.meta_history.record_loss(mean_loss);
         primary.meta_history.record_policy_loss(mean_policy_loss);
         primary.meta_history.record_value_loss(mean_value_loss);
-        primary.meta_history.record_value_mae(mean_value_mae / CRITIC_MAE_NORM);
+        primary.meta_history.record_value_mae(mean_value_mae);
         primary.meta_history.record_grad_norm(mean_grad_norm);
 
         println!("  Loss: {:.4} (Policy: {:.4}, Value: {:.4}, MAE: {:.4}) GradNorm: {:.4}",
-                 mean_loss, mean_policy_loss, mean_value_loss, mean_value_mae / CRITIC_MAE_NORM, mean_grad_norm);
+                 mean_loss, mean_policy_loss, mean_value_loss, mean_value_mae, mean_grad_norm);
 
         if episode > 0 && episode % 50 == 0 {
             let _ = std::fs::create_dir_all("weights");
