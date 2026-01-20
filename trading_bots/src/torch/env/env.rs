@@ -431,7 +431,7 @@ impl Env {
 
         let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
         let (reward, reward_per_ticker, cash_reward) =
-            self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
+            self.get_hybrid_reward_breakdown(absolute_step, commissions);
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -498,7 +498,7 @@ impl Env {
 
         let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
         let (reward, reward_per_ticker, cash_reward) =
-            self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
+            self.get_hybrid_reward_breakdown(absolute_step, commissions);
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {

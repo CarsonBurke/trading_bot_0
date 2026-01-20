@@ -6,8 +6,6 @@ use super::{
 };
 use crate::torch::constants::{PER_TICKER_STATIC_OBS, TICKERS_COUNT};
 
-const POOL_TEMPERATURE_MIN: f64 = 0.1;
-const POOL_TEMPERATURE_MAX: f64 = 8.0;
 
 impl TradingModel {
     pub(super) fn head_with_temporal_pool(
@@ -159,84 +157,27 @@ impl TradingModel {
             .unsqueeze(1);
         let pooled_enriched = combined + global_ctx;
 
-        // Cash pathway uses full temporal sequence from x_time: [batch, seq_len, tickers, dim]
-        let x_time_for_cash = x_time.permute([0, 2, 1, 3]); // [batch, tickers, seq_len, dim]
-        let token_seq = x_time_for_cash.reshape([batch_size, TICKERS_COUNT * temporal_len, MODEL_DIM]);
-        let cash_slope =
-            self.cash_recent_slope_raw.sigmoid() * (2.0 / temporal_len as f64);
-        let positions = self.decay_positions.narrow(0, 0, temporal_len);
-        let distances = (temporal_len - 1) as f64 - &positions;
-        let ones = self.decay_ones.narrow(0, 0, temporal_len);
-        let cash_decay = (&ones - &distances * &cash_slope).clamp_min(0.0);
-        let cash_decay = &cash_decay / cash_decay.sum(Kind::Float).clamp_min(1e-6);
-        let cash_decay = cash_decay
-            .reshape([1, 1, temporal_len, 1])
-            .to_kind(x_time_for_cash.kind());
-        let cash_recent = (&x_time_for_cash * &cash_decay)
-            .sum_dim_intlist([2].as_slice(), false, x_time_for_cash.kind())
-            .mean_dim([1].as_slice(), false, x_time_for_cash.kind());
-        let cash_recent_proj = cash_recent.apply(&self.cash_recent_proj);
-        let cash_recent_gate = cash_recent.apply(&self.cash_recent_gate).sigmoid();
-        let cash_q = self
-            .cash_queries
-            .unsqueeze(0)
-            .expand(&[batch_size, self.cash_pool_queries, MODEL_DIM], false)
-            + (cash_recent_proj * cash_recent_gate).unsqueeze(1);
-        let cash_q = cash_q
-            .apply(&self.cash_q_proj);
-        let cash_k = token_seq.apply(&self.cash_k_proj);
-        let cash_v = token_seq.apply(&self.cash_v_proj);
-        let cash_temp = self.cash_attn_temp_raw.exp().clamp(POOL_TEMPERATURE_MIN, POOL_TEMPERATURE_MAX);
-        let scores =
-            cash_q.matmul(&cash_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt() * cash_temp;
-        let cash_attn_f = scores.softmax(-1, Kind::Float).to_kind(cash_q.kind());
-        let cash_ctx = cash_attn_f.matmul(&cash_v);
-        let global_tokens = self
-            .global_tokens
-            .unsqueeze(0)
-            .expand(&[batch_size, super::GLOBAL_TOKEN_COUNT, MODEL_DIM], false)
-            + global_static
-                .apply(&self.global_token_proj)
-                .unsqueeze(1);
-        let global_summary = global_tokens
-            .mean_dim([1].as_slice(), false, global_tokens.kind())
-            .apply(&self.global_token_merge);
-        let cash_summary = cash_ctx
-            .mean_dim(1, false, cash_ctx.kind())
+        // Cash pathway for policy (still needed for actor)
+        let cash_summary = pooled_enriched
+            .mean_dim([1].as_slice(), false, pooled_enriched.kind())
             .apply(&self.cash_merge);
-        let cash_summary = cash_summary + global_summary;
-        let entropy_denom = (temporal_len as f64).ln().max(1.0);
-        let cash_attn_entropy = -(cash_attn_f.clamp_min(1e-9)
-            * cash_attn_f.clamp_min(1e-9).log())
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-            .mean_dim([1].as_slice(), false, Kind::Float)
-            / entropy_denom;
-        let attn_entropy = cash_attn_entropy.to_kind(pooled_enriched.kind());
+        let attn_entropy = Tensor::zeros([batch_size], (Kind::Float, pooled_enriched.device()));
 
-        // Batch value computation: combine ticker and cash inputs, apply RMSNorm + MLP once
-        let pooled_flat = pooled_enriched.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]);
-        let cash_flat = cash_summary.view([batch_size, MODEL_DIM]);
-        let value_input = Tensor::cat(&[pooled_flat, cash_flat], 0);
+        // Portfolio-level critic: pool all tickers into single representation
+        let portfolio_repr = pooled_enriched
+            .mean_dim([1].as_slice(), false, pooled_enriched.kind()); // [batch, dim]
         let value_hidden = self
             .value_ln
-            .forward(&value_input)
+            .forward(&portfolio_repr)
             .apply(&self.value_mlp_fc1)
             .silu()
             .apply(&self.value_mlp_fc2);
-        let ticker_value_hidden = value_hidden.narrow(0, 0, batch_size * TICKERS_COUNT);
-        let cash_value_hidden = value_hidden.narrow(0, batch_size * TICKERS_COUNT, batch_size);
-        let value_logits_ticker = ticker_value_hidden
-            .apply(&self.critic_out)
-            .reshape([batch_size, TICKERS_COUNT, super::NUM_VALUE_BUCKETS]);
-        let value_cash = cash_value_hidden
-            .apply(&self.critic_out)
-            .reshape([batch_size, 1, super::NUM_VALUE_BUCKETS]);
-        let critic_logits = Tensor::cat(&[value_logits_ticker, value_cash], 1);
+        let critic_logits = value_hidden.apply(&self.critic_out); // [batch, NUM_VALUE_BUCKETS]
         let critic_probs = critic_logits.softmax(-1, Kind::Float);
         let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
         let values_symlog = critic_probs
             .matmul(&bucket_centers.unsqueeze(-1))
-            .squeeze_dim(-1);
+            .squeeze_dim(-1); // [batch]
         let values = symexp_tensor(&values_symlog).to_kind(pooled_enriched.kind());
 
         // Batch policy computation: combine ticker and cash inputs, apply policy_ln + head_proj + head_ln once

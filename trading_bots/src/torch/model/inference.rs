@@ -156,9 +156,10 @@ impl TradingModel {
                 self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
             {
                 let state_idx = layer * TICKERS_COUNT as usize + t;
-                let normed = norm.forward(&x);
-                let out = ssm.forward_with_state_dt_scale(
-                    &normed,
+                let out = ssm.forward_with_state_pre_norm_dt_scale(
+                    &x,
+                    norm.weight(),
+                    norm.eps(),
                     &mut state.ssm_states[state_idx],
                     Some(&dt_scale),
                 );
@@ -189,8 +190,13 @@ impl TradingModel {
                 self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
             {
                 let state_idx = layer * TICKERS_COUNT as usize + t;
-                let normed = norm.forward(&x_in);
-                let out = ssm.step_with_dt_scale(&normed, &mut state.ssm_states[state_idx], dt_scale);
+                let out = ssm.step_with_pre_norm_dt_scale(
+                    &x_in,
+                    norm.weight(),
+                    norm.eps(),
+                    &mut state.ssm_states[state_idx],
+                    dt_scale,
+                );
                 x_in = x_in + out;
             }
             outputs.push(x_in.unsqueeze(1));

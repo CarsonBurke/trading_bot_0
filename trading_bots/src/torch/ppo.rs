@@ -1,11 +1,13 @@
 use std::env;
 use std::time::Instant;
-use tch::{nn, Kind, Tensor, nn::OptimizerConfig};
+use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 
 use crate::constants::TICKERS;
-use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS};
-use crate::torch::model::{symlog_tensor, symexp_tensor, TradingModel, PATCH_SEQ_LEN};
+use crate::torch::constants::{
+    ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
+};
 use crate::torch::env::VecEnv;
+use crate::torch::model::{symexp_tensor, symlog_tensor, TradingModel, PATCH_SEQ_LEN};
 
 const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
@@ -19,13 +21,12 @@ const VALUE_LOSS_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.0; // SDE and RPO make this effectively unecessary
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_GRAD_NORM: f64 = 0.5;
-const RPO_ALPHA_MIN: f64 = 0.01;
-const RPO_ALPHA_MAX: f64 = 0.15;
+const RPO_ALPHA_MIN: f64 = 0.005;
+const RPO_ALPHA_MAX: f64 = 0.05;
 const RPO_TARGET_KL: f64 = 0.018;
 pub const VALUE_LOG_CLIP: f64 = 8.0;
 const CRITIC_ENTROPY_COEF: f64 = 0.01;
 const LOG_2PI: f64 = 1.8378770664093453;
-const ADV_MIXED_WEIGHT: f64 = 0.5;
 const GRAD_ACCUM_STEPS: usize = 2;
 pub(crate) const DEBUG_NUMERICS: bool = false;
 
@@ -121,12 +122,18 @@ fn twohot_encode(t: &Tensor, centers: &Tensor) -> Tensor {
 }
 
 pub async fn train(weights_path: Option<&str>) {
-    if let Some(threads) = env::var("TORCH_NUM_THREADS").ok().and_then(|v| v.parse::<i32>().ok()) {
+    if let Some(threads) = env::var("TORCH_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
         tch::set_num_threads(threads);
     } else {
         tch::set_num_threads(1);
     }
-    if let Some(threads) = env::var("TORCH_NUM_INTEROP_THREADS").ok().and_then(|v| v.parse::<i32>().ok()) {
+    if let Some(threads) = env::var("TORCH_NUM_INTEROP_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
         tch::set_num_interop_threads(threads);
     } else {
         tch::set_num_interop_threads(1);
@@ -138,14 +145,13 @@ pub async fn train(weights_path: Option<&str>) {
     let mut vs = nn::VarStore::new(device);
     let trading_model = TradingModel::new(&vs.root());
 
-
     if let Some(path) = weights_path {
         println!("Loading weights from {}", path);
         vs.load(path).unwrap();
     } else {
         println!("Starting training from scratch");
     }
-    
+
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
     let mut env = VecEnv::new(true);
@@ -162,17 +168,19 @@ pub async fn train(weights_path: Option<&str>) {
     let mut s_seq_idx = GpuRollingBuffer::new(memory_size, seq_idx_dim, Kind::Int64, device);
     let mut s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
     let mut s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let mut s_rewards = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
+    let mut s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level reward
     let mut s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let mut s_values = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
-    let mut s_action_weights = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
+    let mut s_values = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level value
+    let mut s_action_weights =
+        Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
 
     let mut rpo_rho = vs.root().var("rpo_rho", &[1], nn::Init::Const(0.0));
 
     for episode in 0..1000000 {
         let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
-        let mut obs_static = Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
+        let mut obs_static =
+            Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
         let mut obs_seq_idx = Tensor::zeros(&[NPROCS, seq_idx_dim], (Kind::Int64, device));
         obs_price.copy_(&obs_price_cpu);
         obs_static.copy_(&obs_static_cpu);
@@ -181,14 +189,19 @@ pub async fn train(weights_path: Option<&str>) {
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_cash_reward = Tensor::zeros(&[NPROCS], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
-        
+
         let action_dim = (TICKERS_COUNT + 1) as usize;
         let mut actions_flat = vec![0.0f64; NPROCS as usize * action_dim];
         let mut actions_vec = vec![vec![0.0f64; action_dim]; NPROCS as usize];
 
         for step in 0..rollout_steps as usize {
             let (values, _, (action_mean, action_log_std), _) = tch::no_grad(|| {
-                trading_model.forward_with_seq_idx(&obs_price, &obs_static, Some(&obs_seq_idx), false)
+                trading_model.forward_with_seq_idx(
+                    &obs_price,
+                    &obs_static,
+                    Some(&obs_seq_idx),
+                    false,
+                )
             });
 
             if DEBUG_NUMERICS {
@@ -198,17 +211,21 @@ pub async fn train(weights_path: Option<&str>) {
 
             let action_std = action_log_std.exp();
             let u = &action_mean + Tensor::randn_like(&action_mean) * &action_std;
-            
+
+            // Gaussian log_prob on logits u; softmax applied only for env actions
             let u_normalized = (&u - &action_mean) / &action_std;
-            let log_prob_gaussian = (u_normalized.pow_tensor_scalar(2) + action_log_std * 2.0 + LOG_2PI).sum_dim_intlist(-1, false, Kind::Float).g_mul_scalar(-0.5);
-            let log_det = u.log_softmax(-1, Kind::Float).sum_dim_intlist(-1, false, Kind::Float);
-            let action_log_prob = log_prob_gaussian - log_det;
+            let action_log_prob =
+                (u_normalized.pow_tensor_scalar(2) + action_log_std * 2.0 + LOG_2PI)
+                    .sum_dim_intlist(-1, false, Kind::Float)
+                    .g_mul_scalar(-0.5);
 
             let actions_softmax = u.softmax(-1, Kind::Float);
             if DEBUG_NUMERICS {
                 let _ = debug_tensor_stats("u", &u, episode as i64, step);
-                let _ = debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
-                let _ = debug_tensor_stats("actions_softmax", &actions_softmax, episode as i64, step);
+                let _ =
+                    debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
+                let _ =
+                    debug_tensor_stats("actions_softmax", &actions_softmax, episode as i64, step);
             }
             let actions_cpu = actions_softmax
                 .flatten(0, -1)
@@ -232,49 +249,60 @@ pub async fn train(weights_path: Option<&str>) {
             );
 
             let mem_idx = step as i64 * NPROCS;
-            
+
             s_price_deltas.push(&obs_price);
             s_static_obs.push(&obs_static);
             s_seq_idx.push(&obs_seq_idx);
             let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&u);
-            let _ = s_old_log_probs.narrow(0, mem_idx, NPROCS).copy_(&action_log_prob);
-            
-            let rewards_combined =
-                Tensor::cat(&[&step_reward_per_ticker, &step_cash_reward.unsqueeze(1)], 1);
+            let _ = s_old_log_probs
+                .narrow(0, mem_idx, NPROCS)
+                .copy_(&action_log_prob);
+
+            // Portfolio-level reward: include cash penalty to avoid trivial cash-hold policy.
+            let portfolio_reward =
+                step_reward_per_ticker.sum_dim_intlist([1].as_slice(), false, Kind::Float)
+                    + &step_cash_reward;
             if DEBUG_NUMERICS {
-                let _ = debug_tensor_stats("rewards_combined", &rewards_combined, episode as i64, step);
+                let _ =
+                    debug_tensor_stats("portfolio_reward", &portfolio_reward, episode as i64, step);
                 let _ = debug_tensor_stats("values", &values, episode as i64, step);
                 let _ = debug_tensor_stats("step_is_done", &step_is_done, episode as i64, step);
             }
-            let _ = s_rewards.narrow(0, mem_idx, NPROCS).copy_(&rewards_combined);
+            let _ = s_rewards
+                .narrow(0, mem_idx, NPROCS)
+                .copy_(&portfolio_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
             let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
-            let _ = s_action_weights.narrow(0, mem_idx, NPROCS).copy_(&actions_softmax);
+            let _ = s_action_weights
+                .narrow(0, mem_idx, NPROCS)
+                .copy_(&actions_softmax);
         }
 
-        // Compute GAE
-        let advantages = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
-        let returns = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
+        // Compute GAE on portfolio-level values
+        let advantages = Tensor::zeros(&[memory_size], (Kind::Float, device));
+        let returns = Tensor::zeros(&[memory_size], (Kind::Float, device));
         let gamma = 0.99f64;
         let gae_lambda = 0.95f64;
 
         tch::no_grad(|| {
-            let mut last_gae = Tensor::zeros(&[NPROCS, TICKERS_COUNT + 1], (Kind::Float, device));
+            let mut last_gae = Tensor::zeros(&[NPROCS], (Kind::Float, device));
             for t in (0..rollout_steps).rev() {
                 let mem_idx = t * NPROCS;
                 let next_values = if t == rollout_steps - 1 {
-                    Tensor::zeros(&[NPROCS, TICKERS_COUNT + 1], (Kind::Float, device))
+                    Tensor::zeros(&[NPROCS], (Kind::Float, device))
                 } else {
                     s_values.narrow(0, (t + 1) * NPROCS, NPROCS)
                 };
                 let cur_values = s_values.narrow(0, mem_idx, NPROCS);
                 let rewards = s_rewards.narrow(0, mem_idx, NPROCS);
-                let dones = s_dones.narrow(0, mem_idx, NPROCS).unsqueeze(1);
-                
-                let delta = rewards + (1.0 - &dones) * gamma * next_values - &cur_values;
-                last_gae = delta + (1.0 - &dones) * gamma * gae_lambda * last_gae;
+                let dones = s_dones.narrow(0, mem_idx, NPROCS);
+
+                let delta = rewards + (1.0 - &dones) * gamma * &next_values - &cur_values;
+                last_gae = delta + (1.0 - &dones) * gamma * gae_lambda * &last_gae;
                 let _ = advantages.narrow(0, mem_idx, NPROCS).copy_(&last_gae);
-                let _ = returns.narrow(0, mem_idx, NPROCS).copy_(&(&last_gae + &cur_values));
+                let _ = returns
+                    .narrow(0, mem_idx, NPROCS)
+                    .copy_(&(&last_gae + &cur_values));
             }
         });
 
@@ -290,7 +318,10 @@ pub async fn train(weights_path: Option<&str>) {
         let mut total_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut total_value_mae_weighted = Tensor::zeros([], (Kind::Float, device));
+        // Explained variance accumulators: EV = 1 - Var(residuals) / Var(targets)
+        let mut total_residual_sq = Tensor::zeros([], (Kind::Float, device));
+        let mut total_target_sum = Tensor::zeros([], (Kind::Float, device));
+        let mut total_target_sq_sum = Tensor::zeros([], (Kind::Float, device));
         let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut total_sample_count = 0i64;
         let mut grad_norm_count = 0i64;
@@ -328,51 +359,75 @@ pub async fn train(weights_path: Option<&str>) {
                     let mb_std = adv_mb_raw.std(false) + 1e-8;
                     (&adv_mb_raw - mb_mean) / mb_std
                 };
-                let old_log_probs_mb = s_old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
-                let weight_mb = action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
+                let old_log_probs_mb =
+                    s_old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
+                let weight_mb =
+                    action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
                 let (values, critic_logits, (action_mean, action_log_stds), attn_entropy) =
-                    trading_model.forward_with_seq_idx(&pd_chunk, &so_chunk, Some(&seq_idx_chunk), true);
-                
-                let values = values.to_kind(Kind::Float).view([chunk_sample_count, TICKERS_COUNT + 1]);
+                    trading_model.forward_with_seq_idx(
+                        &pd_chunk,
+                        &so_chunk,
+                        Some(&seq_idx_chunk),
+                        true,
+                    );
+
+                let values = values.to_kind(Kind::Float).view([chunk_sample_count]); // portfolio-level
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let action_log_stds = action_log_stds.to_kind(Kind::Float);
-                
+
                 let rpo_alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
-                let rpo_noise = Tensor::cat(&[
-                    Tensor::empty([chunk_sample_count, TICKERS_COUNT], (Kind::Float, device)).uniform_(-1.0, 1.0) * rpo_alpha.detach(),
-                    Tensor::zeros([chunk_sample_count, 1], (Kind::Float, device))
-                ], 1);
+                let rpo_noise = Tensor::cat(
+                    &[
+                        Tensor::empty([chunk_sample_count, TICKERS_COUNT], (Kind::Float, device))
+                            .uniform_(-1.0, 1.0)
+                            * rpo_alpha.detach(),
+                        Tensor::zeros([chunk_sample_count, 1], (Kind::Float, device)),
+                    ],
+                    1,
+                );
                 let action_mean_noisy = &action_mean + &rpo_noise;
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("act_mb", &act_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
+                    let _ =
+                        debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_log_stds", &action_log_stds, _epoch, chunk_i);
+                    let _ =
+                        debug_tensor_stats("action_log_stds", &action_log_stds, _epoch, chunk_i);
                 }
 
+                // Gaussian log_prob on logits; softmax only for env
                 let u_normalized = (&act_mb - &action_mean_noisy) / action_log_stds.exp();
-                let log_prob_gaussian = (u_normalized.pow_tensor_scalar(2) + &action_log_stds * 2.0 + LOG_2PI).sum_dim_intlist(-1, false, Kind::Float).g_mul_scalar(-0.5);
-                let log_det = act_mb.log_softmax(-1, Kind::Float).sum_dim_intlist(-1, false, Kind::Float);
-                let action_log_probs = log_prob_gaussian - log_det;
+                let action_log_probs =
+                    (u_normalized.pow_tensor_scalar(2) + &action_log_stds * 2.0 + LOG_2PI)
+                        .sum_dim_intlist(-1, false, Kind::Float)
+                        .g_mul_scalar(-0.5);
 
                 let log_ratio_raw = &action_log_probs - &old_log_probs_mb;
-                let log_ratio = log_ratio_raw.tanh() * 0.3;
+                let c = 0.3; // bounds to approximately (-0.5, 0.5)
+                let log_ratio = &log_ratio_raw * c / (c + log_ratio_raw.abs());
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
+                    let _ =
+                        debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
                 }
                 let ratio = log_ratio.exp();
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
-                
-                let adv_reduced = adv_mb.mean_dim([-1].as_slice(), false, Kind::Float) + (&adv_mb * &weight_mb).sum_dim_intlist(-1, false, Kind::Float) * ADV_MIXED_WEIGHT;
-                let action_loss = -Tensor::min_other(&(&ratio * &adv_reduced), &(&ratio_clipped * &adv_reduced)).mean(Kind::Float);
 
+                // Single portfolio advantage - no more weighted combination
+                let action_loss =
+                    -Tensor::min_other(&(&ratio * &adv_mb), &(&ratio_clipped * &adv_mb))
+                        .mean(Kind::Float);
+
+                // Portfolio-level value loss: ret_mb is [chunk_sample_count], critic_logits is [chunk_sample_count, NUM_VALUE_BUCKETS]
                 let returns_symlog = symlog_tensor(&ret_mb.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP));
-                let target_twohot = twohot_encode(&returns_symlog, trading_model.value_centers()).view([chunk_sample_count, TICKERS_COUNT + 1, -1]);
-                let log_probs = critic_logits.to_kind(Kind::Float).log_softmax(-1, Kind::Float);
+                let target_twohot = twohot_encode(&returns_symlog, trading_model.value_centers())
+                    .view([chunk_sample_count, -1]);
+                let log_probs = critic_logits
+                    .to_kind(Kind::Float)
+                    .log_softmax(-1, Kind::Float);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("returns_symlog", &returns_symlog, _epoch, chunk_i);
                     let _ = debug_tensor_stats("target_twohot", &target_twohot, _epoch, chunk_i);
@@ -381,34 +436,57 @@ pub async fn train(weights_path: Option<&str>) {
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
                 }
-                let ce_loss = -(target_twohot * &log_probs).sum_dim_intlist(-1, false, Kind::Float).mean(Kind::Float);
-                let critic_entropy = -(log_probs.exp() * &log_probs).sum_dim_intlist(-1, false, Kind::Float).mean(Kind::Float);
+                let ce_loss = -(target_twohot * &log_probs)
+                    .sum_dim_intlist(-1, false, Kind::Float)
+                    .mean(Kind::Float);
+                let critic_entropy = -(log_probs.exp() * &log_probs)
+                    .sum_dim_intlist(-1, false, Kind::Float)
+                    .mean(Kind::Float);
                 let value_loss = ce_loss - CRITIC_ENTROPY_COEF * critic_entropy;
 
-                let dist_entropy = (&action_log_stds * 2.0 + (1.0 + LOG_2PI)).g_mul_scalar(0.5).mean(Kind::Float);
-                
-                let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF + action_loss.shallow_clone() - dist_entropy * ENTROPY_COEF;
-                
-                let inv_var_mean = action_log_stds.detach().exp().pow_tensor_scalar(2).clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (ACTION_COUNT as f64 / 6.0) * inv_var_mean;
+                let dist_entropy = (&action_log_stds * 2.0 + (1.0 + LOG_2PI))
+                    .g_mul_scalar(0.5)
+                    .mean(Kind::Float);
+
+                let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
+                    + action_loss.shallow_clone()
+                    - dist_entropy * ENTROPY_COEF;
+
+                let inv_var_mean = action_log_stds
+                    .detach()
+                    .exp()
+                    .pow_tensor_scalar(2)
+                    .clamp_min(1e-4)
+                    .reciprocal()
+                    .mean(Kind::Float);
+                let induced_kl =
+                    rpo_alpha.pow_tensor_scalar(2) * (ACTION_COUNT as f64 / 6.0) * inv_var_mean;
                 let alpha_loss = (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0);
 
-                let total_chunk_loss = (ppo_loss.shallow_clone() + alpha_loss * ALPHA_LOSS_COEF) / GRAD_ACCUM_STEPS as f64;
-                
+                let total_chunk_loss = (ppo_loss.shallow_clone() + alpha_loss * ALPHA_LOSS_COEF)
+                    / GRAD_ACCUM_STEPS as f64;
+
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
                 total_chunk_loss.backward();
                 bwd_time_us += bwd_start.elapsed().as_micros() as u64;
 
-                let approx_kl_val = tch::no_grad(|| (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float));
+                let approx_kl_val =
+                    tch::no_grad(|| (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float));
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
                 }
                 let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 let _ = total_loss_weighted.g_add_(&(&ppo_loss * chunk_sample_count as f64));
-                let _ = total_policy_loss_weighted.g_add_(&(&action_loss * chunk_sample_count as f64));
-                let _ = total_value_loss_weighted.g_add_(&(&value_loss * chunk_sample_count as f64));
-                let _ = total_value_mae_weighted.g_add_(&((&values - &ret_mb).abs().mean(Kind::Float) * chunk_sample_count as f64));
+                let _ =
+                    total_policy_loss_weighted.g_add_(&(&action_loss * chunk_sample_count as f64));
+                let _ =
+                    total_value_loss_weighted.g_add_(&(&value_loss * chunk_sample_count as f64));
+                // Explained variance accumulators
+                let residuals = &values - &ret_mb;
+                let _ = total_residual_sq.g_add_(&residuals.square().sum(Kind::Float));
+                let _ = total_target_sum.g_add_(&ret_mb.sum(Kind::Float));
+                let _ = total_target_sq_sum.g_add_(&ret_mb.square().sum(Kind::Float));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 epoch_kl_count += chunk_sample_count;
                 total_sample_count += chunk_sample_count;
@@ -419,7 +497,10 @@ pub async fn train(weights_path: Option<&str>) {
                             let mut found = false;
                             for v in opt.trainable_variables() {
                                 let g = v.grad();
-                                if g.defined() && (g.isnan().any().int64_value(&[]) != 0 || g.isinf().any().int64_value(&[]) != 0) {
+                                if g.defined()
+                                    && (g.isnan().any().int64_value(&[]) != 0
+                                        || g.isinf().any().int64_value(&[]) != 0)
+                                {
                                     found = true;
                                     break;
                                 }
@@ -430,12 +511,14 @@ pub async fn train(weights_path: Option<&str>) {
                             println!("ERROR: Non-finite gradients detected!");
                         }
                     }
-                    
+
                     let batch_grad_norm = tch::no_grad(|| {
                         let mut norm_sq = Tensor::zeros([], (Kind::Float, device));
                         for v in opt.trainable_variables() {
                             let g = v.grad();
-                            if g.defined() { norm_sq += g.pow_tensor_scalar(2).sum(Kind::Float); }
+                            if g.defined() {
+                                norm_sq += g.pow_tensor_scalar(2).sum(Kind::Float);
+                            }
                         }
                         norm_sq.sqrt()
                     });
@@ -446,38 +529,87 @@ pub async fn train(weights_path: Option<&str>) {
                     opt.step();
                     opt.zero_grad();
                 }
-                
-                let _ = total_clipped.g_add_(&tch::no_grad(|| (&ratio - 1.0).abs().gt(PPO_CLIP_RATIO).to_kind(Kind::Float).sum(Kind::Float)));
+
+                let _ = total_clipped.g_add_(&tch::no_grad(|| {
+                    (&ratio - 1.0)
+                        .abs()
+                        .gt(PPO_CLIP_RATIO)
+                        .to_kind(Kind::Float)
+                        .sum(Kind::Float)
+                }));
                 total_ratio_samples += chunk_sample_count;
             }
-            
+
             let mean_epoch_kl = epoch_kl_gpu.double_value(&[]) / epoch_kl_count as f64;
-            println!("Epoch {}/{}: KL {:.4}", _epoch + 1, OPTIM_EPOCHS, mean_epoch_kl);
-            if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER { break 'epoch_loop; }
+            println!(
+                "Epoch {}/{}: KL {:.4}",
+                _epoch + 1,
+                OPTIM_EPOCHS,
+                mean_epoch_kl
+            );
+            if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
+                break 'epoch_loop;
+            }
         }
 
-        println!("fwd: {:.1}ms  bwd: {:.1}ms", fwd_time_us as f64 / 1000.0, bwd_time_us as f64 / 1000.0);
-        
+        println!(
+            "fwd: {:.1}ms  bwd: {:.1}ms",
+            fwd_time_us as f64 / 1000.0,
+            bwd_time_us as f64 / 1000.0
+        );
+
         let max_param_norm = tch::no_grad(|| {
-            let norms: Vec<Tensor> = opt.trainable_variables()
-                .iter()
-                .map(|v| v.norm())
-                .collect();
+            let norms: Vec<Tensor> = opt.trainable_variables().iter().map(|v| v.norm()).collect();
             if norms.is_empty() {
                 0.0f64
             } else {
                 Tensor::stack(&norms, 0).max().double_value(&[])
             }
         });
-        if max_param_norm > 1000.0 { println!("WARNING: Large parameter norm detected: {:.2}", max_param_norm); }
+        if max_param_norm > 1000.0 {
+            println!(
+                "WARNING: Large parameter norm detected: {:.2}",
+                max_param_norm
+            );
+        }
 
-        let (mean_losses, mean_grad_norm_t, clip_frac_t) = if total_sample_count > 0 {
-            let losses = Tensor::stack(&[&total_loss_weighted, &total_policy_loss_weighted, &total_value_loss_weighted, &total_value_mae_weighted], 0) / (total_sample_count as f64);
-            let grad_norm = if grad_norm_count > 0 { &grad_norm_sum / (grad_norm_count as f64) } else { Tensor::zeros([], (Kind::Float, device)) };
-            let clip = if total_ratio_samples > 0 { &total_clipped / (total_ratio_samples as f64) } else { Tensor::zeros([], (Kind::Float, device)) };
-            (losses, grad_norm, clip)
+        let (mean_losses, mean_grad_norm_t, clip_frac_t, explained_var_t) = if total_sample_count > 0
+        {
+            let n = total_sample_count as f64;
+            // EV = 1 - Var(residuals) / Var(targets)
+            // Var(targets) = E[t^2] - E[t]^2
+            let mean_target = &total_target_sum / n;
+            let var_targets = &total_target_sq_sum / n - mean_target.square();
+            let var_residuals = &total_residual_sq / n;
+            // Clamp var_targets to avoid division by zero; if targets have no variance, EV is undefined
+            let explained_var =
+                Tensor::from(1.0) - &var_residuals / var_targets.clamp_min(1e-8);
+            let losses = Tensor::stack(
+                &[
+                    &total_loss_weighted,
+                    &total_policy_loss_weighted,
+                    &total_value_loss_weighted,
+                ],
+                0,
+            ) / n;
+            let grad_norm = if grad_norm_count > 0 {
+                &grad_norm_sum / (grad_norm_count as f64)
+            } else {
+                Tensor::zeros([], (Kind::Float, device))
+            };
+            let clip = if total_ratio_samples > 0 {
+                &total_clipped / (total_ratio_samples as f64)
+            } else {
+                Tensor::zeros([], (Kind::Float, device))
+            };
+            (losses, grad_norm, clip, explained_var)
         } else {
-            (Tensor::zeros([4], (Kind::Float, device)), Tensor::zeros([], (Kind::Float, device)), Tensor::zeros([], (Kind::Float, device)))
+            (
+                Tensor::zeros([3], (Kind::Float, device)),
+                Tensor::zeros([], (Kind::Float, device)),
+                Tensor::zeros([], (Kind::Float, device)),
+                Tensor::zeros([], (Kind::Float, device)),
+            )
         };
 
         let logit_stats = tch::no_grad(|| {
@@ -488,28 +620,59 @@ pub async fn train(weights_path: Option<&str>) {
                 false,
             );
             let action_std = action_log_std.exp();
-            let rpo_alpha = (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze();
-            Tensor::stack(&[action_std.mean(Kind::Float), action_std.min(), action_std.max(), rpo_alpha], 0)
+            let rpo_alpha =
+                (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze();
+            Tensor::stack(
+                &[
+                    action_std.mean(Kind::Float),
+                    action_std.min(),
+                    action_std.max(),
+                    rpo_alpha,
+                ],
+                0,
+            )
         });
 
-        let all_scalars = Tensor::cat(&[mean_losses.view([4]), mean_grad_norm_t.view([1]), clip_frac_t.view([1]), logit_stats.view([4])], 0);
-        let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu)).unwrap_or_else(|_| vec![0.0; 10]);
-        let (mean_loss, mean_policy_loss, mean_value_loss, mean_value_mae) = (all_scalars_vec[0], all_scalars_vec[1], all_scalars_vec[2], all_scalars_vec[3]);
-        let mean_grad_norm = all_scalars_vec[4];
-        let clip_frac = all_scalars_vec[5];
+        let all_scalars = Tensor::cat(
+            &[
+                mean_losses.view([3]),
+                mean_grad_norm_t.view([1]),
+                clip_frac_t.view([1]),
+                explained_var_t.view([1]),
+                logit_stats.view([4]),
+            ],
+            0,
+        );
+        let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
+            .unwrap_or_else(|_| vec![0.0; 10]);
+        let (mean_loss, mean_policy_loss, mean_value_loss) = (
+            all_scalars_vec[0],
+            all_scalars_vec[1],
+            all_scalars_vec[2],
+        );
+        let mean_grad_norm = all_scalars_vec[3];
+        let clip_frac = all_scalars_vec[4];
+        let explained_var = all_scalars_vec[5];
         let stats_vec = &all_scalars_vec[6..10];
 
         let primary = env.primary_mut();
-        primary.meta_history.record_logit_noise_stats(stats_vec[0], stats_vec[1], stats_vec[2], stats_vec[3]);
+        primary.meta_history.record_logit_noise_stats(
+            stats_vec[0],
+            stats_vec[1],
+            stats_vec[2],
+            stats_vec[3],
+        );
         primary.meta_history.record_clip_fraction(clip_frac);
         primary.meta_history.record_loss(mean_loss);
         primary.meta_history.record_policy_loss(mean_policy_loss);
         primary.meta_history.record_value_loss(mean_value_loss);
-        primary.meta_history.record_value_mae(mean_value_mae);
+        primary.meta_history.record_explained_var(explained_var);
         primary.meta_history.record_grad_norm(mean_grad_norm);
 
-        println!("  Loss: {:.4} (Policy: {:.4}, Value: {:.4}, MAE: {:.4}) GradNorm: {:.4}",
-                 mean_loss, mean_policy_loss, mean_value_loss, mean_value_mae, mean_grad_norm);
+        println!(
+            "  Loss: {:.4} (Policy: {:.4}, Value: {:.4}, EV: {:.4}) GradNorm: {:.4}",
+            mean_loss, mean_policy_loss, mean_value_loss, explained_var, mean_grad_norm
+        );
 
         if episode > 0 && episode % 50 == 0 {
             let _ = std::fs::create_dir_all("../weights");

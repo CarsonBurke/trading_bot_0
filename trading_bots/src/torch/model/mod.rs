@@ -33,8 +33,7 @@ struct InterTickerBlock {
 }
 
 impl InterTickerBlock {
-    fn new(p: &nn::Path, kv_heads: i64, head_dim: i64, ticker_latents: i64) -> Self {
-        let _ = (kv_heads, head_dim);
+    fn new(p: &nn::Path, ticker_latents: i64) -> Self {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), MODEL_DIM, 1e-6);
         let ticker_latent_q =
             nn::linear(p / "ticker_latent_q", MODEL_DIM, MODEL_DIM, Default::default());
@@ -100,13 +99,10 @@ const MODEL_DIM: i64 = 128;
 const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
-const LOG_STD_INIT: f64 = -2.0;
+const LOG_STD_INIT: f64 = -1.0;
 const LOG_STD_MIN: f64 = -3.0;
 const LOG_STD_MAX: f64 = 0.5;
 const SDE_EPS: f64 = 1e-6;
-const USE_SDPA: bool = true;
-const SDPA_MIN_LEN: i64 = 64;
-const SDPA_MIN_LEN_CROSS: i64 = 1;
 const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const HEAD_HIDDEN: i64 = 192;
@@ -124,9 +120,7 @@ pub(crate) fn symexp_tensor(t: &Tensor) -> Tensor {
     let abs = t.abs();
     t.sign() * (abs.exp() - 1.0)
 }
-const DEFAULT_CASH_POOL_QUERIES: i64 = 4;
 const TEMPORAL_STATIC_DIM: i64 = 64;
-const GLOBAL_TOKEN_COUNT: i64 = 4;
 
 const PATCH_CONFIGS: [(i64, i64); 7] = [
     (4608, 128),  // 36 tokens - ~16 days
@@ -206,15 +200,11 @@ pub struct DebugMetrics {
 #[derive(Clone, Copy)]
 pub struct TradingModelConfig {
     pub ssm_layers: usize,
-    pub cash_pool_queries: i64,
 }
 
 impl Default for TradingModelConfig {
     fn default() -> Self {
-        Self {
-            ssm_layers: 2,
-            cash_pool_queries: DEFAULT_CASH_POOL_QUERIES,
-        }
+        Self { ssm_layers: 2 }
     }
 }
 
@@ -265,10 +255,6 @@ pub struct TradingModel {
     static_cross_v: nn::Linear,
     static_cross_out: nn::Linear,
     cross_ticker_embed: nn::Linear,
-    global_ticker_token: Tensor,
-    global_tokens: Tensor,
-    global_token_proj: nn::Linear,
-    global_token_merge: nn::Linear,
     global_to_ticker: nn::Linear,
     global_inject_down: nn::Linear,
     global_inject_up: nn::Linear,
@@ -282,54 +268,16 @@ pub struct TradingModel {
     actor_out: nn::Linear,
     critic_out: nn::Linear,
     cash_log_std_param: Tensor,
-    cash_queries: Tensor,
-    cash_q_proj: nn::Linear,
-    cash_k_proj: nn::Linear,
-    cash_v_proj: nn::Linear,
     cash_merge: nn::Linear,
-    cash_recent_proj: nn::Linear,
-    cash_recent_gate: nn::Linear,
-    cash_recent_slope_raw: Tensor,
-    cash_attn_temp_raw: Tensor,
     sde_fc: nn::Linear,
     ln_sde: RMSNorm,
     log_std_param: Tensor,
     bucket_centers: Tensor,
     value_centers: Tensor,
     device: tch::Device,
-    num_heads: i64,
-    kv_heads: i64,
-    head_dim: i64,
-    cash_pool_queries: i64,
-    decay_positions: Tensor,
-    decay_ones: Tensor,
 }
 
 impl TradingModel {
-    fn use_sdpa(&self, seq_len: i64) -> bool {
-        if !USE_SDPA {
-            return false;
-        }
-        let _ = seq_len;
-        true
-    }
-
-    fn use_sdpa_cross(&self, seq_len: i64) -> bool {
-        if !USE_SDPA {
-            return false;
-        }
-        let _ = seq_len;
-        true
-    }
-
-    fn attn_softmax_fp32(&self, q: &Tensor, k: &Tensor) -> Tensor {
-        let q_f = q.to_kind(Kind::Float);
-        let k_f = k.to_kind(Kind::Float);
-        let scores = (q_f.matmul(&k_f.transpose(-2, -1)) / (self.head_dim as f64).sqrt())
-            .softmax(-1, Kind::Float);
-        scores.to_kind(q.kind())
-    }
-
     fn cast_inputs(&self, input: &Tensor) -> Tensor {
         let target_kind = self.log_std_param.kind();
         if input.kind() == target_kind {
@@ -458,22 +406,7 @@ impl TradingModel {
         );
         let ln_static_proj = RMSNorm::new(&(p / "ln_static_proj"), MODEL_DIM, 1e-6);
 
-        let num_heads = 8i64;
-        let kv_heads = 8i64;
-        let head_dim = 16i64;
-        assert!(num_heads % kv_heads == 0, "num_heads must be divisible by kv_heads");
-        assert_eq!(
-            num_heads * head_dim,
-            MODEL_DIM,
-            "num_heads * head_dim must equal MODEL_DIM"
-        );
-        assert!(config.cash_pool_queries > 0, "cash_pool_queries must be > 0");
-        let inter_ticker_block = InterTickerBlock::new(
-            &(p / "inter_ticker_0"),
-            kv_heads,
-            head_dim,
-            TICKER_LATENT_FACTORS,
-        );
+        let inter_ticker_block = InterTickerBlock::new(&(p / "inter_ticker_0"), TICKER_LATENT_FACTORS);
         let time_pos_proj = nn::linear(p / "time_pos_proj", 4, MODEL_DIM, Default::default());
         let time_global_ctx = nn::linear(
             p / "time_global_ctx",
@@ -497,24 +430,6 @@ impl TradingModel {
             MODEL_DIM,
             Default::default(),
         );
-        let global_ticker_token = p.var(
-            "global_ticker_token",
-            &[TICKERS_COUNT as i64, MODEL_DIM],
-            Init::Uniform { lo: -0.01, up: 0.01 },
-        );
-        let global_tokens = p.var(
-            "global_tokens",
-            &[GLOBAL_TOKEN_COUNT, MODEL_DIM],
-            Init::Uniform { lo: -0.01, up: 0.01 },
-        );
-        let global_token_proj = nn::linear(
-            p / "global_token_proj",
-            GLOBAL_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let global_token_merge =
-            nn::linear(p / "global_token_merge", MODEL_DIM, MODEL_DIM, Default::default());
         let global_to_ticker = nn::linear(
             p / "global_to_ticker",
             GLOBAL_STATIC_OBS as i64,
@@ -568,22 +483,7 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let cash_queries = p.var(
-            "cash_queries",
-            &[config.cash_pool_queries, MODEL_DIM],
-            Init::Uniform {
-                lo: -0.01,
-                up: 0.01,
-            },
-        );
-        let cash_q_proj = nn::linear(p / "cash_q_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_k_proj = nn::linear(p / "cash_k_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_v_proj = nn::linear(p / "cash_v_proj", MODEL_DIM, MODEL_DIM, Default::default());
         let cash_merge = nn::linear(p / "cash_merge", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_recent_proj = nn::linear(p / "cash_recent_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_recent_gate = nn::linear(p / "cash_recent_gate", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_recent_slope_raw = p.var("cash_recent_slope_raw", &[1], Init::Const(0.0));
-        let cash_attn_temp_raw = p.var("cash_attn_temp_raw", &[1], Init::Const(0.0));
         const SDE_LATENT_DIM: i64 = 64;
         let sde_fc = nn::linear(p / "sde_fc", HEAD_HIDDEN, SDE_LATENT_DIM, Default::default());
         let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-6);
@@ -600,8 +500,6 @@ impl TradingModel {
             (Kind::Float, p.device()),
         );
         let bucket_centers = value_centers.shallow_clone();
-        let decay_positions = Tensor::arange(SEQ_LEN, (Kind::Float, p.device()));
-        let decay_ones = Tensor::ones(&[SEQ_LEN], (Kind::Float, p.device()));
         Self {
             patch_embed_weight,
             patch_embed_bias,
@@ -630,10 +528,6 @@ impl TradingModel {
             static_cross_v,
             static_cross_out,
             cross_ticker_embed,
-            global_ticker_token,
-            global_tokens,
-            global_token_proj,
-            global_token_merge,
             global_to_ticker,
             global_inject_down,
             global_inject_up,
@@ -647,62 +541,14 @@ impl TradingModel {
             actor_out,
             critic_out,
             cash_log_std_param,
-            cash_queries,
-            cash_q_proj,
-            cash_k_proj,
-            cash_v_proj,
             cash_merge,
-            cash_recent_proj,
-            cash_recent_gate,
-            cash_recent_slope_raw,
-            cash_attn_temp_raw,
             sde_fc,
             ln_sde,
             log_std_param,
             bucket_centers,
             value_centers,
             device: p.device(),
-            num_heads,
-            kv_heads,
-            head_dim,
-            cash_pool_queries: config.cash_pool_queries,
-            decay_positions,
-            decay_ones,
         }
-    }
-
-    fn rope_cos_sin(&self, positions: &Tensor, kind: Kind, device: tch::Device) -> (Tensor, Tensor) {
-        let half = self.head_dim / 2;
-        let idx = Tensor::arange(half, (Kind::Float, device));
-        let inv_freq = (-(idx * 2.0 / self.head_dim as f64) * ROPE_BASE.ln()).exp();
-        let freqs = positions.to_kind(Kind::Float).unsqueeze(1) * inv_freq.unsqueeze(0);
-        let cos = freqs.cos().to_kind(kind);
-        let sin = freqs.sin().to_kind(kind);
-        (cos, sin)
-    }
-
-    fn apply_rope_cached(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
-        let sizes = x.size();
-        let (b, h, s, d) = (sizes[0], sizes[1], sizes[2], sizes[3]);
-        let half = self.head_dim / 2;
-        let cos = cos.unsqueeze(0).unsqueeze(0);
-        let sin = sin.unsqueeze(0).unsqueeze(0);
-        let x = x.view([b, h, s, half, 2]);
-        let x_even = x.select(-1, 0);
-        let x_odd = x.select(-1, 1);
-        let rot = Tensor::stack(
-            &[
-                &x_even * &cos - &x_odd * &sin,
-                &x_even * &sin + &x_odd * &cos,
-            ],
-            -1,
-        );
-        rot.view([b, h, s, d])
-    }
-
-    fn apply_rope_single(&self, x: &Tensor, positions: &Tensor) -> Tensor {
-        let (cos, sin) = self.rope_cos_sin(positions, x.kind(), x.device());
-        self.apply_rope_cached(x, &cos, &sin)
     }
 
     fn build_sin_cos_pos_embed(seq_len: i64, dim: i64, device: tch::Device) -> Tensor {
@@ -809,18 +655,6 @@ impl TradingModel {
         let patch_ends = patch_ends.squeeze_dim(0).squeeze_dim(-1);
         let mask = leading.unsqueeze(1).ge_tensor(&patch_ends);
         mask.to_kind(Kind::Int64).neg()
-    }
-
-    fn enrich_patches(&self, patches: &Tensor) -> Tensor {
-        let patch_len = patches.size()[2];
-        let mean = patches
-            .mean_dim([2].as_slice(), true, Kind::Float)
-            .to_kind(patches.kind());
-        let std = patches.std_dim(2, false, true).to_kind(patches.kind());
-        let first = patches.narrow(2, 0, 1);
-        let last = patches.narrow(2, patch_len - 1, 1);
-        let slope = &last - &first;
-        Tensor::cat(&[patches, &mean, &std, &last, &slope], 2)
     }
 
     fn patch_embed_fused(&self, deltas: &Tensor) -> Tensor {
