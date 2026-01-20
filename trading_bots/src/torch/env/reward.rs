@@ -60,6 +60,56 @@ impl Env {
         (base_reward_scaled, per_ticker_rewards, cash_penalty_scaled)
     }
 
+    pub fn get_cash_upswing_penalty_reward_breakdown(
+        &self,
+        absolute_step: usize,
+        _: f64,
+    ) -> (f64, Vec<f64>, f64) {
+        let n_tickers = self.tickers.len();
+        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+            return (0.0, vec![0.0; n_tickers], 0.0);
+        }
+
+        let next_absolute_step = absolute_step + 1;
+        let total_assets = self.account.total_assets;
+        let inv_total_assets = 1.0 / total_assets;
+        let inv_n_tickers = 1.0 / n_tickers as f64;
+        let mut contributions = vec![0.0; n_tickers];
+        let mut total_assets_next = self.account.cash;
+        let mut index_log_return = 0.0;
+
+        for ticker_idx in 0..n_tickers {
+            let current_price = self.prices[ticker_idx][absolute_step];
+            let next_price = self.prices[ticker_idx][next_absolute_step];
+            let position = &self.account.positions[ticker_idx];
+            let current_value = position.value_with_price(current_price);
+            let next_value = position.value_with_price(next_price);
+            total_assets_next += next_value;
+            contributions[ticker_idx] = (next_value - current_value) * inv_total_assets;
+            index_log_return += (next_price / current_price).ln();
+        }
+
+        let portfolio_return: f64 = contributions.iter().sum();
+        let strategy_log_return = (total_assets_next * inv_total_assets).ln() * REWARD_SCALE;
+        index_log_return *= inv_n_tickers;
+
+        let cash_weight = (self.account.cash * inv_total_assets).clamp(0.0, 1.0);
+        let cash_penalty =
+            -cash_weight * index_log_return.max(0.0) * REWARD_SCALE;
+
+        let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
+            vec![0.0; n_tickers]
+        } else {
+            let inv_portfolio_return = 1.0 / portfolio_return;
+            contributions
+                .iter()
+                .map(|c| strategy_log_return * (c * inv_portfolio_return))
+                .collect()
+        };
+
+        (strategy_log_return, per_ticker_rewards, cash_penalty)
+    }
+
     #[allow(dead_code)]
     pub fn get_unrealized_pnl_reward_breakdown(
         &self,
