@@ -5,6 +5,7 @@ mod results;
 use std::time::Instant;
 use tch::{nn, Device, Kind, Tensor};
 use trading_bot_0::torch::{
+    constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT},
     mamba_fused,
     model::TradingModel,
     ssm::{Mamba2, Mamba2Config},
@@ -253,17 +254,13 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         let _ = tensor.set_data(&tensor.to_kind(dtype));
     }
 
-    // Use actual model dimensions from constants
-    const TICKERS_COUNT: i64 = 1;
-    const PRICE_DELTAS_PER_TICKER: i64 = 3400;
-    const GLOBAL_STATIC_OBS: i64 = 7 + 8; // GLOBAL_MACRO_OBS = 8
-    const PER_TICKER_STATIC_OBS: i64 = 19 + 12; // PER_TICKER_EARNINGS_OBS = 12
-    const STATIC_OBS: i64 = GLOBAL_STATIC_OBS + TICKERS_COUNT * PER_TICKER_STATIC_OBS;
-    const PRICE_DELTAS_DIM: i64 = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER;
+    // Use actual model dimensions from shared constants
+    let price_deltas_dim = (TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER) as i64;
+    let static_obs_dim = STATIC_OBSERVATIONS as i64;
 
     for &batch in &[1, 4, 8] {
-        let price_deltas = Tensor::randn(&[batch, PRICE_DELTAS_DIM], (dtype, device));
-        let static_features = Tensor::randn(&[batch, STATIC_OBS], (dtype, device));
+        let price_deltas = Tensor::randn(&[batch, price_deltas_dim], (dtype, device));
+        let static_features = Tensor::randn(&[batch, static_obs_dim], (dtype, device));
 
         // Warmup
         for _ in 0..10 {
@@ -286,16 +283,16 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
                 fwd_ms,
                 BenchmarkRun {
                     batch,
-                    seq_len: PRICE_DELTAS_PER_TICKER,
+                    seq_len: PRICE_DELTAS_PER_TICKER as i64,
                     dtype: format!("{:?}", dtype),
                 },
             ));
         });
 
         // Forward + Backward (Training) - need fresh tensors with grads
-        let price_deltas = Tensor::randn(&[batch, PRICE_DELTAS_DIM], (dtype, device))
+        let price_deltas = Tensor::randn(&[batch, price_deltas_dim], (dtype, device))
             .set_requires_grad(true);
-        let static_features = Tensor::randn(&[batch, STATIC_OBS], (dtype, device))
+        let static_features = Tensor::randn(&[batch, static_obs_dim], (dtype, device))
             .set_requires_grad(true);
 
         let start = Instant::now();
@@ -316,7 +313,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
             fwd_bwd_ms,
             BenchmarkRun {
                 batch,
-                seq_len: PRICE_DELTAS_PER_TICKER,
+                seq_len: PRICE_DELTAS_PER_TICKER as i64,
                 dtype: format!("{:?}", dtype),
             },
         ));

@@ -20,17 +20,14 @@ use rmsnorm::RMSNorm;
 
 struct InterTickerBlock {
     ticker_ln: RMSNorm,
-    ticker_rp_q: nn::Linear,
-    ticker_rp_v: Tensor,
-    ticker_rp_k_frozen: Tensor,
     ticker_latent_q: nn::Linear,
     ticker_latent_k: Tensor,
+    ticker_latent_k_frozen: Tensor,
     ticker_latent_v: Tensor,
     ticker_out: nn::Linear,
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
     mlp_ln: RMSNorm,
-    alpha_ticker_rp: Tensor,
     alpha_ticker_attn: Tensor,
     alpha_mlp: Tensor,
 }
@@ -39,20 +36,6 @@ impl InterTickerBlock {
     fn new(p: &nn::Path, kv_heads: i64, head_dim: i64, ticker_latents: i64) -> Self {
         let _ = (kv_heads, head_dim);
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), MODEL_DIM, 1e-6);
-        let ticker_rp_q = nn::linear(p / "ticker_rp_q", MODEL_DIM, MODEL_DIM, Default::default());
-        let ticker_rp_v = p.var(
-            "ticker_rp_v",
-            &[ticker_latents, MODEL_DIM],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
-            },
-        );
-        let ticker_rp_k_frozen = Tensor::randn(
-            &[ticker_latents, MODEL_DIM],
-            (Kind::Float, p.device()),
-        ) * (1.0 / (MODEL_DIM as f64).sqrt());
-        ticker_rp_k_frozen.set_requires_grad(false);
         let ticker_latent_q =
             nn::linear(p / "ticker_latent_q", MODEL_DIM, MODEL_DIM, Default::default());
         let ticker_latent_k = p.var(
@@ -63,6 +46,15 @@ impl InterTickerBlock {
                 stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
             },
         );
+        let ticker_latent_k_frozen = p.var(
+            "ticker_latent_k_frozen",
+            &[ticker_latents, MODEL_DIM],
+            Init::Randn {
+                mean: 0.0,
+                stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
+            },
+        );
+        let _ = ticker_latent_k_frozen.set_requires_grad(false);
         let ticker_latent_v = p.var(
             "ticker_latent_v",
             &[ticker_latents, MODEL_DIM],
@@ -75,23 +67,19 @@ impl InterTickerBlock {
         let mlp_fc1 = nn::linear(p / "mlp_fc1", MODEL_DIM, 2 * FF_DIM, Default::default());
         let mlp_fc2 = nn::linear(p / "mlp_fc2", FF_DIM, MODEL_DIM, Default::default());
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), MODEL_DIM, 1e-6);
-        let alpha_ticker_rp = p.var("alpha_ticker_rp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         let alpha_ticker_attn =
             p.var("alpha_ticker_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         let alpha_mlp = p.var("alpha_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
             ticker_ln,
-            ticker_rp_q,
-            ticker_rp_v,
-            ticker_rp_k_frozen,
             ticker_latent_q,
             ticker_latent_k,
+            ticker_latent_k_frozen,
             ticker_latent_v,
             ticker_out,
             mlp_fc1,
             mlp_fc2,
             mlp_ln,
-            alpha_ticker_rp,
             alpha_ticker_attn,
             alpha_mlp,
         }
@@ -109,7 +97,12 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 
 const SSM_DIM: i64 = 128;
 const MODEL_DIM: i64 = 128;
+const SSM_NHEADS: i64 = 2;
+const SSM_HEADDIM: i64 = 64;
+const SSM_DSTATE: i64 = 128;
 const LOG_STD_INIT: f64 = -2.0;
+const LOG_STD_MIN: f64 = -3.0;
+const LOG_STD_MAX: f64 = 0.5;
 const SDE_EPS: f64 = 1e-6;
 const USE_SDPA: bool = true;
 const SDPA_MIN_LEN: i64 = 64;
@@ -120,7 +113,7 @@ const HEAD_HIDDEN: i64 = 192;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -4.0;
 const ROPE_BASE: f64 = 10000.0;
-const TICKER_LATENT_FACTORS: i64 = 32;
+const TICKER_LATENT_FACTORS: i64 = 8;
 
 pub(crate) fn symlog_tensor(t: &Tensor) -> Tensor {
     let abs = t.abs();
@@ -132,8 +125,6 @@ pub(crate) fn symexp_tensor(t: &Tensor) -> Tensor {
     t.sign() * (abs.exp() - 1.0)
 }
 const DEFAULT_CASH_POOL_QUERIES: i64 = 4;
-const TEMPORAL_POOL_GROUPS: i64 = 4;
-const PMA_QUERIES: i64 = 2;
 const TEMPORAL_STATIC_DIM: i64 = 64;
 const GLOBAL_TOKEN_COUNT: i64 = 4;
 
@@ -265,13 +256,6 @@ pub struct TradingModel {
     ssm_proj: nn::Conv1D,
     static_proj: nn::Linear,
     ln_static_proj: RMSNorm,
-    static_to_temporal: nn::Linear,
-    ln_static_temporal: RMSNorm,
-    pma_queries: Tensor,
-    pma_q_proj: nn::Linear,
-    pma_k_proj: nn::Linear,
-    pma_v_proj: nn::Linear,
-    pma_out: nn::Linear,
     inter_ticker_block: InterTickerBlock,
     time_pos_proj: nn::Linear,
     time_global_ctx: nn::Linear,
@@ -473,33 +457,6 @@ impl TradingModel {
             Default::default(),
         );
         let ln_static_proj = RMSNorm::new(&(p / "ln_static_proj"), MODEL_DIM, 1e-6);
-        let static_to_temporal = nn::linear(
-            p / "static_to_temporal",
-            PER_TICKER_STATIC_OBS as i64,
-            TEMPORAL_STATIC_DIM,
-            Default::default(),
-        );
-        let ln_static_temporal =
-            RMSNorm::new(&(p / "ln_static_temporal"), TEMPORAL_STATIC_DIM, 1e-6);
-        let pma_queries = p.var(
-            "pma_queries",
-            &[PMA_QUERIES, MODEL_DIM],
-            Init::Uniform { lo: -0.01, up: 0.01 },
-        );
-        let pma_q_proj = nn::linear(p / "pma_q_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let pma_k_proj = nn::linear(
-            p / "pma_k_proj",
-            MODEL_DIM + TEMPORAL_STATIC_DIM,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let pma_v_proj = nn::linear(
-            p / "pma_v_proj",
-            MODEL_DIM + TEMPORAL_STATIC_DIM,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let pma_out = nn::linear(p / "pma_out", MODEL_DIM, MODEL_DIM, Default::default());
 
         let num_heads = 8i64;
         let kv_heads = 8i64;
@@ -664,13 +621,6 @@ impl TradingModel {
             ssm_proj,
             static_proj,
             ln_static_proj,
-            static_to_temporal,
-            ln_static_temporal,
-            pma_queries,
-            pma_q_proj,
-            pma_k_proj,
-            pma_v_proj,
-            pma_out,
             inter_ticker_block,
             time_pos_proj,
             time_global_ctx,

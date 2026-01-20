@@ -1,11 +1,11 @@
 {
-  "timestamp": "2026-01-18T19:06:24.677460096Z",
-  "git_commit": "5aae5b0f",
+  "timestamp": "2026-01-18T21:56:36.055816502Z",
+  "git_commit": "3e58ff8b",
   "cuda_version": null,
   "results": [
     {
       "name": "mamba2_forward_train",
-      "time_ms": 1.3160871650000001,
+      "time_ms": 1.014174365,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -14,7 +14,7 @@
     },
     {
       "name": "mamba2_fwd_bwd_train",
-      "time_ms": 1.483687165,
+      "time_ms": 1.118239515,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -23,7 +23,7 @@
     },
     {
       "name": "mamba2_infer_prefill",
-      "time_ms": 1.06076635,
+      "time_ms": 1.0509289800000001,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -32,7 +32,7 @@
     },
     {
       "name": "mamba2_infer_step",
-      "time_ms": 0.1065394325,
+      "time_ms": 0.10621784,
       "config": {
         "batch": 4,
         "seq_len": 1,
@@ -41,55 +41,55 @@
     },
     {
       "name": "model_forward_infer_b1",
-      "time_ms": 2.1683011499999996,
+      "time_ms": 1.22396934,
       "config": {
         "batch": 1,
-        "seq_len": 3400,
+        "seq_len": 8636,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_fwd_bwd_train_b1",
-      "time_ms": 6.4519611,
+      "time_ms": 4.80254053,
       "config": {
         "batch": 1,
-        "seq_len": 3400,
+        "seq_len": 8636,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_forward_infer_b4",
-      "time_ms": 2.2540429399999997,
+      "time_ms": 1.2056042599999999,
       "config": {
         "batch": 4,
-        "seq_len": 3400,
+        "seq_len": 8636,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_fwd_bwd_train_b4",
-      "time_ms": 6.03359066,
+      "time_ms": 4.58137643,
       "config": {
         "batch": 4,
-        "seq_len": 3400,
+        "seq_len": 8636,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_forward_infer_b8",
-      "time_ms": 2.15111147,
+      "time_ms": 1.3032144600000002,
       "config": {
         "batch": 8,
-        "seq_len": 3400,
+        "seq_len": 8636,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_fwd_bwd_train_b8",
-      "time_ms": 5.758649919999999,
+      "time_ms": 4.70855039,
       "config": {
         "batch": 8,
-        "seq_len": 3400,
+        "seq_len": 8636,
         "dtype": "BFloat16"
       }
     }
