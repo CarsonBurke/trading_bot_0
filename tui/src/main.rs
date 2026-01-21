@@ -134,14 +134,15 @@ impl App {
             "final_assets",
             "cumulative_reward",
             "outperformance",
-            "loss_log",
             "advantage_stats_log",
             "total_commissions",
             "logit_noise",
             "grad_norm_log",
             "target_weights",
             "clip_fraction",
-            "explained_var"
+            "explained_var",
+            "value_loss",
+            "policy_loss"
         ];
 
         // Ticker-specific chart base names

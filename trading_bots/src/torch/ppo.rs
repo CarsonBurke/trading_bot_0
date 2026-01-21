@@ -260,8 +260,7 @@ pub async fn train(weights_path: Option<&str>) {
 
             // Portfolio-level reward: include cash penalty to avoid trivial cash-hold policy.
             let portfolio_reward =
-                step_reward_per_ticker.sum_dim_intlist([1].as_slice(), false, Kind::Float)
-                    + &step_cash_reward;
+                step_reward_per_ticker.sum_dim_intlist([1].as_slice(), false, Kind::Float);
             if DEBUG_NUMERICS {
                 let _ =
                     debug_tensor_stats("portfolio_reward", &portfolio_reward, episode as i64, step);
@@ -309,16 +308,27 @@ pub async fn train(weights_path: Option<&str>) {
         let advantages = advantages.detach();
         let returns = returns.detach();
 
+        // Compute advantage stats once per rollout (before normalization)
+        let adv_stats = tch::no_grad(|| {
+            Tensor::stack(
+                &[
+                    advantages.mean(Kind::Float),
+                    advantages.min(),
+                    advantages.max(),
+                ],
+                0,
+            )
+        });
+
         let price_deltas_batch = s_price_deltas.data.shallow_clone();
         let static_obs_batch = s_static_obs.data.shallow_clone();
         let seq_idx_batch = s_seq_idx.data.shallow_clone();
         let action_weights_batch = s_action_weights.shallow_clone();
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut total_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
-        // Explained variance accumulators: EV = 1 - Var(residuals) / Var(targets)
+        // Explained variance in symlog space: EV = 1 - Var(residuals) / Var(targets)
         let mut total_residual_sq = Tensor::zeros([], (Kind::Float, device));
         let mut total_target_sum = Tensor::zeros([], (Kind::Float, device));
         let mut total_target_sq_sum = Tensor::zeros([], (Kind::Float, device));
@@ -477,16 +487,16 @@ pub async fn train(weights_path: Option<&str>) {
                     let _ = debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
                 }
                 let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
-                let _ = total_loss_weighted.g_add_(&(&ppo_loss * chunk_sample_count as f64));
                 let _ =
                     total_policy_loss_weighted.g_add_(&(&action_loss * chunk_sample_count as f64));
                 let _ =
                     total_value_loss_weighted.g_add_(&(&value_loss * chunk_sample_count as f64));
-                // Explained variance accumulators
-                let residuals = &values - &ret_mb;
-                let _ = total_residual_sq.g_add_(&residuals.square().sum(Kind::Float));
-                let _ = total_target_sum.g_add_(&ret_mb.sum(Kind::Float));
-                let _ = total_target_sq_sum.g_add_(&ret_mb.square().sum(Kind::Float));
+                // Explained variance in symlog space (reuse returns_symlog from loss computation)
+                let values_symlog = symlog_tensor(&values.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP));
+                let residuals_symlog = &values_symlog - &returns_symlog;
+                let _ = total_residual_sq.g_add_(&residuals_symlog.square().sum(Kind::Float));
+                let _ = total_target_sum.g_add_(&returns_symlog.sum(Kind::Float));
+                let _ = total_target_sq_sum.g_add_(&returns_symlog.square().sum(Kind::Float));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 epoch_kl_count += chunk_sample_count;
                 total_sample_count += chunk_sample_count;
@@ -573,44 +583,38 @@ pub async fn train(weights_path: Option<&str>) {
             );
         }
 
-        let (mean_losses, mean_grad_norm_t, clip_frac_t, explained_var_t) = if total_sample_count > 0
-        {
-            let n = total_sample_count as f64;
-            // EV = 1 - Var(residuals) / Var(targets)
-            // Var(targets) = E[t^2] - E[t]^2
-            let mean_target = &total_target_sum / n;
-            let var_targets = &total_target_sq_sum / n - mean_target.square();
-            let var_residuals = &total_residual_sq / n;
-            // Clamp var_targets to avoid division by zero; if targets have no variance, EV is undefined
-            let explained_var =
-                Tensor::from(1.0) - &var_residuals / var_targets.clamp_min(1e-8);
-            let losses = Tensor::stack(
-                &[
-                    &total_loss_weighted,
-                    &total_policy_loss_weighted,
-                    &total_value_loss_weighted,
-                ],
-                0,
-            ) / n;
-            let grad_norm = if grad_norm_count > 0 {
-                &grad_norm_sum / (grad_norm_count as f64)
+        // Compute all metrics on GPU, single transfer to CPU
+        let (mean_policy_loss_t, mean_value_loss_t, explained_var_t, mean_grad_norm_t, clip_frac_t) =
+            if total_sample_count > 0 {
+                let n = total_sample_count as f64;
+                let mean_policy = &total_policy_loss_weighted / n;
+                let mean_value = &total_value_loss_weighted / n;
+                // EV = 1 - Var(residuals) / Var(targets)
+                let mean_target = &total_target_sum / n;
+                let var_targets = &total_target_sq_sum / n - mean_target.square();
+                let var_residuals = &total_residual_sq / n;
+                let explained_var =
+                    Tensor::from(1.0) - &var_residuals / var_targets.clamp_min(1e-8);
+                let grad_norm = if grad_norm_count > 0 {
+                    &grad_norm_sum / (grad_norm_count as f64)
+                } else {
+                    Tensor::zeros([], (Kind::Float, device))
+                };
+                let clip = if total_ratio_samples > 0 {
+                    &total_clipped / (total_ratio_samples as f64)
+                } else {
+                    Tensor::zeros([], (Kind::Float, device))
+                };
+                (mean_policy, mean_value, explained_var, grad_norm, clip)
             } else {
-                Tensor::zeros([], (Kind::Float, device))
+                (
+                    Tensor::zeros([], (Kind::Float, device)),
+                    Tensor::zeros([], (Kind::Float, device)),
+                    Tensor::zeros([], (Kind::Float, device)),
+                    Tensor::zeros([], (Kind::Float, device)),
+                    Tensor::zeros([], (Kind::Float, device)),
+                )
             };
-            let clip = if total_ratio_samples > 0 {
-                &total_clipped / (total_ratio_samples as f64)
-            } else {
-                Tensor::zeros([], (Kind::Float, device))
-            };
-            (losses, grad_norm, clip, explained_var)
-        } else {
-            (
-                Tensor::zeros([3], (Kind::Float, device)),
-                Tensor::zeros([], (Kind::Float, device)),
-                Tensor::zeros([], (Kind::Float, device)),
-                Tensor::zeros([], (Kind::Float, device)),
-            )
-        };
 
         let logit_stats = tch::no_grad(|| {
             let (_, _, (_, action_log_std), _) = trading_model.forward_with_seq_idx(
@@ -633,45 +637,49 @@ pub async fn train(weights_path: Option<&str>) {
             )
         });
 
+        // Single GPU->CPU transfer for all scalars
         let all_scalars = Tensor::cat(
             &[
-                mean_losses.view([3]),
+                mean_policy_loss_t.view([1]),
+                mean_value_loss_t.view([1]),
+                explained_var_t.view([1]),
                 mean_grad_norm_t.view([1]),
                 clip_frac_t.view([1]),
-                explained_var_t.view([1]),
+                adv_stats.view([3]),
                 logit_stats.view([4]),
             ],
             0,
         );
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 10]);
-        let (mean_loss, mean_policy_loss, mean_value_loss) = (
-            all_scalars_vec[0],
-            all_scalars_vec[1],
-            all_scalars_vec[2],
-        );
+            .unwrap_or_else(|_| vec![0.0; 12]);
+        let mean_policy_loss = all_scalars_vec[0];
+        let mean_value_loss = all_scalars_vec[1];
+        let explained_var = all_scalars_vec[2];
         let mean_grad_norm = all_scalars_vec[3];
         let clip_frac = all_scalars_vec[4];
-        let explained_var = all_scalars_vec[5];
-        let stats_vec = &all_scalars_vec[6..10];
+        let (adv_mean, adv_min, adv_max) =
+            (all_scalars_vec[5], all_scalars_vec[6], all_scalars_vec[7]);
+        let logit_stats_vec = &all_scalars_vec[8..12];
 
         let primary = env.primary_mut();
+        primary
+            .meta_history
+            .record_advantage_stats(adv_mean, adv_min, adv_max);
         primary.meta_history.record_logit_noise_stats(
-            stats_vec[0],
-            stats_vec[1],
-            stats_vec[2],
-            stats_vec[3],
+            logit_stats_vec[0],
+            logit_stats_vec[1],
+            logit_stats_vec[2],
+            logit_stats_vec[3],
         );
         primary.meta_history.record_clip_fraction(clip_frac);
-        primary.meta_history.record_loss(mean_loss);
         primary.meta_history.record_policy_loss(mean_policy_loss);
         primary.meta_history.record_value_loss(mean_value_loss);
         primary.meta_history.record_explained_var(explained_var);
         primary.meta_history.record_grad_norm(mean_grad_norm);
 
         println!(
-            "  Loss: {:.4} (Policy: {:.4}, Value: {:.4}, EV: {:.4}) GradNorm: {:.4}",
-            mean_loss, mean_policy_loss, mean_value_loss, explained_var, mean_grad_norm
+            "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",
+            mean_policy_loss, mean_value_loss, explained_var, mean_grad_norm
         );
 
         if episode > 0 && episode % 50 == 0 {

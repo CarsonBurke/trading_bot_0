@@ -1,11 +1,105 @@
 use super::env::Env;
+use crate::types::Position;
 
 const REWARD_SCALE: f64 = 10.0;
-const HYBRID_STRATEGY_WEIGHT: f64 = 1.0;
-const HYBRID_EXCESS_WEIGHT: f64 = 0.5;
-const HYBRID_CASH_PENALTY_WEIGHT: f64 = 1.0;
 
 impl Env {
+    pub fn get_counterfactual_reward_breakdown(
+        &self,
+        absolute_step: usize,
+        pre_total_assets: f64,
+        pre_cash: f64,
+        pre_positions: &[Position],
+    ) -> (f64, Vec<f64>, f64) {
+        let n_tickers = self.tickers.len();
+        if self.step + 1 >= self.max_step || pre_total_assets <= 0.0 {
+            return (0.0, vec![0.0; n_tickers], 0.0);
+        }
+
+        let next_absolute_step = absolute_step + 1;
+        let mut actual_next = self.account.cash;
+        let mut hold_next = pre_cash;
+
+        for ticker_idx in 0..n_tickers {
+            let next_price = self.prices[ticker_idx][next_absolute_step];
+            actual_next += self.account.positions[ticker_idx].value_with_price(next_price);
+            hold_next += pre_positions[ticker_idx].value_with_price(next_price);
+        }
+
+        let actual_return = (actual_next / pre_total_assets).ln();
+        let hold_return = (hold_next / pre_total_assets).ln();
+        let reward = (actual_return - hold_return) * REWARD_SCALE;
+
+        let delta_total = actual_next - hold_next;
+        if delta_total.abs() < 1e-9 {
+            return (reward, vec![0.0; n_tickers], reward);
+        }
+
+        let mut per_ticker_rewards = vec![0.0; n_tickers];
+        for ticker_idx in 0..n_tickers {
+            let next_price = self.prices[ticker_idx][next_absolute_step];
+            let post_qty = self.account.positions[ticker_idx].quantity;
+            let pre_qty = pre_positions[ticker_idx].quantity;
+            let delta_value = (post_qty - pre_qty) * next_price;
+            per_ticker_rewards[ticker_idx] = reward * (delta_value / delta_total);
+        }
+
+        let cash_delta = self.account.cash - pre_cash;
+        let cash_reward = reward * (cash_delta / delta_total);
+
+        (reward, per_ticker_rewards, cash_reward)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_shadow_benchmark_reward_breakdown(
+        &self,
+        absolute_step: usize,
+        _: f64,
+    ) -> (f64, Vec<f64>, f64) {
+        let n_tickers = self.tickers.len();
+        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+            return (0.0, vec![0.0; n_tickers], 0.0);
+        }
+
+        let next_absolute_step = absolute_step + 1;
+        let total_assets = self.account.total_assets;
+        let inv_total_assets = 1.0 / total_assets;
+        let inv_n_tickers = 1.0 / n_tickers as f64;
+        let mut contributions = vec![0.0; n_tickers];
+        let mut total_assets_next = self.account.cash;
+        let mut index_log_return = 0.0;
+
+        for ticker_idx in 0..n_tickers {
+            let current_price = self.prices[ticker_idx][absolute_step];
+            let next_price = self.prices[ticker_idx][next_absolute_step];
+            let position = &self.account.positions[ticker_idx];
+            let current_value = position.value_with_price(current_price);
+            let next_value = position.value_with_price(next_price);
+            total_assets_next += next_value;
+            contributions[ticker_idx] = (next_value - current_value) * inv_total_assets;
+            index_log_return += (next_price / current_price).ln();
+        }
+
+        index_log_return *= inv_n_tickers;
+        let strategy_log_return = (total_assets_next * inv_total_assets).ln() * REWARD_SCALE;
+        let cash_weight = (self.account.cash * inv_total_assets).clamp(0.0, 1.0);
+        let cash_reward = -cash_weight * index_log_return * REWARD_SCALE;
+
+        let portfolio_return: f64 = contributions.iter().sum();
+        let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
+            vec![0.0; n_tickers]
+        } else {
+            let inv_portfolio_return = 1.0 / portfolio_return;
+            contributions
+                .iter()
+                .map(|c| strategy_log_return * (c * inv_portfolio_return))
+                .collect()
+        };
+
+        (strategy_log_return, per_ticker_rewards, cash_reward)
+    }
+
+    #[allow(dead_code)]
     pub fn get_hybrid_reward_breakdown(
         &self,
         absolute_step: usize,
@@ -39,13 +133,11 @@ impl Env {
         let strategy_log_return = (total_assets_next * inv_total_assets).ln();
         index_log_return *= inv_n_tickers;
 
-        let base_reward = HYBRID_STRATEGY_WEIGHT * strategy_log_return
-            + HYBRID_EXCESS_WEIGHT * (strategy_log_return - index_log_return);
-        let base_reward_scaled = base_reward * REWARD_SCALE;
+        let base_reward = REWARD_SCALE * strategy_log_return;
 
         let cash_weight = (self.account.cash * inv_total_assets).clamp(0.0, 1.0);
-        let cash_penalty_scaled =
-            -HYBRID_CASH_PENALTY_WEIGHT * cash_weight * index_log_return.max(0.0) * REWARD_SCALE;
+        let cash_penalty =
+            -cash_weight * index_log_return.max(0.0) * REWARD_SCALE;
 
         let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
             vec![0.0; n_tickers]
@@ -53,13 +145,14 @@ impl Env {
             let inv_portfolio_return = 1.0 / portfolio_return;
             contributions
                 .iter()
-                .map(|c| base_reward_scaled * (c * inv_portfolio_return))
+                .map(|c| base_reward * (c * inv_portfolio_return))
                 .collect()
         };
 
-        (base_reward_scaled, per_ticker_rewards, cash_penalty_scaled)
+        (base_reward, per_ticker_rewards, cash_penalty)
     }
 
+    #[allow(dead_code)]
     pub fn get_cash_upswing_penalty_reward_breakdown(
         &self,
         absolute_step: usize,
@@ -110,7 +203,6 @@ impl Env {
         (strategy_log_return, per_ticker_rewards, cash_penalty)
     }
 
-    #[allow(dead_code)]
     pub fn get_unrealized_pnl_reward_breakdown(
         &self,
         absolute_step: usize,

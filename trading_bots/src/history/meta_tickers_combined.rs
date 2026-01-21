@@ -8,7 +8,6 @@ pub struct MetaHistory {
     pub final_assets: Vec<f64>,
     pub cumulative_reward: Vec<f64>,
     pub outperformance: Vec<f64>,
-    pub loss: Vec<f64>,
     pub policy_loss: Vec<f64>,
     pub value_loss: Vec<f64>,
     pub explained_var: Vec<f64>,
@@ -44,10 +43,6 @@ impl MetaHistory {
         self.total_commissions.push(history.total_commissions);
     }
 
-    pub fn record_loss(&mut self, loss: f64) {
-        self.loss.push(loss);
-    }
-
     pub fn record_policy_loss(&mut self, loss: f64) {
         self.policy_loss.push(loss);
     }
@@ -70,15 +65,11 @@ impl MetaHistory {
         self.logit_noise_max.push(max);
         self.rpo_alpha.push(rpo_alpha);
     }
-
+    
     pub fn record_advantage_stats(&mut self, mean: f64, min: f64, max: f64) {
         self.mean_advantage.push(mean);
         self.min_advantage.push(min);
         self.max_advantage.push(max);
-    }
-
-    pub fn record_logit_scale(&mut self, logit_scale: f64) {
-        self.logit_scale.push(logit_scale);
     }
 
     pub fn record_clip_fraction(&mut self, clip_fraction: f64) {
@@ -154,30 +145,31 @@ impl MetaHistory {
             };
             let _ = write_report(&format!("{base_dir}/outperformance.report.bin"), &report);
         }
-        if !self.loss.is_empty() {
+        if !self.policy_loss.is_empty() {
             let report = Report {
-                title: "Loss (Log)".to_string(),
+                title: "Policy Loss".to_string(),
                 x_label: Some("Episode".to_string()),
                 y_label: Some("Loss".to_string()),
-                scale: ScaleKind::Symlog,
-                kind: ReportKind::MultiLine {
-                    series: vec![
-                        ReportSeries {
-                            label: "total".to_string(),
-                            values: f64_to_f32(&self.loss),
-                        },
-                        ReportSeries {
-                            label: "policy".to_string(),
-                            values: f64_to_f32(&self.policy_loss),
-                        },
-                        ReportSeries {
-                            label: "value".to_string(),
-                            values: f64_to_f32(&self.value_loss),
-                        },
-                    ],
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: f64_to_f32(&self.policy_loss),
+                    ema_alpha: Some(0.05),
                 },
             };
-            let _ = write_report(&format!("{base_dir}/loss_log.report.bin"), &report);
+            let _ = write_report(&format!("{base_dir}/policy_loss.report.bin"), &report);
+        }
+        if !self.value_loss.is_empty() {
+            let report = Report {
+                title: "Value Loss".to_string(),
+                x_label: Some("Episode".to_string()),
+                y_label: Some("Loss".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: f64_to_f32(&self.value_loss),
+                    ema_alpha: Some(0.05),
+                },
+            };
+            let _ = write_report(&format!("{base_dir}/value_loss.report.bin"), &report);
         }
         if !self.explained_var.is_empty() {
             let report = Report {
@@ -197,7 +189,7 @@ impl MetaHistory {
                 title: "Grad Norm (Log)".to_string(),
                 x_label: Some("Episode".to_string()),
                 y_label: Some("Grad Norm".to_string()),
-                scale: ScaleKind::Symlog,
+                scale: ScaleKind::Linear,
                 kind: ReportKind::Simple {
                     values: f64_to_f32(&self.grad_norm),
                     ema_alpha: Some(0.05),
