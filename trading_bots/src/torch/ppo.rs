@@ -18,17 +18,22 @@ const PPO_CLIP_RATIO: f64 = 0.2;
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
-const ENTROPY_COEF: f64 = 0.0; // SDE and RPO make this effectively unecessary
-const ALPHA_LOSS_COEF: f64 = 0.1;
+const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
-const RPO_ALPHA_MIN: f64 = 0.005;
-const RPO_ALPHA_MAX: f64 = 0.05;
-const RPO_TARGET_KL: f64 = 0.018;
 pub const VALUE_LOG_CLIP: f64 = 8.0;
 const CRITIC_ENTROPY_COEF: f64 = 0.01;
-const LOG_2PI: f64 = 1.8378770664093453;
 const GRAD_ACCUM_STEPS: usize = 2;
 pub(crate) const DEBUG_NUMERICS: bool = false;
+const LOG_2PI: f64 = 1.8378770664093453;
+
+// RPO: Random Policy Optimization - adds bounded noise to action mean during training
+// Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
+const RPO_ALPHA_MIN: f64 = 0.01;
+const RPO_ALPHA_MAX: f64 = 0.3;
+const RPO_ALPHA_INIT: f64 = 0.1;
+const RPO_TARGET_KL: f64 = 0.018;
+const ALPHA_LOSS_COEF: f64 = 1.0;
+const MAX_DELTA_ALPHA: f64 = 0.02;
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -145,6 +150,17 @@ pub async fn train(weights_path: Option<&str>) {
     let mut vs = nn::VarStore::new(device);
     let trading_model = TradingModel::new(&vs.root());
 
+    // RPO alpha via sigmoid: alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
+    let mut rpo_rho = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+        let p_init = (RPO_ALPHA_INIT - RPO_ALPHA_MIN) / (RPO_ALPHA_MAX - RPO_ALPHA_MIN);
+        let p_init = p_init.clamp(1e-6, 1.0 - 1e-6);
+        let rho_init = (p_init / (1.0 - p_init)).ln();
+        vs.root().var("rpo_alpha_rho", &[1], nn::Init::Const(rho_init))
+    } else {
+        // RPO disabled - create dummy tensor
+        Tensor::zeros(&[1], (Kind::Float, device))
+    };
+
     if let Some(path) = weights_path {
         println!("Loading weights from {}", path);
         vs.load(path).unwrap();
@@ -174,8 +190,6 @@ pub async fn train(weights_path: Option<&str>) {
     let mut s_action_weights =
         Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
 
-    let mut rpo_rho = vs.root().var("rpo_rho", &[1], nn::Init::Const(0.0));
-
     for episode in 0..1000000 {
         let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
@@ -194,6 +208,7 @@ pub async fn train(weights_path: Option<&str>) {
         let mut actions_flat = vec![0.0f64; NPROCS as usize * action_dim];
         let mut actions_vec = vec![vec![0.0f64; action_dim]; NPROCS as usize];
 
+        let stats_kind = (Kind::Float, device);
         for step in 0..rollout_steps as usize {
             let (values, _, (action_mean, action_log_std), _) = tch::no_grad(|| {
                 trading_model.forward_with_seq_idx(
@@ -203,31 +218,36 @@ pub async fn train(weights_path: Option<&str>) {
                     false,
                 )
             });
+            let values = values.to_kind(Kind::Float);
+            let action_mean = action_mean.to_kind(Kind::Float);
+            let action_log_std = action_log_std.to_kind(Kind::Float);
+
+            // Sample: u = mean + std * noise, then softmax for simplex actions
+            let action_std = action_log_std.exp();
+            let noise_ticker = Tensor::randn([NPROCS, TICKERS_COUNT], stats_kind);
+            let noise_cash = Tensor::zeros([NPROCS, 1], stats_kind);
+            let noise = Tensor::cat(&[noise_ticker, noise_cash], 1);
+            let u = &action_mean + &action_std * noise;
+            let actions = u.softmax(-1, Kind::Float);
+
+            // Log prob: Gaussian on u with softmax Jacobian correction
+            let u_normalized = (&u - &action_mean) / &action_std;
+            let u_squared = u_normalized.pow_tensor_scalar(2);
+            let two_log_std = &action_log_std * 2.0;
+            let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
+            let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
+            let log_det = u
+                .log_softmax(-1, Kind::Float)
+                .sum_dim_intlist(-1, false, Kind::Float);
+            let action_log_prob = &log_prob_gaussian - &log_det;
 
             if DEBUG_NUMERICS {
                 let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
                 let _ = debug_tensor_stats("action_log_std", &action_log_std, episode as i64, step);
-            }
-
-            let action_std = action_log_std.exp();
-            let u = &action_mean + Tensor::randn_like(&action_mean) * &action_std;
-
-            // Gaussian log_prob on logits u; softmax applied only for env actions
-            let u_normalized = (&u - &action_mean) / &action_std;
-            let action_log_prob =
-                (u_normalized.pow_tensor_scalar(2) + action_log_std * 2.0 + LOG_2PI)
-                    .sum_dim_intlist(-1, false, Kind::Float)
-                    .g_mul_scalar(-0.5);
-
-            let actions_softmax = u.softmax(-1, Kind::Float);
-            if DEBUG_NUMERICS {
                 let _ = debug_tensor_stats("u", &u, episode as i64, step);
-                let _ =
-                    debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
-                let _ =
-                    debug_tensor_stats("actions_softmax", &actions_softmax, episode as i64, step);
+                let _ = debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
-            let actions_cpu = actions_softmax
+            let actions_cpu = actions
                 .flatten(0, -1)
                 .to_device(tch::Device::Cpu)
                 .to_kind(Kind::Double);
@@ -253,7 +273,7 @@ pub async fn train(weights_path: Option<&str>) {
             s_price_deltas.push(&obs_price);
             s_static_obs.push(&obs_static);
             s_seq_idx.push(&obs_seq_idx);
-            let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&u);
+            let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&u); // Store pre-softmax u for training
             let _ = s_old_log_probs
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&action_log_prob);
@@ -274,7 +294,7 @@ pub async fn train(weights_path: Option<&str>) {
             let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
             let _ = s_action_weights
                 .narrow(0, mem_idx, NPROCS)
-                .copy_(&actions_softmax);
+                .copy_(&actions);
         }
 
         // Compute GAE on portfolio-level values
@@ -344,6 +364,7 @@ pub async fn train(weights_path: Option<&str>) {
         let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
 
+
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             use rand::seq::SliceRandom;
             chunk_order.shuffle(&mut rand::rng());
@@ -375,7 +396,7 @@ pub async fn train(weights_path: Option<&str>) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (values, critic_logits, (action_mean, action_log_stds), attn_entropy) =
+                let (values, critic_logits, (action_mean, action_log_stds), _attn_entropy) =
                     trading_model.forward_with_seq_idx(
                         &pd_chunk,
                         &so_chunk,
@@ -387,37 +408,48 @@ pub async fn train(weights_path: Option<&str>) {
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let action_log_stds = action_log_stds.to_kind(Kind::Float);
 
-                let rpo_alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
-                let rpo_noise = Tensor::cat(
-                    &[
-                        Tensor::empty([chunk_sample_count, TICKERS_COUNT], (Kind::Float, device))
-                            .uniform_(-1.0, 1.0)
-                            * rpo_alpha.detach(),
-                        Tensor::zeros([chunk_sample_count, 1], (Kind::Float, device)),
-                    ],
-                    1,
-                );
-                let action_mean_noisy = &action_mean + &rpo_noise;
+                // act_mb contains the stored u (pre-softmax logits)
+                let u = act_mb;
+
+                // RPO: sigmoid parameterization for smooth gradients
+                let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                    let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
+                    let alpha_detached = alpha.detach();
+                    let rpo_noise_ticker = Tensor::empty(
+                        [chunk_sample_count, TICKERS_COUNT],
+                        (Kind::Float, device),
+                    )
+                    .uniform_(-1.0, 1.0)
+                        * &alpha_detached;
+                    let rpo_noise_cash = Tensor::zeros([chunk_sample_count, 1], (Kind::Float, device));
+                    let rpo_noise = Tensor::cat(&[rpo_noise_ticker, rpo_noise_cash], 1);
+                    (alpha, &action_mean + rpo_noise)
+                } else {
+                    (Tensor::zeros(&[1], (Kind::Float, device)), action_mean.shallow_clone())
+                };
+
+                // Log prob: Gaussian on u with softmax Jacobian correction
+                let action_std = action_log_stds.exp();
+                let two_log_std = &action_log_stds * 2.0;
+                let u_normalized = (&u - &action_mean_perturbed) / &action_std;
+                let u_squared = u_normalized.pow_tensor_scalar(2);
+                let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
+                let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
+                let log_det = u
+                    .log_softmax(-1, Kind::Float)
+                    .sum_dim_intlist(-1, false, Kind::Float);
+                let action_log_probs = (log_prob_gaussian - log_det).nan_to_num(0.0, 0.0, 0.0);
 
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("act_mb", &act_mb, _epoch, chunk_i);
-                    let _ =
-                        debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ =
-                        debug_tensor_stats("action_log_stds", &action_log_stds, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_log_stds", &action_log_stds, _epoch, chunk_i);
                 }
 
-                // Gaussian log_prob on logits; softmax only for env
-                let u_normalized = (&act_mb - &action_mean_noisy) / action_log_stds.exp();
-                let action_log_probs =
-                    (u_normalized.pow_tensor_scalar(2) + &action_log_stds * 2.0 + LOG_2PI)
-                        .sum_dim_intlist(-1, false, Kind::Float)
-                        .g_mul_scalar(-0.5);
-
                 let log_ratio_raw = &action_log_probs - &old_log_probs_mb;
-                let c = 0.3; // bounds to approximately (-0.5, 0.5)
-                let log_ratio = &log_ratio_raw * c / (c + log_ratio_raw.abs());
+                // Soft clamp log_ratio to prevent extreme probability ratios
+                let log_ratio = log_ratio_raw.tanh() * 0.3;
                 if DEBUG_NUMERICS {
                     let _ =
                         debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
@@ -454,27 +486,27 @@ pub async fn train(weights_path: Option<&str>) {
                     .mean(Kind::Float);
                 let value_loss = ce_loss - CRITIC_ENTROPY_COEF * critic_entropy;
 
-                let dist_entropy = (&action_log_stds * 2.0 + (1.0 + LOG_2PI))
-                    .g_mul_scalar(0.5)
-                    .mean(Kind::Float);
+                // Entropy of Gaussian (per action dimension)
+                let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
+                let dist_entropy = entropy_components.g_mul_scalar(0.5).mean(Kind::Float);
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
                     + action_loss.shallow_clone()
                     - dist_entropy * ENTROPY_COEF;
 
-                let inv_var_mean = action_log_stds
-                    .detach()
-                    .exp()
-                    .pow_tensor_scalar(2)
-                    .clamp_min(1e-4)
-                    .reciprocal()
-                    .mean(Kind::Float);
-                let induced_kl =
-                    rpo_alpha.pow_tensor_scalar(2) * (ACTION_COUNT as f64 / 6.0) * inv_var_mean;
-                let alpha_loss = (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0);
+                // RPO alpha loss: target induced KL
+                let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                    let action_std_detached = action_log_stds.detach().exp();
+                    let var = action_std_detached.pow_tensor_scalar(2);
+                    let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
+                    let d = TICKERS_COUNT as f64;
+                    let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
+                    (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
+                } else {
+                    Tensor::zeros([], (Kind::Float, device))
+                };
 
-                let total_chunk_loss = (ppo_loss.shallow_clone() + alpha_loss * ALPHA_LOSS_COEF)
-                    / GRAD_ACCUM_STEPS as f64;
+                let total_chunk_loss = (ppo_loss.shallow_clone() + alpha_loss) / GRAD_ACCUM_STEPS as f64;
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
@@ -536,7 +568,18 @@ pub async fn train(weights_path: Option<&str>) {
                     grad_norm_count += 1;
 
                     opt.clip_grad_norm(MAX_GRAD_NORM);
-                    opt.step();
+
+                    if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                        let max_delta_rho = MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
+                        tch::no_grad(|| {
+                            let rho_before = rpo_rho.detach();
+                            opt.step();
+                            let rho_new = &rho_before + (&rpo_rho - &rho_before).clamp(-max_delta_rho, max_delta_rho);
+                            let _ = rpo_rho.copy_(&rho_new);
+                        });
+                    } else {
+                        opt.step();
+                    }
                     opt.zero_grad();
                 }
 
@@ -616,7 +659,8 @@ pub async fn train(weights_path: Option<&str>) {
                 )
             };
 
-        let logit_stats = tch::no_grad(|| {
+        // Compute action std stats + rpo_alpha
+        let log_std_stats = tch::no_grad(|| {
             let (_, _, (_, action_log_std), _) = trading_model.forward_with_seq_idx(
                 &s_price_deltas.get(0),
                 &s_static_obs.get(0),
@@ -624,14 +668,17 @@ pub async fn train(weights_path: Option<&str>) {
                 false,
             );
             let action_std = action_log_std.exp();
-            let rpo_alpha =
-                (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze();
+            let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze()
+            } else {
+                Tensor::zeros([], (Kind::Float, device))
+            };
             Tensor::stack(
                 &[
                     action_std.mean(Kind::Float),
                     action_std.min(),
                     action_std.max(),
-                    rpo_alpha,
+                    rpo_alpha_val,
                 ],
                 0,
             )
@@ -646,7 +693,7 @@ pub async fn train(weights_path: Option<&str>) {
                 mean_grad_norm_t.view([1]),
                 clip_frac_t.view([1]),
                 adv_stats.view([3]),
-                logit_stats.view([4]),
+                log_std_stats.view([4]),
             ],
             0,
         );
@@ -659,17 +706,18 @@ pub async fn train(weights_path: Option<&str>) {
         let clip_frac = all_scalars_vec[4];
         let (adv_mean, adv_min, adv_max) =
             (all_scalars_vec[5], all_scalars_vec[6], all_scalars_vec[7]);
-        let logit_stats_vec = &all_scalars_vec[8..12];
+        let log_std_stats_vec = &all_scalars_vec[8..12];
 
         let primary = env.primary_mut();
         primary
             .meta_history
             .record_advantage_stats(adv_mean, adv_min, adv_max);
+        // Record log-std stats in place of logit noise stats
         primary.meta_history.record_logit_noise_stats(
-            logit_stats_vec[0],
-            logit_stats_vec[1],
-            logit_stats_vec[2],
-            logit_stats_vec[3],
+            log_std_stats_vec[0],
+            log_std_stats_vec[1],
+            log_std_stats_vec[2],
+            log_std_stats_vec[3],
         );
         primary.meta_history.record_clip_fraction(clip_frac);
         primary.meta_history.record_policy_loss(mean_policy_loss);

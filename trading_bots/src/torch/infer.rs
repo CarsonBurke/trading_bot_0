@@ -7,6 +7,7 @@ use crate::torch::model::{TradingModel, TradingModelConfig};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::Env;
 
+
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: Device,
@@ -17,24 +18,35 @@ pub fn load_model<P: AsRef<Path>>(
     Ok((vs, model))
 }
 
-pub fn sample_actions_from_dist(
+/// Sample actions: u = mean + std * noise, then softmax to simplex
+pub fn sample_actions(
     action_mean: &Tensor,
     action_log_std: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let batch_size = action_mean.size()[0];
-    let noise_ticker =
-        Tensor::randn([batch_size, TICKERS_COUNT], (Kind::Float, action_mean.device()));
-    let noise_cash = Tensor::zeros([batch_size, 1], (Kind::Float, action_mean.device()));
-    let noise = Tensor::cat(&[noise_ticker, noise_cash], 1);
+    let action_mean = action_mean.to_kind(Kind::Float);
+    let action_log_std = action_log_std.to_kind(Kind::Float);
 
-    let u = if deterministic || temperature == 0.0 {
-        action_mean.shallow_clone()
+    let u = if deterministic {
+        action_mean
     } else {
-        let action_std = action_log_std.exp() * temperature;
-        action_mean + &action_std * noise
+        let action_std = action_log_std.exp();
+        let batch = action_mean.size()[0];
+        let action_dim = action_mean.size()[1];
+        // No noise on cash (last action)
+        let noise_ticker = Tensor::randn([batch, action_dim - 1], (Kind::Float, action_mean.device()));
+        let noise_cash = Tensor::zeros([batch, 1], (Kind::Float, action_mean.device()));
+        let noise = Tensor::cat(&[noise_ticker, noise_cash], 1);
+        &action_mean + &action_std * noise
     };
+
+    let u = if temperature != 1.0 && temperature != 0.0 {
+        &u / temperature
+    } else {
+        u
+    };
+
     u.softmax(-1, Kind::Float)
 }
 
@@ -100,7 +112,7 @@ pub fn run_inference<P: AsRef<Path>>(
                     model.step(price_input, &static_obs_tensor, &mut stream_state);
                 (action_mean, action_log_std)
             });
-            let actions = sample_actions_from_dist(
+            let actions = sample_actions(
                 &action_mean,
                 &action_log_std,
                 deterministic,

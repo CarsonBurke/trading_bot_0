@@ -194,20 +194,24 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, super::HEAD_HIDDEN]);
         let cash_head_base = policy_hidden.narrow(0, batch_size * TICKERS_COUNT, batch_size);
 
+        // Action mean (logits before softmax)
         let action_mean_ticker = ticker_head_base.apply(&self.actor_out).squeeze_dim(-1);
         let cash_logit = cash_head_base.apply(&self.actor_out).squeeze_dim(-1);
         let action_mean = Tensor::cat(&[action_mean_ticker, cash_logit.unsqueeze(1)], 1);
+
+        // gSDE: state-dependent exploration via learned latent features
         let sde_input = ticker_head_base.reshape([batch_size * TICKERS_COUNT, super::HEAD_HIDDEN]);
         let sde_latent = sde_input.apply(&self.sde_fc);
-        let sde_latent = self.ln_sde.forward(&sde_latent);
+        let sde_latent = (self.ln_sde.forward(&sde_latent) / 1.5).tanh();
         let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, -1]);
-        let log_std = &self.log_std_param + super::LOG_STD_INIT;
-        let std = log_std.exp();
-        let std_sq = std.pow_tensor_scalar(2).transpose(0, 1);
+
+        // Compute action_log_std from gSDE variance
+        let log_std = (&self.log_std_param + super::LOG_STD_INIT).clamp(-3.0, -0.5);
+        let std_sq = log_std.exp().pow_tensor_scalar(2).transpose(0, 1);
         let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
             .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
         let action_log_std_ticker = (variance + super::SDE_EPS).sqrt().log();
-        let cash_log_std = &self.cash_log_std_param + super::LOG_STD_INIT;
+        let cash_log_std = (&self.cash_log_std_param + super::LOG_STD_INIT).clamp(-3.0, -0.5);
         let action_log_std = Tensor::cat(
             &[
                 action_log_std_ticker,

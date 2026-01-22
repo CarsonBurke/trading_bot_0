@@ -2,6 +2,7 @@ use super::env::Env;
 use crate::types::Position;
 
 const REWARD_SCALE: f64 = 10.0;
+const OPPORTUNITY_COST_ONLY: bool = true;
 
 impl Env {
     pub fn get_counterfactual_reward_breakdown(
@@ -18,36 +19,36 @@ impl Env {
 
         let next_absolute_step = absolute_step + 1;
         let mut actual_next = self.account.cash;
-        let mut hold_next = pre_cash;
 
         for ticker_idx in 0..n_tickers {
             let next_price = self.prices[ticker_idx][next_absolute_step];
             actual_next += self.account.positions[ticker_idx].value_with_price(next_price);
-            hold_next += pre_positions[ticker_idx].value_with_price(next_price);
         }
 
         let actual_return = (actual_next / pre_total_assets).ln();
-        let hold_return = (hold_next / pre_total_assets).ln();
-        let reward = (actual_return - hold_return) * REWARD_SCALE;
-
-        let delta_total = actual_next - hold_next;
-        if delta_total.abs() < 1e-9 {
-            return (reward, vec![0.0; n_tickers], reward);
-        }
-
         let mut per_ticker_rewards = vec![0.0; n_tickers];
+        let mut miss_sum = 0.0;
+
         for ticker_idx in 0..n_tickers {
+            let current_price = self.prices[ticker_idx][absolute_step];
             let next_price = self.prices[ticker_idx][next_absolute_step];
-            let post_qty = self.account.positions[ticker_idx].quantity;
-            let pre_qty = pre_positions[ticker_idx].quantity;
-            let delta_value = (post_qty - pre_qty) * next_price;
-            per_ticker_rewards[ticker_idx] = reward * (delta_value / delta_total);
+            let ticker_return = (next_price / current_price).ln();
+            let counterfactual_return = ticker_return.max(0.0);
+            let mut miss = counterfactual_return - actual_return;
+            if OPPORTUNITY_COST_ONLY {
+                miss = miss.max(0.0);
+            }
+            miss_sum += miss;
+            per_ticker_rewards[ticker_idx] = -miss * REWARD_SCALE;
         }
 
-        let cash_delta = self.account.cash - pre_cash;
-        let cash_reward = reward * (cash_delta / delta_total);
+        let reward = if n_tickers > 0 {
+            -(miss_sum / n_tickers as f64) * REWARD_SCALE
+        } else {
+            0.0
+        };
 
-        (reward, per_ticker_rewards, cash_reward)
+        (reward, per_ticker_rewards, 0.0)
     }
 
     #[allow(dead_code)]

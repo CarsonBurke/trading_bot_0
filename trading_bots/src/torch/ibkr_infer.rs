@@ -17,7 +17,7 @@ use crate::torch::constants::{
     ACTION_HISTORY_LEN, ACTION_THRESHOLD, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS,
     PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
-use crate::torch::infer::{load_model, sample_actions_from_dist};
+use crate::torch::infer::{load_model, sample_actions};
 use crate::types::Account;
 
 const MAX_ACCOUNT_VALUE: Option<f64> = Some(10_000.0);
@@ -373,11 +373,11 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                     model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state);
                 (action_mean, action_log_std)
             });
-            let actions = sample_actions_from_dist(
+            let actions = sample_actions(
                 &action_mean,
                 &action_log_std,
-                true,
-                0.0,
+                true,  // deterministic
+                0.0,   // temperature
             );
 
             let actions_vec = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();

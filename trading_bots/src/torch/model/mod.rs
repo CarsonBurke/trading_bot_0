@@ -99,10 +99,9 @@ const MODEL_DIM: i64 = 128;
 const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
-const LOG_STD_INIT: f64 = -1.0;
-const LOG_STD_MIN: f64 = -3.0;
-const LOG_STD_MAX: f64 = 0.5;
-const SDE_EPS: f64 = 1e-6;
+pub(crate) const SDE_LATENT_DIM: i64 = 64;
+pub(crate) const LOG_STD_INIT: f64 = -2.0;
+pub(crate) const SDE_EPS: f64 = 1e-6;
 const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const HEAD_HIDDEN: i64 = 192;
@@ -181,6 +180,8 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
 const NUM_VALUE_BUCKETS: i64 = 127;
 
 // (values, critic_logits, (action_mean, action_log_std), attn_entropy)
+// action_mean: [batch, TICKERS_COUNT + 1] logits before softmax
+// action_log_std: [batch, TICKERS_COUNT + 1] per-action log std
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor), Tensor);
 
 pub struct DebugMetrics {
@@ -267,11 +268,12 @@ pub struct TradingModel {
     value_mlp_fc2: nn::Linear,
     actor_out: nn::Linear,
     critic_out: nn::Linear,
-    cash_log_std_param: Tensor,
     cash_merge: nn::Linear,
+    // SDE for state-dependent exploration (gSDE)
     sde_fc: nn::Linear,
     ln_sde: RMSNorm,
-    log_std_param: Tensor,
+    log_std_param: Tensor,      // [SDE_LATENT_DIM, TICKERS_COUNT]
+    cash_log_std_param: Tensor, // [1]
     bucket_centers: Tensor,
     value_centers: Tensor,
     device: tch::Device,
@@ -290,6 +292,7 @@ impl TradingModel {
     pub fn value_centers(&self) -> &Tensor {
         &self.value_centers
     }
+
 
     pub fn new(p: &nn::Path) -> Self {
         Self::new_with_config(p, TradingModelConfig::default())
@@ -472,7 +475,6 @@ impl TradingModel {
                 ..Default::default()
             },
         );
-        let cash_log_std_param = p.var("cash_log_std", &[1], Init::Const(0.0));
         let critic_out = nn::linear(
             p / "critic_out",
             MODEL_DIM,
@@ -484,14 +486,17 @@ impl TradingModel {
             },
         );
         let cash_merge = nn::linear(p / "cash_merge", MODEL_DIM, MODEL_DIM, Default::default());
-        const SDE_LATENT_DIM: i64 = 64;
+
+        // SDE for state-dependent exploration (SB3-style with learn_features=True)
         let sde_fc = nn::linear(p / "sde_fc", HEAD_HIDDEN, SDE_LATENT_DIM, Default::default());
-        let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-6);
+        let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-5);
+        let cash_log_std_param = p.var("cash_log_std", &[1], Init::Const(0.0));
         let log_std_param = p.var(
             "log_std",
             &[SDE_LATENT_DIM, TICKERS_COUNT],
             Init::Const(0.0),
         );
+
         let value_clip_symlog = symlog_tensor(&Tensor::from(VALUE_LOG_CLIP)).double_value(&[]);
         let value_centers = Tensor::linspace(
             -value_clip_symlog,
@@ -540,11 +545,11 @@ impl TradingModel {
             value_mlp_fc2,
             actor_out,
             critic_out,
-            cash_log_std_param,
             cash_merge,
             sde_fc,
             ln_sde,
             log_std_param,
+            cash_log_std_param,
             bucket_centers,
             value_centers,
             device: p.device(),
