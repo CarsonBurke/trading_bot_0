@@ -5,6 +5,7 @@ const REWARD_SCALE: f64 = 10.0;
 const OPPORTUNITY_COST_ONLY: bool = true;
 
 impl Env {
+    #[allow(dead_code)]
     pub fn get_counterfactual_reward_breakdown(
         &self,
         absolute_step: usize,
@@ -249,7 +250,7 @@ impl Env {
                 .map(|c| strategy_log_return * (c * inv_portfolio_return))
                 .collect()
         };
-        (strategy_log_return, per_ticker_rewards, cash_penalty)
+        (strategy_log_return, per_ticker_rewards, 0.0)
     }
 
     #[allow(dead_code)]
