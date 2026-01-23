@@ -529,7 +529,12 @@ impl ChartViewer {
                 let (node_idx, _) = self.flattened[i];
                 if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
                     if let Ok(report) = load_report(path) {
-                        let temp_path = render_report_to_temp(&report)?;
+                        let skip = if self.viewing_mode == ViewingMode::MetaCharts {
+                            self.row_skip
+                        } else {
+                            0
+                        };
+                        let temp_path = render_report_to_temp(&report, skip)?;
                         clipboard::copy_image_to_clipboard(&temp_path)?;
                     } else {
                         clipboard::copy_image_to_clipboard(path)?;
@@ -829,8 +834,8 @@ fn report_title_from_path(path: &PathBuf) -> Option<String> {
     Some(report.title)
 }
 
-fn render_report_to_temp(report: &Report) -> Result<PathBuf> {
-    let image = render_report(report)?;
+fn render_report_to_temp(report: &Report, skip: usize) -> Result<PathBuf> {
+    let image = render_report_with_skip(report, skip)?;
     let mut path = std::env::temp_dir();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
