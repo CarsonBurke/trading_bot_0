@@ -222,16 +222,19 @@ pub async fn train(weights_path: Option<&str>) {
             let action_mean = action_mean.to_kind(Kind::Float);
             let action_log_std = action_log_std.to_kind(Kind::Float);
 
-            // Sample: u = mean + std * noise, then softmax for simplex actions
+            // Sample: u = mean + std * noise (tickers only), then softmax for simplex actions
+            // action_log_std is [batch, tickers] - no cash
             let action_std = action_log_std.exp();
             let noise_ticker = Tensor::randn([NPROCS, TICKERS_COUNT], stats_kind);
-            let noise_cash = Tensor::zeros([NPROCS, 1], stats_kind);
-            let noise = Tensor::cat(&[noise_ticker, noise_cash], 1);
-            let u = &action_mean + &action_std * noise;
+            let action_mean_ticker = action_mean.narrow(1, 0, TICKERS_COUNT);
+            let action_mean_cash = action_mean.narrow(1, TICKERS_COUNT, 1);
+            let u_ticker = &action_mean_ticker + &action_std * &noise_ticker;
+            let u = Tensor::cat(&[u_ticker, action_mean_cash], 1);
             let actions = u.softmax(-1, Kind::Float);
 
-            // Log prob: Gaussian on u with softmax Jacobian correction
-            let u_normalized = (&u - &action_mean) / &action_std;
+            // Log prob: Gaussian on tickers only (cash is deterministic)
+            let u_ticker = u.narrow(1, 0, TICKERS_COUNT);
+            let u_normalized = (&u_ticker - &action_mean_ticker) / &action_std;
             let u_squared = u_normalized.pow_tensor_scalar(2);
             let two_log_std = &action_log_std * 2.0;
             let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
@@ -428,10 +431,12 @@ pub async fn train(weights_path: Option<&str>) {
                     (Tensor::zeros(&[1], (Kind::Float, device)), action_mean.shallow_clone())
                 };
 
-                // Log prob: Gaussian on u with softmax Jacobian correction
+                // Log prob: Gaussian on tickers only (cash is deterministic)
                 let action_std = action_log_stds.exp();
                 let two_log_std = &action_log_stds * 2.0;
-                let u_normalized = (&u - &action_mean_perturbed) / &action_std;
+                let u_ticker = u.narrow(1, 0, TICKERS_COUNT);
+                let action_mean_ticker = action_mean_perturbed.narrow(1, 0, TICKERS_COUNT);
+                let u_normalized = (&u_ticker - &action_mean_ticker) / &action_std;
                 let u_squared = u_normalized.pow_tensor_scalar(2);
                 let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
@@ -447,9 +452,9 @@ pub async fn train(weights_path: Option<&str>) {
                     let _ = debug_tensor_stats("action_log_stds", &action_log_stds, _epoch, chunk_i);
                 }
 
-                let log_ratio_raw = &action_log_probs - &old_log_probs_mb;
+                let log_ratio = &action_log_probs - &old_log_probs_mb;
                 // Soft clamp log_ratio to prevent extreme probability ratios
-                let log_ratio = log_ratio_raw.tanh() * 0.3;
+                // let log_ratio = log_ratio_raw.tanh() * 0.3;
                 if DEBUG_NUMERICS {
                     let _ =
                         debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);

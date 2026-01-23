@@ -18,7 +18,8 @@ pub fn load_model<P: AsRef<Path>>(
     Ok((vs, model))
 }
 
-/// Sample actions: u = mean + std * noise, then softmax to simplex
+/// Sample actions: u = mean + std * noise (tickers only), then softmax to simplex
+/// action_log_std is [batch, tickers] - no cash dimension
 pub fn sample_actions(
     action_mean: &Tensor,
     action_log_std: &Tensor,
@@ -27,18 +28,18 @@ pub fn sample_actions(
 ) -> Tensor {
     let action_mean = action_mean.to_kind(Kind::Float);
     let action_log_std = action_log_std.to_kind(Kind::Float);
+    let batch = action_mean.size()[0];
+    let num_tickers = action_log_std.size()[1];
 
     let u = if deterministic {
         action_mean
     } else {
         let action_std = action_log_std.exp();
-        let batch = action_mean.size()[0];
-        let action_dim = action_mean.size()[1];
-        // No noise on cash (last action)
-        let noise_ticker = Tensor::randn([batch, action_dim - 1], (Kind::Float, action_mean.device()));
-        let noise_cash = Tensor::zeros([batch, 1], (Kind::Float, action_mean.device()));
-        let noise = Tensor::cat(&[noise_ticker, noise_cash], 1);
-        &action_mean + &action_std * noise
+        let noise_ticker = Tensor::randn([batch, num_tickers], (Kind::Float, action_mean.device()));
+        let action_mean_ticker = action_mean.narrow(1, 0, num_tickers);
+        let action_mean_cash = action_mean.narrow(1, num_tickers, 1);
+        let u_ticker = &action_mean_ticker + &action_std * &noise_ticker;
+        Tensor::cat(&[u_ticker, action_mean_cash], 1)
     };
 
     let u = if temperature != 1.0 && temperature != 0.0 {
