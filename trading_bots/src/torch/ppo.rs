@@ -7,7 +7,7 @@ use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{symexp_tensor, symlog_tensor, TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
+use crate::torch::model::{expln, symexp_tensor, symlog_tensor, TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
 
 const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
@@ -473,15 +473,15 @@ pub async fn train(weights_path: Option<&str>) {
                     let _ = debug_tensor_stats("action_log_stds", &action_log_stds, _epoch, chunk_i);
                 }
 
-                let log_ratio_raw = &action_log_probs - &old_log_probs_mb;
+                let log_ratio = &action_log_probs - &old_log_probs_mb;
                 // Soft clamp log_ratio to prevent extreme probability ratios
-                let log_ratio = log_ratio_raw.tanh() * 0.3;
+                // let log_ratio = log_ratio_raw.tanh() * 0.3;
                 if DEBUG_NUMERICS {
                     let _ =
                         debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
                 }
-                let ratio = log_ratio.exp();
+                let ratio = expln(&log_ratio);
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
 
                 // Single portfolio advantage - no more weighted combination

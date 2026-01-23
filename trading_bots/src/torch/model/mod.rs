@@ -119,6 +119,18 @@ pub(crate) fn symexp_tensor(t: &Tensor) -> Tensor {
     let abs = t.abs();
     t.sign() * (abs.exp() - 1.0)
 }
+
+/// expln: numerically stable exp alternative that bounds growth for positive inputs
+/// expln(x) = exp(x)        if x <= 0
+///          = ln(x + 1) + 1 if x > 0
+pub(crate) fn expln(t: &Tensor) -> Tensor {
+    let below = t.le(0.0).to_kind(Kind::Float);
+    let above = t.gt(0.0).to_kind(Kind::Float);
+    let below_threshold = t.exp() * &below;
+    let safe_t = t * &above + 1e-8;
+    let above_threshold = (safe_t.log1p() + 1.0) * &above;
+    below_threshold + above_threshold
+}
 const TEMPORAL_STATIC_DIM: i64 = 64;
 
 const PATCH_CONFIGS: [(i64, i64); 7] = [
