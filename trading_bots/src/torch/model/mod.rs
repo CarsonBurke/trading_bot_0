@@ -228,9 +228,6 @@ pub struct StreamState {
     pub initialized: bool,
 }
 
-// Number of Givens rotations (pairs of dimensions to rotate) - 32 pairs covers all 64 dims
-const SDE_NUM_GIVENS: i64 = 32;
-
 pub struct TradingModel {
     patch_embed_weight: Tensor,
     patch_embed_bias: Tensor,
@@ -276,9 +273,6 @@ pub struct TradingModel {
     sde_fc: nn::Linear,
     ln_sde: RMSNorm,
     log_std_param: Tensor,        // [SDE_LATENT_DIM, TICKERS_COUNT]
-    sde_fixed_basis: Tensor,       // Fixed orthonormal [SDE_LATENT_DIM, SDE_LATENT_DIM]
-    sde_givens_angles: Tensor,     // Learned rotation angles [SDE_NUM_GIVENS]
-    sde_givens_pairs: Tensor,      // Fixed random pairs of dims to rotate [SDE_NUM_GIVENS, 2]
     bucket_centers: Tensor,
     value_centers: Tensor,
     device: tch::Device,
@@ -500,23 +494,6 @@ impl TradingModel {
             &[SDE_LATENT_DIM, TICKERS_COUNT],
             Init::Const(0.0),
         );
-        // Fixed orthonormal basis via QR decomposition of random matrix
-        let sde_fixed_basis = {
-            let random_mat = Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], (Kind::Float, p.device()));
-            let (q, _r) = Tensor::linalg_qr(&random_mat, "reduced");
-            let _ = q.set_requires_grad(false);
-            q
-        };
-        // Givens rotation: learn angles for pairs of dimensions
-        let sde_givens_angles = p.var("sde_givens_angles", &[SDE_NUM_GIVENS], Init::Const(0.0));
-        // Pair consecutive dimensions: (0,1), (2,3), (4,5), ...
-        let sde_givens_pairs = {
-            let pairs: Vec<i64> = (0..SDE_NUM_GIVENS * 2).collect();
-            let t = Tensor::from_slice(&pairs).reshape([SDE_NUM_GIVENS, 2]).to_device(p.device());
-            let _ = t.set_requires_grad(false);
-            t
-        };
-
         let value_clip_symlog = symlog_tensor(&Tensor::from(VALUE_LOG_CLIP)).double_value(&[]);
         let value_centers = Tensor::linspace(
             -value_clip_symlog,
@@ -569,41 +546,10 @@ impl TradingModel {
             sde_fc,
             ln_sde,
             log_std_param,
-            sde_fixed_basis,
-            sde_givens_angles,
-            sde_givens_pairs,
             bucket_centers,
             value_centers,
             device: p.device(),
         }
-    }
-
-    /// Apply learned Givens rotations to the fixed basis (vectorized, autograd-safe).
-    pub(crate) fn sde_rotated_basis(&self) -> Tensor {
-        let kind = self.sde_givens_angles.kind();
-        let device = self.sde_givens_angles.device();
-        let basis = self.sde_fixed_basis.to_kind(kind).to_device(device);
-        let n = SDE_LATENT_DIM;
-        let pairs = self.sde_givens_pairs.to_device(device); // [num_givens, 2]
-        let idx_i = pairs.select(1, 0).to_kind(Kind::Int64); // [num_givens]
-        let idx_j = pairs.select(1, 1).to_kind(Kind::Int64); // [num_givens]
-
-        // Gather rows for all pairs: [num_givens, dim]
-        let rows_i = basis.index_select(0, &idx_i);
-        let rows_j = basis.index_select(0, &idx_j);
-
-        let cos_a = self.sde_givens_angles.cos().unsqueeze(1); // [num_givens, 1]
-        let sin_a = self.sde_givens_angles.sin().unsqueeze(1);
-
-        // Compute deltas (what to add to each row)
-        let delta_i = &rows_i * (&cos_a - 1.0) - &rows_j * &sin_a;
-        let delta_j = &rows_i * &sin_a + &rows_j * (&cos_a - 1.0);
-
-        // Build result via scatter_add (autograd-friendly)
-        let zeros = Tensor::zeros([n, n], (kind, device));
-        let update_i = zeros.index_add(0, &idx_i, &delta_i);
-        let update_j = update_i.index_add(0, &idx_j, &delta_j);
-        basis + update_j
     }
 
     fn build_sin_cos_pos_embed(seq_len: i64, dim: i64, device: tch::Device) -> Tensor {

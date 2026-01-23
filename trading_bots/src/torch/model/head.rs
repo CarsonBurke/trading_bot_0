@@ -201,22 +201,16 @@ impl TradingModel {
 
         // gSDE: state-dependent exploration via learned latent features
         let sde_input = ticker_head_base.reshape([batch_size * TICKERS_COUNT, super::HEAD_HIDDEN]);
-        let sde_magnitudes = sde_input.apply(&self.sde_fc);
-        let sde_magnitudes = self.ln_sde.forward(&sde_magnitudes);
-        // Soft lower bound: magnitudes can't go below ~0.1 to prevent exploration collapse
-        let sde_magnitudes = sde_magnitudes.abs() + 0.1;
-        let sde_magnitudes = sde_magnitudes.reshape([batch_size, TICKERS_COUNT, super::SDE_LATENT_DIM]);
-        // Apply rotated basis
-        let rotated_basis = self.sde_rotated_basis();
-        let sde_latent = sde_magnitudes.matmul(&rotated_basis);
+        let sde_latent = sde_input.apply(&self.sde_fc);
+        let sde_latent = self.ln_sde.forward(&sde_latent);
+        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, super::SDE_LATENT_DIM]);
 
-        // Compute action_log_std from gSDE variance
-        let log_std = (&self.log_std_param + super::LOG_STD_INIT).clamp(-4.0, 0.0);
+        // Compute action_log_std from gSDE variance (tickers only)
+        let log_std = (&self.log_std_param + super::LOG_STD_INIT).clamp(-3.0, -0.5);
         let std_sq = log_std.exp().pow_tensor_scalar(2).transpose(0, 1);
         let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
             .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-        let action_log_std = (variance.clamp(super::SDE_EPS, 100.0)).sqrt().log();
-        // No cash in action_log_std - it's deterministic
+        let action_log_std = (variance + super::SDE_EPS).sqrt().log();
 
         let debug_metrics = None;
 

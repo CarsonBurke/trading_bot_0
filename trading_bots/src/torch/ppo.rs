@@ -9,7 +9,7 @@ use crate::torch::constants::{
 use crate::torch::env::VecEnv;
 use crate::torch::model::{symexp_tensor, symlog_tensor, TradingModel, PATCH_SEQ_LEN};
 
-const LEARNING_RATE: f64 = 1e-4;
+const LEARNING_RATE: f64 = 3e-5;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
@@ -453,8 +453,6 @@ pub async fn train(weights_path: Option<&str>) {
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
-                // Soft clamp log_ratio to prevent extreme probability ratios
-                // let log_ratio = log_ratio_raw.tanh() * 0.3;
                 if DEBUG_NUMERICS {
                     let _ =
                         debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
