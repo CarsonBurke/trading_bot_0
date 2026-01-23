@@ -830,31 +830,56 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         }
                                     }
                                 }
-                                AppMode::ChartViewer => match key.code {
-                                    KeyCode::Esc | KeyCode::Char('q') => {
-                                        app.mode = app.previous_mode;
-                                    }
-                                    KeyCode::Down | KeyCode::Char('j') => {
-                                        app.chart_viewer.next();
-                                    }
-                                    KeyCode::Up | KeyCode::Char('k') => {
-                                        app.chart_viewer.previous();
-                                    }
-                                    KeyCode::Enter => {
-                                        app.chart_viewer.toggle_expand();
-                                    }
-                                    KeyCode::Char('r') => {
-                                        if app.chart_viewer.is_viewing_meta_charts() {
-                                            app.load_latest_meta_charts()?;
-                                            app.chart_viewer
-                                                .load_charts(&app.latest_meta_charts)?;
+                                AppMode::ChartViewer => {
+                                    if app.chart_viewer.is_editing_row_skip() {
+                                        match key.code {
+                                            KeyCode::Esc => {
+                                                app.chart_viewer.cancel_editing_row_skip();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.chart_viewer.stop_editing_row_skip();
+                                            }
+                                            KeyCode::Char(c) => {
+                                                app.chart_viewer.row_skip_input_push(c);
+                                            }
+                                            KeyCode::Backspace => {
+                                                app.chart_viewer.row_skip_input_pop();
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::Char('q') => {
+                                                app.mode = app.previous_mode;
+                                            }
+                                            KeyCode::Char('/') => {
+                                                if app.chart_viewer.is_viewing_meta_charts() {
+                                                    app.chart_viewer.start_editing_row_skip();
+                                                }
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.chart_viewer.next();
+                                            }
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.chart_viewer.previous();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.chart_viewer.toggle_expand();
+                                            }
+                                            KeyCode::Char('r') => {
+                                                if app.chart_viewer.is_viewing_meta_charts() {
+                                                    app.load_latest_meta_charts()?;
+                                                    app.chart_viewer
+                                                        .load_charts(&app.latest_meta_charts)?;
+                                                }
+                                            }
+                                            KeyCode::Char('c') => {
+                                                let _ = app.chart_viewer.copy_current_image();
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                    KeyCode::Char('c') => {
-                                        let _ = app.chart_viewer.copy_current_image();
-                                    }
-                                    _ => {}
-                                },
+                                }
                                 AppMode::Logs => match key.code {
                                     KeyCode::Esc | KeyCode::Char('q') => {
                                         app.mode = AppMode::Main;
