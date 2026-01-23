@@ -205,20 +205,13 @@ impl TradingModel {
         let sde_latent = self.ln_sde.forward(&sde_latent);
         let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, super::SDE_LATENT_DIM]);
 
-        // Compute action_log_std from gSDE variance (tickers only)
-        let log_std = (&self.log_std_param + super::LOG_STD_INIT).clamp(-3.0, -0.5);
-        let std_sq = log_std.exp().pow_tensor_scalar(2).transpose(0, 1);
-        let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-        let action_log_std = (variance + super::SDE_EPS).sqrt().log();
-
         let debug_metrics = None;
 
         (
             (
                 values,
                 critic_logits,
-                (action_mean, action_log_std),
+                (action_mean, sde_latent),
                 attn_entropy,
             ),
             debug_metrics,

@@ -368,14 +368,16 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 state_guard.get_step_deltas().to_device(device)
             };
 
-            let (action_mean, action_log_std) = tch::no_grad(|| {
-                let (_, _, (action_mean, action_log_std), _) =
+            let (action_mean, sde_latent, sde_std) = tch::no_grad(|| {
+                let (_, _, (action_mean, sde_latent), _) =
                     model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state);
-                (action_mean, action_log_std)
+                let sde_std = model.sde_std();
+                (action_mean, sde_latent, sde_std)
             });
             let actions = sample_actions(
                 &action_mean,
-                &action_log_std,
+                &sde_latent,
+                &sde_std,
                 true,  // deterministic
                 0.0,   // temperature
             );

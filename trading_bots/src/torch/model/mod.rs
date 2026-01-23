@@ -182,6 +182,8 @@ const NUM_VALUE_BUCKETS: i64 = 127;
 // (values, critic_logits, (action_mean, action_log_std), attn_entropy)
 // action_mean: [batch, TICKERS_COUNT + 1] logits before softmax
 // action_log_std: [batch, TICKERS_COUNT + 1] per-action log std
+/// (values, critic_logits, (action_mean, sde_latent), attn_entropy)
+/// sde_latent: [batch, tickers, SDE_LATENT_DIM] for gSDE noise computation
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor), Tensor);
 
 pub struct DebugMetrics {
@@ -292,6 +294,10 @@ impl TradingModel {
         &self.value_centers
     }
 
+    /// Get exploration std for gSDE: [SDE_LATENT_DIM, TICKERS_COUNT]
+    pub fn sde_std(&self) -> Tensor {
+        (&self.log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5).exp()
+    }
 
     pub fn new(p: &nn::Path) -> Self {
         Self::new_with_config(p, TradingModelConfig::default())
