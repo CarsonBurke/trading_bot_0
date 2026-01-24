@@ -333,12 +333,23 @@ pub async fn train(weights_path: Option<&str>) {
         let gamma = 0.99f64;
         let gae_lambda = 0.95f64;
 
+        // Bootstrap value from final observation state
+        let bootstrap_value = tch::no_grad(|| {
+            let (values, _, _, _) = trading_model.forward_with_seq_idx(
+                &obs_price,
+                &obs_static,
+                Some(&obs_seq_idx),
+                false,
+            );
+            values.to_kind(Kind::Float)
+        });
+
         tch::no_grad(|| {
             let mut last_gae = Tensor::zeros(&[NPROCS], (Kind::Float, device));
             for t in (0..rollout_steps).rev() {
                 let mem_idx = t * NPROCS;
                 let next_values = if t == rollout_steps - 1 {
-                    Tensor::zeros(&[NPROCS], (Kind::Float, device))
+                    bootstrap_value.shallow_clone()
                 } else {
                     s_values.narrow(0, (t + 1) * NPROCS, NPROCS)
                 };

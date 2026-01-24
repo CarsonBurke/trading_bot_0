@@ -161,7 +161,8 @@ const fn compute_patch_totals() -> (i64, i64) {
 const PATCH_TOTALS: (i64, i64) = compute_patch_totals();
 const SEQ_LEN: i64 = PATCH_TOTALS.1;
 pub(crate) const PATCH_SEQ_LEN: i64 = SEQ_LEN;
-const PATCH_EXTRA_FEATS: i64 = 4;
+// Enriched patch dim: 2 * max_patch_size (values + intra_dt) + 3 (mean, std, slope)
+const PATCH_SCALAR_FEATS: i64 = 3;
 const FINEST_PATCH_SIZE: i64 = 1;
 const FINEST_PATCH_INDEX: usize = 6;
 
@@ -252,11 +253,10 @@ pub struct TradingModel {
     patch_gather_idx: Tensor,
     patch_mask: Tensor,
     patch_sizes: Tensor,
-    patch_last_idx: Tensor,
+    patch_intra_dt: Tensor,
     patch_config_ids: Tensor,
     ssm_layers: Vec<StatefulMamba>,
     ssm_norms: Vec<RMSNorm>,
-    post_ssm_ln: RMSNorm,
     ssm_gate: nn::Linear,
     ssm_proj: nn::Conv1D,
     static_proj: nn::Linear,
@@ -276,7 +276,6 @@ pub struct TradingModel {
     global_inject_up: nn::Linear,
     global_inject_gate_raw: Tensor,
     head_proj: nn::Linear,
-    head_ln: RMSNorm,
     policy_ln: RMSNorm,
     value_ln: RMSNorm,
     value_mlp_fc1: nn::Linear,
@@ -329,7 +328,7 @@ impl TradingModel {
             .map(|&(_, patch_size)| patch_size)
             .max()
             .unwrap_or(0);
-        let max_input_dim = max_patch_size + PATCH_EXTRA_FEATS;
+        let max_input_dim = 2 * max_patch_size + PATCH_SCALAR_FEATS;
         let patch_embed_weight = p.var(
             "patch_embed_weight",
             &[num_configs, max_input_dim, SSM_DIM],
@@ -364,11 +363,11 @@ impl TradingModel {
                 .view([1, SEQ_LEN, 1])
                 .to_device(p.device())
         };
-        let (patch_gather_idx, patch_mask, patch_sizes, patch_last_idx, patch_config_ids) = {
+        let (patch_gather_idx, patch_mask, patch_sizes, patch_intra_dt, patch_config_ids) = {
             let mut gather_idx = Vec::with_capacity((SEQ_LEN * max_patch_size) as usize);
             let mut mask = Vec::with_capacity((SEQ_LEN * max_patch_size) as usize);
             let mut sizes = Vec::with_capacity(SEQ_LEN as usize);
-            let mut last_idx = Vec::with_capacity(SEQ_LEN as usize);
+            let mut intra_dt = Vec::with_capacity((SEQ_LEN * max_patch_size) as usize);
             let mut cfg_ids = Vec::with_capacity(SEQ_LEN as usize);
             let mut offset = 0i64;
             for (cfg_idx, &(days, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
@@ -376,15 +375,18 @@ impl TradingModel {
                 for p_idx in 0..n_patches {
                     let start = offset + p_idx * patch_size;
                     sizes.push(patch_size as f32);
-                    last_idx.push((patch_size - 1) as i64);
                     cfg_ids.push(cfg_idx as i64);
                     for k in 0..max_patch_size {
                         if k < patch_size {
                             gather_idx.push(start + k);
                             mask.push(1.0);
+                            // Normalized intra-patch temporal position [0, 1]
+                            let denom = (patch_size - 1).max(1) as f32;
+                            intra_dt.push(k as f32 / denom);
                         } else {
                             gather_idx.push(-1);
                             mask.push(0.0);
+                            intra_dt.push(0.0);
                         }
                     }
                 }
@@ -400,14 +402,13 @@ impl TradingModel {
             let sizes = Tensor::from_slice(&sizes)
                 .view([1, SEQ_LEN, 1])
                 .to_device(p.device());
-            let last_idx = Tensor::from_slice(&last_idx)
-                .view([1, SEQ_LEN, 1])
-                .to_kind(Kind::Int64)
+            let intra_dt = Tensor::from_slice(&intra_dt)
+                .view([SEQ_LEN, max_patch_size])
                 .to_device(p.device());
             let cfg_ids = Tensor::from_slice(&cfg_ids)
                 .to_kind(Kind::Int64)
                 .to_device(p.device());
-            (gather_idx, mask, sizes, last_idx, cfg_ids)
+            (gather_idx, mask, sizes, intra_dt, cfg_ids)
         };
 
         let ssm_cfg = Mamba2Config {
@@ -421,7 +422,6 @@ impl TradingModel {
         let ssm_norms = (0..config.ssm_layers)
             .map(|i| RMSNorm::new(&(p / format!("ssm_norm_{}", i)), SSM_DIM, 1e-6))
             .collect::<Vec<_>>();
-        let post_ssm_ln = RMSNorm::new(&(p / "post_ssm_ln"), SSM_DIM, 1e-6);
         let ssm_gate = nn::linear(p / "ssm_gate", SSM_DIM, SSM_DIM, Default::default());
         let ssm_proj = nn::conv1d(p / "ssm_proj", SSM_DIM, MODEL_DIM, 1, Default::default());
 
@@ -486,7 +486,6 @@ impl TradingModel {
                 ..Default::default()
             },
         );
-        let head_ln = RMSNorm::new(&(p / "head_ln"), HEAD_HIDDEN, 1e-6);
         let policy_ln = RMSNorm::new(&(p / "policy_ln"), MODEL_DIM, 1e-6);
         let value_ln = RMSNorm::new(&(p / "value_ln"), MODEL_DIM, 1e-6);
         let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", MODEL_DIM, MODEL_DIM, Default::default());
@@ -539,11 +538,10 @@ impl TradingModel {
             patch_gather_idx,
             patch_mask,
             patch_sizes,
-            patch_last_idx,
+            patch_intra_dt,
             patch_config_ids,
             ssm_layers,
             ssm_norms,
-            post_ssm_ln,
             ssm_gate,
             ssm_proj,
             static_proj,
@@ -563,7 +561,6 @@ impl TradingModel {
             global_inject_up,
             global_inject_gate_raw,
             head_proj,
-            head_ln,
             policy_ln,
             value_ln,
             value_mlp_fc1,
@@ -707,22 +704,26 @@ impl TradingModel {
             .unsqueeze(0)
             .expand(&[batch_tokens, SEQ_LEN, max_patch_size], false);
         patches = patches * &mask_exp;
-        let sizes = self.patch_sizes.to_device(device).to_kind(Kind::Float);
-        let sizes_f = sizes.to_kind(Kind::Float);
+        let sizes_f = self.patch_sizes.to_device(device).to_kind(Kind::Float);
         let patches_f = patches.to_kind(Kind::Float);
+        let intra_dt = self.patch_intra_dt
+            .to_device(device)
+            .to_kind(Kind::Float)
+            .unsqueeze(0)
+            .expand(&[batch_tokens, SEQ_LEN, max_patch_size], false);
         let mean = patches_f.sum_dim_intlist([2].as_slice(), true, Kind::Float) / &sizes_f;
         let var = (&patches_f - &mean).pow_tensor_scalar(2.0) * &mask_exp.to_kind(Kind::Float);
         let var = var.sum_dim_intlist([2].as_slice(), true, Kind::Float) / &sizes_f;
         let std = (var + 1e-5).sqrt();
         let first = patches_f.narrow(2, 0, 1);
-        let last_idx = self.patch_last_idx.to_device(device);
-        let last = patches_f.gather(2, &last_idx.expand(&[batch_tokens, SEQ_LEN, 1], false), false);
+        let last_pos = (sizes_f - 1.0).clamp_min(0.0).to_kind(Kind::Int64);
+        let last = patches_f.gather(2, &last_pos.expand(&[batch_tokens, SEQ_LEN, 1], false), false);
         let slope = &last - &first;
         let enriched = Tensor::cat(&[
             &patches_f,
+            &intra_dt,
             &mean,
             &std,
-            &last,
             &slope,
         ], 2);
         let config_ids = self.patch_config_ids.to_device(device);
@@ -746,13 +747,23 @@ impl TradingModel {
         let kind = patches.kind();
         let patches_f = patches.to_kind(Kind::Float);
         let patch_len = patches_f.size()[2];
+        // Build intra_dt for this specific patch config (normalized [0, 1])
+        let batch = patches_f.size()[0];
+        let n_patches = patches_f.size()[1];
+        let intra_dt = Tensor::arange(patch_len, (Kind::Float, device))
+            / (patch_len - 1).max(1) as f64;
+        let intra_dt = intra_dt
+            .view([1, 1, patch_len])
+            .expand([batch, n_patches, patch_len], false);
         let mean = patches_f.mean_dim([2].as_slice(), true, Kind::Float);
         let std = patches_f.std_dim(2, false, true);
         let first = patches_f.narrow(2, 0, 1);
         let last = patches_f.narrow(2, patch_len - 1, 1);
         let slope = &last - &first;
-        let enriched = Tensor::cat(&[&patches_f, &mean, &std, &last, &slope], 2);
-        let weight = self.patch_embed_weight.get(config_idx);
+        let enriched = Tensor::cat(&[&patches_f, &intra_dt, &mean, &std, &slope], 2);
+        let input_dim = 2 * patch_len + PATCH_SCALAR_FEATS;
+        // Slice weight to match actual input dim (weights are sized for max_patch_size)
+        let weight = self.patch_embed_weight.get(config_idx).narrow(0, 0, input_dim);
         let bias = self.patch_embed_bias.get(config_idx);
         let out = enriched.matmul(&weight) + bias;
         let ln_weight = self.patch_ln_weight.get(config_idx);

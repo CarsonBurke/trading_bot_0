@@ -16,7 +16,7 @@ impl TradingModel {
         batch_size: i64,
         _debug: bool,
     ) -> (ModelOutput, Option<DebugMetrics>) {
-        let x = self.post_ssm_ln.forward(x_ssm);
+        let x = x_ssm.shallow_clone();
         let x = &x * x.apply(&self.ssm_gate).sigmoid();
         let x = x.permute([0, 2, 1]);
         let x = x.apply(&self.ssm_proj);
@@ -181,7 +181,7 @@ impl TradingModel {
             .squeeze_dim(-1); // [batch]
         let values = symexp_tensor(&values_symlog).to_kind(pooled_enriched.kind());
 
-        // Batch policy computation: combine ticker and cash inputs, apply policy_ln + head_proj + head_ln once
+        // Batch policy computation: combine ticker and cash inputs, apply policy_ln + head_proj once
         let pooled_flat = pooled_enriched.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]);
         let cash_policy_flat = cash_summary.view([batch_size, MODEL_DIM]);
         let policy_input = Tensor::cat(&[pooled_flat, cash_policy_flat], 0);
@@ -189,7 +189,7 @@ impl TradingModel {
             .policy_ln
             .forward(&policy_input)
             .apply(&self.head_proj);
-        let policy_hidden = self.head_ln.forward(&policy_hidden).silu();
+        let policy_hidden = policy_hidden.silu();
         let ticker_head_base = policy_hidden
             .narrow(0, 0, batch_size * TICKERS_COUNT)
             .reshape([batch_size, TICKERS_COUNT, super::HEAD_HIDDEN]);
