@@ -110,16 +110,6 @@ const RESIDUAL_ALPHA_INIT: f64 = -4.0;
 const ROPE_BASE: f64 = 10000.0;
 const TICKER_LATENT_FACTORS: i64 = 8;
 
-pub(crate) fn symlog_tensor(t: &Tensor) -> Tensor {
-    let abs = t.abs();
-    t.sign() * (abs + 1.0).log()
-}
-
-pub(crate) fn symexp_tensor(t: &Tensor) -> Tensor {
-    let abs = t.abs();
-    t.sign() * (abs.exp() - 1.0)
-}
-
 /// expln: numerically stable exp alternative that bounds growth for positive inputs
 /// expln(x) = exp(x)        if x <= 0
 ///          = ln(x + 1) + 1 if x > 0
@@ -518,10 +508,9 @@ impl TradingModel {
             Init::Const(0.0),
         );
         let cash_log_std_param = p.var("cash_log_std", &[1], Init::Const(0.0));
-        let value_clip_symlog = symlog_tensor(&Tensor::from(VALUE_LOG_CLIP)).double_value(&[]);
         let value_centers = Tensor::linspace(
-            -value_clip_symlog,
-            value_clip_symlog,
+            -VALUE_LOG_CLIP,
+            VALUE_LOG_CLIP,
             NUM_VALUE_BUCKETS,
             (Kind::Float, p.device()),
         );

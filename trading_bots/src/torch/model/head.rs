@@ -1,7 +1,7 @@
 use tch::{Kind, Tensor};
 
 use super::{
-    symexp_tensor, DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM,
+    DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM,
     RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS,
 };
 use crate::torch::constants::{PER_TICKER_STATIC_OBS, TICKERS_COUNT};
@@ -176,10 +176,10 @@ impl TradingModel {
         let critic_logits = value_hidden.apply(&self.critic_out); // [batch, NUM_VALUE_BUCKETS]
         let critic_probs = critic_logits.softmax(-1, Kind::Float);
         let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
-        let values_symlog = critic_probs
+        let values = critic_probs
             .matmul(&bucket_centers.unsqueeze(-1))
             .squeeze_dim(-1); // [batch]
-        let values = symexp_tensor(&values_symlog).to_kind(pooled_enriched.kind());
+        let values = values.to_kind(pooled_enriched.kind());
 
         // Batch policy computation: combine ticker and cash inputs, apply policy_ln + head_proj once
         let pooled_flat = pooled_enriched.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]);

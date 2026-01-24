@@ -7,7 +7,7 @@ use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{expln, symexp_tensor, symlog_tensor, TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
+use crate::torch::model::{expln, TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
 
 const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
@@ -393,7 +393,7 @@ pub async fn train(weights_path: Option<&str>) {
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
-        // Explained variance in symlog space: EV = 1 - Var(residuals) / Var(targets)
+        // Explained variance: EV = 1 - Var(residuals) / Var(targets)
         let mut total_residual_sq = Tensor::zeros([], (Kind::Float, device));
         let mut total_target_sum = Tensor::zeros([], (Kind::Float, device));
         let mut total_target_sq_sum = Tensor::zeros([], (Kind::Float, device));
@@ -523,14 +523,14 @@ pub async fn train(weights_path: Option<&str>) {
                         .mean(Kind::Float);
 
                 // Portfolio-level value loss: ret_mb is [chunk_sample_count], critic_logits is [chunk_sample_count, NUM_VALUE_BUCKETS]
-                let returns_symlog = symlog_tensor(&ret_mb.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP));
-                let target_twohot = twohot_encode(&returns_symlog, trading_model.value_centers())
+                let returns_clipped = ret_mb.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
+                let target_twohot = twohot_encode(&returns_clipped, trading_model.value_centers())
                     .view([chunk_sample_count, -1]);
                 let log_probs = critic_logits
                     .to_kind(Kind::Float)
                     .log_softmax(-1, Kind::Float);
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("returns_symlog", &returns_symlog, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("returns_clipped", &returns_clipped, _epoch, chunk_i);
                     let _ = debug_tensor_stats("target_twohot", &target_twohot, _epoch, chunk_i);
                     let _ = debug_tensor_stats("critic_logits", &critic_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_probs", &log_probs, _epoch, chunk_i);
@@ -582,12 +582,12 @@ pub async fn train(weights_path: Option<&str>) {
                     total_policy_loss_weighted.g_add_(&(&action_loss * chunk_sample_count as f64));
                 let _ =
                     total_value_loss_weighted.g_add_(&(&value_loss * chunk_sample_count as f64));
-                // Explained variance in symlog space (reuse returns_symlog from loss computation)
-                let values_symlog = symlog_tensor(&values.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP));
-                let residuals_symlog = &values_symlog - &returns_symlog;
-                let _ = total_residual_sq.g_add_(&residuals_symlog.square().sum(Kind::Float));
-                let _ = total_target_sum.g_add_(&returns_symlog.sum(Kind::Float));
-                let _ = total_target_sq_sum.g_add_(&returns_symlog.square().sum(Kind::Float));
+                // Explained variance
+                let values_clipped = values.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
+                let residuals = &values_clipped - &returns_clipped;
+                let _ = total_residual_sq.g_add_(&residuals.square().sum(Kind::Float));
+                let _ = total_target_sum.g_add_(&returns_clipped.sum(Kind::Float));
+                let _ = total_target_sq_sum.g_add_(&returns_clipped.square().sum(Kind::Float));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 epoch_kl_count += chunk_sample_count;
                 total_sample_count += chunk_sample_count;
