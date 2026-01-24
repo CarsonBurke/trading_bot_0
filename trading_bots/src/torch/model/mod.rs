@@ -285,7 +285,6 @@ pub struct TradingModel {
     cash_merge: nn::Linear,
     // SDE for state-dependent exploration (gSDE)
     sde_fc: nn::Linear,
-    ln_sde: RMSNorm,
     log_std_param: Tensor,        // [SDE_LATENT_DIM, TICKERS_COUNT]
     cash_log_std_param: Tensor,   // [1] - state-independent cash exploration
     bucket_centers: Tensor,
@@ -513,7 +512,6 @@ impl TradingModel {
 
         // SDE for state-dependent exploration (SB3-style with learn_features=True)
         let sde_fc = nn::linear(p / "sde_fc", HEAD_HIDDEN, SDE_LATENT_DIM, Default::default());
-        let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-5);
         let log_std_param = p.var(
             "log_std",
             &[SDE_LATENT_DIM, TICKERS_COUNT],
@@ -569,7 +567,6 @@ impl TradingModel {
             critic_out,
             cash_merge,
             sde_fc,
-            ln_sde,
             log_std_param,
             cash_log_std_param,
             bucket_centers,

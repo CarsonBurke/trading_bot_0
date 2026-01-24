@@ -202,9 +202,9 @@ impl TradingModel {
 
         // gSDE: state-dependent exploration via learned latent features
         let sde_input = ticker_head_base.reshape([batch_size * TICKERS_COUNT, super::HEAD_HIDDEN]);
-        let sde_latent = sde_input.apply(&self.sde_fc);
-        let sde_latent = self.ln_sde.forward(&sde_latent);
-        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, super::SDE_LATENT_DIM]);
+        let sde_latent = sde_input
+            .apply(&self.sde_fc)
+            .reshape([batch_size, TICKERS_COUNT, super::SDE_LATENT_DIM]);
 
         let debug_metrics = None;
 
