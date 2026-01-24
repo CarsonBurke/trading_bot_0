@@ -629,14 +629,22 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         .modifiers
                                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                                 {
-                                    app.dialog_mode = DialogMode::ConfirmQuit;
+                                    if app.is_training_running() {
+                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                    } else {
+                                        return Ok(());
+                                    }
                                 }
                                 KeyCode::Char('d')
                                     if key
                                         .modifiers
                                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                                 {
-                                    app.dialog_mode = DialogMode::ConfirmQuit;
+                                    if app.is_training_running() {
+                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                    } else {
+                                        return Ok(());
+                                    }
                                 }
                                 KeyCode::Char('o') => {
                                     // Don't open page jump when searching
@@ -652,7 +660,11 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                             match app.mode {
                                 AppMode::Main => match key.code {
                                     KeyCode::Char('q') => {
-                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                        if app.is_training_running() {
+                                            app.dialog_mode = DialogMode::ConfirmQuit;
+                                        } else {
+                                            return Ok(());
+                                        }
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
