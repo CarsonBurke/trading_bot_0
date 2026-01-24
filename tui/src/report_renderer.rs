@@ -542,7 +542,7 @@ struct LegendConfig;
 
 impl LegendConfig {
     fn position() -> SeriesLabelPosition {
-        SeriesLabelPosition::UpperRight
+        SeriesLabelPosition::UpperLeft
     }
 
     fn background() -> RGBAColor {
