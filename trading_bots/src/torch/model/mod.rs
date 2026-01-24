@@ -265,6 +265,7 @@ pub struct TradingModel {
     time_pos_proj: nn::Linear,
     time_global_ctx: nn::Linear,
     time_ticker_ctx: nn::Linear,
+    last_token_ln: RMSNorm,
     static_cross_q: nn::Linear,
     static_cross_k: nn::Linear,
     static_cross_v: nn::Linear,
@@ -287,6 +288,7 @@ pub struct TradingModel {
     sde_fc: nn::Linear,
     ln_sde: RMSNorm,
     log_std_param: Tensor,        // [SDE_LATENT_DIM, TICKERS_COUNT]
+    cash_log_std_param: Tensor,   // [1] - state-independent cash exploration
     bucket_centers: Tensor,
     value_centers: Tensor,
     device: tch::Device,
@@ -309,6 +311,11 @@ impl TradingModel {
     /// Get exploration std for gSDE: [SDE_LATENT_DIM, TICKERS_COUNT]
     pub fn sde_std(&self) -> Tensor {
         (&self.log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5).exp()
+    }
+
+    /// Get cash exploration log_std (state-independent): scalar
+    pub fn cash_log_std(&self) -> Tensor {
+        (&self.cash_log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5)
     }
 
     pub fn new(p: &nn::Path) -> Self {
@@ -440,6 +447,7 @@ impl TradingModel {
             MODEL_DIM,
             Default::default(),
         );
+        let last_token_ln = RMSNorm::new(&(p / "last_token_ln"), MODEL_DIM, 1e-6);
         let static_cross_q = nn::linear(p / "static_cross_q", MODEL_DIM, MODEL_DIM, Default::default());
         let static_cross_k = nn::linear(p / "static_cross_k", MODEL_DIM, MODEL_DIM, Default::default());
         let static_cross_v = nn::linear(p / "static_cross_v", MODEL_DIM, MODEL_DIM, Default::default());
@@ -512,6 +520,7 @@ impl TradingModel {
             &[SDE_LATENT_DIM, TICKERS_COUNT],
             Init::Const(0.0),
         );
+        let cash_log_std_param = p.var("cash_log_std", &[1], Init::Const(0.0));
         let value_clip_symlog = symlog_tensor(&Tensor::from(VALUE_LOG_CLIP)).double_value(&[]);
         let value_centers = Tensor::linspace(
             -value_clip_symlog,
@@ -543,6 +552,7 @@ impl TradingModel {
             time_pos_proj,
             time_global_ctx,
             time_ticker_ctx,
+            last_token_ln,
             static_cross_q,
             static_cross_k,
             static_cross_v,
@@ -564,6 +574,7 @@ impl TradingModel {
             sde_fc,
             ln_sde,
             log_std_param,
+            cash_log_std_param,
             bucket_centers,
             value_centers,
             device: p.device(),

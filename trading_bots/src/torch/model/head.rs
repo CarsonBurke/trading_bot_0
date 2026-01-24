@@ -73,8 +73,9 @@ impl TradingModel {
         let last_tokens_flat = last_tokens
             .squeeze_dim(1)
             .reshape([batch_size * TICKERS_COUNT, 1, MODEL_DIM]);
+        let last_tokens_norm = self.last_token_ln.forward(&last_tokens_flat);
         let exo_tokens_flat = exo_tokens.reshape([batch_size * TICKERS_COUNT, 3, MODEL_DIM]);
-        let q_exo = last_tokens_flat.apply(&self.static_cross_q);
+        let q_exo = last_tokens_norm.apply(&self.static_cross_q);
         let k_exo = exo_tokens_flat.apply(&self.static_cross_k);
         let v_exo = exo_tokens_flat.apply(&self.static_cross_v);
         let exo_scores = q_exo.matmul(&k_exo.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
