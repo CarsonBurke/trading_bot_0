@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use crate::components::episode_status;
-use crate::report_renderer::{render_report, render_report_with_skip};
+use crate::report_renderer::render_report_with_options;
 use crate::utils::clipboard;
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,7 @@ pub struct ChartViewer {
     row_skip_input: String,
     editing_row_skip: bool,
     row_skip: usize,
+    show_legend: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +69,17 @@ impl ChartViewer {
             row_skip_input: String::new(),
             editing_row_skip: false,
             row_skip: 0,
+            show_legend: true,
         }
+    }
+
+    pub fn toggle_legend(&mut self) {
+        self.show_legend = !self.show_legend;
+        self.load_current_image();
+    }
+
+    pub fn is_legend_visible(&self) -> bool {
+        self.show_legend
     }
 
     pub fn is_editing_row_skip(&self) -> bool {
@@ -453,7 +464,7 @@ impl ChartViewer {
                         } else {
                             0
                         };
-                        if let Ok(img) = render_report_with_skip(&report, skip) {
+                        if let Ok(img) = render_report_with_options(&report, skip, self.show_legend) {
                             let protocol = self.picker.new_resize_protocol(img);
                             self.current_image = Some(protocol);
                         }
@@ -534,7 +545,7 @@ impl ChartViewer {
                         } else {
                             0
                         };
-                        let temp_path = render_report_to_temp(&report, skip)?;
+                        let temp_path = render_report_to_temp(&report, skip, self.show_legend)?;
                         clipboard::copy_image_to_clipboard(&temp_path)?;
                     } else {
                         clipboard::copy_image_to_clipboard(path)?;
@@ -575,7 +586,7 @@ impl ChartViewer {
                     Constraint::Length(3),
                     Constraint::Length(3),
                     Constraint::Min(0),
-                    Constraint::Length(3),
+                    Constraint::Length(4),
                 ])
                 .split(area)
         } else {
@@ -584,7 +595,7 @@ impl ChartViewer {
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(0),
-                    Constraint::Length(3),
+                    Constraint::Length(4),
                 ])
                 .split(area)
         };
@@ -704,39 +715,52 @@ impl ChartViewer {
 
         f.render_stateful_widget(list, list_chunk, &mut self.list_state);
 
-        let help_line = if self.viewing_mode == ViewingMode::MetaCharts {
-            Line::from(vec![
-                Span::styled("↑/k", Style::default().fg(Color::Cyan)),
-                Span::raw(": Up  "),
-                Span::styled("↓/j", Style::default().fg(Color::Cyan)),
-                Span::raw(": Down  "),
-                Span::styled("/", Style::default().fg(Color::Yellow)),
-                Span::raw(": Filter  "),
-                Span::styled("Enter", Style::default().fg(Color::Green)),
-                Span::raw(": Expand  "),
-                Span::styled("c", Style::default().fg(Color::Magenta)),
-                Span::raw(": Copy  "),
-                Span::styled("r", Style::default().fg(Color::Yellow)),
-                Span::raw(": Refresh  "),
-                Span::styled("q/Esc", Style::default().fg(Color::Red)),
-                Span::raw(": Back"),
-            ])
+        let legend_label = if self.show_legend { "Legend" } else { "Legend (off)" };
+        let (help_line1, help_line2) = if self.viewing_mode == ViewingMode::MetaCharts {
+            (
+                Line::from(vec![
+                    Span::styled("↑/k", Style::default().fg(Color::Cyan)),
+                    Span::raw(": Up  "),
+                    Span::styled("↓/j", Style::default().fg(Color::Cyan)),
+                    Span::raw(": Down  "),
+                    Span::styled("Enter", Style::default().fg(Color::Green)),
+                    Span::raw(": Expand  "),
+                    Span::styled("c", Style::default().fg(Color::Magenta)),
+                    Span::raw(": Copy  "),
+                    Span::styled("q/Esc", Style::default().fg(Color::Red)),
+                    Span::raw(": Back"),
+                ]),
+                Line::from(vec![
+                    Span::styled("/", Style::default().fg(Color::Yellow)),
+                    Span::raw(": Filter  "),
+                    Span::styled("l", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(": {}  ", legend_label)),
+                    Span::styled("r", Style::default().fg(Color::Yellow)),
+                    Span::raw(": Refresh"),
+                ]),
+            )
         } else {
-            Line::from(vec![
-                Span::styled("↑/k", Style::default().fg(Color::Cyan)),
-                Span::raw(": Up  "),
-                Span::styled("↓/j", Style::default().fg(Color::Cyan)),
-                Span::raw(": Down  "),
-                Span::styled("Enter", Style::default().fg(Color::Green)),
-                Span::raw(": Expand/Collapse  "),
-                Span::styled("c", Style::default().fg(Color::Magenta)),
-                Span::raw(": Copy  "),
-                Span::styled("q/Esc", Style::default().fg(Color::Red)),
-                Span::raw(": Back"),
-            ])
+            (
+                Line::from(vec![
+                    Span::styled("↑/k", Style::default().fg(Color::Cyan)),
+                    Span::raw(": Up  "),
+                    Span::styled("↓/j", Style::default().fg(Color::Cyan)),
+                    Span::raw(": Down  "),
+                    Span::styled("Enter", Style::default().fg(Color::Green)),
+                    Span::raw(": Expand/Collapse  "),
+                    Span::styled("c", Style::default().fg(Color::Magenta)),
+                    Span::raw(": Copy  "),
+                    Span::styled("q/Esc", Style::default().fg(Color::Red)),
+                    Span::raw(": Back"),
+                ]),
+                Line::from(vec![
+                    Span::styled("l", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(": {}", legend_label)),
+                ]),
+            )
         };
 
-        let help = Paragraph::new(vec![help_line])
+        let help = Paragraph::new(vec![help_line1, help_line2])
             .block(Block::default().borders(Borders::ALL).title("Controls"));
         f.render_widget(help, help_chunk);
     }
@@ -834,8 +858,8 @@ fn report_title_from_path(path: &PathBuf) -> Option<String> {
     Some(report.title)
 }
 
-fn render_report_to_temp(report: &Report, skip: usize) -> Result<PathBuf> {
-    let image = render_report_with_skip(report, skip)?;
+fn render_report_to_temp(report: &Report, skip: usize, show_legend: bool) -> Result<PathBuf> {
+    let image = render_report_with_options(report, skip, show_legend)?;
     let mut path = std::env::temp_dir();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

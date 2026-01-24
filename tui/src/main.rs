@@ -888,6 +888,9 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                             KeyCode::Char('c') => {
                                                 let _ = app.chart_viewer.copy_current_image();
                                             }
+                                            KeyCode::Char('l') => {
+                                                app.chart_viewer.toggle_legend();
+                                            }
                                             _ => {}
                                         }
                                     }

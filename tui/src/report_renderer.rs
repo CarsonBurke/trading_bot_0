@@ -8,10 +8,18 @@ use shared::theme::plotters_colors as theme;
 const CHART_DIMS: (u32, u32) = (2560, 780);
 
 pub fn render_report(report: &Report) -> Result<DynamicImage> {
-    render_report_with_skip(report, 0)
+    render_report_with_options(report, 0, true)
 }
 
 pub fn render_report_with_skip(report: &Report, skip: usize) -> Result<DynamicImage> {
+    render_report_with_options(report, skip, true)
+}
+
+pub fn render_report_with_options(
+    report: &Report,
+    skip: usize,
+    show_legend: bool,
+) -> Result<DynamicImage> {
     let mut buffer = vec![0u8; (CHART_DIMS.0 * CHART_DIMS.1 * 3) as usize];
     {
         let root = BitMapBackend::with_buffer(&mut buffer, CHART_DIMS).into_drawing_area();
@@ -22,7 +30,7 @@ pub fn render_report_with_skip(report: &Report, skip: usize) -> Result<DynamicIm
         match &report.kind {
             ReportKind::Simple { values, ema_alpha } => {
                 let values = skip_slice(values, skip);
-                render_simple(&root, report, values, *ema_alpha, x_offset)?;
+                render_simple(&root, report, values, *ema_alpha, x_offset, show_legend)?;
             }
             ReportKind::MultiLine { series } => {
                 let series: Vec<ReportSeries> = series
@@ -32,7 +40,7 @@ pub fn render_report_with_skip(report: &Report, skip: usize) -> Result<DynamicIm
                         values: skip_slice(&s.values, skip).to_vec(),
                     })
                     .collect();
-                render_multi_line(&root, report, &series, x_offset)?;
+                render_multi_line(&root, report, &series, x_offset, show_legend)?;
             }
             ReportKind::Assets {
                 total,
@@ -54,6 +62,7 @@ pub fn render_report_with_skip(report: &Report, skip: usize) -> Result<DynamicIm
                     positioned.as_ref(),
                     benchmark.as_ref(),
                     x_offset,
+                    show_legend,
                 )?;
             }
             ReportKind::BuySell {
@@ -106,6 +115,7 @@ fn render_simple(
     values: &[f32],
     ema_alpha: Option<f64>,
     x_offset: u32,
+    show_legend: bool,
 ) -> Result<()> {
     if values.is_empty() {
         return Ok(());
@@ -177,13 +187,15 @@ fn render_simple(
             .legend(legend_rect(&theme::YELLOW));
     }
 
-    chart
-        .configure_series_labels()
-        .position(LegendConfig::position())
-        .background_style(LegendConfig::background())
-        .border_style(LegendConfig::border())
-        .label_font(LegendConfig::font())
-        .draw()?;
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
 
     Ok(())
 }
@@ -193,6 +205,7 @@ fn render_multi_line(
     report: &Report,
     series: &[ReportSeries],
     x_offset: u32,
+    show_legend: bool,
 ) -> Result<()> {
     let all_values: Vec<f32> = series.iter().flat_map(|s| s.values.iter()).copied().collect();
     if all_values.is_empty() {
@@ -256,13 +269,15 @@ fn render_multi_line(
             .legend(legend_rect(color));
     }
 
-    chart
-        .configure_series_labels()
-        .position(LegendConfig::position())
-        .background_style(LegendConfig::background())
-        .border_style(LegendConfig::border())
-        .label_font(LegendConfig::font())
-        .draw()?;
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
 
     Ok(())
 }
@@ -275,6 +290,7 @@ fn render_assets(
     positioned: Option<&Vec<f32>>,
     benchmark: Option<&Vec<f32>>,
     x_offset: u32,
+    show_legend: bool,
 ) -> Result<()> {
     if total.is_empty() {
         return Ok(());
@@ -370,13 +386,15 @@ fn render_assets(
             .legend(legend_rect(&theme::MAUVE));
     }
 
-    chart
-        .configure_series_labels()
-        .position(LegendConfig::position())
-        .background_style(LegendConfig::background())
-        .border_style(LegendConfig::border())
-        .label_font(LegendConfig::font())
-        .draw()?;
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
 
     Ok(())
 }
