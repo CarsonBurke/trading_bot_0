@@ -103,11 +103,14 @@ fn twohot_encode(t: &Tensor, centers: &Tensor) -> Tensor {
     let centers_expanded = centers.unsqueeze(0);
     let flat_t_expanded = flat_t.unsqueeze(1);
 
-    let diff = (&flat_t_expanded - &centers_expanded).abs();
-    let idx = diff.argmin(1, false);
 
-    let low_idx = idx.shallow_clone();
-    let high_idx = (idx + 1).clamp(0, n_buckets - 1);
+    let low_idx = centers_expanded
+        .le_tensor(&flat_t_expanded)
+        .to_kind(Kind::Int64)
+        .sum_dim_intlist([1i64].as_slice(), false, Kind::Int64)
+        - 1;
+    let low_idx = low_idx.clamp(0, n_buckets - 2);
+    let high_idx = &low_idx + 1;
 
     let low_val = centers.index_select(0, &low_idx);
     let high_val = centers.index_select(0, &high_idx);
@@ -288,6 +291,11 @@ pub async fn train(weights_path: Option<&str>) {
                 let start = i * action_dim;
                 actions_vec[i].copy_from_slice(&actions_flat[start..start + action_dim]);
             }
+
+            s_price_deltas.push(&obs_price);
+            s_static_obs.push(&obs_static);
+            s_seq_idx.push(&obs_seq_idx);
+
             env.step_into_full(
                 &actions_vec,
                 &mut obs_price,
@@ -299,10 +307,6 @@ pub async fn train(weights_path: Option<&str>) {
             );
 
             let mem_idx = step as i64 * NPROCS;
-
-            s_price_deltas.push(&obs_price);
-            s_static_obs.push(&obs_static);
-            s_seq_idx.push(&obs_seq_idx);
             let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&u); // Store pre-softmax u for training
             let _ = s_old_log_probs
                 .narrow(0, mem_idx, NPROCS)
