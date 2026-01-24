@@ -456,15 +456,17 @@ pub async fn train(weights_path: Option<&str>) {
                 // act_mb contains the stored u (pre-softmax logits)
                 let u = act_mb;
 
-                // Compute effective action_std from sde_latent using rollout_sde_std for consistency
-                let std_sq = rollout_sde_std.pow_tensor_scalar(2).transpose(0, 1); // [TICKERS_COUNT, SDE_LATENT_DIM]
+                // Compute effective action_std from sde_latent with fresh sde_std() for gradient flow
+                let sde_std = trading_model.sde_std();
+                let std_sq = sde_std.pow_tensor_scalar(2).transpose(0, 1); // [TICKERS_COUNT, SDE_LATENT_DIM]
                 let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
                     .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
                 let ticker_std = (variance + 1e-6).sqrt();
                 let ticker_log_std = ticker_std.log();
-                // Combine ticker gSDE + cash constant std
+                // Combine ticker gSDE + cash constant std (fresh call for gradient flow)
+                let cash_log_std = trading_model.cash_log_std();
                 let action_log_stds = Tensor::cat(
-                    &[ticker_log_std, rollout_cash_log_std.expand(&[chunk_sample_count, 1], false)],
+                    &[ticker_log_std, cash_log_std.expand(&[chunk_sample_count, 1], false)],
                     1,
                 );
 
