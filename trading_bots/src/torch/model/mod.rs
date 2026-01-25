@@ -107,7 +107,6 @@ const FF_DIM: i64 = 512;
 const HEAD_HIDDEN: i64 = 192;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -4.0;
-const ROPE_BASE: f64 = 10000.0;
 const TICKER_LATENT_FACTORS: i64 = 8;
 
 /// expln: numerically stable exp alternative that bounds growth for positive inputs
@@ -238,7 +237,6 @@ pub struct TradingModel {
     patch_embed_bias: Tensor,
     patch_ln_weight: Tensor,
     patch_dt_scale: Tensor,
-    stem_pos_embed: Tensor,
     stem_scale_embed: Tensor,
     patch_gather_idx: Tensor,
     patch_mask: Tensor,
@@ -338,8 +336,6 @@ impl TradingModel {
             &[num_configs, SSM_DIM],
             Init::Uniform { lo: -0.01, up: 0.01 },
         );
-        let stem_pos_embed = Self::build_sin_cos_pos_embed(SEQ_LEN, SSM_DIM, p.device())
-            .unsqueeze(0);
         let patch_dt_scale = {
             let mut scales = Vec::with_capacity(SEQ_LEN as usize);
             for &(days, patch_size) in &PATCH_CONFIGS {
@@ -522,7 +518,6 @@ impl TradingModel {
             patch_embed_bias,
             patch_ln_weight,
             patch_dt_scale,
-            stem_pos_embed,
             stem_scale_embed,
             patch_gather_idx,
             patch_mask,
@@ -566,17 +561,6 @@ impl TradingModel {
         }
     }
 
-    fn build_sin_cos_pos_embed(seq_len: i64, dim: i64, device: tch::Device) -> Tensor {
-        let half = dim / 2;
-        let positions = Tensor::arange(seq_len, (Kind::Float, device)).unsqueeze(1);
-        let idx = Tensor::arange(half, (Kind::Float, device)).unsqueeze(0);
-        let inv_freq = (-(idx * 2.0 / dim as f64) * ROPE_BASE.ln()).exp();
-        let angles = positions * inv_freq;
-        let sin = angles.sin();
-        let cos = angles.cos();
-        Tensor::cat(&[sin, cos], 1)
-    }
-
     fn parse_static(&self, static_features: &Tensor, batch_size: i64) -> (Tensor, Tensor) {
         let global = static_features.narrow(1, 0, GLOBAL_STATIC_OBS as i64);
         let per_ticker = static_features
@@ -591,13 +575,7 @@ impl TradingModel {
 
     fn patch_embed_single(&self, ticker_data: &Tensor) -> Tensor {
         let deltas = ticker_data.to_device(self.device);
-        let kind = deltas.kind();
-        let pos_embed = if self.stem_pos_embed.kind() == kind {
-            self.stem_pos_embed.shallow_clone()
-        } else {
-            self.stem_pos_embed.to_kind(kind)
-        };
-        self.patch_embed_fused(&deltas) + pos_embed
+        self.patch_embed_fused(&deltas)
     }
 
     fn normalize_seq_idx(&self, seq_idx: &Tensor, batch_size: i64) -> Tensor {
@@ -630,12 +608,7 @@ impl TradingModel {
             .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
 
         let kind = deltas.kind();
-        let pos_embed = if self.stem_pos_embed.kind() == kind {
-            self.stem_pos_embed.shallow_clone()
-        } else {
-            self.stem_pos_embed.to_kind(kind)
-        };
-        let x = self.patch_embed_fused(&deltas) + pos_embed;
+        let x = self.patch_embed_fused(&deltas);
         let seq_idx = match seq_idx {
             Some(seq_idx) => self.normalize_seq_idx(seq_idx, batch_size),
             None => Self::build_seq_idx_from_padding(
