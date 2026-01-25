@@ -482,8 +482,7 @@ pub async fn train(weights_path: Option<&str>) {
                         (Kind::Float, device),
                     )
                     .uniform_(-1.0, 1.0)
-                        * &alpha_detached
-                        * action_std.detach().narrow(1, 0, TICKERS_COUNT);
+                        * &alpha_detached;
                     let rpo_noise_cash = Tensor::zeros([chunk_sample_count, 1], (Kind::Float, device));
                     let rpo_noise = Tensor::cat(&[rpo_noise_ticker, rpo_noise_cash], 1);
                     (alpha, &action_mean + rpo_noise)
@@ -553,10 +552,14 @@ pub async fn train(weights_path: Option<&str>) {
                     + action_loss.shallow_clone()
                     - dist_entropy * ENTROPY_COEF;
 
-                // RPO alpha loss: target induced KL (noise scaled by action_std)
+                // RPO alpha loss: target induced KL (uniform noise in logit space)
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                    let action_std_detached = action_log_stds.detach().exp();
+                    let var = action_std_detached.pow_tensor_scalar(2);
+                    let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
                     let d = TICKERS_COUNT as f64;
-                    let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0);
+                    let induced_kl =
+                        rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                     (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
                 } else {
                     Tensor::zeros([], (Kind::Float, device))
