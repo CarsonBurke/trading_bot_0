@@ -20,7 +20,7 @@ const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
-pub const VALUE_LOG_CLIP: f64 = 8.0;
+pub const VALUE_LOG_CLIP: f64 = 20.0;
 const CRITIC_ENTROPY_COEF: f64 = 0.01;
 const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
@@ -28,12 +28,12 @@ const LOG_2PI: f64 = 1.8378770664093453;
 
 // RPO: Random Policy Optimization - adds bounded noise to action mean during training
 // Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
-const RPO_ALPHA_MIN: f64 = 0.05;
-const RPO_ALPHA_MAX: f64 = 0.3;
-const RPO_ALPHA_INIT: f64 = 0.1;
+const RPO_ALPHA_MIN: f64 = 0.02;
+const RPO_ALPHA_MAX: f64 = 0.5;
+const RPO_ALPHA_INIT: f64 = 0.1; // CleanRL impl found 0.1 reliably improved results in all test envs over PPO
 const RPO_TARGET_KL: f64 = 0.018;
-const ALPHA_LOSS_COEF: f64 = 1.0;
-const MAX_DELTA_ALPHA: f64 = 0.02;
+const ALPHA_LOSS_COEF: f64 = 0.1;
+const MAX_DELTA_ALPHA: f64 = 0.2;
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -325,7 +325,8 @@ pub async fn train(weights_path: Option<&str>) {
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&portfolio_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
-            let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
+            // Clip stored values to bucket bounds for consistent GAE computation
+            let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP));
             let _ = s_action_weights
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&actions);
@@ -337,7 +338,7 @@ pub async fn train(weights_path: Option<&str>) {
         let gamma = 0.99f64;
         let gae_lambda = 0.95f64;
 
-        // Bootstrap value from final observation state
+        // Bootstrap value from final observation state (clipped to bucket bounds)
         let bootstrap_value = tch::no_grad(|| {
             let (values, _, _, _) = trading_model.forward_with_seq_idx(
                 &obs_price,
@@ -345,7 +346,7 @@ pub async fn train(weights_path: Option<&str>) {
                 Some(&obs_seq_idx),
                 false,
             );
-            values.to_kind(Kind::Float)
+            values.to_kind(Kind::Float).clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP)
         });
 
         tch::no_grad(|| {
@@ -364,9 +365,9 @@ pub async fn train(weights_path: Option<&str>) {
                 let delta = rewards + (1.0 - &dones) * gamma * &next_values - &cur_values;
                 last_gae = delta + (1.0 - &dones) * gamma * gae_lambda * &last_gae;
                 let _ = advantages.narrow(0, mem_idx, NPROCS).copy_(&last_gae);
-                let _ = returns
-                    .narrow(0, mem_idx, NPROCS)
-                    .copy_(&(&last_gae + &cur_values));
+                // Clip returns to value bucket bounds to ensure critic trains on representable targets
+                let step_returns = (&last_gae + &cur_values).clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
+                let _ = returns.narrow(0, mem_idx, NPROCS).copy_(&step_returns);
             }
         });
 
@@ -470,6 +471,8 @@ pub async fn train(weights_path: Option<&str>) {
                     1,
                 );
 
+                // Log prob: Gaussian on all actions (tickers gSDE + cash constant)
+                let action_std = action_log_stds.exp();
                 // RPO: sigmoid parameterization for smooth gradients
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
@@ -479,7 +482,8 @@ pub async fn train(weights_path: Option<&str>) {
                         (Kind::Float, device),
                     )
                     .uniform_(-1.0, 1.0)
-                        * &alpha_detached;
+                        * &alpha_detached
+                        * action_std.detach().narrow(1, 0, TICKERS_COUNT);
                     let rpo_noise_cash = Tensor::zeros([chunk_sample_count, 1], (Kind::Float, device));
                     let rpo_noise = Tensor::cat(&[rpo_noise_ticker, rpo_noise_cash], 1);
                     (alpha, &action_mean + rpo_noise)
@@ -487,8 +491,6 @@ pub async fn train(weights_path: Option<&str>) {
                     (Tensor::zeros(&[1], (Kind::Float, device)), action_mean.shallow_clone())
                 };
 
-                // Log prob: Gaussian on all actions (tickers gSDE + cash constant)
-                let action_std = action_log_stds.exp();
                 let u_normalized = (&u - &action_mean_perturbed) / &action_std;
                 let u_squared = u_normalized.pow_tensor_scalar(2);
                 let two_log_std = &action_log_stds * 2.0;
@@ -522,20 +524,18 @@ pub async fn train(weights_path: Option<&str>) {
                     -Tensor::min_other(&(&ratio * &adv_mb), &(&ratio_clipped * &adv_mb))
                         .mean(Kind::Float);
 
-                // Portfolio-level value loss: ret_mb is [chunk_sample_count], critic_logits is [chunk_sample_count, NUM_VALUE_BUCKETS]
-                let returns_clipped = ret_mb.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
-                let target_twohot = twohot_encode(&returns_clipped, trading_model.value_centers())
+                // Portfolio-level value loss: ret_mb is [chunk_sample_count] (pre-clipped to bucket bounds during GAE)
+                let target_twohot = twohot_encode(&ret_mb, trading_model.value_centers())
                     .view([chunk_sample_count, -1]);
                 let log_probs = critic_logits
                     .to_kind(Kind::Float)
                     .log_softmax(-1, Kind::Float);
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("returns_clipped", &returns_clipped, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("target_twohot", &target_twohot, _epoch, chunk_i);
                     let _ = debug_tensor_stats("critic_logits", &critic_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_probs", &log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
                 }
                 let ce_loss = -(target_twohot * &log_probs)
                     .sum_dim_intlist(-1, false, Kind::Float)
@@ -553,13 +553,10 @@ pub async fn train(weights_path: Option<&str>) {
                     + action_loss.shallow_clone()
                     - dist_entropy * ENTROPY_COEF;
 
-                // RPO alpha loss: target induced KL
+                // RPO alpha loss: target induced KL (noise scaled by action_std)
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let action_std_detached = action_log_stds.detach().exp();
-                    let var = action_std_detached.pow_tensor_scalar(2);
-                    let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
                     let d = TICKERS_COUNT as f64;
-                    let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
+                    let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0);
                     (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
                 } else {
                     Tensor::zeros([], (Kind::Float, device))
@@ -582,12 +579,12 @@ pub async fn train(weights_path: Option<&str>) {
                     total_policy_loss_weighted.g_add_(&(&action_loss * chunk_sample_count as f64));
                 let _ =
                     total_value_loss_weighted.g_add_(&(&value_loss * chunk_sample_count as f64));
-                // Explained variance
+                // Explained variance (ret_mb is pre-clipped to bucket bounds)
                 let values_clipped = values.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
-                let residuals = &values_clipped - &returns_clipped;
+                let residuals = &values_clipped - &ret_mb;
                 let _ = total_residual_sq.g_add_(&residuals.square().sum(Kind::Float));
-                let _ = total_target_sum.g_add_(&returns_clipped.sum(Kind::Float));
-                let _ = total_target_sq_sum.g_add_(&returns_clipped.square().sum(Kind::Float));
+                let _ = total_target_sum.g_add_(&ret_mb.sum(Kind::Float));
+                let _ = total_target_sq_sum.g_add_(&ret_mb.square().sum(Kind::Float));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 epoch_kl_count += chunk_sample_count;
                 total_sample_count += chunk_sample_count;
