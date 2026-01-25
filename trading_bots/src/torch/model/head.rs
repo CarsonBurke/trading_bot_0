@@ -201,10 +201,11 @@ impl TradingModel {
         let action_mean = Tensor::cat(&[action_mean_ticker, cash_logit.unsqueeze(1)], 1);
 
         // gSDE: state-dependent exploration via learned latent features
+        // RMSNorm + tanh bounds sde_latent to prevent exploration collapse/explosion
         let sde_input = ticker_head_base.reshape([batch_size * TICKERS_COUNT, super::HEAD_HIDDEN]);
-        let sde_latent = sde_input
-            .apply(&self.sde_fc)
-            .reshape([batch_size, TICKERS_COUNT, super::SDE_LATENT_DIM]);
+        let sde_latent = sde_input.apply(&self.sde_fc);
+        let sde_latent = (self.ln_sde.forward(&sde_latent) / 1.5).tanh();
+        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, super::SDE_LATENT_DIM]);
 
         let debug_metrics = None;
 
