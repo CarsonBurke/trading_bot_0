@@ -1,7 +1,7 @@
 use super::env::Env;
 use crate::types::Position;
 
-const REWARD_SCALE: f64 = 10.0;
+const REWARD_SCALE: f64 = 2.0;
 const OPPORTUNITY_COST_ONLY: bool = true;
 
 impl Env {
