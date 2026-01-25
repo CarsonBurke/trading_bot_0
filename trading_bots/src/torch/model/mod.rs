@@ -479,13 +479,15 @@ impl TradingModel {
         let value_ln = RMSNorm::new(&(p / "value_ln"), MODEL_DIM, 1e-6);
         let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", MODEL_DIM, MODEL_DIM, Default::default());
         let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, Default::default());
+        
         let actor_out = nn::linear(
             p / "actor_out",
             HEAD_HIDDEN,
             1,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(HEAD_HIDDEN, 1),
-                ..Default::default()
+                ws_init: Init::Randn { mean: 0.0, stdev: 0.01 },
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
             },
         );
         let critic_out = nn::linear(
