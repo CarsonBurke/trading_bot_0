@@ -26,7 +26,7 @@ const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
 const LOG_2PI: f64 = 1.8378770664093453;
 
-// RPO: Random Policy Optimization - adds bounded noise to action mean during training
+// RPO: Random Policy Optimization - adds bounded noise to action mean during training and intentionally not during rollout
 // Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
 const RPO_ALPHA_MIN: f64 = 0.02;
 const RPO_ALPHA_MAX: f64 = 0.5;
@@ -498,7 +498,7 @@ pub async fn train(weights_path: Option<&str>) {
                 let log_det = u
                     .log_softmax(-1, Kind::Float)
                     .sum_dim_intlist(-1, false, Kind::Float);
-                let action_log_probs = (log_prob_gaussian - log_det).nan_to_num(0.0, 0.0, 0.0);
+                let action_log_probs = log_prob_gaussian - log_det;
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
