@@ -6,6 +6,7 @@ pub mod load;
 pub mod ensemble;
 pub mod mamba_fused;
 pub mod ssm;
+pub mod ssm_ref;
 #[cfg(test)]
 mod ssm_tests;
 pub mod constants;

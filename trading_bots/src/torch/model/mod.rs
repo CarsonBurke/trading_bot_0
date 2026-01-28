@@ -12,7 +12,7 @@ use crate::torch::constants::{
     GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
 use crate::torch::ppo::VALUE_LOG_CLIP;
-use crate::torch::ssm::{stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMamba};
+use crate::torch::ssm_ref::{stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMambaRef};
 
 pub use shared::constants::GLOBAL_MACRO_OBS;
 
@@ -243,7 +243,7 @@ pub struct TradingModel {
     patch_sizes: Tensor,
     patch_intra_dt: Tensor,
     patch_config_ids: Tensor,
-    ssm_layers: Vec<StatefulMamba>,
+    ssm_layers: Vec<StatefulMambaRef>,
     ssm_norms: Vec<RMSNorm>,
     ssm_gate: nn::Linear,
     ssm_proj: nn::Conv1D,
