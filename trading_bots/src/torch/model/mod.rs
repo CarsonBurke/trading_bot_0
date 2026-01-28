@@ -226,7 +226,7 @@ pub struct StreamState {
     pub patch_buf: Tensor,
     /// Position within current patch
     pub patch_pos: i64,
-    /// SSM hidden state per ticker per layer
+    /// SSM hidden state per layer (batched over tickers)
     pub ssm_states: Vec<Mamba2State>,
     /// Whether initialized with full sequence
     pub initialized: bool,

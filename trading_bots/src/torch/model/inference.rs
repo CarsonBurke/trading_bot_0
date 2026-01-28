@@ -29,8 +29,8 @@ impl TradingModel {
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
-            ssm_states: (0..(TICKERS_COUNT * self.ssm_layers.len() as i64))
-                .map(|_| self.ssm_layers[0].init_state(1, self.device))
+            ssm_states: (0..self.ssm_layers.len())
+                .map(|_| self.ssm_layers[0].init_state(TICKERS_COUNT, self.device))
                 .collect(),
             initialized: false,
         }
@@ -48,8 +48,10 @@ impl TradingModel {
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
-            ssm_states: (0..(batch_size * TICKERS_COUNT * self.ssm_layers.len() as i64) as usize)
-                .map(|_| self.ssm_layers[0].init_state(1, self.device))
+            ssm_states: (0..self.ssm_layers.len())
+                .map(|_| {
+                    self.ssm_layers[0].init_state(batch_size * TICKERS_COUNT, self.device)
+                })
                 .collect(),
             initialized: false,
         }
@@ -147,30 +149,21 @@ impl TradingModel {
         let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
         let dt_scale = self.patch_dt_scale.shallow_clone();
 
-        let mut outputs = Vec::with_capacity(TICKERS_COUNT as usize);
-        for t in 0..TICKERS_COUNT as usize {
-            let ticker_data = reshaped.get(t as i64).unsqueeze(0);
-            let x_stem = self.patch_embed_single(&ticker_data);
-            let mut x = x_stem;
-            for (layer, (ssm, norm)) in
-                self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
-            {
-                let state_idx = layer * TICKERS_COUNT as usize + t;
-                let out = ssm.forward_with_state_pre_norm_dt_scale(
-                    &x,
-                    norm.weight(),
-                    norm.eps(),
-                    &mut state.ssm_states[state_idx],
-                    Some(&dt_scale),
-                );
-                x = x + out;
-            }
-            outputs.push(x);
+        let mut x = self.patch_embed_single(&reshaped);
+        for (layer, (ssm, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
+        {
+            let out = ssm.forward_with_state_pre_norm_dt_scale(
+                &x,
+                norm.weight(),
+                norm.eps(),
+                &mut state.ssm_states[layer],
+                Some(&dt_scale),
+            );
+            x = x + out;
         }
 
         state.initialized = true;
-        let x_ssm = Tensor::cat(&outputs, 0);
-        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, 1, false)
+        self.head_with_temporal_pool(&x, &global_static, &per_ticker_static, 1, false)
             .0
     }
 
@@ -183,24 +176,18 @@ impl TradingModel {
             .squeeze_dim(1);
         let dt_scale = FINEST_PATCH_SIZE as f64;
 
-        let mut outputs = Vec::with_capacity(TICKERS_COUNT as usize);
-        for t in 0..TICKERS_COUNT as usize {
-            let mut x_in = patch_emb.get(t as i64).unsqueeze(0);
-            for (layer, (ssm, norm)) in
-                self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
-            {
-                let state_idx = layer * TICKERS_COUNT as usize + t;
-                let out = ssm.step_with_pre_norm_dt_scale(
-                    &x_in,
-                    norm.weight(),
-                    norm.eps(),
-                    &mut state.ssm_states[state_idx],
-                    dt_scale,
-                );
-                x_in = x_in + out;
-            }
-            outputs.push(x_in.unsqueeze(1));
+        let mut x_in = patch_emb;
+        for (layer, (ssm, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
+        {
+            let out = ssm.step_with_pre_norm_dt_scale(
+                &x_in,
+                norm.weight(),
+                norm.eps(),
+                &mut state.ssm_states[layer],
+                dt_scale,
+            );
+            x_in = x_in + out;
         }
-        Tensor::cat(&outputs, 0)
+        x_in.unsqueeze(1)
     }
 }
