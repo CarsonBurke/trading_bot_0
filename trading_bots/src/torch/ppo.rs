@@ -188,7 +188,7 @@ pub async fn train(weights_path: Option<&str>) {
     let mut env = VecEnv::new(true);
     if start_episode > 0 {
         env.set_episode(start_episode);
-        env.primary_mut().meta_history.episode_offset = start_episode;
+        env.primary_mut().meta_history.load_from_episode(start_episode);
     }
 
     let rollout_steps = SEQ_LEN;

@@ -25,7 +25,7 @@ pub fn render_report_with_options(
         let root = BitMapBackend::with_buffer(&mut buffer, CHART_DIMS).into_drawing_area();
         root.fill(&theme::BASE)?;
 
-        let x_offset = skip as u32 + report.x_offset;
+        let x_offset = skip as u32;
 
         match &report.kind {
             ReportKind::Simple { values, ema_alpha } => {

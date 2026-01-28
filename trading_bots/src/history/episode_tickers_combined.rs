@@ -111,7 +111,6 @@ impl EpisodeHistory {
                     buys,
                     sells,
                 },
-                x_offset: 0,
             };
             let _ = write_report(&format!("{ticker_dir}/buy_sell.report.bin"), &report);
 
@@ -142,7 +141,6 @@ impl EpisodeHistory {
                     positioned: Some(f64_to_f32(positioned_assets)),
                     benchmark: ticker_benchmark.as_ref().map(|b| f64_to_f32(b)),
                 },
-                x_offset: 0,
             };
             let _ = write_report(&format!("{ticker_dir}/assets.report.bin"), &report);
 
@@ -155,7 +153,6 @@ impl EpisodeHistory {
                     values: f64_to_f32(&self.raw_actions[ticker_index]),
                     ema_alpha: None,
                 },
-                x_offset: 0,
             };
             let _ = write_report(&format!("{ticker_dir}/raw_action.report.bin"), &report);
         }
@@ -178,7 +175,6 @@ impl EpisodeHistory {
                 positioned: Some(f64_to_f32(&positioned_assets_per_step)),
                 benchmark: index_benchmark.as_ref().map(|b| f64_to_f32(b)),
             },
-            x_offset: 0,
         };
         let _ = write_report(&format!("{episode_dir}/assets.report.bin"), &report);
 
@@ -191,7 +187,6 @@ impl EpisodeHistory {
                 values: f64_to_f32(&self.rewards),
                 ema_alpha: None,
             },
-            x_offset: 0,
         };
         let _ = write_report(&format!("{episode_dir}/reward.report.bin"), &report);
 
@@ -216,7 +211,6 @@ impl EpisodeHistory {
                 y_label: None,
                 scale: ScaleKind::Linear,
                 kind: ReportKind::MultiLine { series },
-                x_offset: 0,
             };
             let _ = write_report(&format!("{episode_dir}/target_weights.report.bin"), &report);
         }
@@ -234,7 +228,6 @@ impl EpisodeHistory {
                     action_step0: self.action_step0.as_ref().map(|v| f64_to_f32(v)),
                     action_final: self.action_final.as_ref().map(|v| f64_to_f32(v)),
                 },
-                x_offset: 0,
             };
             let _ = write_report(&format!("{episode_dir}/observations.report.bin"), &report);
         }
