@@ -5,7 +5,6 @@ from Rust via Python FFI. All tensor I/O uses standard PyTorch tensors.
 """
 import sys
 import os
-import math
 
 import torch
 import torch.nn as nn
@@ -16,7 +15,7 @@ from einops import rearrange
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -27,6 +26,18 @@ try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 except ImportError:
     selective_state_update = None
+
+if causal_conv1d_fn is None or causal_conv1d_update is None:
+    raise RuntimeError(
+        "causal_conv1d is required for the Mamba2 reference bridge. "
+        "Install causal_conv1d to avoid slow Python fallbacks."
+    )
+
+if selective_state_update is None:
+    raise RuntimeError(
+        "selective_state_update is required for the Mamba2 reference bridge. "
+        "Install mamba-ssm with triton ops to avoid slow Python fallbacks."
+    )
 
 _registry = {}  # handle_id -> Mamba2 instance
 _next_id = 0
@@ -70,39 +81,15 @@ def set_train(handle, mode):
     _registry[handle].train(mode)
 
 
-def invalidate_cache(handle):
-    """Clear cached derived params so they are recomputed on next forward."""
-    layer = _registry[handle]
-    if hasattr(layer, '_cached'):
-        del layer._cached
-
-
-def _ensure_cache(layer):
-    """Compute and cache derived parameters that are constant between param updates."""
-    if hasattr(layer, '_cached'):
-        return layer._cached
+def _ensure_layout_cache(layer):
+    """Cache layout constants that are fixed for the lifetime of the layer."""
+    if hasattr(layer, '_layout_cache'):
+        return layer._layout_cache
 
     cache = {}
-    # conv1d weight: rearrange "d 1 w -> d w" (just a view/squeeze)
-    cache['conv1d_weight_2d'] = layer.conv1d.weight.squeeze(1)
-    # A = -exp(A_log) — recomputed only after param sync
-    cache['A_neg_exp'] = -torch.exp(layer.A_log.float())
-    # D rearranged for fused kernel
-    if layer.D_has_hdim:
-        cache['D_rearranged'] = rearrange(layer.D, "(h p) -> h p", p=layer.headdim)
-    else:
-        cache['D_rearranged'] = layer.D
-    # d_mlp and layout constants
     cache['d_mlp'] = (layer.in_proj.weight.shape[0] - 2 * layer.d_ssm
                       - 2 * layer.ngroups * layer.d_state - layer.nheads) // 2
-    cache['rest_dim'] = layer.d_ssm + layer.d_ssm + 2 * layer.ngroups * layer.d_state + layer.nheads
-    cache['dt_offset'] = layer.d_ssm + layer.d_ssm + 2 * layer.ngroups * layer.d_state
-    # rmsnorm params
-    cache['rmsnorm_weight'] = layer.norm.weight if layer.rmsnorm else None
-    cache['rmsnorm_eps'] = layer.norm.eps if layer.rmsnorm else 1e-6
-    cache['headdim_arg'] = None if layer.D_has_hdim else layer.headdim
-
-    layer._cached = cache
+    layer._layout_cache = cache
     return cache
 
 
@@ -110,38 +97,8 @@ def forward_with_pre_norm(handle, x, norm_weight, norm_eps, dt_scale, seq_idx):
     """Forward pass with pre-RMSNorm. seq_idx should already be int32 from Rust."""
     layer = _registry[handle]
     normed = _rmsnorm(x, norm_weight, norm_eps)
-    if causal_conv1d_fn is not None:
-        return _forward_fused(layer, normed, dt_scale, seq_idx)
     return _forward_inner(layer, normed, dt_scale, seq_idx,
                           return_final_states=False)
-
-
-def forward_batch_layers(handles, x, norm_weights, norm_epses, dt_scale, seq_idx):
-    """Process multiple SSM layers sequentially in a single Python call.
-
-    Each layer applies: x = x + ssm_layer(rmsnorm(x))
-    This avoids per-layer GIL acquire/release overhead on the Rust side.
-
-    Args:
-        handles: list of layer handle IDs
-        x: input tensor [batch, seq, d_model]
-        norm_weights: list of norm weight tensors (one per layer)
-        norm_epses: list of norm eps values (one per layer)
-        dt_scale: shared dt_scale tensor or None
-        seq_idx: shared seq_idx tensor (int32) or None
-    Returns:
-        x after all residual SSM layers applied
-    """
-    for i, handle in enumerate(handles):
-        layer = _registry[handle]
-        normed = _rmsnorm(x, norm_weights[i], norm_epses[i])
-        if causal_conv1d_fn is not None:
-            out = _forward_fused(layer, normed, dt_scale, seq_idx)
-        else:
-            out = _forward_inner(layer, normed, dt_scale, seq_idx,
-                                 return_final_states=False)
-        x = x + out
-    return x
 
 
 def forward_with_pre_norm_stateful(handle, x, norm_weight, norm_eps,
@@ -208,9 +165,6 @@ def set_param_tensor(handle, name, new_tensor):
     param = getattr(obj, parts[-1])
     with torch.no_grad():
         param.data = new_tensor
-    # Invalidate cache since parameter data changed
-    if hasattr(layer, '_cached'):
-        del layer._cached
 
 
 def init_state(handle, batch_size, device_str, dtype_str):
@@ -254,59 +208,16 @@ def _rmsnorm(x, weight, eps):
     return (x_f32 * rms * weight.float()).to(dtype)
 
 
-def _forward_fused(layer, x, dt_scale, seq_idx):
-    """Fused forward using mamba_split_conv1d_scan_combined with cached params."""
-    cache = _ensure_cache(layer)
-    d_mlp = cache['d_mlp']
-
-    zxbcdt = layer.in_proj(x)
-    if d_mlp > 0:
-        z0, x0, zxbcdt_rest = torch.split(
-            zxbcdt, [d_mlp, d_mlp, cache['rest_dim']], dim=-1)
-    else:
-        z0 = x0 = None
-        zxbcdt_rest = zxbcdt
-
-    # dt_scale injection: out-of-place to avoid clone()
-    if dt_scale is not None:
-        dt_off = cache['dt_offset']
-        pre_dt = zxbcdt_rest[..., :dt_off]
-        dt_part = zxbcdt_rest[..., dt_off:] * dt_scale
-        zxbcdt_rest = torch.cat([pre_dt, dt_part], dim=-1)
-
-    y = mamba_split_conv1d_scan_combined(
-        zxbcdt_rest,
-        cache['conv1d_weight_2d'],
-        layer.conv1d.bias,
-        layer.dt_bias,
-        A=cache['A_neg_exp'],
-        D=cache['D_rearranged'],
-        chunk_size=layer.chunk_size,
-        seq_idx=seq_idx,
-        activation=layer.activation,
-        rmsnorm_weight=cache['rmsnorm_weight'],
-        rmsnorm_eps=cache['rmsnorm_eps'],
-        outproj_weight=None,
-        outproj_bias=None,
-        headdim=cache['headdim_arg'],
-        ngroups=layer.ngroups,
-        norm_before_gate=layer.norm_before_gate,
-    )
-    if d_mlp > 0:
-        y = torch.cat([F.silu(z0) * x0, y], dim=-1)
-    return layer.out_proj(y)
-
-
 def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
-    """Non-mem-eff forward through the Mamba2 layer internals."""
-    cache = _ensure_cache(layer)
+    """Non-mem-eff forward with dt_scale support (post-softplus scaling)."""
+    layout = _ensure_layout_cache(layer)
     batch, seqlen, _ = x.shape
     d_ssm = layer.d_ssm
     nheads = layer.nheads
     headdim = layer.headdim
     d_state = layer.d_state
     ngroups = layer.ngroups
-    d_mlp = cache['d_mlp']
+    d_mlp = layout['d_mlp']
 
     zxbcdt = layer.in_proj(x)
     z0, x0, z, xBC, dt = torch.split(
@@ -322,8 +233,8 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
         )
     else:
         xBC = causal_conv1d_fn(
-            xBC.transpose(1, 2),
-            cache['conv1d_weight_2d'],
+            xBC.contiguous().transpose(1, 2),
+            rearrange(layer.conv1d.weight, "d 1 w -> d w"),
             bias=layer.conv1d.bias,
             activation=layer.activation,
             seq_idx=seq_idx,
@@ -333,7 +244,7 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
         xBC, [d_ssm, ngroups * d_state, ngroups * d_state], dim=-1
     )
 
-    A = cache['A_neg_exp']
+    A = -torch.exp(layer.A_log.float())
 
     dt_limit_kwargs = (
         {} if layer.dt_limit == (0.0, float("inf"))
@@ -351,7 +262,7 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
 
     scan_kwargs = dict(
         chunk_size=layer.chunk_size,
-        D=cache['D_rearranged'],
+        D=rearrange(layer.D, "(h p) -> h p", p=headdim) if layer.D_has_hdim else layer.D,
         z=rearrange(z, "b l (h p) -> b l h p", p=headdim) if not layer.rmsnorm else None,
         dt_bias=scan_dt_bias,
         dt_softplus=scan_dt_softplus,
@@ -396,7 +307,7 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
 
 def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
     """Single-step recurrent inference through Mamba2 internals."""
-    cache = _ensure_cache(layer)
+    layout = _ensure_layout_cache(layer)
     dtype = x.dtype
     batch = x.shape[0]
     d_ssm = layer.d_ssm
@@ -405,7 +316,7 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
     d_state = layer.d_state
     ngroups = layer.ngroups
     d_conv = layer.d_conv
-    d_mlp = cache['d_mlp']
+    d_mlp = layout['d_mlp']
 
     zxbcdt = layer.in_proj(x)
     z0, x0, z, xBC, dt_raw = torch.split(
@@ -414,19 +325,19 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
         dim=-1
     )
 
+    conv1d_weight_2d = rearrange(layer.conv1d.weight, "d 1 w -> d w")
     if causal_conv1d_update is not None:
         xBC_conv = causal_conv1d_update(
             xBC,
             conv_state,
-            cache['conv1d_weight_2d'],
+            conv1d_weight_2d,
             layer.conv1d.bias,
             layer.activation,
         )
     else:
         conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
         conv_state[:, :, -1] = xBC
-        conv_w = cache['conv1d_weight_2d']
-        xBC_conv = (conv_state.float() * conv_w.float()).sum(-1)
+        xBC_conv = (conv_state.float() * conv1d_weight_2d.float()).sum(-1)
         if layer.conv1d.bias is not None:
             xBC_conv = xBC_conv + layer.conv1d.bias.float()
         xBC_conv = F.silu(xBC_conv).to(dtype)
@@ -435,7 +346,7 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
         xBC_conv, [d_ssm, ngroups * d_state, ngroups * d_state], dim=-1
     )
 
-    A = cache['A_neg_exp']
+    A = -torch.exp(layer.A_log.float())
 
     dt = F.softplus(dt_raw.float() + layer.dt_bias.float())
     if dt_scale is not None:

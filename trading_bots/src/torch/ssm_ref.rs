@@ -8,7 +8,8 @@
 
 use std::sync::LazyLock;
 
-use cpython::{ObjectProtocol, PyClone, PyModule, PyObject, PyTuple, Python, PythonObject, ToPyObject};
+use cpython::{ObjectProtocol, PyClone, PyModule, PyObject, PyTuple, PythonObject, ToPyObject};
+use cpython::Python;
 use tch::{nn, Kind, Tensor};
 
 pub use super::ssm::{Mamba2Config, Mamba2State};
@@ -35,7 +36,14 @@ fn ensure_bridge_init() {
 fn device_str(device: tch::Device) -> &'static str {
     match device {
         tch::Device::Cpu => "cpu",
-        tch::Device::Cuda(i) => Box::leak(format!("cuda:{}", i).into_boxed_str()),
+        tch::Device::Cuda(0) => "cuda:0",
+        tch::Device::Cuda(1) => "cuda:1",
+        tch::Device::Cuda(2) => "cuda:2",
+        tch::Device::Cuda(3) => "cuda:3",
+        tch::Device::Cuda(4) => "cuda:4",
+        tch::Device::Cuda(5) => "cuda:5",
+        tch::Device::Cuda(6) => "cuda:6",
+        tch::Device::Cuda(7) => "cuda:7",
         _ => panic!("unsupported device {:?}", device),
     }
 }
@@ -89,7 +97,7 @@ fn tuple_get(py: Python, tup: &PyObject, idx: i32) -> PyObject {
 pub struct Mamba2Ref {
     handle: i64,
     bridge: PyObject,
-    /// (python_name, tensor) — tensor is the *same* storage as Python's parameter
+    /// (python_name, tensor) -- tensor is the *same* storage as Python's parameter
     params: Vec<(String, Tensor)>,
     pub config: Mamba2Config,
 }
@@ -178,6 +186,14 @@ impl Mamba2Ref {
                 .call_method(py, "set_param_tensor", (handle, name.as_str(), py_tensor), None)
                 .expect("set_param_tensor failed");
         }
+    }
+
+    pub fn handle(&self) -> i64 {
+        self.handle
+    }
+
+    pub fn bridge(&self) -> &PyObject {
+        &self.bridge
     }
 
     pub fn set_train(&self, mode: bool) {
@@ -395,9 +411,19 @@ impl StatefulMambaRef {
     pub fn set_train(&self, mode: bool) {
         self.mamba.set_train(mode);
     }
+
+    pub fn handle(&self) -> i64 {
+        self.mamba.handle()
+    }
+
+    pub fn bridge(&self) -> &PyObject {
+        self.mamba.bridge()
+    }
+
 }
 
 /// Factory matching `stateful_mamba_block_cfg` from ssm.rs
 pub fn stateful_mamba_block_cfg(p: &nn::Path, config: Mamba2Config) -> StatefulMambaRef {
     StatefulMambaRef::new(p, config)
 }
+

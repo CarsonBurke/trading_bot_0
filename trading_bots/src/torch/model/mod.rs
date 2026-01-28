@@ -245,8 +245,7 @@ pub struct TradingModel {
     patch_config_ids: Tensor,
     ssm_layers: Vec<StatefulMambaRef>,
     ssm_norms: Vec<RMSNorm>,
-    ssm_gate: nn::Linear,
-    ssm_proj: nn::Conv1D,
+    ssm_final_norm: RMSNorm,
     static_proj: nn::Linear,
     ln_static_proj: RMSNorm,
     inter_ticker_block: InterTickerBlock,
@@ -407,8 +406,7 @@ impl TradingModel {
         let ssm_norms = (0..config.ssm_layers)
             .map(|i| RMSNorm::new(&(p / format!("ssm_norm_{}", i)), SSM_DIM, 1e-6))
             .collect::<Vec<_>>();
-        let ssm_gate = nn::linear(p / "ssm_gate", SSM_DIM, SSM_DIM, Default::default());
-        let ssm_proj = nn::conv1d(p / "ssm_proj", SSM_DIM, MODEL_DIM, 1, Default::default());
+        let ssm_final_norm = RMSNorm::new(&(p / "ssm_final_norm"), SSM_DIM, 1e-6);
 
         let static_proj = nn::linear(
             p / "static_proj",
@@ -526,8 +524,7 @@ impl TradingModel {
             patch_config_ids,
             ssm_layers,
             ssm_norms,
-            ssm_gate,
-            ssm_proj,
+            ssm_final_norm,
             static_proj,
             ln_static_proj,
             inter_ticker_block,
@@ -617,6 +614,13 @@ impl TradingModel {
                 &self.patch_mask,
                 &self.patch_sizes,
             ),
+        };
+        // Cast to int32 here so Python bridge doesn't need to cast per forward call.
+        // causal_conv1d CUDA kernel requires int32 seq_idx.
+        let seq_idx = if seq_idx.numel() > 0 {
+            seq_idx.to_kind(Kind::Int)
+        } else {
+            seq_idx
         };
         let dt_scale = self.patch_dt_scale.to_kind(kind).clamp_min(1e-4);
         (x, dt_scale, seq_idx)

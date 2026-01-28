@@ -16,19 +16,13 @@ impl TradingModel {
         batch_size: i64,
         _debug: bool,
     ) -> (ModelOutput, Option<DebugMetrics>) {
-        let x = x_ssm.shallow_clone();
-        let x = &x * x.apply(&self.ssm_gate).sigmoid();
-        let x = x.permute([0, 2, 1]);
-        let x = x.apply(&self.ssm_proj);
-        let temporal_len = x.size()[2];
+        let x = self.ssm_final_norm.forward(x_ssm);
+        // [batch*tickers, seq_len, SSM_DIM] -> [batch, tickers, seq_len, SSM_DIM]
+        let temporal_len = x.size()[1];
+        let x_time = x.view([batch_size, TICKERS_COUNT, temporal_len, MODEL_DIM]);
 
-        // Reshape to [batch, seq_len, tickers, dim]
-        let x_time = x
-            .view([batch_size, TICKERS_COUNT, MODEL_DIM, temporal_len])
-            .permute([0, 3, 1, 2]);
-
-        // TimeXer-style: Pool last token FIRST (SSM already compressed temporal info)
-        let last_tokens = x_time.narrow(1, temporal_len - 1, 1); // [batch, 1, tickers, dim]
+        // Extract last token: [batch, tickers, MODEL_DIM]
+        let last_tokens = x_time.narrow(2, temporal_len - 1, 1).squeeze_dim(2);
 
         // Build exo context for last tokens only
         let global_ctx = global_static
@@ -71,7 +65,6 @@ impl TradingModel {
 
         // Cross-attention on last tokens only: [batch, tickers, dim] queries exo_tokens
         let last_tokens_flat = last_tokens
-            .squeeze_dim(1)
             .reshape([batch_size * TICKERS_COUNT, 1, MODEL_DIM]);
         let last_tokens_norm = self.last_token_ln.forward(&last_tokens_flat);
         let exo_tokens_flat = exo_tokens.reshape([batch_size * TICKERS_COUNT, 3, MODEL_DIM]);
@@ -86,7 +79,7 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
 
         // Add exo context and global injection to pooled tokens
-        let mut pooled = last_tokens.squeeze_dim(1) + exo_ctx; // [batch, tickers, dim]
+        let mut pooled = &last_tokens + exo_ctx; // [batch, tickers, dim]
         let global_inject = global_static
             .apply(&self.global_inject_down)
             .apply(&self.global_inject_up);

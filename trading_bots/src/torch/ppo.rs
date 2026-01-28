@@ -164,16 +164,32 @@ pub async fn train(weights_path: Option<&str>) {
         Tensor::zeros(&[1], (Kind::Float, device))
     };
 
-    if let Some(path) = weights_path {
+    let start_episode = if let Some(path) = weights_path {
         println!("Loading weights from {}", path);
         vs.load(path).unwrap();
+        // Extract episode number from filename like "ppo_ep500.ot"
+        let ep = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("ppo_ep"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        if ep > 0 {
+            println!("Resuming from episode {}", ep);
+        }
+        ep
     } else {
         println!("Starting training from scratch");
-    }
+        0
+    };
 
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
     let mut env = VecEnv::new(true);
+    if start_episode > 0 {
+        env.set_episode(start_episode);
+        env.primary_mut().meta_history.episode_offset = start_episode;
+    }
 
     let rollout_steps = SEQ_LEN;
     let memory_size = rollout_steps * NPROCS;
@@ -196,7 +212,7 @@ pub async fn train(weights_path: Option<&str>) {
     let mut rollout_sde_std = Tensor::zeros(&[SDE_LATENT_DIM, TICKERS_COUNT], (Kind::Float, device));
     let mut rollout_cash_log_std = Tensor::zeros(&[1], (Kind::Float, device));
 
-    for episode in 0..1000000 {
+    for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
         let mut obs_static =

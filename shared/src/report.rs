@@ -7,6 +7,8 @@ pub struct Report {
     pub y_label: Option<String>,
     pub scale: ScaleKind,
     pub kind: ReportKind,
+    #[serde(default)]
+    pub x_offset: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

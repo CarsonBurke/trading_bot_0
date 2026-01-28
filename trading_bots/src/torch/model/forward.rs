@@ -35,8 +35,7 @@ impl TradingModel {
 
         let mut x_for_ssm = x_stem;
         let seq_idx_ref = if seq_idx.numel() == 0 { None } else { Some(&seq_idx) };
-        for (layer_idx, (layer, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate() {
-            debug_fused_layer("x_for_ssm_in", layer_idx, &x_for_ssm);
+        for (layer, norm) in self.ssm_layers.iter().zip(self.ssm_norms.iter()) {
             let out = layer.forward_with_pre_norm_seq_idx(
                 &x_for_ssm,
                 norm.weight(),
@@ -44,10 +43,7 @@ impl TradingModel {
                 Some(&dt_scale),
                 seq_idx_ref,
             );
-            debug_fused_layer("ssm_out", layer_idx, &out);
-
             x_for_ssm = x_for_ssm + out;
-            debug_fused_layer("x_for_ssm_out", layer_idx, &x_for_ssm);
         }
         debug_fused("model_x_for_ssm", &x_for_ssm);
 
