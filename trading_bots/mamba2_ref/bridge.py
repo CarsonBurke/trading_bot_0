@@ -55,7 +55,7 @@ def create_layer(d_model, d_state, d_conv, expand, headdim, d_ssm,
         dt_max=dt_max,
         norm_before_gate=norm_before_gate,
         D_has_hdim=D_has_hdim,
-        rmsnorm=False,
+        rmsnorm=True,
         use_mem_eff_path=False,
     ).to(device=device, dtype=dtype)
 
@@ -70,34 +70,83 @@ def set_train(handle, mode):
     _registry[handle].train(mode)
 
 
-def forward_with_pre_norm(handle, x, norm_weight, norm_eps, dt_scale, seq_idx):
-    """
-    Forward pass with pre-RMSNorm, matching Rust forward_with_pre_norm_seq_idx.
+def invalidate_cache(handle):
+    """Clear cached derived params so they are recomputed on next forward."""
+    layer = _registry[handle]
+    if hasattr(layer, '_cached'):
+        del layer._cached
 
-    Uses fused mamba_split_conv1d_scan_combined (requires causal_conv1d).
-    Falls back to manual _forward_inner if causal_conv1d is unavailable.
-    """
+
+def _ensure_cache(layer):
+    """Compute and cache derived parameters that are constant between param updates."""
+    if hasattr(layer, '_cached'):
+        return layer._cached
+
+    cache = {}
+    # conv1d weight: rearrange "d 1 w -> d w" (just a view/squeeze)
+    cache['conv1d_weight_2d'] = layer.conv1d.weight.squeeze(1)
+    # A = -exp(A_log) — recomputed only after param sync
+    cache['A_neg_exp'] = -torch.exp(layer.A_log.float())
+    # D rearranged for fused kernel
+    if layer.D_has_hdim:
+        cache['D_rearranged'] = rearrange(layer.D, "(h p) -> h p", p=layer.headdim)
+    else:
+        cache['D_rearranged'] = layer.D
+    # d_mlp and layout constants
+    cache['d_mlp'] = (layer.in_proj.weight.shape[0] - 2 * layer.d_ssm
+                      - 2 * layer.ngroups * layer.d_state - layer.nheads) // 2
+    cache['rest_dim'] = layer.d_ssm + layer.d_ssm + 2 * layer.ngroups * layer.d_state + layer.nheads
+    cache['dt_offset'] = layer.d_ssm + layer.d_ssm + 2 * layer.ngroups * layer.d_state
+    # rmsnorm params
+    cache['rmsnorm_weight'] = layer.norm.weight if layer.rmsnorm else None
+    cache['rmsnorm_eps'] = layer.norm.eps if layer.rmsnorm else 1e-6
+    cache['headdim_arg'] = None if layer.D_has_hdim else layer.headdim
+
+    layer._cached = cache
+    return cache
+
+
+def forward_with_pre_norm(handle, x, norm_weight, norm_eps, dt_scale, seq_idx):
+    """Forward pass with pre-RMSNorm. seq_idx should already be int32 from Rust."""
     layer = _registry[handle]
     normed = _rmsnorm(x, norm_weight, norm_eps)
-    # causal_conv1d CUDA kernel requires int32 seq_idx
-    if seq_idx is not None:
-        seq_idx = seq_idx.to(torch.int32)
     if causal_conv1d_fn is not None:
         return _forward_fused(layer, normed, dt_scale, seq_idx)
     return _forward_inner(layer, normed, dt_scale, seq_idx,
                           return_final_states=False)
 
 
+def forward_batch_layers(handles, x, norm_weights, norm_epses, dt_scale, seq_idx):
+    """Process multiple SSM layers sequentially in a single Python call.
+
+    Each layer applies: x = x + ssm_layer(rmsnorm(x))
+    This avoids per-layer GIL acquire/release overhead on the Rust side.
+
+    Args:
+        handles: list of layer handle IDs
+        x: input tensor [batch, seq, d_model]
+        norm_weights: list of norm weight tensors (one per layer)
+        norm_epses: list of norm eps values (one per layer)
+        dt_scale: shared dt_scale tensor or None
+        seq_idx: shared seq_idx tensor (int32) or None
+    Returns:
+        x after all residual SSM layers applied
+    """
+    for i, handle in enumerate(handles):
+        layer = _registry[handle]
+        normed = _rmsnorm(x, norm_weights[i], norm_epses[i])
+        if causal_conv1d_fn is not None:
+            out = _forward_fused(layer, normed, dt_scale, seq_idx)
+        else:
+            out = _forward_inner(layer, normed, dt_scale, seq_idx,
+                                 return_final_states=False)
+        x = x + out
+    return x
+
+
 def forward_with_pre_norm_stateful(handle, x, norm_weight, norm_eps,
                                    conv_state, ssm_state, dt_scale):
-    """
-    Forward pass that also returns final conv and ssm states.
-
-    conv_state and ssm_state inputs are accepted for signature compatibility
-    with the Rust caller but are not used (states are derived from the sequence).
-
-    Returns: (output, final_conv_state, final_ssm_state)
-    """
+    """Forward pass that also returns final conv and ssm states."""
     layer = _registry[handle]
     normed = _rmsnorm(x, norm_weight, norm_eps)
     return _forward_inner(layer, normed, dt_scale, seq_idx=None,
@@ -105,20 +154,7 @@ def forward_with_pre_norm_stateful(handle, x, norm_weight, norm_eps,
 
 
 def step(handle, x, norm_weight, norm_eps, conv_state, ssm_state, dt_scale):
-    """
-    Single-step inference, matching Rust step_with_pre_norm_dt_scale.
-
-    Args:
-        handle: layer handle
-        x: [batch, d_model] single token (no seq dim)
-        norm_weight: [d_model] RMSNorm weight
-        norm_eps: float
-        conv_state: [batch, conv_dim, d_conv]
-        ssm_state: [batch, nheads, headdim, d_state]
-        dt_scale: float or None
-
-    Returns: (output [batch, d_model], new_conv_state, new_ssm_state)
-    """
+    """Single-step inference."""
     layer = _registry[handle]
     normed = _rmsnorm(x, norm_weight, norm_eps)
     return _step_inner(layer, normed, conv_state, ssm_state, dt_scale)
@@ -131,7 +167,7 @@ def get_named_parameters(handle):
 
 
 def get_param_info(handle):
-    """Return list of (name, shape_list) for all parameters — no tensor data."""
+    """Return list of (name, shape_list) for all parameters -- no tensor data."""
     layer = _registry[handle]
     return [(name, list(param.shape)) for name, param in layer.named_parameters()]
 
@@ -165,15 +201,16 @@ def set_param_from_flat_bytes(handle, name, flat_bytes, shape):
 def set_param_tensor(handle, name, new_tensor):
     """Replace a parameter's data with a new tensor (zero-copy shared storage)."""
     layer = _registry[handle]
-    # Navigate dotted name to find the nn.Parameter
     parts = name.split('.')
     obj = layer
     for part in parts[:-1]:
         obj = getattr(obj, part)
     param = getattr(obj, parts[-1])
-    # Replace the parameter data with the new tensor's storage
     with torch.no_grad():
         param.data = new_tensor
+    # Invalidate cache since parameter data changed
+    if hasattr(layer, '_cached'):
+        del layer._cached
 
 
 def init_state(handle, batch_size, device_str, dtype_str):
@@ -218,48 +255,40 @@ def _rmsnorm(x, weight, eps):
 
 
 def _forward_fused(layer, x, dt_scale, seq_idx):
-    """
-    Fused forward using mamba_split_conv1d_scan_combined.
-    Handles conv1d + scan + norm + out_proj in one fused call.
-    dt_scale is injected by pre-scaling the dt component of the projection output.
+    """Fused forward using mamba_split_conv1d_scan_combined with cached params."""
+    cache = _ensure_cache(layer)
+    d_mlp = cache['d_mlp']
 
-    The fused kernel computes softplus(dt + dt_bias). To get softplus(dt + dt_bias) * dt_scale,
-    we can't inject dt_scale directly. Instead, we pre-scale dt so the kernel sees
-    softplus(dt * dt_scale + dt_bias), which is mathematically different but learnable.
-    """
-    d_mlp = (layer.in_proj.weight.shape[0] - 2 * layer.d_ssm
-             - 2 * layer.ngroups * layer.d_state - layer.nheads) // 2
     zxbcdt = layer.in_proj(x)
-    rest_dim = layer.d_ssm + layer.d_ssm + 2 * layer.ngroups * layer.d_state + layer.nheads
     if d_mlp > 0:
         z0, x0, zxbcdt_rest = torch.split(
-            zxbcdt, [d_mlp, d_mlp, rest_dim], dim=-1)
+            zxbcdt, [d_mlp, d_mlp, cache['rest_dim']], dim=-1)
     else:
         z0 = x0 = None
         zxbcdt_rest = zxbcdt
 
-    # Pre-scale dt component if dt_scale is provided
+    # dt_scale injection: out-of-place to avoid clone()
     if dt_scale is not None:
-        # zxbcdt_rest layout: [z(d_ssm), xBC(d_ssm + 2*ngroups*d_state), dt(nheads)]
-        dt_offset = layer.d_ssm + layer.d_ssm + 2 * layer.ngroups * layer.d_state
-        zxbcdt_rest = zxbcdt_rest.clone()
-        zxbcdt_rest[..., dt_offset:].mul_(dt_scale)
+        dt_off = cache['dt_offset']
+        pre_dt = zxbcdt_rest[..., :dt_off]
+        dt_part = zxbcdt_rest[..., dt_off:] * dt_scale
+        zxbcdt_rest = torch.cat([pre_dt, dt_part], dim=-1)
 
     y = mamba_split_conv1d_scan_combined(
         zxbcdt_rest,
-        rearrange(layer.conv1d.weight, "d 1 w -> d w"),
+        cache['conv1d_weight_2d'],
         layer.conv1d.bias,
         layer.dt_bias,
-        A=-torch.exp(layer.A_log.float()),
-        D=rearrange(layer.D, "(h p) -> h p", p=layer.headdim) if layer.D_has_hdim else layer.D,
+        A=cache['A_neg_exp'],
+        D=cache['D_rearranged'],
         chunk_size=layer.chunk_size,
         seq_idx=seq_idx,
         activation=layer.activation,
-        rmsnorm_weight=layer.norm.weight if layer.rmsnorm else None,
-        rmsnorm_eps=layer.norm.eps if layer.rmsnorm else 1e-6,
+        rmsnorm_weight=cache['rmsnorm_weight'],
+        rmsnorm_eps=cache['rmsnorm_eps'],
         outproj_weight=None,
         outproj_bias=None,
-        headdim=None if layer.D_has_hdim else layer.headdim,
+        headdim=cache['headdim_arg'],
         ngroups=layer.ngroups,
         norm_before_gate=layer.norm_before_gate,
     )
@@ -269,63 +298,49 @@ def _forward_fused(layer, x, dt_scale, seq_idx):
 
 
 def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
-    """
-    Non-mem-eff forward through the Mamba2 layer internals.
-
-    Manually runs the projection, conv, and chunked scan so we can inject
-    dt_scale after softplus, matching the Rust implementation.
-    """
+    """Non-mem-eff forward through the Mamba2 layer internals."""
+    cache = _ensure_cache(layer)
     batch, seqlen, _ = x.shape
     d_ssm = layer.d_ssm
-    d_inner = layer.d_inner
     nheads = layer.nheads
     headdim = layer.headdim
     d_state = layer.d_state
     ngroups = layer.ngroups
+    d_mlp = cache['d_mlp']
 
-    # Project: [z0, x0, z, xBC, dt]
-    zxbcdt = layer.in_proj(x)  # (B, L, d_in_proj)
-
-    d_mlp = (zxbcdt.shape[-1] - 2 * d_ssm - 2 * ngroups * d_state - nheads) // 2
+    zxbcdt = layer.in_proj(x)
     z0, x0, z, xBC, dt = torch.split(
         zxbcdt,
         [d_mlp, d_mlp, d_ssm, d_ssm + 2 * ngroups * d_state, nheads],
         dim=-1
     )
 
-    # Conv1d
     assert layer.activation in ("silu", "swish")
     if causal_conv1d_fn is None or layer.activation not in ("silu", "swish"):
-        # Without causal_conv1d, seq_idx boundaries are not enforced in conv1d
         xBC = layer.act(
             layer.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(layer.d_conv - 1)]
         )
     else:
         xBC = causal_conv1d_fn(
             xBC.transpose(1, 2),
-            rearrange(layer.conv1d.weight, "d 1 w -> d w"),
+            cache['conv1d_weight_2d'],
             bias=layer.conv1d.bias,
             activation=layer.activation,
             seq_idx=seq_idx,
         ).transpose(1, 2)
 
     x_ssm, B, C = torch.split(
-        xBC,
-        [d_ssm, ngroups * d_state, ngroups * d_state],
-        dim=-1
+        xBC, [d_ssm, ngroups * d_state, ngroups * d_state], dim=-1
     )
 
-    A = -torch.exp(layer.A_log.float())
+    A = cache['A_neg_exp']
 
-    # dt_scale handling: compute dt with softplus and scale, then pass
-    # dt_softplus=False and no dt_bias to the scan.
     dt_limit_kwargs = (
         {} if layer.dt_limit == (0.0, float("inf"))
         else dict(dt_limit=layer.dt_limit)
     )
 
     if dt_scale is not None:
-        # Manually apply softplus(dt + dt_bias) * dt_scale
         dt_processed = F.softplus(dt + layer.dt_bias) * dt_scale
         scan_dt_bias = None
         scan_dt_softplus = False
@@ -336,7 +351,7 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
 
     scan_kwargs = dict(
         chunk_size=layer.chunk_size,
-        D=rearrange(layer.D, "(h p) -> h p", p=headdim) if layer.D_has_hdim else layer.D,
+        D=cache['D_rearranged'],
         z=rearrange(z, "b l (h p) -> b l h p", p=headdim) if not layer.rmsnorm else None,
         dt_bias=scan_dt_bias,
         dt_softplus=scan_dt_softplus,
@@ -356,8 +371,6 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
 
     if return_final_states:
         y, last_state = y
-        # Capture conv state: last d_conv elements of xBC input (pre-conv)
-        # Recompute xBC_raw from the pre-conv split
         _, _, _, xBC_raw, _ = torch.split(
             zxbcdt,
             [d_mlp, d_mlp, d_ssm, d_ssm + 2 * ngroups * d_state, nheads],
@@ -382,73 +395,55 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
 
 
 def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
-    """
-    Single-step recurrent inference through Mamba2 internals.
-
-    Mirrors the Rust step_impl logic:
-    1. in_proj on single token
-    2. Update conv_state with shift + insert
-    3. Manual conv1d via dot product with conv weights
-    4. SSM recurrence: dA, dBx update
-    5. Output with optional RMSNorm gating
-    """
+    """Single-step recurrent inference through Mamba2 internals."""
+    cache = _ensure_cache(layer)
     dtype = x.dtype
     batch = x.shape[0]
     d_ssm = layer.d_ssm
-    d_inner = layer.d_inner
     nheads = layer.nheads
     headdim = layer.headdim
     d_state = layer.d_state
     ngroups = layer.ngroups
     d_conv = layer.d_conv
+    d_mlp = cache['d_mlp']
 
-    # x is [batch, d_model] (no seq dim)
-    zxbcdt = layer.in_proj(x)  # (B, d_in_proj)
-    d_mlp = (zxbcdt.shape[-1] - 2 * d_ssm - 2 * ngroups * d_state - nheads) // 2
-
+    zxbcdt = layer.in_proj(x)
     z0, x0, z, xBC, dt_raw = torch.split(
         zxbcdt,
         [d_mlp, d_mlp, d_ssm, d_ssm + 2 * ngroups * d_state, nheads],
         dim=-1
     )
 
-    # Update conv state: shift left, insert new
     if causal_conv1d_update is not None:
         xBC_conv = causal_conv1d_update(
             xBC,
             conv_state,
-            rearrange(layer.conv1d.weight, "d 1 w -> d w"),
+            cache['conv1d_weight_2d'],
             layer.conv1d.bias,
             layer.activation,
         )
     else:
         conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
         conv_state[:, :, -1] = xBC
-        conv_w = rearrange(layer.conv1d.weight, "d 1 w -> d w")
+        conv_w = cache['conv1d_weight_2d']
         xBC_conv = (conv_state.float() * conv_w.float()).sum(-1)
         if layer.conv1d.bias is not None:
             xBC_conv = xBC_conv + layer.conv1d.bias.float()
         xBC_conv = F.silu(xBC_conv).to(dtype)
 
     x_ssm, B, C = torch.split(
-        xBC_conv,
-        [d_ssm, ngroups * d_state, ngroups * d_state],
-        dim=-1
+        xBC_conv, [d_ssm, ngroups * d_state, ngroups * d_state], dim=-1
     )
 
-    A = -torch.exp(layer.A_log.float())
+    A = cache['A_neg_exp']
 
-    # Compute dt: softplus(dt_raw + dt_bias), optionally scaled
-    dt = F.softplus(dt_raw.float() + layer.dt_bias.float())  # (batch, nheads)
+    dt = F.softplus(dt_raw.float() + layer.dt_bias.float())
     if dt_scale is not None:
         dt = dt * dt_scale
     if layer.dt_limit != (0.0, float("inf")):
         dt = dt.clamp(layer.dt_limit[0], layer.dt_limit[1])
 
-    # SSM recurrence
     if selective_state_update is not None and dt_scale is None:
-        # Use fused triton kernel (only when no dt_scale, since it applies
-        # softplus internally and we can't inject scale)
         x_reshaped = rearrange(x_ssm, "b (h p) -> b h p", p=headdim)
         dt_for_kernel = rearrange(dt_raw, "b h -> b h") if dt_raw.dim() == 2 else dt_raw
         dt_bias_for_kernel = rearrange(layer.dt_bias, "h -> h p", p=headdim) if headdim > 1 else layer.dt_bias
@@ -468,12 +463,10 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
         )
         y_flat = rearrange(y, "b h p -> b (h p)")
     else:
-        # Manual SSM recurrence (matches Rust CPU path)
         heads_per_group = nheads // ngroups
-        dA = (dt.unsqueeze(-1) * A.view(1, nheads, 1)).exp()  # (B, nheads, 1)
+        dA = (dt.unsqueeze(-1) * A.view(1, nheads, 1)).exp()
         x_heads = x_ssm.float().view(batch, nheads, headdim)
 
-        # Expand B, C from groups to heads
         if ngroups == 1:
             B_heads = B.float().view(batch, 1, d_state).expand(batch, nheads, d_state)
             C_heads = C.float().view(batch, 1, d_state).expand(batch, nheads, d_state)
@@ -485,17 +478,11 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
                        .expand(batch, ngroups, heads_per_group, d_state)
                        .reshape(batch, nheads, d_state))
 
-        # dBx = dt[:, :, None] * B[:, :, None, :] * x[:, :, :, None]
-        dB = dt.unsqueeze(-1) * B_heads  # (B, nheads, d_state)
-        dBx = x_heads.unsqueeze(-1) * dB.unsqueeze(2)  # (B, nheads, headdim, d_state)
-
-        # Update state
+        dB = dt.unsqueeze(-1) * B_heads
+        dBx = x_heads.unsqueeze(-1) * dB.unsqueeze(2)
         ssm_state.copy_(ssm_state * dA.unsqueeze(2) + dBx)
+        y = (ssm_state.to(dtype) * C_heads.unsqueeze(2)).sum(-1)
 
-        # Output
-        y = (ssm_state.to(dtype) * C_heads.unsqueeze(2)).sum(-1)  # (B, nheads, headdim)
-
-        # D skip connection
         if layer.D_has_hdim:
             D_expanded = layer.D.view(1, nheads, headdim)
         else:
@@ -503,7 +490,6 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
         y = y + x_heads.to(dtype) * D_expanded.to(dtype)
         y_flat = y.view(batch, d_ssm)
 
-    # Gating / norm
     if layer.rmsnorm:
         z_for_gate = z.view(batch, d_ssm)
         y_out = layer.norm(y_flat.unsqueeze(1), z_for_gate.unsqueeze(1)).squeeze(1)
