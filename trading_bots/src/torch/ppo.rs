@@ -7,9 +7,9 @@ use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{expln, TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
+use crate::torch::model::{TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
 
-const LEARNING_RATE: f64 = 3e-4;
+const LEARNING_RATE: f64 = 1e-3;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
@@ -210,7 +210,7 @@ pub async fn train(weights_path: Option<&str>) {
         Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
     // Store sde_std used during rollout for consistent log_prob computation
     let mut rollout_sde_std = Tensor::zeros(&[SDE_LATENT_DIM, TICKERS_COUNT], (Kind::Float, device));
-    let mut rollout_cash_log_std = Tensor::zeros(&[1], (Kind::Float, device));
+    let mut rollout_cash_std = Tensor::zeros(&[1], (Kind::Float, device));
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
@@ -235,7 +235,7 @@ pub async fn train(weights_path: Option<&str>) {
         // Capture sde_std at start of rollout for consistent log_prob during training
         tch::no_grad(|| {
             rollout_sde_std.copy_(&trading_model.sde_std());
-            rollout_cash_log_std.copy_(&trading_model.cash_log_std());
+            rollout_cash_std.copy_(&trading_model.cash_std());
         });
 
         for step in 0..rollout_steps as usize {
@@ -259,9 +259,8 @@ pub async fn train(weights_path: Option<&str>) {
                 let action_mean_ticker = action_mean.narrow(1, 0, TICKERS_COUNT);
                 let action_mean_cash = action_mean.narrow(1, TICKERS_COUNT, 1);
                 let u_ticker = &action_mean_ticker + &noise_ticker;
-                // Cash: state-independent exploration
-                let cash_std = rollout_cash_log_std.exp();
-                let cash_noise = Tensor::randn([NPROCS, 1], stats_kind) * &cash_std;
+                // Cash: state-independent exploration (rollout_cash_std is already std, not log_std)
+                let cash_noise = Tensor::randn([NPROCS, 1], stats_kind) * &rollout_cash_std;
                 let u_cash = &action_mean_cash + &cash_noise;
                 let u = Tensor::cat(&[u_ticker, u_cash], 1);
                 let actions = u.softmax(-1, Kind::Float);
@@ -271,12 +270,12 @@ pub async fn train(weights_path: Option<&str>) {
                 let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
                     .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
                 let ticker_std = (variance + 1e-6).sqrt();
-                let ticker_log_std = ticker_std.log();
-                // Combine: [batch, tickers] + [batch, 1] -> [batch, tickers+1]
-                let action_log_std = Tensor::cat(
-                    &[ticker_log_std, rollout_cash_log_std.expand(&[NPROCS, 1], false)],
+                // Combine stds then compute log for Gaussian formula
+                let action_std = Tensor::cat(
+                    &[ticker_std, rollout_cash_std.expand(&[NPROCS, 1], false)],
                     1,
                 );
+                let action_log_std = action_std.log();
 
                 let u_normalized = (&u - &action_mean) / action_log_std.exp();
                 let u_squared = u_normalized.pow_tensor_scalar(2);
@@ -479,16 +478,12 @@ pub async fn train(weights_path: Option<&str>) {
                 let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
                     .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
                 let ticker_std = (variance + 1e-6).sqrt();
-                let ticker_log_std = ticker_std.log();
-                // Combine ticker gSDE + cash constant std (fresh call for gradient flow)
-                let cash_log_std = trading_model.cash_log_std();
-                let action_log_stds = Tensor::cat(
-                    &[ticker_log_std, cash_log_std.expand(&[chunk_sample_count, 1], false)],
+                // Combine ticker gSDE + cash std
+                let cash_std = trading_model.cash_std();
+                let action_std = Tensor::cat(
+                    &[ticker_std, cash_std.expand(&[chunk_sample_count, 1], false)],
                     1,
                 );
-
-                // Log prob: Gaussian on all actions (tickers gSDE + cash constant)
-                let action_std = action_log_stds.exp();
                 // RPO: sigmoid parameterization for smooth gradients
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
@@ -508,8 +503,8 @@ pub async fn train(weights_path: Option<&str>) {
 
                 let u_normalized = (&u - &action_mean_perturbed) / &action_std;
                 let u_squared = u_normalized.pow_tensor_scalar(2);
-                let two_log_std = &action_log_stds * 2.0;
-                let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
+                let two_log_std = action_std.log() * 2.0;
+                let log_prob_u = (&u_squared + &two_log_std + LOG_2PI).g_mul_scalar(-0.5);
                 let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
                 let log_det = u
                     .log_softmax(-1, Kind::Float)
@@ -520,7 +515,7 @@ pub async fn train(weights_path: Option<&str>) {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
                     let _ = debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_log_stds", &action_log_stds, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
@@ -531,7 +526,7 @@ pub async fn train(weights_path: Option<&str>) {
                         debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
                 }
-                let ratio = expln(&log_ratio);
+                let ratio = log_ratio.exp();
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
 
                 // Single portfolio advantage - no more weighted combination
@@ -560,8 +555,8 @@ pub async fn train(weights_path: Option<&str>) {
                     .mean(Kind::Float);
                 let value_loss = ce_loss - CRITIC_ENTROPY_COEF * critic_entropy;
 
-                // Entropy of Gaussian (per action dimension)
-                let entropy_components: Tensor = 1.0 + LOG_2PI + 2.0 * &action_log_stds;
+                // Entropy of Gaussian (per action dimension): 0.5 * (1 + log(2π) + 2*log(σ))
+                let entropy_components: Tensor = 1.0 + LOG_2PI + &two_log_std;
                 let dist_entropy = entropy_components.g_mul_scalar(0.5).mean(Kind::Float);
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
@@ -570,7 +565,7 @@ pub async fn train(weights_path: Option<&str>) {
 
                 // RPO alpha loss: target induced KL (uniform noise in logit space)
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let action_std_detached = action_log_stds.detach().exp();
+                    let action_std_detached = action_std.detach();
                     let var = action_std_detached.pow_tensor_scalar(2);
                     let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
                     let d = TICKERS_COUNT as f64;

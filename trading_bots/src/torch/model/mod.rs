@@ -294,13 +294,25 @@ impl TradingModel {
     }
 
     /// Get exploration std for gSDE: [SDE_LATENT_DIM, TICKERS_COUNT]
+    /// Uses expln (SB3-style) to ensure positive std with bounded growth rate
     pub fn sde_std(&self) -> Tensor {
-        (&self.log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5).exp()
+        let log_std = &self.log_std_param + LOG_STD_INIT;
+        Self::expln(&log_std)
     }
 
-    /// Get cash exploration log_std (state-independent): scalar
-    pub fn cash_log_std(&self) -> Tensor {
-        (&self.cash_log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5)
+    /// Get cash exploration std (state-independent): scalar
+    /// Uses expln for consistency with ticker SDE
+    pub fn cash_std(&self) -> Tensor {
+        let log_std = &self.cash_log_std_param + LOG_STD_INIT;
+        Self::expln(&log_std)
+    }
+
+    /// expln: exp(x) for x <= 0, log(1+x)+1 for x > 0
+    /// Ensures positive output with at most logarithmic growth for large positive inputs
+    fn expln(x: &Tensor) -> Tensor {
+        let below = x.exp() * x.le(0.0);
+        let above = (x.clamp_min(1e-6).log1p() + 1.0) * x.gt(0.0);
+        below + above
     }
 
     pub fn new(p: &nn::Path) -> Self {
