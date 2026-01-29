@@ -624,12 +624,10 @@ impl TradingModel {
         let batch = deltas.size()[0];
         let max_patch_size = self.patch_embed_weight.size()[1] - PATCH_SCALAR_FEATS;
 
-        // Phase 1: per-config enrichment into a uniform-width tensor
-        // Each config produces [batch, n_patches, patch_size + 3], zero-padded to max_input_dim
+        // Phase 1: per-config enrichment, zero-padded to max_input_dim, then cat
         let max_input_dim = max_patch_size + PATCH_SCALAR_FEATS;
-        let enriched = Tensor::zeros(&[batch, SEQ_LEN, max_input_dim], (Kind::Float, device));
+        let mut enriched_parts = Vec::with_capacity(PATCH_CONFIGS.len());
         let mut delta_offset = 0i64;
-        let mut token_offset = 0i64;
         for &(days, patch_size) in &PATCH_CONFIGS {
             let n_patches = days / patch_size;
             let patches = deltas
@@ -637,20 +635,25 @@ impl TradingModel {
                 .view([batch, n_patches, patch_size])
                 .to_kind(Kind::Float);
             let mean = patches.mean_dim([2].as_slice(), true, Kind::Float);
-            let std = patches.std_dim(2, false, true);
+            let var = (&patches - &mean).pow_tensor_scalar(2.0)
+                .mean_dim([2].as_slice(), true, Kind::Float);
+            let std = (var + 1e-5).sqrt();
             let first = patches.narrow(2, 0, 1);
             let last = patches.narrow(2, patch_size - 1, 1);
             let slope = &last - &first;
-            let input_dim = patch_size + PATCH_SCALAR_FEATS;
-            let dst = enriched.narrow(1, token_offset, n_patches).narrow(2, 0, input_dim);
-            // Write [values, mean, std, slope] directly into the padded slot
-            dst.narrow(2, 0, patch_size).copy_(&patches);
-            dst.narrow(2, patch_size, 1).copy_(&mean);
-            dst.narrow(2, patch_size + 1, 1).copy_(&std);
-            dst.narrow(2, patch_size + 2, 1).copy_(&slope);
+            let enriched = Tensor::cat(&[&patches, &mean, &std, &slope], 2);
+            // Zero-pad to max_input_dim so all configs share the einsum
+            let pad_cols = max_input_dim - (patch_size + PATCH_SCALAR_FEATS);
+            let padded = if pad_cols > 0 {
+                let pad = Tensor::zeros(&[batch, n_patches, pad_cols], (Kind::Float, device));
+                Tensor::cat(&[&enriched, &pad], 2)
+            } else {
+                enriched
+            };
+            enriched_parts.push(padded);
             delta_offset += days;
-            token_offset += n_patches;
         }
+        let enriched = Tensor::cat(&enriched_parts.iter().collect::<Vec<_>>(), 1);
 
         // Phase 2: fused projection — single einsum over all 256 tokens
         let config_ids = self.patch_config_ids.to_device(device);
@@ -674,7 +677,9 @@ impl TradingModel {
         let patches_f = patches.to_kind(Kind::Float);
         let patch_len = patches_f.size()[2];
         let mean = patches_f.mean_dim([2].as_slice(), true, Kind::Float);
-        let std = patches_f.std_dim(2, false, true);
+        let var = (&patches_f - &mean).pow_tensor_scalar(2.0)
+            .mean_dim([2].as_slice(), true, Kind::Float);
+        let std = (var + 1e-5).sqrt();
         let first = patches_f.narrow(2, 0, 1);
         let last = patches_f.narrow(2, patch_len - 1, 1);
         let slope = &last - &first;

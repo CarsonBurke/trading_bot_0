@@ -178,24 +178,26 @@ impl TradingModel {
         let pooled_flat = pooled_enriched.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]);
         let cash_policy_flat = cash_summary.view([batch_size, MODEL_DIM]);
         let policy_input = Tensor::cat(&[pooled_flat, cash_policy_flat], 0);
-        let policy_hidden = self
+        let policy_projected = self
             .policy_ln
             .forward(&policy_input)
             .apply(&self.head_proj);
-        let policy_hidden = policy_hidden.silu();
+
+        // Actor path: SiLU activation (unbounded, good for regression)
+        let policy_hidden = policy_projected.silu();
         let ticker_head_base = policy_hidden
             .narrow(0, 0, batch_size * TICKERS_COUNT)
             .reshape([batch_size, TICKERS_COUNT, super::HEAD_HIDDEN]);
         let cash_head_base = policy_hidden.narrow(0, batch_size * TICKERS_COUNT, batch_size);
-
-        // Action mean (logits before softmax)
         let action_mean_ticker = ticker_head_base.apply(&self.actor_out).squeeze_dim(-1);
         let cash_logit = cash_head_base.apply(&self.actor_out).squeeze_dim(-1);
         let action_mean = Tensor::cat(&[action_mean_ticker, cash_logit.unsqueeze(1)], 1);
 
-        // gSDE: SB3's policy MLP uses Tanh activation, so latent_sde is bounded [-1,1].
-        // Our policy uses SiLU (unbounded), so apply tanh to bound latent² for variance.
-        let sde_latent = ticker_head_base.tanh();
+        // SDE path: tanh on pre-activation output (Linear → Tanh, matching SB3's MLP)
+        let sde_latent = policy_projected
+            .narrow(0, 0, batch_size * TICKERS_COUNT)
+            .reshape([batch_size, TICKERS_COUNT, super::HEAD_HIDDEN])
+            .tanh();
 
         let debug_metrics = None;
 
