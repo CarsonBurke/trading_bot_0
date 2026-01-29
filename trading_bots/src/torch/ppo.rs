@@ -9,7 +9,7 @@ use crate::torch::constants::{
 use crate::torch::env::VecEnv;
 use crate::torch::model::{TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
 
-const LEARNING_RATE: f64 = 1e-3;
+const LEARNING_RATE: f64 = 4e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
@@ -259,8 +259,8 @@ pub async fn train(weights_path: Option<&str>) {
                 let action_mean_ticker = action_mean.narrow(1, 0, TICKERS_COUNT);
                 let action_mean_cash = action_mean.narrow(1, TICKERS_COUNT, 1);
                 let u_ticker = &action_mean_ticker + &noise_ticker;
-                // Cash: state-independent exploration (rollout_cash_std is already std, not log_std)
-                let cash_noise = Tensor::randn([NPROCS, 1], stats_kind) * &rollout_cash_std;
+                // Cash: state-independent exploration, scaled to match gSDE magnitude
+                let cash_noise = Tensor::randn([NPROCS, 1], stats_kind) * &rollout_cash_std * (SDE_LATENT_DIM as f64).sqrt();
                 let u_cash = &action_mean_cash + &cash_noise;
                 let u = Tensor::cat(&[u_ticker, u_cash], 1);
                 let actions = u.softmax(-1, Kind::Float);
@@ -270,9 +270,10 @@ pub async fn train(weights_path: Option<&str>) {
                 let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
                     .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
                 let ticker_std = (variance + 1e-6).sqrt();
-                // Combine stds then compute log for Gaussian formula
+                // Scale cash std to match gSDE magnitude (sum over SDE_LATENT_DIM)
+                let cash_std_scaled = &rollout_cash_std * (SDE_LATENT_DIM as f64).sqrt();
                 let action_std = Tensor::cat(
-                    &[ticker_std, rollout_cash_std.expand(&[NPROCS, 1], false)],
+                    &[ticker_std, cash_std_scaled.expand(&[NPROCS, 1], false)],
                     1,
                 );
                 let action_log_std = action_std.log();
@@ -478,8 +479,8 @@ pub async fn train(weights_path: Option<&str>) {
                 let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
                     .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
                 let ticker_std = (variance + 1e-6).sqrt();
-                // Combine ticker gSDE + cash std
-                let cash_std = trading_model.cash_std();
+                // Scale cash std to match gSDE magnitude (sum over SDE_LATENT_DIM)
+                let cash_std = trading_model.cash_std() * (SDE_LATENT_DIM as f64).sqrt();
                 let action_std = Tensor::cat(
                     &[ticker_std, cash_std.expand(&[chunk_sample_count, 1], false)],
                     1,
