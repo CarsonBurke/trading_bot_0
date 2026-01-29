@@ -61,7 +61,7 @@ pub async fn train_networks_genetic() {
         let mut neural_net_ids = Vec::new();
         let mut handles = Vec::new();
 
-        let mut replays: Vec<Replay> = Vec::new();
+        let _replays: Vec<Replay> = Vec::new();
 
         let tickers_set = generate_tickers_set(&mut rng);
 

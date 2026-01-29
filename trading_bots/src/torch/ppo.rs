@@ -2,9 +2,8 @@ use std::env;
 use std::time::Instant;
 use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 
-use crate::constants::TICKERS;
 use crate::torch::constants::{
-    ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
+    PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
 use crate::torch::model::{TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
@@ -201,12 +200,12 @@ pub async fn train(weights_path: Option<&str>) {
     let mut s_price_deltas = GpuRollingBuffer::new(memory_size, pd_dim, Kind::Float, device);
     let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, Kind::Float, device);
     let mut s_seq_idx = GpuRollingBuffer::new(memory_size, seq_idx_dim, Kind::Int64, device);
-    let mut s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
-    let mut s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let mut s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level reward
-    let mut s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let mut s_values = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level value
-    let mut s_action_weights =
+    let s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
+    let s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
+    let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level reward
+    let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
+    let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level value
+    let s_action_weights =
         Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
     // Store sde_std used during rollout for consistent log_prob computation
     let mut rollout_sde_std = Tensor::zeros(&[SDE_LATENT_DIM, TICKERS_COUNT], (Kind::Float, device));
@@ -454,7 +453,7 @@ pub async fn train(weights_path: Option<&str>) {
                 };
                 let old_log_probs_mb =
                     s_old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
-                let weight_mb =
+                let _weight_mb =
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();

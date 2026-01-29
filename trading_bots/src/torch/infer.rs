@@ -28,7 +28,7 @@ pub fn sample_actions(
 ) -> Tensor {
     let action_mean = action_mean.to_kind(Kind::Float);
     let sde_latent = sde_latent.to_kind(Kind::Float);
-    let batch = action_mean.size()[0];
+    let _batch = action_mean.size()[0];
     let num_tickers = TICKERS_COUNT as i64;
 
     let u = if deterministic {
@@ -59,8 +59,8 @@ pub fn sample_actions(
 pub fn run_inference<P: AsRef<Path>>(
     weight_path: P,
     num_episodes: usize,
-    deterministic: bool,
-    temperature: f64,
+    _deterministic: bool,
+    _temperature: f64,
     tickers: Option<Vec<String>>,
     random_start: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {

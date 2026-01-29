@@ -2,7 +2,6 @@ use std::env;
 use tch::Tensor;
 
 use super::{DebugMetrics, ModelOutput, StreamState, TradingModel};
-use crate::torch::mamba_fused;
 
 impl TradingModel {
     pub fn forward(

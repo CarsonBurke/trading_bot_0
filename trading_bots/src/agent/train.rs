@@ -1,23 +1,21 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     fs,
     sync::Arc,
 };
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 use uuid::Uuid;
 
 use crate::{
     agent::Agent,
-    charts::assets_chart,
     constants::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
-        files::{TRAINING_PATH, WEIGHTS_PATH}, TICKERS,
+        files::{TRAINING_PATH, WEIGHTS_PATH},
     },
     data::historical::get_historical_data,
     strategies,
     types::{Account, MakeCharts, MappedHistorical},
-    utils::{convert_historical, get_rsi_values},
 };
 
 use super::create::create_agents;

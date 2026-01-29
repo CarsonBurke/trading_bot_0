@@ -368,10 +368,10 @@ impl Mamba2 {
     ) -> Tensor {
         let call_id = MAMBA_CALL_ID.fetch_add(1, Ordering::Relaxed);
         let (batch, seqlen, _) = u.size3().unwrap();
-        let nheads = self.nheads;
-        let headdim = self.config.headdim;
-        let d_state = self.config.d_state;
-        let ngroups = self.config.ngroups;
+        let _nheads = self.nheads;
+        let _headdim = self.config.headdim;
+        let _d_state = self.config.d_state;
+        let _ngroups = self.config.ngroups;
 
         let debug_mem = *DEBUG_MEM;
         if debug_mem {
@@ -704,7 +704,7 @@ impl Mamba2 {
         c: &Tensor,  // [batch, seq, ngroups, d_state]
         initial_state: &Tensor, // [batch, nheads, headdim, d_state]
     ) -> (Tensor, Tensor) {
-        let (batch, seqlen, nheads, headdim) = x.size4().unwrap();
+        let (batch, seqlen, nheads, _headdim) = x.size4().unwrap();
         let d_state = self.config.d_state;
         let ngroups = self.config.ngroups;
         let chunk_size = self.config.chunk_size.min(seqlen);
@@ -810,7 +810,7 @@ impl Mamba2 {
         &self,
         zxbcdt: &Tensor,
         batch: i64,
-        seqlen: i64,
+        _seqlen: i64,
         dt_scale: Option<&Tensor>,
         seq_idx: Option<&Tensor>,
         call_id: usize,
@@ -1024,10 +1024,10 @@ impl Mamba2 {
     }
 
     fn forward_with_state_from_zxbcdt(&self, zxbcdt: &Tensor, state: &mut Mamba2State, dt_scale: Option<&Tensor>) -> Tensor {
-        let nheads = self.nheads;
+        let _nheads = self.nheads;
         let headdim = self.config.headdim;
         let ngroups = self.config.ngroups;
-        let d_ssm = self.d_ssm;
+        let _d_ssm = self.d_ssm;
         let device = zxbcdt.device();
         let kind = zxbcdt.kind();
         let seqlen = zxbcdt.size()[1];

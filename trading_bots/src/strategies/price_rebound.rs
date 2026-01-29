@@ -1,20 +1,13 @@
-use core::{f64, panic};
+use core::f64;
 
 use hashbrown::HashMap;
-use ibapi::{
-    client,
-    market_data::historical::{self, HistoricalData},
-    Client,
-};
-use ndarray::aview1;
-use time::convert::Week;
 
 use crate::{
     agent::{self, Agent, Weight},
-    charts::{assets_chart, buy_sell_chart, candle_chart, simple_chart},
-    constants::{self, files::TRAINING_PATH, rsi, MAX_VALUE_PER_TICKER, TICKERS},
+    charts::{assets_chart, buy_sell_chart, simple_chart},
+    constants::{files::TRAINING_PATH, rsi, TICKERS},
     types::{Account, MakeCharts, MappedHistorical, Position},
-    utils::{convert_historical, create_folder_if_not_exists, ema, get_price_deltas, get_rsi_values, is_min_transaction, percent_diff, percent_diff_abs, round_to_stock, round_to_stock_fractional},
+    utils::{convert_historical, create_folder_if_not_exists, ema, get_rsi_values, is_min_transaction, percent_diff, percent_diff_abs, round_to_stock_fractional},
 };
 
 /// Returns: total assets
@@ -27,7 +20,7 @@ pub fn basic(
     let indexes = mapped_data[0].len();
     let mut positions_by_ticker: Vec<Vec<f64>> = Vec::new();
 
-    for (ticker, _) in mapped_data.iter().enumerate() {
+    for (_ticker, _) in mapped_data.iter().enumerate() {
         positions_by_ticker.push(Vec::new());
     }
 
@@ -347,9 +340,9 @@ pub fn basic(
 }
 
 pub fn can_try_sell(
-    ticker: usize,
-    decider_rsi: f64,
-    highest_rsis: &mut HashMap<usize, f64>,
+    _ticker: usize,
+    _decider_rsi: f64,
+    _highest_rsis: &mut HashMap<usize, f64>,
     agent: &Agent,
     price: f64,
     local_maximum: f64,
@@ -389,8 +382,8 @@ pub fn can_try_sell(
 
 pub fn can_try_buy(
     ticker: usize,
-    decider_rsi: f64,
-    lowest_rsis: &mut HashMap<usize, f64>,
+    _decider_rsi: f64,
+    _lowest_rsis: &mut HashMap<usize, f64>,
     agent: &Agent,
     price: f64,
     local_minimum: f64,
@@ -462,7 +455,7 @@ pub fn try_sell(
     index: usize,
     price: f64,
     amount_rsi: f64,
-    decider_rsi: f64,
+    _decider_rsi: f64,
     assets: f64,
     agent: &Agent,
     account: &mut Account,
@@ -532,11 +525,11 @@ pub fn try_sell(
 pub fn get_sell_price_quantity(
     position: &Position,
     price: f64,
-    rsi: f64,
+    _rsi: f64,
     assets: f64,
-    cash: f64,
+    _cash: f64,
     agent: &Agent,
-    price_ema: f64,
+    _price_ema: f64,
     sell_local_minimum: f64,
 ) -> Option<(f64, f64)> {
     // let available_sell = (position.quantity as f64) * price;
@@ -590,11 +583,11 @@ pub fn get_sell_price_quantity(
 pub fn get_buy_price_quantity(
     position: &Position,
     price: f64,
-    rsi: f64,
+    _rsi: f64,
     assets: f64,
     cash: f64,
     agent: &Agent,
-    price_ema: f64,
+    _price_ema: f64,
     local_maximum: f64,
 ) -> Option<(f64, f64)> {
     // let available_cash = cash.min(assets /* - position.value_with_price(price) */);

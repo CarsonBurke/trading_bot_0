@@ -1,15 +1,6 @@
-use std::{collections::HashMap, fs};
+use std::fs;
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
-use ibapi::market_data::{historical::{self, Bar}, realtime};
-use plotters::{
-    coord::types::RangedCoordf32,
-    data,
-    prelude::{BitMapBackend, CandleStick, Circle, EmptyElement, IntoDrawingArea, Text},
-    series::{AreaSeries, LineSeries, PointSeries},
-    style::{Color, BLUE, GREEN, RED, WHITE, YELLOW},
-};
-use time::OffsetDateTime;
+use ibapi::market_data::historical::{self, Bar};
 
 use crate::types::{Data, MappedHistorical};
 
@@ -94,7 +85,7 @@ pub fn ema(data: &[f64], alpha: f64) -> Data {
     let mut averages = Vec::new();
     let mut previous = data[0];
 
-    for (index, value) in data.iter().enumerate() {
+    for (_index, value) in data.iter().enumerate() {
         let avg = *value * alpha + previous * (1. - alpha);
         averages.push(avg);
 
@@ -107,7 +98,7 @@ pub fn ema_diff_percent(data: &[f64], alpha: f64) -> Data {
     let mut averages = Vec::new();
     let mut previous = data[0];
 
-    for (index, value) in data.iter().enumerate() {
+    for (_index, value) in data.iter().enumerate() {
         let avg = *value * alpha + previous * (1. - alpha);
         let diff_percent = (value - avg) / avg;
         averages.push(diff_percent);
@@ -241,7 +232,7 @@ pub fn round_to_stock_fractional(price: f64, max: f64) -> (f64, f64) {
     (max, quantity)
 }
 
-pub fn estimate_stock_value(financials: String) {
+pub fn estimate_stock_value(_financials: String) {
     // based on growth, with a weighted preference (ema) for more recent data
     // quarterly for the last 3 years?
     // total revenue is all that matters? Or also care about cost of revenue and marginal?

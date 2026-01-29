@@ -2,17 +2,15 @@ use core::f64;
 
 use colored::Colorize;
 use hashbrown::HashMap;
-use rand::seq::index::sample;
 use rust_neural_network::neural_network::{NeuralNetwork};
 
 use crate::{
-    charts::{assets_chart, buy_sell_chart, simple_chart, want_chart},
+    charts::{assets_chart, buy_sell_chart, want_chart},
     constants::{
-        self, agent::STARTING_CASH, files::TRAINING_PATH, neural_net::{BUY_INDEX, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, SELL_INDEX, TICKER_SETS}, TICKERS
+        self, agent::STARTING_CASH, files::TRAINING_PATH, neural_net::{INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
     },
-    neural_net::create::Indicators,
     types::{Account, Data, MakeCharts, MappedHistorical, Position},
-    utils::{convert_historical, create_folder_if_not_exists, ema, find_highest, get_rsi_values},
+    utils::{convert_historical, create_folder_if_not_exists},
 };
 
 pub fn basic_nn(
@@ -94,7 +92,7 @@ pub fn basic_nn(
 
                 let position = &mut account.positions[ticker_index];
 
-                let diffs = &mapped_diffs[ticker_index];
+                let _diffs = &mapped_diffs[ticker_index];
 
                 // Assign inputs
 

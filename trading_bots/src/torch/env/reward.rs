@@ -10,8 +10,8 @@ impl Env {
         &self,
         absolute_step: usize,
         pre_total_assets: f64,
-        pre_cash: f64,
-        pre_positions: &[Position],
+        _pre_cash: f64,
+        _pre_positions: &[Position],
     ) -> (f64, Vec<f64>, f64) {
         let n_tickers = self.tickers.len();
         if self.step + 1 >= self.max_step || pre_total_assets <= 0.0 {
@@ -239,7 +239,7 @@ impl Env {
 
         benchmark_log_return *= inv_n_tickers;
         let cash_weight = (self.account.cash * inv_total_assets).clamp(0.0, 1.0);
-        let cash_penalty = -cash_weight * benchmark_log_return * REWARD_SCALE;
+        let _cash_penalty = -cash_weight * benchmark_log_return * REWARD_SCALE;
 
         let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
             vec![0.0; n_tickers]

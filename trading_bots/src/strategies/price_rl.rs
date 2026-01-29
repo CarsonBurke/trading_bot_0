@@ -1,16 +1,16 @@
 use crate::{data::historical::get_historical_data, types::{Data, MakeCharts, MappedHistorical}};
 
 pub fn price_rl(
-    ticker_sets: &[Vec<usize>],
-    mapped_data: &MappedHistorical,
-    mapped_diffs: &[Data],
+    _ticker_sets: &[Vec<usize>],
+    _mapped_data: &MappedHistorical,
+    _mapped_diffs: &[Data],
     // mapped_indicators: &Vec<Indicators>,
-    inputs_count: usize,
-    make_charts: Option<MakeCharts>,
+    _inputs_count: usize,
+    _make_charts: Option<MakeCharts>,
 ) {
-    let time = std::time::Instant::now();
+    let _time = std::time::Instant::now();
 
-    let mapped_historical = get_historical_data(None);
+    let _mapped_historical = get_historical_data(None);
     
     
 }

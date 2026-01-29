@@ -382,7 +382,7 @@ fn price_statistics_chart(
     // Calculate statistics
     let min_price = prices.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_price = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mean_price = prices.iter().sum::<f64>() / prices.len() as f64;
+    let _mean_price = prices.iter().sum::<f64>() / prices.len() as f64;
 
     let returns: Vec<f64> = prices
         .windows(2)

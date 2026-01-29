@@ -14,7 +14,6 @@ use crate::torch::constants::{
 use crate::torch::ppo::VALUE_LOG_CLIP;
 use crate::torch::ssm_ref::{stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMambaRef};
 
-pub use shared::constants::GLOBAL_MACRO_OBS;
 
 use rmsnorm::RMSNorm;
 

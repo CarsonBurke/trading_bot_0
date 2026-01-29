@@ -255,7 +255,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     symbols: Vec<String>,
     update_interval_secs: u64,
     max_steps: usize,
-    temperature: f64,
+    _temperature: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== IBKR Paper Trading ===");
     println!("Weight path: {:?}", weight_path.as_ref());
@@ -425,8 +425,8 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 }
 
 fn execute_trades(
-    client: &Arc<Client>,
-    symbols: &[String],
+    _client: &Arc<Client>,
+    _symbols: &[String],
     actions: &[f64],
     current_prices: &[f64],
     account: &Account,
@@ -436,8 +436,8 @@ fn execute_trades(
             continue;
         }
 
-        let current_price = current_prices[ticker_idx];
-        let position = &account.positions[ticker_idx];
+        let _current_price = current_prices[ticker_idx];
+        let _position = &account.positions[ticker_idx];
         
         // Needs to implement new trade fn logic from step.rs
 

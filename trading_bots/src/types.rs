@@ -1,4 +1,3 @@
-use hashbrown::HashMap;
 use ibapi::market_data::historical;
 
 /// A list of prices, where the last index is the most recent
