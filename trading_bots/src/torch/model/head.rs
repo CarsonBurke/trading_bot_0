@@ -129,22 +129,22 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
         pooled = pooled + &mlp * &alpha_mlp;
 
-        // Combine with per-ticker static and apply projection
-        let combined = Tensor::cat(&[pooled, per_ticker_static.shallow_clone()], 2)
+        // Residual static enrichment: SSM signal preserved through skip connection
+        let static_ctx = Tensor::cat(&[pooled.shallow_clone(), per_ticker_static.shallow_clone()], 2)
             .reshape([
                 batch_size * TICKERS_COUNT,
                 MODEL_DIM + PER_TICKER_STATIC_OBS as i64,
             ])
             .apply(&self.static_proj);
-        let combined = self
+        let static_ctx = self
             .ln_static_proj
-            .forward(&combined)
+            .forward(&static_ctx)
             .silu()
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
         let global_ctx = global_static
             .apply(&self.global_to_ticker)
             .unsqueeze(1);
-        let pooled_enriched = combined + global_ctx;
+        let pooled_enriched = pooled + static_ctx + global_ctx;
 
         // Cash pathway for policy (still needed for actor)
         let cash_summary = pooled_enriched

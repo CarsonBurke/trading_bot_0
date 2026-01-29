@@ -287,15 +287,13 @@ impl TradingModel {
     /// Get exploration std for gSDE: [HEAD_HIDDEN, TICKERS_COUNT]
     /// Uses expln (SB3-style) to ensure positive std with bounded growth rate
     pub fn sde_std(&self) -> Tensor {
-        let log_std = &self.log_std_param + LOG_STD_INIT;
-        Self::expln(&log_std)
+        Self::expln(&self.log_std_param)
     }
 
     /// Get cash exploration std (state-independent): scalar
     /// Uses expln for consistency with ticker SDE
     pub fn cash_std(&self) -> Tensor {
-        let log_std = &self.cash_log_std_param + LOG_STD_INIT;
-        Self::expln(&log_std)
+        Self::expln(&self.cash_log_std_param)
     }
 
     /// expln: exp(x) for x <= 0, log(1+x)+1 for x > 0
@@ -465,9 +463,9 @@ impl TradingModel {
         let log_std_param = p.var(
             "log_std",
             &[SDE_LATENT_DIM, TICKERS_COUNT],
-            Init::Const(0.0),
+            Init::Const(LOG_STD_INIT),
         );
-        let cash_log_std_param = p.var("cash_log_std", &[1], Init::Const(0.0));
+        let cash_log_std_param = p.var("cash_log_std", &[1], Init::Const(LOG_STD_INIT));
         let value_centers = Tensor::linspace(
             -VALUE_LOG_CLIP,
             VALUE_LOG_CLIP,
