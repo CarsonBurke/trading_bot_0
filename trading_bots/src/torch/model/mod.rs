@@ -120,8 +120,6 @@ pub(crate) fn expln(t: &Tensor) -> Tensor {
     let above_threshold = (safe_t.log1p() + 1.0) * &above;
     below_threshold + above_threshold
 }
-const TEMPORAL_STATIC_DIM: i64 = 64;
-
 const PATCH_CONFIGS: [(i64, i64); 7] = [
     (4608, 128),  // 36 tokens - ~16 days
     (2048, 64),   // 32 tokens - ~7.1 days
@@ -256,9 +254,6 @@ pub struct TradingModel {
     static_cross_out: nn::Linear,
     cross_ticker_embed: nn::Linear,
     global_to_ticker: nn::Linear,
-    global_inject_down: nn::Linear,
-    global_inject_up: nn::Linear,
-    global_inject_gate_raw: Tensor,
     head_proj: nn::Linear,
     policy_ln: RMSNorm,
     value_ln: RMSNorm,
@@ -430,19 +425,6 @@ impl TradingModel {
             MODEL_DIM,
             Default::default(),
         );
-        let global_inject_down = nn::linear(
-            p / "global_inject_down",
-            GLOBAL_STATIC_OBS as i64,
-            TEMPORAL_STATIC_DIM,
-            Default::default(),
-        );
-        let global_inject_up = nn::linear(
-            p / "global_inject_up",
-            TEMPORAL_STATIC_DIM,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let global_inject_gate_raw = p.var("global_inject_gate_raw", &[1], Init::Const(-2.0));
         let head_proj = nn::linear(
             p / "head_proj",
             MODEL_DIM,
@@ -517,9 +499,6 @@ impl TradingModel {
             static_cross_out,
             cross_ticker_embed,
             global_to_ticker,
-            global_inject_down,
-            global_inject_up,
-            global_inject_gate_raw,
             head_proj,
             policy_ln,
             value_ln,

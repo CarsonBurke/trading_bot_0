@@ -78,13 +78,8 @@ impl TradingModel {
             .apply(&self.static_cross_out)
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
 
-        // Add exo context and global injection to pooled tokens
+        // Add exo context to pooled tokens
         let mut pooled = &last_tokens + exo_ctx; // [batch, tickers, dim]
-        let global_inject = global_static
-            .apply(&self.global_inject_down)
-            .apply(&self.global_inject_up);
-        let global_inject = global_inject * self.global_inject_gate_raw.sigmoid();
-        pooled = pooled + global_inject.unsqueeze(1);
 
         // InterTickerBlock on pooled tokens: [batch, tickers, dim]
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
