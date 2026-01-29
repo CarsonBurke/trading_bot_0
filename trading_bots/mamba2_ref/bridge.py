@@ -82,15 +82,44 @@ def set_train(handle, mode):
 
 
 def _ensure_layout_cache(layer):
-    """Cache layout constants that are fixed for the lifetime of the layer."""
+    """Cache layout constants and rearranged weights that are fixed for the lifetime of the layer."""
     if hasattr(layer, '_layout_cache'):
         return layer._layout_cache
 
     cache = {}
     cache['d_mlp'] = (layer.in_proj.weight.shape[0] - 2 * layer.d_ssm
                       - 2 * layer.ngroups * layer.d_state - layer.nheads) // 2
+
+    # Pre-rearrange conv1d weight (view, not copy)
+    cache['conv1d_weight_2d'] = rearrange(layer.conv1d.weight, "d 1 w -> d w")
+
+    # D rearrangement for scan path (_forward_inner)
+    headdim = layer.headdim
+    if layer.D_has_hdim:
+        cache['D_scan'] = rearrange(layer.D, "(h p) -> h p", p=headdim)
+    else:
+        cache['D_scan'] = layer.D
+
+    # D for step fallback path (_step_inner)
+    if layer.D_has_hdim:
+        cache['D_step'] = layer.D.view(1, layer.nheads, headdim)
+    else:
+        cache['D_step'] = layer.D.view(1, layer.nheads, 1)
+
+    # Avoid repeated tuple comparison each call
+    cache['has_dt_limit'] = layer.dt_limit != (0.0, float("inf"))
+    if cache['has_dt_limit']:
+        cache['dt_limit'] = layer.dt_limit
+
     layer._layout_cache = cache
     return cache
+
+
+def invalidate_layout_cache(handle):
+    """Invalidate cached layout after parameter changes (e.g. loading new weights)."""
+    layer = _registry.get(handle)
+    if layer is not None and hasattr(layer, '_layout_cache'):
+        del layer._layout_cache
 
 
 def forward_with_pre_norm(handle, x, norm_weight, norm_eps, dt_scale, seq_idx):
@@ -165,6 +194,9 @@ def set_param_tensor(handle, name, new_tensor):
     param = getattr(obj, parts[-1])
     with torch.no_grad():
         param.data = new_tensor
+    # New storage invalidates cached views
+    if hasattr(layer, '_layout_cache'):
+        del layer._layout_cache
 
 
 def init_state(handle, batch_size, device_str, dtype_str):
@@ -234,7 +266,7 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
     else:
         xBC = causal_conv1d_fn(
             xBC.contiguous().transpose(1, 2),
-            rearrange(layer.conv1d.weight, "d 1 w -> d w"),
+            layout['conv1d_weight_2d'],
             bias=layer.conv1d.bias,
             activation=layer.activation,
             seq_idx=seq_idx,
@@ -246,10 +278,7 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
 
     A = -torch.exp(layer.A_log.float())
 
-    dt_limit_kwargs = (
-        {} if layer.dt_limit == (0.0, float("inf"))
-        else dict(dt_limit=layer.dt_limit)
-    )
+    dt_limit_kwargs = {} if not layout['has_dt_limit'] else dict(dt_limit=layout['dt_limit'])
 
     if dt_scale is not None:
         dt_processed = F.softplus(dt + layer.dt_bias) * dt_scale
@@ -262,7 +291,7 @@ def _forward_inner(layer, x, dt_scale, seq_idx, return_final_states=False):
 
     scan_kwargs = dict(
         chunk_size=layer.chunk_size,
-        D=rearrange(layer.D, "(h p) -> h p", p=headdim) if layer.D_has_hdim else layer.D,
+        D=layout['D_scan'],
         z=rearrange(z, "b l (h p) -> b l h p", p=headdim) if not layer.rmsnorm else None,
         dt_bias=scan_dt_bias,
         dt_softplus=scan_dt_softplus,
@@ -325,7 +354,7 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
         dim=-1
     )
 
-    conv1d_weight_2d = rearrange(layer.conv1d.weight, "d 1 w -> d w")
+    conv1d_weight_2d = layout['conv1d_weight_2d']
     if causal_conv1d_update is not None:
         xBC_conv = causal_conv1d_update(
             xBC,
@@ -351,8 +380,8 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
     dt = F.softplus(dt_raw.float() + layer.dt_bias.float())
     if dt_scale is not None:
         dt = dt * dt_scale
-    if layer.dt_limit != (0.0, float("inf")):
-        dt = dt.clamp(layer.dt_limit[0], layer.dt_limit[1])
+    if layout['has_dt_limit']:
+        dt = dt.clamp(layout['dt_limit'][0], layout['dt_limit'][1])
 
     if selective_state_update is not None and dt_scale is None:
         x_reshaped = rearrange(x_ssm, "b (h p) -> b h p", p=headdim)
@@ -394,10 +423,7 @@ def _step_inner(layer, x, conv_state, ssm_state, dt_scale):
         ssm_state.copy_(ssm_state * dA.unsqueeze(2) + dBx)
         y = (ssm_state.to(dtype) * C_heads.unsqueeze(2)).sum(-1)
 
-        if layer.D_has_hdim:
-            D_expanded = layer.D.view(1, nheads, headdim)
-        else:
-            D_expanded = layer.D.view(1, nheads, 1)
+        D_expanded = layout['D_step']
         y = y + x_heads.to(dtype) * D_expanded.to(dtype)
         y_flat = y.view(batch, d_ssm)
 

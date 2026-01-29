@@ -194,14 +194,6 @@ impl Mamba2Ref {
         }
     }
 
-    pub fn handle(&self) -> i64 {
-        self.handle
-    }
-
-    pub fn bridge(&self) -> &PyObject {
-        &self.bridge
-    }
-
     pub fn set_train(&self, mode: bool) {
         Python::with_gil(|py| {
             self.bridge.bind(py)
@@ -389,14 +381,6 @@ impl StatefulMambaRef {
 
     pub fn set_train(&self, mode: bool) {
         self.mamba.set_train(mode);
-    }
-
-    pub fn handle(&self) -> i64 {
-        self.mamba.handle()
-    }
-
-    pub fn bridge(&self) -> &PyObject {
-        self.mamba.bridge()
     }
 }
 
