@@ -442,7 +442,7 @@ impl TradingModel {
             HEAD_HIDDEN,
             1,
             nn::LinearConfig {
-                ws_init: Init::Randn { mean: 0.0, stdev: 0.01 },
+                ws_init: Init::Orthogonal { gain: 0.01 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
