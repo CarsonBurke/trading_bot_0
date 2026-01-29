@@ -193,11 +193,9 @@ impl TradingModel {
         let cash_logit = cash_head_base.apply(&self.actor_out).squeeze_dim(-1);
         let action_mean = Tensor::cat(&[action_mean_ticker, cash_logit.unsqueeze(1)], 1);
 
-        // gSDE: state-dependent exploration via learned latent features
-        // Tanh bounds sde_latent to [-1, 1] to prevent exploration collapse (matches SB3 convention)
-        let sde_input = ticker_head_base.reshape([batch_size * TICKERS_COUNT, super::HEAD_HIDDEN]);
-        let sde_latent = sde_input.apply(&self.sde_fc).tanh();
-        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, super::SDE_LATENT_DIM]);
+        // gSDE: SB3's policy MLP uses Tanh activation, so latent_sde is bounded [-1,1].
+        // Our policy uses SiLU (unbounded), so apply tanh to bound latent² for variance.
+        let sde_latent = ticker_head_base.tanh();
 
         let debug_metrics = None;
 
