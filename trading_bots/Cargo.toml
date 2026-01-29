@@ -19,7 +19,7 @@ candle-nn = {version = "0.9.1" }
 chrono = "0.4.38"
 clap = { version = "4.5.21", features = ["derive"] }
 colored = "2.1.0"
-cpython = "0.7.2"
+pyo3 = { version = "0.24", features = ["auto-initialize", "abi3-py313"] }
 enum-map = { version = "2.7.3", features = ["serde"] }
 hashbrown = "0.15.2"
 ibapi = { version = "2.2.2", default-features = false, features = ["sync"] }
