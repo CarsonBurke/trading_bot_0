@@ -20,6 +20,26 @@ impl TradingModel {
         seq_idx: Option<&Tensor>,
         _train: bool,
     ) -> ModelOutput {
+        self.forward_with_seq_idx_inner(price_deltas, static_features, seq_idx, true)
+    }
+
+    pub fn forward_with_seq_idx_no_values(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        seq_idx: Option<&Tensor>,
+        _train: bool,
+    ) -> ModelOutput {
+        self.forward_with_seq_idx_inner(price_deltas, static_features, seq_idx, false)
+    }
+
+    fn forward_with_seq_idx_inner(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        seq_idx: Option<&Tensor>,
+        compute_values: bool,
+    ) -> ModelOutput {
         let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
 
@@ -51,6 +71,7 @@ impl TradingModel {
             &global_static,
             &per_ticker_static,
             batch_size,
+            compute_values,
             false,
         )
         .0
@@ -105,6 +126,7 @@ impl TradingModel {
             &global_static,
             &per_ticker_static,
             batch_size,
+            true,
             true,
         );
         (

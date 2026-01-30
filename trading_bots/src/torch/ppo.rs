@@ -6,7 +6,10 @@ use crate::torch::constants::{
     PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_STD_REG, PATCH_SEQ_LEN, SDE_EPS, SDE_LATENT_DIM};
+use crate::torch::model::{
+    symlog_tensor, TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_STD_REG, PATCH_SEQ_LEN,
+    SDE_EPS, SDE_LATENT_DIM,
+};
 
 const LEARNING_RATE: f64 = 4e-4;
 pub const NPROCS: i64 = 16;
@@ -19,7 +22,7 @@ const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
-pub const VALUE_LOG_CLIP: f64 = 20.0;
+pub const VALUE_LOG_CLIP: f64 = 10.0;
 const CRITIC_ENTROPY_COEF: f64 = 0.01;
 const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
@@ -93,39 +96,32 @@ impl GpuRollingBuffer {
     }
 }
 
-fn twohot_encode(t: &Tensor, centers: &Tensor) -> Tensor {
+fn twohot_log_prob_loss(targets: &Tensor, log_probs: &Tensor, centers: &Tensor) -> Tensor {
+    let centers = centers.to_kind(log_probs.kind());
     let n_buckets = centers.size()[0];
-    let device = t.device();
-    let flat_t = t.flatten(0, -1);
-    let n_elements = flat_t.size()[0];
+    let min_center = centers.narrow(0, 0, 1).squeeze_dim(0);
+    let step = centers.narrow(0, 1, 1).squeeze_dim(0) - &min_center;
+    let step = step.clamp_min(1e-6);
+    let targets = targets.to_kind(log_probs.kind());
 
-    let centers_expanded = centers.unsqueeze(0);
-    let flat_t_expanded = flat_t.unsqueeze(1);
-
-
-    let low_idx = centers_expanded
-        .le_tensor(&flat_t_expanded)
-        .to_kind(Kind::Int64)
-        .sum_dim_intlist([1i64].as_slice(), false, Kind::Int64)
-        - 1;
-    let low_idx = low_idx.clamp(0, n_buckets - 2);
+    let pos = (&targets - &min_center) / &step;
+    let low_idx = pos
+        .floor()
+        .clamp(0, n_buckets - 2)
+        .to_kind(Kind::Int64);
     let high_idx = &low_idx + 1;
-
-    let low_val = centers.index_select(0, &low_idx);
-    let high_val = centers.index_select(0, &high_idx);
-
-    let dist = (&high_val - &low_val).clamp_min(1e-6);
-    let weight_high = (&flat_t - &low_val) / &dist;
-    let weight_high = weight_high.clamp(0.0, 1.0);
+    let low_val = &min_center + &step * low_idx.to_kind(log_probs.kind());
+    let weight_high = ((&targets - &low_val) / &step).clamp(0.0, 1.0);
     let weight_low = weight_high.g_mul_scalar(-1.0) + 1.0;
 
-    let mut out = Tensor::zeros(&[n_elements, n_buckets], (Kind::Float, device));
-    let _ = out.scatter_(1, &low_idx.unsqueeze(1), &weight_low.unsqueeze(1));
-    let _ = out.scatter_(1, &high_idx.unsqueeze(1), &weight_high.unsqueeze(1));
+    let log_p_low = log_probs
+        .gather(1, &low_idx.unsqueeze(1), false)
+        .squeeze_dim(1);
+    let log_p_high = log_probs
+        .gather(1, &high_idx.unsqueeze(1), false)
+        .squeeze_dim(1);
 
-    let mut shape = t.size();
-    shape.push(n_buckets);
-    out.view(shape.as_slice())
+    -(weight_low * log_p_low + weight_high * log_p_high).mean(Kind::Float)
 }
 
 /// MVN log prob + log|Σ|: returns (log_prob, log_det_sigma) to avoid redundant Cholesky
@@ -441,9 +437,6 @@ pub async fn train(weights_path: Option<&str>) {
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         // Explained variance: EV = 1 - Var(residuals) / Var(targets)
-        let mut total_residual_sq = Tensor::zeros([], (Kind::Float, device));
-        let mut total_target_sum = Tensor::zeros([], (Kind::Float, device));
-        let mut total_target_sq_sum = Tensor::zeros([], (Kind::Float, device));
         let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut total_sample_count = 0i64;
         let mut grad_norm_count = 0i64;
@@ -488,15 +481,14 @@ pub async fn train(weights_path: Option<&str>) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (values, critic_logits, (action_mean, sde_latent)) =
-                    trading_model.forward_with_seq_idx(
+                let (_, critic_logits, (action_mean, sde_latent)) =
+                    trading_model.forward_with_seq_idx_no_values(
                         &pd_chunk,
                         &so_chunk,
                         Some(&seq_idx_chunk),
                         true,
                     );
 
-                let values = values.to_kind(Kind::Float).view([chunk_sample_count]); // portfolio-level
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let sde_latent = sde_latent.to_kind(Kind::Float); // [chunk, SDE_LATENT_DIM]
 
@@ -554,21 +546,22 @@ pub async fn train(weights_path: Option<&str>) {
                         .mean(Kind::Float);
 
                 // Portfolio-level value loss: ret_mb is [chunk_sample_count] (pre-clipped to bucket bounds during GAE)
-                let target_twohot = twohot_encode(&ret_mb, trading_model.value_centers())
-                    .view([chunk_sample_count, -1]);
                 let log_probs = critic_logits
                     .to_kind(Kind::Float)
                     .log_softmax(-1, Kind::Float);
+                let ret_symlog = symlog_tensor(&ret_mb);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("target_twohot", &target_twohot, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("ret_symlog", &ret_symlog, _epoch, chunk_i);
                     let _ = debug_tensor_stats("critic_logits", &critic_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_probs", &log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
-                let ce_loss = -(target_twohot * &log_probs)
-                    .sum_dim_intlist(-1, false, Kind::Float)
-                    .mean(Kind::Float);
+                let ce_loss = twohot_log_prob_loss(
+                    &ret_symlog,
+                    &log_probs,
+                    trading_model.value_centers(),
+                );
                 let critic_entropy = -(log_probs.exp() * &log_probs)
                     .sum_dim_intlist(-1, false, Kind::Float)
                     .mean(Kind::Float);
@@ -611,12 +604,6 @@ pub async fn train(weights_path: Option<&str>) {
                     total_policy_loss_weighted.g_add_(&(&action_loss * chunk_sample_count as f64));
                 let _ =
                     total_value_loss_weighted.g_add_(&(&value_loss * chunk_sample_count as f64));
-                // Explained variance (ret_mb is pre-clipped to bucket bounds)
-                let values_clipped = values.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
-                let residuals = &values_clipped - &ret_mb;
-                let _ = total_residual_sq.g_add_(&residuals.square().sum(Kind::Float));
-                let _ = total_target_sum.g_add_(&ret_mb.sum(Kind::Float));
-                let _ = total_target_sq_sum.g_add_(&ret_mb.square().sum(Kind::Float));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 epoch_kl_count += chunk_sample_count;
                 total_sample_count += chunk_sample_count;
@@ -715,17 +702,11 @@ pub async fn train(weights_path: Option<&str>) {
         }
 
         // Compute all metrics on GPU, single transfer to CPU
-        let (mean_policy_loss_t, mean_value_loss_t, explained_var_t, mean_grad_norm_t, clip_frac_t) =
+        let (mean_policy_loss_t, mean_value_loss_t, mean_grad_norm_t, clip_frac_t) =
             if total_sample_count > 0 {
                 let n = total_sample_count as f64;
                 let mean_policy = &total_policy_loss_weighted / n;
                 let mean_value = &total_value_loss_weighted / n;
-                // EV = 1 - Var(residuals) / Var(targets)
-                let mean_target = &total_target_sum / n;
-                let var_targets = &total_target_sq_sum / n - mean_target.square();
-                let var_residuals = &total_residual_sq / n;
-                let explained_var =
-                    Tensor::from(1.0) - &var_residuals / var_targets.clamp_min(1e-8);
                 let grad_norm = if grad_norm_count > 0 {
                     &grad_norm_sum / (grad_norm_count as f64)
                 } else {
@@ -736,16 +717,44 @@ pub async fn train(weights_path: Option<&str>) {
                 } else {
                     Tensor::zeros([], (Kind::Float, device))
                 };
-                (mean_policy, mean_value, explained_var, grad_norm, clip)
+                (mean_policy, mean_value, grad_norm, clip)
             } else {
                 (
                     Tensor::zeros([], (Kind::Float, device)),
                     Tensor::zeros([], (Kind::Float, device)),
                     Tensor::zeros([], (Kind::Float, device)),
                     Tensor::zeros([], (Kind::Float, device)),
-                    Tensor::zeros([], (Kind::Float, device)),
                 )
             };
+
+        let explained_var_t = if total_sample_count > 0 {
+            let ev_steps = CHUNK_SIZE.min(rollout_steps);
+            let ev_samples = ev_steps * NPROCS;
+            tch::no_grad(|| {
+                let pd_ev = price_deltas_batch.narrow(0, 0, ev_samples);
+                let so_ev = static_obs_batch.narrow(0, 0, ev_samples);
+                let seq_ev = seq_idx_batch.narrow(0, 0, ev_samples);
+                let ret_ev = returns.narrow(0, 0, ev_samples);
+                let (values, _, _) = trading_model.forward_with_seq_idx(
+                    &pd_ev,
+                    &so_ev,
+                    Some(&seq_ev),
+                    true,
+                );
+                let values = values
+                    .to_kind(Kind::Float)
+                    .view([ev_samples])
+                    .clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
+                let residuals = &values - &ret_ev;
+                let mean_target = ret_ev.mean(Kind::Float);
+                let var_targets =
+                    ret_ev.square().mean(Kind::Float) - mean_target.square();
+                let var_residuals = residuals.square().mean(Kind::Float);
+                Tensor::from(1.0) - &var_residuals / var_targets.clamp_min(1e-8)
+            })
+        } else {
+            Tensor::zeros([], (Kind::Float, device))
+        };
 
         // Compute action std stats + rpo_alpha
         let log_std_stats = tch::no_grad(|| {

@@ -98,8 +98,8 @@ const MODEL_DIM: i64 = 128;
 const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
-pub(crate) const SDE_LATENT_DIM: i64 = HEAD_HIDDEN;
-pub(crate) const LOG_STD_INIT: f64 = 0.0;
+pub(crate) const SDE_LATENT_DIM: i64 = TICKERS_COUNT * MODEL_DIM;
+pub(crate) const LOG_STD_INIT: f64 = -1.0;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
 pub(crate) const LATTICE_STD_REG: f64 = 0.0;
@@ -108,7 +108,6 @@ pub(crate) const LATTICE_MAX_STD: f64 = 10.0;
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
-const HEAD_HIDDEN: i64 = 64;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -4.0;
 const TICKER_LATENT_FACTORS: i64 = 8;
@@ -184,8 +183,16 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
 const NUM_VALUE_BUCKETS: i64 = 127;
 
 /// (values, critic_logits, (action_mean, sde_latent))
-/// sde_latent: [batch, SDE_LATENT_DIM] shared latent for Lattice noise computation
+/// sde_latent: [batch, SDE_LATENT_DIM] flat ticker features for Lattice noise
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor));
+
+pub(crate) fn symlog_tensor(x: &Tensor) -> Tensor {
+    x.sign() * (x.abs() + 1.0).log()
+}
+
+pub(crate) fn symexp_tensor(x: &Tensor) -> Tensor {
+    x.sign() * (x.abs().exp() - 1.0)
+}
 
 pub struct DebugMetrics {
     pub time_alpha_attn_mean: f64,
@@ -253,7 +260,6 @@ pub struct TradingModel {
     value_mlp_fc1: nn::Linear,
     value_mlp_fc2: nn::Linear,
     actor_out: nn::Linear,
-    latent_proj: nn::Linear,
     critic_out: nn::Linear,
     // Lattice exploration: correlated + independent noise via policy network weights
     log_std_param: Tensor,        // [SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM]
@@ -287,7 +293,7 @@ impl TradingModel {
         (corr_std, ind_std)
     }
 
-    /// W_policy: actor_out weights [ACTION_DIM, HEAD_HIDDEN] for Lattice covariance
+    /// W_policy: actor_out weights [ACTION_DIM, SDE_LATENT_DIM] for Lattice covariance
     pub fn w_policy(&self) -> Tensor {
         self.actor_out.ws.shallow_clone()
     }
@@ -401,10 +407,10 @@ impl TradingModel {
         
         let actor_out = nn::linear(
             p / "actor_out",
-            HEAD_HIDDEN,
+            SDE_LATENT_DIM,
             ACTION_DIM,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(HEAD_HIDDEN, ACTION_DIM),
+                ws_init: truncated_normal_init(SDE_LATENT_DIM, ACTION_DIM),
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
@@ -419,27 +425,16 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // Lattice: flatten per-ticker features into shared latent
-        let latent_proj = nn::linear(
-            p / "latent_proj",
-            TICKERS_COUNT * MODEL_DIM,
-            HEAD_HIDDEN,
-            nn::LinearConfig {
-                ws_init: truncated_normal_init(TICKERS_COUNT * MODEL_DIM, HEAD_HIDDEN),
-                ..Default::default()
-            },
-        );
-
-
         // Lattice exploration: correlated (SDE_LATENT_DIM) + independent (ACTION_DIM) noise dims
         let log_std_param = p.var(
             "log_std",
             &[SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM],
             Init::Const(LOG_STD_INIT),
         );
+        let max_symlog = (VALUE_LOG_CLIP + 1.0).ln();
         let value_centers = Tensor::linspace(
-            -VALUE_LOG_CLIP,
-            VALUE_LOG_CLIP,
+            -max_symlog,
+            max_symlog,
             NUM_VALUE_BUCKETS,
             (Kind::Float, p.device()),
         );
@@ -467,7 +462,6 @@ impl TradingModel {
             value_mlp_fc1,
             value_mlp_fc2,
             actor_out,
-            latent_proj,
             critic_out,
             log_std_param,
             bucket_centers,

@@ -107,7 +107,7 @@ impl TradingModel {
             let x_last = self.process_new_patch(state);
             let _ = state.patch_buf.zero_();
             return self
-                .head_with_temporal_pool(&x_last, &global_static, &per_ticker_static, 1, false)
+                .head_with_temporal_pool(&x_last, &global_static, &per_ticker_static, 1, true, false)
                 .0;
         }
 
@@ -116,6 +116,7 @@ impl TradingModel {
             &global_static,
             &per_ticker_static,
             1,
+            true,
             false,
         )
         .0
@@ -163,7 +164,7 @@ impl TradingModel {
         }
 
         state.initialized = true;
-        self.head_with_temporal_pool(&x, &global_static, &per_ticker_static, 1, false)
+        self.head_with_temporal_pool(&x, &global_static, &per_ticker_static, 1, true, false)
             .0
     }
 

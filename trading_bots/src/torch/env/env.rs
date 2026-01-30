@@ -415,8 +415,8 @@ impl Env {
         }
 
         let pre_total_assets = self.account.total_assets;
-        let _pre_cash = self.account.cash;
-        let _pre_positions = self.account.positions.clone();
+        let pre_cash = self.account.cash;
+        let pre_positions = self.account.positions.clone();
 
         let mut real_actions = vec![0.0; ACTION_COUNT as usize];
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
@@ -434,11 +434,12 @@ impl Env {
         }
 
         let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        let (reward, reward_per_ticker, cash_reward) = self.get_unrealized_pnl_reward_breakdown(
+        self.account.update_total(&self.prices, absolute_step);
+        let (reward, reward_per_ticker, cash_reward) = self.get_counterfactual_reward_breakdown(
             absolute_step,
             pre_total_assets,
-            // pre_cash,
-            // &pre_positions,
+            pre_cash,
+            &pre_positions,
         );
 
         self.last_reward = reward;
@@ -490,8 +491,8 @@ impl Env {
         }
 
         let pre_total_assets = self.account.total_assets;
-        let _pre_cash = self.account.cash;
-        let _pre_positions = self.account.positions.clone();
+        let pre_cash = self.account.cash;
+        let pre_positions = self.account.positions.clone();
 
         let mut real_actions = vec![0.0; ACTION_COUNT as usize];
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
@@ -509,11 +510,12 @@ impl Env {
         }
 
         let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        let (reward, reward_per_ticker, cash_reward) = self.get_unrealized_pnl_reward_breakdown(
+        self.account.update_total(&self.prices, absolute_step);
+        let (reward, reward_per_ticker, cash_reward) = self.get_counterfactual_reward_breakdown(
             absolute_step,
             pre_total_assets,
-            // pre_cash,
-            // &pre_positions,
+            pre_cash,
+            &pre_positions,
         );
 
         self.last_reward = reward;

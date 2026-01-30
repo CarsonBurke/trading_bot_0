@@ -14,6 +14,7 @@ impl TradingModel {
         global_static: &Tensor,
         per_ticker_static: &Tensor,
         batch_size: i64,
+        compute_values: bool,
         _debug: bool,
     ) -> (ModelOutput, Option<DebugMetrics>) {
         let x = self.ssm_final_norm.forward(x_ssm);
@@ -131,17 +132,19 @@ impl TradingModel {
             .silu()
             .apply(&self.value_mlp_fc2);
         let critic_logits = value_hidden.apply(&self.critic_out); // [batch, NUM_VALUE_BUCKETS]
-        let critic_probs = critic_logits.softmax(-1, Kind::Float);
-        let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
-        let values = critic_probs
-            .matmul(&bucket_centers.unsqueeze(-1))
-            .squeeze_dim(-1); // [batch]
-        let values = values.to_kind(pooled_enriched.kind());
-        let sde_latent = flat_tickers
-            .apply(&self.latent_proj)
-            .silu(); // [batch, HEAD_HIDDEN]
+        let values = if compute_values {
+            let critic_probs = critic_logits.softmax(-1, Kind::Float);
+            let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
+            let values_symlog = critic_probs
+                .matmul(&bucket_centers.unsqueeze(-1))
+                .squeeze_dim(-1); // [batch]
+            super::symexp_tensor(&values_symlog).to_kind(pooled_enriched.kind())
+        } else {
+            Tensor::zeros(&[batch_size], (pooled_enriched.kind(), pooled_enriched.device()))
+        };
+        let sde_latent = flat_tickers; // [batch, TICKERS_COUNT * MODEL_DIM]
 
-        // Action mean: actor_out(sde_latent) = W @ h + b, W is [ACTION_DIM, HEAD_HIDDEN]
+        // Action mean: actor_out(sde_latent) = W @ h + b, W is [ACTION_DIM, SDE_LATENT_DIM]
         let action_mean = sde_latent.apply(&self.actor_out);
 
         let debug_metrics = None;
