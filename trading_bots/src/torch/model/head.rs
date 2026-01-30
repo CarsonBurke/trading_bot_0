@@ -178,7 +178,6 @@ impl TradingModel {
             .forward(&policy_input)
             .apply(&self.head_proj);
 
-        // Actor path: SiLU activation (unbounded, good for regression)
         let policy_hidden = policy_projected.silu();
         let ticker_head_base = policy_hidden
             .narrow(0, 0, batch_size * TICKERS_COUNT)
@@ -188,11 +187,8 @@ impl TradingModel {
         let cash_logit = cash_head_base.apply(&self.actor_out).squeeze_dim(-1);
         let action_mean = Tensor::cat(&[action_mean_ticker, cash_logit.unsqueeze(1)], 1);
 
-        // SDE path: tanh on pre-activation output (Linear → Tanh, matching SB3's MLP)
-        let sde_latent = policy_projected
-            .narrow(0, 0, batch_size * TICKERS_COUNT)
-            .reshape([batch_size, TICKERS_COUNT, super::HEAD_HIDDEN])
-            .tanh();
+        // gSDE: shared silu'd latent
+        let sde_latent = ticker_head_base.shallow_clone();
 
         let debug_metrics = None;
 
