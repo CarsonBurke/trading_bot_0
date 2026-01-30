@@ -120,7 +120,6 @@ impl TradingModel {
                 temporal_attn_eff_len: 0.0,
                 temporal_attn_center: 0.0,
                 temporal_attn_last_weight: 0.0,
-                cross_ticker_embed_norm: 0.0,
             }),
         )
     }

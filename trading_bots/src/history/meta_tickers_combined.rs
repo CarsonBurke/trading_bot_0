@@ -32,7 +32,6 @@ pub struct MetaHistory {
     pub temporal_attn_eff_len: Vec<f64>,
     pub temporal_attn_center: Vec<f64>,
     pub temporal_attn_last_weight: Vec<f64>,
-    pub cross_ticker_embed_norm: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -88,7 +87,6 @@ impl MetaHistory {
         temporal_attn_eff_len: f64,
         temporal_attn_center: f64,
         temporal_attn_last_weight: f64,
-        cross_ticker_embed_norm: f64,
     ) {
         self.time_alpha_attn_mean.push(time_alpha_attn_mean);
         self.time_alpha_mlp_mean.push(time_alpha_mlp_mean);
@@ -100,7 +98,6 @@ impl MetaHistory {
         self.temporal_attn_eff_len.push(temporal_attn_eff_len);
         self.temporal_attn_center.push(temporal_attn_center);
         self.temporal_attn_last_weight.push(temporal_attn_last_weight);
-        self.cross_ticker_embed_norm.push(cross_ticker_embed_norm);
     }
 
     /// Load meta history from existing reports at the given episode
@@ -160,7 +157,6 @@ impl MetaHistory {
         self.temporal_attn_eff_len = load_multiline(&temporal_path, "temporal_eff_len");
         self.temporal_attn_center = load_multiline(&temporal_path, "temporal_attn_center");
         self.temporal_attn_last_weight = load_multiline(&temporal_path, "temporal_attn_last");
-        self.cross_ticker_embed_norm = load_multiline(&temporal_path, "cross_embed_norm");
 
         println!("Loaded meta history from episode {} ({} data points)", episode, self.final_assets.len());
     }
@@ -263,7 +259,6 @@ impl MetaHistory {
                     ReportSeries { label: "temporal_eff_len".to_string(), values: f64_to_f32(&self.temporal_attn_eff_len) },
                     ReportSeries { label: "temporal_attn_center".to_string(), values: f64_to_f32(&self.temporal_attn_center) },
                     ReportSeries { label: "temporal_attn_last".to_string(), values: f64_to_f32(&self.temporal_attn_last_weight) },
-                    ReportSeries { label: "cross_embed_norm".to_string(), values: f64_to_f32(&self.cross_ticker_embed_norm) },
                 ],
             });
             let _ = write_report(&format!("{base_dir}/temporal_embed_debug.report.bin"), &r);

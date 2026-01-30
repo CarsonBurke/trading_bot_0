@@ -29,46 +29,26 @@ impl TradingModel {
             .apply(&self.time_global_ctx)
             .unsqueeze(1)
             .unsqueeze(1);
-        let exo_ticker_base = per_ticker_static
+        let exo_ticker = per_ticker_static
             .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
             .apply(&self.time_ticker_ctx)
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let exo_ticker_embed = per_ticker_static
-            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&self.cross_ticker_embed)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let exo_ticker = &exo_ticker_base + &exo_ticker_embed;
-        let step_progress = global_static.narrow(1, 0, 1);
-        let angle1 = &step_progress * (2.0 * std::f64::consts::PI);
-        let angle2 = &step_progress * (4.0 * std::f64::consts::PI);
-        let time_feats = Tensor::cat(&[angle1.sin(), angle1.cos(), angle2.sin(), angle2.cos()], 1);
-        let time_pos = time_feats
-            .apply(&self.time_pos_proj)
-            .unsqueeze(1)
-            .unsqueeze(1);
-        let exo_global = global_ctx.squeeze_dim(1).squeeze_dim(1);
-        let exo_time = time_pos.squeeze_dim(1).squeeze_dim(1);
-        let exo_global = exo_global
-            .unsqueeze(1)
-            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
-        let exo_time = exo_time
+        let exo_global = global_ctx.squeeze_dim(1).squeeze_dim(1)
             .unsqueeze(1)
             .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
         let exo_tokens = Tensor::cat(
             &[
                 exo_global.unsqueeze(2),
                 exo_ticker.unsqueeze(2),
-                exo_time.unsqueeze(2),
             ],
             2,
-        ); // [batch, tickers, 3, dim]
+        ); // [batch, tickers, 2, dim]
 
         // Cross-attention on last tokens only: [batch, tickers, dim] queries exo_tokens
         let last_tokens_flat = last_tokens
             .reshape([batch_size * TICKERS_COUNT, 1, MODEL_DIM]);
-        let last_tokens_norm = self.last_token_ln.forward(&last_tokens_flat);
-        let exo_tokens_flat = exo_tokens.reshape([batch_size * TICKERS_COUNT, 3, MODEL_DIM]);
-        let q_exo = last_tokens_norm.apply(&self.static_cross_q);
+        let exo_tokens_flat = exo_tokens.reshape([batch_size * TICKERS_COUNT, 2, MODEL_DIM]);
+        let q_exo = last_tokens_flat.apply(&self.static_cross_q);
         let k_exo = exo_tokens_flat.apply(&self.static_cross_k);
         let v_exo = exo_tokens_flat.apply(&self.static_cross_v);
         let exo_scores = q_exo.matmul(&k_exo.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
@@ -135,29 +115,18 @@ impl TradingModel {
                 batch_size * TICKERS_COUNT,
                 MODEL_DIM + PER_TICKER_STATIC_OBS as i64,
             ])
-            .apply(&self.static_proj);
-        let static_ctx = self
-            .ln_static_proj
-            .forward(&static_ctx)
+            .apply(&self.static_proj)
             .silu()
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let global_ctx = global_static
-            .apply(&self.global_to_ticker)
-            .unsqueeze(1);
-        let pooled_enriched = pooled + static_ctx + global_ctx;
+        let pooled_enriched = pooled + static_ctx;
 
-        // Cash pathway for policy (still needed for actor)
-        let cash_summary = pooled_enriched
-            .mean_dim([1].as_slice(), false, pooled_enriched.kind())
-            .apply(&self.cash_merge);
-        let attn_entropy = Tensor::zeros([batch_size], (Kind::Float, pooled_enriched.device()));
+        // Flatten per-ticker features, shared by actor and critic
+        let flat_tickers = pooled_enriched.reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
 
-        // Portfolio-level critic: pool all tickers into single representation
-        let portfolio_repr = pooled_enriched
-            .mean_dim([1].as_slice(), false, pooled_enriched.kind()); // [batch, dim]
+        // Critic
         let value_hidden = self
             .value_ln
-            .forward(&portfolio_repr)
+            .forward(&flat_tickers)
             .apply(&self.value_mlp_fc1)
             .silu()
             .apply(&self.value_mlp_fc2);
@@ -168,37 +137,17 @@ impl TradingModel {
             .matmul(&bucket_centers.unsqueeze(-1))
             .squeeze_dim(-1); // [batch]
         let values = values.to_kind(pooled_enriched.kind());
+        let sde_latent = flat_tickers
+            .apply(&self.latent_proj)
+            .silu(); // [batch, HEAD_HIDDEN]
 
-        // Batch policy computation: combine ticker and cash inputs, apply policy_ln + head_proj once
-        let pooled_flat = pooled_enriched.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]);
-        let cash_policy_flat = cash_summary.view([batch_size, MODEL_DIM]);
-        let policy_input = Tensor::cat(&[pooled_flat, cash_policy_flat], 0);
-        let policy_projected = self
-            .policy_ln
-            .forward(&policy_input)
-            .apply(&self.head_proj);
-
-        let policy_hidden = policy_projected.silu();
-        let ticker_head_base = policy_hidden
-            .narrow(0, 0, batch_size * TICKERS_COUNT)
-            .reshape([batch_size, TICKERS_COUNT, super::HEAD_HIDDEN]);
-        let cash_head_base = policy_hidden.narrow(0, batch_size * TICKERS_COUNT, batch_size);
-        let action_mean_ticker = ticker_head_base.apply(&self.actor_out).squeeze_dim(-1);
-        let cash_logit = cash_head_base.apply(&self.actor_out).squeeze_dim(-1);
-        let action_mean = Tensor::cat(&[action_mean_ticker, cash_logit.unsqueeze(1)], 1);
-
-        // gSDE: shared silu'd latent
-        let sde_latent = ticker_head_base.shallow_clone();
+        // Action mean: actor_out(sde_latent) = W @ h + b, W is [ACTION_DIM, HEAD_HIDDEN]
+        let action_mean = sde_latent.apply(&self.actor_out);
 
         let debug_metrics = None;
 
         (
-            (
-                values,
-                critic_logits,
-                (action_mean, sde_latent),
-                attn_entropy,
-            ),
+            (values, critic_logits, (action_mean, sde_latent)),
             debug_metrics,
         )
     }

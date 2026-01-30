@@ -6,7 +6,7 @@ use crate::torch::constants::{
     PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{TradingModel, PATCH_SEQ_LEN, SDE_LATENT_DIM};
+use crate::torch::model::{TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_STD_REG, PATCH_SEQ_LEN, SDE_EPS, SDE_LATENT_DIM};
 
 const LEARNING_RATE: f64 = 4e-4;
 pub const NPROCS: i64 = 16;
@@ -128,6 +128,45 @@ fn twohot_encode(t: &Tensor, centers: &Tensor) -> Tensor {
     out.view(shape.as_slice())
 }
 
+/// MVN log prob + log|Σ|: returns (log_prob, log_det_sigma) to avoid redundant Cholesky
+fn mvn_log_prob(sigma_mat: &Tensor, diff: &Tensor, k: i64) -> (Tensor, Tensor) {
+    let jitter = Tensor::eye(k, (Kind::Float, sigma_mat.device())).unsqueeze(0) * SDE_EPS;
+    let chol = (sigma_mat + &jitter).linalg_cholesky(false);
+    let diff_col = diff.unsqueeze(-1);
+    let y = chol.linalg_solve_triangular(&diff_col, false, true, false);
+    let mahal = y.transpose(-2, -1).matmul(&y).squeeze_dim(-1).squeeze_dim(-1);
+    let log_det = chol.diagonal(0, -2, -1).log()
+        .sum_dim_intlist([-1].as_slice(), false, Kind::Float) * 2.0;
+    let log_prob = (&mahal + &log_det + k as f64 * LOG_2PI).g_mul_scalar(-0.5);
+    (log_prob, log_det)
+}
+
+/// Build Lattice covariance matrix [batch, ACTION_DIM, ACTION_DIM]
+/// Σ = α²·W·diag(h²@σ_corr²)·Wᵀ + diag(h²@σ_ind²)
+fn build_lattice_covariance(
+    sde_latent: &Tensor,   // [batch, SDE_LATENT_DIM]
+    corr_std: &Tensor,     // [SDE_LATENT_DIM, SDE_LATENT_DIM]
+    ind_std: &Tensor,      // [SDE_LATENT_DIM, ACTION_DIM]
+    w_policy: &Tensor,     // [ACTION_DIM, SDE_LATENT_DIM]
+) -> Tensor {
+    // latent_corr_var[b,d] = sum_j(h[b,j]^2 * sigma_corr[j,d]^2) -- [batch, SDE_LATENT_DIM]
+    let latent_corr_var = sde_latent.pow_tensor_scalar(2)
+        .matmul(&corr_std.pow_tensor_scalar(2));
+
+    // sigma_corr = alpha^2 * W * diag(latent_corr_var) * W^T -- [batch, ACTION_DIM, ACTION_DIM]
+    // w_scaled[b,a,d] = W[a,d] * latent_corr_var[b,d]
+    let w_scaled = w_policy.unsqueeze(0) * latent_corr_var.unsqueeze(1);
+    let sigma_corr = (LATTICE_ALPHA * LATTICE_ALPHA)
+        * w_scaled.matmul(&w_policy.transpose(0, 1));
+
+    // latent_ind_var[b,a] = sum_j(h[b,j]^2 * sigma_ind[j,a]^2) + reg^2 -- [batch, ACTION_DIM]
+    let latent_ind_var = sde_latent.pow_tensor_scalar(2)
+        .matmul(&ind_std.pow_tensor_scalar(2))
+        + LATTICE_STD_REG * LATTICE_STD_REG;
+
+    &sigma_corr + &Tensor::diag_embed(&latent_ind_var, 0, -2, -1)
+}
+
 pub async fn train(weights_path: Option<&str>) {
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
@@ -207,9 +246,9 @@ pub async fn train(weights_path: Option<&str>) {
     let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level value
     let s_action_weights =
         Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
-    // Store sde_std used during rollout for consistent log_prob computation
-    let mut rollout_sde_std = Tensor::zeros(&[SDE_LATENT_DIM, TICKERS_COUNT], (Kind::Float, device));
-    let mut rollout_cash_std = Tensor::zeros(&[1], (Kind::Float, device));
+    // Store lattice stds used during rollout for consistent log_prob computation
+    let mut rollout_corr_std = Tensor::zeros(&[SDE_LATENT_DIM, SDE_LATENT_DIM], (Kind::Float, device));
+    let mut rollout_ind_std = Tensor::zeros(&[SDE_LATENT_DIM, ACTION_DIM], (Kind::Float, device));
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
@@ -231,15 +270,16 @@ pub async fn train(weights_path: Option<&str>) {
 
         let stats_kind = (Kind::Float, device);
 
-        // Capture sde_std at start of rollout for consistent log_prob during training
+        // Capture lattice stds at start of rollout for consistent log_prob during training
         tch::no_grad(|| {
-            rollout_sde_std.copy_(&trading_model.sde_std());
-            rollout_cash_std.copy_(&trading_model.cash_std());
+            let (corr, ind) = trading_model.lattice_stds();
+            rollout_corr_std.copy_(&corr);
+            rollout_ind_std.copy_(&ind);
         });
 
         for step in 0..rollout_steps as usize {
             let (values, action_mean, u, actions, action_log_prob) = tch::no_grad(|| {
-                let (values, _, (action_mean, sde_latent), _) = trading_model.forward_with_seq_idx(
+                let (values, _, (action_mean, sde_latent)) = trading_model.forward_with_seq_idx(
                     &obs_price,
                     &obs_static,
                     Some(&obs_seq_idx),
@@ -249,43 +289,34 @@ pub async fn train(weights_path: Option<&str>) {
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let sde_latent = sde_latent.to_kind(Kind::Float);
 
-                // gSDE: sample exploration matrix using rollout_sde_std
-                let exploration_mat = Tensor::randn([SDE_LATENT_DIM, TICKERS_COUNT], stats_kind) * &rollout_sde_std;
-                let exploration_t = exploration_mat.transpose(0, 1);
-                let noise_ticker = (&sde_latent * exploration_t.unsqueeze(0))
-                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+                // Lattice: sample two exploration matrices
+                let corr_exploration_mat = Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], stats_kind)
+                    * &rollout_corr_std;
+                let ind_exploration_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind)
+                    * &rollout_ind_std;
 
-                let action_mean_ticker = action_mean.narrow(1, 0, TICKERS_COUNT);
-                let action_mean_cash = action_mean.narrow(1, TICKERS_COUNT, 1);
-                let u_ticker = &action_mean_ticker + &noise_ticker;
-                // Cash: state-independent exploration, scaled to match gSDE magnitude
-                let cash_noise = Tensor::randn([NPROCS, 1], stats_kind) * &rollout_cash_std * (SDE_LATENT_DIM as f64).sqrt();
-                let u_cash = &action_mean_cash + &cash_noise;
-                let u = Tensor::cat(&[u_ticker, u_cash], 1);
+                // Correlated noise: perturb shared latent, project through W
+                let latent_noise = sde_latent.matmul(&corr_exploration_mat); // [batch, SDE_LATENT_DIM]
+                let w = trading_model.w_policy(); // [ACTION_DIM, SDE_LATENT_DIM]
+                let correlated_action_noise = LATTICE_ALPHA
+                    * latent_noise.matmul(&w.transpose(0, 1)); // [batch, ACTION_DIM]
+
+                // Independent noise: project shared latent through ind noise
+                let independent_action_noise = sde_latent.matmul(&ind_exploration_mat); // [batch, ACTION_DIM]
+
+                let noise = &correlated_action_noise + &independent_action_noise;
+                let u = &action_mean + &noise;
                 let actions = u.softmax(-1, Kind::Float);
 
-                // Log prob: ticker gSDE + cash constant std
-                let std_sq = rollout_sde_std.pow_tensor_scalar(2).transpose(0, 1);
-                let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
-                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-                let ticker_std = (variance + 1e-6).sqrt();
-                // Scale cash std to match gSDE magnitude (sum over SDE_LATENT_DIM)
-                let cash_std_scaled = &rollout_cash_std * (SDE_LATENT_DIM as f64).sqrt();
-                let action_std = Tensor::cat(
-                    &[ticker_std, cash_std_scaled.expand(&[NPROCS, 1], false)],
-                    1,
+                // Log prob via MVN
+                let sigma_mat = build_lattice_covariance(
+                    &sde_latent, &rollout_corr_std, &rollout_ind_std, &trading_model.w_policy(),
                 );
-                let action_log_std = action_std.log();
-
-                let u_normalized = (&u - &action_mean) / action_log_std.exp();
-                let u_squared = u_normalized.pow_tensor_scalar(2);
-                let two_log_std = &action_log_std * 2.0;
-                let log_prob_u = (&u_squared + two_log_std + LOG_2PI).g_mul_scalar(-0.5);
-                let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-                let log_det = u
-                    .log_softmax(-1, Kind::Float)
+                let diff = &u - &action_mean;
+                let (log_prob_gaussian, _) = mvn_log_prob(&sigma_mat, &diff, ACTION_DIM);
+                let log_det_jac = u.log_softmax(-1, Kind::Float)
                     .sum_dim_intlist(-1, false, Kind::Float);
-                let action_log_prob = &log_prob_gaussian - &log_det;
+                let action_log_prob = &log_prob_gaussian - &log_det_jac;
 
                 (values, action_mean, u, actions, action_log_prob)
             });
@@ -355,7 +386,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         // Bootstrap value from final observation state (clipped to bucket bounds)
         let bootstrap_value = tch::no_grad(|| {
-            let (values, _, _, _) = trading_model.forward_with_seq_idx(
+            let (values, _, _) = trading_model.forward_with_seq_idx(
                 &obs_price,
                 &obs_static,
                 Some(&obs_seq_idx),
@@ -457,7 +488,7 @@ pub async fn train(weights_path: Option<&str>) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (values, critic_logits, (action_mean, sde_latent), _attn_entropy) =
+                let (values, critic_logits, (action_mean, sde_latent)) =
                     trading_model.forward_with_seq_idx(
                         &pd_chunk,
                         &so_chunk,
@@ -467,55 +498,43 @@ pub async fn train(weights_path: Option<&str>) {
 
                 let values = values.to_kind(Kind::Float).view([chunk_sample_count]); // portfolio-level
                 let action_mean = action_mean.to_kind(Kind::Float);
-                let sde_latent = sde_latent.to_kind(Kind::Float); // [chunk, tickers, SDE_LATENT_DIM]
+                let sde_latent = sde_latent.to_kind(Kind::Float); // [chunk, SDE_LATENT_DIM]
 
                 // act_mb contains the stored u (pre-softmax logits)
                 let u = act_mb;
 
-                // Compute effective action_std from sde_latent with fresh sde_std() for gradient flow
-                let sde_std = trading_model.sde_std();
-                let std_sq = sde_std.pow_tensor_scalar(2).transpose(0, 1); // [TICKERS_COUNT, SDE_LATENT_DIM]
-                let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
-                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-                let ticker_std = (variance + 1e-6).sqrt();
-                // Scale cash std to match gSDE magnitude (sum over SDE_LATENT_DIM)
-                let cash_std = trading_model.cash_std() * (SDE_LATENT_DIM as f64).sqrt();
-                let action_std = Tensor::cat(
-                    &[ticker_std, cash_std.expand(&[chunk_sample_count, 1], false)],
-                    1,
+                let (corr_std, ind_std) = trading_model.lattice_stds();
+                let sigma_mat = build_lattice_covariance(
+                    &sde_latent, &corr_std, &ind_std, &trading_model.w_policy(),
                 );
+
                 // RPO: sigmoid parameterization for smooth gradients
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
                     let alpha_detached = alpha.detach();
-                    let rpo_noise_ticker = Tensor::empty(
-                        [chunk_sample_count, TICKERS_COUNT],
+                    let rpo_noise = Tensor::empty(
+                        [chunk_sample_count, ACTION_DIM],
                         (Kind::Float, device),
                     )
                     .uniform_(-1.0, 1.0)
                         * &alpha_detached;
-                    let rpo_noise_cash = Tensor::zeros([chunk_sample_count, 1], (Kind::Float, device));
-                    let rpo_noise = Tensor::cat(&[rpo_noise_ticker, rpo_noise_cash], 1);
                     (alpha, &action_mean + rpo_noise)
                 } else {
                     (Tensor::zeros(&[1], (Kind::Float, device)), action_mean.shallow_clone())
                 };
 
-                let u_normalized = (&u - &action_mean_perturbed) / &action_std;
-                let u_squared = u_normalized.pow_tensor_scalar(2);
-                let two_log_std = action_std.log() * 2.0;
-                let log_prob_u = (&u_squared + &two_log_std + LOG_2PI).g_mul_scalar(-0.5);
-                let log_prob_gaussian = log_prob_u.sum_dim_intlist(-1, false, Kind::Float);
-                let log_det = u
+                let diff = &u - &action_mean_perturbed;
+                let (log_prob_gaussian, log_det_sigma) = mvn_log_prob(&sigma_mat, &diff, ACTION_DIM);
+                let log_det_jac = u
                     .log_softmax(-1, Kind::Float)
                     .sum_dim_intlist(-1, false, Kind::Float);
-                let action_log_probs = log_prob_gaussian - log_det;
+                let action_log_probs = log_prob_gaussian - log_det_jac;
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
                     let _ = debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("sigma_mat", &sigma_mat, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
@@ -555,9 +574,9 @@ pub async fn train(weights_path: Option<&str>) {
                     .mean(Kind::Float);
                 let value_loss = ce_loss - CRITIC_ENTROPY_COEF * critic_entropy;
 
-                // Entropy of Gaussian (per action dimension): 0.5 * (1 + log(2π) + 2*log(σ))
-                let entropy_components: Tensor = 1.0 + LOG_2PI + &two_log_std;
-                let dist_entropy = entropy_components.g_mul_scalar(0.5).mean(Kind::Float);
+                // MVN entropy: 0.5 * (k*(1+ln(2pi)) + ln|Sigma|), reuses Cholesky from log_prob
+                let dist_entropy = (ACTION_DIM as f64 * (1.0 + LOG_2PI) + &log_det_sigma)
+                    .g_mul_scalar(0.5).mean(Kind::Float);
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
                     + action_loss.shallow_clone()
@@ -565,10 +584,9 @@ pub async fn train(weights_path: Option<&str>) {
 
                 // RPO alpha loss: target induced KL (uniform noise in logit space)
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let action_std_detached = action_std.detach();
-                    let var = action_std_detached.pow_tensor_scalar(2);
-                    let inv_var_mean = var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                    let d = TICKERS_COUNT as f64;
+                    let action_var = sigma_mat.diagonal(0, -2, -1).detach();
+                    let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
+                    let d = ACTION_DIM as f64;
                     let induced_kl =
                         rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                     (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
@@ -731,18 +749,17 @@ pub async fn train(weights_path: Option<&str>) {
 
         // Compute action std stats + rpo_alpha
         let log_std_stats = tch::no_grad(|| {
-            let (_, _, (_, sde_latent), _) = trading_model.forward_with_seq_idx(
+            let (_, _, (_, sde_latent)) = trading_model.forward_with_seq_idx(
                 &s_price_deltas.get(0),
                 &s_static_obs.get(0),
                 Some(&s_seq_idx.get(0)),
                 false,
             );
-            // Compute effective action_std from sde_latent
-            let sde_std = trading_model.sde_std();
-            let std_sq = sde_std.pow_tensor_scalar(2).transpose(0, 1);
-            let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
-                .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-            let action_std = (variance + 1e-6).sqrt();
+            let (corr_std, ind_std) = trading_model.lattice_stds();
+            let sigma_mat = build_lattice_covariance(
+                &sde_latent, &corr_std, &ind_std, &trading_model.w_policy(),
+            );
+            let action_std = sigma_mat.diagonal(0, -2, -1).clamp_min(1e-6).sqrt();
             let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                 (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze()
             } else {

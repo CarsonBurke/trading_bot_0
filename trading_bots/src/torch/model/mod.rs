@@ -99,8 +99,13 @@ const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
 pub(crate) const SDE_LATENT_DIM: i64 = HEAD_HIDDEN;
-pub(crate) const LOG_STD_INIT: f64 = -2.0;
+pub(crate) const LOG_STD_INIT: f64 = 0.0;
 pub(crate) const SDE_EPS: f64 = 1e-6;
+pub(crate) const LATTICE_ALPHA: f64 = 1.0;
+pub(crate) const LATTICE_STD_REG: f64 = 0.0;
+pub(crate) const LATTICE_MIN_STD: f64 = 1e-3;
+pub(crate) const LATTICE_MAX_STD: f64 = 10.0;
+pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const HEAD_HIDDEN: i64 = 64;
@@ -178,12 +183,9 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
 
 const NUM_VALUE_BUCKETS: i64 = 127;
 
-// (values, critic_logits, (action_mean, action_log_std), attn_entropy)
-// action_mean: [batch, TICKERS_COUNT + 1] logits before softmax
-// action_log_std: [batch, TICKERS_COUNT + 1] per-action log std
-/// (values, critic_logits, (action_mean, sde_latent), attn_entropy)
-/// sde_latent: [batch, tickers, SDE_LATENT_DIM] for gSDE noise computation
-pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor), Tensor);
+/// (values, critic_logits, (action_mean, sde_latent))
+/// sde_latent: [batch, SDE_LATENT_DIM] shared latent for Lattice noise computation
+pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor));
 
 pub struct DebugMetrics {
     pub time_alpha_attn_mean: f64,
@@ -196,7 +198,6 @@ pub struct DebugMetrics {
     pub temporal_attn_eff_len: f64,
     pub temporal_attn_center: f64,
     pub temporal_attn_last_weight: f64,
-    pub cross_ticker_embed_norm: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -241,29 +242,21 @@ pub struct TradingModel {
     ssm_norms: Vec<RMSNorm>,
     ssm_final_norm: RMSNorm,
     static_proj: nn::Linear,
-    ln_static_proj: RMSNorm,
     inter_ticker_block: InterTickerBlock,
-    time_pos_proj: nn::Linear,
     time_global_ctx: nn::Linear,
     time_ticker_ctx: nn::Linear,
-    last_token_ln: RMSNorm,
     static_cross_q: nn::Linear,
     static_cross_k: nn::Linear,
     static_cross_v: nn::Linear,
     static_cross_out: nn::Linear,
-    cross_ticker_embed: nn::Linear,
-    global_to_ticker: nn::Linear,
-    head_proj: nn::Linear,
-    policy_ln: RMSNorm,
     value_ln: RMSNorm,
     value_mlp_fc1: nn::Linear,
     value_mlp_fc2: nn::Linear,
     actor_out: nn::Linear,
+    latent_proj: nn::Linear,
     critic_out: nn::Linear,
-    cash_merge: nn::Linear,
-    // SDE for state-dependent exploration (gSDE, SB3-aligned: no separate sde_fc layer)
-    log_std_param: Tensor,        // [SDE_LATENT_DIM, TICKERS_COUNT] where SDE_LATENT_DIM = HEAD_HIDDEN
-    cash_log_std_param: Tensor,   // [1] - state-independent cash exploration
+    // Lattice exploration: correlated + independent noise via policy network weights
+    log_std_param: Tensor,        // [SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM]
     bucket_centers: Tensor,
     value_centers: Tensor,
     device: tch::Device,
@@ -283,24 +276,20 @@ impl TradingModel {
         &self.value_centers
     }
 
-    /// Get exploration std for gSDE: [HEAD_HIDDEN, TICKERS_COUNT]
-    /// Uses expln (SB3-style) to ensure positive std with bounded growth rate
-    pub fn sde_std(&self) -> Tensor {
-        Self::expln(&self.log_std_param)
+    /// Lattice stds: correlated [LATENT, LATENT] and independent [LATENT, ACTION_DIM]
+    pub fn lattice_stds(&self) -> (Tensor, Tensor) {
+        let log_std = self.log_std_param
+            .clamp(LATTICE_MIN_STD.ln(), LATTICE_MAX_STD.ln());
+        let log_std = &log_std - 0.5 * (SDE_LATENT_DIM as f64).ln();
+        let std = expln(&log_std);
+        let corr_std = std.narrow(1, 0, SDE_LATENT_DIM);
+        let ind_std = std.narrow(1, SDE_LATENT_DIM, ACTION_DIM);
+        (corr_std, ind_std)
     }
 
-    /// Get cash exploration std (state-independent): scalar
-    /// Uses expln for consistency with ticker SDE
-    pub fn cash_std(&self) -> Tensor {
-        Self::expln(&self.cash_log_std_param)
-    }
-
-    /// expln: exp(x) for x <= 0, log(1+x)+1 for x > 0
-    /// Ensures positive output with at most logarithmic growth for large positive inputs
-    fn expln(x: &Tensor) -> Tensor {
-        let below = x.exp() * x.le(0.0);
-        let above = (x.clamp_min(1e-6).log1p() + 1.0) * x.gt(0.0);
-        below + above
+    /// W_policy: actor_out weights [ACTION_DIM, HEAD_HIDDEN] for Lattice covariance
+    pub fn w_policy(&self) -> Tensor {
+        self.actor_out.ws.shallow_clone()
     }
 
     pub fn new(p: &nn::Path) -> Self {
@@ -389,10 +378,7 @@ impl TradingModel {
             MODEL_DIM,
             Default::default(),
         );
-        let ln_static_proj = RMSNorm::new(&(p / "ln_static_proj"), MODEL_DIM, 1e-6);
-
         let inter_ticker_block = InterTickerBlock::new(&(p / "inter_ticker_0"), TICKER_LATENT_FACTORS);
-        let time_pos_proj = nn::linear(p / "time_pos_proj", 4, MODEL_DIM, Default::default());
         let time_global_ctx = nn::linear(
             p / "time_global_ctx",
             GLOBAL_STATIC_OBS as i64,
@@ -405,43 +391,20 @@ impl TradingModel {
             MODEL_DIM,
             Default::default(),
         );
-        let last_token_ln = RMSNorm::new(&(p / "last_token_ln"), MODEL_DIM, 1e-6);
         let static_cross_q = nn::linear(p / "static_cross_q", MODEL_DIM, MODEL_DIM, Default::default());
         let static_cross_k = nn::linear(p / "static_cross_k", MODEL_DIM, MODEL_DIM, Default::default());
         let static_cross_v = nn::linear(p / "static_cross_v", MODEL_DIM, MODEL_DIM, Default::default());
         let static_cross_out = nn::linear(p / "static_cross_out", MODEL_DIM, MODEL_DIM, Default::default());
-        let cross_ticker_embed = nn::linear(
-            p / "cross_ticker_embed",
-            PER_TICKER_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let global_to_ticker = nn::linear(
-            p / "global_to_ticker",
-            GLOBAL_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let head_proj = nn::linear(
-            p / "head_proj",
-            MODEL_DIM,
-            HEAD_HIDDEN,
-            nn::LinearConfig {
-                ws_init: truncated_normal_init(MODEL_DIM, HEAD_HIDDEN),
-                ..Default::default()
-            },
-        );
-        let policy_ln = RMSNorm::new(&(p / "policy_ln"), MODEL_DIM, 1e-6);
-        let value_ln = RMSNorm::new(&(p / "value_ln"), MODEL_DIM, 1e-6);
-        let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", MODEL_DIM, MODEL_DIM, Default::default());
+        let value_ln = RMSNorm::new(&(p / "value_ln"), TICKERS_COUNT * MODEL_DIM, 1e-6);
+        let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", TICKERS_COUNT * MODEL_DIM, MODEL_DIM, Default::default());
         let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, Default::default());
         
         let actor_out = nn::linear(
             p / "actor_out",
             HEAD_HIDDEN,
-            1,
+            ACTION_DIM,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.01 },
+                ws_init: truncated_normal_init(HEAD_HIDDEN, ACTION_DIM),
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
@@ -456,15 +419,24 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let cash_merge = nn::linear(p / "cash_merge", MODEL_DIM, MODEL_DIM, Default::default());
+        // Lattice: flatten per-ticker features into shared latent
+        let latent_proj = nn::linear(
+            p / "latent_proj",
+            TICKERS_COUNT * MODEL_DIM,
+            HEAD_HIDDEN,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(TICKERS_COUNT * MODEL_DIM, HEAD_HIDDEN),
+                ..Default::default()
+            },
+        );
 
-        // SDE for state-dependent exploration (SB3-aligned: latent_pi used directly)
+
+        // Lattice exploration: correlated (SDE_LATENT_DIM) + independent (ACTION_DIM) noise dims
         let log_std_param = p.var(
             "log_std",
-            &[SDE_LATENT_DIM, TICKERS_COUNT],
+            &[SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM],
             Init::Const(LOG_STD_INIT),
         );
-        let cash_log_std_param = p.var("cash_log_std", &[1], Init::Const(LOG_STD_INIT));
         let value_centers = Tensor::linspace(
             -VALUE_LOG_CLIP,
             VALUE_LOG_CLIP,
@@ -484,28 +456,20 @@ impl TradingModel {
             ssm_norms,
             ssm_final_norm,
             static_proj,
-            ln_static_proj,
             inter_ticker_block,
-            time_pos_proj,
             time_global_ctx,
             time_ticker_ctx,
-            last_token_ln,
             static_cross_q,
             static_cross_k,
             static_cross_v,
             static_cross_out,
-            cross_ticker_embed,
-            global_to_ticker,
-            head_proj,
-            policy_ln,
             value_ln,
             value_mlp_fc1,
             value_mlp_fc2,
             actor_out,
+            latent_proj,
             critic_out,
-            cash_merge,
             log_std_param,
-            cash_log_std_param,
             bucket_centers,
             value_centers,
             device: p.device(),

@@ -3,6 +3,8 @@
 #![feature(f16)]
 #![feature(stdarch_x86_avx512_bf16)]
 
+#![allow(dead_code)]
+
 use clap::{Parser, Subcommand};
 use colored::{self, Colorize};
 
