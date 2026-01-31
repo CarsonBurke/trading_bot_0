@@ -8,6 +8,7 @@ pub struct LogsPageState {
     pub logs_list_state: ListState,
     pub logs_list_area: Rect,
     first_view: bool,
+    follow: bool,
 }
 
 impl LogsPageState {
@@ -17,6 +18,7 @@ impl LogsPageState {
             logs_list_state: ListState::default(),
             logs_list_area: Rect::default(),
             first_view: true,
+            follow: true,
         }
     }
 
@@ -28,7 +30,9 @@ impl LogsPageState {
 
             if new_lines != self.training_output {
                 self.training_output = new_lines;
-                if let Some(selected) = self.logs_list_state.selected() {
+                if self.follow {
+                    self.jump_to_bottom();
+                } else if let Some(selected) = self.logs_list_state.selected() {
                     self.set_logs_position(selected);
                 }
             }
@@ -53,6 +57,7 @@ impl LogsPageState {
     }
 
     pub fn next(&mut self) {
+        self.follow = false;
         if self.training_output.is_empty() {
             return;
         }
@@ -71,6 +76,7 @@ impl LogsPageState {
     }
 
     pub fn previous(&mut self) {
+        self.follow = false;
         if self.training_output.is_empty() {
             return;
         }
@@ -89,6 +95,7 @@ impl LogsPageState {
     }
 
     pub fn jump_to_top(&mut self) {
+        self.follow = false;
         if !self.training_output.is_empty() {
             self.logs_list_state.select(Some(0));
             self.set_logs_position(0);
@@ -96,6 +103,7 @@ impl LogsPageState {
     }
 
     pub fn jump_to_bottom(&mut self) {
+        self.follow = true;
         if !self.training_output.is_empty() {
             let last = self.training_output.len() - 1;
             self.logs_list_state.select(Some(last));
