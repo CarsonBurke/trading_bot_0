@@ -123,7 +123,7 @@ pub fn run_inference<P: AsRef<Path>>(
                     &price_deltas_incremental
                 };
                 let (_, _, (action_mean, sde_latent)) =
-                    model.step(price_input, &static_obs_tensor, &mut stream_state);
+                    model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
                 let (corr_std, ind_std) = model.lattice_stds();
                 let w_policy = model.w_policy();
                 (action_mean, sde_latent, corr_std, ind_std, w_policy)

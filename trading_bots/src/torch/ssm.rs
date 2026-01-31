@@ -224,6 +224,19 @@ impl Mamba2 {
         }
     }
 
+    fn maybe_to_device_kind(&self, input: &Tensor, device: tch::Device, kind: Kind) -> Tensor {
+        let input = if input.device() == device {
+            input.shallow_clone()
+        } else {
+            input.to_device(device)
+        };
+        if input.kind() == kind {
+            input
+        } else {
+            input.to_kind(kind)
+        }
+    }
+
     pub fn new(p: &nn::Path, config: Mamba2Config) -> Self {
         let mut config = config;
         let d_inner = config.d_inner();
@@ -437,14 +450,14 @@ impl Mamba2 {
 
         let zxbcdt = if matches!(device, tch::Device::Cuda(_)) {
             let bias = match &self.in_proj.bs {
-                Some(b) => b.to_kind(kind).to_device(device),
+                Some(b) => self.maybe_to_device_kind(b, device, kind),
                 None => self.empty_tensor(kind, device),
             };
             mamba_fused::rmsnorm_linear(
                 u,
-                &norm_weight.to_kind(kind).to_device(device),
+                &self.maybe_to_device_kind(norm_weight, device, kind),
                 norm_eps,
-                &self.in_proj.ws.to_kind(kind).to_device(device),
+                &self.maybe_to_device_kind(&self.in_proj.ws, device, kind),
                 &bias,
             )
         } else {

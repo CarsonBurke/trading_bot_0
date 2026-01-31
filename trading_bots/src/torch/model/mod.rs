@@ -269,6 +269,23 @@ pub struct TradingModel {
 }
 
 impl TradingModel {
+    fn maybe_to_device(&self, input: &Tensor, device: tch::Device) -> Tensor {
+        if input.device() == device {
+            input.shallow_clone()
+        } else {
+            input.to_device(device)
+        }
+    }
+
+    fn maybe_to_device_kind(&self, input: &Tensor, device: tch::Device, kind: Kind) -> Tensor {
+        let input = self.maybe_to_device(input, device);
+        if input.kind() == kind {
+            input
+        } else {
+            input.to_kind(kind)
+        }
+    }
+
     fn cast_inputs(&self, input: &Tensor) -> Tensor {
         let target_kind = self.log_std_param.kind();
         if input.kind() == target_kind {
@@ -491,7 +508,14 @@ impl TradingModel {
         if seq_idx.numel() == 0 {
             return seq_idx.shallow_clone();
         }
-        let seq_idx = seq_idx.to_device(self.device);
+        let seq_idx = self.maybe_to_device(seq_idx, self.device);
+        self.normalize_seq_idx_on_device(&seq_idx, batch_size)
+    }
+
+    fn normalize_seq_idx_on_device(&self, seq_idx: &Tensor, batch_size: i64) -> Tensor {
+        if seq_idx.numel() == 0 {
+            return seq_idx.shallow_clone();
+        }
         let sizes = seq_idx.size();
         if sizes.len() != 2 {
             panic!("seq_idx must be 2D");
@@ -511,16 +535,27 @@ impl TradingModel {
         batch_size: i64,
         seq_idx: Option<&Tensor>,
     ) -> (Tensor, Tensor, Tensor) {
+        let price_deltas = self.maybe_to_device(price_deltas, self.device);
+        let seq_idx = seq_idx.map(|seq_idx| self.maybe_to_device(seq_idx, self.device));
+        self.patch_latent_stem_on_device(&price_deltas, batch_size, seq_idx.as_ref())
+    }
+
+    fn patch_latent_stem_on_device(
+        &self,
+        price_deltas: &Tensor,
+        batch_size: i64,
+        seq_idx: Option<&Tensor>,
+    ) -> (Tensor, Tensor, Tensor) {
         let batch_tokens = batch_size * TICKERS_COUNT;
         let deltas = price_deltas
             .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
             .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
 
         let kind = deltas.kind();
-        let x = self.patch_embed(&deltas)
-            + self.patch_pos_embed.to_device(deltas.device()).to_kind(kind);
+        let pos_embed = self.maybe_to_device_kind(&self.patch_pos_embed, deltas.device(), kind);
+        let x = self.patch_embed(&deltas) + pos_embed;
         let seq_idx = match seq_idx {
-            Some(seq_idx) => self.normalize_seq_idx(seq_idx, batch_size),
+            Some(seq_idx) => self.normalize_seq_idx_on_device(seq_idx, batch_size),
             None => Self::build_seq_idx_from_padding(&deltas, &self.patch_sizes),
         };
         // Cast to int32 here so Python bridge doesn't need to cast per forward call.
@@ -530,7 +565,9 @@ impl TradingModel {
         } else {
             seq_idx
         };
-        let dt_scale = self.patch_dt_scale.to_kind(kind).clamp_min(1e-4);
+        let dt_scale = self
+            .maybe_to_device_kind(&self.patch_dt_scale, deltas.device(), kind)
+            .clamp_min(1e-4);
         (x, dt_scale, seq_idx)
     }
 
@@ -543,7 +580,11 @@ impl TradingModel {
         if max_leading == 0 {
             return Tensor::zeros(&[0], (Kind::Int64, device));
         }
-        let patch_sizes = patch_sizes.to_device(device);
+        let patch_sizes = if patch_sizes.device() == device {
+            patch_sizes.shallow_clone()
+        } else {
+            patch_sizes.to_device(device)
+        };
         let patch_ends = patch_sizes.to_kind(Kind::Int64).cumsum(1, Kind::Int64);
         let patch_ends = patch_ends.squeeze_dim(0).squeeze_dim(-1);
         let mask = leading.unsqueeze(1).ge_tensor(&patch_ends);
@@ -590,16 +631,16 @@ impl TradingModel {
         let enriched = Tensor::cat(&enriched_parts.iter().collect::<Vec<_>>(), 1);
 
         // Phase 2: fused projection — single einsum over all 256 tokens
-        let config_ids = self.patch_config_ids.to_device(device);
-        let weight = self.patch_embed_weight.to_device(device).to_kind(Kind::Float);
-        let bias = self.patch_embed_bias.to_device(device).to_kind(Kind::Float);
+        let config_ids = self.maybe_to_device(&self.patch_config_ids, device);
+        let weight = self.maybe_to_device_kind(&self.patch_embed_weight, device, Kind::Float);
+        let bias = self.maybe_to_device_kind(&self.patch_embed_bias, device, Kind::Float);
         let weight_per_patch = weight.index_select(0, &config_ids);
         let bias_per_patch = bias.index_select(0, &config_ids);
         let out = Tensor::einsum("blm,lmd->bld", &[&enriched, &weight_per_patch], None::<&[i64]>);
         let out = out + bias_per_patch.unsqueeze(0);
 
         // RMSNorm with per-config scale
-        let ln_weight = self.patch_ln_weight.to_device(device).to_kind(Kind::Float);
+        let ln_weight = self.maybe_to_device_kind(&self.patch_ln_weight, device, Kind::Float);
         let ln_weight = ln_weight.index_select(0, &config_ids).unsqueeze(0);
         let rms = (out.pow_tensor_scalar(2.0).mean_dim(-1, true, Kind::Float) + 1e-5).sqrt();
         (out / rms * ln_weight).to_kind(kind)

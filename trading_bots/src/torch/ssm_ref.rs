@@ -223,7 +223,14 @@ impl Mamba2Ref {
                     opt_tensor_to_py(py, dt_scale),
                     opt_tensor_to_py(py, seq_idx),
                 ),
-            ).expect("forward_with_pre_norm failed");
+            );
+            let result = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    err.print(py);
+                    panic!("forward_with_pre_norm failed: {}", err);
+                }
+            };
 
             py_to_tensor(&result.unbind())
         })

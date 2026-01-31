@@ -13,6 +13,15 @@ impl TradingModel {
         self.forward_with_seq_idx(price_deltas, static_features, None, _train)
     }
 
+    pub fn forward_on_device(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        _train: bool,
+    ) -> ModelOutput {
+        self.forward_with_seq_idx_on_device(price_deltas, static_features, None, _train)
+    }
+
     pub fn forward_with_seq_idx(
         &self,
         price_deltas: &Tensor,
@@ -21,6 +30,16 @@ impl TradingModel {
         _train: bool,
     ) -> ModelOutput {
         self.forward_with_seq_idx_inner(price_deltas, static_features, seq_idx, true)
+    }
+
+    pub fn forward_with_seq_idx_on_device(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        seq_idx: Option<&Tensor>,
+        _train: bool,
+    ) -> ModelOutput {
+        self.forward_with_seq_idx_inner_on_device(price_deltas, static_features, seq_idx, true)
     }
 
     pub fn forward_with_seq_idx_no_values(
@@ -33,6 +52,16 @@ impl TradingModel {
         self.forward_with_seq_idx_inner(price_deltas, static_features, seq_idx, false)
     }
 
+    pub fn forward_with_seq_idx_no_values_on_device(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        seq_idx: Option<&Tensor>,
+        _train: bool,
+    ) -> ModelOutput {
+        self.forward_with_seq_idx_inner_on_device(price_deltas, static_features, seq_idx, false)
+    }
+
     fn forward_with_seq_idx_inner(
         &self,
         price_deltas: &Tensor,
@@ -42,13 +71,34 @@ impl TradingModel {
     ) -> ModelOutput {
         let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
+        self.forward_with_seq_idx_inner_on_device(
+            &price_deltas,
+            &static_features,
+            seq_idx,
+            compute_values,
+        )
+    }
+
+    fn forward_with_seq_idx_inner_on_device(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        seq_idx: Option<&Tensor>,
+        compute_values: bool,
+    ) -> ModelOutput {
+        if price_deltas.device() != self.device || static_features.device() != self.device {
+            panic!("forward_with_seq_idx_on_device requires tensors on {:?}", self.device);
+        }
+        let price_deltas = self.cast_inputs(price_deltas);
+        let static_features = self.cast_inputs(static_features);
 
         debug_fused("model_price_deltas", &price_deltas);
         debug_fused("model_static_features", &static_features);
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale, seq_idx) = self.patch_latent_stem(&price_deltas, batch_size, seq_idx);
+        let (x_stem, dt_scale, seq_idx) =
+            self.patch_latent_stem_on_device(&price_deltas, batch_size, seq_idx);
         debug_fused("model_x_stem", &x_stem);
         debug_fused("model_dt_scale", &dt_scale);
 

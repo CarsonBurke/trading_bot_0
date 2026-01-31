@@ -65,13 +65,27 @@ impl TradingModel {
     ) -> ModelOutput {
         let new_deltas = self.cast_inputs(&new_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
+        self.step_on_device(&new_deltas, &static_features, state)
+    }
+
+    pub fn step_on_device(
+        &self,
+        new_deltas: &Tensor,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        if new_deltas.device() != self.device || static_features.device() != self.device {
+            panic!("step_on_device requires tensors on {:?}", self.device);
+        }
+        let new_deltas = self.cast_inputs(new_deltas);
+        let static_features = self.cast_inputs(static_features);
 
         let full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
         let is_full = (new_deltas.dim() == 1 && new_deltas.size()[0] == full_obs)
             || (new_deltas.dim() == 2 && new_deltas.size()[1] == full_obs);
 
         if is_full {
-            return self.init_from_full(&new_deltas, &static_features, state);
+            return self.init_from_full_on_device(&new_deltas, &static_features, state);
         }
 
         let new_deltas = if new_deltas.dim() == 1 {
@@ -128,6 +142,30 @@ impl TradingModel {
         static_features: &Tensor,
         state: &mut StreamState,
     ) -> ModelOutput {
+        let price = if price_deltas.dim() == 1 {
+            price_deltas.unsqueeze(0)
+        } else {
+            price_deltas.shallow_clone()
+        };
+        let static_features = if static_features.dim() == 1 {
+            static_features.unsqueeze(0)
+        } else {
+            static_features.shallow_clone()
+        };
+        let price = self.cast_inputs(&price.to_device(self.device));
+        let static_features = self.cast_inputs(&static_features.to_device(self.device));
+        self.init_from_full_on_device(&price, &static_features, state)
+    }
+
+    fn init_from_full_on_device(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        if price_deltas.device() != self.device || static_features.device() != self.device {
+            panic!("init_from_full_on_device requires tensors on {:?}", self.device);
+        }
         let price = if price_deltas.dim() == 1 {
             price_deltas.unsqueeze(0)
         } else {

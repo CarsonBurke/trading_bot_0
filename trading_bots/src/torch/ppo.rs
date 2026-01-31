@@ -252,17 +252,22 @@ pub async fn train(weights_path: Option<&str>) {
         let mut obs_static =
             Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
         let mut obs_seq_idx = Tensor::zeros(&[NPROCS, seq_idx_dim], (Kind::Int64, device));
+        let ring_len = PRICE_DELTAS_PER_TICKER as i64;
+        let base_idx = Tensor::arange(ring_len, (Kind::Int64, device));
+        let mut ring_pos = ring_len - 1;
+        let mut ring_buf = Tensor::zeros(
+            &[NPROCS, TICKERS_COUNT, ring_len],
+            (Kind::Float, device),
+        );
+        let mut step_deltas = Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         obs_price.copy_(&obs_price_cpu);
         obs_static.copy_(&obs_static_cpu);
         obs_seq_idx.copy_(&obs_seq_idx_cpu);
+        ring_buf.copy_(&obs_price.view([NPROCS, TICKERS_COUNT, ring_len]));
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_cash_reward = Tensor::zeros(&[NPROCS], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
-
-        let action_dim = (TICKERS_COUNT + 1) as usize;
-        let mut actions_flat = vec![0.0f64; NPROCS as usize * action_dim];
-        let mut actions_vec = vec![vec![0.0f64; action_dim]; NPROCS as usize];
 
         let stats_kind = (Kind::Float, device);
 
@@ -275,7 +280,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         for step in 0..rollout_steps as usize {
             let (values, action_mean, u, actions, action_log_prob) = tch::no_grad(|| {
-                let (values, _, (action_mean, sde_latent)) = trading_model.forward_with_seq_idx(
+                let (values, _, (action_mean, sde_latent)) = trading_model.forward_with_seq_idx_on_device(
                     &obs_price,
                     &obs_static,
                     Some(&obs_seq_idx),
@@ -322,31 +327,44 @@ pub async fn train(weights_path: Option<&str>) {
                 let _ = debug_tensor_stats("u", &u, episode as i64, step);
                 let _ = debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
-            let actions_cpu = actions
-                .flatten(0, -1)
-                .to_device(tch::Device::Cpu)
-                .to_kind(Kind::Double);
-            tch::Cuda::synchronize(0);
-            let actions_flat_len = actions_flat.len();
-            actions_cpu.copy_data(&mut actions_flat, actions_flat_len);
-            for i in 0..NPROCS as usize {
-                let start = i * action_dim;
-                actions_vec[i].copy_from_slice(&actions_flat[start..start + action_dim]);
-            }
-
             s_price_deltas.push(&obs_price);
             s_static_obs.push(&obs_static);
             s_seq_idx.push(&obs_seq_idx);
 
-            env.step_into_full(
-                &actions_vec,
-                &mut obs_price,
+            let (reset_indices, reset_price_deltas) = env.step_into_ring_tensor(
+                &actions,
+                &mut step_deltas,
                 &mut obs_static,
                 &mut step_reward_per_ticker,
                 &mut step_cash_reward,
                 &mut step_is_done,
-                &mut obs_seq_idx,
             );
+
+            ring_pos = (ring_pos + 1) % ring_len;
+            let _ = ring_buf
+                .narrow(2, ring_pos, 1)
+                .copy_(&step_deltas.unsqueeze(-1));
+
+            if !reset_indices.is_empty() {
+                let idx = (&base_idx + (ring_pos + 1)).remainder(ring_len);
+                let pd_dim_usize =
+                    (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64) as usize;
+                for (reset_i, env_idx) in reset_indices.iter().enumerate() {
+                    let start = reset_i * pd_dim_usize;
+                    let end = start + pd_dim_usize;
+                    let ordered = Tensor::from_slice(&reset_price_deltas[start..end])
+                        .view([TICKERS_COUNT, ring_len])
+                        .to_device(device);
+                    let mut ring_env = ring_buf
+                        .narrow(0, *env_idx as i64, 1)
+                        .squeeze_dim(0);
+                    let _ = ring_env.index_copy_(1, &idx, &ordered);
+                }
+            }
+
+            let idx = (&base_idx + (ring_pos + 1)).remainder(ring_len);
+            let ordered = ring_buf.index_select(2, &idx);
+            obs_price.copy_(&ordered.view([NPROCS, pd_dim]));
 
             let mem_idx = step as i64 * NPROCS;
             let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&u); // Store pre-softmax u for training
@@ -382,7 +400,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         // Bootstrap value from final observation state (clipped to bucket bounds)
         let bootstrap_value = tch::no_grad(|| {
-            let (values, _, _) = trading_model.forward_with_seq_idx(
+            let (values, _, _) = trading_model.forward_with_seq_idx_on_device(
                 &obs_price,
                 &obs_static,
                 Some(&obs_seq_idx),
@@ -485,7 +503,7 @@ pub async fn train(weights_path: Option<&str>) {
 
                 let fwd_start = Instant::now();
                 let (_, critic_logits, (action_mean, sde_latent)) =
-                    trading_model.forward_with_seq_idx_no_values(
+                    trading_model.forward_with_seq_idx_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
                         Some(&seq_idx_chunk),
@@ -742,7 +760,7 @@ pub async fn train(weights_path: Option<&str>) {
                 let so_ev = static_obs_batch.narrow(0, 0, ev_samples);
                 let seq_ev = seq_idx_batch.narrow(0, 0, ev_samples);
                 let ret_ev = returns.narrow(0, 0, ev_samples);
-                let (values, _, _) = trading_model.forward_with_seq_idx(
+                let (values, _, _) = trading_model.forward_with_seq_idx_on_device(
                     &pd_ev,
                     &so_ev,
                     Some(&seq_ev),
@@ -771,7 +789,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         // Compute action std stats + rpo_alpha
         let log_std_stats = tch::no_grad(|| {
-            let (_, _, (_, sde_latent)) = trading_model.forward_with_seq_idx(
+            let (_, _, (_, sde_latent)) = trading_model.forward_with_seq_idx_on_device(
                 &s_price_deltas.get(0),
                 &s_static_obs.get(0),
                 Some(&s_seq_idx.get(0)),

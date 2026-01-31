@@ -1,4 +1,4 @@
-use tch::{Device, Tensor};
+use tch::{Device, Kind, Tensor};
 use std::path::Path;
 use std::time::Instant;
 use std::collections::VecDeque;
@@ -344,6 +344,12 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 
     let mut step = 0;
     let start_time = Instant::now();
+    let mut static_obs_gpu = Tensor::zeros(&[1, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
+    let mut full_obs_gpu = Tensor::zeros(
+        &[1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
+        (Kind::Float, device),
+    );
+    let mut step_obs_gpu = Tensor::zeros(&[TICKERS_COUNT as i64], (Kind::Float, device));
     loop {
         if step >= max_steps {
             break;
@@ -357,20 +363,23 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
         state_guard.update_account_total();
 
         if let Some((price_deltas_tensor, static_obs_tensor)) = state_guard.build_observation() {
-            let static_obs_gpu = static_obs_tensor.to_device(device);
+            static_obs_gpu.copy_(&static_obs_tensor);
 
             // First step: use full observation to initialize streaming state
             // Subsequent steps: use single delta per ticker for O(1) inference
             let price_deltas_gpu = if !state_guard.model_initialized {
                 state_guard.model_initialized = true;
-                price_deltas_tensor.to_device(device)
+                full_obs_gpu.copy_(&price_deltas_tensor);
+                &full_obs_gpu
             } else {
-                state_guard.get_step_deltas().to_device(device)
+                let step_deltas = state_guard.get_step_deltas();
+                step_obs_gpu.copy_(&step_deltas);
+                &step_obs_gpu
             };
 
             let (action_mean, sde_latent, corr_std, ind_std, w_policy) = tch::no_grad(|| {
                 let (_, _, (action_mean, sde_latent)) =
-                    model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state);
+                    model.step_on_device(price_deltas_gpu, &static_obs_gpu, &mut stream_state);
                 let (corr_std, ind_std) = model.lattice_stds();
                 let w_policy = model.w_policy();
                 (action_mean, sde_latent, corr_std, ind_std, w_policy)
