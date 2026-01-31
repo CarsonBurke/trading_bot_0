@@ -356,7 +356,7 @@ pub async fn train(weights_path: Option<&str>) {
 
             // Portfolio-level reward: include cash penalty to avoid trivial cash-hold policy.
             let portfolio_reward =
-                step_reward_per_ticker.sum_dim_intlist([1].as_slice(), false, Kind::Float) + &step_cash_reward;
+                step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float) + &step_cash_reward;
             if DEBUG_NUMERICS {
                 let _ =
                     debug_tensor_stats("portfolio_reward", &portfolio_reward, episode as i64, step);

@@ -37,36 +37,22 @@ impl VecEnv {
         let patch_ends = patch_ends_cpu();
         let seq_len = patch_ends.len();
         let rows = (NPROCS * TICKERS_COUNT) as usize;
-        let per_row = PRICE_DELTAS_PER_TICKER as usize;
         debug_assert_eq!(seq_len as i64, PATCH_SEQ_LEN);
         debug_assert_eq!(self.seq_idx_buf.len(), rows * seq_len);
         for row in 0..rows {
-            let row_offset = row * per_row;
-            let mut leading = 0usize;
-            while leading < per_row && self.price_deltas_buf[row_offset + leading] == 0.0 {
-                leading += 1;
-            }
-            let leading_i64 = leading as i64;
             let out_offset = row * seq_len;
             for (idx, end) in patch_ends.iter().enumerate() {
-                self.seq_idx_buf[out_offset + idx] = if leading_i64 >= *end { -1 } else { 0 };
+                self.seq_idx_buf[out_offset + idx] = if *end <= 0 { -1 } else { 0 };
             }
         }
     }
 
     pub fn new(random_start: bool) -> Self {
-        // Select random tickers ONCE, share across all envs
-        let count = TICKERS_COUNT as usize;
-        let mut available: Vec<String> = AVAILABLE_TICKERS.iter().map(|s| s.to_string()).collect();
-        available.shuffle(&mut rand::rng());
-        let tickers: Vec<String> = available.into_iter().take(count).collect();
-        eprintln!("VecEnv using tickers: {:?}", tickers);
-
         let mut envs = Vec::with_capacity(NPROCS as usize);
-        envs.push(Env::new_with_tickers_and_recording(tickers.clone(), random_start, true));
+        envs.push(Env::new_with_recording(random_start, true));
         eprintln!("first env");
         for i in 1..(NPROCS as usize) {
-            envs.push(Env::new_with_tickers_and_recording(tickers.clone(), random_start, false));
+            envs.push(Env::new_with_recording(random_start, false));
             eprintln!("env {}", i);
         }
         for (i, env) in envs.iter_mut().enumerate() {
