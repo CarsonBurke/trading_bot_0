@@ -144,7 +144,6 @@ impl TradingModel {
         };
 
         // Actor branch: dedicated MLP produces sde_latent (decoupled from critic)
-        // No trailing activation — sde_latent h² must span both signs for Lattice covariance
         let sde_latent = flat_tickers
             .apply(&self.actor_mlp_fc1)
             .silu()
