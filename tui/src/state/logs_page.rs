@@ -7,7 +7,6 @@ pub struct LogsPageState {
     pub training_output: Vec<String>,
     pub logs_list_state: ListState,
     pub logs_list_area: Rect,
-    first_view: bool,
     follow: bool,
 }
 
@@ -17,7 +16,6 @@ impl LogsPageState {
             training_output: Vec::new(),
             logs_list_state: ListState::default(),
             logs_list_area: Rect::default(),
-            first_view: true,
             follow: true,
         }
     }
@@ -112,10 +110,7 @@ impl LogsPageState {
     }
 
     pub fn enter(&mut self) {
-        if self.first_view {
-            self.first_view = false;
-            self.jump_to_bottom();
-        }
+        self.follow = true;
     }
 
     pub fn page_up(&mut self) {
