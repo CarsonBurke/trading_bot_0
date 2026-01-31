@@ -98,7 +98,8 @@ const MODEL_DIM: i64 = 128;
 const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
-pub(crate) const SDE_LATENT_DIM: i64 = TICKERS_COUNT * MODEL_DIM;
+const ACTOR_HIDDEN: i64 = 256;
+pub(crate) const SDE_LATENT_DIM: i64 = ACTOR_HIDDEN;
 pub(crate) const LOG_STD_INIT: f64 = 0.0;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
@@ -259,6 +260,8 @@ pub struct TradingModel {
     value_ln: RMSNorm,
     value_mlp_fc1: nn::Linear,
     value_mlp_fc2: nn::Linear,
+    actor_mlp_fc1: nn::Linear,
+    actor_mlp_fc2: nn::Linear,
     actor_out: nn::Linear,
     critic_out: nn::Linear,
     // Lattice exploration: correlated + independent noise via policy network weights
@@ -422,6 +425,18 @@ impl TradingModel {
         let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", TICKERS_COUNT * MODEL_DIM, MODEL_DIM, Default::default());
         let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, Default::default());
         
+        let actor_mlp_fc1 = nn::linear(
+            p / "actor_mlp_fc1",
+            TICKERS_COUNT * MODEL_DIM,
+            ACTOR_HIDDEN,
+            Default::default(),
+        );
+        let actor_mlp_fc2 = nn::linear(
+            p / "actor_mlp_fc2",
+            ACTOR_HIDDEN,
+            ACTOR_HIDDEN,
+            Default::default(),
+        );
         let actor_out = nn::linear(
             p / "actor_out",
             SDE_LATENT_DIM,
@@ -478,6 +493,8 @@ impl TradingModel {
             value_ln,
             value_mlp_fc1,
             value_mlp_fc2,
+            actor_mlp_fc1,
+            actor_mlp_fc2,
             actor_out,
             critic_out,
             log_std_param,

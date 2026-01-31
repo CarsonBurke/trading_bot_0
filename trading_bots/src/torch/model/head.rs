@@ -124,7 +124,7 @@ impl TradingModel {
         // Flatten per-ticker features, shared by actor and critic
         let flat_tickers = pooled_enriched.reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
 
-        // Critic
+        // Critic branch (reads flat_tickers directly)
         let value_hidden = self
             .value_ln
             .forward(&flat_tickers)
@@ -142,9 +142,13 @@ impl TradingModel {
         } else {
             Tensor::zeros(&[batch_size], (pooled_enriched.kind(), pooled_enriched.device()))
         };
-        let sde_latent = flat_tickers; // [batch, TICKERS_COUNT * MODEL_DIM]
 
-        // Action mean: actor_out(sde_latent) = W @ h + b, W is [ACTION_DIM, SDE_LATENT_DIM]
+        // Actor branch: dedicated MLP produces sde_latent (decoupled from critic)
+        // No trailing activation — sde_latent h² must span both signs for Lattice covariance
+        let sde_latent = flat_tickers
+            .apply(&self.actor_mlp_fc1)
+            .silu()
+            .apply(&self.actor_mlp_fc2); // [batch, SDE_LATENT_DIM]
         let action_mean = sde_latent.apply(&self.actor_out);
 
         let debug_metrics = None;
