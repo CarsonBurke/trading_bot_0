@@ -26,6 +26,9 @@ impl Env {
             actual_next += self.account.positions[ticker_idx].value_with_price(next_price);
         }
 
+        if actual_next <= 0.0 {
+            return (0.0, vec![0.0; n_tickers], 0.0);
+        }
         let actual_return = (actual_next / pre_total_assets).ln();
         let mut per_ticker_rewards = vec![0.0; n_tickers];
         let mut miss_sum = 0.0;
