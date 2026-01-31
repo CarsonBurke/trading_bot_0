@@ -442,6 +442,9 @@ pub async fn train(weights_path: Option<&str>) {
         let mut grad_norm_count = 0i64;
         let mut total_clipped = Tensor::zeros([], (Kind::Float, device));
         let mut total_ratio_samples = 0i64;
+        let mut total_entropy_weighted = Tensor::zeros([], (Kind::Float, device));
+        let mut entropy_min = Tensor::from(f64::INFINITY).to_device(device);
+        let mut entropy_max = Tensor::from(f64::NEG_INFINITY).to_device(device);
 
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
@@ -570,10 +573,11 @@ pub async fn train(weights_path: Option<&str>) {
                 // MVN entropy: 0.5 * (k*(1+ln(2pi)) + ln|Sigma|), reuses Cholesky from log_prob
                 let dist_entropy = (ACTION_DIM as f64 * (1.0 + LOG_2PI) + &log_det_sigma)
                     .g_mul_scalar(0.5).mean(Kind::Float);
+                let dist_entropy_detached = dist_entropy.detach();
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
                     + action_loss.shallow_clone()
-                    - dist_entropy * ENTROPY_COEF;
+                    - &dist_entropy * ENTROPY_COEF;
 
                 // RPO alpha loss: target induced KL (uniform noise in logit space)
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
@@ -605,6 +609,9 @@ pub async fn train(weights_path: Option<&str>) {
                 let _ =
                     total_value_loss_weighted.g_add_(&(&value_loss * chunk_sample_count as f64));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
+                let _ = total_entropy_weighted.g_add_(&(&dist_entropy_detached * chunk_sample_count as f64));
+                entropy_min = entropy_min.min_other(&dist_entropy_detached);
+                entropy_max = entropy_max.max_other(&dist_entropy_detached);
                 epoch_kl_count += chunk_sample_count;
                 total_sample_count += chunk_sample_count;
 
@@ -756,6 +763,12 @@ pub async fn train(weights_path: Option<&str>) {
             Tensor::zeros([], (Kind::Float, device))
         };
 
+        let entropy_mean_t = if total_sample_count > 0 {
+            &total_entropy_weighted / total_sample_count as f64
+        } else {
+            Tensor::zeros([], (Kind::Float, device))
+        };
+
         // Compute action std stats + rpo_alpha
         let log_std_stats = tch::no_grad(|| {
             let (_, _, (_, sde_latent)) = trading_model.forward_with_seq_idx(
@@ -795,11 +808,14 @@ pub async fn train(weights_path: Option<&str>) {
                 clip_frac_t.view([1]),
                 adv_stats.view([3]),
                 log_std_stats.view([4]),
+                entropy_mean_t.view([1]),
+                entropy_min.view([1]),
+                entropy_max.view([1]),
             ],
             0,
         );
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 12]);
+            .unwrap_or_else(|_| vec![0.0; 15]);
         let mean_policy_loss = all_scalars_vec[0];
         let mean_value_loss = all_scalars_vec[1];
         let explained_var = all_scalars_vec[2];
@@ -808,6 +824,8 @@ pub async fn train(weights_path: Option<&str>) {
         let (adv_mean, adv_min, adv_max) =
             (all_scalars_vec[5], all_scalars_vec[6], all_scalars_vec[7]);
         let log_std_stats_vec = &all_scalars_vec[8..12];
+        let (entropy_mean, entropy_min_val, entropy_max_val) =
+            (all_scalars_vec[12], all_scalars_vec[13], all_scalars_vec[14]);
 
         let primary = env.primary_mut();
         primary
@@ -825,6 +843,7 @@ pub async fn train(weights_path: Option<&str>) {
         primary.meta_history.record_value_loss(mean_value_loss);
         primary.meta_history.record_explained_var(explained_var);
         primary.meta_history.record_grad_norm(mean_grad_norm);
+        primary.meta_history.record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",

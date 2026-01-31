@@ -32,6 +32,9 @@ pub struct MetaHistory {
     pub temporal_attn_eff_len: Vec<f64>,
     pub temporal_attn_center: Vec<f64>,
     pub temporal_attn_last_weight: Vec<f64>,
+    pub policy_entropy_mean: Vec<f64>,
+    pub policy_entropy_min: Vec<f64>,
+    pub policy_entropy_max: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -73,6 +76,12 @@ impl MetaHistory {
 
     pub fn record_clip_fraction(&mut self, clip_fraction: f64) {
         self.clip_fraction.push(clip_fraction);
+    }
+
+    pub fn record_policy_entropy(&mut self, mean: f64, min: f64, max: f64) {
+        self.policy_entropy_mean.push(mean);
+        self.policy_entropy_min.push(min);
+        self.policy_entropy_max.push(max);
     }
 
     pub fn record_temporal_debug(
@@ -158,6 +167,11 @@ impl MetaHistory {
         self.temporal_attn_center = load_multiline(&temporal_path, "temporal_attn_center");
         self.temporal_attn_last_weight = load_multiline(&temporal_path, "temporal_attn_last");
 
+        let entropy_path = format!("{base_dir}/policy_entropy.report.bin");
+        self.policy_entropy_mean = load_multiline(&entropy_path, "mean");
+        self.policy_entropy_min = load_multiline(&entropy_path, "min");
+        self.policy_entropy_max = load_multiline(&entropy_path, "max");
+
         println!("Loaded meta history from episode {} ({} data points)", episode, self.final_assets.len());
     }
 
@@ -238,6 +252,16 @@ impl MetaHistory {
         if !self.clip_fraction.is_empty() {
             let r = Self::report("Clip Fraction", "Episode", Some("Fraction"), ScaleKind::Linear, simple(&self.clip_fraction));
             let _ = write_report(&format!("{base_dir}/clip_fraction.report.bin"), &r);
+        }
+        if !self.policy_entropy_mean.is_empty() {
+            let r = Self::report("Policy Entropy", "Episode", Some("Entropy (nats)"), ScaleKind::Linear, ReportKind::MultiLine {
+                series: vec![
+                    ReportSeries { label: "mean".to_string(), values: f64_to_f32(&self.policy_entropy_mean) },
+                    ReportSeries { label: "min".to_string(), values: f64_to_f32(&self.policy_entropy_min) },
+                    ReportSeries { label: "max".to_string(), values: f64_to_f32(&self.policy_entropy_max) },
+                ],
+            });
+            let _ = write_report(&format!("{base_dir}/policy_entropy.report.bin"), &r);
         }
         if !self.time_alpha_attn_mean.is_empty() {
             let r = Self::report("Time/Cross Alpha Means", "Episode", Some("Alpha"), ScaleKind::Linear, ReportKind::MultiLine {

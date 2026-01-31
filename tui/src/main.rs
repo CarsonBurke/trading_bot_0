@@ -142,7 +142,8 @@ impl App {
             "clip_fraction",
             "explained_var",
             "value_loss",
-            "policy_loss"
+            "policy_loss",
+            "policy_entropy"
         ];
 
         // Ticker-specific chart base names
