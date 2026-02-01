@@ -427,8 +427,7 @@ pub async fn train(weights_path: Option<&str>) {
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&portfolio_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
-            // Clip stored values to bucket bounds for consistent GAE computation
-            let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values.clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP));
+            let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
             let _ = s_action_weights
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&actions);
@@ -440,7 +439,7 @@ pub async fn train(weights_path: Option<&str>) {
         let gamma = 0.99f64;
         let gae_lambda = 0.95f64;
 
-        // Bootstrap value from final observation state (clipped to bucket bounds)
+        // Bootstrap value from final observation state
         let bootstrap_value = tch::no_grad(|| {
             let (values, _, _) = trading_model.forward_with_seq_idx_on_device(
                 &obs_price,
@@ -448,7 +447,7 @@ pub async fn train(weights_path: Option<&str>) {
                 Some(&obs_seq_idx),
                 false,
             );
-            values.to_kind(Kind::Float).clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP)
+            values.to_kind(Kind::Float)
         });
 
         tch::no_grad(|| {
@@ -467,8 +466,7 @@ pub async fn train(weights_path: Option<&str>) {
                 let delta = rewards + (1.0 - &dones) * gamma * &next_values - &cur_values;
                 last_gae = delta + (1.0 - &dones) * gamma * gae_lambda * &last_gae;
                 let _ = advantages.narrow(0, mem_idx, NPROCS).copy_(&last_gae);
-                // Clip returns to value bucket bounds to ensure critic trains on representable targets
-                let step_returns = (&last_gae + &cur_values).clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
+                let step_returns = &last_gae + &cur_values;
                 let _ = returns.narrow(0, mem_idx, NPROCS).copy_(&step_returns);
             }
         });
