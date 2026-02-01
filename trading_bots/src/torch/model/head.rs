@@ -144,10 +144,12 @@ impl TradingModel {
         };
 
         // Actor branch: dedicated MLP produces sde_latent (decoupled from critic)
-        let sde_latent = flat_tickers
+        let sde_latent = self.actor_ln
+            .forward(&flat_tickers)
             .apply(&self.actor_mlp_fc1)
             .silu()
-            .apply(&self.actor_mlp_fc2); // [batch, SDE_LATENT_DIM]
+            .apply(&self.actor_mlp_fc2)
+            .silu(); // [batch, SDE_LATENT_DIM]
         let action_mean = sde_latent.apply(&self.actor_out);
 
         let debug_metrics = None;

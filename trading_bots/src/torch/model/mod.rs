@@ -100,7 +100,7 @@ const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
 const ACTOR_HIDDEN: i64 = 256;
 pub(crate) const SDE_LATENT_DIM: i64 = ACTOR_HIDDEN;
-pub(crate) const LOG_STD_INIT: f64 = -1.2;
+pub(crate) const LOG_STD_INIT: f64 = 0.0;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
 pub(crate) const LATTICE_STD_REG: f64 = 0.0;
@@ -260,6 +260,7 @@ pub struct TradingModel {
     value_ln: RMSNorm,
     value_mlp_fc1: nn::Linear,
     value_mlp_fc2: nn::Linear,
+    actor_ln: RMSNorm,
     actor_mlp_fc1: nn::Linear,
     actor_mlp_fc2: nn::Linear,
     actor_out: nn::Linear,
@@ -306,9 +307,7 @@ impl TradingModel {
     pub fn lattice_stds(&self) -> (Tensor, Tensor) {
         let log_std = self.log_std_param
             .clamp(LATTICE_MIN_STD.ln(), LATTICE_MAX_STD.ln());
-        // tanh bounding on sde_latent caps h² ∈ [0,1], so the
-        // variance-scaling correction for unbounded h is no longer needed
-        let log_std = &log_std;
+        let log_std = &log_std - 0.5 * (SDE_LATENT_DIM as f64).ln();
         let std = expln(&log_std);
         let corr_std = std.narrow(1, 0, SDE_LATENT_DIM);
         let ind_std = std.narrow(1, SDE_LATENT_DIM, ACTION_DIM);
@@ -427,6 +426,7 @@ impl TradingModel {
         let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", TICKERS_COUNT * MODEL_DIM, MODEL_DIM, Default::default());
         let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, Default::default());
         
+        let actor_ln = RMSNorm::new(&(p / "actor_ln"), TICKERS_COUNT * MODEL_DIM, 1e-6);
         let actor_mlp_fc1 = nn::linear(
             p / "actor_mlp_fc1",
             TICKERS_COUNT * MODEL_DIM,
@@ -437,7 +437,10 @@ impl TradingModel {
             p / "actor_mlp_fc2",
             ACTOR_HIDDEN,
             ACTOR_HIDDEN,
-            Default::default(),
+            nn::LinearConfig {
+                ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
+                ..Default::default()
+            },
         );
         let actor_out = nn::linear(
             p / "actor_out",
@@ -495,6 +498,7 @@ impl TradingModel {
             value_ln,
             value_mlp_fc1,
             value_mlp_fc2,
+            actor_ln,
             actor_mlp_fc1,
             actor_mlp_fc2,
             actor_out,
