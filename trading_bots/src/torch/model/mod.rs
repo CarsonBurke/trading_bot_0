@@ -100,7 +100,7 @@ const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
 const ACTOR_HIDDEN: i64 = 256;
 pub(crate) const SDE_LATENT_DIM: i64 = ACTOR_HIDDEN;
-pub(crate) const LOG_STD_INIT: f64 = 0.0;
+pub(crate) const LOG_STD_INIT: f64 = -1.2;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
 pub(crate) const LATTICE_STD_REG: f64 = 0.0;
@@ -306,7 +306,9 @@ impl TradingModel {
     pub fn lattice_stds(&self) -> (Tensor, Tensor) {
         let log_std = self.log_std_param
             .clamp(LATTICE_MIN_STD.ln(), LATTICE_MAX_STD.ln());
-        let log_std = &log_std - 0.5 * (SDE_LATENT_DIM as f64).ln();
+        // tanh bounding on sde_latent caps h² ∈ [0,1], so the
+        // variance-scaling correction for unbounded h is no longer needed
+        let log_std = &log_std;
         let std = expln(&log_std);
         let corr_std = std.narrow(1, 0, SDE_LATENT_DIM);
         let ind_std = std.narrow(1, SDE_LATENT_DIM, ACTION_DIM);

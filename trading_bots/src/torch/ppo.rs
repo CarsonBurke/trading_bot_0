@@ -335,14 +335,17 @@ pub async fn train(weights_path: Option<&str>) {
                 let ind_exploration_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind)
                     * &rollout_ind_std;
 
+                // Bound latent for noise path only (prevents h-shrinkage incentive)
+                let sde_latent_bounded = sde_latent.tanh();
+
                 // Correlated noise: perturb shared latent, project through W
-                let latent_noise = sde_latent.matmul(&corr_exploration_mat); // [batch, SDE_LATENT_DIM]
+                let latent_noise = sde_latent_bounded.matmul(&corr_exploration_mat); // [batch, SDE_LATENT_DIM]
                 let w = trading_model.w_policy(); // [ACTION_DIM, SDE_LATENT_DIM]
                 let correlated_action_noise = LATTICE_ALPHA
                     * latent_noise.matmul(&w.transpose(0, 1)); // [batch, ACTION_DIM]
 
                 // Independent noise: project shared latent through ind noise
-                let independent_action_noise = sde_latent.matmul(&ind_exploration_mat); // [batch, ACTION_DIM]
+                let independent_action_noise = sde_latent_bounded.matmul(&ind_exploration_mat); // [batch, ACTION_DIM]
 
                 let noise = &correlated_action_noise + &independent_action_noise;
                 let u = &action_mean + &noise;
@@ -350,7 +353,7 @@ pub async fn train(weights_path: Option<&str>) {
 
                 // Log prob via MVN
                 let sigma_mat = build_lattice_covariance(
-                    &sde_latent, &rollout_corr_std, &rollout_ind_std, &trading_model.w_policy(),
+                    &sde_latent_bounded, &rollout_corr_std, &rollout_ind_std, &trading_model.w_policy(),
                 );
                 let diff = &u - &action_mean;
                 let (log_prob_gaussian, _) = mvn_log_prob(&sigma_mat, &diff, ACTION_DIM);
@@ -554,7 +557,7 @@ pub async fn train(weights_path: Option<&str>) {
 
                 // learn_features=false: detach sde_latent for covariance (h²) path
                 // Action mean gradients still flow through the attached sde_latent
-                let sde_latent_detached = sde_latent.detach();
+                let sde_latent_detached = sde_latent.detach().tanh();
                 let (corr_std, ind_std) = trading_model.lattice_stds();
                 let sigma_mat = build_lattice_covariance(
                     &sde_latent_detached, &corr_std, &ind_std, &trading_model.w_policy(),
@@ -836,7 +839,7 @@ pub async fn train(weights_path: Option<&str>) {
             );
             let (corr_std, ind_std) = trading_model.lattice_stds();
             let sigma_mat = build_lattice_covariance(
-                &sde_latent, &corr_std, &ind_std, &trading_model.w_policy(),
+                &sde_latent.tanh(), &corr_std, &ind_std, &trading_model.w_policy(),
             );
             let action_std = sigma_mat.diagonal(0, -2, -1).clamp_min(1e-6).sqrt();
             let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
