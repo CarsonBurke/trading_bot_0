@@ -516,9 +516,12 @@ pub async fn train(weights_path: Option<&str>) {
                 // act_mb contains the stored u (pre-softmax logits)
                 let u = act_mb;
 
+                // learn_features=false: detach sde_latent for covariance (h²) path
+                // Action mean gradients still flow through the attached sde_latent
+                let sde_latent_detached = sde_latent.detach();
                 let (corr_std, ind_std) = trading_model.lattice_stds();
                 let sigma_mat = build_lattice_covariance(
-                    &sde_latent, &corr_std, &ind_std, &trading_model.w_policy(),
+                    &sde_latent_detached, &corr_std, &ind_std, &trading_model.w_policy(),
                 );
 
                 // RPO: sigmoid parameterization for smooth gradients
