@@ -474,6 +474,14 @@ pub async fn train(weights_path: Option<&str>) {
         let advantages = advantages.detach();
         let returns = returns.detach();
 
+        let max_ret_abs = returns.abs().max().double_value(&[]);
+        if max_ret_abs > VALUE_LOG_CLIP {
+            eprintln!(
+                "Warning: returns exceed VALUE_LOG_CLIP: max_abs={:.6} clip={:.6}",
+                max_ret_abs, VALUE_LOG_CLIP
+            );
+        }
+
         let ret_norm_scale = return_normalizer.update(&returns);
 
         // Compute advantage stats once per rollout (before normalization)
