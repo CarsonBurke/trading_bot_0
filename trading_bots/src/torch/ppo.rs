@@ -11,7 +11,7 @@ use crate::torch::model::{
     SDE_EPS, SDE_LATENT_DIM,
 };
 
-const LEARNING_RATE: f64 = 4e-4;
+const LEARNING_RATE: f64 = 3e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
@@ -36,6 +36,43 @@ const RPO_ALPHA_INIT: f64 = 0.1; // CleanRL impl found 0.1 reliably improved res
 const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
+
+struct ReturnNormalizer {
+    percentile_low: f64,
+    percentile_high: f64,
+    initialized: bool,
+}
+
+impl ReturnNormalizer {
+    fn new() -> Self {
+        Self { percentile_low: 0.0, percentile_high: 0.0, initialized: false }
+    }
+
+    fn update(&mut self, returns: &Tensor) -> f64 {
+        const DECAY: f64 = 0.99;
+        const LOW_PCT: f64 = 0.05;
+        const HIGH_PCT: f64 = 0.95;
+
+        let sorted = returns.to_kind(Kind::Float).sort(0, false).0;
+        let n = sorted.size()[0];
+        let low_idx = ((n as f64 * LOW_PCT).floor() as i64).clamp(0, n - 1);
+        let high_idx = ((n as f64 * HIGH_PCT).floor() as i64).clamp(0, n - 1);
+        let p5: f64 = sorted.double_value(&[low_idx]);
+        let p95: f64 = sorted.double_value(&[high_idx]);
+
+        if !self.initialized {
+            self.percentile_low = p5;
+            self.percentile_high = p95;
+            self.initialized = true;
+        } else {
+            self.percentile_low = DECAY * self.percentile_low + (1.0 - DECAY) * p5;
+            self.percentile_high = DECAY * self.percentile_high + (1.0 - DECAY) * p95;
+        }
+
+        let range = self.percentile_high - self.percentile_low;
+        range.max(1.0)
+    }
+}
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -246,6 +283,8 @@ pub async fn train(weights_path: Option<&str>) {
     let mut rollout_corr_std = Tensor::zeros(&[SDE_LATENT_DIM, SDE_LATENT_DIM], (Kind::Float, device));
     let mut rollout_ind_std = Tensor::zeros(&[SDE_LATENT_DIM, ACTION_DIM], (Kind::Float, device));
 
+    let mut return_normalizer = ReturnNormalizer::new();
+
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
@@ -434,6 +473,8 @@ pub async fn train(weights_path: Option<&str>) {
         let advantages = advantages.detach();
         let returns = returns.detach();
 
+        let ret_norm_scale = return_normalizer.update(&returns);
+
         // Compute advantage stats once per rollout (before normalization)
         let adv_stats = tch::no_grad(|| {
             Tensor::stack(
@@ -490,12 +531,7 @@ pub async fn train(weights_path: Option<&str>) {
                 let act_mb = s_actions.narrow(0, chunk_sample_start, chunk_sample_count);
                 let ret_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
                 let adv_mb_raw = advantages.narrow(0, chunk_sample_start, chunk_sample_count);
-                // Per-minibatch advantage normalization (CleanRL style)
-                let adv_mb = {
-                    let mb_mean = adv_mb_raw.mean(Kind::Float);
-                    let mb_std = adv_mb_raw.std(false) + 1e-8;
-                    (&adv_mb_raw - mb_mean) / mb_std
-                };
+                let adv_mb = &adv_mb_raw / ret_norm_scale;
                 let old_log_probs_mb =
                     s_old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
                 let _weight_mb =
