@@ -105,7 +105,7 @@ pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
 pub(crate) const LATTICE_STD_REG: f64 = 0.0;
 pub(crate) const LATTICE_MIN_STD: f64 = 1e-3;
-pub(crate) const LATTICE_MAX_STD: f64 = 2.0; // Official lattice uses 1.0
+pub(crate) const LATTICE_MAX_STD: f64 = 10.0;
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
@@ -423,15 +423,24 @@ impl TradingModel {
         let static_cross_v = nn::linear(p / "static_cross_v", MODEL_DIM, MODEL_DIM, Default::default());
         let static_cross_out = nn::linear(p / "static_cross_out", MODEL_DIM, MODEL_DIM, Default::default());
         let value_ln = RMSNorm::new(&(p / "value_ln"), TICKERS_COUNT * MODEL_DIM, 1e-6);
-        let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", TICKERS_COUNT * MODEL_DIM, MODEL_DIM, Default::default());
-        let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, Default::default());
+        let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", TICKERS_COUNT * MODEL_DIM, MODEL_DIM, nn::LinearConfig {
+            ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
+            ..Default::default()
+        });
+        let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, nn::LinearConfig {
+            ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
+            ..Default::default()
+        });
         
         let actor_ln = RMSNorm::new(&(p / "actor_ln"), TICKERS_COUNT * MODEL_DIM, 1e-6);
         let actor_mlp_fc1 = nn::linear(
             p / "actor_mlp_fc1",
             TICKERS_COUNT * MODEL_DIM,
             ACTOR_HIDDEN,
-            Default::default(),
+            nn::LinearConfig {
+                ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
+                ..Default::default()
+            },
         );
         let actor_mlp_fc2 = nn::linear(
             p / "actor_mlp_fc2",

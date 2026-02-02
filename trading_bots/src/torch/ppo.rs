@@ -310,11 +310,16 @@ pub async fn train(weights_path: Option<&str>) {
 
         let stats_kind = (Kind::Float, device);
 
-        // Capture lattice stds at start of rollout for consistent log_prob during training
-        tch::no_grad(|| {
+        // Capture lattice stds and sample exploration matrices once per rollout
+        let (corr_exploration_mat, ind_exploration_mat) = tch::no_grad(|| {
             let (corr, ind) = trading_model.lattice_stds();
             rollout_corr_std.copy_(&corr);
             rollout_ind_std.copy_(&ind);
+            let corr_mat = Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], stats_kind)
+                * &rollout_corr_std;
+            let ind_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind)
+                * &rollout_ind_std;
+            (corr_mat, ind_mat)
         });
 
         for step in 0..rollout_steps as usize {
@@ -328,12 +333,6 @@ pub async fn train(weights_path: Option<&str>) {
                 let values = values.to_kind(Kind::Float);
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let sde_latent = sde_latent.to_kind(Kind::Float);
-
-                // Lattice: sample two exploration matrices
-                let corr_exploration_mat = Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], stats_kind)
-                    * &rollout_corr_std;
-                let ind_exploration_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind)
-                    * &rollout_ind_std;
 
                 // Correlated noise: perturb shared latent, project through W
                 let latent_noise = sde_latent.matmul(&corr_exploration_mat); // [batch, SDE_LATENT_DIM]
