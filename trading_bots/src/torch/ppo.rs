@@ -631,7 +631,7 @@ pub async fn train(weights_path: Option<&str>) {
                     -Tensor::min_other(&(&ratio * &adv_mb), &(&ratio_clipped * &adv_mb))
                         .mean(Kind::Float);
 
-                // Portfolio-level value loss: ret_mb is [chunk_sample_count] (pre-clipped to bucket bounds during GAE)
+                // Portfolio-level value loss
                 let log_probs = critic_logits
                     .to_kind(Kind::Float)
                     .log_softmax(-1, Kind::Float);
