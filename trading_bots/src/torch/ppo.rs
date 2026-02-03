@@ -166,8 +166,8 @@ fn mvn_log_prob(sigma_mat: &Tensor, diff: &Tensor, k: i64) -> (Tensor, Tensor) {
     let jitter = Tensor::eye(k, (Kind::Float, sigma_mat.device())).unsqueeze(0) * SDE_EPS;
     let chol = (sigma_mat + &jitter).linalg_cholesky(false);
     let diff_col = diff.unsqueeze(-1);
-    let y = chol.linalg_solve_triangular(&diff_col, false, true, false);
-    let mahal = y.transpose(-2, -1).matmul(&y).squeeze_dim(-1).squeeze_dim(-1);
+    let y = chol.linalg_solve_triangular(&diff_col, false, true, false).squeeze_dim(-1);
+    let mahal = y.pow_tensor_scalar(2).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
     let log_det = chol.diagonal(0, -2, -1).log()
         .sum_dim_intlist([-1].as_slice(), false, Kind::Float) * 2.0;
     let log_prob = (&mahal + &log_det + k as f64 * LOG_2PI).g_mul_scalar(-0.5);
