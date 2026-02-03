@@ -23,6 +23,7 @@ const VALUE_LOSS_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
 pub const VALUE_LOG_CLIP: f64 = 10.0;
+const VALUE_RAW_CLIP: f64 = 22025.465794806718; // symexp(VALUE_LOG_CLIP) = exp(10) - 1
 const CRITIC_ENTROPY_COEF: f64 = 0.0;
 const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
@@ -489,11 +490,12 @@ pub async fn train(weights_path: Option<&str>) {
         let advantages = advantages.detach();
         let returns = returns.detach();
 
+        let raw_clip = VALUE_RAW_CLIP;
         let max_ret_abs = returns.abs().max().double_value(&[]);
-        if max_ret_abs > VALUE_LOG_CLIP {
+        if max_ret_abs > raw_clip {
             eprintln!(
-                "Warning: returns exceed VALUE_LOG_CLIP: max_abs={:.6} clip={:.6}",
-                max_ret_abs, VALUE_LOG_CLIP
+                "Warning: returns exceed bin range: max_abs={:.6} clip={:.6}",
+                max_ret_abs, raw_clip
             );
         }
 
@@ -828,10 +830,11 @@ pub async fn train(weights_path: Option<&str>) {
                     Some(&seq_ev),
                     true,
                 );
+                let raw_clip = VALUE_RAW_CLIP;
                 let values = values
                     .to_kind(Kind::Float)
                     .view([ev_samples])
-                    .clamp(-VALUE_LOG_CLIP, VALUE_LOG_CLIP);
+                    .clamp(-raw_clip, raw_clip);
                 let residuals = &values - &ret_ev;
                 let mean_target = ret_ev.mean(Kind::Float);
                 let var_targets =

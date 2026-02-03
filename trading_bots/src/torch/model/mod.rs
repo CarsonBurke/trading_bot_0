@@ -181,7 +181,7 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
         .as_slice()
 }
 
-const NUM_VALUE_BUCKETS: i64 = 255;
+const NUM_VALUE_BUCKETS: i64 = 255; // Must be odd due to handling
 
 /// (values, critic_logits, (action_mean, sde_latent))
 /// sde_latent: [batch, SDE_LATENT_DIM] flat ticker features for Lattice noise
