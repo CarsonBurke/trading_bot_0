@@ -7,7 +7,7 @@ use crate::torch::constants::{
 };
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    symlog_tensor, TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_STD_REG, PATCH_SEQ_LEN,
+    TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_STD_REG, PATCH_SEQ_LEN,
     SDE_EPS, SDE_LATENT_DIM,
 };
 
@@ -23,7 +23,7 @@ const VALUE_LOSS_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
 pub const VALUE_LOG_CLIP: f64 = 10.0;
-const CRITIC_ENTROPY_COEF: f64 = 0.01;
+const CRITIC_ENTROPY_COEF: f64 = 0.0;
 const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
 const LOG_2PI: f64 = 1.8378770664093453;
@@ -133,32 +133,51 @@ impl GpuRollingBuffer {
     }
 }
 
+/// DreamerV3-style twohot CE loss for non-uniform bin spacing.
+/// Finds the two nearest bins via searchsorted, weights by distance.
 fn twohot_log_prob_loss(targets: &Tensor, log_probs: &Tensor, centers: &Tensor) -> Tensor {
     let centers = centers.to_kind(log_probs.kind());
     let n_buckets = centers.size()[0];
-    let min_center = centers.narrow(0, 0, 1).squeeze_dim(0);
-    let step = centers.narrow(0, 1, 1).squeeze_dim(0) - &min_center;
-    let step = step.clamp_min(1e-6);
     let targets = targets.to_kind(log_probs.kind());
 
-    let pos = (&targets - &min_center) / &step;
-    let low_idx = pos
-        .floor()
-        .clamp(0, n_buckets - 2)
-        .to_kind(Kind::Int64);
-    let high_idx = &low_idx + 1;
-    let low_val = &min_center + &step * low_idx.to_kind(log_probs.kind());
-    let weight_high = ((&targets - &low_val) / &step).clamp(0.0, 1.0);
-    let weight_low = weight_high.g_mul_scalar(-1.0) + 1.0;
+    // below = number of bins <= target, minus 1 (index of bin at or just below)
+    let below = centers
+        .unsqueeze(0)
+        .le_tensor(&targets.unsqueeze(1))
+        .to_kind(Kind::Int64)
+        .sum_dim_intlist(-1, false, Kind::Int64)
+        - 1;
+    let below = below.clamp(0, n_buckets - 1);
+    // above = n_buckets - number of bins > target (index of bin at or just above)
+    let above = n_buckets
+        - centers
+            .unsqueeze(0)
+            .gt_tensor(&targets.unsqueeze(1))
+            .to_kind(Kind::Int64)
+            .sum_dim_intlist(-1, false, Kind::Int64);
+    let above = above.clamp(0, n_buckets - 1);
 
-    let log_p_low = log_probs
-        .gather(1, &low_idx.unsqueeze(1), false)
+    let bin_below = centers.index_select(0, &below.flatten(0, -1)).reshape_as(&targets);
+    let bin_above = centers.index_select(0, &above.flatten(0, -1)).reshape_as(&targets);
+
+    // When below == above (exact bin hit), both distances are 0.
+    // clamp_min ensures 0/eps → 0 for both, but we gather the same log_prob
+    // for both below and above, so weight_below + weight_above doesn't matter
+    // as long as they sum to 1. Adding eps to both distances achieves this.
+    let dist_to_below = (&bin_below - &targets).abs() + 1e-8;
+    let dist_to_above = (&bin_above - &targets).abs() + 1e-8;
+    let total = &dist_to_below + &dist_to_above;
+    let weight_below = &dist_to_above / &total;
+    let weight_above = &dist_to_below / &total;
+
+    let log_p_below = log_probs
+        .gather(1, &below.unsqueeze(1), false)
         .squeeze_dim(1);
-    let log_p_high = log_probs
-        .gather(1, &high_idx.unsqueeze(1), false)
+    let log_p_above = log_probs
+        .gather(1, &above.unsqueeze(1), false)
         .squeeze_dim(1);
 
-    -(weight_low * log_p_low + weight_high * log_p_high).mean(Kind::Float)
+    -(weight_below * log_p_below + weight_above * log_p_above).mean(Kind::Float)
 }
 
 /// MVN log prob + log|Σ|: returns (log_prob, log_det_sigma) to avoid redundant Cholesky
@@ -423,7 +442,7 @@ pub async fn train(weights_path: Option<&str>) {
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&portfolio_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
-            let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
+            let _ = s_values.narrow(0, mem_idx, NPROCS);
             let _ = s_action_weights
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&actions);
@@ -614,16 +633,15 @@ pub async fn train(weights_path: Option<&str>) {
                 let log_probs = critic_logits
                     .to_kind(Kind::Float)
                     .log_softmax(-1, Kind::Float);
-                let ret_symlog = symlog_tensor(&ret_mb);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("ret_symlog", &ret_symlog, _epoch, chunk_i);
                     let _ = debug_tensor_stats("critic_logits", &critic_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_probs", &log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
+                // Bins are in raw return space (symexp-spaced), targets stay raw
                 let ce_loss = twohot_log_prob_loss(
-                    &ret_symlog,
+                    &ret_mb,
                     &log_probs,
                     trading_model.value_centers(),
                 );

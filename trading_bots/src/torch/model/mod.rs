@@ -181,7 +181,7 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
         .as_slice()
 }
 
-const NUM_VALUE_BUCKETS: i64 = 127;
+const NUM_VALUE_BUCKETS: i64 = 255;
 
 /// (values, critic_logits, (action_mean, sde_latent))
 /// sde_latent: [batch, SDE_LATENT_DIM] flat ticker features for Lattice noise
@@ -461,12 +461,13 @@ impl TradingModel {
                 bias: true,
             },
         );
+        // Zero-init critic output (DreamerV3 outscale=0.0): uniform softmax → zero value via symmetric sum
         let critic_out = nn::linear(
             p / "critic_out",
             MODEL_DIM,
             NUM_VALUE_BUCKETS,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(MODEL_DIM, NUM_VALUE_BUCKETS),
+                ws_init: Init::Const(0.0),
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
@@ -477,13 +478,13 @@ impl TradingModel {
             &[SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM],
             Init::Const(LOG_STD_INIT),
         );
-        let max_symlog = (VALUE_LOG_CLIP + 1.0).ln();
-        let value_centers = Tensor::linspace(
-            -max_symlog,
-            max_symlog,
-            NUM_VALUE_BUCKETS,
-            (Kind::Float, p.device()),
-        );
+        // DreamerV3-style exponential bin spacing: symexp(linspace(-VALUE_LOG_CLIP, 0))
+        // Dense near zero (where most returns land), sparse at extremes
+        let half_n = (NUM_VALUE_BUCKETS - 1) / 2 + 1; // 128
+        let neg_half = Tensor::linspace(-VALUE_LOG_CLIP, 0.0, half_n, (Kind::Float, p.device()));
+        let neg_half = symexp_tensor(&neg_half);
+        let pos_half = neg_half.narrow(0, 0, half_n - 1).flip([0]).neg();
+        let value_centers = Tensor::cat(&[neg_half, pos_half], 0);
         let bucket_centers = value_centers.shallow_clone();
         Self {
             patch_embed_weight,

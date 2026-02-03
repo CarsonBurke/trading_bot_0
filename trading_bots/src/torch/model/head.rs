@@ -133,12 +133,23 @@ impl TradingModel {
             .apply(&self.value_mlp_fc2);
         let critic_logits = value_hidden.apply(&self.critic_out); // [batch, NUM_VALUE_BUCKETS]
         let values = if compute_values {
+            // DreamerV3 symmetric sum: pair negative/positive bins to cancel
+            // floating point errors, ensuring zero prediction at uniform init
             let critic_probs = critic_logits.softmax(-1, Kind::Float);
             let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
-            let values_symlog = critic_probs
-                .matmul(&bucket_centers.unsqueeze(-1))
-                .squeeze_dim(-1); // [batch]
-            super::symexp_tensor(&values_symlog).to_kind(pooled_enriched.kind())
+            let n = bucket_centers.size()[0];
+            let m = (n - 1) / 2; // 127 for 255 bins
+            let p_neg = critic_probs.narrow(-1, 0, m);
+            let p_mid = critic_probs.narrow(-1, m, 1);
+            let p_pos = critic_probs.narrow(-1, m + 1, m);
+            let b_neg = bucket_centers.narrow(0, 0, m);
+            let b_mid = bucket_centers.narrow(0, m, 1);
+            let b_pos = bucket_centers.narrow(0, m + 1, m);
+            // Sum paired terms: (p_neg * b_neg)[reversed] + (p_pos * b_pos)
+            let paired = (&p_neg * &b_neg).flip([-1]) + &p_pos * &b_pos;
+            let wavg = paired.sum_dim_intlist(-1, false, Kind::Float)
+                + (&p_mid * &b_mid).squeeze_dim(-1);
+            wavg.to_kind(pooled_enriched.kind())
         } else {
             Tensor::zeros(&[batch_size], (pooled_enriched.kind(), pooled_enriched.device()))
         };
