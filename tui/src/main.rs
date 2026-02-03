@@ -74,6 +74,26 @@ pub struct App {
     pub process_manager: ProcessManagerState,
 }
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC [ ... (final byte is 0x40-0x7E)
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() || c == '~' {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl App {
     fn coerce_weights_filename(input: &str) -> String {
         let trimmed = input.trim();
@@ -251,13 +271,10 @@ impl App {
             if line.contains("Episode") && line.contains("Total Assets") && !line.starts_with("[Ep")
             {
                 if let Some(ep_str) = line.split("Episode").nth(1) {
-                    if let Some(num_str) = ep_str.trim().split_whitespace().next() {
-                        // Strip ANSI codes if present
-                        let clean_num = num_str
-                            .chars()
-                            .filter(|c| c.is_ascii_digit())
-                            .collect::<String>();
-                        if let Ok(ep) = clean_num.parse::<usize>() {
+                    // Strip ANSI escape sequences first, then grab the number
+                    let stripped: String = strip_ansi(ep_str);
+                    if let Some(num_str) = stripped.trim().split_whitespace().next() {
+                        if let Ok(ep) = num_str.parse::<usize>() {
                             return Some(ep);
                         }
                     }
