@@ -54,12 +54,12 @@ impl ReturnNormalizer {
         const LOW_PCT: f64 = 0.05;
         const HIGH_PCT: f64 = 0.95;
 
-        let sorted = returns.to_kind(Kind::Float).sort(0, false).0;
-        let n = sorted.size()[0];
-        let low_idx = ((n as f64 * LOW_PCT).floor() as i64).clamp(0, n - 1);
-        let high_idx = ((n as f64 * HIGH_PCT).floor() as i64).clamp(0, n - 1);
-        let p5: f64 = sorted.double_value(&[low_idx]);
-        let p95: f64 = sorted.double_value(&[high_idx]);
+        let flat = returns.to_kind(Kind::Float).reshape([-1]);
+        let n = flat.size()[0];
+        let low_k = ((n as f64 * LOW_PCT).floor() as i64).clamp(1, n);
+        let high_k = ((n as f64 * HIGH_PCT).floor() as i64).clamp(1, n);
+        let p5: f64 = flat.kthvalue(low_k, 0, false).0.double_value(&[]);
+        let p95: f64 = flat.kthvalue(high_k, 0, false).0.double_value(&[]);
 
         if !self.initialized {
             self.percentile_low = p5;
