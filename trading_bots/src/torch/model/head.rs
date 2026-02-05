@@ -75,21 +75,14 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT * MODEL_DIM])
             .apply(&self.value_out);
 
+        // Bins are scaled-symlog-spaced in raw return space
+        // Weighted average gives value prediction directly in return space
         let values = if compute_values {
             let critic_probs = critic_logits.softmax(-1, Kind::Float);
             let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
-            let n = bucket_centers.size()[0];
-            let m = (n - 1) / 2;
-            let p_neg = critic_probs.narrow(-1, 0, m);
-            let p_mid = critic_probs.narrow(-1, m, 1);
-            let p_pos = critic_probs.narrow(-1, m + 1, m);
-            let b_neg = bucket_centers.narrow(0, 0, m);
-            let b_mid = bucket_centers.narrow(0, m, 1);
-            let b_pos = bucket_centers.narrow(0, m + 1, m);
-            let paired = (&p_neg * &b_neg).flip([-1]) + &p_pos * &b_pos;
-            let wavg = paired.sum_dim_intlist(-1, false, Kind::Float)
-                + (&p_mid * &b_mid).squeeze_dim(-1);
-            wavg.to_kind(ticker_repr.kind())
+            let value = (&critic_probs * &bucket_centers)
+                .sum_dim_intlist(-1, false, Kind::Float);
+            value.to_kind(ticker_repr.kind())
         } else {
             Tensor::zeros(&[batch_size], (ticker_repr.kind(), ticker_repr.device()))
         };

@@ -22,12 +22,14 @@ const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
-pub const VALUE_LOG_CLIP: f64 = 2.0;
-const VALUE_RAW_CLIP: f64 = 6.38905609893; // symexp(VALUE_LOG_CLIP) = exp(2) - 1
 const CRITIC_ENTROPY_COEF: f64 = 0.0;
 const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
 const LOG_2PI: f64 = 1.8378770664093453;
+const RETNORM_RATE: f64 = 0.01;
+const RETNORM_LIMIT: f64 = 1.0;
+const RETNORM_PERCLO: f64 = 0.05;
+const RETNORM_PERCHI: f64 = 0.95;
 
 // RPO: Random Policy Optimization - adds bounded noise to action mean during training and intentionally not during rollout
 // Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
@@ -38,40 +40,39 @@ const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
 
-struct ReturnNormalizer {
-    percentile_low: f64,
-    percentile_high: f64,
+/// DreamerV3-style return normalizer: scales advantages by percentile range of returns
+struct RetNorm {
+    lo: f64,          // 5th percentile (EMA)
+    hi: f64,          // 95th percentile (EMA)
     initialized: bool,
 }
 
-impl ReturnNormalizer {
+impl RetNorm {
     fn new() -> Self {
-        Self { percentile_low: 0.0, percentile_high: 0.0, initialized: false }
+        Self { lo: 0.0, hi: 1.0, initialized: false }
     }
 
-    fn update(&mut self, returns: &Tensor) -> f64 {
-        const DECAY: f64 = 0.99;
-        const LOW_PCT: f64 = 0.05;
-        const HIGH_PCT: f64 = 0.95;
-
+    fn update(&mut self, returns: &Tensor) {
         let flat = returns.to_kind(Kind::Float).reshape([-1]);
         let n = flat.size()[0];
-        let low_k = ((n as f64 * LOW_PCT).floor() as i64).clamp(1, n);
-        let high_k = ((n as f64 * HIGH_PCT).floor() as i64).clamp(1, n);
+        let low_k = ((n as f64 * RETNORM_PERCLO).floor() as i64).clamp(1, n);
+        let high_k = ((n as f64 * RETNORM_PERCHI).floor() as i64).clamp(1, n);
         let p5: f64 = flat.kthvalue(low_k, 0, false).0.double_value(&[]);
         let p95: f64 = flat.kthvalue(high_k, 0, false).0.double_value(&[]);
 
         if !self.initialized {
-            self.percentile_low = p5;
-            self.percentile_high = p95;
+            self.lo = p5;
+            self.hi = p95;
             self.initialized = true;
         } else {
-            self.percentile_low = DECAY * self.percentile_low + (1.0 - DECAY) * p5;
-            self.percentile_high = DECAY * self.percentile_high + (1.0 - DECAY) * p95;
+            // EMA: new = old * (1 - rate) + rate * value
+            self.lo = self.lo * (1.0 - RETNORM_RATE) + RETNORM_RATE * p5;
+            self.hi = self.hi * (1.0 - RETNORM_RATE) + RETNORM_RATE * p95;
         }
+    }
 
-        let range = self.percentile_high - self.percentile_low;
-        range.max(1.0)
+    fn scale(&self) -> f64 {
+        (self.hi - self.lo).max(RETNORM_LIMIT)
     }
 }
 
@@ -300,7 +301,7 @@ pub async fn train(weights_path: Option<&str>) {
     let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level value
     let s_action_weights =
         Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
-    let mut return_normalizer = ReturnNormalizer::new();
+    let mut retnorm = RetNorm::new();
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
@@ -445,21 +446,21 @@ pub async fn train(weights_path: Option<&str>) {
                 .copy_(&actions);
         }
 
-        // Compute GAE on portfolio-level values
+        // Compute GAE on portfolio-level values (model outputs raw returns directly)
         let advantages = Tensor::zeros(&[memory_size], (Kind::Float, device));
         let returns = Tensor::zeros(&[memory_size], (Kind::Float, device));
         let gamma = 0.99f64;
         let gae_lambda = 0.95f64;
 
-        // Bootstrap value from final observation state
+        // Bootstrap value from final observation state (raw return space)
         let bootstrap_value = tch::no_grad(|| {
-            let (values, _, _) = trading_model.forward_with_seq_idx_on_device(
+            let (values_raw, _, _) = trading_model.forward_with_seq_idx_on_device(
                 &obs_price,
                 &obs_static,
                 Some(&obs_seq_idx),
                 false,
             );
-            values.to_kind(Kind::Float)
+            values_raw.to_kind(Kind::Float)
         });
 
         tch::no_grad(|| {
@@ -486,16 +487,11 @@ pub async fn train(weights_path: Option<&str>) {
         let advantages = advantages.detach();
         let returns = returns.detach();
 
-        let raw_clip = VALUE_RAW_CLIP;
-        let max_ret_abs = returns.abs().max().double_value(&[]);
-        if max_ret_abs > raw_clip {
-            eprintln!(
-                "Warning: returns exceed bin range: max_abs={:.6} clip={:.6}",
-                max_ret_abs, raw_clip
-            );
-        }
+        // Update value normalizer with computed returns (for next rollout)
+        retnorm.update(&returns);
 
-        let ret_norm_scale = return_normalizer.update(&returns);
+        // Compute advantage normalization scale from returns range
+        let ret_norm_scale = retnorm.scale();
 
         // Compute advantage stats once per rollout (before normalization)
         let adv_stats = tch::no_grad(|| {
@@ -635,7 +631,6 @@ pub async fn train(weights_path: Option<&str>) {
                     let _ = debug_tensor_stats("log_probs", &log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
-                // Bins are in raw return space (symexp-spaced), targets stay raw
                 let ce_loss = twohot_log_prob_loss(
                     &ret_mb,
                     &log_probs,
@@ -818,17 +813,13 @@ pub async fn train(weights_path: Option<&str>) {
                 let so_ev = static_obs_batch.narrow(0, 0, ev_samples);
                 let seq_ev = seq_idx_batch.narrow(0, 0, ev_samples);
                 let ret_ev = returns.narrow(0, 0, ev_samples);
-                let (values, _, _) = trading_model.forward_with_seq_idx_on_device(
+                let (values_raw, _, _) = trading_model.forward_with_seq_idx_on_device(
                     &pd_ev,
                     &so_ev,
                     Some(&seq_ev),
                     true,
                 );
-                let raw_clip = VALUE_RAW_CLIP;
-                let values = values
-                    .to_kind(Kind::Float)
-                    .view([ev_samples])
-                    .clamp(-raw_clip, raw_clip);
+                let values = values_raw.to_kind(Kind::Float).view([ev_samples]);
                 let residuals = &values - &ret_ev;
                 let mean_target = ret_ev.mean(Kind::Float);
                 let var_targets =

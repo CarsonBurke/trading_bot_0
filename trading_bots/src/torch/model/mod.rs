@@ -11,7 +11,8 @@ use tch::{nn, Kind, Tensor};
 use crate::torch::constants::{
     GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
-use crate::torch::ppo::VALUE_LOG_CLIP;
+
+pub(crate) const NUM_VALUE_BUCKETS: i64 = 255;
 use crate::torch::ssm_ref::{stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMambaRef};
 
 
@@ -115,6 +116,8 @@ pub(crate) const LATTICE_MIN_STD: f64 = 1e-3;
 pub(crate) const LATTICE_MAX_STD: f64 = 1.0;
 const LOG_STD_INIT: f64 = 0.0;
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
+const SYMLOG_SCALE: f64 = 0.1;
+const SYMLOG_LOG_RANGE: f64 = 5.0;
 const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
@@ -188,18 +191,17 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
         .as_slice()
 }
 
-const NUM_VALUE_BUCKETS: i64 = 255; // Must be odd due to handling
 
 /// (values, critic_logits, (action_mean, sde_latent))
 /// sde_latent: [batch, SDE_LATENT_DIM] flat ticker features for Lattice noise
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor));
 
-pub(crate) fn symlog_tensor(x: &Tensor) -> Tensor {
-    x.sign() * (x.abs() + 1.0).log()
+pub(crate) fn symlog_tensor(x: &Tensor, s: f64) -> Tensor {
+    x.sign() * (x.abs() / s + 1.0).log()
 }
 
-pub(crate) fn symexp_tensor(x: &Tensor) -> Tensor {
-    x.sign() * (x.abs().exp() - 1.0)
+pub(crate) fn symexp_tensor(x: &Tensor, s: f64) -> Tensor {
+    x.sign() * s * (x.abs().exp() - 1.0)
 }
 
 pub struct DebugMetrics {
@@ -451,14 +453,15 @@ impl TradingModel {
             &[SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM],
             Init::Const(LOG_STD_INIT),
         );
-        // DreamerV3-style exponential bin spacing: symexp(linspace(-VALUE_LOG_CLIP, 0))
-        // Dense near zero (where most returns land), sparse at extremes
+        // Scaled symlog bins in raw return space (s=0.1, log_range=5 → ±14.7)
+        // Dense near 0 for typical ±0.3 returns, log-compressed tails to ±14.7
         let half_n = (NUM_VALUE_BUCKETS - 1) / 2 + 1; // 128
-        let neg_half = Tensor::linspace(-VALUE_LOG_CLIP, 0.0, half_n, (Kind::Float, p.device()));
-        let neg_half = symexp_tensor(&neg_half);
-        let pos_half = neg_half.narrow(0, 0, half_n - 1).flip([0]).neg();
-        let value_centers = Tensor::cat(&[neg_half, pos_half], 0);
-        let bucket_centers = value_centers.shallow_clone();
+        let half_log = Tensor::linspace(-SYMLOG_LOG_RANGE, 0.0, half_n, (Kind::Float, p.device()));
+        let half = symexp_tensor(&half_log, SYMLOG_SCALE);
+        // Positive: negate and reverse first 127 elements (excluding zero)
+        let pos_half = half.narrow(0, 0, half_n - 1).flip([0]).neg();
+        let bucket_centers = Tensor::cat(&[half, pos_half], 0);
+        let value_centers = bucket_centers.shallow_clone();
         Self {
             patch_embed_weight,
             patch_embed_bias,
