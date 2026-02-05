@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::torch::load::load_var_store_partial;
-use crate::torch::model::{TradingModel, TradingModelConfig, SDE_LATENT_DIM, ACTION_DIM, LATTICE_ALPHA};
+use crate::torch::model::{TradingModel, TradingModelConfig, ACTION_DIM, LATTICE_ALPHA, SDE_LATENT_DIM};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::Env;
 
@@ -18,7 +18,7 @@ pub fn load_model<P: AsRef<Path>>(
     Ok((vs, model))
 }
 
-/// Sample actions using Lattice exploration: correlated + independent noise via MVN, then softmax
+/// Sample actions using Lattice exploration: h² weighted correlated + independent noise, then softmax
 pub fn sample_actions(
     action_mean: &Tensor,
     sde_latent: &Tensor,       // [batch, SDE_LATENT_DIM]
@@ -34,22 +34,19 @@ pub fn sample_actions(
     let u = if deterministic {
         action_mean
     } else {
-        let corr_exploration_mat = Tensor::randn(
-            [SDE_LATENT_DIM, SDE_LATENT_DIM],
-            (Kind::Float, action_mean.device()),
-        ) * corr_std;
-        let ind_exploration_mat = Tensor::randn(
-            [SDE_LATENT_DIM, ACTION_DIM],
-            (Kind::Float, action_mean.device()),
-        ) * ind_std;
+        let device = action_mean.device();
+        let stats_kind = (Kind::Float, device);
 
-        // Correlated: perturb shared latent, project through W
-        let latent_noise = sde_latent.matmul(&corr_exploration_mat); // [batch, L]
-        let correlated_action_noise = LATTICE_ALPHA
-            * latent_noise.matmul(&w_policy.transpose(0, 1)); // [batch, A]
+        // Sample exploration matrices
+        let corr_exploration_mat = Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], stats_kind) * corr_std;
+        let ind_exploration_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind) * ind_std;
 
-        // Independent: project shared latent through ind noise
-        let independent_action_noise = sde_latent.matmul(&ind_exploration_mat); // [batch, A]
+        // Correlated noise: perturb latent, project through W
+        let latent_noise = sde_latent.matmul(&corr_exploration_mat);
+        let correlated_action_noise = LATTICE_ALPHA * latent_noise.matmul(&w_policy.transpose(0, 1));
+
+        // Independent noise: project latent through ind noise
+        let independent_action_noise = sde_latent.matmul(&ind_exploration_mat);
 
         let noise = &correlated_action_noise + &independent_action_noise;
         &action_mean + noise

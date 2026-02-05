@@ -1,7 +1,7 @@
 use tch::{Kind, Tensor};
 
 use super::{
-    DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM, NUM_VALUE_BUCKETS,
+    DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM,
     RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS,
 };
 use crate::torch::constants::TICKERS_COUNT;
@@ -23,9 +23,9 @@ impl TradingModel {
         // Extract last token: [batch, tickers, MODEL_DIM]
         let last_tokens = x_time.narrow(2, temporal_len - 1, 1).squeeze_dim(2);
 
-        let mut pooled = last_tokens;
+        let mut ticker_repr = last_tokens;
 
-        // InterTickerBlock on pooled tokens: [batch, tickers, dim]
+        // InterTickerBlock on ticker representations: [batch, tickers, dim]
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
         let block = &self.inter_ticker_block;
         let alpha_ticker_attn = block.alpha_ticker_attn.sigmoid() * alpha_scale;
@@ -33,7 +33,7 @@ impl TradingModel {
 
         let x_ticker_norm = block
             .ticker_ln
-            .forward(&pooled.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]))
+            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]))
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
         let q = x_ticker_norm.apply(&block.ticker_q);
         let k = x_ticker_norm.apply(&block.ticker_k);
@@ -45,20 +45,20 @@ impl TradingModel {
             .matmul(&v)
             .apply(&block.ticker_out)
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        pooled = pooled + &ticker_ctx * &alpha_ticker_attn;
+        ticker_repr = ticker_repr + &ticker_ctx * &alpha_ticker_attn;
 
         let mlp_in = block
             .mlp_ln
-            .forward(&pooled.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]));
+            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]));
         let mlp_proj = mlp_in.apply(&block.mlp_fc1);
         let mlp_parts = mlp_proj.split(FF_DIM, -1);
         let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
             .apply(&block.mlp_fc2)
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        pooled = pooled + &mlp * &alpha_mlp;
+        ticker_repr = ticker_repr + &mlp * &alpha_mlp;
 
         // Actor: per-ticker scalar score + cash bias -> action_mean
-        let ticker_scores = pooled
+        let ticker_scores = ticker_repr
             .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
             .apply(&self.actor_score)
             .reshape([batch_size, TICKERS_COUNT]);
@@ -66,18 +66,14 @@ impl TradingModel {
         let cash = cash.to_kind(ticker_scores.kind());
         let action_mean = Tensor::cat(&[&ticker_scores, &cash], 1);
 
-        // SDE latent: softmax-normalized to bound noise scale (lattice covariance scales with h²)
-        let sde_latent = pooled
-            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM])
-            .softmax(-1, Kind::Float)
-            .to_kind(pooled.kind());
+        // SDE latent: raw features for Lattice h² weighting (no normalization per paper)
+        let sde_latent = ticker_repr
+            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
 
-        // Critic: per-ticker bucket logits, summed (product-of-experts in log-space)
-        let critic_logits = pooled
-            .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
-            .apply(&self.critic_out)
-            .reshape([batch_size, TICKERS_COUNT, NUM_VALUE_BUCKETS])
-            .sum_dim_intlist(1, false, Kind::Float);
+        // Critic: direct projection (no MLP - backbone already processed)
+        let critic_logits = ticker_repr
+            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM])
+            .apply(&self.value_out);
 
         let values = if compute_values {
             let critic_probs = critic_logits.softmax(-1, Kind::Float);
@@ -93,9 +89,9 @@ impl TradingModel {
             let paired = (&p_neg * &b_neg).flip([-1]) + &p_pos * &b_pos;
             let wavg = paired.sum_dim_intlist(-1, false, Kind::Float)
                 + (&p_mid * &b_mid).squeeze_dim(-1);
-            wavg.to_kind(pooled.kind())
+            wavg.to_kind(ticker_repr.kind())
         } else {
-            Tensor::zeros(&[batch_size], (pooled.kind(), pooled.device()))
+            Tensor::zeros(&[batch_size], (ticker_repr.kind(), ticker_repr.device()))
         };
 
         let debug_metrics = None;

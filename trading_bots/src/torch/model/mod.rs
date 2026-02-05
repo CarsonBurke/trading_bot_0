@@ -108,12 +108,12 @@ const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
 pub(crate) const SDE_LATENT_DIM: i64 = TICKERS_COUNT * MODEL_DIM;
-pub(crate) const LOG_STD_INIT: f64 = 0.0;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
-pub(crate) const LATTICE_STD_REG: f64 = 0.0;
+pub(crate) const LATTICE_STD_REG: f64 = 0.01;
 pub(crate) const LATTICE_MIN_STD: f64 = 1e-3;
-pub(crate) const LATTICE_MAX_STD: f64 = 8.0;
+pub(crate) const LATTICE_MAX_STD: f64 = 1.0;
+const LOG_STD_INIT: f64 = 0.0;
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
@@ -263,9 +263,9 @@ pub struct TradingModel {
     actor_score: nn::Linear,
     cash_bias: Tensor,
     actor_out: nn::Linear,
-    critic_out: nn::Linear,
-    // Lattice exploration: correlated + independent noise via policy network weights
-    log_std_param: Tensor,        // [SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM]
+    value_out: nn::Linear,
+    // Lattice exploration: learned log-std for correlated + independent noise
+    log_std_param: Tensor,  // [SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM]
     bucket_centers: Tensor,
     value_centers: Tensor,
     device: tch::Device,
@@ -290,7 +290,7 @@ impl TradingModel {
     }
 
     fn cast_inputs(&self, input: &Tensor) -> Tensor {
-        let target_kind = self.log_std_param.kind();
+        let target_kind = self.patch_embed_weight.kind();
         if input.kind() == target_kind {
             input.shallow_clone()
         } else {
@@ -302,10 +302,12 @@ impl TradingModel {
         &self.value_centers
     }
 
-    /// Lattice stds: correlated [LATENT, LATENT] and independent [LATENT, ACTION_DIM]
+    /// Lattice stds: corr_std [SDE_LATENT_DIM, SDE_LATENT_DIM], ind_std [SDE_LATENT_DIM, ACTION_DIM]
+    /// With dimension correction and clipping per the paper
     pub fn lattice_stds(&self) -> (Tensor, Tensor) {
         let log_std = self.log_std_param
             .clamp(LATTICE_MIN_STD.ln(), LATTICE_MAX_STD.ln());
+        // Dimension correction: prevents variance from scaling with latent_dim
         let log_std = &log_std - 0.5 * (SDE_LATENT_DIM as f64).ln();
         let std = expln(&log_std);
         let corr_std = std.narrow(1, 0, SDE_LATENT_DIM);
@@ -432,9 +434,9 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let critic_out = nn::linear(
-            p / "critic_out",
-            MODEL_DIM,
+        let value_out = nn::linear(
+            p / "value_out",
+            TICKERS_COUNT * MODEL_DIM,
             NUM_VALUE_BUCKETS,
             nn::LinearConfig {
                 ws_init: Init::Const(0.0),
@@ -442,7 +444,8 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // Lattice exploration: correlated (SDE_LATENT_DIM) + independent (ACTION_DIM) noise dims
+        // Lattice log-std: [SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM]
+        // First SDE_LATENT_DIM columns = corr_std, last ACTION_DIM columns = ind_std
         let log_std_param = p.var(
             "log_std",
             &[SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM],
@@ -474,7 +477,7 @@ impl TradingModel {
             actor_score,
             cash_bias,
             actor_out,
-            critic_out,
+            value_out,
             log_std_param,
             bucket_centers,
             value_centers,
