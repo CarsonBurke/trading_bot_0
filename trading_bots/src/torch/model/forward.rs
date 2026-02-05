@@ -102,9 +102,11 @@ impl TradingModel {
         debug_fused("model_x_stem", &x_stem);
         debug_fused("model_dt_scale", &dt_scale);
 
+        let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, batch_size);
+
         let mut x_for_ssm = x_stem;
         let seq_idx_ref = if seq_idx.numel() == 0 { None } else { Some(&seq_idx) };
-        for (layer, norm) in self.ssm_layers.iter().zip(self.ssm_norms.iter()) {
+        for (i, (layer, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate() {
             let out = layer.forward_with_pre_norm_seq_idx(
                 &x_for_ssm,
                 norm.weight(),
@@ -113,13 +115,12 @@ impl TradingModel {
                 seq_idx_ref,
             );
             x_for_ssm = x_for_ssm + out;
+            x_for_ssm = self.maybe_apply_exo_cross(&x_for_ssm, &exo_kv, i);
         }
         debug_fused("model_x_for_ssm", &x_for_ssm);
 
         self.head_with_temporal_pool(
             &x_for_ssm,
-            &global_static,
-            &per_ticker_static,
             batch_size,
             compute_values,
             false,
@@ -154,6 +155,8 @@ impl TradingModel {
         debug_fused("model_x_stem", &x_stem);
         debug_fused("model_dt_scale", &dt_scale);
 
+        let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, batch_size);
+
         let mut x_for_ssm = x_stem;
         let seq_idx_ref = if seq_idx.numel() == 0 { None } else { Some(&seq_idx) };
         for (layer_idx, (layer, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate() {
@@ -167,14 +170,13 @@ impl TradingModel {
             );
             debug_fused_layer("ssm_out", layer_idx, &out);
             x_for_ssm = x_for_ssm + out;
+            x_for_ssm = self.maybe_apply_exo_cross(&x_for_ssm, &exo_kv, layer_idx);
             debug_fused_layer("x_for_ssm_out", layer_idx, &x_for_ssm);
         }
         debug_fused("model_x_for_ssm", &x_for_ssm);
 
         let (out, debug) = self.head_with_temporal_pool(
             &x_for_ssm,
-            &global_static,
-            &per_ticker_static,
             batch_size,
             true,
             true,

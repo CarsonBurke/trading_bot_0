@@ -1,18 +1,16 @@
 use tch::{Kind, Tensor};
 
 use super::{
-    DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM,
+    DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM, NUM_VALUE_BUCKETS,
     RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS,
 };
-use crate::torch::constants::{PER_TICKER_STATIC_OBS, TICKERS_COUNT};
+use crate::torch::constants::TICKERS_COUNT;
 
 
 impl TradingModel {
     pub(super) fn head_with_temporal_pool(
         &self,
         x_ssm: &Tensor,
-        global_static: &Tensor,
-        per_ticker_static: &Tensor,
         batch_size: i64,
         compute_values: bool,
         _debug: bool,
@@ -25,42 +23,7 @@ impl TradingModel {
         // Extract last token: [batch, tickers, MODEL_DIM]
         let last_tokens = x_time.narrow(2, temporal_len - 1, 1).squeeze_dim(2);
 
-        // Build exo context for last tokens only
-        let global_ctx = global_static
-            .apply(&self.time_global_ctx)
-            .unsqueeze(1)
-            .unsqueeze(1);
-        let exo_ticker = per_ticker_static
-            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&self.time_ticker_ctx)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let exo_global = global_ctx.squeeze_dim(1).squeeze_dim(1)
-            .unsqueeze(1)
-            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
-        let exo_tokens = Tensor::cat(
-            &[
-                exo_global.unsqueeze(2),
-                exo_ticker.unsqueeze(2),
-            ],
-            2,
-        ); // [batch, tickers, 2, dim]
-
-        // Cross-attention on last tokens only: [batch, tickers, dim] queries exo_tokens
-        let last_tokens_flat = last_tokens
-            .reshape([batch_size * TICKERS_COUNT, 1, MODEL_DIM]);
-        let exo_tokens_flat = exo_tokens.reshape([batch_size * TICKERS_COUNT, 2, MODEL_DIM]);
-        let q_exo = last_tokens_flat.apply(&self.static_cross_q);
-        let k_exo = exo_tokens_flat.apply(&self.static_cross_k);
-        let v_exo = exo_tokens_flat.apply(&self.static_cross_v);
-        let exo_scores = q_exo.matmul(&k_exo.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
-        let exo_attn = exo_scores.softmax(-1, Kind::Float).to_kind(q_exo.kind());
-        let exo_ctx = exo_attn
-            .matmul(&v_exo)
-            .apply(&self.static_cross_out)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-
-        // Add exo context to pooled tokens
-        let mut pooled = &last_tokens + exo_ctx; // [batch, tickers, dim]
+        let mut pooled = last_tokens;
 
         // InterTickerBlock on pooled tokens: [batch, tickers, dim]
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
@@ -72,33 +35,17 @@ impl TradingModel {
             .ticker_ln
             .forward(&pooled.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]))
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let latent_q = x_ticker_norm.apply(&block.ticker_latent_q);
-        let kind = latent_q.kind();
-        let latent_k_learned = if block.ticker_latent_k.kind() == kind {
-            block.ticker_latent_k.shallow_clone()
-        } else {
-            block.ticker_latent_k.to_kind(kind)
-        };
-        let latent_k_frozen = if block.ticker_latent_k_frozen.kind() == kind {
-            block.ticker_latent_k_frozen.shallow_clone()
-        } else {
-            block.ticker_latent_k_frozen.to_kind(kind)
-        };
-        let latent_k = Tensor::cat(&[&latent_k_learned, &latent_k_frozen], 0);
-        let latent_scores =
-            latent_q.matmul(&latent_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
-        let latent_attn = latent_scores.softmax(-1, Kind::Float).to_kind(kind);
-        let latent_v_base = if block.ticker_latent_v.kind() == kind {
-            block.ticker_latent_v.shallow_clone()
-        } else {
-            block.ticker_latent_v.to_kind(kind)
-        };
-        let latent_v = Tensor::cat(&[&latent_v_base, &latent_v_base], 0);
-        let latent_ctx = latent_attn
-            .matmul(&latent_v)
+        let q = x_ticker_norm.apply(&block.ticker_q);
+        let k = x_ticker_norm.apply(&block.ticker_k);
+        let v = x_ticker_norm.apply(&block.ticker_v);
+        let kind = q.kind();
+        let scores = q.matmul(&k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let attn = scores.softmax(-1, Kind::Float).to_kind(kind);
+        let ticker_ctx = attn
+            .matmul(&v)
             .apply(&block.ticker_out)
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        pooled = pooled + &latent_ctx * &alpha_ticker_attn;
+        pooled = pooled + &ticker_ctx * &alpha_ticker_attn;
 
         let mlp_in = block
             .mlp_ln
@@ -110,58 +57,46 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
         pooled = pooled + &mlp * &alpha_mlp;
 
-        // Residual static enrichment: SSM signal preserved through skip connection
-        let static_ctx = Tensor::cat(&[pooled.shallow_clone(), per_ticker_static.shallow_clone()], 2)
-            .reshape([
-                batch_size * TICKERS_COUNT,
-                MODEL_DIM + PER_TICKER_STATIC_OBS as i64,
-            ])
-            .apply(&self.static_proj)
-            .silu()
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let pooled_enriched = pooled + static_ctx;
+        // Actor: per-ticker scalar score + cash bias -> action_mean
+        let ticker_scores = pooled
+            .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
+            .apply(&self.actor_score)
+            .reshape([batch_size, TICKERS_COUNT]);
+        let cash = self.cash_bias.expand(&[batch_size, 1], false);
+        let cash = cash.to_kind(ticker_scores.kind());
+        let action_mean = Tensor::cat(&[&ticker_scores, &cash], 1);
 
-        // Flatten per-ticker features, shared by actor and critic
-        let flat_tickers = pooled_enriched.reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
+        // SDE latent: softmax-normalized to bound noise scale (lattice covariance scales with h²)
+        let sde_latent = pooled
+            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM])
+            .softmax(-1, Kind::Float)
+            .to_kind(pooled.kind());
 
-        // Critic branch (reads flat_tickers directly)
-        let value_hidden = self
-            .value_ln
-            .forward(&flat_tickers)
-            .apply(&self.value_mlp_fc1)
-            .silu()
-            .apply(&self.value_mlp_fc2);
-        let critic_logits = value_hidden.apply(&self.critic_out); // [batch, NUM_VALUE_BUCKETS]
+        // Critic: per-ticker bucket logits, summed (product-of-experts in log-space)
+        let critic_logits = pooled
+            .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
+            .apply(&self.critic_out)
+            .reshape([batch_size, TICKERS_COUNT, NUM_VALUE_BUCKETS])
+            .sum_dim_intlist(1, false, Kind::Float);
+
         let values = if compute_values {
-            // DreamerV3 symmetric sum: pair negative/positive bins to cancel
-            // floating point errors, ensuring zero prediction at uniform init
             let critic_probs = critic_logits.softmax(-1, Kind::Float);
             let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
             let n = bucket_centers.size()[0];
-            let m = (n - 1) / 2; // 127 for 255 bins
+            let m = (n - 1) / 2;
             let p_neg = critic_probs.narrow(-1, 0, m);
             let p_mid = critic_probs.narrow(-1, m, 1);
             let p_pos = critic_probs.narrow(-1, m + 1, m);
             let b_neg = bucket_centers.narrow(0, 0, m);
             let b_mid = bucket_centers.narrow(0, m, 1);
             let b_pos = bucket_centers.narrow(0, m + 1, m);
-            // Sum paired terms: (p_neg * b_neg)[reversed] + (p_pos * b_pos)
             let paired = (&p_neg * &b_neg).flip([-1]) + &p_pos * &b_pos;
             let wavg = paired.sum_dim_intlist(-1, false, Kind::Float)
                 + (&p_mid * &b_mid).squeeze_dim(-1);
-            wavg.to_kind(pooled_enriched.kind())
+            wavg.to_kind(pooled.kind())
         } else {
-            Tensor::zeros(&[batch_size], (pooled_enriched.kind(), pooled_enriched.device()))
+            Tensor::zeros(&[batch_size], (pooled.kind(), pooled.device()))
         };
-
-        // Actor branch: dedicated MLP produces sde_latent (decoupled from critic)
-        let sde_latent = self.actor_ln
-            .forward(&flat_tickers)
-            .apply(&self.actor_mlp_fc1)
-            .silu()
-            .apply(&self.actor_mlp_fc2)
-            .silu(); // [batch, SDE_LATENT_DIM]
-        let action_mean = sde_latent.apply(&self.actor_out);
 
         let debug_metrics = None;
 

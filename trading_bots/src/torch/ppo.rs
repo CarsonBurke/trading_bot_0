@@ -443,7 +443,7 @@ pub async fn train(weights_path: Option<&str>) {
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&portfolio_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
-            let _ = s_values.narrow(0, mem_idx, NPROCS);
+            let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
             let _ = s_action_weights
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&actions);
@@ -687,9 +687,9 @@ pub async fn train(weights_path: Option<&str>) {
                 }
                 let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 let _ =
-                    total_policy_loss_weighted.g_add_(&(&action_loss * chunk_sample_count as f64));
+                    total_policy_loss_weighted.g_add_(&(&action_loss.detach() * chunk_sample_count as f64));
                 let _ =
-                    total_value_loss_weighted.g_add_(&(&value_loss * chunk_sample_count as f64));
+                    total_value_loss_weighted.g_add_(&(&value_loss.detach() * chunk_sample_count as f64));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
                 let _ = total_entropy_weighted.g_add_(&(&dist_entropy_detached * chunk_sample_count as f64));
                 entropy_min = entropy_min.min_other(&dist_entropy_detached);

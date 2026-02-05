@@ -115,20 +115,19 @@ impl TradingModel {
             static_features
         };
         let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
+        let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, 1);
 
         if state.patch_pos >= FINEST_PATCH_SIZE {
             state.patch_pos = 0;
-            let x_last = self.process_new_patch(state);
+            let x_last = self.process_new_patch(state, &exo_kv);
             let _ = state.patch_buf.zero_();
             return self
-                .head_with_temporal_pool(&x_last, &global_static, &per_ticker_static, 1, true, false)
+                .head_with_temporal_pool(&x_last, 1, true, false)
                 .0;
         }
 
         self.head_with_temporal_pool(
             &Tensor::zeros(&[TICKERS_COUNT, 1, SSM_DIM], (Kind::Float, self.device)),
-            &global_static,
-            &per_ticker_static,
             1,
             true,
             false,
@@ -186,6 +185,7 @@ impl TradingModel {
         let _ = state.patch_buf.zero_();
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
+        let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, 1);
         let dt_scale = self.patch_dt_scale.shallow_clone();
 
         let mut x = self.patch_embed_single(&reshaped);
@@ -199,14 +199,15 @@ impl TradingModel {
                 Some(&dt_scale),
             );
             x = x + out;
+            x = self.maybe_apply_exo_cross(&x, &exo_kv, layer);
         }
 
         state.initialized = true;
-        self.head_with_temporal_pool(&x, &global_static, &per_ticker_static, 1, true, false)
+        self.head_with_temporal_pool(&x, 1, true, false)
             .0
     }
 
-    fn process_new_patch(&self, state: &mut StreamState) -> Tensor {
+    fn process_new_patch(&self, state: &mut StreamState, exo_kv: &Tensor) -> Tensor {
         let patches = state
             .patch_buf
             .view([TICKERS_COUNT, 1, FINEST_PATCH_SIZE]);
@@ -226,6 +227,13 @@ impl TradingModel {
                 dt_scale,
             );
             x_in = x_in + out;
+            // Apply exo cross-block (unsqueeze for seq_len=1 dim, then squeeze back)
+            if super::EXO_CROSS_AFTER.contains(&layer) {
+                let pos = super::EXO_CROSS_AFTER.iter().position(|&i| i == layer).unwrap();
+                x_in = self.exo_cross_blocks[pos]
+                    .forward(&x_in.unsqueeze(1), exo_kv)
+                    .squeeze_dim(1);
+            }
         }
         x_in.unsqueeze(1)
     }

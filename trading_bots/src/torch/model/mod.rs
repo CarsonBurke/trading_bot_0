@@ -19,10 +19,9 @@ use rmsnorm::RMSNorm;
 
 struct InterTickerBlock {
     ticker_ln: RMSNorm,
-    ticker_latent_q: nn::Linear,
-    ticker_latent_k: Tensor,
-    ticker_latent_k_frozen: Tensor,
-    ticker_latent_v: Tensor,
+    ticker_q: nn::Linear,
+    ticker_k: nn::Linear,
+    ticker_v: nn::Linear,
     ticker_out: nn::Linear,
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
@@ -32,35 +31,11 @@ struct InterTickerBlock {
 }
 
 impl InterTickerBlock {
-    fn new(p: &nn::Path, ticker_latents: i64) -> Self {
+    fn new(p: &nn::Path) -> Self {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), MODEL_DIM, 1e-6);
-        let ticker_latent_q =
-            nn::linear(p / "ticker_latent_q", MODEL_DIM, MODEL_DIM, Default::default());
-        let ticker_latent_k = p.var(
-            "ticker_latent_k",
-            &[ticker_latents, MODEL_DIM],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
-            },
-        );
-        let ticker_latent_k_frozen = p.var(
-            "ticker_latent_k_frozen",
-            &[ticker_latents, MODEL_DIM],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
-            },
-        );
-        let _ = ticker_latent_k_frozen.set_requires_grad(false);
-        let ticker_latent_v = p.var(
-            "ticker_latent_v",
-            &[ticker_latents, MODEL_DIM],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
-            },
-        );
+        let ticker_q = nn::linear(p / "ticker_q", MODEL_DIM, MODEL_DIM, Default::default());
+        let ticker_k = nn::linear(p / "ticker_k", MODEL_DIM, MODEL_DIM, Default::default());
+        let ticker_v = nn::linear(p / "ticker_v", MODEL_DIM, MODEL_DIM, Default::default());
         let ticker_out = nn::linear(p / "ticker_out", MODEL_DIM, MODEL_DIM, Default::default());
         let mlp_fc1 = nn::linear(p / "mlp_fc1", MODEL_DIM, 2 * FF_DIM, Default::default());
         let mlp_fc2 = nn::linear(p / "mlp_fc2", FF_DIM, MODEL_DIM, Default::default());
@@ -70,10 +45,9 @@ impl InterTickerBlock {
         let alpha_mlp = p.var("alpha_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
             ticker_ln,
-            ticker_latent_q,
-            ticker_latent_k,
-            ticker_latent_k_frozen,
-            ticker_latent_v,
+            ticker_q,
+            ticker_k,
+            ticker_v,
             ticker_out,
             mlp_fc1,
             mlp_fc2,
@@ -81,6 +55,41 @@ impl InterTickerBlock {
             alpha_ticker_attn,
             alpha_mlp,
         }
+    }
+}
+
+const EXO_CROSS_AFTER: &[usize] = &[0];
+
+struct ExoCrossBlock {
+    cross_ln: RMSNorm,
+    cross_q: nn::Linear,
+    cross_k: nn::Linear,
+    cross_v: nn::Linear,
+    cross_out: nn::Linear,
+    alpha_cross: Tensor,
+}
+
+impl ExoCrossBlock {
+    fn new(p: &nn::Path) -> Self {
+        let cross_ln = RMSNorm::new(&(p / "cross_ln"), MODEL_DIM, 1e-6);
+        let cross_q = nn::linear(p / "cross_q", MODEL_DIM, MODEL_DIM, Default::default());
+        let cross_k = nn::linear(p / "cross_k", MODEL_DIM, MODEL_DIM, Default::default());
+        let cross_v = nn::linear(p / "cross_v", MODEL_DIM, MODEL_DIM, Default::default());
+        let cross_out = nn::linear(p / "cross_out", MODEL_DIM, MODEL_DIM, Default::default());
+        let alpha_cross = p.var("alpha_cross", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
+        Self {
+            cross_ln, cross_q, cross_k, cross_v, cross_out, alpha_cross,
+        }
+    }
+
+    fn forward(&self, x: &Tensor, exo_kv: &Tensor) -> Tensor {
+        let q = self.cross_ln.forward(x).apply(&self.cross_q);
+        let k = exo_kv.apply(&self.cross_k);
+        let v = exo_kv.apply(&self.cross_v);
+        let scores = q.matmul(&k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let attn = scores.softmax(-1, Kind::Float).to_kind(q.kind());
+        let out = attn.matmul(&v).apply(&self.cross_out);
+        x + self.alpha_cross.sigmoid() * RESIDUAL_ALPHA_MAX * out
     }
 }
 
@@ -98,8 +107,7 @@ const MODEL_DIM: i64 = 128;
 const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
-const ACTOR_HIDDEN: i64 = 256;
-pub(crate) const SDE_LATENT_DIM: i64 = ACTOR_HIDDEN;
+pub(crate) const SDE_LATENT_DIM: i64 = TICKERS_COUNT * MODEL_DIM;
 pub(crate) const LOG_STD_INIT: f64 = 0.0;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
@@ -111,7 +119,6 @@ const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -4.0;
-const TICKER_LATENT_FACTORS: i64 = 8;
 
 /// expln: numerically stable exp alternative that bounds growth for positive inputs
 /// expln(x) = exp(x)        if x <= 0
@@ -249,20 +256,12 @@ pub struct TradingModel {
     ssm_layers: Vec<StatefulMambaRef>,
     ssm_norms: Vec<RMSNorm>,
     ssm_final_norm: RMSNorm,
-    static_proj: nn::Linear,
+    exo_global_proj: nn::Linear,
+    exo_ticker_proj: nn::Linear,
+    exo_cross_blocks: Vec<ExoCrossBlock>,
     inter_ticker_block: InterTickerBlock,
-    time_global_ctx: nn::Linear,
-    time_ticker_ctx: nn::Linear,
-    static_cross_q: nn::Linear,
-    static_cross_k: nn::Linear,
-    static_cross_v: nn::Linear,
-    static_cross_out: nn::Linear,
-    value_ln: RMSNorm,
-    value_mlp_fc1: nn::Linear,
-    value_mlp_fc2: nn::Linear,
-    actor_ln: RMSNorm,
-    actor_mlp_fc1: nn::Linear,
-    actor_mlp_fc2: nn::Linear,
+    actor_score: nn::Linear,
+    cash_bias: Tensor,
     actor_out: nn::Linear,
     critic_out: nn::Linear,
     // Lattice exploration: correlated + independent noise via policy network weights
@@ -399,58 +398,30 @@ impl TradingModel {
             .collect::<Vec<_>>();
         let ssm_final_norm = RMSNorm::new(&(p / "ssm_final_norm"), SSM_DIM, 1e-6);
 
-        let static_proj = nn::linear(
-            p / "static_proj",
-            MODEL_DIM + PER_TICKER_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let inter_ticker_block = InterTickerBlock::new(&(p / "inter_ticker_0"), TICKER_LATENT_FACTORS);
-        let time_global_ctx = nn::linear(
-            p / "time_global_ctx",
+        let exo_global_proj = nn::linear(
+            p / "exo_global_proj",
             GLOBAL_STATIC_OBS as i64,
             MODEL_DIM,
             Default::default(),
         );
-        let time_ticker_ctx = nn::linear(
-            p / "time_ticker_ctx",
+        let exo_ticker_proj = nn::linear(
+            p / "exo_ticker_proj",
             PER_TICKER_STATIC_OBS as i64,
             MODEL_DIM,
             Default::default(),
         );
-        let static_cross_q = nn::linear(p / "static_cross_q", MODEL_DIM, MODEL_DIM, Default::default());
-        let static_cross_k = nn::linear(p / "static_cross_k", MODEL_DIM, MODEL_DIM, Default::default());
-        let static_cross_v = nn::linear(p / "static_cross_v", MODEL_DIM, MODEL_DIM, Default::default());
-        let static_cross_out = nn::linear(p / "static_cross_out", MODEL_DIM, MODEL_DIM, Default::default());
-        let value_ln = RMSNorm::new(&(p / "value_ln"), TICKERS_COUNT * MODEL_DIM, 1e-6);
-        let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", TICKERS_COUNT * MODEL_DIM, MODEL_DIM, nn::LinearConfig {
-            ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
-            ..Default::default()
+        let exo_cross_blocks = EXO_CROSS_AFTER
+            .iter()
+            .enumerate()
+            .map(|(i, _)| ExoCrossBlock::new(&(p / format!("exo_cross_{}", i))))
+            .collect::<Vec<_>>();
+        let inter_ticker_block = InterTickerBlock::new(&(p / "inter_ticker_0"));
+        let actor_score = nn::linear(p / "actor_score", MODEL_DIM, 1, nn::LinearConfig {
+            ws_init: truncated_normal_init(MODEL_DIM, 1),
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
         });
-        let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, nn::LinearConfig {
-            ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
-            ..Default::default()
-        });
-        
-        let actor_ln = RMSNorm::new(&(p / "actor_ln"), TICKERS_COUNT * MODEL_DIM, 1e-6);
-        let actor_mlp_fc1 = nn::linear(
-            p / "actor_mlp_fc1",
-            TICKERS_COUNT * MODEL_DIM,
-            ACTOR_HIDDEN,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
-                ..Default::default()
-            },
-        );
-        let actor_mlp_fc2 = nn::linear(
-            p / "actor_mlp_fc2",
-            ACTOR_HIDDEN,
-            ACTOR_HIDDEN,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
-                ..Default::default()
-            },
-        );
+        let cash_bias = p.var("cash_bias", &[1], Init::Const(0.0));
         let actor_out = nn::linear(
             p / "actor_out",
             SDE_LATENT_DIM,
@@ -461,7 +432,6 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // Zero-init critic output (DreamerV3 outscale=0.0): uniform softmax → zero value via symmetric sum
         let critic_out = nn::linear(
             p / "critic_out",
             MODEL_DIM,
@@ -497,20 +467,12 @@ impl TradingModel {
             ssm_layers,
             ssm_norms,
             ssm_final_norm,
-            static_proj,
+            exo_global_proj,
+            exo_ticker_proj,
+            exo_cross_blocks,
             inter_ticker_block,
-            time_global_ctx,
-            time_ticker_ctx,
-            static_cross_q,
-            static_cross_k,
-            static_cross_v,
-            static_cross_out,
-            value_ln,
-            value_mlp_fc1,
-            value_mlp_fc2,
-            actor_ln,
-            actor_mlp_fc1,
-            actor_mlp_fc2,
+            actor_score,
+            cash_bias,
             actor_out,
             critic_out,
             log_std_param,
@@ -530,6 +492,30 @@ impl TradingModel {
             )
             .reshape([batch_size, TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64]);
         (global, per_ticker)
+    }
+
+    /// Apply exo cross-block if this SSM layer index is in EXO_CROSS_AFTER
+    fn maybe_apply_exo_cross(&self, x: &Tensor, exo_kv: &Tensor, ssm_layer_idx: usize) -> Tensor {
+        if let Some(pos) = EXO_CROSS_AFTER.iter().position(|&i| i == ssm_layer_idx) {
+            self.exo_cross_blocks[pos].forward(x, exo_kv)
+        } else {
+            x.shallow_clone()
+        }
+    }
+
+    /// Build exogenous KV bank: [batch*tickers, 2, MODEL_DIM]
+    /// Token 0 = projected global static, Token 1 = projected per-ticker static
+    fn build_exo_kv(&self, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64) -> Tensor {
+        let global_emb = global_static.apply(&self.exo_global_proj); // [batch, MODEL_DIM]
+        let ticker_emb = per_ticker_static
+            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
+            .apply(&self.exo_ticker_proj)
+            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]); // [batch, tickers, MODEL_DIM]
+        let global_exp = global_emb
+            .unsqueeze(1)
+            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false); // [batch, tickers, MODEL_DIM]
+        Tensor::stack(&[global_exp, ticker_emb], 2)
+            .reshape([batch_size * TICKERS_COUNT, 2, MODEL_DIM]) // [batch*tickers, 2, MODEL_DIM]
     }
 
     fn patch_embed_single(&self, ticker_data: &Tensor) -> Tensor {
