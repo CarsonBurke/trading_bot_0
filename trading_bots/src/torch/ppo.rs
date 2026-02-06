@@ -7,8 +7,8 @@ use crate::torch::constants::{
 };
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_STD_REG, PATCH_SEQ_LEN,
-    SDE_EPS, SDE_LATENT_DIM,
+    symlog_tensor, SlowCritic, TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_STD_REG,
+    PATCH_SEQ_LEN, SDE_EPS, SDE_LATENT_DIM,
 };
 
 const LEARNING_RATE: f64 = 1e-4;
@@ -39,6 +39,10 @@ const RPO_ALPHA_INIT: f64 = 0.1; // CleanRL impl found 0.1 reliably improved res
 const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
+
+// DreamerV3-style slow target for value stabilization
+const SLOW_CRITIC_RATE: f64 = 0.02; // EMA blend rate (half-life ~35 updates)
+const SLOW_CRITIC_REG: f64 = 1.0;   // Regularization weight (matched to DreamerV3)
 
 /// DreamerV3-style return normalizer: scales advantages by percentile range of returns
 struct RetNorm {
@@ -276,6 +280,7 @@ pub async fn train(weights_path: Option<&str>) {
         0
     };
 
+    let mut slow_critic = SlowCritic::new(&trading_model, SLOW_CRITIC_RATE);
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
     let mut env = VecEnv::new(true);
@@ -636,10 +641,19 @@ pub async fn train(weights_path: Option<&str>) {
                     &log_probs,
                     trading_model.value_centers(),
                 );
+                // Slow target regularization: pull live critic toward slow EMA copy
+                let slow_reg_loss = {
+                    let slow_logits = slow_critic.forward(&sde_latent);
+                    let slow_probs = slow_logits.softmax(-1, Kind::Float).detach();
+                    // CE(live_logits, sg(slow_probs)): -sum(slow_probs * log_probs)
+                    -(&slow_probs * &log_probs).sum_dim_intlist(-1, false, Kind::Float)
+                        .mean(Kind::Float)
+                };
                 let critic_entropy = -(log_probs.exp() * &log_probs)
                     .sum_dim_intlist(-1, false, Kind::Float)
                     .mean(Kind::Float);
-                let value_loss = ce_loss - CRITIC_ENTROPY_COEF * critic_entropy;
+                let value_loss = ce_loss + SLOW_CRITIC_REG * slow_reg_loss
+                    - CRITIC_ENTROPY_COEF * critic_entropy;
 
                 // MVN entropy: 0.5 * (k*(1+ln(2pi)) + ln|Sigma|), reuses Cholesky from log_prob
                 let dist_entropy = (ACTION_DIM as f64 * (1.0 + LOG_2PI) + &log_det_sigma)
@@ -734,6 +748,7 @@ pub async fn train(weights_path: Option<&str>) {
                         opt.step();
                     }
                     opt.zero_grad();
+                    slow_critic.update(&trading_model);
                 }
 
                 let _ = total_clipped.g_add_(&tch::no_grad(|| {
@@ -819,11 +834,12 @@ pub async fn train(weights_path: Option<&str>) {
                     Some(&seq_ev),
                     true,
                 );
-                let values = values_raw.to_kind(Kind::Float).view([ev_samples]);
-                let residuals = &values - &ret_ev;
-                let mean_target = ret_ev.mean(Kind::Float);
+                let values = symlog_tensor(&values_raw.to_kind(Kind::Float).view([ev_samples]), 1.0);
+                let targets = symlog_tensor(&ret_ev, 1.0);
+                let residuals = &values - &targets;
+                let mean_target = targets.mean(Kind::Float);
                 let var_targets =
-                    ret_ev.square().mean(Kind::Float) - mean_target.square();
+                    targets.square().mean(Kind::Float) - mean_target.square();
                 let var_residuals = residuals.square().mean(Kind::Float);
                 Tensor::from(1.0) - &var_residuals / var_targets.clamp_min(1e-8)
             })

@@ -198,6 +198,71 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
 /// sde_latent: [batch, SDE_LATENT_DIM] flat ticker features for Lattice noise
 pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor));
 
+/// DreamerV3-style slow target for value function stabilization.
+/// Holds an EMA copy of critic weights (not in the optimizer's VarStore).
+/// Forward pass produces target logits; regularization loss pulls live critic toward these.
+pub struct SlowCritic {
+    mlp_weights: Vec<Tensor>,  // [CRITIC_LAYERS] linear weights
+    mlp_biases: Vec<Tensor>,   // [CRITIC_LAYERS] linear biases
+    norm_weights: Vec<Tensor>, // [CRITIC_LAYERS] RMSNorm weights
+    out_weight: Tensor,
+    out_bias: Tensor,
+    rate: f64,
+}
+
+impl SlowCritic {
+    /// Initialize from the live critic parameters (deep copy, detached)
+    pub fn new(model: &TradingModel, rate: f64) -> Self {
+        let mlp_weights: Vec<Tensor> = model.value_mlp_linears.iter()
+            .map(|l| l.ws.detach().copy())
+            .collect();
+        let mlp_biases: Vec<Tensor> = model.value_mlp_linears.iter()
+            .map(|l| l.bs.as_ref().unwrap().detach().copy())
+            .collect();
+        let norm_weights: Vec<Tensor> = model.value_mlp_norms.iter()
+            .map(|n| n.weight().detach().copy())
+            .collect();
+        let out_weight = model.value_out.ws.detach().copy();
+        let out_bias = model.value_out.bs.as_ref().unwrap().detach().copy();
+        Self { mlp_weights, mlp_biases, norm_weights, out_weight, out_bias, rate }
+    }
+
+    /// EMA update: slow = rate * live + (1-rate) * slow
+    pub fn update(&mut self, model: &TradingModel) {
+        let r = self.rate;
+        let blend = |slow: &mut Tensor, live: &Tensor| {
+            tch::no_grad(|| {
+                let _ = slow.g_mul_scalar_(1.0 - r).g_add_(&(live.detach() * r));
+            });
+        };
+        for (i, l) in model.value_mlp_linears.iter().enumerate() {
+            blend(&mut self.mlp_weights[i], &l.ws);
+            blend(&mut self.mlp_biases[i], l.bs.as_ref().unwrap());
+        }
+        for (i, n) in model.value_mlp_norms.iter().enumerate() {
+            blend(&mut self.norm_weights[i], &n.weight());
+        }
+        blend(&mut self.out_weight, &model.value_out.ws);
+        blend(&mut self.out_bias, model.value_out.bs.as_ref().unwrap());
+    }
+
+    /// Forward pass through slow critic (no grad). Returns logits [batch, NUM_VALUE_BUCKETS].
+    pub fn forward(&self, critic_input: &Tensor) -> Tensor {
+        tch::no_grad(|| {
+            let mut x = critic_input.shallow_clone();
+            for i in 0..self.mlp_weights.len() {
+                x = x.linear(&self.mlp_weights[i], Some(&self.mlp_biases[i]));
+                // RMSNorm: x * weight / rms(x)
+                let variance = x.pow_tensor_scalar(2).mean_dim(-1, true, Kind::Float);
+                let rms = (variance + 1e-6).sqrt();
+                x = (&x / &rms) * &self.norm_weights[i];
+                x = x.silu();
+            }
+            x.linear(&self.out_weight, Some(&self.out_bias))
+        })
+    }
+}
+
 pub(crate) fn symlog_tensor(x: &Tensor, s: f64) -> Tensor {
     x.sign() * (x.abs() / s + 1.0).log()
 }
