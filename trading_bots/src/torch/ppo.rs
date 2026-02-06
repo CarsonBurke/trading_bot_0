@@ -335,7 +335,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         for step in 0..rollout_steps as usize {
             let (values, action_mean, u, actions, action_log_prob) = tch::no_grad(|| {
-                let (values, _, (action_mean, sde_latent)) = trading_model.forward_with_seq_idx_on_device(
+                let (values, _, _, (action_mean, sde_latent)) = trading_model.forward_with_seq_idx_on_device(
                     &obs_price,
                     &obs_static,
                     Some(&obs_seq_idx),
@@ -459,7 +459,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         // Bootstrap value from final observation state (raw return space)
         let bootstrap_value = tch::no_grad(|| {
-            let (values_raw, _, _) = trading_model.forward_with_seq_idx_on_device(
+            let (values_raw, _, _, _) = trading_model.forward_with_seq_idx_on_device(
                 &obs_price,
                 &obs_static,
                 Some(&obs_seq_idx),
@@ -561,7 +561,7 @@ pub async fn train(weights_path: Option<&str>) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (_, critic_logits, (action_mean, sde_latent)) =
+                let (_, critic_logits, critic_input, (action_mean, sde_latent)) =
                     trading_model.forward_with_seq_idx_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
@@ -643,7 +643,7 @@ pub async fn train(weights_path: Option<&str>) {
                 );
                 // Slow target regularization: pull live critic toward slow EMA copy
                 let slow_reg_loss = {
-                    let slow_logits = slow_critic.forward(&sde_latent);
+                    let slow_logits = slow_critic.forward(&critic_input);
                     let slow_probs = slow_logits.softmax(-1, Kind::Float).detach();
                     // CE(live_logits, sg(slow_probs)): -sum(slow_probs * log_probs)
                     -(&slow_probs * &log_probs).sum_dim_intlist(-1, false, Kind::Float)
@@ -828,7 +828,7 @@ pub async fn train(weights_path: Option<&str>) {
                 let so_ev = static_obs_batch.narrow(0, 0, ev_samples);
                 let seq_ev = seq_idx_batch.narrow(0, 0, ev_samples);
                 let ret_ev = returns.narrow(0, 0, ev_samples);
-                let (values_raw, _, _) = trading_model.forward_with_seq_idx_on_device(
+                let (values_raw, _, _, _) = trading_model.forward_with_seq_idx_on_device(
                     &pd_ev,
                     &so_ev,
                     Some(&seq_ev),
@@ -855,7 +855,7 @@ pub async fn train(weights_path: Option<&str>) {
 
         // Compute action std stats + rpo_alpha
         let log_std_stats = tch::no_grad(|| {
-            let (_, _, (_, sde_latent)) = trading_model.forward_with_seq_idx_on_device(
+            let (_, _, _, (_, sde_latent)) = trading_model.forward_with_seq_idx_on_device(
                 &s_price_deltas.get(0),
                 &s_static_obs.get(0),
                 Some(&s_seq_idx.get(0)),

@@ -57,22 +57,35 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
         ticker_repr = ticker_repr + &mlp * &alpha_mlp;
 
-        // Actor: per-ticker scalar score + cash bias -> action_mean
-        let ticker_scores = ticker_repr
-            .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
+        // Actor: DreamerV3-style MLP → per-ticker scalar score + cash bias -> action_mean
+        let mut actor_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]);
+        for i in 0..self.actor_mlp_linears.len() {
+            actor_x = actor_x.apply(&self.actor_mlp_linears[i]);
+            actor_x = self.actor_mlp_norms[i].forward(&actor_x);
+            actor_x = actor_x.silu();
+        }
+        let ticker_scores = actor_x
             .apply(&self.actor_score)
             .reshape([batch_size, TICKERS_COUNT]);
         let cash = self.cash_bias.expand(&[batch_size, 1], false);
         let cash = cash.to_kind(ticker_scores.kind());
         let action_mean = Tensor::cat(&[&ticker_scores, &cash], 1);
 
-        // SDE latent: raw features for Lattice h² weighting (no normalization per paper)
-        let sde_latent = ticker_repr
-            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
+        // SDE latent: DreamerV3-style MLP per-ticker → flatten → project
+        let mut sde_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]);
+        for i in 0..self.sde_mlp_linears.len() {
+            sde_x = sde_x.apply(&self.sde_mlp_linears[i]);
+            sde_x = self.sde_mlp_norms[i].forward(&sde_x);
+            sde_x = sde_x.silu();
+        }
+        let sde_latent = sde_x
+            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM])
+            .apply(&self.sde_proj);
 
         // Critic: DreamerV3-style MLP (Linear → RMSNorm → SiLU) → Linear
-        let mut critic_x = ticker_repr
+        let critic_input = ticker_repr
             .reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
+        let mut critic_x = critic_input.shallow_clone();
         for i in 0..self.value_mlp_linears.len() {
             critic_x = critic_x.apply(&self.value_mlp_linears[i]);
             critic_x = self.value_mlp_norms[i].forward(&critic_x);
@@ -95,7 +108,7 @@ impl TradingModel {
         let debug_metrics = None;
 
         (
-            (values, critic_logits, (action_mean, sde_latent)),
+            (values, critic_logits, critic_input, (action_mean, sde_latent)),
             debug_metrics,
         )
     }

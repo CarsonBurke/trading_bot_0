@@ -108,7 +108,7 @@ const MODEL_DIM: i64 = 128;
 const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
 const SSM_DSTATE: i64 = 128;
-pub(crate) const SDE_LATENT_DIM: i64 = TICKERS_COUNT * MODEL_DIM;
+pub(crate) const SDE_LATENT_DIM: i64 = 128;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
 pub(crate) const LATTICE_STD_REG: f64 = 0.01;
@@ -122,6 +122,8 @@ const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -4.0;
+const ACTOR_MLP_LAYERS: usize = 1;
+const SDE_MLP_LAYERS: usize = 1;
 const CRITIC_LAYERS: usize = 2;
 const CRITIC_HIDDEN: i64 = FF_DIM; // 512, matches model MLP width
 
@@ -194,9 +196,10 @@ pub(crate) fn patch_ends_cpu() -> &'static [i64] {
 }
 
 
-/// (values, critic_logits, (action_mean, sde_latent))
+/// (values, critic_logits, critic_input, (action_mean, sde_latent))
+/// critic_input: [batch, TICKERS_COUNT * MODEL_DIM] pre-MLP input for slow target
 /// sde_latent: [batch, SDE_LATENT_DIM] flat ticker features for Lattice noise
-pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor));
+pub type ModelOutput = (Tensor, Tensor, Tensor, (Tensor, Tensor));
 
 /// DreamerV3-style slow target for value function stabilization.
 /// Holds an EMA copy of critic weights (not in the optimizer's VarStore).
@@ -329,8 +332,13 @@ pub struct TradingModel {
     exo_ticker_proj: nn::Linear,
     exo_cross_blocks: Vec<ExoCrossBlock>,
     inter_ticker_block: InterTickerBlock,
+    actor_mlp_linears: Vec<nn::Linear>,
+    actor_mlp_norms: Vec<RMSNorm>,
     actor_score: nn::Linear,
     cash_bias: Tensor,
+    sde_mlp_linears: Vec<nn::Linear>,
+    sde_mlp_norms: Vec<RMSNorm>,
+    sde_proj: nn::Linear,
     actor_out: nn::Linear,
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
@@ -489,12 +497,58 @@ impl TradingModel {
             .map(|(i, _)| ExoCrossBlock::new(&(p / format!("exo_cross_{}", i))))
             .collect::<Vec<_>>();
         let inter_ticker_block = InterTickerBlock::new(&(p / "inter_ticker_0"));
+        // Actor DreamerV3-style MLP: (Linear → RMSNorm → SiLU) before score projection
+        let actor_mlp_linears = (0..ACTOR_MLP_LAYERS)
+            .map(|i| {
+                nn::linear(
+                    p / format!("actor_mlp_{}", i),
+                    MODEL_DIM,
+                    MODEL_DIM,
+                    nn::LinearConfig {
+                        ws_init: truncated_normal_init(MODEL_DIM, MODEL_DIM),
+                        bs_init: Some(Init::Const(0.0)),
+                        bias: true,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let actor_mlp_norms = (0..ACTOR_MLP_LAYERS)
+            .map(|i| RMSNorm::new(&(p / format!("actor_mlp_norm_{}", i)), MODEL_DIM, 1e-6))
+            .collect::<Vec<_>>();
         let actor_score = nn::linear(p / "actor_score", MODEL_DIM, 1, nn::LinearConfig {
             ws_init: truncated_normal_init(MODEL_DIM, 1),
             bs_init: Some(Init::Const(0.0)),
             bias: true,
         });
         let cash_bias = p.var("cash_bias", &[1], Init::Const(0.0));
+        // SDE latent DreamerV3-style MLP per-ticker, then flatten → project to SDE_LATENT_DIM
+        let sde_mlp_linears = (0..SDE_MLP_LAYERS)
+            .map(|i| {
+                nn::linear(
+                    p / format!("sde_mlp_{}", i),
+                    MODEL_DIM,
+                    MODEL_DIM,
+                    nn::LinearConfig {
+                        ws_init: truncated_normal_init(MODEL_DIM, MODEL_DIM),
+                        bs_init: Some(Init::Const(0.0)),
+                        bias: true,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let sde_mlp_norms = (0..SDE_MLP_LAYERS)
+            .map(|i| RMSNorm::new(&(p / format!("sde_mlp_norm_{}", i)), MODEL_DIM, 1e-6))
+            .collect::<Vec<_>>();
+        let sde_proj = nn::linear(
+            p / "sde_proj",
+            TICKERS_COUNT * MODEL_DIM,
+            SDE_LATENT_DIM,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(TICKERS_COUNT * MODEL_DIM, SDE_LATENT_DIM),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
         let actor_out = nn::linear(
             p / "actor_out",
             SDE_LATENT_DIM,
@@ -568,8 +622,13 @@ impl TradingModel {
             exo_ticker_proj,
             exo_cross_blocks,
             inter_ticker_block,
+            actor_mlp_linears,
+            actor_mlp_norms,
             actor_score,
             cash_bias,
+            sde_mlp_linears,
+            sde_mlp_norms,
+            sde_proj,
             actor_out,
             value_mlp_linears,
             value_mlp_norms,

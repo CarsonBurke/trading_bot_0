@@ -378,7 +378,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
             };
 
             let (action_mean, sde_latent, corr_std, ind_std, w_policy) = tch::no_grad(|| {
-                let (_, _, (action_mean, sde_latent)) =
+                let (_, _, _, (action_mean, sde_latent)) =
                     model.step_on_device(price_deltas_gpu, &static_obs_gpu, &mut stream_state);
                 let (corr_std, ind_std) = model.lattice_stds();
                 let w_policy = model.w_policy();
