@@ -320,7 +320,6 @@ pub struct StreamState {
 pub struct TradingModel {
     patch_embed_weight: Tensor,
     patch_embed_bias: Tensor,
-    patch_ln_weight: Tensor,
     patch_dt_scale: Tensor,
     patch_sizes: Tensor,
     patch_config_ids: Tensor,
@@ -420,11 +419,6 @@ impl TradingModel {
             "patch_embed_bias",
             &[num_configs, SSM_DIM],
             Init::Const(0.0),
-        );
-        let patch_ln_weight = p.var(
-            "patch_ln_weight",
-            &[num_configs, SSM_DIM],
-            Init::Const(1.0),
         );
         let patch_dt_scale = {
             let mut scales = Vec::with_capacity(SEQ_LEN as usize);
@@ -610,7 +604,6 @@ impl TradingModel {
         Self {
             patch_embed_weight,
             patch_embed_bias,
-            patch_ln_weight,
             patch_dt_scale,
             patch_sizes,
             patch_config_ids,
@@ -815,12 +808,7 @@ impl TradingModel {
         let bias_per_patch = bias.index_select(0, &config_ids);
         let out = Tensor::einsum("blm,lmd->bld", &[&enriched, &weight_per_patch], None::<&[i64]>);
         let out = out + bias_per_patch.unsqueeze(0);
-
-        // RMSNorm with per-config scale
-        let ln_weight = self.maybe_to_device_kind(&self.patch_ln_weight, device, Kind::Float);
-        let ln_weight = ln_weight.index_select(0, &config_ids).unsqueeze(0);
-        let rms = (out.pow_tensor_scalar(2.0).mean_dim(-1, true, Kind::Float) + 1e-5).sqrt();
-        (out / rms * ln_weight).to_kind(kind)
+        out.to_kind(kind)
     }
 
     /// Single-config embedding for streaming inference (one patch at a time).
@@ -840,8 +828,6 @@ impl TradingModel {
         let weight = self.patch_embed_weight.get(config_idx).narrow(0, 0, input_dim);
         let bias = self.patch_embed_bias.get(config_idx);
         let out = enriched.matmul(&weight) + bias;
-        let ln_weight = self.patch_ln_weight.get(config_idx);
-        let rms = (out.pow_tensor_scalar(2.0).mean_dim(-1, true, Kind::Float) + 1e-5).sqrt();
-        (out / rms * ln_weight).to_kind(kind)
+        out.to_kind(kind)
     }
 }
