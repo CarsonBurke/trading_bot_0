@@ -13,7 +13,89 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use tch::{nn, Kind, Tensor};
 
-pub use super::ssm::{Mamba2Config, Mamba2State};
+const D_STATE: i64 = 128;
+const D_CONV: i64 = 4;
+const EXPAND: i64 = 2;
+const HEADDIM: i64 = 64;
+const NGROUPS: i64 = 1;
+const CHUNK_SIZE: i64 = 256;
+const DT_MIN: f64 = 0.001;
+const DT_MAX: f64 = 0.1;
+
+#[derive(Clone, Debug)]
+pub struct Mamba2Config {
+    pub d_model: i64,
+    pub d_state: i64,
+    pub d_conv: i64,
+    pub expand: i64,
+    pub headdim: i64,
+    /// If set, SSM is applied only on this many inner dims; the remainder uses gated MLP.
+    pub d_ssm: Option<i64>,
+    pub ngroups: i64,
+    pub chunk_size: i64,
+    pub dt_min: f64,
+    pub dt_max: f64,
+    pub dt_limit: (f64, f64),
+    pub rmsnorm: bool,
+    pub norm_before_gate: bool,
+    /// If true, D skip connection is per-channel [nheads, headdim] instead of per-head [nheads]
+    pub d_has_hdim: bool,
+}
+
+impl Default for Mamba2Config {
+    fn default() -> Self {
+        Self {
+            d_model: 64,
+            d_state: D_STATE,
+            d_conv: D_CONV,
+            expand: EXPAND,
+            headdim: HEADDIM,
+            d_ssm: None,
+            ngroups: NGROUPS,
+            chunk_size: CHUNK_SIZE,
+            dt_min: DT_MIN,
+            dt_max: DT_MAX,
+            dt_limit: (0.0, f64::INFINITY),
+            rmsnorm: true,
+            norm_before_gate: false,
+            d_has_hdim: false,
+        }
+    }
+}
+
+impl Mamba2Config {
+    pub fn new(d_model: i64) -> Self {
+        Self {
+            d_model,
+            ..Default::default()
+        }
+    }
+
+    pub fn d_inner(&self) -> i64 {
+        self.d_model * self.expand
+    }
+
+    pub fn nheads(&self) -> i64 {
+        self.d_inner() / self.headdim
+    }
+}
+
+/// Inference state for O(1) per-step computation
+pub struct Mamba2State {
+    /// Conv buffer: [batch, conv_dim, d_conv]
+    pub conv_state: Tensor,
+    /// SSM hidden state: [batch, nheads, headdim, d_state]
+    pub ssm_state: Tensor,
+    pub has_conv_state: bool,
+}
+
+impl Mamba2State {
+    pub fn reset(&mut self) {
+        let _ = self.conv_state.zero_();
+        let _ = self.ssm_state.zero_();
+        self.has_conv_state = false;
+    }
+}
 
 static BRIDGE_DIR: LazyLock<String> = LazyLock::new(|| {
     let manifest = std::env::var("CARGO_MANIFEST_DIR")

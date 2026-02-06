@@ -22,24 +22,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mamba2_stack() {
-        let vs = nn::VarStore::new(tch::Device::Cpu);
-        let config = Mamba2Config {
-            d_model: 32,
-            headdim: 16,
-            d_state: 16,
-            chunk_size: 16,
-            ..Default::default()
-        };
-        let stack = mamba_stack_cfg(&vs.root(), config, 3);
-
-        let x = Tensor::randn(&[1, 50, 32], (Kind::Float, tch::Device::Cpu));
-        let y = stack(&x, false);
-
-        assert_eq!(y.size(), vec![1, 50, 32]);
-    }
-
-    #[test]
     fn test_mamba2_default_d_state() {
         let vs = nn::VarStore::new(tch::Device::Cpu);
         let config = Mamba2Config {

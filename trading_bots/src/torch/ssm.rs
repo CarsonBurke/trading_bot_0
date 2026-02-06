@@ -13,6 +13,7 @@ use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
 use crate::torch::mamba_fused;
+pub use crate::torch::ssm_ref::{Mamba2Config, Mamba2State};
 
 static DEBUG_MEM: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("MAMBA_DEBUG_MEM").ok().as_deref() == Some("1")
@@ -22,75 +23,9 @@ static USE_CUDA_GRAPH: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("MAMBA_USE_CUDA_GRAPH").ok().as_deref() == Some("1")
 });
 
-const D_STATE: i64 = 128;
-const D_CONV: i64 = 4;
-const EXPAND: i64 = 2;
-const HEADDIM: i64 = 64;
-const NGROUPS: i64 = 1;
-const CHUNK_SIZE: i64 = 256;
-const DT_MIN: f64 = 0.001;
-const DT_MAX: f64 = 0.1;
 const DT_INIT_FLOOR: f64 = 1e-4;
 
 static MAMBA_CALL_ID: AtomicUsize = AtomicUsize::new(0);
-
-#[derive(Clone, Debug)]
-pub struct Mamba2Config {
-    pub d_model: i64,
-    pub d_state: i64,
-    pub d_conv: i64,
-    pub expand: i64,
-    pub headdim: i64,
-    /// If set, SSM is applied only on this many inner dims; the remainder uses gated MLP.
-    pub d_ssm: Option<i64>,
-    pub ngroups: i64,
-    pub chunk_size: i64,
-    pub dt_min: f64,
-    pub dt_max: f64,
-    pub dt_limit: (f64, f64),
-    pub rmsnorm: bool,
-    pub norm_before_gate: bool,
-    /// If true, D skip connection is per-channel [nheads, headdim] instead of per-head [nheads]
-    pub d_has_hdim: bool,
-}
-
-impl Default for Mamba2Config {
-    fn default() -> Self {
-        Self {
-            d_model: 64,
-            d_state: D_STATE,
-            d_conv: D_CONV,
-            expand: EXPAND,
-            headdim: HEADDIM,
-            d_ssm: None,
-            ngroups: NGROUPS,
-            chunk_size: CHUNK_SIZE,
-            dt_min: DT_MIN,
-            dt_max: DT_MAX,
-            dt_limit: (0.0, f64::INFINITY),
-            rmsnorm: true,
-            norm_before_gate: false,
-            d_has_hdim: false,
-        }
-    }
-}
-
-impl Mamba2Config {
-    pub fn new(d_model: i64) -> Self {
-        Self {
-            d_model,
-            ..Default::default()
-        }
-    }
-
-    pub fn d_inner(&self) -> i64 {
-        self.d_model * self.expand
-    }
-
-    pub fn nheads(&self) -> i64 {
-        self.d_inner() / self.headdim
-    }
-}
 
 /// RMSNorm with optional gating fusion and group normalization
 struct RMSNormGated {
@@ -154,23 +89,6 @@ impl RMSNormGated {
     }
 }
 
-/// Inference state for O(1) per-step computation
-pub struct Mamba2State {
-    /// Conv buffer: [batch, conv_dim, d_conv]
-    pub conv_state: Tensor,
-    /// SSM hidden state: [batch, nheads, headdim, d_state]
-    pub ssm_state: Tensor,
-    pub has_conv_state: bool,
-}
-
-impl Mamba2State {
-    pub fn reset(&mut self) {
-        let _ = self.conv_state.zero_();
-        let _ = self.ssm_state.zero_();
-        self.has_conv_state = false;
-    }
-}
-
 pub struct Mamba2 {
     config: Mamba2Config,
     in_proj: nn::Linear,
@@ -183,30 +101,9 @@ pub struct Mamba2 {
     d_ssm: i64,
     d_inner: i64,
     nheads: i64,
-    conv1d_w_f32: Tensor,
-    conv1d_b_f32: Tensor,
-    dt_bias_f32: Tensor,
     // Pre-allocated empty tensors for Option::None cases
     empty_f32: Tensor,
     empty_i64: Tensor,
-}
-
-struct RMSNormSimple {
-    weight: Tensor,
-    eps: f64,
-}
-
-impl RMSNormSimple {
-    fn new(p: &nn::Path, dim: i64, eps: f64) -> Self {
-        let weight = p.var("weight", &[dim], Init::Const(1.0));
-        Self { weight, eps }
-    }
-
-    fn forward(&self, x: &Tensor) -> Tensor {
-        let x_f32 = x.to_kind(Kind::Float);
-        let rms = (x_f32.pow_tensor_scalar(2).mean_dim(-1, true, Kind::Float) + self.eps).sqrt();
-        (x_f32 / rms * &self.weight).to_kind(x.kind())
-    }
 }
 
 impl Mamba2 {
@@ -332,13 +229,6 @@ impl Mamba2 {
             },
         );
 
-        let conv1d_w_f32 = conv1d.ws.squeeze_dim(1).to_kind(Kind::Float);
-        let conv1d_b_f32 = match &conv1d.bs {
-            Some(b) => b.to_kind(Kind::Float),
-            None => Tensor::zeros(&[0], (Kind::Float, p.device())),
-        };
-        let dt_bias_f32 = dt_bias.to_kind(Kind::Float);
-
         let device = in_proj.ws.device();
         let empty_f32 = Tensor::zeros(&[0], (Kind::Float, device));
         let empty_i64 = Tensor::zeros(&[0], (Kind::Int64, device));
@@ -355,9 +245,6 @@ impl Mamba2 {
             d_ssm,
             d_inner,
             nheads,
-            conv1d_w_f32,
-            conv1d_b_f32,
-            dt_bias_f32,
             empty_f32,
             empty_i64,
         }
@@ -685,138 +572,6 @@ impl Mamba2 {
         };
 
         self.step_impl(&u_normed, state, Some(dt_scale))
-    }
-
-    /// Chunked SSM scan - parallel within chunks, sequential across chunks
-    fn chunked_ssm_scan(
-        &self,
-        x: &Tensor,  // [batch, seq, nheads, headdim]
-        dt: &Tensor, // [batch, seq, nheads]
-        a: &Tensor,  // [nheads]
-        b: &Tensor,  // [batch, seq, ngroups, d_state]
-        c: &Tensor,  // [batch, seq, ngroups, d_state]
-    ) -> Tensor {
-        let (batch, _seqlen, nheads, headdim) = x.size4().unwrap();
-        let d_state = self.config.d_state;
-        let device = x.device();
-        let kind = x.kind();
-        let initial_state = Tensor::zeros(&[batch, nheads, headdim, d_state], (kind, device));
-        let (output, _) = self.chunked_ssm_scan_with_state(x, dt, a, b, c, &initial_state);
-        output
-    }
-
-    /// Chunked SSM scan with external state - SSD algorithm from Mamba2 paper
-    /// Uses attention-like within-chunk computation: Y = (L ◦ CB^T) @ X
-    /// Avoids materializing [B,H,L,N,P] outer product tensors
-    fn chunked_ssm_scan_with_state(
-        &self,
-        x: &Tensor,  // [batch, seq, nheads, headdim]
-        dt: &Tensor, // [batch, seq, nheads]
-        a: &Tensor,  // [nheads]
-        b: &Tensor,  // [batch, seq, ngroups, d_state]
-        c: &Tensor,  // [batch, seq, ngroups, d_state]
-        initial_state: &Tensor, // [batch, nheads, headdim, d_state]
-    ) -> (Tensor, Tensor) {
-        let (batch, seqlen, nheads, _headdim) = x.size4().unwrap();
-        let d_state = self.config.d_state;
-        let ngroups = self.config.ngroups;
-        let chunk_size = self.config.chunk_size.min(seqlen);
-        let heads_per_group = nheads / ngroups;
-
-        let device = x.device();
-        let x_kind = x.kind();
-
-        let log_da = dt.to_kind(Kind::Float) * a.view([1, 1, nheads]);
-        let dt_f = dt.to_kind(Kind::Float);
-        let x_f = x.to_kind(Kind::Float);
-
-        let b_exp = if ngroups == 1 {
-            b.expand([batch, seqlen, nheads, d_state], false)
-        } else {
-            b.unsqueeze(3)
-                .expand([batch, seqlen, ngroups, heads_per_group, d_state], false)
-                .reshape([batch, seqlen, nheads, d_state])
-        }
-        .to_kind(Kind::Float);
-
-        let c_exp = if ngroups == 1 {
-            c.expand([batch, seqlen, nheads, d_state], false)
-        } else {
-            c.unsqueeze(3)
-                .expand([batch, seqlen, ngroups, heads_per_group, d_state], false)
-                .reshape([batch, seqlen, nheads, d_state])
-        }
-        .to_kind(Kind::Float);
-
-        let mut state = initial_state.to_device(device).to_kind(Kind::Float);
-        let num_chunks = (seqlen + chunk_size - 1) / chunk_size;
-        let mut outputs: Vec<Tensor> = Vec::with_capacity(num_chunks as usize);
-
-        for chunk_idx in 0..num_chunks {
-            let start = chunk_idx * chunk_size;
-            let end = (start + chunk_size).min(seqlen);
-            let chunk_len = end - start;
-
-            let x_chunk = x_f.narrow(1, start, chunk_len);
-            let dt_chunk = dt_f.narrow(1, start, chunk_len);
-            let log_da_chunk = log_da.narrow(1, start, chunk_len);
-            let b_chunk = b_exp.narrow(1, start, chunk_len);
-            let c_chunk = c_exp.narrow(1, start, chunk_len);
-
-            // Scale x by dt: [B, L, H, P]
-            let x_dt = &x_chunk * dt_chunk.unsqueeze(-1);
-
-            // Transpose to [B, H, L, *] for matmuls (strided ok for matmul)
-            let x_t = x_dt.permute([0, 2, 1, 3]);  // [B, H, L, P]
-            let b_t = b_chunk.permute([0, 2, 1, 3]); // [B, H, L, N]
-            let c_t = c_chunk.permute([0, 2, 1, 3]); // [B, H, L, N]
-            let log_da_t = log_da_chunk.permute([0, 2, 1]); // [B, H, L]
-
-            // Cumulative log(A) for decay computations
-            let a_cumsum = log_da_t.cumsum(-1, Kind::Float); // [B, H, L]
-
-            // === Within-chunk: SSD attention-like form ===
-            // Y_diag = (L ◦ C @ B^T) @ X  where L_ij = exp(cumsum_i - cumsum_j) for i >= j
-            // Compute via: for each head, attention scores = C @ B^T, masked by L
-
-            // L matrix: segsum gives log(L), exp for L
-            let l_mat = segsum_stable(&log_da_t).exp(); // [B, H, L, L]
-
-            // SSD quadratic form: scores = C @ B^T, then (L ◦ scores) @ X
-            // scores: [B, H, L, L] via [B, H, L, N] @ [B, H, N, L]
-            let scores = c_t.matmul(&b_t.transpose(-1, -2)); // [B, H, L, L]
-            let masked_scores = &l_mat * &scores; // [B, H, L, L]
-
-            // y_diag = masked_scores @ x: [B, H, L, L] @ [B, H, L, P] -> [B, H, L, P]
-            let y_diag = masked_scores.matmul(&x_t); // [B, H, L, P]
-
-            // === Cross-chunk: contribution from previous state ===
-            // y_off = decay * (state @ C^T)
-            // state: [B, H, P, N], C: [B, H, L, N] -> [B, H, L, P]
-            let decay = a_cumsum.exp().unsqueeze(-1); // [B, H, L, 1]
-            // state @ C^T: [B, H, P, N] @ [B, H, N, L] -> [B, H, P, L] -> transpose -> [B, H, L, P]
-            let state_contrib = state.matmul(&c_t.transpose(-1, -2)).transpose(-1, -2); // [B, H, L, P]
-            let y_off = &decay * &state_contrib; // [B, H, L, P]
-
-            let y_chunk = (&y_diag + &y_off).permute([0, 2, 1, 3]); // [B, L, H, P]
-            outputs.push(y_chunk);
-
-            // === Update state for next chunk ===
-            // state_new = decay_total * state + sum_t(decay_from_t * B_t * x_t)
-            let a_last = a_cumsum.select(-1, chunk_len - 1); // [B, H]
-            let decay_total = a_last.unsqueeze(-1).unsqueeze(-1).exp(); // [B, H, 1, 1]
-
-            // Decay from each position to end of chunk
-            let decay_states = (a_last.unsqueeze(-1) - &a_cumsum).exp(); // [B, H, L]
-            // B weighted by decay: [B, H, L, N] * [B, H, L, 1]
-            let b_decay = &b_t * decay_states.unsqueeze(-1); // [B, H, L, N]
-            // state_add = X^T @ B_decay: [B, H, P, L] @ [B, H, L, N] -> [B, H, P, N]
-            let state_add = x_t.transpose(-1, -2).matmul(&b_decay); // [B, H, P, N]
-
-            state = &decay_total * &state + state_add;
-        }
-
-        (Tensor::cat(&outputs, 1).to_kind(x_kind), state.to_kind(x_kind))
     }
 
     fn forward_fused_from_zxbcdt(
@@ -1180,240 +935,10 @@ impl Mamba2 {
         self.forward_with_state_dt_scale(u, state, dt_scale)
     }
 
-    fn update_conv_state_from_xbc(&self, state: &mut Mamba2State, xbc_t: &Tensor, include_prev: bool) -> Tensor {
-        let d_conv = self.config.d_conv;
-        let conv_input = if include_prev && d_conv > 1 {
-            let prev = state
-                .conv_state
-                .narrow(2, 0, d_conv - 1)
-                .to_kind(xbc_t.kind())
-                .to_device(xbc_t.device());
-            Tensor::cat(&[prev, xbc_t.shallow_clone()], 2)
-        } else {
-            xbc_t.shallow_clone()
-        };
-        let total = conv_input.size()[2];
-        let updated = if total >= d_conv {
-            conv_input.narrow(2, total - d_conv, d_conv)
-        } else {
-            let pad = Tensor::zeros(
-                &[conv_input.size()[0], conv_input.size()[1], d_conv - total],
-                (conv_input.kind(), conv_input.device()),
-            );
-            Tensor::cat(&[pad, conv_input.shallow_clone()], 2)
-        };
-        state.conv_state.copy_(&updated);
-        state.has_conv_state = true;
-        conv_input
-    }
 }
 
-fn segsum_stable(a: &Tensor) -> Tensor {
-    debug_assert_eq!(a.dim(), 3);
-    let b = a.size()[0];
-    let h = a.size()[1];
-    let t = a.size()[2];
-    let device = a.device();
-
-    let a = a.unsqueeze(-1).expand(&[b, h, t, t], false);
-    let mask_strict = Tensor::ones(&[t, t], (Kind::Bool, device)).tril(-1);
-    let a = a.masked_fill(&mask_strict.logical_not(), 0.0);
-    let a = a.cumsum(-2, Kind::Float);
-    let mask = Tensor::ones(&[t, t], (Kind::Bool, device)).tril(0);
-    a.masked_fill(&mask.logical_not(), f64::NEG_INFINITY)
-}
-
-pub type MambaLayer = Box<dyn Fn(&Tensor, bool) -> Tensor>;
-
-/// Stateful Mamba block for O(1) streaming inference
-pub struct StatefulMamba {
-    mamba: Mamba2,
-}
-
-impl StatefulMamba {
-    pub fn new(p: &nn::Path, config: Mamba2Config) -> Self {
-        Self { mamba: Mamba2::new(p, config) }
-    }
-
-    pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
-        self.mamba.forward(x, train)
-    }
-
-    pub fn forward_with_dt_scale(&self, x: &Tensor, dt_scale: Option<&Tensor>) -> Tensor {
-        self.mamba.forward_with_dt_scale(x, dt_scale)
-    }
-
-    pub fn forward_with_dt_scale_seq_idx(
-        &self,
-        x: &Tensor,
-        dt_scale: Option<&Tensor>,
-        seq_idx: Option<&Tensor>,
-    ) -> Tensor {
-        self.mamba.forward_with_dt_scale_seq_idx(x, dt_scale, seq_idx)
-    }
-
-    pub fn forward_with_pre_norm_seq_idx(
-        &self,
-        x: &Tensor,
-        norm_weight: &Tensor,
-        norm_eps: f64,
-        dt_scale: Option<&Tensor>,
-        seq_idx: Option<&Tensor>,
-    ) -> Tensor {
-        self.mamba
-            .forward_with_pre_norm_seq_idx(x, norm_weight, norm_eps, dt_scale, seq_idx)
-    }
-
-    pub fn forward_with_state(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
-        self.mamba.forward_with_state(x, state)
-    }
-
-    pub fn forward_with_state_dt_scale(&self, x: &Tensor, state: &mut Mamba2State, dt_scale: Option<&Tensor>) -> Tensor {
-        self.mamba.forward_with_state_dt_scale(x, state, dt_scale)
-    }
-
-    pub fn init_state(&self, batch_size: i64, device: tch::Device) -> Mamba2State {
-        self.mamba.init_state(batch_size, device)
-    }
-
-    pub fn step(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
-        self.mamba.step(x, state)
-    }
-
-    pub fn step_with_dt_scale(&self, x: &Tensor, state: &mut Mamba2State, dt_scale: f64) -> Tensor {
-        self.mamba.step_with_dt_scale(x, state, dt_scale)
-    }
-
-    pub fn step_with_pre_norm_dt_scale(
-        &self,
-        x: &Tensor,
-        norm_weight: &Tensor,
-        norm_eps: f64,
-        state: &mut Mamba2State,
-        dt_scale: f64,
-    ) -> Tensor {
-        self.mamba.step_with_pre_norm_dt_scale(x, norm_weight, norm_eps, state, dt_scale)
-    }
-
-    pub fn forward_with_state_pre_norm_dt_scale(
-        &self,
-        x: &Tensor,
-        norm_weight: &Tensor,
-        norm_eps: f64,
-        state: &mut Mamba2State,
-        dt_scale: Option<&Tensor>,
-    ) -> Tensor {
-        self.mamba.forward_with_state_pre_norm_dt_scale(x, norm_weight, norm_eps, state, dt_scale)
-    }
-
-    pub fn forward_batched_init(&self, x: &Tensor, state: &mut Mamba2State) -> Tensor {
-        self.mamba.forward_batched_init(x, state)
-    }
-
-    pub fn forward_batched_init_dt_scale(
-        &self,
-        x: &Tensor,
-        state: &mut Mamba2State,
-        dt_scale: Option<&Tensor>,
-    ) -> Tensor {
-        self.mamba.forward_batched_init_dt_scale(x, state, dt_scale)
-    }
-}
-
-/// Create a Mamba2 block with default config
-pub fn mamba_block(p: &nn::Path, d_model: i64) -> MambaLayer {
-    mamba_block_cfg(p, Mamba2Config::new(d_model))
-}
-
-/// Create a Mamba2 block with custom config
-pub fn mamba_block_cfg(p: &nn::Path, config: Mamba2Config) -> MambaLayer {
+/// Create a Mamba2 block with custom config (returns closure for test use)
+pub fn mamba_block_cfg(p: &nn::Path, config: Mamba2Config) -> Box<dyn Fn(&Tensor, bool) -> Tensor> {
     let mamba = Mamba2::new(p, config);
     Box::new(move |x: &Tensor, train: bool| mamba.forward(x, train))
-}
-
-/// Create a stateful Mamba2 block for streaming inference
-pub fn stateful_mamba_block(p: &nn::Path, d_model: i64) -> StatefulMamba {
-    stateful_mamba_block_cfg(p, Mamba2Config::new(d_model))
-}
-
-/// Create a stateful Mamba2 block with custom config
-pub fn stateful_mamba_block_cfg(p: &nn::Path, config: Mamba2Config) -> StatefulMamba {
-    StatefulMamba::new(p, config)
-}
-
-/// Stack of Mamba2 blocks with residual connections
-pub fn mamba_stack(p: &nn::Path, d_model: i64, n_layers: i64) -> MambaLayer {
-    mamba_stack_cfg(p, Mamba2Config::new(d_model), n_layers)
-}
-
-pub fn mamba_stack_cfg(p: &nn::Path, config: Mamba2Config, n_layers: i64) -> MambaLayer {
-    let layers: Vec<_> = (0..n_layers)
-        .map(|i| {
-            let cfg = Mamba2Config {
-                d_model: config.d_model,
-                d_state: config.d_state,
-                d_conv: config.d_conv,
-                expand: config.expand,
-                headdim: config.headdim,
-                d_ssm: config.d_ssm,
-                ngroups: config.ngroups,
-                chunk_size: config.chunk_size,
-                dt_min: config.dt_min,
-                dt_max: config.dt_max,
-                dt_limit: config.dt_limit,
-                rmsnorm: config.rmsnorm,
-                norm_before_gate: config.norm_before_gate,
-                d_has_hdim: config.d_has_hdim,
-            };
-            (
-                Mamba2::new(&(p / format!("layer_{}", i)), cfg),
-                RMSNormSimple::new(&(p / format!("ln_{}", i)), config.d_model, 1e-5),
-            )
-        })
-        .collect();
-
-    Box::new(move |x: &Tensor, train: bool| {
-        let mut out = x.shallow_clone();
-        for (mamba, ln) in &layers {
-            let normed = ln.forward(&out);
-            out = &out + mamba.forward(&normed, train);
-        }
-        out
-    })
-}
-
-#[cfg(test)]
-mod ssd_attention_shape_tests {
-    use super::*;
-
-    #[test]
-    fn test_ssd_attention_shaped_equivalence() {
-        let device = tch::Device::Cpu;
-        let b = 2i64;
-        let h = 3i64;
-        let l = 8i64;
-        let n = 5i64;
-        let p = 4i64;
-
-        let log_da = Tensor::randn(&[b, h, l], (Kind::Float, device)).clamp(-5.0, 0.0);
-        let l_mat = segsum_stable(&log_da).exp(); // [B,H,L,L]
-
-        let k = Tensor::randn(&[b, h, l, n], (Kind::Float, device));
-        let q = Tensor::randn(&[b, h, l, n], (Kind::Float, device));
-        let v = Tensor::randn(&[b, h, l, p], (Kind::Float, device));
-
-        let kv = k.unsqueeze(-1) * v.unsqueeze(-2); // [B,H,L,N,P]
-        let kv_flat = kv.reshape([b * h, l, n * p]);
-        let l_batched = l_mat.reshape([b * h, l, l]);
-        let tmp = l_batched.bmm(&kv_flat).reshape([b, h, l, n, p]);
-        let y1 = (tmp * q.unsqueeze(-1)).sum_dim_intlist(3, false, Kind::Float); // [B,H,L,P]
-
-        let scores = q.matmul(&k.transpose(-1, -2)); // [B,H,L,L]
-        let weights = scores * l_mat; // [B,H,L,L]
-        let v_flat = v.reshape([b * h, l, p]);
-        let y2 = weights.reshape([b * h, l, l]).bmm(&v_flat).reshape([b, h, l, p]);
-
-        let max_diff: f64 = (&y1 - &y2).abs().max().double_value(&[]);
-        assert!(max_diff < 1e-4, "Max diff {} too large", max_diff);
-    }
 }
