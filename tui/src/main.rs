@@ -163,7 +163,8 @@ impl App {
             "explained_var",
             "value_loss",
             "policy_loss",
-            "policy_entropy"
+            "policy_entropy",
+            "approx_kl"
         ];
 
         // Ticker-specific chart base names

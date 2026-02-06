@@ -535,6 +535,8 @@ pub async fn train(weights_path: Option<&str>) {
         let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
 
 
+        let mut first_epoch_kl = 0.0f64;
+
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             use rand::seq::SliceRandom;
             chunk_order.shuffle(&mut rand::rng());
@@ -762,6 +764,9 @@ pub async fn train(weights_path: Option<&str>) {
             }
 
             let mean_epoch_kl = epoch_kl_gpu.double_value(&[]) / epoch_kl_count as f64;
+            if _epoch == 0 {
+                first_epoch_kl = mean_epoch_kl;
+            }
             println!(
                 "Epoch {}/{}: KL {:.4}",
                 _epoch + 1,
@@ -927,6 +932,7 @@ pub async fn train(weights_path: Option<&str>) {
         primary.meta_history.record_explained_var(explained_var);
         primary.meta_history.record_grad_norm(mean_grad_norm);
         primary.meta_history.record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
+        primary.meta_history.record_approx_kl(first_epoch_kl);
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",
