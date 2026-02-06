@@ -122,6 +122,8 @@ const TIME_CROSS_LAYERS: usize = 1;
 const FF_DIM: i64 = 512;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -4.0;
+const CRITIC_LAYERS: usize = 2;
+const CRITIC_HIDDEN: i64 = FF_DIM; // 512, matches model MLP width
 
 /// expln: numerically stable exp alternative that bounds growth for positive inputs
 /// expln(x) = exp(x)        if x <= 0
@@ -265,6 +267,8 @@ pub struct TradingModel {
     actor_score: nn::Linear,
     cash_bias: Tensor,
     actor_out: nn::Linear,
+    value_mlp_linears: Vec<nn::Linear>,
+    value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
     // Lattice exploration: learned log-std for correlated + independent noise
     log_std_param: Tensor,  // [SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM]
@@ -436,9 +440,31 @@ impl TradingModel {
                 bias: true,
             },
         );
+        // DreamerV3-style critic MLP: (Linear → RMSNorm → SiLU) → Linear(→bins, zero_init)
+        let critic_in = TICKERS_COUNT * MODEL_DIM;
+        let value_mlp_linears = (0..CRITIC_LAYERS)
+            .map(|i| {
+                let in_dim = if i == 0 { critic_in } else { CRITIC_HIDDEN };
+                nn::linear(
+                    p / format!("value_mlp_{}", i),
+                    in_dim,
+                    CRITIC_HIDDEN,
+                    nn::LinearConfig {
+                        ws_init: truncated_normal_init(in_dim, CRITIC_HIDDEN),
+                        bs_init: Some(Init::Const(0.0)),
+                        bias: true,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let value_mlp_norms = (0..CRITIC_LAYERS)
+            .map(|i| {
+                RMSNorm::new(&(p / format!("value_mlp_norm_{}", i)), CRITIC_HIDDEN, 1e-6)
+            })
+            .collect::<Vec<_>>();
         let value_out = nn::linear(
             p / "value_out",
-            TICKERS_COUNT * MODEL_DIM,
+            CRITIC_HIDDEN,
             NUM_VALUE_BUCKETS,
             nn::LinearConfig {
                 ws_init: Init::Const(0.0),
@@ -480,6 +506,8 @@ impl TradingModel {
             actor_score,
             cash_bias,
             actor_out,
+            value_mlp_linears,
+            value_mlp_norms,
             value_out,
             log_std_param,
             bucket_centers,

@@ -11,7 +11,7 @@ use crate::torch::model::{
     SDE_EPS, SDE_LATENT_DIM,
 };
 
-const LEARNING_RATE: f64 = 3e-4;
+const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;

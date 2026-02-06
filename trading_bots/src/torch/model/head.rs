@@ -70,10 +70,15 @@ impl TradingModel {
         let sde_latent = ticker_repr
             .reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
 
-        // Critic: direct projection (no MLP - backbone already processed)
-        let critic_logits = ticker_repr
-            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM])
-            .apply(&self.value_out);
+        // Critic: DreamerV3-style MLP (Linear → RMSNorm → SiLU) → Linear
+        let mut critic_x = ticker_repr
+            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
+        for i in 0..self.value_mlp_linears.len() {
+            critic_x = critic_x.apply(&self.value_mlp_linears[i]);
+            critic_x = self.value_mlp_norms[i].forward(&critic_x);
+            critic_x = critic_x.silu();
+        }
+        let critic_logits = critic_x.apply(&self.value_out);
 
         // Bins are scaled-symlog-spaced in raw return space
         // Weighted average gives value prediction directly in return space
