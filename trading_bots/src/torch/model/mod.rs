@@ -9,7 +9,8 @@ use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
 use crate::torch::constants::{
-    GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
+    GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS,
+    TICKERS_COUNT,
 };
 
 pub(crate) const NUM_VALUE_BUCKETS: i64 = 255;
@@ -74,8 +75,8 @@ impl ExoCrossBlock {
     fn new(p: &nn::Path) -> Self {
         let cross_ln = RMSNorm::new(&(p / "cross_ln"), MODEL_DIM, 1e-6);
         let cross_q = nn::linear(p / "cross_q", MODEL_DIM, MODEL_DIM, Default::default());
-        let cross_k = nn::linear(p / "cross_k", MODEL_DIM, MODEL_DIM, Default::default());
-        let cross_v = nn::linear(p / "cross_v", MODEL_DIM, MODEL_DIM, Default::default());
+        let cross_k = nn::linear(p / "cross_k", MODEL_DIM, CROSS_NUM_KV_HEADS * CROSS_HEAD_DIM, Default::default());
+        let cross_v = nn::linear(p / "cross_v", MODEL_DIM, CROSS_NUM_KV_HEADS * CROSS_HEAD_DIM, Default::default());
         let cross_out = nn::linear(p / "cross_out", MODEL_DIM, MODEL_DIM, Default::default());
         let alpha_cross = p.var("alpha_cross", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
@@ -84,13 +85,39 @@ impl ExoCrossBlock {
     }
 
     fn forward(&self, x: &Tensor, exo_kv: &Tensor) -> Tensor {
-        let q = self.cross_ln.forward(x).apply(&self.cross_q);
+        let (b, s, _d) = x.size3().unwrap_or_else(|_| {
+            let (b, _d) = x.size2().unwrap();
+            (b, 1, _d)
+        });
+        let x_3d = if x.dim() == 2 { x.unsqueeze(1) } else { x.shallow_clone() };
+        let t = exo_kv.size()[1];
+
+        let q = self.cross_ln.forward(&x_3d).apply(&self.cross_q);
         let k = exo_kv.apply(&self.cross_k);
         let v = exo_kv.apply(&self.cross_v);
-        let scores = q.matmul(&k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+
+        let q = q.reshape([b, s, CROSS_NUM_Q_HEADS, CROSS_HEAD_DIM]).permute([0, 2, 1, 3]);
+        let k = k.reshape([b, t, CROSS_NUM_KV_HEADS, CROSS_HEAD_DIM]).permute([0, 2, 1, 3]);
+        let v = v.reshape([b, t, CROSS_NUM_KV_HEADS, CROSS_HEAD_DIM]).permute([0, 2, 1, 3]);
+
+        let heads_per_group = CROSS_NUM_Q_HEADS / CROSS_NUM_KV_HEADS;
+        let k = k.unsqueeze(2)
+            .expand([b, CROSS_NUM_KV_HEADS, heads_per_group, t, CROSS_HEAD_DIM], false)
+            .reshape([b, CROSS_NUM_Q_HEADS, t, CROSS_HEAD_DIM]);
+        let v = v.unsqueeze(2)
+            .expand([b, CROSS_NUM_KV_HEADS, heads_per_group, t, CROSS_HEAD_DIM], false)
+            .reshape([b, CROSS_NUM_Q_HEADS, t, CROSS_HEAD_DIM]);
+
+        let scale = (CROSS_HEAD_DIM as f64).sqrt();
+        let scores = q.matmul(&k.transpose(-2, -1)) / scale;
         let attn = scores.softmax(-1, Kind::Float).to_kind(q.kind());
-        let out = attn.matmul(&v).apply(&self.cross_out);
-        x + self.alpha_cross.sigmoid() * RESIDUAL_ALPHA_MAX * out
+        let out = attn.matmul(&v);
+
+        let out = out.permute([0, 2, 1, 3]).reshape([b, s, MODEL_DIM]);
+        let out = out.apply(&self.cross_out);
+
+        let result = &x_3d + self.alpha_cross.sigmoid() * RESIDUAL_ALPHA_MAX * out;
+        if x.dim() == 2 { result.squeeze_dim(1) } else { result }
     }
 }
 
@@ -126,6 +153,10 @@ const ACTOR_MLP_LAYERS: usize = 1;
 const SDE_MLP_LAYERS: usize = 1;
 const CRITIC_LAYERS: usize = 2;
 const CRITIC_HIDDEN: i64 = FF_DIM; // 512, matches model MLP width
+const CROSS_NUM_Q_HEADS: i64 = 4;
+const CROSS_NUM_KV_HEADS: i64 = 2;
+const CROSS_HEAD_DIM: i64 = 32;
+const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 
 /// expln: numerically stable exp alternative that bounds growth for positive inputs
 /// expln(x) = exp(x)        if x <= 0
@@ -327,8 +358,8 @@ pub struct TradingModel {
     ssm_layers: Vec<StatefulMambaRef>,
     ssm_norms: Vec<RMSNorm>,
     ssm_final_norm: RMSNorm,
-    exo_global_proj: nn::Linear,
-    exo_ticker_proj: nn::Linear,
+    exo_feat_w: Tensor,
+    exo_feat_b: Tensor,
     exo_cross_blocks: Vec<ExoCrossBlock>,
     inter_ticker_block: InterTickerBlock,
     actor_mlp_linears: Vec<nn::Linear>,
@@ -473,18 +504,8 @@ impl TradingModel {
             .collect::<Vec<_>>();
         let ssm_final_norm = RMSNorm::new(&(p / "ssm_final_norm"), SSM_DIM, 1e-6);
 
-        let exo_global_proj = nn::linear(
-            p / "exo_global_proj",
-            GLOBAL_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let exo_ticker_proj = nn::linear(
-            p / "exo_ticker_proj",
-            PER_TICKER_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
+        let exo_feat_w = p.var("exo_feat_w", &[NUM_EXO_TOKENS, MODEL_DIM], Init::Randn { mean: 0.0, stdev: (1.0 / MODEL_DIM as f64).sqrt() });
+        let exo_feat_b = p.var("exo_feat_b", &[NUM_EXO_TOKENS, MODEL_DIM], Init::Const(0.0));
         let exo_cross_blocks = EXO_CROSS_AFTER
             .iter()
             .enumerate()
@@ -611,8 +632,8 @@ impl TradingModel {
             ssm_layers,
             ssm_norms,
             ssm_final_norm,
-            exo_global_proj,
-            exo_ticker_proj,
+            exo_feat_w,
+            exo_feat_b,
             exo_cross_blocks,
             inter_ticker_block,
             actor_mlp_linears,
@@ -654,19 +675,16 @@ impl TradingModel {
         }
     }
 
-    /// Build exogenous KV bank: [batch*tickers, 2, MODEL_DIM]
-    /// Token 0 = projected global static, Token 1 = projected per-ticker static
+    /// Build exogenous KV bank: [batch*tickers, NUM_EXO_TOKENS, MODEL_DIM]
+    /// Each of the 46 static features gets its own token via per-feature learned projection
     fn build_exo_kv(&self, global_static: &Tensor, per_ticker_static: &Tensor, batch_size: i64) -> Tensor {
-        let global_emb = global_static.apply(&self.exo_global_proj); // [batch, MODEL_DIM]
-        let ticker_emb = per_ticker_static
-            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&self.exo_ticker_proj)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]); // [batch, tickers, MODEL_DIM]
-        let global_exp = global_emb
+        let global_exp = global_static
             .unsqueeze(1)
-            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false); // [batch, tickers, MODEL_DIM]
-        Tensor::stack(&[global_exp, ticker_emb], 2)
-            .reshape([batch_size * TICKERS_COUNT, 2, MODEL_DIM]) // [batch*tickers, 2, MODEL_DIM]
+            .expand(&[batch_size, TICKERS_COUNT, GLOBAL_STATIC_OBS as i64], false);
+        let all_feats = Tensor::cat(&[global_exp, per_ticker_static.shallow_clone()], -1);
+        let all_feats = all_feats.reshape([batch_size * TICKERS_COUNT, NUM_EXO_TOKENS]);
+        let feats_expanded = all_feats.unsqueeze(-1);
+        feats_expanded * &self.exo_feat_w + &self.exo_feat_b
     }
 
     fn patch_embed_single(&self, ticker_data: &Tensor) -> Tensor {
