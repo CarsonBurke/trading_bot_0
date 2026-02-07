@@ -7,8 +7,8 @@ use crate::torch::constants::{
 };
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    symlog_tensor, SlowCritic, TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_STD_REG,
-    PATCH_SEQ_LEN, SDE_EPS, SDE_LATENT_DIM,
+    symlog_tensor, SlowCritic, TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_LEARN_FEATURES,
+    LATTICE_STD_REG, PATCH_SEQ_LEN, SDE_EPS, SDE_LATENT_DIM,
 };
 
 const LEARNING_RATE: f64 = 1e-4;
@@ -577,11 +577,11 @@ pub async fn train(weights_path: Option<&str>) {
                 // act_mb contains the stored u (pre-softmax logits)
                 let u = act_mb;
 
-                // Detach latent for covariance path; action mean gradients still flow.
-                let sde_latent_detached = sde_latent.detach();
+                // Conditionally detach latent for covariance
+                let sde_latent_cov = if LATTICE_LEARN_FEATURES { sde_latent.shallow_clone() } else { sde_latent.detach() };
                 let (corr_std, ind_std) = trading_model.lattice_stds();
                 let w_policy = trading_model.w_policy();
-                let sigma_mat = build_lattice_covariance(&sde_latent_detached, &corr_std, &ind_std, &w_policy);
+                let sigma_mat = build_lattice_covariance(&sde_latent_cov, &corr_std, &ind_std, &w_policy);
 
                 // RPO: sigmoid parameterization for smooth gradients
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
@@ -613,8 +613,7 @@ pub async fn train(weights_path: Option<&str>) {
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
-                // Soft clamp log_ratio to prevent extreme probability ratios
-                // let log_ratio = log_ratio_raw.tanh() * 0.3;
+
                 if DEBUG_NUMERICS {
                     let _ =
                         debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
