@@ -707,7 +707,7 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // DreamerV3-style critic MLP: (Linear → RMSNorm → SiLU) → Linear(→bins, zero_init)
+        // Critic MLP: (Linear → RMSNorm → SiLU) → Linear(→bins), orthogonally initialized.
         let critic_in = TICKERS_COUNT * spec.model_dim;
         let critic_hidden = spec.ff_dim;
         let value_mlp_linears = (0..CRITIC_LAYERS)
@@ -718,7 +718,7 @@ impl TradingModel {
                     in_dim,
                     critic_hidden,
                     nn::LinearConfig {
-                        ws_init: truncated_normal_init(in_dim, critic_hidden),
+                        ws_init: Init::Orthogonal { gain: 1.0 },
                         bs_init: Some(Init::Const(0.0)),
                         bias: true,
                     },
@@ -733,7 +733,7 @@ impl TradingModel {
             critic_hidden,
             NUM_VALUE_BUCKETS,
             nn::LinearConfig {
-                ws_init: Init::Const(0.0),
+                ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
