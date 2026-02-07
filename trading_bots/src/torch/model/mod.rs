@@ -150,7 +150,7 @@ const SSM_DIM: i64 = 128;
 const MODEL_DIM: i64 = 128;
 const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
-const SSM_DSTATE: i64 = 64;
+const SSM_DSTATE: i64 = 128;
 pub(crate) const SDE_LATENT_DIM: i64 = 128;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
@@ -341,7 +341,7 @@ pub struct TradingModelConfig {
 
 impl Default for TradingModelConfig {
     fn default() -> Self {
-        Self { ssm_layers: 4 }
+        Self { ssm_layers: 2 }
     }
 }
 
