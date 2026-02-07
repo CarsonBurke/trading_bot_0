@@ -16,7 +16,6 @@ pub struct VecEnv {
     actions_buf: Vec<f64>,
     reward_buf: Vec<f32>,
     reward_per_ticker_buf: Vec<f32>,
-    cash_reward_buf: Vec<f32>,
     is_done_buf: Vec<f32>,
     price_deltas_buf: Vec<f32>,
     static_obs_buf: Vec<f32>,
@@ -96,7 +95,6 @@ impl VecEnv {
             actions_buf,
             reward_buf: vec![0.0; NPROCS as usize],
             reward_per_ticker_buf: vec![0.0; NPROCS as usize * TICKERS_COUNT as usize],
-            cash_reward_buf: vec![0.0; NPROCS as usize],
             is_done_buf: vec![0.0; NPROCS as usize],
             price_deltas_buf: vec![0.0; price_deltas_dim],
             static_obs_buf: vec![0.0; static_obs_dim],
@@ -254,7 +252,6 @@ impl VecEnv {
         out_price_deltas: &mut Tensor,
         out_static_obs: &mut Tensor,
         out_reward_per_ticker: &mut Tensor,
-        out_cash_reward: &mut Tensor,
         out_is_done: &mut Tensor,
         out_seq_idx: &mut Tensor,
     ) {
@@ -268,7 +265,6 @@ impl VecEnv {
             let reward_start = i * TICKERS_COUNT as usize;
             self.reward_per_ticker_buf[reward_start..reward_start + TICKERS_COUNT as usize]
                 .copy_from_slice(&step.reward_per_ticker);
-            self.cash_reward_buf[i] = step.cash_reward;
             self.is_done_buf[i] = step.is_done;
             let pd_offset = i * price_deltas_dim;
             let so_offset = i * static_obs_dim;
@@ -307,7 +303,6 @@ impl VecEnv {
 
         let rpt_cpu = self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);
         out_reward_per_ticker.copy_(&rpt_cpu);
-        out_cash_reward.copy_(&self.tensor_from_f32(&self.cash_reward_buf, &[NPROCS]));
         out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[NPROCS]));
     }
 
@@ -350,14 +345,13 @@ impl VecEnv {
         &mut self,
         actions_flat: &[f64],
         out_static_obs: &mut Tensor,
-    ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
         let action_dim = ACTION_COUNT as usize;
         let envs_len = self.envs.len();
         debug_assert_eq!(actions_flat.len(), envs_len * action_dim);
 
         let mut rewards = [0f32; NPROCS as usize];
         let mut rewards_per_ticker = vec![0f32; NPROCS as usize * TICKERS_COUNT as usize];
-        let mut cash_rewards = [0f32; NPROCS as usize];
         let mut is_dones = [0f32; NPROCS as usize];
         let mut all_step_deltas = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
         let mut all_static_obs = Vec::with_capacity(NPROCS as usize * STATIC_OBSERVATIONS);
@@ -368,7 +362,6 @@ impl VecEnv {
 
             if self.done_mask[i] {
                 rewards[i] = 0.0;
-                cash_rewards[i] = 0.0;
                 is_dones[i] = 1.0;
                 let step_start = i * TICKERS_COUNT as usize;
                 let static_start = i * STATIC_OBSERVATIONS;
@@ -386,7 +379,6 @@ impl VecEnv {
             let reward_start = i * TICKERS_COUNT as usize;
             rewards_per_ticker[reward_start..reward_start + TICKERS_COUNT as usize]
                 .copy_from_slice(&step.reward_per_ticker);
-            cash_rewards[i] = step.cash_reward;
             is_dones[i] = step.is_done;
             all_step_deltas.extend_from_slice(&step.step_deltas);
             all_static_obs.extend_from_slice(&step.static_obs);
@@ -408,11 +400,10 @@ impl VecEnv {
         let reward = Tensor::from_slice(&rewards);
         let reward_per_ticker =
             Tensor::from_slice(&rewards_per_ticker).view([NPROCS, TICKERS_COUNT]);
-        let cash_reward = Tensor::from_slice(&cash_rewards);
         let is_done = Tensor::from_slice(&is_dones);
         let step_deltas = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
 
-        (reward, reward_per_ticker, cash_reward, is_done, step_deltas)
+        (reward, reward_per_ticker, is_done, step_deltas)
     }
 
     pub fn step_incremental_tensor_into(
@@ -421,17 +412,15 @@ impl VecEnv {
         out_static_obs: &mut Tensor,
         out_reward: &mut Tensor,
         out_reward_per_ticker: &mut Tensor,
-        out_cash_reward: &mut Tensor,
         out_is_done: &mut Tensor,
         out_step_deltas: &mut Tensor,
     ) {
         let actions_cpu = actions.to_device(Device::Cpu);
         let actions_flat = Vec::<f64>::try_from(actions_cpu.flatten(0, -1)).unwrap();
-        let (reward, reward_per_ticker, cash_reward, is_done, step_deltas) =
+        let (reward, reward_per_ticker, is_done, step_deltas) =
             self.step_incremental(&actions_flat, out_static_obs);
         out_reward.copy_(&reward);
         out_reward_per_ticker.copy_(&reward_per_ticker);
-        out_cash_reward.copy_(&cash_reward);
         out_is_done.copy_(&is_done);
         out_step_deltas.copy_(&step_deltas);
     }
@@ -440,7 +429,7 @@ impl VecEnv {
         &mut self,
         actions: &Tensor,
         out_static_obs: &mut Tensor,
-    ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
         let actions_cpu = actions.to_device(Device::Cpu);
         let actions_flat = Vec::<f64>::try_from(actions_cpu.flatten(0, -1)).unwrap();
         self.step_incremental(&actions_flat, out_static_obs)
@@ -452,7 +441,6 @@ impl VecEnv {
         out_step_deltas: &mut Tensor,
         out_static_obs: &mut Tensor,
         out_reward_per_ticker: &mut Tensor,
-        out_cash_reward: &mut Tensor,
         out_is_done: &mut Tensor,
     ) -> (Vec<usize>, Vec<f32>) {
         let action_dim = ACTION_COUNT as usize;
@@ -472,7 +460,6 @@ impl VecEnv {
             let reward_start = i * TICKERS_COUNT as usize;
             self.reward_per_ticker_buf[reward_start..reward_start + TICKERS_COUNT as usize]
                 .copy_from_slice(&step.reward_per_ticker);
-            self.cash_reward_buf[i] = step.cash_reward;
             self.is_done_buf[i] = step.is_done;
 
             let step_offset = i * step_deltas_dim;
@@ -506,7 +493,6 @@ impl VecEnv {
 
         let rpt_cpu = self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);
         out_reward_per_ticker.copy_(&rpt_cpu);
-        out_cash_reward.copy_(&self.tensor_from_f32(&self.cash_reward_buf, &[NPROCS]));
         out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[NPROCS]));
 
         (reset_indices, reset_price_deltas)
@@ -518,7 +504,6 @@ impl VecEnv {
         out_step_deltas: &mut Tensor,
         out_static_obs: &mut Tensor,
         out_reward_per_ticker: &mut Tensor,
-        out_cash_reward: &mut Tensor,
         out_is_done: &mut Tensor,
     ) -> (Vec<usize>, Vec<f32>) {
         let actions_cpu = actions.to_device(Device::Cpu).to_kind(tch::Kind::Double);
@@ -532,7 +517,6 @@ impl VecEnv {
             out_step_deltas,
             out_static_obs,
             out_reward_per_ticker,
-            out_cash_reward,
             out_is_done,
         )
     }

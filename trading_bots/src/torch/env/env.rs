@@ -443,8 +443,6 @@ impl Env {
         }
 
         let pre_total_assets = self.account.total_assets;
-        let pre_cash = self.account.cash;
-        let pre_positions = self.account.positions.clone();
 
         let mut real_actions = vec![0.0; ACTION_COUNT as usize];
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
@@ -463,11 +461,9 @@ impl Env {
 
         let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
         self.account.update_total(&self.prices, absolute_step);
-        let (reward, reward_per_ticker, cash_reward) = self.get_unrealized_pnl_reward_breakdown(
+        let (reward, reward_per_ticker) = self.get_unrealized_pnl_reward_breakdown(
             absolute_step,
             pre_total_assets,
-            // pre_cash,
-            // &pre_positions,
         );
 
         self.last_reward = reward;
@@ -500,7 +496,6 @@ impl Env {
         SingleStep {
             reward,
             reward_per_ticker: reward_per_ticker.iter().map(|v| *v as f32).collect(),
-            cash_reward: cash_reward as f32,
             price_deltas,
             static_obs,
             is_done,
@@ -519,8 +514,6 @@ impl Env {
         }
 
         let pre_total_assets = self.account.total_assets;
-        let pre_cash = self.account.cash;
-        let pre_positions = self.account.positions.clone();
 
         let mut real_actions = vec![0.0; ACTION_COUNT as usize];
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
@@ -539,11 +532,9 @@ impl Env {
 
         let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
         self.account.update_total(&self.prices, absolute_step);
-        let (reward, reward_per_ticker, cash_reward) = self.get_unrealized_pnl_reward_breakdown(
+        let (reward, reward_per_ticker) = self.get_unrealized_pnl_reward_breakdown(
             absolute_step,
             pre_total_assets,
-            // pre_cash,
-            // &pre_positions,
         );
 
         self.last_reward = reward;
@@ -576,7 +567,6 @@ impl Env {
         SingleStepStep {
             reward,
             reward_per_ticker: reward_per_ticker.iter().map(|v| *v as f32).collect(),
-            cash_reward: cash_reward as f32,
             step_deltas,
             static_obs,
             is_done,
@@ -601,7 +591,6 @@ impl Env {
 pub struct SingleStep {
     pub reward: f64,
     pub reward_per_ticker: Vec<f32>,
-    pub cash_reward: f32,
     pub price_deltas: Vec<f32>,
     pub static_obs: Vec<f32>,
     pub is_done: f32,
@@ -610,7 +599,6 @@ pub struct SingleStep {
 pub struct SingleStepStep {
     pub reward: f64,
     pub reward_per_ticker: Vec<f32>,
-    pub cash_reward: f32,
     pub step_deltas: Vec<f32>,
     pub static_obs: Vec<f32>,
     pub is_done: f32,

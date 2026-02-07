@@ -496,7 +496,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         ring_buf.copy_(&obs_price.view([NPROCS, TICKERS_COUNT, ring_len]));
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
-        let mut step_cash_reward = Tensor::zeros(&[NPROCS], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
 
         for step in 0..rollout_steps as usize {
@@ -523,7 +522,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 &mut step_deltas,
                 &mut obs_static,
                 &mut step_reward_per_ticker,
-                &mut step_cash_reward,
                 &mut step_is_done,
             );
 
@@ -556,10 +554,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&action_log_prob);
 
-            // Portfolio-level reward: include cash penalty to avoid trivial cash-hold policy.
-            let portfolio_reward =
-                step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float)
-                    + &step_cash_reward;
+            let portfolio_reward = step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float);
             if DEBUG_NUMERICS {
                 let _ =
                     debug_tensor_stats("portfolio_reward", &portfolio_reward, episode as i64, step);
