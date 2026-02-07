@@ -23,8 +23,15 @@ impl LogsPageState {
     pub fn poll_training_output(&mut self) {
         let log_path = "../training/training.log";
         if let Ok(content) = fs::read_to_string(log_path) {
-            let new_lines: Vec<String> = content.lines().collect::<Vec<_>>()
-                .into_iter().rev().take(MAX_LOGS).rev().map(|s| s.to_string()).collect();
+            let new_lines: Vec<String> = content
+                .lines()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .take(MAX_LOGS)
+                .rev()
+                .map(|s| s.to_string())
+                .collect();
 
             if new_lines != self.training_output {
                 self.training_output = new_lines;
@@ -51,7 +58,9 @@ impl LogsPageState {
         } else {
             0
         };
-        self.logs_list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
+        self.logs_list_state = ListState::default()
+            .with_selected(Some(selected))
+            .with_offset(offset);
     }
 
     pub fn next(&mut self) {

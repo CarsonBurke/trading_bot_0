@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
+use rand::seq::index;
+use rand::thread_rng;
 use shared::paths::TRAINING_PATH;
 use shared::report::Report;
 use std::fs;
 use std::path::PathBuf;
-use rand::seq::index;
-use rand::thread_rng;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -32,7 +32,9 @@ fn main() -> Result<()> {
             continue;
         }
         if let Some(value) = arg.strip_prefix("--sample=") {
-            let count = value.parse::<usize>().context("sample must be an integer")?;
+            let count = value
+                .parse::<usize>()
+                .context("sample must be an integer")?;
             sample = Some(count);
             i += 1;
             continue;
@@ -93,7 +95,10 @@ fn main() -> Result<()> {
 
     let mut lines = report.kind.to_lines();
     if let Some(ref filter) = var_filter {
-        lines.retain(|line| line.split('\t').any(|t| t.split_once('=').is_some_and(|(k, _)| k == filter)));
+        lines.retain(|line| {
+            line.split('\t')
+                .any(|t| t.split_once('=').is_some_and(|(k, _)| k == filter))
+        });
     }
     if let Some(count) = min {
         lines = select_by_value(lines, count, false, var_filter.as_deref());
@@ -120,7 +125,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn select_by_value(lines: Vec<String>, count: usize, pick_max: bool, var_filter: Option<&str>) -> Vec<String> {
+fn select_by_value(
+    lines: Vec<String>,
+    count: usize,
+    pick_max: bool,
+    var_filter: Option<&str>,
+) -> Vec<String> {
     let mut scored: Vec<(f32, String)> = lines
         .into_iter()
         .filter_map(|line| {
@@ -128,17 +138,9 @@ fn select_by_value(lines: Vec<String>, count: usize, pick_max: bool, var_filter:
             if values.is_empty() {
                 None
             } else if pick_max {
-                values
-                    .iter()
-                    .cloned()
-                    .reduce(f32::max)
-                    .map(|v| (v, line))
+                values.iter().cloned().reduce(f32::max).map(|v| (v, line))
             } else {
-                values
-                    .iter()
-                    .cloned()
-                    .reduce(f32::min)
-                    .map(|v| (v, line))
+                values.iter().cloned().reduce(f32::min).map(|v| (v, line))
             }
         })
         .collect();

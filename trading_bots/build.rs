@@ -7,7 +7,10 @@ fn main() {
     match os.as_str() {
         "linux" | "windows" => {
             if let Some(lib_path) = std::env::var_os("DEP_TCH_LIBTORCH_LIB") {
-                println!("cargo:rustc-link-arg=-Wl,-rpath={}", lib_path.to_string_lossy());
+                println!(
+                    "cargo:rustc-link-arg=-Wl,-rpath={}",
+                    lib_path.to_string_lossy()
+                );
             }
             println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
             println!("cargo:rustc-link-arg=-ltorch");
@@ -16,7 +19,8 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("Missing OUT_DIR"));
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR"));
     let cuda_ops_dir = manifest_dir.join("cuda_ops");
     let cpp_src = cuda_ops_dir.join("mamba_fused_ops.cpp");
     let cu_src = cuda_ops_dir.join("mamba_fused_ops.cu");
@@ -38,7 +42,10 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={}", triton_dir.join(file).display());
     }
-    println!("cargo:rerun-if-changed={}", manifest_dir.join("build.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("build.rs").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("src/torch/mamba_fused.rs").display()
@@ -108,7 +115,10 @@ fn main() {
     }
 
     println!("cargo:rustc-env=MAMBA_FUSED_LIB_PATH={}", so_path.display());
-    println!("cargo:rustc-env=MAMBA_FUSED_WRAPPER_PATH={}", wrapper_path.display());
+    println!(
+        "cargo:rustc-env=MAMBA_FUSED_WRAPPER_PATH={}",
+        wrapper_path.display()
+    );
 }
 
 fn run(cmd: &mut Command) {

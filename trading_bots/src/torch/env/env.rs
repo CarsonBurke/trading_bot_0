@@ -8,23 +8,24 @@ use colored::Colorize;
 use tch::Tensor;
 
 use super::earnings::EarningsIndicators;
-use std::sync::Arc;
 use super::macro_ind::MacroIndicators;
 use super::momentum::MomentumIndicators;
 use crate::{
-    data::historical::{get_historical_data},
+    data::historical::get_historical_data,
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
-    torch::{
-        constants::{
-            ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER,
-            STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
-        },
+    torch::constants::{
+        ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS,
+        STEPS_PER_EPISODE, TICKERS_COUNT,
     },
     types::Account,
     utils::{create_folder_if_not_exists, get_mapped_price_deltas},
 };
+use std::sync::Arc;
 
-const AVAILABLE_TICKERS: [&str; AVAILABLE_TICKERS_COUNT] = ["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD", "ADBE", "GOOG", "META", "NKE", "DELL", "CMCSA", "FDX"];
+const AVAILABLE_TICKERS: [&str; AVAILABLE_TICKERS_COUNT] = [
+    "TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD", "ADBE", "GOOG", "META", "NKE", "DELL", "CMCSA",
+    "FDX",
+];
 
 pub struct Env {
     pub env_id: usize,
@@ -70,10 +71,13 @@ impl Env {
     }
 
     pub fn new_with_recording(random_start: bool, record_history_io: bool) -> Self {
-
         let rng = &mut rand::rng();
-        let tickers = AVAILABLE_TICKERS.to_vec().choose_multiple(rng, TICKERS_COUNT as usize).map(|ticker| ticker.to_string()).collect();
-        
+        let tickers = AVAILABLE_TICKERS
+            .to_vec()
+            .choose_multiple(rng, TICKERS_COUNT as usize)
+            .map(|ticker| ticker.to_string())
+            .collect();
+
         Self::new_with_tickers_and_recording(tickers, random_start, record_history_io)
     }
 
@@ -130,7 +134,8 @@ impl Env {
             eprint!("{}..", ticker);
             let reports = crate::data::get_earnings_data_any(ticker);
             eprint!("r");
-            let ind = EarningsIndicators::get_or_compute(ticker, &reports, &bar_dates[i], &prices[i]);
+            let ind =
+                EarningsIndicators::get_or_compute(ticker, &reports, &bar_dates[i], &prices[i]);
             eprint!("i");
             earnings.push(ind);
         }
@@ -301,26 +306,49 @@ impl Env {
     /// Reset for VecEnv - returns raw vectors instead of tensors
     pub fn reset_single(&mut self) -> (Vec<f32>, Vec<f32>) {
         let rng = &mut rand::rng();
-        let tickers: Vec<String> = AVAILABLE_TICKERS.to_vec().choose_multiple(rng, TICKERS_COUNT as usize).map(|ticker| ticker.to_string()).collect();
+        let tickers: Vec<String> = AVAILABLE_TICKERS
+            .to_vec()
+            .choose_multiple(rng, TICKERS_COUNT as usize)
+            .map(|ticker| ticker.to_string())
+            .collect();
 
         // Reload price data and indicators for new tickers
         let mapped_bars = get_historical_data(Some(
             &tickers.iter().map(|t| t.as_str()).collect::<Vec<&str>>(),
         ));
-        self.prices = mapped_bars.iter().map(|bar| bar.iter().map(|b| b.close).collect()).collect();
+        self.prices = mapped_bars
+            .iter()
+            .map(|bar| bar.iter().map(|b| b.close).collect())
+            .collect();
         self.price_deltas = get_mapped_price_deltas(&mapped_bars);
         self.total_data_length = self.prices[0].len();
 
         // Reload momentum indicators (cached)
-        self.momentum = tickers.iter().zip(self.prices.iter())
+        self.momentum = tickers
+            .iter()
+            .zip(self.prices.iter())
             .map(|(ticker, p)| MomentumIndicators::get_or_compute(ticker, p))
             .collect();
 
         // Reload earnings indicators (cached)
-        let bar_dates: Vec<Vec<String>> = mapped_bars.iter()
-            .map(|bars| bars.iter().map(|b| format!("{:04}-{:02}-{:02}", b.date.year(), b.date.month() as u8, b.date.day())).collect())
+        let bar_dates: Vec<Vec<String>> = mapped_bars
+            .iter()
+            .map(|bars| {
+                bars.iter()
+                    .map(|b| {
+                        format!(
+                            "{:04}-{:02}-{:02}",
+                            b.date.year(),
+                            b.date.month() as u8,
+                            b.date.day()
+                        )
+                    })
+                    .collect()
+            })
             .collect();
-        self.earnings = tickers.iter().enumerate()
+        self.earnings = tickers
+            .iter()
+            .enumerate()
             .map(|(i, ticker)| {
                 let reports = crate::data::get_earnings_data_any(ticker);
                 EarningsIndicators::get_or_compute(ticker, &reports, &bar_dates[i], &self.prices[i])

@@ -63,7 +63,7 @@ impl ProcessManagerState {
         self.is_training_running() || self.inference_process.is_some()
     }
 
-    pub fn start_training(&mut self, weights: Option<String>) -> Result<()> {
+    pub fn start_training(&mut self, weights: Option<String>, model_size: &str) -> Result<()> {
         if self.is_anything_running() {
             return Ok(());
         }
@@ -79,7 +79,9 @@ impl ProcessManagerState {
             .arg("run")
             .arg("--release")
             .arg("--")
-            .arg("train");
+            .arg("train")
+            .arg("--model-size")
+            .arg(model_size);
 
         if let Some(w) = weights {
             cmd.arg("--weights").arg(w);
@@ -96,7 +98,12 @@ impl ProcessManagerState {
         Ok(())
     }
 
-    pub fn start_inference(&mut self, weights: String, ticker: Option<String>, episodes: usize) -> Result<()> {
+    pub fn start_inference(
+        &mut self,
+        weights: String,
+        ticker: Option<String>,
+        episodes: usize,
+    ) -> Result<()> {
         if self.is_anything_running() {
             return Ok(());
         }

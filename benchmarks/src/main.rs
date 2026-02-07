@@ -7,7 +7,7 @@ use tch::{nn, Device, Kind, Tensor};
 use trading_bot_0::torch::{
     constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT},
     mamba_fused,
-    model::TradingModel,
+    model::{ModelVariant, TradingModel, TradingModelConfig},
     ssm::{Mamba2, Mamba2Config},
 };
 
@@ -85,7 +85,11 @@ fn run_component_timing(mamba: &Mamba2, x: &Tensor, device: Device, iters: usize
         for _ in 0..iters {
             let start = Instant::now();
             let y_f32 = y_norm.to_kind(tch::Kind::Float);
-            let rms = (y_f32.pow_tensor_scalar(2).mean_dim(-1, true, tch::Kind::Float) + 1e-6).sqrt();
+            let rms = (y_f32
+                .pow_tensor_scalar(2)
+                .mean_dim(-1, true, tch::Kind::Float)
+                + 1e-6)
+                .sqrt();
             let normed = (y_f32 / rms * &norm_w.to_kind(tch::Kind::Float)).to_kind(dtype);
             let _ = normed * z_gate.silu();
             sync_device(device);
@@ -106,16 +110,31 @@ fn run_component_timing(mamba: &Mamba2, x: &Tensor, device: Device, iters: usize
         // Estimate scan time (includes the CUDA kernel for chunk scan)
         let scan_time = fused_time - in_proj_time - conv_time - norm_time - out_proj_time;
 
-        println!("  Input Projection:        {:.3} ms/iter ({:.1}%)",
-                 in_proj_time, 100.0 * in_proj_time / fused_time);
-        println!("  Conv1D:                  {:.3} ms/iter ({:.1}%)",
-                 conv_time, 100.0 * conv_time / fused_time);
-        println!("  Chunk Scan (CUDA):       {:.3} ms/iter ({:.1}%)",
-                 scan_time, 100.0 * scan_time / fused_time);
-        println!("  RMSNorm + Gate:          {:.3} ms/iter ({:.1}%)",
-                 norm_time, 100.0 * norm_time / fused_time);
-        println!("  Output Projection:       {:.3} ms/iter ({:.1}%)",
-                 out_proj_time, 100.0 * out_proj_time / fused_time);
+        println!(
+            "  Input Projection:        {:.3} ms/iter ({:.1}%)",
+            in_proj_time,
+            100.0 * in_proj_time / fused_time
+        );
+        println!(
+            "  Conv1D:                  {:.3} ms/iter ({:.1}%)",
+            conv_time,
+            100.0 * conv_time / fused_time
+        );
+        println!(
+            "  Chunk Scan (CUDA):       {:.3} ms/iter ({:.1}%)",
+            scan_time,
+            100.0 * scan_time / fused_time
+        );
+        println!(
+            "  RMSNorm + Gate:          {:.3} ms/iter ({:.1}%)",
+            norm_time,
+            100.0 * norm_time / fused_time
+        );
+        println!(
+            "  Output Projection:       {:.3} ms/iter ({:.1}%)",
+            out_proj_time,
+            100.0 * out_proj_time / fused_time
+        );
         println!("  Total:                   {:.3} ms/iter", fused_time);
     });
 }
@@ -183,7 +202,11 @@ fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
     suite.add(BenchmarkResult::new(
         "mamba2_forward_train",
         fwd_ms,
-        BenchmarkRun { batch, seq_len: seqlen, dtype: format!("{:?}", dtype) },
+        BenchmarkRun {
+            batch,
+            seq_len: seqlen,
+            dtype: format!("{:?}", dtype),
+        },
     ));
 
     // Forward + Backward
@@ -198,7 +221,11 @@ fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
     suite.add(BenchmarkResult::new(
         "mamba2_fwd_bwd_train",
         fwd_bwd_ms,
-        BenchmarkRun { batch, seq_len: seqlen, dtype: format!("{:?}", dtype) },
+        BenchmarkRun {
+            batch,
+            seq_len: seqlen,
+            dtype: format!("{:?}", dtype),
+        },
     ));
 
     // Memory stats
@@ -218,7 +245,11 @@ fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         suite.add(BenchmarkResult::new(
             "mamba2_infer_prefill",
             prefill_ms,
-            BenchmarkRun { batch, seq_len: seqlen, dtype: format!("{:?}", dtype) },
+            BenchmarkRun {
+                batch,
+                seq_len: seqlen,
+                dtype: format!("{:?}", dtype),
+            },
         ));
     });
 
@@ -236,7 +267,11 @@ fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         suite.add(BenchmarkResult::new(
             "mamba2_infer_step",
             step_ms,
-            BenchmarkRun { batch, seq_len: 1, dtype: format!("{:?}", dtype) },
+            BenchmarkRun {
+                batch,
+                seq_len: 1,
+                dtype: format!("{:?}", dtype),
+            },
         ));
     });
 
@@ -245,78 +280,84 @@ fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
 
 fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
     println!("--- TradingModel Forward Benchmarks ---");
-    let vs = nn::VarStore::new(device);
-
-    // Cast varstore to BFloat16
-    let model = TradingModel::new(&vs.root());
     let dtype = Kind::BFloat16;
-    for (_name, mut tensor) in vs.variables() {
-        let _ = tensor.set_data(&tensor.to_kind(dtype));
-    }
-
-    // Use actual model dimensions from shared constants
     let price_deltas_dim = (TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER) as i64;
     let static_obs_dim = STATIC_OBSERVATIONS as i64;
 
-    for &batch in &[1, 4, 8] {
-        let price_deltas = Tensor::randn(&[batch, price_deltas_dim], (dtype, device));
-        let static_features = Tensor::randn(&[batch, static_obs_dim], (dtype, device));
-
-        // Warmup
-        for _ in 0..10 {
-            let _ = model.forward(&price_deltas, &static_features, false);
+    for &variant in &[ModelVariant::Base, ModelVariant::AblationSmall] {
+        let vs = nn::VarStore::new(device);
+        let model = TradingModel::new_with_config(
+            &vs.root(),
+            TradingModelConfig {
+                variant,
+                ..TradingModelConfig::default()
+            },
+        );
+        for (_name, mut tensor) in vs.variables() {
+            let _ = tensor.set_data(&tensor.to_kind(dtype));
         }
-        sync_device(device);
+        println!("  Variant: {}", variant.as_str());
 
-        // Forward (Inference)
-        let iters = 100;
-        tch::no_grad(|| {
-            let start = Instant::now();
-            for _ in 0..iters {
+        for &batch in &[1, 4, 8] {
+            let price_deltas = Tensor::randn(&[batch, price_deltas_dim], (dtype, device));
+            let static_features = Tensor::randn(&[batch, static_obs_dim], (dtype, device));
+
+            for _ in 0..10 {
                 let _ = model.forward(&price_deltas, &static_features, false);
             }
             sync_device(device);
-            let fwd_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-            println!("  Forward (batch={}):       {:.3} ms/iter", batch, fwd_ms);
+
+            let iters = 100;
+            tch::no_grad(|| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let _ = model.forward(&price_deltas, &static_features, false);
+                }
+                sync_device(device);
+                let fwd_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+                println!("    Forward (batch={}):       {:.3} ms/iter", batch, fwd_ms);
+                suite.add(BenchmarkResult::new(
+                    &format!("model_{}_forward_infer_b{}", variant.as_str(), batch),
+                    fwd_ms,
+                    BenchmarkRun {
+                        batch,
+                        seq_len: PRICE_DELTAS_PER_TICKER as i64,
+                        dtype: format!("{:?}", dtype),
+                    },
+                ));
+            });
+
+            let price_deltas =
+                Tensor::randn(&[batch, price_deltas_dim], (dtype, device)).set_requires_grad(true);
+            let static_features =
+                Tensor::randn(&[batch, static_obs_dim], (dtype, device)).set_requires_grad(true);
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                let (values, critic_logits, _, (action_mean, sde_latent)) =
+                    model.forward(&price_deltas, &static_features, true);
+                let loss = values.sum(Kind::Float)
+                    + critic_logits.sum(Kind::Float)
+                    + action_mean.sum(Kind::Float)
+                    + sde_latent.sum(Kind::Float);
+                loss.backward();
+            }
+            sync_device(device);
+            let fwd_bwd_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            println!(
+                "    Fwd+Bwd (batch={}):       {:.3} ms/iter",
+                batch, fwd_bwd_ms
+            );
             suite.add(BenchmarkResult::new(
-                &format!("model_forward_infer_b{}", batch),
-                fwd_ms,
+                &format!("model_{}_fwd_bwd_train_b{}", variant.as_str(), batch),
+                fwd_bwd_ms,
                 BenchmarkRun {
                     batch,
                     seq_len: PRICE_DELTAS_PER_TICKER as i64,
                     dtype: format!("{:?}", dtype),
                 },
             ));
-        });
-
-        // Forward + Backward (Training) - need fresh tensors with grads
-        let price_deltas = Tensor::randn(&[batch, price_deltas_dim], (dtype, device))
-            .set_requires_grad(true);
-        let static_features = Tensor::randn(&[batch, static_obs_dim], (dtype, device))
-            .set_requires_grad(true);
-
-        let start = Instant::now();
-        for _ in 0..iters {
-            let (values, critic_logits, _, (action_mean, sde_latent)) =
-                model.forward(&price_deltas, &static_features, true);
-            let loss = values.sum(Kind::Float)
-                + critic_logits.sum(Kind::Float)
-                + action_mean.sum(Kind::Float)
-                + sde_latent.sum(Kind::Float);
-            loss.backward();
         }
-        sync_device(device);
-        let fwd_bwd_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-        println!("  Fwd+Bwd (batch={}):       {:.3} ms/iter", batch, fwd_bwd_ms);
-        suite.add(BenchmarkResult::new(
-            &format!("model_fwd_bwd_train_b{}", batch),
-            fwd_bwd_ms,
-            BenchmarkRun {
-                batch,
-                seq_len: PRICE_DELTAS_PER_TICKER as i64,
-                dtype: format!("{:?}", dtype),
-            },
-        ));
     }
 
     // Memory stats after model benchmarks

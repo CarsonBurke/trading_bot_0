@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::{theme, App};
 use super::base::BaseDialog;
+use crate::{theme, App};
 
 pub fn render(f: &mut Frame, app: &App, for_training: bool, for_inference: bool) {
     let title = if for_training {
@@ -41,15 +41,27 @@ pub fn render(f: &mut Frame, app: &App, for_training: bool, for_inference: bool)
         .split(inner);
 
     // Hint text
-    let prompt_text = vec![Line::from(vec![
-        Span::styled("Shorthand: ", Style::default().fg(theme::SUBTEXT0)),
-        Span::styled("'400' -> 'ppo_ep400.ot'", Style::default().fg(theme::TEAL)),
-        Span::raw("  |  "),
-        Span::styled("Default: ", Style::default().fg(theme::SUBTEXT0)),
-        Span::styled(default_text, Style::default().fg(theme::GREEN)),
-    ])];
-    let prompt = Paragraph::new(prompt_text)
-        .style(Style::default().fg(theme::TEXT).bg(theme::BASE));
+    let prompt_text = vec![
+        Line::from(vec![
+            Span::styled("Shorthand: ", Style::default().fg(theme::SUBTEXT0)),
+            Span::styled("'400' -> 'ppo_ep400.ot'", Style::default().fg(theme::TEAL)),
+            Span::raw("  |  "),
+            Span::styled("Default: ", Style::default().fg(theme::SUBTEXT0)),
+            Span::styled(default_text, Style::default().fg(theme::GREEN)),
+        ]),
+        Line::from(vec![
+            Span::styled("Training model: ", Style::default().fg(theme::SUBTEXT0)),
+            Span::styled(
+                app.training_model_size.clone(),
+                Style::default().fg(theme::BLUE),
+            ),
+            Span::raw("  (toggle with "),
+            Span::styled("p", Style::default().fg(theme::TEAL)),
+            Span::raw(" on main page)"),
+        ]),
+    ];
+    let prompt =
+        Paragraph::new(prompt_text).style(Style::default().fg(theme::TEXT).bg(theme::BASE));
     f.render_widget(prompt, chunks[0]);
 
     // Input field
@@ -78,10 +90,18 @@ pub fn render(f: &mut Frame, app: &App, for_training: bool, for_inference: bool)
 
     // Help bar
     let help = Paragraph::new(vec![Line::from(vec![
-        Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Enter ",
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("Start Training", Style::default().fg(theme::SUBTEXT1)),
         Span::raw("   "),
-        Span::styled(" Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Esc ",
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("Cancel", Style::default().fg(theme::SUBTEXT1)),
     ])])
     .style(Style::default().fg(theme::TEXT).bg(theme::BASE))

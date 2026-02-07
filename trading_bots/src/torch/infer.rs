@@ -1,19 +1,27 @@
-use tch::{nn, Device, Kind, Tensor};
 use std::path::Path;
 use std::time::Instant;
+use tch::{nn, Device, Kind, Tensor};
 
-use crate::torch::load::load_var_store_partial;
-use crate::torch::model::{TradingModel, TradingModelConfig, ACTION_DIM, LATTICE_ALPHA, SDE_LATENT_DIM};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::Env;
-
+use crate::torch::load::load_var_store_partial;
+use crate::torch::model::{
+    ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM, LATTICE_ALPHA, SDE_LATENT_DIM,
+};
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: Device,
+    model_variant: ModelVariant,
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
-    let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+    let model = TradingModel::new_with_config(
+        &vs.root(),
+        TradingModelConfig {
+            variant: model_variant,
+            ..TradingModelConfig::default()
+        },
+    );
     let _ = load_var_store_partial(&mut vs, weight_path)?;
     Ok((vs, model))
 }
@@ -21,10 +29,10 @@ pub fn load_model<P: AsRef<Path>>(
 /// Sample actions using Lattice exploration: h² weighted correlated + independent noise, then softmax
 pub fn sample_actions(
     action_mean: &Tensor,
-    sde_latent: &Tensor,       // [batch, SDE_LATENT_DIM]
-    corr_std: &Tensor,         // [SDE_LATENT_DIM, SDE_LATENT_DIM]
-    ind_std: &Tensor,          // [SDE_LATENT_DIM, ACTION_DIM]
-    w_policy: &Tensor,         // [ACTION_DIM, SDE_LATENT_DIM]
+    sde_latent: &Tensor, // [batch, SDE_LATENT_DIM]
+    corr_std: &Tensor,   // [SDE_LATENT_DIM, SDE_LATENT_DIM]
+    ind_std: &Tensor,    // [SDE_LATENT_DIM, ACTION_DIM]
+    w_policy: &Tensor,   // [ACTION_DIM, SDE_LATENT_DIM]
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
@@ -38,12 +46,14 @@ pub fn sample_actions(
         let stats_kind = (Kind::Float, device);
 
         // Sample exploration matrices
-        let corr_exploration_mat = Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], stats_kind) * corr_std;
+        let corr_exploration_mat =
+            Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], stats_kind) * corr_std;
         let ind_exploration_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind) * ind_std;
 
         // Correlated noise: perturb latent, project through W
         let latent_noise = sde_latent.matmul(&corr_exploration_mat);
-        let correlated_action_noise = LATTICE_ALPHA * latent_noise.matmul(&w_policy.transpose(0, 1));
+        let correlated_action_noise =
+            LATTICE_ALPHA * latent_noise.matmul(&w_policy.transpose(0, 1));
 
         // Independent noise: project latent through ind noise
         let independent_action_noise = sde_latent.matmul(&ind_exploration_mat);
@@ -68,6 +78,7 @@ pub fn run_inference<P: AsRef<Path>>(
     _temperature: f64,
     tickers: Option<Vec<String>>,
     random_start: bool,
+    model_variant: ModelVariant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting inference run...");
     println!("Loading model from: {:?}", weight_path.as_ref());
@@ -78,7 +89,7 @@ pub fn run_inference<P: AsRef<Path>>(
     let deterministic = true;
     let temperature = 0.0;
 
-    let (_vs, model) = load_model(&weight_path, device)?;
+    let (_vs, model) = load_model(&weight_path, device, model_variant)?;
 
     let mut env = match tickers {
         Some(t) => Env::new_with_tickers(t, random_start),
@@ -97,12 +108,9 @@ pub fn run_inference<P: AsRef<Path>>(
             [TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
             (Kind::Float, device),
         );
-        let mut price_deltas_incremental =
-            Tensor::zeros([TICKERS_COUNT], (Kind::Float, device));
-        let mut static_obs_tensor = Tensor::zeros(
-            [STATIC_OBSERVATIONS as i64],
-            (Kind::Float, device),
-        );
+        let mut price_deltas_incremental = Tensor::zeros([TICKERS_COUNT], (Kind::Float, device));
+        let mut static_obs_tensor =
+            Tensor::zeros([STATIC_OBSERVATIONS as i64], (Kind::Float, device));
         price_deltas_full.copy_(&Tensor::from_slice(&price_deltas));
         static_obs_tensor.copy_(&Tensor::from_slice(&static_obs));
         let mut use_full = true;
@@ -154,7 +162,9 @@ pub fn run_inference<P: AsRef<Path>>(
 
         println!(
             "Episode {}: Reward: {:.4}, Commissions: ${:.2}, Time: {:.2}s",
-            episode, episode_reward, total_commissions,
+            episode,
+            episode_reward,
+            total_commissions,
             Instant::now().duration_since(episode_start).as_secs_f32()
         );
     }

@@ -1,8 +1,4 @@
-use std::{
-    collections::VecDeque,
-    fs,
-    sync::Arc,
-};
+use std::{collections::VecDeque, fs, sync::Arc};
 
 use hashbrown::HashSet;
 use uuid::Uuid;

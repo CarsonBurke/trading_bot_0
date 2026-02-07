@@ -19,7 +19,6 @@ pub struct Agent {
 
 impl Agent {
     pub fn from_weights_file() -> Self {
-
         let file = fs::read("weights/weights.bin").unwrap();
         let weights: Weights = postcard::from_bytes(&file).unwrap();
 
@@ -60,7 +59,6 @@ impl Weights {
 
 impl Default for Weights {
     fn default() -> Self {
-
         let _rng = rand::thread_rng();
 
         Self {

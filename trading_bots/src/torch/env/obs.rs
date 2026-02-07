@@ -123,7 +123,10 @@ impl Env {
 
         for &real_idx in &self.ticker_perm {
             let ticker_price_deltas = &self.price_deltas[real_idx];
-            let v = ticker_price_deltas.get(absolute_step).copied().unwrap_or(0.0);
+            let v = ticker_price_deltas
+                .get(absolute_step)
+                .copied()
+                .unwrap_or(0.0);
             step_deltas.push(v as f32);
         }
 

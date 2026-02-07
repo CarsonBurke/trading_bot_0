@@ -141,8 +141,7 @@ impl Env {
         let base_reward = REWARD_SCALE * strategy_log_return;
 
         let cash_weight = (self.account.cash * inv_total_assets).clamp(0.0, 1.0);
-        let cash_penalty =
-            -cash_weight * index_log_return.max(0.0) * REWARD_SCALE;
+        let cash_penalty = -cash_weight * index_log_return.max(0.0) * REWARD_SCALE;
 
         let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
             vec![0.0; n_tickers]
@@ -192,8 +191,7 @@ impl Env {
         index_log_return *= inv_n_tickers;
 
         let cash_weight = (self.account.cash * inv_total_assets).clamp(0.0, 1.0);
-        let cash_penalty =
-            -cash_weight * index_log_return.max(0.0) * REWARD_SCALE;
+        let cash_penalty = -cash_weight * index_log_return.max(0.0) * REWARD_SCALE;
 
         let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
             vec![0.0; n_tickers]

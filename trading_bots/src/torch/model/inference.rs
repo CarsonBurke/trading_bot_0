@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{ModelOutput, StreamState, TradingModel, FINEST_PATCH_INDEX, FINEST_PATCH_SIZE, SSM_DIM};
+use super::{ModelOutput, StreamState, TradingModel};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
 
 impl StreamState {
@@ -25,7 +25,7 @@ impl TradingModel {
             ),
             ring_pos: 0,
             patch_buf: Tensor::zeros(
-                &[TICKERS_COUNT, FINEST_PATCH_SIZE],
+                &[TICKERS_COUNT, self.finest_patch_size],
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
@@ -44,14 +44,12 @@ impl TradingModel {
             ),
             ring_pos: 0,
             patch_buf: Tensor::zeros(
-                &[batch_size * TICKERS_COUNT, FINEST_PATCH_SIZE],
+                &[batch_size * TICKERS_COUNT, self.finest_patch_size],
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
             ssm_states: (0..self.ssm_layers.len())
-                .map(|_| {
-                    self.ssm_layers[0].init_state(batch_size * TICKERS_COUNT, self.device)
-                })
+                .map(|_| self.ssm_layers[0].init_state(batch_size * TICKERS_COUNT, self.device))
                 .collect(),
             initialized: false,
         }
@@ -117,17 +115,18 @@ impl TradingModel {
         let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
         let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, 1);
 
-        if state.patch_pos >= FINEST_PATCH_SIZE {
+        if state.patch_pos >= self.finest_patch_size {
             state.patch_pos = 0;
             let x_last = self.process_new_patch(state, &exo_kv);
             let _ = state.patch_buf.zero_();
-            return self
-                .head_with_temporal_pool(&x_last, 1, true, false)
-                .0;
+            return self.head_with_temporal_pool(&x_last, 1, true, false).0;
         }
 
         self.head_with_temporal_pool(
-            &Tensor::zeros(&[TICKERS_COUNT, 1, SSM_DIM], (Kind::Float, self.device)),
+            &Tensor::zeros(
+                &[TICKERS_COUNT, 1, self.ssm_dim],
+                (Kind::Float, self.device),
+            ),
             1,
             true,
             false,
@@ -163,7 +162,10 @@ impl TradingModel {
         state: &mut StreamState,
     ) -> ModelOutput {
         if price_deltas.device() != self.device || static_features.device() != self.device {
-            panic!("init_from_full_on_device requires tensors on {:?}", self.device);
+            panic!(
+                "init_from_full_on_device requires tensors on {:?}",
+                self.device
+            );
         }
         let price = if price_deltas.dim() == 1 {
             price_deltas.unsqueeze(0)
@@ -189,7 +191,11 @@ impl TradingModel {
         let dt_scale = self.patch_dt_scale.shallow_clone();
 
         let mut x = self.patch_embed_single(&reshaped);
-        for (layer, (ssm, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
+        for (layer, (ssm, norm)) in self
+            .ssm_layers
+            .iter()
+            .zip(self.ssm_norms.iter())
+            .enumerate()
         {
             let out = ssm.forward_with_state_pre_norm_dt_scale(
                 &x,
@@ -203,21 +209,24 @@ impl TradingModel {
         }
 
         state.initialized = true;
-        self.head_with_temporal_pool(&x, 1, true, false)
-            .0
+        self.head_with_temporal_pool(&x, 1, true, false).0
     }
 
     fn process_new_patch(&self, state: &mut StreamState, exo_kv: &Tensor) -> Tensor {
         let patches = state
             .patch_buf
-            .view([TICKERS_COUNT, 1, FINEST_PATCH_SIZE]);
+            .view([TICKERS_COUNT, 1, self.finest_patch_size]);
         let patch_emb = self
-            .embed_patch_config(&patches, FINEST_PATCH_INDEX as i64)
+            .embed_patch_config(&patches, self.finest_patch_index as i64)
             .squeeze_dim(1);
-        let dt_scale = FINEST_PATCH_SIZE as f64;
+        let dt_scale = self.finest_patch_size as f64;
 
         let mut x_in = patch_emb;
-        for (layer, (ssm, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
+        for (layer, (ssm, norm)) in self
+            .ssm_layers
+            .iter()
+            .zip(self.ssm_norms.iter())
+            .enumerate()
         {
             let out = ssm.step_with_pre_norm_dt_scale(
                 &x_in,
@@ -229,9 +238,17 @@ impl TradingModel {
             x_in = x_in + out;
             // Apply exo cross-block (unsqueeze for seq_len=1 dim, then squeeze back)
             if super::EXO_CROSS_AFTER.contains(&layer) {
-                let pos = super::EXO_CROSS_AFTER.iter().position(|&i| i == layer).unwrap();
+                let pos = super::EXO_CROSS_AFTER
+                    .iter()
+                    .position(|&i| i == layer)
+                    .unwrap();
                 x_in = self.exo_cross_blocks[pos]
-                    .forward(&x_in.unsqueeze(1), exo_kv)
+                    .forward(
+                        &x_in.unsqueeze(1),
+                        exo_kv,
+                        self.model_dim,
+                        self.cross_head_dim,
+                    )
                     .squeeze_dim(1);
             }
         }

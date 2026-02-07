@@ -1,11 +1,11 @@
-use tch::{Device, Tensor};
-use rand::seq::SliceRandom;
 use super::env::Env;
-use crate::torch::ppo::NPROCS;
 use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
-use crate::torch::model::{patch_ends_cpu, PATCH_SEQ_LEN};
+use crate::torch::model::{patch_ends_for_variant, patch_seq_len_for_variant, ModelVariant};
+use crate::torch::ppo::NPROCS;
+use rand::seq::SliceRandom;
+use tch::{Device, Tensor};
 
 pub struct VecEnv {
     pub envs: Vec<Env>,
@@ -21,6 +21,8 @@ pub struct VecEnv {
     price_deltas_buf: Vec<f32>,
     static_obs_buf: Vec<f32>,
     seq_idx_buf: Vec<i64>,
+    patch_ends: Vec<i64>,
+    patch_seq_len: i64,
 }
 
 /// Available tickers for random selection
@@ -28,28 +30,43 @@ const AVAILABLE_TICKERS: &[&str] = &["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AM
 
 impl VecEnv {
     fn tensor_from_f32(&self, data: &[f32], size: &[i64]) -> Tensor {
-        unsafe { Tensor::from_blob(data.as_ptr() as *const u8, size, &[], tch::Kind::Float, Device::Cpu) }
+        unsafe {
+            Tensor::from_blob(
+                data.as_ptr() as *const u8,
+                size,
+                &[],
+                tch::Kind::Float,
+                Device::Cpu,
+            )
+        }
     }
 
     fn tensor_from_i64(&self, data: &[i64], size: &[i64]) -> Tensor {
-        unsafe { Tensor::from_blob(data.as_ptr() as *const u8, size, &[], tch::Kind::Int64, Device::Cpu) }
+        unsafe {
+            Tensor::from_blob(
+                data.as_ptr() as *const u8,
+                size,
+                &[],
+                tch::Kind::Int64,
+                Device::Cpu,
+            )
+        }
     }
 
     fn fill_seq_idx_buf(&mut self) {
-        let patch_ends = patch_ends_cpu();
-        let seq_len = patch_ends.len();
+        let seq_len = self.patch_ends.len();
         let rows = (NPROCS * TICKERS_COUNT) as usize;
-        debug_assert_eq!(seq_len as i64, PATCH_SEQ_LEN);
+        debug_assert_eq!(seq_len as i64, self.patch_seq_len);
         debug_assert_eq!(self.seq_idx_buf.len(), rows * seq_len);
         for row in 0..rows {
             let out_offset = row * seq_len;
-            for (idx, end) in patch_ends.iter().enumerate() {
+            for (idx, end) in self.patch_ends.iter().enumerate() {
                 self.seq_idx_buf[out_offset + idx] = if *end <= 0 { -1 } else { 0 };
             }
         }
     }
 
-    pub fn new(random_start: bool) -> Self {
+    pub fn new(random_start: bool, model_variant: ModelVariant) -> Self {
         let mut envs = Vec::with_capacity(NPROCS as usize);
         envs.push(Env::new_with_recording(random_start, true));
         eprintln!("first env");
@@ -60,10 +77,11 @@ impl VecEnv {
         for (i, env) in envs.iter_mut().enumerate() {
             env.env_id = i;
         }
-        let price_deltas_dim =
-            NPROCS as usize * TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
+        let price_deltas_dim = NPROCS as usize * TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
         let static_obs_dim = NPROCS as usize * STATIC_OBSERVATIONS;
-        let seq_idx_dim = NPROCS as usize * TICKERS_COUNT as usize * PATCH_SEQ_LEN as usize;
+        let patch_seq_len = patch_seq_len_for_variant(model_variant);
+        let patch_ends = patch_ends_for_variant(model_variant);
+        let seq_idx_dim = NPROCS as usize * TICKERS_COUNT as usize * patch_seq_len as usize;
         let done_mask = vec![false; NPROCS as usize];
         let last_static_obs = vec![0.0; NPROCS as usize * STATIC_OBSERVATIONS];
         let last_step_deltas = vec![0.0; NPROCS as usize * TICKERS_COUNT as usize];
@@ -83,6 +101,8 @@ impl VecEnv {
             price_deltas_buf: vec![0.0; price_deltas_dim],
             static_obs_buf: vec![0.0; static_obs_dim],
             seq_idx_buf: vec![0; seq_idx_dim],
+            patch_ends,
+            patch_seq_len,
         }
     }
 
@@ -109,14 +129,14 @@ impl VecEnv {
 
         let price_deltas = Tensor::from_slice(&all_price_deltas)
             .view([NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
-        let static_obs = Tensor::from_slice(&all_static_obs)
-            .view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let static_obs =
+            Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
         let seq_idx = self
             .tensor_from_i64(
                 &self.seq_idx_buf,
-                &[NPROCS * TICKERS_COUNT, PATCH_SEQ_LEN],
+                &[NPROCS * TICKERS_COUNT, self.patch_seq_len],
             )
-            .view([NPROCS, TICKERS_COUNT * PATCH_SEQ_LEN]);
+            .view([NPROCS, TICKERS_COUNT * self.patch_seq_len]);
 
         self.done_mask.fill(false);
         self.last_static_obs.clone_from(&all_static_obs);
@@ -142,8 +162,8 @@ impl VecEnv {
         }
 
         let step_deltas = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
-        let static_obs = Tensor::from_slice(&all_static_obs)
-            .view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let static_obs =
+            Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
 
         self.done_mask.fill(false);
         self.last_static_obs.clone_from(&all_static_obs);
@@ -163,8 +183,8 @@ impl VecEnv {
             all_static_obs.extend(so);
         }
 
-        let static_obs = Tensor::from_slice(&all_static_obs)
-            .view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let static_obs =
+            Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
 
         let mut deltas_flat = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
         for deltas in &all_deltas_per_env {
@@ -280,13 +300,12 @@ impl VecEnv {
         let seq_idx_cpu = self
             .tensor_from_i64(
                 &self.seq_idx_buf,
-                &[NPROCS * TICKERS_COUNT, PATCH_SEQ_LEN],
+                &[NPROCS * TICKERS_COUNT, self.patch_seq_len],
             )
-            .view([NPROCS, TICKERS_COUNT * PATCH_SEQ_LEN]);
+            .view([NPROCS, TICKERS_COUNT * self.patch_seq_len]);
         out_seq_idx.copy_(&seq_idx_cpu);
 
-        let rpt_cpu =
-            self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);
+        let rpt_cpu = self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);
         out_reward_per_ticker.copy_(&rpt_cpu);
         out_cash_reward.copy_(&self.tensor_from_f32(&self.cash_reward_buf, &[NPROCS]));
         out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[NPROCS]));
@@ -318,8 +337,7 @@ impl VecEnv {
         let deltas_cpu = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
         out_step_deltas.copy_(&deltas_cpu);
 
-        let so_cpu = Tensor::from_slice(&all_static_obs)
-            .view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let so_cpu = Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
         out_static_obs.copy_(&so_cpu);
 
         let reward = Tensor::from_slice(&rewards);
@@ -338,8 +356,7 @@ impl VecEnv {
         debug_assert_eq!(actions_flat.len(), envs_len * action_dim);
 
         let mut rewards = [0f32; NPROCS as usize];
-        let mut rewards_per_ticker =
-            vec![0f32; NPROCS as usize * TICKERS_COUNT as usize];
+        let mut rewards_per_ticker = vec![0f32; NPROCS as usize * TICKERS_COUNT as usize];
         let mut cash_rewards = [0f32; NPROCS as usize];
         let mut is_dones = [0f32; NPROCS as usize];
         let mut all_step_deltas = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
@@ -385,8 +402,7 @@ impl VecEnv {
             }
         }
 
-        let so_cpu = Tensor::from_slice(&all_static_obs)
-            .view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let so_cpu = Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
         out_static_obs.copy_(&so_cpu);
 
         let reward = Tensor::from_slice(&rewards);
@@ -481,16 +497,14 @@ impl VecEnv {
             }
         }
 
-        let deltas_cpu =
-            self.tensor_from_f32(&self.step_deltas_buf, &[NPROCS, TICKERS_COUNT]);
+        let deltas_cpu = self.tensor_from_f32(&self.step_deltas_buf, &[NPROCS, TICKERS_COUNT]);
         out_step_deltas.copy_(&deltas_cpu);
 
         let so_cpu =
             self.tensor_from_f32(&self.static_obs_buf, &[NPROCS, STATIC_OBSERVATIONS as i64]);
         out_static_obs.copy_(&so_cpu);
 
-        let rpt_cpu =
-            self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);
+        let rpt_cpu = self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);
         out_reward_per_ticker.copy_(&rpt_cpu);
         out_cash_reward.copy_(&self.tensor_from_f32(&self.cash_reward_buf, &[NPROCS]));
         out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[NPROCS]));
@@ -526,7 +540,11 @@ impl VecEnv {
     pub fn max_step(&self) -> usize {
         let first = self.envs[0].max_step;
         for (i, env) in self.envs.iter().enumerate().skip(1) {
-            assert_eq!(env.max_step, first, "VecEnv desync: env[{}].max_step={} != env[0].max_step={}", i, env.max_step, first);
+            assert_eq!(
+                env.max_step, first,
+                "VecEnv desync: env[{}].max_step={} != env[0].max_step={}",
+                i, env.max_step, first
+            );
         }
         first
     }
@@ -558,5 +576,4 @@ impl VecEnv {
     pub fn prices(&self) -> &Vec<Vec<f64>> {
         &self.envs[0].prices
     }
-
 }

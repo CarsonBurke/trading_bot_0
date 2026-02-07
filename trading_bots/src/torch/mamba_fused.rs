@@ -15,7 +15,6 @@ fn module_lock() -> &'static Mutex<CModule> {
     })
 }
 
-
 pub fn fused_conv_scan(
     zxbcdt: &Tensor,
     conv_w: &Tensor,
@@ -51,7 +50,9 @@ pub fn fused_conv_scan(
         IValue::Double(dt_min),
         IValue::Double(dt_max),
     ];
-    let out = module.forward_is(&inputs).expect("mamba fused forward failed");
+    let out = module
+        .forward_is(&inputs)
+        .expect("mamba fused forward failed");
     let (y, final_state): (Tensor, Tensor) = out.try_into().expect("bad mamba fused output");
     (y, final_state)
 }
@@ -279,9 +280,7 @@ fn fallback_fused_post(
 
     let y_flat = y.view([batch, seqlen, d_ssm]);
     let y_f = y_flat.to_kind(Kind::Float);
-    let z = zxbcdt
-        .narrow(2, 2 * d_mlp, d_ssm)
-        .to_kind(Kind::Float);
+    let z = zxbcdt.narrow(2, 2 * d_mlp, d_ssm).to_kind(Kind::Float);
 
     let y_norm = if rmsnorm_weight.defined() && rmsnorm_weight.numel() > 0 {
         let group_size = d_ssm / ngroups;

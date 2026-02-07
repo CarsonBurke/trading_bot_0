@@ -1,11 +1,9 @@
 use tch::{Kind, Tensor};
 
 use super::{
-    DebugMetrics, ModelOutput, TradingModel, ATTN_LOGIT_CAP, FF_DIM, MODEL_DIM,
-    RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS,
+    DebugMetrics, ModelOutput, TradingModel, ATTN_LOGIT_CAP, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS,
 };
 use crate::torch::constants::TICKERS_COUNT;
-
 
 impl TradingModel {
     pub(super) fn head_with_temporal_pool(
@@ -18,7 +16,7 @@ impl TradingModel {
         let x = self.ssm_final_norm.forward(x_ssm);
         // [batch*tickers, seq_len, SSM_DIM] -> [batch, tickers, seq_len, SSM_DIM]
         let temporal_len = x.size()[1];
-        let x_time = x.view([batch_size, TICKERS_COUNT, temporal_len, MODEL_DIM]);
+        let x_time = x.view([batch_size, TICKERS_COUNT, temporal_len, self.model_dim]);
 
         // Extract last token: [batch, tickers, MODEL_DIM]
         let last_tokens = x_time.narrow(2, temporal_len - 1, 1).squeeze_dim(2);
@@ -33,47 +31,47 @@ impl TradingModel {
 
         let x_ticker_norm = block
             .ticker_ln
-            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]))
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
+            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]))
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
         let q = block.q_norm.forward(&x_ticker_norm.apply(&block.ticker_q));
         let k = block.k_norm.forward(&x_ticker_norm.apply(&block.ticker_k));
         let v = x_ticker_norm.apply(&block.ticker_v);
         let kind = q.kind();
-        let scores = q.matmul(&k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let scores = q.matmul(&k.transpose(-2, -1)) / (self.model_dim as f64).sqrt();
         let scores = ATTN_LOGIT_CAP * (scores / ATTN_LOGIT_CAP).tanh();
         let attn = scores.softmax(-1, Kind::Float).to_kind(kind);
-        let ticker_ctx = attn
-            .matmul(&v)
-            .apply(&block.ticker_out)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
+        let ticker_ctx = attn.matmul(&v).apply(&block.ticker_out).reshape([
+            batch_size,
+            TICKERS_COUNT,
+            self.model_dim,
+        ]);
         ticker_repr = ticker_repr + &ticker_ctx * &alpha_ticker_attn;
 
         let mlp_in = block
             .mlp_ln
-            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]));
+            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]));
         let mlp_proj = mlp_in.apply(&block.mlp_fc1);
-        let mlp_parts = mlp_proj.split(FF_DIM, -1);
+        let mlp_parts = mlp_proj.split(self.ff_dim, -1);
         let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
             .apply(&block.mlp_fc2)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
         ticker_repr = ticker_repr + &mlp * &alpha_mlp;
 
         // Actor head: MLP per-ticker → flatten → project to latent → action_mean
         // actor_out.W is shared with Lattice covariance (W D Wᵀ)
-        let mut actor_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]);
+        let mut actor_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]);
         for i in 0..self.actor_mlp_linears.len() {
             actor_x = actor_x.apply(&self.actor_mlp_linears[i]);
             actor_x = self.actor_mlp_norms[i].forward(&actor_x);
             actor_x = actor_x.silu();
         }
         let actor_latent = actor_x
-            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM])
+            .reshape([batch_size, TICKERS_COUNT * self.model_dim])
             .apply(&self.actor_proj);
         let action_mean = actor_latent.apply(&self.actor_out);
 
         // Critic: DreamerV3-style MLP (Linear → RMSNorm → SiLU) → Linear
-        let critic_input = ticker_repr
-            .reshape([batch_size, TICKERS_COUNT * MODEL_DIM]);
+        let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
         let mut critic_x = critic_input.shallow_clone();
         for i in 0..self.value_mlp_linears.len() {
             critic_x = critic_x.apply(&self.value_mlp_linears[i]);
@@ -87,8 +85,7 @@ impl TradingModel {
         let values = if compute_values {
             let critic_probs = critic_logits.softmax(-1, Kind::Float);
             let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
-            let value = (&critic_probs * &bucket_centers)
-                .sum_dim_intlist(-1, false, Kind::Float);
+            let value = (&critic_probs * &bucket_centers).sum_dim_intlist(-1, false, Kind::Float);
             value.to_kind(ticker_repr.kind())
         } else {
             Tensor::zeros(&[batch_size], (ticker_repr.kind(), ticker_repr.device()))
@@ -97,7 +94,12 @@ impl TradingModel {
         let debug_metrics = None;
 
         (
-            (values, critic_logits, critic_input, (action_mean, actor_latent)),
+            (
+                values,
+                critic_logits,
+                critic_input,
+                (action_mean, actor_latent),
+            ),
             debug_metrics,
         )
     }

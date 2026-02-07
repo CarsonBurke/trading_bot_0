@@ -64,10 +64,7 @@ impl BenchmarkSuite {
         let output_dir = PathBuf::from(OUTPUT_DIR);
         fs::create_dir_all(&output_dir)?;
 
-        let filename = format!(
-            "bench_{}.json",
-            self.timestamp.format("%Y%m%d_%H%M%S")
-        );
+        let filename = format!("bench_{}.json", self.timestamp.format("%Y%m%d_%H%M%S"));
         let path = output_dir.join(&filename);
 
         let json = serde_json::to_string_pretty(self)?;

@@ -464,7 +464,8 @@ impl ChartViewer {
                         } else {
                             0
                         };
-                        if let Ok(img) = render_report_with_options(&report, skip, self.show_legend) {
+                        if let Ok(img) = render_report_with_options(&report, skip, self.show_legend)
+                        {
                             let protocol = self.picker.new_resize_protocol(img);
                             self.current_image = Some(protocol);
                         }
@@ -715,7 +716,11 @@ impl ChartViewer {
 
         f.render_stateful_widget(list, list_chunk, &mut self.list_state);
 
-        let legend_label = if self.show_legend { "Legend" } else { "Legend (off)" };
+        let legend_label = if self.show_legend {
+            "Legend"
+        } else {
+            "Legend (off)"
+        };
         let (help_line1, help_line2) = if self.viewing_mode == ViewingMode::MetaCharts {
             (
                 Line::from(vec![

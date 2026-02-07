@@ -87,7 +87,10 @@ impl TradingModel {
         compute_values: bool,
     ) -> ModelOutput {
         if price_deltas.device() != self.device || static_features.device() != self.device {
-            panic!("forward_with_seq_idx_on_device requires tensors on {:?}", self.device);
+            panic!(
+                "forward_with_seq_idx_on_device requires tensors on {:?}",
+                self.device
+            );
         }
         let price_deltas = self.cast_inputs(price_deltas);
         let static_features = self.cast_inputs(static_features);
@@ -105,8 +108,17 @@ impl TradingModel {
         let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, batch_size);
 
         let mut x_for_ssm = x_stem;
-        let seq_idx_ref = if seq_idx.numel() == 0 { None } else { Some(&seq_idx) };
-        for (i, (layer, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate() {
+        let seq_idx_ref = if seq_idx.numel() == 0 {
+            None
+        } else {
+            Some(&seq_idx)
+        };
+        for (i, (layer, norm)) in self
+            .ssm_layers
+            .iter()
+            .zip(self.ssm_norms.iter())
+            .enumerate()
+        {
             let out = layer.forward_with_pre_norm_seq_idx(
                 &x_for_ssm,
                 norm.weight(),
@@ -119,13 +131,8 @@ impl TradingModel {
         }
         debug_fused("model_x_for_ssm", &x_for_ssm);
 
-        self.head_with_temporal_pool(
-            &x_for_ssm,
-            batch_size,
-            compute_values,
-            false,
-        )
-        .0
+        self.head_with_temporal_pool(&x_for_ssm, batch_size, compute_values, false)
+            .0
     }
 
     pub fn forward_with_debug(
@@ -151,15 +158,25 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale, seq_idx) = self.patch_latent_stem(&price_deltas, batch_size, seq_idx);
+        let (x_stem, dt_scale, seq_idx) =
+            self.patch_latent_stem(&price_deltas, batch_size, seq_idx);
         debug_fused("model_x_stem", &x_stem);
         debug_fused("model_dt_scale", &dt_scale);
 
         let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, batch_size);
 
         let mut x_for_ssm = x_stem;
-        let seq_idx_ref = if seq_idx.numel() == 0 { None } else { Some(&seq_idx) };
-        for (layer_idx, (layer, norm)) in self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate() {
+        let seq_idx_ref = if seq_idx.numel() == 0 {
+            None
+        } else {
+            Some(&seq_idx)
+        };
+        for (layer_idx, (layer, norm)) in self
+            .ssm_layers
+            .iter()
+            .zip(self.ssm_norms.iter())
+            .enumerate()
+        {
             debug_fused_layer("x_for_ssm_in", layer_idx, &x_for_ssm);
             let out = layer.forward_with_pre_norm_seq_idx(
                 &x_for_ssm,
@@ -175,12 +192,7 @@ impl TradingModel {
         }
         debug_fused("model_x_for_ssm", &x_for_ssm);
 
-        let (out, debug) = self.head_with_temporal_pool(
-            &x_for_ssm,
-            batch_size,
-            true,
-            true,
-        );
+        let (out, debug) = self.head_with_temporal_pool(&x_for_ssm, batch_size, true, true);
         (
             out,
             debug.unwrap_or(DebugMetrics {

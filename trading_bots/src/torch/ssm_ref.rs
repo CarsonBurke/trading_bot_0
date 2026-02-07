@@ -107,7 +107,9 @@ static BRIDGE_INIT: LazyLock<()> = LazyLock::new(|| {
     Python::with_gil(|py| {
         let sys = py.import("sys").expect("failed to import sys");
         let path = sys.getattr("path").expect("no sys.path");
-        let path = path.downcast::<pyo3::types::PyList>().expect("sys.path is not a list");
+        let path = path
+            .downcast::<pyo3::types::PyList>()
+            .expect("sys.path is not a list");
         path.insert(0, &*BRIDGE_DIR)
             .expect("failed to insert bridge dir into sys.path");
     });
@@ -209,28 +211,38 @@ impl Mamba2Ref {
             let kind = Kind::Float;
 
             macro_rules! py_val {
-                ($v:expr) => { $v.into_pyobject(py).expect("into_pyobject").to_owned().into_any().unbind() }
+                ($v:expr) => {
+                    $v.into_pyobject(py)
+                        .expect("into_pyobject")
+                        .to_owned()
+                        .into_any()
+                        .unbind()
+                };
             }
             let d_ssm_py: PyObject = match config.d_ssm {
                 Some(v) => py_val!(v),
                 None => py.None(),
             };
-            let create_args = PyTuple::new(py, &[
-                py_val!(config.d_model),
-                py_val!(config.d_state),
-                py_val!(config.d_conv),
-                py_val!(config.expand),
-                py_val!(config.headdim),
-                d_ssm_py,
-                py_val!(config.ngroups),
-                py_val!(config.chunk_size),
-                py_val!(config.dt_min),
-                py_val!(config.dt_max),
-                py_val!(config.norm_before_gate),
-                py_val!(config.d_has_hdim),
-                py_val!(device_str(device)),
-                py_val!(kind_str(kind)),
-            ]).expect("failed to create tuple");
+            let create_args = PyTuple::new(
+                py,
+                &[
+                    py_val!(config.d_model),
+                    py_val!(config.d_state),
+                    py_val!(config.d_conv),
+                    py_val!(config.expand),
+                    py_val!(config.headdim),
+                    d_ssm_py,
+                    py_val!(config.ngroups),
+                    py_val!(config.chunk_size),
+                    py_val!(config.dt_min),
+                    py_val!(config.dt_max),
+                    py_val!(config.norm_before_gate),
+                    py_val!(config.d_has_hdim),
+                    py_val!(device_str(device)),
+                    py_val!(kind_str(kind)),
+                ],
+            )
+            .expect("failed to create tuple");
 
             let handle: i64 = bridge
                 .call_method1(py, "create_layer", create_args)
@@ -253,12 +265,19 @@ impl Mamba2Ref {
                 eprintln!("[ssm_ref] param {i}: {name} shape={:?}", tensor.size());
                 let var_name = name.replace('.', "/");
                 let mut var = p.var(&var_name, &tensor.size(), tch::nn::Init::Const(0.0));
-                tch::no_grad(|| { let _ = var.copy_(&tensor); });
+                tch::no_grad(|| {
+                    let _ = var.copy_(&tensor);
+                });
                 params.push((name, var));
             }
             Self::replace_python_params(py, &bridge, handle, &params);
 
-            Self { handle, bridge, params, config }
+            Self {
+                handle,
+                bridge,
+                params,
+                config,
+            }
         })
     }
 
@@ -278,7 +297,8 @@ impl Mamba2Ref {
 
     pub fn set_train(&self, mode: bool) {
         Python::with_gil(|py| {
-            self.bridge.bind(py)
+            self.bridge
+                .bind(py)
                 .call_method1(intern!(py, "set_train"), (self.handle, mode))
                 .expect("set_train failed");
         });
@@ -329,18 +349,20 @@ impl Mamba2Ref {
     ) -> Tensor {
         Python::with_gil(|py| {
             let bridge = self.bridge.bind(py);
-            let result = bridge.call_method1(
-                intern!(py, "forward_with_pre_norm_stateful"),
-                (
-                    self.handle,
-                    tensor_to_py(py, x),
-                    tensor_to_py(py, norm_weight),
-                    norm_eps,
-                    tensor_to_py(py, &state.conv_state),
-                    tensor_to_py(py, &state.ssm_state),
-                    opt_tensor_to_py(py, dt_scale),
-                ),
-            ).expect("forward_with_pre_norm_stateful failed");
+            let result = bridge
+                .call_method1(
+                    intern!(py, "forward_with_pre_norm_stateful"),
+                    (
+                        self.handle,
+                        tensor_to_py(py, x),
+                        tensor_to_py(py, norm_weight),
+                        norm_eps,
+                        tensor_to_py(py, &state.conv_state),
+                        tensor_to_py(py, &state.ssm_state),
+                        opt_tensor_to_py(py, dt_scale),
+                    ),
+                )
+                .expect("forward_with_pre_norm_stateful failed");
 
             let ptr = result.as_ptr();
             let y = unsafe { tuple_get_tensor(ptr, 0) };
@@ -367,18 +389,20 @@ impl Mamba2Ref {
     ) -> Tensor {
         Python::with_gil(|py| {
             let bridge = self.bridge.bind(py);
-            let result = bridge.call_method1(
-                intern!(py, "step"),
-                (
-                    self.handle,
-                    tensor_to_py(py, x),
-                    tensor_to_py(py, norm_weight),
-                    norm_eps,
-                    tensor_to_py(py, &state.conv_state),
-                    tensor_to_py(py, &state.ssm_state),
-                    dt_scale,
-                ),
-            ).expect("step failed");
+            let result = bridge
+                .call_method1(
+                    intern!(py, "step"),
+                    (
+                        self.handle,
+                        tensor_to_py(py, x),
+                        tensor_to_py(py, norm_weight),
+                        norm_eps,
+                        tensor_to_py(py, &state.conv_state),
+                        tensor_to_py(py, &state.ssm_state),
+                        dt_scale,
+                    ),
+                )
+                .expect("step failed");
 
             let ptr = result.as_ptr();
             let y = unsafe { tuple_get_tensor(ptr, 0) };
@@ -398,10 +422,12 @@ impl Mamba2Ref {
     pub fn init_state(&self, batch_size: i64, device: tch::Device) -> Mamba2State {
         Python::with_gil(|py| {
             let bridge = self.bridge.bind(py);
-            let result = bridge.call_method1(
-                intern!(py, "init_state"),
-                (self.handle, batch_size, device_str(device), "float32"),
-            ).expect("init_state failed");
+            let result = bridge
+                .call_method1(
+                    intern!(py, "init_state"),
+                    (self.handle, batch_size, device_str(device), "float32"),
+                )
+                .expect("init_state failed");
 
             let ptr = result.as_ptr();
             Mamba2State {
@@ -416,7 +442,10 @@ impl Mamba2Ref {
 impl Drop for Mamba2Ref {
     fn drop(&mut self) {
         Python::with_gil(|py| {
-            let _ = self.bridge.bind(py).call_method1("destroy_layer", (self.handle,));
+            let _ = self
+                .bridge
+                .bind(py)
+                .call_method1("destroy_layer", (self.handle,));
         });
     }
 }
@@ -428,7 +457,9 @@ pub struct StatefulMambaRef {
 
 impl StatefulMambaRef {
     pub fn new(p: &nn::Path, config: Mamba2Config) -> Self {
-        Self { mamba: Mamba2Ref::new(p, config) }
+        Self {
+            mamba: Mamba2Ref::new(p, config),
+        }
     }
 
     pub fn forward_with_pre_norm_seq_idx(
@@ -439,7 +470,8 @@ impl StatefulMambaRef {
         dt_scale: Option<&Tensor>,
         seq_idx: Option<&Tensor>,
     ) -> Tensor {
-        self.mamba.forward_with_pre_norm_seq_idx(x, norm_weight, norm_eps, dt_scale, seq_idx)
+        self.mamba
+            .forward_with_pre_norm_seq_idx(x, norm_weight, norm_eps, dt_scale, seq_idx)
     }
 
     pub fn forward_with_state_pre_norm_dt_scale(
@@ -450,7 +482,8 @@ impl StatefulMambaRef {
         state: &mut Mamba2State,
         dt_scale: Option<&Tensor>,
     ) -> Tensor {
-        self.mamba.forward_with_state_pre_norm_dt_scale(x, norm_weight, norm_eps, state, dt_scale)
+        self.mamba
+            .forward_with_state_pre_norm_dt_scale(x, norm_weight, norm_eps, state, dt_scale)
     }
 
     pub fn step_with_pre_norm_dt_scale(
@@ -461,7 +494,8 @@ impl StatefulMambaRef {
         state: &mut Mamba2State,
         dt_scale: f64,
     ) -> Tensor {
-        self.mamba.step_with_pre_norm_dt_scale(x, norm_weight, norm_eps, state, dt_scale)
+        self.mamba
+            .step_with_pre_norm_dt_scale(x, norm_weight, norm_eps, state, dt_scale)
     }
 
     pub fn init_state(&self, batch_size: i64, device: tch::Device) -> Mamba2State {

@@ -21,17 +21,27 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let is_training_for_title = app.is_training_running();
     let current_episode_for_title = app.get_current_episode();
 
-    let mut title_spans = vec![
-        Span::styled(" Trading Bot TUI ", Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD)),
-    ];
-    title_spans.extend(episode_status::episode_status_spans(is_training_for_title, current_episode_for_title));
+    let mut title_spans = vec![Span::styled(
+        " Trading Bot TUI ",
+        Style::default()
+            .fg(theme::MAUVE)
+            .add_modifier(Modifier::BOLD),
+    )];
+    title_spans.extend(episode_status::episode_status_spans(
+        is_training_for_title,
+        current_episode_for_title,
+    ));
+    title_spans.push(Span::raw("  "));
+    title_spans.push(Span::styled(
+        format!("model: {}", app.training_model_size),
+        Style::default().fg(theme::TEAL),
+    ));
 
-    let title = Paragraph::new(Line::from(title_spans))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::LAVENDER)),
-        );
+    let title = Paragraph::new(Line::from(title_spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::LAVENDER)),
+    );
     f.render_widget(title, chunks[0]);
 
     // Empty block for middle section
@@ -44,6 +54,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Line::from(vec![
             Span::styled("s", Style::default().fg(Color::Green)),
             Span::raw(": Start Training  "),
+            Span::styled("p", Style::default().fg(Color::Cyan)),
+            Span::raw(": Toggle Model Size  "),
             Span::styled("f", Style::default().fg(Color::Blue)),
             Span::raw(": Run Inference  "),
             Span::styled("x", Style::default().fg(Color::Red)),
@@ -65,7 +77,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         ]),
     ];
 
-    let help = Paragraph::new(help_text).block(Block::default().borders(Borders::ALL).title(" Controls "));
+    let help =
+        Paragraph::new(help_text).block(Block::default().borders(Borders::ALL).title(" Controls "));
     f.render_widget(help, chunks[2]);
 }
-

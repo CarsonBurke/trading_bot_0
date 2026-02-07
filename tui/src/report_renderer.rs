@@ -207,18 +207,18 @@ fn render_multi_line(
     x_offset: u32,
     show_legend: bool,
 ) -> Result<()> {
-    let all_values: Vec<f32> = series.iter().flat_map(|s| s.values.iter()).copied().collect();
+    let all_values: Vec<f32> = series
+        .iter()
+        .flat_map(|s| s.values.iter())
+        .copied()
+        .collect();
     if all_values.is_empty() {
         return Ok(());
     }
 
     let scale = report.scale;
     let (y_min, y_max) = range_for(&all_values, scale == ScaleKind::Symlog)?;
-    let x_len = series
-        .iter()
-        .map(|s| s.values.len())
-        .max()
-        .unwrap_or(1) as u32;
+    let x_len = series.iter().map(|s| s.values.len()).max().unwrap_or(1) as u32;
     let x_end = x_offset + x_len;
 
     let title = normalize_title(&report.title);
@@ -328,16 +328,16 @@ fn render_assets(
 
     chart
         .draw_series(
-        AreaSeries::new(
-            total
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (x_offset + index as u32, *value as f32)),
-            0.0,
-            theme::BLUE.mix(0.2),
-        )
-        .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
-    )?
+            AreaSeries::new(
+                total
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                0.0,
+                theme::BLUE.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
+        )?
         .label("total")
         .legend(legend_rect(&theme::BLUE));
 
@@ -345,43 +345,43 @@ fn render_assets(
     if !positioned.is_empty() {
         chart
             .draw_series(
-            AreaSeries::new(
-                positioned
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
-                0.0,
-                theme::RED.mix(0.2),
-            )
-            .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
-        )?
+                AreaSeries::new(
+                    positioned
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                    0.0,
+                    theme::RED.mix(0.2),
+                )
+                .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
+            )?
             .label("positioned")
             .legend(legend_rect(&theme::RED));
     }
 
     chart
         .draw_series(
-        AreaSeries::new(
-            cash.iter()
-                .enumerate()
-                .map(|(index, value)| (x_offset + index as u32, *value as f32)),
-            0.0,
-            theme::GREEN.mix(0.2),
-        )
-        .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
-    )?
+            AreaSeries::new(
+                cash.iter()
+                    .enumerate()
+                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                0.0,
+                theme::GREEN.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
+        )?
         .label("cash")
         .legend(legend_rect(&theme::GREEN));
 
     if let Some(bench) = benchmark {
         chart
             .draw_series(LineSeries::new(
-            bench
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (x_offset + index as u32, *value as f32)),
-            ShapeStyle::from(&theme::MAUVE).stroke_width(1),
-        ))?
+                bench
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                ShapeStyle::from(&theme::MAUVE).stroke_width(1),
+            ))?
             .label("benchmark")
             .legend(legend_rect(&theme::MAUVE));
     }
@@ -457,17 +457,26 @@ fn render_buy_sell(
         sells
             .iter()
             .filter(|p| (p.index as usize) < prices.len())
-            .map(|p| (x_offset + p.index, prices.get(p.index as usize).copied().unwrap_or(0.0) as f64)),
+            .map(|p| {
+                (
+                    x_offset + p.index,
+                    prices.get(p.index as usize).copied().unwrap_or(0.0) as f64,
+                )
+            }),
         point_size,
         theme::YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
     chart.draw_series(PointSeries::of_element(
-        buys
-            .iter()
+        buys.iter()
             .filter(|p| (p.index as usize) < prices.len())
-            .map(|p| (x_offset + p.index, prices.get(p.index as usize).copied().unwrap_or(0.0) as f64)),
+            .map(|p| {
+                (
+                    x_offset + p.index,
+                    prices.get(p.index as usize).copied().unwrap_or(0.0) as f64,
+                )
+            }),
         point_size,
         theme::RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),

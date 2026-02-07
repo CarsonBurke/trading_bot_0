@@ -1,7 +1,9 @@
 use hashbrown::HashMap;
 
 use crate::constants::files::TRAINING_PATH;
-use crate::history::report::{write_report, Report, ReportKind, ReportSeries, ScaleKind, TradePoint};
+use crate::history::report::{
+    write_report, Report, ReportKind, ReportSeries, ScaleKind, TradePoint,
+};
 use crate::utils::create_folder_if_not_exists;
 
 #[derive(Debug)]
@@ -40,11 +42,30 @@ impl EpisodeHistory {
         }
     }
 
-    pub fn record(&self, episode: usize, tickers: &[String], prices: &[Vec<f64>], start_offset: usize) {
-        self.record_to_path(&format!("{TRAINING_PATH}/gens"), episode, tickers, prices, start_offset);
+    pub fn record(
+        &self,
+        episode: usize,
+        tickers: &[String],
+        prices: &[Vec<f64>],
+        start_offset: usize,
+    ) {
+        self.record_to_path(
+            &format!("{TRAINING_PATH}/gens"),
+            episode,
+            tickers,
+            prices,
+            start_offset,
+        );
     }
 
-    pub fn record_to_path(&self, base_path: &str, episode: usize, tickers: &[String], prices: &[Vec<f64>], start_offset: usize) {
+    pub fn record_to_path(
+        &self,
+        base_path: &str,
+        episode: usize,
+        tickers: &[String],
+        prices: &[Vec<f64>],
+        start_offset: usize,
+    ) {
         let episode_dir = format!("{}/{}", base_path, episode);
         create_folder_if_not_exists(&episode_dir);
 
@@ -116,19 +137,21 @@ impl EpisodeHistory {
 
             let positioned_assets = &self.positioned[ticker_index];
 
-            let ticker_benchmark = if !ticker_prices.is_empty() && num_steps > 0 && start_offset < ticker_prices.len() {
-                let initial_value = total_assets_per_step[0];
-                let initial_price = ticker_prices[start_offset];
-                let end_idx = (start_offset + num_steps).min(ticker_prices.len());
-                Some(
-                    ticker_prices[start_offset..end_idx]
-                        .iter()
-                        .map(|&current_price| initial_value * current_price / initial_price)
-                        .collect::<Vec<f64>>()
-                )
-            } else {
-                None
-            };
+            let ticker_benchmark =
+                if !ticker_prices.is_empty() && num_steps > 0 && start_offset < ticker_prices.len()
+                {
+                    let initial_value = total_assets_per_step[0];
+                    let initial_price = ticker_prices[start_offset];
+                    let end_idx = (start_offset + num_steps).min(ticker_prices.len());
+                    Some(
+                        ticker_prices[start_offset..end_idx]
+                            .iter()
+                            .map(|&current_price| initial_value * current_price / initial_price)
+                            .collect::<Vec<f64>>(),
+                    )
+                } else {
+                    None
+                };
 
             let report = Report {
                 title: "Assets".to_string(),
@@ -191,7 +214,10 @@ impl EpisodeHistory {
         let _ = write_report(&format!("{episode_dir}/reward.report.bin"), &report);
 
         // Combined target weights chart (all tickers + cash) - every 5 episodes like meta charts
-        if episode % 5 == 0 && !self.cash_weight.is_empty() && self.target_weights.iter().any(|w| !w.is_empty()) {
+        if episode % 5 == 0
+            && !self.cash_weight.is_empty()
+            && self.target_weights.iter().any(|w| !w.is_empty())
+        {
             let mut series: Vec<ReportSeries> = Vec::new();
             for (ticker_index, ticker) in tickers.iter().enumerate() {
                 if !self.target_weights[ticker_index].is_empty() {
@@ -216,7 +242,10 @@ impl EpisodeHistory {
         }
 
         // Write static observations and attention weights
-        if episode & 5 == 0 && !self.static_observations.is_empty() && !self.attention_weights.is_empty() {
+        if episode & 5 == 0
+            && !self.static_observations.is_empty()
+            && !self.attention_weights.is_empty()
+        {
             let report = Report {
                 title: "Observations".to_string(),
                 x_label: None,
@@ -234,7 +263,11 @@ impl EpisodeHistory {
     }
 
     pub fn final_assets(&self) -> f64 {
-        let positioned = self.positioned.iter().map(|p| p.last().unwrap()).sum::<f64>();
+        let positioned = self
+            .positioned
+            .iter()
+            .map(|p| p.last().unwrap())
+            .sum::<f64>();
         positioned + self.cash.last().unwrap()
     }
 }

@@ -1,6 +1,8 @@
 use crate::constants::files::TRAINING_PATH;
 use crate::history::episode_tickers_combined::EpisodeHistory;
-use crate::history::report::{read_report, write_report, Report, ReportKind, ReportSeries, ScaleKind};
+use crate::history::report::{
+    read_report, write_report, Report, ReportKind, ReportSeries, ScaleKind,
+};
 use crate::utils::create_folder_if_not_exists;
 
 #[derive(Default, Debug)]
@@ -41,7 +43,8 @@ pub struct MetaHistory {
 impl MetaHistory {
     pub fn record(&mut self, history: &EpisodeHistory, outperformance: f64) {
         self.final_assets.push(history.final_assets());
-        self.cumulative_reward.push(history.rewards.iter().sum::<f64>());
+        self.cumulative_reward
+            .push(history.rewards.iter().sum::<f64>());
         self.outperformance.push(outperformance);
         self.total_commissions.push(history.total_commissions);
     }
@@ -68,7 +71,7 @@ impl MetaHistory {
         self.logit_noise_max.push(max);
         self.rpo_alpha.push(rpo_alpha);
     }
-    
+
     pub fn record_advantage_stats(&mut self, mean: f64, min: f64, max: f64) {
         self.mean_advantage.push(mean);
         self.min_advantage.push(min);
@@ -111,28 +114,36 @@ impl MetaHistory {
         self.temporal_attn_max.push(temporal_attn_max);
         self.temporal_attn_eff_len.push(temporal_attn_eff_len);
         self.temporal_attn_center.push(temporal_attn_center);
-        self.temporal_attn_last_weight.push(temporal_attn_last_weight);
+        self.temporal_attn_last_weight
+            .push(temporal_attn_last_weight);
     }
 
     /// Load meta history from existing reports at the given episode
     pub fn load_from_episode(&mut self, episode: usize) {
         let base_dir = format!("{TRAINING_PATH}/gens/{}", episode);
         let load_simple = |path: &str| -> Vec<f64> {
-            read_report(path).ok().map(|r| match r.kind {
-                ReportKind::Simple { values, .. } => values.into_iter().map(|v| v as f64).collect(),
-                _ => vec![],
-            }).unwrap_or_default()
+            read_report(path)
+                .ok()
+                .map(|r| match r.kind {
+                    ReportKind::Simple { values, .. } => {
+                        values.into_iter().map(|v| v as f64).collect()
+                    }
+                    _ => vec![],
+                })
+                .unwrap_or_default()
         };
         let load_multiline = |path: &str, label: &str| -> Vec<f64> {
-            read_report(path).ok().map(|r| match r.kind {
-                ReportKind::MultiLine { series } => {
-                    series.into_iter()
+            read_report(path)
+                .ok()
+                .map(|r| match r.kind {
+                    ReportKind::MultiLine { series } => series
+                        .into_iter()
                         .find(|s| s.label == label)
                         .map(|s| s.values.into_iter().map(|v| v as f64).collect())
-                        .unwrap_or_default()
-                }
-                _ => vec![],
-            }).unwrap_or_default()
+                        .unwrap_or_default(),
+                    _ => vec![],
+                })
+                .unwrap_or_default()
         };
 
         self.final_assets = load_simple(&format!("{base_dir}/final_assets.report.bin"));
@@ -179,10 +190,20 @@ impl MetaHistory {
 
         self.approx_kl = load_simple(&format!("{base_dir}/approx_kl.report.bin"));
 
-        println!("Loaded meta history from episode {} ({} data points)", episode, self.final_assets.len());
+        println!(
+            "Loaded meta history from episode {} ({} data points)",
+            episode,
+            self.final_assets.len()
+        );
     }
 
-    fn report(title: &str, x_label: &str, y_label: Option<&str>, scale: ScaleKind, kind: ReportKind) -> Report {
+    fn report(
+        title: &str,
+        x_label: &str,
+        y_label: Option<&str>,
+        scale: ScaleKind,
+        kind: ReportKind,
+    ) -> Report {
         Report {
             title: title.to_string(),
             x_label: Some(x_label.to_string()),
@@ -200,102 +221,258 @@ impl MetaHistory {
             ema_alpha: Some(0.05),
         };
         if !self.final_assets.is_empty() {
-            let r = Self::report("Final Assets", "Episode", Some("Assets"), ScaleKind::Linear, simple(&self.final_assets));
+            let r = Self::report(
+                "Final Assets",
+                "Episode",
+                Some("Assets"),
+                ScaleKind::Linear,
+                simple(&self.final_assets),
+            );
             let _ = write_report(&format!("{base_dir}/final_assets.report.bin"), &r);
         }
         if !self.cumulative_reward.is_empty() {
-            let r = Self::report("Cumulative Reward", "Episode", Some("Reward"), ScaleKind::Linear, simple(&self.cumulative_reward));
+            let r = Self::report(
+                "Cumulative Reward",
+                "Episode",
+                Some("Reward"),
+                ScaleKind::Linear,
+                simple(&self.cumulative_reward),
+            );
             let _ = write_report(&format!("{base_dir}/cumulative_reward.report.bin"), &r);
         }
         if !self.outperformance.is_empty() {
-            let r = Self::report("Outperformance", "Episode", Some("Outperformance"), ScaleKind::Linear, simple(&self.outperformance));
+            let r = Self::report(
+                "Outperformance",
+                "Episode",
+                Some("Outperformance"),
+                ScaleKind::Linear,
+                simple(&self.outperformance),
+            );
             let _ = write_report(&format!("{base_dir}/outperformance.report.bin"), &r);
         }
         if !self.policy_loss.is_empty() {
-            let r = Self::report("Policy Loss", "Episode", Some("Loss"), ScaleKind::Linear, simple(&self.policy_loss));
+            let r = Self::report(
+                "Policy Loss",
+                "Episode",
+                Some("Loss"),
+                ScaleKind::Linear,
+                simple(&self.policy_loss),
+            );
             let _ = write_report(&format!("{base_dir}/policy_loss.report.bin"), &r);
         }
         if !self.value_loss.is_empty() {
-            let r = Self::report("Value Loss", "Episode", Some("Loss"), ScaleKind::Linear, simple(&self.value_loss));
+            let r = Self::report(
+                "Value Loss",
+                "Episode",
+                Some("Loss"),
+                ScaleKind::Linear,
+                simple(&self.value_loss),
+            );
             let _ = write_report(&format!("{base_dir}/value_loss.report.bin"), &r);
         }
         if !self.explained_var.is_empty() {
-            let r = Self::report("Explained Variance", "Episode", Some("EV"), ScaleKind::Linear, simple(&self.explained_var));
+            let r = Self::report(
+                "Explained Variance",
+                "Episode",
+                Some("EV"),
+                ScaleKind::Linear,
+                simple(&self.explained_var),
+            );
             let _ = write_report(&format!("{base_dir}/explained_var.report.bin"), &r);
         }
         if !self.grad_norm.is_empty() {
-            let r = Self::report("Grad Norm (Log)", "Episode", Some("Grad Norm"), ScaleKind::Linear, simple(&self.grad_norm));
+            let r = Self::report(
+                "Grad Norm (Log)",
+                "Episode",
+                Some("Grad Norm"),
+                ScaleKind::Linear,
+                simple(&self.grad_norm),
+            );
             let _ = write_report(&format!("{base_dir}/grad_norm_log.report.bin"), &r);
         }
         if !self.total_commissions.is_empty() {
-            let r = Self::report("Total Commissions", "Episode", Some("Commissions"), ScaleKind::Linear, simple(&self.total_commissions));
+            let r = Self::report(
+                "Total Commissions",
+                "Episode",
+                Some("Commissions"),
+                ScaleKind::Linear,
+                simple(&self.total_commissions),
+            );
             let _ = write_report(&format!("{base_dir}/total_commissions.report.bin"), &r);
         }
         if !self.logit_noise_mean.is_empty() {
-            let r = Self::report("Logit Noise", "Episode", None, ScaleKind::Linear, ReportKind::MultiLine {
-                series: vec![
-                    ReportSeries { label: "mean".to_string(), values: f64_to_f32(&self.logit_noise_mean) },
-                    ReportSeries { label: "min".to_string(), values: f64_to_f32(&self.logit_noise_min) },
-                    ReportSeries { label: "max".to_string(), values: f64_to_f32(&self.logit_noise_max) },
-                    ReportSeries { label: "rpo_alpha".to_string(), values: f64_to_f32(&self.rpo_alpha) },
-                ],
-            });
+            let r = Self::report(
+                "Logit Noise",
+                "Episode",
+                None,
+                ScaleKind::Linear,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "mean".to_string(),
+                            values: f64_to_f32(&self.logit_noise_mean),
+                        },
+                        ReportSeries {
+                            label: "min".to_string(),
+                            values: f64_to_f32(&self.logit_noise_min),
+                        },
+                        ReportSeries {
+                            label: "max".to_string(),
+                            values: f64_to_f32(&self.logit_noise_max),
+                        },
+                        ReportSeries {
+                            label: "rpo_alpha".to_string(),
+                            values: f64_to_f32(&self.rpo_alpha),
+                        },
+                    ],
+                },
+            );
             let _ = write_report(&format!("{base_dir}/logit_noise.report.bin"), &r);
         }
         if !self.mean_advantage.is_empty() {
-            let r = Self::report("Advantage Stats (Log)", "Episode", None, ScaleKind::Symlog, ReportKind::MultiLine {
-                series: vec![
-                    ReportSeries { label: "mean".to_string(), values: f64_to_f32(&self.mean_advantage) },
-                    ReportSeries { label: "min".to_string(), values: f64_to_f32(&self.min_advantage) },
-                    ReportSeries { label: "max".to_string(), values: f64_to_f32(&self.max_advantage) },
-                ],
-            });
+            let r = Self::report(
+                "Advantage Stats (Log)",
+                "Episode",
+                None,
+                ScaleKind::Symlog,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "mean".to_string(),
+                            values: f64_to_f32(&self.mean_advantage),
+                        },
+                        ReportSeries {
+                            label: "min".to_string(),
+                            values: f64_to_f32(&self.min_advantage),
+                        },
+                        ReportSeries {
+                            label: "max".to_string(),
+                            values: f64_to_f32(&self.max_advantage),
+                        },
+                    ],
+                },
+            );
             let _ = write_report(&format!("{base_dir}/advantage_stats_log.report.bin"), &r);
         }
         if !self.logit_scale.is_empty() {
-            let r = Self::report("Logit Scale", "Episode", Some("Scale"), ScaleKind::Linear, simple(&self.logit_scale));
+            let r = Self::report(
+                "Logit Scale",
+                "Episode",
+                Some("Scale"),
+                ScaleKind::Linear,
+                simple(&self.logit_scale),
+            );
             let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &r);
         }
         if !self.clip_fraction.is_empty() {
-            let r = Self::report("Clip Fraction", "Episode", Some("Fraction"), ScaleKind::Linear, simple(&self.clip_fraction));
+            let r = Self::report(
+                "Clip Fraction",
+                "Episode",
+                Some("Fraction"),
+                ScaleKind::Linear,
+                simple(&self.clip_fraction),
+            );
             let _ = write_report(&format!("{base_dir}/clip_fraction.report.bin"), &r);
         }
         if !self.approx_kl.is_empty() {
-            let r = Self::report("Approx KL", "Episode", Some("KL"), ScaleKind::Linear, simple(&self.approx_kl));
+            let r = Self::report(
+                "Approx KL",
+                "Episode",
+                Some("KL"),
+                ScaleKind::Linear,
+                simple(&self.approx_kl),
+            );
             let _ = write_report(&format!("{base_dir}/approx_kl.report.bin"), &r);
         }
         if !self.policy_entropy_mean.is_empty() {
-            let r = Self::report("Policy Entropy", "Episode", Some("Entropy (nats)"), ScaleKind::Linear, ReportKind::MultiLine {
-                series: vec![
-                    ReportSeries { label: "mean".to_string(), values: f64_to_f32(&self.policy_entropy_mean) },
-                    ReportSeries { label: "min".to_string(), values: f64_to_f32(&self.policy_entropy_min) },
-                    ReportSeries { label: "max".to_string(), values: f64_to_f32(&self.policy_entropy_max) },
-                ],
-            });
+            let r = Self::report(
+                "Policy Entropy",
+                "Episode",
+                Some("Entropy (nats)"),
+                ScaleKind::Linear,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "mean".to_string(),
+                            values: f64_to_f32(&self.policy_entropy_mean),
+                        },
+                        ReportSeries {
+                            label: "min".to_string(),
+                            values: f64_to_f32(&self.policy_entropy_min),
+                        },
+                        ReportSeries {
+                            label: "max".to_string(),
+                            values: f64_to_f32(&self.policy_entropy_max),
+                        },
+                    ],
+                },
+            );
             let _ = write_report(&format!("{base_dir}/policy_entropy.report.bin"), &r);
         }
         if !self.time_alpha_attn_mean.is_empty() {
-            let r = Self::report("Time/Cross Alpha Means", "Episode", Some("Alpha"), ScaleKind::Linear, ReportKind::MultiLine {
-                series: vec![
-                    ReportSeries { label: "time_attn".to_string(), values: f64_to_f32(&self.time_alpha_attn_mean) },
-                    ReportSeries { label: "time_mlp".to_string(), values: f64_to_f32(&self.time_alpha_mlp_mean) },
-                    ReportSeries { label: "cross_attn".to_string(), values: f64_to_f32(&self.cross_alpha_attn_mean) },
-                    ReportSeries { label: "cross_mlp".to_string(), values: f64_to_f32(&self.cross_alpha_mlp_mean) },
-                ],
-            });
+            let r = Self::report(
+                "Time/Cross Alpha Means",
+                "Episode",
+                Some("Alpha"),
+                ScaleKind::Linear,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "time_attn".to_string(),
+                            values: f64_to_f32(&self.time_alpha_attn_mean),
+                        },
+                        ReportSeries {
+                            label: "time_mlp".to_string(),
+                            values: f64_to_f32(&self.time_alpha_mlp_mean),
+                        },
+                        ReportSeries {
+                            label: "cross_attn".to_string(),
+                            values: f64_to_f32(&self.cross_alpha_attn_mean),
+                        },
+                        ReportSeries {
+                            label: "cross_mlp".to_string(),
+                            values: f64_to_f32(&self.cross_alpha_mlp_mean),
+                        },
+                    ],
+                },
+            );
             let _ = write_report(&format!("{base_dir}/time_cross_alpha_means.report.bin"), &r);
         }
         if !self.temporal_tau.is_empty() {
-            let r = Self::report("Temporal/Embed Debug", "Episode", None, ScaleKind::Linear, ReportKind::MultiLine {
-                series: vec![
-                    ReportSeries { label: "temporal_tau".to_string(), values: f64_to_f32(&self.temporal_tau) },
-                    ReportSeries { label: "temporal_entropy".to_string(), values: f64_to_f32(&self.temporal_attn_entropy) },
-                    ReportSeries { label: "temporal_attn_max".to_string(), values: f64_to_f32(&self.temporal_attn_max) },
-                    ReportSeries { label: "temporal_eff_len".to_string(), values: f64_to_f32(&self.temporal_attn_eff_len) },
-                    ReportSeries { label: "temporal_attn_center".to_string(), values: f64_to_f32(&self.temporal_attn_center) },
-                    ReportSeries { label: "temporal_attn_last".to_string(), values: f64_to_f32(&self.temporal_attn_last_weight) },
-                ],
-            });
+            let r = Self::report(
+                "Temporal/Embed Debug",
+                "Episode",
+                None,
+                ScaleKind::Linear,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "temporal_tau".to_string(),
+                            values: f64_to_f32(&self.temporal_tau),
+                        },
+                        ReportSeries {
+                            label: "temporal_entropy".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_entropy),
+                        },
+                        ReportSeries {
+                            label: "temporal_attn_max".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_max),
+                        },
+                        ReportSeries {
+                            label: "temporal_eff_len".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_eff_len),
+                        },
+                        ReportSeries {
+                            label: "temporal_attn_center".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_center),
+                        },
+                        ReportSeries {
+                            label: "temporal_attn_last".to_string(),
+                            values: f64_to_f32(&self.temporal_attn_last_weight),
+                        },
+                    ],
+                },
+            );
             let _ = write_report(&format!("{base_dir}/temporal_embed_debug.report.bin"), &r);
         }
     }

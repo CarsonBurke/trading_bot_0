@@ -112,7 +112,11 @@ pub fn get_macd(data: &[f64]) -> Data {
     let ema_12 = ema(data, 1. / 12.);
     let ema_26 = ema(data, 1. / 26.);
 
-    ema_12.iter().zip(ema_26.iter()).map(|(a, b)| a - b).collect()
+    ema_12
+        .iter()
+        .zip(ema_26.iter())
+        .map(|(a, b)| a - b)
+        .collect()
 }
 
 pub fn get_stochastic_oscillator(bars: &[historical::Bar]) -> Data {
@@ -209,8 +213,12 @@ pub fn get_mapped_price_normals(data: &MappedHistorical) -> Vec<Vec<f64>> {
 
 pub fn get_price_normals(data: &[Bar]) -> Vec<f64> {
     let mut norms = Vec::with_capacity(data.len());
-    
-    let min = data.iter().min_by(|a, b| a.close.partial_cmp(&b.close).unwrap()).unwrap().close;
+
+    let min = data
+        .iter()
+        .min_by(|a, b| a.close.partial_cmp(&b.close).unwrap())
+        .unwrap()
+        .close;
 
     for price in data.iter() {
         norms.push((price.close - min) / min)
@@ -264,7 +272,7 @@ pub fn min_transaction_cost(assets: f64) -> f64 {
 }
 
 pub fn is_min_transaction(assets: f64, transaction: f64) -> bool {
-    return transaction > min_transaction_cost(assets)
+    return transaction > min_transaction_cost(assets);
 }
 
 pub fn percent_diff(bigger: f64, smaller: f64) -> f64 {

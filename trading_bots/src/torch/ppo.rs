@@ -2,13 +2,12 @@ use std::env;
 use std::time::Instant;
 use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 
-use crate::torch::constants::{
-    PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
-};
+use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    symlog_tensor, SlowCritic, TradingModel, ACTION_DIM, LATTICE_ALPHA, LATTICE_LEARN_FEATURES,
-    LATTICE_STD_REG, PATCH_SEQ_LEN, SDE_EPS, SDE_LATENT_DIM,
+    patch_seq_len_for_variant, symlog_tensor, ModelVariant, SlowCritic, TradingModel,
+    TradingModelConfig, ACTION_DIM, LATTICE_ALPHA, LATTICE_LEARN_FEATURES, LATTICE_STD_REG,
+    SDE_EPS, SDE_LATENT_DIM,
 };
 
 const LEARNING_RATE: f64 = 1e-4;
@@ -42,18 +41,22 @@ const MAX_DELTA_ALPHA: f64 = 0.2;
 
 // DreamerV3-style slow target for value stabilization
 const SLOW_CRITIC_RATE: f64 = 0.02; // EMA blend rate (half-life ~35 updates)
-const SLOW_CRITIC_REG: f64 = 1.0;   // Regularization weight (matched to DreamerV3)
+const SLOW_CRITIC_REG: f64 = 1.0; // Regularization weight (matched to DreamerV3)
 
 /// DreamerV3-style return normalizer: scales advantages by percentile range of returns
 struct RetNorm {
-    lo: f64,          // 5th percentile (EMA)
-    hi: f64,          // 95th percentile (EMA)
+    lo: f64, // 5th percentile (EMA)
+    hi: f64, // 95th percentile (EMA)
     initialized: bool,
 }
 
 impl RetNorm {
     fn new() -> Self {
-        Self { lo: 0.0, hi: 1.0, initialized: false }
+        Self {
+            lo: 0.0,
+            hi: 1.0,
+            initialized: false,
+        }
     }
 
     fn update(&mut self, returns: &Tensor) {
@@ -163,8 +166,12 @@ fn twohot_log_prob_loss(targets: &Tensor, log_probs: &Tensor, centers: &Tensor) 
             .sum_dim_intlist(-1, false, Kind::Int64);
     let above = above.clamp(0, n_buckets - 1);
 
-    let bin_below = centers.index_select(0, &below.flatten(0, -1)).reshape_as(&targets);
-    let bin_above = centers.index_select(0, &above.flatten(0, -1)).reshape_as(&targets);
+    let bin_below = centers
+        .index_select(0, &below.flatten(0, -1))
+        .reshape_as(&targets);
+    let bin_above = centers
+        .index_select(0, &above.flatten(0, -1))
+        .reshape_as(&targets);
 
     // When below == above (exact bin hit), both distances are 0.
     // clamp_min ensures 0/eps → 0 for both, but we gather the same log_prob
@@ -191,10 +198,17 @@ fn mvn_log_prob(sigma_mat: &Tensor, diff: &Tensor, k: i64) -> (Tensor, Tensor) {
     let jitter = Tensor::eye(k, (Kind::Float, sigma_mat.device())).unsqueeze(0) * SDE_EPS;
     let chol = (sigma_mat + &jitter).linalg_cholesky(false);
     let diff_col = diff.unsqueeze(-1);
-    let y = chol.linalg_solve_triangular(&diff_col, false, true, false).squeeze_dim(-1);
-    let mahal = y.pow_tensor_scalar(2).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-    let log_det = chol.diagonal(0, -2, -1).log()
-        .sum_dim_intlist([-1].as_slice(), false, Kind::Float) * 2.0;
+    let y = chol
+        .linalg_solve_triangular(&diff_col, false, true, false)
+        .squeeze_dim(-1);
+    let mahal = y
+        .pow_tensor_scalar(2)
+        .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+    let log_det =
+        chol.diagonal(0, -2, -1)
+            .log()
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+            * 2.0;
     let log_prob = (&mahal + &log_det + k as f64 * LOG_2PI).g_mul_scalar(-0.5);
     (log_prob, log_det)
 }
@@ -202,10 +216,10 @@ fn mvn_log_prob(sigma_mat: &Tensor, diff: &Tensor, k: i64) -> (Tensor, Tensor) {
 /// Build Lattice covariance matrix [batch, ACTION_DIM, ACTION_DIM]
 /// Σ = α²·W·diag(h²@σ_corr²)·Wᵀ + diag(h²@σ_ind² + reg²)
 fn build_lattice_covariance(
-    sde_latent: &Tensor,   // [batch, SDE_LATENT_DIM]
-    corr_std: &Tensor,     // [SDE_LATENT_DIM, SDE_LATENT_DIM]
-    ind_std: &Tensor,      // [SDE_LATENT_DIM, ACTION_DIM]
-    w_policy: &Tensor,     // [ACTION_DIM, SDE_LATENT_DIM]
+    sde_latent: &Tensor, // [batch, SDE_LATENT_DIM]
+    corr_std: &Tensor,   // [SDE_LATENT_DIM, SDE_LATENT_DIM]
+    ind_std: &Tensor,    // [SDE_LATENT_DIM, ACTION_DIM]
+    w_policy: &Tensor,   // [ACTION_DIM, SDE_LATENT_DIM]
 ) -> Tensor {
     // h² weighting: variance scales with squared latent activations
     let h_sq = sde_latent.pow_tensor_scalar(2);
@@ -216,12 +230,11 @@ fn build_lattice_covariance(
     // σ_corr = α² * W * diag(latent_corr_var) * Wᵀ -- [batch, ACTION_DIM, ACTION_DIM]
     // w_scaled[b,a,d] = W[a,d] * latent_corr_var[b,d]
     let w_scaled = w_policy.unsqueeze(0) * latent_corr_var.unsqueeze(1);
-    let sigma_corr = (LATTICE_ALPHA * LATTICE_ALPHA)
-        * w_scaled.matmul(&w_policy.transpose(0, 1));
+    let sigma_corr = (LATTICE_ALPHA * LATTICE_ALPHA) * w_scaled.matmul(&w_policy.transpose(0, 1));
 
     // latent_ind_var[b,a] = sum_j(h[b,j]² * σ_ind[j,a]²) + reg² -- [batch, ACTION_DIM]
-    let latent_ind_var = h_sq.matmul(&ind_std.pow_tensor_scalar(2))
-        + LATTICE_STD_REG * LATTICE_STD_REG;
+    let latent_ind_var =
+        h_sq.matmul(&ind_std.pow_tensor_scalar(2)) + LATTICE_STD_REG * LATTICE_STD_REG;
 
     &sigma_corr + &Tensor::diag_embed(&latent_ind_var, 0, -2, -1)
 }
@@ -376,7 +389,7 @@ fn compute_action_std_stats(
     })
 }
 
-pub async fn train(weights_path: Option<&str>) {
+pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
@@ -398,14 +411,21 @@ pub async fn train(weights_path: Option<&str>) {
     println!("device is cuda: {}", device.is_cuda());
 
     let mut vs = nn::VarStore::new(device);
-    let trading_model = TradingModel::new(&vs.root());
+    let trading_model = TradingModel::new_with_config(
+        &vs.root(),
+        TradingModelConfig {
+            variant: model_variant,
+            ..TradingModelConfig::default()
+        },
+    );
 
     // RPO alpha via sigmoid: alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
     let mut rpo_rho = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
         let p_init = (RPO_ALPHA_INIT - RPO_ALPHA_MIN) / (RPO_ALPHA_MAX - RPO_ALPHA_MIN);
         let p_init = p_init.clamp(1e-6, 1.0 - 1e-6);
         let rho_init = (p_init / (1.0 - p_init)).ln();
-        vs.root().var("rpo_alpha_rho", &[1], nn::Init::Const(rho_init))
+        vs.root()
+            .var("rpo_alpha_rho", &[1], nn::Init::Const(rho_init))
     } else {
         // RPO disabled - create dummy tensor
         Tensor::zeros(&[1], (Kind::Float, device))
@@ -433,10 +453,12 @@ pub async fn train(weights_path: Option<&str>) {
     let mut slow_critic = SlowCritic::new(&trading_model, SLOW_CRITIC_RATE);
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
-    let mut env = VecEnv::new(true);
+    let mut env = VecEnv::new(true, model_variant);
     if start_episode > 0 {
         env.set_episode(start_episode);
-        env.primary_mut().meta_history.load_from_episode(start_episode);
+        env.primary_mut()
+            .meta_history
+            .load_from_episode(start_episode);
     }
 
     let rollout_steps = SEQ_LEN;
@@ -444,7 +466,7 @@ pub async fn train(weights_path: Option<&str>) {
 
     let pd_dim = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
     let so_dim = STATIC_OBSERVATIONS as i64;
-    let seq_idx_dim = TICKERS_COUNT * PATCH_SEQ_LEN;
+    let seq_idx_dim = TICKERS_COUNT * patch_seq_len_for_variant(model_variant);
 
     let mut s_price_deltas = GpuRollingBuffer::new(memory_size, pd_dim, Kind::Float, device);
     let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, Kind::Float, device);
@@ -454,8 +476,7 @@ pub async fn train(weights_path: Option<&str>) {
     let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level reward
     let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level value
-    let s_action_weights =
-        Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
+    let s_action_weights = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
     let mut retnorm = RetNorm::new();
 
     for episode in start_episode..1000000 {
@@ -467,10 +488,7 @@ pub async fn train(weights_path: Option<&str>) {
         let ring_len = PRICE_DELTAS_PER_TICKER as i64;
         let base_idx = Tensor::arange(ring_len, (Kind::Int64, device));
         let mut ring_pos = ring_len - 1;
-        let mut ring_buf = Tensor::zeros(
-            &[NPROCS, TICKERS_COUNT, ring_len],
-            (Kind::Float, device),
-        );
+        let mut ring_buf = Tensor::zeros(&[NPROCS, TICKERS_COUNT, ring_len], (Kind::Float, device));
         let mut step_deltas = Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         obs_price.copy_(&obs_price_cpu);
         obs_static.copy_(&obs_static_cpu);
@@ -482,13 +500,19 @@ pub async fn train(weights_path: Option<&str>) {
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
 
         for step in 0..rollout_steps as usize {
-            let (values, action_mean, u, actions, action_log_prob) =
-                sample_rollout_actions(&trading_model, &obs_price, &obs_static, &obs_seq_idx, device);
+            let (values, action_mean, u, actions, action_log_prob) = sample_rollout_actions(
+                &trading_model,
+                &obs_price,
+                &obs_static,
+                &obs_seq_idx,
+                device,
+            );
 
             if DEBUG_NUMERICS {
                 let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
                 let _ = debug_tensor_stats("u", &u, episode as i64, step);
-                let _ = debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
+                let _ =
+                    debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
             s_price_deltas.push(&obs_price);
             s_static_obs.push(&obs_static);
@@ -510,17 +534,14 @@ pub async fn train(weights_path: Option<&str>) {
 
             if !reset_indices.is_empty() {
                 let idx = (&base_idx + (ring_pos + 1)).remainder(ring_len);
-                let pd_dim_usize =
-                    (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64) as usize;
+                let pd_dim_usize = (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64) as usize;
                 for (reset_i, env_idx) in reset_indices.iter().enumerate() {
                     let start = reset_i * pd_dim_usize;
                     let end = start + pd_dim_usize;
                     let ordered = Tensor::from_slice(&reset_price_deltas[start..end])
                         .view([TICKERS_COUNT, ring_len])
                         .to_device(device);
-                    let mut ring_env = ring_buf
-                        .narrow(0, *env_idx as i64, 1)
-                        .squeeze_dim(0);
+                    let mut ring_env = ring_buf.narrow(0, *env_idx as i64, 1).squeeze_dim(0);
                     let _ = ring_env.index_copy_(1, &idx, &ordered);
                 }
             }
@@ -537,7 +558,8 @@ pub async fn train(weights_path: Option<&str>) {
 
             // Portfolio-level reward: include cash penalty to avoid trivial cash-hold policy.
             let portfolio_reward =
-                step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float) + &step_cash_reward;
+                step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float)
+                    + &step_cash_reward;
             if DEBUG_NUMERICS {
                 let _ =
                     debug_tensor_stats("portfolio_reward", &portfolio_reward, episode as i64, step);
@@ -549,9 +571,7 @@ pub async fn train(weights_path: Option<&str>) {
                 .copy_(&portfolio_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
             let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
-            let _ = s_action_weights
-                .narrow(0, mem_idx, NPROCS)
-                .copy_(&actions);
+            let _ = s_action_weights.narrow(0, mem_idx, NPROCS).copy_(&actions);
         }
 
         // Bootstrap value from final observation state (raw return space)
@@ -566,8 +586,14 @@ pub async fn train(weights_path: Option<&str>) {
         });
 
         let (advantages, returns) = compute_gae(
-            &s_rewards, &s_values, &s_dones, &bootstrap_value,
-            rollout_steps, 0.99, 0.95, device,
+            &s_rewards,
+            &s_values,
+            &s_dones,
+            &bootstrap_value,
+            rollout_steps,
+            0.99,
+            0.95,
+            device,
         );
 
         // Update value normalizer with computed returns (for next rollout)
@@ -612,7 +638,6 @@ pub async fn train(weights_path: Option<&str>) {
         let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
 
-
         let mut first_epoch_kl = 0.0f64;
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
@@ -641,8 +666,8 @@ pub async fn train(weights_path: Option<&str>) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (_, critic_logits, critic_input, (action_mean, sde_latent)) =
-                    trading_model.forward_with_seq_idx_no_values_on_device(
+                let (_, critic_logits, critic_input, (action_mean, sde_latent)) = trading_model
+                    .forward_with_seq_idx_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
                         Some(&seq_idx_chunk),
@@ -656,36 +681,44 @@ pub async fn train(weights_path: Option<&str>) {
                 let u = act_mb;
 
                 // Conditionally detach latent for covariance
-                let sde_latent_cov = if LATTICE_LEARN_FEATURES { sde_latent.shallow_clone() } else { sde_latent.detach() };
+                let sde_latent_cov = if LATTICE_LEARN_FEATURES {
+                    sde_latent.shallow_clone()
+                } else {
+                    sde_latent.detach()
+                };
                 let (corr_std, ind_std) = trading_model.lattice_stds();
                 let w_policy = trading_model.w_policy();
-                let sigma_mat = build_lattice_covariance(&sde_latent_cov, &corr_std, &ind_std, &w_policy);
+                let sigma_mat =
+                    build_lattice_covariance(&sde_latent_cov, &corr_std, &ind_std, &w_policy);
 
                 // RPO: sigmoid parameterization for smooth gradients
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
                     let alpha_detached = alpha.detach();
-                    let rpo_noise = Tensor::empty(
-                        [chunk_sample_count, ACTION_DIM],
-                        (Kind::Float, device),
-                    )
-                    .uniform_(-1.0, 1.0)
-                        * &alpha_detached;
+                    let rpo_noise =
+                        Tensor::empty([chunk_sample_count, ACTION_DIM], (Kind::Float, device))
+                            .uniform_(-1.0, 1.0)
+                            * &alpha_detached;
                     (alpha, &action_mean + rpo_noise)
                 } else {
-                    (Tensor::zeros(&[1], (Kind::Float, device)), action_mean.shallow_clone())
+                    (
+                        Tensor::zeros(&[1], (Kind::Float, device)),
+                        action_mean.shallow_clone(),
+                    )
                 };
 
                 let diff = &u - &action_mean_perturbed;
-                let (log_prob_gaussian, log_det_sigma) = mvn_log_prob(&sigma_mat, &diff, ACTION_DIM);
-                let log_det_jac = u
-                    .log_softmax(-1, Kind::Float)
-                    .sum_dim_intlist(-1, false, Kind::Float);
+                let (log_prob_gaussian, log_det_sigma) =
+                    mvn_log_prob(&sigma_mat, &diff, ACTION_DIM);
+                let log_det_jac =
+                    u.log_softmax(-1, Kind::Float)
+                        .sum_dim_intlist(-1, false, Kind::Float);
                 let action_log_probs = log_prob_gaussian - log_det_jac;
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
+                    let _ =
+                        debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
                     let _ = debug_tensor_stats("sigma_mat", &sigma_mat, _epoch, chunk_i);
                 }
@@ -715,17 +748,15 @@ pub async fn train(weights_path: Option<&str>) {
                     let _ = debug_tensor_stats("log_probs", &log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
-                let ce_loss = twohot_log_prob_loss(
-                    &ret_mb,
-                    &log_probs,
-                    trading_model.value_centers(),
-                );
+                let ce_loss =
+                    twohot_log_prob_loss(&ret_mb, &log_probs, trading_model.value_centers());
                 // Slow target regularization: pull live critic toward slow EMA copy
                 let slow_reg_loss = {
                     let slow_logits = slow_critic.forward(&critic_input);
                     let slow_probs = slow_logits.softmax(-1, Kind::Float).detach();
                     // CE(live_logits, sg(slow_probs)): -sum(slow_probs * log_probs)
-                    -(&slow_probs * &log_probs).sum_dim_intlist(-1, false, Kind::Float)
+                    -(&slow_probs * &log_probs)
+                        .sum_dim_intlist(-1, false, Kind::Float)
                         .mean(Kind::Float)
                 };
                 let critic_entropy = -(log_probs.exp() * &log_probs)
@@ -736,7 +767,8 @@ pub async fn train(weights_path: Option<&str>) {
 
                 // MVN entropy: 0.5 * (k*(1+ln(2pi)) + ln|Sigma|), reuses Cholesky from log_prob
                 let dist_entropy = (ACTION_DIM as f64 * (1.0 + LOG_2PI) + &log_det_sigma)
-                    .g_mul_scalar(0.5).mean(Kind::Float);
+                    .g_mul_scalar(0.5)
+                    .mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
@@ -748,14 +780,14 @@ pub async fn train(weights_path: Option<&str>) {
                     let action_var = sigma_mat.diagonal(0, -2, -1).detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
                     let d = ACTION_DIM as f64;
-                    let induced_kl =
-                        rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
+                    let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                     (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
                 } else {
                     Tensor::zeros([], (Kind::Float, device))
                 };
 
-                let total_chunk_loss = (ppo_loss.shallow_clone() + alpha_loss) / GRAD_ACCUM_STEPS as f64;
+                let total_chunk_loss =
+                    (ppo_loss.shallow_clone() + alpha_loss) / GRAD_ACCUM_STEPS as f64;
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
@@ -768,12 +800,13 @@ pub async fn train(weights_path: Option<&str>) {
                     let _ = debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
                 }
                 let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
-                let _ =
-                    total_policy_loss_weighted.g_add_(&(&action_loss.detach() * chunk_sample_count as f64));
-                let _ =
-                    total_value_loss_weighted.g_add_(&(&value_loss.detach() * chunk_sample_count as f64));
+                let _ = total_policy_loss_weighted
+                    .g_add_(&(&action_loss.detach() * chunk_sample_count as f64));
+                let _ = total_value_loss_weighted
+                    .g_add_(&(&value_loss.detach() * chunk_sample_count as f64));
                 let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
-                let _ = total_entropy_weighted.g_add_(&(&dist_entropy_detached * chunk_sample_count as f64));
+                let _ = total_entropy_weighted
+                    .g_add_(&(&dist_entropy_detached * chunk_sample_count as f64));
                 entropy_min = entropy_min.min_other(&dist_entropy_detached);
                 entropy_max = entropy_max.max_other(&dist_entropy_detached);
                 epoch_kl_count += chunk_sample_count;
@@ -816,11 +849,13 @@ pub async fn train(weights_path: Option<&str>) {
                     opt.clip_grad_norm(MAX_GRAD_NORM);
 
                     if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                        let max_delta_rho = MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
+                        let max_delta_rho =
+                            MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
                         tch::no_grad(|| {
                             let rho_before = rpo_rho.detach();
                             opt.step();
-                            let rho_new = &rho_before + (&rpo_rho - &rho_before).clamp(-max_delta_rho, max_delta_rho);
+                            let rho_new = &rho_before
+                                + (&rpo_rho - &rho_before).clamp(-max_delta_rho, max_delta_rho);
                             let _ = rpo_rho.copy_(&rho_new);
                         });
                     } else {
@@ -904,8 +939,12 @@ pub async fn train(weights_path: Option<&str>) {
 
         let explained_var_t = if total_sample_count > 0 {
             compute_explained_variance(
-                &trading_model, &price_deltas_batch, &static_obs_batch,
-                &seq_idx_batch, &returns, rollout_steps,
+                &trading_model,
+                &price_deltas_batch,
+                &static_obs_batch,
+                &seq_idx_batch,
+                &returns,
+                rollout_steps,
             )
         } else {
             Tensor::zeros([], (Kind::Float, device))
@@ -918,7 +957,12 @@ pub async fn train(weights_path: Option<&str>) {
         };
 
         let log_std_stats = compute_action_std_stats(
-            &trading_model, &s_price_deltas, &s_static_obs, &s_seq_idx, &rpo_rho, device,
+            &trading_model,
+            &s_price_deltas,
+            &s_static_obs,
+            &s_seq_idx,
+            &rpo_rho,
+            device,
         );
 
         // Single GPU->CPU transfer for all scalars
@@ -947,8 +991,11 @@ pub async fn train(weights_path: Option<&str>) {
         let (adv_mean, adv_min, adv_max) =
             (all_scalars_vec[5], all_scalars_vec[6], all_scalars_vec[7]);
         let log_std_stats_vec = &all_scalars_vec[8..12];
-        let (entropy_mean, entropy_min_val, entropy_max_val) =
-            (all_scalars_vec[12], all_scalars_vec[13], all_scalars_vec[14]);
+        let (entropy_mean, entropy_min_val, entropy_max_val) = (
+            all_scalars_vec[12],
+            all_scalars_vec[13],
+            all_scalars_vec[14],
+        );
 
         let primary = env.primary_mut();
         primary
@@ -966,7 +1013,9 @@ pub async fn train(weights_path: Option<&str>) {
         primary.meta_history.record_value_loss(mean_value_loss);
         primary.meta_history.record_explained_var(explained_var);
         primary.meta_history.record_grad_norm(mean_grad_norm);
-        primary.meta_history.record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
+        primary
+            .meta_history
+            .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
         primary.meta_history.record_approx_kl(first_epoch_kl);
 
         println!(

@@ -1,14 +1,17 @@
-use tch::{Device, Kind, Tensor};
-use std::path::Path;
-use std::time::Instant;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
+use tch::{Device, Kind, Tensor};
 
 use ibapi::{
     accounts::{types::AccountGroup, AccountSummaryResult, AccountSummaryTags, PositionUpdate},
     contracts::Contract,
-    market_data::{realtime::{BarSize, WhatToShow}, TradingHours},
+    market_data::{
+        realtime::{BarSize, WhatToShow},
+        TradingHours,
+    },
     Client,
 };
 
@@ -18,6 +21,7 @@ use crate::torch::constants::{
     PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::infer::{load_model, sample_actions};
+use crate::torch::model::ModelVariant;
 use crate::types::Account;
 
 const MAX_ACCOUNT_VALUE: Option<f64> = Some(10_000.0);
@@ -84,7 +88,9 @@ impl LiveMarketState {
 
     fn update_account_total(&mut self) {
         let current_prices = self.get_current_prices();
-        let position_values: f64 = self.account.positions
+        let position_values: f64 = self
+            .account
+            .positions
             .iter()
             .enumerate()
             .map(|(i, p)| p.value_with_price(current_prices[i]))
@@ -93,7 +99,11 @@ impl LiveMarketState {
     }
 
     fn build_observation(&self) -> Option<(Tensor, Tensor)> {
-        if self.price_deltas.iter().any(|d| d.len() < PRICE_DELTAS_PER_TICKER) {
+        if self
+            .price_deltas
+            .iter()
+            .any(|d| d.len() < PRICE_DELTAS_PER_TICKER)
+        {
             return None;
         }
 
@@ -139,8 +149,8 @@ impl LiveMarketState {
 
             // Momentum (20-step lookback)
             let momentum = if self.prices[ticker_idx].len() >= 20 {
-                let past_price = self.prices[ticker_idx]
-                    [self.prices[ticker_idx].len().saturating_sub(20)];
+                let past_price =
+                    self.prices[ticker_idx][self.prices[ticker_idx].len().saturating_sub(20)];
                 (current_price / past_price - 1.0) as f32
             } else {
                 0.0f32
@@ -156,7 +166,9 @@ impl LiveMarketState {
 
             // Position age (normalized: 0 = no position, higher = longer held)
             let position_age = match self.position_open_step[ticker_idx] {
-                Some(open_step) => (self.step_count.saturating_sub(open_step) as f64 / 500.0).min(1.0),
+                Some(open_step) => {
+                    (self.step_count.saturating_sub(open_step) as f64 / 500.0).min(1.0)
+                }
                 None => 0.0,
             };
             static_obs.push(position_age as f32);
@@ -196,17 +208,17 @@ fn sync_account_from_ibkr(
     symbols: &[String],
     account: &mut Account,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let account_subscription = client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
+    let account_subscription =
+        client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
 
     for update in &account_subscription {
         match update {
             AccountSummaryResult::Summary(summary) => {
                 if summary.tag == "TotalCashValue" {
-                    account.cash = summary.value.parse::<f64>()
-                        .unwrap_or_else(|_| {
-                            println!("Warning: Could not parse cash value");
-                            account.cash
-                        });
+                    account.cash = summary.value.parse::<f64>().unwrap_or_else(|_| {
+                        println!("Warning: Could not parse cash value");
+                        account.cash
+                    });
 
                     if let Some(max_value) = MAX_ACCOUNT_VALUE {
                         account.cash = account.cash.min(max_value);
@@ -235,7 +247,10 @@ fn sync_account_from_ibkr(
     for position in &positions_subscription {
         match position {
             PositionUpdate::Position(pos) => {
-                if let Some(ticker_idx) = symbols.iter().position(|s| s == pos.contract.symbol.as_str()) {
+                if let Some(ticker_idx) = symbols
+                    .iter()
+                    .position(|s| s == pos.contract.symbol.as_str())
+                {
                     account.positions[ticker_idx].quantity = pos.position;
                     account.positions[ticker_idx].avg_price = pos.average_cost;
                 }
@@ -256,6 +271,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     update_interval_secs: u64,
     max_steps: usize,
     _temperature: f64,
+    model_variant: ModelVariant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== IBKR Paper Trading ===");
     println!("Weight path: {:?}", weight_path.as_ref());
@@ -266,22 +282,28 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     let client = Client::connect(api::CONNECTION_URL, 100)?;
     println!("Connected to IBKR");
 
-    let account_subscription = client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
+    let account_subscription =
+        client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
 
     let mut starting_cash = 0.0;
     for update in &account_subscription {
         match update {
             AccountSummaryResult::Summary(summary) => {
                 if summary.tag == "TotalCashValue" {
-                    starting_cash = summary.value.parse::<f64>()
-                        .unwrap_or_else(|_| {
-                            println!("Warning: Could not parse cash value '{}', using 0.0", summary.value);
-                            0.0
-                        });
+                    starting_cash = summary.value.parse::<f64>().unwrap_or_else(|_| {
+                        println!(
+                            "Warning: Could not parse cash value '{}', using 0.0",
+                            summary.value
+                        );
+                        0.0
+                    });
 
                     if let Some(max_value) = MAX_ACCOUNT_VALUE {
                         starting_cash = starting_cash.min(max_value);
-                        println!("Account cash: ${:.2} (limited to ${:.2})", starting_cash, max_value);
+                        println!(
+                            "Account cash: ${:.2} (limited to ${:.2})",
+                            starting_cash, max_value
+                        );
                     } else {
                         println!("Account cash: ${:.2}", starting_cash);
                     }
@@ -304,11 +326,14 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     drop(account_subscription);
 
     let device = Device::cuda_if_available();
-    let (_vs, model) = load_model(weight_path, device)?;
+    let (_vs, model) = load_model(weight_path, device, model_variant)?;
     let mut stream_state = model.init_stream_state();
 
     let ticker_count = symbols.len();
-    let state = Arc::new(Mutex::new(LiveMarketState::new(ticker_count, starting_cash)));
+    let state = Arc::new(Mutex::new(LiveMarketState::new(
+        ticker_count,
+        starting_cash,
+    )));
 
     let client_arc = Arc::new(client);
 
@@ -340,7 +365,9 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
         });
     }
 
-    thread::sleep(std::time::Duration::from_secs(PRICE_DELTAS_PER_TICKER as u64 / 12 + 10));
+    thread::sleep(std::time::Duration::from_secs(
+        PRICE_DELTAS_PER_TICKER as u64 / 12 + 10,
+    ));
 
     let mut step = 0;
     let start_time = Instant::now();
@@ -390,8 +417,8 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 &corr_std,
                 &ind_std,
                 &w_policy,
-                true,  // deterministic
-                0.0,   // temperature
+                true, // deterministic
+                0.0,  // temperature
             );
 
             let actions_vec = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
@@ -418,9 +445,16 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 print_status(step, &state_guard, &start_time);
             }
         } else {
-            println!("Waiting for sufficient price data... ({}/{})",
-                state_guard.price_deltas.iter().map(|d| d.len()).min().unwrap_or(0),
-                PRICE_DELTAS_PER_TICKER);
+            println!(
+                "Waiting for sufficient price data... ({}/{})",
+                state_guard
+                    .price_deltas
+                    .iter()
+                    .map(|d| d.len())
+                    .min()
+                    .unwrap_or(0),
+                PRICE_DELTAS_PER_TICKER
+            );
         }
     }
 
@@ -428,10 +462,15 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     println!("\n=== Final Summary ===");
     println!("Total steps: {}", final_state.step_count);
     println!("Starting cash: ${:.2}", starting_cash);
-    println!("Final total assets: ${:.2}", final_state.account.total_assets);
-    println!("Total P&L: ${:.2} ({:.2}%)",
+    println!(
+        "Final total assets: ${:.2}",
+        final_state.account.total_assets
+    );
+    println!(
+        "Total P&L: ${:.2} ({:.2}%)",
         final_state.account.total_assets - starting_cash,
-        (final_state.account.total_assets / starting_cash - 1.0) * 100.0);
+        (final_state.account.total_assets / starting_cash - 1.0) * 100.0
+    );
 
     Ok(())
 }
@@ -450,7 +489,7 @@ fn execute_trades(
 
         let _current_price = current_prices[ticker_idx];
         let _position = &account.positions[ticker_idx];
-        
+
         // Needs to implement new trade fn logic from step.rs
 
         // if action > 0.0 {
@@ -533,8 +572,10 @@ fn print_status(step: usize, state: &LiveMarketState, start_time: &Instant) {
         if position.quantity > 0.0 {
             let value = position.value_with_price(current_prices[i]);
             let pnl_pct = position.appreciation(current_prices[i]) * 100.0;
-            println!("Position {}: {:.2} shares @ ${:.2} (value: ${:.2}, P&L: {:.2}%)",
-                i, position.quantity, current_prices[i], value, pnl_pct);
+            println!(
+                "Position {}: {:.2} shares @ ${:.2} (value: ${:.2}, P&L: {:.2}%)",
+                i, position.quantity, current_prices[i], value, pnl_pct
+            );
         }
     }
 }

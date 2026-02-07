@@ -7,7 +7,10 @@ use crate::{
     charts::{assets_chart, buy_sell_chart, simple_chart},
     constants::{files::TRAINING_PATH, rsi, TICKERS},
     types::{Account, MakeCharts, MappedHistorical, Position},
-    utils::{convert_historical, create_folder_if_not_exists, ema, get_rsi_values, is_min_transaction, percent_diff, round_to_stock_fractional},
+    utils::{
+        convert_historical, create_folder_if_not_exists, ema, get_rsi_values, is_min_transaction,
+        percent_diff, round_to_stock_fractional,
+    },
 };
 
 /// Returns: total assets
@@ -390,7 +393,7 @@ pub fn can_try_buy(
     _last_buy_price: &HashMap<usize, f64>,
     _last_sell_price: &HashMap<usize, f64>,
 ) -> bool {
-/*     if percent_diff(price, local_minimum) <= agent.weights.map[Weight::ReboundBuyPriceThreshold] {
+    /*     if percent_diff(price, local_minimum) <= agent.weights.map[Weight::ReboundBuyPriceThreshold] {
         return false;
     }
 
@@ -584,11 +587,11 @@ pub fn get_buy_price_quantity(
 
     // let buy_want = max_buy_for_rsi(rsi, assets, available_cash, weight).min(available_cash);
     let distance = percent_diff(local_maximum, price);
-    let distance_weight = distance / agent.weights.map[Weight::BuyDistanceWeightAmount]; 
+    let distance_weight = distance / agent.weights.map[Weight::BuyDistanceWeightAmount];
 
     let percent = agent.weights.map[Weight::BuyPercent] * distance_weight;
     let available =
-        (cash).min((((assets / TICKERS.len() as f64)) - position.value_with_price(price)) * percent);
+        (cash).min(((assets / TICKERS.len() as f64) - position.value_with_price(price)) * percent);
     // println!("available {available}");
     // panic!();
 

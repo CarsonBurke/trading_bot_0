@@ -26,8 +26,10 @@ pub mod constants {
     // Earnings (6): steps_to_next, revenue_growth, opex_growth, net_profit_growth, eps, eps_surprise
     pub const PER_TICKER_EARNINGS_OBS: usize = 6;
     pub const PER_TICKER_STATIC_OBS: usize = 19 + PER_TICKER_EARNINGS_OBS;
-    pub const STATIC_OBSERVATIONS: usize = GLOBAL_STATIC_OBS + (TICKERS_COUNT * PER_TICKER_STATIC_OBS);
-    pub const OBSERVATION_SPACE: usize = (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
+    pub const STATIC_OBSERVATIONS: usize =
+        GLOBAL_STATIC_OBS + (TICKERS_COUNT * PER_TICKER_STATIC_OBS);
+    pub const OBSERVATION_SPACE: usize =
+        (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
 
     pub const STEPS_PER_EPISODE: usize = 4_000;
     pub const ACTION_THRESHOLD: f64 = 0.001;
@@ -35,5 +37,5 @@ pub mod constants {
     pub const RETROACTIVE_BUY_REWARD: bool = false;
 }
 
-pub mod theme;
 pub mod report;
+pub mod theme;

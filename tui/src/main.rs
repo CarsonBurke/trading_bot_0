@@ -66,6 +66,7 @@ pub struct App {
     pub ticker_input: String,
     pub episodes_input: String,
     pub weights_path: Option<String>,
+    pub training_model_size: String,
     pub latest_meta_charts: Vec<PathBuf>,
     last_refresh: Instant,
     pub generation_browser: GenerationBrowserState,
@@ -123,6 +124,7 @@ impl App {
             ticker_input: String::new(),
             episodes_input: String::new(),
             weights_path: None,
+            training_model_size: "base".to_string(),
             latest_meta_charts: Vec::new(),
             last_refresh: Instant::now(),
             generation_browser,
@@ -164,7 +166,7 @@ impl App {
             "value_loss",
             "policy_loss",
             "policy_entropy",
-            "approx_kl"
+            "approx_kl",
         ];
 
         // Ticker-specific chart base names
@@ -305,7 +307,16 @@ impl App {
                 format!("{}/{}", WEIGHTS_PATH, w)
             }
         });
-        self.process_manager.start_training(weights)
+        self.process_manager
+            .start_training(weights, &self.training_model_size)
+    }
+
+    fn toggle_training_model_size(&mut self) {
+        self.training_model_size = if self.training_model_size == "base" {
+            "ablation-small".to_string()
+        } else {
+            "base".to_string()
+        };
     }
 
     fn start_inference(
@@ -691,6 +702,11 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                                 for_training: true,
                                                 for_inference: false,
                                             };
+                                        }
+                                    }
+                                    KeyCode::Char('p') => {
+                                        if !app.is_training_running() {
+                                            app.toggle_training_model_size();
                                         }
                                     }
                                     KeyCode::Char('f') => {

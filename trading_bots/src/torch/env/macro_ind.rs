@@ -1,15 +1,19 @@
-use std::sync::{Arc, OnceLock};
+use crate::data::macro_econ::{get_macro_data, MacroObservation, MacroSeries};
+use serde::{Deserialize, Serialize};
 use std::fs;
-use serde::{Serialize, Deserialize};
-use crate::data::macro_econ::{MacroSeries, get_macro_data, MacroObservation};
+use std::sync::{Arc, OnceLock};
 
 /// Convert YYYY-MM-DD to sortable integer (approximate day number)
 #[inline]
 fn date_to_int(date: &str) -> i32 {
     let b = date.as_bytes();
-    if b.len() < 10 { return 0; }
-    let y = (b[0] - b'0') as i32 * 1000 + (b[1] - b'0') as i32 * 100
-          + (b[2] - b'0') as i32 * 10 + (b[3] - b'0') as i32;
+    if b.len() < 10 {
+        return 0;
+    }
+    let y = (b[0] - b'0') as i32 * 1000
+        + (b[1] - b'0') as i32 * 100
+        + (b[2] - b'0') as i32 * 10
+        + (b[3] - b'0') as i32;
     let m = (b[5] - b'0') as i32 * 10 + (b[6] - b'0') as i32;
     let d = (b[8] - b'0') as i32 * 10 + (b[9] - b'0') as i32;
     y * 365 + m * 30 + d
@@ -62,28 +66,36 @@ impl MacroIndicators {
 
     /// Get cached or compute macro indicators
     pub fn get_or_compute(bar_dates: &[String]) -> Arc<MacroIndicators> {
-        MACRO_CACHE.get_or_init(|| {
-            // Try disk cache first
-            if let Ok(bytes) = fs::read(MACRO_CACHE_PATH) {
-                if let Ok(cached) = postcard::from_bytes::<MacroIndicators>(&bytes) {
-                    if cached.gdp_growth.len() == bar_dates.len() {
-                        eprintln!("Loaded macro indicators from cache ({} dates)", bar_dates.len());
-                        return Arc::new(cached);
+        MACRO_CACHE
+            .get_or_init(|| {
+                // Try disk cache first
+                if let Ok(bytes) = fs::read(MACRO_CACHE_PATH) {
+                    if let Ok(cached) = postcard::from_bytes::<MacroIndicators>(&bytes) {
+                        if cached.gdp_growth.len() == bar_dates.len() {
+                            eprintln!(
+                                "Loaded macro indicators from cache ({} dates)",
+                                bar_dates.len()
+                            );
+                            return Arc::new(cached);
+                        }
                     }
                 }
-            }
 
-            eprintln!("Computing macro indicators for {} dates...", bar_dates.len());
-            let result = Self::compute_inner(bar_dates);
+                eprintln!(
+                    "Computing macro indicators for {} dates...",
+                    bar_dates.len()
+                );
+                let result = Self::compute_inner(bar_dates);
 
-            // Save to disk cache
-            if let Ok(bytes) = postcard::to_allocvec(&result) {
-                let _ = fs::write(MACRO_CACHE_PATH, bytes);
-                eprintln!("Saved macro indicators to cache");
-            }
+                // Save to disk cache
+                if let Ok(bytes) = postcard::to_allocvec(&result) {
+                    let _ = fs::write(MACRO_CACHE_PATH, bytes);
+                    eprintln!("Saved macro indicators to cache");
+                }
 
-            Arc::new(result)
-        }).clone()
+                Arc::new(result)
+            })
+            .clone()
     }
 
     fn compute_inner(bar_dates: &[String]) -> Self {
@@ -104,7 +116,8 @@ impl MacroIndicators {
         let fed_obs = obs_to_ints(&get_macro_data(MacroSeries::FedFundsRate).observations);
         let t10y_obs = obs_to_ints(&get_macro_data(MacroSeries::Treasury10Y).observations);
         let t2y_obs = obs_to_ints(&get_macro_data(MacroSeries::Treasury2Y).observations);
-        let sentiment_obs = obs_to_ints(&get_macro_data(MacroSeries::ConsumerSentiment).observations);
+        let sentiment_obs =
+            obs_to_ints(&get_macro_data(MacroSeries::ConsumerSentiment).observations);
         let claims_obs = obs_to_ints(&get_macro_data(MacroSeries::InitialClaims).observations);
 
         let mut result = Self::empty(n);
@@ -139,14 +152,19 @@ impl MacroIndicators {
             let cpi_current = advance_and_get(&cpi_obs, &mut cpi_idx, bar_int - 15);
             let cpi_prev = advance_and_get(&cpi_obs, &mut cpi_yoy_idx, bar_int - 15 - 365);
             result.cpi_yoy[i] = match (cpi_current, cpi_prev) {
-                (Some(c), Some(p)) if p.abs() > 0.001 => (((c / p - 1.0) * 100.0 - 2.0) / 5.0).clamp(-1.0, 1.0),
+                (Some(c), Some(p)) if p.abs() > 0.001 => {
+                    (((c / p - 1.0) * 100.0 - 2.0) / 5.0).clamp(-1.0, 1.0)
+                }
                 _ => 0.0,
             };
 
             let core_current = advance_and_get(&core_cpi_obs, &mut core_cpi_idx, bar_int - 15);
-            let core_prev = advance_and_get(&core_cpi_obs, &mut core_cpi_yoy_idx, bar_int - 15 - 365);
+            let core_prev =
+                advance_and_get(&core_cpi_obs, &mut core_cpi_yoy_idx, bar_int - 15 - 365);
             result.core_cpi_yoy[i] = match (core_current, core_prev) {
-                (Some(c), Some(p)) if p.abs() > 0.001 => (((c / p - 1.0) * 100.0 - 2.0) / 5.0).clamp(-1.0, 1.0),
+                (Some(c), Some(p)) if p.abs() > 0.001 => {
+                    (((c / p - 1.0) * 100.0 - 2.0) / 5.0).clamp(-1.0, 1.0)
+                }
                 _ => 0.0,
             };
 
@@ -166,9 +184,10 @@ impl MacroIndicators {
                 _ => 0.0,
             };
 
-            result.consumer_sentiment[i] = advance_and_get(&sentiment_obs, &mut sentiment_idx, bar_int - 15)
-                .map(|v| ((v - 90.0) / 30.0).clamp(-1.0, 1.0))
-                .unwrap_or(0.0);
+            result.consumer_sentiment[i] =
+                advance_and_get(&sentiment_obs, &mut sentiment_idx, bar_int - 15)
+                    .map(|v| ((v - 90.0) / 30.0).clamp(-1.0, 1.0))
+                    .unwrap_or(0.0);
 
             result.initial_claims[i] = advance_and_get(&claims_obs, &mut claims_idx, bar_int - 5)
                 .map(|v| ((v - 250.0) / 200.0).clamp(-1.0, 1.0))

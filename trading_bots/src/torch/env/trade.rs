@@ -4,11 +4,7 @@ use super::env::{Env, TRADE_EMA_ALPHA};
 
 impl Env {
     #[allow(dead_code)]
-    pub fn trade_by_delta_percent(
-        &mut self,
-        actions: &[f64],
-        absolute_step: usize,
-    ) -> f64 {
+    pub fn trade_by_delta_percent(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let mut total_commission = 0.0;
 
         // === PASS 1: Execute all SELLS first (frees up cash) ===
@@ -115,11 +111,7 @@ impl Env {
     const WEIGHT_DELTA_MIN_TRADE_FRAC: f64 = 0.005;
 
     #[allow(dead_code)]
-    pub fn trade_by_weight_delta(
-        &mut self,
-        actions: &[f64],
-        absolute_step: usize,
-    ) -> f64 {
+    pub fn trade_by_weight_delta(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let n_tickers = self.tickers.len();
         let min_trade_frac = Self::WEIGHT_DELTA_MIN_TRADE_FRAC;
 
@@ -198,9 +190,8 @@ impl Env {
 
         // 4. Execute sells first (frees up cash)
         for intent in sell_intents {
-            let sell_value = (-intent.delta_value).min(
-                self.account.positions[intent.ticker_index].value_with_price(intent.price),
-            );
+            let sell_value = (-intent.delta_value)
+                .min(self.account.positions[intent.ticker_index].value_with_price(intent.price));
             if sell_value <= 0.0 {
                 continue;
             }
@@ -263,11 +254,7 @@ impl Env {
         total_commission
     }
 
-    pub fn trade_by_target_weights(
-        &mut self,
-        actions: &[f64],
-        absolute_step: usize,
-    ) -> f64 {
+    pub fn trade_by_target_weights(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let n_tickers = self.tickers.len();
 
         let mut total_commission = 0.0;
@@ -313,17 +300,24 @@ impl Env {
             }
 
             if delta_value < 0.0 {
-                sell_intents.push(TradeIntent { ticker_index, price, delta_value });
+                sell_intents.push(TradeIntent {
+                    ticker_index,
+                    price,
+                    delta_value,
+                });
             } else {
-                buy_intents.push(TradeIntent { ticker_index, price, delta_value });
+                buy_intents.push(TradeIntent {
+                    ticker_index,
+                    price,
+                    delta_value,
+                });
             }
         }
 
         // 3. Execute sells first
         for intent in sell_intents {
-            let sell_value = (-intent.delta_value).min(
-                self.account.positions[intent.ticker_index].value_with_price(intent.price),
-            );
+            let sell_value = (-intent.delta_value)
+                .min(self.account.positions[intent.ticker_index].value_with_price(intent.price));
             if sell_value <= 0.0 {
                 continue;
             }
