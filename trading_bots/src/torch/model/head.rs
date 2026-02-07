@@ -1,7 +1,7 @@
 use tch::{Kind, Tensor};
 
 use super::{
-    DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM,
+    DebugMetrics, ModelOutput, TradingModel, ATTN_LOGIT_CAP, FF_DIM, MODEL_DIM,
     RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS,
 };
 use crate::torch::constants::TICKERS_COUNT;
@@ -35,11 +35,12 @@ impl TradingModel {
             .ticker_ln
             .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, MODEL_DIM]))
             .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let q = x_ticker_norm.apply(&block.ticker_q);
-        let k = x_ticker_norm.apply(&block.ticker_k);
+        let q = block.q_norm.forward(&x_ticker_norm.apply(&block.ticker_q));
+        let k = block.k_norm.forward(&x_ticker_norm.apply(&block.ticker_k));
         let v = x_ticker_norm.apply(&block.ticker_v);
         let kind = q.kind();
         let scores = q.matmul(&k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
+        let scores = ATTN_LOGIT_CAP * (scores / ATTN_LOGIT_CAP).tanh();
         let attn = scores.softmax(-1, Kind::Float).to_kind(kind);
         let ticker_ctx = attn
             .matmul(&v)

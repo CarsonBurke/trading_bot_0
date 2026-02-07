@@ -25,6 +25,8 @@ struct InterTickerBlock {
     ticker_k: nn::Linear,
     ticker_v: nn::Linear,
     ticker_out: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
     mlp_ln: RMSNorm,
@@ -39,6 +41,8 @@ impl InterTickerBlock {
         let ticker_k = nn::linear(p / "ticker_k", MODEL_DIM, MODEL_DIM, Default::default());
         let ticker_v = nn::linear(p / "ticker_v", MODEL_DIM, MODEL_DIM, Default::default());
         let ticker_out = nn::linear(p / "ticker_out", MODEL_DIM, MODEL_DIM, Default::default());
+        let q_norm = RMSNorm::new(&(p / "ticker_q_norm"), MODEL_DIM, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "ticker_k_norm"), MODEL_DIM, 1e-6);
         let mlp_fc1 = nn::linear(p / "mlp_fc1", MODEL_DIM, 2 * FF_DIM, Default::default());
         let mlp_fc2 = nn::linear(p / "mlp_fc2", FF_DIM, MODEL_DIM, Default::default());
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), MODEL_DIM, 1e-6);
@@ -51,6 +55,8 @@ impl InterTickerBlock {
             ticker_k,
             ticker_v,
             ticker_out,
+            q_norm,
+            k_norm,
             mlp_fc1,
             mlp_fc2,
             mlp_ln,
@@ -61,6 +67,7 @@ impl InterTickerBlock {
 }
 
 const EXO_CROSS_AFTER: &[usize] = &[0];
+const ATTN_LOGIT_CAP: f64 = 30.0;
 
 struct ExoCrossBlock {
     cross_ln: RMSNorm,
@@ -68,6 +75,8 @@ struct ExoCrossBlock {
     cross_k: nn::Linear,
     cross_v: nn::Linear,
     cross_out: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     alpha_cross: Tensor,
 }
 
@@ -78,9 +87,11 @@ impl ExoCrossBlock {
         let cross_k = nn::linear(p / "cross_k", MODEL_DIM, CROSS_NUM_KV_HEADS * CROSS_HEAD_DIM, Default::default());
         let cross_v = nn::linear(p / "cross_v", MODEL_DIM, CROSS_NUM_KV_HEADS * CROSS_HEAD_DIM, Default::default());
         let cross_out = nn::linear(p / "cross_out", MODEL_DIM, MODEL_DIM, Default::default());
+        let q_norm = RMSNorm::new(&(p / "cross_q_norm"), CROSS_HEAD_DIM, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "cross_k_norm"), CROSS_HEAD_DIM, 1e-6);
         let alpha_cross = p.var("alpha_cross", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
-            cross_ln, cross_q, cross_k, cross_v, cross_out, alpha_cross,
+            cross_ln, cross_q, cross_k, cross_v, cross_out, q_norm, k_norm, alpha_cross,
         }
     }
 
@@ -100,6 +111,10 @@ impl ExoCrossBlock {
         let k = k.reshape([b, t, CROSS_NUM_KV_HEADS, CROSS_HEAD_DIM]).permute([0, 2, 1, 3]);
         let v = v.reshape([b, t, CROSS_NUM_KV_HEADS, CROSS_HEAD_DIM]).permute([0, 2, 1, 3]);
 
+        // QKNorm: apply RMSNorm per-head on head_dim (last dimension)
+        let q = self.q_norm.forward(&q);
+        let k = self.k_norm.forward(&k);
+
         let heads_per_group = CROSS_NUM_Q_HEADS / CROSS_NUM_KV_HEADS;
         let k = k.unsqueeze(2)
             .expand([b, CROSS_NUM_KV_HEADS, heads_per_group, t, CROSS_HEAD_DIM], false)
@@ -110,6 +125,7 @@ impl ExoCrossBlock {
 
         let scale = (CROSS_HEAD_DIM as f64).sqrt();
         let scores = q.matmul(&k.transpose(-2, -1)) / scale;
+        let scores = ATTN_LOGIT_CAP * (scores / ATTN_LOGIT_CAP).tanh();
         let attn = scores.softmax(-1, Kind::Float).to_kind(q.kind());
         let out = attn.matmul(&v);
 
@@ -134,7 +150,7 @@ const SSM_DIM: i64 = 128;
 const MODEL_DIM: i64 = 128;
 const SSM_NHEADS: i64 = 2;
 const SSM_HEADDIM: i64 = 64;
-const SSM_DSTATE: i64 = 128;
+const SSM_DSTATE: i64 = 64;
 pub(crate) const SDE_LATENT_DIM: i64 = 128;
 pub(crate) const SDE_EPS: f64 = 1e-6;
 pub(crate) const LATTICE_ALPHA: f64 = 1.0;
@@ -325,7 +341,7 @@ pub struct TradingModelConfig {
 
 impl Default for TradingModelConfig {
     fn default() -> Self {
-        Self { ssm_layers: 2 }
+        Self { ssm_layers: 4 }
     }
 }
 
