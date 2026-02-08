@@ -652,6 +652,9 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             chunk_order.shuffle(&mut rand::rng());
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
+            let total_epoch_samples = rollout_steps * NPROCS;
+            let samples_per_accum =
+                (CHUNK_SIZE * NPROCS * GRAD_ACCUM_STEPS as i64).min(total_epoch_samples);
 
             for (chunk_i, &chunk_idx) in chunk_order.iter().enumerate() {
                 let chunk_start_step = chunk_idx as i64 * CHUNK_SIZE;
@@ -786,8 +789,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     Tensor::zeros([], (Kind::Float, device))
                 };
 
+                let scaled_ppo_loss =
+                    &ppo_loss * (chunk_sample_count as f64 / samples_per_accum as f64);
                 let total_chunk_loss =
-                    (ppo_loss.shallow_clone() + alpha_loss) / GRAD_ACCUM_STEPS as f64;
+                    (scaled_ppo_loss + alpha_loss) / GRAD_ACCUM_STEPS as f64;
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
