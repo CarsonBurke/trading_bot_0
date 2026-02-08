@@ -404,19 +404,16 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 &step_obs_gpu
             };
 
-            let (action_mean, sde_latent, corr_std, ind_std, w_policy) = tch::no_grad(|| {
+            let (action_mean, sde_latent, sde_std) = tch::no_grad(|| {
                 let (_, _, _, (action_mean, sde_latent)) =
                     model.step_on_device(price_deltas_gpu, &static_obs_gpu, &mut stream_state);
-                let (corr_std, ind_std) = model.lattice_stds();
-                let w_policy = model.w_policy();
-                (action_mean, sde_latent, corr_std, ind_std, w_policy)
+                let sde_std = model.sde_std();
+                (action_mean, sde_latent, sde_std)
             });
             let actions = sample_actions(
                 &action_mean,
                 &sde_latent,
-                &corr_std,
-                &ind_std,
-                &w_policy,
+                &sde_std,
                 true, // deterministic
                 0.0,  // temperature
             );

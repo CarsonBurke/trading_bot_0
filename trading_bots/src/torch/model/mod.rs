@@ -197,12 +197,8 @@ const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_SSM_LAYERS: usize = 1;
 pub(crate) const SDE_LATENT_DIM: i64 = 128;
-pub(crate) const SDE_EPS: f64 = 1e-6;
-pub(crate) const LATTICE_ALPHA: f64 = 1.0;
-pub(crate) const LATTICE_STD_REG: f64 = 0.01;
-pub(crate) const LATTICE_MIN_STD: f64 = 1e-3;
-pub(crate) const LATTICE_MAX_STD: f64 = 10.0;
-const LOG_STD_INIT: f64 = 0.0;
+pub(crate) const GSDE_EPS: f64 = 1e-6;
+pub(crate) const GSDE_LOG_STD_INIT: f64 = -2.0;
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 const SYMLOG_SCALE: f64 = 0.1;
 const SYMLOG_LOG_RANGE: f64 = 5.0;
@@ -210,7 +206,7 @@ const TIME_CROSS_LAYERS: usize = 1;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -4.0;
 const ACTOR_MLP_LAYERS: usize = 1;
-pub(crate) const LATTICE_LEARN_FEATURES: bool = true;
+pub(crate) const GSDE_LEARN_FEATURES: bool = true;
 const CRITIC_LAYERS: usize = 2;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
@@ -313,14 +309,14 @@ pub(crate) fn expln(t: &Tensor) -> Tensor {
     let below = t.le(0.0).to_kind(Kind::Float);
     let above = t.gt(0.0).to_kind(Kind::Float);
     let below_threshold = t.exp() * &below;
-    let safe_t = t * &above + 1e-8;
+    let safe_t = t * &above + GSDE_EPS;
     let above_threshold = (safe_t.log1p() + 1.0) * &above;
     below_threshold + above_threshold
 }
 
 /// (values, critic_logits, critic_input, (action_mean, actor_latent))
 /// critic_input: [batch, TICKERS_COUNT * MODEL_DIM] pre-MLP input for slow target
-/// actor_latent: [batch, SDE_LATENT_DIM] shared actor/Lattice latent
+/// actor_latent: [batch, SDE_LATENT_DIM] shared actor/gSDE latent
 pub type ModelOutput = (Tensor, Tensor, Tensor, (Tensor, Tensor));
 
 /// DreamerV3-style slow target for value function stabilization.
@@ -487,8 +483,8 @@ pub struct TradingModel {
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
-    // Lattice exploration: learned log-std for correlated + independent noise
-    log_std_param: Tensor, // [SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM]
+    // gSDE exploration: learned log-std for latent->action noise projection
+    log_std_param: Tensor, // [SDE_LATENT_DIM, ACTION_DIM]
     bucket_centers: Tensor,
     value_centers: Tensor,
     device: tch::Device,
@@ -525,23 +521,9 @@ impl TradingModel {
         &self.value_centers
     }
 
-    /// Lattice stds: corr_std [SDE_LATENT_DIM, SDE_LATENT_DIM], ind_std [SDE_LATENT_DIM, ACTION_DIM]
-    /// With dimension correction and clipping per the paper
-    pub fn lattice_stds(&self) -> (Tensor, Tensor) {
-        let log_std = self
-            .log_std_param
-            .clamp(LATTICE_MIN_STD.ln(), LATTICE_MAX_STD.ln());
-        // Dimension correction: prevents variance from scaling with latent_dim
-        let log_std = &log_std - 0.5 * (SDE_LATENT_DIM as f64).ln();
-        let std = expln(&log_std);
-        let corr_std = std.narrow(1, 0, SDE_LATENT_DIM);
-        let ind_std = std.narrow(1, SDE_LATENT_DIM, ACTION_DIM);
-        (corr_std, ind_std)
-    }
-
-    /// W_policy: actor_out weights [ACTION_DIM, SDE_LATENT_DIM] for Lattice covariance
-    pub fn w_policy(&self) -> Tensor {
-        self.actor_out.ws.shallow_clone()
+    /// gSDE std matrix used to scale exploration noise matrices.
+    pub fn sde_std(&self) -> Tensor {
+        expln(&self.log_std_param)
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -702,7 +684,7 @@ impl TradingModel {
             SDE_LATENT_DIM,
             ACTION_DIM,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(SDE_LATENT_DIM, ACTION_DIM),
+                ws_init: Init::Orthogonal { gain: 0.01 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
@@ -738,12 +720,11 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // Lattice log-std: [SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM]
-        // First SDE_LATENT_DIM columns = corr_std, last ACTION_DIM columns = ind_std
+        // gSDE log-std: [SDE_LATENT_DIM, ACTION_DIM]
         let log_std_param = p.var(
             "log_std",
-            &[SDE_LATENT_DIM, SDE_LATENT_DIM + ACTION_DIM],
-            Init::Const(LOG_STD_INIT),
+            &[SDE_LATENT_DIM, ACTION_DIM],
+            Init::Const(GSDE_LOG_STD_INIT),
         );
         // Scaled symlog bins in raw return space (s=0.1, log_range=5 → ±14.7)
         // Dense near 0 for typical ±0.3 returns, log-compressed tails to ±14.7

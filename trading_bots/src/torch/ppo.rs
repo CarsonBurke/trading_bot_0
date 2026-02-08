@@ -6,8 +6,7 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
     patch_seq_len_for_variant, symlog_tensor, ModelVariant, SlowCritic, TradingModel,
-    TradingModelConfig, ACTION_DIM, LATTICE_ALPHA, LATTICE_LEARN_FEATURES, LATTICE_STD_REG,
-    SDE_EPS, SDE_LATENT_DIM,
+    TradingModelConfig, ACTION_DIM, GSDE_EPS, GSDE_LEARN_FEATURES, SDE_LATENT_DIM,
 };
 
 const LEARNING_RATE: f64 = 1e-4;
@@ -29,6 +28,36 @@ const RETNORM_RATE: f64 = 0.01;
 const RETNORM_LIMIT: f64 = 1.0;
 const RETNORM_PERCLO: f64 = 0.05;
 const RETNORM_PERCHI: f64 = 0.95;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GsdeResampleMode {
+    PerEpisode,
+    PerStep,
+}
+
+// SB3-like options:
+// - PerEpisode: sample once per rollout (similar to sde_sample_freq = -1)
+// - PerStep: resample every env step (similar to sde_sample_freq = 1)
+const GSDE_RESAMPLE_MODE: GsdeResampleMode = GsdeResampleMode::PerStep;
+
+fn gsde_resample_mode_from_env() -> GsdeResampleMode {
+    match env::var("GSDE_RESAMPLE_MODE")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("episode") | Some("per-episode") => GsdeResampleMode::PerEpisode,
+        Some("step") | Some("per-step") => GsdeResampleMode::PerStep,
+        _ => GSDE_RESAMPLE_MODE,
+    }
+}
+
+fn gsde_sample_freq(mode: GsdeResampleMode) -> i64 {
+    match mode {
+        GsdeResampleMode::PerEpisode => -1,
+        GsdeResampleMode::PerStep => 1,
+    }
+}
 
 // RPO: Random Policy Optimization - adds bounded noise to action mean during training and intentionally not during rollout
 // Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
@@ -193,62 +222,45 @@ fn twohot_log_prob_loss(targets: &Tensor, log_probs: &Tensor, centers: &Tensor) 
     -(weight_below * log_p_below + weight_above * log_p_above).mean(Kind::Float)
 }
 
-/// MVN log prob + log|Σ|: returns (log_prob, log_det_sigma) to avoid redundant Cholesky
-fn mvn_log_prob(sigma_mat: &Tensor, diff: &Tensor, k: i64) -> (Tensor, Tensor) {
-    let jitter = Tensor::eye(k, (Kind::Float, sigma_mat.device())).unsqueeze(0) * SDE_EPS;
-    let chol = (sigma_mat + &jitter).linalg_cholesky(false);
-    let diff_col = diff.unsqueeze(-1);
-    let y = chol
-        .linalg_solve_triangular(&diff_col, false, true, false)
-        .squeeze_dim(-1);
-    let mahal = y
-        .pow_tensor_scalar(2)
-        .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-    let log_det =
-        chol.diagonal(0, -2, -1)
-            .log()
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-            * 2.0;
-    let log_prob = (&mahal + &log_det + k as f64 * LOG_2PI).g_mul_scalar(-0.5);
-    (log_prob, log_det)
+fn gsde_action_std(sde_latent: &Tensor, sde_std: &Tensor) -> Tensor {
+    let latent_sq = sde_latent.pow_tensor_scalar(2);
+    let std_sq = sde_std.pow_tensor_scalar(2);
+    (latent_sq.matmul(&std_sq) + GSDE_EPS).sqrt()
 }
 
-/// Build Lattice covariance matrix [batch, ACTION_DIM, ACTION_DIM]
-/// Σ = α²·W·diag(h²@σ_corr²)·Wᵀ + diag(h²@σ_ind² + reg²)
-fn build_lattice_covariance(
-    sde_latent: &Tensor, // [batch, SDE_LATENT_DIM]
-    corr_std: &Tensor,   // [SDE_LATENT_DIM, SDE_LATENT_DIM]
-    ind_std: &Tensor,    // [SDE_LATENT_DIM, ACTION_DIM]
-    w_policy: &Tensor,   // [ACTION_DIM, SDE_LATENT_DIM]
-) -> Tensor {
-    // h² weighting: variance scales with squared latent activations
-    let h_sq = sde_latent.pow_tensor_scalar(2);
-
-    // latent_corr_var[b,d] = sum_j(h[b,j]² * σ_corr[j,d]²) -- [batch, SDE_LATENT_DIM]
-    let latent_corr_var = h_sq.matmul(&corr_std.pow_tensor_scalar(2));
-
-    // σ_corr = α² * W * diag(latent_corr_var) * Wᵀ -- [batch, ACTION_DIM, ACTION_DIM]
-    // w_scaled[b,a,d] = W[a,d] * latent_corr_var[b,d]
-    let w_scaled = w_policy.unsqueeze(0) * latent_corr_var.unsqueeze(1);
-    let sigma_corr = (LATTICE_ALPHA * LATTICE_ALPHA) * w_scaled.matmul(&w_policy.transpose(0, 1));
-
-    // latent_ind_var[b,a] = sum_j(h[b,j]² * σ_ind[j,a]²) + reg² -- [batch, ACTION_DIM]
-    let latent_ind_var =
-        h_sq.matmul(&ind_std.pow_tensor_scalar(2)) + LATTICE_STD_REG * LATTICE_STD_REG;
-
-    &sigma_corr + &Tensor::diag_embed(&latent_ind_var, 0, -2, -1)
+fn diag_gaussian_log_prob(diff: &Tensor, action_std: &Tensor) -> Tensor {
+    let log_std = action_std.log();
+    let normalized = diff / action_std;
+    let quadratic = normalized.pow_tensor_scalar(2);
+    let terms = quadratic + log_std.g_mul_scalar(2.0) + LOG_2PI;
+    terms
+        .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+        .g_mul_scalar(-0.5)
 }
 
-/// Sample actions from the lattice SDE policy during rollout (no_grad).
+fn diag_gaussian_entropy(action_std: &Tensor) -> Tensor {
+    (action_std.log() + 0.5 * (1.0 + LOG_2PI)).sum_dim_intlist(
+        [-1].as_slice(),
+        false,
+        Kind::Float,
+    )
+}
+
+fn sample_exploration_mats(sde_std: &Tensor, device: tch::Device) -> Tensor {
+    Tensor::randn([NPROCS, SDE_LATENT_DIM, ACTION_DIM], (Kind::Float, device))
+        * &sde_std.unsqueeze(0)
+}
+
+/// Sample actions from the gSDE policy during rollout (no_grad).
 /// Returns (values, action_mean, u, actions, action_log_prob).
 fn sample_rollout_actions(
     model: &TradingModel,
     obs_price: &Tensor,
     obs_static: &Tensor,
     obs_seq_idx: &Tensor,
-    device: tch::Device,
+    exploration_mats: &Tensor,
+    sde_std: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
-    let stats_kind = (Kind::Float, device);
     tch::no_grad(|| {
         let (values, _, _, (action_mean, sde_latent)) =
             model.forward_with_seq_idx_on_device(obs_price, obs_static, Some(obs_seq_idx), false);
@@ -256,26 +268,15 @@ fn sample_rollout_actions(
         let action_mean = action_mean.to_kind(Kind::Float);
         let sde_latent = sde_latent.to_kind(Kind::Float);
 
-        let (corr_std, ind_std) = model.lattice_stds();
-        let w_policy = model.w_policy();
-
-        let corr_exploration_mat =
-            Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], stats_kind) * &corr_std;
-        let ind_exploration_mat =
-            Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind) * &ind_std;
-
-        let latent_noise = sde_latent.matmul(&corr_exploration_mat);
-        let correlated_action_noise =
-            LATTICE_ALPHA * latent_noise.matmul(&w_policy.transpose(0, 1));
-        let independent_action_noise = sde_latent.matmul(&ind_exploration_mat);
-
-        let noise = &correlated_action_noise + &independent_action_noise;
+        let noise = sde_latent
+            .unsqueeze(1)
+            .bmm(exploration_mats)
+            .squeeze_dim(1);
         let u = &action_mean + &noise;
         let actions = u.softmax(-1, Kind::Float);
 
-        let sigma_mat = build_lattice_covariance(&sde_latent, &corr_std, &ind_std, &w_policy);
-        let diff = &u - &action_mean;
-        let (log_prob_gaussian, _) = mvn_log_prob(&sigma_mat, &diff, ACTION_DIM);
+        let action_std = gsde_action_std(&sde_latent, sde_std);
+        let log_prob_gaussian = diag_gaussian_log_prob(&noise, &action_std);
         let log_det_jac = u
             .log_softmax(-1, Kind::Float)
             .sum_dim_intlist(-1, false, Kind::Float);
@@ -368,10 +369,8 @@ fn compute_action_std_stats(
             Some(&s_seq_idx.get(0)),
             false,
         );
-        let (corr_std, ind_std) = model.lattice_stds();
-        let w_policy = model.w_policy();
-        let sigma_mat = build_lattice_covariance(&sde_latent, &corr_std, &ind_std, &w_policy);
-        let action_std = sigma_mat.diagonal(0, -2, -1).clamp_min(1e-6).sqrt();
+        let sde_std = model.sde_std().to_kind(Kind::Float);
+        let action_std = gsde_action_std(&sde_latent.to_kind(Kind::Float), &sde_std);
         let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
             (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze()
         } else {
@@ -409,6 +408,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
     let device = tch::Device::cuda_if_available();
     println!("device is cuda: {}", device.is_cuda());
+    let gsde_resample_mode = gsde_resample_mode_from_env();
+    let gsde_sample_freq = gsde_sample_freq(gsde_resample_mode);
+    println!(
+        "gSDE resample mode: {:?} (sample_freq={})",
+        gsde_resample_mode, gsde_sample_freq
+    );
 
     let mut vs = nn::VarStore::new(device);
     let trading_model = TradingModel::new_with_config(
@@ -497,14 +502,21 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
+        let sde_std_rollout = tch::no_grad(|| trading_model.sde_std().to_kind(Kind::Float));
+        let mut exploration_mats = sample_exploration_mats(&sde_std_rollout, device);
 
         for step in 0..rollout_steps as usize {
+            // Match SB3 behavior: if sde_sample_freq > 0, resample when step % freq == 0.
+            if gsde_sample_freq > 0 && (step as i64) % gsde_sample_freq == 0 {
+                exploration_mats = sample_exploration_mats(&sde_std_rollout, device);
+            }
             let (values, action_mean, u, actions, action_log_prob) = sample_rollout_actions(
                 &trading_model,
                 &obs_price,
                 &obs_static,
                 &obs_seq_idx,
-                device,
+                &exploration_mats,
+                &sde_std_rollout,
             );
 
             if DEBUG_NUMERICS {
@@ -675,16 +687,13 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 // act_mb contains the stored u (pre-softmax logits)
                 let u = act_mb;
 
-                // Conditionally detach latent for covariance
-                let sde_latent_cov = if LATTICE_LEARN_FEATURES {
+                let sde_latent_cov = if GSDE_LEARN_FEATURES {
                     sde_latent.shallow_clone()
                 } else {
                     sde_latent.detach()
                 };
-                let (corr_std, ind_std) = trading_model.lattice_stds();
-                let w_policy = trading_model.w_policy();
-                let sigma_mat =
-                    build_lattice_covariance(&sde_latent_cov, &corr_std, &ind_std, &w_policy);
+                let sde_std = trading_model.sde_std().to_kind(Kind::Float);
+                let action_std = gsde_action_std(&sde_latent_cov, &sde_std);
 
                 // RPO: sigmoid parameterization for smooth gradients
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
@@ -703,8 +712,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 };
 
                 let diff = &u - &action_mean_perturbed;
-                let (log_prob_gaussian, log_det_sigma) =
-                    mvn_log_prob(&sigma_mat, &diff, ACTION_DIM);
+                let log_prob_gaussian = diag_gaussian_log_prob(&diff, &action_std);
                 let log_det_jac =
                     u.log_softmax(-1, Kind::Float)
                         .sum_dim_intlist(-1, false, Kind::Float);
@@ -715,7 +723,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     let _ =
                         debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("sigma_mat", &sigma_mat, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
@@ -760,10 +768,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let value_loss = ce_loss + SLOW_CRITIC_REG * slow_reg_loss
                     - CRITIC_ENTROPY_COEF * critic_entropy;
 
-                // MVN entropy: 0.5 * (k*(1+ln(2pi)) + ln|Sigma|), reuses Cholesky from log_prob
-                let dist_entropy = (ACTION_DIM as f64 * (1.0 + LOG_2PI) + &log_det_sigma)
-                    .g_mul_scalar(0.5)
-                    .mean(Kind::Float);
+                let dist_entropy = diag_gaussian_entropy(&action_std).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
@@ -772,7 +777,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
                 // RPO alpha loss: target induced KL (uniform noise in logit space)
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let action_var = sigma_mat.diagonal(0, -2, -1).detach();
+                    let action_var = action_std.pow_tensor_scalar(2).detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
                     let d = ACTION_DIM as f64;
                     let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;

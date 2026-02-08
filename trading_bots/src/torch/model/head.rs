@@ -58,7 +58,6 @@ impl TradingModel {
         ticker_repr = ticker_repr + &mlp * &alpha_mlp;
 
         // Actor head: MLP per-ticker → flatten → project to latent → action_mean
-        // actor_out.W is shared with Lattice covariance (W D Wᵀ)
         let mut actor_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]);
         for i in 0..self.actor_mlp_linears.len() {
             actor_x = actor_x.apply(&self.actor_mlp_linears[i]);

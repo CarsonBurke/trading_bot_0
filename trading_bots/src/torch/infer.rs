@@ -6,7 +6,7 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{
-    ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM, LATTICE_ALPHA, SDE_LATENT_DIM,
+    ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM, SDE_LATENT_DIM,
 };
 
 pub fn load_model<P: AsRef<Path>>(
@@ -26,13 +26,11 @@ pub fn load_model<P: AsRef<Path>>(
     Ok((vs, model))
 }
 
-/// Sample actions using Lattice exploration: h² weighted correlated + independent noise, then softmax
+/// Sample actions using gSDE exploration, then softmax.
 pub fn sample_actions(
     action_mean: &Tensor,
     sde_latent: &Tensor, // [batch, SDE_LATENT_DIM]
-    corr_std: &Tensor,   // [SDE_LATENT_DIM, SDE_LATENT_DIM]
-    ind_std: &Tensor,    // [SDE_LATENT_DIM, ACTION_DIM]
-    w_policy: &Tensor,   // [ACTION_DIM, SDE_LATENT_DIM]
+    sde_std: &Tensor,    // [SDE_LATENT_DIM, ACTION_DIM]
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
@@ -44,21 +42,8 @@ pub fn sample_actions(
     } else {
         let device = action_mean.device();
         let stats_kind = (Kind::Float, device);
-
-        // Sample exploration matrices
-        let corr_exploration_mat =
-            Tensor::randn([SDE_LATENT_DIM, SDE_LATENT_DIM], stats_kind) * corr_std;
-        let ind_exploration_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind) * ind_std;
-
-        // Correlated noise: perturb latent, project through W
-        let latent_noise = sde_latent.matmul(&corr_exploration_mat);
-        let correlated_action_noise =
-            LATTICE_ALPHA * latent_noise.matmul(&w_policy.transpose(0, 1));
-
-        // Independent noise: project latent through ind noise
-        let independent_action_noise = sde_latent.matmul(&ind_exploration_mat);
-
-        let noise = &correlated_action_noise + &independent_action_noise;
+        let exploration_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind) * sde_std;
+        let noise = sde_latent.matmul(&exploration_mat);
         &action_mean + noise
     };
 
@@ -121,7 +106,7 @@ pub fn run_inference<P: AsRef<Path>>(
             env.step = step;
 
             // First call uses full history, then we switch to incremental per-ticker deltas.
-            let (action_mean, sde_latent, corr_std, ind_std, w_policy) = tch::no_grad(|| {
+            let (action_mean, sde_latent, sde_std) = tch::no_grad(|| {
                 let price_input = if use_full {
                     &price_deltas_full
                 } else {
@@ -129,16 +114,13 @@ pub fn run_inference<P: AsRef<Path>>(
                 };
                 let (_, _, _, (action_mean, sde_latent)) =
                     model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
-                let (corr_std, ind_std) = model.lattice_stds();
-                let w_policy = model.w_policy();
-                (action_mean, sde_latent, corr_std, ind_std, w_policy)
+                let sde_std = model.sde_std();
+                (action_mean, sde_latent, sde_std)
             });
             let actions = sample_actions(
                 &action_mean,
                 &sde_latent,
-                &corr_std,
-                &ind_std,
-                &w_policy,
+                &sde_std,
                 deterministic,
                 temperature,
             );
