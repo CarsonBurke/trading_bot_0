@@ -14,7 +14,8 @@ pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
 const OPTIM_EPOCHS: i64 = 4;
-const PPO_CLIP_RATIO: f64 = 0.2;
+const PPO_CLIP_LOW: f64 = 0.2;
+const PPO_CLIP_HIGH: f64 = 0.28; // DAPO-style asymmetric: wider upper bound prevents entropy collapse
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
@@ -738,7 +739,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
                 }
                 let ratio = log_ratio.exp();
-                let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_RATIO, 1.0 + PPO_CLIP_RATIO);
+                let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_LOW, 1.0 + PPO_CLIP_HIGH);
 
                 // Single portfolio advantage - no more weighted combination
                 let action_loss =
@@ -874,11 +875,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 }
 
                 let _ = total_clipped.g_add_(&tch::no_grad(|| {
-                    (&ratio - 1.0)
-                        .abs()
-                        .gt(PPO_CLIP_RATIO)
-                        .to_kind(Kind::Float)
-                        .sum(Kind::Float)
+                    let dev = &ratio - 1.0;
+                    let clipped_lo = dev.le(-PPO_CLIP_LOW).to_kind(Kind::Float);
+                    let clipped_hi = dev.ge(PPO_CLIP_HIGH).to_kind(Kind::Float);
+                    (clipped_lo + clipped_hi).sum(Kind::Float)
                 }));
                 total_ratio_samples += chunk_sample_count;
             }
