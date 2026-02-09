@@ -698,7 +698,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let sde_std = trading_model.sde_std().to_kind(Kind::Float);
                 let action_std = gsde_action_std(&sde_latent_cov, &sde_std);
 
-                // RPO: sigmoid parameterization for smooth gradients
+                // RPO (CleanRL-style): iid uniform perturbation on each action-mean dimension.
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
                     let alpha_detached = alpha.detach();
@@ -778,7 +778,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     + action_loss.shallow_clone()
                     - &dist_entropy * ENTROPY_COEF;
 
-                // RPO alpha loss: target induced KL (uniform noise in logit space)
+                // RPO alpha loss: target induced KL for uniform logit perturbation.
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let action_var = action_std.pow_tensor_scalar(2).detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
@@ -791,8 +791,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
                 let scaled_ppo_loss =
                     &ppo_loss * (chunk_sample_count as f64 / samples_per_accum as f64);
+                let scaled_alpha_loss =
+                    &alpha_loss * (chunk_sample_count as f64 / samples_per_accum as f64);
                 let total_chunk_loss =
-                    (scaled_ppo_loss + alpha_loss) / GRAD_ACCUM_STEPS as f64;
+                    (scaled_ppo_loss + scaled_alpha_loss) / GRAD_ACCUM_STEPS as f64;
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
