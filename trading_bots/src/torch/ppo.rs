@@ -25,10 +25,6 @@ const CRITIC_ENTROPY_COEF: f64 = 0.0;
 const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
 const LOG_2PI: f64 = 1.8378770664093453;
-const RETNORM_RATE: f64 = 0.01;
-const RETNORM_LIMIT: f64 = 1.0;
-const RETNORM_PERCLO: f64 = 0.05;
-const RETNORM_PERCHI: f64 = 0.95;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GsdeResampleMode {
@@ -72,46 +68,6 @@ const MAX_DELTA_ALPHA: f64 = 0.2;
 // DreamerV3-style slow target for value stabilization
 const SLOW_CRITIC_RATE: f64 = 0.02; // EMA blend rate (half-life ~35 updates)
 const SLOW_CRITIC_REG: f64 = 1.0; // Regularization weight (matched to DreamerV3)
-
-/// DreamerV3-style return normalizer: scales advantages by percentile range of returns
-struct RetNorm {
-    lo: f64, // 5th percentile (EMA)
-    hi: f64, // 95th percentile (EMA)
-    initialized: bool,
-}
-
-impl RetNorm {
-    fn new() -> Self {
-        Self {
-            lo: 0.0,
-            hi: 1.0,
-            initialized: false,
-        }
-    }
-
-    fn update(&mut self, returns: &Tensor) {
-        let flat = returns.to_kind(Kind::Float).reshape([-1]);
-        let n = flat.size()[0];
-        let low_k = ((n as f64 * RETNORM_PERCLO).floor() as i64).clamp(1, n);
-        let high_k = ((n as f64 * RETNORM_PERCHI).floor() as i64).clamp(1, n);
-        let p5: f64 = flat.kthvalue(low_k, 0, false).0.double_value(&[]);
-        let p95: f64 = flat.kthvalue(high_k, 0, false).0.double_value(&[]);
-
-        if !self.initialized {
-            self.lo = p5;
-            self.hi = p95;
-            self.initialized = true;
-        } else {
-            // EMA: new = old * (1 - rate) + rate * value
-            self.lo = self.lo * (1.0 - RETNORM_RATE) + RETNORM_RATE * p5;
-            self.hi = self.hi * (1.0 - RETNORM_RATE) + RETNORM_RATE * p95;
-        }
-    }
-
-    fn scale(&self) -> f64 {
-        (self.hi - self.lo).max(RETNORM_LIMIT)
-    }
-}
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -485,7 +441,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
     let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level value
     let s_action_weights = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
-    let mut retnorm = RetNorm::new();
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
@@ -606,12 +561,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             device,
         );
 
-        // Update value normalizer with computed returns (for next rollout)
-        retnorm.update(&returns);
-
-        // Compute advantage normalization scale from returns range
-        let ret_norm_scale = retnorm.scale();
-
         // Compute advantage stats once per rollout (before normalization)
         let adv_stats = tch::no_grad(|| {
             Tensor::stack(
@@ -672,7 +621,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let act_mb = s_actions.narrow(0, chunk_sample_start, chunk_sample_count);
                 let ret_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
                 let adv_mb_raw = advantages.narrow(0, chunk_sample_start, chunk_sample_count);
-                let adv_mb = &adv_mb_raw / ret_norm_scale;
+                let adv_mb = (&adv_mb_raw - adv_mb_raw.mean(Kind::Float))
+                    / (adv_mb_raw.std(true) + 1e-8);
                 let old_log_probs_mb =
                     s_old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
                 let _weight_mb =
