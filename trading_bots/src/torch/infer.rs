@@ -30,7 +30,7 @@ pub fn load_model<P: AsRef<Path>>(
 pub fn sample_actions(
     action_mean: &Tensor,
     sde_latent: &Tensor, // [batch, SDE_LATENT_DIM]
-    sde_std: &Tensor,    // [SDE_LATENT_DIM, ACTION_DIM]
+    sde_std: &Tensor,    // [SDE_LATENT_DIM, ACTION_DIM - 1]
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
@@ -42,9 +42,11 @@ pub fn sample_actions(
     } else {
         let device = action_mean.device();
         let stats_kind = (Kind::Float, device);
-        let exploration_mat = Tensor::randn([SDE_LATENT_DIM, ACTION_DIM], stats_kind) * sde_std;
-        let noise = sde_latent.matmul(&exploration_mat);
-        &action_mean + noise
+        let exploration_mat =
+            Tensor::randn([SDE_LATENT_DIM, ACTION_DIM - 1], stats_kind) * sde_std;
+        let noise = sde_latent.matmul(&exploration_mat); // [batch, ACTION_DIM - 1]
+        let noise_pad = Tensor::zeros([noise.size()[0], 1], stats_kind); // gauge reference
+        &action_mean + Tensor::cat(&[noise, noise_pad], -1)
     };
 
     let u = if temperature != 1.0 && temperature != 0.0 {
