@@ -69,6 +69,126 @@ impl InterTickerBlock {
     }
 }
 
+struct TemporalPmaBlock {
+    num_heads: i64,
+    head_dim: i64,
+    queries: Tensor,
+    q_proj: nn::Linear,
+    k_proj: nn::Linear,
+    v_proj: nn::Linear,
+    out_proj: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+}
+
+impl TemporalPmaBlock {
+    fn new(p: &nn::Path, model_dim: i64, num_heads: i64) -> Self {
+        assert!(
+            model_dim % num_heads == 0,
+            "model_dim must be divisible by PMA heads"
+        );
+        let head_dim = model_dim / num_heads;
+        let queries = p.var(
+            "queries",
+            &[PMA_QUERIES, model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: (1.0 / model_dim as f64).sqrt(),
+            },
+        );
+        let q_proj = nn::linear(
+            p / "q_proj",
+            model_dim,
+            model_dim,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(model_dim, model_dim),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let k_proj = nn::linear(
+            p / "k_proj",
+            model_dim,
+            model_dim,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(model_dim, model_dim),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let v_proj = nn::linear(
+            p / "v_proj",
+            model_dim,
+            model_dim,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(model_dim, model_dim),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let out_proj = nn::linear(
+            p / "out_proj",
+            model_dim,
+            model_dim,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(model_dim, model_dim),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let q_norm = RMSNorm::new(&(p / "q_norm"), head_dim, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "k_norm"), head_dim, 1e-6);
+        Self {
+            num_heads,
+            head_dim,
+            queries,
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+            q_norm,
+            k_norm,
+        }
+    }
+
+    fn forward(&self, x_time: &Tensor, batch_size: i64, model_dim: i64) -> Tensor {
+        let temporal_len = x_time.size()[2];
+        let bt = batch_size * TICKERS_COUNT;
+        let x_flat = x_time.reshape([bt, temporal_len, model_dim]);
+        let q = self
+            .queries
+            .unsqueeze(0)
+            .expand([bt, PMA_QUERIES, model_dim], false)
+            .apply(&self.q_proj);
+        let k = x_flat.apply(&self.k_proj);
+        let v = x_flat.apply(&self.v_proj);
+
+        let q = q
+            .view([bt, PMA_QUERIES, self.num_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+        let k = k
+            .view([bt, temporal_len, self.num_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+        let v = v
+            .view([bt, temporal_len, self.num_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+
+        let q = self.q_norm.forward(&q);
+        let k = self.k_norm.forward(&k);
+        let scores = q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt();
+        let scores = ATTN_LOGIT_CAP * (scores / ATTN_LOGIT_CAP).tanh();
+        let attn = scores.softmax(-1, Kind::Float).to_kind(q.kind());
+        let ctx = attn
+            .matmul(&v)
+            .permute([0, 2, 1, 3])
+            .reshape([bt, PMA_QUERIES, model_dim])
+            .apply(&self.out_proj);
+        ctx.mean_dim([1].as_slice(), false, Kind::Float)
+            .to_kind(x_time.kind())
+            .reshape([batch_size, TICKERS_COUNT, model_dim])
+    }
+}
+
 const EXO_CROSS_AFTER: &[usize] = &[0];
 const ATTN_LOGIT_CAP: f64 = 30.0;
 
@@ -204,12 +324,14 @@ const SYMLOG_SCALE: f64 = 0.1;
 const SYMLOG_LOG_RANGE: f64 = 5.0;
 const TIME_CROSS_LAYERS: usize = 1;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
-const RESIDUAL_ALPHA_INIT: f64 = -4.0;
+const RESIDUAL_ALPHA_INIT: f64 = -2.0;
 const ACTOR_MLP_LAYERS: usize = 1;
 pub(crate) const GSDE_LEARN_FEATURES: bool = true;
 const CRITIC_LAYERS: usize = 2;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
+const PMA_QUERIES: i64 = 2;
+const PMA_NUM_HEADS: i64 = 4;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
 
@@ -475,6 +597,7 @@ pub struct TradingModel {
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
     exo_cross_blocks: Vec<ExoCrossBlock>,
+    temporal_pma_block: TemporalPmaBlock,
     inter_ticker_block: InterTickerBlock,
     actor_mlp_linears: Vec<nn::Linear>,
     actor_mlp_norms: Vec<RMSNorm>,
@@ -484,7 +607,7 @@ pub struct TradingModel {
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
     // gSDE exploration: learned log-std for latent->action noise projection
-    log_std_param: Tensor, // [SDE_LATENT_DIM, ACTION_DIM]
+    log_std_param: Tensor, // [SDE_LATENT_DIM, ACTION_DIM - 1]
     bucket_centers: Tensor,
     value_centers: Tensor,
     device: tch::Device,
@@ -649,6 +772,8 @@ impl TradingModel {
                 )
             })
             .collect::<Vec<_>>();
+        let temporal_pma_block =
+            TemporalPmaBlock::new(&(p / "temporal_pma"), spec.model_dim, PMA_NUM_HEADS);
         let inter_ticker_block =
             InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
         // Actor latent MLP per-ticker, then flatten → project to SDE_LATENT_DIM
@@ -720,10 +845,11 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // gSDE log-std: [SDE_LATENT_DIM, ACTION_DIM]
+        // gSDE log-std: [SDE_LATENT_DIM, ACTION_DIM - 1]
+        // K-1 noise dims (last logit is gauge reference with zero noise)
         let log_std_param = p.var(
             "log_std",
-            &[SDE_LATENT_DIM, ACTION_DIM],
+            &[SDE_LATENT_DIM, ACTION_DIM - 1],
             Init::Const(GSDE_LOG_STD_INIT),
         );
         // Scaled symlog bins in raw return space (s=0.1, log_range=5 → ±14.7)
@@ -758,6 +884,7 @@ impl TradingModel {
             exo_feat_w,
             exo_feat_b,
             exo_cross_blocks,
+            temporal_pma_block,
             inter_ticker_block,
             actor_mlp_linears,
             actor_mlp_norms,

@@ -9,7 +9,7 @@ use crate::torch::model::{
     TradingModelConfig, ACTION_DIM, GSDE_EPS, GSDE_LEARN_FEATURES, SDE_LATENT_DIM,
 };
 
-const LEARNING_RATE: f64 = 1e-4;
+const LEARNING_RATE: f64 = 3e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
@@ -228,27 +228,28 @@ fn gsde_action_std(sde_latent: &Tensor, sde_std: &Tensor) -> Tensor {
     (latent_sq.matmul(&std_sq) + GSDE_EPS).sqrt()
 }
 
+/// Diagonal Gaussian log prob on K-1 noise dims (gauge-free by construction).
 fn diag_gaussian_log_prob(diff: &Tensor, action_std: &Tensor) -> Tensor {
     let log_std = action_std.log();
     let normalized = diff / action_std;
-    let quadratic = normalized.pow_tensor_scalar(2);
-    let terms = quadratic + log_std.g_mul_scalar(2.0) + LOG_2PI;
+    let terms = normalized.pow_tensor_scalar(2) + log_std * 2.0 + LOG_2PI;
     terms
         .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
         .g_mul_scalar(-0.5)
 }
 
+/// Diagonal Gaussian entropy on K-1 dims: H = 0.5 * sum(log(2πe·σ_i²))
 fn diag_gaussian_entropy(action_std: &Tensor) -> Tensor {
-    (action_std.log() + 0.5 * (1.0 + LOG_2PI)).sum_dim_intlist(
-        [-1].as_slice(),
-        false,
-        Kind::Float,
-    )
+    let k = action_std.size().last().copied().unwrap() as f64;
+    action_std.log().sum_dim_intlist([-1].as_slice(), false, Kind::Float) + 0.5 * k * (1.0 + LOG_2PI)
 }
 
 fn sample_exploration_mats(sde_std: &Tensor, device: tch::Device) -> Tensor {
-    Tensor::randn([NPROCS, SDE_LATENT_DIM, ACTION_DIM], (Kind::Float, device))
-        * &sde_std.unsqueeze(0)
+    // K-1 noise dims: last logit is gauge reference (zero noise)
+    Tensor::randn(
+        [NPROCS, SDE_LATENT_DIM, ACTION_DIM - 1],
+        (Kind::Float, device),
+    ) * &sde_std.unsqueeze(0)
 }
 
 /// Sample actions from the gSDE policy during rollout (no_grad).
@@ -268,19 +269,20 @@ fn sample_rollout_actions(
         let action_mean = action_mean.to_kind(Kind::Float);
         let sde_latent = sde_latent.to_kind(Kind::Float);
 
+        // K-1 noise dims; last logit is gauge reference (zero noise)
         let noise = sde_latent
             .unsqueeze(1)
             .bmm(exploration_mats)
-            .squeeze_dim(1);
-        let u = &action_mean + &noise;
+            .squeeze_dim(1); // [B, K-1]
+        let noise_pad = Tensor::zeros(
+            &[noise.size()[0], 1],
+            (Kind::Float, noise.device()),
+        );
+        let u = &action_mean + Tensor::cat(&[&noise, &noise_pad], -1);
         let actions = u.softmax(-1, Kind::Float);
 
-        let action_std = gsde_action_std(&sde_latent, sde_std);
-        let log_prob_gaussian = diag_gaussian_log_prob(&noise, &action_std);
-        let log_det_jac = u
-            .log_softmax(-1, Kind::Float)
-            .sum_dim_intlist(-1, false, Kind::Float);
-        let action_log_prob = &log_prob_gaussian - &log_det_jac;
+        let action_std = gsde_action_std(&sde_latent, sde_std); // [B, K-1]
+        let action_log_prob = diag_gaussian_log_prob(&noise, &action_std);
 
         (values, action_mean, u, actions, action_log_prob)
     })
@@ -714,12 +716,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     )
                 };
 
-                let diff = &u - &action_mean_perturbed;
-                let log_prob_gaussian = diag_gaussian_log_prob(&diff, &action_std);
-                let log_det_jac =
-                    u.log_softmax(-1, Kind::Float)
-                        .sum_dim_intlist(-1, false, Kind::Float);
-                let action_log_probs = log_prob_gaussian - log_det_jac;
+                let diff = &u - &action_mean_perturbed; // [B, K]
+                // Gauge fix: subtract reference (last) component → K-1 independent noise coords
+                let diff_ref = diff.narrow(-1, ACTION_DIM - 1, 1); // [B, 1]
+                let diff_v = diff.narrow(-1, 0, ACTION_DIM - 1) - diff_ref; // [B, K-1]
+                let action_log_probs = diag_gaussian_log_prob(&diff_v, &action_std);
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
@@ -782,7 +783,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let action_var = action_std.pow_tensor_scalar(2).detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                    let d = ACTION_DIM as f64;
+                    let d = (ACTION_DIM - 1) as f64;
                     let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                     (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
                 } else {
