@@ -5,7 +5,7 @@ use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    patch_seq_len_for_variant, symlog_tensor, ModelVariant, SlowCritic, TradingModel,
+    patch_seq_len_for_variant, symlog_tensor, ModelVariant, TradingModel,
     TradingModelConfig, ACTION_DIM, GSDE_EPS, GSDE_LEARN_FEATURES, SDE_LATENT_DIM,
 };
 
@@ -66,8 +66,6 @@ const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
 
 // DreamerV3-style slow target for value stabilization
-const SLOW_CRITIC_RATE: f64 = 0.02; // EMA blend rate (half-life ~35 updates)
-const SLOW_CRITIC_REG: f64 = 1.0; // Regularization weight (matched to DreamerV3)
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -414,7 +412,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         0
     };
 
-    let mut slow_critic = SlowCritic::new(&trading_model, SLOW_CRITIC_RATE);
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
     let mut env = VecEnv::new(true, model_variant);
@@ -629,7 +626,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (_, critic_logits, critic_input, (action_mean, sde_latent)) = trading_model
+                let (_, critic_logits, _critic_input, (action_mean, sde_latent)) = trading_model
                     .forward_with_seq_idx_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
@@ -708,20 +705,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 }
                 let ce_loss =
                     twohot_log_prob_loss(&ret_mb, &log_probs, trading_model.value_centers());
-                // Slow target regularization: pull live critic toward slow EMA copy
-                let slow_reg_loss = {
-                    let slow_logits = slow_critic.forward(&critic_input);
-                    let slow_probs = slow_logits.softmax(-1, Kind::Float).detach();
-                    // CE(live_logits, sg(slow_probs)): -sum(slow_probs * log_probs)
-                    -(&slow_probs * &log_probs)
-                        .sum_dim_intlist(-1, false, Kind::Float)
-                        .mean(Kind::Float)
-                };
                 let critic_entropy = -(log_probs.exp() * &log_probs)
                     .sum_dim_intlist(-1, false, Kind::Float)
                     .mean(Kind::Float);
-                let value_loss = ce_loss + SLOW_CRITIC_REG * slow_reg_loss
-                    - CRITIC_ENTROPY_COEF * critic_entropy;
+                let value_loss = ce_loss - CRITIC_ENTROPY_COEF * critic_entropy;
 
                 let dist_entropy = diag_gaussian_entropy(&action_std).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
@@ -821,7 +808,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                         opt.step();
                     }
                     opt.zero_grad();
-                    slow_critic.update(&trading_model);
                 }
 
                 let _ = total_clipped.g_add_(&tch::no_grad(|| {
