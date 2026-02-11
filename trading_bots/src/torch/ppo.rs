@@ -5,8 +5,8 @@ use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    patch_seq_len_for_variant, symlog_tensor, ModelVariant, TradingModel,
-    TradingModelConfig, ACTION_DIM, GSDE_EPS, GSDE_LEARN_FEATURES, SDE_LATENT_DIM,
+    patch_seq_len_for_variant, ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
+    GSDE_EPS, GSDE_LEARN_FEATURES, SDE_LATENT_DIM,
 };
 
 const LEARNING_RATE: f64 = 3e-4;
@@ -21,7 +21,6 @@ const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
-const CRITIC_ENTROPY_COEF: f64 = 0.0;
 const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
 const LOG_2PI: f64 = 1.8378770664093453;
@@ -64,8 +63,6 @@ const RPO_ALPHA_INIT: f64 = 0.1; // CleanRL impl found 0.1 reliably improved res
 const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
-
-// DreamerV3-style slow target for value stabilization
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -124,57 +121,6 @@ impl GpuRollingBuffer {
     fn get(&self, step: i64) -> Tensor {
         self.data.narrow(0, step * NPROCS, NPROCS)
     }
-}
-
-/// DreamerV3-style twohot CE loss for non-uniform bin spacing.
-/// Finds the two nearest bins via searchsorted, weights by distance.
-fn twohot_log_prob_loss(targets: &Tensor, log_probs: &Tensor, centers: &Tensor) -> Tensor {
-    let centers = centers.to_kind(log_probs.kind());
-    let n_buckets = centers.size()[0];
-    let targets = targets.to_kind(log_probs.kind());
-
-    // below = number of bins <= target, minus 1 (index of bin at or just below)
-    let below = centers
-        .unsqueeze(0)
-        .le_tensor(&targets.unsqueeze(1))
-        .to_kind(Kind::Int64)
-        .sum_dim_intlist(-1, false, Kind::Int64)
-        - 1;
-    let below = below.clamp(0, n_buckets - 1);
-    // above = n_buckets - number of bins > target (index of bin at or just above)
-    let above = n_buckets
-        - centers
-            .unsqueeze(0)
-            .gt_tensor(&targets.unsqueeze(1))
-            .to_kind(Kind::Int64)
-            .sum_dim_intlist(-1, false, Kind::Int64);
-    let above = above.clamp(0, n_buckets - 1);
-
-    let bin_below = centers
-        .index_select(0, &below.flatten(0, -1))
-        .reshape_as(&targets);
-    let bin_above = centers
-        .index_select(0, &above.flatten(0, -1))
-        .reshape_as(&targets);
-
-    // When below == above (exact bin hit), both distances are 0.
-    // clamp_min ensures 0/eps → 0 for both, but we gather the same log_prob
-    // for both below and above, so weight_below + weight_above doesn't matter
-    // as long as they sum to 1. Adding eps to both distances achieves this.
-    let dist_to_below = (&bin_below - &targets).abs() + 1e-8;
-    let dist_to_above = (&bin_above - &targets).abs() + 1e-8;
-    let total = &dist_to_below + &dist_to_above;
-    let weight_below = &dist_to_above / &total;
-    let weight_above = &dist_to_below / &total;
-
-    let log_p_below = log_probs
-        .gather(1, &below.unsqueeze(1), false)
-        .squeeze_dim(1);
-    let log_p_above = log_probs
-        .gather(1, &above.unsqueeze(1), false)
-        .squeeze_dim(1);
-
-    -(weight_below * log_p_below + weight_above * log_p_above).mean(Kind::Float)
 }
 
 fn gsde_action_std(sde_latent: &Tensor, sde_std: &Tensor) -> Tensor {
@@ -300,8 +246,8 @@ fn compute_explained_variance(
         let ret_ev = returns.narrow(0, 0, ev_samples);
         let (values_raw, _, _, _) =
             model.forward_with_seq_idx_on_device(&pd_ev, &so_ev, Some(&seq_ev), true);
-        let values = symlog_tensor(&values_raw.to_kind(Kind::Float).view([ev_samples]), 1.0);
-        let targets = symlog_tensor(&ret_ev, 1.0);
+        let values = values_raw.to_kind(Kind::Float).view([ev_samples]);
+        let targets = ret_ev;
         let residuals = &values - &targets;
         let mean_target = targets.mean(Kind::Float);
         let var_targets = targets.square().mean(Kind::Float) - mean_target.square();
@@ -626,7 +572,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (_, critic_logits, _critic_input, (action_mean, sde_latent)) = trading_model
+                let (_, critic_values, _critic_input, (action_mean, sde_latent)) = trading_model
                     .forward_with_seq_idx_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
@@ -693,22 +639,16 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     -Tensor::min_other(&(&ratio * &adv_mb), &(&ratio_clipped * &adv_mb))
                         .mean(Kind::Float);
 
-                // Portfolio-level value loss
-                let log_probs = critic_logits
-                    .to_kind(Kind::Float)
-                    .log_softmax(-1, Kind::Float);
+                // PPO-standard scalar value regression against returns.
+                let critic_values = critic_values.to_kind(Kind::Float).view([chunk_sample_count]);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("critic_logits", &critic_logits, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("log_probs", &log_probs, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("critic_values", &critic_values, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
-                let ce_loss =
-                    twohot_log_prob_loss(&ret_mb, &log_probs, trading_model.value_centers());
-                let critic_entropy = -(log_probs.exp() * &log_probs)
-                    .sum_dim_intlist(-1, false, Kind::Float)
+                let value_loss = (&critic_values - &ret_mb)
+                    .pow_tensor_scalar(2.0)
                     .mean(Kind::Float);
-                let value_loss = ce_loss - CRITIC_ENTROPY_COEF * critic_entropy;
 
                 let dist_entropy = diag_gaussian_entropy(&action_std).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();

@@ -69,7 +69,7 @@ impl TradingModel {
             .apply(&self.actor_proj);
         let action_mean = actor_latent.apply(&self.actor_out);
 
-        // Critic: DreamerV3-style MLP (Linear → RMSNorm → SiLU) → Linear
+        // Critic: PPO-style scalar value head.
         let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
         let mut critic_x = critic_input.shallow_clone();
         for i in 0..self.value_mlp_linears.len() {
@@ -77,15 +77,10 @@ impl TradingModel {
             critic_x = self.value_mlp_norms[i].forward(&critic_x);
             critic_x = critic_x.silu();
         }
-        let critic_logits = critic_x.apply(&self.value_out);
+        let critic_values = critic_x.apply(&self.value_out).squeeze_dim(-1);
 
-        // Bins are scaled-symlog-spaced in raw return space
-        // Weighted average gives value prediction directly in return space
         let values = if compute_values {
-            let critic_probs = critic_logits.softmax(-1, Kind::Float);
-            let bucket_centers = self.bucket_centers.to_kind(critic_probs.kind());
-            let value = (&critic_probs * &bucket_centers).sum_dim_intlist(-1, false, Kind::Float);
-            value.to_kind(ticker_repr.kind())
+            critic_values.to_kind(ticker_repr.kind())
         } else {
             Tensor::zeros(&[batch_size], (ticker_repr.kind(), ticker_repr.device()))
         };
@@ -95,7 +90,7 @@ impl TradingModel {
         (
             (
                 values,
-                critic_logits,
+                critic_values,
                 critic_input,
                 (action_mean, actor_latent),
             ),

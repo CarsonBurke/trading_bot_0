@@ -12,7 +12,6 @@ use crate::torch::constants::{
     TICKERS_COUNT,
 };
 
-pub(crate) const NUM_VALUE_BUCKETS: i64 = 255;
 use crate::torch::ssm_ref::{
     stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMambaRef,
 };
@@ -320,8 +319,6 @@ pub(crate) const SDE_LATENT_DIM: i64 = 128;
 pub(crate) const GSDE_EPS: f64 = 1e-6;
 pub(crate) const GSDE_LOG_STD_INIT: f64 = -2.0;
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
-const SYMLOG_SCALE: f64 = 0.1;
-const SYMLOG_LOG_RANGE: f64 = 5.0;
 const TIME_CROSS_LAYERS: usize = 1;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -2.0;
@@ -436,14 +433,12 @@ pub(crate) fn expln(t: &Tensor) -> Tensor {
     below_threshold + above_threshold
 }
 
-/// (values, critic_logits, critic_input, (action_mean, actor_latent))
-/// critic_input: [batch, TICKERS_COUNT * MODEL_DIM] pre-MLP input for slow target
+/// (values, critic_values, critic_input, (action_mean, actor_latent))
+/// critic_input: [batch, TICKERS_COUNT * MODEL_DIM] pre-MLP input for debugging/probing
 /// actor_latent: [batch, SDE_LATENT_DIM] shared actor/gSDE latent
 pub type ModelOutput = (Tensor, Tensor, Tensor, (Tensor, Tensor));
 
-/// DreamerV3-style slow target for value function stabilization.
-/// Holds an EMA copy of critic weights (not in the optimizer's VarStore).
-/// Forward pass produces target logits; regularization loss pulls live critic toward these.
+/// EMA copy of critic weights (not in the optimizer's VarStore).
 pub struct SlowCritic {
     mlp_weights: Vec<Tensor>,  // [CRITIC_LAYERS] linear weights
     mlp_biases: Vec<Tensor>,   // [CRITIC_LAYERS] linear biases
@@ -502,7 +497,7 @@ impl SlowCritic {
         blend(&mut self.out_bias, model.value_out.bs.as_ref().unwrap());
     }
 
-    /// Forward pass through slow critic (no grad). Returns logits [batch, NUM_VALUE_BUCKETS].
+    /// Forward pass through slow critic (no grad). Returns scalar values [batch, 1].
     pub fn forward(&self, critic_input: &Tensor) -> Tensor {
         tch::no_grad(|| {
             let mut x = critic_input.shallow_clone();
@@ -517,14 +512,6 @@ impl SlowCritic {
             x.linear(&self.out_weight, Some(&self.out_bias))
         })
     }
-}
-
-pub(crate) fn symlog_tensor(x: &Tensor, s: f64) -> Tensor {
-    x.sign() * (x.abs() / s + 1.0).log()
-}
-
-pub(crate) fn symexp_tensor(x: &Tensor, s: f64) -> Tensor {
-    x.sign() * s * (x.abs().exp() - 1.0)
 }
 
 pub struct DebugMetrics {
@@ -608,8 +595,6 @@ pub struct TradingModel {
     value_out: nn::Linear,
     // gSDE exploration: learned log-std for latent->action noise projection
     log_std_param: Tensor, // [SDE_LATENT_DIM, ACTION_DIM - 1]
-    bucket_centers: Tensor,
-    value_centers: Tensor,
     device: tch::Device,
 }
 
@@ -638,10 +623,6 @@ impl TradingModel {
         } else {
             input.to_kind(target_kind)
         }
-    }
-
-    pub fn value_centers(&self) -> &Tensor {
-        &self.value_centers
     }
 
     /// gSDE std matrix used to scale exploration noise matrices.
@@ -814,7 +795,7 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // Critic MLP: (Linear → RMSNorm → SiLU) → Linear(→bins), orthogonally initialized.
+        // Critic MLP: (Linear → RMSNorm → SiLU) → Linear(→scalar value), orthogonally initialized.
         let critic_in = TICKERS_COUNT * spec.model_dim;
         let critic_hidden = spec.ff_dim;
         let value_mlp_linears = (0..CRITIC_LAYERS)
@@ -838,7 +819,7 @@ impl TradingModel {
         let value_out = nn::linear(
             p / "value_out",
             critic_hidden,
-            NUM_VALUE_BUCKETS,
+            1,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
@@ -852,15 +833,6 @@ impl TradingModel {
             &[SDE_LATENT_DIM, ACTION_DIM - 1],
             Init::Const(GSDE_LOG_STD_INIT),
         );
-        // Scaled symlog bins in raw return space (s=0.1, log_range=5 → ±14.7)
-        // Dense near 0 for typical ±0.3 returns, log-compressed tails to ±14.7
-        let half_n = (NUM_VALUE_BUCKETS - 1) / 2 + 1; // 128
-        let half_log = Tensor::linspace(-SYMLOG_LOG_RANGE, 0.0, half_n, (Kind::Float, p.device()));
-        let half = symexp_tensor(&half_log, SYMLOG_SCALE);
-        // Positive: negate and reverse first 127 elements (excluding zero)
-        let pos_half = half.narrow(0, 0, half_n - 1).flip([0]).neg();
-        let bucket_centers = Tensor::cat(&[half, pos_half], 0);
-        let value_centers = bucket_centers.shallow_clone();
         Self {
             variant: config.variant,
             patch_configs,
@@ -894,8 +866,6 @@ impl TradingModel {
             value_mlp_norms,
             value_out,
             log_std_param,
-            bucket_centers,
-            value_centers,
             device: p.device(),
         }
     }
