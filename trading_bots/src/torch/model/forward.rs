@@ -10,7 +10,7 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> ModelOutput {
-        self.forward_with_seq_idx(price_deltas, static_features, None, _train)
+        self.forward_inner(price_deltas, static_features, true)
     }
 
     pub fn forward_on_device(
@@ -19,76 +19,47 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> ModelOutput {
-        self.forward_with_seq_idx_on_device(price_deltas, static_features, None, _train)
+        self.forward_inner_on_device(price_deltas, static_features, true)
     }
 
-    pub fn forward_with_seq_idx(
+    pub fn forward_no_values(
         &self,
         price_deltas: &Tensor,
         static_features: &Tensor,
-        seq_idx: Option<&Tensor>,
         _train: bool,
     ) -> ModelOutput {
-        self.forward_with_seq_idx_inner(price_deltas, static_features, seq_idx, true)
+        self.forward_inner(price_deltas, static_features, false)
     }
 
-    pub fn forward_with_seq_idx_on_device(
+    pub fn forward_no_values_on_device(
         &self,
         price_deltas: &Tensor,
         static_features: &Tensor,
-        seq_idx: Option<&Tensor>,
         _train: bool,
     ) -> ModelOutput {
-        self.forward_with_seq_idx_inner_on_device(price_deltas, static_features, seq_idx, true)
+        self.forward_inner_on_device(price_deltas, static_features, false)
     }
 
-    pub fn forward_with_seq_idx_no_values(
+    fn forward_inner(
         &self,
         price_deltas: &Tensor,
         static_features: &Tensor,
-        seq_idx: Option<&Tensor>,
-        _train: bool,
-    ) -> ModelOutput {
-        self.forward_with_seq_idx_inner(price_deltas, static_features, seq_idx, false)
-    }
-
-    pub fn forward_with_seq_idx_no_values_on_device(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        seq_idx: Option<&Tensor>,
-        _train: bool,
-    ) -> ModelOutput {
-        self.forward_with_seq_idx_inner_on_device(price_deltas, static_features, seq_idx, false)
-    }
-
-    fn forward_with_seq_idx_inner(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        seq_idx: Option<&Tensor>,
         compute_values: bool,
     ) -> ModelOutput {
         let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
-        self.forward_with_seq_idx_inner_on_device(
-            &price_deltas,
-            &static_features,
-            seq_idx,
-            compute_values,
-        )
+        self.forward_inner_on_device(&price_deltas, &static_features, compute_values)
     }
 
-    fn forward_with_seq_idx_inner_on_device(
+    fn forward_inner_on_device(
         &self,
         price_deltas: &Tensor,
         static_features: &Tensor,
-        seq_idx: Option<&Tensor>,
         compute_values: bool,
     ) -> ModelOutput {
         if price_deltas.device() != self.device || static_features.device() != self.device {
             panic!(
-                "forward_with_seq_idx_on_device requires tensors on {:?}",
+                "forward_on_device requires tensors on {:?}",
                 self.device
             );
         }
@@ -100,38 +71,19 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale, seq_idx) =
-            self.patch_latent_stem_on_device(&price_deltas, batch_size, seq_idx);
+        let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
-        debug_fused("model_dt_scale", &dt_scale);
 
         let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, batch_size);
 
-        let mut x_for_ssm = x_stem;
-        let seq_idx_ref = if seq_idx.numel() == 0 {
-            None
-        } else {
-            Some(&seq_idx)
-        };
-        for (i, (layer, norm)) in self
-            .ssm_layers
-            .iter()
-            .zip(self.ssm_norms.iter())
-            .enumerate()
-        {
-            let out = layer.forward_with_pre_norm_seq_idx(
-                &x_for_ssm,
-                norm.weight(),
-                norm.eps(),
-                Some(&dt_scale),
-                seq_idx_ref,
-            );
-            x_for_ssm = x_for_ssm + out;
-            x_for_ssm = self.maybe_apply_exo_cross(&x_for_ssm, &exo_kv, i);
+        let mut x = x_stem;
+        for (i, layer) in self.gqa_layers.iter().enumerate() {
+            x = layer.forward(&x);
+            x = self.maybe_apply_exo_cross(&x, &exo_kv, i);
         }
-        debug_fused("model_x_for_ssm", &x_for_ssm);
+        debug_fused("model_x_gqa", &x);
 
-        self.head_with_temporal_pool(&x_for_ssm, batch_size, compute_values, false)
+        self.head_with_temporal_pool(&x, batch_size, compute_values, false)
             .0
     }
 
@@ -141,16 +93,6 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> (ModelOutput, DebugMetrics) {
-        self.forward_with_debug_seq_idx(price_deltas, static_features, None, _train)
-    }
-
-    pub fn forward_with_debug_seq_idx(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        seq_idx: Option<&Tensor>,
-        _train: bool,
-    ) -> (ModelOutput, DebugMetrics) {
         let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
         debug_fused("model_price_deltas", &price_deltas);
@@ -158,41 +100,22 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let (x_stem, dt_scale, seq_idx) =
-            self.patch_latent_stem(&price_deltas, batch_size, seq_idx);
+        let x_stem = self.patch_latent_stem(&price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
-        debug_fused("model_dt_scale", &dt_scale);
 
         let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, batch_size);
 
-        let mut x_for_ssm = x_stem;
-        let seq_idx_ref = if seq_idx.numel() == 0 {
-            None
-        } else {
-            Some(&seq_idx)
-        };
-        for (layer_idx, (layer, norm)) in self
-            .ssm_layers
-            .iter()
-            .zip(self.ssm_norms.iter())
-            .enumerate()
-        {
-            debug_fused_layer("x_for_ssm_in", layer_idx, &x_for_ssm);
-            let out = layer.forward_with_pre_norm_seq_idx(
-                &x_for_ssm,
-                norm.weight(),
-                norm.eps(),
-                Some(&dt_scale),
-                seq_idx_ref,
-            );
-            debug_fused_layer("ssm_out", layer_idx, &out);
-            x_for_ssm = x_for_ssm + out;
-            x_for_ssm = self.maybe_apply_exo_cross(&x_for_ssm, &exo_kv, layer_idx);
-            debug_fused_layer("x_for_ssm_out", layer_idx, &x_for_ssm);
+        let mut x = x_stem;
+        for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
+            debug_fused_layer("x_gqa_in", layer_idx, &x);
+            x = layer.forward(&x);
+            debug_fused_layer("gqa_out", layer_idx, &x);
+            x = self.maybe_apply_exo_cross(&x, &exo_kv, layer_idx);
+            debug_fused_layer("x_gqa_out", layer_idx, &x);
         }
-        debug_fused("model_x_for_ssm", &x_for_ssm);
+        debug_fused("model_x_gqa", &x);
 
-        let (out, debug) = self.head_with_temporal_pool(&x_for_ssm, batch_size, true, true);
+        let (out, debug) = self.head_with_temporal_pool(&x, batch_size, true, true);
         (
             out,
             debug.unwrap_or(DebugMetrics {
@@ -260,7 +183,7 @@ fn debug_fused(tag: &str, t: &Tensor) {
     let has_inf = t.isinf().any().int64_value(&[]) != 0;
     if has_nan || has_inf {
         eprintln!(
-            "mamba_fused_debug {} nan={} inf={} shape={:?}",
+            "debug {} nan={} inf={} shape={:?}",
             tag,
             has_nan,
             has_inf,
@@ -278,7 +201,7 @@ fn debug_fused_layer(tag: &str, layer_idx: usize, t: &Tensor) {
     let has_inf = t.isinf().any().int64_value(&[]) != 0;
     if has_nan || has_inf {
         eprintln!(
-            "mamba_fused_debug {}_l{} nan={} inf={} shape={:?}",
+            "debug {}_l{} nan={} inf={} shape={:?}",
             tag,
             layer_idx,
             has_nan,

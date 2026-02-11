@@ -23,6 +23,7 @@ pub fn load_model<P: AsRef<Path>>(
         },
     );
     let _ = load_var_store_partial(&mut vs, weight_path)?;
+    vs.bfloat16();
     Ok((vs, model))
 }
 

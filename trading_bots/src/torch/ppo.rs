@@ -5,7 +5,7 @@ use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    patch_seq_len_for_variant, ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
+    ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
     GSDE_EPS, GSDE_LEARN_FEATURES, SDE_LATENT_DIM,
 };
 
@@ -159,13 +159,12 @@ fn sample_rollout_actions(
     model: &TradingModel,
     obs_price: &Tensor,
     obs_static: &Tensor,
-    obs_seq_idx: &Tensor,
     exploration_mats: &Tensor,
     sde_std: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
     tch::no_grad(|| {
         let (values, _, _, (action_mean, sde_latent)) =
-            model.forward_with_seq_idx_on_device(obs_price, obs_static, Some(obs_seq_idx), false);
+            model.forward_on_device(obs_price, obs_static, false);
         let values = values.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
         let sde_latent = sde_latent.to_kind(Kind::Float);
@@ -233,7 +232,6 @@ fn compute_explained_variance(
     model: &TradingModel,
     price_deltas: &Tensor,
     static_obs: &Tensor,
-    seq_idx: &Tensor,
     returns: &Tensor,
     rollout_steps: i64,
 ) -> Tensor {
@@ -242,10 +240,9 @@ fn compute_explained_variance(
     tch::no_grad(|| {
         let pd_ev = price_deltas.narrow(0, 0, ev_samples);
         let so_ev = static_obs.narrow(0, 0, ev_samples);
-        let seq_ev = seq_idx.narrow(0, 0, ev_samples);
         let ret_ev = returns.narrow(0, 0, ev_samples);
         let (values_raw, _, _, _) =
-            model.forward_with_seq_idx_on_device(&pd_ev, &so_ev, Some(&seq_ev), true);
+            model.forward_on_device(&pd_ev, &so_ev, true);
         let values = values_raw.to_kind(Kind::Float).view([ev_samples]);
         let targets = ret_ev;
         let residuals = &values - &targets;
@@ -261,15 +258,13 @@ fn compute_action_std_stats(
     model: &TradingModel,
     s_price_deltas: &GpuRollingBuffer,
     s_static_obs: &GpuRollingBuffer,
-    s_seq_idx: &GpuRollingBuffer,
     rpo_rho: &Tensor,
     device: tch::Device,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, _, _, (_, sde_latent)) = model.forward_with_seq_idx_on_device(
+        let (_, _, _, (_, sde_latent)) = model.forward_on_device(
             &s_price_deltas.get(0),
             &s_static_obs.get(0),
-            Some(&s_seq_idx.get(0)),
             false,
         );
         let sde_std = model.sde_std().to_kind(Kind::Float);
@@ -358,6 +353,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         0
     };
 
+    // Cast all model parameters to bf16 for faster compute.
+    // Done after weight loading so loaded fp32 weights get cast.
+    // Adam optimizer handles mixed bf16 parameters correctly.
+    vs.bfloat16();
+
     let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
 
     let mut env = VecEnv::new(true, model_variant);
@@ -373,11 +373,9 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
     let pd_dim = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
     let so_dim = STATIC_OBSERVATIONS as i64;
-    let seq_idx_dim = TICKERS_COUNT * patch_seq_len_for_variant(model_variant);
 
     let mut s_price_deltas = GpuRollingBuffer::new(memory_size, pd_dim, Kind::Float, device);
     let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, Kind::Float, device);
-    let mut s_seq_idx = GpuRollingBuffer::new(memory_size, seq_idx_dim, Kind::Int64, device);
     let s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
     let s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level reward
@@ -386,11 +384,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
     let s_action_weights = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
 
     for episode in start_episode..1000000 {
-        let (obs_price_cpu, obs_static_cpu, obs_seq_idx_cpu) = env.reset();
+        let (obs_price_cpu, obs_static_cpu) = env.reset();
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
         let mut obs_static =
             Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
-        let mut obs_seq_idx = Tensor::zeros(&[NPROCS, seq_idx_dim], (Kind::Int64, device));
         let ring_len = PRICE_DELTAS_PER_TICKER as i64;
         let base_idx = Tensor::arange(ring_len, (Kind::Int64, device));
         let mut ring_pos = ring_len - 1;
@@ -398,7 +395,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         let mut step_deltas = Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         obs_price.copy_(&obs_price_cpu);
         obs_static.copy_(&obs_static_cpu);
-        obs_seq_idx.copy_(&obs_seq_idx_cpu);
         ring_buf.copy_(&obs_price.view([NPROCS, TICKERS_COUNT, ring_len]));
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
@@ -415,7 +411,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 &trading_model,
                 &obs_price,
                 &obs_static,
-                &obs_seq_idx,
                 &exploration_mats,
                 &sde_std_rollout,
             );
@@ -428,7 +423,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             }
             s_price_deltas.push(&obs_price);
             s_static_obs.push(&obs_static);
-            s_seq_idx.push(&obs_seq_idx);
 
             let (reset_indices, reset_price_deltas) = env.step_into_ring_tensor(
                 &actions,
@@ -484,10 +478,9 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
         // Bootstrap value from final observation state (raw return space)
         let bootstrap_value = tch::no_grad(|| {
-            let (values_raw, _, _, _) = trading_model.forward_with_seq_idx_on_device(
+            let (values_raw, _, _, _) = trading_model.forward_on_device(
                 &obs_price,
                 &obs_static,
-                Some(&obs_seq_idx),
                 false,
             );
             values_raw.to_kind(Kind::Float)
@@ -518,7 +511,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
         let price_deltas_batch = s_price_deltas.data.shallow_clone();
         let static_obs_batch = s_static_obs.data.shallow_clone();
-        let seq_idx_batch = s_seq_idx.data.shallow_clone();
         let action_weights_batch = s_action_weights.shallow_clone();
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -560,7 +552,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
                 let pd_chunk = price_deltas_batch.narrow(0, chunk_sample_start, chunk_sample_count);
                 let so_chunk = static_obs_batch.narrow(0, chunk_sample_start, chunk_sample_count);
-                let seq_idx_chunk = seq_idx_batch.narrow(0, chunk_sample_start, chunk_sample_count);
                 let act_mb = s_actions.narrow(0, chunk_sample_start, chunk_sample_count);
                 let ret_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
                 let adv_mb_raw = advantages.narrow(0, chunk_sample_start, chunk_sample_count);
@@ -573,10 +564,9 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
                 let fwd_start = Instant::now();
                 let (_, critic_values, _critic_input, (action_mean, sde_latent)) = trading_model
-                    .forward_with_seq_idx_no_values_on_device(
+                    .forward_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
-                        Some(&seq_idx_chunk),
                         true,
                     );
 
@@ -826,7 +816,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 &trading_model,
                 &price_deltas_batch,
                 &static_obs_batch,
-                &seq_idx_batch,
                 &returns,
                 rollout_steps,
             )
@@ -844,7 +833,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             &trading_model,
             &s_price_deltas,
             &s_static_obs,
-            &s_seq_idx,
             &rpo_rho,
             device,
         );

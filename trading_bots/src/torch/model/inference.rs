@@ -9,9 +9,6 @@ impl StreamState {
         self.ring_pos = 0;
         let _ = self.patch_buf.zero_();
         self.patch_pos = 0;
-        for s in &mut self.ssm_states {
-            s.reset();
-        }
         self.initialized = false;
     }
 }
@@ -29,9 +26,6 @@ impl TradingModel {
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
-            ssm_states: (0..self.ssm_layers.len())
-                .map(|_| self.ssm_layers[0].init_state(TICKERS_COUNT, self.device))
-                .collect(),
             initialized: false,
         }
     }
@@ -48,9 +42,6 @@ impl TradingModel {
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
-            ssm_states: (0..self.ssm_layers.len())
-                .map(|_| self.ssm_layers[0].init_state(batch_size * TICKERS_COUNT, self.device))
-                .collect(),
             initialized: false,
         }
     }
@@ -112,47 +103,26 @@ impl TradingModel {
         } else {
             static_features
         };
-        let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
-        let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, 1);
 
         if state.patch_pos >= self.finest_patch_size {
             state.patch_pos = 0;
-            let x_last = self.process_new_patch(state, &exo_kv);
             let _ = state.patch_buf.zero_();
-            return self.head_with_temporal_pool(&x_last, 1, true, false).0;
+            // Full forward pass from ring buffer
+            let price_deltas = state.delta_ring.view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
+            return self.forward_on_device(&price_deltas, &static_features, false);
         }
 
+        // Not enough deltas for a new patch yet; return zeros
         self.head_with_temporal_pool(
             &Tensor::zeros(
-                &[TICKERS_COUNT, 1, self.ssm_dim],
-                (Kind::Float, self.device),
+                &[TICKERS_COUNT, 1, self.model_dim],
+                (self.patch_embed_weight.kind(), self.device),
             ),
             1,
             true,
             false,
         )
         .0
-    }
-
-    fn init_from_full(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        state: &mut StreamState,
-    ) -> ModelOutput {
-        let price = if price_deltas.dim() == 1 {
-            price_deltas.unsqueeze(0)
-        } else {
-            price_deltas.shallow_clone()
-        };
-        let static_features = if static_features.dim() == 1 {
-            static_features.unsqueeze(0)
-        } else {
-            static_features.shallow_clone()
-        };
-        let price = self.cast_inputs(&price.to_device(self.device));
-        let static_features = self.cast_inputs(&static_features.to_device(self.device));
-        self.init_from_full_on_device(&price, &static_features, state)
     }
 
     fn init_from_full_on_device(
@@ -185,73 +155,9 @@ impl TradingModel {
         state.ring_pos = 0;
         state.patch_pos = 0;
         let _ = state.patch_buf.zero_();
-
-        let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
-        let exo_kv = self.build_exo_kv(&global_static, &per_ticker_static, 1);
-        let dt_scale = self.patch_dt_scale.shallow_clone();
-
-        let mut x = self.patch_embed_single(&reshaped);
-        for (layer, (ssm, norm)) in self
-            .ssm_layers
-            .iter()
-            .zip(self.ssm_norms.iter())
-            .enumerate()
-        {
-            let out = ssm.forward_with_state_pre_norm_dt_scale(
-                &x,
-                norm.weight(),
-                norm.eps(),
-                &mut state.ssm_states[layer],
-                Some(&dt_scale),
-            );
-            x = x + out;
-            x = self.maybe_apply_exo_cross(&x, &exo_kv, layer);
-        }
-
         state.initialized = true;
-        self.head_with_temporal_pool(&x, 1, true, false).0
-    }
 
-    fn process_new_patch(&self, state: &mut StreamState, exo_kv: &Tensor) -> Tensor {
-        let patches = state
-            .patch_buf
-            .view([TICKERS_COUNT, 1, self.finest_patch_size]);
-        let patch_emb = self
-            .embed_patch_config(&patches, self.finest_patch_index as i64)
-            .squeeze_dim(1);
-        let dt_scale = self.finest_patch_size as f64;
-
-        let mut x_in = patch_emb;
-        for (layer, (ssm, norm)) in self
-            .ssm_layers
-            .iter()
-            .zip(self.ssm_norms.iter())
-            .enumerate()
-        {
-            let out = ssm.step_with_pre_norm_dt_scale(
-                &x_in,
-                norm.weight(),
-                norm.eps(),
-                &mut state.ssm_states[layer],
-                dt_scale,
-            );
-            x_in = x_in + out;
-            // Apply exo cross-block (unsqueeze for seq_len=1 dim, then squeeze back)
-            if super::EXO_CROSS_AFTER.contains(&layer) {
-                let pos = super::EXO_CROSS_AFTER
-                    .iter()
-                    .position(|&i| i == layer)
-                    .unwrap();
-                x_in = self.exo_cross_blocks[pos]
-                    .forward(
-                        &x_in.unsqueeze(1),
-                        exo_kv,
-                        self.model_dim,
-                        self.cross_head_dim,
-                    )
-                    .squeeze_dim(1);
-            }
-        }
-        x_in.unsqueeze(1)
+        // Full forward pass
+        self.forward_on_device(&price.view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]), &static_features, false)
     }
 }

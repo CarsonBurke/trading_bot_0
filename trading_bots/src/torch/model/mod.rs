@@ -12,10 +12,6 @@ use crate::torch::constants::{
     TICKERS_COUNT,
 };
 
-use crate::torch::ssm_ref::{
-    stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMambaRef,
-};
-
 use rmsnorm::RMSNorm;
 
 struct InterTickerBlock {
@@ -174,22 +170,23 @@ impl TemporalPmaBlock {
 
         let q = self.q_norm.forward(&q);
         let k = self.k_norm.forward(&k);
-        let scores = q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt();
-        let scores = ATTN_LOGIT_CAP * (scores / ATTN_LOGIT_CAP).tanh();
-        let attn = scores.softmax(-1, Kind::Float).to_kind(q.kind());
-        let ctx = attn
-            .matmul(&v)
+        let ctx = Tensor::scaled_dot_product_attention(
+            &q, &k, &v,
+            None::<&Tensor>,
+            0.0,
+            false,
+            None,
+            false,
+        )
             .permute([0, 2, 1, 3])
             .reshape([bt, PMA_QUERIES, model_dim])
             .apply(&self.out_proj);
-        ctx.mean_dim([1].as_slice(), false, Kind::Float)
-            .to_kind(x_time.kind())
+        ctx.mean_dim([1].as_slice(), false, x_time.kind())
             .reshape([batch_size, TICKERS_COUNT, model_dim])
     }
 }
 
 const EXO_CROSS_AFTER: &[usize] = &[0];
-const ATTN_LOGIT_CAP: f64 = 30.0;
 
 struct ExoCrossBlock {
     cross_ln: RMSNorm,
@@ -264,27 +261,14 @@ impl ExoCrossBlock {
         let q = self.q_norm.forward(&q);
         let k = self.k_norm.forward(&k);
 
-        let heads_per_group = CROSS_NUM_Q_HEADS / CROSS_NUM_KV_HEADS;
-        let k = k
-            .unsqueeze(2)
-            .expand(
-                [b, CROSS_NUM_KV_HEADS, heads_per_group, t, cross_head_dim],
-                false,
-            )
-            .reshape([b, CROSS_NUM_Q_HEADS, t, cross_head_dim]);
-        let v = v
-            .unsqueeze(2)
-            .expand(
-                [b, CROSS_NUM_KV_HEADS, heads_per_group, t, cross_head_dim],
-                false,
-            )
-            .reshape([b, CROSS_NUM_Q_HEADS, t, cross_head_dim]);
-
-        let scale = (cross_head_dim as f64).sqrt();
-        let scores = q.matmul(&k.transpose(-2, -1)) / scale;
-        let scores = ATTN_LOGIT_CAP * (scores / ATTN_LOGIT_CAP).tanh();
-        let attn = scores.softmax(-1, Kind::Float).to_kind(q.kind());
-        let out = attn.matmul(&v);
+        let out = Tensor::scaled_dot_product_attention(
+            &q, &k, &v,
+            None::<&Tensor>,
+            0.0,
+            false,
+            None,
+            true,
+        );
 
         let out = out.permute([0, 2, 1, 3]).reshape([b, s, model_dim]);
         let out = out.apply(&self.cross_out);
@@ -298,6 +282,101 @@ impl ExoCrossBlock {
     }
 }
 
+const GQA_NUM_Q_HEADS: i64 = 4;
+const GQA_NUM_KV_HEADS: i64 = 2;
+
+struct GqaBlock {
+    attn_ln: RMSNorm,
+    attn_q: nn::Linear,
+    attn_k: nn::Linear,
+    attn_v: nn::Linear,
+    attn_out: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    alpha_attn: Tensor,
+    ffn_ln: RMSNorm,
+    ffn_fc1: nn::Linear,
+    ffn_fc2: nn::Linear,
+    alpha_ffn: Tensor,
+}
+
+impl GqaBlock {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
+        let head_dim = model_dim / GQA_NUM_Q_HEADS;
+        let kv_dim = GQA_NUM_KV_HEADS * head_dim;
+        let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
+        let attn_q = nn::linear(p / "attn_q", model_dim, model_dim, Default::default());
+        let attn_k = nn::linear(p / "attn_k", model_dim, kv_dim, Default::default());
+        let attn_v = nn::linear(p / "attn_v", model_dim, kv_dim, Default::default());
+        let attn_out = nn::linear(p / "attn_out", model_dim, model_dim, Default::default());
+        let q_norm = RMSNorm::new(&(p / "attn_q_norm"), head_dim, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "attn_k_norm"), head_dim, 1e-6);
+        let alpha_attn = p.var("alpha_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
+        let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
+        let ffn_fc1 = nn::linear(p / "ffn_fc1", model_dim, 2 * ff_dim, Default::default());
+        let ffn_fc2 = nn::linear(p / "ffn_fc2", ff_dim, model_dim, Default::default());
+        let alpha_ffn = p.var("alpha_ffn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
+        Self {
+            attn_ln,
+            attn_q,
+            attn_k,
+            attn_v,
+            attn_out,
+            q_norm,
+            k_norm,
+            alpha_attn,
+            ffn_ln,
+            ffn_fc1,
+            ffn_fc2,
+            alpha_ffn,
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let (b, s, _d) = x.size3().unwrap();
+        let head_dim = _d / GQA_NUM_Q_HEADS;
+
+        // Self-attention with pre-norm
+        let x_norm = self.attn_ln.forward(x);
+        let q = x_norm.apply(&self.attn_q);
+        let k = x_norm.apply(&self.attn_k);
+        let v = x_norm.apply(&self.attn_v);
+
+        let q = q
+            .reshape([b, s, GQA_NUM_Q_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+        let k = k
+            .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+        let v = v
+            .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+
+        let q = self.q_norm.forward(&q);
+        let k = self.k_norm.forward(&k);
+
+        let out = Tensor::scaled_dot_product_attention(
+            &q, &k, &v,
+            None::<&Tensor>,
+            0.0,
+            true,
+            None,
+            true,
+        )
+            .permute([0, 2, 1, 3])
+            .reshape([b, s, _d]);
+        let out = out.apply(&self.attn_out);
+        let x = x + self.alpha_attn.sigmoid() * RESIDUAL_ALPHA_MAX * out;
+
+        // SwiGLU FFN with pre-norm
+        let ffn_in = self.ffn_ln.forward(&x);
+        let ffn_proj = ffn_in.apply(&self.ffn_fc1);
+        let ffn_parts = ffn_proj.chunk(2, -1);
+        let ffn_out = (ffn_parts[0].silu() * &ffn_parts[1]).apply(&self.ffn_fc2);
+        &x + self.alpha_ffn.sigmoid() * RESIDUAL_ALPHA_MAX * ffn_out
+    }
+}
+
 fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
     let denoms = (in_features + out_features) as f64 / 2.0;
     let std = (1.0 / denoms).sqrt() / 0.8796;
@@ -307,14 +386,12 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
     }
 }
 
-const BASE_SSM_DIM: i64 = 128;
 const BASE_MODEL_DIM: i64 = 128;
 const BASE_FF_DIM: i64 = 512;
-const BASE_SSM_LAYERS: usize = 2;
-const ABLATION_SMALL_SSM_DIM: i64 = 64;
+const BASE_GQA_LAYERS: usize = 2;
 const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
-const ABLATION_SMALL_SSM_LAYERS: usize = 1;
+const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(crate) const SDE_LATENT_DIM: i64 = 128;
 pub(crate) const GSDE_EPS: f64 = 1e-6;
 pub(crate) const GSDE_LOG_STD_INIT: f64 = -2.0;
@@ -362,27 +439,24 @@ impl ModelVariant {
 
 #[derive(Clone, Copy)]
 struct ModelSpec {
-    ssm_dim: i64,
     model_dim: i64,
     ff_dim: i64,
-    ssm_layers: usize,
+    gqa_layers: usize,
     patch_configs: &'static [(i64, i64)],
 }
 
 fn model_spec(variant: ModelVariant) -> ModelSpec {
     match variant {
         ModelVariant::Base => ModelSpec {
-            ssm_dim: BASE_SSM_DIM,
             model_dim: BASE_MODEL_DIM,
             ff_dim: BASE_FF_DIM,
-            ssm_layers: BASE_SSM_LAYERS,
+            gqa_layers: BASE_GQA_LAYERS,
             patch_configs: BASE_PATCH_CONFIGS,
         },
         ModelVariant::AblationSmall => ModelSpec {
-            ssm_dim: ABLATION_SMALL_SSM_DIM,
             model_dim: ABLATION_SMALL_MODEL_DIM,
             ff_dim: ABLATION_SMALL_FF_DIM,
-            ssm_layers: ABLATION_SMALL_SSM_LAYERS,
+            gqa_layers: ABLATION_SMALL_GQA_LAYERS,
             patch_configs: ABLATION_SMALL_PATCH_CONFIGS,
         },
     }
@@ -530,22 +604,20 @@ pub struct DebugMetrics {
 #[derive(Clone, Copy)]
 pub struct TradingModelConfig {
     pub variant: ModelVariant,
-    pub ssm_layers_override: Option<usize>,
 }
 
 impl Default for TradingModelConfig {
     fn default() -> Self {
         Self {
             variant: ModelVariant::Base,
-            ssm_layers_override: None,
         }
     }
 }
 
-/// Streaming state for O(1) inference per step
-/// - Ring buffer holds full delta history for head computation
+/// Streaming state for inference
+/// - Ring buffer holds full delta history
 /// - Patch buffer accumulates deltas until full patch ready
-/// - SSM state carries compressed history (only process new token each patch)
+/// - No model state needed (GQA is stateless, uses full forward pass)
 pub struct StreamState {
     /// Ring buffer: [TICKERS_COUNT, PRICE_DELTAS_PER_TICKER]
     pub delta_ring: Tensor,
@@ -555,8 +627,6 @@ pub struct StreamState {
     pub patch_buf: Tensor,
     /// Position within current patch
     pub patch_pos: i64,
-    /// SSM hidden state per layer (batched over tickers)
-    pub ssm_states: Vec<Mamba2State>,
     /// Whether initialized with full sequence
     pub initialized: bool,
 }
@@ -566,21 +636,15 @@ pub struct TradingModel {
     patch_configs: &'static [(i64, i64)],
     seq_len: i64,
     finest_patch_size: i64,
-    finest_patch_index: usize,
-    ssm_dim: i64,
     model_dim: i64,
     ff_dim: i64,
     cross_head_dim: i64,
-    critic_hidden_dim: i64,
     patch_embed_weight: Tensor,
     patch_embed_bias: Tensor,
-    patch_dt_scale: Tensor,
-    patch_sizes: Tensor,
     patch_config_ids: Tensor,
     patch_pos_embed: Tensor,
-    ssm_layers: Vec<StatefulMambaRef>,
-    ssm_norms: Vec<RMSNorm>,
-    ssm_final_norm: RMSNorm,
+    gqa_layers: Vec<GqaBlock>,
+    final_norm: RMSNorm,
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
     exo_cross_blocks: Vec<ExoCrossBlock>,
@@ -593,7 +657,6 @@ pub struct TradingModel {
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
-    // gSDE exploration: learned log-std for latent->action noise projection
     log_std_param: Tensor, // [SDE_LATENT_DIM, ACTION_DIM - 1]
     device: tch::Device,
 }
@@ -644,7 +707,7 @@ impl TradingModel {
 
     pub fn new_with_config(p: &nn::Path, config: TradingModelConfig) -> Self {
         let spec = model_spec(config.variant);
-        let ssm_layers_count = config.ssm_layers_override.unwrap_or(spec.ssm_layers);
+        let gqa_layers_count = spec.gqa_layers;
         let patch_configs = spec.patch_configs;
         let (total_days, seq_len) = compute_patch_totals(patch_configs);
         assert!(
@@ -662,7 +725,7 @@ impl TradingModel {
         let max_input_dim = max_patch_size + PATCH_SCALAR_FEATS;
         let patch_embed_weight = p.var(
             "patch_embed_weight",
-            &[num_configs, max_input_dim, spec.ssm_dim],
+            &[num_configs, max_input_dim, spec.model_dim],
             Init::Uniform {
                 lo: -0.02,
                 up: 0.02,
@@ -670,33 +733,9 @@ impl TradingModel {
         );
         let patch_embed_bias = p.var(
             "patch_embed_bias",
-            &[num_configs, spec.ssm_dim],
+            &[num_configs, spec.model_dim],
             Init::Const(0.0),
         );
-        let patch_dt_scale = {
-            let mut scales = Vec::with_capacity(seq_len as usize);
-            for &(days, patch_size) in patch_configs {
-                let n_patches = days / patch_size;
-                for _ in 0..n_patches {
-                    scales.push(patch_size as f32);
-                }
-            }
-            Tensor::from_slice(&scales)
-                .view([1, seq_len, 1])
-                .to_device(p.device())
-        };
-        let patch_sizes = {
-            let mut sizes = Vec::with_capacity(seq_len as usize);
-            for &(days, patch_size) in patch_configs {
-                let n_patches = days / patch_size;
-                for _ in 0..n_patches {
-                    sizes.push(patch_size as f32);
-                }
-            }
-            Tensor::from_slice(&sizes)
-                .view([1, seq_len, 1])
-                .to_device(p.device())
-        };
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
             for (cfg_idx, &(days, patch_size)) in patch_configs.iter().enumerate() {
@@ -711,22 +750,14 @@ impl TradingModel {
         };
         let patch_pos_embed = p.var(
             "patch_pos_embed",
-            &[seq_len, spec.ssm_dim],
+            &[seq_len, spec.model_dim],
             Init::Const(0.0),
         );
 
-        let ssm_cfg = Mamba2Config {
-            d_model: spec.ssm_dim,
-            d_ssm: Some(spec.ssm_dim),
-            ..Mamba2Config::default()
-        };
-        let ssm_layers = (0..ssm_layers_count)
-            .map(|i| stateful_mamba_block_cfg(&(p / format!("ssm_{}", i)), ssm_cfg.clone()))
+        let gqa_layers = (0..gqa_layers_count)
+            .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim))
             .collect::<Vec<_>>();
-        let ssm_norms = (0..ssm_layers_count)
-            .map(|i| RMSNorm::new(&(p / format!("ssm_norm_{}", i)), spec.ssm_dim, 1e-6))
-            .collect::<Vec<_>>();
-        let ssm_final_norm = RMSNorm::new(&(p / "ssm_final_norm"), spec.ssm_dim, 1e-6);
+        let final_norm = RMSNorm::new(&(p / "final_norm"), spec.model_dim, 1e-6);
 
         let exo_feat_w = p.var(
             "exo_feat_w",
@@ -838,21 +869,15 @@ impl TradingModel {
             patch_configs,
             seq_len,
             finest_patch_size,
-            finest_patch_index,
-            ssm_dim: spec.ssm_dim,
             model_dim: spec.model_dim,
             ff_dim: spec.ff_dim,
             cross_head_dim,
-            critic_hidden_dim: critic_hidden,
             patch_embed_weight,
             patch_embed_bias,
-            patch_dt_scale,
-            patch_sizes,
             patch_config_ids,
             patch_pos_embed,
-            ssm_layers,
-            ssm_norms,
-            ssm_final_norm,
+            gqa_layers,
+            final_norm,
             exo_feat_w,
             exo_feat_b,
             exo_cross_blocks,
@@ -882,9 +907,9 @@ impl TradingModel {
         (global, per_ticker)
     }
 
-    /// Apply exo cross-block if this SSM layer index is in EXO_CROSS_AFTER
-    fn maybe_apply_exo_cross(&self, x: &Tensor, exo_kv: &Tensor, ssm_layer_idx: usize) -> Tensor {
-        if let Some(pos) = EXO_CROSS_AFTER.iter().position(|&i| i == ssm_layer_idx) {
+    /// Apply exo cross-block if this layer index is in EXO_CROSS_AFTER
+    fn maybe_apply_exo_cross(&self, x: &Tensor, exo_kv: &Tensor, layer_idx: usize) -> Tensor {
+        if let Some(pos) = EXO_CROSS_AFTER.iter().position(|&i| i == layer_idx) {
             self.exo_cross_blocks[pos].forward(x, exo_kv, self.model_dim, self.cross_head_dim)
         } else {
             x.shallow_clone()
@@ -909,53 +934,20 @@ impl TradingModel {
         feats_expanded * &self.exo_feat_w + &self.exo_feat_b
     }
 
-    fn patch_embed_single(&self, ticker_data: &Tensor) -> Tensor {
-        let deltas = ticker_data.to_device(self.device);
-        self.patch_embed(&deltas)
-    }
-
-    fn normalize_seq_idx(&self, seq_idx: &Tensor, batch_size: i64) -> Tensor {
-        if seq_idx.numel() == 0 {
-            return seq_idx.shallow_clone();
-        }
-        let seq_idx = self.maybe_to_device(seq_idx, self.device);
-        self.normalize_seq_idx_on_device(&seq_idx, batch_size)
-    }
-
-    fn normalize_seq_idx_on_device(&self, seq_idx: &Tensor, batch_size: i64) -> Tensor {
-        if seq_idx.numel() == 0 {
-            return seq_idx.shallow_clone();
-        }
-        let sizes = seq_idx.size();
-        if sizes.len() != 2 {
-            panic!("seq_idx must be 2D");
-        }
-        if sizes[0] == batch_size && sizes[1] == TICKERS_COUNT * self.seq_len {
-            seq_idx.view([batch_size * TICKERS_COUNT, self.seq_len])
-        } else if sizes[0] == batch_size * TICKERS_COUNT && sizes[1] == self.seq_len {
-            seq_idx.shallow_clone()
-        } else {
-            panic!("unexpected seq_idx shape {:?}", sizes);
-        }
-    }
-
     fn patch_latent_stem(
         &self,
         price_deltas: &Tensor,
         batch_size: i64,
-        seq_idx: Option<&Tensor>,
-    ) -> (Tensor, Tensor, Tensor) {
+    ) -> Tensor {
         let price_deltas = self.maybe_to_device(price_deltas, self.device);
-        let seq_idx = seq_idx.map(|seq_idx| self.maybe_to_device(seq_idx, self.device));
-        self.patch_latent_stem_on_device(&price_deltas, batch_size, seq_idx.as_ref())
+        self.patch_latent_stem_on_device(&price_deltas, batch_size)
     }
 
     fn patch_latent_stem_on_device(
         &self,
         price_deltas: &Tensor,
         batch_size: i64,
-        seq_idx: Option<&Tensor>,
-    ) -> (Tensor, Tensor, Tensor) {
+    ) -> Tensor {
         let batch_tokens = batch_size * TICKERS_COUNT;
         let deltas = price_deltas
             .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
@@ -963,44 +955,7 @@ impl TradingModel {
 
         let kind = deltas.kind();
         let pos_embed = self.maybe_to_device_kind(&self.patch_pos_embed, deltas.device(), kind);
-        let x = self.patch_embed(&deltas) + pos_embed;
-        let seq_idx = match seq_idx {
-            Some(seq_idx) => self.normalize_seq_idx_on_device(seq_idx, batch_size),
-            None => Self::build_seq_idx_from_padding(&deltas, &self.patch_sizes),
-        };
-        // Cast to int32 here so Python bridge doesn't need to cast per forward call.
-        // causal_conv1d CUDA kernel requires int32 seq_idx.
-        let seq_idx = if seq_idx.numel() > 0 {
-            seq_idx.to_kind(Kind::Int)
-        } else {
-            seq_idx
-        };
-        let dt_scale = self
-            .maybe_to_device_kind(&self.patch_dt_scale, deltas.device(), kind)
-            .clamp_min(1e-4);
-        (x, dt_scale, seq_idx)
-    }
-
-    fn build_seq_idx_from_padding(deltas: &Tensor, patch_sizes: &Tensor) -> Tensor {
-        let device = deltas.device();
-        let zeros = deltas.eq(0.0).to_kind(Kind::Float);
-        let prefix = zeros.cumprod(1, Kind::Float);
-        let leading = prefix
-            .sum_dim_intlist([1].as_slice(), false, Kind::Float)
-            .to_kind(Kind::Int64);
-        let max_leading = leading.max().int64_value(&[]);
-        if max_leading == 0 {
-            return Tensor::zeros(&[0], (Kind::Int64, device));
-        }
-        let patch_sizes = if patch_sizes.device() == device {
-            patch_sizes.shallow_clone()
-        } else {
-            patch_sizes.to_device(device)
-        };
-        let patch_ends = patch_sizes.to_kind(Kind::Int64).cumsum(1, Kind::Int64);
-        let patch_ends = patch_ends.squeeze_dim(0).squeeze_dim(-1);
-        let mask = leading.unsqueeze(1).ge_tensor(&patch_ends);
-        mask.to_kind(Kind::Int64).neg()
+        self.patch_embed(&deltas) + pos_embed
     }
 
     /// Per-config enrichment (avoids [batch, 256, 8636] expand), then fused
@@ -1043,12 +998,13 @@ impl TradingModel {
             enriched_parts.push(padded);
             delta_offset += days;
         }
-        let enriched = Tensor::cat(&enriched_parts.iter().collect::<Vec<_>>(), 1);
+        let enriched = Tensor::cat(&enriched_parts.iter().collect::<Vec<_>>(), 1)
+            .to_kind(kind);
 
         // Phase 2: fused projection — single einsum over all 256 tokens
         let config_ids = self.maybe_to_device(&self.patch_config_ids, device);
-        let weight = self.maybe_to_device_kind(&self.patch_embed_weight, device, Kind::Float);
-        let bias = self.maybe_to_device_kind(&self.patch_embed_bias, device, Kind::Float);
+        let weight = self.maybe_to_device(&self.patch_embed_weight, device);
+        let bias = self.maybe_to_device(&self.patch_embed_bias, device);
         let weight_per_patch = weight.index_select(0, &config_ids);
         let bias_per_patch = bias.index_select(0, &config_ids);
         let out = Tensor::einsum(
@@ -1056,32 +1012,7 @@ impl TradingModel {
             &[&enriched, &weight_per_patch],
             None::<&[i64]>,
         );
-        let out = out + bias_per_patch.unsqueeze(0);
-        out.to_kind(kind)
+        out + bias_per_patch.unsqueeze(0)
     }
 
-    /// Single-config embedding for streaming inference (one patch at a time).
-    fn embed_patch_config(&self, patches: &Tensor, config_idx: i64) -> Tensor {
-        let kind = patches.kind();
-        let patches_f = patches.to_kind(Kind::Float);
-        let patch_len = patches_f.size()[2];
-        let mean = patches_f.mean_dim([2].as_slice(), true, Kind::Float);
-        let var =
-            (&patches_f - &mean)
-                .pow_tensor_scalar(2.0)
-                .mean_dim([2].as_slice(), true, Kind::Float);
-        let std = (var + 1e-5).sqrt();
-        let first = patches_f.narrow(2, 0, 1);
-        let last = patches_f.narrow(2, patch_len - 1, 1);
-        let slope = &last - &first;
-        let enriched = Tensor::cat(&[&patches_f, &mean, &std, &slope], 2);
-        let input_dim = patch_len + PATCH_SCALAR_FEATS;
-        let weight = self
-            .patch_embed_weight
-            .get(config_idx)
-            .narrow(0, 0, input_dim);
-        let bias = self.patch_embed_bias.get(config_idx);
-        let out = enriched.matmul(&weight) + bias;
-        out.to_kind(kind)
-    }
 }

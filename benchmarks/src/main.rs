@@ -157,7 +157,7 @@ fn main() {
 
 fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
     println!("--- Mamba2 SSM Benchmarks ---");
-    let vs = nn::VarStore::new(device);
+    let mut vs = nn::VarStore::new(device);
     let dtype = Kind::BFloat16;
 
     let config = Mamba2Config {
@@ -168,9 +168,7 @@ fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         ..Default::default()
     };
     let mamba = Mamba2::new(&vs.root(), config);
-    for (_name, mut tensor) in vs.variables() {
-        let _ = tensor.set_data(&tensor.to_kind(dtype));
-    }
+    vs.bfloat16();
 
     let batch = 4;
     let seqlen = 4096;
@@ -285,7 +283,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
     let static_obs_dim = STATIC_OBSERVATIONS as i64;
 
     for &variant in &[ModelVariant::Base, ModelVariant::AblationSmall] {
-        let vs = nn::VarStore::new(device);
+        let mut vs = nn::VarStore::new(device);
         let model = TradingModel::new_with_config(
             &vs.root(),
             TradingModelConfig {
@@ -293,9 +291,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
                 ..TradingModelConfig::default()
             },
         );
-        for (_name, mut tensor) in vs.variables() {
-            let _ = tensor.set_data(&tensor.to_kind(dtype));
-        }
+        vs.bfloat16();
         println!("  Variant: {}", variant.as_str());
 
         for &batch in &[1, 4, 8] {

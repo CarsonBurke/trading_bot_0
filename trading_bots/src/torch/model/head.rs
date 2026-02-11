@@ -1,8 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{
-    DebugMetrics, ModelOutput, TradingModel, ATTN_LOGIT_CAP, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS,
-};
+use super::{DebugMetrics, ModelOutput, TradingModel, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -13,8 +11,8 @@ impl TradingModel {
         compute_values: bool,
         _debug: bool,
     ) -> (ModelOutput, Option<DebugMetrics>) {
-        let x = self.ssm_final_norm.forward(x_ssm);
-        // [batch*tickers, seq_len, SSM_DIM] -> [batch, tickers, seq_len, SSM_DIM]
+        let x = self.final_norm.forward(x_ssm);
+        // [batch*tickers, seq_len, model_dim] -> [batch, tickers, seq_len, model_dim]
         let temporal_len = x.size()[1];
         let x_time = x.view([batch_size, TICKERS_COUNT, temporal_len, self.model_dim]);
 
@@ -33,18 +31,22 @@ impl TradingModel {
             .ticker_ln
             .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]))
             .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
-        let q = block.q_norm.forward(&x_ticker_norm.apply(&block.ticker_q));
-        let k = block.k_norm.forward(&x_ticker_norm.apply(&block.ticker_k));
-        let v = x_ticker_norm.apply(&block.ticker_v);
-        let kind = q.kind();
-        let scores = q.matmul(&k.transpose(-2, -1)) / (self.model_dim as f64).sqrt();
-        let scores = ATTN_LOGIT_CAP * (scores / ATTN_LOGIT_CAP).tanh();
-        let attn = scores.softmax(-1, Kind::Float).to_kind(kind);
-        let ticker_ctx = attn.matmul(&v).apply(&block.ticker_out).reshape([
-            batch_size,
-            TICKERS_COUNT,
-            self.model_dim,
-        ]);
+        let q = block
+            .q_norm
+            .forward(&x_ticker_norm.apply(&block.ticker_q))
+            .unsqueeze(1);
+        let k = block
+            .k_norm
+            .forward(&x_ticker_norm.apply(&block.ticker_k))
+            .unsqueeze(1);
+        let v = x_ticker_norm.apply(&block.ticker_v).unsqueeze(1);
+        let ticker_ctx = Tensor::scaled_dot_product_attention(
+            &q, &k, &v,
+            None::<&Tensor>, 0.0, false, None, false,
+        )
+            .squeeze_dim(1)
+            .apply(&block.ticker_out)
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
         ticker_repr = ticker_repr + &ticker_ctx * &alpha_ticker_attn;
 
         let mlp_in = block
@@ -79,11 +81,16 @@ impl TradingModel {
         }
         let critic_values = critic_x.apply(&self.value_out).squeeze_dim(-1);
 
+        // Cast all outputs to fp32 for loss computation
         let values = if compute_values {
-            critic_values.to_kind(ticker_repr.kind())
+            critic_values.to_kind(Kind::Float)
         } else {
-            Tensor::zeros(&[batch_size], (ticker_repr.kind(), ticker_repr.device()))
+            Tensor::zeros(&[batch_size], (Kind::Float, ticker_repr.device()))
         };
+        let critic_values = critic_values.to_kind(Kind::Float);
+        let critic_input = critic_input.to_kind(Kind::Float);
+        let action_mean = action_mean.to_kind(Kind::Float);
+        let actor_latent = actor_latent.to_kind(Kind::Float);
 
         let debug_metrics = None;
 
