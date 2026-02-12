@@ -670,14 +670,7 @@ impl TradingModel {
         }
     }
 
-    fn maybe_to_device_kind(&self, input: &Tensor, device: tch::Device, kind: Kind) -> Tensor {
-        let input = self.maybe_to_device(input, device);
-        if input.kind() == kind {
-            input
-        } else {
-            input.to_kind(kind)
-        }
-    }
+
 
     fn cast_inputs(&self, input: &Tensor) -> Tensor {
         let target_kind = self.patch_embed_weight.kind();
@@ -954,7 +947,11 @@ impl TradingModel {
             .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
 
         let kind = deltas.kind();
-        let pos_embed = self.maybe_to_device_kind(&self.patch_pos_embed, deltas.device(), kind);
+        let pos_embed = if self.patch_pos_embed.kind() == kind {
+            self.patch_pos_embed.shallow_clone()
+        } else {
+            self.patch_pos_embed.to_kind(kind)
+        };
         self.patch_embed(&deltas) + pos_embed
     }
 
@@ -1002,11 +999,8 @@ impl TradingModel {
             .to_kind(kind);
 
         // Phase 2: fused projection — single einsum over all 256 tokens
-        let config_ids = self.maybe_to_device(&self.patch_config_ids, device);
-        let weight = self.maybe_to_device(&self.patch_embed_weight, device);
-        let bias = self.maybe_to_device(&self.patch_embed_bias, device);
-        let weight_per_patch = weight.index_select(0, &config_ids);
-        let bias_per_patch = bias.index_select(0, &config_ids);
+        let weight_per_patch = self.patch_embed_weight.index_select(0, &self.patch_config_ids);
+        let bias_per_patch = self.patch_embed_bias.index_select(0, &self.patch_config_ids);
         let out = Tensor::einsum(
             "blm,lmd->bld",
             &[&enriched, &weight_per_patch],
