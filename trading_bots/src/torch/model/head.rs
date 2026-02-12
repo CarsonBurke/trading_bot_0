@@ -31,15 +31,11 @@ impl TradingModel {
             .ticker_ln
             .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]))
             .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
-        let q = block
-            .q_norm
-            .forward(&x_ticker_norm.apply(&block.ticker_q))
-            .unsqueeze(1);
-        let k = block
-            .k_norm
-            .forward(&x_ticker_norm.apply(&block.ticker_k))
-            .unsqueeze(1);
-        let v = x_ticker_norm.apply(&block.ticker_v).unsqueeze(1);
+        let qkv = x_ticker_norm.apply(&block.ticker_qkv);
+        let parts = qkv.split(self.model_dim, -1);
+        let q = block.q_norm.forward(&parts[0]).unsqueeze(1);
+        let k = block.k_norm.forward(&parts[1]).unsqueeze(1);
+        let v = parts[2].unsqueeze(1);
         let ticker_ctx = Tensor::scaled_dot_product_attention(
             &q, &k, &v,
             None::<&Tensor>, 0.0, false, None, false,

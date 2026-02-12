@@ -16,9 +16,7 @@ use rmsnorm::RMSNorm;
 
 struct InterTickerBlock {
     ticker_ln: RMSNorm,
-    ticker_q: nn::Linear,
-    ticker_k: nn::Linear,
-    ticker_v: nn::Linear,
+    ticker_qkv: nn::Linear,
     ticker_out: nn::Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
@@ -32,9 +30,7 @@ struct InterTickerBlock {
 impl InterTickerBlock {
     fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
-        let ticker_q = nn::linear(p / "ticker_q", model_dim, model_dim, Default::default());
-        let ticker_k = nn::linear(p / "ticker_k", model_dim, model_dim, Default::default());
-        let ticker_v = nn::linear(p / "ticker_v", model_dim, model_dim, Default::default());
+        let ticker_qkv = nn::linear(p / "ticker_qkv", model_dim, 3 * model_dim, Default::default());
         let ticker_out = nn::linear(p / "ticker_out", model_dim, model_dim, Default::default());
         let q_norm = RMSNorm::new(&(p / "ticker_q_norm"), model_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "ticker_k_norm"), model_dim, 1e-6);
@@ -49,9 +45,7 @@ impl InterTickerBlock {
         let alpha_mlp = p.var("alpha_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
             ticker_ln,
-            ticker_q,
-            ticker_k,
-            ticker_v,
+            ticker_qkv,
             ticker_out,
             q_norm,
             k_norm,
@@ -191,30 +185,20 @@ const EXO_CROSS_AFTER: &[usize] = &[0];
 struct ExoCrossBlock {
     cross_ln: RMSNorm,
     cross_q: nn::Linear,
-    cross_k: nn::Linear,
-    cross_v: nn::Linear,
+    cross_kv: nn::Linear,
     cross_out: nn::Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
+    kv_dim: i64,
     alpha_cross: Tensor,
 }
 
 impl ExoCrossBlock {
     fn new(p: &nn::Path, model_dim: i64, cross_head_dim: i64) -> Self {
+        let kv_dim = CROSS_NUM_KV_HEADS * cross_head_dim;
         let cross_ln = RMSNorm::new(&(p / "cross_ln"), model_dim, 1e-6);
         let cross_q = nn::linear(p / "cross_q", model_dim, model_dim, Default::default());
-        let cross_k = nn::linear(
-            p / "cross_k",
-            model_dim,
-            CROSS_NUM_KV_HEADS * cross_head_dim,
-            Default::default(),
-        );
-        let cross_v = nn::linear(
-            p / "cross_v",
-            model_dim,
-            CROSS_NUM_KV_HEADS * cross_head_dim,
-            Default::default(),
-        );
+        let cross_kv = nn::linear(p / "cross_kv", model_dim, 2 * kv_dim, Default::default());
         let cross_out = nn::linear(p / "cross_out", model_dim, model_dim, Default::default());
         let q_norm = RMSNorm::new(&(p / "cross_q_norm"), cross_head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "cross_k_norm"), cross_head_dim, 1e-6);
@@ -222,11 +206,11 @@ impl ExoCrossBlock {
         Self {
             cross_ln,
             cross_q,
-            cross_k,
-            cross_v,
+            cross_kv,
             cross_out,
             q_norm,
             k_norm,
+            kv_dim,
             alpha_cross,
         }
     }
@@ -244,16 +228,16 @@ impl ExoCrossBlock {
         let t = exo_kv.size()[1];
 
         let q = self.cross_ln.forward(&x_3d).apply(&self.cross_q);
-        let k = exo_kv.apply(&self.cross_k);
-        let v = exo_kv.apply(&self.cross_v);
+        let kv = exo_kv.apply(&self.cross_kv);
+        let kv_parts = kv.split(self.kv_dim, -1);
 
         let q = q
             .reshape([b, s, CROSS_NUM_Q_HEADS, cross_head_dim])
             .permute([0, 2, 1, 3]);
-        let k = k
+        let k = kv_parts[0]
             .reshape([b, t, CROSS_NUM_KV_HEADS, cross_head_dim])
             .permute([0, 2, 1, 3]);
-        let v = v
+        let v = kv_parts[1]
             .reshape([b, t, CROSS_NUM_KV_HEADS, cross_head_dim])
             .permute([0, 2, 1, 3]);
 
@@ -287,12 +271,12 @@ const GQA_NUM_KV_HEADS: i64 = 2;
 
 struct GqaBlock {
     attn_ln: RMSNorm,
-    attn_q: nn::Linear,
-    attn_k: nn::Linear,
-    attn_v: nn::Linear,
+    attn_qkv: nn::Linear,
     attn_out: nn::Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
+    q_dim: i64,
+    kv_dim: i64,
     alpha_attn: Tensor,
     ffn_ln: RMSNorm,
     ffn_fc1: nn::Linear,
@@ -304,10 +288,9 @@ impl GqaBlock {
     fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
         let head_dim = model_dim / GQA_NUM_Q_HEADS;
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
+        let qkv_dim = model_dim + 2 * kv_dim;
         let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
-        let attn_q = nn::linear(p / "attn_q", model_dim, model_dim, Default::default());
-        let attn_k = nn::linear(p / "attn_k", model_dim, kv_dim, Default::default());
-        let attn_v = nn::linear(p / "attn_v", model_dim, kv_dim, Default::default());
+        let attn_qkv = nn::linear(p / "attn_qkv", model_dim, qkv_dim, Default::default());
         let attn_out = nn::linear(p / "attn_out", model_dim, model_dim, Default::default());
         let q_norm = RMSNorm::new(&(p / "attn_q_norm"), head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "attn_k_norm"), head_dim, 1e-6);
@@ -318,12 +301,12 @@ impl GqaBlock {
         let alpha_ffn = p.var("alpha_ffn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
             attn_ln,
-            attn_q,
-            attn_k,
-            attn_v,
+            attn_qkv,
             attn_out,
             q_norm,
             k_norm,
+            q_dim: model_dim,
+            kv_dim,
             alpha_attn,
             ffn_ln,
             ffn_fc1,
@@ -338,19 +321,18 @@ impl GqaBlock {
 
         // Self-attention with pre-norm
         let x_norm = self.attn_ln.forward(x);
-        let q = x_norm.apply(&self.attn_q);
-        let k = x_norm.apply(&self.attn_k);
-        let v = x_norm.apply(&self.attn_v);
-
-        let q = q
+        let qkv = x_norm.apply(&self.attn_qkv);
+        let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
+        let q = parts[0]
             .reshape([b, s, GQA_NUM_Q_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
-        let k = k
+        let k = parts[1]
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
-        let v = v
+        let v = parts[2]
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
-            .permute([0, 2, 1, 3]);
+            .permute([0, 2, 1, 3])
+            .contiguous();
 
         let q = self.q_norm.forward(&q);
         let k = self.k_norm.forward(&k);
@@ -364,6 +346,7 @@ impl GqaBlock {
             true,
         )
             .permute([0, 2, 1, 3])
+            .contiguous()
             .reshape([b, s, _d]);
         let out = out.apply(&self.attn_out);
         let x = x + self.alpha_attn.sigmoid() * RESIDUAL_ALPHA_MAX * out;
