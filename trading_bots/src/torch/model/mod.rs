@@ -744,7 +744,10 @@ impl TradingModel {
         let patch_pos_embed = p.var(
             "patch_pos_embed",
             &[seq_len, spec.model_dim],
-            Init::Const(0.0),
+            Init::Randn {
+                mean: 0.0,
+                stdev: 0.02,
+            },
         );
 
         let gqa_layers = (0..gqa_layers_count)
