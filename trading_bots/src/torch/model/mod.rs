@@ -359,7 +359,7 @@ impl GqaBlock {
             &q, &k, &v,
             None::<&Tensor>,
             0.0,
-            true,
+            false,
             None,
             true,
         )
