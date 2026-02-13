@@ -1,6 +1,8 @@
 use std::env;
 use std::time::Instant;
-use tch::{nn, nn::OptimizerConfig, Kind, Tensor};
+use tch::{nn, Kind, Tensor};
+
+use super::Fp32Adam;
 
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::VecEnv;
@@ -355,7 +357,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
     // Adam optimizer handles mixed bf16 parameters correctly.
     vs.bfloat16();
 
-    let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE).unwrap();
+    let mut opt = Fp32Adam::new(&vs, LEARNING_RATE);
 
     let mut env = VecEnv::new(true, model_variant);
     if start_episode > 0 {
