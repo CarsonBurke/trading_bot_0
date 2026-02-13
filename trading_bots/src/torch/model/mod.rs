@@ -331,8 +331,7 @@ impl GqaBlock {
             .permute([0, 2, 1, 3]);
         let v = parts[2]
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
-            .permute([0, 2, 1, 3])
-            .contiguous();
+            .permute([0, 2, 1, 3]);
 
         let q = self.q_norm.forward(&q);
         let k = self.k_norm.forward(&k);
