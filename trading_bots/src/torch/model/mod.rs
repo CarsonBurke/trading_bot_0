@@ -30,12 +30,12 @@ struct InterTickerBlock {
 impl InterTickerBlock {
     fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
-        let ticker_qkv = nn::linear(p / "ticker_qkv", model_dim, 3 * model_dim, Default::default());
-        let ticker_out = nn::linear(p / "ticker_out", model_dim, model_dim, Default::default());
+        let ticker_qkv = linear_truncated(p, "ticker_qkv", model_dim, 3 * model_dim);
+        let ticker_out = linear_truncated(p, "ticker_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "ticker_q_norm"), model_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "ticker_k_norm"), model_dim, 1e-6);
-        let mlp_fc1 = nn::linear(p / "mlp_fc1", model_dim, 2 * ff_dim, Default::default());
-        let mlp_fc2 = nn::linear(p / "mlp_fc2", ff_dim, model_dim, Default::default());
+        let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, 2 * ff_dim);
+        let mlp_fc2 = linear_truncated(p, "mlp_fc2", ff_dim, model_dim);
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
         let alpha_ticker_attn = p.var(
             "alpha_ticker_attn_raw",
@@ -197,9 +197,9 @@ impl ExoCrossBlock {
     fn new(p: &nn::Path, model_dim: i64, cross_head_dim: i64) -> Self {
         let kv_dim = CROSS_NUM_KV_HEADS * cross_head_dim;
         let cross_ln = RMSNorm::new(&(p / "cross_ln"), model_dim, 1e-6);
-        let cross_q = nn::linear(p / "cross_q", model_dim, model_dim, Default::default());
-        let cross_kv = nn::linear(p / "cross_kv", model_dim, 2 * kv_dim, Default::default());
-        let cross_out = nn::linear(p / "cross_out", model_dim, model_dim, Default::default());
+        let cross_q = linear_truncated(p, "cross_q", model_dim, model_dim);
+        let cross_kv = linear_truncated(p, "cross_kv", model_dim, 2 * kv_dim);
+        let cross_out = linear_truncated(p, "cross_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "cross_q_norm"), cross_head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "cross_k_norm"), cross_head_dim, 1e-6);
         let alpha_cross = p.var("alpha_cross", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
@@ -290,14 +290,14 @@ impl GqaBlock {
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
         let qkv_dim = model_dim + 2 * kv_dim;
         let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
-        let attn_qkv = nn::linear(p / "attn_qkv", model_dim, qkv_dim, Default::default());
-        let attn_out = nn::linear(p / "attn_out", model_dim, model_dim, Default::default());
+        let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
+        let attn_out = linear_truncated(p, "attn_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "attn_q_norm"), head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "attn_k_norm"), head_dim, 1e-6);
         let alpha_attn = p.var("alpha_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
-        let ffn_fc1 = nn::linear(p / "ffn_fc1", model_dim, 2 * ff_dim, Default::default());
-        let ffn_fc2 = nn::linear(p / "ffn_fc2", ff_dim, model_dim, Default::default());
+        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
+        let ffn_fc2 = linear_truncated(p, "ffn_fc2", ff_dim, model_dim);
         let alpha_ffn = p.var("alpha_ffn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
             attn_ln,
@@ -367,6 +367,19 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
         mean: 0.0,
         stdev: std,
     }
+}
+
+fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i64) -> nn::Linear {
+    nn::linear(
+        p / name,
+        in_features,
+        out_features,
+        nn::LinearConfig {
+            ws_init: truncated_normal_init(in_features, out_features),
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
+        },
+    )
 }
 
 const BASE_MODEL_DIM: i64 = 128;
