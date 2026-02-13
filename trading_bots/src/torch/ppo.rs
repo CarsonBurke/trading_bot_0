@@ -166,23 +166,20 @@ fn sample_rollout_actions(
         let (values, _, _, (action_mean, sde_latent)) =
             model.forward_on_device(obs_price, obs_static, false);
         let values = values.to_kind(Kind::Float);
-        let action_mean = action_mean.to_kind(Kind::Float);
+        let action_mean = action_mean.to_kind(Kind::Float); // [B, ACTION_DIM]
         let sde_latent = sde_latent.to_kind(Kind::Float);
 
-        // K-1 noise dims; last logit is gauge reference (zero noise)
-        let noise = sde_latent
+        let noise_v = sde_latent
             .unsqueeze(1)
             .bmm(exploration_mats)
-            .squeeze_dim(1); // [B, K-1]
-        let noise_pad = Tensor::zeros(
-            &[noise.size()[0], 1],
-            (Kind::Float, noise.device()),
-        );
-        let u = &action_mean + Tensor::cat(&[&noise, &noise_pad], -1);
+            .squeeze_dim(1); // [B, ACTION_DIM - 1]
+        let noise_pad = Tensor::zeros([noise_v.size()[0], 1], (Kind::Float, noise_v.device()));
+        let noise = Tensor::cat(&[&noise_v, &noise_pad], -1); // cash gets zero noise
+        let u = &action_mean + &noise;
         let actions = u.softmax(-1, Kind::Float);
 
-        let action_std = gsde_action_std(&sde_latent, sde_std); // [B, K-1]
-        let action_log_prob = diag_gaussian_log_prob(&noise, &action_std);
+        let action_std_v = gsde_action_std(&sde_latent, sde_std); // [B, ACTION_DIM - 1]
+        let action_log_prob = diag_gaussian_log_prob(&noise_v, &action_std_v);
 
         (values, action_mean, u, actions, action_log_prob)
     })
