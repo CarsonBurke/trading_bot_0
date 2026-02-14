@@ -16,10 +16,8 @@ impl TradingModel {
         let temporal_len = x.size()[1];
         let x_time = x.view([batch_size, TICKERS_COUNT, temporal_len, self.model_dim]);
 
-        // Full-sequence PMA pooling with 2 learned queries per ticker.
-        let mut ticker_repr = self
-            .temporal_pma_block
-            .forward(&x_time, batch_size, self.model_dim);
+        // Extract CLS token (position 0) as per-ticker representation.
+        let mut ticker_repr = x_time.select(2, 0);
 
         // InterTickerBlock on ticker representations: [batch, tickers, dim]
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
