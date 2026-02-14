@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS};
+use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -67,7 +67,7 @@ impl TradingModel {
             .apply(&self.actor_proj);
         let action_mean = actor_latent.apply(&self.actor_out);
 
-        // Critic: PPO-style scalar value head.
+        // Critic: distributional two-hot value head.
         let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
         let mut critic_x = critic_input.shallow_clone();
         for i in 0..self.value_mlp_linears.len() {
@@ -75,15 +75,30 @@ impl TradingModel {
             critic_x = self.value_mlp_norms[i].forward(&critic_x);
             critic_x = critic_x.silu();
         }
-        let critic_values = critic_x.apply(&self.value_out).squeeze_dim(-1);
+        let critic_logits = critic_x.apply(&self.value_out); // [batch, NUM_VALUE_BUCKETS]
+
+        let values = if compute_values {
+            let probs = critic_logits.softmax(-1, Kind::Float);
+            let centers = self.bucket_centers.to_kind(probs.kind());
+            let m: i64 = (NUM_VALUE_BUCKETS - 1) / 2; // 127
+            let p1 = probs.narrow(-1, 0, m);
+            let p2 = probs.narrow(-1, m, 1);
+            let p3 = probs.narrow(-1, m + 1, m);
+            let b1 = centers.narrow(0, 0, m);
+            let b2 = centers.narrow(0, m, 1);
+            let b3 = centers.narrow(0, m + 1, m);
+            let left = (&p1 * &b1).flip([-1]);
+            let right = &p3 * &b3;
+            ((&p2 * &b2).sum_dim_intlist(-1, false, Kind::Float)
+                + (&left + &right).sum_dim_intlist(-1, false, Kind::Float))
+                .to_kind(ticker_repr.kind())
+        } else {
+            Tensor::zeros(&[batch_size], (ticker_repr.kind(), ticker_repr.device()))
+        };
 
         // Cast all outputs to fp32 for loss computation
-        let values = if compute_values {
-            critic_values.to_kind(Kind::Float)
-        } else {
-            Tensor::zeros(&[batch_size], (Kind::Float, ticker_repr.device()))
-        };
-        let critic_values = critic_values.to_kind(Kind::Float);
+        let values = values.to_kind(Kind::Float);
+        let critic_logits = critic_logits.to_kind(Kind::Float);
         let critic_input = critic_input.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
         let actor_latent = actor_latent.to_kind(Kind::Float);
@@ -93,7 +108,7 @@ impl TradingModel {
         (
             (
                 values,
-                critic_values,
+                critic_logits,
                 critic_input,
                 (action_mean, actor_latent),
             ),

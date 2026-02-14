@@ -9,6 +9,7 @@ use crate::torch::env::VecEnv;
 use crate::torch::model::{
     ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
     GSDE_EPS, GSDE_LEARN_FEATURES, SDE_LATENT_DIM,
+    twohot_ce_loss,
 };
 
 const LEARNING_RATE: f64 = 3e-4;
@@ -322,14 +323,13 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
     );
 
     // RPO alpha via sigmoid: alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
+    // Kept outside VarStore so Fp32Adam doesn't pick it up (custom clamped update rule)
     let mut rpo_rho = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
         let p_init = (RPO_ALPHA_INIT - RPO_ALPHA_MIN) / (RPO_ALPHA_MAX - RPO_ALPHA_MIN);
         let p_init = p_init.clamp(1e-6, 1.0 - 1e-6);
         let rho_init = (p_init / (1.0 - p_init)).ln();
-        vs.root()
-            .var("rpo_alpha_rho", &[1], nn::Init::Const(rho_init))
+        Tensor::from(rho_init).to_device(device).set_requires_grad(true)
     } else {
-        // RPO disabled - create dummy tensor
         Tensor::zeros(&[1], (Kind::Float, device))
     };
 
@@ -562,7 +562,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (_, critic_values, _critic_input, (action_mean, sde_latent)) = trading_model
+                let (_, critic_logits, _critic_input, (action_mean, sde_latent)) = trading_model
                     .forward_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
@@ -628,16 +628,15 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     -Tensor::min_other(&(&ratio * &adv_mb), &(&ratio_clipped * &adv_mb))
                         .mean(Kind::Float);
 
-                // PPO-standard scalar value regression against returns.
-                let critic_values = critic_values.to_kind(Kind::Float).view([chunk_sample_count]);
+                // Distributional two-hot CE value loss.
+                let critic_logits = critic_logits.to_kind(Kind::Float);
+                let log_probs = critic_logits.log_softmax(-1, Kind::Float);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("critic_values", &critic_values, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("critic_logits", &critic_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
-                let value_loss = (&critic_values - &ret_mb)
-                    .pow_tensor_scalar(2.0)
-                    .mean(Kind::Float);
+                let value_loss = twohot_ce_loss(&ret_mb, &log_probs, trading_model.bucket_centers()).mean(Kind::Float);
 
                 let dist_entropy = diag_gaussian_entropy(&action_std).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();

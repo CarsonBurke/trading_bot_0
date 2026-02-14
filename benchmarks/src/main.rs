@@ -330,10 +330,10 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
 
             let start = Instant::now();
             for _ in 0..iters {
-                let (values, critic_values, _, (action_mean, sde_latent)) =
+                let (values, critic_logits, _, (action_mean, sde_latent)) =
                     model.forward(&price_deltas, &static_features, true);
                 let loss = values.sum(Kind::Float)
-                    + critic_values.sum(Kind::Float)
+                    + critic_logits.sum(Kind::Float)
                     + action_mean.sum(Kind::Float)
                     + sde_latent.sum(Kind::Float);
                 loss.backward();

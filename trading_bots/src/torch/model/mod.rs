@@ -403,6 +403,11 @@ const PMA_QUERIES: i64 = 2;
 const PMA_NUM_HEADS: i64 = 4;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
+pub(crate) const NUM_VALUE_BUCKETS: i64 = 255;
+// symexp(x,s) ≈ s*x near zero → linear spacing ~s*(range/N) ≈ 0.001 per bin
+// full range: ±s*(e^range - 1) ≈ ±2.67
+const SYMLOG_SCALE: f64 = 0.03;
+const SYMLOG_LOG_RANGE: f64 = 4.5;
 
 const BASE_PATCH_CONFIGS: &[(i64, i64)] = &[
     (4608, 128),
@@ -502,12 +507,51 @@ pub(crate) fn expln(t: &Tensor) -> Tensor {
     below_threshold + above_threshold
 }
 
-/// (values, critic_values, critic_input, (action_mean, actor_latent))
+pub(crate) fn symlog_tensor(x: &Tensor, s: f64) -> Tensor {
+    x.sign() * (x.abs() / s).log1p()
+}
+
+pub(crate) fn symexp_tensor(x: &Tensor, s: f64) -> Tensor {
+    x.sign() * s * x.abs().expm1()
+}
+
+/// Two-hot CE loss with searchsorted bin finding.
+/// targets: [batch] raw return values, log_probs: [batch, NUM_VALUE_BUCKETS],
+/// centers: [NUM_VALUE_BUCKETS] monotonically increasing bin centers in raw space.
+pub(crate) fn twohot_ce_loss(targets: &Tensor, log_probs: &Tensor, centers: &Tensor) -> Tensor {
+    let n = centers.size()[0];
+    let targets_f = targets.to_kind(log_probs.kind());
+    let centers_f = centers.to_kind(log_probs.kind());
+
+    let above = targets_f
+        .f_searchsorted(&centers_f, false, false, "right", None::<&Tensor>)
+        .unwrap()
+        .clamp(1, n - 1);
+    let below = (&above - 1).clamp(0, n - 1);
+
+    let bin_below = centers_f.index_select(0, &below.flatten(0, -1)).reshape_as(&targets_f);
+    let bin_above = centers_f.index_select(0, &above.flatten(0, -1)).reshape_as(&targets_f);
+
+    let dist_below = (&bin_below - &targets_f).abs() + 1e-8;
+    let dist_above = (&bin_above - &targets_f).abs() + 1e-8;
+    let total = &dist_below + &dist_above;
+    let w_below = &dist_above / &total;
+    let w_above = &dist_below / &total;
+
+    let lp_below = log_probs.gather(1, &below.unsqueeze(1), false).squeeze_dim(1);
+    let lp_above = log_probs.gather(1, &above.unsqueeze(1), false).squeeze_dim(1);
+
+    -(w_below * lp_below + w_above * lp_above)
+}
+
+/// (values, critic_logits, critic_input, (action_mean, actor_latent))
+/// critic_logits: [batch, NUM_VALUE_BUCKETS] distributional value logits
 /// critic_input: [batch, TICKERS_COUNT * MODEL_DIM] pre-MLP input for debugging/probing
 /// actor_latent: [batch, SDE_LATENT_DIM] shared actor/gSDE latent
 pub type ModelOutput = (Tensor, Tensor, Tensor, (Tensor, Tensor));
 
 /// EMA copy of critic weights (not in the optimizer's VarStore).
+/// Returns logits [batch, NUM_VALUE_BUCKETS] (distributional two-hot critic).
 pub struct SlowCritic {
     mlp_weights: Vec<Tensor>,  // [CRITIC_LAYERS] linear weights
     mlp_biases: Vec<Tensor>,   // [CRITIC_LAYERS] linear biases
@@ -653,6 +697,7 @@ pub struct TradingModel {
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
     log_std_param: Tensor, // [SDE_LATENT_DIM, ACTION_DIM - 1]
+    bucket_centers: Tensor, // [NUM_VALUE_BUCKETS] sorted ascending
     device: tch::Device,
 }
 
@@ -679,6 +724,10 @@ impl TradingModel {
     /// gSDE std matrix used to scale exploration noise matrices.
     pub fn sde_std(&self) -> Tensor {
         expln(&self.log_std_param)
+    }
+
+    pub fn bucket_centers(&self) -> &Tensor {
+        &self.bucket_centers
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -841,7 +890,7 @@ impl TradingModel {
         let value_out = nn::linear(
             p / "value_out",
             critic_hidden,
-            1,
+            NUM_VALUE_BUCKETS,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
@@ -855,6 +904,11 @@ impl TradingModel {
             &[SDE_LATENT_DIM, ACTION_DIM - 1],
             Init::Const(GSDE_LOG_STD_INIT),
         );
+        let half_n = (NUM_VALUE_BUCKETS - 1) / 2 + 1; // 128
+        let half_log = Tensor::linspace(-SYMLOG_LOG_RANGE, 0.0, half_n, (Kind::Float, p.device()));
+        let half = symexp_tensor(&half_log, SYMLOG_SCALE);
+        let pos_half = half.narrow(0, 0, half_n - 1).flip([0]).neg();
+        let bucket_centers = Tensor::cat(&[half, pos_half], 0); // [255], sorted ascending
         Self {
             variant: config.variant,
             patch_configs,
@@ -882,6 +936,7 @@ impl TradingModel {
             value_mlp_norms,
             value_out,
             log_std_param,
+            bucket_centers,
             device: p.device(),
         }
     }
