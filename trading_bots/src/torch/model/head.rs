@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS};
+use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, LOG_STD_CLAMP_MIN, LOG_STD_CLAMP_MAX};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -53,17 +53,44 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
         ticker_repr = ticker_repr + &mlp * &alpha_mlp;
 
-        // Actor head: MLP per-ticker → flatten → project to latent → action_mean
+        // Actor head: per-ticker MLP → per-ticker logits + cash logit
         let mut actor_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]);
         for i in 0..self.actor_mlp_linears.len() {
             actor_x = actor_x.apply(&self.actor_mlp_linears[i]);
             actor_x = self.actor_mlp_norms[i].forward(&actor_x);
             actor_x = actor_x.silu();
         }
-        let actor_latent = actor_x
-            .reshape([batch_size, TICKERS_COUNT * self.model_dim])
-            .apply(&self.actor_proj);
-        let action_mean = actor_latent.apply(&self.actor_out);
+
+        // Per-ticker logits (shared actor_out: model_dim -> 1)
+        let ticker_logits = actor_x
+            .apply(&self.actor_out)
+            .reshape([batch_size, TICKERS_COUNT]);
+
+        // Cash logit from mean-pooled ticker representations
+        let cash_logit = actor_x
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim])
+            .mean_dim([1].as_slice(), false, actor_x.kind())
+            .apply(&self.cash_proj)
+            .squeeze_dim(-1);
+
+        // action_mean: [B, ACTION_DIM]
+        let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
+
+        // Per-ticker log_std (same features, parallel projection)
+        let ticker_log_std = actor_x
+            .apply(&self.actor_log_std_out)
+            .reshape([batch_size, TICKERS_COUNT])
+            .clamp(LOG_STD_CLAMP_MIN, LOG_STD_CLAMP_MAX);
+
+        // Cash log_std from mean-pooled ticker representations
+        let cash_log_std = actor_x
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim])
+            .mean_dim([1].as_slice(), false, actor_x.kind())
+            .apply(&self.cash_log_std_proj)
+            .squeeze_dim(-1)
+            .clamp(LOG_STD_CLAMP_MIN, LOG_STD_CLAMP_MAX);
+
+        let action_log_std = Tensor::cat(&[ticker_log_std, cash_log_std.unsqueeze(-1)], -1);
 
         // Critic: distributional two-hot value head.
         let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
@@ -99,7 +126,7 @@ impl TradingModel {
         let critic_logits = critic_logits.to_kind(Kind::Float);
         let critic_input = critic_input.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
-        let actor_latent = actor_latent.to_kind(Kind::Float);
+        let action_log_std = action_log_std.to_kind(Kind::Float);
 
         let debug_metrics = None;
 
@@ -108,7 +135,8 @@ impl TradingModel {
                 values,
                 critic_logits,
                 critic_input,
-                (action_mean, actor_latent),
+                action_mean,
+                action_log_std,
             ),
             debug_metrics,
         )

@@ -6,7 +6,7 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{
-    ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM, SDE_LATENT_DIM,
+    ModelVariant, TradingModel, TradingModelConfig,
 };
 
 pub fn load_model<P: AsRef<Path>>(
@@ -27,27 +27,20 @@ pub fn load_model<P: AsRef<Path>>(
     Ok((vs, model))
 }
 
-/// Sample actions using gSDE exploration, then softmax.
 pub fn sample_actions(
     action_mean: &Tensor,
-    sde_latent: &Tensor, // [batch, SDE_LATENT_DIM]
-    sde_std: &Tensor,    // [SDE_LATENT_DIM, ACTION_DIM - 1]
+    action_log_std: &Tensor,  // [batch, ACTION_DIM] (state-dependent)
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
     let action_mean = action_mean.to_kind(Kind::Float);
-    let sde_latent = sde_latent.to_kind(Kind::Float);
 
     let u = if deterministic {
         action_mean
     } else {
-        let device = action_mean.device();
-        let stats_kind = (Kind::Float, device);
-        let exploration_mat =
-            Tensor::randn([SDE_LATENT_DIM, ACTION_DIM - 1], stats_kind) * sde_std;
-        let noise = sde_latent.matmul(&exploration_mat); // [batch, ACTION_DIM - 1]
-        let noise_pad = Tensor::zeros([noise.size()[0], 1], stats_kind); // gauge reference
-        &action_mean + Tensor::cat(&[noise, noise_pad], -1)
+        let action_std = action_log_std.to_kind(Kind::Float).exp();
+        let noise = Tensor::randn_like(&action_mean) * &action_std;
+        &action_mean + noise
     };
 
     let u = if temperature != 1.0 && temperature != 0.0 {
@@ -109,21 +102,19 @@ pub fn run_inference<P: AsRef<Path>>(
             env.step = step;
 
             // First call uses full history, then we switch to incremental per-ticker deltas.
-            let (action_mean, sde_latent, sde_std) = tch::no_grad(|| {
+            let (action_mean, action_log_std) = tch::no_grad(|| {
                 let price_input = if use_full {
                     &price_deltas_full
                 } else {
                     &price_deltas_incremental
                 };
-                let (_, _, _, (action_mean, sde_latent)) =
+                let (_, _, _, action_mean, action_log_std) =
                     model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
-                let sde_std = model.sde_std();
-                (action_mean, sde_latent, sde_std)
+                (action_mean, action_log_std)
             });
             let actions = sample_actions(
                 &action_mean,
-                &sde_latent,
-                &sde_std,
+                &action_log_std,
                 deterministic,
                 temperature,
             );

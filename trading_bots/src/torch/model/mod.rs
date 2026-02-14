@@ -265,15 +265,14 @@ const BASE_GQA_LAYERS: usize = 2;
 const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
-pub(crate) const SDE_LATENT_DIM: i64 = 128;
-pub(crate) const GSDE_EPS: f64 = 1e-6;
-pub(crate) const GSDE_LOG_STD_INIT: f64 = -2.0;
+pub(crate) const LOG_STD_INIT: f64 = 0.0;
+const LOG_STD_CLAMP_MIN: f64 = -5.0; // std ≈ 0.007
+const LOG_STD_CLAMP_MAX: f64 = 2.0; // std ≈ 7.4
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 const TIME_CROSS_LAYERS: usize = 1;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -2.0;
 const ACTOR_MLP_LAYERS: usize = 1;
-pub(crate) const GSDE_LEARN_FEATURES: bool = true;
 const CRITIC_LAYERS: usize = 2;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
@@ -371,18 +370,6 @@ pub fn patch_ends_for_variant(variant: ModelVariant) -> Vec<i64> {
     ends
 }
 
-/// expln: numerically stable exp alternative that bounds growth for positive inputs
-/// expln(x) = exp(x)        if x <= 0
-///          = ln(x + 1) + 1 if x > 0
-pub(crate) fn expln(t: &Tensor) -> Tensor {
-    let below = t.le(0.0).to_kind(Kind::Float);
-    let above = t.gt(0.0).to_kind(Kind::Float);
-    let below_threshold = t.exp() * &below;
-    let safe_t = t * &above + GSDE_EPS;
-    let above_threshold = (safe_t.log1p() + 1.0) * &above;
-    below_threshold + above_threshold
-}
-
 pub(crate) fn symlog_tensor(x: &Tensor, s: f64) -> Tensor {
     x.sign() * (x.abs() / s).log1p()
 }
@@ -420,11 +407,8 @@ pub(crate) fn twohot_ce_loss(targets: &Tensor, log_probs: &Tensor, centers: &Ten
     -(w_below * lp_below + w_above * lp_above)
 }
 
-/// (values, critic_logits, critic_input, (action_mean, actor_latent))
-/// critic_logits: [batch, NUM_VALUE_BUCKETS] distributional value logits
-/// critic_input: [batch, TICKERS_COUNT * MODEL_DIM] pre-MLP input for debugging/probing
-/// actor_latent: [batch, SDE_LATENT_DIM] shared actor/gSDE latent
-pub type ModelOutput = (Tensor, Tensor, Tensor, (Tensor, Tensor));
+/// (values, critic_logits, critic_input, action_mean, action_log_std)
+pub type ModelOutput = (Tensor, Tensor, Tensor, Tensor, Tensor);
 
 /// EMA copy of critic weights (not in the optimizer's VarStore).
 /// Returns logits [batch, NUM_VALUE_BUCKETS] (distributional two-hot critic).
@@ -567,12 +551,13 @@ pub struct TradingModel {
     inter_ticker_block: InterTickerBlock,
     actor_mlp_linears: Vec<nn::Linear>,
     actor_mlp_norms: Vec<RMSNorm>,
-    actor_proj: nn::Linear,
-    actor_out: nn::Linear,
+    actor_out: nn::Linear,          // model_dim -> 1 (shared per-ticker readout)
+    cash_proj: nn::Linear,          // model_dim -> 1 (cash logit from mean-pooled tickers)
+    actor_log_std_out: nn::Linear,  // model_dim -> 1 (per-ticker log_std)
+    cash_log_std_proj: nn::Linear,  // model_dim -> 1 (cash log_std from mean-pooled)
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
-    log_std_param: Tensor, // [SDE_LATENT_DIM, ACTION_DIM - 1]
     bucket_centers: Tensor, // [NUM_VALUE_BUCKETS] sorted ascending
     device: tch::Device,
 }
@@ -595,11 +580,6 @@ impl TradingModel {
         } else {
             input.to_kind(target_kind)
         }
-    }
-
-    /// gSDE std matrix used to scale exploration noise matrices.
-    pub fn sde_std(&self) -> Tensor {
-        expln(&self.log_std_param)
     }
 
     pub fn bucket_centers(&self) -> &Tensor {
@@ -703,7 +683,6 @@ impl TradingModel {
         let cls_token = p.var("cls_token", &[1, 1, spec.model_dim], Init::Randn { mean: 0.0, stdev: 0.02 });
         let inter_ticker_block =
             InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
-        // Actor latent MLP per-ticker, then flatten → project to SDE_LATENT_DIM
         let actor_mlp_linears = (0..ACTOR_MLP_LAYERS)
             .map(|i| {
                 nn::linear(
@@ -711,7 +690,7 @@ impl TradingModel {
                     spec.model_dim,
                     spec.model_dim,
                     nn::LinearConfig {
-                        ws_init: truncated_normal_init(spec.model_dim, spec.model_dim),
+                        ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
                         bs_init: Some(Init::Const(0.0)),
                         bias: true,
                     },
@@ -721,23 +700,43 @@ impl TradingModel {
         let actor_mlp_norms = (0..ACTOR_MLP_LAYERS)
             .map(|i| RMSNorm::new(&(p / format!("actor_mlp_norm_{}", i)), spec.model_dim, 1e-6))
             .collect::<Vec<_>>();
-        let actor_proj = nn::linear(
-            p / "actor_proj",
-            TICKERS_COUNT * spec.model_dim,
-            SDE_LATENT_DIM,
+        let actor_out = nn::linear(
+            p / "actor_out",
+            spec.model_dim,
+            1,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(TICKERS_COUNT * spec.model_dim, SDE_LATENT_DIM),
+                ws_init: Init::Orthogonal { gain: 0.01 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
         );
-        let actor_out = nn::linear(
-            p / "actor_out",
-            SDE_LATENT_DIM,
-            ACTION_DIM,
+        let cash_proj = nn::linear(
+            p / "cash_proj",
+            spec.model_dim,
+            1,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 0.01 },
                 bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let actor_log_std_out = nn::linear(
+            p / "actor_log_std_out",
+            spec.model_dim,
+            1,
+            nn::LinearConfig {
+                ws_init: Init::Orthogonal { gain: 0.01 },
+                bs_init: Some(Init::Const(LOG_STD_INIT)),
+                bias: true,
+            },
+        );
+        let cash_log_std_proj = nn::linear(
+            p / "cash_log_std_proj",
+            spec.model_dim,
+            1,
+            nn::LinearConfig {
+                ws_init: Init::Orthogonal { gain: 0.01 },
+                bs_init: Some(Init::Const(LOG_STD_INIT)),
                 bias: true,
             },
         );
@@ -772,13 +771,6 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // gSDE log-std: [SDE_LATENT_DIM, ACTION_DIM - 1]
-        // K-1 noise dims (last logit is gauge reference with zero noise)
-        let log_std_param = p.var(
-            "log_std",
-            &[SDE_LATENT_DIM, ACTION_DIM - 1],
-            Init::Const(GSDE_LOG_STD_INIT),
-        );
         let half_n = (NUM_VALUE_BUCKETS - 1) / 2 + 1; // 128
         let half_log = Tensor::linspace(-SYMLOG_LOG_RANGE, 0.0, half_n, (Kind::Float, p.device()));
         let half = symexp_tensor(&half_log, SYMLOG_SCALE);
@@ -805,12 +797,13 @@ impl TradingModel {
             inter_ticker_block,
             actor_mlp_linears,
             actor_mlp_norms,
-            actor_proj,
             actor_out,
+            cash_proj,
+            actor_log_std_out,
+            cash_log_std_proj,
             value_mlp_linears,
             value_mlp_norms,
             value_out,
-            log_std_param,
             bucket_centers,
             device: p.device(),
         }

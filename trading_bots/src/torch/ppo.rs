@@ -8,7 +8,6 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
     ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
-    GSDE_EPS, GSDE_LEARN_FEATURES, SDE_LATENT_DIM,
     twohot_ce_loss,
 };
 
@@ -27,36 +26,6 @@ const MAX_GRAD_NORM: f64 = 0.5;
 const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
 const LOG_2PI: f64 = 1.8378770664093453;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GsdeResampleMode {
-    PerEpisode,
-    PerStep,
-}
-
-// SB3-like options:
-// - PerEpisode: sample once per rollout (similar to sde_sample_freq = -1)
-// - PerStep: resample every env step (similar to sde_sample_freq = 1)
-const GSDE_RESAMPLE_MODE: GsdeResampleMode = GsdeResampleMode::PerStep;
-
-fn gsde_resample_mode_from_env() -> GsdeResampleMode {
-    match env::var("GSDE_RESAMPLE_MODE")
-        .ok()
-        .map(|v| v.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("episode") | Some("per-episode") => GsdeResampleMode::PerEpisode,
-        Some("step") | Some("per-step") => GsdeResampleMode::PerStep,
-        _ => GSDE_RESAMPLE_MODE,
-    }
-}
-
-fn gsde_sample_freq(mode: GsdeResampleMode) -> i64 {
-    match mode {
-        GsdeResampleMode::PerEpisode => -1,
-        GsdeResampleMode::PerStep => 1,
-    }
-}
 
 // RPO: Random Policy Optimization - adds bounded noise to action mean during training and intentionally not during rollout
 // Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
@@ -126,13 +95,7 @@ impl GpuRollingBuffer {
     }
 }
 
-fn gsde_action_std(sde_latent: &Tensor, sde_std: &Tensor) -> Tensor {
-    let latent_sq = sde_latent.pow_tensor_scalar(2);
-    let std_sq = sde_std.pow_tensor_scalar(2);
-    (latent_sq.matmul(&std_sq) + GSDE_EPS).sqrt()
-}
-
-/// Diagonal Gaussian log prob on K-1 noise dims (gauge-free by construction).
+/// Diagonal Gaussian log prob.
 fn diag_gaussian_log_prob(diff: &Tensor, action_std: &Tensor) -> Tensor {
     let log_std = action_std.log();
     let normalized = diff / action_std;
@@ -142,47 +105,29 @@ fn diag_gaussian_log_prob(diff: &Tensor, action_std: &Tensor) -> Tensor {
         .g_mul_scalar(-0.5)
 }
 
-/// Diagonal Gaussian entropy on K-1 dims: H = 0.5 * sum(log(2πe·σ_i²))
+/// Diagonal Gaussian entropy: H = 0.5 * sum(log(2πe·σ_i²))
 fn diag_gaussian_entropy(action_std: &Tensor) -> Tensor {
     let k = action_std.size().last().copied().unwrap() as f64;
     action_std.log().sum_dim_intlist([-1].as_slice(), false, Kind::Float) + 0.5 * k * (1.0 + LOG_2PI)
 }
 
-fn sample_exploration_mats(sde_std: &Tensor, device: tch::Device) -> Tensor {
-    // K-1 noise dims: last logit is gauge reference (zero noise)
-    Tensor::randn(
-        [NPROCS, SDE_LATENT_DIM, ACTION_DIM - 1],
-        (Kind::Float, device),
-    ) * &sde_std.unsqueeze(0)
-}
-
-/// Sample actions from the gSDE policy during rollout (no_grad).
-/// Returns (values, action_mean, u, actions, action_log_prob).
 fn sample_rollout_actions(
     model: &TradingModel,
     obs_price: &Tensor,
     obs_static: &Tensor,
-    exploration_mats: &Tensor,
-    sde_std: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
     tch::no_grad(|| {
-        let (values, _, _, (action_mean, sde_latent)) =
+        let (values, _, _, action_mean, action_log_std) =
             model.forward_on_device(obs_price, obs_static, false);
         let values = values.to_kind(Kind::Float);
-        let action_mean = action_mean.to_kind(Kind::Float); // [B, ACTION_DIM]
-        let sde_latent = sde_latent.to_kind(Kind::Float);
+        let action_mean = action_mean.to_kind(Kind::Float);
+        let action_log_std = action_log_std.to_kind(Kind::Float);
 
-        let noise_v = sde_latent
-            .unsqueeze(1)
-            .bmm(exploration_mats)
-            .squeeze_dim(1); // [B, ACTION_DIM - 1]
-        let noise_pad = Tensor::zeros([noise_v.size()[0], 1], (Kind::Float, noise_v.device()));
-        let noise = Tensor::cat(&[&noise_v, &noise_pad], -1); // cash gets zero noise
+        let action_std = action_log_std.exp();
+        let noise = Tensor::randn_like(&action_mean) * &action_std;
         let u = &action_mean + &noise;
         let actions = u.softmax(-1, Kind::Float);
-
-        let action_std_v = gsde_action_std(&sde_latent, sde_std); // [B, ACTION_DIM - 1]
-        let action_log_prob = diag_gaussian_log_prob(&noise_v, &action_std_v);
+        let action_log_prob = diag_gaussian_log_prob(&noise, &action_std);
 
         (values, action_mean, u, actions, action_log_prob)
     })
@@ -241,7 +186,7 @@ fn compute_explained_variance(
         let pd_ev = price_deltas.narrow(0, 0, ev_samples);
         let so_ev = static_obs.narrow(0, 0, ev_samples);
         let ret_ev = returns.narrow(0, 0, ev_samples);
-        let (values_raw, _, _, _) =
+        let (values_raw, _, _, _, _) =
             model.forward_on_device(&pd_ev, &so_ev, true);
         let values = values_raw.to_kind(Kind::Float).view([ev_samples]);
         let targets = ret_ev;
@@ -262,13 +207,12 @@ fn compute_action_std_stats(
     device: tch::Device,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, _, _, (_, sde_latent)) = model.forward_on_device(
+        let (_, _, _, _, action_log_std) = model.forward_on_device(
             &s_price_deltas.get(0),
             &s_static_obs.get(0),
             false,
         );
-        let sde_std = model.sde_std().to_kind(Kind::Float);
-        let action_std = gsde_action_std(&sde_latent.to_kind(Kind::Float), &sde_std);
+        let action_std = action_log_std.to_kind(Kind::Float).exp();
         let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
             (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze()
         } else {
@@ -306,13 +250,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
     let device = tch::Device::cuda_if_available();
     println!("device is cuda: {}", device.is_cuda());
-    let gsde_resample_mode = gsde_resample_mode_from_env();
-    let gsde_sample_freq = gsde_sample_freq(gsde_resample_mode);
-    println!(
-        "gSDE resample mode: {:?} (sample_freq={})",
-        gsde_resample_mode, gsde_sample_freq
-    );
-
     let mut vs = nn::VarStore::new(device);
     let trading_model = TradingModel::new_with_config(
         &vs.root(),
@@ -398,20 +335,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
-        let sde_std_rollout = tch::no_grad(|| trading_model.sde_std().to_kind(Kind::Float));
-        let mut exploration_mats = sample_exploration_mats(&sde_std_rollout, device);
-
         for step in 0..rollout_steps as usize {
-            // Match SB3 behavior: if sde_sample_freq > 0, resample when step % freq == 0.
-            if gsde_sample_freq > 0 && (step as i64) % gsde_sample_freq == 0 {
-                exploration_mats = sample_exploration_mats(&sde_std_rollout, device);
-            }
             let (values, action_mean, u, actions, action_log_prob) = sample_rollout_actions(
                 &trading_model,
                 &obs_price,
                 &obs_static,
-                &exploration_mats,
-                &sde_std_rollout,
             );
 
             if DEBUG_NUMERICS {
@@ -477,7 +405,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
         // Bootstrap value from final observation state (raw return space)
         let bootstrap_value = tch::no_grad(|| {
-            let (values_raw, _, _, _) = trading_model.forward_on_device(
+            let (values_raw, _, _, _, _) = trading_model.forward_on_device(
                 &obs_price,
                 &obs_static,
                 false,
@@ -562,7 +490,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (_, critic_logits, _critic_input, (action_mean, sde_latent)) = trading_model
+                let (_, critic_logits, _critic_input, action_mean, action_log_std) = trading_model
                     .forward_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
@@ -570,18 +498,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     );
 
                 let action_mean = action_mean.to_kind(Kind::Float);
-                let sde_latent = sde_latent.to_kind(Kind::Float); // [chunk, SDE_LATENT_DIM]
+                let action_log_std = action_log_std.to_kind(Kind::Float);
+                let action_std = action_log_std.exp();
 
                 // act_mb contains the stored u (pre-softmax logits)
                 let u = act_mb;
-
-                let sde_latent_cov = if GSDE_LEARN_FEATURES {
-                    sde_latent.shallow_clone()
-                } else {
-                    sde_latent.detach()
-                };
-                let sde_std = trading_model.sde_std().to_kind(Kind::Float);
-                let action_std = gsde_action_std(&sde_latent_cov, &sde_std);
 
                 // RPO (CleanRL-style): iid uniform perturbation on each action-mean dimension.
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
@@ -599,11 +520,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     )
                 };
 
-                let diff = &u - &action_mean_perturbed; // [B, K]
-                // Gauge fix: subtract reference (last) component → K-1 independent noise coords
-                let diff_ref = diff.narrow(-1, ACTION_DIM - 1, 1); // [B, 1]
-                let diff_v = diff.narrow(-1, 0, ACTION_DIM - 1) - diff_ref; // [B, K-1]
-                let action_log_probs = diag_gaussian_log_prob(&diff_v, &action_std);
+                let diff = &u - &action_mean_perturbed;
+                let action_log_probs = diag_gaussian_log_prob(&diff, &action_std);
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
@@ -649,7 +567,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let action_var = action_std.pow_tensor_scalar(2).detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                    let d = (ACTION_DIM - 1) as f64;
+                    let d = ACTION_DIM as f64;
                     let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                     (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
                 } else {
