@@ -95,20 +95,19 @@ impl GpuRollingBuffer {
     }
 }
 
-/// Diagonal Gaussian log prob.
-fn diag_gaussian_log_prob(diff: &Tensor, action_std: &Tensor) -> Tensor {
-    let log_std = action_std.log();
-    let normalized = diff / action_std;
-    let terms = normalized.pow_tensor_scalar(2) + log_std * 2.0 + LOG_2PI;
+/// Diagonal Gaussian log prob (accepts log_std directly to avoid exp→log round-trip).
+fn diag_gaussian_log_prob(diff: &Tensor, log_std: &Tensor) -> Tensor {
+    let inv_var = (log_std * -2.0).exp();
+    let terms = diff.pow_tensor_scalar(2) * &inv_var + log_std * 2.0 + LOG_2PI;
     terms
         .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
         .g_mul_scalar(-0.5)
 }
 
 /// Diagonal Gaussian entropy: H = 0.5 * sum(log(2πe·σ_i²))
-fn diag_gaussian_entropy(action_std: &Tensor) -> Tensor {
-    let k = action_std.size().last().copied().unwrap() as f64;
-    action_std.log().sum_dim_intlist([-1].as_slice(), false, Kind::Float) + 0.5 * k * (1.0 + LOG_2PI)
+fn diag_gaussian_entropy(log_std: &Tensor) -> Tensor {
+    let k = log_std.size().last().copied().unwrap() as f64;
+    log_std.sum_dim_intlist([-1].as_slice(), false, Kind::Float) + 0.5 * k * (1.0 + LOG_2PI)
 }
 
 fn sample_rollout_actions(
@@ -127,7 +126,7 @@ fn sample_rollout_actions(
         let noise = Tensor::randn_like(&action_mean) * &action_std;
         let u = &action_mean + &noise;
         let actions = u.softmax(-1, Kind::Float);
-        let action_log_prob = diag_gaussian_log_prob(&noise, &action_std);
+        let action_log_prob = diag_gaussian_log_prob(&noise, &action_log_std);
 
         (values, action_mean, u, actions, action_log_prob)
     })
@@ -499,7 +498,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let action_log_std = action_log_std.to_kind(Kind::Float);
-                let action_std = action_log_std.exp();
 
                 // act_mb contains the stored u (pre-softmax logits)
                 let u = act_mb;
@@ -521,14 +519,14 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 };
 
                 let diff = &u - &action_mean_perturbed;
-                let action_log_probs = diag_gaussian_log_prob(&diff, &action_std);
+                let action_log_probs = diag_gaussian_log_prob(&diff, &action_log_std);
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
                     let _ =
                         debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_log_std", &action_log_std, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
@@ -556,7 +554,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 }
                 let value_loss = twohot_ce_loss(&ret_mb, &log_probs, trading_model.bucket_centers()).mean(Kind::Float);
 
-                let dist_entropy = diag_gaussian_entropy(&action_std).mean(Kind::Float);
+                let dist_entropy = diag_gaussian_entropy(&action_log_std).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
@@ -565,7 +563,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
                 // RPO alpha loss: target induced KL for uniform logit perturbation.
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let action_var = action_std.pow_tensor_scalar(2).detach();
+                    let action_var = (&action_log_std * 2.0).exp().detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
                     let d = ACTION_DIM as f64;
                     let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
