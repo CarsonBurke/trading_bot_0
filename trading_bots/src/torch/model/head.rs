@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, LOG_STD_CLAMP_MIN, LOG_STD_CLAMP_MAX};
+use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, SDE_DIM};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -76,19 +76,26 @@ impl TradingModel {
         // action_mean: [B, ACTION_DIM]
         let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
 
-        // Per-ticker log_std (same features, parallel projection)
-        let ticker_log_std = actor_x
-            .apply(&self.actor_log_std_out)
-            .reshape([batch_size, TICKERS_COUNT])
-            .clamp(LOG_STD_CLAMP_MIN, LOG_STD_CLAMP_MAX);
+        // gSDE: FC → RMSNorm → SiLU → quadratic form for per-ticker variance
+        let sde_latent = self.sde_norm.forward(
+            &actor_x.apply(&self.sde_fc)
+        ).silu().reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
 
-        // Cash log_std from mean-pooled ticker representations
-        let cash_log_std = actor_x
-            .reshape([batch_size, TICKERS_COUNT, self.model_dim])
-            .mean_dim([1].as_slice(), false, actor_x.kind())
-            .apply(&self.cash_log_std_proj)
-            .squeeze_dim(-1)
-            .clamp(LOG_STD_CLAMP_MIN, LOG_STD_CLAMP_MAX);
+        let sde_latent_sq = sde_latent.pow_tensor_scalar(2);
+
+        // Per-ticker variance: Σ_j latent[b,i,j]² · exp(2·log_std[j,i])
+        let ticker_std_sq = (&self.sde_log_std_param * 2.0).exp(); // [SDE_DIM, TICKERS_COUNT]
+        let ticker_var = (&sde_latent_sq * ticker_std_sq.transpose(0, 1).unsqueeze(0))
+            .sum_dim_intlist([-1].as_slice(), false, sde_latent.kind()); // [B, TICKERS_COUNT]
+        let ticker_log_std = (ticker_var + 1e-8).log() * 0.5;
+
+        // Cash variance: mean-pool SDE latent across tickers, same quadratic form
+        let cash_latent_sq = sde_latent_sq
+            .mean_dim([1].as_slice(), false, sde_latent.kind()); // [B, SDE_DIM]
+        let cash_std_sq = (&self.cash_sde_log_std * 2.0).exp(); // [SDE_DIM]
+        let cash_var = (&cash_latent_sq * &cash_std_sq)
+            .sum_dim_intlist([-1].as_slice(), false, sde_latent.kind()); // [B]
+        let cash_log_std = (cash_var + 1e-8).log() * 0.5;
 
         let action_log_std = Tensor::cat(&[ticker_log_std, cash_log_std.unsqueeze(-1)], -1);
 

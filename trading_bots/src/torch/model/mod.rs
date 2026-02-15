@@ -265,9 +265,8 @@ const BASE_GQA_LAYERS: usize = 2;
 const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
-pub(crate) const LOG_STD_INIT: f64 = 0.0;
-const LOG_STD_CLAMP_MIN: f64 = -5.0; // std ≈ 0.007
-const LOG_STD_CLAMP_MAX: f64 = 2.0; // std ≈ 7.4
+const SDE_DIM: i64 = 64;
+const SDE_LOG_STD_INIT: f64 = -2.0;
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 const TIME_CROSS_LAYERS: usize = 1;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
@@ -553,8 +552,10 @@ pub struct TradingModel {
     actor_mlp_norms: Vec<RMSNorm>,
     actor_out: nn::Linear,          // model_dim -> 1 (shared per-ticker readout)
     cash_proj: nn::Linear,          // model_dim -> 1 (cash logit from mean-pooled tickers)
-    actor_log_std_out: nn::Linear,  // model_dim -> 1 (per-ticker log_std)
-    cash_log_std_proj: nn::Linear,  // model_dim -> 1 (cash log_std from mean-pooled)
+    sde_fc: nn::Linear,             // model_dim -> SDE_DIM (gSDE latent projection)
+    sde_norm: RMSNorm,              // SDE_DIM
+    sde_log_std_param: Tensor,      // [SDE_DIM, TICKERS_COUNT] learnable variance weights
+    cash_sde_log_std: Tensor,       // [SDE_DIM] cash variance weights (quadratic form on mean-pooled SDE latent)
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
@@ -720,25 +721,26 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let actor_log_std_out = nn::linear(
-            p / "actor_log_std_out",
+        let sde_fc = nn::linear(
+            p / "sde_fc",
             spec.model_dim,
-            1,
+            SDE_DIM,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.01 },
-                bs_init: Some(Init::Const(LOG_STD_INIT)),
+                ws_init: Init::Orthogonal { gain: 1.0 },
+                bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
         );
-        let cash_log_std_proj = nn::linear(
-            p / "cash_log_std_proj",
-            spec.model_dim,
-            1,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.01 },
-                bs_init: Some(Init::Const(LOG_STD_INIT)),
-                bias: true,
-            },
+        let sde_norm = RMSNorm::new(&(p / "sde_norm"), SDE_DIM, 1e-6);
+        let sde_log_std_param = p.var(
+            "sde_log_std",
+            &[SDE_DIM, TICKERS_COUNT],
+            Init::Const(SDE_LOG_STD_INIT),
+        );
+        let cash_sde_log_std = p.var(
+            "cash_sde_log_std",
+            &[SDE_DIM],
+            Init::Const(SDE_LOG_STD_INIT),
         );
         // Critic MLP: (Linear → RMSNorm → SiLU) → Linear(→scalar value), orthogonally initialized.
         let critic_in = TICKERS_COUNT * spec.model_dim;
@@ -799,8 +801,10 @@ impl TradingModel {
             actor_mlp_norms,
             actor_out,
             cash_proj,
-            actor_log_std_out,
-            cash_log_std_proj,
+            sde_fc,
+            sde_norm,
+            sde_log_std_param,
+            cash_sde_log_std,
             value_mlp_linears,
             value_mlp_norms,
             value_out,
