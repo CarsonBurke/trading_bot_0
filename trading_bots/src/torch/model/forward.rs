@@ -78,7 +78,7 @@ impl TradingModel {
 
         let mut x = x_stem;
         for (i, layer) in self.gqa_layers.iter().enumerate() {
-            x = layer.forward(&x);
+            x = layer.forward(&x, &self.rope);
             x = self.maybe_apply_exo_cross(&x, &exo_kv, i);
         }
         debug_fused("model_x_gqa", &x);
@@ -108,7 +108,7 @@ impl TradingModel {
         let mut x = x_stem;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
             debug_fused_layer("x_gqa_in", layer_idx, &x);
-            x = layer.forward(&x);
+            x = layer.forward(&x, &self.rope);
             debug_fused_layer("gqa_out", layer_idx, &x);
             x = self.maybe_apply_exo_cross(&x, &exo_kv, layer_idx);
             debug_fused_layer("x_gqa_out", layer_idx, &x);

@@ -147,6 +147,44 @@ impl ExoCrossBlock {
 const GQA_NUM_Q_HEADS: i64 = 4;
 const GQA_NUM_KV_HEADS: i64 = 2;
 
+fn rotate_half(x: &Tensor) -> Tensor {
+    let last_dim = *x.size().last().unwrap();
+    let half = last_dim / 2;
+    let x1 = x.narrow(-1, 0, half);
+    let x2 = x.narrow(-1, half, half);
+    Tensor::cat(&[&(-&x2), &x1], -1)
+}
+
+struct RotaryEmbedding {
+    cos_cached: Tensor, // [max_seq_len, head_dim]
+    sin_cached: Tensor, // [max_seq_len, head_dim]
+}
+
+impl RotaryEmbedding {
+    fn new(max_seq_len: i64, head_dim: i64, device: tch::Device) -> Self {
+        let half_dim = head_dim / 2;
+        let exponents =
+            Tensor::arange(half_dim, (Kind::Float, device)) * (2.0 / head_dim as f64);
+        let inv_freq = (exponents * -(10000.0_f64.ln())).exp(); // [half_dim]
+        let positions = Tensor::arange(max_seq_len, (Kind::Float, device)); // [max_seq_len]
+        let angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0); // [max_seq_len, half_dim]
+        let cos_half = angles.cos();
+        let sin_half = angles.sin();
+        Self {
+            cos_cached: Tensor::cat(&[&cos_half, &cos_half], -1).set_requires_grad(false),
+            sin_cached: Tensor::cat(&[&sin_half, &sin_half], -1).set_requires_grad(false),
+        }
+    }
+
+    fn apply(&self, x: &Tensor) -> Tensor {
+        // x: [batch, heads, seq_len, head_dim]
+        let seq_len = x.size()[2];
+        let cos = self.cos_cached.narrow(0, 0, seq_len).to_kind(x.kind());
+        let sin = self.sin_cached.narrow(0, 0, seq_len).to_kind(x.kind());
+        x * &cos + rotate_half(x) * &sin
+    }
+}
+
 struct GqaBlock {
     attn_ln: RMSNorm,
     attn_qkv: nn::Linear,
@@ -193,7 +231,7 @@ impl GqaBlock {
         }
     }
 
-    fn forward(&self, x: &Tensor) -> Tensor {
+    fn forward(&self, x: &Tensor, rope: &RotaryEmbedding) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
         let head_dim = _d / GQA_NUM_Q_HEADS;
 
@@ -211,8 +249,8 @@ impl GqaBlock {
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
 
-        let q = self.q_norm.forward(&q);
-        let k = self.k_norm.forward(&k);
+        let q = rope.apply(&self.q_norm.forward(&q));
+        let k = rope.apply(&self.k_norm.forward(&k));
 
         let out = Tensor::scaled_dot_product_attention(
             &q, &k, &v,
@@ -542,6 +580,7 @@ pub struct TradingModel {
     patch_config_ids: Tensor,
     patch_pos_embed: Tensor,
     gqa_layers: Vec<GqaBlock>,
+    rope: RotaryEmbedding,
     final_norm: RMSNorm,
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
@@ -653,6 +692,8 @@ impl TradingModel {
         let gqa_layers = (0..gqa_layers_count)
             .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim))
             .collect::<Vec<_>>();
+        let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
+        let rope = RotaryEmbedding::new(seq_len + 1, head_dim, p.device());
         let final_norm = RMSNorm::new(&(p / "final_norm"), spec.model_dim, 1e-6);
 
         let exo_feat_w = p.var(
@@ -785,6 +826,7 @@ impl TradingModel {
             patch_config_ids,
             patch_pos_embed,
             gqa_layers,
+            rope,
             final_norm,
             exo_feat_w,
             exo_feat_b,
