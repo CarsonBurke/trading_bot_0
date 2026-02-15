@@ -81,23 +81,15 @@ impl TradingModel {
             &actor_x.apply(&self.sde_fc)
         ).silu().reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
 
-        let sde_latent_sq = sde_latent.pow_tensor_scalar(2);
-
         // Per-ticker variance: Σ_j latent[b,i,j]² · exp(2·log_std[j,i])
         let ticker_std_sq = (&self.sde_log_std_param * 2.0).exp(); // [SDE_DIM, TICKERS_COUNT]
-        let ticker_var = (&sde_latent_sq * ticker_std_sq.transpose(0, 1).unsqueeze(0))
+        let ticker_var = (sde_latent.pow_tensor_scalar(2) * ticker_std_sq.transpose(0, 1).unsqueeze(0))
             .sum_dim_intlist([-1].as_slice(), false, sde_latent.kind()); // [B, TICKERS_COUNT]
         let ticker_log_std = (ticker_var + 1e-8).log() * 0.5;
 
-        // Cash variance: mean-pool SDE latent across tickers, same quadratic form
-        let cash_latent_sq = sde_latent_sq
-            .mean_dim([1].as_slice(), false, sde_latent.kind()); // [B, SDE_DIM]
-        let cash_std_sq = (&self.cash_sde_log_std * 2.0).exp(); // [SDE_DIM]
-        let cash_var = (&cash_latent_sq * &cash_std_sq)
-            .sum_dim_intlist([-1].as_slice(), false, sde_latent.kind()); // [B]
-        let cash_log_std = (cash_var + 1e-8).log() * 0.5;
-
-        let action_log_std = Tensor::cat(&[ticker_log_std, cash_log_std.unsqueeze(-1)], -1);
+        // Cash is deterministic (redundant DOF on simplex — noise is pure gradient variance).
+        // action_log_std is [B, TICKERS_COUNT] only; cash excluded from log_prob.
+        let action_log_std = ticker_log_std;
 
         // Critic: distributional two-hot value head.
         let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);

@@ -555,7 +555,6 @@ pub struct TradingModel {
     sde_fc: nn::Linear,             // model_dim -> SDE_DIM (gSDE latent projection)
     sde_norm: RMSNorm,              // SDE_DIM
     sde_log_std_param: Tensor,      // [SDE_DIM, TICKERS_COUNT] learnable variance weights
-    cash_sde_log_std: Tensor,       // [SDE_DIM] cash variance weights (quadratic form on mean-pooled SDE latent)
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
@@ -737,11 +736,6 @@ impl TradingModel {
             &[SDE_DIM, TICKERS_COUNT],
             Init::Const(SDE_LOG_STD_INIT),
         );
-        let cash_sde_log_std = p.var(
-            "cash_sde_log_std",
-            &[SDE_DIM],
-            Init::Const(SDE_LOG_STD_INIT),
-        );
         // Critic MLP: (Linear → RMSNorm → SiLU) → Linear(→scalar value), orthogonally initialized.
         let critic_in = TICKERS_COUNT * spec.model_dim;
         let critic_hidden = spec.ff_dim;
@@ -804,7 +798,6 @@ impl TradingModel {
             sde_fc,
             sde_norm,
             sde_log_std_param,
-            cash_sde_log_std,
             value_mlp_linears,
             value_mlp_norms,
             value_out,

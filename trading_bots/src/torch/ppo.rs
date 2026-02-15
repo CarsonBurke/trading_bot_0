@@ -122,11 +122,13 @@ fn sample_rollout_actions(
         let action_mean = action_mean.to_kind(Kind::Float);
         let action_log_std = action_log_std.to_kind(Kind::Float);
 
-        let action_std = action_log_std.exp();
-        let noise = Tensor::randn_like(&action_mean) * &action_std;
+        let action_std = action_log_std.exp(); // [B, TICKERS_COUNT]
+        let ticker_noise = Tensor::randn_like(&action_std) * &action_std;
+        let action_log_prob = diag_gaussian_log_prob(&ticker_noise, &action_log_std);
+        let zero_cash = Tensor::zeros(&[action_mean.size()[0], 1], (Kind::Float, action_mean.device()));
+        let noise = Tensor::cat(&[ticker_noise, zero_cash], -1); // [B, ACTION_DIM]
         let u = &action_mean + &noise;
         let actions = u.softmax(-1, Kind::Float);
-        let action_log_prob = diag_gaussian_log_prob(&noise, &action_log_std);
 
         (values, action_mean, u, actions, action_log_prob)
     })
@@ -518,7 +520,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     )
                 };
 
-                let diff = &u - &action_mean_perturbed;
+                // Only ticker dims for log_prob (cash is deterministic, excluded)
+                let diff = (&u - &action_mean_perturbed).narrow(-1, 0, TICKERS_COUNT);
                 let action_log_probs = diag_gaussian_log_prob(&diff, &action_log_std);
 
                 if DEBUG_NUMERICS {

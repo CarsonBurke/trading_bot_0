@@ -29,7 +29,7 @@ pub fn load_model<P: AsRef<Path>>(
 
 pub fn sample_actions(
     action_mean: &Tensor,
-    action_log_std: &Tensor,  // [batch, ACTION_DIM] (state-dependent)
+    action_log_std: &Tensor,  // [batch, TICKERS_COUNT] (tickers only, cash deterministic)
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
@@ -39,7 +39,9 @@ pub fn sample_actions(
         action_mean
     } else {
         let action_std = action_log_std.to_kind(Kind::Float).exp();
-        let noise = Tensor::randn_like(&action_mean) * &action_std;
+        let ticker_noise = Tensor::randn_like(&action_std) * &action_std;
+        let zero_cash = Tensor::zeros(&[action_mean.size()[0], 1], (Kind::Float, action_mean.device()));
+        let noise = Tensor::cat(&[ticker_noise, zero_cash], -1);
         &action_mean + noise
     };
 
