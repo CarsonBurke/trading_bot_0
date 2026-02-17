@@ -82,7 +82,9 @@ impl TradingModel {
         ).silu().reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
 
         // Per-ticker variance: Σ_j latent[b,i,j]² · exp(2·log_std[j,i])
-        let ticker_std_sq = (&self.sde_log_std_param * 2.0).exp(); // [SDE_DIM, TICKERS_COUNT]
+        // Normalize by SDE_DIM so variance doesn't scale with latent dimension count.
+        let normalized_log_std = &self.sde_log_std_param - 0.5 * (SDE_DIM as f64).ln();
+        let ticker_std_sq = (&normalized_log_std * 2.0).exp(); // [SDE_DIM, TICKERS_COUNT]
         let ticker_var = (sde_latent.pow_tensor_scalar(2) * ticker_std_sq.transpose(0, 1).unsqueeze(0))
             .sum_dim_intlist([-1].as_slice(), false, sde_latent.kind()); // [B, TICKERS_COUNT]
         let ticker_log_std = (ticker_var + 1e-8).log() * 0.5;
