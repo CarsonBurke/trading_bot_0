@@ -76,16 +76,15 @@ impl TradingModel {
         // action_mean: [B, ACTION_DIM]
         let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
 
-        // gSDE: FC → RMSNorm → SiLU → quadratic form for per-ticker variance
+        // gSDE: FC → RMSNorm → tanh → quadratic form for per-ticker variance
+        // tanh bounds each latent factor to [-1, 1], preventing degenerative noise growth.
         let sde_latent = self.sde_norm.forward(
             &actor_x.apply(&self.sde_fc)
-        ).silu().reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
+        ).tanh().reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
 
-        // Gram matrix covariance: L[b,i,k] = sde_latent[b,i,k] * exp(normalized_log_std[k,i])
-        // cov = L @ L^T + εI  (PSD by construction), then Cholesky for efficient MVN.
-        let normalized_log_std = &self.sde_log_std_param - 0.5 * (SDE_DIM as f64).ln();
-        let scales = normalized_log_std.exp().transpose(0, 1).unsqueeze(0); // [1, T, SDE_DIM]
-        let l_factor = &sde_latent * scales; // [B, T, SDE_DIM]
+        // Gram matrix covariance: L = sde_latent / sqrt(SDE_DIM), cov = LL^T + εI.
+        // Fixed 1/sqrt(d) normalization: with tanh ∈ [-1,1], max per-ticker std ≈ 1.0.
+        let l_factor = &sde_latent * (1.0 / (SDE_DIM as f64).sqrt());
         // Cholesky in fp32 for numerical stability (bf16 lacks precision for matrix decomposition).
         let l_factor = l_factor.to_kind(Kind::Float);
         let cov = l_factor.bmm(&l_factor.transpose(1, 2))

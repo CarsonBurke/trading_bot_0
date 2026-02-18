@@ -99,7 +99,7 @@ impl GpuRollingBuffer {
 fn mvn_log_prob(diff: &Tensor, chol: &Tensor) -> Tensor {
     let k = diff.size().last().copied().unwrap() as f64;
     // Solve L y = diff for y via forward substitution
-    let (y, _) = diff.unsqueeze(-1).triangular_solve(chol, false, false, false);
+    let y = chol.linalg_solve_triangular(&diff.unsqueeze(-1), false, false, false);
     let mahal = y.squeeze_dim(-1).pow_tensor_scalar(2)
         .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
     let half_log_det = chol.diagonal(0, -2, -1).log()
