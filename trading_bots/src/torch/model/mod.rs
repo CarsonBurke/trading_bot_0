@@ -444,7 +444,7 @@ pub(crate) fn twohot_ce_loss(targets: &Tensor, log_probs: &Tensor, centers: &Ten
     -(w_below * lp_below + w_above * lp_above)
 }
 
-/// (values, critic_logits, critic_input, action_mean, action_log_std)
+/// (values, critic_logits, critic_input, action_mean, action_cov_chol)
 pub type ModelOutput = (Tensor, Tensor, Tensor, Tensor, Tensor);
 
 pub struct DebugMetrics {

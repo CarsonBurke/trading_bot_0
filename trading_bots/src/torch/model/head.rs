@@ -81,17 +81,18 @@ impl TradingModel {
             &actor_x.apply(&self.sde_fc)
         ).silu().reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
 
-        // Per-ticker variance: Σ_j latent[b,i,j]² · exp(2·log_std[j,i])
-        // Normalize by SDE_DIM so variance doesn't scale with latent dimension count.
+        // Gram matrix covariance: L[b,i,k] = sde_latent[b,i,k] * exp(normalized_log_std[k,i])
+        // cov = L @ L^T + εI  (PSD by construction), then Cholesky for efficient MVN.
         let normalized_log_std = &self.sde_log_std_param - 0.5 * (SDE_DIM as f64).ln();
-        let ticker_std_sq = (&normalized_log_std * 2.0).exp(); // [SDE_DIM, TICKERS_COUNT]
-        let ticker_var = (sde_latent.pow_tensor_scalar(2) * ticker_std_sq.transpose(0, 1).unsqueeze(0))
-            .sum_dim_intlist([-1].as_slice(), false, sde_latent.kind()); // [B, TICKERS_COUNT]
-        let ticker_log_std = (ticker_var + 1e-8).log() * 0.5;
-
+        let scales = normalized_log_std.exp().transpose(0, 1).unsqueeze(0); // [1, T, SDE_DIM]
+        let l_factor = &sde_latent * scales; // [B, T, SDE_DIM]
+        // Cholesky in fp32 for numerical stability (bf16 lacks precision for matrix decomposition).
+        let l_factor = l_factor.to_kind(Kind::Float);
+        let cov = l_factor.bmm(&l_factor.transpose(1, 2))
+            + Tensor::eye(TICKERS_COUNT, (Kind::Float, sde_latent.device())) * 1e-4;
         // Cash is deterministic (redundant DOF on simplex — noise is pure gradient variance).
-        // action_log_std is [B, TICKERS_COUNT] only; cash excluded from log_prob.
-        let action_log_std = ticker_log_std;
+        // action_cov_chol is [B, TICKERS_COUNT, TICKERS_COUNT]; cash excluded from log_prob.
+        let action_cov_chol = cov.linalg_cholesky(false);
 
         // Critic: distributional two-hot value head.
         let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
@@ -127,7 +128,7 @@ impl TradingModel {
         let critic_logits = critic_logits.to_kind(Kind::Float);
         let critic_input = critic_input.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
-        let action_log_std = action_log_std.to_kind(Kind::Float);
+        let action_cov_chol = action_cov_chol.to_kind(Kind::Float);
 
         let debug_metrics = None;
 
@@ -137,7 +138,7 @@ impl TradingModel {
                 critic_logits,
                 critic_input,
                 action_mean,
-                action_log_std,
+                action_cov_chol,
             ),
             debug_metrics,
         )

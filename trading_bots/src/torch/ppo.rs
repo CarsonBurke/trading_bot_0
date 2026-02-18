@@ -95,19 +95,24 @@ impl GpuRollingBuffer {
     }
 }
 
-/// Diagonal Gaussian log prob (accepts log_std directly to avoid exp→log round-trip).
-fn diag_gaussian_log_prob(diff: &Tensor, log_std: &Tensor) -> Tensor {
-    let inv_var = (log_std * -2.0).exp();
-    let terms = diff.pow_tensor_scalar(2) * &inv_var + log_std * 2.0 + LOG_2PI;
-    terms
-        .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-        .g_mul_scalar(-0.5)
+/// MVN log prob given lower-triangular Cholesky factor L: log N(diff; 0, L L^T).
+fn mvn_log_prob(diff: &Tensor, chol: &Tensor) -> Tensor {
+    let k = diff.size().last().copied().unwrap() as f64;
+    // Solve L y = diff for y via forward substitution
+    let (y, _) = diff.unsqueeze(-1).triangular_solve(chol, false, false, false);
+    let mahal = y.squeeze_dim(-1).pow_tensor_scalar(2)
+        .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+    let half_log_det = chol.diagonal(0, -2, -1).log()
+        .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+    (mahal + 2.0 * &half_log_det + k * LOG_2PI) * -0.5
 }
 
-/// Diagonal Gaussian entropy: H = 0.5 * sum(log(2πe·σ_i²))
-fn diag_gaussian_entropy(log_std: &Tensor) -> Tensor {
-    let k = log_std.size().last().copied().unwrap() as f64;
-    log_std.sum_dim_intlist([-1].as_slice(), false, Kind::Float) + 0.5 * k * (1.0 + LOG_2PI)
+/// MVN entropy: H = 0.5 * (k (1 + log 2π) + log |det Σ|)
+fn mvn_entropy(chol: &Tensor) -> Tensor {
+    let k = chol.size()[chol.dim() - 1] as f64;
+    let half_log_det = chol.diagonal(0, -2, -1).log()
+        .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+    half_log_det + 0.5 * k * (1.0 + LOG_2PI)
 }
 
 fn sample_rollout_actions(
@@ -116,16 +121,17 @@ fn sample_rollout_actions(
     obs_static: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
     tch::no_grad(|| {
-        let (values, _, _, action_mean, action_log_std) =
+        let (values, _, _, action_mean, action_cov_chol) =
             model.forward_on_device(obs_price, obs_static, false);
         let values = values.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
-        let action_log_std = action_log_std.to_kind(Kind::Float);
+        let action_cov_chol = action_cov_chol.to_kind(Kind::Float);
 
-        let action_std = action_log_std.exp(); // [B, TICKERS_COUNT]
-        let ticker_noise = Tensor::randn_like(&action_std) * &action_std;
-        let action_log_prob = diag_gaussian_log_prob(&ticker_noise, &action_log_std);
-        let zero_cash = Tensor::zeros(&[action_mean.size()[0], 1], (Kind::Float, action_mean.device()));
+        let batch = action_mean.size()[0];
+        let z = Tensor::randn(&[batch, TICKERS_COUNT, 1], (Kind::Float, action_mean.device()));
+        let ticker_noise = action_cov_chol.bmm(&z).squeeze_dim(-1); // [B, TICKERS_COUNT]
+        let action_log_prob = mvn_log_prob(&ticker_noise, &action_cov_chol);
+        let zero_cash = Tensor::zeros(&[batch, 1], (Kind::Float, action_mean.device()));
         let noise = Tensor::cat(&[ticker_noise, zero_cash], -1); // [B, ACTION_DIM]
         let u = &action_mean + &noise;
         let actions = u.softmax(-1, Kind::Float);
@@ -208,12 +214,15 @@ fn compute_action_std_stats(
     device: tch::Device,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, _, _, _, action_log_std) = model.forward_on_device(
+        let (_, _, _, _, action_cov_chol) = model.forward_on_device(
             &s_price_deltas.get(0),
             &s_static_obs.get(0),
             false,
         );
-        let action_std = action_log_std.to_kind(Kind::Float).exp();
+        let chol = action_cov_chol.to_kind(Kind::Float);
+        // Diagonal variance from Cholesky: var_i = sum_j L[i,j]²
+        let action_std = chol.pow_tensor_scalar(2)
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float).sqrt();
         let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
             (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze()
         } else {
@@ -491,7 +500,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (_, critic_logits, _critic_input, action_mean, action_log_std) = trading_model
+                let (_, critic_logits, _critic_input, action_mean, action_cov_chol) = trading_model
                     .forward_no_values_on_device(
                         &pd_chunk,
                         &so_chunk,
@@ -499,7 +508,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     );
 
                 let action_mean = action_mean.to_kind(Kind::Float);
-                let action_log_std = action_log_std.to_kind(Kind::Float);
+                let action_cov_chol = action_cov_chol.to_kind(Kind::Float);
 
                 // act_mb contains the stored u (pre-softmax logits)
                 let u = act_mb;
@@ -522,14 +531,14 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
                 // Only ticker dims for log_prob (cash is deterministic, excluded)
                 let diff = (&u - &action_mean_perturbed).narrow(-1, 0, TICKERS_COUNT);
-                let action_log_probs = diag_gaussian_log_prob(&diff, &action_log_std);
+                let action_log_probs = mvn_log_prob(&diff, &action_cov_chol);
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
                     let _ =
                         debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_log_std", &action_log_std, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_cov_chol", &action_cov_chol, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
@@ -557,7 +566,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 }
                 let value_loss = twohot_ce_loss(&ret_mb, &log_probs, trading_model.bucket_centers()).mean(Kind::Float);
 
-                let dist_entropy = diag_gaussian_entropy(&action_log_std).mean(Kind::Float);
+                let dist_entropy = mvn_entropy(&action_cov_chol).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
@@ -566,7 +575,9 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
                 // RPO alpha loss: target induced KL for uniform logit perturbation.
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let action_var = (&action_log_std * 2.0).exp().detach();
+                    // Diagonal variance from Cholesky: var_i = sum_j L[i,j]²
+                    let action_var = action_cov_chol.pow_tensor_scalar(2)
+                        .sum_dim_intlist([-1].as_slice(), false, Kind::Float).detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
                     let d = ACTION_DIM as f64;
                     let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
