@@ -76,11 +76,13 @@ impl TradingModel {
         // action_mean: [B, ACTION_DIM]
         let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
 
-        // gSDE: FC → RMSNorm → tanh → quadratic form for per-ticker variance
-        // tanh bounds each latent factor to [-1, 1], preventing degenerative noise growth.
-        let sde_latent = self.sde_norm.forward(
-            &actor_x.apply(&self.sde_fc)
-        ).tanh().reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
+        // gSDE: FC → softsign*2 → quadratic form for per-ticker variance
+        // 2*softsign bounds factors to (-2, 2) with polynomial gradient decay (1/(1+|x|)²),
+        // maintaining gradient flow even at extremes unlike tanh's exponential decay.
+        let sde_raw = actor_x.apply(&self.sde_fc);
+        let sde_softsign = &sde_raw / (sde_raw.abs() + 1.0);
+        let sde_latent = (sde_softsign * 2.0)
+            .reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
 
         // Gram matrix covariance: L = sde_latent / sqrt(SDE_DIM), cov = LL^T + εI.
         // Fixed 1/sqrt(d) normalization: with tanh ∈ [-1,1], max per-ticker std ≈ 1.0.

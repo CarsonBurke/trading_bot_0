@@ -514,7 +514,6 @@ pub struct TradingModel {
     actor_out: nn::Linear,          // model_dim -> 1 (shared per-ticker readout)
     cash_proj: nn::Linear,          // model_dim -> 1 (cash logit from mean-pooled tickers)
     sde_fc: nn::Linear,             // model_dim -> SDE_DIM (gSDE latent projection)
-    sde_norm: RMSNorm,              // SDE_DIM
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
@@ -692,7 +691,6 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let sde_norm = RMSNorm::new(&(p / "sde_norm"), SDE_DIM, 1e-6);
         // Critic MLP: (Linear → RMSNorm → SiLU) → Linear(→scalar value), orthogonally initialized.
         let critic_in = TICKERS_COUNT * spec.model_dim;
         let critic_hidden = spec.ff_dim;
@@ -754,7 +752,6 @@ impl TradingModel {
             actor_out,
             cash_proj,
             sde_fc,
-            sde_norm,
             value_mlp_linears,
             value_mlp_norms,
             value_out,
