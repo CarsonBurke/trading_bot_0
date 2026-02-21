@@ -28,7 +28,7 @@ const LOG_2PI: f64 = 1.8378770664093453;
 
 // RPO: Random Policy Optimization - adds bounded noise to action mean during training and intentionally not during rollout
 // Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
-const RPO_ALPHA_MIN: f64 = 0.05;
+const RPO_ALPHA_MIN: f64 = 0.01;
 const RPO_ALPHA_MAX: f64 = 0.5;
 const RPO_ALPHA_INIT: f64 = 0.1; // CleanRL impl found 0.1 reliably improved results in all test envs over PPO
 const RPO_TARGET_KL: f64 = 0.018;
