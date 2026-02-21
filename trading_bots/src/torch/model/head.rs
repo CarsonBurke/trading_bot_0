@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, SDE_DIM};
+use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, SDE_NOISE_SCALE};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -76,24 +76,18 @@ impl TradingModel {
         // action_mean: [B, ACTION_DIM]
         let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
 
-        // gSDE: FC → softsign*2 → quadratic form for per-ticker variance
-        // 2*softsign bounds factors to (-2, 2) with polynomial gradient decay (1/(1+|x|)²),
-        // maintaining gradient flow even at extremes unlike tanh's exponential decay.
-        let sde_raw = actor_x.apply(&self.sde_fc);
-        let sde_softsign = &sde_raw / (sde_raw.abs() + 1.0);
-        let sde_latent = (sde_softsign * 2.0)
-            .reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
+        // Per-feature diagonal noise in latent space
+        let sde_raw = actor_x.apply(&self.sde_fc); // [B*T, model_dim]
+        let sde_sigma = (&sde_raw / (sde_raw.abs() + 1.0)).abs() * SDE_NOISE_SCALE; // bounded positive
 
-        // Gram matrix covariance: L = sde_latent / sqrt(SDE_DIM), cov = LL^T + εI.
-        // Fixed 1/sqrt(d) normalization: with tanh ∈ [-1,1], max per-ticker std ≈ 1.0.
-        let l_factor = &sde_latent * (1.0 / (SDE_DIM as f64).sqrt());
-        // Cholesky in fp32 for numerical stability (bf16 lacks precision for matrix decomposition).
-        let l_factor = l_factor.to_kind(Kind::Float);
-        let cov = l_factor.bmm(&l_factor.transpose(1, 2))
-            + Tensor::eye(TICKERS_COUNT, (Kind::Float, sde_latent.device())) * 1e-4;
-        // Cash is deterministic (redundant DOF on simplex — noise is pure gradient variance).
-        // action_cov_chol is [B, TICKERS_COUNT, TICKERS_COUNT]; cash excluded from log_prob.
-        let action_cov_chol = cov.linalg_cholesky(false);
+        // Effective logit std per ticker via output head weights
+        let w_actor = self.actor_out.ws.squeeze(); // [model_dim] (actor_out is model_dim->1)
+        let w_sq = w_actor.pow_tensor_scalar(2); // [model_dim]
+        let effective_var = (sde_sigma.pow_tensor_scalar(2) * &w_sq)
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float) // [B*T]
+            .reshape([batch_size, TICKERS_COUNT]) // [B, TICKERS_COUNT]
+            .clamp_min(1e-8);
+        let action_noise_std = effective_var.sqrt(); // [B, TICKERS_COUNT]
 
         // Critic: distributional two-hot value head.
         let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
@@ -129,7 +123,7 @@ impl TradingModel {
         let critic_logits = critic_logits.to_kind(Kind::Float);
         let critic_input = critic_input.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
-        let action_cov_chol = action_cov_chol.to_kind(Kind::Float);
+        let action_noise_std = action_noise_std.to_kind(Kind::Float);
 
         let debug_metrics = None;
 
@@ -139,7 +133,7 @@ impl TradingModel {
                 critic_logits,
                 critic_input,
                 action_mean,
-                action_cov_chol,
+                action_noise_std,
             ),
             debug_metrics,
         )

@@ -29,7 +29,7 @@ pub fn load_model<P: AsRef<Path>>(
 
 pub fn sample_actions(
     action_mean: &Tensor,
-    action_cov_chol: &Tensor,  // [batch, TICKERS_COUNT, TICKERS_COUNT] lower-triangular Cholesky
+    action_noise_std: &Tensor,  // [batch, TICKERS_COUNT]
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
@@ -38,10 +38,10 @@ pub fn sample_actions(
     let u = if deterministic {
         action_mean
     } else {
-        let chol = action_cov_chol.to_kind(Kind::Float);
+        let std = action_noise_std.to_kind(Kind::Float);
         let batch = action_mean.size()[0];
-        let z = Tensor::randn(&[batch, TICKERS_COUNT, 1], (Kind::Float, action_mean.device()));
-        let ticker_noise = chol.bmm(&z).squeeze_dim(-1); // [B, TICKERS_COUNT]
+        let z = Tensor::randn(&[batch, TICKERS_COUNT], (Kind::Float, action_mean.device()));
+        let ticker_noise = &std * &z;
         let zero_cash = Tensor::zeros(&[batch, 1], (Kind::Float, action_mean.device()));
         let noise = Tensor::cat(&[ticker_noise, zero_cash], -1);
         &action_mean + noise
@@ -106,19 +106,19 @@ pub fn run_inference<P: AsRef<Path>>(
             env.step = step;
 
             // First call uses full history, then we switch to incremental per-ticker deltas.
-            let (action_mean, action_cov_chol) = tch::no_grad(|| {
+            let (action_mean, action_noise_std) = tch::no_grad(|| {
                 let price_input = if use_full {
                     &price_deltas_full
                 } else {
                     &price_deltas_incremental
                 };
-                let (_, _, _, action_mean, action_cov_chol) =
+                let (_, _, _, action_mean, action_noise_std) =
                     model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
-                (action_mean, action_cov_chol)
+                (action_mean, action_noise_std)
             });
             let actions = sample_actions(
                 &action_mean,
-                &action_cov_chol,
+                &action_noise_std,
                 deterministic,
                 temperature,
             );

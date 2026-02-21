@@ -404,14 +404,14 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 &step_obs_gpu
             };
 
-            let (action_mean, action_cov_chol) = tch::no_grad(|| {
-                let (_, _, _, action_mean, action_cov_chol) =
+            let (action_mean, action_noise_std) = tch::no_grad(|| {
+                let (_, _, _, action_mean, action_noise_std) =
                     model.step_on_device(price_deltas_gpu, &static_obs_gpu, &mut stream_state);
-                (action_mean, action_cov_chol)
+                (action_mean, action_noise_std)
             });
             let actions = sample_actions(
                 &action_mean,
-                &action_cov_chol,
+                &action_noise_std,
                 true, // deterministic
                 0.0,  // temperature
             );
