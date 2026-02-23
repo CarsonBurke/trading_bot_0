@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, SDE_NOISE_SCALE};
+use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, LOG_STD_INIT, SDE_EPS};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -76,18 +76,15 @@ impl TradingModel {
         // action_mean: [B, ACTION_DIM]
         let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
 
-        // Per-feature diagonal noise in latent space
-        let sde_raw = actor_x.apply(&self.sde_fc); // [B*T, model_dim]
-        let sde_sigma = (&sde_raw / (sde_raw.abs() + 1.0)).abs() * SDE_NOISE_SCALE; // bounded positive
-
-        // Effective logit std per ticker via output head weights
-        let w_actor = self.actor_out.ws.squeeze(); // [model_dim] (actor_out is model_dim->1)
-        let w_sq = w_actor.pow_tensor_scalar(2); // [model_dim]
-        let effective_var = (sde_sigma.pow_tensor_scalar(2) * &w_sq)
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float) // [B*T]
-            .reshape([batch_size, TICKERS_COUNT]) // [B, TICKERS_COUNT]
-            .clamp_min(1e-8);
-        let action_noise_std = effective_var.sqrt(); // [B, TICKERS_COUNT]
+        // gSDE: state-dependent exploration with learned per-dimension noise scale
+        let sde_raw = actor_x.apply(&self.sde_fc); // [B*TICKERS, SDE_LATENT_DIM]
+        let sde_latent = self.sde_norm.forward(&sde_raw).apply(&self.sde_fc2).tanh(); // [-1, 1]
+        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, -1]); // [B, TICKERS, SDE_LATENT_DIM]
+        let log_std = (&self.log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5); // [SDE_LATENT_DIM, TICKERS]
+        let std_sq = log_std.exp().pow_tensor_scalar(2).transpose(0, 1); // [TICKERS, SDE_LATENT_DIM]
+        let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float); // [B, TICKERS]
+        let action_noise_std = (variance + SDE_EPS).sqrt(); // [B, TICKERS_COUNT]
 
         // Critic: distributional two-hot value head.
         let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);

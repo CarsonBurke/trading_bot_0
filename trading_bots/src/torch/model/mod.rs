@@ -304,7 +304,9 @@ const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
-pub(super) const SDE_NOISE_SCALE: f64 = 2.5;
+pub(super) const SDE_LATENT_DIM: i64 = 64;
+pub(super) const LOG_STD_INIT: f64 = -2.0;
+pub(super) const SDE_EPS: f64 = 1e-6;
 const TIME_CROSS_LAYERS: usize = 1;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -2.0;
@@ -513,7 +515,10 @@ pub struct TradingModel {
     actor_mlp_norms: Vec<RMSNorm>,
     actor_out: nn::Linear,          // model_dim -> 1 (shared per-ticker readout)
     cash_proj: nn::Linear,          // model_dim -> 1 (cash logit from mean-pooled tickers)
-    sde_fc: nn::Linear,             // model_dim -> model_dim (gSDE latent projection)
+    sde_fc: nn::Linear,             // model_dim -> SDE_LATENT_DIM (gSDE latent projection)
+    sde_norm: RMSNorm,              // RMSNorm on SDE_LATENT_DIM
+    sde_fc2: nn::Linear,            // SDE_LATENT_DIM -> SDE_LATENT_DIM
+    log_std_param: Tensor,           // [SDE_LATENT_DIM, TICKERS_COUNT] learned noise scale
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
@@ -684,12 +689,28 @@ impl TradingModel {
         let sde_fc = nn::linear(
             p / "sde_fc",
             spec.model_dim,
-            spec.model_dim,
+            SDE_LATENT_DIM,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
+        );
+        let sde_norm = RMSNorm::new(&(p / "sde_norm"), SDE_LATENT_DIM, 1e-5);
+        let sde_fc2 = nn::linear(
+            p / "sde_fc2",
+            SDE_LATENT_DIM,
+            SDE_LATENT_DIM,
+            nn::LinearConfig {
+                ws_init: Init::Orthogonal { gain: 1.0 },
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let log_std_param = p.var(
+            "log_std",
+            &[SDE_LATENT_DIM, TICKERS_COUNT],
+            Init::Const(0.0),
         );
         // Critic MLP: (Linear → RMSNorm → SiLU) → Linear(→scalar value), orthogonally initialized.
         let critic_in = TICKERS_COUNT * spec.model_dim;
@@ -752,6 +773,9 @@ impl TradingModel {
             actor_out,
             cash_proj,
             sde_fc,
+            sde_norm,
+            sde_fc2,
+            log_std_param,
             value_mlp_linears,
             value_mlp_norms,
             value_out,

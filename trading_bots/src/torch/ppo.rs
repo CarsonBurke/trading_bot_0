@@ -134,11 +134,16 @@ fn sample_rollout_actions(
             (Kind::Float, action_mean.device()),
         );
         let ticker_noise = &action_noise_std * &z; // [B, TICKERS_COUNT]
-        let action_log_prob = gaussian_log_prob(&ticker_noise, &action_noise_std);
+        let log_prob_gauss = gaussian_log_prob(&ticker_noise, &action_noise_std);
         let zero_cash = Tensor::zeros(&[batch, 1], (Kind::Float, action_mean.device()));
         let noise = Tensor::cat(&[ticker_noise, zero_cash], -1); // [B, ACTION_DIM]
         let u = &action_mean + &noise;
         let actions = u.softmax(-1, Kind::Float);
+
+        // Softmax Jacobian correction (covers all dims incl cash on the simplex)
+        let log_det_jacobian = u.log_softmax(-1, Kind::Float)
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+        let action_log_prob = log_prob_gauss - log_det_jacobian;
 
         (values, action_mean, u, actions, action_log_prob)
     })
@@ -506,10 +511,14 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
                     let alpha_detached = alpha.detach();
-                    let rpo_noise =
-                        Tensor::empty([chunk_sample_count, ACTION_DIM], (Kind::Float, device))
+                    let rpo_ticker_noise =
+                        Tensor::empty([chunk_sample_count, TICKERS_COUNT], (Kind::Float, device))
                             .uniform_(-1.0, 1.0)
                             * &alpha_detached;
+                    let rpo_noise = Tensor::cat(
+                        &[rpo_ticker_noise, Tensor::zeros(&[chunk_sample_count, 1], (Kind::Float, device))],
+                        -1,
+                    );
                     (alpha, &action_mean + rpo_noise)
                 } else {
                     (
@@ -518,9 +527,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     )
                 };
 
-                // Only ticker dims for log_prob (cash is deterministic, excluded)
+                // Ticker-only Gaussian log-prob + softmax Jacobian correction (covers all dims incl cash)
                 let diff = (&u - &action_mean_perturbed).narrow(-1, 0, TICKERS_COUNT);
-                let action_log_probs = gaussian_log_prob(&diff, &action_noise_std);
+                let log_prob_gauss = gaussian_log_prob(&diff, &action_noise_std);
+                let log_det_jacobian = u.log_softmax(-1, Kind::Float)
+                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+                let action_log_probs = log_prob_gauss - log_det_jacobian;
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
@@ -558,9 +570,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     twohot_ce_loss(&ret_mb, &log_probs, trading_model.bucket_centers())
                         .mean(Kind::Float);
 
-                let gauss_ent = gaussian_entropy(&action_noise_std).mean(Kind::Float);
-                let cat_ent = softmax_entropy(&action_mean).mean(Kind::Float);
-                let dist_entropy = &gauss_ent + &cat_ent;
+                let dist_entropy = gaussian_entropy(&action_noise_std).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
