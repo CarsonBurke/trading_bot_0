@@ -262,6 +262,24 @@ impl EpisodeHistory {
         }
     }
 
+    /// Write per-step normalized rewards chart to the episode directory.
+    /// `values` should already be subsampled (e.g. every 5 steps).
+    pub fn write_normalized_rewards(episode: usize, values: Vec<f32>) {
+        let episode_dir = format!("{TRAINING_PATH}/gens/{episode}");
+        create_folder_if_not_exists(&episode_dir);
+        let report = Report {
+            title: "Normalized Rewards".to_string(),
+            x_label: Some("Step (x5)".to_string()),
+            y_label: Some("Normalized Reward".to_string()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::Simple {
+                values,
+                ema_alpha: None,
+            },
+        };
+        let _ = write_report(&format!("{episode_dir}/normalized_reward.report.bin"), &report);
+    }
+
     pub fn final_assets(&self) -> f64 {
         let positioned = self
             .positioned

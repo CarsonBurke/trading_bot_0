@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, LOG_STD_INIT, SDE_EPS};
+use super::{DebugMetrics, ModelOutput, TradingModel, SDE_LATENT_DIM, LOG_STD_INIT, SDE_EPS};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -14,81 +14,58 @@ impl TradingModel {
         let temporal_len = x.size()[1];
         let x_time = x.view([batch_size, TICKERS_COUNT, temporal_len, self.model_dim]);
 
-        let mut ticker_repr = x_time.select(2, 0);
+        let flat_dim_per = temporal_len * self.model_dim;
+        let flat_dim_all = TICKERS_COUNT * flat_dim_per;
+        let scale_per = 1.0 / (flat_dim_per as f64).sqrt();
+        let scale_all = 1.0 / (flat_dim_all as f64).sqrt();
 
-        let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
-        let block = &self.inter_ticker_block;
-        let alpha_ticker_attn = block.alpha_ticker_attn.sigmoid() * alpha_scale;
-        let alpha_mlp = block.alpha_mlp.sigmoid() * alpha_scale;
+        let flat_per_ticker = x_time
+            .reshape([batch_size, TICKERS_COUNT, flat_dim_per]);
+        let flat_all = flat_per_ticker
+            .reshape([batch_size, flat_dim_all]);
 
-        let x_ticker_norm = block
-            .ticker_ln
-            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]))
-            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
-        let qkv = x_ticker_norm.apply(&block.ticker_qkv);
-        let parts = qkv.split(self.model_dim, -1);
-        let q = block.q_norm.forward(&parts[0]).unsqueeze(1);
-        let k = block.k_norm.forward(&parts[1]).unsqueeze(1);
-        let v = parts[2].unsqueeze(1);
-        let ticker_ctx = Tensor::scaled_dot_product_attention(
-            &q, &k, &v,
-            None::<&Tensor>, 0.0, false, None, false,
-        )
-            .squeeze_dim(1)
-            .apply(&block.ticker_out)
-            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
-        ticker_repr = ticker_repr + &ticker_ctx * &alpha_ticker_attn;
+        // Weightless RMSNorm: x / rms(x), rms computed in f32
+        let flat_per_normed = {
+            let x = flat_per_ticker.reshape([batch_size * TICKERS_COUNT, flat_dim_per]);
+            let xf = x.to_kind(Kind::Float);
+            let rms = (xf.pow_tensor_scalar(2).mean_dim([-1].as_slice(), true, Kind::Float) + 1e-6).sqrt();
+            (xf / rms).to_kind(x.kind()).reshape([batch_size, TICKERS_COUNT, flat_dim_per])
+        };
+        let flat_all_normed = {
+            let xf = flat_all.to_kind(Kind::Float);
+            let rms = (xf.pow_tensor_scalar(2).mean_dim([-1].as_slice(), true, Kind::Float) + 1e-6).sqrt();
+            (xf / rms).to_kind(flat_all.kind())
+        };
 
-        let mlp_in = block
-            .mlp_ln
-            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]));
-        let mlp_proj = mlp_in.apply(&block.mlp_fc1);
-        let mlp_parts = mlp_proj.split(self.ff_dim, -1);
-        let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
-            .apply(&block.mlp_fc2)
-            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
-        ticker_repr = ticker_repr + &mlp * &alpha_mlp;
+        // Actor: per-ticker flatten -> RMSNorm -> projection -> scale
+        let ticker_logits = flat_per_normed
+            .reshape([batch_size * TICKERS_COUNT, flat_dim_per])
+            .apply(&self.actor_proj)
+            .reshape([batch_size, TICKERS_COUNT])
+            * scale_per;
 
-        // Actor head
-        let mut actor_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]);
-        for i in 0..self.actor_mlp_linears.len() {
-            actor_x = actor_x.apply(&self.actor_mlp_linears[i]);
-            actor_x = self.actor_mlp_norms[i].forward(&actor_x);
-            actor_x = actor_x.silu();
-        }
-
-        let ticker_logits = actor_x
-            .apply(&self.actor_out)
-            .reshape([batch_size, TICKERS_COUNT]);
-
-        let cash_logit = actor_x
-            .reshape([batch_size, TICKERS_COUNT, self.model_dim])
-            .mean_dim([1].as_slice(), false, actor_x.kind())
-            .apply(&self.cash_proj)
-            .squeeze_dim(-1);
+        // Cash: all-ticker flatten -> RMSNorm -> projection -> scale
+        let cash_logit = flat_all_normed.apply(&self.cash_proj).squeeze_dim(-1) * scale_all;
 
         let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
 
-        // gSDE
-        let sde_raw = actor_x.apply(&self.sde_fc);
-        let sde_latent = self.sde_norm.forward(&sde_raw).apply(&self.sde_fc2).tanh();
-        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, -1]);
+        // gSDE: CLS token -> latent -> tanh -> fc3, variance over latent features
+        let cls = x_time.select(2, 0); // [batch, tickers, model_dim]
+        let sde_in = cls.reshape([batch_size * TICKERS_COUNT, self.model_dim]);
+        let sde_latent = self.sde_norm.forward(&sde_in.apply(&self.sde_fc))
+            .apply(&self.sde_fc2)
+            .tanh()
+            .apply(&self.sde_fc3);
+        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, SDE_LATENT_DIM]);
         let log_std = (&self.log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5);
         let std_sq = log_std.exp().pow_tensor_scalar(2).transpose(0, 1);
         let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
             .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
         let action_noise_std = (variance + SDE_EPS).sqrt();
 
-        // Scalar critic
-        let mut critic_x = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
-        for i in 0..self.value_mlp_linears.len() {
-            critic_x = critic_x.apply(&self.value_mlp_linears[i]);
-            critic_x = self.value_mlp_norms[i].forward(&critic_x);
-            critic_x = critic_x.silu();
-        }
-        let values = critic_x.apply(&self.value_out).squeeze_dim(-1); // [batch]
+        // Critic: all-ticker flatten -> RMSNorm -> projection -> scale
+        let values = flat_all_normed.apply(&self.value_proj).squeeze_dim(-1) * scale_all;
 
-        // Cast all outputs to fp32
         let values = values.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
         let action_noise_std = action_noise_std.to_kind(Kind::Float);

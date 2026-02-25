@@ -9,7 +9,7 @@ use crate::torch::env::VecEnv;
 use crate::torch::model::{
     ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
 };
-use crate::history::report::{write_report, Report, ReportKind, ScaleKind};
+use crate::history::episode_tickers_combined::EpisodeHistory;
 
 const LEARNING_RATE: f64 = 3e-4;
 pub const NPROCS: i64 = 16;
@@ -20,7 +20,7 @@ const PPO_CLIP_LOW: f64 = 0.2;
 const PPO_CLIP_HIGH: f64 = 0.28; // DAPO-style asymmetric: wider upper bound prevents entropy collapse
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
-const VALUE_LOSS_COEF: f64 = 0.5;
+const VALUE_LOSS_COEF: f64 = 0.1;
 const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
 const GRAD_ACCUM_STEPS: usize = 1;
@@ -143,10 +143,9 @@ fn sample_rollout_actions(
         let u = &action_mean + &noise;
         let actions = u.softmax(-1, Kind::Float);
 
-        // Softmax Jacobian correction (covers all dims incl cash on the simplex)
-        let log_det_jacobian = u.log_softmax(-1, Kind::Float)
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-        let action_log_prob = log_prob_gauss - log_det_jacobian;
+        // Rollout: cash baseline shift is zero by construction (u_cash = mu_cash),
+        // so plain Gaussian log-prob on ticker noise is correct.
+        let action_log_prob = log_prob_gauss;
 
         (values, action_mean, u, actions, action_log_prob)
     })
@@ -576,12 +575,14 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     )
                 };
 
-                // Ticker-only Gaussian log-prob + softmax Jacobian correction (covers all dims incl cash)
-                let diff = (&u - &action_mean_perturbed).narrow(-1, 0, TICKERS_COUNT);
-                let log_prob_gauss = gaussian_log_prob(&diff, &action_noise_std);
-                let log_det_jacobian = u.log_softmax(-1, Kind::Float)
-                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-                let action_log_probs = log_prob_gauss - log_det_jacobian;
+                // Logit-difference log-prob: subtract cash residual so density is measured in
+                // softmax-invariant space. Consistent with rollout (ppo.rs:139-148) where
+                // zero cash noise makes this subtraction a no-op: diff_cash = u_cash - mu_old_cash = 0.
+                let diff_full = &u - &action_mean_perturbed;
+                let diff_ticker = diff_full.narrow(-1, 0, TICKERS_COUNT);
+                let diff_cash = diff_full.narrow(-1, TICKERS_COUNT as i64, 1);
+                let diff = diff_ticker - diff_cash;
+                let action_log_probs = gaussian_log_prob(&diff, &action_noise_std);
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
@@ -631,7 +632,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let action_var = action_noise_std.pow_tensor_scalar(2).detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                    let d = ACTION_DIM as f64;
+                    let d = TICKERS_COUNT as f64;
                     let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                     (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
                 } else {
@@ -863,33 +864,18 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
         primary.meta_history.record_approx_kl(first_epoch_kl);
-        let norm_reward_mean = s_rewards.mean(Kind::Float).double_value(&[]);
-        primary.meta_history.record_normalized_reward(norm_reward_mean);
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",
             mean_policy_loss, mean_value_loss, explained_var, mean_grad_norm
         );
 
-        // Write per-step normalized reward report for env 0 every 5 episodes
         if episode % 5 == 0 {
-            let episode_dir = format!("training/gens/{}", episode);
-            let _ = std::fs::create_dir_all(&episode_dir);
-            // Extract env 0's normalized rewards: indices [step * NPROCS + 0] for each step
             let env0_norm: Vec<f32> = (0..rollout_steps)
+                .step_by(5)
                 .map(|s| s_rewards.double_value(&[s * NPROCS]) as f32)
                 .collect();
-            let report = Report {
-                title: "Normalized Rewards".to_string(),
-                x_label: Some("Step".to_string()),
-                y_label: Some("Normalized Reward".to_string()),
-                scale: ScaleKind::Linear,
-                kind: ReportKind::Simple {
-                    values: env0_norm,
-                    ema_alpha: None,
-                },
-            };
-            let _ = write_report(&format!("{episode_dir}/normalized_reward.report.bin"), &report);
+            EpisodeHistory::write_normalized_rewards(episode, env0_norm);
         }
 
         if episode > 0 && episode % 50 == 0 {

@@ -38,7 +38,6 @@ pub struct MetaHistory {
     pub policy_entropy_min: Vec<f64>,
     pub policy_entropy_max: Vec<f64>,
     pub approx_kl: Vec<f64>,
-    pub normalized_reward: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -91,10 +90,6 @@ impl MetaHistory {
 
     pub fn record_approx_kl(&mut self, kl: f64) {
         self.approx_kl.push(kl);
-    }
-
-    pub fn record_normalized_reward(&mut self, reward: f64) {
-        self.normalized_reward.push(reward);
     }
 
     pub fn record_temporal_debug(
@@ -194,7 +189,6 @@ impl MetaHistory {
         self.policy_entropy_max = load_multiline(&entropy_path, "max");
 
         self.approx_kl = load_simple(&format!("{base_dir}/approx_kl.report.bin"));
-        self.normalized_reward = load_simple(&format!("{base_dir}/reward.report.bin"));
 
         println!(
             "Loaded meta history from episode {} ({} data points)",
@@ -389,16 +383,6 @@ impl MetaHistory {
                 simple(&self.approx_kl),
             );
             let _ = write_report(&format!("{base_dir}/approx_kl.report.bin"), &r);
-        }
-        if !self.normalized_reward.is_empty() {
-            let r = Self::report(
-                "Normalized Reward",
-                "Episode",
-                Some("Reward"),
-                ScaleKind::Linear,
-                simple(&self.normalized_reward),
-            );
-            let _ = write_report(&format!("{base_dir}/reward.report.bin"), &r);
         }
         if !self.policy_entropy_mean.is_empty() {
             let r = Self::report(

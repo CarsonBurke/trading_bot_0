@@ -56,6 +56,34 @@ impl InterTickerBlock {
             alpha_mlp,
         }
     }
+
+    fn forward(&self, x: &Tensor, model_dim: i64, ff_dim: i64) -> Tensor {
+        let (batch, num_items, _) = x.size3().unwrap();
+        let x_norm = self.ticker_ln
+            .forward(&x.reshape([batch * num_items, model_dim]))
+            .reshape([batch, num_items, model_dim]);
+        let qkv = x_norm.apply(&self.ticker_qkv);
+        let parts = qkv.split(model_dim, -1);
+        let q = self.q_norm.forward(&parts[0]).unsqueeze(1);
+        let k = self.k_norm.forward(&parts[1]).unsqueeze(1);
+        let v = parts[2].unsqueeze(1);
+        let ctx = Tensor::scaled_dot_product_attention(
+            &q, &k, &v,
+            None::<&Tensor>, 0.0, false, None, false,
+        )
+            .squeeze_dim(1)
+            .apply(&self.ticker_out)
+            .reshape([batch, num_items, model_dim]);
+        let x = x + self.alpha_ticker_attn.sigmoid() * RESIDUAL_ALPHA_MAX * ctx;
+        let mlp_in = self.mlp_ln
+            .forward(&x.reshape([batch * num_items, model_dim]));
+        let mlp_proj = mlp_in.apply(&self.mlp_fc1);
+        let mlp_parts = mlp_proj.split(ff_dim, -1);
+        let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
+            .apply(&self.mlp_fc2)
+            .reshape([batch, num_items, model_dim]);
+        &x + self.alpha_mlp.sigmoid() * RESIDUAL_ALPHA_MAX * mlp
+    }
 }
 
 const EXO_CROSS_AFTER: &[usize] = &[0];
@@ -299,7 +327,7 @@ fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i6
 
 const BASE_MODEL_DIM: i64 = 128;
 const BASE_FF_DIM: i64 = 512;
-const BASE_GQA_LAYERS: usize = 2;
+const BASE_GQA_LAYERS: usize = 3;
 const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
@@ -307,11 +335,9 @@ pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const LOG_STD_INIT: f64 = -2.0;
 pub(super) const SDE_EPS: f64 = 1e-6;
-const TIME_CROSS_LAYERS: usize = 1;
+const INTER_TICKER_AFTER: usize = 1;
 const RESIDUAL_ALPHA_MAX: f64 = 0.5;
 const RESIDUAL_ALPHA_INIT: f64 = -2.0;
-const ACTOR_MLP_LAYERS: usize = 1;
-const CRITIC_LAYERS: usize = 2;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
@@ -469,17 +495,14 @@ pub struct TradingModel {
     exo_cross_blocks: Vec<ExoCrossBlock>,
     cls_token: Tensor,
     inter_ticker_block: InterTickerBlock,
-    actor_mlp_linears: Vec<nn::Linear>,
-    actor_mlp_norms: Vec<RMSNorm>,
-    actor_out: nn::Linear,          // model_dim -> 1 (shared per-ticker readout)
-    cash_proj: nn::Linear,          // model_dim -> 1 (cash logit from mean-pooled tickers)
-    sde_fc: nn::Linear,             // model_dim -> SDE_LATENT_DIM (gSDE latent projection)
-    sde_norm: RMSNorm,              // RMSNorm on SDE_LATENT_DIM
-    sde_fc2: nn::Linear,            // SDE_LATENT_DIM -> SDE_LATENT_DIM
-    log_std_param: Tensor,           // [SDE_LATENT_DIM, TICKERS_COUNT] learned noise scale
-    value_mlp_linears: Vec<nn::Linear>,
-    value_mlp_norms: Vec<RMSNorm>,
-    value_out: nn::Linear,
+    actor_proj: nn::Linear,
+    cash_proj: nn::Linear,
+    value_proj: nn::Linear,
+    sde_fc: nn::Linear,
+    sde_norm: RMSNorm,
+    sde_fc2: nn::Linear,
+    sde_fc3: nn::Linear,
+    log_std_param: Tensor,
     device: tch::Device,
 }
 
@@ -602,26 +625,12 @@ impl TradingModel {
         let cls_token = p.var("cls_token", &[1, 1, spec.model_dim], Init::Randn { mean: 0.0, stdev: 0.02 });
         let inter_ticker_block =
             InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
-        let actor_mlp_linears = (0..ACTOR_MLP_LAYERS)
-            .map(|i| {
-                nn::linear(
-                    p / format!("actor_mlp_{}", i),
-                    spec.model_dim,
-                    spec.model_dim,
-                    nn::LinearConfig {
-                        ws_init: Init::Orthogonal { gain: 2.0_f64.sqrt() },
-                        bs_init: Some(Init::Const(0.0)),
-                        bias: true,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let actor_mlp_norms = (0..ACTOR_MLP_LAYERS)
-            .map(|i| RMSNorm::new(&(p / format!("actor_mlp_norm_{}", i)), spec.model_dim, 1e-6))
-            .collect::<Vec<_>>();
-        let actor_out = nn::linear(
-            p / "actor_out",
-            spec.model_dim,
+        let full_seq_len = seq_len + 1;
+        let flat_per_ticker = full_seq_len * spec.model_dim;
+        let flat_all_tickers = TICKERS_COUNT * flat_per_ticker;
+        let actor_proj = nn::linear(
+            p / "actor_proj",
+            flat_per_ticker,
             1,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
@@ -631,10 +640,20 @@ impl TradingModel {
         );
         let cash_proj = nn::linear(
             p / "cash_proj",
-            spec.model_dim,
+            flat_all_tickers,
             1,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.01 },
+                ws_init: Init::Orthogonal { gain: 1.0 },
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let value_proj = nn::linear(
+            p / "value_proj",
+            flat_all_tickers,
+            1,
+            nn::LinearConfig {
+                ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
@@ -660,41 +679,20 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let log_std_param = p.var(
-            "log_std",
-            &[SDE_LATENT_DIM, TICKERS_COUNT],
-            Init::Const(0.0),
-        );
-        // Critic MLP: (Linear → RMSNorm → SiLU) → Linear(→scalar value), orthogonally initialized.
-        let critic_in = TICKERS_COUNT * spec.model_dim;
-        let critic_hidden = spec.ff_dim;
-        let value_mlp_linears = (0..CRITIC_LAYERS)
-            .map(|i| {
-                let in_dim = if i == 0 { critic_in } else { critic_hidden };
-                nn::linear(
-                    p / format!("value_mlp_{}", i),
-                    in_dim,
-                    critic_hidden,
-                    nn::LinearConfig {
-                        ws_init: Init::Orthogonal { gain: 1.0 },
-                        bs_init: Some(Init::Const(0.0)),
-                        bias: true,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let value_mlp_norms = (0..CRITIC_LAYERS)
-            .map(|i| RMSNorm::new(&(p / format!("value_mlp_norm_{}", i)), critic_hidden, 1e-6))
-            .collect::<Vec<_>>();
-        let value_out = nn::linear(
-            p / "value_out",
-            critic_hidden,
-            1,
+        let sde_fc3 = nn::linear(
+            p / "sde_fc3",
+            SDE_LATENT_DIM,
+            SDE_LATENT_DIM,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
+        );
+        let log_std_param = p.var(
+            "log_std",
+            &[SDE_LATENT_DIM, TICKERS_COUNT],
+            Init::Const(0.0),
         );
         Self {
             variant: config.variant,
@@ -716,17 +714,14 @@ impl TradingModel {
             exo_cross_blocks,
             cls_token,
             inter_ticker_block,
-            actor_mlp_linears,
-            actor_mlp_norms,
-            actor_out,
+            actor_proj,
             cash_proj,
+            value_proj,
             sde_fc,
             sde_norm,
             sde_fc2,
+            sde_fc3,
             log_std_param,
-            value_mlp_linears,
-            value_mlp_norms,
-            value_out,
             device: p.device(),
         }
     }
@@ -750,6 +745,21 @@ impl TradingModel {
         } else {
             x.shallow_clone()
         }
+    }
+
+    fn maybe_apply_inter_ticker(&self, x: &Tensor, layer_idx: usize) -> Tensor {
+        if layer_idx != INTER_TICKER_AFTER {
+            return x.shallow_clone();
+        }
+        let bt = x.size()[0];
+        let seq = x.size()[1];
+        let batch_size = bt / TICKERS_COUNT;
+        let x_4d = x.view([batch_size, TICKERS_COUNT, seq, self.model_dim]);
+        let cls = x_4d.select(2, 0);
+        let enriched_cls = self.inter_ticker_block.forward(&cls, self.model_dim, self.ff_dim);
+        let non_cls = x_4d.narrow(2, 1, seq - 1);
+        Tensor::cat(&[&enriched_cls.unsqueeze(2), &non_cls], 2)
+            .reshape([bt, seq, self.model_dim])
     }
 
     /// Build exogenous KV bank: [batch*tickers, NUM_EXO_TOKENS, MODEL_DIM]
