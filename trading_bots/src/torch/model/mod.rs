@@ -316,11 +316,6 @@ const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
-pub(crate) const NUM_VALUE_BUCKETS: i64 = 255;
-// symexp(x,s) ≈ s*x near zero → linear spacing ~s*(range/N) ≈ 0.001 per bin
-// full range: ±s*(e^range - 1) ≈ ±2.67
-const SYMLOG_SCALE: f64 = 0.03;
-const SYMLOG_LOG_RANGE: f64 = 4.5;
 
 const BASE_PATCH_CONFIGS: &[(i64, i64)] = &[
     (4608, 128),
@@ -408,45 +403,8 @@ pub fn patch_ends_for_variant(variant: ModelVariant) -> Vec<i64> {
     ends
 }
 
-pub(crate) fn symlog_tensor(x: &Tensor, s: f64) -> Tensor {
-    x.sign() * (x.abs() / s).log1p()
-}
-
-pub(crate) fn symexp_tensor(x: &Tensor, s: f64) -> Tensor {
-    x.sign() * s * x.abs().expm1()
-}
-
-/// Two-hot CE loss with searchsorted bin finding.
-/// targets: [batch] raw return values, log_probs: [batch, NUM_VALUE_BUCKETS],
-/// centers: [NUM_VALUE_BUCKETS] monotonically increasing bin centers in raw space.
-pub(crate) fn twohot_ce_loss(targets: &Tensor, log_probs: &Tensor, centers: &Tensor) -> Tensor {
-    let n = centers.size()[0];
-    let targets_f = targets.to_kind(log_probs.kind());
-    let centers_f = centers.to_kind(log_probs.kind());
-
-    let above = targets_f
-        .f_searchsorted(&centers_f, false, false, "right", None::<&Tensor>)
-        .unwrap()
-        .clamp(1, n - 1);
-    let below = (&above - 1).clamp(0, n - 1);
-
-    let bin_below = centers_f.index_select(0, &below.flatten(0, -1)).reshape_as(&targets_f);
-    let bin_above = centers_f.index_select(0, &above.flatten(0, -1)).reshape_as(&targets_f);
-
-    let dist_below = (&bin_below - &targets_f).abs() + 1e-8;
-    let dist_above = (&bin_above - &targets_f).abs() + 1e-8;
-    let total = &dist_below + &dist_above;
-    let w_below = &dist_above / &total;
-    let w_above = &dist_below / &total;
-
-    let lp_below = log_probs.gather(1, &below.unsqueeze(1), false).squeeze_dim(1);
-    let lp_above = log_probs.gather(1, &above.unsqueeze(1), false).squeeze_dim(1);
-
-    -(w_below * lp_below + w_above * lp_above)
-}
-
-/// (values, critic_logits, critic_input, action_mean, action_noise_std)
-pub type ModelOutput = (Tensor, Tensor, Tensor, Tensor, Tensor);
+/// (values, action_mean, action_noise_std)
+pub type ModelOutput = (Tensor, Tensor, Tensor);
 
 pub struct DebugMetrics {
     pub time_alpha_attn_mean: f64,
@@ -522,7 +480,6 @@ pub struct TradingModel {
     value_mlp_linears: Vec<nn::Linear>,
     value_mlp_norms: Vec<RMSNorm>,
     value_out: nn::Linear,
-    bucket_centers: Tensor, // [NUM_VALUE_BUCKETS] sorted ascending
     device: tch::Device,
 }
 
@@ -544,10 +501,6 @@ impl TradingModel {
         } else {
             input.to_kind(target_kind)
         }
-    }
-
-    pub fn bucket_centers(&self) -> &Tensor {
-        &self.bucket_centers
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -736,18 +689,13 @@ impl TradingModel {
         let value_out = nn::linear(
             p / "value_out",
             critic_hidden,
-            NUM_VALUE_BUCKETS,
+            1,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
         );
-        let half_n = (NUM_VALUE_BUCKETS - 1) / 2 + 1; // 128
-        let half_log = Tensor::linspace(-SYMLOG_LOG_RANGE, 0.0, half_n, (Kind::Float, p.device()));
-        let half = symexp_tensor(&half_log, SYMLOG_SCALE);
-        let pos_half = half.narrow(0, 0, half_n - 1).flip([0]).neg();
-        let bucket_centers = Tensor::cat(&[half, pos_half], 0); // [255], sorted ascending
         Self {
             variant: config.variant,
             patch_configs,
@@ -779,7 +727,6 @@ impl TradingModel {
             value_mlp_linears,
             value_mlp_norms,
             value_out,
-            bucket_centers,
             device: p.device(),
         }
     }

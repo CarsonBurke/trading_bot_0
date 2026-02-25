@@ -10,7 +10,9 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> ModelOutput {
-        self.forward_inner(price_deltas, static_features, true)
+        let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
+        let static_features = self.cast_inputs(&static_features.to_device(self.device));
+        self.forward_on_device(&price_deltas, &static_features, _train)
     }
 
     pub fn forward_on_device(
@@ -18,44 +20,6 @@ impl TradingModel {
         price_deltas: &Tensor,
         static_features: &Tensor,
         _train: bool,
-    ) -> ModelOutput {
-        self.forward_inner_on_device(price_deltas, static_features, true)
-    }
-
-    pub fn forward_no_values(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        _train: bool,
-    ) -> ModelOutput {
-        self.forward_inner(price_deltas, static_features, false)
-    }
-
-    pub fn forward_no_values_on_device(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        _train: bool,
-    ) -> ModelOutput {
-        self.forward_inner_on_device(price_deltas, static_features, false)
-    }
-
-    fn forward_inner(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        compute_values: bool,
-    ) -> ModelOutput {
-        let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
-        let static_features = self.cast_inputs(&static_features.to_device(self.device));
-        self.forward_inner_on_device(&price_deltas, &static_features, compute_values)
-    }
-
-    fn forward_inner_on_device(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        compute_values: bool,
     ) -> ModelOutput {
         if price_deltas.device() != self.device || static_features.device() != self.device {
             panic!(
@@ -83,7 +47,7 @@ impl TradingModel {
         }
         debug_fused("model_x_gqa", &x);
 
-        self.head_with_temporal_pool(&x, batch_size, compute_values, false)
+        self.head_with_temporal_pool(&x, batch_size, false)
             .0
     }
 
@@ -115,7 +79,7 @@ impl TradingModel {
         }
         debug_fused("model_x_gqa", &x);
 
-        let (out, debug) = self.head_with_temporal_pool(&x, batch_size, true, true);
+        let (out, debug) = self.head_with_temporal_pool(&x, batch_size, true);
         (
             out,
             debug.unwrap_or(DebugMetrics {

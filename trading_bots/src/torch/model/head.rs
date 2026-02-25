@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, LOG_STD_INIT, SDE_EPS};
+use super::{DebugMetrics, ModelOutput, TradingModel, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, LOG_STD_INIT, SDE_EPS};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -8,18 +8,14 @@ impl TradingModel {
         &self,
         x_ssm: &Tensor,
         batch_size: i64,
-        compute_values: bool,
         _debug: bool,
     ) -> (ModelOutput, Option<DebugMetrics>) {
         let x = self.final_norm.forward(x_ssm);
-        // [batch*tickers, seq_len, model_dim] -> [batch, tickers, seq_len, model_dim]
         let temporal_len = x.size()[1];
         let x_time = x.view([batch_size, TICKERS_COUNT, temporal_len, self.model_dim]);
 
-        // Extract CLS token (position 0) as per-ticker representation.
         let mut ticker_repr = x_time.select(2, 0);
 
-        // InterTickerBlock on ticker representations: [batch, tickers, dim]
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
         let block = &self.inter_ticker_block;
         let alpha_ticker_attn = block.alpha_ticker_attn.sigmoid() * alpha_scale;
@@ -53,7 +49,7 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
         ticker_repr = ticker_repr + &mlp * &alpha_mlp;
 
-        // Actor head: per-ticker MLP → per-ticker logits + cash logit
+        // Actor head
         let mut actor_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]);
         for i in 0..self.actor_mlp_linears.len() {
             actor_x = actor_x.apply(&self.actor_mlp_linears[i]);
@@ -61,78 +57,45 @@ impl TradingModel {
             actor_x = actor_x.silu();
         }
 
-        // Per-ticker logits (shared actor_out: model_dim -> 1)
         let ticker_logits = actor_x
             .apply(&self.actor_out)
             .reshape([batch_size, TICKERS_COUNT]);
 
-        // Cash logit from mean-pooled ticker representations
         let cash_logit = actor_x
             .reshape([batch_size, TICKERS_COUNT, self.model_dim])
             .mean_dim([1].as_slice(), false, actor_x.kind())
             .apply(&self.cash_proj)
             .squeeze_dim(-1);
 
-        // action_mean: [B, ACTION_DIM]
         let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
 
-        // gSDE: state-dependent exploration with learned per-dimension noise scale
-        let sde_raw = actor_x.apply(&self.sde_fc); // [B*TICKERS, SDE_LATENT_DIM]
-        let sde_latent = self.sde_norm.forward(&sde_raw).apply(&self.sde_fc2).tanh(); // [-1, 1]
-        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, -1]); // [B, TICKERS, SDE_LATENT_DIM]
-        let log_std = (&self.log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5); // [SDE_LATENT_DIM, TICKERS]
-        let std_sq = log_std.exp().pow_tensor_scalar(2).transpose(0, 1); // [TICKERS, SDE_LATENT_DIM]
+        // gSDE
+        let sde_raw = actor_x.apply(&self.sde_fc);
+        let sde_latent = self.sde_norm.forward(&sde_raw).apply(&self.sde_fc2).tanh();
+        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, -1]);
+        let log_std = (&self.log_std_param + LOG_STD_INIT).clamp(-3.0, -0.5);
+        let std_sq = log_std.exp().pow_tensor_scalar(2).transpose(0, 1);
         let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float); // [B, TICKERS]
-        let action_noise_std = (variance + SDE_EPS).sqrt(); // [B, TICKERS_COUNT]
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+        let action_noise_std = (variance + SDE_EPS).sqrt();
 
-        // Critic: distributional two-hot value head.
-        let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
-        let mut critic_x = critic_input.shallow_clone();
+        // Scalar critic
+        let mut critic_x = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
         for i in 0..self.value_mlp_linears.len() {
             critic_x = critic_x.apply(&self.value_mlp_linears[i]);
             critic_x = self.value_mlp_norms[i].forward(&critic_x);
             critic_x = critic_x.silu();
         }
-        let critic_logits = critic_x.apply(&self.value_out); // [batch, NUM_VALUE_BUCKETS]
+        let values = critic_x.apply(&self.value_out).squeeze_dim(-1); // [batch]
 
-        let values = if compute_values {
-            let probs = critic_logits.softmax(-1, Kind::Float);
-            let centers = self.bucket_centers.to_kind(probs.kind());
-            let m: i64 = (NUM_VALUE_BUCKETS - 1) / 2; // 127
-            let p1 = probs.narrow(-1, 0, m);
-            let p2 = probs.narrow(-1, m, 1);
-            let p3 = probs.narrow(-1, m + 1, m);
-            let b1 = centers.narrow(0, 0, m);
-            let b2 = centers.narrow(0, m, 1);
-            let b3 = centers.narrow(0, m + 1, m);
-            let left = (&p1 * &b1).flip([-1]);
-            let right = &p3 * &b3;
-            ((&p2 * &b2).sum_dim_intlist(-1, false, Kind::Float)
-                + (&left + &right).sum_dim_intlist(-1, false, Kind::Float))
-                .to_kind(ticker_repr.kind())
-        } else {
-            Tensor::zeros(&[batch_size], (ticker_repr.kind(), ticker_repr.device()))
-        };
-
-        // Cast all outputs to fp32 for loss computation
+        // Cast all outputs to fp32
         let values = values.to_kind(Kind::Float);
-        let critic_logits = critic_logits.to_kind(Kind::Float);
-        let critic_input = critic_input.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
         let action_noise_std = action_noise_std.to_kind(Kind::Float);
 
-        let debug_metrics = None;
-
         (
-            (
-                values,
-                critic_logits,
-                critic_input,
-                action_mean,
-                action_noise_std,
-            ),
-            debug_metrics,
+            (values, action_mean, action_noise_std),
+            None,
         )
     }
 }

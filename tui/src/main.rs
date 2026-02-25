@@ -153,6 +153,7 @@ impl App {
         let meta_chart_bases = vec![
             "assets",
             "reward",
+            "normalized_reward",
             "final_assets",
             "cumulative_reward",
             "outperformance",

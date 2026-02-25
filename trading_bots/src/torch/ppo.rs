@@ -7,8 +7,9 @@ use super::Fp32Adam;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    twohot_ce_loss, ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
+    ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
 };
+use crate::history::report::{write_report, Report, ReportKind, ScaleKind};
 
 const LEARNING_RATE: f64 = 3e-4;
 pub const NPROCS: i64 = 16;
@@ -34,6 +35,8 @@ const RPO_ALPHA_INIT: f64 = 0.1; // CleanRL impl found 0.1 reliably improved res
 const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
+const VALUE_CLIP: f64 = 0.3;
+
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -122,7 +125,7 @@ fn sample_rollout_actions(
     obs_static: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
     tch::no_grad(|| {
-        let (values, _, _, action_mean, action_noise_std) =
+        let (values, action_mean, action_noise_std) =
             model.forward_on_device(obs_price, obs_static, false);
         let values = values.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
@@ -189,27 +192,14 @@ fn compute_gae(
 }
 
 /// Compute explained variance on a subset of the rollout.
-fn compute_explained_variance(
-    model: &TradingModel,
-    price_deltas: &Tensor,
-    static_obs: &Tensor,
-    returns: &Tensor,
-    rollout_steps: i64,
-) -> Tensor {
-    let ev_steps = CHUNK_SIZE.min(rollout_steps);
-    let ev_samples = ev_steps * NPROCS;
+/// EV using pre-training rollout values, matching CleanRL.
+fn compute_explained_variance(rollout_values: &Tensor, returns: &Tensor) -> Tensor {
     tch::no_grad(|| {
-        let pd_ev = price_deltas.narrow(0, 0, ev_samples);
-        let so_ev = static_obs.narrow(0, 0, ev_samples);
-        let ret_ev = returns.narrow(0, 0, ev_samples);
-        let (values_raw, _, _, _, _) = model.forward_on_device(&pd_ev, &so_ev, true);
-        let values = values_raw.to_kind(Kind::Float).view([ev_samples]);
-        let targets = ret_ev;
-        let residuals = &values - &targets;
-        let mean_target = targets.mean(Kind::Float);
-        let var_targets = targets.square().mean(Kind::Float) - mean_target.square();
-        let var_residuals = residuals.square().mean(Kind::Float);
-        Tensor::from(1.0) - &var_residuals / var_targets.clamp_min(1e-8)
+        let residuals = rollout_values - returns;
+        let mean_ret = returns.mean(Kind::Float);
+        let var_ret = returns.square().mean(Kind::Float) - mean_ret.square();
+        let var_resid = residuals.square().mean(Kind::Float);
+        Tensor::from(1.0) - &var_resid / var_ret.clamp_min(1e-8)
     })
 }
 
@@ -222,7 +212,7 @@ fn compute_action_std_stats(
     device: tch::Device,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, _, _, _, action_noise_std) =
+        let (_, _, action_noise_std) =
             model.forward_on_device(&s_price_deltas.get(0), &s_static_obs.get(0), false);
         let action_std = action_noise_std.to_kind(Kind::Float);
         let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
@@ -327,13 +317,43 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
     let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, Kind::Float, device);
     let s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
     let s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level reward
+    let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device)); // portfolio-level value
+    let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device));
+
     let s_action_weights = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
+
+    // Per-env NormalizeReward (matching CleanRL: each env has its own RunningMeanStd)
+    // Kept outside VarStore to avoid bf16 precision loss and Adam corruption
+    let n = NPROCS as usize;
+    let mut ret_rms_mean = vec![0.0f64; n];
+    let mut ret_rms_var = vec![1.0f64; n];
+    let mut ret_rms_count = vec![1e-4f64; n];
+    let mut disc_ret = vec![0.0f64; n];
+    if start_episode > 0 {
+        let meta_path = format!("../weights/ppo_ep{}.reward_norm.json", start_episode);
+        if let Ok(json) = std::fs::read_to_string(&meta_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
+                let load_vec = |key: &str, default: f64| -> Vec<f64> {
+                    parsed[key].as_array()
+                        .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(default)).collect())
+                        .unwrap_or_else(|| vec![default; n])
+                };
+                ret_rms_mean = load_vec("mean", 0.0);
+                ret_rms_var = load_vec("var", 1.0);
+                ret_rms_count = load_vec("count", 1e-4);
+                disc_ret = load_vec("disc_ret", 0.0);
+                let avg_var: f64 = ret_rms_var.iter().sum::<f64>() / n as f64;
+                let avg_count: f64 = ret_rms_count.iter().sum::<f64>() / n as f64;
+                println!("Loaded reward norm: avg_var={:.6}, avg_count={:.0}", avg_var, avg_count);
+            }
+        }
+    }
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu) = env.reset();
+        // env.reset() resets all envs — zero per-env discounted returns
+        for i in 0..n { disc_ret[i] = 0.0; }
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
         let mut obs_static =
             Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
@@ -400,6 +420,34 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
             let portfolio_reward =
                 step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float);
+
+            // Per-env NormalizeReward (gym-style): each env has its own RunningMeanStd
+            let rewards_f64: Vec<f64> = Vec::<f64>::try_from(
+                portfolio_reward.to_kind(Kind::Double).flatten(0, -1),
+            ).unwrap();
+            let dones_f64: Vec<f64> = Vec::<f64>::try_from(
+                step_is_done.to_kind(Kind::Double).flatten(0, -1),
+            ).unwrap();
+            let mut norm_rewards = vec![0.0f32; n];
+            for i in 0..n {
+                // Step 1: accumulate discounted return
+                disc_ret[i] = disc_ret[i] * 0.99 + rewards_f64[i];
+                // Step 2: Welford update (batch_count=1, batch_var=0)
+                let delta = disc_ret[i] - ret_rms_mean[i];
+                ret_rms_count[i] += 1.0;
+                ret_rms_mean[i] += delta / ret_rms_count[i];
+                let delta2 = disc_ret[i] - ret_rms_mean[i];
+                // Online variance: var = M2/count, M2 += delta * delta2
+                let m2 = ret_rms_var[i] * (ret_rms_count[i] - 1.0) + delta * delta2;
+                ret_rms_var[i] = m2 / ret_rms_count[i];
+                // Step 3: normalize reward by this env's sqrt(var)
+                let scale = (ret_rms_var[i] + 1e-8).sqrt();
+                norm_rewards[i] = (rewards_f64[i] / scale) as f32;
+                // Step 4: reset discounted return on done
+                if dones_f64[i] > 0.5 { disc_ret[i] = 0.0; }
+            }
+            let normalized_reward = Tensor::from_slice(&norm_rewards).to_device(device);
+
             if DEBUG_NUMERICS {
                 let _ =
                     debug_tensor_stats("portfolio_reward", &portfolio_reward, episode as i64, step);
@@ -408,15 +456,16 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             }
             let _ = s_rewards
                 .narrow(0, mem_idx, NPROCS)
-                .copy_(&portfolio_reward);
+                .copy_(&normalized_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
             let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
+
             let _ = s_action_weights.narrow(0, mem_idx, NPROCS).copy_(&actions);
         }
 
-        // Bootstrap value from final observation state (raw return space)
+        // Bootstrap value from final observation state
         let bootstrap_value = tch::no_grad(|| {
-            let (values_raw, _, _, _, _) =
+            let (values_raw, _, _) =
                 trading_model.forward_on_device(&obs_price, &obs_static, false);
             values_raw.to_kind(Kind::Float)
         });
@@ -498,8 +547,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (_, critic_logits, _critic_input, action_mean, action_noise_std) =
-                    trading_model.forward_no_values_on_device(&pd_chunk, &so_chunk, true);
+                let (new_values, action_mean, action_noise_std) =
+                    trading_model.forward_on_device(&pd_chunk, &so_chunk, true);
 
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let action_noise_std = action_noise_std.to_kind(Kind::Float);
@@ -558,17 +607,18 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     -Tensor::min_other(&(&ratio * &adv_mb), &(&ratio_clipped * &adv_mb))
                         .mean(Kind::Float);
 
-                // Distributional two-hot CE value loss.
-                let critic_logits = critic_logits.to_kind(Kind::Float);
-                let log_probs = critic_logits.log_softmax(-1, Kind::Float);
+                // Scalar value loss with PPO value clipping
+                let new_values = new_values.to_kind(Kind::Float);
+                let old_val_mb = s_values.narrow(0, chunk_sample_start, chunk_sample_count);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("critic_logits", &critic_logits, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("new_values", &new_values, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
-                let value_loss =
-                    twohot_ce_loss(&ret_mb, &log_probs, trading_model.bucket_centers())
-                        .mean(Kind::Float);
+                let v_clipped = &old_val_mb + (&new_values - &old_val_mb).clamp(-VALUE_CLIP, VALUE_CLIP);
+                let loss_unclipped = (&new_values - &ret_mb).pow_tensor_scalar(2);
+                let loss_clipped = (&v_clipped - &ret_mb).pow_tensor_scalar(2);
+                let value_loss = loss_unclipped.max_other(&loss_clipped).mean(Kind::Float) * 0.5;
 
                 let dist_entropy = gaussian_entropy(&action_noise_std).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
@@ -742,13 +792,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             };
 
         let explained_var_t = if total_sample_count > 0 {
-            compute_explained_variance(
-                &trading_model,
-                &price_deltas_batch,
-                &static_obs_batch,
-                &returns,
-                rollout_steps,
-            )
+            compute_explained_variance(&s_values, &returns)
         } else {
             Tensor::zeros([], (Kind::Float, device))
         };
@@ -819,11 +863,34 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
         primary.meta_history.record_approx_kl(first_epoch_kl);
+        let norm_reward_mean = s_rewards.mean(Kind::Float).double_value(&[]);
+        primary.meta_history.record_normalized_reward(norm_reward_mean);
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",
             mean_policy_loss, mean_value_loss, explained_var, mean_grad_norm
         );
+
+        // Write per-step normalized reward report for env 0 every 5 episodes
+        if episode % 5 == 0 {
+            let episode_dir = format!("training/gens/{}", episode);
+            let _ = std::fs::create_dir_all(&episode_dir);
+            // Extract env 0's normalized rewards: indices [step * NPROCS + 0] for each step
+            let env0_norm: Vec<f32> = (0..rollout_steps)
+                .map(|s| s_rewards.double_value(&[s * NPROCS]) as f32)
+                .collect();
+            let report = Report {
+                title: "Normalized Rewards".to_string(),
+                x_label: Some("Step".to_string()),
+                y_label: Some("Normalized Reward".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: env0_norm,
+                    ema_alpha: None,
+                },
+            };
+            let _ = write_report(&format!("{episode_dir}/normalized_reward.report.bin"), &report);
+        }
 
         if episode > 0 && episode % 50 == 0 {
             let _ = std::fs::create_dir_all("../weights");
@@ -832,6 +899,16 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 println!("Error while saving weights: {}", err);
             } else {
                 println!("Saved model weights: {}", path);
+                let meta_path = format!("../weights/ppo_ep{}.reward_norm.json", episode);
+                let json = serde_json::json!({
+                    "mean": &ret_rms_mean,
+                    "var": &ret_rms_var,
+                    "count": &ret_rms_count,
+                    "disc_ret": &disc_ret,
+                });
+                if let Err(err) = std::fs::write(&meta_path, json.to_string()) {
+                    println!("Error saving reward norm state: {}", err);
+                }
             }
         }
     }

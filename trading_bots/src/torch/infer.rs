@@ -112,7 +112,7 @@ pub fn run_inference<P: AsRef<Path>>(
                 } else {
                     &price_deltas_incremental
                 };
-                let (_, _, _, action_mean, action_noise_std) =
+                let (_, action_mean, action_noise_std) =
                     model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
                 (action_mean, action_noise_std)
             });

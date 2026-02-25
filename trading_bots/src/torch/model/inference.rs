@@ -119,7 +119,6 @@ impl TradingModel {
                 (self.patch_embed_weight.kind(), self.device),
             ),
             1,
-            true,
             false,
         )
         .0
