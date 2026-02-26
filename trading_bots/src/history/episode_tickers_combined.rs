@@ -269,7 +269,7 @@ impl EpisodeHistory {
         create_folder_if_not_exists(&episode_dir);
         let report = Report {
             title: "Normalized Rewards".to_string(),
-            x_label: Some("Step (x5)".to_string()),
+            x_label: Some("Step".to_string()),
             y_label: Some("Normalized Reward".to_string()),
             scale: ScaleKind::Linear,
             kind: ReportKind::Simple {

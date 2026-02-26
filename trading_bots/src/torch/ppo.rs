@@ -872,7 +872,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
         if episode % 5 == 0 {
             let env0_norm: Vec<f32> = (0..rollout_steps)
-                .step_by(5)
                 .map(|s| s_rewards.double_value(&[s * NPROCS]) as f32)
                 .collect();
             EpisodeHistory::write_normalized_rewards(episode, env0_norm);
