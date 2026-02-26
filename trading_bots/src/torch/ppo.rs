@@ -9,7 +9,6 @@ use crate::torch::env::VecEnv;
 use crate::torch::model::{
     ModelVariant, TradingModel, TradingModelConfig,
 };
-use crate::history::episode_tickers_combined::EpisodeHistory;
 
 const LEARNING_RATE: f64 = 3e-4;
 pub const NPROCS: i64 = 16;
@@ -450,6 +449,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let _ = debug_tensor_stats("values", &values, episode as i64, step);
                 let _ = debug_tensor_stats("step_is_done", &step_is_done, episode as i64, step);
             }
+            env.primary_mut().episode_history.normalized_rewards.push(norm_rewards[0]);
             let _ = s_rewards
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&normalized_reward);
@@ -857,13 +857,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",
             mean_policy_loss, mean_value_loss, explained_var, mean_grad_norm
         );
-
-        if episode % 5 == 0 {
-            let env0_norm: Vec<f32> = (0..rollout_steps)
-                .map(|s| s_rewards.double_value(&[s * NPROCS]) as f32)
-                .collect();
-            EpisodeHistory::write_normalized_rewards(episode, env0_norm);
-        }
 
         if episode > 0 && episode % 50 == 0 {
             let _ = std::fs::create_dir_all("../weights");

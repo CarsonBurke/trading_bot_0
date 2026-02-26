@@ -19,6 +19,7 @@ pub struct EpisodeHistory {
     pub attention_weights: Vec<Vec<f32>>,
     pub target_weights: Vec<Vec<f64>>,
     pub cash_weight: Vec<f64>,
+    pub normalized_rewards: Vec<f32>,
     pub action_step0: Option<Vec<f64>>,
     pub action_final: Option<Vec<f64>>,
 }
@@ -37,6 +38,7 @@ impl EpisodeHistory {
             attention_weights: Vec::new(),
             target_weights: vec![vec![]; ticker_count],
             cash_weight: Vec::new(),
+            normalized_rewards: Vec::new(),
             action_step0: None,
             action_final: None,
         }
@@ -213,6 +215,20 @@ impl EpisodeHistory {
         };
         let _ = write_report(&format!("{episode_dir}/reward.report.bin"), &report);
 
+        if !self.normalized_rewards.is_empty() {
+            let report = Report {
+                title: "Normalized Rewards".to_string(),
+                x_label: Some("Step".to_string()),
+                y_label: Some("Normalized Reward".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::Simple {
+                    values: self.normalized_rewards.clone(),
+                    ema_alpha: None,
+                },
+            };
+            let _ = write_report(&format!("{episode_dir}/normalized_reward.report.bin"), &report);
+        }
+
         // Combined target weights chart (all tickers + cash) - every 5 episodes like meta charts
         if episode % 5 == 0
             && !self.cash_weight.is_empty()
@@ -260,24 +276,6 @@ impl EpisodeHistory {
             };
             let _ = write_report(&format!("{episode_dir}/observations.report.bin"), &report);
         }
-    }
-
-    /// Write per-step normalized rewards chart to the episode directory.
-    /// `values` should already be subsampled (e.g. every 5 steps).
-    pub fn write_normalized_rewards(episode: usize, values: Vec<f32>) {
-        let episode_dir = format!("{TRAINING_PATH}/gens/{episode}");
-        create_folder_if_not_exists(&episode_dir);
-        let report = Report {
-            title: "Normalized Rewards".to_string(),
-            x_label: Some("Step".to_string()),
-            y_label: Some("Normalized Reward".to_string()),
-            scale: ScaleKind::Linear,
-            kind: ReportKind::Simple {
-                values,
-                ema_alpha: None,
-            },
-        };
-        let _ = write_report(&format!("{episode_dir}/normalized_reward.report.bin"), &report);
     }
 
     pub fn final_assets(&self) -> f64 {
