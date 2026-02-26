@@ -7,7 +7,7 @@ use super::Fp32Adam;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
-    ModelVariant, TradingModel, TradingModelConfig, ACTION_DIM,
+    ModelVariant, TradingModel, TradingModelConfig,
 };
 use crate::history::episode_tickers_combined::EpisodeHistory;
 
@@ -136,16 +136,13 @@ fn sample_rollout_actions(
             &[batch, TICKERS_COUNT],
             (Kind::Float, action_mean.device()),
         );
-        let ticker_noise = &action_noise_std * &z; // [B, TICKERS_COUNT]
-        let log_prob_gauss = gaussian_log_prob(&ticker_noise, &action_noise_std);
+        let ticker_noise = &action_noise_std * &z;
+        let action_log_prob = gaussian_log_prob(&ticker_noise, &action_noise_std);
+        let u = &action_mean + &ticker_noise;
+        // Cash logit pinned to 0 (reference category)
         let zero_cash = Tensor::zeros(&[batch, 1], (Kind::Float, action_mean.device()));
-        let noise = Tensor::cat(&[ticker_noise, zero_cash], -1); // [B, ACTION_DIM]
-        let u = &action_mean + &noise;
-        let actions = u.softmax(-1, Kind::Float);
-
-        // Rollout: cash baseline shift is zero by construction (u_cash = mu_cash),
-        // so plain Gaussian log-prob on ticker noise is correct.
-        let action_log_prob = log_prob_gauss;
+        let u_full = Tensor::cat(&[&u, &zero_cash], -1);
+        let actions = u_full.softmax(-1, Kind::Float);
 
         (values, action_mean, u, actions, action_log_prob)
     })
@@ -314,7 +311,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
     let mut s_price_deltas = GpuRollingBuffer::new(memory_size, pd_dim, Kind::Float, device);
     let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, Kind::Float, device);
-    let s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
+    let s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT], (Kind::Float, device));
     let s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
@@ -559,14 +556,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
                     let alpha_detached = alpha.detach();
-                    let rpo_ticker_noise =
+                    let rpo_noise =
                         Tensor::empty([chunk_sample_count, TICKERS_COUNT], (Kind::Float, device))
                             .uniform_(-1.0, 1.0)
                             * &alpha_detached;
-                    let rpo_noise = Tensor::cat(
-                        &[rpo_ticker_noise, Tensor::zeros(&[chunk_sample_count, 1], (Kind::Float, device))],
-                        -1,
-                    );
                     (alpha, &action_mean + rpo_noise)
                 } else {
                     (
@@ -575,13 +568,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
                     )
                 };
 
-                // Logit-difference log-prob: subtract cash residual so density is measured in
-                // softmax-invariant space. Consistent with rollout (ppo.rs:139-148) where
-                // zero cash noise makes this subtraction a no-op: diff_cash = u_cash - mu_old_cash = 0.
-                let diff_full = &u - &action_mean_perturbed;
-                let diff_ticker = diff_full.narrow(-1, 0, TICKERS_COUNT);
-                let diff_cash = diff_full.narrow(-1, TICKERS_COUNT as i64, 1);
-                let diff = diff_ticker - diff_cash;
+                // u and action_mean are ticker-only logits (cash pinned to 0)
+                let diff = &u - &action_mean_perturbed;
                 let action_log_probs = gaussian_log_prob(&diff, &action_noise_std);
 
                 if DEBUG_NUMERICS {

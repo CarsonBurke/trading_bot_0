@@ -18,29 +18,23 @@ struct InterTickerBlock {
     ticker_ln: RMSNorm,
     ticker_qkv: nn::Linear,
     ticker_out: nn::Linear,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
     mlp_ln: RMSNorm,
 }
 
 impl InterTickerBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, num_layers: usize) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
         let ticker_qkv = linear_truncated(p, "ticker_qkv", model_dim, 3 * model_dim);
-        let ticker_out = linear_residual_out(p, "ticker_out", model_dim, model_dim, num_layers);
-        let q_norm = RMSNorm::new(&(p / "ticker_q_norm"), model_dim, 1e-6);
-        let k_norm = RMSNorm::new(&(p / "ticker_k_norm"), model_dim, 1e-6);
+        let ticker_out = linear_residual_out(p, "ticker_out", model_dim, model_dim);
         let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, 2 * ff_dim);
-        let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim, num_layers);
+        let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim);
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
         Self {
             ticker_ln,
             ticker_qkv,
             ticker_out,
-            q_norm,
-            k_norm,
             mlp_fc1,
             mlp_fc2,
             mlp_ln,
@@ -54,8 +48,8 @@ impl InterTickerBlock {
             .reshape([batch, num_items, model_dim]);
         let qkv = x_norm.apply(&self.ticker_qkv);
         let parts = qkv.split(model_dim, -1);
-        let q = self.q_norm.forward(&parts[0]).unsqueeze(1);
-        let k = self.k_norm.forward(&parts[1]).unsqueeze(1);
+        let q = parts[0].unsqueeze(1);
+        let k = parts[1].unsqueeze(1);
         let v = parts[2].unsqueeze(1);
         let ctx = Tensor::scaled_dot_product_attention(
             &q, &k, &v,
@@ -83,27 +77,21 @@ struct ExoCrossBlock {
     cross_q: nn::Linear,
     cross_kv: nn::Linear,
     cross_out: nn::Linear,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
     kv_dim: i64,
 }
 
 impl ExoCrossBlock {
-    fn new(p: &nn::Path, model_dim: i64, cross_head_dim: i64, num_layers: usize) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, cross_head_dim: i64) -> Self {
         let kv_dim = CROSS_NUM_KV_HEADS * cross_head_dim;
         let cross_ln = RMSNorm::new(&(p / "cross_ln"), model_dim, 1e-6);
         let cross_q = linear_truncated(p, "cross_q", model_dim, model_dim);
         let cross_kv = linear_truncated(p, "cross_kv", model_dim, 2 * kv_dim);
-        let cross_out = linear_residual_out(p, "cross_out", model_dim, model_dim, num_layers);
-        let q_norm = RMSNorm::new(&(p / "cross_q_norm"), cross_head_dim, 1e-6);
-        let k_norm = RMSNorm::new(&(p / "cross_k_norm"), cross_head_dim, 1e-6);
+        let cross_out = linear_residual_out(p, "cross_out", model_dim, model_dim);
         Self {
             cross_ln,
             cross_q,
             cross_kv,
             cross_out,
-            q_norm,
-            k_norm,
             kv_dim,
         }
     }
@@ -133,10 +121,6 @@ impl ExoCrossBlock {
         let v = kv_parts[1]
             .reshape([b, t, CROSS_NUM_KV_HEADS, cross_head_dim])
             .permute([0, 2, 1, 3]);
-
-        // QKNorm: apply RMSNorm per-head on head_dim (last dimension)
-        let q = self.q_norm.forward(&q);
-        let k = self.k_norm.forward(&k);
 
         let out = Tensor::scaled_dot_product_attention(
             &q, &k, &v,
@@ -204,8 +188,6 @@ struct GqaBlock {
     attn_ln: RMSNorm,
     attn_qkv: nn::Linear,
     attn_out: nn::Linear,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
     q_dim: i64,
     kv_dim: i64,
     ffn_ln: RMSNorm,
@@ -214,24 +196,20 @@ struct GqaBlock {
 }
 
 impl GqaBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, num_layers: usize) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
         let head_dim = model_dim / GQA_NUM_Q_HEADS;
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
         let qkv_dim = model_dim + 2 * kv_dim;
         let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
         let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
-        let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim, num_layers);
-        let q_norm = RMSNorm::new(&(p / "attn_q_norm"), head_dim, 1e-6);
-        let k_norm = RMSNorm::new(&(p / "attn_k_norm"), head_dim, 1e-6);
+        let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim);
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
-        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim, num_layers);
+        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
         Self {
             attn_ln,
             attn_qkv,
             attn_out,
-            q_norm,
-            k_norm,
             q_dim: model_dim,
             kv_dim,
             ffn_ln,
@@ -258,8 +236,8 @@ impl GqaBlock {
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
 
-        let q = rope.apply(&self.q_norm.forward(&q));
-        let k = rope.apply(&self.k_norm.forward(&k));
+        let q = rope.apply(&q);
+        let k = rope.apply(&k);
 
         let out = Tensor::scaled_dot_product_attention(
             &q, &k, &v,
@@ -309,16 +287,14 @@ fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i6
     )
 }
 
-/// Output projection feeding into a residual add — init scaled by 1/√(2L)
+/// Output projection feeding into a residual add
 fn linear_residual_out(
     p: &nn::Path,
     name: &str,
     in_features: i64,
     out_features: i64,
-    num_layers: usize,
 ) -> nn::Linear {
     let base_std = truncated_normal_std(in_features, out_features);
-    let scale = 1.0 / (2.0 * num_layers as f64).sqrt();
     nn::linear(
         p / name,
         in_features,
@@ -326,7 +302,7 @@ fn linear_residual_out(
         nn::LinearConfig {
             ws_init: Init::Randn {
                 mean: 0.0,
-                stdev: base_std * scale,
+                stdev: base_std,
             },
             bs_init: Some(Init::Const(0.0)),
             bias: true,
@@ -340,7 +316,6 @@ const BASE_GQA_LAYERS: usize = 3;
 const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
-pub(crate) const ACTION_DIM: i64 = TICKERS_COUNT + 1;
 pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const LOG_STD_INIT: f64 = -2.0;
 pub(super) const SDE_EPS: f64 = 1e-6;
@@ -489,7 +464,6 @@ pub struct TradingModel {
     patch_embed_weight: Tensor,
     patch_embed_bias: Tensor,
     patch_config_ids: Tensor,
-    patch_pos_embed: Tensor,
     gqa_layers: Vec<GqaBlock>,
     rope: RotaryEmbedding,
     final_norm: RMSNorm,
@@ -499,7 +473,6 @@ pub struct TradingModel {
     cls_token: Tensor,
     inter_ticker_block: InterTickerBlock,
     actor_proj: nn::Linear,
-    cash_proj: nn::Linear,
     value_proj: nn::Linear,
     sde_fc: nn::Linear,
     sde_norm: RMSNorm,
@@ -559,12 +532,13 @@ impl TradingModel {
             .max()
             .unwrap_or(0);
         let max_input_dim = max_patch_size + PATCH_SCALAR_FEATS;
+        let xavier_std = (2.0 / (max_input_dim + spec.model_dim) as f64).sqrt();
         let patch_embed_weight = p.var(
             "patch_embed_weight",
             &[num_configs, max_input_dim, spec.model_dim],
-            Init::Uniform {
-                lo: -0.02,
-                up: 0.02,
+            Init::Randn {
+                mean: 0.0,
+                stdev: xavier_std,
             },
         );
         let patch_embed_bias = p.var(
@@ -584,22 +558,13 @@ impl TradingModel {
                 .to_kind(Kind::Int64)
                 .to_device(p.device())
         };
-        let patch_pos_embed = p.var(
-            "patch_pos_embed",
-            &[seq_len, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 0.02,
-            },
-        );
 
         let gqa_layers = (0..gqa_layers_count)
-            .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim, gqa_layers_count))
+            .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim))
             .collect::<Vec<_>>();
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
         let rope = RotaryEmbedding::new(seq_len + 1, head_dim, p.device());
         let final_norm = RMSNorm::new(&(p / "final_norm"), spec.model_dim, 1e-6);
-
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -622,29 +587,15 @@ impl TradingModel {
                     &(p / format!("exo_cross_{}", i)),
                     spec.model_dim,
                     cross_head_dim,
-                    gqa_layers_count,
                 )
             })
             .collect::<Vec<_>>();
-        let cls_token = p.var("cls_token", &[1, 1, spec.model_dim], Init::Randn { mean: 0.0, stdev: 0.02 });
+        let cls_token = p.var("cls_token", &[1, 1, spec.model_dim], Init::Const(0.0));
         let inter_ticker_block =
-            InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim, gqa_layers_count);
-        let full_seq_len = seq_len + 1;
-        let flat_per_ticker = full_seq_len * spec.model_dim;
-        let flat_all_tickers = TICKERS_COUNT * flat_per_ticker;
+            InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
         let actor_proj = nn::linear(
             p / "actor_proj",
-            flat_per_ticker,
-            1,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
-            },
-        );
-        let cash_proj = nn::linear(
-            p / "cash_proj",
-            flat_all_tickers,
+            spec.model_dim,
             1,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
@@ -654,7 +605,7 @@ impl TradingModel {
         );
         let value_proj = nn::linear(
             p / "value_proj",
-            flat_all_tickers,
+            TICKERS_COUNT * spec.model_dim,
             1,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
@@ -688,7 +639,7 @@ impl TradingModel {
             SDE_LATENT_DIM,
             SDE_LATENT_DIM,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.1 },
+                ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
@@ -696,7 +647,7 @@ impl TradingModel {
         let log_std_param = p.var(
             "log_std",
             &[SDE_LATENT_DIM, TICKERS_COUNT],
-            Init::Const(0.0),
+            Init::Const(LOG_STD_INIT),
         );
         Self {
             variant: config.variant,
@@ -709,7 +660,6 @@ impl TradingModel {
             patch_embed_weight,
             patch_embed_bias,
             patch_config_ids,
-            patch_pos_embed,
             gqa_layers,
             rope,
             final_norm,
@@ -719,7 +669,6 @@ impl TradingModel {
             cls_token,
             inter_ticker_block,
             actor_proj,
-            cash_proj,
             value_proj,
             sde_fc,
             sde_norm,
@@ -804,12 +753,7 @@ impl TradingModel {
             .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
 
         let kind = deltas.kind();
-        let pos_embed = if self.patch_pos_embed.kind() == kind {
-            self.patch_pos_embed.shallow_clone()
-        } else {
-            self.patch_pos_embed.to_kind(kind)
-        };
-        let patch_tokens = self.patch_embed(&deltas) + pos_embed;
+        let patch_tokens = self.patch_embed(&deltas);
         let cls = self.cls_token.to_kind(kind).expand([batch_tokens, 1, self.model_dim], false);
         Tensor::cat(&[&cls, &patch_tokens], 1)
     }
