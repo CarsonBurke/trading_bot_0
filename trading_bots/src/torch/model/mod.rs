@@ -318,7 +318,6 @@ const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const SDE_EPS: f64 = 1e-6;
-pub(super) const SDE_NOISE_FLOOR: f64 = 0.5;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
@@ -598,7 +597,7 @@ impl TradingModel {
             flat_per_ticker,
             1,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 100.0 },
+                ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
@@ -639,7 +638,7 @@ impl TradingModel {
             SDE_LATENT_DIM,
             SDE_LATENT_DIM,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.01 },
+                ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
