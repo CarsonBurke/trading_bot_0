@@ -317,8 +317,8 @@ const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(super) const SDE_LATENT_DIM: i64 = 64;
-pub(super) const LOG_STD_INIT: f64 = -2.0;
 pub(super) const SDE_EPS: f64 = 1e-6;
+pub(super) const SDE_NOISE_FLOOR: f64 = 0.5;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
@@ -466,7 +466,6 @@ pub struct TradingModel {
     patch_config_ids: Tensor,
     gqa_layers: Vec<GqaBlock>,
     rope: RotaryEmbedding,
-    final_norm: RMSNorm,
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
     exo_cross_blocks: Vec<ExoCrossBlock>,
@@ -478,7 +477,6 @@ pub struct TradingModel {
     sde_norm: RMSNorm,
     sde_fc2: nn::Linear,
     sde_fc3: nn::Linear,
-    log_std_param: Tensor,
     device: tch::Device,
 }
 
@@ -564,7 +562,6 @@ impl TradingModel {
             .collect::<Vec<_>>();
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
         let rope = RotaryEmbedding::new(seq_len + 1, head_dim, p.device());
-        let final_norm = RMSNorm::new(&(p / "final_norm"), spec.model_dim, 1e-6);
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -593,19 +590,22 @@ impl TradingModel {
         let cls_token = p.var("cls_token", &[1, 1, spec.model_dim], Init::Const(0.0));
         let inter_ticker_block =
             InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
+        let full_seq_len = seq_len + 1;
+        let flat_per_ticker = full_seq_len * spec.model_dim;
+        let flat_all_tickers = TICKERS_COUNT * flat_per_ticker;
         let actor_proj = nn::linear(
             p / "actor_proj",
-            spec.model_dim,
+            flat_per_ticker,
             1,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
+                ws_init: Init::Orthogonal { gain: 100.0 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
         );
         let value_proj = nn::linear(
             p / "value_proj",
-            TICKERS_COUNT * spec.model_dim,
+            flat_all_tickers,
             1,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
@@ -639,15 +639,10 @@ impl TradingModel {
             SDE_LATENT_DIM,
             SDE_LATENT_DIM,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
+                ws_init: Init::Orthogonal { gain: 0.01 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
-        );
-        let log_std_param = p.var(
-            "log_std",
-            &[SDE_LATENT_DIM, TICKERS_COUNT],
-            Init::Const(LOG_STD_INIT),
         );
         Self {
             variant: config.variant,
@@ -662,7 +657,6 @@ impl TradingModel {
             patch_config_ids,
             gqa_layers,
             rope,
-            final_norm,
             exo_feat_w,
             exo_feat_b,
             exo_cross_blocks,
@@ -674,7 +668,6 @@ impl TradingModel {
             sde_norm,
             sde_fc2,
             sde_fc3,
-            log_std_param,
             device: p.device(),
         }
     }
