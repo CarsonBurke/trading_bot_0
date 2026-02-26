@@ -85,10 +85,6 @@ impl TradingModel {
         (
             out,
             debug.unwrap_or(DebugMetrics {
-                time_alpha_attn_mean: 0.0,
-                time_alpha_mlp_mean: 0.0,
-                cross_alpha_attn_mean: 0.0,
-                cross_alpha_mlp_mean: 0.0,
                 temporal_tau: 0.0,
                 temporal_attn_entropy: 0.0,
                 temporal_attn_max: 0.0,

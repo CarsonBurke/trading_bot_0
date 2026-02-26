@@ -44,7 +44,6 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT])
             * scale_per;
 
-        // Cash: all-ticker flatten -> RMSNorm -> projection -> scale
         let cash_logit = flat_all_normed.apply(&self.cash_proj).squeeze_dim(-1) * scale_all;
 
         let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);

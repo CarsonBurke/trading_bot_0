@@ -23,26 +23,18 @@ struct InterTickerBlock {
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
     mlp_ln: RMSNorm,
-    alpha_ticker_attn: Tensor,
-    alpha_mlp: Tensor,
 }
 
 impl InterTickerBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, num_layers: usize) -> Self {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
         let ticker_qkv = linear_truncated(p, "ticker_qkv", model_dim, 3 * model_dim);
-        let ticker_out = linear_truncated(p, "ticker_out", model_dim, model_dim);
+        let ticker_out = linear_residual_out(p, "ticker_out", model_dim, model_dim, num_layers);
         let q_norm = RMSNorm::new(&(p / "ticker_q_norm"), model_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "ticker_k_norm"), model_dim, 1e-6);
         let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, 2 * ff_dim);
-        let mlp_fc2 = linear_truncated(p, "mlp_fc2", ff_dim, model_dim);
+        let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim, num_layers);
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
-        let alpha_ticker_attn = p.var(
-            "alpha_ticker_attn_raw",
-            &[1],
-            Init::Const(RESIDUAL_ALPHA_INIT),
-        );
-        let alpha_mlp = p.var("alpha_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
             ticker_ln,
             ticker_qkv,
@@ -52,8 +44,6 @@ impl InterTickerBlock {
             mlp_fc1,
             mlp_fc2,
             mlp_ln,
-            alpha_ticker_attn,
-            alpha_mlp,
         }
     }
 
@@ -74,7 +64,7 @@ impl InterTickerBlock {
             .squeeze_dim(1)
             .apply(&self.ticker_out)
             .reshape([batch, num_items, model_dim]);
-        let x = x + self.alpha_ticker_attn.sigmoid() * RESIDUAL_ALPHA_MAX * ctx;
+        let x = x + ctx;
         let mlp_in = self.mlp_ln
             .forward(&x.reshape([batch * num_items, model_dim]));
         let mlp_proj = mlp_in.apply(&self.mlp_fc1);
@@ -82,7 +72,7 @@ impl InterTickerBlock {
         let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
             .apply(&self.mlp_fc2)
             .reshape([batch, num_items, model_dim]);
-        &x + self.alpha_mlp.sigmoid() * RESIDUAL_ALPHA_MAX * mlp
+        &x + mlp
     }
 }
 
@@ -96,19 +86,17 @@ struct ExoCrossBlock {
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     kv_dim: i64,
-    alpha_cross: Tensor,
 }
 
 impl ExoCrossBlock {
-    fn new(p: &nn::Path, model_dim: i64, cross_head_dim: i64) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, cross_head_dim: i64, num_layers: usize) -> Self {
         let kv_dim = CROSS_NUM_KV_HEADS * cross_head_dim;
         let cross_ln = RMSNorm::new(&(p / "cross_ln"), model_dim, 1e-6);
         let cross_q = linear_truncated(p, "cross_q", model_dim, model_dim);
         let cross_kv = linear_truncated(p, "cross_kv", model_dim, 2 * kv_dim);
-        let cross_out = linear_truncated(p, "cross_out", model_dim, model_dim);
+        let cross_out = linear_residual_out(p, "cross_out", model_dim, model_dim, num_layers);
         let q_norm = RMSNorm::new(&(p / "cross_q_norm"), cross_head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "cross_k_norm"), cross_head_dim, 1e-6);
-        let alpha_cross = p.var("alpha_cross", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         Self {
             cross_ln,
             cross_q,
@@ -117,7 +105,6 @@ impl ExoCrossBlock {
             q_norm,
             k_norm,
             kv_dim,
-            alpha_cross,
         }
     }
 
@@ -163,7 +150,7 @@ impl ExoCrossBlock {
         let out = out.permute([0, 2, 1, 3]).reshape([b, s, model_dim]);
         let out = out.apply(&self.cross_out);
 
-        let result = &x_3d + self.alpha_cross.sigmoid() * RESIDUAL_ALPHA_MAX * out;
+        let result = &x_3d + out;
         if x.dim() == 2 {
             result.squeeze_dim(1)
         } else {
@@ -221,28 +208,24 @@ struct GqaBlock {
     k_norm: RMSNorm,
     q_dim: i64,
     kv_dim: i64,
-    alpha_attn: Tensor,
     ffn_ln: RMSNorm,
     ffn_fc1: nn::Linear,
     ffn_fc2: nn::Linear,
-    alpha_ffn: Tensor,
 }
 
 impl GqaBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, num_layers: usize) -> Self {
         let head_dim = model_dim / GQA_NUM_Q_HEADS;
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
         let qkv_dim = model_dim + 2 * kv_dim;
         let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
         let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
-        let attn_out = linear_truncated(p, "attn_out", model_dim, model_dim);
+        let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim, num_layers);
         let q_norm = RMSNorm::new(&(p / "attn_q_norm"), head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "attn_k_norm"), head_dim, 1e-6);
-        let alpha_attn = p.var("alpha_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
-        let ffn_fc2 = linear_truncated(p, "ffn_fc2", ff_dim, model_dim);
-        let alpha_ffn = p.var("alpha_ffn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
+        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim, num_layers);
         Self {
             attn_ln,
             attn_qkv,
@@ -251,11 +234,9 @@ impl GqaBlock {
             k_norm,
             q_dim: model_dim,
             kv_dim,
-            alpha_attn,
             ffn_ln,
             ffn_fc1,
             ffn_fc2,
-            alpha_ffn,
         }
     }
 
@@ -292,23 +273,26 @@ impl GqaBlock {
             .contiguous()
             .reshape([b, s, _d]);
         let out = out.apply(&self.attn_out);
-        let x = x + self.alpha_attn.sigmoid() * RESIDUAL_ALPHA_MAX * out;
+        let x = x + out;
 
         // SwiGLU FFN with pre-norm
         let ffn_in = self.ffn_ln.forward(&x);
         let ffn_proj = ffn_in.apply(&self.ffn_fc1);
         let ffn_parts = ffn_proj.chunk(2, -1);
         let ffn_out = (ffn_parts[0].silu() * &ffn_parts[1]).apply(&self.ffn_fc2);
-        &x + self.alpha_ffn.sigmoid() * RESIDUAL_ALPHA_MAX * ffn_out
+        &x + ffn_out
     }
 }
 
-fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
+fn truncated_normal_std(in_features: i64, out_features: i64) -> f64 {
     let denoms = (in_features + out_features) as f64 / 2.0;
-    let std = (1.0 / denoms).sqrt() / 0.8796;
+    (1.0 / denoms).sqrt() / 0.8796
+}
+
+fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
     Init::Randn {
         mean: 0.0,
-        stdev: std,
+        stdev: truncated_normal_std(in_features, out_features),
     }
 }
 
@@ -319,6 +303,31 @@ fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i6
         out_features,
         nn::LinearConfig {
             ws_init: truncated_normal_init(in_features, out_features),
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
+        },
+    )
+}
+
+/// Output projection feeding into a residual add — init scaled by 1/√(2L)
+fn linear_residual_out(
+    p: &nn::Path,
+    name: &str,
+    in_features: i64,
+    out_features: i64,
+    num_layers: usize,
+) -> nn::Linear {
+    let base_std = truncated_normal_std(in_features, out_features);
+    let scale = 1.0 / (2.0 * num_layers as f64).sqrt();
+    nn::linear(
+        p / name,
+        in_features,
+        out_features,
+        nn::LinearConfig {
+            ws_init: Init::Randn {
+                mean: 0.0,
+                stdev: base_std * scale,
+            },
             bs_init: Some(Init::Const(0.0)),
             bias: true,
         },
@@ -336,8 +345,6 @@ pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const LOG_STD_INIT: f64 = -2.0;
 pub(super) const SDE_EPS: f64 = 1e-6;
 const INTER_TICKER_AFTER: usize = 1;
-const RESIDUAL_ALPHA_MAX: f64 = 0.5;
-const RESIDUAL_ALPHA_INIT: f64 = -2.0;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
@@ -433,10 +440,6 @@ pub fn patch_ends_for_variant(variant: ModelVariant) -> Vec<i64> {
 pub type ModelOutput = (Tensor, Tensor, Tensor);
 
 pub struct DebugMetrics {
-    pub time_alpha_attn_mean: f64,
-    pub time_alpha_mlp_mean: f64,
-    pub cross_alpha_attn_mean: f64,
-    pub cross_alpha_mlp_mean: f64,
     pub temporal_tau: f64,
     pub temporal_attn_entropy: f64,
     pub temporal_attn_max: f64,
@@ -591,7 +594,7 @@ impl TradingModel {
         );
 
         let gqa_layers = (0..gqa_layers_count)
-            .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim))
+            .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim, gqa_layers_count))
             .collect::<Vec<_>>();
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
         let rope = RotaryEmbedding::new(seq_len + 1, head_dim, p.device());
@@ -619,12 +622,13 @@ impl TradingModel {
                     &(p / format!("exo_cross_{}", i)),
                     spec.model_dim,
                     cross_head_dim,
+                    gqa_layers_count,
                 )
             })
             .collect::<Vec<_>>();
         let cls_token = p.var("cls_token", &[1, 1, spec.model_dim], Init::Randn { mean: 0.0, stdev: 0.02 });
         let inter_ticker_block =
-            InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
+            InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim, gqa_layers_count);
         let full_seq_len = seq_len + 1;
         let flat_per_ticker = full_seq_len * spec.model_dim;
         let flat_all_tickers = TICKERS_COUNT * flat_per_ticker;
@@ -684,7 +688,7 @@ impl TradingModel {
             SDE_LATENT_DIM,
             SDE_LATENT_DIM,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
+                ws_init: Init::Orthogonal { gain: 0.1 },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },

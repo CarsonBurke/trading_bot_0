@@ -24,10 +24,6 @@ pub struct MetaHistory {
     pub max_advantage: Vec<f64>,
     pub logit_scale: Vec<f64>,
     pub clip_fraction: Vec<f64>,
-    pub time_alpha_attn_mean: Vec<f64>,
-    pub time_alpha_mlp_mean: Vec<f64>,
-    pub cross_alpha_attn_mean: Vec<f64>,
-    pub cross_alpha_mlp_mean: Vec<f64>,
     pub temporal_tau: Vec<f64>,
     pub temporal_attn_entropy: Vec<f64>,
     pub temporal_attn_max: Vec<f64>,
@@ -94,10 +90,6 @@ impl MetaHistory {
 
     pub fn record_temporal_debug(
         &mut self,
-        time_alpha_attn_mean: f64,
-        time_alpha_mlp_mean: f64,
-        cross_alpha_attn_mean: f64,
-        cross_alpha_mlp_mean: f64,
         temporal_tau: f64,
         temporal_attn_entropy: f64,
         temporal_attn_max: f64,
@@ -105,10 +97,6 @@ impl MetaHistory {
         temporal_attn_center: f64,
         temporal_attn_last_weight: f64,
     ) {
-        self.time_alpha_attn_mean.push(time_alpha_attn_mean);
-        self.time_alpha_mlp_mean.push(time_alpha_mlp_mean);
-        self.cross_alpha_attn_mean.push(cross_alpha_attn_mean);
-        self.cross_alpha_mlp_mean.push(cross_alpha_mlp_mean);
         self.temporal_tau.push(temporal_tau);
         self.temporal_attn_entropy.push(temporal_attn_entropy);
         self.temporal_attn_max.push(temporal_attn_max);
@@ -168,12 +156,6 @@ impl MetaHistory {
         self.mean_advantage = load_multiline(&adv_path, "mean");
         self.min_advantage = load_multiline(&adv_path, "min");
         self.max_advantage = load_multiline(&adv_path, "max");
-
-        let alpha_path = format!("{base_dir}/time_cross_alpha_means.report.bin");
-        self.time_alpha_attn_mean = load_multiline(&alpha_path, "time_attn");
-        self.time_alpha_mlp_mean = load_multiline(&alpha_path, "time_mlp");
-        self.cross_alpha_attn_mean = load_multiline(&alpha_path, "cross_attn");
-        self.cross_alpha_mlp_mean = load_multiline(&alpha_path, "cross_mlp");
 
         let temporal_path = format!("{base_dir}/temporal_embed_debug.report.bin");
         self.temporal_tau = load_multiline(&temporal_path, "temporal_tau");
@@ -408,35 +390,6 @@ impl MetaHistory {
                 },
             );
             let _ = write_report(&format!("{base_dir}/policy_entropy.report.bin"), &r);
-        }
-        if !self.time_alpha_attn_mean.is_empty() {
-            let r = Self::report(
-                "Time/Cross Alpha Means",
-                "Episode",
-                Some("Alpha"),
-                ScaleKind::Linear,
-                ReportKind::MultiLine {
-                    series: vec![
-                        ReportSeries {
-                            label: "time_attn".to_string(),
-                            values: f64_to_f32(&self.time_alpha_attn_mean),
-                        },
-                        ReportSeries {
-                            label: "time_mlp".to_string(),
-                            values: f64_to_f32(&self.time_alpha_mlp_mean),
-                        },
-                        ReportSeries {
-                            label: "cross_attn".to_string(),
-                            values: f64_to_f32(&self.cross_alpha_attn_mean),
-                        },
-                        ReportSeries {
-                            label: "cross_mlp".to_string(),
-                            values: f64_to_f32(&self.cross_alpha_mlp_mean),
-                        },
-                    ],
-                },
-            );
-            let _ = write_report(&format!("{base_dir}/time_cross_alpha_means.report.bin"), &r);
         }
         if !self.temporal_tau.is_empty() {
             let r = Self::report(
