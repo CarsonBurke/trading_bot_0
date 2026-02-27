@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, SDE_EPS};
+use super::{DebugMetrics, ModelOutput, TradingModel, SDE_EPS, LOG_STD_FLOOR, LOG_STD_MAX};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -43,13 +43,11 @@ impl TradingModel {
             .apply(&self.sde_fc2)
             .tanh();
         let latent_sq = sde_latent.pow_tensor_scalar(2);
-        let noise_w_sq_t = self
-            .sde_out
-            .ws
-            .to_kind(latent_sq.kind())
-            .pow_tensor_scalar(2)
-            .transpose(0, 1);
-        let variance = latent_sq.matmul(&noise_w_sq_t).reshape([batch_size, TICKERS_COUNT]);
+        let log_std = (&self.log_std_param + LOG_STD_FLOOR)
+            .clamp_max(LOG_STD_MAX)
+            .to_kind(latent_sq.kind());
+        let std_sq = (log_std * 2.0).exp();
+        let variance = latent_sq.matmul(&std_sq).reshape([batch_size, TICKERS_COUNT]);
         let action_noise_std = (variance + SDE_EPS).sqrt();
 
         // Critic: RMSNorm → projection

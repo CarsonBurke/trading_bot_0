@@ -318,6 +318,8 @@ const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const SDE_EPS: f64 = 1e-6;
+pub(super) const LOG_STD_FLOOR: f64 = -1.0;
+pub(super) const LOG_STD_MAX: f64 = -1.0;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
@@ -477,7 +479,7 @@ pub struct TradingModel {
     sde_fc: nn::Linear,
     sde_norm: RMSNorm,
     sde_fc2: nn::Linear,
-    sde_out: nn::Linear,
+    log_std_param: Tensor,
     device: tch::Device,
 }
 
@@ -604,7 +606,7 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let mean_scale = p.var("mean_scale", &[1], Init::Const(0.1));
+        let mean_scale = p.var("mean_scale", &[1], Init::Const(1.0));
         let value_proj = nn::linear(
             p / "value_proj",
             flat_all_tickers,
@@ -636,16 +638,7 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let sde_out = nn::linear(
-            p / "sde_out",
-            SDE_LATENT_DIM,
-            TICKERS_COUNT,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
-            },
-        );
+        let log_std_param = p.var("log_std_param", &[SDE_LATENT_DIM, TICKERS_COUNT as i64], Init::Const(0.0));
         Self {
             variant: config.variant,
             patch_configs,
@@ -670,7 +663,7 @@ impl TradingModel {
             sde_fc,
             sde_norm,
             sde_fc2,
-            sde_out,
+            log_std_param,
             device: p.device(),
         }
     }
