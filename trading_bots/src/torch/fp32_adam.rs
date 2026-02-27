@@ -39,7 +39,7 @@ impl Fp32Adam {
             lr,
             beta1: 0.9,
             beta2: 0.999,
-            eps: 1e-8,
+            eps: 1e-5,
             step_count: 0,
         }
     }

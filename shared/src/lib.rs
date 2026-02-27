@@ -10,7 +10,7 @@ pub mod constants {
     pub const AVAILABLE_TICKERS_COUNT: usize = 13;
     pub const ACTION_COUNT: usize = TICKERS_COUNT + 1; // +1 for cash weight
     pub const ACTION_HISTORY_LEN: usize = 0;
-    pub const PRICE_DELTAS_PER_TICKER: usize = 8636;
+    pub const PRICE_DELTAS_PER_TICKER: usize = 8693;
 
     // Global (7): step_progress, cash_percent, pnl, drawdown, commissions, last_reward, last_fill_ratio
     // Macro (14): gdp_growth, unemployment, jobs_growth, cpi_yoy, core_cpi_yoy, fed_funds, treasury_10y, yield_spread, consumer_sentiment, initial_claims
