@@ -331,7 +331,8 @@ const BASE_PATCH_CONFIGS: &[(i64, i64)] = &[
     (512, 16),
     (256, 8),
     (128, 4),
-    (60, 1),
+    (116, 2),
+    (1, 1),
 ];
 
 const ABLATION_SMALL_PATCH_CONFIGS: &[(i64, i64)] = &[(8192, 256), (384, 8), (60, 1)];
@@ -471,11 +472,12 @@ pub struct TradingModel {
     cls_token: Tensor,
     inter_ticker_block: InterTickerBlock,
     actor_proj: nn::Linear,
+    mean_scale: Tensor,
     value_proj: nn::Linear,
     sde_fc: nn::Linear,
     sde_norm: RMSNorm,
     sde_fc2: nn::Linear,
-    sde_fc3: nn::Linear,
+    sde_out: nn::Linear,
     device: tch::Device,
 }
 
@@ -602,6 +604,7 @@ impl TradingModel {
                 bias: true,
             },
         );
+        let mean_scale = p.var("mean_scale", &[1], Init::Const(0.1));
         let value_proj = nn::linear(
             p / "value_proj",
             flat_all_tickers,
@@ -633,10 +636,10 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let sde_fc3 = nn::linear(
-            p / "sde_fc3",
+        let sde_out = nn::linear(
+            p / "sde_out",
             SDE_LATENT_DIM,
-            SDE_LATENT_DIM,
+            TICKERS_COUNT,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
@@ -662,11 +665,12 @@ impl TradingModel {
             cls_token,
             inter_ticker_block,
             actor_proj,
+            mean_scale,
             value_proj,
             sde_fc,
             sde_norm,
             sde_fc2,
-            sde_fc3,
+            sde_out,
             device: p.device(),
         }
     }
@@ -693,7 +697,7 @@ impl TradingModel {
     }
 
     fn maybe_apply_inter_ticker(&self, x: &Tensor, layer_idx: usize) -> Tensor {
-        if layer_idx != INTER_TICKER_AFTER {
+        if layer_idx != INTER_TICKER_AFTER || TICKERS_COUNT == 1 {
             return x.shallow_clone();
         }
         let bt = x.size()[0];
