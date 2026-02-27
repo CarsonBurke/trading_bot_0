@@ -79,6 +79,11 @@ impl EarningsIndicators {
                 report_idx += 1;
             }
 
+            // No report published yet at this bar's date — leave zeros
+            if reports[report_idx].date > *bar_date {
+                continue;
+            }
+
             let report = &reports[report_idx];
 
             if report_idx + 1 < reports.len() {
