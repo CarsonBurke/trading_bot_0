@@ -52,12 +52,7 @@ pub fn multi_line_chart_with_labels(
     let y_range = (y_max - y_min).max(0.01);
     let y_min = y_min - y_range * 0.05;
     let y_max = y_max + y_range * 0.05;
-    let x_max = series
-        .iter()
-        .map(|(_, data)| data.len())
-        .max()
-        .unwrap_or(1) as u32
-        * x_scale;
+    let x_max = series.iter().map(|(_, data)| data.len()).max().unwrap_or(1) as u32 * x_scale;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
         .caption(name, ("sans-serif", 20, &theme::TEXT))
@@ -165,12 +160,7 @@ pub fn multi_line_chart_log_with_labels(
     let y_range = y_max - y_min;
     let y_min_t = symlog(y_min - y_range * 0.05);
     let y_max_t = symlog(y_max + y_range * 0.05);
-    let x_max = series
-        .iter()
-        .map(|(_, data)| data.len())
-        .max()
-        .unwrap_or(1) as u32
-        * x_scale;
+    let x_max = series.iter().map(|(_, data)| data.len()).max().unwrap_or(1) as u32 * x_scale;
 
     let mut chart = plotters::chart::ChartBuilder::on(&root)
         .caption(name, ("sans-serif", 20, &theme::TEXT))

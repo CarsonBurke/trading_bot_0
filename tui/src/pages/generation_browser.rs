@@ -22,13 +22,19 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let is_training = app.is_training_running();
     let current_episode = app.get_current_episode();
 
-    let mut title_spans = vec![
-        Span::styled(" Training Episodes ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-    ];
-    title_spans.extend(episode_status::episode_status_spans(is_training, current_episode));
+    let mut title_spans = vec![Span::styled(
+        " Training Episodes ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    title_spans.extend(episode_status::episode_status_spans(
+        is_training,
+        current_episode,
+    ));
 
-    let title = Paragraph::new(Line::from(title_spans))
-        .block(Block::default().borders(Borders::ALL));
+    let title =
+        Paragraph::new(Line::from(title_spans)).block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
     let search_style = if app.generation_browser.searching {
@@ -42,7 +48,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let search_text = if app.generation_browser.searching {
         format!("Search: {}_", app.generation_browser.search_input)
     } else {
-        format!("Search: {} (press / to search)", app.generation_browser.search_input)
+        format!(
+            "Search: {} (press / to search)",
+            app.generation_browser.search_input
+        )
     };
 
     let search = Paragraph::new(search_text)
@@ -51,7 +60,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     f.render_widget(search, chunks[1]);
 
     let items: Vec<ListItem> = app
-        .generation_browser.filtered_generations
+        .generation_browser
+        .filtered_generations
         .iter()
         .map(|gen| {
             ListItem::new(format!("Episode {}", gen.number))

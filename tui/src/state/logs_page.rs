@@ -7,7 +7,7 @@ pub struct LogsPageState {
     pub training_output: Vec<String>,
     pub logs_list_state: ListState,
     pub logs_list_area: Rect,
-    first_view: bool,
+    follow: bool,
 }
 
 impl LogsPageState {
@@ -16,19 +16,28 @@ impl LogsPageState {
             training_output: Vec::new(),
             logs_list_state: ListState::default(),
             logs_list_area: Rect::default(),
-            first_view: true,
+            follow: true,
         }
     }
 
     pub fn poll_training_output(&mut self) {
         let log_path = "../training/training.log";
         if let Ok(content) = fs::read_to_string(log_path) {
-            let new_lines: Vec<String> = content.lines().collect::<Vec<_>>()
-                .into_iter().rev().take(MAX_LOGS).rev().map(|s| s.to_string()).collect();
+            let new_lines: Vec<String> = content
+                .lines()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .take(MAX_LOGS)
+                .rev()
+                .map(|s| s.to_string())
+                .collect();
 
             if new_lines != self.training_output {
                 self.training_output = new_lines;
-                if let Some(selected) = self.logs_list_state.selected() {
+                if self.follow {
+                    self.jump_to_bottom();
+                } else if let Some(selected) = self.logs_list_state.selected() {
                     self.set_logs_position(selected);
                 }
             }
@@ -49,10 +58,13 @@ impl LogsPageState {
         } else {
             0
         };
-        self.logs_list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
+        self.logs_list_state = ListState::default()
+            .with_selected(Some(selected))
+            .with_offset(offset);
     }
 
     pub fn next(&mut self) {
+        self.follow = false;
         if self.training_output.is_empty() {
             return;
         }
@@ -71,6 +83,7 @@ impl LogsPageState {
     }
 
     pub fn previous(&mut self) {
+        self.follow = false;
         if self.training_output.is_empty() {
             return;
         }
@@ -89,6 +102,7 @@ impl LogsPageState {
     }
 
     pub fn jump_to_top(&mut self) {
+        self.follow = false;
         if !self.training_output.is_empty() {
             self.logs_list_state.select(Some(0));
             self.set_logs_position(0);
@@ -96,6 +110,7 @@ impl LogsPageState {
     }
 
     pub fn jump_to_bottom(&mut self) {
+        self.follow = true;
         if !self.training_output.is_empty() {
             let last = self.training_output.len() - 1;
             self.logs_list_state.select(Some(last));
@@ -104,10 +119,7 @@ impl LogsPageState {
     }
 
     pub fn enter(&mut self) {
-        if self.first_view {
-            self.first_view = false;
-            self.jump_to_bottom();
-        }
+        self.follow = true;
     }
 
     pub fn page_up(&mut self) {

@@ -5,7 +5,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::constants::agent::{LEARNING_RATE, MAX_WEIGHT, MIN_WEIGHT};
+use crate::constants::agent::LEARNING_RATE;
 
 pub mod create;
 pub mod runner;
@@ -19,7 +19,6 @@ pub struct Agent {
 
 impl Agent {
     pub fn from_weights_file() -> Self {
-
         let file = fs::read("weights/weights.bin").unwrap();
         let weights: Weights = postcard::from_bytes(&file).unwrap();
 
@@ -60,8 +59,7 @@ impl Weights {
 
 impl Default for Weights {
     fn default() -> Self {
-
-        let mut rng = rand::thread_rng();
+        let _rng = rand::thread_rng();
 
         Self {
             /* map: enum_map! {

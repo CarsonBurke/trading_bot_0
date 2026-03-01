@@ -1,15 +1,15 @@
 use anyhow::{bail, Context, Result};
+use rand::seq::index;
+use rand::thread_rng;
 use shared::paths::TRAINING_PATH;
 use shared::report::Report;
 use std::fs;
 use std::path::PathBuf;
-use rand::seq::index;
-use rand::thread_rng;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        bail!("usage: report_cli <generation> <report_name> [ticker] [--sample N] [--min N] [--max N]");
+        bail!("usage: report_cli <generation> <report_name> [ticker] [--sample N] [--min N] [--max N] [--var NAME]");
     }
 
     let generation = args[1]
@@ -20,6 +20,7 @@ fn main() -> Result<()> {
     let mut sample: Option<usize> = None;
     let mut min: Option<usize> = None;
     let mut max: Option<usize> = None;
+    let mut var_filter: Option<String> = None;
     let mut i = 3;
     while i < args.len() {
         let arg = &args[i];
@@ -31,7 +32,9 @@ fn main() -> Result<()> {
             continue;
         }
         if let Some(value) = arg.strip_prefix("--sample=") {
-            let count = value.parse::<usize>().context("sample must be an integer")?;
+            let count = value
+                .parse::<usize>()
+                .context("sample must be an integer")?;
             sample = Some(count);
             i += 1;
             continue;
@@ -62,6 +65,17 @@ fn main() -> Result<()> {
             i += 1;
             continue;
         }
+        if arg == "--var" || arg == "-v" {
+            let next = args.get(i + 1).context("missing --var value")?;
+            var_filter = Some(next.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--var=") {
+            var_filter = Some(value.to_string());
+            i += 1;
+            continue;
+        }
         if ticker.is_none() {
             ticker = Some(arg.as_str());
             i += 1;
@@ -80,50 +94,53 @@ fn main() -> Result<()> {
     let report: Report = postcard::from_bytes(&bytes).context("failed to decode report")?;
 
     let mut lines = report.kind.to_lines();
+    if let Some(ref filter) = var_filter {
+        lines.retain(|line| {
+            line.split('\t')
+                .any(|t| t.split_once('=').is_some_and(|(k, _)| k == filter))
+        });
+    }
     if let Some(count) = min {
-        lines = select_by_value(lines, count, false);
+        lines = select_by_value(lines, count, false, var_filter.as_deref());
     } else if let Some(count) = max {
-        lines = select_by_value(lines, count, true);
+        lines = select_by_value(lines, count, true, var_filter.as_deref());
     }
     if let Some(count) = sample {
         if count >= lines.len() {
             for line in lines {
-                println!("{line}");
+                println!("{}", format_line(&line, var_filter.as_deref()));
             }
         } else {
             let mut rng = thread_rng();
             let indices = index::sample(&mut rng, lines.len(), count);
             for idx in indices.iter() {
-                println!("{}", lines[idx]);
+                println!("{}", format_line(&lines[idx], var_filter.as_deref()));
             }
         }
     } else {
         for line in lines {
-            println!("{line}");
+            println!("{}", format_line(&line, var_filter.as_deref()));
         }
     }
     Ok(())
 }
 
-fn select_by_value(lines: Vec<String>, count: usize, pick_max: bool) -> Vec<String> {
+fn select_by_value(
+    lines: Vec<String>,
+    count: usize,
+    pick_max: bool,
+    var_filter: Option<&str>,
+) -> Vec<String> {
     let mut scored: Vec<(f32, String)> = lines
         .into_iter()
         .filter_map(|line| {
-            let values = extract_values(&line);
+            let values = extract_values(&line, var_filter);
             if values.is_empty() {
                 None
             } else if pick_max {
-                values
-                    .iter()
-                    .cloned()
-                    .reduce(f32::max)
-                    .map(|v| (v, line))
+                values.iter().cloned().reduce(f32::max).map(|v| (v, line))
             } else {
-                values
-                    .iter()
-                    .cloned()
-                    .reduce(f32::min)
-                    .map(|v| (v, line))
+                values.iter().cloned().reduce(f32::min).map(|v| (v, line))
             }
         })
         .collect();
@@ -142,11 +159,20 @@ fn select_by_value(lines: Vec<String>, count: usize, pick_max: bool) -> Vec<Stri
         .collect()
 }
 
-fn extract_values(line: &str) -> Vec<f32> {
+fn extract_values(line: &str, var_filter: Option<&str>) -> Vec<f32> {
     let mut values = Vec::new();
     for token in line.split('\t') {
-        if let Some((_, value)) = token.split_once('=') {
-            collect_values(value, &mut values);
+        if let Some((key, value)) = token.split_once('=') {
+            if let Some(filter) = var_filter {
+                if key == filter {
+                    collect_values(value, &mut values);
+                }
+            } else {
+                collect_values(value, &mut values);
+            }
+            continue;
+        }
+        if var_filter.is_some() {
             continue;
         }
         if token.parse::<usize>().is_ok() {
@@ -163,6 +189,23 @@ fn collect_values(token: &str, values: &mut Vec<f32>) {
             values.push(value);
         }
     }
+}
+
+fn format_line(line: &str, var_filter: Option<&str>) -> String {
+    let Some(var) = var_filter else {
+        return line.to_string();
+    };
+    let mut parts = Vec::new();
+    for token in line.split('\t') {
+        if let Some((key, _)) = token.split_once('=') {
+            if key == var {
+                parts.push(token);
+            }
+        } else {
+            parts.push(token);
+        }
+    }
+    parts.join("\t")
 }
 
 fn normalize_report_name(raw: &str) -> String {

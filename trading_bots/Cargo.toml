@@ -7,6 +7,7 @@ description = "A trading bot using machine learning and genetic algorithms, work
 repository = "https://github.com/CarsonBurke/trading_bot_0"
 keywords = ["trading", "finance", "deep-learning", "machine-learning"]
 categories = ["science"]
+default-run = "trading_bot_0"
 
 [dependencies]
 shared = { path = "../shared", features = ["plotters"] }
@@ -18,12 +19,13 @@ candle-nn = {version = "0.9.1" }
 chrono = "0.4.38"
 clap = { version = "4.5.21", features = ["derive"] }
 colored = "2.1.0"
-cpython = "0.7.2"
+pyo3 = { version = "0.24", features = ["auto-initialize", "abi3-py313"] }
 enum-map = { version = "2.7.3", features = ["serde"] }
 hashbrown = "0.15.2"
 ibapi = { version = "2.2.2", default-features = false, features = ["sync"] }
 image = { version = "0.25", features = ["webp"] }
 libc = "0.2"
+libloading = "0.8.6"
 nvml-wrapper = "0.11"
 ndarray = "0.16.1"
 ordered-float = "4.5.0"
@@ -35,7 +37,7 @@ ringbuffer = "0.16.0"
 rust_neural_network = "0.18.0"
 serde = "1.0.228"
 serde_json = "1.0"
-tch = { version = "0.22.0", features = ["rl-python", "download-libtorch"] }
+tch = { version = "0.23.0", features = ["rl-python", "python-extension", "download-libtorch"] }
 time = "0.3.36"
 tokio = { version = "1.47.0", features = ["full"] }
 uuid = { version = "1.11.0", features = ["v4"] }
@@ -43,6 +45,11 @@ uuid = { version = "1.11.0", features = ["v4"] }
 [features]
 default = ["debug_training"]
 debug_training = []
+perf_timing = []
+
+[build-dependencies]
+serde_json = "1.0"
+tch = { version = "0.23.0", features = ["download-libtorch"] }
 
 [profile.release]
 debug = 1

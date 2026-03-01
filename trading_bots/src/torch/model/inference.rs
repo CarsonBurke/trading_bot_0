@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{ModelOutput, StreamState, TradingModel, FINEST_PATCH_INDEX, FINEST_PATCH_SIZE, SSM_DIM};
+use super::{ModelOutput, StreamState, TradingModel};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
 
 impl StreamState {
@@ -9,9 +9,6 @@ impl StreamState {
         self.ring_pos = 0;
         let _ = self.patch_buf.zero_();
         self.patch_pos = 0;
-        for s in &mut self.ssm_states {
-            s.reset();
-        }
         self.initialized = false;
     }
 }
@@ -25,13 +22,10 @@ impl TradingModel {
             ),
             ring_pos: 0,
             patch_buf: Tensor::zeros(
-                &[TICKERS_COUNT, FINEST_PATCH_SIZE],
+                &[TICKERS_COUNT, self.finest_patch_size],
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
-            ssm_states: (0..(TICKERS_COUNT * self.ssm_layers.len() as i64))
-                .map(|_| self.ssm_layers[0].init_state(1, self.device))
-                .collect(),
             initialized: false,
         }
     }
@@ -44,13 +38,10 @@ impl TradingModel {
             ),
             ring_pos: 0,
             patch_buf: Tensor::zeros(
-                &[batch_size * TICKERS_COUNT, FINEST_PATCH_SIZE],
+                &[batch_size * TICKERS_COUNT, self.finest_patch_size],
                 (Kind::Float, self.device),
             ),
             patch_pos: 0,
-            ssm_states: (0..(batch_size * TICKERS_COUNT * self.ssm_layers.len() as i64) as usize)
-                .map(|_| self.ssm_layers[0].init_state(1, self.device))
-                .collect(),
             initialized: false,
         }
     }
@@ -63,13 +54,27 @@ impl TradingModel {
     ) -> ModelOutput {
         let new_deltas = self.cast_inputs(&new_deltas.to_device(self.device));
         let static_features = self.cast_inputs(&static_features.to_device(self.device));
+        self.step_on_device(&new_deltas, &static_features, state)
+    }
+
+    pub fn step_on_device(
+        &self,
+        new_deltas: &Tensor,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        if new_deltas.device() != self.device || static_features.device() != self.device {
+            panic!("step_on_device requires tensors on {:?}", self.device);
+        }
+        let new_deltas = self.cast_inputs(new_deltas);
+        let static_features = self.cast_inputs(static_features);
 
         let full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
         let is_full = (new_deltas.dim() == 1 && new_deltas.size()[0] == full_obs)
             || (new_deltas.dim() == 2 && new_deltas.size()[1] == full_obs);
 
         if is_full {
-            return self.init_from_full(&new_deltas, &static_features, state);
+            return self.init_from_full_on_device(&new_deltas, &static_features, state);
         }
 
         let new_deltas = if new_deltas.dim() == 1 {
@@ -98,33 +103,40 @@ impl TradingModel {
         } else {
             static_features
         };
-        let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
 
-        if state.patch_pos >= FINEST_PATCH_SIZE {
+        if state.patch_pos >= self.finest_patch_size {
             state.patch_pos = 0;
-            let x_last = self.process_new_patch(state);
             let _ = state.patch_buf.zero_();
-            return self
-                .head_with_temporal_pool(&x_last, &global_static, &per_ticker_static, 1, false)
-                .0;
+            // Full forward pass from ring buffer
+            let price_deltas = state.delta_ring.view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
+            return self.forward_on_device(&price_deltas, &static_features, false);
         }
 
+        // Not enough deltas for a new patch yet; return zeros
         self.head_with_temporal_pool(
-            &Tensor::zeros(&[TICKERS_COUNT, SSM_DIM, 1], (Kind::Float, self.device)),
-            &global_static,
-            &per_ticker_static,
+            &Tensor::zeros(
+                &[TICKERS_COUNT, 1, self.model_dim],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
             1,
+            true,
             false,
         )
         .0
     }
 
-    fn init_from_full(
+    fn init_from_full_on_device(
         &self,
         price_deltas: &Tensor,
         static_features: &Tensor,
         state: &mut StreamState,
     ) -> ModelOutput {
+        if price_deltas.device() != self.device || static_features.device() != self.device {
+            panic!(
+                "init_from_full_on_device requires tensors on {:?}",
+                self.device
+            );
+        }
         let price = if price_deltas.dim() == 1 {
             price_deltas.unsqueeze(0)
         } else {
@@ -143,60 +155,9 @@ impl TradingModel {
         state.ring_pos = 0;
         state.patch_pos = 0;
         let _ = state.patch_buf.zero_();
-
-        let (global_static, per_ticker_static) = self.parse_static(&static_features, 1);
-        let dt_scale = self.patch_dt_scale.shallow_clone();
-
-        let mut outputs = Vec::with_capacity(TICKERS_COUNT as usize);
-        for t in 0..TICKERS_COUNT as usize {
-            let ticker_data = reshaped.get(t as i64).unsqueeze(0);
-            let x_stem = self.patch_embed_single(&ticker_data);
-            let mut x = x_stem.permute([0, 2, 1]);
-            for (layer, (ssm, norm)) in
-                self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
-            {
-                let state_idx = layer * TICKERS_COUNT as usize + t;
-                let normed = norm.forward(&x);
-                let out = ssm.forward_with_state_dt_scale(
-                    &normed,
-                    &mut state.ssm_states[state_idx],
-                    Some(&dt_scale),
-                );
-                x = x + out;
-            }
-            outputs.push(x.permute([0, 2, 1]));
-        }
-
         state.initialized = true;
-        let x_ssm = Tensor::cat(&outputs, 0);
-        self.head_with_temporal_pool(&x_ssm, &global_static, &per_ticker_static, 1, false)
-            .0
-    }
 
-    fn process_new_patch(&self, state: &mut StreamState) -> Tensor {
-        let patches = state
-            .patch_buf
-            .view([TICKERS_COUNT, 1, FINEST_PATCH_SIZE]);
-        let patches = self.enrich_patches(&patches);
-        let patch_emb = patches.apply(&self.patch_embeds[FINEST_PATCH_INDEX]);
-        let patch_emb = self.patch_lns[FINEST_PATCH_INDEX]
-            .forward(&patch_emb)
-            .squeeze_dim(1);
-        let dt_scale = FINEST_PATCH_SIZE as f64;
-
-        let mut outputs = Vec::with_capacity(TICKERS_COUNT as usize);
-        for t in 0..TICKERS_COUNT as usize {
-            let mut x_in = patch_emb.get(t as i64).unsqueeze(0);
-            for (layer, (ssm, norm)) in
-                self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
-            {
-                let state_idx = layer * TICKERS_COUNT as usize + t;
-                let normed = norm.forward(&x_in);
-                let out = ssm.step_with_dt_scale(&normed, &mut state.ssm_states[state_idx], dt_scale);
-                x_in = x_in + out;
-            }
-            outputs.push(x_in.unsqueeze(-1));
-        }
-        Tensor::cat(&outputs, 0)
+        // Full forward pass
+        self.forward_on_device(&price.view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]), &static_features, false)
     }
 }

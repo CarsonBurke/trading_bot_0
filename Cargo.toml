@@ -5,4 +5,6 @@ members = [
     "tui",
     "shared",
     "report_cli",
+    "benchmarks",
+    "training_log_server",
 ]

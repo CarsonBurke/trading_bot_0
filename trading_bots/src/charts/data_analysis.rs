@@ -53,10 +53,7 @@ pub fn create_index_chart(
         .iter()
         .cloned()
         .fold(f64::NEG_INFINITY, f64::max);
-    let min_val = index_values
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
+    let min_val = index_values.iter().cloned().fold(f64::INFINITY, f64::min);
 
     let mut chart = ChartBuilder::on(&root)
         .caption(
@@ -86,11 +83,7 @@ pub fn create_index_chart(
     Ok(())
 }
 
-fn volatility_chart(
-    dir: &str,
-    ticker: &str,
-    prices: &[f64],
-) -> Result<(), Box<dyn Error>> {
+fn volatility_chart(dir: &str, ticker: &str, prices: &[f64]) -> Result<(), Box<dyn Error>> {
     const WINDOW: usize = 20;
 
     let mut rolling_volatility = Vec::new();
@@ -103,11 +96,8 @@ fn volatility_chart(
             .collect();
 
         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns
-            .iter()
-            .map(|r| (r - mean).powi(2))
-            .sum::<f64>()
-            / returns.len() as f64;
+        let variance =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         let std_dev = variance.sqrt();
 
         // Annualized volatility (assuming 252 trading days, 78 5-min bars per day)
@@ -140,10 +130,7 @@ fn volatility_chart(
         .margin(10)
         .x_label_area_size(40)
         .y_label_area_size(60)
-        .build_cartesian_2d(
-            0..rolling_volatility.len(),
-            min_vol * 0.9..max_vol * 1.1,
-        )?;
+        .build_cartesian_2d(0..rolling_volatility.len(), min_vol * 0.9..max_vol * 1.1)?;
 
     chart
         .configure_mesh()
@@ -204,10 +191,7 @@ fn returns_distribution_chart(
         .margin(10)
         .x_label_area_size(40)
         .y_label_area_size(60)
-        .build_cartesian_2d(
-            min_return..max_return,
-            0u32..max_count + max_count / 10,
-        )?;
+        .build_cartesian_2d(min_return..max_return, 0u32..max_count + max_count / 10)?;
 
     chart
         .configure_mesh()
@@ -222,21 +206,14 @@ fn returns_distribution_chart(
     chart.draw_series(histogram.iter().enumerate().map(|(i, &count)| {
         let x_left = min_return + i as f64 * bin_width;
         let x_right = min_return + (i + 1) as f64 * bin_width;
-        Rectangle::new(
-            [(x_left, 0), (x_right, count)],
-            theme::BLUE.filled(),
-        )
+        Rectangle::new([(x_left, 0), (x_right, count)], theme::BLUE.filled())
     }))?;
 
     root.present()?;
     Ok(())
 }
 
-fn rolling_metrics_chart(
-    dir: &str,
-    ticker: &str,
-    prices: &[f64],
-) -> Result<(), Box<dyn Error>> {
+fn rolling_metrics_chart(dir: &str, ticker: &str, prices: &[f64]) -> Result<(), Box<dyn Error>> {
     const WINDOW: usize = 100;
 
     let mut rolling_sharpe = Vec::new();
@@ -298,10 +275,7 @@ fn rolling_metrics_chart(
             .iter()
             .cloned()
             .fold(f64::NEG_INFINITY, f64::max);
-        let min_sharpe = rolling_sharpe
-            .iter()
-            .cloned()
-            .fold(f64::INFINITY, f64::min);
+        let min_sharpe = rolling_sharpe.iter().cloned().fold(f64::INFINITY, f64::min);
 
         let mut chart = ChartBuilder::on(&upper)
             .caption(
@@ -311,10 +285,7 @@ fn rolling_metrics_chart(
             .margin(10)
             .x_label_area_size(30)
             .y_label_area_size(60)
-            .build_cartesian_2d(
-                0..rolling_sharpe.len(),
-                min_sharpe * 1.1..max_sharpe * 1.1,
-            )?;
+            .build_cartesian_2d(0..rolling_sharpe.len(), min_sharpe * 1.1..max_sharpe * 1.1)?;
 
         chart
             .configure_mesh()
@@ -357,7 +328,10 @@ fn rolling_metrics_chart(
             .draw()?;
 
         chart.draw_series(LineSeries::new(
-            rolling_max_drawdown.iter().enumerate().map(|(i, v)| (i, *v)),
+            rolling_max_drawdown
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, *v)),
             &theme::RED,
         ))?;
     }
@@ -366,11 +340,7 @@ fn rolling_metrics_chart(
     Ok(())
 }
 
-fn price_statistics_chart(
-    dir: &str,
-    ticker: &str,
-    prices: &[f64],
-) -> Result<(), Box<dyn Error>> {
+fn price_statistics_chart(dir: &str, ticker: &str, prices: &[f64]) -> Result<(), Box<dyn Error>> {
     if prices.is_empty() {
         return Ok(());
     }
@@ -382,7 +352,7 @@ fn price_statistics_chart(
     // Calculate statistics
     let min_price = prices.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_price = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mean_price = prices.iter().sum::<f64>() / prices.len() as f64;
+    let _mean_price = prices.iter().sum::<f64>() / prices.len() as f64;
 
     let returns: Vec<f64> = prices
         .windows(2)
@@ -418,22 +388,24 @@ fn price_statistics_chart(
         .draw()?;
 
     // Price line
-    chart.draw_series(LineSeries::new(
-        prices.iter().enumerate().map(|(i, p)| (i, *p)),
-        &theme::BLUE,
-    ))?
-    .label("Price")
-    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &theme::BLUE));
+    chart
+        .draw_series(LineSeries::new(
+            prices.iter().enumerate().map(|(i, p)| (i, *p)),
+            &theme::BLUE,
+        ))?
+        .label("Price")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &theme::BLUE));
 
     // EMA line
     let alpha = 0.05;
     let ema = super::simple::compute_ema(prices, alpha);
-    chart.draw_series(LineSeries::new(
-        ema.iter().enumerate().map(|(i, v)| (i, *v)),
-        theme::GREEN.stroke_width(2),
-    ))?
-    .label("EMA")
-    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], theme::GREEN));
+    chart
+        .draw_series(LineSeries::new(
+            ema.iter().enumerate().map(|(i, v)| (i, *v)),
+            theme::GREEN.stroke_width(2),
+        ))?
+        .label("EMA")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], theme::GREEN));
 
     // Add text with statistics
     chart

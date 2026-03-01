@@ -2,7 +2,9 @@
 #![recursion_limit = "256"]
 #![feature(f16)]
 #![feature(stdarch_x86_avx512_bf16)]
+#![allow(dead_code)]
 
+use crate::torch::model::ModelVariant;
 use clap::{Parser, Subcommand};
 use colored::{self, Colorize};
 
@@ -10,12 +12,10 @@ mod agent;
 mod charts;
 mod constants;
 mod data;
+mod history;
 mod neural_net;
 mod strategies;
 mod torch;
-mod candle;
-// mod burn;
-mod history;
 mod types;
 mod utils;
 // mod gym;
@@ -33,9 +33,12 @@ enum Commands {
     Train {
         #[arg(short, long)]
         weights: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = ModelVariant::Base)]
+        model_size: ModelVariant,
     },
     Infer {
-        #[arg(short, long, default_value = "weights/ppo_ep1000.safetensors")]
+        #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
         #[arg(short, long, default_value_t = 10)]
@@ -52,9 +55,12 @@ enum Commands {
 
         #[arg(short, long, default_value_t = true)]
         random_start: bool,
+
+        #[arg(long, value_enum, default_value_t = ModelVariant::Base)]
+        model_size: ModelVariant,
     },
     Paper {
-        #[arg(short, long, default_value = "weights/ppo_ep1000.safetensors")]
+        #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
         #[arg(short, long, value_delimiter = ',', default_value = "TSLA,AAPL")]
@@ -68,6 +74,9 @@ enum Commands {
 
         #[arg(short, long, default_value_t = 0.8)]
         temperature: f64,
+
+        #[arg(long, value_enum, default_value_t = ModelVariant::Base)]
+        model_size: ModelVariant,
     },
 }
 
@@ -78,24 +87,52 @@ async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Train { weights }) => {
-            torch::ppo::train(weights.as_deref());
+        Some(Commands::Train {
+            weights,
+            model_size,
+        }) => {
+            torch::ppo::train(weights.as_deref(), *model_size).await;
         }
-        Some(Commands::Infer { weights, episodes, deterministic, temperature, tickers, random_start }) => {
-            torch::infer::run_inference(weights, *episodes, *deterministic, *temperature, tickers.clone(), *random_start)
-                .expect("inference failed");
+        Some(Commands::Infer {
+            weights,
+            episodes,
+            deterministic,
+            temperature,
+            tickers,
+            random_start,
+            model_size,
+        }) => {
+            torch::infer::run_inference(
+                weights,
+                *episodes,
+                *deterministic,
+                *temperature,
+                tickers.clone(),
+                *random_start,
+                *model_size,
+            )
+            .expect("inference failed");
         }
-        Some(Commands::Paper { weights, symbols, interval, max_steps, temperature }) => {
+        Some(Commands::Paper {
+            weights,
+            symbols,
+            interval,
+            max_steps,
+            temperature,
+            model_size,
+        }) => {
             torch::ibkr_infer::run_ibkr_paper_trading(
                 weights,
                 symbols.clone(),
                 *interval,
                 *max_steps,
                 *temperature,
-            ).expect("paper trading failed");
+                *model_size,
+            )
+            .expect("paper trading failed");
         }
         None => {
-            torch::ppo::train(None);
+            torch::ppo::train(None, ModelVariant::Base).await;
         }
     }
 

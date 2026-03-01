@@ -1,6 +1,6 @@
 use crate::charts::simple_chart;
-use crate::history::episode_tickers_separate::EpisodeHistory;
 use crate::constants::files::TRAINING_PATH;
+use crate::history::episode_tickers_separate::EpisodeHistory;
 use crate::utils::create_folder_if_not_exists;
 
 #[derive(Default, Debug)]

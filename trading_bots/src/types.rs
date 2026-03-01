@@ -1,4 +1,3 @@
-use hashbrown::HashMap;
 use ibapi::market_data::historical;
 
 /// A list of prices, where the last index is the most recent
@@ -13,41 +12,48 @@ pub struct Account {
 
 impl Account {
     pub fn new(cash: f64, ticker_count: usize) -> Self {
-        
         Self {
             cash,
             total_assets: cash,
             positions: vec![Position::default(); ticker_count],
         }
     }
-    
+
     pub fn update_total(&mut self, prices: &[Vec<f64>], step: usize) {
         self.total_assets = self.position_values(prices, step).iter().sum::<f64>() + self.cash;
     }
-    
+
     pub fn cash_cost_basis_ratio(&self) -> f64 {
         let cost_basis = self.cost_basis();
         if cost_basis == 0.0 {
             return 0.0;
         }
-        
+
         self.total_assets / cost_basis
     }
-    
+
     pub fn cost_basis(&self) -> f64 {
         self.positions.iter().map(|p| p.cost_basis()).sum::<f64>()
     }
-    
+
     pub fn position_percents(&self, prices: &[Vec<f64>], step: usize) -> Vec<f64> {
-        self.positions.iter().enumerate().map(|(index, p)| p.value_with_price(prices[index][step]) / self.total_assets).collect()
+        self.positions
+            .iter()
+            .enumerate()
+            .map(|(index, p)| p.value_with_price(prices[index][step]) / self.total_assets)
+            .collect()
     }
-    
+
     pub fn position_values(&self, prices: &[Vec<f64>], step: usize) -> Vec<f64> {
-        self.positions.iter().enumerate().map(|(index, p)| p.value_with_price(prices[index][step])).collect()
+        self.positions
+            .iter()
+            .enumerate()
+            .map(|(index, p)| p.value_with_price(prices[index][step]))
+            .collect()
     }
 }
 
-/// A list of positions 
+/// A list of positions
 pub type Positions = Vec<Position>;
 
 /// Key: Ticker, Value: Historical Bars
@@ -76,7 +82,7 @@ impl Position {
     pub fn value_with_price(&self, price: f64) -> f64 {
         price * self.quantity
     }
-    
+
     /// The percentage appreciation of the position based on a provided Price Per Unit
     pub fn appreciation(&self, price: f64) -> f64 {
         if self.quantity == 0.0 {

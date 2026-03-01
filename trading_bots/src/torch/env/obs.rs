@@ -97,19 +97,19 @@ impl Env {
     pub fn get_next_obs(&self) -> (Vec<f32>, Vec<f32>) {
         let mut price_deltas = Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER);
         let absolute_step = self.episode_start_offset + self.step;
+        debug_assert!(
+            absolute_step + 1 >= PRICE_DELTAS_PER_TICKER,
+            "absolute_step {} too small for full window {}",
+            absolute_step,
+            PRICE_DELTAS_PER_TICKER
+        );
 
         for &real_idx in &self.ticker_perm {
             let ticker_price_deltas = &self.price_deltas[real_idx];
-            let start_idx = absolute_step.saturating_sub(PRICE_DELTAS_PER_TICKER - 1);
-            let end_idx = (absolute_step + 1).min(ticker_price_deltas.len());
+            let end_idx = absolute_step + 1;
+            let start_idx = end_idx - PRICE_DELTAS_PER_TICKER;
             let slice = &ticker_price_deltas[start_idx..end_idx];
-            let to_take = slice.len().min(PRICE_DELTAS_PER_TICKER);
-
-            let padding_needed = PRICE_DELTAS_PER_TICKER - to_take;
-            if padding_needed > 0 {
-                price_deltas.extend(std::iter::repeat(0.0f32).take(padding_needed));
-            }
-            price_deltas.extend(slice.iter().take(to_take).map(|&x| x as f32));
+            price_deltas.extend(slice.iter().map(|&x| x as f32));
         }
 
         let static_obs = self.build_static_obs(absolute_step);
@@ -123,7 +123,10 @@ impl Env {
 
         for &real_idx in &self.ticker_perm {
             let ticker_price_deltas = &self.price_deltas[real_idx];
-            let v = ticker_price_deltas.get(absolute_step).copied().unwrap_or(0.0);
+            let v = ticker_price_deltas
+                .get(absolute_step)
+                .copied()
+                .unwrap_or(0.0);
             step_deltas.push(v as f32);
         }
 

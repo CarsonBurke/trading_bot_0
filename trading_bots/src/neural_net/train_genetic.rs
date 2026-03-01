@@ -1,16 +1,24 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use colored::Colorize;
-use hashbrown::{HashMap, HashSet};
-use ibapi::{market_data::historical, Client};
+use hashbrown::HashSet;
 
-use rand::{seq::{index::sample, SliceRandom}, Rng};
+use rand::seq::index::sample;
 use rust_neural_network::neural_network::NeuralNetwork;
 
 use crate::{
-    charts::simple_chart, constants::{
-        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
-    }, data::historical::get_historical_data, neural_net::{create::create_mapped_indicators, Replay}, strategies::basic_nn::basic_nn, types::{Account, MakeCharts}, utils::{create_folder_if_not_exists, get_mapped_price_deltas}
+    charts::simple_chart,
+    constants::{
+        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
+        files::TRAINING_PATH,
+        neural_net::{INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS},
+        TICKERS,
+    },
+    data::historical::get_historical_data,
+    neural_net::{create::create_mapped_indicators, Replay},
+    strategies::basic_nn::basic_nn,
+    types::MakeCharts,
+    utils::{create_folder_if_not_exists, get_mapped_price_deltas},
 };
 
 use super::create::{create_networks, Indicator, Indicators};
@@ -28,8 +36,7 @@ pub async fn train_networks_genetic() {
 
     let mut inputs = vec![
         // Percent of assets that are in cash
-        0.,
-        // Percent of total assets in the position
+        0., // Percent of total assets in the position
         0.,
         // Percent difference between current price and average purchase price (or 0 if we have no money in position)
         0.,
@@ -40,7 +47,7 @@ pub async fn train_networks_genetic() {
         inputs.push(0.);
     }
 
-    for _ in 0..(MAX_STEPS+INDEX_STEP) {
+    for _ in 0..(MAX_STEPS + INDEX_STEP) {
         inputs.push(0.);
     }
 
@@ -62,7 +69,7 @@ pub async fn train_networks_genetic() {
         let mut neural_net_ids = Vec::new();
         let mut handles = Vec::new();
 
-        let mut replays: Vec<Replay> = Vec::new();
+        let _replays: Vec<Replay> = Vec::new();
 
         let tickers_set = generate_tickers_set(&mut rng);
 
@@ -78,7 +85,7 @@ pub async fn train_networks_genetic() {
             let cloned_tickers_set = tickers_set.to_vec();
 
             // let indexes = ticker_indexes.clone();
-            
+
             // let cloned_historical = ticker_indexes.iter().map(|index| mapped_historical[*index].clone()).collect::<Vec<Vec<historical::Bar>>>();
             // let cloned_indicators = mapped_indicators.clone();
             // println!("cloned historical len: {}", cloned_historical.len());
@@ -151,7 +158,10 @@ pub async fn train_networks_genetic() {
             "Completed generation: {gen} with networks: {}",
             neural_nets.len()
         );
-        println!("{} {gen_best_assets:.2}", "Highest this gen:".bright_green());
+        println!(
+            "{} {gen_best_assets:.2}",
+            "Highest this gen:".bright_green()
+        );
     }
 
     println!("Completed training");
@@ -202,7 +212,7 @@ pub async fn train_networks_genetic() {
         "Improvement from training of : ${diff:.2} ({:.2}%)",
         (final_assets - first_assets) / start * 100.0
     );
-    
+
     chart_indicators(&mapped_indicators);
 
     last_net.write_to_file();
@@ -238,14 +248,19 @@ pub fn chart_indicators(mapped_indicators: &Vec<Indicators>) {
         simple_chart(&dir, "EmaDiff1000", &indicators[Indicator::EMADiff1000]).unwrap();
         simple_chart(&dir, "Rsi100", &indicators[Indicator::RSI100]).unwrap();
 
-        simple_chart(&dir, "StochasticOscillator", &indicators[Indicator::StochasticOscillator]).unwrap();
+        simple_chart(
+            &dir,
+            "StochasticOscillator",
+            &indicators[Indicator::StochasticOscillator],
+        )
+        .unwrap();
         simple_chart(&dir, "MacdDiff", &indicators[Indicator::MACDDiff]).unwrap();
     }
 }
 
 pub fn generate_tickers_set(rng: &mut impl rand::Rng) -> Vec<Vec<usize>> {
     let mut tickers_set = Vec::new();
-    
+
     for _ in 0..TICKER_SETS {
         let indexes: Vec<usize> = match sample(rng, TICKERS.len() - 1, SAMPLE_INDEXES) {
             rand::seq::index::IndexVec::U64(v) => v.into_iter().map(|i| i as usize).collect(),
@@ -254,7 +269,6 @@ pub fn generate_tickers_set(rng: &mut impl rand::Rng) -> Vec<Vec<usize>> {
 
         tickers_set.push(indexes.clone());
     }
-
 
     tickers_set
 }

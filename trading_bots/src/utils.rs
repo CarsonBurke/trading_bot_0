@@ -1,15 +1,6 @@
-use std::{collections::HashMap, fs};
+use std::fs;
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
-use ibapi::market_data::{historical::{self, Bar}, realtime};
-use plotters::{
-    coord::types::RangedCoordf32,
-    data,
-    prelude::{BitMapBackend, CandleStick, Circle, EmptyElement, IntoDrawingArea, Text},
-    series::{AreaSeries, LineSeries, PointSeries},
-    style::{Color, BLUE, GREEN, RED, WHITE, YELLOW},
-};
-use time::OffsetDateTime;
+use ibapi::market_data::historical::{self, Bar};
 
 use crate::types::{Data, MappedHistorical};
 
@@ -94,7 +85,7 @@ pub fn ema(data: &[f64], alpha: f64) -> Data {
     let mut averages = Vec::new();
     let mut previous = data[0];
 
-    for (index, value) in data.iter().enumerate() {
+    for (_index, value) in data.iter().enumerate() {
         let avg = *value * alpha + previous * (1. - alpha);
         averages.push(avg);
 
@@ -107,7 +98,7 @@ pub fn ema_diff_percent(data: &[f64], alpha: f64) -> Data {
     let mut averages = Vec::new();
     let mut previous = data[0];
 
-    for (index, value) in data.iter().enumerate() {
+    for (_index, value) in data.iter().enumerate() {
         let avg = *value * alpha + previous * (1. - alpha);
         let diff_percent = (value - avg) / avg;
         averages.push(diff_percent);
@@ -121,7 +112,11 @@ pub fn get_macd(data: &[f64]) -> Data {
     let ema_12 = ema(data, 1. / 12.);
     let ema_26 = ema(data, 1. / 26.);
 
-    ema_12.iter().zip(ema_26.iter()).map(|(a, b)| a - b).collect()
+    ema_12
+        .iter()
+        .zip(ema_26.iter())
+        .map(|(a, b)| a - b)
+        .collect()
 }
 
 pub fn get_stochastic_oscillator(bars: &[historical::Bar]) -> Data {
@@ -197,16 +192,16 @@ pub fn get_price_deltas(data: &[Bar]) -> Vec<f64> {
     let mut diff = Vec::with_capacity(data.len());
 
     for (index, value) in data.iter().enumerate() {
-        let previous = {
-            let (previous_index, overflowed) = index.overflowing_sub(1);
+        let (previous_index, overflowed) = index.overflowing_sub(1);
 
-            if overflowed {
-                100.
-            } else {
-                data[previous_index].close
-            }
-        };
-        diff.push((value.close - previous) / previous)
+        if overflowed {
+            // First element: ln(1) = 0
+            diff.push(0.0);
+        } else {
+            let previous = data[previous_index].close;
+            // Log return: ln(price / previous)
+            diff.push((value.close / previous).ln());
+        }
     }
 
     diff
@@ -218,8 +213,12 @@ pub fn get_mapped_price_normals(data: &MappedHistorical) -> Vec<Vec<f64>> {
 
 pub fn get_price_normals(data: &[Bar]) -> Vec<f64> {
     let mut norms = Vec::with_capacity(data.len());
-    
-    let min = data.iter().min_by(|a, b| a.close.partial_cmp(&b.close).unwrap()).unwrap().close;
+
+    let min = data
+        .iter()
+        .min_by(|a, b| a.close.partial_cmp(&b.close).unwrap())
+        .unwrap()
+        .close;
 
     for price in data.iter() {
         norms.push((price.close - min) / min)
@@ -241,7 +240,7 @@ pub fn round_to_stock_fractional(price: f64, max: f64) -> (f64, f64) {
     (max, quantity)
 }
 
-pub fn estimate_stock_value(financials: String) {
+pub fn estimate_stock_value(_financials: String) {
     // based on growth, with a weighted preference (ema) for more recent data
     // quarterly for the last 3 years?
     // total revenue is all that matters? Or also care about cost of revenue and marginal?
@@ -273,7 +272,7 @@ pub fn min_transaction_cost(assets: f64) -> f64 {
 }
 
 pub fn is_min_transaction(assets: f64, transaction: f64) -> bool {
-    return transaction > min_transaction_cost(assets)
+    return transaction > min_transaction_cost(assets);
 }
 
 pub fn percent_diff(bigger: f64, smaller: f64) -> f64 {

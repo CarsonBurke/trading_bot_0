@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::{theme, App, InferenceField};
 use super::base::BaseDialog;
+use crate::{theme, App, InferenceField};
 
 pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
     let inner = BaseDialog::new(" Run Inference ")
@@ -39,16 +39,23 @@ pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
         Span::styled("Esc", Style::default().fg(theme::RED)),
         Span::styled(": Cancel  ", Style::default().fg(theme::SUBTEXT1)),
         Span::styled("Tip: ", Style::default().fg(theme::SUBTEXT0)),
-        Span::styled("'400' -> 'ppo_ep400.safetensors'", Style::default().fg(theme::TEAL)),
+        Span::styled("'400' -> 'ppo_ep400.ot'", Style::default().fg(theme::TEAL)),
     ])])
     .style(Style::default().bg(theme::BASE));
     f.render_widget(help, chunks[0]);
 
     // Weights field
     let weights_focused = focused == InferenceField::Weights;
-    let weights_border = if weights_focused { theme::BLUE } else { theme::SURFACE2 };
+    let weights_border = if weights_focused {
+        theme::BLUE
+    } else {
+        theme::SURFACE2
+    };
     let weights_line = if app.input.is_empty() {
-        Line::from(vec![Span::styled(" infer.safetensors (default)", Style::default().fg(theme::OVERLAY0))])
+        Line::from(vec![Span::styled(
+            " infer.ot (default)",
+            Style::default().fg(theme::OVERLAY0),
+        )])
     } else {
         Line::from(vec![Span::styled(
             format!(" {}{}", app.input, if weights_focused { "" } else { "" }),
@@ -68,12 +75,23 @@ pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
 
     // Ticker field
     let ticker_focused = focused == InferenceField::Ticker;
-    let ticker_border = if ticker_focused { theme::BLUE } else { theme::SURFACE2 };
+    let ticker_border = if ticker_focused {
+        theme::BLUE
+    } else {
+        theme::SURFACE2
+    };
     let ticker_line = if app.ticker_input.is_empty() {
-        Line::from(vec![Span::styled(" (use default tickers)", Style::default().fg(theme::OVERLAY0))])
+        Line::from(vec![Span::styled(
+            " (use default tickers)",
+            Style::default().fg(theme::OVERLAY0),
+        )])
     } else {
         Line::from(vec![Span::styled(
-            format!(" {}{}", app.ticker_input, if ticker_focused { "" } else { "" }),
+            format!(
+                " {}{}",
+                app.ticker_input,
+                if ticker_focused { "" } else { "" }
+            ),
             Style::default().fg(theme::TEXT),
         )])
     };
@@ -90,12 +108,23 @@ pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
 
     // Episodes field
     let episodes_focused = focused == InferenceField::Episodes;
-    let episodes_border = if episodes_focused { theme::BLUE } else { theme::SURFACE2 };
+    let episodes_border = if episodes_focused {
+        theme::BLUE
+    } else {
+        theme::SURFACE2
+    };
     let episodes_line = if app.episodes_input.is_empty() {
-        Line::from(vec![Span::styled(" 10 (default)", Style::default().fg(theme::OVERLAY0))])
+        Line::from(vec![Span::styled(
+            " 10 (default)",
+            Style::default().fg(theme::OVERLAY0),
+        )])
     } else {
         Line::from(vec![Span::styled(
-            format!(" {}{}", app.episodes_input, if episodes_focused { "" } else { "" }),
+            format!(
+                " {}{}",
+                app.episodes_input,
+                if episodes_focused { "" } else { "" }
+            ),
             Style::default().fg(theme::TEXT),
         )])
     };
@@ -112,10 +141,18 @@ pub fn render(f: &mut Frame, app: &App, focused: InferenceField) {
 
     // Bottom help bar
     let help = Paragraph::new(vec![Line::from(vec![
-        Span::styled(" Enter ", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Enter ",
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("Start Inference", Style::default().fg(theme::SUBTEXT1)),
         Span::raw("   "),
-        Span::styled(" Esc ", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Esc ",
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("Cancel", Style::default().fg(theme::SUBTEXT1)),
     ])])
     .style(Style::default().fg(theme::TEXT).bg(theme::BASE))

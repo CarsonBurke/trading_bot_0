@@ -1,6 +1,11 @@
 use hashbrown::HashMap;
 
-use crate::{charts::{assets_chart, buy_sell_chart, reward_chart}, constants::{files::TRAINING_PATH, TICKERS}, types::MappedHistorical, utils::create_folder_if_not_exists};
+use crate::{
+    charts::{assets_chart, buy_sell_chart, reward_chart},
+    constants::{files::TRAINING_PATH, TICKERS},
+    types::MappedHistorical,
+    utils::create_folder_if_not_exists,
+};
 
 #[derive(Debug)]
 pub struct EpisodeHistory {

@@ -1,328 +1,135 @@
 use tch::{Kind, Tensor};
 
-use super::{
-    DebugMetrics, ModelOutput, TradingModel, FF_DIM, MODEL_DIM, PMA_QUERIES,
-    RESIDUAL_ALPHA_MAX, TEMPORAL_POOL_GROUPS, TIME_CROSS_LAYERS,
-};
-use crate::torch::constants::{PER_TICKER_STATIC_OBS, TICKERS_COUNT};
-
-const POOL_TEMPERATURE_MIN: f64 = 0.1;
-const POOL_TEMPERATURE_MAX: f64 = 8.0;
+use super::{DebugMetrics, ModelOutput, TradingModel, NUM_VALUE_BUCKETS, RESIDUAL_ALPHA_MAX, TIME_CROSS_LAYERS, SDE_DIM};
+use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
     pub(super) fn head_with_temporal_pool(
         &self,
         x_ssm: &Tensor,
-        global_static: &Tensor,
-        per_ticker_static: &Tensor,
         batch_size: i64,
+        compute_values: bool,
         _debug: bool,
     ) -> (ModelOutput, Option<DebugMetrics>) {
-        let x = x_ssm.permute([0, 2, 1]);
-        let x = self.post_ssm_ln.forward(&x);
-        let x = &x * x.apply(&self.ssm_gate).sigmoid();
-        let x = x.permute([0, 2, 1]);
-        let mut x = x.apply(&self.ssm_proj);
-        let temporal_len = x.size()[2];
+        let x = self.final_norm.forward(x_ssm);
+        // [batch*tickers, seq_len, model_dim] -> [batch, tickers, seq_len, model_dim]
+        let temporal_len = x.size()[1];
+        let x_time = x.view([batch_size, TICKERS_COUNT, temporal_len, self.model_dim]);
 
-        let x_time = x
-            .view([batch_size, TICKERS_COUNT, MODEL_DIM, temporal_len])
-            .permute([0, 3, 1, 2]);
-        let x_time = x_time;
-        let global_ctx = global_static
-            .apply(&self.time_global_ctx)
-            .unsqueeze(1)
-            .unsqueeze(1);
-        let exo_ticker_base = per_ticker_static
-            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&self.time_ticker_ctx)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let exo_ticker_embed = per_ticker_static
-            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&self.cross_ticker_embed)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM]);
-        let exo_ticker = &exo_ticker_base + &exo_ticker_embed;
-        let step_progress = global_static.narrow(1, 0, 1);
-        let angle1 = &step_progress * (2.0 * std::f64::consts::PI);
-        let angle2 = &step_progress * (4.0 * std::f64::consts::PI);
-        let time_feats = Tensor::cat(&[angle1.sin(), angle1.cos(), angle2.sin(), angle2.cos()], 1);
-        let time_pos = time_feats
-            .apply(&self.time_pos_proj)
-            .unsqueeze(1)
-            .unsqueeze(1);
-        let exo_global = global_ctx.squeeze_dim(1).squeeze_dim(1);
-        let exo_time = time_pos.squeeze_dim(1).squeeze_dim(1);
-        let exo_global = exo_global
-            .unsqueeze(1)
-            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
-        let exo_time = exo_time
-            .unsqueeze(1)
-            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
-        let exo_tokens = Tensor::cat(
-            &[
-                exo_global.unsqueeze(2),
-                exo_ticker.unsqueeze(2),
-                exo_time.unsqueeze(2),
-            ],
-            2,
-        );
-        let mut global_token = self
-            .global_ticker_token
-            .unsqueeze(0)
-            .expand(&[batch_size, TICKERS_COUNT, MODEL_DIM], false);
-        global_token = global_token + &exo_ticker + &exo_global + &exo_time;
-        let global_token = global_token.unsqueeze(1);
-        let mut x_time = Tensor::cat(&[x_time, global_token], 1);
-        let temporal_len_all = temporal_len + 1;
-        let x_time_flat = x_time
-            .permute([0, 2, 1, 3])
-            .reshape([batch_size * TICKERS_COUNT, temporal_len_all, MODEL_DIM]);
-        let exo_tokens_flat =
-            exo_tokens.reshape([batch_size * TICKERS_COUNT, 3, MODEL_DIM]);
-        let q_exo = x_time_flat.apply(&self.static_cross_q);
-        let k_exo = exo_tokens_flat.apply(&self.static_cross_k);
-        let v_exo = exo_tokens_flat.apply(&self.static_cross_v);
-        let exo_scores = q_exo.matmul(&k_exo.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
-        let exo_attn = exo_scores.softmax(-1, Kind::Float);
-        let exo_ctx = exo_attn
-            .matmul(&v_exo)
-            .apply(&self.static_cross_out)
-            .reshape([batch_size, TICKERS_COUNT, temporal_len_all, MODEL_DIM])
-            .permute([0, 2, 1, 3]);
-        x_time = x_time + exo_ctx;
-        let global_inject = global_static
-            .apply(&self.global_inject_down)
-            .apply(&self.global_inject_up);
-        let global_inject = global_inject * self.global_inject_gate_raw.sigmoid();
-        x_time = x_time + global_inject.unsqueeze(1).unsqueeze(1);
+        // Extract CLS token (position 0) as per-ticker representation.
+        let mut ticker_repr = x_time.select(2, 0);
+
+        // InterTickerBlock on ticker representations: [batch, tickers, dim]
         let alpha_scale = RESIDUAL_ALPHA_MAX / (TIME_CROSS_LAYERS as f64).sqrt();
         let block = &self.inter_ticker_block;
         let alpha_ticker_attn = block.alpha_ticker_attn.sigmoid() * alpha_scale;
         let alpha_mlp = block.alpha_mlp.sigmoid() * alpha_scale;
-        let mut x_2d = x_time;
-        let btk = batch_size * temporal_len_all * TICKERS_COUNT;
-        let bt = batch_size * temporal_len_all;
 
         let x_ticker_norm = block
             .ticker_ln
-            .forward(&x_2d.reshape([btk, MODEL_DIM]))
-            .reshape([bt, TICKERS_COUNT, MODEL_DIM]);
-        let latent_q = x_ticker_norm.apply(&block.ticker_latent_q);
-        let latent_k = block.ticker_latent_k.to_kind(latent_q.kind());
-        let latent_scores =
-            latent_q.matmul(&latent_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt();
-        let latent_attn = latent_scores.softmax(-1, Kind::Float);
-        let latent_v = block.ticker_latent_v.to_kind(latent_q.kind());
-        let latent_ctx = latent_attn
-            .matmul(&latent_v)
+            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]))
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
+        let qkv = x_ticker_norm.apply(&block.ticker_qkv);
+        let parts = qkv.split(self.model_dim, -1);
+        let q = block.q_norm.forward(&parts[0]).unsqueeze(1);
+        let k = block.k_norm.forward(&parts[1]).unsqueeze(1);
+        let v = parts[2].unsqueeze(1);
+        let ticker_ctx = Tensor::scaled_dot_product_attention(
+            &q, &k, &v,
+            None::<&Tensor>, 0.0, false, None, false,
+        )
+            .squeeze_dim(1)
             .apply(&block.ticker_out)
-            .reshape([batch_size, temporal_len_all, TICKERS_COUNT, MODEL_DIM]);
-        x_2d = x_2d + &latent_ctx * &alpha_ticker_attn;
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
+        ticker_repr = ticker_repr + &ticker_ctx * &alpha_ticker_attn;
 
         let mlp_in = block
             .mlp_ln
-            .forward(&x_2d.reshape([btk, MODEL_DIM]));
+            .forward(&ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]));
         let mlp_proj = mlp_in.apply(&block.mlp_fc1);
-        let mlp_parts = mlp_proj.split(FF_DIM, -1);
+        let mlp_parts = mlp_proj.split(self.ff_dim, -1);
         let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
             .apply(&block.mlp_fc2)
-            .reshape([batch_size, temporal_len_all, TICKERS_COUNT, MODEL_DIM]);
-        x_2d = x_2d + &mlp * &alpha_mlp;
-        let x_time = x_2d.permute([0, 2, 1, 3]).narrow(2, 0, temporal_len);
-        let per_ticker_static_expanded = per_ticker_static
-            .unsqueeze(2)
-            .expand(
-                &[
-                    batch_size,
-                    TICKERS_COUNT,
-                    temporal_len,
-                    PER_TICKER_STATIC_OBS as i64,
-                ],
-                false,
-            );
-        let combined = Tensor::cat(&[x_time, per_ticker_static_expanded], 3)
-            .reshape([
-                batch_size * TICKERS_COUNT * temporal_len,
-                MODEL_DIM + PER_TICKER_STATIC_OBS as i64,
-            ])
-            .apply(&self.static_proj);
-        let combined = self
-            .ln_static_proj
-            .forward(&combined)
-            .silu()
-            .reshape([batch_size, TICKERS_COUNT, temporal_len, MODEL_DIM]);
-        let global_ctx = global_static
-            .apply(&self.global_to_ticker)
-            .unsqueeze(1)
-            .unsqueeze(1);
-        let enriched = combined + global_ctx;
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
+        ticker_repr = ticker_repr + &mlp * &alpha_mlp;
 
-        let pooled_input = enriched
-            .reshape([batch_size * TICKERS_COUNT, temporal_len, MODEL_DIM])
-            .permute([0, 2, 1]);
-        let static_proj = per_ticker_static
-            .reshape([batch_size * TICKERS_COUNT, PER_TICKER_STATIC_OBS as i64])
-            .apply(&self.static_to_temporal);
-        let static_proj = self
-            .ln_static_temporal
-            .forward(&static_proj)
-            .unsqueeze(2)
-            .expand(&[-1, -1, temporal_len], false);
-        let combined_full = Tensor::cat(&[pooled_input.shallow_clone(), static_proj], 1);
-        let combined_full_t = combined_full.permute([0, 2, 1]);
-        let bt = batch_size * TICKERS_COUNT;
-        let q = self
-            .pma_queries
-            .unsqueeze(0)
-            .expand(&[bt, PMA_QUERIES, MODEL_DIM], false)
-            .apply(&self.pma_q_proj);
-        let k = combined_full_t.apply(&self.pma_k_proj);
-        let v = combined_full_t.apply(&self.pma_v_proj);
-        let q = q
-            .view([bt, PMA_QUERIES, self.num_heads, self.head_dim])
-            .permute([0, 2, 1, 3]);
-        let k = k
-            .view([bt, temporal_len, self.num_heads, self.head_dim])
-            .permute([0, 2, 1, 3]);
-        let v = v
-            .view([bt, temporal_len, self.num_heads, self.head_dim])
-            .permute([0, 2, 1, 3]);
-        let scores = q.matmul(&k.transpose(-2, -1)) / (self.head_dim as f64).sqrt();
-        let attn = scores.softmax(-1, Kind::Float);
-        let ctx = attn
-            .matmul(&v)
-            .permute([0, 2, 1, 3])
-            .reshape([bt, PMA_QUERIES, MODEL_DIM])
-            .apply(&self.pma_out);
-        let pooled_enriched = ctx
-            .mean_dim([1].as_slice(), false, Kind::Float)
-            .reshape([batch_size, TICKERS_COUNT, MODEL_DIM])
-            .to_kind(enriched.kind());
+        // Actor head: per-ticker MLP → per-ticker logits + cash logit
+        let mut actor_x = ticker_repr.reshape([batch_size * TICKERS_COUNT, self.model_dim]);
+        for i in 0..self.actor_mlp_linears.len() {
+            actor_x = actor_x.apply(&self.actor_mlp_linears[i]);
+            actor_x = self.actor_mlp_norms[i].forward(&actor_x);
+            actor_x = actor_x.silu();
+        }
 
-        let head_base = self
-            .policy_ln
-            .forward(&pooled_enriched)
-            .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
-            .apply(&self.head_proj);
-        let head_base = self
-            .head_ln
-            .forward(&head_base)
-            .silu()
-            .reshape([batch_size, TICKERS_COUNT, super::HEAD_HIDDEN]);
+        // Per-ticker logits (shared actor_out: model_dim -> 1)
+        let ticker_logits = actor_x
+            .apply(&self.actor_out)
+            .reshape([batch_size, TICKERS_COUNT]);
 
-        let token_seq = enriched.reshape([batch_size, TICKERS_COUNT * temporal_len, MODEL_DIM]);
-        let cash_slope =
-            self.cash_recent_slope_raw.sigmoid() * (2.0 / temporal_len as f64);
-        let positions = self.decay_positions.narrow(0, 0, temporal_len);
-        let distances = (temporal_len - 1) as f64 - &positions;
-        let ones = self.decay_ones.narrow(0, 0, temporal_len);
-        let cash_decay = (&ones - &distances * &cash_slope).clamp_min(0.0);
-        let cash_decay = &cash_decay / cash_decay.sum(Kind::Float).clamp_min(1e-6);
-        let cash_decay = cash_decay
-            .reshape([1, 1, temporal_len, 1])
-            .to_kind(enriched.kind());
-        let cash_recent = (&enriched * &cash_decay)
-            .sum_dim_intlist([2].as_slice(), false, enriched.kind())
-            .mean_dim([1].as_slice(), false, enriched.kind());
-        let cash_recent_proj = cash_recent.apply(&self.cash_recent_proj);
-        let cash_recent_gate = cash_recent.apply(&self.cash_recent_gate).sigmoid();
-        let cash_q = self
-            .cash_queries
-            .unsqueeze(0)
-            .expand(&[batch_size, self.cash_pool_queries, MODEL_DIM], false)
-            + (cash_recent_proj * cash_recent_gate).unsqueeze(1);
-        let cash_q = cash_q
-            .apply(&self.cash_q_proj);
-        let cash_k = token_seq.apply(&self.cash_k_proj);
-        let cash_v = token_seq.apply(&self.cash_v_proj);
-        let cash_temp = self.cash_attn_temp_raw.exp().clamp(POOL_TEMPERATURE_MIN, POOL_TEMPERATURE_MAX);
-        let scores =
-            cash_q.matmul(&cash_k.transpose(-2, -1)) / (MODEL_DIM as f64).sqrt() * cash_temp;
-        let cash_attn_f = scores.softmax(-1, Kind::Float);
-        let cash_ctx = cash_attn_f.matmul(&cash_v);
-        let global_tokens = self
-            .global_tokens
-            .unsqueeze(0)
-            .expand(&[batch_size, super::GLOBAL_TOKEN_COUNT, MODEL_DIM], false)
-            + global_static
-                .apply(&self.global_token_proj)
-                .unsqueeze(1);
-        let global_summary = global_tokens
-            .mean_dim([1].as_slice(), false, Kind::Float)
-            .apply(&self.global_token_merge);
-        let cash_summary = cash_ctx
-            .mean_dim(1, false, Kind::Float)
-            .apply(&self.cash_merge)
-            .to_kind(pooled_enriched.kind());
-        let cash_summary = cash_summary + global_summary;
-        let entropy_denom = (temporal_len as f64).ln().max(1.0);
-        let temporal_attn = attn
-            .mean_dim([1, 2].as_slice(), false, Kind::Float)
-            .reshape([batch_size, TICKERS_COUNT, temporal_len]);
-        let temporal_attn_entropy = -(temporal_attn.clamp_min(1e-9)
-            * temporal_attn.clamp_min(1e-9).log())
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-            .mean_dim([1].as_slice(), false, Kind::Float)
-            / entropy_denom;
-        let cash_attn_entropy = -(cash_attn_f.clamp_min(1e-9)
-            * cash_attn_f.clamp_min(1e-9).log())
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-            .mean_dim([1].as_slice(), false, Kind::Float)
-            / entropy_denom;
-        let attn_entropy =
-            (temporal_attn_entropy + cash_attn_entropy).to_kind(pooled_enriched.kind());
+        // Cash logit from mean-pooled ticker representations
+        let cash_logit = actor_x
+            .reshape([batch_size, TICKERS_COUNT, self.model_dim])
+            .mean_dim([1].as_slice(), false, actor_x.kind())
+            .apply(&self.cash_proj)
+            .squeeze_dim(-1);
 
-        let value_tokens = self
-            .value_ln
-            .forward(&pooled_enriched)
-            .apply(&self.value_mlp_fc1)
-            .silu()
-            .apply(&self.value_mlp_fc2);
-        let value_logits_ticker = value_tokens
-            .reshape([batch_size * TICKERS_COUNT, MODEL_DIM])
-            .apply(&self.critic_out)
-            .reshape([batch_size, TICKERS_COUNT, super::NUM_VALUE_BUCKETS]);
-        let value_cash = self
-            .value_ln
-            .forward(&cash_summary)
-            .apply(&self.value_mlp_fc1)
-            .silu()
-            .apply(&self.value_mlp_fc2)
-            .apply(&self.critic_out)
-            .reshape([batch_size, 1, super::NUM_VALUE_BUCKETS]);
-        let critic_logits = Tensor::cat(&[value_logits_ticker, value_cash], 1);
-        let critic_probs = critic_logits.softmax(-1, Kind::Float);
-        let values = critic_probs
-            .matmul(&self.bucket_centers.unsqueeze(-1))
-            .squeeze_dim(-1)
-            .to_kind(pooled_enriched.kind());
+        // action_mean: [B, ACTION_DIM]
+        let action_mean = Tensor::cat(&[ticker_logits, cash_logit.unsqueeze(-1)], -1);
 
-        let action_mean_ticker = head_base.apply(&self.actor_out).squeeze_dim(-1);
-        let cash_head_base = self
-            .policy_ln
-            .forward(&cash_summary)
-            .apply(&self.head_proj);
-        let cash_head_base = self.head_ln.forward(&cash_head_base).silu();
-        let cash_logit = cash_head_base.apply(&self.actor_out).squeeze_dim(-1);
-        let action_mean = Tensor::cat(&[action_mean_ticker, cash_logit.unsqueeze(1)], 1);
-        let sde_input = head_base
-            .reshape([batch_size * TICKERS_COUNT, super::HEAD_HIDDEN]);
-        let sde_latent = sde_input.apply(&self.sde_fc);
-        let sde_latent = (self.ln_sde.forward(&sde_latent) / 1.5).tanh();
-        let sde_latent = sde_latent.reshape([batch_size, TICKERS_COUNT, -1]);
-        let log_std = (&self.log_std_param + super::LOG_STD_INIT).clamp(-3.0, -0.5);
-        let std_sq = log_std.exp().pow_tensor_scalar(2).transpose(0, 1);
-        let variance = (sde_latent.pow_tensor_scalar(2) * std_sq.unsqueeze(0))
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-        let action_log_std_ticker = (variance + super::SDE_EPS).sqrt().log();
-        let cash_log_std = (&self.cash_log_std_param + super::LOG_STD_INIT).clamp(-3.0, -0.5);
-        let action_log_std = Tensor::cat(
-            &[
-                action_log_std_ticker,
-                cash_log_std.expand(&[batch_size, 1], false),
-            ],
-            1,
-        );
+        // gSDE: FC → softsign*2 → quadratic form for per-ticker variance
+        // 2*softsign bounds factors to (-2, 2) with polynomial gradient decay (1/(1+|x|)²),
+        // maintaining gradient flow even at extremes unlike tanh's exponential decay.
+        let sde_raw = actor_x.apply(&self.sde_fc);
+        let sde_softsign = &sde_raw / (sde_raw.abs() + 1.0);
+        let sde_latent = (sde_softsign * 2.0)
+            .reshape([batch_size, TICKERS_COUNT, SDE_DIM]);
+
+        // Gram matrix covariance: L = sde_latent / sqrt(SDE_DIM), cov = LL^T + εI.
+        // Fixed 1/sqrt(d) normalization: with tanh ∈ [-1,1], max per-ticker std ≈ 1.0.
+        let l_factor = &sde_latent * (1.0 / (SDE_DIM as f64).sqrt());
+        // Cholesky in fp32 for numerical stability (bf16 lacks precision for matrix decomposition).
+        let l_factor = l_factor.to_kind(Kind::Float);
+        let cov = l_factor.bmm(&l_factor.transpose(1, 2))
+            + Tensor::eye(TICKERS_COUNT, (Kind::Float, sde_latent.device())) * 1e-4;
+        // Cash is deterministic (redundant DOF on simplex — noise is pure gradient variance).
+        // action_cov_chol is [B, TICKERS_COUNT, TICKERS_COUNT]; cash excluded from log_prob.
+        let action_cov_chol = cov.linalg_cholesky(false);
+
+        // Critic: distributional two-hot value head.
+        let critic_input = ticker_repr.reshape([batch_size, TICKERS_COUNT * self.model_dim]);
+        let mut critic_x = critic_input.shallow_clone();
+        for i in 0..self.value_mlp_linears.len() {
+            critic_x = critic_x.apply(&self.value_mlp_linears[i]);
+            critic_x = self.value_mlp_norms[i].forward(&critic_x);
+            critic_x = critic_x.silu();
+        }
+        let critic_logits = critic_x.apply(&self.value_out); // [batch, NUM_VALUE_BUCKETS]
+
+        let values = if compute_values {
+            let probs = critic_logits.softmax(-1, Kind::Float);
+            let centers = self.bucket_centers.to_kind(probs.kind());
+            let m: i64 = (NUM_VALUE_BUCKETS - 1) / 2; // 127
+            let p1 = probs.narrow(-1, 0, m);
+            let p2 = probs.narrow(-1, m, 1);
+            let p3 = probs.narrow(-1, m + 1, m);
+            let b1 = centers.narrow(0, 0, m);
+            let b2 = centers.narrow(0, m, 1);
+            let b3 = centers.narrow(0, m + 1, m);
+            let left = (&p1 * &b1).flip([-1]);
+            let right = &p3 * &b3;
+            ((&p2 * &b2).sum_dim_intlist(-1, false, Kind::Float)
+                + (&left + &right).sum_dim_intlist(-1, false, Kind::Float))
+                .to_kind(ticker_repr.kind())
+        } else {
+            Tensor::zeros(&[batch_size], (ticker_repr.kind(), ticker_repr.device()))
+        };
+
+        // Cast all outputs to fp32 for loss computation
+        let values = values.to_kind(Kind::Float);
+        let critic_logits = critic_logits.to_kind(Kind::Float);
+        let critic_input = critic_input.to_kind(Kind::Float);
+        let action_mean = action_mean.to_kind(Kind::Float);
+        let action_cov_chol = action_cov_chol.to_kind(Kind::Float);
 
         let debug_metrics = None;
 
@@ -330,8 +137,9 @@ impl TradingModel {
             (
                 values,
                 critic_logits,
-                (action_mean, action_log_std),
-                attn_entropy,
+                critic_input,
+                action_mean,
+                action_cov_chol,
             ),
             debug_metrics,
         )

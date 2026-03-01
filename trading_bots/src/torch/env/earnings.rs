@@ -1,6 +1,6 @@
-use std::sync::{Arc, OnceLock, Mutex};
-use std::collections::HashMap;
 use crate::data::EarningsReport;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Global cache for earnings indicators (ticker -> indicators)
 static EARNINGS_CACHE: OnceLock<Mutex<HashMap<String, Arc<EarningsIndicators>>>> = OnceLock::new();
@@ -42,7 +42,10 @@ impl EarningsIndicators {
         } else {
             Arc::new(Self::compute(reports, bar_dates, prices))
         };
-        cache.lock().unwrap().insert(ticker.to_string(), computed.clone());
+        cache
+            .lock()
+            .unwrap()
+            .insert(ticker.to_string(), computed.clone());
         computed
     }
 

@@ -8,17 +8,39 @@ use shared::theme::plotters_colors as theme;
 const CHART_DIMS: (u32, u32) = (2560, 780);
 
 pub fn render_report(report: &Report) -> Result<DynamicImage> {
+    render_report_with_options(report, 0, true)
+}
+
+pub fn render_report_with_skip(report: &Report, skip: usize) -> Result<DynamicImage> {
+    render_report_with_options(report, skip, true)
+}
+
+pub fn render_report_with_options(
+    report: &Report,
+    skip: usize,
+    show_legend: bool,
+) -> Result<DynamicImage> {
     let mut buffer = vec![0u8; (CHART_DIMS.0 * CHART_DIMS.1 * 3) as usize];
     {
         let root = BitMapBackend::with_buffer(&mut buffer, CHART_DIMS).into_drawing_area();
         root.fill(&theme::BASE)?;
 
+        let x_offset = skip as u32;
+
         match &report.kind {
             ReportKind::Simple { values, ema_alpha } => {
-                render_simple(&root, report, values, *ema_alpha)?;
+                let values = skip_slice(values, skip);
+                render_simple(&root, report, values, *ema_alpha, x_offset, show_legend)?;
             }
             ReportKind::MultiLine { series } => {
-                render_multi_line(&root, report, series)?;
+                let series: Vec<ReportSeries> = series
+                    .iter()
+                    .map(|s| ReportSeries {
+                        label: s.label.clone(),
+                        values: skip_slice(&s.values, skip).to_vec(),
+                    })
+                    .collect();
+                render_multi_line(&root, report, &series, x_offset, show_legend)?;
             }
             ReportKind::Assets {
                 total,
@@ -26,14 +48,45 @@ pub fn render_report(report: &Report) -> Result<DynamicImage> {
                 positioned,
                 benchmark,
             } => {
-                render_assets(&root, report, total, cash, positioned.as_ref(), benchmark.as_ref())?;
+                let total = skip_slice(total, skip);
+                let cash = skip_slice(cash, skip);
+                let positioned: Option<Vec<f32>> =
+                    positioned.as_ref().map(|p| skip_slice(p, skip).to_vec());
+                let benchmark: Option<Vec<f32>> =
+                    benchmark.as_ref().map(|b| skip_slice(b, skip).to_vec());
+                render_assets(
+                    &root,
+                    report,
+                    total,
+                    cash,
+                    positioned.as_ref(),
+                    benchmark.as_ref(),
+                    x_offset,
+                    show_legend,
+                )?;
             }
             ReportKind::BuySell {
                 prices,
                 buys,
                 sells,
             } => {
-                render_buy_sell(&root, report, prices, buys, sells)?;
+                let prices = skip_slice(prices, skip);
+                // Filter buys/sells to only those within skipped range, adjust indices
+                let buys: Vec<TradePoint> = buys
+                    .iter()
+                    .filter(|p| (p.index as usize) >= skip)
+                    .map(|p| TradePoint {
+                        index: p.index - skip as u32,
+                    })
+                    .collect();
+                let sells: Vec<TradePoint> = sells
+                    .iter()
+                    .filter(|p| (p.index as usize) >= skip)
+                    .map(|p| TradePoint {
+                        index: p.index - skip as u32,
+                    })
+                    .collect();
+                render_buy_sell(&root, report, prices, &buys, &sells, x_offset)?;
             }
             ReportKind::Observations { .. } => {
                 return Err(anyhow!("report type not renderable"));
@@ -48,11 +101,21 @@ pub fn render_report(report: &Report) -> Result<DynamicImage> {
     Ok(DynamicImage::ImageRgb8(image))
 }
 
+fn skip_slice<T>(slice: &[T], skip: usize) -> &[T] {
+    if skip >= slice.len() {
+        &[]
+    } else {
+        &slice[skip..]
+    }
+}
+
 fn render_simple(
     root: &DrawingArea<BitMapBackend, Shift>,
     report: &Report,
     values: &[f32],
     ema_alpha: Option<f64>,
+    x_offset: u32,
+    show_legend: bool,
 ) -> Result<()> {
     if values.is_empty() {
         return Ok(());
@@ -61,12 +124,13 @@ fn render_simple(
     let scale = report.scale;
     let (y_min, y_max) = range_for(values, scale == ScaleKind::Symlog)?;
     let title = normalize_title(&report.title);
+    let x_end = x_offset + values.len() as u32;
     let mut chart = plotters::chart::ChartBuilder::on(root)
         .caption(title.as_str(), ("sans-serif", 20, &theme::TEXT))
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
-        .build_cartesian_2d(0..values.len() as u32, y_min..y_max)?;
+        .build_cartesian_2d(x_offset..x_end, y_min..y_max)?;
 
     let mut mesh = chart.configure_mesh();
     mesh.label_style(("sans-serif", 15, &theme::TEXT))
@@ -87,7 +151,7 @@ fn render_simple(
         .iter()
         .enumerate()
         .filter(|(_, v)| v.is_finite())
-        .map(|(idx, v)| (idx as u32, map_value(*v as f64, scale)));
+        .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
 
     if scale == ScaleKind::Symlog {
         chart
@@ -113,7 +177,7 @@ fn render_simple(
             .iter()
             .enumerate()
             .filter(|(_, v)| v.is_finite())
-            .map(|(idx, v)| (idx as u32, map_value(*v as f64, scale)));
+            .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
         chart
             .draw_series(LineSeries::new(
                 ema_series,
@@ -123,13 +187,15 @@ fn render_simple(
             .legend(legend_rect(&theme::YELLOW));
     }
 
-    chart
-        .configure_series_labels()
-        .position(LegendConfig::position())
-        .background_style(LegendConfig::background())
-        .border_style(LegendConfig::border())
-        .label_font(LegendConfig::font())
-        .draw()?;
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
 
     Ok(())
 }
@@ -138,19 +204,22 @@ fn render_multi_line(
     root: &DrawingArea<BitMapBackend, Shift>,
     report: &Report,
     series: &[ReportSeries],
+    x_offset: u32,
+    show_legend: bool,
 ) -> Result<()> {
-    let all_values: Vec<f32> = series.iter().flat_map(|s| s.values.iter()).copied().collect();
+    let all_values: Vec<f32> = series
+        .iter()
+        .flat_map(|s| s.values.iter())
+        .copied()
+        .collect();
     if all_values.is_empty() {
         return Ok(());
     }
 
     let scale = report.scale;
     let (y_min, y_max) = range_for(&all_values, scale == ScaleKind::Symlog)?;
-    let x_max = series
-        .iter()
-        .map(|s| s.values.len())
-        .max()
-        .unwrap_or(1) as u32;
+    let x_len = series.iter().map(|s| s.values.len()).max().unwrap_or(1) as u32;
+    let x_end = x_offset + x_len;
 
     let title = normalize_title(&report.title);
     let mut chart = plotters::chart::ChartBuilder::on(root)
@@ -158,7 +227,7 @@ fn render_multi_line(
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
-        .build_cartesian_2d(0..x_max, y_min..y_max)?;
+        .build_cartesian_2d(x_offset..x_end, y_min..y_max)?;
 
     let mut mesh = chart.configure_mesh();
     mesh.label_style(("sans-serif", 15, &theme::TEXT))
@@ -190,7 +259,7 @@ fn render_multi_line(
             .iter()
             .enumerate()
             .filter(|(_, v)| v.is_finite())
-            .map(|(idx, v)| (idx as u32, map_value(*v as f64, scale)));
+            .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
         chart
             .draw_series(LineSeries::new(
                 mapped,
@@ -200,13 +269,15 @@ fn render_multi_line(
             .legend(legend_rect(color));
     }
 
-    chart
-        .configure_series_labels()
-        .position(LegendConfig::position())
-        .background_style(LegendConfig::background())
-        .border_style(LegendConfig::border())
-        .label_font(LegendConfig::font())
-        .draw()?;
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
 
     Ok(())
 }
@@ -218,6 +289,8 @@ fn render_assets(
     cash: &[f32],
     positioned: Option<&Vec<f32>>,
     benchmark: Option<&Vec<f32>>,
+    x_offset: u32,
+    show_legend: bool,
 ) -> Result<()> {
     if total.is_empty() {
         return Ok(());
@@ -236,6 +309,7 @@ fn render_assets(
     }
 
     let y_max = max_val as f32 * 1.1;
+    let x_end = x_offset + total.len() as u32;
 
     let title = normalize_title(&report.title);
     let mut chart = plotters::chart::ChartBuilder::on(root)
@@ -243,7 +317,7 @@ fn render_assets(
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
-        .build_cartesian_2d(0..total.len() as u32, 0.0..y_max)?;
+        .build_cartesian_2d(x_offset..x_end, 0.0..y_max)?;
 
     chart
         .configure_mesh()
@@ -254,16 +328,16 @@ fn render_assets(
 
     chart
         .draw_series(
-        AreaSeries::new(
-            total
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value as f32)),
-            0.0,
-            theme::BLUE.mix(0.2),
-        )
-        .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
-    )?
+            AreaSeries::new(
+                total
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                0.0,
+                theme::BLUE.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
+        )?
         .label("total")
         .legend(legend_rect(&theme::BLUE));
 
@@ -271,54 +345,56 @@ fn render_assets(
     if !positioned.is_empty() {
         chart
             .draw_series(
-            AreaSeries::new(
-                positioned
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| (index as u32, *value as f32)),
-                0.0,
-                theme::RED.mix(0.2),
-            )
-            .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
-        )?
+                AreaSeries::new(
+                    positioned
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                    0.0,
+                    theme::RED.mix(0.2),
+                )
+                .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
+            )?
             .label("positioned")
             .legend(legend_rect(&theme::RED));
     }
 
     chart
         .draw_series(
-        AreaSeries::new(
-            cash.iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value as f32)),
-            0.0,
-            theme::GREEN.mix(0.2),
-        )
-        .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
-    )?
+            AreaSeries::new(
+                cash.iter()
+                    .enumerate()
+                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                0.0,
+                theme::GREEN.mix(0.2),
+            )
+            .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
+        )?
         .label("cash")
         .legend(legend_rect(&theme::GREEN));
 
     if let Some(bench) = benchmark {
         chart
             .draw_series(LineSeries::new(
-            bench
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (index as u32, *value as f32)),
-            ShapeStyle::from(&theme::MAUVE).stroke_width(1),
-        ))?
+                bench
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                ShapeStyle::from(&theme::MAUVE).stroke_width(1),
+            ))?
             .label("benchmark")
             .legend(legend_rect(&theme::MAUVE));
     }
 
-    chart
-        .configure_series_labels()
-        .position(LegendConfig::position())
-        .background_style(LegendConfig::background())
-        .border_style(LegendConfig::border())
-        .label_font(LegendConfig::font())
-        .draw()?;
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
 
     Ok(())
 }
@@ -329,6 +405,7 @@ fn render_buy_sell(
     prices: &[f32],
     buys: &[TradePoint],
     sells: &[TradePoint],
+    x_offset: u32,
 ) -> Result<()> {
     if prices.is_empty() {
         return Ok(());
@@ -345,6 +422,7 @@ fn render_buy_sell(
     let y_range = (y_max - y_min).max(0.01);
     let y_min = y_min - y_range * 0.05;
     let y_max = y_max + y_range * 0.05;
+    let x_end = x_offset + prices.len() as u32;
 
     let title = normalize_title(&report.title);
     let mut chart = plotters::chart::ChartBuilder::on(root)
@@ -352,7 +430,7 @@ fn render_buy_sell(
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(50)
-        .build_cartesian_2d(0..prices.len() as u32, y_min..y_max)?;
+        .build_cartesian_2d(x_offset..x_end, y_min..y_max)?;
 
     chart
         .configure_mesh()
@@ -366,27 +444,39 @@ fn render_buy_sell(
             prices
                 .iter()
                 .enumerate()
-                .map(|(index, value)| (index as u32, *value as f64)),
+                .map(|(index, value)| (x_offset + index as u32, *value as f64)),
             0.0f64,
             theme::BLUE.mix(0.2),
         )
         .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
     )?;
 
+    // Filter and offset buy/sell points
     let point_size = 3;
     chart.draw_series(PointSeries::of_element(
         sells
             .iter()
-            .map(|p| (p.index as u32, prices.get(p.index as usize).copied().unwrap_or(0.0) as f64)),
+            .filter(|p| (p.index as usize) < prices.len())
+            .map(|p| {
+                (
+                    x_offset + p.index,
+                    prices.get(p.index as usize).copied().unwrap_or(0.0) as f64,
+                )
+            }),
         point_size,
         theme::YELLOW.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
     ))?;
 
     chart.draw_series(PointSeries::of_element(
-        buys
-            .iter()
-            .map(|p| (p.index as u32, prices.get(p.index as usize).copied().unwrap_or(0.0) as f64)),
+        buys.iter()
+            .filter(|p| (p.index as usize) < prices.len())
+            .map(|p| {
+                (
+                    x_offset + p.index,
+                    prices.get(p.index as usize).copied().unwrap_or(0.0) as f64,
+                )
+            }),
         point_size,
         theme::RED.mix(0.9).filled(),
         &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
@@ -479,7 +569,7 @@ struct LegendConfig;
 
 impl LegendConfig {
     fn position() -> SeriesLabelPosition {
-        SeriesLabelPosition::UpperRight
+        SeriesLabelPosition::UpperLeft
     }
 
     fn background() -> RGBAColor {

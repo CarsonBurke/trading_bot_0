@@ -1,50 +1,69 @@
-use tch::{nn, Device, Kind, Tensor};
 use std::path::Path;
 use std::time::Instant;
+use tch::{nn, Device, Kind, Tensor};
 
-use crate::torch::load::load_var_store_partial;
-use crate::torch::model::{TradingModel, TradingModelConfig};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::Env;
+use crate::torch::load::load_var_store_partial;
+use crate::torch::model::{
+    ModelVariant, TradingModel, TradingModelConfig,
+};
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: Device,
+    model_variant: ModelVariant,
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
     let mut vs = nn::VarStore::new(device);
-    let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+    let model = TradingModel::new_with_config(
+        &vs.root(),
+        TradingModelConfig {
+            variant: model_variant,
+            ..TradingModelConfig::default()
+        },
+    );
     let _ = load_var_store_partial(&mut vs, weight_path)?;
+    vs.bfloat16();
     Ok((vs, model))
 }
 
-pub fn sample_actions_from_dist(
+pub fn sample_actions(
     action_mean: &Tensor,
-    action_log_std: &Tensor,
+    action_cov_chol: &Tensor,  // [batch, TICKERS_COUNT, TICKERS_COUNT] lower-triangular Cholesky
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let batch_size = action_mean.size()[0];
-    let noise_ticker =
-        Tensor::randn([batch_size, TICKERS_COUNT], (Kind::Float, action_mean.device()));
-    let noise_cash = Tensor::zeros([batch_size, 1], (Kind::Float, action_mean.device()));
-    let noise = Tensor::cat(&[noise_ticker, noise_cash], 1);
+    let action_mean = action_mean.to_kind(Kind::Float);
 
-    let u = if deterministic || temperature == 0.0 {
-        action_mean.shallow_clone()
+    let u = if deterministic {
+        action_mean
     } else {
-        let action_std = action_log_std.exp() * temperature;
-        action_mean + &action_std * noise
+        let chol = action_cov_chol.to_kind(Kind::Float);
+        let batch = action_mean.size()[0];
+        let z = Tensor::randn(&[batch, TICKERS_COUNT, 1], (Kind::Float, action_mean.device()));
+        let ticker_noise = chol.bmm(&z).squeeze_dim(-1); // [B, TICKERS_COUNT]
+        let zero_cash = Tensor::zeros(&[batch, 1], (Kind::Float, action_mean.device()));
+        let noise = Tensor::cat(&[ticker_noise, zero_cash], -1);
+        &action_mean + noise
     };
+
+    let u = if temperature != 1.0 && temperature != 0.0 {
+        &u / temperature
+    } else {
+        u
+    };
+
     u.softmax(-1, Kind::Float)
 }
 
 pub fn run_inference<P: AsRef<Path>>(
     weight_path: P,
     num_episodes: usize,
-    deterministic: bool,
-    temperature: f64,
+    _deterministic: bool,
+    _temperature: f64,
     tickers: Option<Vec<String>>,
     random_start: bool,
+    model_variant: ModelVariant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting inference run...");
     println!("Loading model from: {:?}", weight_path.as_ref());
@@ -55,7 +74,7 @@ pub fn run_inference<P: AsRef<Path>>(
     let deterministic = true;
     let temperature = 0.0;
 
-    let (_vs, model) = load_model(&weight_path, device)?;
+    let (_vs, model) = load_model(&weight_path, device, model_variant)?;
 
     let mut env = match tickers {
         Some(t) => Env::new_with_tickers(t, random_start),
@@ -74,12 +93,9 @@ pub fn run_inference<P: AsRef<Path>>(
             [TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
             (Kind::Float, device),
         );
-        let mut price_deltas_step =
-            Tensor::zeros([TICKERS_COUNT], (Kind::Float, device));
-        let mut static_obs_tensor = Tensor::zeros(
-            [STATIC_OBSERVATIONS as i64],
-            (Kind::Float, device),
-        );
+        let mut price_deltas_incremental = Tensor::zeros([TICKERS_COUNT], (Kind::Float, device));
+        let mut static_obs_tensor =
+            Tensor::zeros([STATIC_OBSERVATIONS as i64], (Kind::Float, device));
         price_deltas_full.copy_(&Tensor::from_slice(&price_deltas));
         static_obs_tensor.copy_(&Tensor::from_slice(&static_obs));
         let mut use_full = true;
@@ -89,21 +105,20 @@ pub fn run_inference<P: AsRef<Path>>(
         for step in 0..env.max_step {
             env.step = step;
 
-            // First call: model.step detects full obs and initializes stream state
-            // Subsequent calls: model.step processes single delta per ticker
-            let (action_mean, action_log_std) = tch::no_grad(|| {
+            // First call uses full history, then we switch to incremental per-ticker deltas.
+            let (action_mean, action_cov_chol) = tch::no_grad(|| {
                 let price_input = if use_full {
                     &price_deltas_full
                 } else {
-                    &price_deltas_step
+                    &price_deltas_incremental
                 };
-                let (_, _, (action_mean, action_log_std), _) =
-                    model.step(price_input, &static_obs_tensor, &mut stream_state);
-                (action_mean, action_log_std)
+                let (_, _, _, action_mean, action_cov_chol) =
+                    model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
+                (action_mean, action_cov_chol)
             });
-            let actions = sample_actions_from_dist(
+            let actions = sample_actions(
                 &action_mean,
-                &action_log_std,
+                &action_cov_chol,
                 deterministic,
                 temperature,
             );
@@ -112,7 +127,7 @@ pub fn run_inference<P: AsRef<Path>>(
             let step_result = env.step_step_single(&actions_vec);
             episode_reward += step_result.reward;
 
-            price_deltas_step.copy_(&Tensor::from_slice(&step_result.step_deltas));
+            price_deltas_incremental.copy_(&Tensor::from_slice(&step_result.step_deltas));
             static_obs_tensor.copy_(&Tensor::from_slice(&step_result.static_obs));
             use_full = false;
 
@@ -127,7 +142,9 @@ pub fn run_inference<P: AsRef<Path>>(
 
         println!(
             "Episode {}: Reward: {:.4}, Commissions: ${:.2}, Time: {:.2}s",
-            episode, episode_reward, total_commissions,
+            episode,
+            episode_reward,
+            total_commissions,
             Instant::now().duration_since(episode_start).as_secs_f32()
         );
     }

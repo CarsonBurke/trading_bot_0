@@ -206,7 +206,6 @@
 //                         continue;
 //                     }
 //                 }; */
-
 //                 let position = &mut account.positions[ticker];
 
 //                 // println!("decider rsi: {}", decider_rsi);
@@ -268,22 +267,17 @@
 
 //     /*     println!("buy indexes: {buy_indexes:?}");
 //     println!("sell indexes: {sell_indexes:?}"); */
-
 //     /*     let cash = account.cash;
 //     println!("ended up with cash: {cash:?}");
 
 //     let assets = total_assets.last().unwrap();
 //     println!("ended up with assets: {assets:?}"); */
-
 //     /* let value = account.positions.get(TICKER).unwrap().quantity as f64 * *data.last().unwrap();
 //     println!("ended up with value: {value:?}"); */
-
 //     /* let total = cash + value;
 //     println!("ended up with total value of: {total:?}"); */
-
 //     /* buy_sell_chart(data, &buy_indexes, &sell_indexes).unwrap();
 //     assets_chart(&total_assets, &positioned_assets).unwrap(); */
-
 //     if let Some(charts_config) = make_charts {
 //         println!("Generating charts for gen: {}", charts_config.generation);
 
@@ -304,7 +298,6 @@
 //             let data = convert_historical(bars);
 
 //             /* candle_chart(&ticker_dir, bars); */
-
 //             let ticker_buy_indexes = &buy_indexes[ticker];
 //             let ticker_sell_indexes = &sell_indexes[ticker];
 //             let _ = buy_sell_chart(
@@ -329,7 +322,6 @@
 //                 .map(|(decider, amount)| amount - decider)
 //                 .collect();
 //             simple_chart(&ticker_dir, "rsi_diff", &rsi_diff_values); */
-
 //             let positioned_assets = &positions_by_ticker[ticker];
 //             let _ = assets_chart(
 //                 &ticker_dir,
@@ -364,7 +356,6 @@
 //             return true;
 //         }
 //     } */
-
 //     /* if decider_rsi < agent.weights.map[Weight::MinRsiSell] * 100.0 {
 //         return false;
 //     }
@@ -380,7 +371,6 @@
 //     } else {
 //         highest_rsis.insert(ticker, decider_rsi);
 //     } */
-
 //     true
 // }
 
@@ -406,7 +396,6 @@
 //     /* if price * (1. + agent.weights.map[Weight::ReboundBuyPriceThreshold]) >= local_maximum {
 //         return false;
 //     } */
-
 //     if let Some(last_buy) = last_buy_price.get(&ticker) {
 //         if price > *last_buy {
 //             return false
@@ -421,7 +410,6 @@
 //         /* if price <= *last_sell && price * (1. + agent.weights.map[Weight::SellDropBuyTreshold]) >= *last_sell {
 //             return false;
 //         } */
-
 //         if percent_diff_abs(price, *last_sell) <= agent.weights.map[Weight::SellDropBuyTreshold] {
 //             return false;
 //         }
@@ -437,7 +425,6 @@
 //             return true;
 //         }
 //     } */
-
 //     /* if decider_rsi > agent.weights.map[Weight::MaxRsiBuy] * 100.0 {
 //         return false;
 //     }
@@ -486,7 +473,6 @@
 //             continue;
 //         }
 //     } */
-
 //     // println!("decider rsi: {}", decider_rsi);
 //     // println!("amount rsi: {}", amount_rsi);
 //     // println!("diff {}", decider_rsi - amount_rsi);
@@ -540,7 +526,6 @@
 
 //     /* let available =
 //     cash.min((assets/* - position.value_with_price(price) */) / TICKERS.len() as f64); */
-
 //     let has = position.value_with_price(price);
 
 //     // Simple
