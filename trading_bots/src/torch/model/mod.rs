@@ -606,7 +606,7 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let mean_scale = p.var("mean_scale", &[1], Init::Const(1.0));
+        let mean_scale = p.var("mean_scale", &[1], Init::Const(0.1));
         let value_proj = nn::linear(
             p / "value_proj",
             flat_all_tickers,
