@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use crate::components::episode_status;
-use crate::report_renderer::render_report;
+use crate::report_renderer::render_report_with_options;
 use crate::utils::clipboard;
 
 #[derive(Debug, Clone)]
@@ -38,6 +38,11 @@ pub struct ChartViewer {
     picker: Picker,
     current_image: Option<Box<dyn StatefulProtocol>>,
     viewing_mode: ViewingMode,
+    // Row skip for rendering
+    row_skip_input: String,
+    editing_row_skip: bool,
+    row_skip: usize,
+    show_legend: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,7 +66,64 @@ impl ChartViewer {
             picker,
             current_image: None,
             viewing_mode: ViewingMode::MetaCharts,
+            row_skip_input: String::new(),
+            editing_row_skip: false,
+            row_skip: 0,
+            show_legend: true,
         }
+    }
+
+    pub fn toggle_legend(&mut self) {
+        self.show_legend = !self.show_legend;
+        self.load_current_image();
+    }
+
+    pub fn is_legend_visible(&self) -> bool {
+        self.show_legend
+    }
+
+    pub fn is_editing_row_skip(&self) -> bool {
+        self.editing_row_skip
+    }
+
+    pub fn start_editing_row_skip(&mut self) {
+        self.editing_row_skip = true;
+    }
+
+    pub fn stop_editing_row_skip(&mut self) {
+        self.editing_row_skip = false;
+    }
+
+    pub fn cancel_editing_row_skip(&mut self) {
+        self.editing_row_skip = false;
+        self.row_skip_input.clear();
+        self.row_skip = 0;
+        self.load_current_image();
+    }
+
+    pub fn row_skip_input_push(&mut self, c: char) {
+        if c.is_ascii_digit() {
+            self.row_skip_input.push(c);
+            self.apply_row_skip();
+        }
+    }
+
+    pub fn row_skip_input_pop(&mut self) {
+        self.row_skip_input.pop();
+        self.apply_row_skip();
+    }
+
+    pub fn get_row_skip_input(&self) -> &str {
+        &self.row_skip_input
+    }
+
+    pub fn get_row_skip(&self) -> usize {
+        self.row_skip
+    }
+
+    fn apply_row_skip(&mut self) {
+        self.row_skip = self.row_skip_input.parse().unwrap_or(0);
+        self.load_current_image();
     }
 
     pub fn load_generation(&mut self, gen_path: &PathBuf) -> Result<()> {
@@ -397,7 +459,12 @@ impl ChartViewer {
                 let (node_idx, _) = self.flattened[i];
                 if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
                     if let Ok(report) = load_report(path) {
-                        if let Ok(img) = render_report(&report) {
+                        let skip = if self.viewing_mode == ViewingMode::MetaCharts {
+                            self.row_skip
+                        } else {
+                            0
+                        };
+                        if let Ok(img) = render_report_with_options(&report, skip, self.show_legend) {
                             let protocol = self.picker.new_resize_protocol(img);
                             self.current_image = Some(protocol);
                         }
@@ -473,7 +540,12 @@ impl ChartViewer {
                 let (node_idx, _) = self.flattened[i];
                 if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
                     if let Ok(report) = load_report(path) {
-                        let temp_path = render_report_to_temp(&report)?;
+                        let skip = if self.viewing_mode == ViewingMode::MetaCharts {
+                            self.row_skip
+                        } else {
+                            0
+                        };
+                        let temp_path = render_report_to_temp(&report, skip, self.show_legend)?;
                         clipboard::copy_image_to_clipboard(&temp_path)?;
                     } else {
                         clipboard::copy_image_to_clipboard(path)?;
@@ -505,14 +577,28 @@ impl ChartViewer {
         is_training: bool,
         current_episode: Option<usize>,
     ) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ])
-            .split(area);
+        let show_filter = self.viewing_mode == ViewingMode::MetaCharts;
+
+        let chunks = if show_filter {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(4),
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(4),
+                ])
+                .split(area)
+        };
 
         let title = match &self.viewing_mode {
             ViewingMode::Generation(ep) => {
@@ -559,6 +645,34 @@ impl ChartViewer {
         let title_widget = title.block(Block::default().borders(Borders::ALL));
         f.render_widget(title_widget, chunks[0]);
 
+        // Render row skip input for MetaCharts mode
+        let (list_chunk, help_chunk) = if show_filter {
+            let filter_style = if self.editing_row_skip {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            let filter_text = if self.editing_row_skip {
+                format!("Skip: {}_", self.row_skip_input)
+            } else if self.row_skip_input.is_empty() {
+                "Skip: (press / to set)".to_string()
+            } else {
+                format!("Skip: {}", self.row_skip_input)
+            };
+
+            let filter = Paragraph::new(filter_text)
+                .style(filter_style)
+                .block(Block::default().borders(Borders::ALL).title("Row Skip"));
+            f.render_widget(filter, chunks[1]);
+
+            (chunks[2], chunks[3])
+        } else {
+            (chunks[1], chunks[2])
+        };
+
         let items: Vec<ListItem> = self
             .flattened
             .iter()
@@ -599,41 +713,56 @@ impl ChartViewer {
             )
             .highlight_symbol(">> ");
 
-        f.render_stateful_widget(list, chunks[1], &mut self.list_state);
+        f.render_stateful_widget(list, list_chunk, &mut self.list_state);
 
-        let help_line = if self.viewing_mode == ViewingMode::MetaCharts {
-            Line::from(vec![
-                Span::styled("↑/k", Style::default().fg(Color::Cyan)),
-                Span::raw(": Up  "),
-                Span::styled("↓/j", Style::default().fg(Color::Cyan)),
-                Span::raw(": Down  "),
-                Span::styled("Enter", Style::default().fg(Color::Green)),
-                Span::raw(": Expand/Collapse  "),
-                Span::styled("c", Style::default().fg(Color::Magenta)),
-                Span::raw(": Copy  "),
-                Span::styled("r", Style::default().fg(Color::Yellow)),
-                Span::raw(": Refresh  "),
-                Span::styled("q/Esc", Style::default().fg(Color::Red)),
-                Span::raw(": Back"),
-            ])
+        let legend_label = if self.show_legend { "Legend" } else { "Legend (off)" };
+        let (help_line1, help_line2) = if self.viewing_mode == ViewingMode::MetaCharts {
+            (
+                Line::from(vec![
+                    Span::styled("↑/k", Style::default().fg(Color::Cyan)),
+                    Span::raw(": Up  "),
+                    Span::styled("↓/j", Style::default().fg(Color::Cyan)),
+                    Span::raw(": Down  "),
+                    Span::styled("Enter", Style::default().fg(Color::Green)),
+                    Span::raw(": Expand  "),
+                    Span::styled("c", Style::default().fg(Color::Magenta)),
+                    Span::raw(": Copy  "),
+                    Span::styled("q/Esc", Style::default().fg(Color::Red)),
+                    Span::raw(": Back"),
+                ]),
+                Line::from(vec![
+                    Span::styled("/", Style::default().fg(Color::Yellow)),
+                    Span::raw(": Filter  "),
+                    Span::styled("l", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(": {}  ", legend_label)),
+                    Span::styled("r", Style::default().fg(Color::Yellow)),
+                    Span::raw(": Refresh"),
+                ]),
+            )
         } else {
-            Line::from(vec![
-                Span::styled("↑/k", Style::default().fg(Color::Cyan)),
-                Span::raw(": Up  "),
-                Span::styled("↓/j", Style::default().fg(Color::Cyan)),
-                Span::raw(": Down  "),
-                Span::styled("Enter", Style::default().fg(Color::Green)),
-                Span::raw(": Expand/Collapse  "),
-                Span::styled("c", Style::default().fg(Color::Magenta)),
-                Span::raw(": Copy  "),
-                Span::styled("q/Esc", Style::default().fg(Color::Red)),
-                Span::raw(": Back"),
-            ])
+            (
+                Line::from(vec![
+                    Span::styled("↑/k", Style::default().fg(Color::Cyan)),
+                    Span::raw(": Up  "),
+                    Span::styled("↓/j", Style::default().fg(Color::Cyan)),
+                    Span::raw(": Down  "),
+                    Span::styled("Enter", Style::default().fg(Color::Green)),
+                    Span::raw(": Expand/Collapse  "),
+                    Span::styled("c", Style::default().fg(Color::Magenta)),
+                    Span::raw(": Copy  "),
+                    Span::styled("q/Esc", Style::default().fg(Color::Red)),
+                    Span::raw(": Back"),
+                ]),
+                Line::from(vec![
+                    Span::styled("l", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(": {}", legend_label)),
+                ]),
+            )
         };
 
-        let help = Paragraph::new(vec![help_line])
+        let help = Paragraph::new(vec![help_line1, help_line2])
             .block(Block::default().borders(Borders::ALL).title("Controls"));
-        f.render_widget(help, chunks[2]);
+        f.render_widget(help, help_chunk);
     }
 
     fn render_preview(&mut self, f: &mut Frame, area: Rect) {
@@ -729,8 +858,8 @@ fn report_title_from_path(path: &PathBuf) -> Option<String> {
     Some(report.title)
 }
 
-fn render_report_to_temp(report: &Report) -> Result<PathBuf> {
-    let image = render_report(report)?;
+fn render_report_to_temp(report: &Report, skip: usize, show_legend: bool) -> Result<PathBuf> {
+    let image = render_report_with_options(report, skip, show_legend)?;
     let mut path = std::env::temp_dir();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

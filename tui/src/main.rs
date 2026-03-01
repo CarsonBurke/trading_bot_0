@@ -78,9 +78,9 @@ impl App {
     fn coerce_weights_filename(input: &str) -> String {
         let trimmed = input.trim();
 
-        // If it's just a number, expand to ppo_ep{N}.safetensors
+        // If it's just a number, expand to ppo_ep{N}.ot
         if trimmed.parse::<u32>().is_ok() {
-            return format!("ppo_ep{}.safetensors", trimmed);
+            return format!("ppo_ep{}.ot", trimmed);
         }
 
         // If it already has the pattern, use as-is
@@ -134,14 +134,15 @@ impl App {
             "final_assets",
             "cumulative_reward",
             "outperformance",
-            "loss_log",
             "advantage_stats_log",
             "total_commissions",
             "logit_noise",
             "grad_norm_log",
             "target_weights",
             "clip_fraction",
-            "value_mae"
+            "explained_var",
+            "value_loss",
+            "policy_loss"
         ];
 
         // Ticker-specific chart base names
@@ -294,7 +295,7 @@ impl App {
         ticker: Option<String>,
         episodes: Option<usize>,
     ) -> Result<()> {
-        let weights = weights_file.unwrap_or_else(|| "infer.safetensors".to_string());
+        let weights = weights_file.unwrap_or_else(|| "infer.ot".to_string());
         let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
             weights
         } else {
@@ -628,14 +629,22 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         .modifiers
                                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                                 {
-                                    app.dialog_mode = DialogMode::ConfirmQuit;
+                                    if app.is_training_running() {
+                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                    } else {
+                                        return Ok(());
+                                    }
                                 }
                                 KeyCode::Char('d')
                                     if key
                                         .modifiers
                                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                                 {
-                                    app.dialog_mode = DialogMode::ConfirmQuit;
+                                    if app.is_training_running() {
+                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                    } else {
+                                        return Ok(());
+                                    }
                                 }
                                 KeyCode::Char('o') => {
                                     // Don't open page jump when searching
@@ -651,7 +660,11 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                             match app.mode {
                                 AppMode::Main => match key.code {
                                     KeyCode::Char('q') => {
-                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                        if app.is_training_running() {
+                                            app.dialog_mode = DialogMode::ConfirmQuit;
+                                        } else {
+                                            return Ok(());
+                                        }
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
@@ -829,31 +842,59 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         }
                                     }
                                 }
-                                AppMode::ChartViewer => match key.code {
-                                    KeyCode::Esc | KeyCode::Char('q') => {
-                                        app.mode = app.previous_mode;
-                                    }
-                                    KeyCode::Down | KeyCode::Char('j') => {
-                                        app.chart_viewer.next();
-                                    }
-                                    KeyCode::Up | KeyCode::Char('k') => {
-                                        app.chart_viewer.previous();
-                                    }
-                                    KeyCode::Enter => {
-                                        app.chart_viewer.toggle_expand();
-                                    }
-                                    KeyCode::Char('r') => {
-                                        if app.chart_viewer.is_viewing_meta_charts() {
-                                            app.load_latest_meta_charts()?;
-                                            app.chart_viewer
-                                                .load_charts(&app.latest_meta_charts)?;
+                                AppMode::ChartViewer => {
+                                    if app.chart_viewer.is_editing_row_skip() {
+                                        match key.code {
+                                            KeyCode::Esc => {
+                                                app.chart_viewer.cancel_editing_row_skip();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.chart_viewer.stop_editing_row_skip();
+                                            }
+                                            KeyCode::Char(c) => {
+                                                app.chart_viewer.row_skip_input_push(c);
+                                            }
+                                            KeyCode::Backspace => {
+                                                app.chart_viewer.row_skip_input_pop();
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::Char('q') => {
+                                                app.mode = app.previous_mode;
+                                            }
+                                            KeyCode::Char('/') => {
+                                                if app.chart_viewer.is_viewing_meta_charts() {
+                                                    app.chart_viewer.start_editing_row_skip();
+                                                }
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.chart_viewer.next();
+                                            }
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.chart_viewer.previous();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.chart_viewer.toggle_expand();
+                                            }
+                                            KeyCode::Char('r') => {
+                                                if app.chart_viewer.is_viewing_meta_charts() {
+                                                    app.load_latest_meta_charts()?;
+                                                    app.chart_viewer
+                                                        .load_charts(&app.latest_meta_charts)?;
+                                                }
+                                            }
+                                            KeyCode::Char('c') => {
+                                                let _ = app.chart_viewer.copy_current_image();
+                                            }
+                                            KeyCode::Char('l') => {
+                                                app.chart_viewer.toggle_legend();
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                    KeyCode::Char('c') => {
-                                        let _ = app.chart_viewer.copy_current_image();
-                                    }
-                                    _ => {}
-                                },
+                                }
                                 AppMode::Logs => match key.code {
                                     KeyCode::Esc | KeyCode::Char('q') => {
                                         app.mode = AppMode::Main;

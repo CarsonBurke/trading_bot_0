@@ -1,16 +1,15 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use colored::Colorize;
-use hashbrown::{HashMap, HashSet};
-use ibapi::{market_data::historical, Client};
+use hashbrown::{HashSet};
 
-use rand::{seq::{index::sample, SliceRandom}, Rng};
+use rand::{seq::{index::sample}};
 use rust_neural_network::neural_network::NeuralNetwork;
 
 use crate::{
     charts::simple_chart, constants::{
-        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{self, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
-    }, data::historical::get_historical_data, neural_net::{create::create_mapped_indicators, Replay}, strategies::basic_nn::basic_nn, types::{Account, MakeCharts}, utils::{create_folder_if_not_exists, get_mapped_price_deltas}
+        agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS}, files::TRAINING_PATH, neural_net::{INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS}, TICKERS
+    }, data::historical::get_historical_data, neural_net::{create::create_mapped_indicators, Replay}, strategies::basic_nn::basic_nn, types::{MakeCharts}, utils::{create_folder_if_not_exists, get_mapped_price_deltas}
 };
 
 use super::create::{create_networks, Indicator, Indicators};

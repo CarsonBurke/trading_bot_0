@@ -13,8 +13,6 @@ mod data;
 mod neural_net;
 mod strategies;
 mod torch;
-mod candle;
-// mod burn;
 mod history;
 mod types;
 mod utils;
@@ -35,7 +33,7 @@ enum Commands {
         weights: Option<String>,
     },
     Infer {
-        #[arg(short, long, default_value = "weights/ppo_ep1000.safetensors")]
+        #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
         #[arg(short, long, default_value_t = 10)]
@@ -54,7 +52,7 @@ enum Commands {
         random_start: bool,
     },
     Paper {
-        #[arg(short, long, default_value = "weights/ppo_ep1000.safetensors")]
+        #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
         #[arg(short, long, value_delimiter = ',', default_value = "TSLA,AAPL")]
@@ -79,7 +77,7 @@ async fn main() {
 
     match &cli.command {
         Some(Commands::Train { weights }) => {
-            torch::ppo::train(weights.as_deref());
+            torch::ppo::train(weights.as_deref()).await;
         }
         Some(Commands::Infer { weights, episodes, deterministic, temperature, tickers, random_start }) => {
             torch::infer::run_inference(weights, *episodes, *deterministic, *temperature, tickers.clone(), *random_start)
@@ -95,7 +93,7 @@ async fn main() {
             ).expect("paper trading failed");
         }
         None => {
-            torch::ppo::train(None);
+            torch::ppo::train(None).await;
         }
     }
 

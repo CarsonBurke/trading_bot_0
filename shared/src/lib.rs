@@ -10,7 +10,7 @@ pub mod constants {
     pub const AVAILABLE_TICKERS_COUNT: usize = 13;
     pub const ACTION_COUNT: usize = TICKERS_COUNT + 1; // +1 for cash weight
     pub const ACTION_HISTORY_LEN: usize = 0;
-    pub const PRICE_DELTAS_PER_TICKER: usize = 3400;
+    pub const PRICE_DELTAS_PER_TICKER: usize = 8636;
     pub const REWARD_RANGE: f64 = 100.0;
 
     // Global (7): step_progress, cash_percent, pnl, drawdown, commissions, last_reward, last_fill_ratio

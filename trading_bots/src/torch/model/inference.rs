@@ -110,7 +110,7 @@ impl TradingModel {
         }
 
         self.head_with_temporal_pool(
-            &Tensor::zeros(&[TICKERS_COUNT, SSM_DIM, 1], (Kind::Float, self.device)),
+            &Tensor::zeros(&[TICKERS_COUNT, 1, SSM_DIM], (Kind::Float, self.device)),
             &global_static,
             &per_ticker_static,
             1,
@@ -151,20 +151,21 @@ impl TradingModel {
         for t in 0..TICKERS_COUNT as usize {
             let ticker_data = reshaped.get(t as i64).unsqueeze(0);
             let x_stem = self.patch_embed_single(&ticker_data);
-            let mut x = x_stem.permute([0, 2, 1]);
+            let mut x = x_stem;
             for (layer, (ssm, norm)) in
                 self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
             {
                 let state_idx = layer * TICKERS_COUNT as usize + t;
-                let normed = norm.forward(&x);
-                let out = ssm.forward_with_state_dt_scale(
-                    &normed,
+                let out = ssm.forward_with_state_pre_norm_dt_scale(
+                    &x,
+                    norm.weight(),
+                    norm.eps(),
                     &mut state.ssm_states[state_idx],
                     Some(&dt_scale),
                 );
                 x = x + out;
             }
-            outputs.push(x.permute([0, 2, 1]));
+            outputs.push(x);
         }
 
         state.initialized = true;
@@ -177,10 +178,8 @@ impl TradingModel {
         let patches = state
             .patch_buf
             .view([TICKERS_COUNT, 1, FINEST_PATCH_SIZE]);
-        let patches = self.enrich_patches(&patches);
-        let patch_emb = patches.apply(&self.patch_embeds[FINEST_PATCH_INDEX]);
-        let patch_emb = self.patch_lns[FINEST_PATCH_INDEX]
-            .forward(&patch_emb)
+        let patch_emb = self
+            .embed_patch_config(&patches, FINEST_PATCH_INDEX as i64)
             .squeeze_dim(1);
         let dt_scale = FINEST_PATCH_SIZE as f64;
 
@@ -191,11 +190,16 @@ impl TradingModel {
                 self.ssm_layers.iter().zip(self.ssm_norms.iter()).enumerate()
             {
                 let state_idx = layer * TICKERS_COUNT as usize + t;
-                let normed = norm.forward(&x_in);
-                let out = ssm.step_with_dt_scale(&normed, &mut state.ssm_states[state_idx], dt_scale);
+                let out = ssm.step_with_pre_norm_dt_scale(
+                    &x_in,
+                    norm.weight(),
+                    norm.eps(),
+                    &mut state.ssm_states[state_idx],
+                    dt_scale,
+                );
                 x_in = x_in + out;
             }
-            outputs.push(x_in.unsqueeze(-1));
+            outputs.push(x_in.unsqueeze(1));
         }
         Tensor::cat(&outputs, 0)
     }

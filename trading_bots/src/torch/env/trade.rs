@@ -22,7 +22,7 @@ impl Env {
             if current_value <= 0.0 {
                 continue;
             }
-            
+
             let sell_pct = -action;
             let sell_amount = sell_pct * current_value;
 
@@ -43,7 +43,6 @@ impl Env {
             if self.account.positions[ticker_index].quantity < 1e-8 {
                 self.position_open_step[ticker_index] = None;
             }
-
         }
 
         // === PASS 2: Collect buy intents and compute proportional fill ===
@@ -107,21 +106,22 @@ impl Env {
             if was_empty {
                 self.position_open_step[intent.ticker_index] = Some(absolute_step);
             }
-
         }
 
         total_commission
     }
 
-    /// Weight-based trading with dead zone. Full control outside dead zone.
-    /// |action| <= threshold = hold. Otherwise adds action directly to target weight.
+    #[allow(dead_code)]
+    const WEIGHT_DELTA_MIN_TRADE_FRAC: f64 = 0.005;
+
+    #[allow(dead_code)]
     pub fn trade_by_weight_delta(
         &mut self,
         actions: &[f64],
         absolute_step: usize,
     ) -> f64 {
         let n_tickers = self.tickers.len();
-        let min_trade_frac = 0.005;
+        let min_trade_frac = Self::WEIGHT_DELTA_MIN_TRADE_FRAC;
 
         let mut total_commission = 0.0;
 
@@ -220,7 +220,6 @@ impl Env {
             if self.account.positions[intent.ticker_index].quantity < 1e-8 {
                 self.position_open_step[intent.ticker_index] = None;
             }
-
         }
 
         // 5. Execute buys with proportional scaling if insufficient cash
@@ -259,14 +258,11 @@ impl Env {
             if was_empty {
                 self.position_open_step[intent.ticker_index] = Some(absolute_step);
             }
-
         }
 
         total_commission
     }
 
-    /// Weight-based trading: actions are target weights in [0,1].
-    /// Actions: [ticker_0, ..., ticker_n, cash] with cash explicitly set.
     pub fn trade_by_target_weights(
         &mut self,
         actions: &[f64],
@@ -347,7 +343,6 @@ impl Env {
             if self.account.positions[intent.ticker_index].quantity < 1e-8 {
                 self.position_open_step[intent.ticker_index] = None;
             }
-
         }
 
         // 4. Execute buys with proportional scaling if insufficient cash
@@ -386,7 +381,6 @@ impl Env {
             if was_empty {
                 self.position_open_step[intent.ticker_index] = Some(absolute_step);
             }
-
         }
 
         total_commission
@@ -450,6 +444,11 @@ impl Env {
     }
 
     #[allow(dead_code)]
+    const DELTA_REBALANCE_RATE: f64 = 1.0;
+    #[allow(dead_code)]
+    const DELTA_MIN_TRADE_FRAC: f64 = 0.005;
+
+    #[allow(dead_code)]
     fn trade_by_delta(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let n_tickers = self.tickers.len();
         let mut total_commissions = 0.0;
@@ -474,9 +473,8 @@ impl Env {
             current_values.push(self.account.positions[ticker_index].value_with_price(price));
         }
 
-        let rebalance_rate: f64 = 1.0;
-        let min_trade_frac: f64 = 0.005;
-        let min_trade_notional = min_trade_frac * total_assets;
+        let rebalance_rate = Self::DELTA_REBALANCE_RATE;
+        let min_trade_notional = Self::DELTA_MIN_TRADE_FRAC * total_assets;
 
         for ticker_index in 0..n_tickers {
             let price = self.prices[ticker_index][absolute_step];
