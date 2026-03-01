@@ -18,6 +18,8 @@ struct InterTickerBlock {
     ticker_ln: RMSNorm,
     ticker_qkv: nn::Linear,
     ticker_out: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
     mlp_ln: RMSNorm,
@@ -28,6 +30,8 @@ impl InterTickerBlock {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
         let ticker_qkv = linear_truncated(p, "ticker_qkv", model_dim, 3 * model_dim);
         let ticker_out = linear_residual_out(p, "ticker_out", model_dim, model_dim);
+        let q_norm = RMSNorm::new(&(p / "q_norm"), model_dim, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "k_norm"), model_dim, 1e-6);
         let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, 2 * ff_dim);
         let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim);
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
@@ -35,6 +39,8 @@ impl InterTickerBlock {
             ticker_ln,
             ticker_qkv,
             ticker_out,
+            q_norm,
+            k_norm,
             mlp_fc1,
             mlp_fc2,
             mlp_ln,
@@ -48,8 +54,13 @@ impl InterTickerBlock {
             .reshape([batch, num_items, model_dim]);
         let qkv = x_norm.apply(&self.ticker_qkv);
         let parts = qkv.split(model_dim, -1);
-        let q = parts[0].unsqueeze(1);
-        let k = parts[1].unsqueeze(1);
+        // QKNorm (single-head, head_dim == model_dim)
+        let q = self.q_norm.forward(&parts[0].reshape([batch * num_items, model_dim]))
+            .reshape([batch, num_items, model_dim])
+            .unsqueeze(1);
+        let k = self.k_norm.forward(&parts[1].reshape([batch * num_items, model_dim]))
+            .reshape([batch, num_items, model_dim])
+            .unsqueeze(1);
         let v = parts[2].unsqueeze(1);
         let ctx = Tensor::scaled_dot_product_attention(
             &q, &k, &v,
@@ -77,6 +88,8 @@ struct ExoCrossBlock {
     cross_q: nn::Linear,
     cross_kv: nn::Linear,
     cross_out: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     kv_dim: i64,
 }
 
@@ -87,11 +100,15 @@ impl ExoCrossBlock {
         let cross_q = linear_truncated(p, "cross_q", model_dim, model_dim);
         let cross_kv = linear_truncated(p, "cross_kv", model_dim, 2 * kv_dim);
         let cross_out = linear_residual_out(p, "cross_out", model_dim, model_dim);
+        let q_norm = RMSNorm::new(&(p / "q_norm"), cross_head_dim, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "k_norm"), cross_head_dim, 1e-6);
         Self {
             cross_ln,
             cross_q,
             cross_kv,
             cross_out,
+            q_norm,
+            k_norm,
             kv_dim,
         }
     }
@@ -121,6 +138,12 @@ impl ExoCrossBlock {
         let v = kv_parts[1]
             .reshape([b, t, CROSS_NUM_KV_HEADS, cross_head_dim])
             .permute([0, 2, 1, 3]);
+
+        // QKNorm
+        let q = self.q_norm.forward(&q.reshape([b * CROSS_NUM_Q_HEADS * s, cross_head_dim]))
+            .reshape([b, CROSS_NUM_Q_HEADS, s, cross_head_dim]);
+        let k = self.k_norm.forward(&k.reshape([b * CROSS_NUM_KV_HEADS * t, cross_head_dim]))
+            .reshape([b, CROSS_NUM_KV_HEADS, t, cross_head_dim]);
 
         let out = Tensor::scaled_dot_product_attention(
             &q, &k, &v,
@@ -188,6 +211,8 @@ struct GqaBlock {
     attn_ln: RMSNorm,
     attn_qkv: nn::Linear,
     attn_out: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     q_dim: i64,
     kv_dim: i64,
     ffn_ln: RMSNorm,
@@ -203,6 +228,8 @@ impl GqaBlock {
         let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
         let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
         let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim);
+        let q_norm = RMSNorm::new(&(p / "q_norm"), head_dim, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "k_norm"), head_dim, 1e-6);
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
         let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
@@ -210,6 +237,8 @@ impl GqaBlock {
             attn_ln,
             attn_qkv,
             attn_out,
+            q_norm,
+            k_norm,
             q_dim: model_dim,
             kv_dim,
             ffn_ln,
@@ -235,6 +264,12 @@ impl GqaBlock {
         let v = parts[2]
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
+
+        // QKNorm before RoPE
+        let q = self.q_norm.forward(&q.reshape([b * GQA_NUM_Q_HEADS * s, head_dim]))
+            .reshape([b, GQA_NUM_Q_HEADS, s, head_dim]);
+        let k = self.k_norm.forward(&k.reshape([b * GQA_NUM_KV_HEADS * s, head_dim]))
+            .reshape([b, GQA_NUM_KV_HEADS, s, head_dim]);
 
         let q = rope.apply(&q);
         let k = rope.apply(&k);
