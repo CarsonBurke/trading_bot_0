@@ -144,7 +144,7 @@ impl App {
 
         self.latest_meta_charts.clear();
 
-        let gens_path = PathBuf::from("../training/gens");
+        let gens_path = PathBuf::from("../training/runs/latest/gens");
         if !gens_path.exists() {
             return Ok(());
         }

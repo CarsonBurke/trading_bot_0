@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 use std::time::Instant;
 use tch::{nn, Kind, Tensor};
 
@@ -9,6 +10,7 @@ use crate::torch::env::VecEnv;
 use crate::torch::model::{
     ModelVariant, TradingModel, TradingModelConfig,
 };
+use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 const LEARNING_RATE: f64 = 3e-4;
 pub const NPROCS: i64 = 16;
@@ -227,7 +229,7 @@ fn compute_action_std_stats(
     })
 }
 
-pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
+pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_name: Option<String>) {
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
@@ -268,11 +270,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         Tensor::zeros(&[1], (Kind::Float, device))
     };
 
-    let start_episode = if let Some(path) = weights_path {
+    let (start_episode, run_dir) = if let Some(path) = weights_path {
         println!("Loading weights from {}", path);
         vs.load(path).unwrap();
-        // Extract episode number from filename like "ppo_ep500.ot"
-        let ep = std::path::Path::new(path)
+        let ep = Path::new(path)
             .file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| s.strip_prefix("ppo_ep"))
@@ -281,11 +282,26 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         if ep > 0 {
             println!("Resuming from episode {}", ep);
         }
-        ep
+        // If weights path is inside runs/*/weights/, resume that run dir
+        let p = Path::new(path);
+        let is_run_weights = p.parent()
+            .and_then(|d| d.file_name())
+            .map(|n| n == "weights")
+            .unwrap_or(false)
+            && p.ancestors().any(|a| a.file_name().map(|n| n == "runs").unwrap_or(false));
+        let rd = if is_run_weights {
+            RunDir::from_weights_path(p).expect("failed to open run dir from weights path")
+        } else {
+            RunDir::create_fresh(RUNS_PATH, run_name.as_deref()).expect("failed to create run dir")
+        };
+        (ep, rd)
     } else {
         println!("Starting training from scratch");
-        0
+        let rd = RunDir::create_fresh(RUNS_PATH, run_name.as_deref()).expect("failed to create run dir");
+        (0, rd)
     };
+    let gens_path = run_dir.gens.to_string_lossy().to_string();
+    println!("Run dir: {}", run_dir.root.display());
 
     // Cast all model parameters to bf16 for faster compute.
     // Done after weight loading so loaded fp32 weights get cast.
@@ -294,12 +310,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
 
     let mut opt = Fp32Adam::new(&vs, LEARNING_RATE);
 
-    let mut env = VecEnv::new(true, model_variant);
+    let mut env = VecEnv::new(true, model_variant, gens_path.clone());
     if start_episode > 0 {
         env.set_episode(start_episode);
         env.primary_mut()
             .meta_history
-            .load_from_episode(start_episode);
+            .load_from_episode(start_episode, &gens_path);
     }
 
     let rollout_steps = SEQ_LEN;
@@ -326,7 +342,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
     let mut ret_rms_count = vec![1e-4f64; n];
     let mut disc_ret = vec![0.0f64; n];
     if start_episode > 0 {
-        let meta_path = format!("../weights/ppo_ep{}.reward_norm.json", start_episode);
+        let meta_path = format!("{}/ppo_ep{}.reward_norm.json", run_dir.weights.display(), start_episode);
+        let meta_path = if Path::new(&meta_path).exists() {
+            meta_path
+        } else {
+            format!("../weights/ppo_ep{}.reward_norm.json", start_episode)
+        };
         if let Ok(json) = std::fs::read_to_string(&meta_path) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
                 let load_vec = |key: &str, default: f64| -> Vec<f64> {
@@ -859,13 +880,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant) {
         );
 
         if episode > 0 && episode % 50 == 0 {
-            let _ = std::fs::create_dir_all("../weights");
-            let path = format!("../weights/ppo_ep{}.ot", episode);
+            let path = format!("{}/ppo_ep{}.ot", run_dir.weights.display(), episode);
             if let Err(err) = vs.save(&path) {
                 println!("Error while saving weights: {}", err);
             } else {
                 println!("Saved model weights: {}", path);
-                let meta_path = format!("../weights/ppo_ep{}.reward_norm.json", episode);
+                let meta_path = format!("{}/ppo_ep{}.reward_norm.json", run_dir.weights.display(), episode);
                 let json = serde_json::json!({
                     "mean": &ret_rms_mean,
                     "var": &ret_rms_var,

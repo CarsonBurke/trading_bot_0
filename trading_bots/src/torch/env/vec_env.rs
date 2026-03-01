@@ -37,12 +37,12 @@ impl VecEnv {
         }
     }
 
-    pub fn new(random_start: bool, _model_variant: ModelVariant) -> Self {
+    pub fn new(random_start: bool, _model_variant: ModelVariant, gens_path: String) -> Self {
         let mut envs = Vec::with_capacity(NPROCS as usize);
-        envs.push(Env::new_with_recording(random_start, true));
+        envs.push(Env::new_with_recording(random_start, true, Some(gens_path)));
         eprintln!("first env");
         for i in 1..(NPROCS as usize) {
-            envs.push(Env::new_with_recording(random_start, false));
+            envs.push(Env::new_with_recording(random_start, false, None));
             eprintln!("env {}", i);
         }
         for (i, env) in envs.iter_mut().enumerate() {

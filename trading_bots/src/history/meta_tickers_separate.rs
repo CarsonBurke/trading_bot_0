@@ -15,8 +15,10 @@ impl MetaHistory {
         self.avg_assets.push(history.avg_final_assets());
     }
 
-    pub fn chart(&self, generation: u32) {
-        let base_dir = format!("{TRAINING_PATH}/gens/{}", generation);
+    pub fn chart(&self, generation: u32, gens_path: Option<&str>) {
+        let default_path = format!("{TRAINING_PATH}/gens");
+        let gp = gens_path.unwrap_or(&default_path);
+        let base_dir = format!("{gp}/{}", generation);
         create_folder_if_not_exists(&base_dir);
         let _ = simple_chart(&base_dir, "min_assets", &self.min_assets);
         let _ = simple_chart(&base_dir, "avg_assets", &self.avg_assets);

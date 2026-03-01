@@ -87,7 +87,14 @@ fn main() -> Result<()> {
         bail!("--min and --max are mutually exclusive");
     }
 
-    let base_path = find_training_path().unwrap_or_else(|| PathBuf::from(TRAINING_PATH));
+    let base_path = find_training_path().unwrap_or_else(|| {
+        let latest = PathBuf::from(TRAINING_PATH).join("runs/latest");
+        if latest.join("gens").exists() {
+            latest
+        } else {
+            PathBuf::from(TRAINING_PATH)
+        }
+    });
     let report_path = build_report_path(&base_path, generation, &report_name, ticker);
     let bytes = fs::read(&report_path)
         .with_context(|| format!("failed to read report {}", report_path.display()))?;
@@ -250,6 +257,12 @@ fn find_training_path() -> Option<PathBuf> {
         let mut dir = Some(start.as_path());
         while let Some(current) = dir {
             let training = current.join("training");
+            // Check new layout first (runs/latest symlink)
+            let latest = training.join("runs/latest");
+            if latest.join("gens").exists() {
+                return Some(latest);
+            }
+            // Fall back to old layout
             if training.join("gens").exists() {
                 return Some(training);
             }

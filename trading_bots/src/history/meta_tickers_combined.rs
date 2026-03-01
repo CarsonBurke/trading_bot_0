@@ -107,8 +107,8 @@ impl MetaHistory {
     }
 
     /// Load meta history from existing reports at the given episode
-    pub fn load_from_episode(&mut self, episode: usize) {
-        let base_dir = format!("{TRAINING_PATH}/gens/{}", episode);
+    pub fn load_from_episode(&mut self, episode: usize, gens_path: &str) {
+        let base_dir = format!("{gens_path}/{}", episode);
         let load_simple = |path: &str| -> Vec<f64> {
             read_report(path)
                 .ok()
@@ -195,8 +195,12 @@ impl MetaHistory {
         }
     }
 
-    pub fn write_reports(&self, episode: usize) {
-        let base_dir = format!("{TRAINING_PATH}/gens/{}", episode);
+    pub fn write_reports_default(&self, episode: usize) {
+        self.write_reports(episode, &format!("{TRAINING_PATH}/gens"));
+    }
+
+    pub fn write_reports(&self, episode: usize, gens_path: &str) {
+        let base_dir = format!("{gens_path}/{}", episode);
         create_folder_if_not_exists(&base_dir);
         let simple = |vals: &[f64]| ReportKind::Simple {
             values: f64_to_f32(vals),

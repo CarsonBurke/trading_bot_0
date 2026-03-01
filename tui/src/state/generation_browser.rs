@@ -34,7 +34,7 @@ impl GenerationBrowserState {
 
     pub fn load_generations(&mut self) -> Result<()> {
         self.generations.clear();
-        let training_path = PathBuf::from("../training/gens");
+        let training_path = PathBuf::from("../training/runs/latest/gens");
 
         if !training_path.exists() {
             return Ok(());

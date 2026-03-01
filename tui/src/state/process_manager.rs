@@ -1,10 +1,13 @@
 use anyhow::Result;
+use shared::{paths::RUNS_PATH, run_dir::RunDir};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub struct ProcessManagerState {
     pub inference_process: Option<Child>,
     pub training_process: Option<Child>,
+    pub active_run: Option<RunDir>,
     cached_training_running: bool,
     last_training_check: Instant,
 }
@@ -14,6 +17,7 @@ impl ProcessManagerState {
         Self {
             inference_process: None,
             training_process: None,
+            active_run: None,
             cached_training_running: false,
             last_training_check: Instant::now(),
         }
@@ -68,11 +72,26 @@ impl ProcessManagerState {
             return Ok(());
         }
 
+        let run_dir = match &weights {
+            Some(w) => {
+                let p = Path::new(w);
+                // If weights are inside runs/*/weights/, reuse that run dir
+                if p.parent().and_then(|d| d.file_name()).map_or(false, |n| n == "weights")
+                    && p.ancestors().any(|a| a.ends_with("runs"))
+                {
+                    RunDir::from_weights_path(p)?
+                } else {
+                    RunDir::create_fresh(RUNS_PATH, None)?
+                }
+            }
+            None => RunDir::create_fresh(RUNS_PATH, None)?,
+        };
+
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open("../training/training.log")?;
+            .open(&run_dir.log_file)?;
 
         let mut cmd = Command::new("cargo");
         cmd.current_dir("../trading_bots")
@@ -93,6 +112,7 @@ impl ProcessManagerState {
             .stderr(log_file);
 
         cmd.spawn()?;
+        self.active_run = Some(run_dir);
         self.cached_training_running = true;
 
         Ok(())
@@ -138,6 +158,7 @@ impl ProcessManagerState {
             .args(["-f", "trading.*train"])
             .spawn()?;
 
+        self.active_run = None;
         self.cached_training_running = false;
         Ok(())
     }

@@ -27,15 +27,17 @@ impl EpisodeHistory {
         }
     }
 
-    pub fn record(&self, generation: u32, mapped_historical: &MappedHistorical) {
-        let base_dir = format!("{TRAINING_PATH}/gens/{}", generation);
+    pub fn record(&self, generation: u32, mapped_historical: &MappedHistorical, gens_path: Option<&str>) {
+        let default_path = format!("{TRAINING_PATH}/gens");
+        let gp = gens_path.unwrap_or(&default_path);
+        let base_dir = format!("{gp}/{}", generation);
         create_folder_if_not_exists(&base_dir);
 
         for (ticker_index, bars) in mapped_historical.iter().enumerate() {
             let prices = bars.iter().map(|bar| bar.close).collect::<Vec<f64>>();
 
             let ticker = TICKERS[ticker_index].to_string();
-            let ticker_dir = format!("{TRAINING_PATH}/gens/{}/{ticker}", generation);
+            let ticker_dir = format!("{gp}/{}/{ticker}", generation);
             create_folder_if_not_exists(&ticker_dir);
 
             let ticker_buy_indexes = &self.buys[ticker_index];

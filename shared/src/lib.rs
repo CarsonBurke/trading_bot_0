@@ -3,7 +3,10 @@ pub mod paths {
     pub const WEIGHTS_PATH: &str = "../weights";
     pub const TRAINING_PATH: &str = "../training";
     pub const INFER_PATH: &str = "../infer";
+    pub const RUNS_PATH: &str = "../training/runs";
 }
+
+pub mod run_dir;
 
 pub mod constants {
     pub const TICKERS_COUNT: usize = 1;

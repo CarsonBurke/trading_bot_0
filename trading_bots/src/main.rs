@@ -36,6 +36,9 @@ enum Commands {
 
         #[arg(long, value_enum, default_value_t = ModelVariant::Base)]
         model_size: ModelVariant,
+
+        #[arg(long)]
+        run: Option<String>,
     },
     Infer {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
@@ -90,8 +93,9 @@ async fn main() {
         Some(Commands::Train {
             weights,
             model_size,
+            run,
         }) => {
-            torch::ppo::train(weights.as_deref(), *model_size).await;
+            torch::ppo::train(weights.as_deref(), *model_size, run.clone()).await;
         }
         Some(Commands::Infer {
             weights,
@@ -132,7 +136,7 @@ async fn main() {
             .expect("paper trading failed");
         }
         None => {
-            torch::ppo::train(None, ModelVariant::Base).await;
+            torch::ppo::train(None, ModelVariant::Base, None).await;
         }
     }
 

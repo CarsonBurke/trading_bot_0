@@ -55,6 +55,7 @@ pub struct Env {
     pub earnings: Vec<Arc<EarningsIndicators>>,
     pub macro_ind: Arc<MacroIndicators>,
     record_history_io: bool,
+    gens_path: Option<String>,
 }
 
 pub const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
@@ -63,14 +64,14 @@ impl Env {
     pub const STARTING_CASH: f64 = 10_000.0;
 
     pub fn new(random_start: bool) -> Self {
-        Self::new_with_recording(random_start, true)
+        Self::new_with_recording(random_start, true, None)
     }
 
     pub fn new_with_tickers(tickers: Vec<String>, random_start: bool) -> Self {
-        Self::new_with_tickers_and_recording(tickers, random_start, true)
+        Self::new_with_tickers_and_recording(tickers, random_start, true, None)
     }
 
-    pub fn new_with_recording(random_start: bool, record_history_io: bool) -> Self {
+    pub fn new_with_recording(random_start: bool, record_history_io: bool, gens_path: Option<String>) -> Self {
         let rng = &mut rand::rng();
         let tickers = AVAILABLE_TICKERS
             .to_vec()
@@ -78,13 +79,14 @@ impl Env {
             .map(|ticker| ticker.to_string())
             .collect();
 
-        Self::new_with_tickers_and_recording(tickers, random_start, record_history_io)
+        Self::new_with_tickers_and_recording(tickers, random_start, record_history_io, gens_path)
     }
 
     pub fn new_with_tickers_and_recording(
         tickers: Vec<String>,
         random_start: bool,
         record_history_io: bool,
+        gens_path: Option<String>,
     ) -> Self {
         eprint!("  hist..");
         let mapped_bars = get_historical_data(Some(
@@ -174,6 +176,7 @@ impl Env {
             earnings,
             macro_ind,
             record_history_io,
+            gens_path,
         }
     }
 
@@ -229,17 +232,31 @@ impl Env {
         );
 
         if self.record_history_io {
-            self.episode_history.record(
-                self.episode,
-                &self.tickers,
-                &self.prices,
-                self.episode_start_offset,
-            );
+            if let Some(ref gp) = self.gens_path {
+                self.episode_history.record_to_path(
+                    gp,
+                    self.episode,
+                    &self.tickers,
+                    &self.prices,
+                    self.episode_start_offset,
+                );
+            } else {
+                self.episode_history.record(
+                    self.episode,
+                    &self.tickers,
+                    &self.prices,
+                    self.episode_start_offset,
+                );
+            }
             self.meta_history
                 .record(&self.episode_history, outperformance);
 
             if self.episode % 5 == 0 {
-                self.meta_history.write_reports(self.episode);
+                if let Some(ref gp) = self.gens_path {
+                    self.meta_history.write_reports(self.episode, gp);
+                } else {
+                    self.meta_history.write_reports_default(self.episode);
+                }
             }
         }
 
