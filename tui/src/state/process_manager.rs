@@ -14,10 +14,11 @@ pub struct ProcessManagerState {
 
 impl ProcessManagerState {
     pub fn new() -> Self {
+        let active_run = RunDir::latest(RUNS_PATH).ok();
         Self {
             inference_process: None,
             training_process: None,
-            active_run: None,
+            active_run,
             cached_training_running: false,
             last_training_check: Instant::now(),
         }
@@ -104,6 +105,10 @@ impl ProcessManagerState {
 
         if let Some(w) = weights {
             cmd.arg("--weights").arg(w);
+        }
+
+        if let Some(name) = run_dir.root.file_name().and_then(|n| n.to_str()) {
+            cmd.arg("--run").arg(name);
         }
 
         cmd.env("CLICOLOR_FORCE", "1")
