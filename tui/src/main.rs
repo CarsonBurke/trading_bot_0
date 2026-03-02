@@ -294,7 +294,9 @@ impl App {
             self.generation_browser.load_generations()?;
             self.inference_browser.load_inferences()?;
             self.load_latest_meta_charts()?;
-            self.logs_page.poll_training_output();
+            let log_path = self.process_manager.active_run.as_ref()
+                .map(|r| r.log_file.to_string_lossy().to_string());
+            self.logs_page.poll_training_output(log_path.as_deref());
             self.last_refresh = now;
         }
         Ok(())
@@ -419,7 +421,9 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
         terminal.draw(|f| ui(f, app))?;
 
         app.maybe_refresh()?;
-        app.logs_page.poll_training_output();
+        let log_path = app.process_manager.active_run.as_ref()
+            .map(|r| r.log_file.to_string_lossy().to_string());
+        app.logs_page.poll_training_output(log_path.as_deref());
 
         // Wait for event, then drain all pending events before redrawing
         if event::poll(Duration::from_millis(16))? {

@@ -20,8 +20,9 @@ impl LogsPageState {
         }
     }
 
-    pub fn poll_training_output(&mut self) {
-        let log_path = "../training/runs/latest/training.log";
+    pub fn poll_training_output(&mut self, log_path: Option<&str>) {
+        let default = "../training/runs/latest/training.log".to_string();
+        let log_path = log_path.unwrap_or(&default);
         if let Ok(content) = fs::read_to_string(log_path) {
             let new_lines: Vec<String> = content
                 .lines()
