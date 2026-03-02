@@ -37,8 +37,8 @@ impl InterTickerBlock {
         let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, 2 * ff_dim);
         let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim);
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
-        let attn_gate = p.var("attn_gate", &[model_dim], Init::Const(0.0));
-        let mlp_gate = p.var("mlp_gate", &[model_dim], Init::Const(0.0));
+        let attn_gate = p.var("attn_gate", &[model_dim], Init::Const(ATTENTION_GATE_INIT));
+        let mlp_gate = p.var("mlp_gate", &[model_dim], Init::Const(ATTENTION_GATE_INIT));
         Self {
             ticker_ln,
             ticker_qkv,
@@ -75,7 +75,7 @@ impl InterTickerBlock {
             .squeeze_dim(1)
             .apply(&self.ticker_out)
             .reshape([batch, num_items, model_dim]);
-        let x = x + ctx * self.attn_gate.tanh();
+        let x = x + ctx * self.attn_gate.sigmoid();
         let mlp_in = self.mlp_ln
             .forward(&x.reshape([batch * num_items, model_dim]));
         let mlp_proj = mlp_in.apply(&self.mlp_fc1);
@@ -83,7 +83,7 @@ impl InterTickerBlock {
         let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
             .apply(&self.mlp_fc2)
             .reshape([batch, num_items, model_dim]);
-        &x + mlp * self.mlp_gate.tanh()
+        &x + mlp * self.mlp_gate.sigmoid()
     }
 }
 
@@ -109,7 +109,7 @@ impl ExoCrossBlock {
         let cross_out = linear_residual_out(p, "cross_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "q_norm"), cross_head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "k_norm"), cross_head_dim, 1e-6);
-        let cross_gate = p.var("cross_gate", &[model_dim], Init::Const(0.0));
+        let cross_gate = p.var("cross_gate", &[model_dim], Init::Const(ATTENTION_GATE_INIT));
         Self {
             cross_ln,
             cross_q,
@@ -166,7 +166,7 @@ impl ExoCrossBlock {
         let out = out.permute([0, 2, 1, 3]).reshape([b, s, model_dim]);
         let out = out.apply(&self.cross_out);
 
-        let result = &x_3d + out * self.cross_gate.tanh();
+        let result = &x_3d + out * self.cross_gate.sigmoid();
         if x.dim() == 2 {
             result.squeeze_dim(1)
         } else {
@@ -244,8 +244,8 @@ impl GqaBlock {
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
         let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
-        let attn_gate = p.var("attn_gate", &[model_dim], Init::Const(0.0));
-        let ffn_gate = p.var("ffn_gate", &[model_dim], Init::Const(0.0));
+        let attn_gate = p.var("attn_gate", &[model_dim], Init::Const(ATTENTION_GATE_INIT));
+        let ffn_gate = p.var("ffn_gate", &[model_dim], Init::Const(ATTENTION_GATE_INIT));
         Self {
             attn_ln,
             attn_qkv,
@@ -301,14 +301,14 @@ impl GqaBlock {
             .contiguous()
             .reshape([b, s, _d]);
         let out = out.apply(&self.attn_out);
-        let x = x + out * self.attn_gate.tanh();
+        let x = x + out * self.attn_gate.sigmoid();
 
         // SwiGLU FFN with pre-norm
         let ffn_in = self.ffn_ln.forward(&x);
         let ffn_proj = ffn_in.apply(&self.ffn_fc1);
         let ffn_parts = ffn_proj.chunk(2, -1);
         let ffn_out = (ffn_parts[0].silu() * &ffn_parts[1]).apply(&self.ffn_fc2);
-        &x + ffn_out * self.ffn_gate.tanh()
+        &x + ffn_out * self.ffn_gate.sigmoid()
     }
 }
 
@@ -369,6 +369,7 @@ const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const SDE_EPS: f64 = 1e-6;
 pub(super) const LOG_STD_FLOOR: f64 = -2.0;
+const ATTENTION_GATE_INIT: f64 = -4.0;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
