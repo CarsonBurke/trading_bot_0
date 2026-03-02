@@ -23,6 +23,8 @@ struct InterTickerBlock {
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
     mlp_ln: RMSNorm,
+    attn_gate: Tensor,
+    mlp_gate: Tensor,
 }
 
 impl InterTickerBlock {
@@ -35,6 +37,8 @@ impl InterTickerBlock {
         let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, 2 * ff_dim);
         let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim);
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
+        let attn_gate = p.var("attn_gate", &[model_dim], Init::Const(0.0));
+        let mlp_gate = p.var("mlp_gate", &[model_dim], Init::Const(0.0));
         Self {
             ticker_ln,
             ticker_qkv,
@@ -44,6 +48,8 @@ impl InterTickerBlock {
             mlp_fc1,
             mlp_fc2,
             mlp_ln,
+            attn_gate,
+            mlp_gate,
         }
     }
 
@@ -69,7 +75,7 @@ impl InterTickerBlock {
             .squeeze_dim(1)
             .apply(&self.ticker_out)
             .reshape([batch, num_items, model_dim]);
-        let x = x + ctx;
+        let x = x + ctx * self.attn_gate.tanh();
         let mlp_in = self.mlp_ln
             .forward(&x.reshape([batch * num_items, model_dim]));
         let mlp_proj = mlp_in.apply(&self.mlp_fc1);
@@ -77,7 +83,7 @@ impl InterTickerBlock {
         let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
             .apply(&self.mlp_fc2)
             .reshape([batch, num_items, model_dim]);
-        &x + mlp
+        &x + mlp * self.mlp_gate.tanh()
     }
 }
 
@@ -91,6 +97,7 @@ struct ExoCrossBlock {
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     kv_dim: i64,
+    cross_gate: Tensor,
 }
 
 impl ExoCrossBlock {
@@ -102,6 +109,7 @@ impl ExoCrossBlock {
         let cross_out = linear_residual_out(p, "cross_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "q_norm"), cross_head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "k_norm"), cross_head_dim, 1e-6);
+        let cross_gate = p.var("cross_gate", &[model_dim], Init::Const(0.0));
         Self {
             cross_ln,
             cross_q,
@@ -110,6 +118,7 @@ impl ExoCrossBlock {
             q_norm,
             k_norm,
             kv_dim,
+            cross_gate,
         }
     }
 
@@ -157,7 +166,7 @@ impl ExoCrossBlock {
         let out = out.permute([0, 2, 1, 3]).reshape([b, s, model_dim]);
         let out = out.apply(&self.cross_out);
 
-        let result = &x_3d + out;
+        let result = &x_3d + out * self.cross_gate.tanh();
         if x.dim() == 2 {
             result.squeeze_dim(1)
         } else {
@@ -218,6 +227,8 @@ struct GqaBlock {
     ffn_ln: RMSNorm,
     ffn_fc1: nn::Linear,
     ffn_fc2: nn::Linear,
+    attn_gate: Tensor,
+    ffn_gate: Tensor,
 }
 
 impl GqaBlock {
@@ -233,6 +244,8 @@ impl GqaBlock {
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
         let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
+        let attn_gate = p.var("attn_gate", &[model_dim], Init::Const(0.0));
+        let ffn_gate = p.var("ffn_gate", &[model_dim], Init::Const(0.0));
         Self {
             attn_ln,
             attn_qkv,
@@ -244,6 +257,8 @@ impl GqaBlock {
             ffn_ln,
             ffn_fc1,
             ffn_fc2,
+            attn_gate,
+            ffn_gate,
         }
     }
 
@@ -286,14 +301,14 @@ impl GqaBlock {
             .contiguous()
             .reshape([b, s, _d]);
         let out = out.apply(&self.attn_out);
-        let x = x + out;
+        let x = x + out * self.attn_gate.tanh();
 
         // SwiGLU FFN with pre-norm
         let ffn_in = self.ffn_ln.forward(&x);
         let ffn_proj = ffn_in.apply(&self.ffn_fc1);
         let ffn_parts = ffn_proj.chunk(2, -1);
         let ffn_out = (ffn_parts[0].silu() * &ffn_parts[1]).apply(&self.ffn_fc2);
-        &x + ffn_out
+        &x + ffn_out * self.ffn_gate.tanh()
     }
 }
 
@@ -511,6 +526,7 @@ pub struct TradingModel {
     actor_proj: nn::Linear,
     mean_scale: Tensor,
     value_proj: nn::Linear,
+    sde_in_proj: nn::Linear,
     sde_fc: nn::Linear,
     sde_norm: RMSNorm,
     sde_fc2: nn::Linear,
@@ -652,6 +668,16 @@ impl TradingModel {
                 bias: true,
             },
         );
+        let sde_in_proj = nn::linear(
+            p / "sde_in_proj",
+            flat_per_ticker,
+            spec.model_dim,
+            nn::LinearConfig {
+                ws_init: Init::Orthogonal { gain: 1.0 },
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
         let sde_fc = nn::linear(
             p / "sde_fc",
             spec.model_dim,
@@ -695,6 +721,7 @@ impl TradingModel {
             actor_proj,
             mean_scale,
             value_proj,
+            sde_in_proj,
             sde_fc,
             sde_norm,
             sde_fc2,
