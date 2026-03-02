@@ -369,7 +369,7 @@ const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const SDE_EPS: f64 = 1e-6;
 pub(super) const LOG_STD_FLOOR: f64 = -2.0;
-const ATTENTION_GATE_INIT: f64 = -4.0;
+const ATTENTION_GATE_INIT: f64 = -2.0;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
@@ -657,7 +657,7 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let mean_scale = p.var("mean_scale", &[1], Init::Const(0.3));
+        let mean_scale = p.var("mean_scale", &[1], Init::Const(0.1));
         let value_proj = nn::linear(
             p / "value_proj",
             flat_all_tickers,
