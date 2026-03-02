@@ -168,6 +168,7 @@ impl App {
             "policy_loss",
             "policy_entropy",
             "approx_kl",
+            "gate_stats"
         ];
 
         // Ticker-specific chart base names
