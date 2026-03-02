@@ -39,17 +39,16 @@ impl TradingModel {
             .reshape([batch_size, TICKERS_COUNT])
             * self.mean_scale.to_kind(flat_per_normed.kind());
 
-        // gSDE: mean-pooled temporal features -> latent -> quadratic variance
-        let sde_pool = x_time.mean_dim([2].as_slice(), false, x_time.kind());
-        let sde_in = sde_pool.reshape([batch_size * TICKERS_COUNT, self.model_dim]);
+        // gSDE: projected flattened per-ticker features -> latent -> quadratic variance
+        let sde_in = flat_per_normed.apply(&self.sde_in_proj);
         let sde_latent = self.sde_norm.forward(&sde_in.apply(&self.sde_fc))
             .apply(&self.sde_fc2)
             .tanh();
         let latent_sq = sde_latent.pow_tensor_scalar(2);
         let log_std = (&self.log_std_param + LOG_STD_FLOOR).to_kind(latent_sq.kind());
         let std_sq = (log_std * 2.0).exp();
-        let variance =
-            latent_sq.matmul(&std_sq).reshape([batch_size, TICKERS_COUNT]);
+        let variance = (latent_sq.matmul(&std_sq) / (SDE_LATENT_DIM as f64).sqrt())
+            .reshape([batch_size, TICKERS_COUNT]);
         let action_noise_std = (variance + SDE_EPS).sqrt();
 
         // Critic: RMSNorm → projection
