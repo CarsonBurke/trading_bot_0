@@ -34,6 +34,8 @@ pub struct MetaHistory {
     pub policy_entropy_min: Vec<f64>,
     pub policy_entropy_max: Vec<f64>,
     pub approx_kl: Vec<f64>,
+    pub gate_mean: Vec<f64>,
+    pub gate_std: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -86,6 +88,11 @@ impl MetaHistory {
 
     pub fn record_approx_kl(&mut self, kl: f64) {
         self.approx_kl.push(kl);
+    }
+
+    pub fn record_gate_stats(&mut self, mean: f64, std: f64) {
+        self.gate_mean.push(mean);
+        self.gate_std.push(std);
     }
 
     pub fn record_temporal_debug(
@@ -171,6 +178,9 @@ impl MetaHistory {
         self.policy_entropy_max = load_multiline(&entropy_path, "max");
 
         self.approx_kl = load_simple(&format!("{base_dir}/approx_kl.report.bin"));
+        let gate_path = format!("{base_dir}/gate_stats.report.bin");
+        self.gate_mean = load_multiline(&gate_path, "mean");
+        self.gate_std = load_multiline(&gate_path, "std");
 
         println!(
             "Loaded meta history from episode {} ({} data points)",
@@ -431,6 +441,27 @@ impl MetaHistory {
                 },
             );
             let _ = write_report(&format!("{base_dir}/temporal_embed_debug.report.bin"), &r);
+        }
+        if !self.gate_mean.is_empty() {
+            let r = Self::report(
+                "Gate Stats",
+                "Episode",
+                None,
+                ScaleKind::Linear,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "mean".to_string(),
+                            values: f64_to_f32(&self.gate_mean),
+                        },
+                        ReportSeries {
+                            label: "std".to_string(),
+                            values: f64_to_f32(&self.gate_std),
+                        },
+                    ],
+                },
+            );
+            let _ = write_report(&format!("{base_dir}/gate_stats.report.bin"), &r);
         }
     }
 }

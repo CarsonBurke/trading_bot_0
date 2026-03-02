@@ -228,6 +228,22 @@ fn compute_action_std_stats(
     })
 }
 
+/// Compute global gate parameter stats (mean/std) with a single on-device reduction.
+fn compute_gate_stats(gate_params: &[Tensor], device: tch::Device) -> Tensor {
+    tch::no_grad(|| {
+        if gate_params.is_empty() {
+            Tensor::zeros([2], (Kind::Float, device))
+        } else {
+            let flat = gate_params
+                .iter()
+                .map(|g| g.to_kind(Kind::Float).flatten(0, -1))
+                .collect::<Vec<_>>();
+            let all = Tensor::cat(&flat, 0);
+            Tensor::stack(&[all.mean(Kind::Float), all.std(false)], 0)
+        }
+    })
+}
+
 pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_name: Option<String>) {
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
@@ -305,6 +321,13 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
     // Done after weight loading so loaded fp32 weights get cast.
     // Adam optimizer handles mixed bf16 parameters correctly.
     vs.bfloat16();
+
+    // Cache gate tensors once; shallow clones stay tied to live parameters.
+    let gate_params: Vec<Tensor> = vs
+        .variables()
+        .into_iter()
+        .filter_map(|(name, t)| if name.contains("gate") { Some(t) } else { None })
+        .collect();
 
     let mut opt = Fp32Adam::new(&vs, LEARNING_RATE);
 
@@ -826,6 +849,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             &rpo_rho,
             device,
         );
+        let gate_stats = compute_gate_stats(&gate_params, device);
 
         // Single GPU->CPU transfer for all scalars
         let all_scalars = Tensor::cat(
@@ -840,11 +864,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 entropy_mean_t.view([1]),
                 entropy_min.view([1]),
                 entropy_max.view([1]),
+                gate_stats.view([2]),
             ],
             0,
         );
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 15]);
+            .unwrap_or_else(|_| vec![0.0; 17]);
         let mean_policy_loss = all_scalars_vec[0];
         let mean_value_loss = all_scalars_vec[1];
         let explained_var = all_scalars_vec[2];
@@ -858,6 +883,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             all_scalars_vec[13],
             all_scalars_vec[14],
         );
+        let gate_mean = all_scalars_vec[15];
+        let gate_std = all_scalars_vec[16];
 
         let primary = env.primary_mut();
         primary
@@ -879,6 +906,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
         primary.meta_history.record_approx_kl(first_epoch_kl);
+        primary.meta_history.record_gate_stats(gate_mean, gate_std);
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",
