@@ -24,7 +24,6 @@ const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.0;
 const MAX_GRAD_NORM: f64 = 0.5;
-const GRAD_ACCUM_STEPS: usize = 1;
 pub(crate) const DEBUG_NUMERICS: bool = false;
 const LOG_2PI: f64 = 1.8378770664093453;
 
@@ -532,8 +531,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         let mut total_clipped = Tensor::zeros([], (Kind::Float, device));
         let mut total_ratio_samples = 0i64;
         let mut total_entropy_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut entropy_min = Tensor::from(f64::INFINITY).to_device(device);
-        let mut entropy_max = Tensor::from(f64::NEG_INFINITY).to_device(device);
+        let mut entropy_min =
+            Tensor::from(f64::INFINITY).to_kind(Kind::Float).to_device(device);
+        let mut entropy_max =
+            Tensor::from(f64::NEG_INFINITY).to_kind(Kind::Float).to_device(device);
 
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
@@ -549,8 +550,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
             let total_epoch_samples = rollout_steps * NPROCS;
-            let samples_per_accum =
-                (CHUNK_SIZE * NPROCS * GRAD_ACCUM_STEPS as i64).min(total_epoch_samples);
+            let samples_per_accum = (CHUNK_SIZE * NPROCS).min(total_epoch_samples);
 
             for (chunk_i, &chunk_idx) in chunk_order.iter().enumerate() {
                 let chunk_start_step = chunk_idx as i64 * CHUNK_SIZE;
@@ -660,8 +660,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                     &ppo_loss * (chunk_sample_count as f64 / samples_per_accum as f64);
                 let scaled_alpha_loss =
                     &alpha_loss * (chunk_sample_count as f64 / samples_per_accum as f64);
-                let total_chunk_loss =
-                    (scaled_ppo_loss + scaled_alpha_loss) / GRAD_ACCUM_STEPS as f64;
+                let total_chunk_loss = scaled_ppo_loss + scaled_alpha_loss;
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
@@ -686,58 +685,56 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 epoch_kl_count += chunk_sample_count;
                 total_sample_count += chunk_sample_count;
 
-                if (chunk_i + 1) % GRAD_ACCUM_STEPS == 0 || chunk_i == chunk_order.len() - 1 {
-                    if DEBUG_NUMERICS {
-                        let has_nan_grad = tch::no_grad(|| {
-                            let mut found = false;
-                            for v in opt.trainable_variables() {
-                                let g = v.grad();
-                                if g.defined()
-                                    && (g.isnan().any().int64_value(&[]) != 0
-                                        || g.isinf().any().int64_value(&[]) != 0)
-                                {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            found
-                        });
-                        if has_nan_grad {
-                            println!("ERROR: Non-finite gradients detected!");
-                        }
-                    }
-
-                    let batch_grad_norm = tch::no_grad(|| {
-                        let mut norm_sq = Tensor::zeros([], (Kind::Float, device));
+                if DEBUG_NUMERICS {
+                    let has_nan_grad = tch::no_grad(|| {
+                        let mut found = false;
                         for v in opt.trainable_variables() {
                             let g = v.grad();
-                            if g.defined() {
-                                norm_sq += g.pow_tensor_scalar(2).sum(Kind::Float);
+                            if g.defined()
+                                && (g.isnan().any().int64_value(&[]) != 0
+                                    || g.isinf().any().int64_value(&[]) != 0)
+                            {
+                                found = true;
+                                break;
                             }
                         }
-                        norm_sq.sqrt()
+                        found
                     });
-                    grad_norm_sum += &batch_grad_norm;
-                    grad_norm_count += 1;
-
-                    opt.clip_grad_norm(MAX_GRAD_NORM);
-
-                    opt.step();
-                    if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                        let max_delta_rho =
-                            MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
-                        tch::no_grad(|| {
-                            let mut rho_grad = rpo_rho.grad();
-                            if rho_grad.defined() {
-                                let rho_step =
-                                    (-LEARNING_RATE * &rho_grad).clamp(-max_delta_rho, max_delta_rho);
-                                let _ = rpo_rho.g_add_(&rho_step);
-                                let _ = rho_grad.zero_();
-                            }
-                        });
+                    if has_nan_grad {
+                        println!("ERROR: Non-finite gradients detected!");
                     }
-                    opt.zero_grad();
                 }
+
+                let batch_grad_norm = tch::no_grad(|| {
+                    let mut norm_sq = Tensor::zeros([], (Kind::Float, device));
+                    for v in opt.trainable_variables() {
+                        let g = v.grad();
+                        if g.defined() {
+                            norm_sq += g.pow_tensor_scalar(2).sum(Kind::Float);
+                        }
+                    }
+                    norm_sq.sqrt()
+                });
+                grad_norm_sum += &batch_grad_norm;
+                grad_norm_count += 1;
+
+                opt.clip_grad_norm(MAX_GRAD_NORM);
+
+                opt.step();
+                if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                    let max_delta_rho =
+                        MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
+                    tch::no_grad(|| {
+                        let mut rho_grad = rpo_rho.grad();
+                        if rho_grad.defined() {
+                            let rho_step =
+                                (-LEARNING_RATE * &rho_grad).clamp(-max_delta_rho, max_delta_rho);
+                            let _ = rpo_rho.g_add_(&rho_step);
+                            let _ = rho_grad.zero_();
+                        }
+                    });
+                }
+                opt.zero_grad();
 
                 let _ = total_clipped.g_add_(&tch::no_grad(|| {
                     let dev = &ratio - 1.0;

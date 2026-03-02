@@ -372,7 +372,7 @@ const BASE_PATCH_CONFIGS: &[(i64, i64)] = &[
     (1, 1),
 ];
 
-const ABLATION_SMALL_PATCH_CONFIGS: &[(i64, i64)] = &[(8192, 256), (384, 8), (60, 1)];
+const ABLATION_SMALL_PATCH_CONFIGS: &[(i64, i64)] = &[(8192, 256), (384, 8), (117, 1)];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
