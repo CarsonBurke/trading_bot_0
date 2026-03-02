@@ -31,8 +31,8 @@ const LOG_2PI: f64 = 1.8378770664093453;
 // RPO: Random Policy Optimization - adds bounded noise to action mean during training and intentionally not during rollout
 // Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
 const RPO_ALPHA_MIN: f64 = 0.01;
-const RPO_ALPHA_MAX: f64 = 0.5;
-const RPO_ALPHA_INIT: f64 = 0.1; // CleanRL impl found 0.1 reliably improved results in all test envs over PPO
+const RPO_ALPHA_MAX: f64 = 0.0;
+const RPO_ALPHA_INIT: f64 = 0.0; // CleanRL impl found 0.1 reliably improved results in all test envs over PPO
 const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
@@ -259,13 +259,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
     );
 
     // RPO alpha via sigmoid: alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
-    // Kept outside VarStore so Fp32Adam doesn't pick it up (custom clamped update rule)
+    // Keep rho fully outside VarStore so Fp32Adam/vs.bfloat16() do not touch it.
     let mut rpo_rho = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
         let p_init = (RPO_ALPHA_INIT - RPO_ALPHA_MIN) / (RPO_ALPHA_MAX - RPO_ALPHA_MIN);
         let p_init = p_init.clamp(1e-6, 1.0 - 1e-6);
         let rho_init = (p_init / (1.0 - p_init)).ln();
-        vs.root()
-            .var("rpo_alpha_rho", &[1], nn::Init::Const(rho_init))
+        Tensor::full([1], rho_init, (Kind::Float, device)).set_requires_grad(true)
     } else {
         Tensor::zeros(&[1], (Kind::Float, device))
     };
@@ -359,6 +358,16 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 ret_rms_var = load_vec("var", 1.0);
                 ret_rms_count = load_vec("count", 1e-4);
                 disc_ret = load_vec("disc_ret", 0.0);
+                if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                    if let Some(rho) = parsed["rpo_rho"].as_f64() {
+                        tch::no_grad(|| {
+                            let _ = rpo_rho.copy_(
+                                &Tensor::from_slice(&[rho as f32]).to_device(device),
+                            );
+                        });
+                        println!("Loaded RPO rho: {:.6}", rho);
+                    }
+                }
                 let avg_var: f64 = ret_rms_var.iter().sum::<f64>() / n as f64;
                 let avg_count: f64 = ret_rms_count.iter().sum::<f64>() / n as f64;
                 println!("Loaded reward norm: avg_var={:.6}, avg_count={:.0}", avg_var, avg_count);
@@ -446,21 +455,20 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             ).unwrap();
             let mut norm_rewards = vec![0.0f32; n];
             for i in 0..n {
-                // Step 1: accumulate discounted return
+                // Reset discounted return on done BEFORE accumulating
+                // (matches gymnasium NormalizeReward: disc_ret *= gamma * (1 - terminated))
+                if dones_f64[i] > 0.5 { disc_ret[i] = 0.0; }
                 disc_ret[i] = disc_ret[i] * 0.99 + rewards_f64[i];
-                // Step 2: Welford update (batch_count=1, batch_var=0)
+                // Welford update
                 let delta = disc_ret[i] - ret_rms_mean[i];
                 ret_rms_count[i] += 1.0;
                 ret_rms_mean[i] += delta / ret_rms_count[i];
                 let delta2 = disc_ret[i] - ret_rms_mean[i];
-                // Online variance: var = M2/count, M2 += delta * delta2
                 let m2 = ret_rms_var[i] * (ret_rms_count[i] - 1.0) + delta * delta2;
                 ret_rms_var[i] = m2 / ret_rms_count[i];
-                // Step 3: normalize reward by this env's sqrt(var)
+                // Normalize reward by sqrt(var)
                 let scale = (ret_rms_var[i] + 1e-8).sqrt();
                 norm_rewards[i] = (rewards_f64[i] / scale) as f32;
-                // Step 4: reset discounted return on done
-                if dones_f64[i] > 0.5 { disc_ret[i] = 0.0; }
             }
             let normalized_reward = Tensor::from_slice(&norm_rewards).to_device(device);
 
@@ -714,18 +722,19 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
 
                     opt.clip_grad_norm(MAX_GRAD_NORM);
 
+                    opt.step();
                     if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                         let max_delta_rho =
                             MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
                         tch::no_grad(|| {
-                            let rho_before = rpo_rho.detach();
-                            opt.step();
-                            let rho_new = &rho_before
-                                + (&rpo_rho - &rho_before).clamp(-max_delta_rho, max_delta_rho);
-                            let _ = rpo_rho.copy_(&rho_new);
+                            let mut rho_grad = rpo_rho.grad();
+                            if rho_grad.defined() {
+                                let rho_step =
+                                    (-LEARNING_RATE * &rho_grad).clamp(-max_delta_rho, max_delta_rho);
+                                let _ = rpo_rho.g_add_(&rho_step);
+                                let _ = rho_grad.zero_();
+                            }
                         });
-                    } else {
-                        opt.step();
                     }
                     opt.zero_grad();
                 }
@@ -891,6 +900,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                     "var": &ret_rms_var,
                     "count": &ret_rms_count,
                     "disc_ret": &disc_ret,
+                    "rpo_rho": if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                        Some(rpo_rho.double_value(&[]))
+                    } else {
+                        None
+                    },
                 });
                 if let Err(err) = std::fs::write(&meta_path, json.to_string()) {
                     println!("Error saving reward norm state: {}", err);
