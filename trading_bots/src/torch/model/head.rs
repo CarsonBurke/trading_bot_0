@@ -2,7 +2,6 @@ use tch::{Kind, Tensor};
 
 use super::{
     DebugMetrics, ModelOutput, TradingModel, SDE_EPS, LOG_STD_FLOOR,
-    SDE_LATENT_DIM,
 };
 use crate::torch::constants::TICKERS_COUNT;
 
@@ -47,7 +46,7 @@ impl TradingModel {
         let latent_sq = sde_latent.pow_tensor_scalar(2);
         let log_std = (&self.log_std_param + LOG_STD_FLOOR).to_kind(latent_sq.kind());
         let std_sq = (log_std * 2.0).exp();
-        let variance = (latent_sq.matmul(&std_sq) / (SDE_LATENT_DIM as f64).sqrt())
+        let variance = latent_sq.matmul(&std_sq)
             .reshape([batch_size, TICKERS_COUNT]);
         let action_noise_std = (variance + SDE_EPS).sqrt();
 
