@@ -43,6 +43,7 @@ pub struct ChartViewer {
     editing_row_skip: bool,
     row_skip: usize,
     show_legend: bool,
+    solo_series: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,11 +71,21 @@ impl ChartViewer {
             editing_row_skip: false,
             row_skip: 0,
             show_legend: true,
+            solo_series: None,
         }
     }
 
     pub fn toggle_legend(&mut self) {
         self.show_legend = !self.show_legend;
+        self.load_current_image();
+    }
+
+    pub fn toggle_solo_series(&mut self, n: usize) {
+        self.solo_series = if self.solo_series == Some(n) {
+            None
+        } else {
+            Some(n)
+        };
         self.load_current_image();
     }
 
@@ -464,7 +475,7 @@ impl ChartViewer {
                         } else {
                             0
                         };
-                        if let Ok(img) = render_report_with_options(&report, skip, self.show_legend)
+                        if let Ok(img) = render_report_with_options(&report, skip, self.show_legend, self.solo_series)
                         {
                             let protocol = self.picker.new_resize_protocol(img);
                             self.current_image = Some(protocol);
@@ -490,6 +501,7 @@ impl ChartViewer {
             None => 0,
         };
         self.list_state.select(Some(i));
+        self.solo_series = None;
         self.load_current_image();
     }
 
@@ -508,6 +520,7 @@ impl ChartViewer {
             None => 0,
         };
         self.list_state.select(Some(i));
+        self.solo_series = None;
         self.load_current_image();
     }
 
@@ -721,6 +734,10 @@ impl ChartViewer {
         } else {
             "Legend (off)"
         };
+        let solo_label = match self.solo_series {
+            Some(n) => format!("Solo ({})", n + 1),
+            None => "Solo".to_string(),
+        };
         let (help_line1, help_line2) = if self.viewing_mode == ViewingMode::MetaCharts {
             (
                 Line::from(vec![
@@ -740,6 +757,8 @@ impl ChartViewer {
                     Span::raw(": Filter  "),
                     Span::styled("l", Style::default().fg(Color::Yellow)),
                     Span::raw(format!(": {}  ", legend_label)),
+                    Span::styled("1-9", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(": {}  ", solo_label)),
                     Span::styled("r", Style::default().fg(Color::Yellow)),
                     Span::raw(": Refresh"),
                 ]),
@@ -760,7 +779,9 @@ impl ChartViewer {
                 ]),
                 Line::from(vec![
                     Span::styled("l", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!(": {}", legend_label)),
+                    Span::raw(format!(": {}  ", legend_label)),
+                    Span::styled("1-9", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(": {}", solo_label)),
                 ]),
             )
         };
@@ -864,7 +885,7 @@ fn report_title_from_path(path: &PathBuf) -> Option<String> {
 }
 
 fn render_report_to_temp(report: &Report, skip: usize, show_legend: bool) -> Result<PathBuf> {
-    let image = render_report_with_options(report, skip, show_legend)?;
+    let image = render_report_with_options(report, skip, show_legend, None)?;
     let mut path = std::env::temp_dir();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -932,6 +932,9 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                             KeyCode::Char('l') => {
                                                 app.chart_viewer.toggle_legend();
                                             }
+                                            KeyCode::Char(c @ '1'..='9') => {
+                                                app.chart_viewer.toggle_solo_series((c as u8 - b'1') as usize);
+                                            }
                                             _ => {}
                                         }
                                     }

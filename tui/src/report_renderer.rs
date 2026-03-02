@@ -8,17 +8,18 @@ use shared::theme::plotters_colors as theme;
 const CHART_DIMS: (u32, u32) = (2560, 780);
 
 pub fn render_report(report: &Report) -> Result<DynamicImage> {
-    render_report_with_options(report, 0, true)
+    render_report_with_options(report, 0, true, None)
 }
 
 pub fn render_report_with_skip(report: &Report, skip: usize) -> Result<DynamicImage> {
-    render_report_with_options(report, skip, true)
+    render_report_with_options(report, skip, true, None)
 }
 
 pub fn render_report_with_options(
     report: &Report,
     skip: usize,
     show_legend: bool,
+    solo_series: Option<usize>,
 ) -> Result<DynamicImage> {
     let mut buffer = vec![0u8; (CHART_DIMS.0 * CHART_DIMS.1 * 3) as usize];
     {
@@ -30,7 +31,7 @@ pub fn render_report_with_options(
         match &report.kind {
             ReportKind::Simple { values, ema_alpha } => {
                 let values = skip_slice(values, skip);
-                render_simple(&root, report, values, *ema_alpha, x_offset, show_legend)?;
+                render_simple(&root, report, values, *ema_alpha, x_offset, show_legend, solo_series)?;
             }
             ReportKind::MultiLine { series } => {
                 let series: Vec<ReportSeries> = series
@@ -40,7 +41,7 @@ pub fn render_report_with_options(
                         values: skip_slice(&s.values, skip).to_vec(),
                     })
                     .collect();
-                render_multi_line(&root, report, &series, x_offset, show_legend)?;
+                render_multi_line(&root, report, &series, x_offset, show_legend, solo_series)?;
             }
             ReportKind::Assets {
                 total,
@@ -63,6 +64,7 @@ pub fn render_report_with_options(
                     benchmark.as_ref(),
                     x_offset,
                     show_legend,
+                    solo_series,
                 )?;
             }
             ReportKind::BuySell {
@@ -116,13 +118,32 @@ fn render_simple(
     ema_alpha: Option<f64>,
     x_offset: u32,
     show_legend: bool,
+    solo_series: Option<usize>,
 ) -> Result<()> {
     if values.is_empty() {
         return Ok(());
     }
 
+    // Series: 0=value, 1=EMA. Out-of-range solo → no solo.
+    let series_count = if ema_alpha.is_some() { 2 } else { 1 };
+    let solo = match solo_series {
+        Some(idx) if idx < series_count => Some(idx),
+        _ => None,
+    };
+    let value_active = solo.is_none() || solo == Some(0);
+    let ema_active = ema_alpha.is_some() && (solo.is_none() || solo == Some(1));
+
     let scale = report.scale;
-    let (y_min, y_max) = range_for(values, scale == ScaleKind::Symlog)?;
+    // Y-range from active series only
+    let range_values: Vec<f32> = if value_active && ema_active {
+        let ema = compute_ema(values, ema_alpha.unwrap());
+        values.iter().chain(ema.iter()).copied().collect()
+    } else if ema_active {
+        compute_ema(values, ema_alpha.unwrap())
+    } else {
+        values.to_vec()
+    };
+    let (y_min, y_max) = range_for(&range_values, scale == ScaleKind::Symlog)?;
     let title = normalize_title(&report.title);
     let x_end = x_offset + values.len() as u32;
     let mut chart = plotters::chart::ChartBuilder::on(root)
@@ -147,44 +168,66 @@ fn render_simple(
     }
     mesh.draw()?;
 
-    let mapped = values
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.is_finite())
-        .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
-
-    if scale == ScaleKind::Symlog {
-        chart
-            .draw_series(LineSeries::new(
-                mapped,
-                ShapeStyle::from(&theme::BLUE).stroke_width(1),
-            ))?
-            .label("value")
-            .legend(legend_rect(&theme::BLUE));
-    } else {
-        chart
-            .draw_series(
-                AreaSeries::new(mapped, 0.0, theme::BLUE.mix(0.2))
-                    .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
-            )?
-            .label("value")
-            .legend(legend_rect(&theme::BLUE));
-    }
-
-    if let Some(alpha) = ema_alpha {
-        let ema = compute_ema(values, alpha);
-        let ema_series = ema
+    // Value series
+    if value_active {
+        let mapped = values
             .iter()
             .enumerate()
             .filter(|(_, v)| v.is_finite())
             .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
+
+        if scale == ScaleKind::Symlog {
+            chart
+                .draw_series(LineSeries::new(
+                    mapped,
+                    ShapeStyle::from(&theme::BLUE).stroke_width(1),
+                ))?
+                .label("value")
+                .legend(legend_rect(&theme::BLUE));
+        } else {
+            chart
+                .draw_series(
+                    AreaSeries::new(mapped, 0.0, theme::BLUE.mix(0.2))
+                        .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
+                )?
+                .label("value")
+                .legend(legend_rect(&theme::BLUE));
+        }
+    } else {
         chart
             .draw_series(LineSeries::new(
-                ema_series,
-                ShapeStyle::from(&theme::YELLOW).stroke_width(1),
+                std::iter::empty::<(u32, f64)>(),
+                ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
             ))?
-            .label("EMA")
-            .legend(legend_rect(&theme::YELLOW));
+            .label("value")
+            .legend(legend_rect(&theme::BLUE));
+    }
+
+    // EMA series
+    if let Some(alpha) = ema_alpha {
+        if ema_active {
+            let ema = compute_ema(values, alpha);
+            let ema_series = ema
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
+            chart
+                .draw_series(LineSeries::new(
+                    ema_series,
+                    ShapeStyle::from(&theme::YELLOW).stroke_width(1),
+                ))?
+                .label("EMA")
+                .legend(legend_rect(&theme::YELLOW));
+        } else {
+            chart
+                .draw_series(LineSeries::new(
+                    std::iter::empty::<(u32, f64)>(),
+                    ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
+                ))?
+                .label("EMA")
+                .legend(legend_rect(&theme::YELLOW));
+        }
     }
 
     if show_legend {
@@ -206,8 +249,19 @@ fn render_multi_line(
     series: &[ReportSeries],
     x_offset: u32,
     show_legend: bool,
+    solo_series: Option<usize>,
 ) -> Result<()> {
-    let all_values: Vec<f32> = series
+    let solo = match solo_series {
+        Some(idx) if idx < series.len() => Some(idx),
+        _ => None,
+    };
+
+    // Y-range from solo series only (or all if no solo)
+    let range_series: Vec<&ReportSeries> = match solo {
+        Some(idx) => vec![&series[idx]],
+        None => series.iter().collect(),
+    };
+    let all_values: Vec<f32> = range_series
         .iter()
         .flat_map(|s| s.values.iter())
         .copied()
@@ -252,21 +306,33 @@ fn render_multi_line(
         &theme::MAUVE,
     ];
 
-    for (i, series) in series.iter().enumerate() {
+    for (i, s) in series.iter().enumerate() {
+        let active = solo.is_none() || solo == Some(i);
         let color = colors[i % colors.len()];
-        let mapped = series
-            .values
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| v.is_finite())
-            .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
-        chart
-            .draw_series(LineSeries::new(
-                mapped,
-                ShapeStyle::from(&color.mix(0.8)).stroke_width(1),
-            ))?
-            .label(series.label.as_str())
-            .legend(legend_rect(color));
+        if active {
+            let mapped = s
+                .values
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
+            chart
+                .draw_series(LineSeries::new(
+                    mapped,
+                    ShapeStyle::from(&color.mix(0.8)).stroke_width(1),
+                ))?
+                .label(s.label.as_str())
+                .legend(legend_rect(color));
+        } else {
+            // Empty series to reserve legend entry, keep original color
+            chart
+                .draw_series(LineSeries::new(
+                    std::iter::empty::<(u32, f64)>(),
+                    ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
+                ))?
+                .label(s.label.as_str())
+                .legend(legend_rect(color));
+        }
     }
 
     if show_legend {
@@ -291,21 +357,44 @@ fn render_assets(
     benchmark: Option<&Vec<f32>>,
     x_offset: u32,
     show_legend: bool,
+    solo_series: Option<usize>,
 ) -> Result<()> {
     if total.is_empty() {
         return Ok(());
     }
 
-    let mut max_val = total
-        .iter()
-        .map(|v| *v as f64)
-        .fold(f64::NEG_INFINITY, f64::max);
-    if let Some(bench) = benchmark {
-        let bench_max = bench
-            .iter()
-            .map(|v| *v as f64)
-            .fold(f64::NEG_INFINITY, f64::max);
-        max_val = max_val.max(bench_max);
+    // Series mapping: 0=total, 1=positioned, 2=cash, 3=benchmark
+    // Count actual series to validate solo index
+    let series_count = 1
+        + positioned.map_or(0, |p| if p.is_empty() { 0 } else { 1 })
+        + 1
+        + benchmark.map_or(0, |_| 1);
+    let solo = match solo_series {
+        Some(idx) if idx < series_count => Some(idx),
+        _ => None,
+    };
+    let show = |idx: usize| solo.is_none() || solo == Some(idx);
+
+    // Compute y range from visible series only
+    let mut max_val = f64::NEG_INFINITY;
+    if show(0) {
+        max_val = max_val.max(total.iter().map(|v| *v as f64).fold(f64::NEG_INFINITY, f64::max));
+    }
+    if show(1) {
+        if let Some(p) = positioned {
+            max_val = max_val.max(p.iter().map(|v| *v as f64).fold(f64::NEG_INFINITY, f64::max));
+        }
+    }
+    if show(2) {
+        max_val = max_val.max(cash.iter().map(|v| *v as f64).fold(f64::NEG_INFINITY, f64::max));
+    }
+    if show(3) {
+        if let Some(bench) = benchmark {
+            max_val = max_val.max(bench.iter().map(|v| *v as f64).fold(f64::NEG_INFINITY, f64::max));
+        }
+    }
+    if max_val == f64::NEG_INFINITY {
+        max_val = 1.0;
     }
 
     let y_max = max_val as f32 * 1.1;
@@ -326,64 +415,108 @@ fn render_assets(
         .light_line_style(&theme::SURFACE0)
         .draw()?;
 
-    chart
-        .draw_series(
-            AreaSeries::new(
-                total
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
-                0.0,
-                theme::BLUE.mix(0.2),
-            )
-            .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
-        )?
-        .label("total")
-        .legend(legend_rect(&theme::BLUE));
-
-    let positioned = positioned.map(|p| p.as_slice()).unwrap_or(&[]);
-    if !positioned.is_empty() {
+    // total (0)
+    if show(0) {
         chart
             .draw_series(
                 AreaSeries::new(
-                    positioned
+                    total
                         .iter()
                         .enumerate()
                         .map(|(index, value)| (x_offset + index as u32, *value as f32)),
                     0.0,
-                    theme::RED.mix(0.2),
+                    theme::BLUE.mix(0.2),
                 )
-                .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
+                .border_style(ShapeStyle::from(&theme::BLUE).stroke_width(1)),
             )?
-            .label("positioned")
-            .legend(legend_rect(&theme::RED));
-    }
-
-    chart
-        .draw_series(
-            AreaSeries::new(
-                cash.iter()
-                    .enumerate()
-                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
-                0.0,
-                theme::GREEN.mix(0.2),
-            )
-            .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
-        )?
-        .label("cash")
-        .legend(legend_rect(&theme::GREEN));
-
-    if let Some(bench) = benchmark {
+            .label("total")
+            .legend(legend_rect(&theme::BLUE));
+    } else {
         chart
             .draw_series(LineSeries::new(
-                bench
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| (x_offset + index as u32, *value as f32)),
-                ShapeStyle::from(&theme::MAUVE).stroke_width(1),
+                std::iter::empty::<(u32, f32)>(),
+                ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
             ))?
-            .label("benchmark")
-            .legend(legend_rect(&theme::MAUVE));
+            .label("total")
+            .legend(legend_rect(&theme::BLUE));
+    }
+
+    // positioned (1)
+    let positioned = positioned.map(|p| p.as_slice()).unwrap_or(&[]);
+    if !positioned.is_empty() {
+        if show(1) {
+            chart
+                .draw_series(
+                    AreaSeries::new(
+                        positioned
+                            .iter()
+                            .enumerate()
+                            .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                        0.0,
+                        theme::RED.mix(0.2),
+                    )
+                    .border_style(ShapeStyle::from(&theme::RED).stroke_width(1)),
+                )?
+                .label("positioned")
+                .legend(legend_rect(&theme::RED));
+        } else {
+            chart
+                .draw_series(LineSeries::new(
+                    std::iter::empty::<(u32, f32)>(),
+                    ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
+                ))?
+                .label("positioned")
+                .legend(legend_rect(&theme::RED));
+        }
+    }
+
+    // cash (2)
+    if show(2) {
+        chart
+            .draw_series(
+                AreaSeries::new(
+                    cash.iter()
+                        .enumerate()
+                        .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                    0.0,
+                    theme::GREEN.mix(0.2),
+                )
+                .border_style(ShapeStyle::from(&theme::GREEN).stroke_width(1)),
+            )?
+            .label("cash")
+            .legend(legend_rect(&theme::GREEN));
+    } else {
+        chart
+            .draw_series(LineSeries::new(
+                std::iter::empty::<(u32, f32)>(),
+                ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
+            ))?
+            .label("cash")
+            .legend(legend_rect(&theme::GREEN));
+    }
+
+    // benchmark (3)
+    if let Some(bench) = benchmark {
+        if show(3) {
+            chart
+                .draw_series(LineSeries::new(
+                    bench
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| (x_offset + index as u32, *value as f32)),
+                    ShapeStyle::from(&theme::MAUVE).stroke_width(1),
+                ))?
+                .label("benchmark")
+                .legend(legend_rect(&theme::MAUVE));
+        } else {
+            chart
+                .draw_series(LineSeries::new(
+                    std::iter::empty::<(u32, f32)>(),
+                    ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
+                ))?
+                .label("benchmark")
+                .legend(legend_rect(&theme::MAUVE));
+        }
     }
 
     if show_legend {
