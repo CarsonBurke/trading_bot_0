@@ -330,7 +330,7 @@ impl MetaHistory {
                 "Advantage Stats (Log)",
                 "Episode",
                 None,
-                ScaleKind::Symlog,
+                ScaleKind::Linear,
                 ReportKind::MultiLine {
                     series: vec![
                         ReportSeries {
