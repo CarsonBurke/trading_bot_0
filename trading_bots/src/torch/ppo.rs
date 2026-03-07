@@ -544,6 +544,9 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         let static_obs_batch = s_static_obs.data.shallow_clone();
         let action_weights_batch = s_action_weights.shallow_clone();
 
+        // Normalize advantages over the full rollout (not per chunk)
+        let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
+
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -586,9 +589,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 let so_chunk = static_obs_batch.narrow(0, chunk_sample_start, chunk_sample_count);
                 let act_mb = s_actions.narrow(0, chunk_sample_start, chunk_sample_count);
                 let ret_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
-                let adv_mb_raw = advantages.narrow(0, chunk_sample_start, chunk_sample_count);
-                let adv_mb =
-                    (&adv_mb_raw - adv_mb_raw.mean(Kind::Float)) / (adv_mb_raw.std(true) + 1e-8);
+                let adv_mb = adv_norm.narrow(0, chunk_sample_start, chunk_sample_count);
                 let old_log_probs_mb =
                     s_old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
                 let _weight_mb =
