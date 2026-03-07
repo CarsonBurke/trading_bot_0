@@ -544,8 +544,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         let static_obs_batch = s_static_obs.data.shallow_clone();
         let action_weights_batch = s_action_weights.shallow_clone();
 
-        // Normalize advantages over the full rollout (not per chunk)
-        let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
+        let total_samples = rollout_steps * NPROCS;
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -565,35 +564,32 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
 
-        let num_chunks = (rollout_steps + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let mut chunk_order: Vec<usize> = (0..num_chunks as usize).collect();
+        let minibatch_size = (CHUNK_SIZE * NPROCS).min(total_samples);
+        let mut b_inds: Vec<i64> = (0..total_samples).collect();
 
         let mut first_epoch_kl = 0.0f64;
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             use rand::seq::SliceRandom;
-            chunk_order.shuffle(&mut rand::rng());
+            b_inds.shuffle(&mut rand::rng());
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
-            let total_epoch_samples = rollout_steps * NPROCS;
-            let samples_per_accum = (CHUNK_SIZE * NPROCS).min(total_epoch_samples);
+            let samples_per_accum = minibatch_size;
 
-            for (chunk_i, &chunk_idx) in chunk_order.iter().enumerate() {
-                let chunk_start_step = chunk_idx as i64 * CHUNK_SIZE;
-                let chunk_end_step = ((chunk_idx as i64 + 1) * CHUNK_SIZE).min(rollout_steps);
-                let chunk_len = chunk_end_step - chunk_start_step;
-                let chunk_sample_count = chunk_len * NPROCS;
-                let chunk_sample_start = chunk_start_step * NPROCS;
+            for (chunk_i, mb_start) in (0..total_samples).step_by(minibatch_size as usize).enumerate() {
+                let mb_end = (mb_start + minibatch_size).min(total_samples);
+                let chunk_sample_count = mb_end - mb_start;
+                let mb_inds_slice = &b_inds[mb_start as usize..mb_end as usize];
+                let mb_inds = Tensor::from_slice(mb_inds_slice).to_device(device);
 
-                let pd_chunk = price_deltas_batch.narrow(0, chunk_sample_start, chunk_sample_count);
-                let so_chunk = static_obs_batch.narrow(0, chunk_sample_start, chunk_sample_count);
-                let act_mb = s_actions.narrow(0, chunk_sample_start, chunk_sample_count);
-                let ret_mb = returns.narrow(0, chunk_sample_start, chunk_sample_count);
-                let adv_mb = adv_norm.narrow(0, chunk_sample_start, chunk_sample_count);
-                let old_log_probs_mb =
-                    s_old_log_probs.narrow(0, chunk_sample_start, chunk_sample_count);
-                let _weight_mb =
-                    action_weights_batch.narrow(0, chunk_sample_start, chunk_sample_count);
+                let pd_chunk = price_deltas_batch.index_select(0, &mb_inds);
+                let so_chunk = static_obs_batch.index_select(0, &mb_inds);
+                let act_mb = s_actions.index_select(0, &mb_inds);
+                let ret_mb = returns.index_select(0, &mb_inds);
+                let adv_mb_raw = advantages.index_select(0, &mb_inds);
+                let adv_mb = (&adv_mb_raw - adv_mb_raw.mean(Kind::Float)) / (adv_mb_raw.std(true) + 1e-8);
+                let old_log_probs_mb = s_old_log_probs.index_select(0, &mb_inds);
+                let _weight_mb = action_weights_batch.index_select(0, &mb_inds);
 
                 let fwd_start = Instant::now();
                 let (new_values, action_mean, action_noise_std) =
@@ -651,7 +647,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
 
                 // Scalar value loss with PPO value clipping
                 let new_values = new_values.to_kind(Kind::Float);
-                let old_val_mb = s_values.narrow(0, chunk_sample_start, chunk_sample_count);
+                let old_val_mb = s_values.index_select(0, &mb_inds);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("new_values", &new_values, _epoch, chunk_i);
