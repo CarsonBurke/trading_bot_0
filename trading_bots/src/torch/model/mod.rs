@@ -8,8 +8,8 @@ use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
 use crate::torch::constants::{
-    GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS,
-    TICKERS_COUNT,
+    ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER,
+    STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 
 use rmsnorm::RMSNorm;
@@ -368,8 +368,10 @@ const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const SDE_EPS: f64 = 1e-6;
-pub(super) const LOG_STD_FLOOR: f64 = -3.0;
-pub(super) const NOISE_RANK: i64 = TICKERS_COUNT;
+pub(super) const LOG_STD_INIT: f64 = -2.0;
+pub(super) const LOG_STD_MIN: f64 = -3.0;
+pub(super) const LOG_STD_MAX: f64 = -0.5;
+pub(super) const SDE_PRESCALE: f64 = 1.5;
 const ATTENTION_GATE_INIT: f64 = -2.0;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
@@ -464,7 +466,7 @@ pub fn patch_ends_for_variant(variant: ModelVariant) -> Vec<i64> {
     ends
 }
 
-/// (values, action_mean, action_noise_std)
+/// (values, action_mean, action_std)
 pub type ModelOutput = (Tensor, Tensor, Tensor);
 
 pub struct DebugMetrics {
@@ -531,12 +533,7 @@ pub struct TradingModel {
     sde_fc: nn::Linear,
     sde_norm: RMSNorm,
     sde_fc2: nn::Linear,
-    noise_basis: Tensor,
-    dir_head: nn::Linear,
-    perturb_head: nn::Linear,
-    amp_floor: Tensor,
-    amp_scale: Tensor,
-    log_std_floor: Tensor,
+    log_std_param: Tensor,
     device: tch::Device,
 }
 
@@ -656,7 +653,7 @@ impl TradingModel {
         let actor_proj = nn::linear(
             p / "actor_proj",
             flat_per_ticker,
-            1,
+            ACTION_COUNT,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
@@ -677,7 +674,7 @@ impl TradingModel {
         let sde_in_proj = nn::linear(
             p / "sde_in_proj",
             flat_per_ticker,
-            spec.model_dim,
+            SDE_LATENT_DIM,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),
@@ -686,7 +683,7 @@ impl TradingModel {
         );
         let sde_fc = nn::linear(
             p / "sde_fc",
-            spec.model_dim,
+            SDE_LATENT_DIM,
             SDE_LATENT_DIM,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
@@ -705,30 +702,7 @@ impl TradingModel {
                 bias: true,
             },
         );
-        // Directional noise parameters (dirnoise_perturb_amprange)
-        let noise_basis = p.var("noise_basis", &[NOISE_RANK, TICKERS_COUNT], Init::Orthogonal { gain: 1.0 });
-        let dir_head = nn::linear(
-            p / "dir_head", SDE_LATENT_DIM, NOISE_RANK,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.01 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
-            },
-        );
-        let perturb_head = nn::linear(
-            p / "perturb_head", SDE_LATENT_DIM, NOISE_RANK * TICKERS_COUNT,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.01 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
-            },
-        );
-        // inv_softplus(x) = ln(exp(x) - 1)
-        let amp_floor_init = (0.05_f64.exp() - 1.0).ln();
-        let amp_scale_init = (0.95_f64.exp() - 1.0).ln();
-        let amp_floor = p.var("amp_floor", &[NOISE_RANK], Init::Const(amp_floor_init));
-        let amp_scale = p.var("amp_scale", &[NOISE_RANK], Init::Const(amp_scale_init));
-        let log_std_floor = p.var("log_std_floor", &[TICKERS_COUNT], Init::Const(LOG_STD_FLOOR));
+        let log_std_param = p.var("log_std_param", &[TICKERS_COUNT * SDE_LATENT_DIM, ACTION_COUNT], Init::Const(0.0));
         Self {
             variant: config.variant,
             patch_configs,
@@ -754,12 +728,7 @@ impl TradingModel {
             sde_fc,
             sde_norm,
             sde_fc2,
-            noise_basis,
-            dir_head,
-            perturb_head,
-            amp_floor,
-            amp_scale,
-            log_std_floor,
+            log_std_param,
             device: p.device(),
         }
     }

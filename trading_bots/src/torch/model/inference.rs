@@ -1,7 +1,7 @@
 use tch::{Kind, Tensor};
 
 use super::{ModelOutput, StreamState, TradingModel};
-use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
+use crate::torch::constants::{ACTION_COUNT, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
 
 impl StreamState {
     pub fn reset(&mut self) {
@@ -115,8 +115,8 @@ impl TradingModel {
         // Not enough deltas for a new patch yet; return zeros
         (
             Tensor::zeros(&[1], (Kind::Float, self.device)),
-            Tensor::zeros(&[1, TICKERS_COUNT], (Kind::Float, self.device)),
-            Tensor::ones(&[1, TICKERS_COUNT], (Kind::Float, self.device)),
+            Tensor::zeros(&[1, ACTION_COUNT], (Kind::Float, self.device)),
+            Tensor::ones(&[1, ACTION_COUNT], (Kind::Float, self.device)),
         )
     }
 

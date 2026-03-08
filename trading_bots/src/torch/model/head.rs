@@ -1,9 +1,12 @@
 use tch::{Kind, Tensor};
 
 use super::{
-    DebugMetrics, ModelOutput, TradingModel, SDE_EPS, NOISE_RANK,
+    DebugMetrics, LOG_STD_INIT, LOG_STD_MAX, LOG_STD_MIN, ModelOutput,
+    SDE_EPS, SDE_PRESCALE, TradingModel,
 };
 use crate::torch::constants::TICKERS_COUNT;
+
+use super::SDE_LATENT_DIM;
 
 impl TradingModel {
     pub(super) fn head_with_temporal_pool(
@@ -32,43 +35,27 @@ impl TradingModel {
             (xf / rms).to_kind(flat_all.kind())
         };
 
-        // Actor: RMSNorm → projection (gain controls init scale directly)
+        // Actor: flat_per → ACTION_COUNT, summed across tickers
         let action_mean = flat_per_normed
             .apply(&self.actor_proj)
-            .reshape([batch_size, TICKERS_COUNT])
+            .reshape([batch_size, TICKERS_COUNT, -1])
+            .sum_dim_intlist([1].as_slice(), false, Kind::Float)
             * self.mean_scale.to_kind(flat_per_normed.kind());
 
-        // Noise hidden features (silu activations, matching reference)
-        let sde_in = flat_per_normed.apply(&self.sde_in_proj);
-        let h = self.sde_norm.forward(&sde_in.apply(&self.sde_fc))
-            .silu()
+        // SDE: flat_per → 64 → 64 (tanh-bounded), then matmul with log_std_param
+        let sde_h = flat_per_normed.apply(&self.sde_in_proj);
+        let sde_latent = (self
+            .sde_norm
+            .forward(&sde_h.apply(&self.sde_fc))
             .apply(&self.sde_fc2)
-            .silu();
-
-        // Per-direction amplitude with learnable range
-        let raw = h.apply(&self.dir_head);
-        let amp_floor = self.amp_floor.to_kind(raw.kind());
-        let amp_scale = self.amp_scale.to_kind(raw.kind());
-        let amp = amp_floor.softplus()
-            + amp_scale.softplus() * raw.sigmoid();
-
-        // State-dependent basis perturbation
-        let perturb = h.apply(&self.perturb_head)
-            .reshape([batch_size, NOISE_RANK, TICKERS_COUNT]) * 0.1;
-        let effective_basis = self.noise_basis.to_kind(perturb.kind()) + perturb;
-
-        // cov_factor: effective_basis^T scaled by amplitude
-        let cov_factor = effective_basis.transpose(-2, -1) * amp.unsqueeze(1);
-
-        // Floor diagonal variance
-        let log_std_fl = self.log_std_floor.to_kind(cov_factor.kind());
-        let cov_diag = log_std_fl.exp().pow_tensor_scalar(2)
-            .expand([batch_size, TICKERS_COUNT], false);
-
-        // Total std: sqrt(sum(cov_factor^2, dim=-1) + cov_diag)
-        let factor_var = cov_factor.pow_tensor_scalar(2)
-            .sum_dim_intlist([-1].as_slice(), false, cov_factor.kind());
-        let action_noise_std = (&factor_var + &cov_diag + SDE_EPS).sqrt();
+            / SDE_PRESCALE)
+            .tanh()
+            .reshape([batch_size, TICKERS_COUNT * SDE_LATENT_DIM]);
+        let log_std = (&self.log_std_param + LOG_STD_INIT)
+            .clamp(LOG_STD_MIN, LOG_STD_MAX)
+            .to_kind(sde_latent.kind());
+        let std_sq = log_std.exp().pow_tensor_scalar(2);
+        let action_std = (sde_latent.pow_tensor_scalar(2).matmul(&std_sq) + SDE_EPS).sqrt();
 
         // Critic: RMSNorm → projection
         let values = flat_all_normed
@@ -77,10 +64,10 @@ impl TradingModel {
 
         let values = values.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
-        let action_noise_std = action_noise_std.to_kind(Kind::Float);
+        let action_std = action_std.to_kind(Kind::Float);
 
         (
-            (values, action_mean, action_noise_std),
+            (values, action_mean, action_std),
             None,
         )
     }

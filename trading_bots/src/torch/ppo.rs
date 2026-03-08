@@ -5,7 +5,9 @@ use tch::{nn, Kind, Tensor};
 
 use super::Fp32Adam;
 
-use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
+use crate::torch::constants::{
+    ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
+};
 use crate::torch::env::VecEnv;
 use crate::torch::model::{
     ModelVariant, TradingModel, TradingModelConfig,
@@ -18,7 +20,7 @@ const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
 const OPTIM_EPOCHS: i64 = 4;
 const PPO_CLIP_LOW: f64 = 0.2;
-const PPO_CLIP_HIGH: f64 = 0.28; // DAPO-style asymmetric: wider upper bound prevents entropy collapse
+const PPO_CLIP_HIGH: f64 = 0.2;
 const TARGET_KL: f64 = 0.03;
 const KL_STOP_MULTIPLIER: f64 = 1.5;
 const VALUE_LOSS_COEF: f64 = 0.5;
@@ -112,11 +114,20 @@ fn gaussian_entropy(std: &Tensor) -> Tensor {
         .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
 }
 
-/// Categorical entropy of softmax policy: H = -sum(p * log p)
-fn softmax_entropy(logits: &Tensor) -> Tensor {
-    let log_probs = logits.log_softmax(-1, Kind::Float);
-    let probs = logits.softmax(-1, Kind::Float);
-    -(probs * log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+fn tanh_action(z: &Tensor) -> Tensor {
+    z.tanh()
+}
+
+fn tanh_inverse(actions: &Tensor) -> Tensor {
+    let eps = 1e-6;
+    let actions = actions.clamp(-1.0 + eps, 1.0 - eps);
+    actions.atanh()
+}
+
+fn tanh_log_jacobian(actions: &Tensor) -> Tensor {
+    let eps = 1e-6;
+    let jac: Tensor = 1.0 - actions.pow_tensor_scalar(2) + eps;
+    jac.log()
 }
 
 fn sample_rollout_actions(
@@ -125,26 +136,26 @@ fn sample_rollout_actions(
     obs_static: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
     tch::no_grad(|| {
-        let (values, action_mean, action_noise_std) =
+        let (values, action_mean, action_std) =
             model.forward_on_device(obs_price, obs_static, false);
         let values = values.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
-        let action_noise_std = action_noise_std.to_kind(Kind::Float);
+        let action_std = action_std.to_kind(Kind::Float);
 
         let batch = action_mean.size()[0];
         let z = Tensor::randn(
-            &[batch, TICKERS_COUNT],
+            &[batch, ACTION_COUNT],
             (Kind::Float, action_mean.device()),
         );
-        let ticker_noise = &action_noise_std * &z;
-        let action_log_prob = gaussian_log_prob(&ticker_noise, &action_noise_std);
-        let u = &action_mean + &ticker_noise;
-        // Cash logit pinned to 0 (reference category)
-        let zero_cash = Tensor::zeros(&[batch, 1], (Kind::Float, action_mean.device()));
-        let u_full = Tensor::cat(&[&u, &zero_cash], -1);
-        let actions = u_full.softmax(-1, Kind::Float);
+        let noise = &action_std * &z;
+        let latent = &action_mean + &noise;
+        let log_prob_z = gaussian_log_prob(&noise, &action_std);
+        let actions = tanh_action(&latent);
+        let log_jacobian = tanh_log_jacobian(&actions)
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+        let action_log_prob = log_prob_z - log_jacobian;
 
-        (values, action_mean, u, actions, action_log_prob)
+        (values, action_mean, action_std, actions, action_log_prob)
     })
 }
 
@@ -208,9 +219,9 @@ fn compute_action_std_stats(
     device: tch::Device,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, _, action_noise_std) =
+        let (_, _, action_std) =
             model.forward_on_device(&s_price_deltas.get(0), &s_static_obs.get(0), false);
-        let action_std = action_noise_std.to_kind(Kind::Float);
+        let action_std = action_std.to_kind(Kind::Float);
         let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
             (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze()
         } else {
@@ -347,13 +358,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
 
     let mut s_price_deltas = GpuRollingBuffer::new(memory_size, pd_dim, Kind::Float, device);
     let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, Kind::Float, device);
-    let s_actions = Tensor::zeros(&[memory_size, TICKERS_COUNT], (Kind::Float, device));
+    let s_actions = Tensor::zeros(&[memory_size, ACTION_COUNT], (Kind::Float, device));
     let s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device));
-
-    let s_action_weights = Tensor::zeros(&[memory_size, TICKERS_COUNT + 1], (Kind::Float, device));
 
     // Per-env NormalizeReward (matching CleanRL: each env has its own RunningMeanStd)
     // Kept outside VarStore to avoid bf16 precision loss and Adam corruption
@@ -416,12 +425,13 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
         for step in 0..rollout_steps as usize {
-            let (values, action_mean, u, actions, action_log_prob) =
+            let (values, action_mean, action_std, actions, action_log_prob) =
                 sample_rollout_actions(&trading_model, &obs_price, &obs_static);
 
             if DEBUG_NUMERICS {
                 let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
-                let _ = debug_tensor_stats("u", &u, episode as i64, step);
+                let _ = debug_tensor_stats("action_std", &action_std, episode as i64, step);
+                let _ = debug_tensor_stats("actions", &actions, episode as i64, step);
                 let _ =
                     debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
@@ -460,7 +470,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             obs_price.copy_(&ordered.view([NPROCS, pd_dim]));
 
             let mem_idx = step as i64 * NPROCS;
-            let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&u); // Store pre-softmax u for training
+            let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&actions);
             let _ = s_old_log_probs
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&action_log_prob);
@@ -506,8 +516,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 .copy_(&normalized_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
             let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
-
-            let _ = s_action_weights.narrow(0, mem_idx, NPROCS).copy_(&actions);
         }
 
         // Bootstrap value from final observation state
@@ -540,11 +548,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             )
         });
 
-        let price_deltas_batch = s_price_deltas.data.shallow_clone();
-        let static_obs_batch = s_static_obs.data.shallow_clone();
-        let action_weights_batch = s_action_weights.shallow_clone();
-
+        let price_deltas_raw = s_price_deltas.data.shallow_clone();
+        let static_obs_raw = s_static_obs.data.shallow_clone();
         let total_samples = rollout_steps * NPROCS;
+        let minibatch_size = (CHUNK_SIZE * NPROCS).min(total_samples);
+        // Full-rollout advantage normalization (not per-minibatch)
+        let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -564,7 +573,6 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
 
-        let minibatch_size = (CHUNK_SIZE * NPROCS).min(total_samples);
         let mut b_inds: Vec<i64> = (0..total_samples).collect();
 
         let mut first_epoch_kl = 0.0f64;
@@ -572,6 +580,17 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             use rand::seq::SliceRandom;
             b_inds.shuffle(&mut rand::rng());
+
+            // Permute all buffers once per epoch, then narrow for zero-copy minibatches
+            let perm = Tensor::from_slice(&b_inds).to_device(device);
+            let pd_perm = price_deltas_raw.index_select(0, &perm);
+            let so_perm = static_obs_raw.index_select(0, &perm);
+            let act_perm = s_actions.index_select(0, &perm);
+            let ret_perm = returns.index_select(0, &perm);
+            let adv_perm = adv_norm.index_select(0, &perm);
+            let olp_perm = s_old_log_probs.index_select(0, &perm);
+            let val_perm = s_values.index_select(0, &perm);
+
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
             let samples_per_accum = minibatch_size;
@@ -579,34 +598,29 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             for (chunk_i, mb_start) in (0..total_samples).step_by(minibatch_size as usize).enumerate() {
                 let mb_end = (mb_start + minibatch_size).min(total_samples);
                 let chunk_sample_count = mb_end - mb_start;
-                let mb_inds_slice = &b_inds[mb_start as usize..mb_end as usize];
-                let mb_inds = Tensor::from_slice(mb_inds_slice).to_device(device);
 
-                let pd_chunk = price_deltas_batch.index_select(0, &mb_inds);
-                let so_chunk = static_obs_batch.index_select(0, &mb_inds);
-                let act_mb = s_actions.index_select(0, &mb_inds);
-                let ret_mb = returns.index_select(0, &mb_inds);
-                let adv_mb_raw = advantages.index_select(0, &mb_inds);
-                let adv_mb = (&adv_mb_raw - adv_mb_raw.mean(Kind::Float)) / (adv_mb_raw.std(true) + 1e-8);
-                let old_log_probs_mb = s_old_log_probs.index_select(0, &mb_inds);
-                let _weight_mb = action_weights_batch.index_select(0, &mb_inds);
+                let pd_chunk = pd_perm.narrow(0, mb_start, chunk_sample_count);
+                let so_chunk = so_perm.narrow(0, mb_start, chunk_sample_count);
+                let act_mb = act_perm.narrow(0, mb_start, chunk_sample_count);
+                let ret_mb = ret_perm.narrow(0, mb_start, chunk_sample_count);
+                let adv_mb = adv_perm.narrow(0, mb_start, chunk_sample_count);
+                let old_log_probs_mb = olp_perm.narrow(0, mb_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (new_values, action_mean, action_noise_std) =
+                let (new_values, action_mean, action_std) =
                     trading_model.forward_on_device(&pd_chunk, &so_chunk, true);
 
                 let action_mean = action_mean.to_kind(Kind::Float);
-                let action_noise_std = action_noise_std.to_kind(Kind::Float);
+                let action_std = action_std.to_kind(Kind::Float);
 
-                // act_mb contains the stored u (pre-softmax logits)
-                let u = act_mb;
+                let actions_mb = act_mb;
 
                 // RPO (CleanRL-style): iid uniform perturbation on each action-mean dimension.
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
                     let alpha_detached = alpha.detach();
                     let rpo_noise =
-                        Tensor::empty([chunk_sample_count, TICKERS_COUNT], (Kind::Float, device))
+                        Tensor::empty([chunk_sample_count, ACTION_COUNT], (Kind::Float, device))
                             .uniform_(-1.0, 1.0)
                             * &alpha_detached;
                     (alpha, &action_mean + rpo_noise)
@@ -617,17 +631,20 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                     )
                 };
 
-                // u and action_mean are ticker-only logits (cash pinned to 0)
-                let diff = &u - &action_mean_perturbed;
-                let action_log_probs = gaussian_log_prob(&diff, &action_noise_std);
+                let latent = tanh_inverse(&actions_mb);
+                let diff = &latent - &action_mean_perturbed;
+                let log_prob_z = gaussian_log_prob(&diff, &action_std);
+                let log_jacobian = tanh_log_jacobian(&actions_mb)
+                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+                let action_log_probs = &log_prob_z - &log_jacobian;
 
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("u", &u, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("actions_mb", &actions_mb, _epoch, chunk_i);
                     let _ =
                         debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
                     let _ =
-                        debug_tensor_stats("action_noise_std", &action_noise_std, _epoch, chunk_i);
+                        debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
@@ -647,7 +664,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
 
                 // Scalar value loss with PPO value clipping
                 let new_values = new_values.to_kind(Kind::Float);
-                let old_val_mb = s_values.index_select(0, &mb_inds);
+                let old_val_mb = val_perm.narrow(0, mb_start, chunk_sample_count);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("new_values", &new_values, _epoch, chunk_i);
@@ -658,7 +675,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 let loss_clipped = (&v_clipped - &ret_mb).pow_tensor_scalar(2);
                 let value_loss = loss_unclipped.max_other(&loss_clipped).mean(Kind::Float) * 0.5;
 
-                let dist_entropy = gaussian_entropy(&action_noise_std).mean(Kind::Float);
+                let dist_entropy = gaussian_entropy(&action_std).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
@@ -667,9 +684,9 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
 
                 // RPO alpha loss: target induced KL for uniform logit perturbation.
                 let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let action_var = action_noise_std.pow_tensor_scalar(2).detach();
+                    let action_var = action_std.pow_tensor_scalar(2).detach();
                     let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                    let d = TICKERS_COUNT as f64;
+                    let d = ACTION_COUNT as f64;
                     let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                     (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
                 } else {
