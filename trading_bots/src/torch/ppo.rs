@@ -110,22 +110,6 @@ fn gaussian_entropy(std: &Tensor) -> Tensor {
     (std.log() + 0.5 * (1.0 + LOG_2PI)).sum_dim_intlist([-1].as_slice(), false, Kind::Float)
 }
 
-fn tanh_action(z: &Tensor) -> Tensor {
-    z.tanh()
-}
-
-fn tanh_inverse(actions: &Tensor) -> Tensor {
-    let eps = 1e-6;
-    let actions = actions.clamp(-1.0 + eps, 1.0 - eps);
-    actions.atanh()
-}
-
-fn tanh_log_jacobian(actions: &Tensor) -> Tensor {
-    let eps = 1e-6;
-    let jac: Tensor = 1.0 - actions.pow_tensor_scalar(2) + eps;
-    jac.log()
-}
-
 fn sample_rollout_actions(
     model: &TradingModel,
     obs_price: &Tensor,
@@ -141,12 +125,8 @@ fn sample_rollout_actions(
         let batch = action_mean.size()[0];
         let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
         let noise = &action_std * &z;
-        let latent = &action_mean + &noise;
-        let log_prob_z = gaussian_log_prob(&noise, &action_std);
-        let actions = tanh_action(&latent);
-        let log_jacobian =
-            tanh_log_jacobian(&actions).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-        let action_log_prob = log_prob_z - log_jacobian;
+        let actions = &action_mean + &noise;
+        let action_log_prob = gaussian_log_prob(&noise, &action_std);
 
         (values, action_mean, action_std, actions, action_log_prob)
     })
@@ -649,15 +629,8 @@ pub async fn train(
                     )
                 };
 
-                let latent = tanh_inverse(&actions_mb);
-                let diff = &latent - &action_mean_perturbed;
-                let log_prob_z = gaussian_log_prob(&diff, &action_std);
-                let log_jacobian = tanh_log_jacobian(&actions_mb).sum_dim_intlist(
-                    [-1].as_slice(),
-                    false,
-                    Kind::Float,
-                );
-                let action_log_probs = &log_prob_z - &log_jacobian;
+                let diff = &actions_mb - &action_mean_perturbed;
+                let action_log_probs = gaussian_log_prob(&diff, &action_std);
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("actions_mb", &actions_mb, _epoch, chunk_i);

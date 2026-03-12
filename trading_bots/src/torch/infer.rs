@@ -25,10 +25,6 @@ pub fn load_model<P: AsRef<Path>>(
     Ok((vs, model))
 }
 
-pub fn tanh_squash(z: &Tensor) -> Tensor {
-    z.tanh()
-}
-
 pub fn sample_actions(
     action_mean: &Tensor,
     action_noise_std: &Tensor,
@@ -38,7 +34,7 @@ pub fn sample_actions(
     let action_mean = action_mean.to_kind(Kind::Float);
     let action_noise_std = action_noise_std.to_kind(Kind::Float);
 
-    let z = if deterministic {
+    if deterministic {
         action_mean
     } else {
         let batch = action_mean.size()[0];
@@ -46,9 +42,7 @@ pub fn sample_actions(
         let scale = if temperature > 0.0 { temperature } else { 1.0 };
         let noise = Tensor::randn(&[batch, action_dim], (Kind::Float, action_mean.device()));
         &action_mean + &action_noise_std * scale * noise
-    };
-
-    tanh_squash(&z)
+    }
 }
 
 pub fn run_inference<P: AsRef<Path>>(
