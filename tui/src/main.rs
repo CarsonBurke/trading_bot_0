@@ -307,6 +307,13 @@ impl App {
         let weights = weights_file.map(|w| {
             if w.starts_with('/') || w.starts_with("..") {
                 w
+            } else if let Some(run) = &self.process_manager.active_run {
+                let run_path = run.weights.join(&w);
+                if run_path.exists() {
+                    run_path.to_string_lossy().into_owned()
+                } else {
+                    format!("{}/{}", WEIGHTS_PATH, w)
+                }
             } else {
                 format!("{}/{}", WEIGHTS_PATH, w)
             }

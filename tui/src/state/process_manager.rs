@@ -163,7 +163,6 @@ impl ProcessManagerState {
             .args(["-f", "trading.*train"])
             .spawn()?;
 
-        self.active_run = None;
         self.cached_training_running = false;
         Ok(())
     }
