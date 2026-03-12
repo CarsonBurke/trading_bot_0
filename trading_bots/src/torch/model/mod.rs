@@ -55,28 +55,40 @@ impl InterTickerBlock {
 
     fn forward(&self, x: &Tensor, model_dim: i64, ff_dim: i64) -> Tensor {
         let (batch, num_items, _) = x.size3().unwrap();
-        let x_norm = self.ticker_ln
+        let x_norm = self
+            .ticker_ln
             .forward(&x.reshape([batch * num_items, model_dim]))
             .reshape([batch, num_items, model_dim]);
         let qkv = x_norm.apply(&self.ticker_qkv);
         let parts = qkv.split(model_dim, -1);
         // QKNorm (single-head, head_dim == model_dim)
-        let q = self.q_norm.forward(&parts[0].reshape([batch * num_items, model_dim]))
+        let q = self
+            .q_norm
+            .forward(&parts[0].reshape([batch * num_items, model_dim]))
             .reshape([batch, num_items, model_dim])
             .unsqueeze(1);
-        let k = self.k_norm.forward(&parts[1].reshape([batch * num_items, model_dim]))
+        let k = self
+            .k_norm
+            .forward(&parts[1].reshape([batch * num_items, model_dim]))
             .reshape([batch, num_items, model_dim])
             .unsqueeze(1);
         let v = parts[2].unsqueeze(1);
         let ctx = Tensor::scaled_dot_product_attention(
-            &q, &k, &v,
-            None::<&Tensor>, 0.0, false, None, false,
+            &q,
+            &k,
+            &v,
+            None::<&Tensor>,
+            0.0,
+            false,
+            None,
+            false,
         )
-            .squeeze_dim(1)
-            .apply(&self.ticker_out)
-            .reshape([batch, num_items, model_dim]);
+        .squeeze_dim(1)
+        .apply(&self.ticker_out)
+        .reshape([batch, num_items, model_dim]);
         let x = x + ctx * self.attn_gate.sigmoid();
-        let mlp_in = self.mlp_ln
+        let mlp_in = self
+            .mlp_ln
             .forward(&x.reshape([batch * num_items, model_dim]));
         let mlp_proj = mlp_in.apply(&self.mlp_fc1);
         let mlp_parts = mlp_proj.split(ff_dim, -1);
@@ -149,13 +161,19 @@ impl ExoCrossBlock {
             .permute([0, 2, 1, 3]);
 
         // QKNorm
-        let q = self.q_norm.forward(&q.reshape([b * CROSS_NUM_Q_HEADS * s, cross_head_dim]))
+        let q = self
+            .q_norm
+            .forward(&q.reshape([b * CROSS_NUM_Q_HEADS * s, cross_head_dim]))
             .reshape([b, CROSS_NUM_Q_HEADS, s, cross_head_dim]);
-        let k = self.k_norm.forward(&k.reshape([b * CROSS_NUM_KV_HEADS * t, cross_head_dim]))
+        let k = self
+            .k_norm
+            .forward(&k.reshape([b * CROSS_NUM_KV_HEADS * t, cross_head_dim]))
             .reshape([b, CROSS_NUM_KV_HEADS, t, cross_head_dim]);
 
         let out = Tensor::scaled_dot_product_attention(
-            &q, &k, &v,
+            &q,
+            &k,
+            &v,
             None::<&Tensor>,
             0.0,
             false,
@@ -194,8 +212,7 @@ struct RotaryEmbedding {
 impl RotaryEmbedding {
     fn new(max_seq_len: i64, head_dim: i64, device: tch::Device) -> Self {
         let half_dim = head_dim / 2;
-        let exponents =
-            Tensor::arange(half_dim, (Kind::Float, device)) * (2.0 / head_dim as f64);
+        let exponents = Tensor::arange(half_dim, (Kind::Float, device)) * (2.0 / head_dim as f64);
         let inv_freq = (exponents * -(10000.0_f64.ln())).exp(); // [half_dim]
         let positions = Tensor::arange(max_seq_len, (Kind::Float, device)); // [max_seq_len]
         let angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0); // [max_seq_len, half_dim]
@@ -281,25 +298,31 @@ impl GqaBlock {
             .permute([0, 2, 1, 3]);
 
         // QKNorm before RoPE
-        let q = self.q_norm.forward(&q.reshape([b * GQA_NUM_Q_HEADS * s, head_dim]))
+        let q = self
+            .q_norm
+            .forward(&q.reshape([b * GQA_NUM_Q_HEADS * s, head_dim]))
             .reshape([b, GQA_NUM_Q_HEADS, s, head_dim]);
-        let k = self.k_norm.forward(&k.reshape([b * GQA_NUM_KV_HEADS * s, head_dim]))
+        let k = self
+            .k_norm
+            .forward(&k.reshape([b * GQA_NUM_KV_HEADS * s, head_dim]))
             .reshape([b, GQA_NUM_KV_HEADS, s, head_dim]);
 
         let q = rope.apply(&q);
         let k = rope.apply(&k);
 
         let out = Tensor::scaled_dot_product_attention(
-            &q, &k, &v,
+            &q,
+            &k,
+            &v,
             None::<&Tensor>,
             0.0,
             false,
             None,
             true,
         )
-            .permute([0, 2, 1, 3])
-            .contiguous()
-            .reshape([b, s, _d]);
+        .permute([0, 2, 1, 3])
+        .contiguous()
+        .reshape([b, s, _d]);
         let out = out.apply(&self.attn_out);
         let x = x + out * self.attn_gate.sigmoid();
 
@@ -366,18 +389,17 @@ const BASE_GQA_LAYERS: usize = 3;
 const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
-pub(super) const SDE_LATENT_DIM: i64 = 64;
 pub(super) const SDE_EPS: f64 = 1e-6;
 pub(super) const LOG_STD_INIT: f64 = -2.0;
 pub(super) const LOG_STD_MIN: f64 = -3.0;
 pub(super) const LOG_STD_MAX: f64 = -0.5;
-pub(super) const SDE_PRESCALE: f64 = 1.5;
 const ATTENTION_GATE_INIT: f64 = -2.0;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
+pub(super) const NUM_HEAD_CLS_TOKENS: i64 = 3;
 
 const BASE_PATCH_CONFIGS: &[(i64, i64)] = &[
     (4608, 128),
@@ -524,15 +546,13 @@ pub struct TradingModel {
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
     exo_cross_blocks: Vec<ExoCrossBlock>,
-    cls_token: Tensor,
+    actor_cls_token: Tensor,
+    critic_cls_token: Tensor,
+    sde_cls_token: Tensor,
     inter_ticker_block: InterTickerBlock,
     actor_proj: nn::Linear,
     mean_scale: Tensor,
     value_proj: nn::Linear,
-    sde_in_proj: nn::Linear,
-    sde_fc: nn::Linear,
-    sde_norm: RMSNorm,
-    sde_fc2: nn::Linear,
     log_std_param: Tensor,
     device: tch::Device,
 }
@@ -545,8 +565,6 @@ impl TradingModel {
             input.to_device(device)
         }
     }
-
-
 
     fn cast_inputs(&self, input: &Tensor) -> Tensor {
         let target_kind = self.patch_embed_weight.kind();
@@ -618,7 +636,7 @@ impl TradingModel {
             .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim))
             .collect::<Vec<_>>();
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
-        let rope = RotaryEmbedding::new(seq_len + 1, head_dim, p.device());
+        let rope = RotaryEmbedding::new(seq_len + NUM_HEAD_CLS_TOKENS, head_dim, p.device());
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -644,15 +662,37 @@ impl TradingModel {
                 )
             })
             .collect::<Vec<_>>();
-        let cls_token = p.var("cls_token", &[1, 1, spec.model_dim], Init::Const(0.0));
+        let cls_std = (1.0 / spec.model_dim as f64).sqrt();
+        let actor_cls_token = p.var(
+            "actor_cls_token",
+            &[1, 1, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: cls_std,
+            },
+        );
+        let critic_cls_token = p.var(
+            "critic_cls_token",
+            &[1, 1, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: cls_std,
+            },
+        );
+        let sde_cls_token = p.var(
+            "sde_cls_token",
+            &[1, 1, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: cls_std,
+            },
+        );
         let inter_ticker_block =
             InterTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
-        let full_seq_len = seq_len + 1;
-        let flat_per_ticker = full_seq_len * spec.model_dim;
-        let flat_all_tickers = TICKERS_COUNT * flat_per_ticker;
+        let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
         let actor_proj = nn::linear(
             p / "actor_proj",
-            flat_per_ticker,
+            spec.model_dim,
             ACTION_COUNT,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
@@ -671,38 +711,11 @@ impl TradingModel {
                 bias: true,
             },
         );
-        let sde_in_proj = nn::linear(
-            p / "sde_in_proj",
-            flat_per_ticker,
-            SDE_LATENT_DIM,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
-            },
+        let log_std_param = p.var(
+            "log_std_param",
+            &[flat_all_tickers, ACTION_COUNT],
+            Init::Const(0.0),
         );
-        let sde_fc = nn::linear(
-            p / "sde_fc",
-            SDE_LATENT_DIM,
-            SDE_LATENT_DIM,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
-            },
-        );
-        let sde_norm = RMSNorm::new(&(p / "sde_norm"), SDE_LATENT_DIM, 1e-5);
-        let sde_fc2 = nn::linear(
-            p / "sde_fc2",
-            SDE_LATENT_DIM,
-            SDE_LATENT_DIM,
-            nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
-            },
-        );
-        let log_std_param = p.var("log_std_param", &[TICKERS_COUNT * SDE_LATENT_DIM, ACTION_COUNT], Init::Const(0.0));
         Self {
             variant: config.variant,
             patch_configs,
@@ -719,15 +732,13 @@ impl TradingModel {
             exo_feat_w,
             exo_feat_b,
             exo_cross_blocks,
-            cls_token,
+            actor_cls_token,
+            critic_cls_token,
+            sde_cls_token,
             inter_ticker_block,
             actor_proj,
             mean_scale,
             value_proj,
-            sde_in_proj,
-            sde_fc,
-            sde_norm,
-            sde_fc2,
             log_std_param,
             device: p.device(),
         }
@@ -762,11 +773,24 @@ impl TradingModel {
         let seq = x.size()[1];
         let batch_size = bt / TICKERS_COUNT;
         let x_4d = x.view([batch_size, TICKERS_COUNT, seq, self.model_dim]);
-        let cls = x_4d.select(2, 0);
-        let enriched_cls = self.inter_ticker_block.forward(&cls, self.model_dim, self.ff_dim);
-        let non_cls = x_4d.narrow(2, 1, seq - 1);
-        Tensor::cat(&[&enriched_cls.unsqueeze(2), &non_cls], 2)
-            .reshape([bt, seq, self.model_dim])
+        let cls = x_4d.narrow(2, 0, NUM_HEAD_CLS_TOKENS);
+        let cls_for_mix = cls.permute([0, 2, 1, 3]).reshape([
+            batch_size * NUM_HEAD_CLS_TOKENS,
+            TICKERS_COUNT,
+            self.model_dim,
+        ]);
+        let enriched_cls = self
+            .inter_ticker_block
+            .forward(&cls_for_mix, self.model_dim, self.ff_dim)
+            .reshape([
+                batch_size,
+                NUM_HEAD_CLS_TOKENS,
+                TICKERS_COUNT,
+                self.model_dim,
+            ])
+            .permute([0, 2, 1, 3]);
+        let non_cls = x_4d.narrow(2, NUM_HEAD_CLS_TOKENS, seq - NUM_HEAD_CLS_TOKENS);
+        Tensor::cat(&[&enriched_cls, &non_cls], 2).reshape([bt, seq, self.model_dim])
     }
 
     /// Build exogenous KV bank: [batch*tickers, NUM_EXO_TOKENS, MODEL_DIM]
@@ -787,20 +811,12 @@ impl TradingModel {
         feats_expanded * &self.exo_feat_w + &self.exo_feat_b
     }
 
-    fn patch_latent_stem(
-        &self,
-        price_deltas: &Tensor,
-        batch_size: i64,
-    ) -> Tensor {
+    fn patch_latent_stem(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
         let price_deltas = self.maybe_to_device(price_deltas, self.device);
         self.patch_latent_stem_on_device(&price_deltas, batch_size)
     }
 
-    fn patch_latent_stem_on_device(
-        &self,
-        price_deltas: &Tensor,
-        batch_size: i64,
-    ) -> Tensor {
+    fn patch_latent_stem_on_device(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
         let batch_tokens = batch_size * TICKERS_COUNT;
         let deltas = price_deltas
             .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
@@ -808,8 +824,19 @@ impl TradingModel {
 
         let kind = deltas.kind();
         let patch_tokens = self.patch_embed(&deltas);
-        let cls = self.cls_token.to_kind(kind).expand([batch_tokens, 1, self.model_dim], false);
-        Tensor::cat(&[&cls, &patch_tokens], 1)
+        let actor_cls = self
+            .actor_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        let critic_cls = self
+            .critic_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        let sde_cls = self
+            .sde_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        Tensor::cat(&[&actor_cls, &critic_cls, &sde_cls, &patch_tokens], 1)
     }
 
     /// Per-config enrichment (avoids [batch, 256, 8636] expand), then fused
@@ -852,12 +879,15 @@ impl TradingModel {
             enriched_parts.push(padded);
             delta_offset += days;
         }
-        let enriched = Tensor::cat(&enriched_parts.iter().collect::<Vec<_>>(), 1)
-            .to_kind(kind);
+        let enriched = Tensor::cat(&enriched_parts.iter().collect::<Vec<_>>(), 1).to_kind(kind);
 
         // Phase 2: fused projection — single einsum over all 256 tokens
-        let weight_per_patch = self.patch_embed_weight.index_select(0, &self.patch_config_ids);
-        let bias_per_patch = self.patch_embed_bias.index_select(0, &self.patch_config_ids);
+        let weight_per_patch = self
+            .patch_embed_weight
+            .index_select(0, &self.patch_config_ids);
+        let bias_per_patch = self
+            .patch_embed_bias
+            .index_select(0, &self.patch_config_ids);
         let out = Tensor::einsum(
             "blm,lmd->bld",
             &[&enriched, &weight_per_patch],
@@ -865,5 +895,4 @@ impl TradingModel {
         );
         out + bias_per_patch.unsqueeze(0)
     }
-
 }

@@ -108,7 +108,9 @@ impl TradingModel {
             state.patch_pos = 0;
             let _ = state.patch_buf.zero_();
             // Full forward pass from ring buffer
-            let price_deltas = state.delta_ring.view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
+            let price_deltas = state
+                .delta_ring
+                .view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
             return self.forward_on_device(&price_deltas, &static_features, false);
         }
 
@@ -153,6 +155,10 @@ impl TradingModel {
         state.initialized = true;
 
         // Full forward pass
-        self.forward_on_device(&price.view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]), &static_features, false)
+        self.forward_on_device(
+            &price.view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]),
+            &static_features,
+            false,
+        )
     }
 }

@@ -22,10 +22,7 @@ impl TradingModel {
         _train: bool,
     ) -> ModelOutput {
         if price_deltas.device() != self.device || static_features.device() != self.device {
-            panic!(
-                "forward_on_device requires tensors on {:?}",
-                self.device
-            );
+            panic!("forward_on_device requires tensors on {:?}", self.device);
         }
         let price_deltas = self.cast_inputs(price_deltas);
         let static_features = self.cast_inputs(static_features);
@@ -48,8 +45,7 @@ impl TradingModel {
         }
         debug_fused("model_x_gqa", &x);
 
-        self.head_with_temporal_pool(&x, batch_size, false)
-            .0
+        self.head_with_temporal_pool(&x, batch_size, false).0
     }
 
     pub fn forward_with_debug(
