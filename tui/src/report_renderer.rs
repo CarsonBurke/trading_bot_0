@@ -31,7 +31,15 @@ pub fn render_report_with_options(
         match &report.kind {
             ReportKind::Simple { values, ema_alpha } => {
                 let values = skip_slice(values, skip);
-                render_simple(&root, report, values, *ema_alpha, x_offset, show_legend, solo_series)?;
+                render_simple(
+                    &root,
+                    report,
+                    values,
+                    *ema_alpha,
+                    x_offset,
+                    show_legend,
+                    solo_series,
+                )?;
             }
             ReportKind::MultiLine { series } => {
                 let series: Vec<ReportSeries> = series
@@ -378,19 +386,37 @@ fn render_assets(
     // Compute y range from visible series only
     let mut max_val = f64::NEG_INFINITY;
     if show(0) {
-        max_val = max_val.max(total.iter().map(|v| *v as f64).fold(f64::NEG_INFINITY, f64::max));
+        max_val = max_val.max(
+            total
+                .iter()
+                .map(|v| *v as f64)
+                .fold(f64::NEG_INFINITY, f64::max),
+        );
     }
     if show(1) {
         if let Some(p) = positioned {
-            max_val = max_val.max(p.iter().map(|v| *v as f64).fold(f64::NEG_INFINITY, f64::max));
+            max_val = max_val.max(
+                p.iter()
+                    .map(|v| *v as f64)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            );
         }
     }
     if show(2) {
-        max_val = max_val.max(cash.iter().map(|v| *v as f64).fold(f64::NEG_INFINITY, f64::max));
+        max_val = max_val.max(
+            cash.iter()
+                .map(|v| *v as f64)
+                .fold(f64::NEG_INFINITY, f64::max),
+        );
     }
     if show(3) {
         if let Some(bench) = benchmark {
-            max_val = max_val.max(bench.iter().map(|v| *v as f64).fold(f64::NEG_INFINITY, f64::max));
+            max_val = max_val.max(
+                bench
+                    .iter()
+                    .map(|v| *v as f64)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            );
         }
     }
     if max_val == f64::NEG_INFINITY {

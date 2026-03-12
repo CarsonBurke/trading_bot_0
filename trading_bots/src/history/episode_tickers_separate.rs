@@ -27,7 +27,12 @@ impl EpisodeHistory {
         }
     }
 
-    pub fn record(&self, generation: u32, mapped_historical: &MappedHistorical, gens_path: Option<&str>) {
+    pub fn record(
+        &self,
+        generation: u32,
+        mapped_historical: &MappedHistorical,
+        gens_path: Option<&str>,
+    ) {
         let default_path = format!("{TRAINING_PATH}/gens");
         let gp = gens_path.unwrap_or(&default_path);
         let base_dir = format!("{gp}/{}", generation);

@@ -168,7 +168,7 @@ impl App {
             "policy_loss",
             "policy_entropy",
             "approx_kl",
-            "gate_stats"
+            "gate_stats",
         ];
 
         // Ticker-specific chart base names
@@ -295,7 +295,10 @@ impl App {
             self.generation_browser.load_generations()?;
             self.inference_browser.load_inferences()?;
             self.load_latest_meta_charts()?;
-            let log_path = self.process_manager.active_run.as_ref()
+            let log_path = self
+                .process_manager
+                .active_run
+                .as_ref()
                 .map(|r| r.log_file.to_string_lossy().to_string());
             self.logs_page.poll_training_output(log_path.as_deref());
             self.last_refresh = now;
@@ -429,7 +432,10 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
         terminal.draw(|f| ui(f, app))?;
 
         app.maybe_refresh()?;
-        let log_path = app.process_manager.active_run.as_ref()
+        let log_path = app
+            .process_manager
+            .active_run
+            .as_ref()
             .map(|r| r.log_file.to_string_lossy().to_string());
         app.logs_page.poll_training_output(log_path.as_deref());
 
@@ -940,7 +946,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                                 app.chart_viewer.toggle_legend();
                                             }
                                             KeyCode::Char(c @ '1'..='9') => {
-                                                app.chart_viewer.toggle_solo_series((c as u8 - b'1') as usize);
+                                                app.chart_viewer
+                                                    .toggle_solo_series((c as u8 - b'1') as usize);
                                             }
                                             _ => {}
                                         }

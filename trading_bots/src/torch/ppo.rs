@@ -9,9 +9,7 @@ use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{
-    ModelVariant, TradingModel, TradingModelConfig,
-};
+use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 const LEARNING_RATE: f64 = 3e-4;
@@ -38,7 +36,6 @@ const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
 const VALUE_CLIP: f64 = 0.3;
-
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -110,8 +107,7 @@ fn gaussian_log_prob(diff: &Tensor, std: &Tensor) -> Tensor {
 
 /// 1D diagonal Gaussian entropy: H = sum(log std + 0.5(1 + log 2pi))
 fn gaussian_entropy(std: &Tensor) -> Tensor {
-    (std.log() + 0.5 * (1.0 + LOG_2PI))
-        .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+    (std.log() + 0.5 * (1.0 + LOG_2PI)).sum_dim_intlist([-1].as_slice(), false, Kind::Float)
 }
 
 fn tanh_action(z: &Tensor) -> Tensor {
@@ -143,16 +139,13 @@ fn sample_rollout_actions(
         let action_std = action_std.to_kind(Kind::Float);
 
         let batch = action_mean.size()[0];
-        let z = Tensor::randn(
-            &[batch, ACTION_COUNT],
-            (Kind::Float, action_mean.device()),
-        );
+        let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
         let noise = &action_std * &z;
         let latent = &action_mean + &noise;
         let log_prob_z = gaussian_log_prob(&noise, &action_std);
         let actions = tanh_action(&latent);
-        let log_jacobian = tanh_log_jacobian(&actions)
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+        let log_jacobian =
+            tanh_log_jacobian(&actions).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
         let action_log_prob = log_prob_z - log_jacobian;
 
         (values, action_mean, action_std, actions, action_log_prob)
@@ -255,7 +248,11 @@ fn compute_gate_stats(gate_params: &[Tensor], device: tch::Device) -> Tensor {
     })
 }
 
-pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_name: Option<String>) {
+pub async fn train(
+    weights_path: Option<&str>,
+    model_variant: ModelVariant,
+    run_name: Option<String>,
+) {
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
@@ -309,11 +306,13 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         }
         // If weights path is inside runs/*/weights/, resume that run dir
         let p = Path::new(path);
-        let is_run_weights = p.parent()
+        let is_run_weights = p
+            .parent()
             .and_then(|d| d.file_name())
             .map(|n| n == "weights")
             .unwrap_or(false)
-            && p.ancestors().any(|a| a.file_name().map(|n| n == "runs").unwrap_or(false));
+            && p.ancestors()
+                .any(|a| a.file_name().map(|n| n == "runs").unwrap_or(false));
         let rd = if is_run_weights {
             RunDir::from_weights_path(p).expect("failed to open run dir from weights path")
         } else {
@@ -322,7 +321,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         (ep, rd)
     } else {
         println!("Starting training from scratch");
-        let rd = RunDir::create_fresh(RUNS_PATH, run_name.as_deref()).expect("failed to create run dir");
+        let rd =
+            RunDir::create_fresh(RUNS_PATH, run_name.as_deref()).expect("failed to create run dir");
         (0, rd)
     };
     let gens_path = run_dir.gens.to_string_lossy().to_string();
@@ -372,7 +372,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
     let mut ret_rms_count = vec![1e-4f64; n];
     let mut disc_ret = vec![0.0f64; n];
     if start_episode > 0 {
-        let meta_path = format!("{}/ppo_ep{}.reward_norm.json", run_dir.weights.display(), start_episode);
+        let meta_path = format!(
+            "{}/ppo_ep{}.reward_norm.json",
+            run_dir.weights.display(),
+            start_episode
+        );
         let meta_path = if Path::new(&meta_path).exists() {
             meta_path
         } else {
@@ -381,7 +385,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         if let Ok(json) = std::fs::read_to_string(&meta_path) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
                 let load_vec = |key: &str, default: f64| -> Vec<f64> {
-                    parsed[key].as_array()
+                    parsed[key]
+                        .as_array()
                         .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(default)).collect())
                         .unwrap_or_else(|| vec![default; n])
                 };
@@ -392,16 +397,18 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     if let Some(rho) = parsed["rpo_rho"].as_f64() {
                         tch::no_grad(|| {
-                            let _ = rpo_rho.copy_(
-                                &Tensor::from_slice(&[rho as f32]).to_device(device),
-                            );
+                            let _ =
+                                rpo_rho.copy_(&Tensor::from_slice(&[rho as f32]).to_device(device));
                         });
                         println!("Loaded RPO rho: {:.6}", rho);
                     }
                 }
                 let avg_var: f64 = ret_rms_var.iter().sum::<f64>() / n as f64;
                 let avg_count: f64 = ret_rms_count.iter().sum::<f64>() / n as f64;
-                println!("Loaded reward norm: avg_var={:.6}, avg_count={:.0}", avg_var, avg_count);
+                println!(
+                    "Loaded reward norm: avg_var={:.6}, avg_count={:.0}",
+                    avg_var, avg_count
+                );
             }
         }
     }
@@ -409,7 +416,9 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu) = env.reset();
         // env.reset() resets all envs — zero per-env discounted returns
-        for i in 0..n { disc_ret[i] = 0.0; }
+        for i in 0..n {
+            disc_ret[i] = 0.0;
+        }
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
         let mut obs_static =
             Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
@@ -479,17 +488,18 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float);
 
             // Per-env NormalizeReward (gym-style): each env has its own RunningMeanStd
-            let rewards_f64: Vec<f64> = Vec::<f64>::try_from(
-                portfolio_reward.to_kind(Kind::Double).flatten(0, -1),
-            ).unwrap();
-            let dones_f64: Vec<f64> = Vec::<f64>::try_from(
-                step_is_done.to_kind(Kind::Double).flatten(0, -1),
-            ).unwrap();
+            let rewards_f64: Vec<f64> =
+                Vec::<f64>::try_from(portfolio_reward.to_kind(Kind::Double).flatten(0, -1))
+                    .unwrap();
+            let dones_f64: Vec<f64> =
+                Vec::<f64>::try_from(step_is_done.to_kind(Kind::Double).flatten(0, -1)).unwrap();
             let mut norm_rewards = vec![0.0f32; n];
             for i in 0..n {
                 // Reset discounted return on done BEFORE accumulating
                 // (matches gymnasium NormalizeReward: disc_ret *= gamma * (1 - terminated))
-                if dones_f64[i] > 0.5 { disc_ret[i] = 0.0; }
+                if dones_f64[i] > 0.5 {
+                    disc_ret[i] = 0.0;
+                }
                 disc_ret[i] = disc_ret[i] * 0.99 + rewards_f64[i];
                 // Welford update
                 let delta = disc_ret[i] - ret_rms_mean[i];
@@ -510,7 +520,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 let _ = debug_tensor_stats("values", &values, episode as i64, step);
                 let _ = debug_tensor_stats("step_is_done", &step_is_done, episode as i64, step);
             }
-            env.primary_mut().episode_history.normalized_rewards.push(norm_rewards[0]);
+            env.primary_mut()
+                .episode_history
+                .normalized_rewards
+                .push(norm_rewards[0]);
             let _ = s_rewards
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&normalized_reward);
@@ -565,10 +578,12 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
         let mut total_clipped = Tensor::zeros([], (Kind::Float, device));
         let mut total_ratio_samples = 0i64;
         let mut total_entropy_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut entropy_min =
-            Tensor::from(f64::INFINITY).to_kind(Kind::Float).to_device(device);
-        let mut entropy_max =
-            Tensor::from(f64::NEG_INFINITY).to_kind(Kind::Float).to_device(device);
+        let mut entropy_min = Tensor::from(f64::INFINITY)
+            .to_kind(Kind::Float)
+            .to_device(device);
+        let mut entropy_max = Tensor::from(f64::NEG_INFINITY)
+            .to_kind(Kind::Float)
+            .to_device(device);
 
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
@@ -595,7 +610,10 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
             let mut epoch_kl_count = 0i64;
             let samples_per_accum = minibatch_size;
 
-            for (chunk_i, mb_start) in (0..total_samples).step_by(minibatch_size as usize).enumerate() {
+            for (chunk_i, mb_start) in (0..total_samples)
+                .step_by(minibatch_size as usize)
+                .enumerate()
+            {
                 let mb_end = (mb_start + minibatch_size).min(total_samples);
                 let chunk_sample_count = mb_end - mb_start;
 
@@ -634,8 +652,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 let latent = tanh_inverse(&actions_mb);
                 let diff = &latent - &action_mean_perturbed;
                 let log_prob_z = gaussian_log_prob(&diff, &action_std);
-                let log_jacobian = tanh_log_jacobian(&actions_mb)
-                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+                let log_jacobian = tanh_log_jacobian(&actions_mb).sum_dim_intlist(
+                    [-1].as_slice(),
+                    false,
+                    Kind::Float,
+                );
                 let action_log_probs = &log_prob_z - &log_jacobian;
 
                 if DEBUG_NUMERICS {
@@ -643,8 +664,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                     let _ =
                         debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ =
-                        debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_mb;
@@ -670,7 +690,8 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                     let _ = debug_tensor_stats("new_values", &new_values, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
-                let v_clipped = &old_val_mb + (&new_values - &old_val_mb).clamp(-VALUE_CLIP, VALUE_CLIP);
+                let v_clipped =
+                    &old_val_mb + (&new_values - &old_val_mb).clamp(-VALUE_CLIP, VALUE_CLIP);
                 let loss_unclipped = (&new_values - &ret_mb).pow_tensor_scalar(2);
                 let loss_clipped = (&v_clipped - &ret_mb).pow_tensor_scalar(2);
                 let value_loss = loss_unclipped.max_other(&loss_clipped).mean(Kind::Float) * 0.5;
@@ -759,8 +780,7 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
 
                 opt.step();
                 if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let max_delta_rho =
-                        MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
+                    let max_delta_rho = MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
                     tch::no_grad(|| {
                         let mut rho_grad = rpo_rho.grad();
                         if rho_grad.defined() {
@@ -933,7 +953,11 @@ pub async fn train(weights_path: Option<&str>, model_variant: ModelVariant, run_
                 println!("Error while saving weights: {}", err);
             } else {
                 println!("Saved model weights: {}", path);
-                let meta_path = format!("{}/ppo_ep{}.reward_norm.json", run_dir.weights.display(), episode);
+                let meta_path = format!(
+                    "{}/ppo_ep{}.reward_norm.json",
+                    run_dir.weights.display(),
+                    episode
+                );
                 let json = serde_json::json!({
                     "mean": &ret_rms_mean,
                     "var": &ret_rms_var,

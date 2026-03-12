@@ -71,7 +71,11 @@ impl Env {
         Self::new_with_tickers_and_recording(tickers, random_start, true, None)
     }
 
-    pub fn new_with_recording(random_start: bool, record_history_io: bool, gens_path: Option<String>) -> Self {
+    pub fn new_with_recording(
+        random_start: bool,
+        record_history_io: bool,
+        gens_path: Option<String>,
+    ) -> Self {
         let rng = &mut rand::rng();
         let tickers = AVAILABLE_TICKERS
             .to_vec()
@@ -480,13 +484,12 @@ impl Env {
 
         let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
         self.account.update_total(&self.prices, absolute_step);
-        let (reward, reward_per_ticker) =
-            self.get_unrealized_pnl_reward_breakdown(
-                absolute_step,
-                pre_total_assets,
-                // pre_cash,
-                // &pre_positions,
-            );
+        let (reward, reward_per_ticker) = self.get_unrealized_pnl_reward_breakdown(
+            absolute_step,
+            pre_total_assets,
+            // pre_cash,
+            // &pre_positions,
+        );
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -556,13 +559,12 @@ impl Env {
 
         let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
         self.account.update_total(&self.prices, absolute_step);
-        let (reward, reward_per_ticker) =
-            self.get_unrealized_pnl_reward_breakdown(
-                absolute_step,
-                pre_total_assets,
-                // pre_cash,
-                // &pre_positions,
-            );
+        let (reward, reward_per_ticker) = self.get_unrealized_pnl_reward_breakdown(
+            absolute_step,
+            pre_total_assets,
+            // pre_cash,
+            // &pre_positions,
+        );
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {

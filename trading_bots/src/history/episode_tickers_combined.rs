@@ -226,7 +226,10 @@ impl EpisodeHistory {
                     ema_alpha: None,
                 },
             };
-            let _ = write_report(&format!("{episode_dir}/normalized_reward.report.bin"), &report);
+            let _ = write_report(
+                &format!("{episode_dir}/normalized_reward.report.bin"),
+                &report,
+            );
         }
 
         // Combined target weights chart (all tickers + cash) - every 5 episodes like meta charts

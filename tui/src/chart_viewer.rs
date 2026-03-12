@@ -475,8 +475,12 @@ impl ChartViewer {
                         } else {
                             0
                         };
-                        if let Ok(img) = render_report_with_options(&report, skip, self.show_legend, self.solo_series)
-                        {
+                        if let Ok(img) = render_report_with_options(
+                            &report,
+                            skip,
+                            self.show_legend,
+                            self.solo_series,
+                        ) {
                             let protocol = self.picker.new_resize_protocol(img);
                             self.current_image = Some(protocol);
                         }

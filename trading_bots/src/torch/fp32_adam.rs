@@ -1,4 +1,4 @@
-use tch::{Kind, Tensor, nn};
+use tch::{nn, Kind, Tensor};
 
 struct ParamGroup {
     bf16_param: Tensor,

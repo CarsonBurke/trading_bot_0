@@ -77,7 +77,9 @@ impl ProcessManagerState {
             Some(w) => {
                 let p = Path::new(w);
                 // If weights are inside runs/*/weights/, reuse that run dir
-                if p.parent().and_then(|d| d.file_name()).map_or(false, |n| n == "weights")
+                if p.parent()
+                    .and_then(|d| d.file_name())
+                    .map_or(false, |n| n == "weights")
                     && p.ancestors().any(|a| a.ends_with("runs"))
                 {
                     RunDir::from_weights_path(p)?

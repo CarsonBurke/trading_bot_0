@@ -66,7 +66,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(theme::SURFACE2));
 
     if let Some(gen) = latest_episode {
-        let obs_path = format!("../training/runs/latest/gens/{}/observations.json", gen.number);
+        let obs_path = format!(
+            "../training/runs/latest/gens/{}/observations.json",
+            gen.number
+        );
 
         if let Ok(contents) = fs::read_to_string(&obs_path) {
             if let Ok(json) = serde_json::from_str::<Value>(&contents) {

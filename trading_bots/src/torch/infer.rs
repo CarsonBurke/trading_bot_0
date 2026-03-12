@@ -5,9 +5,7 @@ use tch::{nn, Device, Kind, Tensor};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
-use crate::torch::model::{
-    ModelVariant, TradingModel, TradingModelConfig,
-};
+use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
@@ -113,12 +111,8 @@ pub fn run_inference<P: AsRef<Path>>(
                     model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
                 (action_mean, action_noise_std)
             });
-            let actions = sample_actions(
-                &action_mean,
-                &action_noise_std,
-                deterministic,
-                temperature,
-            );
+            let actions =
+                sample_actions(&action_mean, &action_noise_std, deterministic, temperature);
 
             let actions_vec: Vec<f64> = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let step_result = env.step_step_single(&actions_vec);
