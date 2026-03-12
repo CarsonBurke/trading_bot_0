@@ -259,16 +259,23 @@ impl Env {
 
         let mut total_commission = 0.0;
 
+        // Softmax: convert raw logits to simplex weights
+        let mut max_a = f64::NEG_INFINITY;
+        for i in 0..=n_tickers {
+            let a = actions.get(i).copied().unwrap_or(0.0);
+            if a > max_a {
+                max_a = a;
+            }
+        }
         let mut weight_sum = 0.0;
         for i in 0..=n_tickers {
-            let preweight = ((actions.get(i).copied().unwrap_or(0.0)).clamp(-1.0, 1.0) + 1.0) / 2.0;
-            self.target_weights[i] = preweight;
-            weight_sum += preweight;
+            let a = actions.get(i).copied().unwrap_or(0.0);
+            let w = (a - max_a).exp();
+            self.target_weights[i] = w;
+            weight_sum += w;
         }
-        if weight_sum > 1e-8 {
-            for weight in &mut self.target_weights {
-                *weight /= weight_sum;
-            }
+        for weight in &mut self.target_weights {
+            *weight /= weight_sum;
         }
 
         // 2. Calculate target deltas and execute trades
