@@ -51,6 +51,7 @@ pub struct Env {
     pub position_open_step: Vec<Option<usize>>,
     pub ticker_perm: Vec<usize>,
     pub target_weights: Vec<f64>,
+    pub realized_weights: Vec<f64>,
     pub momentum: Vec<Arc<MomentumIndicators>>,
     pub earnings: Vec<Arc<EarningsIndicators>>,
     pub macro_ind: Arc<MacroIndicators>,
@@ -152,6 +153,11 @@ impl Env {
         eprintln!("done");
 
         let num_tickers = tickers.len();
+        let mut target_weights = vec![0.0; num_tickers + 1];
+        target_weights[num_tickers] = 1.0;
+        let mut realized_weights = vec![0.0; num_tickers + 1];
+        realized_weights[num_tickers] = 1.0;
+
         Self {
             env_id: 0,
             step: 0,
@@ -175,7 +181,8 @@ impl Env {
             steps_since_trade: vec![0; num_tickers],
             position_open_step: vec![None; num_tickers],
             ticker_perm: (0..num_tickers).collect(),
-            target_weights: vec![0.0; num_tickers + 1],
+            target_weights,
+            realized_weights,
             momentum,
             earnings,
             macro_ind,
@@ -310,6 +317,8 @@ impl Env {
         // Initialize to 100% cash, 0% tickers.
         self.target_weights = vec![0.0; n + 1];
         self.target_weights[n] = 1.0;
+        self.realized_weights = vec![0.0; n + 1];
+        self.realized_weights[n] = 1.0;
 
         // Shuffle ticker permutation for this episode
         let mut rng = rand::rng();
@@ -407,6 +416,8 @@ impl Env {
         let n = self.tickers.len();
         self.target_weights = vec![0.0; n + 1];
         self.target_weights[n] = 1.0;
+        self.realized_weights = vec![0.0; n + 1];
+        self.realized_weights[n] = 1.0;
 
         let mut rng = rand::rng();
         self.ticker_perm.shuffle(&mut rng);
@@ -444,6 +455,8 @@ impl Env {
         let n = self.tickers.len();
         self.target_weights = vec![0.0; n + 1];
         self.target_weights[n] = 1.0;
+        self.realized_weights = vec![0.0; n + 1];
+        self.realized_weights[n] = 1.0;
 
         let mut rng = rand::rng();
         self.ticker_perm.shuffle(&mut rng);
@@ -471,7 +484,6 @@ impl Env {
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
             real_actions[real_idx] = actions[perm_idx];
         }
-        real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize];
 
         if self.step == 0 {
             self.episode_history.action_step0 = Some(real_actions.clone());
@@ -484,6 +496,7 @@ impl Env {
 
         let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
         self.account.update_total(&self.prices, absolute_step);
+        self.sync_realized_weights(absolute_step);
         let (reward, reward_per_ticker) = self.get_unrealized_pnl_reward_breakdown(
             absolute_step,
             pre_total_assets,
@@ -546,7 +559,6 @@ impl Env {
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
             real_actions[real_idx] = actions[perm_idx];
         }
-        real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize];
 
         if self.step == 0 {
             self.episode_history.action_step0 = Some(real_actions.clone());
@@ -559,6 +571,7 @@ impl Env {
 
         let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
         self.account.update_total(&self.prices, absolute_step);
+        self.sync_realized_weights(absolute_step);
         let (reward, reward_per_ticker) = self.get_unrealized_pnl_reward_breakdown(
             absolute_step,
             pre_total_assets,

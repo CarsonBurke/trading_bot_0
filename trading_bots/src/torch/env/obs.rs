@@ -59,7 +59,7 @@ impl Env {
                     .map(|s| (absolute_step.saturating_sub(s) as f64 / 500.0).min(1.0))
                     .unwrap_or(0.0) as f32,
             );
-            static_obs.push(self.target_weights[real_idx].clamp(0.0, 1.0) as f32);
+            static_obs.push(self.realized_weights[real_idx].clamp(0.0, 1.0) as f32);
             static_obs.push(m.mom_5[absolute_step] as f32);
             static_obs.push(
                 ((self.prices[real_idx][absolute_step]

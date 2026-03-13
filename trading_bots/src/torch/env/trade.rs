@@ -3,6 +3,23 @@ use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE};
 use super::env::{Env, TRADE_EMA_ALPHA};
 
 impl Env {
+    pub fn sync_realized_weights(&mut self, absolute_step: usize) {
+        let n_tickers = self.tickers.len();
+        let total_assets = self.account.total_assets;
+        if total_assets <= 0.0 {
+            self.realized_weights.fill(0.0);
+            return;
+        }
+
+        let inv_total_assets = 1.0 / total_assets;
+        for ticker_index in 0..n_tickers {
+            let price = self.prices[ticker_index][absolute_step];
+            let value = self.account.positions[ticker_index].value_with_price(price);
+            self.realized_weights[ticker_index] = (value * inv_total_assets).clamp(0.0, 1.0);
+        }
+        self.realized_weights[n_tickers] = (self.account.cash * inv_total_assets).clamp(0.0, 1.0);
+    }
+
     #[allow(dead_code)]
     pub fn trade_by_delta_percent(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let mut total_commission = 0.0;
@@ -259,16 +276,19 @@ impl Env {
 
         let mut total_commission = 0.0;
 
-        // Softmax: convert raw logits to simplex weights
-        let mut max_a = f64::NEG_INFINITY;
-        for i in 0..=n_tickers {
+        // Softmax with implicit cash: cash keeps a fixed logit of 0.
+        let cash_idx = n_tickers;
+        let mut max_a = 0.0;
+        for i in 0..n_tickers {
             let a = actions.get(i).copied().unwrap_or(0.0);
             if a > max_a {
                 max_a = a;
             }
         }
-        let mut weight_sum = 0.0;
-        for i in 0..=n_tickers {
+        let cash_weight = (-max_a).exp();
+        self.target_weights[cash_idx] = cash_weight;
+        let mut weight_sum = cash_weight;
+        for i in 0..n_tickers {
             let a = actions.get(i).copied().unwrap_or(0.0);
             let w = (a - max_a).exp();
             self.target_weights[i] = w;
