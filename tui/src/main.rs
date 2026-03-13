@@ -5,7 +5,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
-use shared::paths::WEIGHTS_PATH;
+use shared::paths::{RUNS_PATH, WEIGHTS_PATH};
+use shared::run_dir::RunDir;
 use std::{
     io,
     path::PathBuf,
@@ -109,11 +110,15 @@ impl App {
     }
 
     fn new() -> Result<Self> {
-        let mut generation_browser = GenerationBrowserState::new();
-        generation_browser.load_generations()?;
-
         let mut inference_browser = InferenceBrowserState::new();
         inference_browser.load_inferences()?;
+
+        let process_manager = ProcessManagerState::new();
+        let mut generation_browser = GenerationBrowserState::new();
+        if let Some(run) = &process_manager.active_run {
+            generation_browser.gens_path = run.gens.clone();
+        }
+        generation_browser.load_generations()?;
 
         let mut app = App {
             mode: AppMode::Main,
@@ -130,7 +135,7 @@ impl App {
             generation_browser,
             inference_browser,
             logs_page: LogsPageState::new(),
-            process_manager: ProcessManagerState::new(),
+            process_manager,
         };
 
         app.load_latest_meta_charts()?;
@@ -144,7 +149,10 @@ impl App {
 
         self.latest_meta_charts.clear();
 
-        let gens_path = PathBuf::from("../training/runs/latest/gens");
+        let gens_path = match &self.process_manager.active_run {
+            Some(run) => run.gens.clone(),
+            None => PathBuf::from("../training/runs/latest/gens"),
+        };
         if !gens_path.exists() {
             return Ok(());
         }
@@ -309,20 +317,24 @@ impl App {
     fn start_training(&mut self, weights_file: Option<String>) -> Result<()> {
         let weights = weights_file.map(|w| {
             if w.starts_with('/') || w.starts_with("..") {
-                w
-            } else if let Some(run) = &self.process_manager.active_run {
-                let run_path = run.weights.join(&w);
-                if run_path.exists() {
-                    run_path.to_string_lossy().into_owned()
-                } else {
-                    format!("{}/{}", WEIGHTS_PATH, w)
-                }
-            } else {
-                format!("{}/{}", WEIGHTS_PATH, w)
+                return w;
             }
+            if let Some((run_dir, weights_path)) = RunDir::find_with_weights(RUNS_PATH, &w) {
+                self.process_manager.active_run = Some(run_dir);
+                return weights_path.to_string_lossy().into_owned();
+            }
+            format!("{}/{}", WEIGHTS_PATH, w)
         });
-        self.process_manager
-            .start_training(weights, &self.training_model_size)
+        let result = self.process_manager
+            .start_training(weights, &self.training_model_size);
+        self.sync_gens_path();
+        result
+    }
+
+    fn sync_gens_path(&mut self) {
+        if let Some(run) = &self.process_manager.active_run {
+            self.generation_browser.gens_path = run.gens.clone();
+        }
     }
 
     fn toggle_training_model_size(&mut self) {

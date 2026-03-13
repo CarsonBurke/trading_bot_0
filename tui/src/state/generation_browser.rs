@@ -17,6 +17,7 @@ pub struct GenerationBrowserState {
     pub search_input: String,
     pub searching: bool,
     pub list_area: Rect,
+    pub gens_path: PathBuf,
 }
 
 impl GenerationBrowserState {
@@ -29,12 +30,13 @@ impl GenerationBrowserState {
             search_input: String::new(),
             searching: false,
             list_area: Rect::default(),
+            gens_path: PathBuf::from("../training/runs/latest/gens"),
         }
     }
 
     pub fn load_generations(&mut self) -> Result<()> {
         self.generations.clear();
-        let training_path = PathBuf::from("../training/runs/latest/gens");
+        let training_path = &self.gens_path;
 
         if !training_path.exists() {
             return Ok(());

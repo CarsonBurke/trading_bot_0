@@ -70,6 +70,56 @@ impl RunDir {
         })
     }
 
+    /// Scan runs newest-to-oldest, return the first that contains `filename` in its weights dir.
+    pub fn find_with_weights(runs_path: &str, filename: &str) -> Option<(Self, PathBuf)> {
+        let runs = Path::new(runs_path);
+        let mut dirs: Vec<_> = fs::read_dir(runs)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+            .collect();
+        dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+        for entry in dirs {
+            let root = entry.path();
+            let weights_file = root.join("weights").join(filename);
+            if weights_file.exists() {
+                let gens = root.join("gens");
+                let weights = root.join("weights");
+                let log_file = root.join("training.log");
+                let run_dir = Self { root, gens, weights, log_file };
+                return Some((run_dir, weights_file));
+            }
+        }
+        None
+    }
+
+    /// Scan runs newest-to-oldest, return the first whose gens dir is non-empty.
+    pub fn latest_with_data(runs_path: &str) -> Option<Self> {
+        let runs = Path::new(runs_path);
+        let mut dirs: Vec<_> = fs::read_dir(runs)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+            .collect();
+        dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+        for entry in dirs {
+            let root = entry.path();
+            let gens = root.join("gens");
+            let has_data = fs::read_dir(&gens)
+                .ok()
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+            if has_data {
+                let weights = root.join("weights");
+                let log_file = root.join("training.log");
+                return Some(Self { root, gens, weights, log_file });
+            }
+        }
+        None
+    }
+
     pub fn latest(runs_path: &str) -> Result<Self> {
         let latest = Path::new(runs_path).join("latest");
         let target = fs::read_link(&latest).context("failed to read latest symlink")?;

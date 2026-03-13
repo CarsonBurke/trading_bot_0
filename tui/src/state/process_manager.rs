@@ -14,7 +14,8 @@ pub struct ProcessManagerState {
 
 impl ProcessManagerState {
     pub fn new() -> Self {
-        let active_run = RunDir::latest(RUNS_PATH).ok();
+        let active_run = RunDir::latest_with_data(RUNS_PATH)
+            .or_else(|| RunDir::latest(RUNS_PATH).ok());
         Self {
             inference_process: None,
             training_process: None,
