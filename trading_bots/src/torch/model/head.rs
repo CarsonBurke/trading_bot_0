@@ -1,7 +1,8 @@
 use tch::{Kind, Tensor};
 
 use super::{
-    DebugMetrics, ModelOutput, TradingModel, LOG_STD_INIT, LOG_STD_MAX, LOG_STD_MIN, SDE_EPS,
+    ACTION_LOGIT_BOUND, DebugMetrics, ModelOutput, TradingModel, LOG_STD_INIT, LOG_STD_MAX,
+    LOG_STD_MIN, SDE_EPS,
 };
 use crate::torch::constants::TICKERS_COUNT;
 
@@ -22,7 +23,9 @@ impl TradingModel {
             .reshape([batch_size * TICKERS_COUNT, self.model_dim])
             .apply(&self.actor_proj)
             .reshape([batch_size, TICKERS_COUNT, -1])
-            .sum_dim_intlist([1].as_slice(), false, Kind::Float);
+            .sum_dim_intlist([1].as_slice(), false, Kind::Float)
+            .tanh()
+            * ACTION_LOGIT_BOUND;
 
         let sde_latent = sde_cls
             .reshape([batch_size, TICKERS_COUNT * self.model_dim])
