@@ -12,7 +12,7 @@ use crate::torch::env::VecEnv;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
-const LEARNING_RATE: f64 = 3e-4;
+const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
