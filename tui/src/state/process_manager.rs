@@ -118,7 +118,8 @@ impl ProcessManagerState {
             .stdout(log_file.try_clone()?)
             .stderr(log_file);
 
-        cmd.spawn()?;
+        let child = cmd.spawn()?;
+        self.training_process = Some(child);
         self.active_run = Some(run_dir);
         self.cached_training_running = true;
 
@@ -161,9 +162,9 @@ impl ProcessManagerState {
             let _ = child.kill();
         }
 
-        Command::new("pkill")
+        let _ = Command::new("pkill")
             .args(["-f", "trading.*train"])
-            .spawn()?;
+            .output();
 
         self.cached_training_running = false;
         Ok(())
