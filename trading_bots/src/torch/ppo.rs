@@ -5,6 +5,9 @@ use tch::{nn, Kind, Tensor};
 
 use super::Fp32Adam;
 
+use crate::torch::action_space::{
+    gaussian_entropy, implicit_cash_weights, transformed_action_log_prob,
+};
 use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
@@ -96,25 +99,11 @@ impl GpuRollingBuffer {
     }
 }
 
-/// 1D Gaussian log-prob: log N(diff; 0, diag(std^2))
-fn gaussian_log_prob(diff: &Tensor, std: &Tensor) -> Tensor {
-    let var = std.pow_tensor_scalar(2);
-    let log_std = std.log();
-    let mahal = diff.pow_tensor_scalar(2) / &var;
-    let per_dim: Tensor = -(mahal + LOG_2PI) * 0.5 - &log_std;
-    per_dim.sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-}
-
-/// 1D diagonal Gaussian entropy: H = sum(log std + 0.5(1 + log 2pi))
-fn gaussian_entropy(std: &Tensor) -> Tensor {
-    (std.log() + 0.5 * (1.0 + LOG_2PI)).sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-}
-
 fn sample_rollout_actions(
     model: &TradingModel,
     obs_price: &Tensor,
     obs_static: &Tensor,
-) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
     tch::no_grad(|| {
         let (values, action_mean, action_std) =
             model.forward_on_device(obs_price, obs_static, false);
@@ -125,10 +114,23 @@ fn sample_rollout_actions(
         let batch = action_mean.size()[0];
         let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
         let noise = &action_std * &z;
-        let actions = &action_mean + &noise;
-        let action_log_prob = gaussian_log_prob(&noise, &action_std);
+        let latent_actions = &action_mean + &noise;
+        let target_weights = implicit_cash_weights(&latent_actions);
+        let action_log_prob = transformed_action_log_prob(
+            &latent_actions,
+            &action_mean,
+            &action_std,
+            LOG_2PI,
+        );
 
-        (values, action_mean, action_std, actions, action_log_prob)
+        (
+            values,
+            action_mean,
+            action_std,
+            latent_actions,
+            target_weights,
+            action_log_prob,
+        )
     })
 }
 
@@ -392,13 +394,24 @@ pub async fn train(
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
         for step in 0..rollout_steps as usize {
-            let (values, action_mean, action_std, actions, action_log_prob) =
-                sample_rollout_actions(&trading_model, &obs_price, &obs_static);
+            let (
+                values,
+                action_mean,
+                action_std,
+                latent_actions,
+                target_weights,
+                action_log_prob,
+            ) = sample_rollout_actions(
+                &trading_model,
+                &obs_price,
+                &obs_static,
+            );
 
             if DEBUG_NUMERICS {
                 let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
                 let _ = debug_tensor_stats("action_std", &action_std, episode as i64, step);
-                let _ = debug_tensor_stats("actions", &actions, episode as i64, step);
+                let _ = debug_tensor_stats("latent_actions", &latent_actions, episode as i64, step);
+                let _ = debug_tensor_stats("target_weights", &target_weights, episode as i64, step);
                 let _ =
                     debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
@@ -406,7 +419,7 @@ pub async fn train(
             s_static_obs.push(&obs_static);
 
             let (reset_indices, reset_price_deltas) = env.step_into_ring_tensor(
-                &actions,
+                &target_weights,
                 &mut step_deltas,
                 &mut obs_static,
                 &mut step_reward_per_ticker,
@@ -437,7 +450,9 @@ pub async fn train(
             obs_price.copy_(&ordered.view([NPROCS, pd_dim]));
 
             let mem_idx = step as i64 * NPROCS;
-            let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&actions);
+            let _ = s_actions
+                .narrow(0, mem_idx, NPROCS)
+                .copy_(&latent_actions);
             let _ = s_old_log_probs
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&action_log_prob);
@@ -589,7 +604,7 @@ pub async fn train(
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let action_std = action_std.to_kind(Kind::Float);
 
-                let actions_mb = act_mb;
+                let latent_actions_mb = act_mb;
 
                 // RPO (CleanRL-style): iid uniform perturbation on each action-mean dimension.
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
@@ -607,11 +622,16 @@ pub async fn train(
                     )
                 };
 
-                let diff = &actions_mb - &action_mean_perturbed;
-                let action_log_probs = gaussian_log_prob(&diff, &action_std);
+                let action_log_probs = transformed_action_log_prob(
+                    &latent_actions_mb,
+                    &action_mean_perturbed,
+                    &action_std,
+                    LOG_2PI,
+                );
 
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("actions_mb", &actions_mb, _epoch, chunk_i);
+                    let _ =
+                        debug_tensor_stats("latent_actions_mb", &latent_actions_mb, _epoch, chunk_i);
                     let _ =
                         debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
@@ -647,7 +667,7 @@ pub async fn train(
                 let loss_clipped = (&v_clipped - &ret_mb).pow_tensor_scalar(2);
                 let value_loss = loss_unclipped.max_other(&loss_clipped).mean(Kind::Float) * 0.5;
 
-                let dist_entropy = gaussian_entropy(&action_std).mean(Kind::Float);
+                let dist_entropy = gaussian_entropy(&action_std, LOG_2PI).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
 
                 let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF

@@ -379,7 +379,6 @@ pub(super) const SDE_EPS: f64 = 1e-6;
 pub(super) const LOG_STD_INIT: f64 = -2.0;
 pub(super) const LOG_STD_MIN: f64 = -3.0;
 pub(super) const LOG_STD_MAX: f64 = -0.5;
-pub(super) const ACTION_LOGIT_BOUND: f64 = 4.0;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 use tch::{nn, Device, Kind, Tensor};
 
+use crate::torch::action_space::implicit_cash_weights;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
@@ -34,7 +35,7 @@ pub fn sample_actions(
     let action_mean = action_mean.to_kind(Kind::Float);
     let action_noise_std = action_noise_std.to_kind(Kind::Float);
 
-    if deterministic {
+    let latent_actions = if deterministic {
         action_mean
     } else {
         let batch = action_mean.size()[0];
@@ -42,7 +43,9 @@ pub fn sample_actions(
         let scale = if temperature > 0.0 { temperature } else { 1.0 };
         let noise = Tensor::randn(&[batch, action_dim], (Kind::Float, action_mean.device()));
         &action_mean + &action_noise_std * scale * noise
-    }
+    };
+
+    implicit_cash_weights(&latent_actions)
 }
 
 pub fn run_inference<P: AsRef<Path>>(

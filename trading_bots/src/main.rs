@@ -61,6 +61,7 @@ enum Commands {
 
         #[arg(long, value_enum, default_value_t = ModelVariant::Base)]
         model_size: ModelVariant,
+
     },
     Paper {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
@@ -80,6 +81,7 @@ enum Commands {
 
         #[arg(long, value_enum, default_value_t = ModelVariant::Base)]
         model_size: ModelVariant,
+
     },
 }
 

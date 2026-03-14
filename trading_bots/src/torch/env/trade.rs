@@ -276,27 +276,25 @@ impl Env {
 
         let mut total_commission = 0.0;
 
-        // Softmax with implicit cash: cash keeps a fixed logit of 0.
+        // Ticker actions are already simplex weights. Cash remains the residual.
         let cash_idx = n_tickers;
-        let mut max_a = 0.0;
+        let mut ticker_sum = 0.0;
         for i in 0..n_tickers {
-            let a = actions.get(i).copied().unwrap_or(0.0);
-            if a > max_a {
-                max_a = a;
+            let weight = actions
+                .get(i)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            self.target_weights[i] = if weight.is_finite() { weight } else { 0.0 };
+            ticker_sum += self.target_weights[i];
+        }
+        if ticker_sum > 1.0 {
+            for weight in self.target_weights.iter_mut().take(n_tickers) {
+                *weight /= ticker_sum;
             }
+            ticker_sum = 1.0;
         }
-        let cash_weight = (-max_a).exp();
-        self.target_weights[cash_idx] = cash_weight;
-        let mut weight_sum = cash_weight;
-        for i in 0..n_tickers {
-            let a = actions.get(i).copied().unwrap_or(0.0);
-            let w = (a - max_a).exp();
-            self.target_weights[i] = w;
-            weight_sum += w;
-        }
-        for weight in &mut self.target_weights {
-            *weight /= weight_sum;
-        }
+        self.target_weights[cash_idx] = (1.0 - ticker_sum).clamp(0.0, 1.0);
 
         // 2. Calculate target deltas and execute trades
         let total_assets = self.account.total_assets;
