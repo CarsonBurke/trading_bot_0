@@ -1,8 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{
-    DebugMetrics, ModelOutput, TradingModel, LOG_STD_INIT, LOG_STD_MAX, LOG_STD_MIN, SDE_EPS,
-};
+use super::{ACTION_STD_MAX, ACTION_STD_MIN, DebugMetrics, ModelOutput, TradingModel};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -16,22 +14,21 @@ impl TradingModel {
         let x_time = x_ssm.view([batch_size, TICKERS_COUNT, temporal_len, self.model_dim]);
         let actor_cls = x_time.select(2, 0);
         let critic_cls = x_time.select(2, 1);
-        let sde_cls = x_time.select(2, 2);
 
-        let action_mean = actor_cls
+        let policy_mean_std_logit = actor_cls
             .reshape([batch_size * TICKERS_COUNT, self.model_dim])
-            .apply(&self.actor_proj)
+            .apply(&self.policy_mean_std_logit)
             .reshape([batch_size, TICKERS_COUNT, -1])
             .sum_dim_intlist([1].as_slice(), false, Kind::Float);
-
-        let sde_latent = sde_cls
-            .reshape([batch_size, TICKERS_COUNT * self.model_dim])
-            .tanh();
-        let log_std = (&self.log_std_param + LOG_STD_INIT)
-            .clamp(LOG_STD_MIN, LOG_STD_MAX)
-            .to_kind(sde_latent.kind());
-        let std_sq = log_std.exp().pow_tensor_scalar(2);
-        let action_std = (sde_latent.pow_tensor_scalar(2).matmul(&std_sq) + SDE_EPS).sqrt();
+        let action_mean =
+            policy_mean_std_logit.narrow(1, 0, policy_mean_std_logit.size()[1] / 2);
+        let action_std_logit = policy_mean_std_logit.narrow(
+            1,
+            policy_mean_std_logit.size()[1] / 2,
+            policy_mean_std_logit.size()[1] / 2,
+        );
+        let action_std = action_std_logit.sigmoid().g_mul_scalar(ACTION_STD_MAX - ACTION_STD_MIN)
+            + ACTION_STD_MIN;
 
         let values = critic_cls
             .reshape([batch_size, TICKERS_COUNT * self.model_dim])

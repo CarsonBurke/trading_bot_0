@@ -375,10 +375,9 @@ const BASE_GQA_LAYERS: usize = 3;
 const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
-pub(super) const SDE_EPS: f64 = 1e-6;
 pub(super) const LOG_STD_INIT: f64 = -2.0;
-pub(super) const LOG_STD_MIN: f64 = -3.0;
-pub(super) const LOG_STD_MAX: f64 = -0.5;
+pub(super) const ACTION_STD_MIN: f64 = 0.05;
+pub(super) const ACTION_STD_MAX: f64 = 1.05;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
@@ -539,9 +538,8 @@ pub struct TradingModel {
     critic_cls_token: Tensor,
     sde_cls_token: Tensor,
     inter_ticker_block: InterTickerBlock,
-    actor_proj: nn::Linear,
+    policy_mean_std_logit: nn::Linear,
     value_proj: nn::Linear,
-    log_std_param: Tensor,
     device: tch::Device,
 }
 
@@ -691,16 +689,30 @@ impl TradingModel {
             init_scale,
         );
         let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
-        let actor_proj = nn::linear(
-            p / "actor_proj",
+        let policy_mean_std_logit = nn::linear(
+            p / "policy_mean_std_logit",
             spec.model_dim,
-            ACTION_COUNT,
+            ACTION_COUNT * 2,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 0.1 },
+                ws_init: Init::Randn {
+                    mean: 0.0,
+                    stdev: 0.01,
+                },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
         );
+        if let Some(bias) = &policy_mean_std_logit.bs {
+            let init_std = LOG_STD_INIT.exp();
+            let init_p = ((init_std - ACTION_STD_MIN) / (ACTION_STD_MAX - ACTION_STD_MIN))
+                .clamp(1e-6, 1.0 - 1e-6);
+            let init_std_logit = (init_p / (1.0 - init_p)).ln();
+            tch::no_grad(|| {
+                let _ = bias
+                    .narrow(0, ACTION_COUNT, ACTION_COUNT)
+                    .fill_(init_std_logit);
+            });
+        }
         let value_proj = nn::linear(
             p / "value_proj",
             flat_all_tickers,
@@ -710,11 +722,6 @@ impl TradingModel {
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
-        );
-        let log_std_param = p.var(
-            "log_std_param",
-            &[flat_all_tickers, ACTION_COUNT],
-            Init::Const(0.0),
         );
         Self {
             variant: config.variant,
@@ -736,9 +743,8 @@ impl TradingModel {
             critic_cls_token,
             sde_cls_token,
             inter_ticker_block,
-            actor_proj,
+            policy_mean_std_logit,
             value_proj,
-            log_std_param,
             device: p.device(),
         }
     }
