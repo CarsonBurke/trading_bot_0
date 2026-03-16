@@ -882,7 +882,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         app.dialog_mode = DialogMode::PageJump { selected: 0 };
                                     }
                                 }
-                                KeyCode::Char('r') => {
+                                KeyCode::Char('R') => {
                                     if !app.generation_browser.searching
                                         && !app.inference_browser.searching
                                     {

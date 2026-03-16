@@ -73,7 +73,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Span::styled("m", Style::default().fg(Color::Magenta)),
             Span::raw(": View Meta Charts  "),
             Span::styled("v", Style::default().fg(Color::Magenta)),
-            Span::raw(": Model Observations"),
+            Span::raw(": Model Observations  "),
+            Span::styled("R", Style::default().fg(Color::Yellow)),
+            Span::raw(": Switch Run"),
         ]),
     ];
 
