@@ -4153,6 +4153,7 @@ name = "trading-bot-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossterm",
  "image 0.25.9",
  "plotters",

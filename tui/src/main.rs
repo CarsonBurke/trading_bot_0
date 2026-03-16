@@ -34,13 +34,23 @@ pub enum AppMode {
     ModelObservations,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunSelectorPurpose {
+    View,
+    Train,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunInfo {
+    pub name: String,
+    pub gen_count: usize,
+    pub weights: Vec<String>, // .ot filenames sorted newest-first
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum DialogMode {
     None,
-    WeightsInput {
-        for_training: bool,
-        for_inference: bool,
-    },
     InferenceInput {
         focused_field: InferenceField,
     },
@@ -48,6 +58,16 @@ pub enum DialogMode {
     ConfirmStopTraining,
     PageJump {
         selected: usize,
+    },
+    RunSelector {
+        selected: usize,
+        runs: Vec<RunInfo>,
+        purpose: RunSelectorPurpose,
+    },
+    WeightsSelector {
+        run_name: String,
+        selected: usize,
+        weights: Vec<String>,
     },
 }
 
@@ -314,19 +334,10 @@ impl App {
         Ok(())
     }
 
-    fn start_training(&mut self, weights_file: Option<String>) -> Result<()> {
-        let weights = weights_file.map(|w| {
-            if w.starts_with('/') || w.starts_with("..") {
-                return w;
-            }
-            if let Some((run_dir, weights_path)) = RunDir::find_with_weights(RUNS_PATH, &w) {
-                self.process_manager.active_run = Some(run_dir);
-                return weights_path.to_string_lossy().into_owned();
-            }
-            format!("{}/{}", WEIGHTS_PATH, w)
-        });
-        let result = self.process_manager
-            .start_training(weights, &self.training_model_size);
+    fn start_training(&mut self, weights_path: Option<String>) -> Result<()> {
+        let result = self
+            .process_manager
+            .start_training(weights_path, &self.training_model_size);
         self.sync_gens_path();
         result
     }
@@ -335,6 +346,85 @@ impl App {
         if let Some(run) = &self.process_manager.active_run {
             self.generation_browser.gens_path = run.gens.clone();
         }
+    }
+
+    fn open_run_selector(&mut self, purpose: RunSelectorPurpose) {
+        use std::fs;
+        let runs_dir = std::path::Path::new(RUNS_PATH);
+        let mut dirs: Vec<_> = fs::read_dir(runs_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+            .collect();
+        dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+        let active_name = self
+            .process_manager
+            .active_run
+            .as_ref()
+            .and_then(|r| r.root.file_name().map(|n| n.to_string_lossy().to_string()));
+
+        let runs: Vec<RunInfo> = dirs
+            .iter()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let gens = entry.path().join("gens");
+                let gen_count = fs::read_dir(&gens)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+                    .count();
+                let weights_dir = entry.path().join("weights");
+                let mut weights: Vec<String> = fs::read_dir(&weights_dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map_or(false, |ext| ext == "ot")
+                    })
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect();
+                weights.sort_by(|a, b| {
+                    let num = |s: &String| -> usize {
+                        s.chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                            .parse()
+                            .unwrap_or(0)
+                    };
+                    num(b).cmp(&num(a))
+                });
+                let is_active = active_name.as_deref() == Some(&name);
+                if gen_count == 0 && weights.is_empty() {
+                    return None;
+                }
+                Some(RunInfo { name, gen_count, weights, is_active })
+            })
+            .collect();
+
+        let selected = runs.iter().position(|r| r.is_active).unwrap_or(0);
+        self.dialog_mode = DialogMode::RunSelector { selected, runs, purpose };
+    }
+
+    fn switch_to_run(&mut self, name: &str) -> Result<()> {
+        let root = std::path::Path::new(RUNS_PATH).join(name);
+        let gens = root.join("gens");
+        let weights = root.join("weights");
+        let log_file = root.join("training.log");
+        self.process_manager.active_run = Some(RunDir {
+            root,
+            gens,
+            weights,
+            log_file,
+        });
+        self.sync_gens_path();
+        self.generation_browser.load_generations()?;
+        self.load_latest_meta_charts()?;
+        Ok(())
     }
 
     fn toggle_training_model_size(&mut self) {
@@ -457,38 +547,51 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Handle dialogs first (they take priority)
-                    match app.dialog_mode {
-                        DialogMode::WeightsInput {
-                            for_training,
-                            for_inference,
-                        } => match key.code {
-                            KeyCode::Esc => {
-                                app.dialog_mode = DialogMode::None;
-                                app.input.clear();
-                            }
-                            KeyCode::Enter => {
-                                let weights = if app.input.is_empty() {
-                                    None
-                                } else {
-                                    Some(App::coerce_weights_filename(&app.input))
-                                };
-                                app.input.clear();
-                                app.dialog_mode = DialogMode::None;
-
-                                if for_training {
-                                    app.start_training(weights)?;
-                                } else if for_inference {
-                                    app.start_inference(weights, None, None)?;
+                    match app.dialog_mode.clone() {
+                        DialogMode::WeightsSelector {
+                            run_name,
+                            selected,
+                            weights,
+                        } => {
+                            let count = weights.len();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.dialog_mode = DialogMode::None;
                                 }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    if count > 0 {
+                                        let (run_name, weights) = (run_name.clone(), weights.clone());
+                                        app.dialog_mode = DialogMode::WeightsSelector {
+                                            run_name,
+                                            selected: (selected + 1) % count,
+                                            weights,
+                                        };
+                                    }
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    if count > 0 {
+                                        let (run_name, weights) = (run_name.clone(), weights.clone());
+                                        app.dialog_mode = DialogMode::WeightsSelector {
+                                            run_name,
+                                            selected: if selected == 0 { count - 1 } else { selected - 1 },
+                                            weights,
+                                        };
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(filename) = weights.get(selected) {
+                                        let path = std::path::Path::new(RUNS_PATH)
+                                            .join(&run_name)
+                                            .join("weights")
+                                            .join(filename);
+                                        let weights_str = path.to_string_lossy().to_string();
+                                        app.dialog_mode = DialogMode::None;
+                                        app.start_training(Some(weights_str))?;
+                                    }
+                                }
+                                _ => {}
                             }
-                            KeyCode::Char(c) => {
-                                app.input.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                app.input.pop();
-                            }
-                            _ => {}
-                        },
+                        }
                         DialogMode::InferenceInput { focused_field } => match key.code {
                             KeyCode::Esc => {
                                 app.dialog_mode = DialogMode::None;
@@ -682,6 +785,70 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                 _ => {}
                             }
                         }
+                        DialogMode::RunSelector { selected, runs, purpose } => {
+                            let count = runs.len();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.dialog_mode = DialogMode::None;
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    if count > 0 {
+                                        let (runs, purpose) = (runs.clone(), purpose.clone());
+                                        app.dialog_mode = DialogMode::RunSelector {
+                                            selected: (selected + 1) % count,
+                                            runs,
+                                            purpose,
+                                        };
+                                    }
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    if count > 0 {
+                                        let (runs, purpose) = (runs.clone(), purpose.clone());
+                                        app.dialog_mode = DialogMode::RunSelector {
+                                            selected: if selected == 0 {
+                                                count - 1
+                                            } else {
+                                                selected - 1
+                                            },
+                                            runs,
+                                            purpose,
+                                        };
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(run) = runs.get(selected) {
+                                        let name = run.name.clone();
+                                        match purpose {
+                                            RunSelectorPurpose::View => {
+                                                app.dialog_mode = DialogMode::None;
+                                                app.switch_to_run(&name)?;
+                                            }
+                                            RunSelectorPurpose::Train => {
+                                                if run.weights.is_empty() {
+                                                    // No weights, start from scratch
+                                                    app.dialog_mode = DialogMode::None;
+                                                    app.start_training(None)?;
+                                                } else {
+                                                    let weights = run.weights.clone();
+                                                    app.dialog_mode = DialogMode::WeightsSelector {
+                                                        run_name: name,
+                                                        selected: 0,
+                                                        weights,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('n') => {
+                                    if matches!(purpose, RunSelectorPurpose::Train) {
+                                        app.dialog_mode = DialogMode::None;
+                                        app.start_training(None)?;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         DialogMode::None => {
                             // Global keybindings (work in all modes when no dialog is open)
                             match key.code {
@@ -715,6 +882,13 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         app.dialog_mode = DialogMode::PageJump { selected: 0 };
                                     }
                                 }
+                                KeyCode::Char('r') => {
+                                    if !app.generation_browser.searching
+                                        && !app.inference_browser.searching
+                                    {
+                                        app.open_run_selector(RunSelectorPurpose::View);
+                                    }
+                                }
                                 _ => {}
                             }
 
@@ -729,10 +903,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
-                                            app.dialog_mode = DialogMode::WeightsInput {
-                                                for_training: true,
-                                                for_inference: false,
-                                            };
+                                            app.open_run_selector(RunSelectorPurpose::Train);
                                         }
                                     }
                                     KeyCode::Char('p') => {
@@ -1061,15 +1232,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     // Render dialog on top if active
-    match app.dialog_mode {
-        DialogMode::WeightsInput {
-            for_training,
-            for_inference,
-        } => {
-            components::dialogs::weights::render(f, app, for_training, for_inference);
-        }
+    match &app.dialog_mode {
         DialogMode::InferenceInput { focused_field } => {
-            components::dialogs::inference::render(f, app, focused_field);
+            components::dialogs::inference::render(f, app, *focused_field);
         }
         DialogMode::ConfirmQuit => {
             components::dialogs::confirm::render(
@@ -1086,7 +1251,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             );
         }
         DialogMode::PageJump { selected } => {
-            components::dialogs::page_jump::render(f, selected, app.mode);
+            components::dialogs::page_jump::render(f, *selected, app.mode);
+        }
+        DialogMode::RunSelector { selected, runs, purpose } => {
+            components::dialogs::run_selector::render(f, *selected, runs, purpose);
+        }
+        DialogMode::WeightsSelector { run_name, selected, weights } => {
+            components::dialogs::run_selector::render_weights(f, run_name, *selected, weights);
         }
         DialogMode::None => {}
     }
