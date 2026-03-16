@@ -1,6 +1,6 @@
 use tch::{Kind, Tensor};
 
-use super::{ACTION_STD_MAX, ACTION_STD_MIN, DebugMetrics, ModelOutput, TradingModel};
+use super::{DebugMetrics, ModelOutput, TradingModel, LOG_STD_MAX, LOG_STD_MIN};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -15,20 +15,21 @@ impl TradingModel {
         let actor_cls = x_time.select(2, 0);
         let critic_cls = x_time.select(2, 1);
 
-        let policy_mean_std_logit = actor_cls
+        let policy_mean_log_var = actor_cls
             .reshape([batch_size * TICKERS_COUNT, self.model_dim])
-            .apply(&self.policy_mean_std_logit)
+            .apply(&self.policy_mean_log_var)
             .reshape([batch_size, TICKERS_COUNT, -1])
             .sum_dim_intlist([1].as_slice(), false, Kind::Float);
-        let action_mean =
-            policy_mean_std_logit.narrow(1, 0, policy_mean_std_logit.size()[1] / 2);
-        let action_std_logit = policy_mean_std_logit.narrow(
+        let action_mean = policy_mean_log_var.narrow(1, 0, policy_mean_log_var.size()[1] / 2);
+        let action_log_var = policy_mean_log_var.narrow(
             1,
-            policy_mean_std_logit.size()[1] / 2,
-            policy_mean_std_logit.size()[1] / 2,
+            policy_mean_log_var.size()[1] / 2,
+            policy_mean_log_var.size()[1] / 2,
         );
-        let action_std = action_std_logit.sigmoid().g_mul_scalar(ACTION_STD_MAX - ACTION_STD_MIN)
-            + ACTION_STD_MIN;
+        let action_std = action_log_var
+            .clamp(2.0 * LOG_STD_MIN, 2.0 * LOG_STD_MAX)
+            .g_mul_scalar(0.5)
+            .exp();
 
         let values = critic_cls
             .reshape([batch_size, TICKERS_COUNT * self.model_dim])

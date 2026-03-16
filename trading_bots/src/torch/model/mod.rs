@@ -376,8 +376,8 @@ const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 pub(super) const LOG_STD_INIT: f64 = -2.0;
-pub(super) const ACTION_STD_MIN: f64 = 0.05;
-pub(super) const ACTION_STD_MAX: f64 = 1.05;
+pub(super) const LOG_STD_MIN: f64 = -2.995732273553991;
+pub(super) const LOG_STD_MAX: f64 = 0.04879016416943201;
 const INTER_TICKER_AFTER: usize = 1;
 const CROSS_NUM_Q_HEADS: i64 = 4;
 const CROSS_NUM_KV_HEADS: i64 = 2;
@@ -538,7 +538,7 @@ pub struct TradingModel {
     critic_cls_token: Tensor,
     sde_cls_token: Tensor,
     inter_ticker_block: InterTickerBlock,
-    policy_mean_std_logit: nn::Linear,
+    policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
     device: tch::Device,
 }
@@ -689,8 +689,8 @@ impl TradingModel {
             init_scale,
         );
         let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
-        let policy_mean_std_logit = nn::linear(
-            p / "policy_mean_std_logit",
+        let policy_mean_log_var = nn::linear(
+            p / "policy_mean_log_var",
             spec.model_dim,
             ACTION_COUNT * 2,
             nn::LinearConfig {
@@ -702,15 +702,11 @@ impl TradingModel {
                 bias: true,
             },
         );
-        if let Some(bias) = &policy_mean_std_logit.bs {
-            let init_std = LOG_STD_INIT.exp();
-            let init_p = ((init_std - ACTION_STD_MIN) / (ACTION_STD_MAX - ACTION_STD_MIN))
-                .clamp(1e-6, 1.0 - 1e-6);
-            let init_std_logit = (init_p / (1.0 - init_p)).ln();
+        if let Some(bias) = &policy_mean_log_var.bs {
             tch::no_grad(|| {
                 let _ = bias
                     .narrow(0, ACTION_COUNT, ACTION_COUNT)
-                    .fill_(init_std_logit);
+                    .fill_(2.0 * LOG_STD_INIT);
             });
         }
         let value_proj = nn::linear(
@@ -743,7 +739,7 @@ impl TradingModel {
             critic_cls_token,
             sde_cls_token,
             inter_ticker_block,
-            policy_mean_std_logit,
+            policy_mean_log_var,
             value_proj,
             device: p.device(),
         }
