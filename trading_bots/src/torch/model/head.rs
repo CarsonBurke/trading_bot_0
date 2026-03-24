@@ -31,15 +31,15 @@ impl TradingModel {
             .g_mul_scalar(0.5)
             .exp();
 
-        let values = critic_cls
+        // Value logits: [batch, NUM_BINS] for two-hot distributional critic
+        let value_logits = critic_cls
             .reshape([batch_size, TICKERS_COUNT * self.model_dim])
-            .apply(&self.value_proj)
-            .squeeze_dim(-1);
+            .apply(&self.value_proj);
 
-        let values = values.to_kind(Kind::Float);
+        let value_logits = value_logits.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
         let action_std = action_std.to_kind(Kind::Float);
 
-        ((values, action_mean, action_std), None)
+        ((value_logits, action_mean, action_std), None)
     }
 }

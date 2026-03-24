@@ -116,7 +116,7 @@ impl TradingModel {
 
         // Not enough deltas for a new patch yet; return zeros
         (
-            Tensor::zeros(&[1], (Kind::Float, self.device)),
+            Tensor::zeros(&[1, crate::torch::two_hot::NUM_BINS], (Kind::Float, self.device)),
             Tensor::zeros(&[1, ACTION_COUNT], (Kind::Float, self.device)),
             Tensor::ones(&[1, ACTION_COUNT], (Kind::Float, self.device)),
         )

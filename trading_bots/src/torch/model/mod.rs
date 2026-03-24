@@ -11,6 +11,7 @@ use crate::torch::constants::{
     ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER,
     STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
+use crate::torch::two_hot::NUM_BINS;
 
 use rmsnorm::RMSNorm;
 
@@ -712,7 +713,7 @@ impl TradingModel {
         let value_proj = nn::linear(
             p / "value_proj",
             flat_all_tickers,
-            1,
+            NUM_BINS,
             nn::LinearConfig {
                 ws_init: Init::Orthogonal { gain: 1.0 },
                 bs_init: Some(Init::Const(0.0)),

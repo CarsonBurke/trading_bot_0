@@ -13,6 +13,7 @@ use crate::torch::constants::{
 };
 use crate::torch::env::VecEnv;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
+use crate::torch::two_hot::{TwoHotBins, NUM_BINS};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 const LEARNING_RATE: f64 = 1e-4;
@@ -103,13 +104,17 @@ fn sample_rollout_actions(
     model: &TradingModel,
     obs_price: &Tensor,
     obs_static: &Tensor,
+    two_hot: &TwoHotBins,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
     tch::no_grad(|| {
-        let (values, action_mean, action_std) =
+        let (value_logits, action_mean, action_std) =
             model.forward_on_device(obs_price, obs_static, false);
-        let values = values.to_kind(Kind::Float);
+        let value_logits = value_logits.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
         let action_std = action_std.to_kind(Kind::Float);
+
+        // Decode two-hot logits to scalar values for GAE
+        let values = two_hot.decode(&value_logits);
 
         let batch = action_mean.size()[0];
         let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
@@ -310,6 +315,8 @@ pub async fn train(
             .load_from_episode(start_episode, &gens_path);
     }
 
+    let two_hot = TwoHotBins::default_for(device);
+
     let rollout_steps = SEQ_LEN;
     let memory_size = rollout_steps * NPROCS;
 
@@ -405,6 +412,7 @@ pub async fn train(
                 &trading_model,
                 &obs_price,
                 &obs_static,
+                &two_hot,
             );
 
             if DEBUG_NUMERICS {
@@ -504,11 +512,11 @@ pub async fn train(
             let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
         }
 
-        // Bootstrap value from final observation state
+        // Bootstrap value from final observation state (decode two-hot logits)
         let bootstrap_value = tch::no_grad(|| {
-            let (values_raw, _, _) =
+            let (value_logits, _, _) =
                 trading_model.forward_on_device(&obs_price, &obs_static, false);
-            values_raw.to_kind(Kind::Float)
+            two_hot.decode(&value_logits.to_kind(Kind::Float))
         });
 
         let (advantages, returns) = compute_gae(
@@ -598,9 +606,10 @@ pub async fn train(
                 let old_log_probs_mb = olp_perm.narrow(0, mb_start, chunk_sample_count);
 
                 let fwd_start = Instant::now();
-                let (new_values, action_mean, action_std) =
+                let (new_value_logits, action_mean, action_std) =
                     trading_model.forward_on_device(&pd_chunk, &so_chunk, true);
 
+                let new_value_logits = new_value_logits.to_kind(Kind::Float);
                 let action_mean = action_mean.to_kind(Kind::Float);
                 let action_std = action_std.to_kind(Kind::Float);
 
@@ -653,19 +662,36 @@ pub async fn train(
                     -Tensor::min_other(&(&ratio * &adv_mb), &(&ratio_clipped * &adv_mb))
                         .mean(Kind::Float);
 
-                // Scalar value loss with PPO value clipping
-                let new_values = new_values.to_kind(Kind::Float);
+                // Two-hot distributional value loss with PPO-style value clipping
                 let old_val_mb = val_perm.narrow(0, mb_start, chunk_sample_count);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("new_values", &new_values, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("new_value_logits", &new_value_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
-                let v_clipped =
+
+                // Decode current logits to scalar, clip in scalar space, re-encode
+                let new_values = two_hot.decode(&new_value_logits);
+                let clipped_values =
                     &old_val_mb + (&new_values - &old_val_mb).clamp(-VALUE_CLIP, VALUE_CLIP);
-                let loss_unclipped = (&new_values - &ret_mb).pow_tensor_scalar(2);
-                let loss_clipped = (&v_clipped - &ret_mb).pow_tensor_scalar(2);
-                let value_loss = loss_unclipped.max_other(&loss_clipped).mean(Kind::Float) * 0.5;
+
+                // Encode returns and clipped values as two-hot targets
+                let return_bins = two_hot.encode(&ret_mb); // [chunk, NUM_BINS]
+                let clipped_value_bins = two_hot.encode(&clipped_values.detach()); // [chunk, NUM_BINS]
+
+                // Cross-entropy: -sum(target * log_softmax(pred), dim=-1)
+                let log_probs = new_value_logits.log_softmax(-1, Kind::Float);
+                let value_loss_unclipped = -(&return_bins * &log_probs)
+                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+
+                // Clipped loss: treat clipped two-hot as logits (matching dreamer4)
+                let clipped_log_probs = clipped_value_bins.log_softmax(-1, Kind::Float);
+                let value_loss_clipped = -(&return_bins * &clipped_log_probs)
+                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+
+                let value_loss = value_loss_unclipped
+                    .max_other(&value_loss_clipped)
+                    .mean(Kind::Float);
 
                 let dist_entropy = gaussian_entropy(&action_std, LOG_2PI).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
