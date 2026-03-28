@@ -715,7 +715,7 @@ impl TradingModel {
             flat_all_tickers,
             NUM_BINS,
             nn::LinearConfig {
-                ws_init: Init::Orthogonal { gain: 1.0 },
+                ws_init: Init::Const(0.0),
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
