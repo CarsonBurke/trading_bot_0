@@ -17,9 +17,7 @@ pub fn symlog(x: f64) -> f64 {
 /// Precomputed bin boundaries in symexp space for two-hot encoding/decoding.
 pub struct TwoHotBins {
     /// Bin boundary values after symexp transform, length NUM_BINS
-    bin_values: Tensor,
-    /// Raw f64 bin values for CPU-side encode
-    values_vec: Vec<f64>,
+    pub(crate) bin_values: Tensor,
 }
 
 impl TwoHotBins {
@@ -28,72 +26,71 @@ impl TwoHotBins {
         let values_vec: Vec<f64> = (0..num_bins)
             .map(|i| symexp(log_min + step * i as f64))
             .collect();
-        let bin_values =
-            Tensor::from_slice(&values_vec).to_kind(Kind::Float).to_device(device);
-        Self {
-            bin_values,
-            values_vec,
-        }
+        let bin_values = Tensor::from_slice(&values_vec)
+            .to_kind(Kind::Float)
+            .to_device(device);
+        Self { bin_values }
     }
 
     pub fn default_for(device: tch::Device) -> Self {
         Self::new(-20.0, 20.0, NUM_BINS, device)
     }
 
-    /// Encode scalar values [batch] into two-hot distributions [batch, NUM_BINS].
-    /// Done on CPU for simplicity (called infrequently relative to forward pass).
+    /// Encode scalar values [... ] into two-hot distributions [..., NUM_BINS].
+    /// Keeps the operation on-device so clipped-value gradients can flow.
     pub fn encode(&self, values: &Tensor) -> Tensor {
-        let device = values.device();
-        let values_f64 = values.to_kind(Kind::Double).to_device(tch::Device::Cpu);
-        let scalars: Vec<f64> = Vec::try_from(&values_f64).unwrap();
-        let num_bins = self.values_vec.len();
-        let batch = scalars.len();
-        let min_val = self.values_vec[0];
-        let max_val = self.values_vec[num_bins - 1];
+        let values = values.to_kind(Kind::Float);
+        let flat_values = values.reshape([-1]);
+        let bins = self.bin_values.to_device(values.device());
+        let num_bins = bins.size()[0];
 
-        let mut encoded = vec![0.0f32; batch * num_bins];
+        let min_bin = bins.get(0);
+        let max_bin = bins.get(num_bins - 1);
+        let clamped = flat_values.clamp_tensor(Some(&min_bin), Some(&max_bin));
 
-        for (b, &val) in scalars.iter().enumerate() {
-            let val = val.clamp(min_val, max_val);
+        let indices = clamped.bucketize(&bins, false, false);
+        let left_indices = (&indices - 1).clamp(0, num_bins - 2);
+        let right_indices = &left_indices + 1;
 
-            // Binary search for right bin boundary
-            let right = match self
-                .values_vec
-                .binary_search_by(|v| v.partial_cmp(&val).unwrap())
-            {
-                Ok(i) => i.min(num_bins - 1),
-                Err(i) => i.min(num_bins - 1),
-            };
-            let left = if right == 0 { 0 } else { right - 1 };
+        let left_values = bins.gather(0, &left_indices, false);
+        let right_values = bins.gather(0, &right_indices, false);
+        let total_distance = &right_values - &left_values;
 
-            if left == right {
-                encoded[b * num_bins + left] = 1.0;
-            } else {
-                let left_val = self.values_vec[left];
-                let right_val = self.values_vec[right];
-                let total = right_val - left_val;
+        let right_weight = (&clamped - &left_values) / &total_distance;
+        let left_weight = right_weight.ones_like() - &right_weight;
 
-                if total.abs() < 1e-10 {
-                    encoded[b * num_bins + left] = 1.0;
-                } else {
-                    let right_weight = ((val - left_val) / total) as f32;
-                    let left_weight = 1.0 - right_weight;
-                    encoded[b * num_bins + left] = left_weight;
-                    encoded[b * num_bins + right] = right_weight;
-                }
-            }
+        let encoded = Tensor::zeros(
+            [flat_values.size()[0], num_bins],
+            (Kind::Float, values.device()),
+        )
+        .scatter(1, &left_indices.unsqueeze(1), &left_weight.unsqueeze(1))
+        .scatter(1, &right_indices.unsqueeze(1), &right_weight.unsqueeze(1));
+
+        let mut out_shape = values.size();
+        out_shape.push(num_bins);
+        encoded.reshape(out_shape)
+    }
+
+    /// Match dreamer4's bins_to_scalar_value: optionally normalize logits first,
+    /// then compute the expected scalar value in symexp space.
+    pub fn bins_to_scalar_value(&self, logits_or_probs: &Tensor, normalize: bool) -> Tensor {
+        let weights = if normalize {
+            logits_or_probs.softmax(-1, Kind::Float)
+        } else {
+            logits_or_probs.shallow_clone()
         }
-
-        Tensor::from_slice(&encoded)
-            .reshape([batch as i64, num_bins as i64])
-            .to_device(device)
+        .to_kind(Kind::Double);
+        let bins = self
+            .bin_values
+            .to_device(logits_or_probs.device())
+            .to_kind(Kind::Double);
+        (weights * bins)
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Double)
+            .to_kind(Kind::Float)
     }
 
     /// Decode logits [batch, NUM_BINS] to scalar values [batch].
-    /// Accumulates in f64 to avoid f32 summation bias over large symexp bins.
     pub fn decode(&self, logits: &Tensor) -> Tensor {
-        let probs = logits.softmax(-1, Kind::Float).to_kind(Kind::Double);
-        let bins = self.bin_values.unsqueeze(0).to_kind(Kind::Double);
-        (probs * bins).sum_dim_intlist([-1].as_slice(), false, Kind::Double).to_kind(Kind::Float)
+        self.bins_to_scalar_value(logits, true)
     }
 }
