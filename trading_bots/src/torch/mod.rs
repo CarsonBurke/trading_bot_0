@@ -10,9 +10,13 @@ pub mod mamba_fused;
 pub mod model;
 pub mod ppo;
 pub mod ssm;
-pub mod two_hot;
 pub mod ssm_ref;
+pub mod two_hot;
 
 pub use fp32_adam::Fp32Adam;
 #[cfg(test)]
+mod ppo_tests;
+#[cfg(test)]
 mod ssm_tests;
+#[cfg(test)]
+mod two_hot_tests;

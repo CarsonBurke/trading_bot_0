@@ -13,7 +13,7 @@ use crate::torch::constants::{
 };
 use crate::torch::env::VecEnv;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
-use crate::torch::two_hot::{TwoHotBins, NUM_BINS};
+use crate::torch::two_hot::TwoHotBins;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 const LEARNING_RATE: f64 = 1e-4;
@@ -121,12 +121,8 @@ fn sample_rollout_actions(
         let noise = &action_std * &z;
         let latent_actions = &action_mean + &noise;
         let target_weights = implicit_cash_weights(&latent_actions);
-        let action_log_prob = transformed_action_log_prob(
-            &latent_actions,
-            &action_mean,
-            &action_std,
-            LOG_2PI,
-        );
+        let action_log_prob =
+            transformed_action_log_prob(&latent_actions, &action_mean, &action_std, LOG_2PI);
 
         (
             values,
@@ -190,6 +186,29 @@ fn compute_explained_variance(rollout_values: &Tensor, returns: &Tensor) -> Tens
     })
 }
 
+pub(crate) fn two_hot_value_loss_terms(
+    two_hot: &TwoHotBins,
+    value_logits: &Tensor,
+    old_values: &Tensor,
+    returns: &Tensor,
+) -> (Tensor, Tensor) {
+    let new_values = two_hot.bins_to_scalar_value(value_logits, true);
+    let clipped_values = old_values + (&new_values - old_values).clamp(-VALUE_CLIP, VALUE_CLIP);
+
+    let return_bins = two_hot.encode(returns);
+    let clipped_value_bins = two_hot.encode(&clipped_values);
+
+    let log_probs = value_logits.log_softmax(-1, Kind::Float);
+    let value_loss_unclipped =
+        -(&return_bins * &log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+
+    let clipped_log_probs = clipped_value_bins.log_softmax(-1, Kind::Float);
+    let value_loss_clipped =
+        -(&return_bins * &clipped_log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+
+    (value_loss_unclipped, value_loss_clipped)
+}
+
 /// Compute action std and RPO alpha stats from a sample batch.
 fn compute_action_std_stats(
     model: &TradingModel,
@@ -218,7 +237,6 @@ fn compute_action_std_stats(
         )
     })
 }
-
 
 pub async fn train(
     weights_path: Option<&str>,
@@ -401,19 +419,8 @@ pub async fn train(
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
         for step in 0..rollout_steps as usize {
-            let (
-                values,
-                action_mean,
-                action_std,
-                latent_actions,
-                target_weights,
-                action_log_prob,
-            ) = sample_rollout_actions(
-                &trading_model,
-                &obs_price,
-                &obs_static,
-                &two_hot,
-            );
+            let (values, action_mean, action_std, latent_actions, target_weights, action_log_prob) =
+                sample_rollout_actions(&trading_model, &obs_price, &obs_static, &two_hot);
 
             if DEBUG_NUMERICS {
                 let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
@@ -458,9 +465,7 @@ pub async fn train(
             obs_price.copy_(&ordered.view([NPROCS, pd_dim]));
 
             let mem_idx = step as i64 * NPROCS;
-            let _ = s_actions
-                .narrow(0, mem_idx, NPROCS)
-                .copy_(&latent_actions);
+            let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&latent_actions);
             let _ = s_old_log_probs
                 .narrow(0, mem_idx, NPROCS)
                 .copy_(&action_log_prob);
@@ -639,8 +644,12 @@ pub async fn train(
                 );
 
                 if DEBUG_NUMERICS {
-                    let _ =
-                        debug_tensor_stats("latent_actions_mb", &latent_actions_mb, _epoch, chunk_i);
+                    let _ = debug_tensor_stats(
+                        "latent_actions_mb",
+                        &latent_actions_mb,
+                        _epoch,
+                        chunk_i,
+                    );
                     let _ =
                         debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
@@ -666,29 +675,15 @@ pub async fn train(
                 let old_val_mb = val_perm.narrow(0, mb_start, chunk_sample_count);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("new_value_logits", &new_value_logits, _epoch, chunk_i);
+                    let _ =
+                        debug_tensor_stats("new_value_logits", &new_value_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
 
-                // Decode current logits to scalar, clip in scalar space, re-encode
-                let new_values = two_hot.decode(&new_value_logits);
-                let clipped_values =
-                    &old_val_mb + (&new_values - &old_val_mb).clamp(-VALUE_CLIP, VALUE_CLIP);
-
-                // Encode returns and clipped values as two-hot targets
-                let return_bins = two_hot.encode(&ret_mb); // [chunk, NUM_BINS]
-                let clipped_value_bins = two_hot.encode(&clipped_values.detach()); // [chunk, NUM_BINS]
-
-                // Cross-entropy: -sum(target * log_softmax(pred), dim=-1)
-                let log_probs = new_value_logits.log_softmax(-1, Kind::Float);
-                let value_loss_unclipped = -(&return_bins * &log_probs)
-                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-
-                // Clipped loss: treat clipped two-hot as logits (matching dreamer4)
-                let clipped_log_probs = clipped_value_bins.log_softmax(-1, Kind::Float);
-                let value_loss_clipped = -(&return_bins * &clipped_log_probs)
-                    .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-
+                // Match dreamer4: decode to scalar for clipping, then compare both
+                // unclipped and clipped branches in bin space.
+                let (value_loss_unclipped, value_loss_clipped) =
+                    two_hot_value_loss_terms(&two_hot, &new_value_logits, &old_val_mb, &ret_mb);
                 let value_loss = value_loss_unclipped
                     .max_other(&value_loss_clipped)
                     .mean(Kind::Float);
