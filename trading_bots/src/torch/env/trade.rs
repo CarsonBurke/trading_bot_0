@@ -280,11 +280,7 @@ impl Env {
         let cash_idx = n_tickers;
         let mut ticker_sum = 0.0;
         for i in 0..n_tickers {
-            let weight = actions
-                .get(i)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
+            let weight = actions.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
             self.target_weights[i] = if weight.is_finite() { weight } else { 0.0 };
             ticker_sum += self.target_weights[i];
         }
