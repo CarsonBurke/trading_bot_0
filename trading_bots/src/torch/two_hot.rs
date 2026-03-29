@@ -33,7 +33,7 @@ impl TwoHotBins {
     }
 
     pub fn default_for(device: tch::Device) -> Self {
-        Self::new(-20.0, 20.0, NUM_BINS, device)
+        Self::new(-6.0, 6.0, NUM_BINS, device)
     }
 
     /// Encode scalar values [... ] into two-hot distributions [..., NUM_BINS].
