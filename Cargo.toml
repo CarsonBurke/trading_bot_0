@@ -8,3 +8,6 @@ members = [
     "benchmarks",
     "training_log_server",
 ]
+
+[patch.crates-io]
+torch-sys = { path = "vendor/torch-sys-0.23.0" }
