@@ -273,24 +273,19 @@ impl Env {
 
     pub fn trade_by_target_weights(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let n_tickers = self.tickers.len();
+        assert_eq!(n_tickers, 1, "single-ticker action space expected");
 
         let mut total_commission = 0.0;
 
-        // Ticker actions are already simplex weights. Cash remains the residual.
         let cash_idx = n_tickers;
-        let mut ticker_sum = 0.0;
-        for i in 0..n_tickers {
-            let weight = actions.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            self.target_weights[i] = if weight.is_finite() { weight } else { 0.0 };
-            ticker_sum += self.target_weights[i];
-        }
-        if ticker_sum > 1.0 {
-            for weight in self.target_weights.iter_mut().take(n_tickers) {
-                *weight /= ticker_sum;
-            }
-            ticker_sum = 1.0;
-        }
-        self.target_weights[cash_idx] = (1.0 - ticker_sum).clamp(0.0, 1.0);
+        let ticker_weight = actions
+            .first()
+            .copied()
+            .filter(|weight| weight.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        self.target_weights[0] = ticker_weight;
+        self.target_weights[cash_idx] = 1.0 - ticker_weight;
 
         // 2. Calculate target deltas and execute trades
         let total_assets = self.account.total_assets;
