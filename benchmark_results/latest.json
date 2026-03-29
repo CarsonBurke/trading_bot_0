@@ -1,11 +1,11 @@
 {
-  "timestamp": "2026-01-18T21:56:36.055816502Z",
-  "git_commit": "3e58ff8b",
+  "timestamp": "2026-03-28T23:27:18.496925100Z",
+  "git_commit": "c35b0420",
   "cuda_version": null,
   "results": [
     {
       "name": "mamba2_forward_train",
-      "time_ms": 1.014174365,
+      "time_ms": 1.09623689,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -14,7 +14,7 @@
     },
     {
       "name": "mamba2_fwd_bwd_train",
-      "time_ms": 1.118239515,
+      "time_ms": 1.296946385,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -23,7 +23,7 @@
     },
     {
       "name": "mamba2_infer_prefill",
-      "time_ms": 1.0509289800000001,
+      "time_ms": 1.1859459849999998,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -32,7 +32,7 @@
     },
     {
       "name": "mamba2_infer_step",
-      "time_ms": 0.10621784,
+      "time_ms": 0.1097541005,
       "config": {
         "batch": 4,
         "seq_len": 1,
@@ -40,56 +40,110 @@
       }
     },
     {
-      "name": "model_forward_infer_b1",
-      "time_ms": 1.22396934,
+      "name": "model_base_forward_infer_b1",
+      "time_ms": 0.9108125300000001,
       "config": {
         "batch": 1,
-        "seq_len": 8636,
+        "seq_len": 8693,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_fwd_bwd_train_b1",
-      "time_ms": 4.80254053,
+      "name": "model_base_fwd_bwd_train_b1",
+      "time_ms": 4.56887521,
       "config": {
         "batch": 1,
-        "seq_len": 8636,
+        "seq_len": 8693,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_forward_infer_b4",
-      "time_ms": 1.2056042599999999,
+      "name": "model_base_forward_infer_b4",
+      "time_ms": 0.9399203799999999,
       "config": {
         "batch": 4,
-        "seq_len": 8636,
+        "seq_len": 8693,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_fwd_bwd_train_b4",
-      "time_ms": 4.58137643,
+      "name": "model_base_fwd_bwd_train_b4",
+      "time_ms": 4.172754,
       "config": {
         "batch": 4,
-        "seq_len": 8636,
+        "seq_len": 8693,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_forward_infer_b8",
-      "time_ms": 1.3032144600000002,
+      "name": "model_base_forward_infer_b8",
+      "time_ms": 0.93719443,
       "config": {
         "batch": 8,
-        "seq_len": 8636,
+        "seq_len": 8693,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_fwd_bwd_train_b8",
-      "time_ms": 4.70855039,
+      "name": "model_base_fwd_bwd_train_b8",
+      "time_ms": 3.9762455800000005,
       "config": {
         "batch": 8,
-        "seq_len": 8636,
+        "seq_len": 8693,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_ablation-small_forward_infer_b1",
+      "time_ms": 0.43102595,
+      "config": {
+        "batch": 1,
+        "seq_len": 8693,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_ablation-small_fwd_bwd_train_b1",
+      "time_ms": 1.8255494099999998,
+      "config": {
+        "batch": 1,
+        "seq_len": 8693,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_ablation-small_forward_infer_b4",
+      "time_ms": 0.42262139,
+      "config": {
+        "batch": 4,
+        "seq_len": 8693,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_ablation-small_fwd_bwd_train_b4",
+      "time_ms": 1.9075030499999999,
+      "config": {
+        "batch": 4,
+        "seq_len": 8693,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_ablation-small_forward_infer_b8",
+      "time_ms": 0.43673946,
+      "config": {
+        "batch": 8,
+        "seq_len": 8693,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_ablation-small_fwd_bwd_train_b8",
+      "time_ms": 1.9283155499999998,
+      "config": {
+        "batch": 8,
+        "seq_len": 8693,
         "dtype": "BFloat16"
       }
     }
