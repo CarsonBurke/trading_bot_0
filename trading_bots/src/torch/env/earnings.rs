@@ -21,6 +21,15 @@ pub struct EarningsIndicators {
 }
 
 impl EarningsIndicators {
+    pub fn get_cached(ticker: &str, prices_len: usize) -> Option<Arc<EarningsIndicators>> {
+        let cache = get_cache();
+        let locked = cache.lock().unwrap();
+        locked
+            .get(ticker)
+            .filter(|cached| cached.eps.len() == prices_len)
+            .cloned()
+    }
+
     /// Get cached earnings indicators or compute if not present
     pub fn get_or_compute(
         ticker: &str,
@@ -28,15 +37,10 @@ impl EarningsIndicators {
         bar_dates: &[String],
         prices: &[f64],
     ) -> Arc<EarningsIndicators> {
-        let cache = get_cache();
-        {
-            let locked = cache.lock().unwrap();
-            if let Some(cached) = locked.get(ticker) {
-                if cached.eps.len() == prices.len() {
-                    return cached.clone();
-                }
-            }
+        if let Some(cached) = Self::get_cached(ticker, prices.len()) {
+            return cached;
         }
+        let cache = get_cache();
         let computed = if reports.is_empty() {
             Arc::new(Self::empty(prices.len()))
         } else {

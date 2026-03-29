@@ -5,6 +5,7 @@ use crate::torch::constants::{
 use crate::torch::model::ModelVariant;
 use crate::torch::ppo::NPROCS;
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use tch::{Device, Tensor};
 
 pub struct VecEnv {
@@ -401,35 +402,60 @@ impl VecEnv {
 
         let mut reset_indices = Vec::new();
         let mut reset_price_deltas = Vec::new();
+        let step_results = self
+            .envs
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i, env)| {
+                let action_start = i * action_dim;
+                let action_slice = &all_actions[action_start..action_start + action_dim];
+                let step = env.step_step_single(action_slice);
+                if step.is_done == 1.0 {
+                    let (price_deltas, static_obs) = env.reset_single();
+                    (
+                        i,
+                        step.reward_per_ticker,
+                        step.is_done,
+                        None,
+                        static_obs.try_into().unwrap(),
+                        Some(price_deltas),
+                    )
+                } else {
+                    (
+                        i,
+                        step.reward_per_ticker,
+                        step.is_done,
+                        Some(step.step_deltas),
+                        step.static_obs,
+                        None,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
 
-        for (i, env) in self.envs.iter_mut().enumerate() {
-            let action_start = i * action_dim;
-            let action_slice = &all_actions[action_start..action_start + action_dim];
-            let step = env.step_step_single(action_slice);
+        let tail_base = PRICE_DELTAS_PER_TICKER - 1;
+        for (i, reward_per_ticker, is_done, step_deltas, static_obs, reset_price) in step_results {
             let reward_start = i * TICKERS_COUNT as usize;
             self.reward_per_ticker_buf[reward_start..reward_start + TICKERS_COUNT as usize]
-                .copy_from_slice(&step.reward_per_ticker);
-            self.is_done_buf[i] = step.is_done;
+                .copy_from_slice(&reward_per_ticker);
+            self.is_done_buf[i] = is_done;
 
             let step_offset = i * step_deltas_dim;
             let so_offset = i * static_obs_dim;
-            if step.is_done == 1.0 {
-                let (price_deltas, static_obs) = env.reset_single();
-                let tail_base = PRICE_DELTAS_PER_TICKER - 1;
+            if let Some(price_deltas) = reset_price {
                 for t in 0..TICKERS_COUNT as usize {
                     let idx = t * PRICE_DELTAS_PER_TICKER + tail_base;
                     self.step_deltas_buf[step_offset + t] = price_deltas[idx];
                 }
                 self.static_obs_buf[so_offset..so_offset + static_obs_dim]
                     .copy_from_slice(&static_obs);
-
                 reset_indices.push(i);
                 reset_price_deltas.extend(price_deltas);
-            } else {
+            } else if let Some(step_deltas) = step_deltas {
                 self.step_deltas_buf[step_offset..step_offset + step_deltas_dim]
-                    .copy_from_slice(&step.step_deltas);
+                    .copy_from_slice(&step_deltas);
                 self.static_obs_buf[so_offset..so_offset + static_obs_dim]
-                    .copy_from_slice(&step.static_obs);
+                    .copy_from_slice(&static_obs);
             }
         }
 
