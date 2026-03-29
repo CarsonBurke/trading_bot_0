@@ -1,11 +1,11 @@
 {
-  "timestamp": "2026-03-28T23:27:18.496925100Z",
-  "git_commit": "c35b0420",
+  "timestamp": "2026-03-29T17:31:37.661485536Z",
+  "git_commit": "04a371b2",
   "cuda_version": null,
   "results": [
     {
       "name": "mamba2_forward_train",
-      "time_ms": 1.09623689,
+      "time_ms": 0.99779045,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -14,7 +14,7 @@
     },
     {
       "name": "mamba2_fwd_bwd_train",
-      "time_ms": 1.296946385,
+      "time_ms": 1.11828421,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -23,7 +23,7 @@
     },
     {
       "name": "mamba2_infer_prefill",
-      "time_ms": 1.1859459849999998,
+      "time_ms": 1.0389665700000001,
       "config": {
         "batch": 4,
         "seq_len": 4096,
@@ -32,7 +32,7 @@
     },
     {
       "name": "mamba2_infer_step",
-      "time_ms": 0.1097541005,
+      "time_ms": 0.110913916,
       "config": {
         "batch": 4,
         "seq_len": 1,
@@ -41,7 +41,7 @@
     },
     {
       "name": "model_base_forward_infer_b1",
-      "time_ms": 0.9108125300000001,
+      "time_ms": 0.8099939500000001,
       "config": {
         "batch": 1,
         "seq_len": 8693,
@@ -50,7 +50,7 @@
     },
     {
       "name": "model_base_fwd_bwd_train_b1",
-      "time_ms": 4.56887521,
+      "time_ms": 2.85478164,
       "config": {
         "batch": 1,
         "seq_len": 8693,
@@ -59,7 +59,7 @@
     },
     {
       "name": "model_base_forward_infer_b4",
-      "time_ms": 0.9399203799999999,
+      "time_ms": 0.84946119,
       "config": {
         "batch": 4,
         "seq_len": 8693,
@@ -68,7 +68,7 @@
     },
     {
       "name": "model_base_fwd_bwd_train_b4",
-      "time_ms": 4.172754,
+      "time_ms": 2.78509752,
       "config": {
         "batch": 4,
         "seq_len": 8693,
@@ -77,7 +77,7 @@
     },
     {
       "name": "model_base_forward_infer_b8",
-      "time_ms": 0.93719443,
+      "time_ms": 0.81661406,
       "config": {
         "batch": 8,
         "seq_len": 8693,
@@ -86,7 +86,7 @@
     },
     {
       "name": "model_base_fwd_bwd_train_b8",
-      "time_ms": 3.9762455800000005,
+      "time_ms": 2.6851647899999995,
       "config": {
         "batch": 8,
         "seq_len": 8693,
@@ -94,8 +94,89 @@
       }
     },
     {
+      "name": "model_uniform-256-stream_forward_infer_b1",
+      "time_ms": 0.70332462,
+      "config": {
+        "batch": 1,
+        "seq_len": 8704,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_uniform-256-stream_stream_step_b1",
+      "time_ms": 0.9187903199999999,
+      "config": {
+        "batch": 1,
+        "seq_len": 1,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_uniform-256-stream_fwd_bwd_train_b1",
+      "time_ms": 2.42041019,
+      "config": {
+        "batch": 1,
+        "seq_len": 8704,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_uniform-256-stream_forward_infer_b4",
+      "time_ms": 0.67455305,
+      "config": {
+        "batch": 4,
+        "seq_len": 8704,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_uniform-256-stream_stream_step_b4",
+      "time_ms": 0.89855829,
+      "config": {
+        "batch": 4,
+        "seq_len": 1,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_uniform-256-stream_fwd_bwd_train_b4",
+      "time_ms": 2.4209671999999998,
+      "config": {
+        "batch": 4,
+        "seq_len": 8704,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_uniform-256-stream_forward_infer_b8",
+      "time_ms": 0.67195791,
+      "config": {
+        "batch": 8,
+        "seq_len": 8704,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_uniform-256-stream_stream_step_b8",
+      "time_ms": 0.9583243599999999,
+      "config": {
+        "batch": 8,
+        "seq_len": 1,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_uniform-256-stream_fwd_bwd_train_b8",
+      "time_ms": 2.4056411499999997,
+      "config": {
+        "batch": 8,
+        "seq_len": 8704,
+        "dtype": "BFloat16"
+      }
+    },
+    {
       "name": "model_ablation-small_forward_infer_b1",
-      "time_ms": 0.43102595,
+      "time_ms": 0.37655792,
       "config": {
         "batch": 1,
         "seq_len": 8693,
@@ -104,7 +185,7 @@
     },
     {
       "name": "model_ablation-small_fwd_bwd_train_b1",
-      "time_ms": 1.8255494099999998,
+      "time_ms": 1.1177071500000002,
       "config": {
         "batch": 1,
         "seq_len": 8693,
@@ -113,7 +194,7 @@
     },
     {
       "name": "model_ablation-small_forward_infer_b4",
-      "time_ms": 0.42262139,
+      "time_ms": 0.36676926000000004,
       "config": {
         "batch": 4,
         "seq_len": 8693,
@@ -122,7 +203,7 @@
     },
     {
       "name": "model_ablation-small_fwd_bwd_train_b4",
-      "time_ms": 1.9075030499999999,
+      "time_ms": 1.2267197200000002,
       "config": {
         "batch": 4,
         "seq_len": 8693,
@@ -131,7 +212,7 @@
     },
     {
       "name": "model_ablation-small_forward_infer_b8",
-      "time_ms": 0.43673946,
+      "time_ms": 0.39150806000000005,
       "config": {
         "batch": 8,
         "seq_len": 8693,
@@ -140,7 +221,7 @@
     },
     {
       "name": "model_ablation-small_fwd_bwd_train_b8",
-      "time_ms": 1.9283155499999998,
+      "time_ms": 1.44203711,
       "config": {
         "batch": 8,
         "seq_len": 8693,
