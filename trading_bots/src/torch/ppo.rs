@@ -349,36 +349,19 @@ pub async fn train(
     let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device));
 
-    // Per-env NormalizeReward (matching CleanRL: each env has its own RunningMeanStd)
-    // Kept outside VarStore to avoid bf16 precision loss and Adam corruption
-    let n = NPROCS as usize;
-    let mut ret_rms_mean = vec![0.0f64; n];
-    let mut ret_rms_var = vec![1.0f64; n];
-    let mut ret_rms_count = vec![1e-4f64; n];
-    let mut disc_ret = vec![0.0f64; n];
     if start_episode > 0 {
         let meta_path = format!(
-            "{}/ppo_ep{}.reward_norm.json",
+            "{}/ppo_ep{}.rpo.json",
             run_dir.weights.display(),
             start_episode
         );
         let meta_path = if Path::new(&meta_path).exists() {
             meta_path
         } else {
-            format!("../weights/ppo_ep{}.reward_norm.json", start_episode)
+            format!("../weights/ppo_ep{}.rpo.json", start_episode)
         };
         if let Ok(json) = std::fs::read_to_string(&meta_path) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
-                let load_vec = |key: &str, default: f64| -> Vec<f64> {
-                    parsed[key]
-                        .as_array()
-                        .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(default)).collect())
-                        .unwrap_or_else(|| vec![default; n])
-                };
-                ret_rms_mean = load_vec("mean", 0.0);
-                ret_rms_var = load_vec("var", 1.0);
-                ret_rms_count = load_vec("count", 1e-4);
-                disc_ret = load_vec("disc_ret", 0.0);
                 if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     if let Some(rho) = parsed["rpo_rho"].as_f64() {
                         tch::no_grad(|| {
@@ -388,22 +371,12 @@ pub async fn train(
                         println!("Loaded RPO rho: {:.6}", rho);
                     }
                 }
-                let avg_var: f64 = ret_rms_var.iter().sum::<f64>() / n as f64;
-                let avg_count: f64 = ret_rms_count.iter().sum::<f64>() / n as f64;
-                println!(
-                    "Loaded reward norm: avg_var={:.6}, avg_count={:.0}",
-                    avg_var, avg_count
-                );
             }
         }
     }
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu) = env.reset();
-        // env.reset() resets all envs — zero per-env discounted returns
-        for i in 0..n {
-            disc_ret[i] = 0.0;
-        }
         let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
         let mut obs_static =
             Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
@@ -473,46 +446,15 @@ pub async fn train(
             let portfolio_reward =
                 step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float);
 
-            // Per-env NormalizeReward (gym-style): each env has its own RunningMeanStd
-            let rewards_f64: Vec<f64> =
-                Vec::<f64>::try_from(portfolio_reward.to_kind(Kind::Double).flatten(0, -1))
-                    .unwrap();
-            let dones_f64: Vec<f64> =
-                Vec::<f64>::try_from(step_is_done.to_kind(Kind::Double).flatten(0, -1)).unwrap();
-            let mut norm_rewards = vec![0.0f32; n];
-            for i in 0..n {
-                // Reset discounted return on done BEFORE accumulating
-                // (matches gymnasium NormalizeReward: disc_ret *= gamma * (1 - terminated))
-                if dones_f64[i] > 0.5 {
-                    disc_ret[i] = 0.0;
-                }
-                disc_ret[i] = disc_ret[i] * 0.99 + rewards_f64[i];
-                // Welford update
-                let delta = disc_ret[i] - ret_rms_mean[i];
-                ret_rms_count[i] += 1.0;
-                ret_rms_mean[i] += delta / ret_rms_count[i];
-                let delta2 = disc_ret[i] - ret_rms_mean[i];
-                let m2 = ret_rms_var[i] * (ret_rms_count[i] - 1.0) + delta * delta2;
-                ret_rms_var[i] = m2 / ret_rms_count[i];
-                // Normalize reward by sqrt(var)
-                let scale = (ret_rms_var[i] + 1e-8).sqrt();
-                norm_rewards[i] = (rewards_f64[i] / scale) as f32;
-            }
-            let normalized_reward = Tensor::from_slice(&norm_rewards).to_device(device);
-
             if DEBUG_NUMERICS {
                 let _ =
                     debug_tensor_stats("portfolio_reward", &portfolio_reward, episode as i64, step);
                 let _ = debug_tensor_stats("values", &values, episode as i64, step);
                 let _ = debug_tensor_stats("step_is_done", &step_is_done, episode as i64, step);
             }
-            env.primary_mut()
-                .episode_history
-                .normalized_rewards
-                .push(norm_rewards[0]);
             let _ = s_rewards
                 .narrow(0, mem_idx, NPROCS)
-                .copy_(&normalized_reward);
+                .copy_(&portfolio_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
             let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
         }
@@ -939,16 +881,8 @@ pub async fn train(
                 println!("Error while saving weights: {}", err);
             } else {
                 println!("Saved model weights: {}", path);
-                let meta_path = format!(
-                    "{}/ppo_ep{}.reward_norm.json",
-                    run_dir.weights.display(),
-                    episode
-                );
+                let meta_path = format!("{}/ppo_ep{}.rpo.json", run_dir.weights.display(), episode);
                 let json = serde_json::json!({
-                    "mean": &ret_rms_mean,
-                    "var": &ret_rms_var,
-                    "count": &ret_rms_count,
-                    "disc_ret": &disc_ret,
                     "rpo_rho": if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                         Some(rpo_rho.double_value(&[]))
                     } else {
@@ -956,7 +890,7 @@ pub async fn train(
                     },
                 });
                 if let Err(err) = std::fs::write(&meta_path, json.to_string()) {
-                    println!("Error saving reward norm state: {}", err);
+                    println!("Error saving RPO state: {}", err);
                 }
             }
         }
