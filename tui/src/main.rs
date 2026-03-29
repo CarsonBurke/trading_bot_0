@@ -24,6 +24,8 @@ mod utils;
 use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
 
+const TRAINING_MODEL_SIZES: [&str; 3] = ["uniform-256-stream", "base", "ablation-small"];
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
     Main,
@@ -149,7 +151,7 @@ impl App {
             ticker_input: String::new(),
             episodes_input: String::new(),
             weights_path: None,
-            training_model_size: "base".to_string(),
+            training_model_size: "uniform-256-stream".to_string(),
             latest_meta_charts: Vec::new(),
             last_refresh: Instant::now(),
             generation_browser,
@@ -428,11 +430,12 @@ impl App {
     }
 
     fn toggle_training_model_size(&mut self) {
-        self.training_model_size = if self.training_model_size == "base" {
-            "ablation-small".to_string()
-        } else {
-            "base".to_string()
-        };
+        let next_idx = TRAINING_MODEL_SIZES
+            .iter()
+            .position(|size| *size == self.training_model_size)
+            .map(|idx| (idx + 1) % TRAINING_MODEL_SIZES.len())
+            .unwrap_or(0);
+        self.training_model_size = TRAINING_MODEL_SIZES[next_idx].to_string();
     }
 
     fn start_inference(
@@ -448,7 +451,12 @@ impl App {
             format!("{}/{}", WEIGHTS_PATH, weights)
         };
         self.process_manager
-            .start_inference(weights_path, ticker, episodes.unwrap_or(10))
+            .start_inference(
+                weights_path,
+                ticker,
+                episodes.unwrap_or(10),
+                self.training_model_size.clone(),
+            )
     }
 
     fn stop_training(&mut self) -> Result<()> {

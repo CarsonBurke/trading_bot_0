@@ -132,6 +132,7 @@ impl ProcessManagerState {
         weights: String,
         ticker: Option<String>,
         episodes: usize,
+        model_size: String,
     ) -> Result<()> {
         if self.is_anything_running() {
             return Ok(());
@@ -145,6 +146,8 @@ impl ProcessManagerState {
             .arg("infer")
             .arg("--weights")
             .arg(weights)
+            .arg("--model-size")
+            .arg(model_size)
             .arg("--episodes")
             .arg(episodes.to_string());
 
