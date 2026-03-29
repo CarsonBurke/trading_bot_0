@@ -564,7 +564,8 @@ impl TradingModel {
                 }
                 state.uniform_live_fill_host[env_idx as usize] = cur_fill + 1;
             }
-            let next_fill = Tensor::from_slice(&state.uniform_live_fill_host).to_device(self.device);
+            let next_fill =
+                Tensor::from_slice(&state.uniform_live_fill_host).to_device(self.device);
             let _ = state.uniform_live_fill.copy_(&next_fill);
             if cache_dirty {
                 self.rebuild_uniform_live_state(state);

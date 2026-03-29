@@ -87,7 +87,12 @@ impl RunDir {
                 let gens = root.join("gens");
                 let weights = root.join("weights");
                 let log_file = root.join("training.log");
-                let run_dir = Self { root, gens, weights, log_file };
+                let run_dir = Self {
+                    root,
+                    gens,
+                    weights,
+                    log_file,
+                };
                 return Some((run_dir, weights_file));
             }
         }
@@ -114,7 +119,12 @@ impl RunDir {
             if has_data {
                 let weights = root.join("weights");
                 let log_file = root.join("training.log");
-                return Some(Self { root, gens, weights, log_file });
+                return Some(Self {
+                    root,
+                    gens,
+                    weights,
+                    log_file,
+                });
             }
         }
         None

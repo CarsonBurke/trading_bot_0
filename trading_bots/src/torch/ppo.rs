@@ -76,7 +76,15 @@ fn log_tensor_summary(name: &str, t: &Tensor) {
 }
 
 fn cpu_tensor_from_f32(data: &[f32], size: &[i64]) -> Tensor {
-    unsafe { Tensor::from_blob(data.as_ptr() as *const u8, size, &[], Kind::Float, Device::Cpu) }
+    unsafe {
+        Tensor::from_blob(
+            data.as_ptr() as *const u8,
+            size,
+            &[],
+            Kind::Float,
+            Device::Cpu,
+        )
+    }
 }
 
 struct GpuRollingBuffer {

@@ -239,16 +239,19 @@ impl Env {
         if portfolio_return.abs() >= 1e-8 {
             let inv_portfolio_return = 1.0 / portfolio_return;
             for ticker_idx in 0..n_tickers {
-                per_ticker_rewards[ticker_idx] =
-                    (strategy_log_return * (contributions[ticker_idx] * inv_portfolio_return))
-                        as f32;
+                per_ticker_rewards[ticker_idx] = (strategy_log_return
+                    * (contributions[ticker_idx] * inv_portfolio_return))
+                    as f32;
             }
         }
 
         if n_tickers > 0 {
-            let mean_reward =
-                per_ticker_rewards.iter().take(n_tickers).map(|&v| v as f64).sum::<f64>()
-                    / n_tickers as f64;
+            let mean_reward = per_ticker_rewards
+                .iter()
+                .take(n_tickers)
+                .map(|&v| v as f64)
+                .sum::<f64>()
+                / n_tickers as f64;
             let residual = (strategy_log_return - mean_reward) as f32;
             if residual != 0.0 {
                 for reward in per_ticker_rewards.iter_mut().take(n_tickers) {

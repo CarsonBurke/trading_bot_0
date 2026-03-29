@@ -98,7 +98,10 @@ impl Env {
         gens_path: Option<String>,
     ) -> Self {
         eprint!("  hist..");
-        let ticker_refs = tickers.iter().map(|ticker| ticker.as_str()).collect::<Vec<&str>>();
+        let ticker_refs = tickers
+            .iter()
+            .map(|ticker| ticker.as_str())
+            .collect::<Vec<&str>>();
         let mapped_bars = get_historical_data(Some(&ticker_refs));
         let mut prices = Vec::with_capacity(tickers.len());
         let mut price_deltas = Vec::with_capacity(tickers.len());

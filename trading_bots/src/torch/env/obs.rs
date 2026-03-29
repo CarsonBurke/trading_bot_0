@@ -117,7 +117,9 @@ impl Env {
         (price_deltas, static_obs)
     }
 
-    pub fn get_next_step_obs(&self) -> ([f32; TICKERS_COUNT_USIZE], [f32; STATIC_OBSERVATIONS_USIZE]) {
+    pub fn get_next_step_obs(
+        &self,
+    ) -> ([f32; TICKERS_COUNT_USIZE], [f32; STATIC_OBSERVATIONS_USIZE]) {
         let absolute_step = self.episode_start_offset + self.step;
         let mut step_deltas = [0.0; TICKERS_COUNT_USIZE];
 

@@ -20,7 +20,13 @@ pub struct CpuStepBatch {
 }
 
 impl CpuStepBatch {
-    pub fn new(nprocs: usize, action_dim: usize, tickers: usize, static_obs_dim: usize, pd_dim: usize) -> Self {
+    pub fn new(
+        nprocs: usize,
+        action_dim: usize,
+        tickers: usize,
+        static_obs_dim: usize,
+        pd_dim: usize,
+    ) -> Self {
         Self {
             actions_f32: vec![0.0; nprocs * action_dim],
             actions_f64: vec![0.0; nprocs * action_dim],
@@ -503,7 +509,10 @@ impl VecEnv {
     }
 
     pub fn step_from_actions_f32(&mut self, batch: &mut CpuStepBatch) {
-        debug_assert_eq!(batch.actions_f32.len(), self.envs.len() * ACTION_COUNT as usize);
+        debug_assert_eq!(
+            batch.actions_f32.len(),
+            self.envs.len() * ACTION_COUNT as usize
+        );
         for (dst, src) in batch.actions_f64.iter_mut().zip(batch.actions_f32.iter()) {
             *dst = *src as f64;
         }
@@ -512,7 +521,9 @@ impl VecEnv {
         let (reset_indices, reset_price_deltas) = self.step_into_ring_cpu(&batch.actions_f64);
         batch.step_deltas.copy_from_slice(&self.step_deltas_buf);
         batch.static_obs.copy_from_slice(&self.static_obs_buf);
-        batch.reward_per_ticker.copy_from_slice(&self.reward_per_ticker_buf);
+        batch
+            .reward_per_ticker
+            .copy_from_slice(&self.reward_per_ticker_buf);
         batch.is_done.copy_from_slice(&self.is_done_buf);
         batch.reset_indices = reset_indices;
         batch.reset_price_deltas = reset_price_deltas;
