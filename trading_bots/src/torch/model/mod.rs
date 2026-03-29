@@ -568,7 +568,6 @@ pub struct TradingModel {
     patch_stream_conv_w: Tensor,
     patch_stream_conv_b: Tensor,
     gqa_kv_head_index: Tensor,
-    uniform_stream_suffix_mask: Tensor,
     uniform_conv_shift_idx: Tensor,
     uniform_patch_shift_idx: Tensor,
     gqa_layers: Vec<GqaBlock>,
@@ -750,21 +749,6 @@ impl TradingModel {
         let gqa_kv_head_index = Tensor::from_slice(&[0i64, 0, 1, 1])
             .to_kind(Kind::Int64)
             .to_device(p.device());
-        let uniform_suffix_len = 1 + NUM_HEAD_CLS_TOKENS;
-        let uniform_prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
-        let q_pos =
-            Tensor::arange(uniform_suffix_len, (Kind::Int64, p.device())) + uniform_prefix_len;
-        let k_pos = Tensor::arange(
-            uniform_prefix_len + uniform_suffix_len,
-            (Kind::Int64, p.device()),
-        );
-        let allowed = k_pos
-            .unsqueeze(0)
-            .le_tensor(&q_pos.unsqueeze(1))
-            .to_kind(Kind::Float)
-            .unsqueeze(0)
-            .unsqueeze(0);
-        let uniform_stream_suffix_mask = (allowed - 1.0) * 1e9;
         let uniform_conv_shift_idx =
             Tensor::arange(STREAM_PATCH_CONV_KERNEL - 1, (Kind::Int64, p.device())) + 1;
         let uniform_patch_shift_idx =
@@ -885,7 +869,6 @@ impl TradingModel {
             patch_stream_conv_w,
             patch_stream_conv_b,
             gqa_kv_head_index,
-            uniform_stream_suffix_mask,
             uniform_conv_shift_idx,
             uniform_patch_shift_idx,
             gqa_layers,
