@@ -4,7 +4,7 @@ use std::time::Instant;
 use tch::{autocast, nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::action_space::{
-    gaussian_entropy, implicit_cash_weights, transformed_action_log_prob,
+    gaussian_entropy, sigmoid_target_weight, transformed_action_log_prob,
 };
 use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
@@ -130,7 +130,7 @@ fn sample_rollout_actions_from_output(
     let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
     let noise = &action_std * &z;
     let latent_actions = &action_mean + &noise;
-    let target_weights = implicit_cash_weights(&latent_actions);
+    let target_weights = sigmoid_target_weight(&latent_actions);
     let action_log_prob =
         transformed_action_log_prob(&latent_actions, &action_mean, &action_std, LOG_2PI);
 

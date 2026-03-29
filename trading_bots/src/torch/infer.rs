@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 use tch::{nn, Device, Kind, Tensor};
 
-use crate::torch::action_space::implicit_cash_weights;
+use crate::torch::action_space::sigmoid_target_weight;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
@@ -47,7 +47,7 @@ pub fn sample_actions(
         &action_mean + &action_noise_std * scale * noise
     };
 
-    implicit_cash_weights(&latent_actions)
+    sigmoid_target_weight(&latent_actions)
 }
 
 pub fn run_inference<P: AsRef<Path>>(
