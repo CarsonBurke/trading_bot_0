@@ -275,8 +275,12 @@ impl Env {
         self.episode += 1;
     }
 
+    pub(super) fn has_next_transition(&self) -> bool {
+        self.step <= self.max_step
+    }
+
     fn get_is_done(&self) -> f32 {
-        if self.step + 2 > self.max_step {
+        if self.step >= self.max_step {
             1.0
         } else {
             0.0
@@ -477,8 +481,6 @@ impl Env {
         }
 
         let pre_total_assets = self.account.total_assets;
-        let pre_cash = self.account.cash;
-        let pre_positions = self.account.positions.clone();
 
         let mut real_actions = vec![0.0; ACTION_COUNT as usize];
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
@@ -500,8 +502,6 @@ impl Env {
         let (reward, reward_per_ticker) = self.get_unrealized_pnl_reward_breakdown(
             absolute_step,
             pre_total_assets,
-            // pre_cash,
-            // &pre_positions,
         );
 
         self.last_reward = reward;
@@ -525,8 +525,8 @@ impl Env {
             .push(self.target_weights[self.tickers.len()]);
 
         if is_done == 1.0 {
-            self.handle_episode_end(absolute_step);
             self.episode_history.action_final = Some(real_actions.clone());
+            self.handle_episode_end(absolute_step);
         }
 
         self.step += 1;
@@ -552,8 +552,6 @@ impl Env {
         }
 
         let pre_total_assets = self.account.total_assets;
-        let pre_cash = self.account.cash;
-        let pre_positions = self.account.positions.clone();
 
         let mut real_actions = vec![0.0; ACTION_COUNT as usize];
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
@@ -575,8 +573,6 @@ impl Env {
         let (reward, reward_per_ticker) = self.get_unrealized_pnl_reward_breakdown(
             absolute_step,
             pre_total_assets,
-            // pre_cash,
-            // &pre_positions,
         );
 
         self.last_reward = reward;
@@ -600,8 +596,8 @@ impl Env {
             .push(self.target_weights[self.tickers.len()]);
 
         if is_done == 1.0 {
-            self.handle_episode_end(absolute_step);
             self.episode_history.action_final = Some(real_actions.clone());
+            self.handle_episode_end(absolute_step);
         }
 
         self.step += 1;

@@ -13,7 +13,7 @@ impl Env {
         _pre_positions: &[Position],
     ) -> (f64, Vec<f64>, f64) {
         let n_tickers = self.tickers.len();
-        if self.step + 1 >= self.max_step || pre_total_assets <= 0.0 {
+        if !self.has_next_transition() || pre_total_assets <= 0.0 {
             return (0.0, vec![0.0; n_tickers], 0.0);
         }
 
@@ -61,7 +61,7 @@ impl Env {
         _: f64,
     ) -> (f64, Vec<f64>, f64) {
         let n_tickers = self.tickers.len();
-        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+        if !self.has_next_transition() || self.account.total_assets <= 0.0 {
             return (0.0, vec![0.0; n_tickers], 0.0);
         }
 
@@ -110,7 +110,7 @@ impl Env {
         _: f64,
     ) -> (f64, Vec<f64>, f64) {
         let n_tickers = self.tickers.len();
-        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+        if !self.has_next_transition() || self.account.total_assets <= 0.0 {
             return (0.0, vec![0.0; n_tickers], 0.0);
         }
 
@@ -162,7 +162,7 @@ impl Env {
         _: f64,
     ) -> (f64, Vec<f64>, f64) {
         let n_tickers = self.tickers.len();
-        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+        if !self.has_next_transition() || self.account.total_assets <= 0.0 {
             return (0.0, vec![0.0; n_tickers], 0.0);
         }
 
@@ -209,16 +209,15 @@ impl Env {
     pub fn get_unrealized_pnl_reward_breakdown(
         &self,
         absolute_step: usize,
-        _: f64,
+        pre_total_assets: f64,
     ) -> (f64, Vec<f64>) {
         let n_tickers = self.tickers.len();
-        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+        if !self.has_next_transition() || pre_total_assets <= 0.0 {
             return (0.0, vec![0.0; n_tickers]);
         }
 
         let next_absolute_step = absolute_step + 1;
-        let total_assets = self.account.total_assets;
-        let inv_total_assets = 1.0 / total_assets;
+        let inv_pre_total_assets = 1.0 / pre_total_assets;
         let mut contributions = vec![0.0; n_tickers];
         let mut total_assets_next = self.account.cash;
 
@@ -229,13 +228,13 @@ impl Env {
             let current_value = position.value_with_price(current_price);
             let next_value = position.value_with_price(next_price);
             total_assets_next += next_value;
-            contributions[ticker_idx] = (next_value - current_value) * inv_total_assets;
+            contributions[ticker_idx] = (next_value - current_value) * inv_pre_total_assets;
         }
 
         let portfolio_return: f64 = contributions.iter().sum();
-        let strategy_log_return = (total_assets_next * inv_total_assets).ln() * REWARD_SCALE;
+        let strategy_log_return = (total_assets_next * inv_pre_total_assets).ln() * REWARD_SCALE;
 
-        let per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
+        let mut per_ticker_rewards: Vec<f64> = if portfolio_return.abs() < 1e-8 {
             vec![0.0; n_tickers]
         } else {
             let inv_portfolio_return = 1.0 / portfolio_return;
@@ -244,12 +243,23 @@ impl Env {
                 .map(|c| strategy_log_return * (c * inv_portfolio_return))
                 .collect()
         };
+
+        if n_tickers > 0 {
+            let mean_reward = per_ticker_rewards.iter().sum::<f64>() / n_tickers as f64;
+            let residual = strategy_log_return - mean_reward;
+            if residual != 0.0 {
+                for reward in &mut per_ticker_rewards {
+                    *reward += residual;
+                }
+            }
+        }
+
         (strategy_log_return, per_ticker_rewards)
     }
 
     #[allow(dead_code)]
     pub fn get_unrealized_pnl_reward(&self, absolute_step: usize, _commissions: f64) -> f64 {
-        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+        if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
             let total_assets_after_trade = self
                 .account
@@ -278,7 +288,7 @@ impl Env {
 
     #[allow(dead_code)]
     pub fn get_hindsight_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
-        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+        if !self.has_next_transition() || self.account.total_assets <= 0.0 {
             return 0.0;
         }
 
@@ -340,7 +350,7 @@ impl Env {
 
     #[allow(dead_code)]
     pub fn get_action_outcome_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
-        if self.step + 1 >= self.max_step || self.account.total_assets <= 0.0 {
+        if !self.has_next_transition() || self.account.total_assets <= 0.0 {
             return 0.0;
         }
 
@@ -399,7 +409,7 @@ impl Env {
 
     #[allow(dead_code)]
     pub fn get_index_benchmark_pnl_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
-        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+        if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
 
             let total_assets_after_trade = self
@@ -432,7 +442,7 @@ impl Env {
     #[deprecated]
     #[allow(dead_code)]
     fn get_excess_returns_reward(&self, absolute_step: usize) -> f64 {
-        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+        if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
 
             let total_assets_after_trade = self
@@ -458,7 +468,7 @@ impl Env {
 
     #[allow(dead_code)]
     fn get_sharpe_ratio_adjusted_reward(&self, absolute_step: usize) -> f64 {
-        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+        if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
 
             let total_assets_after_trade = self
@@ -481,7 +491,7 @@ impl Env {
 
     #[allow(dead_code)]
     fn get_sortino_ratio_adjusted_reward(&self, absolute_step: usize) -> f64 {
-        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+        if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
 
             let total_assets_after_trade = self
@@ -509,7 +519,7 @@ impl Env {
 
     #[allow(dead_code)]
     fn get_risk_adjusted_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
-        if self.step + 1 < self.max_step && self.account.total_assets > 0.0 {
+        if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
 
             let total_assets_after_trade = self
