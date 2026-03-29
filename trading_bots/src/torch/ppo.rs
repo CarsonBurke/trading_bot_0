@@ -1,9 +1,7 @@
 use std::env;
 use std::path::Path;
 use std::time::Instant;
-use tch::{nn, Kind, Tensor};
-
-use super::Fp32Adam;
+use tch::{autocast, nn, nn::OptimizerConfig, Kind, Tensor};
 
 use crate::torch::action_space::{
     gaussian_entropy, implicit_cash_weights, transformed_action_log_prob,
@@ -12,7 +10,8 @@ use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::VecEnv;
-use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
+use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelConfig};
+use crate::torch::sdp::force_flash_sdp;
 use crate::torch::two_hot::TwoHotBins;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
@@ -20,7 +19,7 @@ const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const CHUNK_SIZE: i64 = 128;
-const OPTIM_EPOCHS: i64 = 4;
+const OPTIM_EPOCHS: i64 = 3;
 const PPO_CLIP_LOW: f64 = 0.2;
 const PPO_CLIP_HIGH: f64 = 0.2;
 const TARGET_KL: f64 = 0.03;
@@ -40,6 +39,14 @@ const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
 const VALUE_CLIP: f64 = 0.3;
+
+fn minibatch_samples_from_env() -> i64 {
+    env::var("PPO_MINIBATCH_SAMPLES")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(CHUNK_SIZE * NPROCS)
+}
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -70,7 +77,6 @@ fn log_tensor_summary(name: &str, t: &Tensor) {
 
 struct GpuRollingBuffer {
     capacity: i64,
-    device: tch::Device,
     data: Tensor,
     ptr: i64,
 }
@@ -80,7 +86,6 @@ impl GpuRollingBuffer {
         let data = Tensor::zeros(&[capacity, dim], (kind, device));
         Self {
             capacity,
-            device,
             data,
             ptr: 0,
         }
@@ -91,7 +96,12 @@ impl GpuRollingBuffer {
         if self.ptr + n > self.capacity {
             self.ptr = 0;
         }
-        let _ = self.data.narrow(0, self.ptr, n).copy_(t);
+        let src = if t.kind() == self.data.kind() {
+            t.shallow_clone()
+        } else {
+            t.to_kind(self.data.kind())
+        };
+        let _ = self.data.narrow(0, self.ptr, n).copy_(&src);
         self.ptr += n;
     }
 
@@ -100,39 +110,34 @@ impl GpuRollingBuffer {
     }
 }
 
-fn sample_rollout_actions(
-    model: &TradingModel,
-    obs_price: &Tensor,
-    obs_static: &Tensor,
+fn sample_rollout_actions_from_output(
+    output: ModelOutput,
     two_hot: &TwoHotBins,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
-    tch::no_grad(|| {
-        let (value_logits, action_mean, action_std) =
-            model.forward_on_device(obs_price, obs_static, false);
-        let value_logits = value_logits.to_kind(Kind::Float);
-        let action_mean = action_mean.to_kind(Kind::Float);
-        let action_std = action_std.to_kind(Kind::Float);
+    let (value_logits, action_mean, action_std) = output;
+    let value_logits = value_logits.to_kind(Kind::Float);
+    let action_mean = action_mean.to_kind(Kind::Float);
+    let action_std = action_std.to_kind(Kind::Float);
 
-        // Decode two-hot logits to scalar values for GAE
-        let values = two_hot.decode(&value_logits);
+    // Decode two-hot logits to scalar values for GAE
+    let values = two_hot.decode(&value_logits);
 
-        let batch = action_mean.size()[0];
-        let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
-        let noise = &action_std * &z;
-        let latent_actions = &action_mean + &noise;
-        let target_weights = implicit_cash_weights(&latent_actions);
-        let action_log_prob =
-            transformed_action_log_prob(&latent_actions, &action_mean, &action_std, LOG_2PI);
+    let batch = action_mean.size()[0];
+    let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
+    let noise = &action_std * &z;
+    let latent_actions = &action_mean + &noise;
+    let target_weights = implicit_cash_weights(&latent_actions);
+    let action_log_prob =
+        transformed_action_log_prob(&latent_actions, &action_mean, &action_std, LOG_2PI);
 
-        (
-            values,
-            action_mean,
-            action_std,
-            latent_actions,
-            target_weights,
-            action_log_prob,
-        )
-    })
+    (
+        values,
+        action_mean,
+        action_std,
+        latent_actions,
+        target_weights,
+        action_log_prob,
+    )
 }
 
 /// Compute GAE advantages and returns from rollout data.
@@ -218,8 +223,9 @@ fn compute_action_std_stats(
     device: tch::Device,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, _, action_std) =
-            model.forward_on_device(&s_price_deltas.get(0), &s_static_obs.get(0), false);
+        let (_, _, action_std) = autocast(true, || {
+            model.forward_on_device(&s_price_deltas.get(0), &s_static_obs.get(0), false)
+        });
         let action_std = action_std.to_kind(Kind::Float);
         let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
             (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze()
@@ -243,6 +249,11 @@ pub async fn train(
     model_variant: ModelVariant,
     run_name: Option<String>,
 ) {
+    assert_eq!(
+        model_variant,
+        ModelVariant::Uniform256Stream,
+        "PPO rollout collection is streaming-only; train with --model-size uniform-256-stream"
+    );
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
@@ -262,6 +273,7 @@ pub async fn train(
 
     let device = tch::Device::cuda_if_available();
     println!("device is cuda: {}", device.is_cuda());
+    force_flash_sdp();
     let mut vs = nn::VarStore::new(device);
     let trading_model = TradingModel::new_with_config(
         &vs.root(),
@@ -272,7 +284,7 @@ pub async fn train(
     );
 
     // RPO alpha via sigmoid: alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
-    // Keep rho fully outside VarStore so Fp32Adam/vs.bfloat16() do not touch it.
+    // Keep rho outside VarStore so AdamW only updates model parameters.
     let mut rpo_rho = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
         let p_init = (RPO_ALPHA_INIT - RPO_ALPHA_MIN) / (RPO_ALPHA_MAX - RPO_ALPHA_MIN);
         let p_init = p_init.clamp(1e-6, 1.0 - 1e-6);
@@ -318,12 +330,11 @@ pub async fn train(
     let gens_path = run_dir.gens.to_string_lossy().to_string();
     println!("Run dir: {}", run_dir.root.display());
 
-    // Cast all model parameters to bf16 for faster compute.
-    // Done after weight loading so loaded fp32 weights get cast.
-    // Adam optimizer handles mixed bf16 parameters correctly.
-    vs.bfloat16();
-
-    let mut opt = Fp32Adam::new(&vs, LEARNING_RATE);
+    let mut opt = nn::AdamW::default()
+        .wd(0.0)
+        .eps(1e-5)
+        .build(&vs, LEARNING_RATE)
+        .expect("failed to build AdamW optimizer");
 
     let mut env = VecEnv::new(true, model_variant, gens_path.clone());
     if start_episode > 0 {
@@ -338,11 +349,13 @@ pub async fn train(
     let rollout_steps = SEQ_LEN;
     let memory_size = rollout_steps * NPROCS;
 
-    let pd_dim = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
+    let raw_pd_dim = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
+    let pd_dim = trading_model.price_input_dim();
     let so_dim = STATIC_OBSERVATIONS as i64;
+    let replay_obs_kind = trading_model.input_kind();
 
-    let mut s_price_deltas = GpuRollingBuffer::new(memory_size, pd_dim, Kind::Float, device);
-    let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, Kind::Float, device);
+    let mut s_price_deltas = GpuRollingBuffer::new(memory_size, pd_dim, replay_obs_kind, device);
+    let mut s_static_obs = GpuRollingBuffer::new(memory_size, so_dim, replay_obs_kind, device);
     let s_actions = Tensor::zeros(&[memory_size, ACTION_COUNT], (Kind::Float, device));
     let s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device));
@@ -377,7 +390,7 @@ pub async fn train(
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu) = env.reset();
-        let mut obs_price = Tensor::zeros(&[NPROCS, pd_dim], (Kind::Float, device));
+        let mut obs_price = Tensor::zeros(&[NPROCS, raw_pd_dim], (Kind::Float, device));
         let mut obs_static =
             Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
         let ring_len = PRICE_DELTAS_PER_TICKER as i64;
@@ -388,12 +401,25 @@ pub async fn train(
         obs_price.copy_(&obs_price_cpu);
         obs_static.copy_(&obs_static_cpu);
         ring_buf.copy_(&obs_price.view([NPROCS, TICKERS_COUNT, ring_len]));
+        let mut stream_state = trading_model.init_stream_state_batched(NPROCS);
+        let stream_layout = trading_model.uniform_stream_layout_from_raw_input(&obs_price);
+        let mut streamed_output = Some(tch::no_grad(|| {
+            autocast(true, || {
+                trading_model.step_on_device(&stream_layout, &obs_static, &mut stream_state)
+            })
+        }));
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
         for step in 0..rollout_steps as usize {
+            let mem_idx = step as i64 * NPROCS;
             let (values, action_mean, action_std, latent_actions, target_weights, action_log_prob) =
-                sample_rollout_actions(&trading_model, &obs_price, &obs_static, &two_hot);
+                sample_rollout_actions_from_output(
+                    streamed_output
+                        .take()
+                        .expect("streamed rollout output missing"),
+                    &two_hot,
+                );
 
             if DEBUG_NUMERICS {
                 let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
@@ -403,7 +429,7 @@ pub async fn train(
                 let _ =
                     debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
-            s_price_deltas.push(&obs_price);
+            s_price_deltas.push(&trading_model.uniform_stream_snapshot(&stream_state));
             s_static_obs.push(&obs_static);
 
             let (reset_indices, reset_price_deltas) = env.step_into_ring_tensor(
@@ -435,9 +461,8 @@ pub async fn train(
 
             let idx = (&base_idx + (ring_pos + 1)).remainder(ring_len);
             let ordered = ring_buf.index_select(2, &idx);
-            obs_price.copy_(&ordered.view([NPROCS, pd_dim]));
+            obs_price.copy_(&ordered.view([NPROCS, raw_pd_dim]));
 
-            let mem_idx = step as i64 * NPROCS;
             let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&latent_actions);
             let _ = s_old_log_probs
                 .narrow(0, mem_idx, NPROCS)
@@ -457,12 +482,26 @@ pub async fn train(
                 .copy_(&portfolio_reward);
             let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
             let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
+
+            streamed_output = Some(tch::no_grad(|| {
+                autocast(true, || {
+                    if reset_indices.is_empty() {
+                        trading_model.step_on_device(&step_deltas, &obs_static, &mut stream_state)
+                    } else {
+                        let stream_layout =
+                            trading_model.uniform_stream_layout_from_raw_input(&obs_price);
+                        trading_model.step_on_device(&stream_layout, &obs_static, &mut stream_state)
+                    }
+                })
+            }));
         }
 
         // Bootstrap value from final observation state (decode two-hot logits)
         let bootstrap_value = tch::no_grad(|| {
-            let (value_logits, _, _) =
-                trading_model.forward_on_device(&obs_price, &obs_static, false);
+            let bootstrap_price = trading_model.uniform_stream_snapshot(&stream_state);
+            let (value_logits, _, _) = autocast(true, || {
+                trading_model.forward_on_device(&bootstrap_price, &obs_static, false)
+            });
             two_hot.decode(&value_logits.to_kind(Kind::Float))
         });
 
@@ -492,7 +531,7 @@ pub async fn train(
         let price_deltas_raw = s_price_deltas.data.shallow_clone();
         let static_obs_raw = s_static_obs.data.shallow_clone();
         let total_samples = rollout_steps * NPROCS;
-        let minibatch_size = (CHUNK_SIZE * NPROCS).min(total_samples);
+        let minibatch_size = minibatch_samples_from_env().min(total_samples);
         // Full-rollout advantage normalization (not per-minibatch)
         let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
 
@@ -526,13 +565,6 @@ pub async fn train(
 
             // Permute all buffers once per epoch, then narrow for zero-copy minibatches
             let perm = Tensor::from_slice(&b_inds).to_device(device);
-            let pd_perm = price_deltas_raw.index_select(0, &perm);
-            let so_perm = static_obs_raw.index_select(0, &perm);
-            let act_perm = s_actions.index_select(0, &perm);
-            let ret_perm = returns.index_select(0, &perm);
-            let adv_perm = adv_norm.index_select(0, &perm);
-            let olp_perm = s_old_log_probs.index_select(0, &perm);
-            let val_perm = s_values.index_select(0, &perm);
 
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
@@ -545,16 +577,18 @@ pub async fn train(
                 let mb_end = (mb_start + minibatch_size).min(total_samples);
                 let chunk_sample_count = mb_end - mb_start;
 
-                let pd_chunk = pd_perm.narrow(0, mb_start, chunk_sample_count);
-                let so_chunk = so_perm.narrow(0, mb_start, chunk_sample_count);
-                let act_mb = act_perm.narrow(0, mb_start, chunk_sample_count);
-                let ret_mb = ret_perm.narrow(0, mb_start, chunk_sample_count);
-                let adv_mb = adv_perm.narrow(0, mb_start, chunk_sample_count);
-                let old_log_probs_mb = olp_perm.narrow(0, mb_start, chunk_sample_count);
+                let mb_inds = perm.narrow(0, mb_start, chunk_sample_count);
+                let pd_chunk = price_deltas_raw.index_select(0, &mb_inds);
+                let so_chunk = static_obs_raw.index_select(0, &mb_inds);
+                let act_mb = s_actions.index_select(0, &mb_inds);
+                let ret_mb = returns.index_select(0, &mb_inds);
+                let adv_mb = adv_norm.index_select(0, &mb_inds);
+                let old_log_probs_mb = s_old_log_probs.index_select(0, &mb_inds);
 
                 let fwd_start = Instant::now();
-                let (new_value_logits, action_mean, action_std) =
-                    trading_model.forward_on_device(&pd_chunk, &so_chunk, true);
+                let (new_value_logits, action_mean, action_std) = autocast(true, || {
+                    trading_model.forward_on_device(&pd_chunk, &so_chunk, true)
+                });
 
                 let new_value_logits = new_value_logits.to_kind(Kind::Float);
                 let action_mean = action_mean.to_kind(Kind::Float);
@@ -614,7 +648,7 @@ pub async fn train(
                         .mean(Kind::Float);
 
                 // Two-hot distributional value loss with PPO-style value clipping
-                let old_val_mb = val_perm.narrow(0, mb_start, chunk_sample_count);
+                let old_val_mb = s_values.index_select(0, &mb_inds);
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
                     let _ =

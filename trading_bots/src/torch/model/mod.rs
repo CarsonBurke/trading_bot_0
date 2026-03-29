@@ -95,97 +95,6 @@ impl InterTickerBlock {
     }
 }
 
-const EXO_CROSS_AFTER: &[usize] = &[0];
-
-struct ExoCrossBlock {
-    cross_ln: RMSNorm,
-    cross_q: nn::Linear,
-    cross_kv: nn::Linear,
-    cross_out: nn::Linear,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
-    kv_dim: i64,
-}
-
-impl ExoCrossBlock {
-    fn new(p: &nn::Path, model_dim: i64, cross_head_dim: i64, init_scale: f64) -> Self {
-        let kv_dim = CROSS_NUM_KV_HEADS * cross_head_dim;
-        let cross_ln = RMSNorm::new(&(p / "cross_ln"), model_dim, 1e-6);
-        let cross_q = linear_truncated(p, "cross_q", model_dim, model_dim);
-        let cross_kv = linear_truncated(p, "cross_kv", model_dim, 2 * kv_dim);
-        let cross_out = linear_residual_out(p, "cross_out", model_dim, model_dim, 0.1 * init_scale);
-        let q_norm = RMSNorm::new(&(p / "q_norm"), cross_head_dim, 1e-6);
-        let k_norm = RMSNorm::new(&(p / "k_norm"), cross_head_dim, 1e-6);
-        Self {
-            cross_ln,
-            cross_q,
-            cross_kv,
-            cross_out,
-            q_norm,
-            k_norm,
-            kv_dim,
-        }
-    }
-
-    fn forward(&self, x: &Tensor, exo_kv: &Tensor, model_dim: i64, cross_head_dim: i64) -> Tensor {
-        let (b, s, _d) = x.size3().unwrap_or_else(|_| {
-            let (b, _d) = x.size2().unwrap();
-            (b, 1, _d)
-        });
-        let x_3d = if x.dim() == 2 {
-            x.unsqueeze(1)
-        } else {
-            x.shallow_clone()
-        };
-        let t = exo_kv.size()[1];
-
-        let q = self.cross_ln.forward(&x_3d).apply(&self.cross_q);
-        let kv = exo_kv.apply(&self.cross_kv);
-        let kv_parts = kv.split(self.kv_dim, -1);
-
-        let q = q
-            .reshape([b, s, CROSS_NUM_Q_HEADS, cross_head_dim])
-            .permute([0, 2, 1, 3]);
-        let k = kv_parts[0]
-            .reshape([b, t, CROSS_NUM_KV_HEADS, cross_head_dim])
-            .permute([0, 2, 1, 3]);
-        let v = kv_parts[1]
-            .reshape([b, t, CROSS_NUM_KV_HEADS, cross_head_dim])
-            .permute([0, 2, 1, 3]);
-
-        // QKNorm
-        let q = self
-            .q_norm
-            .forward(&q.reshape([b * CROSS_NUM_Q_HEADS * s, cross_head_dim]))
-            .reshape([b, CROSS_NUM_Q_HEADS, s, cross_head_dim]);
-        let k = self
-            .k_norm
-            .forward(&k.reshape([b * CROSS_NUM_KV_HEADS * t, cross_head_dim]))
-            .reshape([b, CROSS_NUM_KV_HEADS, t, cross_head_dim]);
-
-        let out = Tensor::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            None::<&Tensor>,
-            0.0,
-            false,
-            None,
-            true,
-        );
-
-        let out = out.permute([0, 2, 1, 3]).reshape([b, s, model_dim]);
-        let out = out.apply(&self.cross_out);
-
-        let result = &x_3d + out;
-        if x.dim() == 2 {
-            result.squeeze_dim(1)
-        } else {
-            result
-        }
-    }
-}
-
 const GQA_NUM_Q_HEADS: i64 = 4;
 const GQA_NUM_KV_HEADS: i64 = 2;
 
@@ -218,10 +127,14 @@ impl RotaryEmbedding {
     }
 
     fn apply(&self, x: &Tensor) -> Tensor {
+        self.apply_from(x, 0)
+    }
+
+    fn apply_from(&self, x: &Tensor, offset: i64) -> Tensor {
         // x: [batch, heads, seq_len, head_dim]
         let seq_len = x.size()[2];
-        let cos = self.cos_cached.narrow(0, 0, seq_len).to_kind(x.kind());
-        let sin = self.sin_cached.narrow(0, 0, seq_len).to_kind(x.kind());
+        let cos = self.cos_cached.narrow(0, offset, seq_len).to_kind(x.kind());
+        let sin = self.sin_cached.narrow(0, offset, seq_len).to_kind(x.kind());
         x * &cos + rotate_half(x) * &sin
     }
 }
@@ -266,11 +179,37 @@ impl GqaBlock {
         }
     }
 
-    fn forward(&self, x: &Tensor, rope: &RotaryEmbedding) -> Tensor {
+    fn forward(&self, x: &Tensor, rope: &RotaryEmbedding, causal: bool) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
         let head_dim = _d / GQA_NUM_Q_HEADS;
 
-        // Self-attention with pre-norm
+        let (q, k, v) = self.project_qkv(x, rope, 0);
+
+        let out = Tensor::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            None::<&Tensor>,
+            0.0,
+            causal,
+            None,
+            true,
+        )
+        .permute([0, 2, 1, 3])
+        .contiguous()
+        .reshape([b, s, _d]);
+        let out = out.apply(&self.attn_out);
+        self.apply_ffn(&(x + out))
+    }
+
+    fn project_qkv(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        rope_offset: i64,
+    ) -> (Tensor, Tensor, Tensor) {
+        let (b, s, d) = x.size3().unwrap();
+        let head_dim = d / GQA_NUM_Q_HEADS;
         let x_norm = self.attn_ln.forward(x);
         let qkv = x_norm.apply(&self.attn_qkv);
         let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
@@ -283,8 +222,6 @@ impl GqaBlock {
         let v = parts[2]
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
-
-        // QKNorm before RoPE
         let q = self
             .q_norm
             .forward(&q.reshape([b * GQA_NUM_Q_HEADS * s, head_dim]))
@@ -293,32 +230,79 @@ impl GqaBlock {
             .k_norm
             .forward(&k.reshape([b * GQA_NUM_KV_HEADS * s, head_dim]))
             .reshape([b, GQA_NUM_KV_HEADS, s, head_dim]);
+        let q = rope.apply_from(&q, rope_offset);
+        let k = rope.apply_from(&k, rope_offset);
+        (q, k, v)
+    }
 
-        let q = rope.apply(&q);
-        let k = rope.apply(&k);
+    fn apply_ffn(&self, x: &Tensor) -> Tensor {
+        let ffn_in = self.ffn_ln.forward(x);
+        let ffn_proj = ffn_in.apply(&self.ffn_fc1);
+        let ffn_parts = ffn_proj.chunk(2, -1);
+        let ffn_out = (ffn_parts[0].silu() * &ffn_parts[1]).apply(&self.ffn_fc2);
+        x + ffn_out
+    }
 
+    fn forward_prefix_and_cache(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+    ) -> (Tensor, Tensor, Tensor) {
+        let (q, k, v) = self.project_qkv(x, rope, 0);
         let out = Tensor::scaled_dot_product_attention(
             &q,
             &k,
             &v,
             None::<&Tensor>,
             0.0,
-            false,
+            true,
             None,
             true,
         )
         .permute([0, 2, 1, 3])
         .contiguous()
-        .reshape([b, s, _d]);
-        let out = out.apply(&self.attn_out);
-        let x = x + out;
+        .reshape(x.size());
+        let x = x + out.apply(&self.attn_out);
+        (self.apply_ffn(&x), k, v)
+    }
 
-        // SwiGLU FFN with pre-norm
-        let ffn_in = self.ffn_ln.forward(&x);
-        let ffn_proj = ffn_in.apply(&self.ffn_fc1);
-        let ffn_parts = ffn_proj.chunk(2, -1);
-        let ffn_out = (ffn_parts[0].silu() * &ffn_parts[1]).apply(&self.ffn_fc2);
-        &x + ffn_out
+    fn forward_suffix_with_cache(
+        &self,
+        x_suffix: &Tensor,
+        prefix_k: &Tensor,
+        prefix_v: &Tensor,
+        rope: &RotaryEmbedding,
+        kv_index: &Tensor,
+        prefix_len: i64,
+    ) -> Tensor {
+        let (q, suffix_k, suffix_v) = self.project_qkv(x_suffix, rope, prefix_len);
+        let suffix_k = suffix_k.index_select(1, kv_index);
+        let suffix_v = suffix_v.index_select(1, kv_index);
+        let suffix_len = q.size()[2];
+        let mut out_parts = Vec::with_capacity(suffix_len as usize);
+        for suffix_pos in 0..suffix_len {
+            let q_pos = q.narrow(2, suffix_pos, 1);
+            let visible_k = Tensor::cat(&[prefix_k, &suffix_k.narrow(2, 0, suffix_pos + 1)], 2);
+            let visible_v = Tensor::cat(&[prefix_v, &suffix_v.narrow(2, 0, suffix_pos + 1)], 2);
+            let out_pos = Tensor::scaled_dot_product_attention(
+                &q_pos,
+                &visible_k,
+                &visible_v,
+                None::<&Tensor>,
+                0.0,
+                false,
+                None,
+                true,
+            );
+            out_parts.push(out_pos);
+        }
+        let out_part_refs: Vec<&Tensor> = out_parts.iter().collect();
+        let out = Tensor::cat(&out_part_refs, 2)
+            .permute([0, 2, 1, 3])
+            .contiguous()
+            .reshape(x_suffix.size());
+        let x = x_suffix + out.apply(&self.attn_out);
+        self.apply_ffn(&x)
     }
 }
 
@@ -376,12 +360,18 @@ const BASE_GQA_LAYERS: usize = 3;
 const ABLATION_SMALL_MODEL_DIM: i64 = 64;
 const ABLATION_SMALL_FF_DIM: i64 = 256;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
+const UNIFORM_STREAM_PATCH_COUNT: i64 = 256;
+const UNIFORM_STREAM_PATCH_SIZE: i64 = 34;
+const UNIFORM_STREAM_LAYOUT_LEN: i64 = UNIFORM_STREAM_PATCH_COUNT * UNIFORM_STREAM_PATCH_SIZE;
+const UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES: i64 = 255;
+const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 = PRICE_DELTAS_PER_TICKER as i64
+    - UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
+const STREAM_PATCH_INNER_DIM: i64 = 32;
+const STREAM_PATCH_CONV_KERNEL: i64 = 8;
 pub(super) const LOG_STD_INIT: f64 = -2.0;
 pub(super) const LOG_STD_MIN: f64 = -2.995732273553991;
 pub(super) const LOG_STD_MAX: f64 = 0.04879016416943201;
 const INTER_TICKER_AFTER: usize = 1;
-const CROSS_NUM_Q_HEADS: i64 = 4;
-const CROSS_NUM_KV_HEADS: i64 = 2;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
 pub(super) const NUM_HEAD_CLS_TOKENS: i64 = 3;
@@ -401,12 +391,26 @@ const BASE_PATCH_CONFIGS: &[(i64, i64)] = &[
     (1, 1),
 ];
 
+const fn uniform_256_patch_configs() -> [(i64, i64); 256] {
+    let mut configs = [(0i64, 0i64); 256];
+    let mut idx = 0usize;
+    while idx < 256 {
+        configs[idx] = (UNIFORM_STREAM_PATCH_SIZE, UNIFORM_STREAM_PATCH_SIZE);
+        idx += 1;
+    }
+    configs
+}
+
+const UNIFORM_256_STREAM_PATCH_CONFIGS: &[(i64, i64)] = &uniform_256_patch_configs();
+
 const ABLATION_SMALL_PATCH_CONFIGS: &[(i64, i64)] = &[(8192, 256), (384, 8), (117, 1)];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum ModelVariant {
     Base,
+    #[value(name = "uniform-256-stream", alias = "uniform256-stream")]
+    Uniform256Stream,
     AblationSmall,
 }
 
@@ -414,6 +418,7 @@ impl ModelVariant {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Base => "base",
+            Self::Uniform256Stream => "uniform-256-stream",
             Self::AblationSmall => "ablation-small",
         }
     }
@@ -434,6 +439,12 @@ fn model_spec(variant: ModelVariant) -> ModelSpec {
             ff_dim: BASE_FF_DIM,
             gqa_layers: BASE_GQA_LAYERS,
             patch_configs: BASE_PATCH_CONFIGS,
+        },
+        ModelVariant::Uniform256Stream => ModelSpec {
+            model_dim: BASE_MODEL_DIM,
+            ff_dim: BASE_FF_DIM,
+            gqa_layers: BASE_GQA_LAYERS,
+            patch_configs: UNIFORM_256_STREAM_PATCH_CONFIGS,
         },
         ModelVariant::AblationSmall => ModelSpec {
             model_dim: ABLATION_SMALL_MODEL_DIM,
@@ -517,6 +528,28 @@ pub struct StreamState {
     pub patch_pos: i64,
     /// Whether initialized with full sequence
     pub initialized: bool,
+    /// Uniform stream bucket layout: [batch*TICKERS_COUNT, 256, 34]
+    pub uniform_layout: Tensor,
+    /// Cached patch tokens for uniform streamed rollout: [batch*TICKERS_COUNT, 256, model_dim]
+    pub uniform_patch_tokens: Tensor,
+    /// Live fill per env for the tail bucket: [batch]
+    pub uniform_live_fill: Tensor,
+    /// Host mirror of live fill to avoid per-step device syncs during streamed rollout.
+    pub uniform_live_fill_host: Vec<i64>,
+    /// Incremental causal-conv state for the live bucket: [batch*TICKERS_COUNT, inner_dim, kernel]
+    pub uniform_live_conv_state: Tensor,
+    /// Running sum for live-bucket scalar features: [batch*TICKERS_COUNT, 1]
+    pub uniform_live_sum: Tensor,
+    /// Running squared-sum for live-bucket scalar features: [batch*TICKERS_COUNT, 1]
+    pub uniform_live_sum_sq: Tensor,
+    /// First live value for slope features: [batch*TICKERS_COUNT, 1]
+    pub uniform_live_first: Tensor,
+    /// Last live value for slope features: [batch*TICKERS_COUNT, 1]
+    pub uniform_live_last: Tensor,
+    /// Per-layer cached prefix K for uniform streamed rollout.
+    pub uniform_prefix_k: Vec<Tensor>,
+    /// Per-layer cached prefix V for uniform streamed rollout.
+    pub uniform_prefix_v: Vec<Tensor>,
 }
 
 pub struct TradingModel {
@@ -526,15 +559,22 @@ pub struct TradingModel {
     finest_patch_size: i64,
     model_dim: i64,
     ff_dim: i64,
-    cross_head_dim: i64,
     patch_embed_weight: Tensor,
     patch_embed_bias: Tensor,
     patch_config_ids: Tensor,
+    patch_stream_lift: nn::Linear,
+    patch_stream_mix: nn::Linear,
+    patch_stream_scalar_proj: nn::Linear,
+    patch_stream_conv_w: Tensor,
+    patch_stream_conv_b: Tensor,
+    gqa_kv_head_index: Tensor,
+    uniform_stream_suffix_mask: Tensor,
+    uniform_conv_shift_idx: Tensor,
+    uniform_patch_shift_idx: Tensor,
     gqa_layers: Vec<GqaBlock>,
     rope: RotaryEmbedding,
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
-    exo_cross_blocks: Vec<ExoCrossBlock>,
     actor_cls_token: Tensor,
     critic_cls_token: Tensor,
     sde_cls_token: Tensor,
@@ -545,6 +585,17 @@ pub struct TradingModel {
 }
 
 impl TradingModel {
+    pub fn price_input_dim(&self) -> i64 {
+        match self.variant {
+            ModelVariant::Uniform256Stream => TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN,
+            _ => TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
+        }
+    }
+
+    pub fn input_kind(&self) -> Kind {
+        self.patch_embed_weight.kind()
+    }
+
     fn maybe_to_device(&self, input: &Tensor, device: tch::Device) -> Tensor {
         if input.device() == device {
             input.shallow_clone()
@@ -570,6 +621,45 @@ impl TradingModel {
         self.seq_len
     }
 
+    fn uniform_stream_layout_from_raw(&self, deltas: &Tensor) -> Tensor {
+        let device = deltas.device();
+        let batch = deltas.size()[0];
+        let layout = Tensor::full(
+            [batch, UNIFORM_STREAM_LAYOUT_LEN],
+            f64::NAN,
+            (Kind::Float, device),
+        );
+        let full_prefix = UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
+        let _ = layout
+            .narrow(1, 0, full_prefix)
+            .copy_(&deltas.narrow(1, 0, full_prefix));
+        let _ = layout
+            .narrow(1, full_prefix, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL)
+            .copy_(&deltas.narrow(1, full_prefix, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL));
+        layout.to_kind(deltas.kind())
+    }
+
+    pub fn uniform_stream_layout_from_raw_input(&self, price_deltas: &Tensor) -> Tensor {
+        assert_eq!(
+            self.variant,
+            ModelVariant::Uniform256Stream,
+            "uniform_stream_layout_from_raw_input is only valid for Uniform256Stream",
+        );
+        let price = if price_deltas.dim() == 1 {
+            price_deltas.unsqueeze(0)
+        } else {
+            price_deltas.shallow_clone()
+        };
+        let price = self.cast_inputs(&self.maybe_to_device(&price, self.device));
+        let batch_size = price.size()[0];
+        self.uniform_stream_layout_from_raw(
+            &price
+                .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
+                .view([batch_size * TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]),
+        )
+        .view([batch_size, TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN])
+    }
+
     pub fn new(p: &nn::Path) -> Self {
         Self::new_with_config(p, TradingModelConfig::default())
     }
@@ -580,10 +670,17 @@ impl TradingModel {
         let init_scale = residual_init_scale(gqa_layers_count);
         let patch_configs = spec.patch_configs;
         let (total_days, seq_len) = compute_patch_totals(patch_configs);
-        assert!(
-            total_days == PRICE_DELTAS_PER_TICKER as i64,
-            "patch configs must sum to PRICE_DELTAS_PER_TICKER"
-        );
+        if config.variant == ModelVariant::Uniform256Stream {
+            assert!(
+                total_days >= PRICE_DELTAS_PER_TICKER as i64,
+                "uniform stream layout must cover the raw observation history"
+            );
+        } else {
+            assert!(
+                total_days == PRICE_DELTAS_PER_TICKER as i64,
+                "patch configs must sum to PRICE_DELTAS_PER_TICKER"
+            );
+        }
         let finest_patch_index = patch_configs.len() - 1;
         let finest_patch_size = patch_configs[finest_patch_index].1;
         let num_configs = patch_configs.len() as i64;
@@ -607,6 +704,71 @@ impl TradingModel {
             &[num_configs, spec.model_dim],
             Init::Const(0.0),
         );
+        let patch_stream_lift = nn::linear(
+            p / "patch_stream_lift",
+            1,
+            STREAM_PATCH_INNER_DIM,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(1, STREAM_PATCH_INNER_DIM),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let patch_stream_mix = nn::linear(
+            p / "patch_stream_mix",
+            STREAM_PATCH_INNER_DIM,
+            spec.model_dim,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(STREAM_PATCH_INNER_DIM, spec.model_dim),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let patch_stream_scalar_proj = nn::linear(
+            p / "patch_stream_scalar_proj",
+            4,
+            spec.model_dim,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(4, spec.model_dim),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let patch_stream_conv_w = p.var(
+            "patch_stream_conv_w",
+            &[STREAM_PATCH_INNER_DIM, 1, STREAM_PATCH_CONV_KERNEL],
+            Init::Randn {
+                mean: 0.0,
+                stdev: (1.0 / STREAM_PATCH_CONV_KERNEL as f64).sqrt(),
+            },
+        );
+        let patch_stream_conv_b = p.var(
+            "patch_stream_conv_b",
+            &[STREAM_PATCH_INNER_DIM],
+            Init::Const(0.0),
+        );
+        let gqa_kv_head_index = Tensor::from_slice(&[0i64, 0, 1, 1])
+            .to_kind(Kind::Int64)
+            .to_device(p.device());
+        let uniform_suffix_len = 1 + NUM_HEAD_CLS_TOKENS;
+        let uniform_prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
+        let q_pos =
+            Tensor::arange(uniform_suffix_len, (Kind::Int64, p.device())) + uniform_prefix_len;
+        let k_pos = Tensor::arange(
+            uniform_prefix_len + uniform_suffix_len,
+            (Kind::Int64, p.device()),
+        );
+        let allowed = k_pos
+            .unsqueeze(0)
+            .le_tensor(&q_pos.unsqueeze(1))
+            .to_kind(Kind::Float)
+            .unsqueeze(0)
+            .unsqueeze(0);
+        let uniform_stream_suffix_mask = (allowed - 1.0) * 1e9;
+        let uniform_conv_shift_idx =
+            Tensor::arange(STREAM_PATCH_CONV_KERNEL - 1, (Kind::Int64, p.device())) + 1;
+        let uniform_patch_shift_idx =
+            Tensor::arange(UNIFORM_STREAM_PATCH_COUNT - 1, (Kind::Int64, p.device())) + 1;
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
             for (cfg_idx, &(days, patch_size)) in patch_configs.iter().enumerate() {
@@ -645,19 +807,6 @@ impl TradingModel {
             &[NUM_EXO_TOKENS, spec.model_dim],
             Init::Const(0.0),
         );
-        let cross_head_dim = spec.model_dim / CROSS_NUM_Q_HEADS;
-        let exo_cross_blocks = EXO_CROSS_AFTER
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                ExoCrossBlock::new(
-                    &(p / format!("exo_cross_{}", i)),
-                    spec.model_dim,
-                    cross_head_dim,
-                    init_scale,
-                )
-            })
-            .collect::<Vec<_>>();
         let cls_std = (1.0 / spec.model_dim as f64).sqrt();
         let actor_cls_token = p.var(
             "actor_cls_token",
@@ -727,15 +876,22 @@ impl TradingModel {
             finest_patch_size,
             model_dim: spec.model_dim,
             ff_dim: spec.ff_dim,
-            cross_head_dim,
             patch_embed_weight,
             patch_embed_bias,
             patch_config_ids,
+            patch_stream_lift,
+            patch_stream_mix,
+            patch_stream_scalar_proj,
+            patch_stream_conv_w,
+            patch_stream_conv_b,
+            gqa_kv_head_index,
+            uniform_stream_suffix_mask,
+            uniform_conv_shift_idx,
+            uniform_patch_shift_idx,
             gqa_layers,
             rope,
             exo_feat_w,
             exo_feat_b,
-            exo_cross_blocks,
             actor_cls_token,
             critic_cls_token,
             sde_cls_token,
@@ -758,15 +914,6 @@ impl TradingModel {
         (global, per_ticker)
     }
 
-    /// Apply exo cross-block if this layer index is in EXO_CROSS_AFTER
-    fn maybe_apply_exo_cross(&self, x: &Tensor, exo_kv: &Tensor, layer_idx: usize) -> Tensor {
-        if let Some(pos) = EXO_CROSS_AFTER.iter().position(|&i| i == layer_idx) {
-            self.exo_cross_blocks[pos].forward(x, exo_kv, self.model_dim, self.cross_head_dim)
-        } else {
-            x.shallow_clone()
-        }
-    }
-
     fn maybe_apply_inter_ticker(&self, x: &Tensor, layer_idx: usize) -> Tensor {
         if layer_idx != INTER_TICKER_AFTER || TICKERS_COUNT == 1 {
             return x.shallow_clone();
@@ -775,7 +922,7 @@ impl TradingModel {
         let seq = x.size()[1];
         let batch_size = bt / TICKERS_COUNT;
         let x_4d = x.view([batch_size, TICKERS_COUNT, seq, self.model_dim]);
-        let cls = x_4d.narrow(2, 0, NUM_HEAD_CLS_TOKENS);
+        let cls = x_4d.narrow(2, seq - NUM_HEAD_CLS_TOKENS, NUM_HEAD_CLS_TOKENS);
         let cls_for_mix = cls.permute([0, 2, 1, 3]).reshape([
             batch_size * NUM_HEAD_CLS_TOKENS,
             TICKERS_COUNT,
@@ -791,8 +938,8 @@ impl TradingModel {
                 self.model_dim,
             ])
             .permute([0, 2, 1, 3]);
-        let non_cls = x_4d.narrow(2, NUM_HEAD_CLS_TOKENS, seq - NUM_HEAD_CLS_TOKENS);
-        Tensor::cat(&[&enriched_cls, &non_cls], 2).reshape([bt, seq, self.model_dim])
+        let non_cls = x_4d.narrow(2, 0, seq - NUM_HEAD_CLS_TOKENS);
+        Tensor::cat(&[&non_cls, &enriched_cls], 2).reshape([bt, seq, self.model_dim])
     }
 
     /// Build exogenous KV bank: [batch*tickers, NUM_EXO_TOKENS, MODEL_DIM]
@@ -820,9 +967,21 @@ impl TradingModel {
 
     fn patch_latent_stem_on_device(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
         let batch_tokens = batch_size * TICKERS_COUNT;
-        let deltas = price_deltas
-            .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
-            .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
+        let deltas = if self.variant == ModelVariant::Uniform256Stream {
+            let expected_layout = TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN;
+            assert_eq!(
+                price_deltas.size()[1],
+                expected_layout,
+                "Uniform256Stream full forward expects anchored layout input"
+            );
+            price_deltas
+                .view([batch_size, TICKERS_COUNT, UNIFORM_STREAM_LAYOUT_LEN])
+                .view([batch_tokens, UNIFORM_STREAM_LAYOUT_LEN])
+        } else {
+            price_deltas
+                .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
+                .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64])
+        };
 
         let kind = deltas.kind();
         let patch_tokens = self.patch_embed(&deltas);
@@ -838,12 +997,15 @@ impl TradingModel {
             .sde_cls_token
             .to_kind(kind)
             .expand([batch_tokens, 1, self.model_dim], false);
-        Tensor::cat(&[&actor_cls, &critic_cls, &sde_cls, &patch_tokens], 1)
+        Tensor::cat(&[&patch_tokens, &actor_cls, &critic_cls, &sde_cls], 1)
     }
 
     /// Per-config enrichment (avoids [batch, 256, 8636] expand), then fused
     /// einsum projection across all 256 tokens in a single kernel.
     fn patch_embed(&self, deltas: &Tensor) -> Tensor {
+        if self.variant == ModelVariant::Uniform256Stream {
+            return self.patch_embed_stream(deltas);
+        }
         let device = deltas.device();
         let kind = deltas.kind();
         let batch = deltas.size()[0];
@@ -896,5 +1058,84 @@ impl TradingModel {
             None::<&[i64]>,
         );
         out + bias_per_patch.unsqueeze(0)
+    }
+
+    fn patch_embed_stream_batch(&self, patch_vals: &Tensor) -> Tensor {
+        let device = patch_vals.device();
+        let target_kind = self.patch_embed_weight.kind();
+        let batch = patch_vals.size()[0];
+        let patch_size = patch_vals.size()[1];
+        let patch_vals = if patch_vals.kind() == target_kind {
+            patch_vals.shallow_clone()
+        } else {
+            patch_vals.to_kind(target_kind)
+        };
+        let valid = patch_vals.isnan().logical_not();
+        let valid_f = valid.to_kind(Kind::Float);
+        let valid_counts_raw = valid_f.sum_dim_intlist([1].as_slice(), false, Kind::Float);
+        let valid_counts = valid_counts_raw.clamp_min(1.0);
+        let clean_vals = patch_vals.nan_to_num(0.0, None, None);
+        let lifted = clean_vals
+            .unsqueeze(-1)
+            .reshape([batch * patch_size, 1])
+            .apply(&self.patch_stream_lift)
+            .reshape([batch, patch_size, STREAM_PATCH_INNER_DIM])
+            .transpose(1, 2);
+        let lifted_pad = lifted.constant_pad_nd([STREAM_PATCH_CONV_KERNEL - 1, 0]);
+        let conv = lifted_pad
+            .conv1d(
+                &self.maybe_to_device(&self.patch_stream_conv_w, device),
+                Some(&self.maybe_to_device(&self.patch_stream_conv_b, device)),
+                1,
+                0,
+                1,
+                STREAM_PATCH_INNER_DIM,
+            )
+            .silu()
+            .transpose(1, 2);
+        let last_valid_idx = valid_counts
+            .to_kind(Kind::Int64)
+            .g_add_scalar(-1)
+            .clamp_min(0)
+            .unsqueeze(-1)
+            .unsqueeze(-1)
+            .expand([batch, 1, STREAM_PATCH_INNER_DIM], false);
+        let final_hidden = conv
+            .gather(1, &last_valid_idx, false)
+            .squeeze_dim(1)
+            .apply(&self.patch_stream_mix);
+        let clean_vals_f = clean_vals.to_kind(Kind::Float);
+        let mean = (&clean_vals_f * &valid_f).sum_dim_intlist([1].as_slice(), true, Kind::Float)
+            / valid_counts.unsqueeze(-1);
+        let var = ((&clean_vals_f - &mean) * &valid_f)
+            .pow_tensor_scalar(2.0)
+            .sum_dim_intlist([1].as_slice(), true, Kind::Float)
+            / valid_counts.unsqueeze(-1);
+        let std = (var + 1e-5).sqrt();
+        let first = clean_vals_f.narrow(1, 0, 1);
+        let last_idx = valid_counts
+            .to_kind(Kind::Int64)
+            .g_add_scalar(-1)
+            .clamp_min(0);
+        let last = clean_vals_f.gather(1, &last_idx.unsqueeze(-1), false);
+        let slope = &last - &first;
+        let fill_fraction = valid_counts_raw.unsqueeze(-1) / patch_size as f64;
+        let scalar = Tensor::cat(&[&mean, &std, &slope, &fill_fraction], 1)
+            .to_kind(target_kind)
+            .apply(&self.patch_stream_scalar_proj);
+        final_hidden + scalar
+    }
+
+    fn patch_embed_stream(&self, deltas: &Tensor) -> Tensor {
+        let batch = deltas.size()[0];
+        let patches = deltas.view([
+            batch * UNIFORM_STREAM_PATCH_COUNT,
+            UNIFORM_STREAM_PATCH_SIZE,
+        ]);
+        self.patch_embed_stream_batch(&patches).view([
+            batch,
+            UNIFORM_STREAM_PATCH_COUNT,
+            self.model_dim,
+        ])
     }
 }

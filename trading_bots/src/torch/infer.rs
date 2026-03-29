@@ -7,12 +7,14 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
+use crate::torch::sdp::force_flash_sdp;
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: Device,
     model_variant: ModelVariant,
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
+    force_flash_sdp();
     let mut vs = nn::VarStore::new(device);
     let model = TradingModel::new_with_config(
         &vs.root(),
@@ -81,14 +83,21 @@ pub fn run_inference<P: AsRef<Path>>(
         let mut episode_reward = 0.0;
         let mut stream_state = model.init_stream_state();
         let (price_deltas, static_obs) = env.reset_single();
-        let mut price_deltas_full = Tensor::zeros(
+        let mut price_deltas_raw = Tensor::zeros(
             [TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
             (Kind::Float, device),
         );
+        let mut price_deltas_full = Tensor::zeros([model.price_input_dim()], (Kind::Float, device));
         let mut price_deltas_incremental = Tensor::zeros([TICKERS_COUNT], (Kind::Float, device));
         let mut static_obs_tensor =
             Tensor::zeros([STATIC_OBSERVATIONS as i64], (Kind::Float, device));
-        price_deltas_full.copy_(&Tensor::from_slice(&price_deltas));
+        price_deltas_raw.copy_(&Tensor::from_slice(&price_deltas));
+        if model.variant() == ModelVariant::Uniform256Stream {
+            let layout = model.uniform_stream_layout_from_raw_input(&price_deltas_raw);
+            price_deltas_full.copy_(&layout.squeeze_dim(0));
+        } else {
+            price_deltas_full.copy_(&price_deltas_raw);
+        }
         static_obs_tensor.copy_(&Tensor::from_slice(&static_obs));
         let mut use_full = true;
 

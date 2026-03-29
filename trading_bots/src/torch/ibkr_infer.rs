@@ -36,8 +36,8 @@ struct LiveMarketState {
     steps_since_trade: Vec<usize>,
     position_open_step: Vec<Option<usize>>,
     trade_activity_ema: Vec<f64>,
-    /// Track latest delta per ticker for streaming inference
-    latest_deltas: Vec<f64>,
+    /// Pending deltas per ticker for streaming inference.
+    pending_deltas: Vec<VecDeque<f64>>,
     /// Whether model has been initialized with full observation
     model_initialized: bool,
 }
@@ -54,7 +54,7 @@ impl LiveMarketState {
             steps_since_trade: vec![0; ticker_count],
             position_open_step: vec![None; ticker_count],
             trade_activity_ema: vec![0.0; ticker_count],
-            latest_deltas: vec![0.0; ticker_count],
+            pending_deltas: vec![VecDeque::new(); ticker_count],
             model_initialized: false,
         }
     }
@@ -75,7 +75,7 @@ impl LiveMarketState {
                 self.price_deltas[ticker_idx].pop_front();
             }
 
-            self.latest_deltas[ticker_idx] = delta;
+            self.pending_deltas[ticker_idx].push_back(delta);
         }
     }
 
@@ -110,7 +110,7 @@ impl LiveMarketState {
         let mut price_deltas_flat =
             Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER);
         for ticker_deltas in &self.price_deltas {
-            for &delta in ticker_deltas.iter().rev().take(PRICE_DELTAS_PER_TICKER) {
+            for &delta in ticker_deltas.iter().take(PRICE_DELTAS_PER_TICKER) {
                 price_deltas_flat.push(delta as f32);
             }
         }
@@ -196,10 +196,20 @@ impl LiveMarketState {
         Some((price_deltas_tensor, static_obs_tensor))
     }
 
-    /// Get step deltas for streaming inference (single delta per ticker)
-    fn get_step_deltas(&self) -> Tensor {
-        let step_deltas: Vec<f32> = self.latest_deltas.iter().map(|&d| d as f32).collect();
-        Tensor::from_slice(&step_deltas)
+    fn has_pending_step(&self) -> bool {
+        self.pending_deltas.iter().all(|deltas| !deltas.is_empty())
+    }
+
+    /// Take the next pending step delta per ticker for streaming inference.
+    fn take_step_deltas(&mut self) -> Option<Tensor> {
+        if !self.has_pending_step() {
+            return None;
+        }
+        let mut step_deltas = Vec::with_capacity(self.pending_deltas.len());
+        for deltas in &mut self.pending_deltas {
+            step_deltas.push(deltas.pop_front().unwrap_or(0.0) as f32);
+        }
+        Some(Tensor::from_slice(&step_deltas))
     }
 }
 
@@ -372,10 +382,11 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     let mut step = 0;
     let start_time = Instant::now();
     let mut static_obs_gpu = Tensor::zeros(&[1, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
-    let mut full_obs_gpu = Tensor::zeros(
+    let mut full_obs_raw_gpu = Tensor::zeros(
         &[1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
         (Kind::Float, device),
     );
+    let mut full_obs_gpu = Tensor::zeros(&[1, model.price_input_dim()], (Kind::Float, device));
     let mut step_obs_gpu = Tensor::zeros(&[TICKERS_COUNT as i64], (Kind::Float, device));
     loop {
         if step >= max_steps {
@@ -396,10 +407,22 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
             // Subsequent steps: use single delta per ticker for O(1) inference
             let price_deltas_gpu = if !state_guard.model_initialized {
                 state_guard.model_initialized = true;
-                full_obs_gpu.copy_(&price_deltas_tensor);
+                for deltas in &mut state_guard.pending_deltas {
+                    deltas.clear();
+                }
+                full_obs_raw_gpu.copy_(&price_deltas_tensor);
+                if model.variant() == ModelVariant::Uniform256Stream {
+                    let layout = model.uniform_stream_layout_from_raw_input(&full_obs_raw_gpu);
+                    full_obs_gpu.copy_(&layout);
+                } else {
+                    full_obs_gpu.copy_(&full_obs_raw_gpu);
+                }
                 &full_obs_gpu
             } else {
-                let step_deltas = state_guard.get_step_deltas();
+                let Some(step_deltas) = state_guard.take_step_deltas() else {
+                    println!("No fresh market delta available yet, skipping inference step");
+                    continue;
+                };
                 step_obs_gpu.copy_(&step_deltas);
                 &step_obs_gpu
             };
