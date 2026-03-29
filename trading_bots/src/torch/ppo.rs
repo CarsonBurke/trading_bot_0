@@ -18,7 +18,7 @@ use shared::{paths::RUNS_PATH, run_dir::RunDir};
 const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
-const CHUNK_SIZE: i64 = 128;q
+const CHUNK_SIZE: i64 = 128;
 const OPTIM_EPOCHS: i64 = 3;
 const PPO_CLIP_LOW: f64 = 0.2;
 const PPO_CLIP_HIGH: f64 = 0.2;
