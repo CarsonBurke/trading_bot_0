@@ -1,7 +1,7 @@
 use std::env;
 use std::path::Path;
 use std::time::Instant;
-use tch::{autocast, nn, nn::OptimizerConfig, Kind, Tensor};
+use tch::{autocast, nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::action_space::{
     gaussian_entropy, implicit_cash_weights, transformed_action_log_prob,
@@ -9,7 +9,7 @@ use crate::torch::action_space::{
 use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
-use crate::torch::env::VecEnv;
+use crate::torch::env::{CpuStepBatch, VecEnv};
 use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelConfig};
 use crate::torch::sdp::force_flash_sdp;
 use crate::torch::two_hot::TwoHotBins;
@@ -18,7 +18,7 @@ use shared::{paths::RUNS_PATH, run_dir::RunDir};
 const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
-const CHUNK_SIZE: i64 = 128;
+const CHUNK_SIZE: i64 = 128;q
 const OPTIM_EPOCHS: i64 = 3;
 const PPO_CLIP_LOW: f64 = 0.2;
 const PPO_CLIP_HIGH: f64 = 0.2;
@@ -73,6 +73,10 @@ fn log_tensor_summary(name: &str, t: &Tensor) {
         "  {}: mean={:.6} min={:.6} max={:.6} abs_max={:.6}",
         name, mean, min, max, abs_max
     );
+}
+
+fn cpu_tensor_from_f32(data: &[f32], size: &[i64]) -> Tensor {
+    unsafe { Tensor::from_blob(data.as_ptr() as *const u8, size, &[], Kind::Float, Device::Cpu) }
 }
 
 struct GpuRollingBuffer {
@@ -411,6 +415,13 @@ pub async fn train(
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
+        let mut cpu_step_batch = CpuStepBatch::new(
+            NPROCS as usize,
+            ACTION_COUNT as usize,
+            TICKERS_COUNT as usize,
+            STATIC_OBSERVATIONS,
+            raw_pd_dim as usize,
+        );
         for step in 0..rollout_steps as usize {
             let mem_idx = step as i64 * NPROCS;
             let (values, action_mean, action_std, latent_actions, target_weights, action_log_prob) =
@@ -432,13 +443,25 @@ pub async fn train(
             s_price_deltas.push(&trading_model.uniform_stream_snapshot(&stream_state));
             s_static_obs.push(&obs_static);
 
-            let (reset_indices, reset_price_deltas) = env.step_into_ring_tensor(
-                &target_weights,
-                &mut step_deltas,
-                &mut obs_static,
-                &mut step_reward_per_ticker,
-                &mut step_is_done,
-            );
+            let target_weights_cpu = target_weights.to_device(Device::Cpu).to_kind(Kind::Float);
+            let actions_len = cpu_step_batch.actions_f32.len();
+            target_weights_cpu.copy_data(&mut cpu_step_batch.actions_f32, actions_len);
+            env.step_from_actions_f32(&mut cpu_step_batch);
+            step_deltas.copy_(&cpu_tensor_from_f32(
+                &cpu_step_batch.step_deltas,
+                &[NPROCS, TICKERS_COUNT],
+            ));
+            obs_static.copy_(&cpu_tensor_from_f32(
+                &cpu_step_batch.static_obs,
+                &[NPROCS, STATIC_OBSERVATIONS as i64],
+            ));
+            step_reward_per_ticker.copy_(&cpu_tensor_from_f32(
+                &cpu_step_batch.reward_per_ticker,
+                &[NPROCS, TICKERS_COUNT],
+            ));
+            step_is_done.copy_(&cpu_tensor_from_f32(&cpu_step_batch.is_done, &[NPROCS]));
+            let reset_indices = &cpu_step_batch.reset_indices;
+            let reset_price_deltas = &cpu_step_batch.reset_price_deltas;
 
             ring_pos = (ring_pos + 1) % ring_len;
             let _ = ring_buf

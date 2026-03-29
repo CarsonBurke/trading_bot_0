@@ -8,4 +8,4 @@ mod trade;
 mod vec_env;
 
 pub use env::Env;
-pub use vec_env::VecEnv;
+pub use vec_env::{CpuStepBatch, VecEnv};

@@ -8,13 +8,38 @@ use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use tch::{Device, Tensor};
 
+pub struct CpuStepBatch {
+    pub actions_f32: Vec<f32>,
+    actions_f64: Vec<f64>,
+    pub step_deltas: Vec<f32>,
+    pub static_obs: Vec<f32>,
+    pub reward_per_ticker: Vec<f32>,
+    pub is_done: Vec<f32>,
+    pub reset_indices: Vec<usize>,
+    pub reset_price_deltas: Vec<f32>,
+}
+
+impl CpuStepBatch {
+    pub fn new(nprocs: usize, action_dim: usize, tickers: usize, static_obs_dim: usize, pd_dim: usize) -> Self {
+        Self {
+            actions_f32: vec![0.0; nprocs * action_dim],
+            actions_f64: vec![0.0; nprocs * action_dim],
+            step_deltas: vec![0.0; nprocs * tickers],
+            static_obs: vec![0.0; nprocs * static_obs_dim],
+            reward_per_ticker: vec![0.0; nprocs * tickers],
+            is_done: vec![0.0; nprocs],
+            reset_indices: Vec::with_capacity(nprocs),
+            reset_price_deltas: Vec::with_capacity(nprocs * pd_dim),
+        }
+    }
+}
+
 pub struct VecEnv {
     pub envs: Vec<Env>,
     done_mask: Vec<bool>,
     last_static_obs: Vec<f32>,
     last_step_deltas: Vec<f32>,
     step_deltas_buf: Vec<f32>,
-    actions_buf: Vec<f64>,
     reward_buf: Vec<f32>,
     reward_per_ticker_buf: Vec<f32>,
     is_done_buf: Vec<f32>,
@@ -55,14 +80,12 @@ impl VecEnv {
         let last_static_obs = vec![0.0; NPROCS as usize * STATIC_OBSERVATIONS];
         let last_step_deltas = vec![0.0; NPROCS as usize * TICKERS_COUNT as usize];
         let step_deltas_buf = vec![0.0; NPROCS as usize * TICKERS_COUNT as usize];
-        let actions_buf = vec![0.0f64; NPROCS as usize * ACTION_COUNT as usize];
         Self {
             envs,
             done_mask,
             last_static_obs,
             last_step_deltas,
             step_deltas_buf,
-            actions_buf,
             reward_buf: vec![0.0; NPROCS as usize],
             reward_per_ticker_buf: vec![0.0; NPROCS as usize * TICKERS_COUNT as usize],
             is_done_buf: vec![0.0; NPROCS as usize],
@@ -385,14 +408,7 @@ impl VecEnv {
         self.step_incremental(&actions_flat, out_static_obs)
     }
 
-    pub fn step_into_ring_flat(
-        &mut self,
-        all_actions: &[f64],
-        out_step_deltas: &mut Tensor,
-        out_static_obs: &mut Tensor,
-        out_reward_per_ticker: &mut Tensor,
-        out_is_done: &mut Tensor,
-    ) -> (Vec<usize>, Vec<f32>) {
+    fn step_into_ring_cpu(&mut self, all_actions: &[f64]) -> (Vec<usize>, Vec<f32>) {
         let action_dim = ACTION_COUNT as usize;
         debug_assert_eq!(all_actions.len(), self.envs.len() * action_dim);
 
@@ -459,6 +475,19 @@ impl VecEnv {
             }
         }
 
+        (reset_indices, reset_price_deltas)
+    }
+
+    pub fn step_into_ring_flat(
+        &mut self,
+        all_actions: &[f64],
+        out_step_deltas: &mut Tensor,
+        out_static_obs: &mut Tensor,
+        out_reward_per_ticker: &mut Tensor,
+        out_is_done: &mut Tensor,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let (reset_indices, reset_price_deltas) = self.step_into_ring_cpu(all_actions);
+
         let deltas_cpu = self.tensor_from_f32(&self.step_deltas_buf, &[NPROCS, TICKERS_COUNT]);
         out_step_deltas.copy_(&deltas_cpu);
 
@@ -473,27 +502,20 @@ impl VecEnv {
         (reset_indices, reset_price_deltas)
     }
 
-    pub fn step_into_ring_tensor(
-        &mut self,
-        actions: &Tensor,
-        out_step_deltas: &mut Tensor,
-        out_static_obs: &mut Tensor,
-        out_reward_per_ticker: &mut Tensor,
-        out_is_done: &mut Tensor,
-    ) -> (Vec<usize>, Vec<f32>) {
-        let actions_cpu = actions.to_device(Device::Cpu).to_kind(tch::Kind::Double);
-        let actions_len = self.actions_buf.len();
-        actions_cpu.copy_data(&mut self.actions_buf, actions_len);
-        let actions_ptr = self.actions_buf.as_ptr();
-        let actions_len = self.actions_buf.len();
-        let actions_slice = unsafe { std::slice::from_raw_parts(actions_ptr, actions_len) };
-        self.step_into_ring_flat(
-            actions_slice,
-            out_step_deltas,
-            out_static_obs,
-            out_reward_per_ticker,
-            out_is_done,
-        )
+    pub fn step_from_actions_f32(&mut self, batch: &mut CpuStepBatch) {
+        debug_assert_eq!(batch.actions_f32.len(), self.envs.len() * ACTION_COUNT as usize);
+        for (dst, src) in batch.actions_f64.iter_mut().zip(batch.actions_f32.iter()) {
+            *dst = *src as f64;
+        }
+        batch.reset_indices.clear();
+        batch.reset_price_deltas.clear();
+        let (reset_indices, reset_price_deltas) = self.step_into_ring_cpu(&batch.actions_f64);
+        batch.step_deltas.copy_from_slice(&self.step_deltas_buf);
+        batch.static_obs.copy_from_slice(&self.static_obs_buf);
+        batch.reward_per_ticker.copy_from_slice(&self.reward_per_ticker_buf);
+        batch.is_done.copy_from_slice(&self.is_done_buf);
+        batch.reset_indices = reset_indices;
+        batch.reset_price_deltas = reset_price_deltas;
     }
 
     pub fn max_step(&self) -> usize {
