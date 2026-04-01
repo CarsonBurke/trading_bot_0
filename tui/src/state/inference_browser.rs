@@ -103,7 +103,9 @@ impl InferenceBrowserState {
         let visible_height = self.list_area.height.saturating_sub(2) as usize;
         let center = visible_height / 2;
         let offset = selected.saturating_sub(center);
-        self.list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
+        self.list_state = ListState::default()
+            .with_selected(Some(selected))
+            .with_offset(offset);
     }
 
     pub fn next(&mut self) {

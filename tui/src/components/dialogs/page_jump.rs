@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::{theme, AppMode};
 use super::base::BaseDialog;
+use crate::{theme, AppMode};
 
 pub fn render(f: &mut Frame, selected: usize, current_mode: AppMode) {
     let inner = BaseDialog::new(" Go to Page ")
@@ -29,7 +29,7 @@ pub fn render(f: &mut Frame, selected: usize, current_mode: AppMode) {
         (Some(AppMode::Main), "1", "Dashboard"),
         (Some(AppMode::GenerationBrowser), "2", "Episodes"),
         (Some(AppMode::InferenceBrowser), "3", "Inferences"),
-        (None, "4", "Meta Charts"),  // Special case: ChartViewer with meta charts
+        (None, "4", "Meta Charts"), // Special case: ChartViewer with meta charts
         (Some(AppMode::Logs), "5", "Logs"),
     ];
 
@@ -47,7 +47,10 @@ pub fn render(f: &mut Frame, selected: usize, current_mode: AppMode) {
             let suffix = if is_current { " (current)" } else { "" };
 
             let style = if is_selected {
-                Style::default().fg(theme::BASE).bg(theme::LAVENDER).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::BASE)
+                    .bg(theme::LAVENDER)
+                    .add_modifier(Modifier::BOLD)
             } else if is_current {
                 Style::default().fg(theme::SUBTEXT0)
             } else {
@@ -59,9 +62,14 @@ pub fn render(f: &mut Frame, selected: usize, current_mode: AppMode) {
                 Span::styled(
                     format!("[{}]", key),
                     if is_selected {
-                        Style::default().fg(theme::BASE).bg(theme::LAVENDER).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(theme::BASE)
+                            .bg(theme::LAVENDER)
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(theme::PEACH).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(theme::PEACH)
+                            .add_modifier(Modifier::BOLD)
                     },
                 ),
                 Span::styled(format!(" {}{}", name, suffix), style),
@@ -69,19 +77,36 @@ pub fn render(f: &mut Frame, selected: usize, current_mode: AppMode) {
         })
         .collect();
 
-    let pages_widget = Paragraph::new(page_lines)
-        .style(Style::default().bg(theme::BASE));
+    let pages_widget = Paragraph::new(page_lines).style(Style::default().bg(theme::BASE));
     f.render_widget(pages_widget, chunks[0]);
 
     // Help bar
     let help = Paragraph::new(vec![Line::from(vec![
-        Span::styled("1-5", Style::default().fg(theme::PEACH).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "1-5",
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" Jump  ", Style::default().fg(theme::SUBTEXT1)),
-        Span::styled("j/k", Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "j/k",
+            Style::default()
+                .fg(theme::BLUE)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" Navigate  ", Style::default().fg(theme::SUBTEXT1)),
-        Span::styled("Enter", Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" Go  ", Style::default().fg(theme::SUBTEXT1)),
-        Span::styled("Esc", Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Esc",
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" Cancel", Style::default().fg(theme::SUBTEXT1)),
     ])])
     .style(Style::default().bg(theme::BASE))

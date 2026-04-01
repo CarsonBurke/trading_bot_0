@@ -1,6 +1,6 @@
-use std::sync::{Arc, OnceLock, Mutex};
-use std::collections::HashMap;
 use crate::data::EarningsReport;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Global cache for earnings indicators (ticker -> indicators)
 static EARNINGS_CACHE: OnceLock<Mutex<HashMap<String, Arc<EarningsIndicators>>>> = OnceLock::new();
@@ -21,6 +21,15 @@ pub struct EarningsIndicators {
 }
 
 impl EarningsIndicators {
+    pub fn get_cached(ticker: &str, prices_len: usize) -> Option<Arc<EarningsIndicators>> {
+        let cache = get_cache();
+        let locked = cache.lock().unwrap();
+        locked
+            .get(ticker)
+            .filter(|cached| cached.eps.len() == prices_len)
+            .cloned()
+    }
+
     /// Get cached earnings indicators or compute if not present
     pub fn get_or_compute(
         ticker: &str,
@@ -28,21 +37,19 @@ impl EarningsIndicators {
         bar_dates: &[String],
         prices: &[f64],
     ) -> Arc<EarningsIndicators> {
-        let cache = get_cache();
-        {
-            let locked = cache.lock().unwrap();
-            if let Some(cached) = locked.get(ticker) {
-                if cached.eps.len() == prices.len() {
-                    return cached.clone();
-                }
-            }
+        if let Some(cached) = Self::get_cached(ticker, prices.len()) {
+            return cached;
         }
+        let cache = get_cache();
         let computed = if reports.is_empty() {
             Arc::new(Self::empty(prices.len()))
         } else {
             Arc::new(Self::compute(reports, bar_dates, prices))
         };
-        cache.lock().unwrap().insert(ticker.to_string(), computed.clone());
+        cache
+            .lock()
+            .unwrap()
+            .insert(ticker.to_string(), computed.clone());
         computed
     }
 
@@ -74,6 +81,11 @@ impl EarningsIndicators {
         for (i, bar_date) in bar_dates.iter().enumerate() {
             while report_idx + 1 < reports.len() && reports[report_idx + 1].date <= *bar_date {
                 report_idx += 1;
+            }
+
+            // No report published yet at this bar's date — leave zeros
+            if reports[report_idx].date > *bar_date {
+                continue;
             }
 
             let report = &reports[report_idx];

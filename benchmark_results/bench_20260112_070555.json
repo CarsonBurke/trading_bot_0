@@ -1,0 +1,97 @@
+{
+  "timestamp": "2026-01-12T07:05:55.367685071Z",
+  "git_commit": "1f45cb12",
+  "cuda_version": null,
+  "results": [
+    {
+      "name": "mamba2_forward_train",
+      "time_ms": 1.3362555849999997,
+      "config": {
+        "batch": 4,
+        "seq_len": 4096,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "mamba2_fwd_bwd_train",
+      "time_ms": 1.4845297299999998,
+      "config": {
+        "batch": 4,
+        "seq_len": 4096,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "mamba2_infer_prefill",
+      "time_ms": 7.716727775000001,
+      "config": {
+        "batch": 4,
+        "seq_len": 4096,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "mamba2_infer_step",
+      "time_ms": 0.12344849300000002,
+      "config": {
+        "batch": 4,
+        "seq_len": 1,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_forward_infer_b1",
+      "time_ms": 2.01298096,
+      "config": {
+        "batch": 1,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_fwd_bwd_train_b1",
+      "time_ms": 5.76428676,
+      "config": {
+        "batch": 1,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_forward_infer_b4",
+      "time_ms": 2.10252927,
+      "config": {
+        "batch": 4,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_fwd_bwd_train_b4",
+      "time_ms": 5.343121099999999,
+      "config": {
+        "batch": 4,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_forward_infer_b8",
+      "time_ms": 1.8116280900000001,
+      "config": {
+        "batch": 8,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_fwd_bwd_train_b8",
+      "time_ms": 5.23019402,
+      "config": {
+        "batch": 8,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    }
+  ]
+}

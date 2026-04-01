@@ -1,0 +1,97 @@
+{
+  "timestamp": "2026-01-12T07:03:05.920241005Z",
+  "git_commit": "1f45cb12",
+  "cuda_version": null,
+  "results": [
+    {
+      "name": "mamba2_forward_train",
+      "time_ms": 1.10377404,
+      "config": {
+        "batch": 4,
+        "seq_len": 4096,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "mamba2_fwd_bwd_train",
+      "time_ms": 1.220625005,
+      "config": {
+        "batch": 4,
+        "seq_len": 4096,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "mamba2_infer_prefill",
+      "time_ms": 6.40127887,
+      "config": {
+        "batch": 4,
+        "seq_len": 4096,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "mamba2_infer_step",
+      "time_ms": 0.1192597705,
+      "config": {
+        "batch": 4,
+        "seq_len": 1,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_forward_infer_b1",
+      "time_ms": 1.33917584,
+      "config": {
+        "batch": 1,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_fwd_bwd_train_b1",
+      "time_ms": 5.27447275,
+      "config": {
+        "batch": 1,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_forward_infer_b4",
+      "time_ms": 1.36617117,
+      "config": {
+        "batch": 4,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_fwd_bwd_train_b4",
+      "time_ms": 5.177938210000001,
+      "config": {
+        "batch": 4,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_forward_infer_b8",
+      "time_ms": 1.34803109,
+      "config": {
+        "batch": 8,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "model_fwd_bwd_train_b8",
+      "time_ms": 5.01792306,
+      "config": {
+        "batch": 8,
+        "seq_len": 3400,
+        "dtype": "BFloat16"
+      }
+    }
+  ]
+}

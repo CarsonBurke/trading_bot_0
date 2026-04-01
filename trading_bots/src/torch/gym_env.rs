@@ -1,5 +1,5 @@
 //! Wrappers around the Python API of the OpenAI gym.
-use cpython::{NoArgs, ObjectProtocol, PyObject, PyResult, Python, ToPyObject};
+use pyo3::prelude::*;
 use tch::Tensor;
 
 /// The return value for a step.
@@ -14,13 +14,18 @@ pub struct Step<A> {
 impl<A: Copy> Step<A> {
     /// Returns a copy of this step changing the observation tensor.
     pub fn copy_with_obs(&self, obs: &Tensor) -> Step<A> {
-        Step { obs: obs.copy(), action: self.action, reward: self.reward, is_done: self.is_done }
+        Step {
+            obs: obs.copy(),
+            action: self.action,
+            reward: self.reward,
+            is_done: self.is_done,
+        }
     }
 }
 
 /// An OpenAI Gym session.
 pub struct GymEnv {
-    env: PyObject,
+    env: Py<PyAny>,
     action_space: i64,
     observation_space: Vec<i64>,
 }
@@ -28,41 +33,55 @@ pub struct GymEnv {
 impl GymEnv {
     /// Creates a new session of the specified OpenAI Gym environment.
     pub fn new(name: &str) -> PyResult<GymEnv> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-        let gym = py.import("gym")?;
-        let env = gym.call(py, "make", (name,), None)?;
-        let _ = env.call_method(py, "seed", (42,), None)?;
-        let action_space = env.getattr(py, "action_space")?;
-        let action_space = if let Ok(val) = action_space.getattr(py, "n") {
-            val.extract(py)?
-        } else {
-            let action_space: Vec<i64> = action_space.getattr(py, "shape")?.extract(py)?;
-            action_space[0]
-        };
-        let observation_space = env.getattr(py, "observation_space")?;
-        let observation_space = observation_space.getattr(py, "shape")?.extract(py)?;
-        Ok(GymEnv { env, action_space, observation_space })
+        Python::with_gil(|py| {
+            let gym = py.import("gym")?;
+            let env = gym.call_method1("make", (name,))?;
+            let _ = env.call_method1("seed", (42,))?;
+            
+            let action_space = env.getattr("action_space")?;
+            let action_space = if let Ok(val) = action_space.getattr("n") {
+                val.extract()?
+            } else {
+                let action_space: Vec<i64> = action_space.getattr("shape")?.extract()?;
+                action_space[0]
+            };
+            
+            let observation_space = env.getattr("observation_space")?;
+            let observation_space: Vec<i64> = observation_space.getattr("shape")?.extract()?;
+            
+            Ok(GymEnv {
+                env: env.into(),
+                action_space,
+                observation_space,
+            })
+        })
     }
 
     /// Resets the environment, returning the observation tensor.
     pub fn reset(&self) -> PyResult<Tensor> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-        let obs = self.env.call_method(py, "reset", NoArgs, None)?;
-        Ok(Tensor::from_slice(&obs.extract::<Vec<f32>>(py)?))
+        Python::with_gil(|py| {
+            let obs = self.env.call_method0(py, "reset")?;
+            let obs_vec: Vec<f32> = obs.extract(py)?;
+            Ok(Tensor::from_slice(&obs_vec))
+        })
     }
 
     /// Applies an environment step using the specified action.
-    pub fn step<A: ToPyObject + Copy>(&self, action: A) -> PyResult<Step<A>> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-        let step = self.env.call_method(py, "step", (action,), None)?;
-        Ok(Step {
-            obs: Tensor::from_slice(&step.get_item(py, 0)?.extract::<Vec<f32>>(py)?),
-            reward: step.get_item(py, 1)?.extract(py)?,
-            is_done: step.get_item(py, 2)?.extract(py)?,
-            action,
+    pub fn step<A: IntoPy<Py<PyAny>> + Copy>(&self, action: A) -> PyResult<Step<A>> {
+        Python::with_gil(|py| {
+            let step = self.env.call_method1(py, "step", (action,))?;
+            let step = step.bind(py);
+            
+            let obs: Vec<f32> = step.get_item(0)?.extract()?;
+            let reward: f64 = step.get_item(1)?.extract()?;
+            let is_done: bool = step.get_item(2)?.extract()?;
+            
+            Ok(Step {
+                obs: Tensor::from_slice(&obs),
+                reward,
+                is_done,
+                action,
+            })
         })
     }
 

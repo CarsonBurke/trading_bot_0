@@ -1,14 +1,17 @@
-use tch::{Device, Tensor};
-use std::path::Path;
-use std::time::Instant;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
+use tch::{Device, Kind, Tensor};
 
 use ibapi::{
     accounts::{types::AccountGroup, AccountSummaryResult, AccountSummaryTags, PositionUpdate},
     contracts::Contract,
-    market_data::{realtime::{BarSize, WhatToShow}, TradingHours},
+    market_data::{
+        realtime::{BarSize, WhatToShow},
+        TradingHours,
+    },
     Client,
 };
 
@@ -17,7 +20,8 @@ use crate::torch::constants::{
     ACTION_HISTORY_LEN, ACTION_THRESHOLD, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS,
     PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
-use crate::torch::infer::{load_model, sample_actions_from_dist};
+use crate::torch::infer::{load_model, sample_actions};
+use crate::torch::model::ModelVariant;
 use crate::types::Account;
 
 const MAX_ACCOUNT_VALUE: Option<f64> = Some(10_000.0);
@@ -32,8 +36,8 @@ struct LiveMarketState {
     steps_since_trade: Vec<usize>,
     position_open_step: Vec<Option<usize>>,
     trade_activity_ema: Vec<f64>,
-    /// Track latest delta per ticker for streaming inference
-    latest_deltas: Vec<f64>,
+    /// Pending deltas per ticker for streaming inference.
+    pending_deltas: Vec<VecDeque<f64>>,
     /// Whether model has been initialized with full observation
     model_initialized: bool,
 }
@@ -50,7 +54,7 @@ impl LiveMarketState {
             steps_since_trade: vec![0; ticker_count],
             position_open_step: vec![None; ticker_count],
             trade_activity_ema: vec![0.0; ticker_count],
-            latest_deltas: vec![0.0; ticker_count],
+            pending_deltas: vec![VecDeque::new(); ticker_count],
             model_initialized: false,
         }
     }
@@ -71,7 +75,7 @@ impl LiveMarketState {
                 self.price_deltas[ticker_idx].pop_front();
             }
 
-            self.latest_deltas[ticker_idx] = delta;
+            self.pending_deltas[ticker_idx].push_back(delta);
         }
     }
 
@@ -84,7 +88,9 @@ impl LiveMarketState {
 
     fn update_account_total(&mut self) {
         let current_prices = self.get_current_prices();
-        let position_values: f64 = self.account.positions
+        let position_values: f64 = self
+            .account
+            .positions
             .iter()
             .enumerate()
             .map(|(i, p)| p.value_with_price(current_prices[i]))
@@ -93,14 +99,18 @@ impl LiveMarketState {
     }
 
     fn build_observation(&self) -> Option<(Tensor, Tensor)> {
-        if self.price_deltas.iter().any(|d| d.len() < PRICE_DELTAS_PER_TICKER) {
+        if self
+            .price_deltas
+            .iter()
+            .any(|d| d.len() < PRICE_DELTAS_PER_TICKER)
+        {
             return None;
         }
 
         let mut price_deltas_flat =
             Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER);
         for ticker_deltas in &self.price_deltas {
-            for &delta in ticker_deltas.iter().rev().take(PRICE_DELTAS_PER_TICKER) {
+            for &delta in ticker_deltas.iter().take(PRICE_DELTAS_PER_TICKER) {
                 price_deltas_flat.push(delta as f32);
             }
         }
@@ -139,8 +149,8 @@ impl LiveMarketState {
 
             // Momentum (20-step lookback)
             let momentum = if self.prices[ticker_idx].len() >= 20 {
-                let past_price = self.prices[ticker_idx]
-                    [self.prices[ticker_idx].len().saturating_sub(20)];
+                let past_price =
+                    self.prices[ticker_idx][self.prices[ticker_idx].len().saturating_sub(20)];
                 (current_price / past_price - 1.0) as f32
             } else {
                 0.0f32
@@ -156,7 +166,9 @@ impl LiveMarketState {
 
             // Position age (normalized: 0 = no position, higher = longer held)
             let position_age = match self.position_open_step[ticker_idx] {
-                Some(open_step) => (self.step_count.saturating_sub(open_step) as f64 / 500.0).min(1.0),
+                Some(open_step) => {
+                    (self.step_count.saturating_sub(open_step) as f64 / 500.0).min(1.0)
+                }
                 None => 0.0,
             };
             static_obs.push(position_age as f32);
@@ -184,10 +196,20 @@ impl LiveMarketState {
         Some((price_deltas_tensor, static_obs_tensor))
     }
 
-    /// Get step deltas for streaming inference (single delta per ticker)
-    fn get_step_deltas(&self) -> Tensor {
-        let step_deltas: Vec<f32> = self.latest_deltas.iter().map(|&d| d as f32).collect();
-        Tensor::from_slice(&step_deltas)
+    fn has_pending_step(&self) -> bool {
+        self.pending_deltas.iter().all(|deltas| !deltas.is_empty())
+    }
+
+    /// Take the next pending step delta per ticker for streaming inference.
+    fn take_step_deltas(&mut self) -> Option<Tensor> {
+        if !self.has_pending_step() {
+            return None;
+        }
+        let mut step_deltas = Vec::with_capacity(self.pending_deltas.len());
+        for deltas in &mut self.pending_deltas {
+            step_deltas.push(deltas.pop_front().unwrap_or(0.0) as f32);
+        }
+        Some(Tensor::from_slice(&step_deltas))
     }
 }
 
@@ -196,17 +218,17 @@ fn sync_account_from_ibkr(
     symbols: &[String],
     account: &mut Account,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let account_subscription = client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
+    let account_subscription =
+        client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
 
     for update in &account_subscription {
         match update {
             AccountSummaryResult::Summary(summary) => {
                 if summary.tag == "TotalCashValue" {
-                    account.cash = summary.value.parse::<f64>()
-                        .unwrap_or_else(|_| {
-                            println!("Warning: Could not parse cash value");
-                            account.cash
-                        });
+                    account.cash = summary.value.parse::<f64>().unwrap_or_else(|_| {
+                        println!("Warning: Could not parse cash value");
+                        account.cash
+                    });
 
                     if let Some(max_value) = MAX_ACCOUNT_VALUE {
                         account.cash = account.cash.min(max_value);
@@ -235,7 +257,10 @@ fn sync_account_from_ibkr(
     for position in &positions_subscription {
         match position {
             PositionUpdate::Position(pos) => {
-                if let Some(ticker_idx) = symbols.iter().position(|s| s == pos.contract.symbol.as_str()) {
+                if let Some(ticker_idx) = symbols
+                    .iter()
+                    .position(|s| s == pos.contract.symbol.as_str())
+                {
                     account.positions[ticker_idx].quantity = pos.position;
                     account.positions[ticker_idx].avg_price = pos.average_cost;
                 }
@@ -255,7 +280,8 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     symbols: Vec<String>,
     update_interval_secs: u64,
     max_steps: usize,
-    temperature: f64,
+    _temperature: f64,
+    model_variant: ModelVariant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== IBKR Paper Trading ===");
     println!("Weight path: {:?}", weight_path.as_ref());
@@ -266,22 +292,28 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     let client = Client::connect(api::CONNECTION_URL, 100)?;
     println!("Connected to IBKR");
 
-    let account_subscription = client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
+    let account_subscription =
+        client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
 
     let mut starting_cash = 0.0;
     for update in &account_subscription {
         match update {
             AccountSummaryResult::Summary(summary) => {
                 if summary.tag == "TotalCashValue" {
-                    starting_cash = summary.value.parse::<f64>()
-                        .unwrap_or_else(|_| {
-                            println!("Warning: Could not parse cash value '{}', using 0.0", summary.value);
-                            0.0
-                        });
+                    starting_cash = summary.value.parse::<f64>().unwrap_or_else(|_| {
+                        println!(
+                            "Warning: Could not parse cash value '{}', using 0.0",
+                            summary.value
+                        );
+                        0.0
+                    });
 
                     if let Some(max_value) = MAX_ACCOUNT_VALUE {
                         starting_cash = starting_cash.min(max_value);
-                        println!("Account cash: ${:.2} (limited to ${:.2})", starting_cash, max_value);
+                        println!(
+                            "Account cash: ${:.2} (limited to ${:.2})",
+                            starting_cash, max_value
+                        );
                     } else {
                         println!("Account cash: ${:.2}", starting_cash);
                     }
@@ -304,11 +336,14 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     drop(account_subscription);
 
     let device = Device::cuda_if_available();
-    let (_vs, model) = load_model(weight_path, device)?;
+    let (_vs, model) = load_model(weight_path, device, model_variant)?;
     let mut stream_state = model.init_stream_state();
 
     let ticker_count = symbols.len();
-    let state = Arc::new(Mutex::new(LiveMarketState::new(ticker_count, starting_cash)));
+    let state = Arc::new(Mutex::new(LiveMarketState::new(
+        ticker_count,
+        starting_cash,
+    )));
 
     let client_arc = Arc::new(client);
 
@@ -340,10 +375,19 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
         });
     }
 
-    thread::sleep(std::time::Duration::from_secs(PRICE_DELTAS_PER_TICKER as u64 / 12 + 10));
+    thread::sleep(std::time::Duration::from_secs(
+        PRICE_DELTAS_PER_TICKER as u64 / 12 + 10,
+    ));
 
     let mut step = 0;
     let start_time = Instant::now();
+    let mut static_obs_gpu = Tensor::zeros(&[1, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
+    let mut full_obs_raw_gpu = Tensor::zeros(
+        &[1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
+        (Kind::Float, device),
+    );
+    let mut full_obs_gpu = Tensor::zeros(&[1, model.price_input_dim()], (Kind::Float, device));
+    let mut step_obs_gpu = Tensor::zeros(&[TICKERS_COUNT as i64], (Kind::Float, device));
     loop {
         if step >= max_steps {
             break;
@@ -357,27 +401,42 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
         state_guard.update_account_total();
 
         if let Some((price_deltas_tensor, static_obs_tensor)) = state_guard.build_observation() {
-            let static_obs_gpu = static_obs_tensor.to_device(device);
+            static_obs_gpu.copy_(&static_obs_tensor);
 
             // First step: use full observation to initialize streaming state
             // Subsequent steps: use single delta per ticker for O(1) inference
             let price_deltas_gpu = if !state_guard.model_initialized {
                 state_guard.model_initialized = true;
-                price_deltas_tensor.to_device(device)
+                for deltas in &mut state_guard.pending_deltas {
+                    deltas.clear();
+                }
+                full_obs_raw_gpu.copy_(&price_deltas_tensor);
+                if model.variant() == ModelVariant::Uniform256Stream {
+                    let layout = model.uniform_stream_layout_from_raw_input(&full_obs_raw_gpu);
+                    full_obs_gpu.copy_(&layout);
+                } else {
+                    full_obs_gpu.copy_(&full_obs_raw_gpu);
+                }
+                &full_obs_gpu
             } else {
-                state_guard.get_step_deltas().to_device(device)
+                let Some(step_deltas) = state_guard.take_step_deltas() else {
+                    println!("No fresh market delta available yet, skipping inference step");
+                    continue;
+                };
+                step_obs_gpu.copy_(&step_deltas);
+                &step_obs_gpu
             };
 
-            let (action_mean, action_log_std) = tch::no_grad(|| {
-                let (_, _, (action_mean, action_log_std), _) =
-                    model.step(&price_deltas_gpu, &static_obs_gpu, &mut stream_state);
-                (action_mean, action_log_std)
+            let (action_mean, action_noise_std) = tch::no_grad(|| {
+                let (_, action_mean, action_noise_std) =
+                    model.step_on_device(price_deltas_gpu, &static_obs_gpu, &mut stream_state);
+                (action_mean, action_noise_std)
             });
-            let actions = sample_actions_from_dist(
+            let actions = sample_actions(
                 &action_mean,
-                &action_log_std,
-                true,
-                0.0,
+                &action_noise_std,
+                true, // deterministic
+                0.0,  // temperature
             );
 
             let actions_vec = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
@@ -404,9 +463,16 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 print_status(step, &state_guard, &start_time);
             }
         } else {
-            println!("Waiting for sufficient price data... ({}/{})",
-                state_guard.price_deltas.iter().map(|d| d.len()).min().unwrap_or(0),
-                PRICE_DELTAS_PER_TICKER);
+            println!(
+                "Waiting for sufficient price data... ({}/{})",
+                state_guard
+                    .price_deltas
+                    .iter()
+                    .map(|d| d.len())
+                    .min()
+                    .unwrap_or(0),
+                PRICE_DELTAS_PER_TICKER
+            );
         }
     }
 
@@ -414,17 +480,22 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     println!("\n=== Final Summary ===");
     println!("Total steps: {}", final_state.step_count);
     println!("Starting cash: ${:.2}", starting_cash);
-    println!("Final total assets: ${:.2}", final_state.account.total_assets);
-    println!("Total P&L: ${:.2} ({:.2}%)",
+    println!(
+        "Final total assets: ${:.2}",
+        final_state.account.total_assets
+    );
+    println!(
+        "Total P&L: ${:.2} ({:.2}%)",
         final_state.account.total_assets - starting_cash,
-        (final_state.account.total_assets / starting_cash - 1.0) * 100.0);
+        (final_state.account.total_assets / starting_cash - 1.0) * 100.0
+    );
 
     Ok(())
 }
 
 fn execute_trades(
-    client: &Arc<Client>,
-    symbols: &[String],
+    _client: &Arc<Client>,
+    _symbols: &[String],
     actions: &[f64],
     current_prices: &[f64],
     account: &Account,
@@ -434,9 +505,9 @@ fn execute_trades(
             continue;
         }
 
-        let current_price = current_prices[ticker_idx];
-        let position = &account.positions[ticker_idx];
-        
+        let _current_price = current_prices[ticker_idx];
+        let _position = &account.positions[ticker_idx];
+
         // Needs to implement new trade fn logic from step.rs
 
         // if action > 0.0 {
@@ -519,8 +590,10 @@ fn print_status(step: usize, state: &LiveMarketState, start_time: &Instant) {
         if position.quantity > 0.0 {
             let value = position.value_with_price(current_prices[i]);
             let pnl_pct = position.appreciation(current_prices[i]) * 100.0;
-            println!("Position {}: {:.2} shares @ ${:.2} (value: ${:.2}, P&L: {:.2}%)",
-                i, position.quantity, current_prices[i], value, pnl_pct);
+            println!(
+                "Position {}: {:.2} shares @ ${:.2} (value: ${:.2}, P&L: {:.2}%)",
+                i, position.quantity, current_prices[i], value, pnl_pct
+            );
         }
     }
 }

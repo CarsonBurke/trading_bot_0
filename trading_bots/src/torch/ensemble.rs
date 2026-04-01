@@ -12,7 +12,10 @@ const OUTPUT_DIM: i64 = 1; // predict next price delta
 
 fn trunc_normal(in_f: i64, out_f: i64) -> Init {
     let std = (2.0 / (in_f + out_f) as f64).sqrt() / 0.8796;
-    Init::Randn { mean: 0.0, stdev: std }
+    Init::Randn {
+        mean: 0.0,
+        stdev: std,
+    }
 }
 
 /// Returns (mean_prediction, disagreement, all_predictions for loss)
@@ -31,20 +34,29 @@ pub fn ensemble(p: &nn::Path) -> EnsembleModel {
             p / format!("ens{}_fc1", i),
             INPUT_DIM,
             HIDDEN_DIM,
-            nn::LinearConfig { ws_init: trunc_normal(INPUT_DIM, HIDDEN_DIM), ..Default::default() },
+            nn::LinearConfig {
+                ws_init: trunc_normal(INPUT_DIM, HIDDEN_DIM),
+                ..Default::default()
+            },
         );
         let fc2 = nn::linear(
             p / format!("ens{}_fc2", i),
             HIDDEN_DIM,
             HIDDEN_DIM,
-            nn::LinearConfig { ws_init: trunc_normal(HIDDEN_DIM, HIDDEN_DIM), ..Default::default() },
+            nn::LinearConfig {
+                ws_init: trunc_normal(HIDDEN_DIM, HIDDEN_DIM),
+                ..Default::default()
+            },
         );
         let out = nn::linear(
             p / format!("ens{}_out", i),
             HIDDEN_DIM,
             OUTPUT_DIM,
             nn::LinearConfig {
-                ws_init: Init::Uniform { lo: -0.01, up: 0.01 },
+                ws_init: Init::Uniform {
+                    lo: -0.01,
+                    up: 0.01,
+                },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
@@ -68,7 +80,9 @@ pub fn ensemble(p: &nn::Path) -> EnsembleModel {
         let context = deltas.narrow(2, context_start, CONTEXT_LEN);
 
         // Flatten to [batch * TICKERS, CONTEXT_LEN]
-        let context_flat = context.reshape([batch_size * TICKERS_COUNT, CONTEXT_LEN]).to_device(device);
+        let context_flat = context
+            .reshape([batch_size * TICKERS_COUNT, CONTEXT_LEN])
+            .to_device(device);
 
         let mut predictions = Vec::with_capacity(NUM_ENSEMBLE as usize);
 
@@ -89,9 +103,10 @@ pub fn ensemble(p: &nn::Path) -> EnsembleModel {
         let disagreement = stacked.std_dim(0, false, false); // [batch * TICKERS]
 
         // Average disagreement across tickers for per-sample bonus
-        let disagreement_per_step = disagreement
-            .view([batch_size, TICKERS_COUNT])
-            .mean_dim(1, false, Kind::Float); // [batch]
+        let disagreement_per_step =
+            disagreement
+                .view([batch_size, TICKERS_COUNT])
+                .mean_dim(1, false, Kind::Float); // [batch]
 
         // Log disagreement for more stable reward signal
         let disagreement_bonus = if train {

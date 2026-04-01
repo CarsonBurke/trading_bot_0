@@ -17,6 +17,7 @@ pub struct GenerationBrowserState {
     pub search_input: String,
     pub searching: bool,
     pub list_area: Rect,
+    pub gens_path: PathBuf,
 }
 
 impl GenerationBrowserState {
@@ -29,12 +30,13 @@ impl GenerationBrowserState {
             search_input: String::new(),
             searching: false,
             list_area: Rect::default(),
+            gens_path: PathBuf::from("../training/runs/latest/gens"),
         }
     }
 
     pub fn load_generations(&mut self) -> Result<()> {
         self.generations.clear();
-        let training_path = PathBuf::from("../training/gens");
+        let training_path = &self.gens_path;
 
         if !training_path.exists() {
             return Ok(());
@@ -87,7 +89,8 @@ impl GenerationBrowserState {
         }
 
         if let Some(selected) = self.list_state.selected() {
-            if selected >= self.filtered_generations.len() && !self.filtered_generations.is_empty() {
+            if selected >= self.filtered_generations.len() && !self.filtered_generations.is_empty()
+            {
                 self.list_state.select(Some(0));
                 self.center_list(0);
             } else if !self.filtered_generations.is_empty() {
@@ -103,7 +106,9 @@ impl GenerationBrowserState {
         let visible_height = self.list_area.height.saturating_sub(2) as usize;
         let center = visible_height / 2;
         let offset = selected.saturating_sub(center);
-        self.list_state = ListState::default().with_selected(Some(selected)).with_offset(offset);
+        self.list_state = ListState::default()
+            .with_selected(Some(selected))
+            .with_offset(offset);
     }
 
     pub fn next(&mut self) {

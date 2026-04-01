@@ -1,13 +1,14 @@
 use enum_map::{enum_map, EnumMap};
 use hashbrown::HashMap;
 use ibapi::market_data::historical;
-use rust_neural_network::neural_network::{NeuralNetwork};
+use rust_neural_network::neural_network::NeuralNetwork;
 
 use crate::{
-    constants::agent::{LEARNING_RATE, TARGET_AGENT_COUNT},
-    types::{Data, MappedHistorical},
+    constants::agent::TARGET_AGENT_COUNT,
+    types::MappedHistorical,
     utils::{
-        convert_historical, ema, ema_diff_percent, get_price_deltas, get_macd, get_rsi_percents, get_rsi_values, get_stochastic_oscillator, get_w_percent_range
+        convert_historical, ema_diff_percent, get_macd, get_rsi_percents,
+        get_stochastic_oscillator, get_w_percent_range,
     },
 };
 
@@ -17,9 +18,11 @@ pub fn create_networks(input_count: usize, output_count: usize) -> HashMap<u32, 
     let bias = 0.0;
     let learning_rate = 0.1;
     let layers = [input_count, 10, 10, output_count];
-    println!("Creating neural networks with bias {bias} learning rate {learning_rate} layers {layers:?}");
+    println!(
+        "Creating neural networks with bias {bias} learning rate {learning_rate} layers {layers:?}"
+    );
 
-    for i in 0..TARGET_AGENT_COUNT {
+    for _i in 0..TARGET_AGENT_COUNT {
         let mut neural_net = NeuralNetwork::new(bias, learning_rate, layers.to_vec());
         neural_net.mutate();
         neural_nets.insert(neural_net.id, neural_net);

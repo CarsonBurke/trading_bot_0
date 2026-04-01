@@ -7,7 +7,7 @@ pub struct LegendConfig;
 
 impl LegendConfig {
     pub fn position() -> SeriesLabelPosition {
-        SeriesLabelPosition::UpperRight
+        SeriesLabelPosition::UpperLeft
     }
 
     pub fn background() -> plotters::style::RGBAColor {

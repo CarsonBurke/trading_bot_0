@@ -1,5 +1,5 @@
-use std::sync::{Arc, OnceLock, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Global cache for momentum indicators (ticker -> indicators)
 static MOMENTUM_CACHE: OnceLock<Mutex<HashMap<String, Arc<MomentumIndicators>>>> = OnceLock::new();
@@ -37,7 +37,10 @@ impl MomentumIndicators {
             }
         }
         let computed = Arc::new(Self::compute(prices));
-        cache.lock().unwrap().insert(ticker.to_string(), computed.clone());
+        cache
+            .lock()
+            .unwrap()
+            .insert(ticker.to_string(), computed.clone());
         computed
     }
 

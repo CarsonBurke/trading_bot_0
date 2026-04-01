@@ -61,7 +61,12 @@ impl<'a> BaseDialog<'a> {
 
     /// Renders the dialog frame and returns the inner area for content
     pub fn render(&self, f: &mut Frame) -> Rect {
-        let area = centered_dialog(self.width_percent, self.min_height, self.max_height, f.area());
+        let area = centered_dialog(
+            self.width_percent,
+            self.min_height,
+            self.max_height,
+            f.area(),
+        );
 
         // Soft backdrop overlay
         let backdrop = Block::default().style(Style::default().bg(theme::CRUST));

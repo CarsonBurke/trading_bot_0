@@ -22,7 +22,11 @@ pub(crate) fn compute_ema(data: &[f64], alpha: f64) -> Vec<f64> {
     result
 }
 
-pub fn simple_chart(dir: &String, name: &str, data: &Data) -> Result<(), Box<dyn std::error::Error>> {
+pub fn simple_chart(
+    dir: &String,
+    name: &str,
+    data: &Data,
+) -> Result<(), Box<dyn std::error::Error>> {
     simple_chart_with_labels(dir, name, data, None, None)
 }
 
@@ -80,9 +84,7 @@ pub fn simple_chart_with_labels(
     let ema = compute_ema(data, alpha);
     chart
         .draw_series(LineSeries::new(
-            ema.iter()
-                .enumerate()
-                .map(|(i, v)| (i as u32, *v)),
+            ema.iter().enumerate().map(|(i, v)| (i as u32, *v)),
             ShapeStyle::from(&theme::YELLOW).stroke_width(1),
         ))?
         .label("EMA")

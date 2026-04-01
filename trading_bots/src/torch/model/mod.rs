@@ -3,200 +3,520 @@ mod head;
 mod inference;
 mod rmsnorm;
 
+use clap::ValueEnum;
 use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
 use crate::torch::constants::{
-    GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
+    ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER,
+    STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
-use crate::torch::ssm::{stateful_mamba_block_cfg, Mamba2Config, Mamba2State, StatefulMamba};
-
-pub use shared::constants::GLOBAL_MACRO_OBS;
+use crate::torch::two_hot::NUM_BINS;
 
 use rmsnorm::RMSNorm;
 
 struct InterTickerBlock {
     ticker_ln: RMSNorm,
-    ticker_rp_q: nn::Linear,
-    ticker_rp_v: Tensor,
-    ticker_rp_k_frozen: Tensor,
-    ticker_latent_q: nn::Linear,
-    ticker_latent_k: Tensor,
-    ticker_latent_v: Tensor,
+    ticker_qkv: nn::Linear,
     ticker_out: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
     mlp_ln: RMSNorm,
-    alpha_ticker_rp: Tensor,
-    alpha_ticker_attn: Tensor,
-    alpha_mlp: Tensor,
 }
 
 impl InterTickerBlock {
-    fn new(p: &nn::Path, kv_heads: i64, head_dim: i64, ticker_latents: i64) -> Self {
-        let _ = (kv_heads, head_dim);
-        let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), MODEL_DIM, 1e-5);
-        let ticker_rp_q = nn::linear(p / "ticker_rp_q", MODEL_DIM, MODEL_DIM, Default::default());
-        let ticker_rp_v = p.var(
-            "ticker_rp_v",
-            &[ticker_latents, MODEL_DIM],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
-            },
-        );
-        let ticker_rp_k_frozen = Tensor::randn(
-            &[ticker_latents, MODEL_DIM],
-            (Kind::Float, p.device()),
-        ) * (1.0 / (MODEL_DIM as f64).sqrt());
-        ticker_rp_k_frozen.set_requires_grad(false);
-        let ticker_latent_q =
-            nn::linear(p / "ticker_latent_q", MODEL_DIM, MODEL_DIM, Default::default());
-        let ticker_latent_k = p.var(
-            "ticker_latent_k",
-            &[ticker_latents, MODEL_DIM],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
-            },
-        );
-        let ticker_latent_v = p.var(
-            "ticker_latent_v",
-            &[ticker_latents, MODEL_DIM],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 1.0 / (MODEL_DIM as f64).sqrt(),
-            },
-        );
-        let ticker_out = nn::linear(p / "ticker_out", MODEL_DIM, MODEL_DIM, Default::default());
-        let mlp_fc1 = nn::linear(p / "mlp_fc1", MODEL_DIM, 2 * FF_DIM, Default::default());
-        let mlp_fc2 = nn::linear(p / "mlp_fc2", FF_DIM, MODEL_DIM, Default::default());
-        let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), MODEL_DIM, 1e-5);
-        let alpha_ticker_rp = p.var("alpha_ticker_rp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
-        let alpha_ticker_attn =
-            p.var("alpha_ticker_attn_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
-        let alpha_mlp = p.var("alpha_mlp_raw", &[1], Init::Const(RESIDUAL_ALPHA_INIT));
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64) -> Self {
+        let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
+        let ticker_qkv = linear_truncated(p, "ticker_qkv", model_dim, 3 * model_dim);
+        let ticker_out =
+            linear_residual_out(p, "ticker_out", model_dim, model_dim, 0.1 * init_scale);
+        let q_norm = RMSNorm::new(&(p / "q_norm"), model_dim, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "k_norm"), model_dim, 1e-6);
+        let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, 2 * ff_dim);
+        let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim, init_scale);
+        let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
         Self {
             ticker_ln,
-            ticker_rp_q,
-            ticker_rp_v,
-            ticker_rp_k_frozen,
-            ticker_latent_q,
-            ticker_latent_k,
-            ticker_latent_v,
+            ticker_qkv,
             ticker_out,
+            q_norm,
+            k_norm,
             mlp_fc1,
             mlp_fc2,
             mlp_ln,
-            alpha_ticker_rp,
-            alpha_ticker_attn,
-            alpha_mlp,
+        }
+    }
+
+    fn forward(&self, x: &Tensor, model_dim: i64, ff_dim: i64) -> Tensor {
+        let (batch, num_items, _) = x.size3().unwrap();
+        let x_norm = self
+            .ticker_ln
+            .forward(&x.reshape([batch * num_items, model_dim]))
+            .reshape([batch, num_items, model_dim]);
+        let qkv = x_norm.apply(&self.ticker_qkv);
+        let parts = qkv.split(model_dim, -1);
+        // QKNorm (single-head, head_dim == model_dim)
+        let q = self
+            .q_norm
+            .forward(&parts[0].reshape([batch * num_items, model_dim]))
+            .reshape([batch, num_items, model_dim])
+            .unsqueeze(1);
+        let k = self
+            .k_norm
+            .forward(&parts[1].reshape([batch * num_items, model_dim]))
+            .reshape([batch, num_items, model_dim])
+            .unsqueeze(1);
+        let v = parts[2].unsqueeze(1);
+        let ctx = Tensor::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            None::<&Tensor>,
+            0.0,
+            false,
+            None,
+            false,
+        )
+        .squeeze_dim(1)
+        .apply(&self.ticker_out)
+        .reshape([batch, num_items, model_dim]);
+        let x = x + ctx;
+        let mlp_in = self
+            .mlp_ln
+            .forward(&x.reshape([batch * num_items, model_dim]));
+        let mlp_proj = mlp_in.apply(&self.mlp_fc1);
+        let mlp_parts = mlp_proj.split(ff_dim, -1);
+        let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
+            .apply(&self.mlp_fc2)
+            .reshape([batch, num_items, model_dim]);
+        &x + mlp
+    }
+}
+
+const GQA_NUM_Q_HEADS: i64 = 4;
+const GQA_NUM_KV_HEADS: i64 = 2;
+
+fn rotate_half(x: &Tensor) -> Tensor {
+    let last_dim = *x.size().last().unwrap();
+    let half = last_dim / 2;
+    let x1 = x.narrow(-1, 0, half);
+    let x2 = x.narrow(-1, half, half);
+    Tensor::cat(&[&(-&x2), &x1], -1)
+}
+
+struct RotaryEmbedding {
+    cos_cached: Tensor, // [max_seq_len, head_dim]
+    sin_cached: Tensor, // [max_seq_len, head_dim]
+}
+
+impl RotaryEmbedding {
+    fn new(max_seq_len: i64, head_dim: i64, device: tch::Device) -> Self {
+        let half_dim = head_dim / 2;
+        let exponents = Tensor::arange(half_dim, (Kind::Float, device)) * (2.0 / head_dim as f64);
+        let inv_freq = (exponents * -(10000.0_f64.ln())).exp(); // [half_dim]
+        let positions = Tensor::arange(max_seq_len, (Kind::Float, device)); // [max_seq_len]
+        let angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0); // [max_seq_len, half_dim]
+        let cos_half = angles.cos();
+        let sin_half = angles.sin();
+        Self {
+            cos_cached: Tensor::cat(&[&cos_half, &cos_half], -1).set_requires_grad(false),
+            sin_cached: Tensor::cat(&[&sin_half, &sin_half], -1).set_requires_grad(false),
+        }
+    }
+
+    fn apply(&self, x: &Tensor) -> Tensor {
+        self.apply_from(x, 0)
+    }
+
+    fn apply_from(&self, x: &Tensor, offset: i64) -> Tensor {
+        // x: [batch, heads, seq_len, head_dim]
+        let seq_len = x.size()[2];
+        let cos = self.cos_cached.narrow(0, offset, seq_len).to_kind(x.kind());
+        let sin = self.sin_cached.narrow(0, offset, seq_len).to_kind(x.kind());
+        x * &cos + rotate_half(x) * &sin
+    }
+}
+
+struct GqaBlock {
+    attn_ln: RMSNorm,
+    attn_qkv: nn::Linear,
+    attn_out: nn::Linear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    q_dim: i64,
+    kv_dim: i64,
+    ffn_ln: RMSNorm,
+    ffn_fc1: nn::Linear,
+    ffn_fc2: nn::Linear,
+}
+
+impl GqaBlock {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64) -> Self {
+        let head_dim = model_dim / GQA_NUM_Q_HEADS;
+        let kv_dim = GQA_NUM_KV_HEADS * head_dim;
+        let qkv_dim = model_dim + 2 * kv_dim;
+        let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
+        let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
+        let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim, 0.1 * init_scale);
+        let q_norm = RMSNorm::new(&(p / "q_norm"), head_dim, 1e-6);
+        let k_norm = RMSNorm::new(&(p / "k_norm"), head_dim, 1e-6);
+        let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
+        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
+        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim, init_scale);
+        Self {
+            attn_ln,
+            attn_qkv,
+            attn_out,
+            q_norm,
+            k_norm,
+            q_dim: model_dim,
+            kv_dim,
+            ffn_ln,
+            ffn_fc1,
+            ffn_fc2,
+        }
+    }
+
+    fn forward(&self, x: &Tensor, rope: &RotaryEmbedding, causal: bool) -> Tensor {
+        let (b, s, _d) = x.size3().unwrap();
+        let head_dim = _d / GQA_NUM_Q_HEADS;
+
+        let (q, k, v) = self.project_qkv(x, rope, 0);
+
+        let out = Tensor::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            None::<&Tensor>,
+            0.0,
+            causal,
+            None,
+            true,
+        )
+        .permute([0, 2, 1, 3])
+        .contiguous()
+        .reshape([b, s, _d]);
+        let out = out.apply(&self.attn_out);
+        self.apply_ffn(&(x + out))
+    }
+
+    fn project_qkv(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        rope_offset: i64,
+    ) -> (Tensor, Tensor, Tensor) {
+        let (b, s, d) = x.size3().unwrap();
+        let head_dim = d / GQA_NUM_Q_HEADS;
+        let x_norm = self.attn_ln.forward(x);
+        let qkv = x_norm.apply(&self.attn_qkv);
+        let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
+        let q = parts[0]
+            .reshape([b, s, GQA_NUM_Q_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+        let k = parts[1]
+            .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+        let v = parts[2]
+            .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+        let q = self
+            .q_norm
+            .forward(&q.reshape([b * GQA_NUM_Q_HEADS * s, head_dim]))
+            .reshape([b, GQA_NUM_Q_HEADS, s, head_dim]);
+        let k = self
+            .k_norm
+            .forward(&k.reshape([b * GQA_NUM_KV_HEADS * s, head_dim]))
+            .reshape([b, GQA_NUM_KV_HEADS, s, head_dim]);
+        let q = rope.apply_from(&q, rope_offset);
+        let k = rope.apply_from(&k, rope_offset);
+        (q, k, v)
+    }
+
+    fn apply_ffn(&self, x: &Tensor) -> Tensor {
+        let ffn_in = self.ffn_ln.forward(x);
+        let ffn_proj = ffn_in.apply(&self.ffn_fc1);
+        let ffn_parts = ffn_proj.chunk(2, -1);
+        let ffn_out = (ffn_parts[0].silu() * &ffn_parts[1]).apply(&self.ffn_fc2);
+        x + ffn_out
+    }
+
+    fn forward_prefix_and_cache(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+    ) -> (Tensor, Tensor, Tensor) {
+        let (q, k, v) = self.project_qkv(x, rope, 0);
+        let out = Tensor::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            None::<&Tensor>,
+            0.0,
+            true,
+            None,
+            true,
+        )
+        .permute([0, 2, 1, 3])
+        .contiguous()
+        .reshape(x.size());
+        let x = x + out.apply(&self.attn_out);
+        (self.apply_ffn(&x), k, v)
+    }
+
+    fn forward_suffix_with_cache(
+        &self,
+        x_suffix: &Tensor,
+        prefix_k: &Tensor,
+        prefix_v: &Tensor,
+        rope: &RotaryEmbedding,
+        kv_index: &Tensor,
+        prefix_len: i64,
+    ) -> Tensor {
+        let (q, suffix_k, suffix_v) = self.project_qkv(x_suffix, rope, prefix_len);
+        let suffix_k = suffix_k.index_select(1, kv_index);
+        let suffix_v = suffix_v.index_select(1, kv_index);
+        let suffix_len = q.size()[2];
+        let mut out_parts = Vec::with_capacity(suffix_len as usize);
+        for suffix_pos in 0..suffix_len {
+            let q_pos = q.narrow(2, suffix_pos, 1);
+            let visible_k = Tensor::cat(&[prefix_k, &suffix_k.narrow(2, 0, suffix_pos + 1)], 2);
+            let visible_v = Tensor::cat(&[prefix_v, &suffix_v.narrow(2, 0, suffix_pos + 1)], 2);
+            let out_pos = Tensor::scaled_dot_product_attention(
+                &q_pos,
+                &visible_k,
+                &visible_v,
+                None::<&Tensor>,
+                0.0,
+                false,
+                None,
+                false,
+            );
+            out_parts.push(out_pos);
+        }
+        let out_part_refs: Vec<&Tensor> = out_parts.iter().collect();
+        let out = Tensor::cat(&out_part_refs, 2)
+            .permute([0, 2, 1, 3])
+            .contiguous()
+            .reshape(x_suffix.size());
+        let x = x_suffix + out.apply(&self.attn_out);
+        self.apply_ffn(&x)
+    }
+}
+
+fn truncated_normal_std(in_features: i64, out_features: i64) -> f64 {
+    let denoms = (in_features + out_features) as f64 / 2.0;
+    (1.0 / denoms).sqrt() / 0.8796
+}
+
+fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
+    Init::Randn {
+        mean: 0.0,
+        stdev: truncated_normal_std(in_features, out_features),
+    }
+}
+
+fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i64) -> nn::Linear {
+    nn::linear(
+        p / name,
+        in_features,
+        out_features,
+        nn::LinearConfig {
+            ws_init: truncated_normal_init(in_features, out_features),
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
+        },
+    )
+}
+
+fn linear_residual_out(
+    p: &nn::Path,
+    name: &str,
+    in_features: i64,
+    out_features: i64,
+    scale: f64,
+) -> nn::Linear {
+    let base_std = truncated_normal_std(in_features, out_features);
+    nn::linear(
+        p / name,
+        in_features,
+        out_features,
+        nn::LinearConfig {
+            ws_init: Init::Randn {
+                mean: 0.0,
+                stdev: base_std * scale,
+            },
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
+        },
+    )
+}
+
+const BASE_MODEL_DIM: i64 = 128;
+const BASE_FF_DIM: i64 = 512;
+const BASE_GQA_LAYERS: usize = 3;
+const ABLATION_SMALL_MODEL_DIM: i64 = 64;
+const ABLATION_SMALL_FF_DIM: i64 = 256;
+const ABLATION_SMALL_GQA_LAYERS: usize = 1;
+const UNIFORM_STREAM_PATCH_COUNT: i64 = 256;
+const UNIFORM_STREAM_PATCH_SIZE: i64 = 34;
+const UNIFORM_STREAM_LAYOUT_LEN: i64 = UNIFORM_STREAM_PATCH_COUNT * UNIFORM_STREAM_PATCH_SIZE;
+const UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES: i64 = 255;
+const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 = PRICE_DELTAS_PER_TICKER as i64
+    - UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
+const STREAM_PATCH_INNER_DIM: i64 = 32;
+const STREAM_PATCH_CONV_KERNEL: i64 = 8;
+pub(super) const LOG_STD_INIT: f64 = -1.0;
+pub(super) const LOG_STD_MIN: f64 = -2.995732273553991;
+pub(super) const LOG_STD_MAX: f64 = 0.04879016416943201;
+const INTER_TICKER_AFTER: usize = 1;
+const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
+const PATCH_SCALAR_FEATS: i64 = 3;
+pub(super) const NUM_HEAD_CLS_TOKENS: i64 = 3;
+
+fn residual_init_scale(num_blocks: usize) -> f64 {
+    1.0 / (2.0 * num_blocks as f64).sqrt()
+}
+
+const BASE_PATCH_CONFIGS: &[(i64, i64)] = &[
+    (4608, 128),
+    (2048, 64),
+    (1024, 32),
+    (512, 16),
+    (256, 8),
+    (128, 4),
+    (116, 2),
+    (1, 1),
+];
+
+const fn uniform_256_patch_configs() -> [(i64, i64); 256] {
+    let mut configs = [(0i64, 0i64); 256];
+    let mut idx = 0usize;
+    while idx < 256 {
+        configs[idx] = (UNIFORM_STREAM_PATCH_SIZE, UNIFORM_STREAM_PATCH_SIZE);
+        idx += 1;
+    }
+    configs
+}
+
+const UNIFORM_256_STREAM_PATCH_CONFIGS: &[(i64, i64)] = &uniform_256_patch_configs();
+
+const ABLATION_SMALL_PATCH_CONFIGS: &[(i64, i64)] = &[(8192, 256), (384, 8), (117, 1)];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ModelVariant {
+    Base,
+    #[value(name = "uniform-256-stream", alias = "uniform256-stream")]
+    Uniform256Stream,
+    AblationSmall,
+}
+
+impl ModelVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Uniform256Stream => "uniform-256-stream",
+            Self::AblationSmall => "ablation-small",
         }
     }
 }
 
-fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
-    let denoms = (in_features + out_features) as f64 / 2.0;
-    let std = (1.0 / denoms).sqrt() / 0.8796;
-    Init::Randn {
-        mean: 0.0,
-        stdev: std,
+#[derive(Clone, Copy)]
+struct ModelSpec {
+    model_dim: i64,
+    ff_dim: i64,
+    gqa_layers: usize,
+    patch_configs: &'static [(i64, i64)],
+}
+
+fn model_spec(variant: ModelVariant) -> ModelSpec {
+    match variant {
+        ModelVariant::Base => ModelSpec {
+            model_dim: BASE_MODEL_DIM,
+            ff_dim: BASE_FF_DIM,
+            gqa_layers: BASE_GQA_LAYERS,
+            patch_configs: BASE_PATCH_CONFIGS,
+        },
+        ModelVariant::Uniform256Stream => ModelSpec {
+            model_dim: BASE_MODEL_DIM,
+            ff_dim: BASE_FF_DIM,
+            gqa_layers: BASE_GQA_LAYERS,
+            patch_configs: UNIFORM_256_STREAM_PATCH_CONFIGS,
+        },
+        ModelVariant::AblationSmall => ModelSpec {
+            model_dim: ABLATION_SMALL_MODEL_DIM,
+            ff_dim: ABLATION_SMALL_FF_DIM,
+            gqa_layers: ABLATION_SMALL_GQA_LAYERS,
+            patch_configs: ABLATION_SMALL_PATCH_CONFIGS,
+        },
     }
 }
 
-const SSM_DIM: i64 = 128;
-const MODEL_DIM: i64 = 128;
-const LOG_STD_INIT: f64 = -2.0;
-const SDE_EPS: f64 = 1e-6;
-const USE_SDPA: bool = true;
-const SDPA_MIN_LEN: i64 = 64;
-const SDPA_MIN_LEN_CROSS: i64 = 1;
-const TIME_CROSS_LAYERS: usize = 1;
-const FF_DIM: i64 = 512;
-const HEAD_HIDDEN: i64 = 192;
-const RESIDUAL_ALPHA_MAX: f64 = 0.5;
-const RESIDUAL_ALPHA_INIT: f64 = -2.0;
-const ROPE_BASE: f64 = 10000.0;
-const TICKER_LATENT_FACTORS: i64 = 32;
-const DEFAULT_CASH_POOL_QUERIES: i64 = 4;
-const TEMPORAL_POOL_GROUPS: i64 = 4;
-const PMA_QUERIES: i64 = 2;
-const TEMPORAL_STATIC_DIM: i64 = 64;
-const GLOBAL_TOKEN_COUNT: i64 = 4;
-
-const PATCH_CONFIGS: [(i64, i64); 7] = [
-    (1600, 64),
-    (1024, 32),
-    (512, 16),
-    (128, 8),
-    (64, 4),
-    (32, 2),
-    (40, 1),
-];
-
-const fn compute_patch_totals() -> (i64, i64) {
+fn compute_patch_totals(patch_configs: &[(i64, i64)]) -> (i64, i64) {
     let mut total_days = 0i64;
     let mut total_tokens = 0i64;
-    let mut i = 0;
-    while i < PATCH_CONFIGS.len() {
-        let (days, patch_size) = PATCH_CONFIGS[i];
-        assert!(days % patch_size == 0, "days must be divisible by patch_size");
+    for &(days, patch_size) in patch_configs {
+        assert!(
+            days % patch_size == 0,
+            "days must be divisible by patch_size"
+        );
         total_days += days;
         total_tokens += days / patch_size;
-        i += 1;
     }
     (total_days, total_tokens)
 }
 
-const PATCH_TOTALS: (i64, i64) = compute_patch_totals();
-const SEQ_LEN: i64 = PATCH_TOTALS.1;
-const PATCH_EXTRA_FEATS: i64 = 4;
-const FINEST_PATCH_SIZE: i64 = 1;
-const FINEST_PATCH_INDEX: usize = 6;
+pub fn patch_seq_len_for_variant(variant: ModelVariant) -> i64 {
+    compute_patch_totals(model_spec(variant).patch_configs).1
+}
 
-const _: () = assert!(
-    PATCH_TOTALS.0 == PRICE_DELTAS_PER_TICKER as i64,
-    "PATCH_CONFIGS days must equal PRICE_DELTAS_PER_TICKER"
-);
+pub fn patch_ends_for_variant(variant: ModelVariant) -> Vec<i64> {
+    let patch_configs = model_spec(variant).patch_configs;
+    let seq_len = patch_seq_len_for_variant(variant);
+    let mut ends = Vec::with_capacity(seq_len as usize);
+    let mut total = 0i64;
+    for &(days, patch_size) in patch_configs {
+        let num = days / patch_size;
+        for _ in 0..num {
+            total += patch_size;
+            ends.push(total);
+        }
+    }
+    ends
+}
 
-const NUM_VALUE_BUCKETS: i64 = 255;
-
-// (values, critic_logits, (action_mean, action_log_std), attn_entropy)
-pub type ModelOutput = (Tensor, Tensor, (Tensor, Tensor), Tensor);
+/// (values, action_mean, action_std)
+pub type ModelOutput = (Tensor, Tensor, Tensor);
 
 pub struct DebugMetrics {
-    pub time_alpha_attn_mean: f64,
-    pub time_alpha_mlp_mean: f64,
-    pub cross_alpha_attn_mean: f64,
-    pub cross_alpha_mlp_mean: f64,
     pub temporal_tau: f64,
     pub temporal_attn_entropy: f64,
     pub temporal_attn_max: f64,
     pub temporal_attn_eff_len: f64,
     pub temporal_attn_center: f64,
     pub temporal_attn_last_weight: f64,
-    pub cross_ticker_embed_norm: f64,
 }
 
 #[derive(Clone, Copy)]
 pub struct TradingModelConfig {
-    pub ssm_layers: usize,
-    pub cash_pool_queries: i64,
+    pub variant: ModelVariant,
 }
 
 impl Default for TradingModelConfig {
     fn default() -> Self {
         Self {
-            ssm_layers: 2,
-            cash_pool_queries: DEFAULT_CASH_POOL_QUERIES,
+            variant: ModelVariant::Base,
         }
     }
 }
 
-/// Streaming state for O(1) inference per step
-/// - Ring buffer holds full delta history for head computation
+/// Streaming state for inference
+/// - Ring buffer holds full delta history
 /// - Patch buffer accumulates deltas until full patch ready
-/// - SSM state carries compressed history (only process new token each patch)
+/// - No model state needed (GQA is stateless, uses full forward pass)
 pub struct StreamState {
     /// Ring buffer: [TICKERS_COUNT, PRICE_DELTAS_PER_TICKER]
     pub delta_ring: Tensor,
@@ -206,108 +526,85 @@ pub struct StreamState {
     pub patch_buf: Tensor,
     /// Position within current patch
     pub patch_pos: i64,
-    /// SSM hidden state per ticker per layer
-    pub ssm_states: Vec<Mamba2State>,
     /// Whether initialized with full sequence
     pub initialized: bool,
+    /// Uniform stream bucket layout: [batch*TICKERS_COUNT, 256, 34]
+    pub uniform_layout: Tensor,
+    /// Cached patch tokens for uniform streamed rollout: [batch*TICKERS_COUNT, 256, model_dim]
+    pub uniform_patch_tokens: Tensor,
+    /// Live fill per env for the tail bucket: [batch]
+    pub uniform_live_fill: Tensor,
+    /// Host mirror of live fill to avoid per-step device syncs during streamed rollout.
+    pub uniform_live_fill_host: Vec<i64>,
+    /// Incremental causal-conv state for the live bucket: [batch*TICKERS_COUNT, inner_dim, kernel]
+    pub uniform_live_conv_state: Tensor,
+    /// Running sum for live-bucket scalar features: [batch*TICKERS_COUNT, 1]
+    pub uniform_live_sum: Tensor,
+    /// Running squared-sum for live-bucket scalar features: [batch*TICKERS_COUNT, 1]
+    pub uniform_live_sum_sq: Tensor,
+    /// First live value for slope features: [batch*TICKERS_COUNT, 1]
+    pub uniform_live_first: Tensor,
+    /// Last live value for slope features: [batch*TICKERS_COUNT, 1]
+    pub uniform_live_last: Tensor,
+    /// Per-layer cached prefix K for uniform streamed rollout.
+    pub uniform_prefix_k: Vec<Tensor>,
+    /// Per-layer cached prefix V for uniform streamed rollout.
+    pub uniform_prefix_v: Vec<Tensor>,
 }
 
 pub struct TradingModel {
-    patch_embeds: Vec<nn::Linear>,
-    patch_lns: Vec<RMSNorm>,
-    patch_dt_scale: Tensor,
-    stem_pos_embed: Tensor,
-    stem_scale_embeds: Vec<Tensor>,
-    ssm_layers: Vec<StatefulMamba>,
-    ssm_norms: Vec<RMSNorm>,
-    post_ssm_ln: RMSNorm,
-    ssm_gate: nn::Linear,
-    ssm_proj: nn::Conv1D,
-    static_proj: nn::Linear,
-    ln_static_proj: RMSNorm,
-    static_to_temporal: nn::Linear,
-    ln_static_temporal: RMSNorm,
-    pma_queries: Tensor,
-    pma_q_proj: nn::Linear,
-    pma_k_proj: nn::Linear,
-    pma_v_proj: nn::Linear,
-    pma_out: nn::Linear,
+    variant: ModelVariant,
+    patch_configs: &'static [(i64, i64)],
+    seq_len: i64,
+    finest_patch_size: i64,
+    model_dim: i64,
+    ff_dim: i64,
+    patch_embed_weight: Tensor,
+    patch_embed_bias: Tensor,
+    patch_config_ids: Tensor,
+    patch_stream_lift: nn::Linear,
+    patch_stream_mix: nn::Linear,
+    patch_stream_scalar_proj: nn::Linear,
+    patch_stream_conv_w: Tensor,
+    patch_stream_conv_b: Tensor,
+    gqa_kv_head_index: Tensor,
+    uniform_conv_shift_idx: Tensor,
+    uniform_patch_shift_idx: Tensor,
+    gqa_layers: Vec<GqaBlock>,
+    rope: RotaryEmbedding,
+    exo_feat_w: Tensor,
+    exo_feat_b: Tensor,
+    actor_cls_token: Tensor,
+    critic_cls_token: Tensor,
+    sde_cls_token: Tensor,
     inter_ticker_block: InterTickerBlock,
-    time_pos_proj: nn::Linear,
-    time_global_ctx: nn::Linear,
-    time_ticker_ctx: nn::Linear,
-    static_cross_q: nn::Linear,
-    static_cross_k: nn::Linear,
-    static_cross_v: nn::Linear,
-    static_cross_out: nn::Linear,
-    cross_ticker_embed: nn::Linear,
-    global_ticker_token: Tensor,
-    global_tokens: Tensor,
-    global_token_proj: nn::Linear,
-    global_token_merge: nn::Linear,
-    global_to_ticker: nn::Linear,
-    global_inject_down: nn::Linear,
-    global_inject_up: nn::Linear,
-    global_inject_gate_raw: Tensor,
-    head_proj: nn::Linear,
-    head_ln: RMSNorm,
-    policy_ln: RMSNorm,
-    value_ln: RMSNorm,
-    value_mlp_fc1: nn::Linear,
-    value_mlp_fc2: nn::Linear,
-    actor_out: nn::Linear,
-    critic_out: nn::Linear,
-    cash_log_std_param: Tensor,
-    cash_queries: Tensor,
-    cash_q_proj: nn::Linear,
-    cash_k_proj: nn::Linear,
-    cash_v_proj: nn::Linear,
-    cash_merge: nn::Linear,
-    cash_recent_proj: nn::Linear,
-    cash_recent_gate: nn::Linear,
-    cash_recent_slope_raw: Tensor,
-    cash_attn_temp_raw: Tensor,
-    sde_fc: nn::Linear,
-    ln_sde: RMSNorm,
-    log_std_param: Tensor,
-    bucket_centers: Tensor,
-    value_centers: Tensor,
+    policy_mean_log_var: nn::Linear,
+    value_proj: nn::Linear,
     device: tch::Device,
-    num_heads: i64,
-    kv_heads: i64,
-    head_dim: i64,
-    cash_pool_queries: i64,
-    decay_positions: Tensor,
-    decay_ones: Tensor,
 }
 
 impl TradingModel {
-    fn use_sdpa(&self, seq_len: i64) -> bool {
-        if !USE_SDPA {
-            return false;
+    pub fn price_input_dim(&self) -> i64 {
+        match self.variant {
+            ModelVariant::Uniform256Stream => TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN,
+            _ => TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         }
-        let _ = seq_len;
-        true
     }
 
-    fn use_sdpa_cross(&self, seq_len: i64) -> bool {
-        if !USE_SDPA {
-            return false;
-        }
-        let _ = seq_len;
-        true
+    pub fn input_kind(&self) -> Kind {
+        self.patch_embed_weight.kind()
     }
 
-    fn attn_softmax_fp32(&self, q: &Tensor, k: &Tensor) -> Tensor {
-        let q_f = q.to_kind(Kind::Float);
-        let k_f = k.to_kind(Kind::Float);
-        let scores = (q_f.matmul(&k_f.transpose(-2, -1)) / (self.head_dim as f64).sqrt())
-            .softmax(-1, Kind::Float);
-        scores.to_kind(q.kind())
+    fn maybe_to_device(&self, input: &Tensor, device: tch::Device) -> Tensor {
+        if input.device() == device {
+            input.shallow_clone()
+        } else {
+            input.to_device(device)
+        }
     }
 
     fn cast_inputs(&self, input: &Tensor) -> Tensor {
-        let target_kind = self.log_std_param.kind();
+        let target_kind = self.patch_embed_weight.kind();
         if input.kind() == target_kind {
             input.shallow_clone()
         } else {
@@ -315,8 +612,51 @@ impl TradingModel {
         }
     }
 
-    pub fn value_centers(&self) -> &Tensor {
-        &self.value_centers
+    pub fn variant(&self) -> ModelVariant {
+        self.variant
+    }
+
+    pub fn patch_seq_len(&self) -> i64 {
+        self.seq_len
+    }
+
+    fn uniform_stream_layout_from_raw(&self, deltas: &Tensor) -> Tensor {
+        let device = deltas.device();
+        let batch = deltas.size()[0];
+        let layout = Tensor::full(
+            [batch, UNIFORM_STREAM_LAYOUT_LEN],
+            f64::NAN,
+            (Kind::Float, device),
+        );
+        let full_prefix = UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
+        let _ = layout
+            .narrow(1, 0, full_prefix)
+            .copy_(&deltas.narrow(1, 0, full_prefix));
+        let _ = layout
+            .narrow(1, full_prefix, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL)
+            .copy_(&deltas.narrow(1, full_prefix, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL));
+        layout.to_kind(deltas.kind())
+    }
+
+    pub fn uniform_stream_layout_from_raw_input(&self, price_deltas: &Tensor) -> Tensor {
+        assert_eq!(
+            self.variant,
+            ModelVariant::Uniform256Stream,
+            "uniform_stream_layout_from_raw_input is only valid for Uniform256Stream",
+        );
+        let price = if price_deltas.dim() == 1 {
+            price_deltas.unsqueeze(0)
+        } else {
+            price_deltas.shallow_clone()
+        };
+        let price = self.cast_inputs(&self.maybe_to_device(&price, self.device));
+        let batch_size = price.size()[0];
+        self.uniform_stream_layout_from_raw(
+            &price
+                .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
+                .view([batch_size * TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]),
+        )
+        .view([batch_size, TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN])
     }
 
     pub fn new(p: &nn::Path) -> Self {
@@ -324,351 +664,225 @@ impl TradingModel {
     }
 
     pub fn new_with_config(p: &nn::Path, config: TradingModelConfig) -> Self {
-        let mut patch_embeds = Vec::new();
-        let mut patch_lns = Vec::new();
-        let mut stem_scale_embeds = Vec::new();
-        for (i, &(_, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
-            let input_dim = patch_size + PATCH_EXTRA_FEATS;
-            patch_embeds.push(nn::linear(
-                p / format!("patch_embed_{}", i),
-                input_dim,
-                SSM_DIM,
-                Default::default(),
-            ));
-            patch_lns.push(RMSNorm::new(
-                &(p / format!("patch_ln_{}", i)),
-                SSM_DIM,
-                1e-5,
-            ));
-            let name = format!("stem_scale_embed_{}", i);
-            stem_scale_embeds.push(p.var(
-                name.as_str(),
-                &[1, 1, SSM_DIM],
-                Init::Uniform { lo: -0.01, up: 0.01 },
-            ));
+        let spec = model_spec(config.variant);
+        let gqa_layers_count = spec.gqa_layers;
+        let init_scale = residual_init_scale(gqa_layers_count);
+        let patch_configs = spec.patch_configs;
+        let (total_days, seq_len) = compute_patch_totals(patch_configs);
+        if config.variant == ModelVariant::Uniform256Stream {
+            assert!(
+                total_days >= PRICE_DELTAS_PER_TICKER as i64,
+                "uniform stream layout must cover the raw observation history"
+            );
+        } else {
+            assert!(
+                total_days == PRICE_DELTAS_PER_TICKER as i64,
+                "patch configs must sum to PRICE_DELTAS_PER_TICKER"
+            );
         }
-        let stem_pos_embed = Self::build_sin_cos_pos_embed(SEQ_LEN, SSM_DIM, p.device())
-            .unsqueeze(0);
-        let patch_dt_scale = {
-            let mut scales = Vec::with_capacity(SEQ_LEN as usize);
-            for &(days, patch_size) in &PATCH_CONFIGS {
-                let n_patches = days / patch_size;
-                for _ in 0..n_patches {
-                    scales.push(patch_size as f32);
-                }
-            }
-            Tensor::from_slice(&scales)
-                .view([1, SEQ_LEN, 1])
-                .to_device(p.device())
-        };
-
-        let ssm_cfg = Mamba2Config {
-            d_model: SSM_DIM,
-            d_ssm: Some(SSM_DIM),
-            ..Mamba2Config::default()
-        };
-        let ssm_layers = (0..config.ssm_layers)
-            .map(|i| stateful_mamba_block_cfg(&(p / format!("ssm_{}", i)), ssm_cfg.clone()))
-            .collect::<Vec<_>>();
-        let ssm_norms = (0..config.ssm_layers)
-            .map(|i| RMSNorm::new(&(p / format!("ssm_norm_{}", i)), SSM_DIM, 1e-5))
-            .collect::<Vec<_>>();
-        let post_ssm_ln = RMSNorm::new(&(p / "post_ssm_ln"), SSM_DIM, 1e-5);
-        let ssm_gate = nn::linear(p / "ssm_gate", SSM_DIM, SSM_DIM, Default::default());
-        let ssm_proj = nn::conv1d(p / "ssm_proj", SSM_DIM, MODEL_DIM, 1, Default::default());
-
-        let static_proj = nn::linear(
-            p / "static_proj",
-            MODEL_DIM + PER_TICKER_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let ln_static_proj = RMSNorm::new(&(p / "ln_static_proj"), MODEL_DIM, 1e-5);
-        let static_to_temporal = nn::linear(
-            p / "static_to_temporal",
-            PER_TICKER_STATIC_OBS as i64,
-            TEMPORAL_STATIC_DIM,
-            Default::default(),
-        );
-        let ln_static_temporal =
-            RMSNorm::new(&(p / "ln_static_temporal"), TEMPORAL_STATIC_DIM, 1e-5);
-        let pma_queries = p.var(
-            "pma_queries",
-            &[PMA_QUERIES, MODEL_DIM],
-            Init::Uniform { lo: -0.01, up: 0.01 },
-        );
-        let pma_q_proj = nn::linear(p / "pma_q_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let pma_k_proj = nn::linear(
-            p / "pma_k_proj",
-            MODEL_DIM + TEMPORAL_STATIC_DIM,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let pma_v_proj = nn::linear(
-            p / "pma_v_proj",
-            MODEL_DIM + TEMPORAL_STATIC_DIM,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let pma_out = nn::linear(p / "pma_out", MODEL_DIM, MODEL_DIM, Default::default());
-
-        let num_heads = 8i64;
-        let kv_heads = 8i64;
-        let head_dim = 16i64;
-        assert!(num_heads % kv_heads == 0, "num_heads must be divisible by kv_heads");
-        assert_eq!(
-            num_heads * head_dim,
-            MODEL_DIM,
-            "num_heads * head_dim must equal MODEL_DIM"
-        );
-        assert!(config.cash_pool_queries > 0, "cash_pool_queries must be > 0");
-        let inter_ticker_block = InterTickerBlock::new(
-            &(p / "inter_ticker_0"),
-            kv_heads,
-            head_dim,
-            TICKER_LATENT_FACTORS,
-        );
-        let time_pos_proj = nn::linear(p / "time_pos_proj", 4, MODEL_DIM, Default::default());
-        let time_global_ctx = nn::linear(
-            p / "time_global_ctx",
-            GLOBAL_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let time_ticker_ctx = nn::linear(
-            p / "time_ticker_ctx",
-            PER_TICKER_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let static_cross_q = nn::linear(p / "static_cross_q", MODEL_DIM, MODEL_DIM, Default::default());
-        let static_cross_k = nn::linear(p / "static_cross_k", MODEL_DIM, MODEL_DIM, Default::default());
-        let static_cross_v = nn::linear(p / "static_cross_v", MODEL_DIM, MODEL_DIM, Default::default());
-        let static_cross_out = nn::linear(p / "static_cross_out", MODEL_DIM, MODEL_DIM, Default::default());
-        let cross_ticker_embed = nn::linear(
-            p / "cross_ticker_embed",
-            PER_TICKER_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let global_ticker_token = p.var(
-            "global_ticker_token",
-            &[TICKERS_COUNT as i64, MODEL_DIM],
-            Init::Uniform { lo: -0.01, up: 0.01 },
-        );
-        let global_tokens = p.var(
-            "global_tokens",
-            &[GLOBAL_TOKEN_COUNT, MODEL_DIM],
-            Init::Uniform { lo: -0.01, up: 0.01 },
-        );
-        let global_token_proj = nn::linear(
-            p / "global_token_proj",
-            GLOBAL_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let global_token_merge =
-            nn::linear(p / "global_token_merge", MODEL_DIM, MODEL_DIM, Default::default());
-        let global_to_ticker = nn::linear(
-            p / "global_to_ticker",
-            GLOBAL_STATIC_OBS as i64,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let global_inject_down = nn::linear(
-            p / "global_inject_down",
-            GLOBAL_STATIC_OBS as i64,
-            TEMPORAL_STATIC_DIM,
-            Default::default(),
-        );
-        let global_inject_up = nn::linear(
-            p / "global_inject_up",
-            TEMPORAL_STATIC_DIM,
-            MODEL_DIM,
-            Default::default(),
-        );
-        let global_inject_gate_raw = p.var("global_inject_gate_raw", &[1], Init::Const(-2.0));
-        let head_proj = nn::linear(
-            p / "head_proj",
-            MODEL_DIM,
-            HEAD_HIDDEN,
-            nn::LinearConfig {
-                ws_init: truncated_normal_init(MODEL_DIM, HEAD_HIDDEN),
-                ..Default::default()
+        let finest_patch_index = patch_configs.len() - 1;
+        let finest_patch_size = patch_configs[finest_patch_index].1;
+        let num_configs = patch_configs.len() as i64;
+        let max_patch_size = patch_configs
+            .iter()
+            .map(|&(_, patch_size)| patch_size)
+            .max()
+            .unwrap_or(0);
+        let max_input_dim = max_patch_size + PATCH_SCALAR_FEATS;
+        let xavier_std = (2.0 / (max_input_dim + spec.model_dim) as f64).sqrt();
+        let patch_embed_weight = p.var(
+            "patch_embed_weight",
+            &[num_configs, max_input_dim, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: xavier_std,
             },
         );
-        let head_ln = RMSNorm::new(&(p / "head_ln"), HEAD_HIDDEN, 1e-5);
-        let policy_ln = RMSNorm::new(&(p / "policy_ln"), MODEL_DIM, 1e-5);
-        let value_ln = RMSNorm::new(&(p / "value_ln"), MODEL_DIM, 1e-5);
-        let value_mlp_fc1 = nn::linear(p / "value_mlp_fc1", MODEL_DIM, MODEL_DIM, Default::default());
-        let value_mlp_fc2 = nn::linear(p / "value_mlp_fc2", MODEL_DIM, MODEL_DIM, Default::default());
-        let actor_out = nn::linear(
-            p / "actor_out",
-            HEAD_HIDDEN,
+        let patch_embed_bias = p.var(
+            "patch_embed_bias",
+            &[num_configs, spec.model_dim],
+            Init::Const(0.0),
+        );
+        let patch_stream_lift = nn::linear(
+            p / "patch_stream_lift",
             1,
+            STREAM_PATCH_INNER_DIM,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(HEAD_HIDDEN, 1),
-                ..Default::default()
-            },
-        );
-        let cash_log_std_param = p.var("cash_log_std", &[1], Init::Const(0.0));
-        let critic_out = nn::linear(
-            p / "critic_out",
-            MODEL_DIM,
-            NUM_VALUE_BUCKETS,
-            nn::LinearConfig {
-                ws_init: truncated_normal_init(MODEL_DIM, NUM_VALUE_BUCKETS),
+                ws_init: truncated_normal_init(1, STREAM_PATCH_INNER_DIM),
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
         );
-        let cash_queries = p.var(
-            "cash_queries",
-            &[config.cash_pool_queries, MODEL_DIM],
-            Init::Uniform {
-                lo: -0.01,
-                up: 0.01,
+        let patch_stream_mix = nn::linear(
+            p / "patch_stream_mix",
+            STREAM_PATCH_INNER_DIM,
+            spec.model_dim,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(STREAM_PATCH_INNER_DIM, spec.model_dim),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
             },
         );
-        let cash_q_proj = nn::linear(p / "cash_q_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_k_proj = nn::linear(p / "cash_k_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_v_proj = nn::linear(p / "cash_v_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_merge = nn::linear(p / "cash_merge", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_recent_proj = nn::linear(p / "cash_recent_proj", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_recent_gate = nn::linear(p / "cash_recent_gate", MODEL_DIM, MODEL_DIM, Default::default());
-        let cash_recent_slope_raw = p.var("cash_recent_slope_raw", &[1], Init::Const(0.0));
-        let cash_attn_temp_raw = p.var("cash_attn_temp_raw", &[1], Init::Const(0.0));
-        const SDE_LATENT_DIM: i64 = 64;
-        let sde_fc = nn::linear(p / "sde_fc", HEAD_HIDDEN, SDE_LATENT_DIM, Default::default());
-        let ln_sde = RMSNorm::new(&(p / "ln_sde"), SDE_LATENT_DIM, 1e-5);
-        let log_std_param = p.var(
-            "log_std",
-            &[SDE_LATENT_DIM, TICKERS_COUNT],
+        let patch_stream_scalar_proj = nn::linear(
+            p / "patch_stream_scalar_proj",
+            4,
+            spec.model_dim,
+            nn::LinearConfig {
+                ws_init: truncated_normal_init(4, spec.model_dim),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let patch_stream_conv_w = p.var(
+            "patch_stream_conv_w",
+            &[STREAM_PATCH_INNER_DIM, 1, STREAM_PATCH_CONV_KERNEL],
+            Init::Randn {
+                mean: 0.0,
+                stdev: (1.0 / STREAM_PATCH_CONV_KERNEL as f64).sqrt(),
+            },
+        );
+        let patch_stream_conv_b = p.var(
+            "patch_stream_conv_b",
+            &[STREAM_PATCH_INNER_DIM],
             Init::Const(0.0),
         );
-        let value_clip = 10.0;
-        let value_centers = Tensor::linspace(
-            -value_clip,
-            value_clip,
-            NUM_VALUE_BUCKETS,
-            (Kind::Float, p.device()),
+        let gqa_kv_head_index = Tensor::from_slice(&[0i64, 0, 1, 1])
+            .to_kind(Kind::Int64)
+            .to_device(p.device());
+        let uniform_conv_shift_idx =
+            Tensor::arange(STREAM_PATCH_CONV_KERNEL - 1, (Kind::Int64, p.device())) + 1;
+        let uniform_patch_shift_idx =
+            Tensor::arange(UNIFORM_STREAM_PATCH_COUNT - 1, (Kind::Int64, p.device())) + 1;
+        let patch_config_ids = {
+            let mut ids = Vec::with_capacity(seq_len as usize);
+            for (cfg_idx, &(days, patch_size)) in patch_configs.iter().enumerate() {
+                let n_patches = days / patch_size;
+                for _ in 0..n_patches {
+                    ids.push(cfg_idx as i64);
+                }
+            }
+            Tensor::from_slice(&ids)
+                .to_kind(Kind::Int64)
+                .to_device(p.device())
+        };
+
+        let gqa_layers = (0..gqa_layers_count)
+            .map(|i| {
+                GqaBlock::new(
+                    &(p / format!("gqa_{}", i)),
+                    spec.model_dim,
+                    spec.ff_dim,
+                    init_scale,
+                )
+            })
+            .collect::<Vec<_>>();
+        let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
+        let rope = RotaryEmbedding::new(seq_len + NUM_HEAD_CLS_TOKENS, head_dim, p.device());
+        let exo_feat_w = p.var(
+            "exo_feat_w",
+            &[NUM_EXO_TOKENS, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: (1.0 / spec.model_dim as f64).sqrt(),
+            },
         );
-        let bucket_centers = value_centers.shallow_clone();
-        let decay_positions = Tensor::arange(SEQ_LEN, (Kind::Float, p.device()));
-        let decay_ones = Tensor::ones(&[SEQ_LEN], (Kind::Float, p.device()));
-        Self {
-            patch_embeds,
-            patch_lns,
-            patch_dt_scale,
-            stem_pos_embed,
-            stem_scale_embeds,
-            ssm_layers,
-            ssm_norms,
-            post_ssm_ln,
-            ssm_gate,
-            ssm_proj,
-            static_proj,
-            ln_static_proj,
-            static_to_temporal,
-            ln_static_temporal,
-            pma_queries,
-            pma_q_proj,
-            pma_k_proj,
-            pma_v_proj,
-            pma_out,
-            inter_ticker_block,
-            time_pos_proj,
-            time_global_ctx,
-            time_ticker_ctx,
-            static_cross_q,
-            static_cross_k,
-            static_cross_v,
-            static_cross_out,
-            cross_ticker_embed,
-            global_ticker_token,
-            global_tokens,
-            global_token_proj,
-            global_token_merge,
-            global_to_ticker,
-            global_inject_down,
-            global_inject_up,
-            global_inject_gate_raw,
-            head_proj,
-            head_ln,
-            policy_ln,
-            value_ln,
-            value_mlp_fc1,
-            value_mlp_fc2,
-            actor_out,
-            critic_out,
-            cash_log_std_param,
-            cash_queries,
-            cash_q_proj,
-            cash_k_proj,
-            cash_v_proj,
-            cash_merge,
-            cash_recent_proj,
-            cash_recent_gate,
-            cash_recent_slope_raw,
-            cash_attn_temp_raw,
-            sde_fc,
-            ln_sde,
-            log_std_param,
-            bucket_centers,
-            value_centers,
-            device: p.device(),
-            num_heads,
-            kv_heads,
-            head_dim,
-            cash_pool_queries: config.cash_pool_queries,
-            decay_positions,
-            decay_ones,
+        let exo_feat_b = p.var(
+            "exo_feat_b",
+            &[NUM_EXO_TOKENS, spec.model_dim],
+            Init::Const(0.0),
+        );
+        let cls_std = (1.0 / spec.model_dim as f64).sqrt();
+        let actor_cls_token = p.var(
+            "actor_cls_token",
+            &[1, 1, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: cls_std,
+            },
+        );
+        let critic_cls_token = p.var(
+            "critic_cls_token",
+            &[1, 1, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: cls_std,
+            },
+        );
+        let sde_cls_token = p.var(
+            "sde_cls_token",
+            &[1, 1, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: cls_std,
+            },
+        );
+        let inter_ticker_block = InterTickerBlock::new(
+            &(p / "inter_ticker_0"),
+            spec.model_dim,
+            spec.ff_dim,
+            init_scale,
+        );
+        let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
+        let policy_mean_log_var = nn::linear(
+            p / "policy_mean_log_var",
+            spec.model_dim,
+            ACTION_COUNT * 2,
+            nn::LinearConfig {
+                ws_init: Init::Randn {
+                    mean: 0.0,
+                    stdev: 0.01,
+                },
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        if let Some(bias) = &policy_mean_log_var.bs {
+            tch::no_grad(|| {
+                let _ = bias
+                    .narrow(0, ACTION_COUNT, ACTION_COUNT)
+                    .fill_(2.0 * LOG_STD_INIT);
+            });
         }
-    }
-
-    fn rope_cos_sin(&self, positions: &Tensor, kind: Kind, device: tch::Device) -> (Tensor, Tensor) {
-        let half = self.head_dim / 2;
-        let idx = Tensor::arange(half, (Kind::Float, device));
-        let inv_freq = (-(idx * 2.0 / self.head_dim as f64) * ROPE_BASE.ln()).exp();
-        let freqs = positions.to_kind(Kind::Float).unsqueeze(1) * inv_freq.unsqueeze(0);
-        let cos = freqs.cos().to_kind(kind);
-        let sin = freqs.sin().to_kind(kind);
-        (cos, sin)
-    }
-
-    fn apply_rope_cached(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
-        let sizes = x.size();
-        let (b, h, s, d) = (sizes[0], sizes[1], sizes[2], sizes[3]);
-        let half = self.head_dim / 2;
-        let cos = cos.unsqueeze(0).unsqueeze(0);
-        let sin = sin.unsqueeze(0).unsqueeze(0);
-        let x = x.view([b, h, s, half, 2]);
-        let x_even = x.select(-1, 0);
-        let x_odd = x.select(-1, 1);
-        let rot = Tensor::stack(
-            &[
-                &x_even * &cos - &x_odd * &sin,
-                &x_even * &sin + &x_odd * &cos,
-            ],
-            -1,
+        let value_proj = nn::linear(
+            p / "value_proj",
+            flat_all_tickers,
+            NUM_BINS,
+            nn::LinearConfig {
+                ws_init: Init::Const(0.0),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
         );
-        rot.view([b, h, s, d])
-    }
-
-    fn apply_rope_single(&self, x: &Tensor, positions: &Tensor) -> Tensor {
-        let (cos, sin) = self.rope_cos_sin(positions, x.kind(), x.device());
-        self.apply_rope_cached(x, &cos, &sin)
-    }
-
-    fn build_sin_cos_pos_embed(seq_len: i64, dim: i64, device: tch::Device) -> Tensor {
-        let half = dim / 2;
-        let positions = Tensor::arange(seq_len, (Kind::Float, device)).unsqueeze(1);
-        let idx = Tensor::arange(half, (Kind::Float, device)).unsqueeze(0);
-        let inv_freq = (-(idx * 2.0 / dim as f64) * ROPE_BASE.ln()).exp();
-        let angles = positions * inv_freq;
-        let sin = angles.sin();
-        let cos = angles.cos();
-        Tensor::cat(&[sin, cos], 1)
+        Self {
+            variant: config.variant,
+            patch_configs,
+            seq_len,
+            finest_patch_size,
+            model_dim: spec.model_dim,
+            ff_dim: spec.ff_dim,
+            patch_embed_weight,
+            patch_embed_bias,
+            patch_config_ids,
+            patch_stream_lift,
+            patch_stream_mix,
+            patch_stream_scalar_proj,
+            patch_stream_conv_w,
+            patch_stream_conv_b,
+            gqa_kv_head_index,
+            uniform_conv_shift_idx,
+            uniform_patch_shift_idx,
+            gqa_layers,
+            rope,
+            exo_feat_w,
+            exo_feat_b,
+            actor_cls_token,
+            critic_cls_token,
+            sde_cls_token,
+            inter_ticker_block,
+            policy_mean_log_var,
+            value_proj,
+            device: p.device(),
+        }
     }
 
     fn parse_static(&self, static_features: &Tensor, batch_size: i64) -> (Tensor, Tensor) {
@@ -683,60 +897,228 @@ impl TradingModel {
         (global, per_ticker)
     }
 
-    fn patch_embed_single(&self, ticker_data: &Tensor) -> Tensor {
-        let mut patches = Vec::with_capacity(PATCH_CONFIGS.len());
-        let mut offset = 0i64;
-        for (i, &(days, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
-            let n_patches = days / patch_size;
-            let chunk = ticker_data.narrow(1, offset, days);
-            let p = chunk.view([1, n_patches, patch_size]);
-            let p = self.enrich_patches(&p);
-            let p = p.apply(&self.patch_embeds[i]);
-            let p = self.patch_lns[i].forward(&p);
-            let kind = p.kind();
-            let p = p + self.stem_scale_embeds[i].to_kind(kind);
-            patches.push(p);
-            offset += days;
+    fn maybe_apply_inter_ticker(&self, x: &Tensor, layer_idx: usize) -> Tensor {
+        if layer_idx != INTER_TICKER_AFTER || TICKERS_COUNT == 1 {
+            return x.shallow_clone();
         }
-        let x = Tensor::cat(&patches, 1) + self.stem_pos_embed.to_kind(ticker_data.kind());
-        x.permute([0, 2, 1])
+        let bt = x.size()[0];
+        let seq = x.size()[1];
+        let batch_size = bt / TICKERS_COUNT;
+        let x_4d = x.view([batch_size, TICKERS_COUNT, seq, self.model_dim]);
+        let cls = x_4d.narrow(2, seq - NUM_HEAD_CLS_TOKENS, NUM_HEAD_CLS_TOKENS);
+        let cls_for_mix = cls.permute([0, 2, 1, 3]).reshape([
+            batch_size * NUM_HEAD_CLS_TOKENS,
+            TICKERS_COUNT,
+            self.model_dim,
+        ]);
+        let enriched_cls = self
+            .inter_ticker_block
+            .forward(&cls_for_mix, self.model_dim, self.ff_dim)
+            .reshape([
+                batch_size,
+                NUM_HEAD_CLS_TOKENS,
+                TICKERS_COUNT,
+                self.model_dim,
+            ])
+            .permute([0, 2, 1, 3]);
+        let non_cls = x_4d.narrow(2, 0, seq - NUM_HEAD_CLS_TOKENS);
+        Tensor::cat(&[&non_cls, &enriched_cls], 2).reshape([bt, seq, self.model_dim])
     }
 
-    fn patch_latent_stem(&self, price_deltas: &Tensor, batch_size: i64) -> (Tensor, Tensor) {
+    /// Build exogenous KV bank: [batch*tickers, NUM_EXO_TOKENS, MODEL_DIM]
+    /// Each of the 46 static features gets its own token via per-feature learned projection
+    fn build_exo_kv(
+        &self,
+        global_static: &Tensor,
+        per_ticker_static: &Tensor,
+        batch_size: i64,
+    ) -> Tensor {
+        let global_exp = global_static.unsqueeze(1).expand(
+            &[batch_size, TICKERS_COUNT, GLOBAL_STATIC_OBS as i64],
+            false,
+        );
+        let all_feats = Tensor::cat(&[global_exp, per_ticker_static.shallow_clone()], -1);
+        let all_feats = all_feats.reshape([batch_size * TICKERS_COUNT, NUM_EXO_TOKENS]);
+        let feats_expanded = all_feats.unsqueeze(-1);
+        feats_expanded * &self.exo_feat_w + &self.exo_feat_b
+    }
+
+    fn patch_latent_stem(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
+        let price_deltas = self.maybe_to_device(price_deltas, self.device);
+        self.patch_latent_stem_on_device(&price_deltas, batch_size)
+    }
+
+    fn patch_latent_stem_on_device(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
         let batch_tokens = batch_size * TICKERS_COUNT;
-        let deltas = price_deltas
-            .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
-            .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64]);
+        let deltas = if self.variant == ModelVariant::Uniform256Stream {
+            let expected_layout = TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN;
+            assert_eq!(
+                price_deltas.size()[1],
+                expected_layout,
+                "Uniform256Stream full forward expects anchored layout input"
+            );
+            price_deltas
+                .view([batch_size, TICKERS_COUNT, UNIFORM_STREAM_LAYOUT_LEN])
+                .view([batch_tokens, UNIFORM_STREAM_LAYOUT_LEN])
+        } else {
+            price_deltas
+                .view([batch_size, TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64])
+                .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64])
+        };
 
-        let mut patches = Vec::with_capacity(PATCH_CONFIGS.len());
-        let mut offset = 0i64;
-        for (i, &(days, patch_size)) in PATCH_CONFIGS.iter().enumerate() {
-            let n_patches = days / patch_size;
-            let chunk = deltas.narrow(1, offset, days);
-            let p = chunk.view([batch_tokens, n_patches, patch_size]);
-            let p = self.enrich_patches(&p);
-            let p = p.apply(&self.patch_embeds[i]);
-            let p = self.patch_lns[i].forward(&p);
-            let kind = p.kind();
-            let p = p + self.stem_scale_embeds[i].to_kind(kind);
-            patches.push(p);
-            offset += days;
-        }
-
-        let x = Tensor::cat(&patches, 1) + self.stem_pos_embed.to_kind(deltas.kind());
-        let x = x.permute([0, 2, 1]);
-        (x, self.patch_dt_scale.shallow_clone())
+        let kind = deltas.kind();
+        let patch_tokens = self.patch_embed(&deltas);
+        let actor_cls = self
+            .actor_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        let critic_cls = self
+            .critic_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        let sde_cls = self
+            .sde_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        Tensor::cat(&[&patch_tokens, &actor_cls, &critic_cls, &sde_cls], 1)
     }
 
-    fn enrich_patches(&self, patches: &Tensor) -> Tensor {
-        let patch_len = patches.size()[2];
-        let mean = patches
-            .mean_dim([2].as_slice(), true, Kind::Float)
-            .to_kind(patches.kind());
-        let std = patches.std_dim(2, false, true).to_kind(patches.kind());
-        let first = patches.narrow(2, 0, 1);
-        let last = patches.narrow(2, patch_len - 1, 1);
+    /// Per-config enrichment (avoids [batch, 256, 8636] expand), then fused
+    /// einsum projection across all 256 tokens in a single kernel.
+    fn patch_embed(&self, deltas: &Tensor) -> Tensor {
+        if self.variant == ModelVariant::Uniform256Stream {
+            return self.patch_embed_stream(deltas);
+        }
+        let device = deltas.device();
+        let kind = deltas.kind();
+        let batch = deltas.size()[0];
+        let max_patch_size = self.patch_embed_weight.size()[1] - PATCH_SCALAR_FEATS;
+
+        // Phase 1: per-config enrichment, zero-padded to max_input_dim, then cat
+        let max_input_dim = max_patch_size + PATCH_SCALAR_FEATS;
+        let mut enriched_parts = Vec::with_capacity(self.patch_configs.len());
+        let mut delta_offset = 0i64;
+        for &(days, patch_size) in self.patch_configs {
+            let n_patches = days / patch_size;
+            let patches = deltas
+                .narrow(1, delta_offset, days)
+                .view([batch, n_patches, patch_size])
+                .to_kind(Kind::Float);
+            let mean = patches.mean_dim([2].as_slice(), true, Kind::Float);
+            let var = (&patches - &mean).pow_tensor_scalar(2.0).mean_dim(
+                [2].as_slice(),
+                true,
+                Kind::Float,
+            );
+            let std = (var + 1e-5).sqrt();
+            let first = patches.narrow(2, 0, 1);
+            let last = patches.narrow(2, patch_size - 1, 1);
+            let slope = &last - &first;
+            let enriched = Tensor::cat(&[&patches, &mean, &std, &slope], 2);
+            // Zero-pad to max_input_dim so all configs share the einsum
+            let pad_cols = max_input_dim - (patch_size + PATCH_SCALAR_FEATS);
+            let padded = if pad_cols > 0 {
+                let pad = Tensor::zeros(&[batch, n_patches, pad_cols], (Kind::Float, device));
+                Tensor::cat(&[&enriched, &pad], 2)
+            } else {
+                enriched
+            };
+            enriched_parts.push(padded);
+            delta_offset += days;
+        }
+        let enriched = Tensor::cat(&enriched_parts.iter().collect::<Vec<_>>(), 1).to_kind(kind);
+
+        // Phase 2: fused projection — single einsum over all 256 tokens
+        let weight_per_patch = self
+            .patch_embed_weight
+            .index_select(0, &self.patch_config_ids);
+        let bias_per_patch = self
+            .patch_embed_bias
+            .index_select(0, &self.patch_config_ids);
+        let out = Tensor::einsum(
+            "blm,lmd->bld",
+            &[&enriched, &weight_per_patch],
+            None::<&[i64]>,
+        );
+        out + bias_per_patch.unsqueeze(0)
+    }
+
+    fn patch_embed_stream_batch(&self, patch_vals: &Tensor) -> Tensor {
+        let device = patch_vals.device();
+        let target_kind = self.patch_embed_weight.kind();
+        let batch = patch_vals.size()[0];
+        let patch_size = patch_vals.size()[1];
+        let patch_vals = if patch_vals.kind() == target_kind {
+            patch_vals.shallow_clone()
+        } else {
+            patch_vals.to_kind(target_kind)
+        };
+        let valid = patch_vals.isnan().logical_not();
+        let valid_f = valid.to_kind(Kind::Float);
+        let valid_counts_raw = valid_f.sum_dim_intlist([1].as_slice(), false, Kind::Float);
+        let valid_counts = valid_counts_raw.clamp_min(1.0);
+        let clean_vals = patch_vals.nan_to_num(0.0, None, None);
+        let lifted = clean_vals
+            .unsqueeze(-1)
+            .reshape([batch * patch_size, 1])
+            .apply(&self.patch_stream_lift)
+            .reshape([batch, patch_size, STREAM_PATCH_INNER_DIM])
+            .transpose(1, 2);
+        let lifted_pad = lifted.constant_pad_nd([STREAM_PATCH_CONV_KERNEL - 1, 0]);
+        let conv = lifted_pad
+            .conv1d(
+                &self.maybe_to_device(&self.patch_stream_conv_w, device),
+                Some(&self.maybe_to_device(&self.patch_stream_conv_b, device)),
+                1,
+                0,
+                1,
+                STREAM_PATCH_INNER_DIM,
+            )
+            .silu()
+            .transpose(1, 2);
+        let last_valid_idx = valid_counts
+            .to_kind(Kind::Int64)
+            .g_add_scalar(-1)
+            .clamp_min(0)
+            .unsqueeze(-1)
+            .unsqueeze(-1)
+            .expand([batch, 1, STREAM_PATCH_INNER_DIM], false);
+        let final_hidden = conv
+            .gather(1, &last_valid_idx, false)
+            .squeeze_dim(1)
+            .apply(&self.patch_stream_mix);
+        let clean_vals_f = clean_vals.to_kind(Kind::Float);
+        let mean = (&clean_vals_f * &valid_f).sum_dim_intlist([1].as_slice(), true, Kind::Float)
+            / valid_counts.unsqueeze(-1);
+        let var = ((&clean_vals_f - &mean) * &valid_f)
+            .pow_tensor_scalar(2.0)
+            .sum_dim_intlist([1].as_slice(), true, Kind::Float)
+            / valid_counts.unsqueeze(-1);
+        let std = (var + 1e-5).sqrt();
+        let first = clean_vals_f.narrow(1, 0, 1);
+        let last_idx = valid_counts
+            .to_kind(Kind::Int64)
+            .g_add_scalar(-1)
+            .clamp_min(0);
+        let last = clean_vals_f.gather(1, &last_idx.unsqueeze(-1), false);
         let slope = &last - &first;
-        Tensor::cat(&[patches, &mean, &std, &last, &slope], 2)
+        let fill_fraction = valid_counts_raw.unsqueeze(-1) / patch_size as f64;
+        let scalar = Tensor::cat(&[&mean, &std, &slope, &fill_fraction], 1)
+            .to_kind(target_kind)
+            .apply(&self.patch_stream_scalar_proj);
+        final_hidden + scalar
+    }
+
+    fn patch_embed_stream(&self, deltas: &Tensor) -> Tensor {
+        let batch = deltas.size()[0];
+        let patches = deltas.view([
+            batch * UNIFORM_STREAM_PATCH_COUNT,
+            UNIFORM_STREAM_PATCH_SIZE,
+        ]);
+        self.patch_embed_stream_batch(&patches).view([
+            batch,
+            UNIFORM_STREAM_PATCH_COUNT,
+            self.model_dim,
+        ])
     }
 }

@@ -5,7 +5,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
-use shared::paths::WEIGHTS_PATH;
+use shared::paths::{RUNS_PATH, WEIGHTS_PATH};
+use shared::run_dir::RunDir;
 use std::{
     io,
     path::PathBuf,
@@ -23,6 +24,8 @@ mod utils;
 use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
 
+const TRAINING_MODEL_SIZES: [&str; 3] = ["uniform-256-stream", "base", "ablation-small"];
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
     Main,
@@ -33,13 +36,23 @@ pub enum AppMode {
     ModelObservations,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunSelectorPurpose {
+    View,
+    Train,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunInfo {
+    pub name: String,
+    pub gen_count: usize,
+    pub weights: Vec<String>, // .ot filenames sorted newest-first
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum DialogMode {
     None,
-    WeightsInput {
-        for_training: bool,
-        for_inference: bool,
-    },
     InferenceInput {
         focused_field: InferenceField,
     },
@@ -47,6 +60,16 @@ pub enum DialogMode {
     ConfirmStopTraining,
     PageJump {
         selected: usize,
+    },
+    RunSelector {
+        selected: usize,
+        runs: Vec<RunInfo>,
+        purpose: RunSelectorPurpose,
+    },
+    WeightsSelector {
+        run_name: String,
+        selected: usize,
+        weights: Vec<String>,
     },
 }
 
@@ -66,6 +89,7 @@ pub struct App {
     pub ticker_input: String,
     pub episodes_input: String,
     pub weights_path: Option<String>,
+    pub training_model_size: String,
     pub latest_meta_charts: Vec<PathBuf>,
     last_refresh: Instant,
     pub generation_browser: GenerationBrowserState,
@@ -74,13 +98,33 @@ pub struct App {
     pub process_manager: ProcessManagerState,
 }
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC [ ... (final byte is 0x40-0x7E)
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() || c == '~' {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl App {
     fn coerce_weights_filename(input: &str) -> String {
         let trimmed = input.trim();
 
-        // If it's just a number, expand to ppo_ep{N}.safetensors
+        // If it's just a number, expand to ppo_ep{N}.ot
         if trimmed.parse::<u32>().is_ok() {
-            return format!("ppo_ep{}.safetensors", trimmed);
+            return format!("ppo_ep{}.ot", trimmed);
         }
 
         // If it already has the pattern, use as-is
@@ -88,11 +132,15 @@ impl App {
     }
 
     fn new() -> Result<Self> {
-        let mut generation_browser = GenerationBrowserState::new();
-        generation_browser.load_generations()?;
-
         let mut inference_browser = InferenceBrowserState::new();
         inference_browser.load_inferences()?;
+
+        let process_manager = ProcessManagerState::new();
+        let mut generation_browser = GenerationBrowserState::new();
+        if let Some(run) = &process_manager.active_run {
+            generation_browser.gens_path = run.gens.clone();
+        }
+        generation_browser.load_generations()?;
 
         let mut app = App {
             mode: AppMode::Main,
@@ -103,12 +151,13 @@ impl App {
             ticker_input: String::new(),
             episodes_input: String::new(),
             weights_path: None,
+            training_model_size: "uniform-256-stream".to_string(),
             latest_meta_charts: Vec::new(),
             last_refresh: Instant::now(),
             generation_browser,
             inference_browser,
             logs_page: LogsPageState::new(),
-            process_manager: ProcessManagerState::new(),
+            process_manager,
         };
 
         app.load_latest_meta_charts()?;
@@ -122,7 +171,10 @@ impl App {
 
         self.latest_meta_charts.clear();
 
-        let gens_path = PathBuf::from("../training/gens");
+        let gens_path = match &self.process_manager.active_run {
+            Some(run) => run.gens.clone(),
+            None => PathBuf::from("../training/runs/latest/gens"),
+        };
         if !gens_path.exists() {
             return Ok(());
         }
@@ -131,17 +183,22 @@ impl App {
         let meta_chart_bases = vec![
             "assets",
             "reward",
+            "normalized_reward",
             "final_assets",
             "cumulative_reward",
             "outperformance",
-            "loss_log",
             "advantage_stats_log",
             "total_commissions",
             "logit_noise",
             "grad_norm_log",
             "target_weights",
             "clip_fraction",
-            "value_mae"
+            "explained_var",
+            "value_loss",
+            "policy_loss",
+            "policy_entropy",
+            "approx_kl",
+            "gate_stats",
         ];
 
         // Ticker-specific chart base names
@@ -249,13 +306,10 @@ impl App {
             if line.contains("Episode") && line.contains("Total Assets") && !line.starts_with("[Ep")
             {
                 if let Some(ep_str) = line.split("Episode").nth(1) {
-                    if let Some(num_str) = ep_str.trim().split_whitespace().next() {
-                        // Strip ANSI codes if present
-                        let clean_num = num_str
-                            .chars()
-                            .filter(|c| c.is_ascii_digit())
-                            .collect::<String>();
-                        if let Ok(ep) = clean_num.parse::<usize>() {
+                    // Strip ANSI escape sequences first, then grab the number
+                    let stripped: String = strip_ansi(ep_str);
+                    if let Some(num_str) = stripped.trim().split_whitespace().next() {
+                        if let Ok(ep) = num_str.parse::<usize>() {
                             return Some(ep);
                         }
                     }
@@ -271,21 +325,117 @@ impl App {
             self.generation_browser.load_generations()?;
             self.inference_browser.load_inferences()?;
             self.load_latest_meta_charts()?;
-            self.logs_page.poll_training_output();
+            let log_path = self
+                .process_manager
+                .active_run
+                .as_ref()
+                .map(|r| r.log_file.to_string_lossy().to_string());
+            self.logs_page.poll_training_output(log_path.as_deref());
             self.last_refresh = now;
         }
         Ok(())
     }
 
-    fn start_training(&mut self, weights_file: Option<String>) -> Result<()> {
-        let weights = weights_file.map(|w| {
-            if w.starts_with('/') || w.starts_with("..") {
-                w
-            } else {
-                format!("{}/{}", WEIGHTS_PATH, w)
-            }
+    fn start_training(&mut self, weights_path: Option<String>) -> Result<()> {
+        let result = self
+            .process_manager
+            .start_training(weights_path, &self.training_model_size);
+        self.sync_gens_path();
+        result
+    }
+
+    fn sync_gens_path(&mut self) {
+        if let Some(run) = &self.process_manager.active_run {
+            self.generation_browser.gens_path = run.gens.clone();
+        }
+    }
+
+    fn open_run_selector(&mut self, purpose: RunSelectorPurpose) {
+        use std::fs;
+        let runs_dir = std::path::Path::new(RUNS_PATH);
+        let mut dirs: Vec<_> = fs::read_dir(runs_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+            .collect();
+        dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+        let active_name = self
+            .process_manager
+            .active_run
+            .as_ref()
+            .and_then(|r| r.root.file_name().map(|n| n.to_string_lossy().to_string()));
+
+        let runs: Vec<RunInfo> = dirs
+            .iter()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let gens = entry.path().join("gens");
+                let gen_count = fs::read_dir(&gens)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+                    .count();
+                let weights_dir = entry.path().join("weights");
+                let mut weights: Vec<String> = fs::read_dir(&weights_dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map_or(false, |ext| ext == "ot")
+                    })
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect();
+                weights.sort_by(|a, b| {
+                    let num = |s: &String| -> usize {
+                        s.chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                            .parse()
+                            .unwrap_or(0)
+                    };
+                    num(b).cmp(&num(a))
+                });
+                let is_active = active_name.as_deref() == Some(&name);
+                if gen_count == 0 && weights.is_empty() {
+                    return None;
+                }
+                Some(RunInfo { name, gen_count, weights, is_active })
+            })
+            .collect();
+
+        let selected = runs.iter().position(|r| r.is_active).unwrap_or(0);
+        self.dialog_mode = DialogMode::RunSelector { selected, runs, purpose };
+    }
+
+    fn switch_to_run(&mut self, name: &str) -> Result<()> {
+        let root = std::path::Path::new(RUNS_PATH).join(name);
+        let gens = root.join("gens");
+        let weights = root.join("weights");
+        let log_file = root.join("training.log");
+        self.process_manager.active_run = Some(RunDir {
+            root,
+            gens,
+            weights,
+            log_file,
         });
-        self.process_manager.start_training(weights)
+        self.sync_gens_path();
+        self.generation_browser.load_generations()?;
+        self.load_latest_meta_charts()?;
+        Ok(())
+    }
+
+    fn toggle_training_model_size(&mut self) {
+        let next_idx = TRAINING_MODEL_SIZES
+            .iter()
+            .position(|size| *size == self.training_model_size)
+            .map(|idx| (idx + 1) % TRAINING_MODEL_SIZES.len())
+            .unwrap_or(0);
+        self.training_model_size = TRAINING_MODEL_SIZES[next_idx].to_string();
     }
 
     fn start_inference(
@@ -294,14 +444,19 @@ impl App {
         ticker: Option<String>,
         episodes: Option<usize>,
     ) -> Result<()> {
-        let weights = weights_file.unwrap_or_else(|| "infer.safetensors".to_string());
+        let weights = weights_file.unwrap_or_else(|| "infer.ot".to_string());
         let weights_path = if weights.starts_with('/') || weights.starts_with("..") {
             weights
         } else {
             format!("{}/{}", WEIGHTS_PATH, weights)
         };
         self.process_manager
-            .start_inference(weights_path, ticker, episodes.unwrap_or(10))
+            .start_inference(
+                weights_path,
+                ticker,
+                episodes.unwrap_or(10),
+                self.training_model_size.clone(),
+            )
     }
 
     fn stop_training(&mut self) -> Result<()> {
@@ -387,7 +542,12 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
         terminal.draw(|f| ui(f, app))?;
 
         app.maybe_refresh()?;
-        app.logs_page.poll_training_output();
+        let log_path = app
+            .process_manager
+            .active_run
+            .as_ref()
+            .map(|r| r.log_file.to_string_lossy().to_string());
+        app.logs_page.poll_training_output(log_path.as_deref());
 
         // Wait for event, then drain all pending events before redrawing
         if event::poll(Duration::from_millis(16))? {
@@ -395,38 +555,51 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Handle dialogs first (they take priority)
-                    match app.dialog_mode {
-                        DialogMode::WeightsInput {
-                            for_training,
-                            for_inference,
-                        } => match key.code {
-                            KeyCode::Esc => {
-                                app.dialog_mode = DialogMode::None;
-                                app.input.clear();
-                            }
-                            KeyCode::Enter => {
-                                let weights = if app.input.is_empty() {
-                                    None
-                                } else {
-                                    Some(App::coerce_weights_filename(&app.input))
-                                };
-                                app.input.clear();
-                                app.dialog_mode = DialogMode::None;
-
-                                if for_training {
-                                    app.start_training(weights)?;
-                                } else if for_inference {
-                                    app.start_inference(weights, None, None)?;
+                    match app.dialog_mode.clone() {
+                        DialogMode::WeightsSelector {
+                            run_name,
+                            selected,
+                            weights,
+                        } => {
+                            let count = weights.len();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.dialog_mode = DialogMode::None;
                                 }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    if count > 0 {
+                                        let (run_name, weights) = (run_name.clone(), weights.clone());
+                                        app.dialog_mode = DialogMode::WeightsSelector {
+                                            run_name,
+                                            selected: (selected + 1) % count,
+                                            weights,
+                                        };
+                                    }
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    if count > 0 {
+                                        let (run_name, weights) = (run_name.clone(), weights.clone());
+                                        app.dialog_mode = DialogMode::WeightsSelector {
+                                            run_name,
+                                            selected: if selected == 0 { count - 1 } else { selected - 1 },
+                                            weights,
+                                        };
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(filename) = weights.get(selected) {
+                                        let path = std::path::Path::new(RUNS_PATH)
+                                            .join(&run_name)
+                                            .join("weights")
+                                            .join(filename);
+                                        let weights_str = path.to_string_lossy().to_string();
+                                        app.dialog_mode = DialogMode::None;
+                                        app.start_training(Some(weights_str))?;
+                                    }
+                                }
+                                _ => {}
                             }
-                            KeyCode::Char(c) => {
-                                app.input.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                app.input.pop();
-                            }
-                            _ => {}
-                        },
+                        }
                         DialogMode::InferenceInput { focused_field } => match key.code {
                             KeyCode::Esc => {
                                 app.dialog_mode = DialogMode::None;
@@ -620,6 +793,70 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                 _ => {}
                             }
                         }
+                        DialogMode::RunSelector { selected, runs, purpose } => {
+                            let count = runs.len();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.dialog_mode = DialogMode::None;
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    if count > 0 {
+                                        let (runs, purpose) = (runs.clone(), purpose.clone());
+                                        app.dialog_mode = DialogMode::RunSelector {
+                                            selected: (selected + 1) % count,
+                                            runs,
+                                            purpose,
+                                        };
+                                    }
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    if count > 0 {
+                                        let (runs, purpose) = (runs.clone(), purpose.clone());
+                                        app.dialog_mode = DialogMode::RunSelector {
+                                            selected: if selected == 0 {
+                                                count - 1
+                                            } else {
+                                                selected - 1
+                                            },
+                                            runs,
+                                            purpose,
+                                        };
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(run) = runs.get(selected) {
+                                        let name = run.name.clone();
+                                        match purpose {
+                                            RunSelectorPurpose::View => {
+                                                app.dialog_mode = DialogMode::None;
+                                                app.switch_to_run(&name)?;
+                                            }
+                                            RunSelectorPurpose::Train => {
+                                                if run.weights.is_empty() {
+                                                    // No weights, start from scratch
+                                                    app.dialog_mode = DialogMode::None;
+                                                    app.start_training(None)?;
+                                                } else {
+                                                    let weights = run.weights.clone();
+                                                    app.dialog_mode = DialogMode::WeightsSelector {
+                                                        run_name: name,
+                                                        selected: 0,
+                                                        weights,
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('n') => {
+                                    if matches!(purpose, RunSelectorPurpose::Train) {
+                                        app.dialog_mode = DialogMode::None;
+                                        app.start_training(None)?;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         DialogMode::None => {
                             // Global keybindings (work in all modes when no dialog is open)
                             match key.code {
@@ -628,14 +865,22 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         .modifiers
                                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                                 {
-                                    app.dialog_mode = DialogMode::ConfirmQuit;
+                                    if app.is_training_running() {
+                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                    } else {
+                                        return Ok(());
+                                    }
                                 }
                                 KeyCode::Char('d')
                                     if key
                                         .modifiers
                                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                                 {
-                                    app.dialog_mode = DialogMode::ConfirmQuit;
+                                    if app.is_training_running() {
+                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                    } else {
+                                        return Ok(());
+                                    }
                                 }
                                 KeyCode::Char('o') => {
                                     // Don't open page jump when searching
@@ -645,20 +890,33 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         app.dialog_mode = DialogMode::PageJump { selected: 0 };
                                     }
                                 }
+                                KeyCode::Char('R') => {
+                                    if !app.generation_browser.searching
+                                        && !app.inference_browser.searching
+                                    {
+                                        app.open_run_selector(RunSelectorPurpose::View);
+                                    }
+                                }
                                 _ => {}
                             }
 
                             match app.mode {
                                 AppMode::Main => match key.code {
                                     KeyCode::Char('q') => {
-                                        app.dialog_mode = DialogMode::ConfirmQuit;
+                                        if app.is_training_running() {
+                                            app.dialog_mode = DialogMode::ConfirmQuit;
+                                        } else {
+                                            return Ok(());
+                                        }
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
-                                            app.dialog_mode = DialogMode::WeightsInput {
-                                                for_training: true,
-                                                for_inference: false,
-                                            };
+                                            app.open_run_selector(RunSelectorPurpose::Train);
+                                        }
+                                    }
+                                    KeyCode::Char('p') => {
+                                        if !app.is_training_running() {
+                                            app.toggle_training_model_size();
                                         }
                                     }
                                     KeyCode::Char('f') => {
@@ -829,31 +1087,63 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         }
                                     }
                                 }
-                                AppMode::ChartViewer => match key.code {
-                                    KeyCode::Esc | KeyCode::Char('q') => {
-                                        app.mode = app.previous_mode;
-                                    }
-                                    KeyCode::Down | KeyCode::Char('j') => {
-                                        app.chart_viewer.next();
-                                    }
-                                    KeyCode::Up | KeyCode::Char('k') => {
-                                        app.chart_viewer.previous();
-                                    }
-                                    KeyCode::Enter => {
-                                        app.chart_viewer.toggle_expand();
-                                    }
-                                    KeyCode::Char('r') => {
-                                        if app.chart_viewer.is_viewing_meta_charts() {
-                                            app.load_latest_meta_charts()?;
-                                            app.chart_viewer
-                                                .load_charts(&app.latest_meta_charts)?;
+                                AppMode::ChartViewer => {
+                                    if app.chart_viewer.is_editing_row_skip() {
+                                        match key.code {
+                                            KeyCode::Esc => {
+                                                app.chart_viewer.cancel_editing_row_skip();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.chart_viewer.stop_editing_row_skip();
+                                            }
+                                            KeyCode::Char(c) => {
+                                                app.chart_viewer.row_skip_input_push(c);
+                                            }
+                                            KeyCode::Backspace => {
+                                                app.chart_viewer.row_skip_input_pop();
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::Char('q') => {
+                                                app.mode = app.previous_mode;
+                                            }
+                                            KeyCode::Char('/') => {
+                                                if app.chart_viewer.is_viewing_meta_charts() {
+                                                    app.chart_viewer.start_editing_row_skip();
+                                                }
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.chart_viewer.next();
+                                            }
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.chart_viewer.previous();
+                                            }
+                                            KeyCode::Enter => {
+                                                app.chart_viewer.toggle_expand();
+                                            }
+                                            KeyCode::Char('r') => {
+                                                if app.chart_viewer.is_viewing_meta_charts() {
+                                                    app.load_latest_meta_charts()?;
+                                                    app.chart_viewer
+                                                        .load_charts(&app.latest_meta_charts)?;
+                                                }
+                                            }
+                                            KeyCode::Char('c') => {
+                                                let _ = app.chart_viewer.copy_current_image();
+                                            }
+                                            KeyCode::Char('l') => {
+                                                app.chart_viewer.toggle_legend();
+                                            }
+                                            KeyCode::Char(c @ '1'..='9') => {
+                                                app.chart_viewer
+                                                    .toggle_solo_series((c as u8 - b'1') as usize);
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                    KeyCode::Char('c') => {
-                                        let _ = app.chart_viewer.copy_current_image();
-                                    }
-                                    _ => {}
-                                },
+                                }
                                 AppMode::Logs => match key.code {
                                     KeyCode::Esc | KeyCode::Char('q') => {
                                         app.mode = AppMode::Main;
@@ -950,15 +1240,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     // Render dialog on top if active
-    match app.dialog_mode {
-        DialogMode::WeightsInput {
-            for_training,
-            for_inference,
-        } => {
-            components::dialogs::weights::render(f, app, for_training, for_inference);
-        }
+    match &app.dialog_mode {
         DialogMode::InferenceInput { focused_field } => {
-            components::dialogs::inference::render(f, app, focused_field);
+            components::dialogs::inference::render(f, app, *focused_field);
         }
         DialogMode::ConfirmQuit => {
             components::dialogs::confirm::render(
@@ -975,7 +1259,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             );
         }
         DialogMode::PageJump { selected } => {
-            components::dialogs::page_jump::render(f, selected, app.mode);
+            components::dialogs::page_jump::render(f, *selected, app.mode);
+        }
+        DialogMode::RunSelector { selected, runs, purpose } => {
+            components::dialogs::run_selector::render(f, *selected, runs, purpose);
+        }
+        DialogMode::WeightsSelector { run_name, selected, weights } => {
+            components::dialogs::run_selector::render_weights(f, run_name, *selected, weights);
         }
         DialogMode::None => {}
     }

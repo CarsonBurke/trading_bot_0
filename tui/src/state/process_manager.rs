@@ -1,19 +1,25 @@
 use anyhow::Result;
+use shared::{paths::RUNS_PATH, run_dir::RunDir};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub struct ProcessManagerState {
     pub inference_process: Option<Child>,
     pub training_process: Option<Child>,
+    pub active_run: Option<RunDir>,
     cached_training_running: bool,
     last_training_check: Instant,
 }
 
 impl ProcessManagerState {
     pub fn new() -> Self {
+        let active_run = RunDir::latest_with_data(RUNS_PATH)
+            .or_else(|| RunDir::latest(RUNS_PATH).ok());
         Self {
             inference_process: None,
             training_process: None,
+            active_run,
             cached_training_running: false,
             last_training_check: Instant::now(),
         }
@@ -63,26 +69,49 @@ impl ProcessManagerState {
         self.is_training_running() || self.inference_process.is_some()
     }
 
-    pub fn start_training(&mut self, weights: Option<String>) -> Result<()> {
+    pub fn start_training(&mut self, weights: Option<String>, model_size: &str) -> Result<()> {
         if self.is_anything_running() {
             return Ok(());
         }
+
+        let run_dir = match &weights {
+            Some(w) => {
+                let p = Path::new(w);
+                // If weights are inside runs/*/weights/, reuse that run dir
+                if p.parent()
+                    .and_then(|d| d.file_name())
+                    .map_or(false, |n| n == "weights")
+                    && p.ancestors().any(|a| a.ends_with("runs"))
+                {
+                    RunDir::from_weights_path(p)?
+                } else {
+                    RunDir::create_fresh(RUNS_PATH, None)?
+                }
+            }
+            None => RunDir::create_fresh(RUNS_PATH, None)?,
+        };
 
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open("../training/training.log")?;
+            .open(&run_dir.log_file)?;
 
         let mut cmd = Command::new("cargo");
         cmd.current_dir("../trading_bots")
             .arg("run")
             .arg("--release")
             .arg("--")
-            .arg("train");
+            .arg("train")
+            .arg("--model-size")
+            .arg(model_size);
 
         if let Some(w) = weights {
             cmd.arg("--weights").arg(w);
+        }
+
+        if let Some(name) = run_dir.root.file_name().and_then(|n| n.to_str()) {
+            cmd.arg("--run").arg(name);
         }
 
         cmd.env("CLICOLOR_FORCE", "1")
@@ -90,13 +119,21 @@ impl ProcessManagerState {
             .stdout(log_file.try_clone()?)
             .stderr(log_file);
 
-        cmd.spawn()?;
+        let child = cmd.spawn()?;
+        self.training_process = Some(child);
+        self.active_run = Some(run_dir);
         self.cached_training_running = true;
 
         Ok(())
     }
 
-    pub fn start_inference(&mut self, weights: String, ticker: Option<String>, episodes: usize) -> Result<()> {
+    pub fn start_inference(
+        &mut self,
+        weights: String,
+        ticker: Option<String>,
+        episodes: usize,
+        model_size: String,
+    ) -> Result<()> {
         if self.is_anything_running() {
             return Ok(());
         }
@@ -109,6 +146,8 @@ impl ProcessManagerState {
             .arg("infer")
             .arg("--weights")
             .arg(weights)
+            .arg("--model-size")
+            .arg(model_size)
             .arg("--episodes")
             .arg(episodes.to_string());
 
@@ -127,9 +166,9 @@ impl ProcessManagerState {
             let _ = child.kill();
         }
 
-        Command::new("pkill")
+        let _ = Command::new("pkill")
             .args(["-f", "trading.*train"])
-            .spawn()?;
+            .output();
 
         self.cached_training_running = false;
         Ok(())

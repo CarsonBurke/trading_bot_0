@@ -1,6 +1,10 @@
 use rand::seq::{IndexedRandom, SliceRandom};
 use rand::Rng;
-use shared::constants::AVAILABLE_TICKERS_COUNT;
+use shared::constants::{
+    ACTION_COUNT as ACTION_COUNT_USIZE, ACTION_HISTORY_LEN as ACTION_HISTORY_LEN_USIZE,
+    AVAILABLE_TICKERS_COUNT, STATIC_OBSERVATIONS as STATIC_OBSERVATIONS_USIZE,
+    TICKERS_COUNT as TICKERS_COUNT_USIZE,
+};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -8,24 +12,24 @@ use colored::Colorize;
 use tch::Tensor;
 
 use super::earnings::EarningsIndicators;
-use std::sync::Arc;
 use super::macro_ind::MacroIndicators;
 use super::momentum::MomentumIndicators;
 use crate::{
-    data::historical::{get_historical_data},
+    data::historical::{get_historical_data, get_historical_series},
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
-    torch::{
-        constants::{
-            ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER,
-            STATIC_OBSERVATIONS, STEPS_PER_EPISODE, TICKERS_COUNT,
-        },
-        ppo::NPROCS,
+    torch::constants::{
+        ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS,
+        STEPS_PER_EPISODE, TICKERS_COUNT,
     },
     types::Account,
-    utils::{create_folder_if_not_exists, get_mapped_price_deltas},
+    utils::{create_folder_if_not_exists, get_mapped_price_deltas, get_price_deltas},
 };
+use std::sync::Arc;
 
-const AVAILABLE_TICKERS: [&str; AVAILABLE_TICKERS_COUNT] = ["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD", "ADBE", "GOOG", "META", "NKE", "DELL", "CMCSA", "FDX"];
+const AVAILABLE_TICKERS: [&str; AVAILABLE_TICKERS_COUNT] = [
+    "TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD", "ADBE", "GOOG", "META", "NKE", "DELL", "CMCSA",
+    "FDX",
+];
 
 pub struct Env {
     pub env_id: usize,
@@ -51,10 +55,12 @@ pub struct Env {
     pub position_open_step: Vec<Option<usize>>,
     pub ticker_perm: Vec<usize>,
     pub target_weights: Vec<f64>,
+    pub realized_weights: Vec<f64>,
     pub momentum: Vec<Arc<MomentumIndicators>>,
     pub earnings: Vec<Arc<EarningsIndicators>>,
     pub macro_ind: Arc<MacroIndicators>,
     record_history_io: bool,
+    gens_path: Option<String>,
 }
 
 pub const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
@@ -63,38 +69,51 @@ impl Env {
     pub const STARTING_CASH: f64 = 10_000.0;
 
     pub fn new(random_start: bool) -> Self {
-        Self::new_with_recording(random_start, true)
+        Self::new_with_recording(random_start, true, None)
     }
 
     pub fn new_with_tickers(tickers: Vec<String>, random_start: bool) -> Self {
-        Self::new_with_tickers_and_recording(tickers, random_start, true)
+        Self::new_with_tickers_and_recording(tickers, random_start, true, None)
     }
 
-    pub fn new_with_recording(random_start: bool, record_history_io: bool) -> Self {
-
+    pub fn new_with_recording(
+        random_start: bool,
+        record_history_io: bool,
+        gens_path: Option<String>,
+    ) -> Self {
         let rng = &mut rand::rng();
-        let tickers = AVAILABLE_TICKERS.to_vec().choose_multiple(rng, TICKERS_COUNT as usize).map(|ticker| ticker.to_string()).collect();
-        
-        Self::new_with_tickers_and_recording(tickers, random_start, record_history_io)
+        let tickers = AVAILABLE_TICKERS
+            .to_vec()
+            .choose_multiple(rng, TICKERS_COUNT as usize)
+            .map(|ticker| ticker.to_string())
+            .collect();
+
+        Self::new_with_tickers_and_recording(tickers, random_start, record_history_io, gens_path)
     }
 
     pub fn new_with_tickers_and_recording(
         tickers: Vec<String>,
         random_start: bool,
         record_history_io: bool,
+        gens_path: Option<String>,
     ) -> Self {
         eprint!("  hist..");
-        let mapped_bars = get_historical_data(Some(
-            &tickers
-                .iter()
-                .map(|ticker| ticker.as_str())
-                .collect::<Vec<&str>>(),
-        ));
-        let prices: Vec<Vec<f64>> = mapped_bars
+        let ticker_refs = tickers
             .iter()
-            .map(|bar| bar.iter().map(|bar| bar.close).collect())
-            .collect();
-        let price_deltas = get_mapped_price_deltas(&mapped_bars);
+            .map(|ticker| ticker.as_str())
+            .collect::<Vec<&str>>();
+        let mapped_bars = get_historical_data(Some(&ticker_refs));
+        let mut prices = Vec::with_capacity(tickers.len());
+        let mut price_deltas = Vec::with_capacity(tickers.len());
+        for (i, ticker) in tickers.iter().enumerate() {
+            if let Some((cached_prices, cached_deltas)) = get_historical_series(ticker) {
+                prices.push(cached_prices);
+                price_deltas.push(cached_deltas);
+            } else {
+                prices.push(mapped_bars[i].iter().map(|bar| bar.close).collect());
+                price_deltas.push(get_price_deltas(&mapped_bars[i]));
+            }
+        }
 
         eprint!("mom..");
         // Get or compute momentum indicators (cached per ticker)
@@ -131,7 +150,8 @@ impl Env {
             eprint!("{}..", ticker);
             let reports = crate::data::get_earnings_data_any(ticker);
             eprint!("r");
-            let ind = EarningsIndicators::get_or_compute(ticker, &reports, &bar_dates[i], &prices[i]);
+            let ind =
+                EarningsIndicators::get_or_compute(ticker, &reports, &bar_dates[i], &prices[i]);
             eprint!("i");
             earnings.push(ind);
         }
@@ -142,6 +162,11 @@ impl Env {
         eprintln!("done");
 
         let num_tickers = tickers.len();
+        let mut target_weights = vec![0.0; num_tickers + 1];
+        target_weights[num_tickers] = 1.0;
+        let mut realized_weights = vec![0.0; num_tickers + 1];
+        realized_weights[num_tickers] = 1.0;
+
         Self {
             env_id: 0,
             step: 0,
@@ -165,108 +190,13 @@ impl Env {
             steps_since_trade: vec![0; num_tickers],
             position_open_step: vec![None; num_tickers],
             ticker_perm: (0..num_tickers).collect(),
-            target_weights: vec![0.0; num_tickers + 1],
+            target_weights,
+            realized_weights,
             momentum,
             earnings,
             macro_ind,
             record_history_io,
-        }
-    }
-
-    pub fn step(&mut self, all_actions: Vec<Vec<f64>>) -> Step {
-        let mut rewards = Vec::with_capacity(NPROCS as usize);
-        let mut rewards_per_ticker = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
-        let mut cash_rewards = Vec::with_capacity(NPROCS as usize);
-        let mut is_dones = Vec::with_capacity(NPROCS as usize);
-        let mut all_price_deltas = Vec::new();
-        let mut all_static_obs = Vec::new();
-
-        for actions in all_actions.iter() {
-            let absolute_step = self.episode_start_offset + self.step;
-            self.account.update_total(&self.prices, absolute_step);
-
-            // Decay trade activity EMAs (trades will add TRADE_EMA_ALPHA back)
-            for ema in &mut self.trade_activity_ema {
-                *ema *= 1.0 - TRADE_EMA_ALPHA;
-            }
-            for steps in &mut self.steps_since_trade {
-                *steps += 1;
-            }
-
-            // Actions come in permuted order - map back to real ticker order
-            // Last action is cash (not permuted)
-            let mut real_actions = vec![0.0; ACTION_COUNT as usize];
-            for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
-                real_actions[real_idx] = actions[perm_idx];
-            }
-            real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize];
-
-            if self.step == 0 {
-                self.episode_history.action_step0 = Some(real_actions.clone());
-            }
-
-            self.action_history.push_back(real_actions.clone());
-            if self.action_history.len() > ACTION_HISTORY_LEN {
-                self.action_history.pop_front();
-            }
-
-            let total_commission = self.trade_by_target_weights(&real_actions, absolute_step);
-            let (reward, reward_per_ticker, cash_reward) =
-                self.get_unrealized_pnl_reward_breakdown(absolute_step, total_commission);
-
-            self.last_reward = reward;
-            if self.account.total_assets > self.peak_assets {
-                self.peak_assets = self.account.total_assets;
-            }
-
-            let is_done = self.get_is_done();
-
-            for (index, _) in self.tickers.iter().enumerate() {
-                self.episode_history.positioned[index].push(
-                    self.account.positions[index]
-                        .value_with_price(self.prices[index][absolute_step]),
-                );
-                self.episode_history.raw_actions[index].push(real_actions[index]);
-                self.episode_history.target_weights[index].push(self.target_weights[index]);
-            }
-            self.episode_history.cash.push(self.account.cash);
-            self.episode_history.rewards.push(reward);
-            // Use target cash weight (last element) for consistent charting with ticker target weights
-            self.episode_history
-                .cash_weight
-                .push(self.target_weights[self.tickers.len()]);
-
-            if is_done == 1.0 {
-                self.handle_episode_end(absolute_step);
-                self.episode_history.action_final = Some(real_actions.clone());
-            }
-
-            rewards.push(reward);
-            rewards_per_ticker.extend(reward_per_ticker.iter().map(|v| *v as f32));
-            is_dones.push(is_done);
-            cash_rewards.push(cash_reward as f32);
-
-            let (price_deltas, static_obs) = self.get_next_obs();
-            all_price_deltas.push(price_deltas);
-            all_static_obs.push(static_obs);
-        }
-
-        let price_deltas_flat: Vec<f32> = all_price_deltas.into_iter().flatten().collect();
-        let static_obs_flat: Vec<f32> = all_static_obs.into_iter().flatten().collect();
-
-        let price_deltas_tensor = Tensor::from_slice(&price_deltas_flat)
-            .view([NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
-        let static_obs_tensor =
-            Tensor::from_slice(&static_obs_flat).view([NPROCS, STATIC_OBSERVATIONS as i64]);
-
-        Step {
-            reward: Tensor::from_slice(&rewards),
-            reward_per_ticker: Tensor::from_slice(&rewards_per_ticker)
-                .view([NPROCS, TICKERS_COUNT]),
-            cash_reward: Tensor::from_slice(&cash_rewards),
-            is_done: Tensor::from_slice(&is_dones),
-            price_deltas: price_deltas_tensor,
-            static_obs: static_obs_tensor,
+            gens_path,
         }
     }
 
@@ -322,17 +252,31 @@ impl Env {
         );
 
         if self.record_history_io {
-            self.episode_history.record(
-                self.episode,
-                &self.tickers,
-                &self.prices,
-                self.episode_start_offset,
-            );
+            if let Some(ref gp) = self.gens_path {
+                self.episode_history.record_to_path(
+                    gp,
+                    self.episode,
+                    &self.tickers,
+                    &self.prices,
+                    self.episode_start_offset,
+                );
+            } else {
+                self.episode_history.record(
+                    self.episode,
+                    &self.tickers,
+                    &self.prices,
+                    self.episode_start_offset,
+                );
+            }
             self.meta_history
                 .record(&self.episode_history, outperformance);
 
             if self.episode % 5 == 0 {
-                self.meta_history.write_reports(self.episode);
+                if let Some(ref gp) = self.gens_path {
+                    self.meta_history.write_reports(self.episode, gp);
+                } else {
+                    self.meta_history.write_reports_default(self.episode);
+                }
             }
         }
 
@@ -340,8 +284,12 @@ impl Env {
         self.episode += 1;
     }
 
+    pub(super) fn has_next_transition(&self) -> bool {
+        self.step <= self.max_step
+    }
+
     fn get_is_done(&self) -> f32 {
-        if self.step + 2 > self.max_step {
+        if self.step >= self.max_step {
             1.0
         } else {
             0.0
@@ -382,6 +330,8 @@ impl Env {
         // Initialize to 100% cash, 0% tickers.
         self.target_weights = vec![0.0; n + 1];
         self.target_weights[n] = 1.0;
+        self.realized_weights = vec![0.0; n + 1];
+        self.realized_weights[n] = 1.0;
 
         // Shuffle ticker permutation for this episode
         let mut rng = rand::rng();
@@ -399,29 +349,69 @@ impl Env {
     /// Reset for VecEnv - returns raw vectors instead of tensors
     pub fn reset_single(&mut self) -> (Vec<f32>, Vec<f32>) {
         let rng = &mut rand::rng();
-        let tickers: Vec<String> = AVAILABLE_TICKERS.to_vec().choose_multiple(rng, TICKERS_COUNT as usize).map(|ticker| ticker.to_string()).collect();
+        let tickers: Vec<String> = AVAILABLE_TICKERS
+            .to_vec()
+            .choose_multiple(rng, TICKERS_COUNT as usize)
+            .map(|ticker| ticker.to_string())
+            .collect();
 
         // Reload price data and indicators for new tickers
-        let mapped_bars = get_historical_data(Some(
-            &tickers.iter().map(|t| t.as_str()).collect::<Vec<&str>>(),
-        ));
-        self.prices = mapped_bars.iter().map(|bar| bar.iter().map(|b| b.close).collect()).collect();
-        self.price_deltas = get_mapped_price_deltas(&mapped_bars);
+        let ticker_refs = tickers.iter().map(|t| t.as_str()).collect::<Vec<&str>>();
+        let mapped_bars = get_historical_data(Some(&ticker_refs));
+        self.prices.clear();
+        self.price_deltas.clear();
+        self.prices.reserve(tickers.len());
+        self.price_deltas.reserve(tickers.len());
+        for (i, ticker) in tickers.iter().enumerate() {
+            if let Some((cached_prices, cached_deltas)) = get_historical_series(ticker) {
+                self.prices.push(cached_prices);
+                self.price_deltas.push(cached_deltas);
+            } else {
+                self.prices
+                    .push(mapped_bars[i].iter().map(|bar| bar.close).collect());
+                self.price_deltas.push(get_price_deltas(&mapped_bars[i]));
+            }
+        }
         self.total_data_length = self.prices[0].len();
 
         // Reload momentum indicators (cached)
-        self.momentum = tickers.iter().zip(self.prices.iter())
+        self.momentum = tickers
+            .iter()
+            .zip(self.prices.iter())
             .map(|(ticker, p)| MomentumIndicators::get_or_compute(ticker, p))
             .collect();
 
         // Reload earnings indicators (cached)
-        let bar_dates: Vec<Vec<String>> = mapped_bars.iter()
-            .map(|bars| bars.iter().map(|b| format!("{:04}-{:02}-{:02}", b.date.year(), b.date.month() as u8, b.date.day())).collect())
+        let bar_dates: Vec<Vec<String>> = mapped_bars
+            .iter()
+            .map(|bars| {
+                bars.iter()
+                    .map(|b| {
+                        format!(
+                            "{:04}-{:02}-{:02}",
+                            b.date.year(),
+                            b.date.month() as u8,
+                            b.date.day()
+                        )
+                    })
+                    .collect()
+            })
             .collect();
-        self.earnings = tickers.iter().enumerate()
+        self.earnings = tickers
+            .iter()
+            .enumerate()
             .map(|(i, ticker)| {
-                let reports = crate::data::get_earnings_data_any(ticker);
-                EarningsIndicators::get_or_compute(ticker, &reports, &bar_dates[i], &self.prices[i])
+                if let Some(cached) = EarningsIndicators::get_cached(ticker, self.prices[i].len()) {
+                    cached
+                } else {
+                    let reports = crate::data::get_earnings_data_any(ticker);
+                    EarningsIndicators::get_or_compute(
+                        ticker,
+                        &reports,
+                        &bar_dates[i],
+                        &self.prices[i],
+                    )
+                }
             })
             .collect();
 
@@ -456,6 +446,8 @@ impl Env {
         let n = self.tickers.len();
         self.target_weights = vec![0.0; n + 1];
         self.target_weights[n] = 1.0;
+        self.realized_weights = vec![0.0; n + 1];
+        self.realized_weights[n] = 1.0;
 
         let mut rng = rand::rng();
         self.ticker_perm.shuffle(&mut rng);
@@ -493,11 +485,14 @@ impl Env {
         let n = self.tickers.len();
         self.target_weights = vec![0.0; n + 1];
         self.target_weights[n] = 1.0;
+        self.realized_weights = vec![0.0; n + 1];
+        self.realized_weights[n] = 1.0;
 
         let mut rng = rand::rng();
         self.ticker_perm.shuffle(&mut rng);
 
-        self.get_next_step_obs()
+        let (step_deltas, static_obs) = self.get_next_step_obs();
+        (step_deltas.to_vec(), static_obs.to_vec())
     }
 
     /// Single-environment step for VecEnv
@@ -512,24 +507,29 @@ impl Env {
             *steps += 1;
         }
 
-        let mut real_actions = vec![0.0; ACTION_COUNT as usize];
+        let pre_total_assets = self.account.total_assets;
+
+        let mut real_actions = [0.0; ACTION_COUNT_USIZE];
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
             real_actions[real_idx] = actions[perm_idx];
         }
-        real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize];
 
         if self.step == 0 {
-            self.episode_history.action_step0 = Some(real_actions.clone());
+            self.episode_history.action_step0 = Some(real_actions.to_vec());
         }
 
-        self.action_history.push_back(real_actions.clone());
-        if self.action_history.len() > ACTION_HISTORY_LEN {
-            self.action_history.pop_front();
+        if ACTION_HISTORY_LEN_USIZE > 0 {
+            self.action_history.push_back(real_actions.to_vec());
+            if self.action_history.len() > ACTION_HISTORY_LEN {
+                self.action_history.pop_front();
+            }
         }
 
-        let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        let (reward, reward_per_ticker, cash_reward) =
-            self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
+        let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
+        self.account.update_total(&self.prices, absolute_step);
+        self.sync_realized_weights(absolute_step);
+        let (reward, reward_per_ticker) =
+            self.get_unrealized_pnl_reward_breakdown(absolute_step, pre_total_assets);
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -552,17 +552,17 @@ impl Env {
             .push(self.target_weights[self.tickers.len()]);
 
         if is_done == 1.0 {
+            self.episode_history.action_final = Some(real_actions.to_vec());
             self.handle_episode_end(absolute_step);
-            self.episode_history.action_final = Some(real_actions.clone());
         }
 
+        self.step += 1;
         let (price_deltas, static_obs) = self.get_next_obs();
         SingleStep {
             reward,
-            reward_per_ticker: reward_per_ticker.iter().map(|v| *v as f32).collect(),
-            cash_reward: cash_reward as f32,
+            reward_per_ticker,
             price_deltas,
-            static_obs,
+            static_obs: static_obs.try_into().unwrap(),
             is_done,
         }
     }
@@ -578,24 +578,29 @@ impl Env {
             *steps += 1;
         }
 
-        let mut real_actions = vec![0.0; ACTION_COUNT as usize];
+        let pre_total_assets = self.account.total_assets;
+
+        let mut real_actions = [0.0; ACTION_COUNT_USIZE];
         for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
             real_actions[real_idx] = actions[perm_idx];
         }
-        real_actions[TICKERS_COUNT as usize] = actions[TICKERS_COUNT as usize];
 
         if self.step == 0 {
-            self.episode_history.action_step0 = Some(real_actions.clone());
+            self.episode_history.action_step0 = Some(real_actions.to_vec());
         }
 
-        self.action_history.push_back(real_actions.clone());
-        if self.action_history.len() > ACTION_HISTORY_LEN {
-            self.action_history.pop_front();
+        if ACTION_HISTORY_LEN_USIZE > 0 {
+            self.action_history.push_back(real_actions.to_vec());
+            if self.action_history.len() > ACTION_HISTORY_LEN {
+                self.action_history.pop_front();
+            }
         }
 
-        let commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        let (reward, reward_per_ticker, cash_reward) =
-            self.get_unrealized_pnl_reward_breakdown(absolute_step, commissions);
+        let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
+        self.account.update_total(&self.prices, absolute_step);
+        self.sync_realized_weights(absolute_step);
+        let (reward, reward_per_ticker) =
+            self.get_unrealized_pnl_reward_breakdown(absolute_step, pre_total_assets);
 
         self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
@@ -618,15 +623,15 @@ impl Env {
             .push(self.target_weights[self.tickers.len()]);
 
         if is_done == 1.0 {
+            self.episode_history.action_final = Some(real_actions.to_vec());
             self.handle_episode_end(absolute_step);
-            self.episode_history.action_final = Some(real_actions.clone());
         }
 
+        self.step += 1;
         let (step_deltas, static_obs) = self.get_next_step_obs();
         SingleStepStep {
             reward,
-            reward_per_ticker: reward_per_ticker.iter().map(|v| *v as f32).collect(),
-            cash_reward: cash_reward as f32,
+            reward_per_ticker,
             step_deltas,
             static_obs,
             is_done,
@@ -647,30 +652,19 @@ impl Env {
     }
 }
 
-pub struct Step {
-    pub reward: Tensor,
-    pub reward_per_ticker: Tensor,
-    pub cash_reward: Tensor,
-    pub price_deltas: Tensor,
-    pub static_obs: Tensor,
-    pub is_done: Tensor,
-}
-
 /// Single-environment step result with raw values (for VecEnv)
 pub struct SingleStep {
     pub reward: f64,
-    pub reward_per_ticker: Vec<f32>,
-    pub cash_reward: f32,
+    pub reward_per_ticker: [f32; TICKERS_COUNT_USIZE],
     pub price_deltas: Vec<f32>,
-    pub static_obs: Vec<f32>,
+    pub static_obs: [f32; STATIC_OBSERVATIONS_USIZE],
     pub is_done: f32,
 }
 
 pub struct SingleStepStep {
     pub reward: f64,
-    pub reward_per_ticker: Vec<f32>,
-    pub cash_reward: f32,
-    pub step_deltas: Vec<f32>,
-    pub static_obs: Vec<f32>,
+    pub reward_per_ticker: [f32; TICKERS_COUNT_USIZE],
+    pub step_deltas: [f32; TICKERS_COUNT_USIZE],
+    pub static_obs: [f32; STATIC_OBSERVATIONS_USIZE],
     pub is_done: f32,
 }

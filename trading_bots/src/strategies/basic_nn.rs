@@ -2,17 +2,19 @@ use core::f64;
 
 use colored::Colorize;
 use hashbrown::HashMap;
-use rand::seq::index::sample;
-use rust_neural_network::neural_network::{NeuralNetwork};
+use rust_neural_network::neural_network::NeuralNetwork;
 
 use crate::{
-    charts::{assets_chart, buy_sell_chart, simple_chart, want_chart},
+    charts::{assets_chart, buy_sell_chart, want_chart},
     constants::{
-        self, agent::STARTING_CASH, files::TRAINING_PATH, neural_net::{BUY_INDEX, INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, SELL_INDEX, TICKER_SETS}, TICKERS
+        self,
+        agent::STARTING_CASH,
+        files::TRAINING_PATH,
+        neural_net::{INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS},
+        TICKERS,
     },
-    neural_net::create::Indicators,
     types::{Account, Data, MakeCharts, MappedHistorical, Position},
-    utils::{convert_historical, create_folder_if_not_exists, ema, find_highest, get_rsi_values},
+    utils::{convert_historical, create_folder_if_not_exists},
 };
 
 pub fn basic_nn(
@@ -24,7 +26,6 @@ pub fn basic_nn(
     inputs_count: usize,
     make_charts: Option<MakeCharts>,
 ) -> f64 {
-
     let mut all_assets = 0.;
     let mut all_min: f64 = f64::MAX;
 
@@ -76,7 +77,7 @@ pub fn basic_nn(
 
                 let position = &account.positions[ticker_index];
                 let positioned = position.value_with_price(price);
-                
+
                 positions_by_ticker[ticker_index].push(positioned);
                 total_positioned += positioned;
             }
@@ -94,7 +95,7 @@ pub fn basic_nn(
 
                 let position = &mut account.positions[ticker_index];
 
-                let diffs = &mapped_diffs[ticker_index];
+                let _diffs = &mapped_diffs[ticker_index];
 
                 // Assign inputs
 
@@ -106,7 +107,7 @@ pub fn basic_nn(
                     0. => 0.,
                     _ => ((price - position.avg_price) / position.avg_price) as f32,
                 };
-                
+
                 // Previous few indexes with full density
 
                 for i in ((index.saturating_sub(INDEX_STEP))..index).rev() {
@@ -153,7 +154,13 @@ pub fn basic_nn(
                 // Forward propagate
 
                 let activation_layers = neural_network.forward_propagate(inputs);
-                let last_layer: Vec<f32> = activation_layers.last().unwrap().rows().into_iter().map(|x| x[0]).collect();
+                let last_layer: Vec<f32> = activation_layers
+                    .last()
+                    .unwrap()
+                    .rows()
+                    .into_iter()
+                    .map(|x| x[0])
+                    .collect();
 
                 // println!("activation layers: {activation_layers:?}");
 
@@ -181,7 +188,9 @@ pub fn basic_nn(
 
                 // println!("change: {change}, current: {current}");
                 if change > 0. {
-                    let buy = (change).min(account.cash).min(assets / SAMPLE_INDEXES as f64 - current);
+                    let buy = (change)
+                        .min(account.cash)
+                        .min(assets / SAMPLE_INDEXES as f64 - current);
                     if buy <= 0. {
                         continue;
                     }
