@@ -292,7 +292,7 @@ impl GqaBlock {
                 0.0,
                 false,
                 None,
-                true,
+                false,
             );
             out_parts.push(out_pos);
         }
@@ -368,7 +368,7 @@ const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 = PRICE_DELTAS_PER_TICKER as i64
     - UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
 const STREAM_PATCH_INNER_DIM: i64 = 32;
 const STREAM_PATCH_CONV_KERNEL: i64 = 8;
-pub(super) const LOG_STD_INIT: f64 = -2.0;
+pub(super) const LOG_STD_INIT: f64 = -1.0;
 pub(super) const LOG_STD_MIN: f64 = -2.995732273553991;
 pub(super) const LOG_STD_MAX: f64 = 0.04879016416943201;
 const INTER_TICKER_AFTER: usize = 1;
