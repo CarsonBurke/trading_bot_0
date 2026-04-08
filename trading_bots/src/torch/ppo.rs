@@ -39,7 +39,6 @@ const RPO_ALPHA_INIT: f64 = 0.0; // CleanRL impl found 0.1 reliably improved res
 const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
-const VALUE_CLIP: f64 = 0.3;
 
 fn minibatch_samples_from_total(total_samples: i64) -> i64 {
     let ratio = env::var("PPO_MINIBATCH_RATIO")
@@ -193,27 +192,14 @@ fn compute_explained_variance(rollout_values: &Tensor, returns: &Tensor) -> Tens
     })
 }
 
-pub(crate) fn two_hot_value_loss_terms(
+pub(crate) fn two_hot_value_loss(
     two_hot: &TwoHotBins,
     value_logits: &Tensor,
-    old_values: &Tensor,
     returns: &Tensor,
-) -> (Tensor, Tensor) {
-    let new_values = two_hot.bins_to_scalar_value(value_logits, true);
-    let clipped_values = old_values + (&new_values - old_values).clamp(-VALUE_CLIP, VALUE_CLIP);
-
+) -> Tensor {
     let return_bins = two_hot.encode(returns);
-    let clipped_value_bins = two_hot.encode(&clipped_values);
-
     let log_probs = value_logits.log_softmax(-1, Kind::Float);
-    let value_loss_unclipped =
-        -(&return_bins * &log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-
-    let clipped_log_probs = clipped_value_bins.log_softmax(-1, Kind::Float);
-    let value_loss_clipped =
-        -(&return_bins * &clipped_log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
-
-    (value_loss_unclipped, value_loss_clipped)
+    -(&return_bins * &log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float)
 }
 
 /// Compute action std and RPO alpha stats from a sample batch.
@@ -650,7 +636,6 @@ pub async fn train(
                 let ret_mb = returns.index_select(0, &mb_inds);
                 let adv_mb = adv_norm.index_select(0, &mb_inds);
                 let old_log_probs_mb = s_old_log_probs.index_select(0, &mb_inds);
-                let old_val_mb = s_values.index_select(0, &mb_inds);
                 let reset_slots_chunk = s_reset_slots
                     .index_select(0, &mb_inds)
                     .view([chunk_count, PPO_CHUNK_LEN]);
