@@ -670,6 +670,28 @@ impl TradingModel {
                 for &env_idx in &rollover_envs {
                     state.uniform_live_fill_host[env_idx as usize] = 0;
                 }
+                let n_rollover = rollover_rows.len() as i64;
+                let zeros_r1 =
+                    Tensor::zeros([n_rollover, 1], (Kind::Float, self.device));
+                state.uniform_live_sum = state
+                    .uniform_live_sum
+                    .index_copy(0, &rollover_row_idx, &zeros_r1);
+                state.uniform_live_sum_sq = state
+                    .uniform_live_sum_sq
+                    .index_copy(0, &rollover_row_idx, &zeros_r1);
+                state.uniform_live_first = state
+                    .uniform_live_first
+                    .index_copy(0, &rollover_row_idx, &zeros_r1);
+                state.uniform_live_last = state
+                    .uniform_live_last
+                    .index_copy(0, &rollover_row_idx, &zeros_r1);
+                let zeros_conv = Tensor::zeros(
+                    [n_rollover, super::STREAM_PATCH_INNER_DIM, super::STREAM_PATCH_CONV_KERNEL],
+                    (Kind::Float, self.device),
+                );
+                state.uniform_live_conv_state = state
+                    .uniform_live_conv_state
+                    .index_copy(0, &rollover_row_idx, &zeros_conv);
             }
             let current_fill_host = state.uniform_live_fill_host.clone();
             let current_fill = Tensor::from_slice(&current_fill_host)
