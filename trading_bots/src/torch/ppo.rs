@@ -19,7 +19,7 @@ const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
 const PPO_CHUNK_LEN: i64 = 250;
-const DEFAULT_PPO_MINIBATCH_RATIO: f64 = 0.03125;
+const DEFAULT_PPO_MINIBATCH_RATIO: f64 = 0.0625;
 const OPTIM_EPOCHS: i64 = 3;
 const PPO_CLIP_LOW: f64 = 0.2;
 const PPO_CLIP_HIGH: f64 = 0.2;
@@ -776,12 +776,8 @@ pub async fn train(
                     let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
                 }
 
-                // Match dreamer4: decode to scalar for clipping, then compare both
-                // unclipped and clipped branches in bin space.
-                let (value_loss_unclipped, value_loss_clipped) =
-                    two_hot_value_loss_terms(&two_hot, &new_value_logits, &old_val_mb, &ret_mb);
-                let value_loss = value_loss_unclipped
-                    .max_other(&value_loss_clipped)
+                let value_loss =
+                    two_hot_value_loss(&two_hot, &new_value_logits, &ret_mb)
                     .mean(Kind::Float);
 
                 let dist_entropy = gaussian_entropy(&action_std, LOG_2PI).mean(Kind::Float);
