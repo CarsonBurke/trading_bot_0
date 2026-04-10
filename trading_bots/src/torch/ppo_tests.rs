@@ -21,8 +21,11 @@ mod tests {
         let loss = two_hot_value_loss(&two_hot, &logits, &returns);
 
         let return_bins = two_hot.encode(&returns);
-        let reference = -(&return_bins * logits.log_softmax(-1, Kind::Float))
-            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+        let reference = -(&return_bins * logits.log_softmax(-1, Kind::Float)).sum_dim_intlist(
+            [-1].as_slice(),
+            false,
+            Kind::Float,
+        );
 
         let actual = loss.double_value(&[0]);
         let expected = reference.double_value(&[0]);

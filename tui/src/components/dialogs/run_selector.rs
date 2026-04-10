@@ -90,10 +90,15 @@ pub fn render(f: &mut Frame, selected: usize, runs: &[RunInfo], purpose: &RunSel
     f.render_widget(list, chunks[0]);
 
     let extra_hint = matches!(purpose, RunSelectorPurpose::Train);
-    render_help_bar(f, chunks[1], match purpose {
-        RunSelectorPurpose::View => "Switch",
-        RunSelectorPurpose::Train => "Select",
-    }, extra_hint);
+    render_help_bar(
+        f,
+        chunks[1],
+        match purpose {
+            RunSelectorPurpose::View => "Switch",
+            RunSelectorPurpose::Train => "Select",
+        },
+        extra_hint,
+    );
 }
 
 pub fn render_weights(f: &mut Frame, run_name: &str, selected: usize, weights: &[String]) {
@@ -157,7 +162,10 @@ fn render_help_bar(f: &mut Frame, area: ratatui::layout::Rect, action: &str, sho
                 .fg(theme::GREEN)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" {}  ", action), Style::default().fg(theme::SUBTEXT1)),
+        Span::styled(
+            format!(" {}  ", action),
+            Style::default().fg(theme::SUBTEXT1),
+        ),
     ];
     if show_new {
         spans.push(Span::styled(
@@ -172,14 +180,17 @@ fn render_help_bar(f: &mut Frame, area: ratatui::layout::Rect, action: &str, sho
         "Esc",
         Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::styled(" Cancel", Style::default().fg(theme::SUBTEXT1)));
+    spans.push(Span::styled(
+        " Cancel",
+        Style::default().fg(theme::SUBTEXT1),
+    ));
 
     let help = Paragraph::new(vec![Line::from(spans)])
-    .style(Style::default().bg(theme::BASE))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::SURFACE2)),
-    );
+        .style(Style::default().bg(theme::BASE))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2)),
+        );
     f.render_widget(help, area);
 }

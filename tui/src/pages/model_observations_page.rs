@@ -520,9 +520,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 );
             }
         } else {
-            let msg = Paragraph::new(format!("No observations file found at {}", obs_path.display()))
-                .block(left_block)
-                .style(Style::default().fg(theme::SUBTEXT0));
+            let msg = Paragraph::new(format!(
+                "No observations file found at {}",
+                obs_path.display()
+            ))
+            .block(left_block)
+            .style(Style::default().fg(theme::SUBTEXT0));
             f.render_widget(msg, content_chunks[0]);
             f.render_widget(
                 Block::default()

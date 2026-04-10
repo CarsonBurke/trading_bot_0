@@ -351,11 +351,15 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
                 tch::no_grad(|| {
                     let start = Instant::now();
                     for _ in 0..iters {
-                        let _ = model.step_on_device(&step_deltas, &static_features, &mut stream_state);
+                        let _ =
+                            model.step_on_device(&step_deltas, &static_features, &mut stream_state);
                     }
                     sync_device(device);
                     let step_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-                    println!("    Stream Step (batch={}):    {:.3} ms/iter", batch, step_ms);
+                    println!(
+                        "    Stream Step (batch={}):    {:.3} ms/iter",
+                        batch, step_ms
+                    );
                     suite.add(BenchmarkResult::new(
                         &format!("model_{}_stream_step_b{}", variant.as_str(), batch),
                         step_ms,
