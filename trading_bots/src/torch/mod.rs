@@ -18,4 +18,6 @@ mod ppo_tests;
 #[cfg(test)]
 mod ssm_tests;
 #[cfg(test)]
+mod stream_tests;
+#[cfg(test)]
 mod two_hot_tests;
