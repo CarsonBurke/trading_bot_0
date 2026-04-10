@@ -4,38 +4,6 @@ use tch::Tensor;
 use super::{DebugMetrics, ModelOutput, StreamState, TradingModel};
 
 impl TradingModel {
-    pub(super) fn tail_condition(
-        &self,
-        global_static: &Tensor,
-        per_ticker_static: &Tensor,
-        batch_size: i64,
-        kind: tch::Kind,
-    ) -> Tensor {
-        let exo_kv = self.build_exo_kv(global_static, per_ticker_static, batch_size);
-        exo_kv
-            .mean_dim([1].as_slice(), false, tch::Kind::Float)
-            .to_kind(kind)
-            .unsqueeze(1)
-    }
-
-    pub(super) fn apply_tail_condition(
-        &self,
-        x: &Tensor,
-        global_static: &Tensor,
-        per_ticker_static: &Tensor,
-        batch_size: i64,
-    ) -> Tensor {
-        let seq = x.size()[1];
-        let tail = self.tail_condition(global_static, per_ticker_static, batch_size, x.kind());
-        let prefix = x.narrow(1, 0, seq - super::NUM_HEAD_CLS_TOKENS);
-        let suffix = x.narrow(
-            1,
-            seq - super::NUM_HEAD_CLS_TOKENS,
-            super::NUM_HEAD_CLS_TOKENS,
-        ) + &tail;
-        Tensor::cat(&[&prefix, &suffix], 1)
-    }
-
     pub fn forward(
         &self,
         price_deltas: &Tensor,
@@ -64,14 +32,16 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
         let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
-        let x_stem =
-            self.apply_tail_condition(&x_stem, &global_static, &per_ticker_static, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
         let mut x = x_stem;
         for (i, layer) in self.gqa_layers.iter().enumerate() {
             x = layer.forward(&x, &self.rope, true);
+            if i == 0 {
+                x = self.cross_attn.forward(&x, &exo_tokens);
+            }
             x = self.maybe_apply_inter_ticker(&x, i);
         }
         debug_fused("model_x_gqa", &x);
@@ -92,15 +62,17 @@ impl TradingModel {
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
         let x_stem = self.patch_latent_stem(&price_deltas, batch_size);
-        let x_stem =
-            self.apply_tail_condition(&x_stem, &global_static, &per_ticker_static, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
         let mut x = x_stem;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
             debug_fused_layer("x_gqa_in", layer_idx, &x);
             x = layer.forward(&x, &self.rope, true);
+            if layer_idx == 0 {
+                x = self.cross_attn.forward(&x, &exo_tokens);
+            }
             debug_fused_layer("gqa_out", layer_idx, &x);
             x = self.maybe_apply_inter_ticker(&x, layer_idx);
             debug_fused_layer("x_gqa_out", layer_idx, &x);

@@ -13,13 +13,12 @@ impl StreamState {
         let _ = self.uniform_patch_tokens.zero_();
         let _ = self.uniform_live_fill.zero_();
         self.uniform_live_fill_host.fill(0);
-        let _ = self.uniform_live_conv_state.zero_();
-        let _ = self.uniform_live_sum.zero_();
-        let _ = self.uniform_live_sum_sq.zero_();
-        let _ = self.uniform_live_first.zero_();
-        let _ = self.uniform_live_last.zero_();
+        let _ = self.uniform_layer0_prefix_hidden.zero_();
+        let _ = self.uniform_layer0_prefix_k.zero_();
+        let _ = self.uniform_layer0_prefix_v.zero_();
         self.uniform_prefix_k.clear();
         self.uniform_prefix_v.clear();
+        self.uniform_cached_static_features = None;
         self.initialized = false;
     }
 }
@@ -32,115 +31,71 @@ impl TradingModel {
         state.uniform_layout = &state.uniform_layout + 0.0;
         state.uniform_patch_tokens = &state.uniform_patch_tokens + 0.0;
         state.uniform_live_fill = &state.uniform_live_fill + 0;
-        state.uniform_live_conv_state = &state.uniform_live_conv_state + 0.0;
-        state.uniform_live_sum = &state.uniform_live_sum + 0.0;
-        state.uniform_live_sum_sq = &state.uniform_live_sum_sq + 0.0;
-        state.uniform_live_first = &state.uniform_live_first + 0.0;
-        state.uniform_live_last = &state.uniform_live_last + 0.0;
+        state.uniform_layer0_prefix_hidden = &state.uniform_layer0_prefix_hidden + 0.0;
+        state.uniform_layer0_prefix_k = &state.uniform_layer0_prefix_k + 0.0;
+        state.uniform_layer0_prefix_v = &state.uniform_layer0_prefix_v + 0.0;
         state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t + 0.0).collect();
         state.uniform_prefix_v = state.uniform_prefix_v.iter().map(|t| t + 0.0).collect();
+        state.uniform_cached_static_features = state
+            .uniform_cached_static_features
+            .as_ref()
+            .map(|t| t + 0.0);
     }
 
-    fn patch_embed_stream_single_patch(&self, patch_vals: &Tensor) -> Tensor {
-        self.patch_embed_stream_batch(patch_vals)
-    }
-
-    fn compute_uniform_live_state(
-        &self,
-        layout: &Tensor,
-        live_fill_host: &[i64],
-    ) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
-        let live_patch = layout.select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1);
+    fn recompute_live_token(&self, state: &StreamState) -> Tensor {
+        let live_patch = state
+            .uniform_layout
+            .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1);
         let rows = live_patch.size()[0];
-        let target_kind = self.patch_embed_weight.kind();
-        let clean_vals = live_patch.nan_to_num(0.0, None, None).to_kind(target_kind);
-        let clean_vals_f = clean_vals.to_kind(Kind::Float);
-        let live_fill_rows_host = live_fill_host
-            .iter()
-            .flat_map(|&fill| std::iter::repeat_n(fill, TICKERS_COUNT as usize))
-            .collect::<Vec<_>>();
-        let live_fill_rows = Tensor::from_slice(&live_fill_rows_host)
-            .to_kind(Kind::Int64)
-            .to_device(self.device);
-        let counts_f = live_fill_rows.to_kind(Kind::Float).unsqueeze(-1);
-        let live_sum = clean_vals_f.sum_dim_intlist([1].as_slice(), true, Kind::Float);
-        let live_sum_sq =
-            clean_vals_f
-                .pow_tensor_scalar(2.0)
-                .sum_dim_intlist([1].as_slice(), true, Kind::Float);
-        let live_first = clean_vals_f.narrow(1, 0, 1);
-        let last_idx = live_fill_rows.clamp_min(1).g_add_scalar(-1).unsqueeze(-1);
-        let live_last = clean_vals_f.gather(1, &last_idx, false);
-        let lifted = clean_vals
-            .unsqueeze(-1)
-            .reshape([rows * super::UNIFORM_STREAM_PATCH_SIZE, 1])
-            .apply(&self.patch_stream_lift)
-            .reshape([
-                rows,
-                super::UNIFORM_STREAM_PATCH_SIZE,
-                super::STREAM_PATCH_INNER_DIM,
-            ]);
-        let left_pad = Tensor::zeros(
-            [rows, super::STREAM_PATCH_CONV_KERNEL - 1, super::STREAM_PATCH_INNER_DIM],
-            (target_kind, self.device),
-        );
-        let padded = Tensor::cat(&[&left_pad, &lifted], 1);
-        let conv_start = live_fill_rows.clamp_min(1).g_add_scalar(-1).unsqueeze(-1);
-        let conv_offsets =
-            Tensor::arange(super::STREAM_PATCH_CONV_KERNEL, (Kind::Int64, self.device))
-                .unsqueeze(0);
-        let conv_index = (conv_start + conv_offsets)
-            .unsqueeze(-1)
-            .expand([rows, super::STREAM_PATCH_CONV_KERNEL, super::STREAM_PATCH_INNER_DIM], false);
-        let live_conv_state = padded.gather(1, &conv_index, false).permute([0, 2, 1]);
-        let counts_safe = counts_f.clamp_min(1.0);
-        let mean = &live_sum / &counts_safe;
-        let var = (&live_sum_sq / &counts_safe - mean.pow_tensor_scalar(2.0)).clamp_min(0.0);
-        let std = (var + 1e-5).sqrt();
-        let slope = &live_last - &live_first;
-        let fill_fraction = counts_f / super::UNIFORM_STREAM_PATCH_SIZE as f64;
-        let conv_w = self.patch_stream_conv_w.squeeze_dim(1).unsqueeze(0);
-        let final_hidden = (&live_conv_state * &conv_w)
-            .sum_dim_intlist([2].as_slice(), false, target_kind)
-            .g_add(&self.patch_stream_conv_b)
-            .silu()
-            .apply(&self.patch_stream_mix);
-        let scalar = Tensor::cat(&[&mean, &std, &slope, &fill_fraction], 1)
-            .to_kind(target_kind)
-            .apply(&self.patch_stream_scalar_proj);
-        let live_tokens = final_hidden + scalar;
-        (
-            live_sum,
-            live_sum_sq,
-            live_first,
-            live_last,
-            live_conv_state,
-            live_tokens,
-        )
+        let batch_size = state.uniform_live_fill.size()[0];
+        let fill_counts = state
+            .uniform_live_fill
+            .unsqueeze(1)
+            .expand([batch_size, TICKERS_COUNT], false)
+            .reshape([rows]);
+        self.patch_embed_stream_batch(&live_patch, &fill_counts)
     }
 
-    fn rebuild_uniform_live_state(&self, state: &mut StreamState) {
-        let (live_sum, live_sum_sq, live_first, live_last, live_conv_state, live_tokens) =
-            self.compute_uniform_live_state(&state.uniform_layout, &state.uniform_live_fill_host);
-        state.uniform_live_sum = live_sum;
-        state.uniform_live_sum_sq = live_sum_sq;
-        state.uniform_live_first = live_first;
-        state.uniform_live_last = live_last;
-        state.uniform_live_conv_state = live_conv_state;
-        let prefix = state
-            .uniform_patch_tokens
-            .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
-        state.uniform_patch_tokens = Tensor::cat(&[&prefix, &live_tokens.unsqueeze(1)], 1);
-    }
-
-    fn prefill_uniform_prefix_cache(&self, state: &mut StreamState) {
-        let mut x = state
+    fn prefill_uniform_prefix_base_cache(&self, state: &mut StreamState) {
+        let x = state
             .uniform_patch_tokens
             .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1)
             .shallow_clone();
+        let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x, &self.rope);
+        state.uniform_layer0_prefix_hidden = x_next;
+        state.uniform_layer0_prefix_k = k.index_select(1, &self.gqa_kv_head_index);
+        state.uniform_layer0_prefix_v = v.index_select(1, &self.gqa_kv_head_index);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
-        for layer in &self.gqa_layers {
+        state.uniform_cached_static_features = None;
+    }
+
+    fn conditioned_prefix_cache_is_fresh(
+        &self,
+        static_features: &Tensor,
+        state: &StreamState,
+    ) -> bool {
+        state.uniform_prefix_k.len() == self.gqa_layers.len()
+            && state.uniform_prefix_v.len() == self.gqa_layers.len()
+            && state
+                .uniform_cached_static_features
+                .as_ref()
+                .map(|cached| cached.allclose(static_features, 0.0, 0.0, true))
+                .unwrap_or(false)
+    }
+
+    fn rebuild_uniform_conditioned_prefix_cache(
+        &self,
+        static_features: &Tensor,
+        exo_tokens: &Tensor,
+        state: &mut StreamState,
+    ) {
+        let mut x = self
+            .cross_attn
+            .forward(&state.uniform_layer0_prefix_hidden, exo_tokens);
+        state.uniform_prefix_k = vec![state.uniform_layer0_prefix_k.shallow_clone()];
+        state.uniform_prefix_v = vec![state.uniform_layer0_prefix_v.shallow_clone()];
+        for layer in self.gqa_layers.iter().skip(1) {
             let (x_next, k, v) = layer.forward_prefix_and_cache(&x, &self.rope);
             state
                 .uniform_prefix_k
@@ -150,6 +105,7 @@ impl TradingModel {
                 .push(v.index_select(1, &self.gqa_kv_head_index));
             x = x_next;
         }
+        state.uniform_cached_static_features = Some(static_features.shallow_clone());
     }
 
     fn uniform_stream_cached_forward(
@@ -158,8 +114,10 @@ impl TradingModel {
         state: &mut StreamState,
     ) -> ModelOutput {
         let batch_size = state.uniform_live_fill.size()[0];
-        if state.uniform_prefix_k.len() != self.gqa_layers.len() {
-            self.prefill_uniform_prefix_cache(state);
+        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+        if !self.conditioned_prefix_cache_is_fresh(static_features, state) {
+            self.rebuild_uniform_conditioned_prefix_cache(static_features, &exo_tokens, state);
         }
         let batch_tokens = batch_size * TICKERS_COUNT;
         let live_token =
@@ -167,23 +125,18 @@ impl TradingModel {
                 .uniform_patch_tokens
                 .narrow(1, super::UNIFORM_STREAM_PATCH_COUNT - 1, 1);
         let kind = live_token.kind();
-        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
-        let tail_cond = self.tail_condition(&global_static, &per_ticker_static, batch_size, kind);
         let actor_cls = self
             .actor_cls_token
             .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false)
-            + &tail_cond;
+            .expand([batch_tokens, 1, self.model_dim], false);
         let critic_cls = self
             .critic_cls_token
             .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false)
-            + &tail_cond;
+            .expand([batch_tokens, 1, self.model_dim], false);
         let sde_cls = self
             .sde_cls_token
             .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false)
-            + &tail_cond;
+            .expand([batch_tokens, 1, self.model_dim], false);
         let mut x_suffix = Tensor::cat(&[&live_token, &actor_cls, &critic_cls, &sde_cls], 1);
         let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
@@ -195,6 +148,10 @@ impl TradingModel {
                 &self.gqa_kv_head_index,
                 prefix_len,
             );
+            if layer_idx == 0 {
+                x_suffix = self.cross_attn.forward(&x_suffix, &exo_tokens);
+            }
+            x_suffix = self.maybe_apply_inter_ticker(&x_suffix, layer_idx);
         }
         self.head_from_uniform_suffix(&x_suffix, batch_size)
     }
@@ -249,9 +206,8 @@ impl TradingModel {
             super::UNIFORM_STREAM_PATCH_COUNT,
             super::UNIFORM_STREAM_PATCH_SIZE,
         ]);
-        let patch_tokens = self.patch_embed(
-            &layouts.view([layouts.size()[0], super::UNIFORM_STREAM_LAYOUT_LEN]),
-        );
+        let patch_tokens =
+            self.patch_embed(&layouts.view([layouts.size()[0], super::UNIFORM_STREAM_LAYOUT_LEN]));
         let live_fill = layouts
             .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1)
             .isnan()
@@ -261,7 +217,8 @@ impl TradingModel {
         let row_indices = env_indices
             .iter()
             .flat_map(|&env_idx| {
-                (0..TICKERS_COUNT).map(move |ticker_idx| (env_idx as i64) * TICKERS_COUNT + ticker_idx)
+                (0..TICKERS_COUNT)
+                    .map(move |ticker_idx| (env_idx as i64) * TICKERS_COUNT + ticker_idx)
             })
             .collect::<Vec<_>>();
         let row_idx = Tensor::from_slice(&row_indices)
@@ -272,11 +229,16 @@ impl TradingModel {
             &row_idx,
             &layouts.to_kind(state.uniform_layout.kind()),
         );
-        state.uniform_patch_tokens = state
-            .uniform_patch_tokens
-            .index_copy(0, &row_idx, &patch_tokens.to_kind(state.uniform_patch_tokens.kind()));
+        state.uniform_patch_tokens = state.uniform_patch_tokens.index_copy(
+            0,
+            &row_idx,
+            &patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
+        );
         let env_idx = Tensor::from_slice(
-            &env_indices.iter().map(|&idx| idx as i64).collect::<Vec<_>>(),
+            &env_indices
+                .iter()
+                .map(|&idx| idx as i64)
+                .collect::<Vec<_>>(),
         )
         .to_kind(Kind::Int64)
         .to_device(self.device);
@@ -296,8 +258,7 @@ impl TradingModel {
             state.uniform_live_fill_host[*env_idx] =
                 live_fill_host[(reset_i as i64 * TICKERS_COUNT) as usize];
         }
-        self.rebuild_uniform_live_state(state);
-        self.prefill_uniform_prefix_cache(state);
+        self.prefill_uniform_prefix_base_cache(state);
     }
 
     pub fn uniform_stream_snapshot(&self, state: &StreamState) -> Tensor {
@@ -348,8 +309,7 @@ impl TradingModel {
                 .fill_(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
             state.uniform_live_fill_host[*env_idx] = super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL;
         }
-        self.rebuild_uniform_live_state(state);
-        self.prefill_uniform_prefix_cache(state);
+        self.prefill_uniform_prefix_base_cache(state);
     }
 
     fn ordered_price_from_ring(&self, state: &StreamState, batch_size: i64) -> Tensor {
@@ -393,20 +353,35 @@ impl TradingModel {
             ),
             uniform_live_fill: Tensor::zeros([1], (Kind::Int64, self.device)),
             uniform_live_fill_host: vec![0; 1],
-            uniform_live_conv_state: Tensor::zeros(
+            uniform_layer0_prefix_hidden: Tensor::zeros(
                 [
                     TICKERS_COUNT,
-                    super::STREAM_PATCH_INNER_DIM,
-                    super::STREAM_PATCH_CONV_KERNEL,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim,
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
-            uniform_live_sum: Tensor::zeros([TICKERS_COUNT, 1], (Kind::Float, self.device)),
-            uniform_live_sum_sq: Tensor::zeros([TICKERS_COUNT, 1], (Kind::Float, self.device)),
-            uniform_live_first: Tensor::zeros([TICKERS_COUNT, 1], (Kind::Float, self.device)),
-            uniform_live_last: Tensor::zeros([TICKERS_COUNT, 1], (Kind::Float, self.device)),
+            uniform_layer0_prefix_k: Tensor::zeros(
+                [
+                    TICKERS_COUNT,
+                    super::GQA_NUM_KV_HEADS,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim / super::GQA_NUM_Q_HEADS,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
+            uniform_layer0_prefix_v: Tensor::zeros(
+                [
+                    TICKERS_COUNT,
+                    super::GQA_NUM_KV_HEADS,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim / super::GQA_NUM_Q_HEADS,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
             uniform_prefix_k: Vec::new(),
             uniform_prefix_v: Vec::new(),
+            uniform_cached_static_features: None,
             initialized: false,
         }
     }
@@ -442,32 +417,35 @@ impl TradingModel {
             ),
             uniform_live_fill: Tensor::zeros([batch_size], (Kind::Int64, self.device)),
             uniform_live_fill_host: vec![0; batch_size as usize],
-            uniform_live_conv_state: Tensor::zeros(
+            uniform_layer0_prefix_hidden: Tensor::zeros(
                 [
                     batch_size * TICKERS_COUNT,
-                    super::STREAM_PATCH_INNER_DIM,
-                    super::STREAM_PATCH_CONV_KERNEL,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim,
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
-            uniform_live_sum: Tensor::zeros(
-                [batch_size * TICKERS_COUNT, 1],
-                (Kind::Float, self.device),
+            uniform_layer0_prefix_k: Tensor::zeros(
+                [
+                    batch_size * TICKERS_COUNT,
+                    super::GQA_NUM_KV_HEADS,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim / super::GQA_NUM_Q_HEADS,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
             ),
-            uniform_live_sum_sq: Tensor::zeros(
-                [batch_size * TICKERS_COUNT, 1],
-                (Kind::Float, self.device),
-            ),
-            uniform_live_first: Tensor::zeros(
-                [batch_size * TICKERS_COUNT, 1],
-                (Kind::Float, self.device),
-            ),
-            uniform_live_last: Tensor::zeros(
-                [batch_size * TICKERS_COUNT, 1],
-                (Kind::Float, self.device),
+            uniform_layer0_prefix_v: Tensor::zeros(
+                [
+                    batch_size * TICKERS_COUNT,
+                    super::GQA_NUM_KV_HEADS,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim / super::GQA_NUM_Q_HEADS,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
             ),
             uniform_prefix_k: Vec::new(),
             uniform_prefix_v: Vec::new(),
+            uniform_cached_static_features: None,
             initialized: false,
         }
     }
@@ -531,95 +509,29 @@ impl TradingModel {
                 "stream state batch size mismatch"
             );
 
-            let conv_shift_idx = &self.uniform_conv_shift_idx;
             let rows = batch_size * TICKERS_COUNT;
             let target_kind = self.patch_embed_weight.kind();
-            let live_fill = state.uniform_live_fill.shallow_clone();
             let has_rollover = state
                 .uniform_live_fill_host
                 .iter()
                 .any(|&fill| fill >= super::UNIFORM_STREAM_PATCH_SIZE);
-            if !has_rollover {
-                let row_deltas = new_deltas.reshape([rows, 1]);
-                let row_deltas_f = row_deltas.to_kind(Kind::Float);
-                let fill_rows = live_fill
-                    .unsqueeze(1)
-                    .expand([batch_size, TICKERS_COUNT], false)
-                    .reshape([rows, 1]);
-                let updated_last = state
-                    .uniform_layout
-                    .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1)
-                    .scatter(1, &fill_rows, &row_deltas);
-                let prefix_layout = state
-                    .uniform_layout
-                    .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
-                state.uniform_layout = Tensor::cat(&[&prefix_layout, &updated_last.unsqueeze(1)], 1);
-                let first_mask = fill_rows.eq(0).to_kind(Kind::Float);
-                let first_keep = Tensor::ones_like(&first_mask) - &first_mask;
-                state.uniform_live_first =
-                    &state.uniform_live_first * &first_keep + &row_deltas_f * &first_mask;
-                state.uniform_live_last = row_deltas_f.shallow_clone();
-                state.uniform_live_sum = &state.uniform_live_sum + &row_deltas_f;
-                state.uniform_live_sum_sq =
-                    &state.uniform_live_sum_sq + row_deltas_f.pow_tensor_scalar(2.0);
-                let lifted = row_deltas
-                    .reshape([rows, 1])
-                    .apply(&self.patch_stream_lift)
-                    .reshape([rows, super::STREAM_PATCH_INNER_DIM, 1]);
-                let kept_state = state
-                    .uniform_live_conv_state
-                    .index_select(2, &conv_shift_idx);
-                let new_conv_state = Tensor::cat(&[&kept_state, &lifted], 2);
-                state.uniform_live_conv_state = new_conv_state;
-                let next_fill = &live_fill + 1;
-                state.uniform_live_fill = next_fill.shallow_clone();
-                for fill in &mut state.uniform_live_fill_host {
-                    *fill += 1;
-                }
-                let counts_f = next_fill
-                    .unsqueeze(1)
-                    .expand([batch_size, TICKERS_COUNT], false)
-                    .reshape([rows, 1])
-                    .to_kind(Kind::Float);
-                let mean = &state.uniform_live_sum / &counts_f;
-                let var = (&state.uniform_live_sum_sq / &counts_f - mean.pow_tensor_scalar(2.0))
-                    .clamp_min(0.0);
-                let std = (var + 1e-5).sqrt();
-                let slope = &state.uniform_live_last - &state.uniform_live_first;
-                let fill_fraction = counts_f / super::UNIFORM_STREAM_PATCH_SIZE as f64;
-                let conv_w = self.patch_stream_conv_w.squeeze_dim(1).unsqueeze(0);
-                let final_hidden = (&state.uniform_live_conv_state * &conv_w)
-                    .sum_dim_intlist([2].as_slice(), false, target_kind)
-                    .g_add(&self.patch_stream_conv_b)
-                    .silu()
-                    .apply(&self.patch_stream_mix);
-                let scalar = Tensor::cat(&[&mean, &std, &slope, &fill_fraction], 1)
-                    .to_kind(target_kind)
-                    .apply(&self.patch_stream_scalar_proj);
-                let live_tokens = final_hidden + scalar;
-                let prefix_tokens = state
-                    .uniform_patch_tokens
-                    .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
-                state.uniform_patch_tokens =
-                    Tensor::cat(&[&prefix_tokens, &live_tokens.unsqueeze(1)], 1);
-                state.initialized = true;
-                return self.uniform_stream_cached_forward(&static_features, state);
-            }
 
-            let rollover_envs = state
-                .uniform_live_fill_host
-                .iter()
-                .enumerate()
-                .filter_map(|(env_idx, &fill)| {
-                    (fill >= super::UNIFORM_STREAM_PATCH_SIZE).then_some(env_idx as i64)
-                })
-                .collect::<Vec<_>>();
-            let cache_dirty = !rollover_envs.is_empty();
-            if cache_dirty {
+            // Handle rollover: shift layout and patch tokens for envs whose live patch is full
+            let cache_dirty = has_rollover;
+            if has_rollover {
+                let rollover_envs = state
+                    .uniform_live_fill_host
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(env_idx, &fill)| {
+                        (fill >= super::UNIFORM_STREAM_PATCH_SIZE).then_some(env_idx as i64)
+                    })
+                    .collect::<Vec<_>>();
                 let rollover_rows = rollover_envs
                     .iter()
                     .flat_map(|&env_idx| {
-                        (0..TICKERS_COUNT).map(move |ticker_idx| env_idx * TICKERS_COUNT + ticker_idx)
+                        (0..TICKERS_COUNT)
+                            .map(move |ticker_idx| env_idx * TICKERS_COUNT + ticker_idx)
                     })
                     .collect::<Vec<_>>();
                 let rollover_row_idx = Tensor::from_slice(&rollover_rows)
@@ -661,44 +573,22 @@ impl TradingModel {
                     &rollover_row_idx,
                     &shifted_layout.to_kind(state.uniform_layout.kind()),
                 );
-                state.uniform_patch_tokens =
-                    state.uniform_patch_tokens.index_copy(
-                        0,
-                        &rollover_row_idx,
-                        &shifted_patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
-                    );
+                state.uniform_patch_tokens = state.uniform_patch_tokens.index_copy(
+                    0,
+                    &rollover_row_idx,
+                    &shifted_patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
+                );
                 for &env_idx in &rollover_envs {
                     state.uniform_live_fill_host[env_idx as usize] = 0;
                 }
-                let n_rollover = rollover_rows.len() as i64;
-                let zeros_r1 =
-                    Tensor::zeros([n_rollover, 1], (Kind::Float, self.device));
-                state.uniform_live_sum = state
-                    .uniform_live_sum
-                    .index_copy(0, &rollover_row_idx, &zeros_r1);
-                state.uniform_live_sum_sq = state
-                    .uniform_live_sum_sq
-                    .index_copy(0, &rollover_row_idx, &zeros_r1);
-                state.uniform_live_first = state
-                    .uniform_live_first
-                    .index_copy(0, &rollover_row_idx, &zeros_r1);
-                state.uniform_live_last = state
-                    .uniform_live_last
-                    .index_copy(0, &rollover_row_idx, &zeros_r1);
-                let zeros_conv = Tensor::zeros(
-                    [n_rollover, super::STREAM_PATCH_INNER_DIM, super::STREAM_PATCH_CONV_KERNEL],
-                    (Kind::Float, self.device),
-                );
-                state.uniform_live_conv_state = state
-                    .uniform_live_conv_state
-                    .index_copy(0, &rollover_row_idx, &zeros_conv);
             }
+
+            // Write new delta into layout at current fill position
             let current_fill_host = state.uniform_live_fill_host.clone();
             let current_fill = Tensor::from_slice(&current_fill_host)
                 .to_kind(Kind::Int64)
                 .to_device(self.device);
             let row_deltas = new_deltas.reshape([rows, 1]);
-            let row_deltas_f = row_deltas.to_kind(Kind::Float);
             let fill_rows = current_fill
                 .unsqueeze(1)
                 .expand([batch_size, TICKERS_COUNT], false)
@@ -707,24 +597,13 @@ impl TradingModel {
                 .uniform_layout
                 .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1)
                 .scatter(1, &fill_rows, &row_deltas);
-            let prefix_layout = state
-                .uniform_layout
-                .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
+            let prefix_layout =
+                state
+                    .uniform_layout
+                    .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
             state.uniform_layout = Tensor::cat(&[&prefix_layout, &updated_last.unsqueeze(1)], 1);
-            let first_mask = fill_rows.eq(0).to_kind(Kind::Float);
-            let first_keep = Tensor::ones_like(&first_mask) - &first_mask;
-            state.uniform_live_first =
-                &state.uniform_live_first * &first_keep + &row_deltas_f * &first_mask;
-            state.uniform_live_last = row_deltas_f.shallow_clone();
-            state.uniform_live_sum = &state.uniform_live_sum + &row_deltas_f;
-            state.uniform_live_sum_sq =
-                &state.uniform_live_sum_sq + row_deltas_f.pow_tensor_scalar(2.0);
-            let lifted = row_deltas
-                .reshape([rows, 1])
-                .apply(&self.patch_stream_lift)
-                .reshape([rows, super::STREAM_PATCH_INNER_DIM, 1]);
-            let kept_state = state.uniform_live_conv_state.index_select(2, &conv_shift_idx);
-            state.uniform_live_conv_state = Tensor::cat(&[&kept_state, &lifted], 2);
+
+            // Increment fill counts
             let next_fill_host = current_fill_host
                 .iter()
                 .map(|&fill| fill + 1)
@@ -733,37 +612,18 @@ impl TradingModel {
             state.uniform_live_fill = Tensor::from_slice(&next_fill_host)
                 .to_kind(Kind::Int64)
                 .to_device(self.device);
-            let counts_f = state
-                .uniform_live_fill
-                .unsqueeze(1)
-                .expand([batch_size, TICKERS_COUNT], false)
-                .reshape([rows, 1])
-                .to_kind(Kind::Float);
-            let counts_safe = counts_f.clamp_min(1.0);
-            let mean = &state.uniform_live_sum / &counts_safe;
-            let var = (&state.uniform_live_sum_sq / &counts_safe - mean.pow_tensor_scalar(2.0))
-                .clamp_min(0.0);
-            let std = (var + 1e-5).sqrt();
-            let slope = &state.uniform_live_last - &state.uniform_live_first;
-            let fill_fraction = counts_f / super::UNIFORM_STREAM_PATCH_SIZE as f64;
-            let conv_w = self.patch_stream_conv_w.squeeze_dim(1).unsqueeze(0);
-            let final_hidden = (&state.uniform_live_conv_state * &conv_w)
-                .sum_dim_intlist([2].as_slice(), false, target_kind)
-                .g_add(&self.patch_stream_conv_b)
-                .silu()
-                .apply(&self.patch_stream_mix);
-            let scalar = Tensor::cat(&[&mean, &std, &slope, &fill_fraction], 1)
-                .to_kind(target_kind)
-                .apply(&self.patch_stream_scalar_proj);
-            let live_tokens = final_hidden + scalar;
-            let prefix_tokens = state
-                .uniform_patch_tokens
-                .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
+
+            // Recompute live token via linear projection
+            let live_tokens = self.recompute_live_token(state);
+            let prefix_tokens =
+                state
+                    .uniform_patch_tokens
+                    .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
             state.uniform_patch_tokens =
                 Tensor::cat(&[&prefix_tokens, &live_tokens.unsqueeze(1)], 1);
             state.initialized = true;
             if cache_dirty {
-                self.prefill_uniform_prefix_cache(state);
+                self.prefill_uniform_prefix_base_cache(state);
             }
             return self.uniform_stream_cached_forward(&static_features, state);
         }
@@ -868,8 +728,7 @@ impl TradingModel {
             state.uniform_live_fill_host =
                 Vec::<i64>::try_from(live_fill.to_device(tch::Device::Cpu)).unwrap();
             state.initialized = true;
-            self.rebuild_uniform_live_state(state);
-            self.prefill_uniform_prefix_cache(state);
+            self.prefill_uniform_prefix_base_cache(state);
 
             return self.uniform_stream_cached_forward(&static_features, state);
         }
