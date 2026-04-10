@@ -10,6 +10,7 @@ use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::env::{CpuStepBatch, VecEnv};
+use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelConfig};
 use crate::torch::sdp::force_flash_sdp;
 use crate::torch::two_hot::TwoHotBins;
@@ -283,7 +284,7 @@ pub async fn train(
 
     let (start_episode, run_dir) = if let Some(path) = weights_path {
         println!("Loading weights from {}", path);
-        vs.load(path).unwrap();
+        load_var_store_partial(&mut vs, path).unwrap();
         let ep = Path::new(path)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -343,8 +344,7 @@ pub async fn train(
     );
     let chunks_per_rollout = rollout_steps / PPO_CHUNK_LEN;
     let total_chunks = chunks_per_rollout * NPROCS;
-    let mut chunk_mem_indices_host =
-        Vec::with_capacity((total_chunks * PPO_CHUNK_LEN) as usize);
+    let mut chunk_mem_indices_host = Vec::with_capacity((total_chunks * PPO_CHUNK_LEN) as usize);
     for chunk_id in 0..total_chunks {
         let env_idx = chunk_id % NPROCS;
         let chunk_start = (chunk_id / NPROCS) * PPO_CHUNK_LEN;
@@ -362,10 +362,11 @@ pub async fn train(
     let so_dim = STATIC_OBSERVATIONS as i64;
     let replay_obs_kind = trading_model.input_kind();
 
-    let s_chunk_start_layouts =
-        Tensor::zeros(&[chunks_per_rollout * NPROCS, pd_dim], (replay_obs_kind, device));
-    let s_step_deltas =
-        Tensor::zeros(&[memory_size, TICKERS_COUNT], (replay_obs_kind, device));
+    let s_chunk_start_layouts = Tensor::zeros(
+        &[chunks_per_rollout * NPROCS, pd_dim],
+        (replay_obs_kind, device),
+    );
+    let s_step_deltas = Tensor::zeros(&[memory_size, TICKERS_COUNT], (replay_obs_kind, device));
     let s_static_obs = Tensor::zeros(&[memory_size, so_dim], (replay_obs_kind, device));
     let s_actions = Tensor::zeros(&[memory_size, ACTION_COUNT], (Kind::Float, device));
     let s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
@@ -503,8 +504,11 @@ pub async fn train(
                         .to_device(device);
                     let mut ring_env = ring_buf.narrow(0, *env_idx as i64, 1).squeeze_dim(0);
                     let _ = ring_env.index_copy_(1, &idx, &ordered);
-                    reset_layout_store
-                        .push(reset_layouts_batch.get(reset_i as i64).to_kind(replay_obs_kind));
+                    reset_layout_store.push(
+                        reset_layouts_batch
+                            .get(reset_i as i64)
+                            .to_kind(replay_obs_kind),
+                    );
                     reset_slots_host[(mem_idx + *env_idx as i64) as usize] =
                         reset_layout_store.len() as i64;
                 }
@@ -681,9 +685,7 @@ pub async fn train(
                         .unwrap();
                         let reset_layout_parts = reset_slot_ids
                             .iter()
-                            .map(|&slot| {
-                                reset_layout_store[(slot - 1) as usize].shallow_clone()
-                            })
+                            .map(|&slot| reset_layout_store[(slot - 1) as usize].shallow_clone())
                             .collect::<Vec<_>>();
                         let _ = autocast(true, || {
                             trading_model.step_on_device(
@@ -708,12 +710,12 @@ pub async fn train(
                     action_std_steps.push(output.2);
                     trading_model.refresh_stream_state_storage_for_autograd(&mut chunk_state);
                 }
-                let new_value_logits = Tensor::stack(&value_logits_steps, 1)
-                    .reshape([chunk_sample_count, -1]);
+                let new_value_logits =
+                    Tensor::stack(&value_logits_steps, 1).reshape([chunk_sample_count, -1]);
                 let action_mean = Tensor::stack(&action_mean_steps, 1)
                     .reshape([chunk_sample_count, ACTION_COUNT]);
-                let action_std = Tensor::stack(&action_std_steps, 1)
-                    .reshape([chunk_sample_count, ACTION_COUNT]);
+                let action_std =
+                    Tensor::stack(&action_std_steps, 1).reshape([chunk_sample_count, ACTION_COUNT]);
 
                 let latent_actions_mb = act_mb;
 
@@ -777,8 +779,7 @@ pub async fn train(
                 }
 
                 let value_loss =
-                    two_hot_value_loss(&two_hot, &new_value_logits, &ret_mb)
-                    .mean(Kind::Float);
+                    two_hot_value_loss(&two_hot, &new_value_logits, &ret_mb).mean(Kind::Float);
 
                 let dist_entropy = gaussian_entropy(&action_std, LOG_2PI).mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
@@ -798,12 +799,10 @@ pub async fn train(
                     Tensor::zeros([], (Kind::Float, device))
                 };
 
-                let scaled_ppo_loss =
-                    &ppo_loss
-                        * (chunk_sample_count as f64 / (chunk_batch_size * PPO_CHUNK_LEN) as f64);
-                let scaled_alpha_loss =
-                    &alpha_loss
-                        * (chunk_sample_count as f64 / (chunk_batch_size * PPO_CHUNK_LEN) as f64);
+                let scaled_ppo_loss = &ppo_loss
+                    * (chunk_sample_count as f64 / (chunk_batch_size * PPO_CHUNK_LEN) as f64);
+                let scaled_alpha_loss = &alpha_loss
+                    * (chunk_sample_count as f64 / (chunk_batch_size * PPO_CHUNK_LEN) as f64);
                 let total_chunk_loss = scaled_ppo_loss + scaled_alpha_loss;
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
