@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
+use std::io;
 use std::path::Path;
 
 use tch::{nn, no_grad, Device, TchError, Tensor};
@@ -14,6 +15,56 @@ pub struct LoadSummary {
     pub loaded: usize,
     pub missing: Vec<String>,
     pub shape_mismatches: Vec<ShapeMismatch>,
+}
+
+impl LoadSummary {
+    pub fn require_complete(&self) -> Result<(), Box<dyn Error>> {
+        if self.missing.is_empty() && self.shape_mismatches.is_empty() {
+            return Ok(());
+        }
+
+        let missing_preview = self
+            .missing
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let shape_preview = self
+            .shape_mismatches
+            .iter()
+            .take(8)
+            .map(|mismatch| {
+                format!(
+                    "{} {:?} -> {:?}",
+                    mismatch.name, mismatch.checkpoint_shape, mismatch.model_shape
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut details = Vec::new();
+        if !self.missing.is_empty() {
+            details.push(format!(
+                "{} missing ({})",
+                self.missing.len(),
+                missing_preview
+            ));
+        }
+        if !self.shape_mismatches.is_empty() {
+            details.push(format!(
+                "{} shape-mismatched ({})",
+                self.shape_mismatches.len(),
+                shape_preview
+            ));
+        }
+
+        Err(io::Error::other(format!(
+            "checkpoint is incompatible with current model: {}",
+            details.join("; ")
+        ))
+        .into())
+    }
 }
 
 fn named_tensors<P: AsRef<Path>>(

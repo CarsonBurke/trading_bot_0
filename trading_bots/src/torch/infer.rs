@@ -23,7 +23,8 @@ pub fn load_model<P: AsRef<Path>>(
             ..TradingModelConfig::default()
         },
     );
-    let _ = load_var_store_partial(&mut vs, weight_path)?;
+    let load_summary = load_var_store_partial(&mut vs, weight_path)?;
+    load_summary.require_complete()?;
     vs.bfloat16();
     Ok((vs, model))
 }

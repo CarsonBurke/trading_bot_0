@@ -290,7 +290,8 @@ pub async fn train(
 
     let (start_episode, run_dir) = if let Some(path) = weights_path {
         println!("Loading weights from {}", path);
-        load_var_store_partial(&mut vs, path).unwrap();
+        let load_summary = load_var_store_partial(&mut vs, path).unwrap();
+        load_summary.require_complete().unwrap();
         let ep = Path::new(path)
             .file_stem()
             .and_then(|s| s.to_str())
