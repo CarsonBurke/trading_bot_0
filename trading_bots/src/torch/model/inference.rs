@@ -120,6 +120,7 @@ impl TradingModel {
             .uniform_patch_tokens
             .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1)
             .shallow_clone();
+        let x = self.input_ln.forward(&x);
         let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x, &self.rope);
         state.uniform_layer0_prefix_hidden = x_next;
         state.uniform_layer0_prefix_k = k.index_select(1, &self.gqa_kv_head_index);
@@ -196,7 +197,10 @@ impl TradingModel {
             .sde_cls_token
             .to_kind(kind)
             .expand([batch_tokens, 1, self.model_dim], false);
-        let mut x_suffix = Tensor::cat(&[&live_token, &actor_cls, &critic_cls, &sde_cls], 1);
+        let mut x_suffix = self.input_ln.forward(&Tensor::cat(
+            &[&live_token, &actor_cls, &critic_cls, &sde_cls],
+            1,
+        ));
         let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
             x_suffix = layer.forward_suffix_with_cache(
@@ -212,6 +216,7 @@ impl TradingModel {
             }
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
+        x_suffix = self.final_ln.forward(&x_suffix);
         self.head_from_uniform_suffix(&x_suffix, batch_size)
     }
 
