@@ -73,11 +73,7 @@ mod tests {
         let bins = HlGaussBins::default_for(tch::Device::Cpu);
         let values = Tensor::from_slice(&[0.25f32]);
         let encoded = bins.encode(&values);
-        let nonzero_count = encoded
-            .get(0)
-            .gt(1e-6)
-            .sum(Kind::Float)
-            .int64_value(&[]);
+        let nonzero_count = encoded.get(0).gt(1e-6).sum(Kind::Float).int64_value(&[]);
         assert!(
             nonzero_count > 2,
             "hl-gauss target should spread mass beyond two bins, got {nonzero_count}"

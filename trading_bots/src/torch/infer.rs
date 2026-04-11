@@ -4,10 +4,10 @@ use tch::{nn, Device, Kind, Tensor};
 
 use crate::torch::action_space::sigmoid_target_weight;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
+use crate::torch::cuda_cfg::configure_cuda;
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
-use crate::torch::cuda_cfg::configure_cuda;
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
