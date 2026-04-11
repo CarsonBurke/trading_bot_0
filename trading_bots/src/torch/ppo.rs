@@ -628,7 +628,7 @@ pub async fn train(
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
 
-        let mut first_epoch_kl = 0.0f64;
+        let mut last_minibatch_approx_kl = 0.0f64;
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             let perm = Tensor::randperm(total_chunks, (Kind::Int64, device));
@@ -678,6 +678,8 @@ pub async fn train(
                 let num_sub_chunks = PPO_CHUNK_LEN / SUB_CHUNK_LEN;
                 let sub_chunk_sample_count = chunk_count * SUB_CHUNK_LEN;
                 let mut global_pos: i64 = 0;
+                let mut minibatch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
+                let mut minibatch_kl_count = 0i64;
 
                 for sub_idx in 0..num_sub_chunks {
                     let mut sub_value_logits: Vec<Tensor> =
@@ -907,6 +909,8 @@ pub async fn train(
                     }
                     let _ = epoch_kl_gpu
                         .g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
+                    let _ = minibatch_kl_gpu
+                        .g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
                     let _ = total_policy_loss_weighted
                         .g_add_(&(&action_loss.detach() * sub_chunk_sample_count as f64));
                     let _ = total_value_loss_weighted
@@ -918,6 +922,7 @@ pub async fn train(
                     entropy_min = entropy_min.min_other(&dist_entropy_detached);
                     entropy_max = entropy_max.max_other(&dist_entropy_detached);
                     epoch_kl_count += sub_chunk_sample_count;
+                    minibatch_kl_count += sub_chunk_sample_count;
                     total_sample_count += sub_chunk_sample_count;
 
                     let _ = total_clipped.g_add_(&tch::no_grad(|| {
@@ -968,12 +973,12 @@ pub async fn train(
                     });
                 }
                 opt.zero_grad();
+
+                last_minibatch_approx_kl =
+                    minibatch_kl_gpu.double_value(&[]) / minibatch_kl_count as f64;
             }
 
             let mean_epoch_kl = epoch_kl_gpu.double_value(&[]) / epoch_kl_count as f64;
-            if _epoch == 0 {
-                first_epoch_kl = mean_epoch_kl;
-            }
             println!(
                 "Epoch {}/{}: KL {:.4}",
                 _epoch + 1,
@@ -1102,7 +1107,7 @@ pub async fn train(
         primary
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
-        primary.meta_history.record_approx_kl(first_epoch_kl);
+        primary.meta_history.record_approx_kl(last_minibatch_approx_kl);
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",
