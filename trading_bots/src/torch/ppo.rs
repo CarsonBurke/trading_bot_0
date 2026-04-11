@@ -19,7 +19,8 @@ use shared::{paths::RUNS_PATH, run_dir::RunDir};
 const LEARNING_RATE: f64 = 1e-4;
 pub const NPROCS: i64 = 16;
 const SEQ_LEN: i64 = 4000;
-const PPO_CHUNK_LEN: i64 = 250;
+const PPO_CHUNK_LEN: i64 = 50;
+const SUB_CHUNK_LEN: i64 = 10;
 const DEFAULT_PPO_MINIBATCH_RATIO: f64 = 0.0625;
 const OPTIM_EPOCHS: i64 = 3;
 const PPO_CLIP_LOW: f64 = 0.2;
@@ -241,6 +242,11 @@ pub async fn train(
         model_variant,
         ModelVariant::Uniform256Stream,
         "PPO rollout collection is streaming-only; train with --model-size uniform-256-stream"
+    );
+    assert_eq!(
+        PPO_CHUNK_LEN % SUB_CHUNK_LEN,
+        0,
+        "PPO_CHUNK_LEN must be divisible by SUB_CHUNK_LEN"
     );
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
@@ -632,7 +638,6 @@ pub async fn train(
                 let chunk_count = mb_end - mb_start;
                 let chunk_ids = perm.narrow(0, mb_start, chunk_count);
                 let mb_inds = chunk_mem_indices.index_select(0, &chunk_ids).reshape([-1]);
-                let chunk_sample_count = chunk_count * PPO_CHUNK_LEN;
                 let boundary_layout = s_chunk_start_layouts.index_select(0, &chunk_ids);
                 let so_chunk_flat = s_static_obs.index_select(0, &mb_inds);
                 let step_deltas_chunk_flat = s_step_deltas.index_select(0, &mb_inds);
@@ -647,186 +652,272 @@ pub async fn train(
                 let step_deltas_chunk =
                     step_deltas_chunk_flat.view([chunk_count, PPO_CHUNK_LEN, TICKERS_COUNT]);
 
-                let fwd_start = Instant::now();
+                let mut fwd_start = Instant::now();
                 let mut chunk_state = trading_model.init_stream_state_batched(chunk_count);
-                let first_static = so_chunk.select(1, 0);
-                let first_output = autocast(true, || {
-                    trading_model.step_on_device(&boundary_layout, &first_static, &mut chunk_state)
-                });
-                let mut value_logits_steps = vec![first_output.0];
-                let mut action_mean_steps = vec![first_output.1];
-                let mut action_std_steps = vec![first_output.2];
-                trading_model.refresh_stream_state_storage_for_autograd(&mut chunk_state);
-                for pos in 1..PPO_CHUNK_LEN {
-                    let prev_step_deltas = step_deltas_chunk.select(1, pos - 1);
-                    let current_static = so_chunk.select(1, pos);
-                    let reset_slot_pos = reset_slots_chunk.select(1, pos - 1);
-                    let reset_mask = reset_slot_pos.gt(0);
-                    let has_reset = reset_mask.any().int64_value(&[]) != 0;
-                    let output = if !has_reset {
-                        autocast(true, || {
-                            trading_model.step_on_device(
-                                &prev_step_deltas,
-                                &current_static,
-                                &mut chunk_state,
-                            )
-                        })
-                    } else {
-                        let reset_rows_tensor = reset_mask.nonzero().squeeze_dim(1);
-                        let reset_rows_i64: Vec<i64> =
-                            Vec::try_from(reset_rows_tensor.to_device(Device::Cpu)).unwrap();
-                        let reset_rows: Vec<usize> =
-                            reset_rows_i64.iter().map(|&idx| idx as usize).collect();
-                        let reset_slot_ids: Vec<i64> = Vec::try_from(
-                            reset_slot_pos
-                                .index_select(0, &reset_rows_tensor)
-                                .to_device(Device::Cpu),
+                let num_sub_chunks = PPO_CHUNK_LEN / SUB_CHUNK_LEN;
+                let sub_chunk_sample_count = chunk_count * SUB_CHUNK_LEN;
+                let mut global_pos: i64 = 0;
+
+                for sub_idx in 0..num_sub_chunks {
+                    let mut sub_value_logits: Vec<Tensor> =
+                        Vec::with_capacity(SUB_CHUNK_LEN as usize);
+                    let mut sub_action_mean: Vec<Tensor> =
+                        Vec::with_capacity(SUB_CHUNK_LEN as usize);
+                    let mut sub_action_std: Vec<Tensor> =
+                        Vec::with_capacity(SUB_CHUNK_LEN as usize);
+
+                    for _ in 0..SUB_CHUNK_LEN {
+                        let output = if global_pos == 0 {
+                            let first_static = so_chunk.select(1, 0);
+                            autocast(true, || {
+                                trading_model.step_on_device(
+                                    &boundary_layout,
+                                    &first_static,
+                                    &mut chunk_state,
+                                )
+                            })
+                        } else {
+                            let prev_step_deltas =
+                                step_deltas_chunk.select(1, global_pos - 1);
+                            let current_static = so_chunk.select(1, global_pos);
+                            let reset_slot_pos = reset_slots_chunk.select(1, global_pos - 1);
+                            let reset_mask = reset_slot_pos.gt(0);
+                            let has_reset = reset_mask.any().int64_value(&[]) != 0;
+                            if !has_reset {
+                                autocast(true, || {
+                                    trading_model.step_on_device(
+                                        &prev_step_deltas,
+                                        &current_static,
+                                        &mut chunk_state,
+                                    )
+                                })
+                            } else {
+                                let reset_rows_tensor = reset_mask.nonzero().squeeze_dim(1);
+                                let reset_rows_i64: Vec<i64> = Vec::try_from(
+                                    reset_rows_tensor.to_device(Device::Cpu),
+                                )
+                                .unwrap();
+                                let reset_rows: Vec<usize> =
+                                    reset_rows_i64.iter().map(|&idx| idx as usize).collect();
+                                let reset_slot_ids: Vec<i64> = Vec::try_from(
+                                    reset_slot_pos
+                                        .index_select(0, &reset_rows_tensor)
+                                        .to_device(Device::Cpu),
+                                )
+                                .unwrap();
+                                let reset_layout_parts = reset_slot_ids
+                                    .iter()
+                                    .map(|&slot| {
+                                        reset_layout_store[(slot - 1) as usize].shallow_clone()
+                                    })
+                                    .collect::<Vec<_>>();
+                                let _ = autocast(true, || {
+                                    trading_model.step_on_device(
+                                        &prev_step_deltas,
+                                        &current_static,
+                                        &mut chunk_state,
+                                    )
+                                });
+                                let reset_layout_batch = Tensor::stack(&reset_layout_parts, 0);
+                                trading_model.reset_uniform_stream_envs_from_layout(
+                                    &mut chunk_state,
+                                    &reset_rows,
+                                    &reset_layout_batch,
+                                );
+                                autocast(true, || {
+                                    trading_model.forward_stream_state_on_device(
+                                        &current_static,
+                                        &mut chunk_state,
+                                    )
+                                })
+                            }
+                        };
+                        sub_value_logits.push(output.0);
+                        sub_action_mean.push(output.1);
+                        sub_action_std.push(output.2);
+                        // Upcast cached state back to Float (weight dtype) while
+                        // preserving the autograd graph, mirroring the pre-refactor
+                        // per-step `+ 0.0` dtype-promotion trick.
+                        trading_model.upcast_stream_state_inplace(&mut chunk_state);
+                        global_pos += 1;
+                    }
+
+                    let new_value_logits = Tensor::stack(&sub_value_logits, 1)
+                        .reshape([sub_chunk_sample_count, -1]);
+                    let action_mean = Tensor::stack(&sub_action_mean, 1)
+                        .reshape([sub_chunk_sample_count, ACTION_COUNT]);
+                    let action_std = Tensor::stack(&sub_action_std, 1)
+                        .reshape([sub_chunk_sample_count, ACTION_COUNT]);
+
+                    // Slice sub-chunk-matching rows from the full-minibatch flat tensors.
+                    // Layout is chunk-major: [chunk_count, PPO_CHUNK_LEN, ...] flattened.
+                    let sub_start = sub_idx * SUB_CHUNK_LEN;
+                    let sub_adv = adv_mb
+                        .view([chunk_count, PPO_CHUNK_LEN])
+                        .narrow(1, sub_start, SUB_CHUNK_LEN)
+                        .reshape([-1]);
+                    let sub_ret = ret_mb
+                        .view([chunk_count, PPO_CHUNK_LEN])
+                        .narrow(1, sub_start, SUB_CHUNK_LEN)
+                        .reshape([-1]);
+                    let sub_old_log_probs = old_log_probs_mb
+                        .view([chunk_count, PPO_CHUNK_LEN])
+                        .narrow(1, sub_start, SUB_CHUNK_LEN)
+                        .reshape([-1]);
+                    let sub_act = act_mb
+                        .view([chunk_count, PPO_CHUNK_LEN, ACTION_COUNT])
+                        .narrow(1, sub_start, SUB_CHUNK_LEN)
+                        .reshape([-1, ACTION_COUNT]);
+
+                    let latent_actions_mb = sub_act;
+
+                    // RPO (CleanRL-style): iid uniform perturbation on each action-mean dimension.
+                    let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                        let alpha =
+                            RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
+                        let alpha_detached = alpha.detach();
+                        let rpo_noise = Tensor::empty(
+                            [sub_chunk_sample_count, ACTION_COUNT],
+                            (Kind::Float, device),
                         )
-                        .unwrap();
-                        let reset_layout_parts = reset_slot_ids
-                            .iter()
-                            .map(|&slot| reset_layout_store[(slot - 1) as usize].shallow_clone())
-                            .collect::<Vec<_>>();
-                        let _ = autocast(true, || {
-                            trading_model.step_on_device(
-                                &prev_step_deltas,
-                                &current_static,
-                                &mut chunk_state,
-                            )
-                        });
-                        let reset_layout_batch = Tensor::stack(&reset_layout_parts, 0);
-                        trading_model.reset_uniform_stream_envs_from_layout(
-                            &mut chunk_state,
-                            &reset_rows,
-                            &reset_layout_batch,
-                        );
-                        autocast(true, || {
-                            trading_model
-                                .forward_stream_state_on_device(&current_static, &mut chunk_state)
-                        })
-                    };
-                    value_logits_steps.push(output.0);
-                    action_mean_steps.push(output.1);
-                    action_std_steps.push(output.2);
-                    trading_model.refresh_stream_state_storage_for_autograd(&mut chunk_state);
-                }
-                let new_value_logits =
-                    Tensor::stack(&value_logits_steps, 1).reshape([chunk_sample_count, -1]);
-                let action_mean = Tensor::stack(&action_mean_steps, 1)
-                    .reshape([chunk_sample_count, ACTION_COUNT]);
-                let action_std =
-                    Tensor::stack(&action_std_steps, 1).reshape([chunk_sample_count, ACTION_COUNT]);
-
-                let latent_actions_mb = act_mb;
-
-                // RPO (CleanRL-style): iid uniform perturbation on each action-mean dimension.
-                let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
-                    let alpha_detached = alpha.detach();
-                    let rpo_noise =
-                        Tensor::empty([chunk_sample_count, ACTION_COUNT], (Kind::Float, device))
-                            .uniform_(-1.0, 1.0)
+                        .uniform_(-1.0, 1.0)
                             * &alpha_detached;
-                    (alpha, &action_mean + rpo_noise)
-                } else {
-                    (
-                        Tensor::zeros(&[1], (Kind::Float, device)),
-                        action_mean.shallow_clone(),
-                    )
-                };
+                        (alpha, &action_mean + rpo_noise)
+                    } else {
+                        (
+                            Tensor::zeros(&[1], (Kind::Float, device)),
+                            action_mean.shallow_clone(),
+                        )
+                    };
 
-                let action_log_probs = transformed_action_log_prob(
-                    &latent_actions_mb,
-                    &action_mean_perturbed,
-                    &action_std,
-                    LOG_2PI,
-                );
-
-                if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats(
-                        "latent_actions_mb",
+                    let action_log_probs = transformed_action_log_prob(
                         &latent_actions_mb,
-                        _epoch,
-                        chunk_i,
+                        &action_mean_perturbed,
+                        &action_std,
+                        LOG_2PI,
                     );
-                    let _ =
-                        debug_tensor_stats("old_log_probs_mb", &old_log_probs_mb, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
+
+                    if DEBUG_NUMERICS {
+                        let _ = debug_tensor_stats(
+                            "latent_actions_mb",
+                            &latent_actions_mb,
+                            _epoch,
+                            chunk_i,
+                        );
+                        let _ = debug_tensor_stats(
+                            "old_log_probs_mb",
+                            &sub_old_log_probs,
+                            _epoch,
+                            chunk_i,
+                        );
+                        let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
+                        let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
+                    }
+
+                    let log_ratio = &action_log_probs - &sub_old_log_probs;
+
+                    if DEBUG_NUMERICS {
+                        let _ = debug_tensor_stats(
+                            "action_log_probs",
+                            &action_log_probs,
+                            _epoch,
+                            chunk_i,
+                        );
+                        let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
+                    }
+                    let ratio = log_ratio.exp();
+                    let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_LOW, 1.0 + PPO_CLIP_HIGH);
+
+                    // Single portfolio advantage - no more weighted combination
+                    let action_loss =
+                        -Tensor::min_other(&(&ratio * &sub_adv), &(&ratio_clipped * &sub_adv))
+                            .mean(Kind::Float);
+
+                    // Two-hot distributional value loss
+                    if DEBUG_NUMERICS {
+                        let _ = debug_tensor_stats("ret_mb", &sub_ret, _epoch, chunk_i);
+                        let _ = debug_tensor_stats(
+                            "new_value_logits",
+                            &new_value_logits,
+                            _epoch,
+                            chunk_i,
+                        );
+                        let _ = debug_tensor_stats("adv_mb", &sub_adv, _epoch, chunk_i);
+                    }
+
+                    let value_loss =
+                        two_hot_value_loss(&two_hot, &new_value_logits, &sub_ret)
+                            .mean(Kind::Float);
+
+                    let dist_entropy = gaussian_entropy(&action_std, LOG_2PI).mean(Kind::Float);
+                    let dist_entropy_detached = dist_entropy.detach();
+
+                    let sub_ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
+                        + action_loss.shallow_clone()
+                        - &dist_entropy * ENTROPY_COEF;
+
+                    // RPO alpha loss
+                    let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                        let action_var = action_std.pow_tensor_scalar(2).detach();
+                        let inv_var_mean =
+                            action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
+                        let d = ACTION_COUNT as f64;
+                        let induced_kl =
+                            rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
+                        (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
+                    } else {
+                        Tensor::zeros([], (Kind::Float, device))
+                    };
+
+                    // Scale loss by this sub-chunk's fraction of the full minibatch so that
+                    // gradients accumulated across all sub-chunks of all chunks equal the
+                    // gradient that a single mean-over-minibatch backward would produce.
+                    let scale = (sub_chunk_sample_count as f64)
+                        / ((chunk_batch_size * PPO_CHUNK_LEN) as f64);
+                    let scaled_sub_loss = (sub_ppo_loss + alpha_loss) * scale;
+
+                    fwd_time_us += fwd_start.elapsed().as_micros() as u64;
+                    let bwd_start = Instant::now();
+                    scaled_sub_loss.backward();
+                    bwd_time_us += bwd_start.elapsed().as_micros() as u64;
+
+                    trading_model.detach_stream_state(&mut chunk_state);
+                    fwd_start = Instant::now();
+
+                    let approx_kl_val = tch::no_grad(|| {
+                        (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float)
+                    });
+                    if DEBUG_NUMERICS {
+                        let _ = debug_tensor_stats(
+                            "approx_kl_val",
+                            &approx_kl_val,
+                            _epoch,
+                            chunk_i,
+                        );
+                    }
+                    let _ = epoch_kl_gpu
+                        .g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
+                    let _ = total_policy_loss_weighted
+                        .g_add_(&(&action_loss.detach() * sub_chunk_sample_count as f64));
+                    let _ = total_value_loss_weighted
+                        .g_add_(&(&value_loss.detach() * sub_chunk_sample_count as f64));
+                    let _ = total_kl_weighted
+                        .g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
+                    let _ = total_entropy_weighted
+                        .g_add_(&(&dist_entropy_detached * sub_chunk_sample_count as f64));
+                    entropy_min = entropy_min.min_other(&dist_entropy_detached);
+                    entropy_max = entropy_max.max_other(&dist_entropy_detached);
+                    epoch_kl_count += sub_chunk_sample_count;
+                    total_sample_count += sub_chunk_sample_count;
+
+                    let _ = total_clipped.g_add_(&tch::no_grad(|| {
+                        let dev = &ratio - 1.0;
+                        let clipped_lo = dev.le(-PPO_CLIP_LOW).to_kind(Kind::Float);
+                        let clipped_hi = dev.ge(PPO_CLIP_HIGH).to_kind(Kind::Float);
+                        (clipped_lo + clipped_hi).sum(Kind::Float)
+                    }));
+                    total_ratio_samples += sub_chunk_sample_count;
                 }
-
-                let log_ratio = &action_log_probs - &old_log_probs_mb;
-
-                if DEBUG_NUMERICS {
-                    let _ =
-                        debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
-                }
-                let ratio = log_ratio.exp();
-                let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_LOW, 1.0 + PPO_CLIP_HIGH);
-
-                // Single portfolio advantage - no more weighted combination
-                let action_loss =
-                    -Tensor::min_other(&(&ratio * &adv_mb), &(&ratio_clipped * &adv_mb))
-                        .mean(Kind::Float);
-
-                // Two-hot distributional value loss with PPO-style value clipping
-                if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("ret_mb", &ret_mb, _epoch, chunk_i);
-                    let _ =
-                        debug_tensor_stats("new_value_logits", &new_value_logits, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("adv_mb", &adv_mb, _epoch, chunk_i);
-                }
-
-                let value_loss =
-                    two_hot_value_loss(&two_hot, &new_value_logits, &ret_mb).mean(Kind::Float);
-
-                let dist_entropy = gaussian_entropy(&action_std, LOG_2PI).mean(Kind::Float);
-                let dist_entropy_detached = dist_entropy.detach();
-
-                let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
-                    + action_loss.shallow_clone()
-                    - &dist_entropy * ENTROPY_COEF;
-
-                // RPO alpha loss: target induced KL for uniform logit perturbation.
-                let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                    let action_var = action_std.pow_tensor_scalar(2).detach();
-                    let inv_var_mean = action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
-                    let d = ACTION_COUNT as f64;
-                    let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
-                    (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
-                } else {
-                    Tensor::zeros([], (Kind::Float, device))
-                };
-
-                let scaled_ppo_loss = &ppo_loss
-                    * (chunk_sample_count as f64 / (chunk_batch_size * PPO_CHUNK_LEN) as f64);
-                let scaled_alpha_loss = &alpha_loss
-                    * (chunk_sample_count as f64 / (chunk_batch_size * PPO_CHUNK_LEN) as f64);
-                let total_chunk_loss = scaled_ppo_loss + scaled_alpha_loss;
-
-                fwd_time_us += fwd_start.elapsed().as_micros() as u64;
-                let bwd_start = Instant::now();
-                total_chunk_loss.backward();
-                bwd_time_us += bwd_start.elapsed().as_micros() as u64;
-
-                let approx_kl_val =
-                    tch::no_grad(|| (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float));
-                if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
-                }
-                let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
-                let _ = total_policy_loss_weighted
-                    .g_add_(&(&action_loss.detach() * chunk_sample_count as f64));
-                let _ = total_value_loss_weighted
-                    .g_add_(&(&value_loss.detach() * chunk_sample_count as f64));
-                let _ = total_kl_weighted.g_add_(&(&approx_kl_val * chunk_sample_count as f64));
-                let _ = total_entropy_weighted
-                    .g_add_(&(&dist_entropy_detached * chunk_sample_count as f64));
-                entropy_min = entropy_min.min_other(&dist_entropy_detached);
-                entropy_max = entropy_max.max_other(&dist_entropy_detached);
-                epoch_kl_count += chunk_sample_count;
-                total_sample_count += chunk_sample_count;
 
                 if DEBUG_NUMERICS {
                     let has_nan_grad = tch::no_grad(|| {
@@ -867,14 +958,6 @@ pub async fn train(
                     });
                 }
                 opt.zero_grad();
-
-                let _ = total_clipped.g_add_(&tch::no_grad(|| {
-                    let dev = &ratio - 1.0;
-                    let clipped_lo = dev.le(-PPO_CLIP_LOW).to_kind(Kind::Float);
-                    let clipped_hi = dev.ge(PPO_CLIP_HIGH).to_kind(Kind::Float);
-                    (clipped_lo + clipped_hi).sum(Kind::Float)
-                }));
-                total_ratio_samples += chunk_sample_count;
             }
 
             let mean_epoch_kl = epoch_kl_gpu.double_value(&[]) / epoch_kl_count as f64;

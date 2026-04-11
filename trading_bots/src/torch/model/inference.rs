@@ -24,22 +24,82 @@ impl StreamState {
 }
 
 impl TradingModel {
-    pub fn refresh_stream_state_storage_for_autograd(&self, state: &mut StreamState) {
+    pub fn detach_stream_state(&self, state: &mut StreamState) {
         if self.variant != super::ModelVariant::Uniform256Stream {
             return;
         }
-        state.uniform_layout = &state.uniform_layout + 0.0;
-        state.uniform_patch_tokens = &state.uniform_patch_tokens + 0.0;
-        state.uniform_live_fill = &state.uniform_live_fill + 0;
-        state.uniform_layer0_prefix_hidden = &state.uniform_layer0_prefix_hidden + 0.0;
-        state.uniform_layer0_prefix_k = &state.uniform_layer0_prefix_k + 0.0;
-        state.uniform_layer0_prefix_v = &state.uniform_layer0_prefix_v + 0.0;
-        state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t + 0.0).collect();
-        state.uniform_prefix_v = state.uniform_prefix_v.iter().map(|t| t + 0.0).collect();
+        // Detach AND upcast to Float. Under autocast the cached state becomes Half,
+        // and downstream model ops (some non-autocast-eligible linears) expect Float
+        // inputs against Float weights. The pre-refactor `+ 0.0` trick implicitly
+        // upcast via f64 scalar promotion; preserve that contract here.
+        let target = self.patch_embed_weight.kind();
+        state.uniform_layout = state.uniform_layout.detach().to_kind(target);
+        state.uniform_patch_tokens = state.uniform_patch_tokens.detach().to_kind(target);
+        state.uniform_layer0_prefix_hidden =
+            state.uniform_layer0_prefix_hidden.detach().to_kind(target);
+        state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach().to_kind(target);
+        state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach().to_kind(target);
+        state.uniform_prefix_k = state
+            .uniform_prefix_k
+            .iter()
+            .map(|t| t.detach().to_kind(target))
+            .collect();
+        state.uniform_prefix_v = state
+            .uniform_prefix_v
+            .iter()
+            .map(|t| t.detach().to_kind(target))
+            .collect();
         state.uniform_cached_static_features = state
             .uniform_cached_static_features
             .as_ref()
-            .map(|t| t + 0.0);
+            .map(|t| t.detach().to_kind(target));
+    }
+
+    /// Upcast the float-valued cached stream-state tensors back to the weight dtype
+    /// (Float32) without breaking the autograd graph. Mirrors the pre-refactor
+    /// per-step `+ 0.0` trick, which implicitly promoted Half -> Float via f64
+    /// Scalar type promotion. Needed inside a training sub-chunk because autocast
+    /// causes model forward outputs (written into cached state) to be Half, while
+    /// some subsequent ops (fused rmsnorm, eager-mode linears reached via paths
+    /// that escape autocast dispatch) require Float inputs.
+    pub fn upcast_stream_state_inplace(&self, state: &mut StreamState) {
+        if self.variant != super::ModelVariant::Uniform256Stream {
+            return;
+        }
+        let target = self.patch_embed_weight.kind();
+        if state.uniform_layout.kind() != target {
+            state.uniform_layout = state.uniform_layout.to_kind(target);
+        }
+        if state.uniform_patch_tokens.kind() != target {
+            state.uniform_patch_tokens = state.uniform_patch_tokens.to_kind(target);
+        }
+        if state.uniform_layer0_prefix_hidden.kind() != target {
+            state.uniform_layer0_prefix_hidden =
+                state.uniform_layer0_prefix_hidden.to_kind(target);
+        }
+        if state.uniform_layer0_prefix_k.kind() != target {
+            state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.to_kind(target);
+        }
+        if state.uniform_layer0_prefix_v.kind() != target {
+            state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.to_kind(target);
+        }
+        if state.uniform_prefix_k.iter().any(|t| t.kind() != target) {
+            state.uniform_prefix_k = state
+                .uniform_prefix_k
+                .iter()
+                .map(|t| t.to_kind(target))
+                .collect();
+            state.uniform_prefix_v = state
+                .uniform_prefix_v
+                .iter()
+                .map(|t| t.to_kind(target))
+                .collect();
+        }
+        if let Some(t) = state.uniform_cached_static_features.as_ref() {
+            if t.kind() != target {
+                state.uniform_cached_static_features = Some(t.to_kind(target));
+            }
+        }
     }
 
     fn recompute_live_token(&self, state: &StreamState) -> Tensor {
