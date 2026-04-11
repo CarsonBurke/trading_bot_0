@@ -36,6 +36,12 @@ pub struct MetaHistory {
     pub approx_kl: Vec<f64>,
     pub gate_mean: Vec<f64>,
     pub gate_std: Vec<f64>,
+    pub return_min: Vec<f64>,
+    pub return_max: Vec<f64>,
+    pub support_min: Vec<f64>,
+    pub support_max: Vec<f64>,
+    pub return_below_support_frac: Vec<f64>,
+    pub return_above_support_frac: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -93,6 +99,23 @@ impl MetaHistory {
     pub fn record_gate_stats(&mut self, mean: f64, std: f64) {
         self.gate_mean.push(mean);
         self.gate_std.push(std);
+    }
+
+    pub fn record_hl_gauss_range_stats(
+        &mut self,
+        return_min: f64,
+        return_max: f64,
+        support_min: f64,
+        support_max: f64,
+        below_frac: f64,
+        above_frac: f64,
+    ) {
+        self.return_min.push(return_min);
+        self.return_max.push(return_max);
+        self.support_min.push(support_min);
+        self.support_max.push(support_max);
+        self.return_below_support_frac.push(below_frac);
+        self.return_above_support_frac.push(above_frac);
     }
 
     pub fn record_temporal_debug(
@@ -181,6 +204,13 @@ impl MetaHistory {
         let gate_path = format!("{base_dir}/gate_stats.report.bin");
         self.gate_mean = load_multiline(&gate_path, "mean");
         self.gate_std = load_multiline(&gate_path, "std");
+        let hl_gauss_path = format!("{base_dir}/hl_gauss_return_range.report.bin");
+        self.return_min = load_multiline(&hl_gauss_path, "return_min");
+        self.return_max = load_multiline(&hl_gauss_path, "return_max");
+        self.support_min = load_multiline(&hl_gauss_path, "support_min");
+        self.support_max = load_multiline(&hl_gauss_path, "support_max");
+        self.return_below_support_frac = load_multiline(&hl_gauss_path, "below_frac");
+        self.return_above_support_frac = load_multiline(&hl_gauss_path, "above_frac");
 
         println!(
             "Loaded meta history from episode {} ({} data points)",
@@ -462,6 +492,43 @@ impl MetaHistory {
                 },
             );
             let _ = write_report(&format!("{base_dir}/gate_stats.report.bin"), &r);
+        }
+        if !self.return_min.is_empty() {
+            let r = Self::report(
+                "HL-Gauss Return Range",
+                "Episode",
+                None,
+                ScaleKind::Linear,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "return_min".to_string(),
+                            values: f64_to_f32(&self.return_min),
+                        },
+                        ReportSeries {
+                            label: "return_max".to_string(),
+                            values: f64_to_f32(&self.return_max),
+                        },
+                        ReportSeries {
+                            label: "support_min".to_string(),
+                            values: f64_to_f32(&self.support_min),
+                        },
+                        ReportSeries {
+                            label: "support_max".to_string(),
+                            values: f64_to_f32(&self.support_max),
+                        },
+                        ReportSeries {
+                            label: "below_frac".to_string(),
+                            values: f64_to_f32(&self.return_below_support_frac),
+                        },
+                        ReportSeries {
+                            label: "above_frac".to_string(),
+                            values: f64_to_f32(&self.return_above_support_frac),
+                        },
+                    ],
+                },
+            );
+            let _ = write_report(&format!("{base_dir}/hl_gauss_return_range.report.bin"), &r);
         }
     }
 }

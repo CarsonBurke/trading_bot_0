@@ -1087,6 +1087,7 @@ pub async fn train(
             &rpo_rho,
             device,
         );
+        let return_range_stats = hl_gauss.range_stats(&returns);
         // Single GPU->CPU transfer for all scalars
         let all_scalars = Tensor::cat(
             &[
@@ -1100,11 +1101,12 @@ pub async fn train(
                 entropy_mean_t.view([1]),
                 entropy_min.view([1]),
                 entropy_max.view([1]),
+                return_range_stats.view([6]),
             ],
             0,
         );
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 15]);
+            .unwrap_or_else(|_| vec![0.0; 21]);
         let mean_policy_loss = all_scalars_vec[0];
         let mean_value_loss = all_scalars_vec[1];
         let explained_var = all_scalars_vec[2];
@@ -1118,6 +1120,22 @@ pub async fn train(
             all_scalars_vec[13],
             all_scalars_vec[14],
         );
+        let (
+            return_min,
+            return_max,
+            support_min,
+            support_max,
+            below_support_frac,
+            above_support_frac,
+        ) = (
+            all_scalars_vec[15],
+            all_scalars_vec[16],
+            all_scalars_vec[17],
+            all_scalars_vec[18],
+            all_scalars_vec[19],
+            all_scalars_vec[20],
+        );
+
         let primary = env.primary_mut();
         primary
             .meta_history
@@ -1137,7 +1155,17 @@ pub async fn train(
         primary
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
-        primary.meta_history.record_approx_kl(last_minibatch_approx_kl);
+        primary
+            .meta_history
+            .record_approx_kl(last_minibatch_approx_kl);
+        primary.meta_history.record_hl_gauss_range_stats(
+            return_min,
+            return_max,
+            support_min,
+            support_max,
+            below_support_frac,
+            above_support_frac,
+        );
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), GradNorm: {:.4}",
