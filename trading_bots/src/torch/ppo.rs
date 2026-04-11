@@ -592,9 +592,15 @@ pub async fn train(
         let total_samples = rollout_steps * NPROCS;
         let minibatch_size = minibatch_samples_from_total(total_samples);
         let chunk_batch_size = ((minibatch_size + PPO_CHUNK_LEN - 1) / PPO_CHUNK_LEN).max(1);
-        let s_reset_slots = Tensor::from_slice(&reset_slots_host)
-            .to_kind(Kind::Int64)
-            .to_device(device);
+        // Per-chunk reset slot ids laid out as [total_chunks, PPO_CHUNK_LEN], matching
+        // `chunk_mem_indices_host` ordering. Entry 0 == no reset; >0 == 1-indexed slot.
+        // Precomputed host-side so the inner sub-chunk loop never needs a device->host
+        // sync to decide whether a reset occurred at the current step.
+        let mut resets_by_chunk_flat: Vec<i64> =
+            Vec::with_capacity((total_chunks * PPO_CHUNK_LEN) as usize);
+        for &mem_idx in &chunk_mem_indices_host {
+            resets_by_chunk_flat.push(reset_slots_host[mem_idx as usize]);
+        }
         println!(
             "ppo update: total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
             total_samples, minibatch_size, PPO_CHUNK_LEN, chunk_batch_size
@@ -645,12 +651,27 @@ pub async fn train(
                 let ret_mb = returns.index_select(0, &mb_inds);
                 let adv_mb = adv_norm.index_select(0, &mb_inds);
                 let old_log_probs_mb = s_old_log_probs.index_select(0, &mb_inds);
-                let reset_slots_chunk = s_reset_slots
-                    .index_select(0, &mb_inds)
-                    .view([chunk_count, PPO_CHUNK_LEN]);
                 let so_chunk = so_chunk_flat.view([chunk_count, PPO_CHUNK_LEN, so_dim]);
                 let step_deltas_chunk =
                     step_deltas_chunk_flat.view([chunk_count, PPO_CHUNK_LEN, TICKERS_COUNT]);
+
+                // Build the per-step reset plan for this minibatch from host-side data.
+                // One device->host copy per minibatch (for `chunk_ids`) replaces
+                // ~SUB_CHUNK_LEN*num_sub_chunks per-step device->host syncs.
+                let chunk_ids_host: Vec<i64> =
+                    Vec::try_from(chunk_ids.to_device(Device::Cpu)).unwrap();
+                // mb_reset_plan[pos_in_chunk] -> Vec<(row_in_mb, slot_id)>
+                let mut mb_reset_plan: Vec<Vec<(usize, i64)>> =
+                    vec![Vec::new(); PPO_CHUNK_LEN as usize];
+                for (row_in_mb, &chunk_id) in chunk_ids_host.iter().enumerate() {
+                    let base = (chunk_id * PPO_CHUNK_LEN) as usize;
+                    for pos in 0..PPO_CHUNK_LEN as usize {
+                        let slot = resets_by_chunk_flat[base + pos];
+                        if slot > 0 {
+                            mb_reset_plan[pos].push((row_in_mb, slot));
+                        }
+                    }
+                }
 
                 let mut fwd_start = Instant::now();
                 let mut chunk_state = trading_model.init_stream_state_batched(chunk_count);
@@ -680,10 +701,10 @@ pub async fn train(
                             let prev_step_deltas =
                                 step_deltas_chunk.select(1, global_pos - 1);
                             let current_static = so_chunk.select(1, global_pos);
-                            let reset_slot_pos = reset_slots_chunk.select(1, global_pos - 1);
-                            let reset_mask = reset_slot_pos.gt(0);
-                            let has_reset = reset_mask.any().int64_value(&[]) != 0;
-                            if !has_reset {
+                            // Host-side lookup: no device sync.
+                            let step_resets =
+                                &mb_reset_plan[(global_pos - 1) as usize];
+                            if step_resets.is_empty() {
                                 autocast(true, || {
                                     trading_model.step_on_device(
                                         &prev_step_deltas,
@@ -692,25 +713,14 @@ pub async fn train(
                                     )
                                 })
                             } else {
-                                let reset_rows_tensor = reset_mask.nonzero().squeeze_dim(1);
-                                let reset_rows_i64: Vec<i64> = Vec::try_from(
-                                    reset_rows_tensor.to_device(Device::Cpu),
-                                )
-                                .unwrap();
                                 let reset_rows: Vec<usize> =
-                                    reset_rows_i64.iter().map(|&idx| idx as usize).collect();
-                                let reset_slot_ids: Vec<i64> = Vec::try_from(
-                                    reset_slot_pos
-                                        .index_select(0, &reset_rows_tensor)
-                                        .to_device(Device::Cpu),
-                                )
-                                .unwrap();
-                                let reset_layout_parts = reset_slot_ids
+                                    step_resets.iter().map(|(row, _)| *row).collect();
+                                let reset_layout_parts: Vec<Tensor> = step_resets
                                     .iter()
-                                    .map(|&slot| {
-                                        reset_layout_store[(slot - 1) as usize].shallow_clone()
+                                    .map(|(_, slot)| {
+                                        reset_layout_store[(*slot - 1) as usize].shallow_clone()
                                     })
-                                    .collect::<Vec<_>>();
+                                    .collect();
                                 let _ = autocast(true, || {
                                     trading_model.step_on_device(
                                         &prev_step_deltas,
