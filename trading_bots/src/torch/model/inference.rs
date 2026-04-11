@@ -173,6 +173,7 @@ impl TradingModel {
         static_features: &Tensor,
         state: &mut StreamState,
     ) -> ModelOutput {
+        self.upcast_stream_state_inplace(state);
         let batch_size = state.uniform_live_fill.size()[0];
         let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
         let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
@@ -560,6 +561,8 @@ impl TradingModel {
             if is_full {
                 return self.init_from_full_on_device(&new_deltas, &static_features, state);
             }
+
+            self.upcast_stream_state_inplace(state);
 
             let new_deltas = if new_deltas.dim() == 1 {
                 new_deltas.unsqueeze(0)
