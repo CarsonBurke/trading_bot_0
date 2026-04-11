@@ -400,9 +400,12 @@ impl ExoMLP {
     }
 }
 
+fn xavier_normal_std(in_features: i64, out_features: i64) -> f64 {
+    (2.0 / (in_features + out_features) as f64).sqrt()
+}
+
 fn truncated_normal_std(in_features: i64, out_features: i64) -> f64 {
-    let denoms = (in_features + out_features) as f64 / 2.0;
-    (1.0 / denoms).sqrt() / 0.8796
+    xavier_normal_std(in_features, out_features) / 0.8796
 }
 
 fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
@@ -780,7 +783,7 @@ impl TradingModel {
             .max()
             .unwrap_or(0);
         let max_input_dim = max_patch_size + PATCH_SCALAR_FEATS;
-        let xavier_std = (2.0 / (max_input_dim + spec.model_dim) as f64).sqrt();
+        let xavier_std = xavier_normal_std(max_input_dim, spec.model_dim);
         let patch_embed_weight = p.var(
             "patch_embed_weight",
             &[num_configs, max_input_dim, spec.model_dim],
@@ -842,7 +845,7 @@ impl TradingModel {
             &[NUM_EXO_TOKENS, spec.model_dim],
             Init::Randn {
                 mean: 0.0,
-                stdev: (1.0 / spec.model_dim as f64).sqrt(),
+                stdev: xavier_normal_std(1, spec.model_dim),
             },
         );
         let exo_feat_b = p.var(
@@ -850,7 +853,7 @@ impl TradingModel {
             &[NUM_EXO_TOKENS, spec.model_dim],
             Init::Const(0.0),
         );
-        let cls_std = (1.0 / spec.model_dim as f64).sqrt();
+        let cls_std = xavier_normal_std(1, spec.model_dim);
         let actor_cls_token = p.var(
             "actor_cls_token",
             &[1, 1, spec.model_dim],
