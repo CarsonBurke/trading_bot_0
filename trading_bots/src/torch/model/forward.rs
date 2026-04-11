@@ -4,36 +4,18 @@ use tch::Tensor;
 use super::{DebugMetrics, ModelOutput, StreamState, TradingModel};
 
 impl TradingModel {
-    pub fn forward(
+    fn forward_prepared_on_device(
         &self,
         price_deltas: &Tensor,
         static_features: &Tensor,
-        _train: bool,
     ) -> ModelOutput {
-        let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
-        let static_features = self.cast_inputs(&static_features.to_device(self.device));
-        self.forward_on_device(&price_deltas, &static_features, _train)
-    }
-
-    pub fn forward_on_device(
-        &self,
-        price_deltas: &Tensor,
-        static_features: &Tensor,
-        _train: bool,
-    ) -> ModelOutput {
-        if price_deltas.device() != self.device || static_features.device() != self.device {
-            panic!("forward_on_device requires tensors on {:?}", self.device);
-        }
-        let price_deltas = self.cast_inputs(price_deltas);
-        let static_features = self.cast_inputs(static_features);
-
-        debug_fused("model_price_deltas", &price_deltas);
-        debug_fused("model_static_features", &static_features);
+        debug_fused("model_price_deltas", price_deltas);
+        debug_fused("model_static_features", static_features);
         let batch_size = price_deltas.size()[0];
 
-        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
+        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
         let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
-        let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
+        let x_stem = self.patch_latent_stem_on_device(price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
         let mut x = x_stem;
@@ -49,21 +31,46 @@ impl TradingModel {
         self.head_with_temporal_pool(&x, batch_size, false).0
     }
 
+    pub fn forward(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        _train: bool,
+    ) -> ModelOutput {
+        let price_deltas = self.cast_inputs(&self.maybe_to_device(price_deltas, self.device));
+        let static_features = self.cast_inputs(&self.maybe_to_device(static_features, self.device));
+        self.forward_prepared_on_device(&price_deltas, &static_features)
+    }
+
+    pub fn forward_on_device(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        _train: bool,
+    ) -> ModelOutput {
+        if price_deltas.device() != self.device || static_features.device() != self.device {
+            panic!("forward_on_device requires tensors on {:?}", self.device);
+        }
+        let price_deltas = self.cast_inputs(price_deltas);
+        let static_features = self.cast_inputs(static_features);
+        self.forward_prepared_on_device(&price_deltas, &static_features)
+    }
+
     pub fn forward_with_debug(
         &self,
         price_deltas: &Tensor,
         static_features: &Tensor,
         _train: bool,
     ) -> (ModelOutput, DebugMetrics) {
-        let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
-        let static_features = self.cast_inputs(&static_features.to_device(self.device));
+        let price_deltas = self.cast_inputs(&self.maybe_to_device(price_deltas, self.device));
+        let static_features = self.cast_inputs(&self.maybe_to_device(static_features, self.device));
         debug_fused("model_price_deltas", &price_deltas);
         debug_fused("model_static_features", &static_features);
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
         let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
-        let x_stem = self.patch_latent_stem(&price_deltas, batch_size);
+        let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
         let mut x = x_stem;

@@ -49,25 +49,14 @@ impl EndogenousTickerBlock {
         }
     }
 
-    fn forward(&self, x: &Tensor, model_dim: i64, ff_dim: i64) -> Tensor {
+    fn forward(&self, x: &Tensor, model_dim: i64, _ff_dim: i64) -> Tensor {
         let (batch, num_items, _) = x.size3().unwrap();
-        let x_norm = self
-            .ticker_ln
-            .forward(&x.reshape([batch * num_items, model_dim]))
-            .reshape([batch, num_items, model_dim]);
+        let x_norm = self.ticker_ln.forward(x);
         let qkv = x_norm.apply(&self.ticker_qkv);
         let parts = qkv.split(model_dim, -1);
         // QKNorm (single-head, head_dim == model_dim)
-        let q = self
-            .q_norm
-            .forward(&parts[0].reshape([batch * num_items, model_dim]))
-            .reshape([batch, num_items, model_dim])
-            .unsqueeze(1);
-        let k = self
-            .k_norm
-            .forward(&parts[1].reshape([batch * num_items, model_dim]))
-            .reshape([batch, num_items, model_dim])
-            .unsqueeze(1);
+        let q = self.q_norm.forward(&parts[0]).unsqueeze(1);
+        let k = self.k_norm.forward(&parts[1]).unsqueeze(1);
         let v = parts[2].unsqueeze(1);
         let ctx = Tensor::scaled_dot_product_attention(
             &q,
@@ -83,14 +72,10 @@ impl EndogenousTickerBlock {
         .apply(&self.ticker_out)
         .reshape([batch, num_items, model_dim]);
         let x = x + ctx;
-        let mlp_in = self
-            .mlp_ln
-            .forward(&x.reshape([batch * num_items, model_dim]));
+        let mlp_in = self.mlp_ln.forward(&x);
         let mlp_proj = mlp_in.apply(&self.mlp_fc1);
-        let mlp_parts = mlp_proj.split(ff_dim, -1);
-        let mlp = (mlp_parts[0].silu() * &mlp_parts[1])
-            .apply(&self.mlp_fc2)
-            .reshape([batch, num_items, model_dim]);
+        let mlp_parts = mlp_proj.chunk(2, -1);
+        let mlp = (mlp_parts[0].silu() * &mlp_parts[1]).apply(&self.mlp_fc2);
         &x + mlp
     }
 }
@@ -183,7 +168,6 @@ impl GqaBlock {
 
     fn forward(&self, x: &Tensor, rope: &RotaryEmbedding, causal: bool) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
-        let head_dim = _d / GQA_NUM_Q_HEADS;
 
         let (q, k, v) = self.project_qkv(x, rope, 0);
 
@@ -224,14 +208,8 @@ impl GqaBlock {
         let v = parts[2]
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
-        let q = self
-            .q_norm
-            .forward(&q.reshape([b * GQA_NUM_Q_HEADS * s, head_dim]))
-            .reshape([b, GQA_NUM_Q_HEADS, s, head_dim]);
-        let k = self
-            .k_norm
-            .forward(&k.reshape([b * GQA_NUM_KV_HEADS * s, head_dim]))
-            .reshape([b, GQA_NUM_KV_HEADS, s, head_dim]);
+        let q = self.q_norm.forward(&q);
+        let k = self.k_norm.forward(&k);
         let q = rope.apply_from(&q, rope_offset);
         let k = rope.apply_from(&k, rope_offset);
         (q, k, v)
@@ -346,19 +324,13 @@ impl ExogenousTickerBlock {
             .apply(&self.q_proj)
             .reshape([b, s, CA_NUM_HEADS, CA_HEAD_DIM])
             .permute([0, 2, 1, 3]);
-        let q = self
-            .q_norm
-            .forward(&q.reshape([b * CA_NUM_HEADS * s, CA_HEAD_DIM]))
-            .reshape([b, CA_NUM_HEADS, s, CA_HEAD_DIM]);
+        let q = self.q_norm.forward(&q);
         let exo_len = exo_kv.size()[1];
         let k = exo_kv
             .apply(&self.k_proj)
             .reshape([b, exo_len, CA_NUM_HEADS, CA_HEAD_DIM])
             .permute([0, 2, 1, 3]);
-        let k = self
-            .k_norm
-            .forward(&k.reshape([b * CA_NUM_HEADS * exo_len, CA_HEAD_DIM]))
-            .reshape([b, CA_NUM_HEADS, exo_len, CA_HEAD_DIM]);
+        let k = self.k_norm.forward(&k);
         let v = exo_kv
             .apply(&self.v_proj)
             .reshape([b, exo_len, CA_NUM_HEADS, CA_HEAD_DIM])
@@ -1008,15 +980,7 @@ impl TradingModel {
         batch_size: i64,
     ) -> Tensor {
         let exo_kv = self.build_exo_kv(global_static, per_ticker_static, batch_size);
-        let (bt, n, d) = exo_kv.size3().unwrap();
-        self.exo_mlp
-            .forward(&exo_kv.reshape([bt * n, d]))
-            .reshape([bt, n, d])
-    }
-
-    fn patch_latent_stem(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
-        let price_deltas = self.maybe_to_device(price_deltas, self.device);
-        self.patch_latent_stem_on_device(&price_deltas, batch_size)
+        self.exo_mlp.forward(&exo_kv)
     }
 
     fn patch_latent_stem_on_device(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {

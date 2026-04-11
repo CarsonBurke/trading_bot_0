@@ -74,8 +74,7 @@ impl TradingModel {
             state.uniform_patch_tokens = state.uniform_patch_tokens.to_kind(target);
         }
         if state.uniform_layer0_prefix_hidden.kind() != target {
-            state.uniform_layer0_prefix_hidden =
-                state.uniform_layer0_prefix_hidden.to_kind(target);
+            state.uniform_layer0_prefix_hidden = state.uniform_layer0_prefix_hidden.to_kind(target);
         }
         if state.uniform_layer0_prefix_k.kind() != target {
             state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.to_kind(target);
