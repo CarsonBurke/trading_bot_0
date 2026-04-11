@@ -40,9 +40,9 @@ impl TradingModel {
         for (i, layer) in self.gqa_layers.iter().enumerate() {
             x = layer.forward(&x, &self.rope, true);
             if i == 0 {
-                x = self.cross_attn.forward(&x, &exo_tokens);
+                x = self.exogenous_ticker_block.forward(&x, &exo_tokens);
             }
-            x = self.maybe_apply_inter_ticker(&x, i);
+            x = self.maybe_apply_endogenous_ticker(&x, i);
         }
         debug_fused("model_x_gqa", &x);
 
@@ -71,10 +71,10 @@ impl TradingModel {
             debug_fused_layer("x_gqa_in", layer_idx, &x);
             x = layer.forward(&x, &self.rope, true);
             if layer_idx == 0 {
-                x = self.cross_attn.forward(&x, &exo_tokens);
+                x = self.exogenous_ticker_block.forward(&x, &exo_tokens);
             }
             debug_fused_layer("gqa_out", layer_idx, &x);
-            x = self.maybe_apply_inter_ticker(&x, layer_idx);
+            x = self.maybe_apply_endogenous_ticker(&x, layer_idx);
             debug_fused_layer("x_gqa_out", layer_idx, &x);
         }
         debug_fused("model_x_gqa", &x);

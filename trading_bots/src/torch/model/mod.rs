@@ -15,7 +15,7 @@ use crate::torch::hl_gauss::NUM_BINS;
 
 use rmsnorm::RMSNorm;
 
-struct InterTickerBlock {
+struct EndogenousTickerBlock {
     ticker_ln: RMSNorm,
     ticker_qkv: nn::Linear,
     ticker_out: nn::Linear,
@@ -26,7 +26,7 @@ struct InterTickerBlock {
     mlp_ln: RMSNorm,
 }
 
-impl InterTickerBlock {
+impl EndogenousTickerBlock {
     fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64) -> Self {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
         let ticker_qkv = linear_truncated(p, "ticker_qkv", model_dim, 3 * model_dim);
@@ -308,7 +308,7 @@ impl GqaBlock {
     }
 }
 
-struct CrossAttentionBlock {
+struct ExogenousTickerBlock {
     q_proj: nn::Linear,
     k_proj: nn::Linear,
     v_proj: nn::Linear,
@@ -318,7 +318,7 @@ struct CrossAttentionBlock {
     k_norm: RMSNorm,
 }
 
-impl CrossAttentionBlock {
+impl ExogenousTickerBlock {
     fn new(p: &nn::Path, model_dim: i64, init_scale: f64) -> Self {
         let ca_dim = CA_NUM_HEADS * CA_HEAD_DIM;
         let ln_q = RMSNorm::new(&(p / "ln_q"), model_dim, 1e-6);
@@ -655,7 +655,7 @@ pub struct TradingModel {
     gqa_kv_head_index: Tensor,
     uniform_patch_shift_idx: Tensor,
     gqa_layers: Vec<GqaBlock>,
-    cross_attn: CrossAttentionBlock,
+    exogenous_ticker_block: ExogenousTickerBlock,
     exo_mlp: ExoMLP,
     rope: RotaryEmbedding,
     exo_feat_w: Tensor,
@@ -663,7 +663,7 @@ pub struct TradingModel {
     actor_cls_token: Tensor,
     critic_cls_token: Tensor,
     sde_cls_token: Tensor,
-    inter_ticker_block: InterTickerBlock,
+    endogenous_ticker_block: EndogenousTickerBlock,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
     device: tch::Device,
@@ -827,8 +827,8 @@ impl TradingModel {
                 )
             })
             .collect::<Vec<_>>();
-        let cross_attn =
-            CrossAttentionBlock::new(&(p / "cross_attn_0"), spec.model_dim, init_scale);
+        let exogenous_ticker_block =
+            ExogenousTickerBlock::new(&(p / "cross_attn_0"), spec.model_dim, init_scale);
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
         let rope = RotaryEmbedding::new(seq_len + NUM_HEAD_CLS_TOKENS, head_dim, p.device());
@@ -870,7 +870,7 @@ impl TradingModel {
                 stdev: cls_std,
             },
         );
-        let inter_ticker_block = InterTickerBlock::new(
+        let endogenous_ticker_block = EndogenousTickerBlock::new(
             &(p / "inter_ticker_0"),
             spec.model_dim,
             spec.ff_dim,
@@ -921,7 +921,7 @@ impl TradingModel {
             gqa_kv_head_index,
             uniform_patch_shift_idx,
             gqa_layers,
-            cross_attn,
+            exogenous_ticker_block,
             exo_mlp,
             rope,
             exo_feat_w,
@@ -929,7 +929,7 @@ impl TradingModel {
             actor_cls_token,
             critic_cls_token,
             sde_cls_token,
-            inter_ticker_block,
+            endogenous_ticker_block,
             policy_mean_log_var,
             value_proj,
             device: p.device(),
@@ -948,7 +948,7 @@ impl TradingModel {
         (global, per_ticker)
     }
 
-    fn maybe_apply_inter_ticker(&self, x: &Tensor, layer_idx: usize) -> Tensor {
+    fn maybe_apply_endogenous_ticker(&self, x: &Tensor, layer_idx: usize) -> Tensor {
         if layer_idx != INTER_TICKER_AFTER || TICKERS_COUNT == 1 {
             return x.shallow_clone();
         }
@@ -963,7 +963,7 @@ impl TradingModel {
             self.model_dim,
         ]);
         let enriched_cls = self
-            .inter_ticker_block
+            .endogenous_ticker_block
             .forward(&cls_for_mix, self.model_dim, self.ff_dim)
             .reshape([
                 batch_size,

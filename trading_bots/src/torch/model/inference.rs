@@ -151,7 +151,7 @@ impl TradingModel {
         state: &mut StreamState,
     ) {
         let mut x = self
-            .cross_attn
+            .exogenous_ticker_block
             .forward(&state.uniform_layer0_prefix_hidden, exo_tokens);
         state.uniform_prefix_k = vec![state.uniform_layer0_prefix_k.shallow_clone()];
         state.uniform_prefix_v = vec![state.uniform_layer0_prefix_v.shallow_clone()];
@@ -209,9 +209,9 @@ impl TradingModel {
                 prefix_len,
             );
             if layer_idx == 0 {
-                x_suffix = self.cross_attn.forward(&x_suffix, &exo_tokens);
+                x_suffix = self.exogenous_ticker_block.forward(&x_suffix, &exo_tokens);
             }
-            x_suffix = self.maybe_apply_inter_ticker(&x_suffix, layer_idx);
+            x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
         self.head_from_uniform_suffix(&x_suffix, batch_size)
     }
