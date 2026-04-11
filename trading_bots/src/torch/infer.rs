@@ -7,14 +7,14 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
-use crate::torch::sdp::force_flash_sdp;
+use crate::torch::cuda_cfg::configure_cuda;
 
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: Device,
     model_variant: ModelVariant,
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
-    force_flash_sdp();
+    configure_cuda();
     let mut vs = nn::VarStore::new(device);
     let model = TradingModel::new_with_config(
         &vs.root(),

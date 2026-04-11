@@ -8,7 +8,7 @@ pub mod load;
 pub mod mamba_fused;
 pub mod model;
 pub mod ppo;
-pub mod sdp;
+pub mod cuda_cfg;
 pub mod ssm;
 pub mod ssm_ref;
 pub mod two_hot;

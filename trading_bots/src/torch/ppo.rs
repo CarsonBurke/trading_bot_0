@@ -12,7 +12,7 @@ use crate::torch::constants::{
 use crate::torch::env::{CpuStepBatch, VecEnv};
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelConfig};
-use crate::torch::sdp::force_flash_sdp;
+use crate::torch::cuda_cfg::configure_cuda;
 use crate::torch::two_hot::TwoHotBins;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
@@ -261,7 +261,7 @@ pub async fn train(
 
     let device = tch::Device::cuda_if_available();
     println!("device is cuda: {}", device.is_cuda());
-    force_flash_sdp();
+    configure_cuda();
     let mut vs = nn::VarStore::new(device);
     let trading_model = TradingModel::new_with_config(
         &vs.root(),
