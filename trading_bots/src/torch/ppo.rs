@@ -1,19 +1,21 @@
+use rand::seq::SliceRandom;
 use std::env;
 use std::path::Path;
 use std::time::Instant;
 use tch::{autocast, nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::action_space::{
-    gaussian_entropy, sigmoid_target_weight, transformed_action_log_prob,
+    sigmoid_target_weight, transformed_action_log_prob,
+    transformed_action_log_prob_entropy_and_var,
 };
 use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
+use crate::torch::cuda_cfg::configure_cuda;
 use crate::torch::env::{CpuStepBatch, VecEnv};
+use crate::torch::hl_gauss::HlGaussBins;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelConfig};
-use crate::torch::cuda_cfg::configure_cuda;
-use crate::torch::hl_gauss::HlGaussBins;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 const LEARNING_RATE: f64 = 1e-4;
@@ -102,18 +104,6 @@ fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool
         return false;
     }
     true
-}
-
-fn cpu_tensor_from_f32(data: &[f32], size: &[i64]) -> Tensor {
-    unsafe {
-        Tensor::from_blob(
-            data.as_ptr() as *const u8,
-            size,
-            &[],
-            Kind::Float,
-            Device::Cpu,
-        )
-    }
 }
 
 fn sample_rollout_actions_from_output(
@@ -368,6 +358,7 @@ pub async fn train(
     let pd_dim = trading_model.price_input_dim();
     let so_dim = STATIC_OBSERVATIONS as i64;
     let replay_obs_kind = trading_model.input_kind();
+    let uniform_reset_live_fill = trading_model.uniform_stream_bootstrap_live_fill();
 
     let s_chunk_start_layouts = Tensor::zeros(
         &[chunks_per_rollout * NPROCS, pd_dim],
@@ -430,15 +421,11 @@ pub async fn train(
         let mut step_reward_per_ticker =
             Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
-        let mut reset_layout_store: Vec<Tensor> = Vec::new();
+        let mut reset_layout_batches: Vec<Tensor> = Vec::new();
+        let mut reset_layout_count = 0i64;
         let mut reset_slots_host = vec![0i64; memory_size as usize];
-        let mut cpu_step_batch = CpuStepBatch::new(
-            NPROCS as usize,
-            ACTION_COUNT as usize,
-            TICKERS_COUNT as usize,
-            STATIC_OBSERVATIONS,
-            raw_pd_dim as usize,
-        );
+        let mut cpu_step_batch =
+            CpuStepBatch::new(NPROCS as usize, ACTION_COUNT as usize, raw_pd_dim as usize);
         for step in 0..rollout_steps as usize {
             let mem_idx = step as i64 * NPROCS;
             let (values, action_mean, action_std, latent_actions, target_weights, action_log_prob) =
@@ -472,20 +459,13 @@ pub async fn train(
             let target_weights_cpu = target_weights.to_device(Device::Cpu).to_kind(Kind::Float);
             let actions_len = cpu_step_batch.actions_f32.len();
             target_weights_cpu.copy_data(&mut cpu_step_batch.actions_f32, actions_len);
-            env.step_from_actions_f32(&mut cpu_step_batch);
-            step_deltas.copy_(&cpu_tensor_from_f32(
-                &cpu_step_batch.step_deltas,
-                &[NPROCS, TICKERS_COUNT],
-            ));
-            obs_static.copy_(&cpu_tensor_from_f32(
-                &cpu_step_batch.static_obs,
-                &[NPROCS, STATIC_OBSERVATIONS as i64],
-            ));
-            step_reward_per_ticker.copy_(&cpu_tensor_from_f32(
-                &cpu_step_batch.reward_per_ticker,
-                &[NPROCS, TICKERS_COUNT],
-            ));
-            step_is_done.copy_(&cpu_tensor_from_f32(&cpu_step_batch.is_done, &[NPROCS]));
+            env.step_from_actions_f32_into(
+                &mut cpu_step_batch,
+                &mut step_deltas,
+                &mut obs_static,
+                &mut step_reward_per_ticker,
+                &mut step_is_done,
+            );
             let reset_indices = &cpu_step_batch.reset_indices;
             let reset_price_deltas = &cpu_step_batch.reset_price_deltas;
             let _ = s_step_deltas.narrow(0, mem_idx, NPROCS).copy_(&step_deltas);
@@ -495,35 +475,41 @@ pub async fn train(
                 .narrow(2, ring_pos, 1)
                 .copy_(&step_deltas.unsqueeze(-1));
 
+            let idx = (&base_idx + (ring_pos + 1)).remainder(ring_len);
             if !reset_indices.is_empty() {
-                let idx = (&base_idx + (ring_pos + 1)).remainder(ring_len);
-                let pd_dim_usize = (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64) as usize;
-                let reset_layout_tensor = Tensor::from_slice(reset_price_deltas)
-                    .view([reset_indices.len() as i64, raw_pd_dim])
+                let reset_count = reset_indices.len() as i64;
+                let reset_raw_batch = Tensor::from_slice(reset_price_deltas)
+                    .view([reset_count, raw_pd_dim])
                     .to_device(device);
                 let reset_layouts_batch =
-                    trading_model.uniform_stream_layout_from_raw_input(&reset_layout_tensor);
+                    trading_model.uniform_stream_layout_from_raw_input(&reset_raw_batch);
+                let reset_ring_ordered =
+                    reset_raw_batch.view([reset_count, TICKERS_COUNT, ring_len]);
+                let mut reset_ring_batch = Tensor::zeros(
+                    &[reset_count, TICKERS_COUNT, ring_len],
+                    (Kind::Float, device),
+                );
+                let _ = reset_ring_batch.index_copy_(2, &idx, &reset_ring_ordered);
+                let reset_env_indices: Vec<i64> = reset_indices
+                    .iter()
+                    .map(|&env_idx| env_idx as i64)
+                    .collect();
+                let reset_env_tensor = Tensor::from_slice(&reset_env_indices)
+                    .to_kind(Kind::Int64)
+                    .to_device(device);
+                let _ = ring_buf.index_copy_(0, &reset_env_tensor, &reset_ring_batch);
                 for (reset_i, env_idx) in reset_indices.iter().enumerate() {
-                    let start = reset_i * pd_dim_usize;
-                    let end = start + pd_dim_usize;
-                    let ordered = Tensor::from_slice(&reset_price_deltas[start..end])
-                        .view([TICKERS_COUNT, ring_len])
-                        .to_device(device);
-                    let mut ring_env = ring_buf.narrow(0, *env_idx as i64, 1).squeeze_dim(0);
-                    let _ = ring_env.index_copy_(1, &idx, &ordered);
-                    reset_layout_store.push(
-                        reset_layouts_batch
-                            .get(reset_i as i64)
-                            .to_kind(replay_obs_kind),
-                    );
                     reset_slots_host[(mem_idx + *env_idx as i64) as usize] =
-                        reset_layout_store.len() as i64;
+                        reset_layout_count + reset_i as i64 + 1;
                 }
+                reset_layout_count += reset_count;
+                reset_layout_batches.push(reset_layouts_batch.to_kind(replay_obs_kind));
             }
 
-            let idx = (&base_idx + (ring_pos + 1)).remainder(ring_len);
-            let ordered = ring_buf.index_select(2, &idx);
-            obs_price.copy_(&ordered.view([NPROCS, raw_pd_dim]));
+            if !reset_indices.is_empty() {
+                let ordered = ring_buf.index_select(2, &idx);
+                obs_price.copy_(&ordered.view([NPROCS, raw_pd_dim]));
+            }
 
             let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&latent_actions);
             let _ = s_old_log_probs
@@ -577,6 +563,12 @@ pub async fn train(
             0.95,
             device,
         );
+        let reset_layout_bank = if reset_layout_batches.is_empty() {
+            Tensor::zeros(&[0, pd_dim], (replay_obs_kind, device))
+        } else {
+            let reset_layout_refs: Vec<&Tensor> = reset_layout_batches.iter().collect();
+            Tensor::cat(&reset_layout_refs, 0)
+        };
 
         // Compute advantage stats once per rollout (before normalization)
         let adv_stats = tch::no_grad(|| {
@@ -608,6 +600,25 @@ pub async fn train(
         );
         // Full-rollout advantage normalization (not per-minibatch)
         let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
+        let chunk_mem_indices_flat = chunk_mem_indices.reshape([-1]);
+        let s_static_obs_by_chunk = s_static_obs
+            .index_select(0, &chunk_mem_indices_flat)
+            .view([total_chunks, PPO_CHUNK_LEN, so_dim]);
+        let s_step_deltas_by_chunk = s_step_deltas
+            .index_select(0, &chunk_mem_indices_flat)
+            .view([total_chunks, PPO_CHUNK_LEN, TICKERS_COUNT]);
+        let s_actions_by_chunk = s_actions
+            .index_select(0, &chunk_mem_indices_flat)
+            .view([total_chunks, PPO_CHUNK_LEN, ACTION_COUNT]);
+        let s_old_log_probs_by_chunk = s_old_log_probs
+            .index_select(0, &chunk_mem_indices_flat)
+            .view([total_chunks, PPO_CHUNK_LEN]);
+        let returns_by_chunk = returns
+            .index_select(0, &chunk_mem_indices_flat)
+            .view([total_chunks, PPO_CHUNK_LEN]);
+        let adv_norm_by_chunk = adv_norm
+            .index_select(0, &chunk_mem_indices_flat)
+            .view([total_chunks, PPO_CHUNK_LEN]);
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -630,9 +641,11 @@ pub async fn train(
         let mut bwd_time_us = 0u64;
 
         let mut last_minibatch_approx_kl = 0.0f64;
+        let mut perm_host: Vec<i64> = (0..total_chunks).collect();
+        let mut rng = rand::rng();
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
-            let perm = Tensor::randperm(total_chunks, (Kind::Int64, device));
+            perm_host.shuffle(&mut rng);
 
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
@@ -643,35 +656,76 @@ pub async fn train(
             {
                 let mb_end = (mb_start + chunk_batch_size).min(total_chunks);
                 let chunk_count = mb_end - mb_start;
-                let chunk_ids = perm.narrow(0, mb_start, chunk_count);
-                let mb_inds = chunk_mem_indices.index_select(0, &chunk_ids).reshape([-1]);
+                let chunk_ids_host = &perm_host[mb_start as usize..mb_end as usize];
+                let chunk_ids = Tensor::from_slice(chunk_ids_host)
+                    .to_kind(Kind::Int64)
+                    .to_device(device);
                 let boundary_layout = s_chunk_start_layouts.index_select(0, &chunk_ids);
-                let so_chunk_flat = s_static_obs.index_select(0, &mb_inds);
-                let step_deltas_chunk_flat = s_step_deltas.index_select(0, &mb_inds);
-                let act_mb = s_actions.index_select(0, &mb_inds);
-                let ret_mb = returns.index_select(0, &mb_inds);
-                let adv_mb = adv_norm.index_select(0, &mb_inds);
-                let old_log_probs_mb = s_old_log_probs.index_select(0, &mb_inds);
-                let so_chunk = so_chunk_flat.view([chunk_count, PPO_CHUNK_LEN, so_dim]);
-                let step_deltas_chunk =
-                    step_deltas_chunk_flat.view([chunk_count, PPO_CHUNK_LEN, TICKERS_COUNT]);
+                let so_chunk = s_static_obs_by_chunk.index_select(0, &chunk_ids);
+                let step_deltas_chunk = s_step_deltas_by_chunk.index_select(0, &chunk_ids);
+                let adv_mb_by_chunk = adv_norm_by_chunk.index_select(0, &chunk_ids);
+                let ret_mb_by_chunk = returns_by_chunk.index_select(0, &chunk_ids);
+                let old_log_probs_by_chunk = s_old_log_probs_by_chunk.index_select(0, &chunk_ids);
+                let act_mb_by_chunk = s_actions_by_chunk.index_select(0, &chunk_ids);
+                let so_steps = so_chunk.unbind(1);
+                let step_delta_steps = step_deltas_chunk.unbind(1);
+                let adv_subchunks = adv_mb_by_chunk.split(SUB_CHUNK_LEN, 1);
+                let ret_subchunks = ret_mb_by_chunk.split(SUB_CHUNK_LEN, 1);
+                let old_log_prob_subchunks = old_log_probs_by_chunk.split(SUB_CHUNK_LEN, 1);
+                let act_subchunks = act_mb_by_chunk.split(SUB_CHUNK_LEN, 1);
 
-                // Build the per-step reset plan for this minibatch from host-side data.
-                // One device->host copy per minibatch (for `chunk_ids`) replaces
-                // ~SUB_CHUNK_LEN*num_sub_chunks per-step device->host syncs.
-                let chunk_ids_host: Vec<i64> =
-                    Vec::try_from(chunk_ids.to_device(Device::Cpu)).unwrap();
-                // mb_reset_plan[pos_in_chunk] -> Vec<(row_in_mb, slot_id)>
-                let mut mb_reset_plan: Vec<Vec<(usize, i64)>> =
-                    vec![Vec::new(); PPO_CHUNK_LEN as usize];
+                let mut mb_reset_rows: Vec<Vec<usize>> = vec![Vec::new(); PPO_CHUNK_LEN as usize];
+                let mut mb_reset_slots: Vec<Vec<i64>> = vec![Vec::new(); PPO_CHUNK_LEN as usize];
                 for (row_in_mb, &chunk_id) in chunk_ids_host.iter().enumerate() {
                     let base = (chunk_id * PPO_CHUNK_LEN) as usize;
                     for pos in 0..PPO_CHUNK_LEN as usize {
                         let slot = resets_by_chunk_flat[base + pos];
                         if slot > 0 {
-                            mb_reset_plan[pos].push((row_in_mb, slot));
+                            mb_reset_rows[pos].push(row_in_mb);
+                            mb_reset_slots[pos].push(slot - 1);
                         }
                     }
+                }
+                let mut mb_reset_env_idx_tensors = Vec::with_capacity(PPO_CHUNK_LEN as usize);
+                let mut mb_reset_row_idx_tensors = Vec::with_capacity(PPO_CHUNK_LEN as usize);
+                let mut mb_reset_live_fill_tensors = Vec::with_capacity(PPO_CHUNK_LEN as usize);
+                let mut mb_reset_layouts = Vec::with_capacity(PPO_CHUNK_LEN as usize);
+                for pos in 0..PPO_CHUNK_LEN as usize {
+                    let rows = &mb_reset_rows[pos];
+                    if rows.is_empty() {
+                        mb_reset_env_idx_tensors.push(None);
+                        mb_reset_row_idx_tensors.push(None);
+                        mb_reset_live_fill_tensors.push(None);
+                        mb_reset_layouts.push(None);
+                        continue;
+                    }
+                    let env_idx_host: Vec<i64> = rows.iter().map(|&row| row as i64).collect();
+                    let row_idx_host: Vec<i64> = rows
+                        .iter()
+                        .flat_map(|&row| {
+                            (0..TICKERS_COUNT)
+                                .map(move |ticker_idx| row as i64 * TICKERS_COUNT + ticker_idx)
+                        })
+                        .collect();
+                    let reset_slot_ids = Tensor::from_slice(&mb_reset_slots[pos])
+                        .to_kind(Kind::Int64)
+                        .to_device(device);
+                    mb_reset_env_idx_tensors.push(Some(
+                        Tensor::from_slice(&env_idx_host)
+                            .to_kind(Kind::Int64)
+                            .to_device(device),
+                    ));
+                    mb_reset_row_idx_tensors.push(Some(
+                        Tensor::from_slice(&row_idx_host)
+                            .to_kind(Kind::Int64)
+                            .to_device(device),
+                    ));
+                    mb_reset_live_fill_tensors.push(Some(Tensor::full(
+                        [rows.len() as i64],
+                        uniform_reset_live_fill,
+                        (Kind::Int64, device),
+                    )));
+                    mb_reset_layouts.push(Some(reset_layout_bank.index_select(0, &reset_slot_ids)));
                 }
 
                 let mut fwd_start = Instant::now();
@@ -692,54 +746,47 @@ pub async fn train(
 
                     for _ in 0..SUB_CHUNK_LEN {
                         let output = if global_pos == 0 {
-                            let first_static = so_chunk.select(1, 0);
+                            let first_static = &so_steps[0];
                             autocast(true, || {
                                 trading_model.step_on_device(
                                     &boundary_layout,
-                                    &first_static,
+                                    first_static,
                                     &mut chunk_state,
                                 )
                             })
                         } else {
-                            let prev_step_deltas =
-                                step_deltas_chunk.select(1, global_pos - 1);
-                            let current_static = so_chunk.select(1, global_pos);
-                            // Host-side lookup: no device sync.
-                            let step_resets =
-                                &mb_reset_plan[(global_pos - 1) as usize];
-                            if step_resets.is_empty() {
+                            let prev_step_deltas = &step_delta_steps[(global_pos - 1) as usize];
+                            let current_static = &so_steps[global_pos as usize];
+                            let step_reset_rows = &mb_reset_rows[(global_pos - 1) as usize];
+                            if step_reset_rows.is_empty() {
                                 autocast(true, || {
                                     trading_model.step_on_device(
-                                        &prev_step_deltas,
-                                        &current_static,
+                                        prev_step_deltas,
+                                        current_static,
                                         &mut chunk_state,
                                     )
                                 })
                             } else {
-                                let reset_rows: Vec<usize> =
-                                    step_resets.iter().map(|(row, _)| *row).collect();
-                                let reset_layout_parts: Vec<Tensor> = step_resets
-                                    .iter()
-                                    .map(|(_, slot)| {
-                                        reset_layout_store[(*slot - 1) as usize].shallow_clone()
-                                    })
-                                    .collect();
                                 let _ = autocast(true, || {
                                     trading_model.step_on_device(
-                                        &prev_step_deltas,
-                                        &current_static,
+                                        prev_step_deltas,
+                                        current_static,
                                         &mut chunk_state,
                                     )
                                 });
-                                let reset_layout_batch = Tensor::stack(&reset_layout_parts, 0);
-                                trading_model.reset_uniform_stream_envs_from_layout(
+                                let reset_pos = (global_pos - 1) as usize;
+                                trading_model.reset_uniform_stream_envs_from_layout_indexed(
                                     &mut chunk_state,
-                                    &reset_rows,
-                                    &reset_layout_batch,
+                                    step_reset_rows,
+                                    mb_reset_env_idx_tensors[reset_pos].as_ref().unwrap(),
+                                    mb_reset_row_idx_tensors[reset_pos].as_ref().unwrap(),
+                                    mb_reset_layouts[reset_pos].as_ref().unwrap(),
+                                    mb_reset_live_fill_tensors[reset_pos].as_ref().unwrap(),
+                                    uniform_reset_live_fill,
                                 );
                                 autocast(true, || {
                                     trading_model.forward_stream_state_on_device(
-                                        &current_static,
+                                        current_static,
                                         &mut chunk_state,
                                     )
                                 })
@@ -755,8 +802,8 @@ pub async fn train(
                         global_pos += 1;
                     }
 
-                    let new_value_logits = Tensor::stack(&sub_value_logits, 1)
-                        .reshape([sub_chunk_sample_count, -1]);
+                    let new_value_logits =
+                        Tensor::stack(&sub_value_logits, 1).reshape([sub_chunk_sample_count, -1]);
                     let action_mean = Tensor::stack(&sub_action_mean, 1)
                         .reshape([sub_chunk_sample_count, ACTION_COUNT]);
                     let action_std = Tensor::stack(&sub_action_std, 1)
@@ -764,23 +811,11 @@ pub async fn train(
 
                     // Slice sub-chunk-matching rows from the full-minibatch flat tensors.
                     // Layout is chunk-major: [chunk_count, PPO_CHUNK_LEN, ...] flattened.
-                    let sub_start = sub_idx * SUB_CHUNK_LEN;
-                    let sub_adv = adv_mb
-                        .view([chunk_count, PPO_CHUNK_LEN])
-                        .narrow(1, sub_start, SUB_CHUNK_LEN)
-                        .reshape([-1]);
-                    let sub_ret = ret_mb
-                        .view([chunk_count, PPO_CHUNK_LEN])
-                        .narrow(1, sub_start, SUB_CHUNK_LEN)
-                        .reshape([-1]);
-                    let sub_old_log_probs = old_log_probs_mb
-                        .view([chunk_count, PPO_CHUNK_LEN])
-                        .narrow(1, sub_start, SUB_CHUNK_LEN)
-                        .reshape([-1]);
-                    let sub_act = act_mb
-                        .view([chunk_count, PPO_CHUNK_LEN, ACTION_COUNT])
-                        .narrow(1, sub_start, SUB_CHUNK_LEN)
-                        .reshape([-1, ACTION_COUNT]);
+                    let sub_adv = adv_subchunks[sub_idx as usize].reshape([-1]);
+                    let sub_ret = ret_subchunks[sub_idx as usize].reshape([-1]);
+                    let sub_old_log_probs =
+                        old_log_prob_subchunks[sub_idx as usize].reshape([-1]);
+                    let sub_act = act_subchunks[sub_idx as usize].reshape([-1, ACTION_COUNT]);
 
                     let latent_actions_mb = sub_act;
 
@@ -803,7 +838,8 @@ pub async fn train(
                         )
                     };
 
-                    let action_log_probs = transformed_action_log_prob(
+                    let (action_log_probs, dist_entropy_per_sample, action_var) =
+                        transformed_action_log_prob_entropy_and_var(
                         &latent_actions_mb,
                         &action_mean_perturbed,
                         &action_std,
@@ -858,11 +894,10 @@ pub async fn train(
                         let _ = debug_tensor_stats("adv_mb", &sub_adv, _epoch, chunk_i);
                     }
 
-                    let value_loss =
-                        hl_gauss_value_loss(&hl_gauss, &new_value_logits, &sub_ret)
-                            .mean(Kind::Float);
+                    let value_loss = hl_gauss_value_loss(&hl_gauss, &new_value_logits, &sub_ret)
+                        .mean(Kind::Float);
 
-                    let dist_entropy = gaussian_entropy(&action_std, LOG_2PI).mean(Kind::Float);
+                    let dist_entropy = dist_entropy_per_sample.mean(Kind::Float);
                     let dist_entropy_detached = dist_entropy.detach();
 
                     let sub_ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
@@ -871,12 +906,13 @@ pub async fn train(
 
                     // RPO alpha loss
                     let alpha_loss = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                        let action_var = action_std.pow_tensor_scalar(2).detach();
-                        let inv_var_mean =
-                            action_var.clamp_min(1e-4).reciprocal().mean(Kind::Float);
+                        let inv_var_mean = action_var
+                            .detach()
+                            .clamp_min(1e-4)
+                            .reciprocal()
+                            .mean(Kind::Float);
                         let d = ACTION_COUNT as f64;
-                        let induced_kl =
-                            rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
+                        let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
                         (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
                     } else {
                         Tensor::zeros([], (Kind::Float, device))
@@ -897,27 +933,21 @@ pub async fn train(
                     trading_model.detach_stream_state(&mut chunk_state);
                     fwd_start = Instant::now();
 
-                    let approx_kl_val = tch::no_grad(|| {
-                        (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float)
-                    });
+                    let approx_kl_val =
+                        tch::no_grad(|| (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float));
                     if DEBUG_NUMERICS {
-                        let _ = debug_tensor_stats(
-                            "approx_kl_val",
-                            &approx_kl_val,
-                            _epoch,
-                            chunk_i,
-                        );
+                        let _ =
+                            debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
                     }
-                    let _ = epoch_kl_gpu
-                        .g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
-                    let _ = minibatch_kl_gpu
-                        .g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
+                    let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
+                    let _ =
+                        minibatch_kl_gpu.g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
                     let _ = total_policy_loss_weighted
                         .g_add_(&(&action_loss.detach() * sub_chunk_sample_count as f64));
                     let _ = total_value_loss_weighted
                         .g_add_(&(&value_loss.detach() * sub_chunk_sample_count as f64));
-                    let _ = total_kl_weighted
-                        .g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
+                    let _ =
+                        total_kl_weighted.g_add_(&(&approx_kl_val * sub_chunk_sample_count as f64));
                     let _ = total_entropy_weighted
                         .g_add_(&(&dist_entropy_detached * sub_chunk_sample_count as f64));
                     entropy_min = entropy_min.min_other(&dist_entropy_detached);
@@ -1088,7 +1118,6 @@ pub async fn train(
             all_scalars_vec[13],
             all_scalars_vec[14],
         );
-
         let primary = env.primary_mut();
         primary
             .meta_history

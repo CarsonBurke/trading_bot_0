@@ -683,6 +683,10 @@ impl TradingModel {
         }
     }
 
+    pub fn uniform_stream_bootstrap_live_fill(&self) -> i64 {
+        UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL
+    }
+
     pub fn input_kind(&self) -> Kind {
         self.patch_embed_weight.kind()
     }
@@ -1047,8 +1051,10 @@ impl TradingModel {
             .sde_cls_token
             .to_kind(kind)
             .expand([batch_tokens, 1, self.model_dim], false);
-        self.input_ln
-            .forward(&Tensor::cat(&[&patch_tokens, &actor_cls, &critic_cls, &sde_cls], 1))
+        self.input_ln.forward(&Tensor::cat(
+            &[&patch_tokens, &actor_cls, &critic_cls, &sde_cls],
+            1,
+        ))
     }
 
     /// Per-config enrichment (avoids [batch, 256, 8636] expand), then fused

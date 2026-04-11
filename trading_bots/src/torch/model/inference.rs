@@ -130,6 +130,30 @@ impl TradingModel {
         state.uniform_cached_static_features = None;
     }
 
+    fn prefill_uniform_prefix_base_cache_indexed(&self, state: &mut StreamState, row_idx: &Tensor) {
+        let x = state
+            .uniform_patch_tokens
+            .index_select(0, row_idx)
+            .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
+        let x = self.input_ln.forward(&x);
+        let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x, &self.rope);
+        state.uniform_layer0_prefix_hidden =
+            state.uniform_layer0_prefix_hidden.index_copy(0, row_idx, &x_next);
+        state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.index_copy(
+            0,
+            row_idx,
+            &k.index_select(1, &self.gqa_kv_head_index),
+        );
+        state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.index_copy(
+            0,
+            row_idx,
+            &v.index_select(1, &self.gqa_kv_head_index),
+        );
+        state.uniform_prefix_k.clear();
+        state.uniform_prefix_v.clear();
+        state.uniform_cached_static_features = None;
+    }
+
     fn conditioned_prefix_cache_is_fresh(
         &self,
         static_features: &Tensor,
@@ -323,7 +347,69 @@ impl TradingModel {
             state.uniform_live_fill_host[*env_idx] =
                 live_fill_host[(reset_i as i64 * TICKERS_COUNT) as usize];
         }
-        self.prefill_uniform_prefix_base_cache(state);
+        self.prefill_uniform_prefix_base_cache_indexed(state, &row_idx);
+    }
+
+    pub(crate) fn reset_uniform_stream_envs_from_layout_indexed(
+        &self,
+        state: &mut StreamState,
+        env_indices: &[usize],
+        env_idx: &Tensor,
+        row_idx: &Tensor,
+        layouts: &Tensor,
+        reset_live_fill: &Tensor,
+        reset_live_fill_value: i64,
+    ) {
+        if self.variant != super::ModelVariant::Uniform256Stream || env_indices.is_empty() {
+            return;
+        }
+        let layouts = if layouts.dim() == 1 {
+            layouts.unsqueeze(0)
+        } else {
+            layouts.shallow_clone()
+        };
+        let layouts = self.cast_inputs(&layouts);
+        let expected = TICKERS_COUNT * super::UNIFORM_STREAM_LAYOUT_LEN;
+        assert_eq!(
+            layouts.size()[1],
+            expected,
+            "reset_uniform_stream_envs_from_layout_indexed expects flattened uniform layouts"
+        );
+        assert_eq!(
+            layouts.size()[0] as usize,
+            env_indices.len(),
+            "layout/reset batch mismatch"
+        );
+        let layouts = layouts.view([
+            layouts.size()[0] * TICKERS_COUNT,
+            super::UNIFORM_STREAM_PATCH_COUNT,
+            super::UNIFORM_STREAM_PATCH_SIZE,
+        ]);
+        let patch_tokens =
+            self.patch_embed(&layouts.view([layouts.size()[0], super::UNIFORM_STREAM_LAYOUT_LEN]));
+        let reset_live_fill =
+            if reset_live_fill.device() == self.device && reset_live_fill.kind() == Kind::Int64 {
+                reset_live_fill.shallow_clone()
+            } else {
+                reset_live_fill.to_kind(Kind::Int64).to_device(self.device)
+            };
+        state.uniform_layout = state.uniform_layout.index_copy(
+            0,
+            row_idx,
+            &layouts.to_kind(state.uniform_layout.kind()),
+        );
+        state.uniform_patch_tokens = state.uniform_patch_tokens.index_copy(
+            0,
+            row_idx,
+            &patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
+        );
+        state.uniform_live_fill = state
+            .uniform_live_fill
+            .index_copy(0, env_idx, &reset_live_fill);
+        for &env_idx in env_indices {
+            state.uniform_live_fill_host[env_idx] = reset_live_fill_value;
+        }
+        self.prefill_uniform_prefix_base_cache_indexed(state, row_idx);
     }
 
     pub fn uniform_stream_snapshot(&self, state: &StreamState) -> Tensor {
@@ -577,34 +663,23 @@ impl TradingModel {
             );
 
             let rows = batch_size * TICKERS_COUNT;
-            let target_kind = self.patch_embed_weight.kind();
             let row_deltas = new_deltas.reshape([rows, 1]);
             let history_len = PRICE_DELTAS_PER_TICKER as i64;
-            let pad_len = super::UNIFORM_STREAM_LAYOUT_LEN - history_len;
             let flat_layout = state
                 .uniform_layout
                 .view([rows, super::UNIFORM_STREAM_LAYOUT_LEN]);
-            let shifted_valid = Tensor::cat(
-                &[&flat_layout.narrow(1, 1, history_len - 1), &row_deltas],
-                1,
-            );
-            let pad = Tensor::full(
-                [rows, pad_len],
-                f64::NAN,
-                (target_kind, self.device),
-            );
-            let next_flat_layout = Tensor::cat(&[&shifted_valid, &pad], 1);
-            state.uniform_layout = next_flat_layout.view([
-                rows,
-                super::UNIFORM_STREAM_PATCH_COUNT,
-                super::UNIFORM_STREAM_PATCH_SIZE,
-            ]);
-            state.uniform_patch_tokens = self.patch_embed(&next_flat_layout);
-            let next_fill_host = vec![super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL; batch_size as usize];
-            state.uniform_live_fill_host = next_fill_host.clone();
-            state.uniform_live_fill = Tensor::from_slice(&next_fill_host)
-                .to_kind(Kind::Int64)
-                .to_device(self.device);
+            let shifted_valid = flat_layout.narrow(1, 1, history_len - 1).shallow_clone();
+            let _ = flat_layout
+                .narrow(1, 0, history_len - 1)
+                .copy_(&shifted_valid);
+            let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
+            state.uniform_patch_tokens = self.patch_embed(&flat_layout);
+            state
+                .uniform_live_fill_host
+                .fill(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+            let _ = state
+                .uniform_live_fill
+                .fill_(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
             state.initialized = true;
             self.prefill_uniform_prefix_base_cache(state);
             return self.uniform_stream_cached_forward(&static_features, state);

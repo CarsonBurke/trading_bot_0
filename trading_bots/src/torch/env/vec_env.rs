@@ -11,29 +11,15 @@ use tch::{Device, Tensor};
 pub struct CpuStepBatch {
     pub actions_f32: Vec<f32>,
     actions_f64: Vec<f64>,
-    pub step_deltas: Vec<f32>,
-    pub static_obs: Vec<f32>,
-    pub reward_per_ticker: Vec<f32>,
-    pub is_done: Vec<f32>,
     pub reset_indices: Vec<usize>,
     pub reset_price_deltas: Vec<f32>,
 }
 
 impl CpuStepBatch {
-    pub fn new(
-        nprocs: usize,
-        action_dim: usize,
-        tickers: usize,
-        static_obs_dim: usize,
-        pd_dim: usize,
-    ) -> Self {
+    pub fn new(nprocs: usize, action_dim: usize, pd_dim: usize) -> Self {
         Self {
             actions_f32: vec![0.0; nprocs * action_dim],
             actions_f64: vec![0.0; nprocs * action_dim],
-            step_deltas: vec![0.0; nprocs * tickers],
-            static_obs: vec![0.0; nprocs * static_obs_dim],
-            reward_per_ticker: vec![0.0; nprocs * tickers],
-            is_done: vec![0.0; nprocs],
             reset_indices: Vec::with_capacity(nprocs),
             reset_price_deltas: Vec::with_capacity(nprocs * pd_dim),
         }
@@ -508,7 +494,14 @@ impl VecEnv {
         (reset_indices, reset_price_deltas)
     }
 
-    pub fn step_from_actions_f32(&mut self, batch: &mut CpuStepBatch) {
+    pub fn step_from_actions_f32_into(
+        &mut self,
+        batch: &mut CpuStepBatch,
+        out_step_deltas: &mut Tensor,
+        out_static_obs: &mut Tensor,
+        out_reward_per_ticker: &mut Tensor,
+        out_is_done: &mut Tensor,
+    ) {
         debug_assert_eq!(
             batch.actions_f32.len(),
             self.envs.len() * ACTION_COUNT as usize
@@ -518,13 +511,13 @@ impl VecEnv {
         }
         batch.reset_indices.clear();
         batch.reset_price_deltas.clear();
-        let (reset_indices, reset_price_deltas) = self.step_into_ring_cpu(&batch.actions_f64);
-        batch.step_deltas.copy_from_slice(&self.step_deltas_buf);
-        batch.static_obs.copy_from_slice(&self.static_obs_buf);
-        batch
-            .reward_per_ticker
-            .copy_from_slice(&self.reward_per_ticker_buf);
-        batch.is_done.copy_from_slice(&self.is_done_buf);
+        let (reset_indices, reset_price_deltas) = self.step_into_ring_flat(
+            &batch.actions_f64,
+            out_step_deltas,
+            out_static_obs,
+            out_reward_per_ticker,
+            out_is_done,
+        );
         batch.reset_indices = reset_indices;
         batch.reset_price_deltas = reset_price_deltas;
     }
