@@ -663,6 +663,8 @@ pub struct TradingModel {
     actor_cls_token: Tensor,
     critic_cls_token: Tensor,
     sde_cls_token: Tensor,
+    actor_head_norm: RMSNorm,
+    critic_head_norm: RMSNorm,
     endogenous_ticker_block: EndogenousTickerBlock,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
@@ -870,6 +872,8 @@ impl TradingModel {
                 stdev: cls_std,
             },
         );
+        let actor_head_norm = RMSNorm::new(&(p / "actor_head_norm"), spec.model_dim, 1e-6);
+        let critic_head_norm = RMSNorm::new(&(p / "critic_head_norm"), spec.model_dim, 1e-6);
         let endogenous_ticker_block = EndogenousTickerBlock::new(
             &(p / "inter_ticker_0"),
             spec.model_dim,
@@ -929,6 +933,8 @@ impl TradingModel {
             actor_cls_token,
             critic_cls_token,
             sde_cls_token,
+            actor_head_norm,
+            critic_head_norm,
             endogenous_ticker_block,
             policy_mean_log_var,
             value_proj,

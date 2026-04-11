@@ -10,14 +10,14 @@ impl TradingModel {
         batch_size: i64,
     ) -> ModelOutput {
         let x_time = x_suffix.view([batch_size, TICKERS_COUNT, 4, self.model_dim]);
-        let actor_cls = x_time.select(2, 1);
-        let critic_cls = x_time.select(2, 2);
+        let actor_cls = self.actor_head_norm.forward(&x_time.select(2, 1));
+        let critic_cls = self.critic_head_norm.forward(&x_time.select(2, 2));
 
-        let policy_mean_log_var = actor_cls
-            .reshape([batch_size * TICKERS_COUNT, self.model_dim])
-            .apply(&self.policy_mean_log_var)
-            .reshape([batch_size, TICKERS_COUNT, -1])
-            .sum_dim_intlist([1].as_slice(), false, Kind::Float);
+        let policy_mean_log_var = actor_cls.apply(&self.policy_mean_log_var).sum_dim_intlist(
+            [1].as_slice(),
+            false,
+            Kind::Float,
+        );
         let action_mean = policy_mean_log_var.narrow(1, 0, policy_mean_log_var.size()[1] / 2);
         let action_log_var = policy_mean_log_var.narrow(
             1,
@@ -46,14 +46,18 @@ impl TradingModel {
     ) -> (ModelOutput, Option<DebugMetrics>) {
         let temporal_len = x_ssm.size()[1];
         let x_time = x_ssm.view([batch_size, TICKERS_COUNT, temporal_len, self.model_dim]);
-        let actor_cls = x_time.select(2, temporal_len - 3);
-        let critic_cls = x_time.select(2, temporal_len - 2);
+        let actor_cls = self
+            .actor_head_norm
+            .forward(&x_time.select(2, temporal_len - 3));
+        let critic_cls = self
+            .critic_head_norm
+            .forward(&x_time.select(2, temporal_len - 2));
 
-        let policy_mean_log_var = actor_cls
-            .reshape([batch_size * TICKERS_COUNT, self.model_dim])
-            .apply(&self.policy_mean_log_var)
-            .reshape([batch_size, TICKERS_COUNT, -1])
-            .sum_dim_intlist([1].as_slice(), false, Kind::Float);
+        let policy_mean_log_var = actor_cls.apply(&self.policy_mean_log_var).sum_dim_intlist(
+            [1].as_slice(),
+            false,
+            Kind::Float,
+        );
         let action_mean = policy_mean_log_var.narrow(1, 0, policy_mean_log_var.size()[1] / 2);
         let action_log_var = policy_mean_log_var.narrow(
             1,
