@@ -570,120 +570,35 @@ impl TradingModel {
 
             let rows = batch_size * TICKERS_COUNT;
             let target_kind = self.patch_embed_weight.kind();
-            let has_rollover = state
-                .uniform_live_fill_host
-                .iter()
-                .any(|&fill| fill >= super::UNIFORM_STREAM_PATCH_SIZE);
-
-            // Handle rollover: shift layout and patch tokens for envs whose live patch is full
-            let cache_dirty = has_rollover;
-            if has_rollover {
-                let rollover_envs = state
-                    .uniform_live_fill_host
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(env_idx, &fill)| {
-                        (fill >= super::UNIFORM_STREAM_PATCH_SIZE).then_some(env_idx as i64)
-                    })
-                    .collect::<Vec<_>>();
-                let rollover_rows = rollover_envs
-                    .iter()
-                    .flat_map(|&env_idx| {
-                        (0..TICKERS_COUNT)
-                            .map(move |ticker_idx| env_idx * TICKERS_COUNT + ticker_idx)
-                    })
-                    .collect::<Vec<_>>();
-                let rollover_row_idx = Tensor::from_slice(&rollover_rows)
-                    .to_kind(Kind::Int64)
-                    .to_device(self.device);
-                let shifted_layout = Tensor::cat(
-                    &[
-                        &state
-                            .uniform_layout
-                            .index_select(0, &rollover_row_idx)
-                            .narrow(1, 1, super::UNIFORM_STREAM_PATCH_COUNT - 1),
-                        &Tensor::full(
-                            [
-                                rollover_rows.len() as i64,
-                                1,
-                                super::UNIFORM_STREAM_PATCH_SIZE,
-                            ],
-                            f64::NAN,
-                            (target_kind, self.device),
-                        ),
-                    ],
-                    1,
-                );
-                let shifted_patch_tokens = Tensor::cat(
-                    &[
-                        &state
-                            .uniform_patch_tokens
-                            .index_select(0, &rollover_row_idx)
-                            .narrow(1, 1, super::UNIFORM_STREAM_PATCH_COUNT - 1),
-                        &Tensor::zeros(
-                            [rollover_rows.len() as i64, 1, self.model_dim],
-                            (target_kind, self.device),
-                        ),
-                    ],
-                    1,
-                );
-                state.uniform_layout = state.uniform_layout.index_copy(
-                    0,
-                    &rollover_row_idx,
-                    &shifted_layout.to_kind(state.uniform_layout.kind()),
-                );
-                state.uniform_patch_tokens = state.uniform_patch_tokens.index_copy(
-                    0,
-                    &rollover_row_idx,
-                    &shifted_patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
-                );
-                for &env_idx in &rollover_envs {
-                    state.uniform_live_fill_host[env_idx as usize] = 0;
-                }
-            }
-
-            // Write new delta into layout at current fill position
-            let current_fill_host = state.uniform_live_fill_host.clone();
-            let current_fill = Tensor::from_slice(&current_fill_host)
-                .to_kind(Kind::Int64)
-                .to_device(self.device);
             let row_deltas = new_deltas.reshape([rows, 1]);
-            let fill_rows = current_fill
-                .unsqueeze(1)
-                .expand([batch_size, TICKERS_COUNT], false)
-                .reshape([rows, 1]);
-            let updated_last = state
+            let history_len = PRICE_DELTAS_PER_TICKER as i64;
+            let pad_len = super::UNIFORM_STREAM_LAYOUT_LEN - history_len;
+            let flat_layout = state
                 .uniform_layout
-                .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1)
-                .scatter(1, &fill_rows, &row_deltas);
-            let prefix_layout =
-                state
-                    .uniform_layout
-                    .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
-            state.uniform_layout = Tensor::cat(&[&prefix_layout, &updated_last.unsqueeze(1)], 1);
-
-            // Increment fill counts
-            let next_fill_host = current_fill_host
-                .iter()
-                .map(|&fill| fill + 1)
-                .collect::<Vec<_>>();
+                .view([rows, super::UNIFORM_STREAM_LAYOUT_LEN]);
+            let shifted_valid = Tensor::cat(
+                &[&flat_layout.narrow(1, 1, history_len - 1), &row_deltas],
+                1,
+            );
+            let pad = Tensor::full(
+                [rows, pad_len],
+                f64::NAN,
+                (target_kind, self.device),
+            );
+            let next_flat_layout = Tensor::cat(&[&shifted_valid, &pad], 1);
+            state.uniform_layout = next_flat_layout.view([
+                rows,
+                super::UNIFORM_STREAM_PATCH_COUNT,
+                super::UNIFORM_STREAM_PATCH_SIZE,
+            ]);
+            state.uniform_patch_tokens = self.patch_embed(&next_flat_layout);
+            let next_fill_host = vec![super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL; batch_size as usize];
             state.uniform_live_fill_host = next_fill_host.clone();
             state.uniform_live_fill = Tensor::from_slice(&next_fill_host)
                 .to_kind(Kind::Int64)
                 .to_device(self.device);
-
-            // Recompute live token via linear projection
-            let live_tokens = self.recompute_live_token(state);
-            let prefix_tokens =
-                state
-                    .uniform_patch_tokens
-                    .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
-            state.uniform_patch_tokens =
-                Tensor::cat(&[&prefix_tokens, &live_tokens.unsqueeze(1)], 1);
             state.initialized = true;
-            if cache_dirty {
-                self.prefill_uniform_prefix_base_cache(state);
-            }
+            self.prefill_uniform_prefix_base_cache(state);
             return self.uniform_stream_cached_forward(&static_features, state);
         }
 
