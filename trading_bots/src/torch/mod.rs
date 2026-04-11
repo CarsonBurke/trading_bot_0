@@ -11,7 +11,7 @@ pub mod ppo;
 pub mod cuda_cfg;
 pub mod ssm;
 pub mod ssm_ref;
-pub mod two_hot;
+pub mod hl_gauss;
 
 #[cfg(test)]
 mod ppo_tests;
@@ -20,4 +20,4 @@ mod ssm_tests;
 #[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
-mod two_hot_tests;
+mod hl_gauss_tests;

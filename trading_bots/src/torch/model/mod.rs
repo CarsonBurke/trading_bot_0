@@ -11,7 +11,7 @@ use crate::torch::constants::{
     ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER,
     STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
-use crate::torch::two_hot::NUM_BINS;
+use crate::torch::hl_gauss::NUM_BINS;
 
 use rmsnorm::RMSNorm;
 

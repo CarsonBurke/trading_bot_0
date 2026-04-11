@@ -13,7 +13,7 @@ use crate::torch::env::{CpuStepBatch, VecEnv};
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelConfig};
 use crate::torch::cuda_cfg::configure_cuda;
-use crate::torch::two_hot::TwoHotBins;
+use crate::torch::hl_gauss::HlGaussBins;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 const LEARNING_RATE: f64 = 1e-4;
@@ -118,12 +118,12 @@ fn cpu_tensor_from_f32(data: &[f32], size: &[i64]) -> Tensor {
 
 fn sample_rollout_actions_from_output(
     output: ModelOutput,
-    two_hot: &TwoHotBins,
+    hl_gauss: &HlGaussBins,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
     let (value_logits, action_mean, action_std) = output;
 
-    // Decode two-hot logits to scalar values for GAE
-    let values = two_hot.decode(&value_logits);
+    // Decode critic logits to scalar values for GAE.
+    let values = hl_gauss.decode(&value_logits);
 
     let batch = action_mean.size()[0];
     let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
@@ -194,12 +194,12 @@ fn compute_explained_variance(rollout_values: &Tensor, returns: &Tensor) -> Tens
     })
 }
 
-pub(crate) fn two_hot_value_loss(
-    two_hot: &TwoHotBins,
+pub(crate) fn hl_gauss_value_loss(
+    hl_gauss: &HlGaussBins,
     value_logits: &Tensor,
     returns: &Tensor,
 ) -> Tensor {
-    let return_bins = two_hot.encode(returns);
+    let return_bins = hl_gauss.encode(returns);
     let log_probs = value_logits.log_softmax(-1, Kind::Float);
     -(&return_bins * &log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float)
 }
@@ -339,7 +339,7 @@ pub async fn train(
             .load_from_episode(start_episode, &gens_path);
     }
 
-    let two_hot = TwoHotBins::default_for(device);
+    let hl_gauss = HlGaussBins::default_for(device);
 
     let rollout_steps = SEQ_LEN;
     let memory_size = rollout_steps * NPROCS;
@@ -445,7 +445,7 @@ pub async fn train(
                     streamed_output
                         .take()
                         .expect("streamed rollout output missing"),
-                    &two_hot,
+                    &hl_gauss,
                 );
 
             if DEBUG_NUMERICS {
@@ -563,7 +563,7 @@ pub async fn train(
             let (value_logits, _, _) = autocast(true, || {
                 trading_model.forward_on_device(&bootstrap_price, &obs_static, false)
             });
-            two_hot.decode(&value_logits)
+            hl_gauss.decode(&value_logits)
         });
 
         let (advantages, returns) = compute_gae(
@@ -856,7 +856,7 @@ pub async fn train(
                     }
 
                     let value_loss =
-                        two_hot_value_loss(&two_hot, &new_value_logits, &sub_ret)
+                        hl_gauss_value_loss(&hl_gauss, &new_value_logits, &sub_ret)
                             .mean(Kind::Float);
 
                     let dist_entropy = gaussian_entropy(&action_std, LOG_2PI).mean(Kind::Float);
