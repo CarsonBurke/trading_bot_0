@@ -35,7 +35,7 @@ Multi-asset trading bot using deep RL (PPO) and historical price data.
 ### Notable Architecture Implementations
 
 - 1.8M parameters
-- mama2-inspired ssm block
+- GQA-based temporal attention stack with streamed prefix/suffix cache for `uniform-256-stream`
 - Continuous action space for position sizing [-1, 1] implicit sell/buy/hold and direction (short term memory/goal setting) for each ticker
 - Timesnet-inspired Conv layers for price delta % observations
 - self-attention layers for weighting time, static inputs, and cross-ticker

@@ -1,7 +1,5 @@
-use tch::nn::{self, Init};
-use tch::{Kind, Tensor};
-
-use crate::torch::mamba_fused;
+use tch::nn::{self, Init, Linear};
+use tch::Tensor;
 
 pub(super) struct RMSNorm {
     weight: Tensor,
@@ -15,13 +13,31 @@ impl RMSNorm {
     }
 
     pub(super) fn forward(&self, x: &Tensor) -> Tensor {
-        if matches!(x.device(), tch::Device::Cuda(_)) {
-            let weight = self.weight.to_device(x.device()).to_kind(Kind::Float);
-            return mamba_fused::rmsnorm_forward(x, &weight, self.eps);
-        }
-        let x_f32 = x.to_kind(Kind::Float);
-        let rms = (x_f32.pow_tensor_scalar(2).mean_dim(-1, true, Kind::Float) + self.eps).sqrt();
-        (x_f32 / rms * &self.weight).to_kind(x.kind())
+        let normalized_shape = [self.weight.size()[0]];
+        let weight = if self.weight.kind() == x.kind() {
+            self.weight.shallow_clone()
+        } else {
+            self.weight.to_kind(x.kind())
+        };
+        x.internal_fused_rms_norm(normalized_shape, Some(&weight), Some(self.eps))
+            .0
+    }
+
+    pub(super) fn forward_linear(&self, x: &Tensor, linear: &Linear) -> Tensor {
+        let x = self.forward(x);
+        let weight = if linear.ws.kind() == x.kind() {
+            linear.ws.shallow_clone()
+        } else {
+            linear.ws.to_kind(x.kind())
+        };
+        let bias = linear.bs.as_ref().map(|b| {
+            if b.kind() == x.kind() {
+                b.shallow_clone()
+            } else {
+                b.to_kind(x.kind())
+            }
+        });
+        x.linear(&weight, bias.as_ref())
     }
 
     pub(super) fn weight(&self) -> &Tensor {
