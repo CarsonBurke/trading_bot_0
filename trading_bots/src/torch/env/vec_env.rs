@@ -3,7 +3,6 @@ use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::model::ModelVariant;
-use crate::torch::ppo::NPROCS;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use tch::{Device, Tensor};
@@ -27,6 +26,7 @@ impl CpuStepBatch {
 }
 
 pub struct VecEnv {
+    nprocs: usize,
     pub envs: Vec<Env>,
     done_mask: Vec<bool>,
     last_static_obs: Vec<f32>,
@@ -43,6 +43,10 @@ pub struct VecEnv {
 const AVAILABLE_TICKERS: &[&str] = &["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD"];
 
 impl VecEnv {
+    fn nprocs_i64(&self) -> i64 {
+        self.nprocs as i64
+    }
+
     fn tensor_from_f32(&self, data: &[f32], size: &[i64]) -> Tensor {
         unsafe {
             Tensor::from_blob(
@@ -55,32 +59,42 @@ impl VecEnv {
         }
     }
 
-    pub fn new(random_start: bool, _model_variant: ModelVariant, gens_path: String) -> Self {
-        let mut envs = Vec::with_capacity(NPROCS as usize);
+    fn owned_tensor_from_f32(&self, data: &[f32], size: &[i64]) -> Tensor {
+        Tensor::from_slice(data).view(size)
+    }
+
+    pub fn new(
+        random_start: bool,
+        _model_variant: ModelVariant,
+        gens_path: String,
+        nprocs: usize,
+    ) -> Self {
+        let mut envs = Vec::with_capacity(nprocs);
         envs.push(Env::new_with_recording(random_start, true, Some(gens_path)));
         eprintln!("first env");
-        for i in 1..(NPROCS as usize) {
+        for i in 1..nprocs {
             envs.push(Env::new_with_recording(random_start, false, None));
             eprintln!("env {}", i);
         }
         for (i, env) in envs.iter_mut().enumerate() {
             env.env_id = i;
         }
-        let price_deltas_dim = NPROCS as usize * TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
-        let static_obs_dim = NPROCS as usize * STATIC_OBSERVATIONS;
-        let done_mask = vec![false; NPROCS as usize];
-        let last_static_obs = vec![0.0; NPROCS as usize * STATIC_OBSERVATIONS];
-        let last_step_deltas = vec![0.0; NPROCS as usize * TICKERS_COUNT as usize];
-        let step_deltas_buf = vec![0.0; NPROCS as usize * TICKERS_COUNT as usize];
+        let price_deltas_dim = nprocs * TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
+        let static_obs_dim = nprocs * STATIC_OBSERVATIONS;
+        let done_mask = vec![false; nprocs];
+        let last_static_obs = vec![0.0; nprocs * STATIC_OBSERVATIONS];
+        let last_step_deltas = vec![0.0; nprocs * TICKERS_COUNT as usize];
+        let step_deltas_buf = vec![0.0; nprocs * TICKERS_COUNT as usize];
         Self {
+            nprocs,
             envs,
             done_mask,
             last_static_obs,
             last_step_deltas,
             step_deltas_buf,
-            reward_buf: vec![0.0; NPROCS as usize],
-            reward_per_ticker_buf: vec![0.0; NPROCS as usize * TICKERS_COUNT as usize],
-            is_done_buf: vec![0.0; NPROCS as usize],
+            reward_buf: vec![0.0; nprocs],
+            reward_per_ticker_buf: vec![0.0; nprocs * TICKERS_COUNT as usize],
+            is_done_buf: vec![0.0; nprocs],
             price_deltas_buf: vec![0.0; price_deltas_dim],
             static_obs_buf: vec![0.0; static_obs_dim],
         }
@@ -89,10 +103,10 @@ impl VecEnv {
     pub fn reset(&mut self) -> (Tensor, Tensor) {
         assert_eq!(
             self.envs.len(),
-            NPROCS as usize,
-            "VecEnv desync: envs.len={} != NPROCS={}",
+            self.nprocs,
+            "VecEnv desync: envs.len={} != nprocs={}",
             self.envs.len(),
-            NPROCS
+            self.nprocs
         );
         let mut all_price_deltas = Vec::new();
         let mut all_static_obs = Vec::new();
@@ -106,10 +120,12 @@ impl VecEnv {
         self.price_deltas_buf.copy_from_slice(&all_price_deltas);
         self.static_obs_buf.copy_from_slice(&all_static_obs);
 
-        let price_deltas = Tensor::from_slice(&all_price_deltas)
-            .view([NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
-        let static_obs =
-            Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let price_deltas = Tensor::from_slice(&all_price_deltas).view([
+            self.nprocs_i64(),
+            TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
+        ]);
+        let static_obs = Tensor::from_slice(&all_static_obs)
+            .view([self.nprocs_i64(), STATIC_OBSERVATIONS as i64]);
 
         self.done_mask.fill(false);
         self.last_static_obs.clone_from(&all_static_obs);
@@ -120,10 +136,10 @@ impl VecEnv {
     pub fn reset_step(&mut self) -> (Tensor, Tensor) {
         assert_eq!(
             self.envs.len(),
-            NPROCS as usize,
-            "VecEnv desync: envs.len={} != NPROCS={}",
+            self.nprocs,
+            "VecEnv desync: envs.len={} != nprocs={}",
             self.envs.len(),
-            NPROCS
+            self.nprocs
         );
         let mut all_step_deltas = Vec::new();
         let mut all_static_obs = Vec::new();
@@ -134,9 +150,10 @@ impl VecEnv {
             all_static_obs.extend(so);
         }
 
-        let step_deltas = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
-        let static_obs =
-            Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let step_deltas =
+            Tensor::from_slice(&all_step_deltas).view([self.nprocs_i64(), TICKERS_COUNT]);
+        let static_obs = Tensor::from_slice(&all_static_obs)
+            .view([self.nprocs_i64(), STATIC_OBSERVATIONS as i64]);
 
         self.done_mask.fill(false);
         self.last_static_obs.clone_from(&all_static_obs);
@@ -146,8 +163,8 @@ impl VecEnv {
     }
 
     pub fn reset_incremental(&mut self) -> (Vec<Vec<f32>>, Tensor) {
-        assert_eq!(self.envs.len(), NPROCS as usize);
-        let mut all_deltas_per_env: Vec<Vec<f32>> = Vec::with_capacity(NPROCS as usize);
+        assert_eq!(self.envs.len(), self.nprocs);
+        let mut all_deltas_per_env: Vec<Vec<f32>> = Vec::with_capacity(self.nprocs);
         let mut all_static_obs = Vec::new();
 
         for env in &mut self.envs {
@@ -156,10 +173,10 @@ impl VecEnv {
             all_static_obs.extend(so);
         }
 
-        let static_obs =
-            Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let static_obs = Tensor::from_slice(&all_static_obs)
+            .view([self.nprocs_i64(), STATIC_OBSERVATIONS as i64]);
 
-        let mut deltas_flat = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
+        let mut deltas_flat = Vec::with_capacity(self.nprocs * TICKERS_COUNT as usize);
         for deltas in &all_deltas_per_env {
             deltas_flat.extend_from_slice(deltas);
         }
@@ -175,8 +192,8 @@ impl VecEnv {
     pub fn step_into(
         &mut self,
         all_actions: &[Vec<f64>],
-        out_price_deltas: &mut Tensor, // [NPROCS, price_deltas_dim] on device
-        out_static_obs: &mut Tensor,   // [NPROCS, static_obs_dim] on device
+        out_price_deltas: &mut Tensor, // [nprocs, price_deltas_dim] on device
+        out_static_obs: &mut Tensor,   // [nprocs, static_obs_dim] on device
     ) -> (Tensor, Tensor) {
         debug_assert_eq!(all_actions.len(), self.envs.len());
 
@@ -206,17 +223,22 @@ impl VecEnv {
         // Single batched copy to GPU
         let pd_cpu = self.tensor_from_f32(
             &self.price_deltas_buf,
-            &[NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
+            &[
+                self.nprocs_i64(),
+                TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
+            ],
         );
         out_price_deltas.copy_(&pd_cpu);
 
-        let so_cpu =
-            self.tensor_from_f32(&self.static_obs_buf, &[NPROCS, STATIC_OBSERVATIONS as i64]);
+        let so_cpu = self.tensor_from_f32(
+            &self.static_obs_buf,
+            &[self.nprocs_i64(), STATIC_OBSERVATIONS as i64],
+        );
         out_static_obs.copy_(&so_cpu);
 
         // Return small tensors - these go to GPU via arithmetic ops later
-        let reward = self.tensor_from_f32(&self.reward_buf, &[NPROCS]);
-        let is_done = self.tensor_from_f32(&self.is_done_buf, &[NPROCS]);
+        let reward = self.tensor_from_f32(&self.reward_buf, &[self.nprocs_i64()]);
+        let is_done = self.tensor_from_f32(&self.is_done_buf, &[self.nprocs_i64()]);
 
         (reward, is_done)
     }
@@ -258,50 +280,61 @@ impl VecEnv {
 
         let pd_cpu = self.tensor_from_f32(
             &self.price_deltas_buf,
-            &[NPROCS, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
+            &[
+                self.nprocs_i64(),
+                TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
+            ],
         );
         out_price_deltas.copy_(&pd_cpu);
 
-        let so_cpu =
-            self.tensor_from_f32(&self.static_obs_buf, &[NPROCS, STATIC_OBSERVATIONS as i64]);
+        let so_cpu = self.tensor_from_f32(
+            &self.static_obs_buf,
+            &[self.nprocs_i64(), STATIC_OBSERVATIONS as i64],
+        );
         out_static_obs.copy_(&so_cpu);
 
-        let rpt_cpu = self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);
+        let rpt_cpu = self.tensor_from_f32(
+            &self.reward_per_ticker_buf,
+            &[self.nprocs_i64(), TICKERS_COUNT],
+        );
         out_reward_per_ticker.copy_(&rpt_cpu);
-        out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[NPROCS]));
+        out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[self.nprocs_i64()]));
     }
 
     pub fn step_into_step(
         &mut self,
         all_actions: &[Vec<f64>],
-        out_step_deltas: &mut Tensor, // [NPROCS, TICKERS_COUNT] on device
-        out_static_obs: &mut Tensor,  // [NPROCS, static_obs_dim] on device
+        out_step_deltas: &mut Tensor, // [nprocs, TICKERS_COUNT] on device
+        out_static_obs: &mut Tensor,  // [nprocs, static_obs_dim] on device
     ) -> (Tensor, Tensor) {
         debug_assert_eq!(all_actions.len(), self.envs.len());
 
         let static_obs_dim = STATIC_OBSERVATIONS;
 
-        let mut rewards = [0f32; NPROCS as usize];
-        let mut is_dones = [0f32; NPROCS as usize];
-        let mut all_step_deltas = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
-        let mut all_static_obs = Vec::with_capacity(NPROCS as usize * static_obs_dim);
-
         for (i, env) in self.envs.iter_mut().enumerate() {
             let step = env.step_step_single(&all_actions[i]);
-            rewards[i] = step.reward as f32;
-            is_dones[i] = step.is_done;
-            all_step_deltas.extend(step.step_deltas);
-            all_static_obs.extend(step.static_obs);
+            self.reward_buf[i] = step.reward as f32;
+            self.is_done_buf[i] = step.is_done;
+            let step_offset = i * TICKERS_COUNT as usize;
+            self.step_deltas_buf[step_offset..step_offset + TICKERS_COUNT as usize]
+                .copy_from_slice(&step.step_deltas);
+            let static_offset = i * static_obs_dim;
+            self.static_obs_buf[static_offset..static_offset + static_obs_dim]
+                .copy_from_slice(&step.static_obs);
         }
 
-        let deltas_cpu = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
+        let deltas_cpu =
+            self.owned_tensor_from_f32(&self.step_deltas_buf, &[self.nprocs_i64(), TICKERS_COUNT]);
         out_step_deltas.copy_(&deltas_cpu);
 
-        let so_cpu = Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let so_cpu = self.owned_tensor_from_f32(
+            &self.static_obs_buf,
+            &[self.nprocs_i64(), STATIC_OBSERVATIONS as i64],
+        );
         out_static_obs.copy_(&so_cpu);
 
-        let reward = Tensor::from_slice(&rewards);
-        let is_done = Tensor::from_slice(&is_dones);
+        let reward = self.owned_tensor_from_f32(&self.reward_buf, &[self.nprocs_i64()]);
+        let is_done = self.owned_tensor_from_f32(&self.is_done_buf, &[self.nprocs_i64()]);
 
         (reward, is_done)
     }
@@ -315,58 +348,63 @@ impl VecEnv {
         let envs_len = self.envs.len();
         debug_assert_eq!(actions_flat.len(), envs_len * action_dim);
 
-        let mut rewards = [0f32; NPROCS as usize];
-        let mut rewards_per_ticker = vec![0f32; NPROCS as usize * TICKERS_COUNT as usize];
-        let mut is_dones = [0f32; NPROCS as usize];
-        let mut all_step_deltas = Vec::with_capacity(NPROCS as usize * TICKERS_COUNT as usize);
-        let mut all_static_obs = Vec::with_capacity(NPROCS as usize * STATIC_OBSERVATIONS);
+        let static_obs_dim = STATIC_OBSERVATIONS;
 
         for (i, env) in self.envs.iter_mut().enumerate() {
             let action_start = i * action_dim;
             let action_slice = &actions_flat[action_start..action_start + action_dim];
+            let step_start = i * TICKERS_COUNT as usize;
+            let static_start = i * static_obs_dim;
 
             if self.done_mask[i] {
-                rewards[i] = 0.0;
-                is_dones[i] = 1.0;
-                let step_start = i * TICKERS_COUNT as usize;
-                let static_start = i * STATIC_OBSERVATIONS;
-                all_step_deltas.extend_from_slice(
-                    &self.last_step_deltas[step_start..step_start + TICKERS_COUNT as usize],
-                );
-                all_static_obs.extend_from_slice(
-                    &self.last_static_obs[static_start..static_start + STATIC_OBSERVATIONS],
+                self.reward_buf[i] = 0.0;
+                self.is_done_buf[i] = 1.0;
+                self.reward_per_ticker_buf[step_start..step_start + TICKERS_COUNT as usize]
+                    .fill(0.0);
+                self.step_deltas_buf[step_start..step_start + TICKERS_COUNT as usize]
+                    .copy_from_slice(
+                        &self.last_step_deltas[step_start..step_start + TICKERS_COUNT as usize],
+                    );
+                self.static_obs_buf[static_start..static_start + static_obs_dim].copy_from_slice(
+                    &self.last_static_obs[static_start..static_start + static_obs_dim],
                 );
                 continue;
             }
 
             let step = env.step_step_single(action_slice);
-            rewards[i] = step.reward as f32;
+            self.reward_buf[i] = step.reward as f32;
             let reward_start = i * TICKERS_COUNT as usize;
-            rewards_per_ticker[reward_start..reward_start + TICKERS_COUNT as usize]
+            self.reward_per_ticker_buf[reward_start..reward_start + TICKERS_COUNT as usize]
                 .copy_from_slice(&step.reward_per_ticker);
-            is_dones[i] = step.is_done;
-            all_step_deltas.extend_from_slice(&step.step_deltas);
-            all_static_obs.extend_from_slice(&step.static_obs);
+            self.is_done_buf[i] = step.is_done;
+            self.step_deltas_buf[step_start..step_start + TICKERS_COUNT as usize]
+                .copy_from_slice(&step.step_deltas);
+            self.static_obs_buf[static_start..static_start + static_obs_dim]
+                .copy_from_slice(&step.static_obs);
 
-            let step_start = i * TICKERS_COUNT as usize;
             self.last_step_deltas[step_start..step_start + TICKERS_COUNT as usize]
                 .copy_from_slice(&step.step_deltas);
-            let static_start = i * STATIC_OBSERVATIONS;
-            self.last_static_obs[static_start..static_start + STATIC_OBSERVATIONS]
+            self.last_static_obs[static_start..static_start + static_obs_dim]
                 .copy_from_slice(&step.static_obs);
             if step.is_done == 1.0 {
                 self.done_mask[i] = true;
             }
         }
 
-        let so_cpu = Tensor::from_slice(&all_static_obs).view([NPROCS, STATIC_OBSERVATIONS as i64]);
+        let so_cpu = self.owned_tensor_from_f32(
+            &self.static_obs_buf,
+            &[self.nprocs_i64(), STATIC_OBSERVATIONS as i64],
+        );
         out_static_obs.copy_(&so_cpu);
 
-        let reward = Tensor::from_slice(&rewards);
-        let reward_per_ticker =
-            Tensor::from_slice(&rewards_per_ticker).view([NPROCS, TICKERS_COUNT]);
-        let is_done = Tensor::from_slice(&is_dones);
-        let step_deltas = Tensor::from_slice(&all_step_deltas).view([NPROCS, TICKERS_COUNT]);
+        let reward = self.owned_tensor_from_f32(&self.reward_buf, &[self.nprocs_i64()]);
+        let reward_per_ticker = self.owned_tensor_from_f32(
+            &self.reward_per_ticker_buf,
+            &[self.nprocs_i64(), TICKERS_COUNT],
+        );
+        let is_done = self.owned_tensor_from_f32(&self.is_done_buf, &[self.nprocs_i64()]);
+        let step_deltas =
+            self.owned_tensor_from_f32(&self.step_deltas_buf, &[self.nprocs_i64(), TICKERS_COUNT]);
 
         (reward, reward_per_ticker, is_done, step_deltas)
     }
@@ -480,16 +518,22 @@ impl VecEnv {
     ) -> (Vec<usize>, Vec<f32>) {
         let (reset_indices, reset_price_deltas) = self.step_into_ring_cpu(all_actions);
 
-        let deltas_cpu = self.tensor_from_f32(&self.step_deltas_buf, &[NPROCS, TICKERS_COUNT]);
+        let deltas_cpu =
+            self.tensor_from_f32(&self.step_deltas_buf, &[self.nprocs_i64(), TICKERS_COUNT]);
         out_step_deltas.copy_(&deltas_cpu);
 
-        let so_cpu =
-            self.tensor_from_f32(&self.static_obs_buf, &[NPROCS, STATIC_OBSERVATIONS as i64]);
+        let so_cpu = self.tensor_from_f32(
+            &self.static_obs_buf,
+            &[self.nprocs_i64(), STATIC_OBSERVATIONS as i64],
+        );
         out_static_obs.copy_(&so_cpu);
 
-        let rpt_cpu = self.tensor_from_f32(&self.reward_per_ticker_buf, &[NPROCS, TICKERS_COUNT]);
+        let rpt_cpu = self.tensor_from_f32(
+            &self.reward_per_ticker_buf,
+            &[self.nprocs_i64(), TICKERS_COUNT],
+        );
         out_reward_per_ticker.copy_(&rpt_cpu);
-        out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[NPROCS]));
+        out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[self.nprocs_i64()]));
 
         (reset_indices, reset_price_deltas)
     }

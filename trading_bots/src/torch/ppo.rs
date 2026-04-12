@@ -5,8 +5,7 @@ use std::time::Instant;
 use tch::{autocast, nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 use crate::torch::action_space::{
-    sigmoid_target_weight, transformed_action_log_prob,
-    transformed_action_log_prob_entropy_and_var,
+    sigmoid_target_weight, transformed_action_log_prob, transformed_action_log_prob_entropy_and_var,
 };
 use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
@@ -19,10 +18,11 @@ use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelC
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 const LEARNING_RATE: f64 = 3e-4;
-pub const NPROCS: i64 = 16;
-const SEQ_LEN: i64 = 4000;
-const PPO_CHUNK_LEN: i64 = 50;
-const SUB_CHUNK_LEN: i64 = 10;
+pub const DEFAULT_NPROCS: i64 = 16;
+const DEFAULT_SEQ_LEN: i64 = 4000;
+const DEFAULT_TOTAL_SAMPLES: i64 = DEFAULT_NPROCS * DEFAULT_SEQ_LEN;
+const DEFAULT_PPO_CHUNK_LEN: i64 = 50;
+const DEFAULT_SUB_CHUNK_LEN: i64 = 10;
 const DEFAULT_PPO_MINIBATCH_RATIO: f64 = 0.1;
 const OPTIM_EPOCHS: i64 = 3;
 const PPO_CLIP_LOW: f64 = 0.2;
@@ -44,14 +44,64 @@ const RPO_TARGET_KL: f64 = 0.018;
 const ALPHA_LOSS_COEF: f64 = 0.1;
 const MAX_DELTA_ALPHA: f64 = 0.2;
 
-fn minibatch_samples_from_total(total_samples: i64) -> i64 {
+#[derive(Clone, Copy, Debug)]
+struct RolloutGeometry {
+    nprocs: i64,
+    seq_len: i64,
+    ppo_chunk_len: i64,
+    sub_chunk_len: i64,
+    total_samples: i64,
+}
+
+fn parse_positive_i64_env(name: &str) -> Option<i64> {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v > 0)
+}
+
+fn align_up(value: i64, multiple: i64) -> i64 {
+    debug_assert!(multiple > 0);
+    ((value + multiple - 1) / multiple) * multiple
+}
+
+fn rollout_geometry() -> RolloutGeometry {
+    let nprocs = parse_positive_i64_env("PPO_NPROCS").unwrap_or(DEFAULT_NPROCS);
+    let ppo_chunk_len = parse_positive_i64_env("PPO_CHUNK_LEN").unwrap_or(DEFAULT_PPO_CHUNK_LEN);
+    let sub_chunk_len =
+        parse_positive_i64_env("PPO_SUB_CHUNK_LEN").unwrap_or(DEFAULT_SUB_CHUNK_LEN);
+    assert_eq!(
+        ppo_chunk_len % sub_chunk_len,
+        0,
+        "PPO_CHUNK_LEN must be divisible by PPO_SUB_CHUNK_LEN"
+    );
+
+    let seq_len = if let Some(seq_len) = parse_positive_i64_env("PPO_SEQ_LEN") {
+        align_up(seq_len.max(ppo_chunk_len), ppo_chunk_len)
+    } else {
+        let target_total_samples =
+            parse_positive_i64_env("PPO_TOTAL_SAMPLES").unwrap_or(DEFAULT_TOTAL_SAMPLES);
+        let target_seq_len = (target_total_samples + nprocs - 1) / nprocs;
+        align_up(target_seq_len.max(ppo_chunk_len), ppo_chunk_len)
+    };
+
+    RolloutGeometry {
+        nprocs,
+        seq_len,
+        ppo_chunk_len,
+        sub_chunk_len,
+        total_samples: nprocs * seq_len,
+    }
+}
+
+fn minibatch_samples_from_total(total_samples: i64, nprocs: i64) -> i64 {
     let ratio = env::var("PPO_MINIBATCH_RATIO")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|&v| v > 0.0 && v <= 1.0)
         .unwrap_or(DEFAULT_PPO_MINIBATCH_RATIO);
     let target = ((total_samples as f64) * ratio).round() as i64;
-    let aligned = ((target + NPROCS - 1) / NPROCS).max(1) * NPROCS;
+    let aligned = ((target + nprocs - 1) / nprocs).max(1) * nprocs;
     aligned.min(total_samples)
 }
 
@@ -140,32 +190,33 @@ fn compute_gae(
     s_dones: &Tensor,
     bootstrap_value: &Tensor,
     rollout_steps: i64,
+    nprocs: i64,
     gamma: f64,
     gae_lambda: f64,
     device: tch::Device,
 ) -> (Tensor, Tensor) {
-    let memory_size = rollout_steps * NPROCS;
+    let memory_size = rollout_steps * nprocs;
     let advantages = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let returns = Tensor::zeros(&[memory_size], (Kind::Float, device));
 
     tch::no_grad(|| {
-        let mut last_gae = Tensor::zeros(&[NPROCS], (Kind::Float, device));
+        let mut last_gae = Tensor::zeros(&[nprocs], (Kind::Float, device));
         for t in (0..rollout_steps).rev() {
-            let mem_idx = t * NPROCS;
+            let mem_idx = t * nprocs;
             let next_values = if t == rollout_steps - 1 {
                 bootstrap_value.shallow_clone()
             } else {
-                s_values.narrow(0, (t + 1) * NPROCS, NPROCS)
+                s_values.narrow(0, (t + 1) * nprocs, nprocs)
             };
-            let cur_values = s_values.narrow(0, mem_idx, NPROCS);
-            let rewards = s_rewards.narrow(0, mem_idx, NPROCS);
-            let dones = s_dones.narrow(0, mem_idx, NPROCS);
+            let cur_values = s_values.narrow(0, mem_idx, nprocs);
+            let rewards = s_rewards.narrow(0, mem_idx, nprocs);
+            let dones = s_dones.narrow(0, mem_idx, nprocs);
 
             let delta = rewards + (1.0 - &dones) * gamma * &next_values - &cur_values;
             last_gae = delta + (1.0 - &dones) * gamma * gae_lambda * &last_gae;
-            let _ = advantages.narrow(0, mem_idx, NPROCS).copy_(&last_gae);
+            let _ = advantages.narrow(0, mem_idx, nprocs).copy_(&last_gae);
             let step_returns = &last_gae + &cur_values;
-            let _ = returns.narrow(0, mem_idx, NPROCS).copy_(&step_returns);
+            let _ = returns.narrow(0, mem_idx, nprocs).copy_(&step_returns);
         }
     });
 
@@ -228,15 +279,16 @@ pub async fn train(
     model_variant: ModelVariant,
     run_name: Option<String>,
 ) {
+    let rollout = rollout_geometry();
     assert_eq!(
         model_variant,
         ModelVariant::Uniform256Stream,
         "PPO rollout collection is streaming-only; train with --model-size uniform-256-stream"
     );
     assert_eq!(
-        PPO_CHUNK_LEN % SUB_CHUNK_LEN,
+        rollout.ppo_chunk_len % rollout.sub_chunk_len,
         0,
-        "PPO_CHUNK_LEN must be divisible by SUB_CHUNK_LEN"
+        "PPO_CHUNK_LEN must be divisible by PPO_SUB_CHUNK_LEN"
     );
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
@@ -258,6 +310,14 @@ pub async fn train(
     let device = tch::Device::cuda_if_available();
     println!("device is cuda: {}", device.is_cuda());
     configure_cuda();
+    println!(
+        "ppo rollout geometry: nprocs={} seq_len={} total_samples={} chunk_len={} sub_chunk_len={}",
+        rollout.nprocs,
+        rollout.seq_len,
+        rollout.total_samples,
+        rollout.ppo_chunk_len,
+        rollout.sub_chunk_len
+    );
     let mut vs = nn::VarStore::new(device);
     let trading_model = TradingModel::new_with_config(
         &vs.root(),
@@ -322,7 +382,12 @@ pub async fn train(
         .expect("failed to build AdamW optimizer");
     let trainable_vars = vs.trainable_variables();
 
-    let mut env = VecEnv::new(true, model_variant, gens_path.clone());
+    let mut env = VecEnv::new(
+        true,
+        model_variant,
+        gens_path.clone(),
+        rollout.nprocs as usize,
+    );
     if start_episode > 0 {
         env.set_episode(start_episode);
         env.primary_mut()
@@ -332,27 +397,28 @@ pub async fn train(
 
     let hl_gauss = HlGaussBins::default_for(device);
 
-    let rollout_steps = SEQ_LEN;
-    let memory_size = rollout_steps * NPROCS;
+    let rollout_steps = rollout.seq_len;
+    let memory_size = rollout_steps * rollout.nprocs;
     assert_eq!(
-        rollout_steps % PPO_CHUNK_LEN,
+        rollout_steps % rollout.ppo_chunk_len,
         0,
         "PPO_CHUNK_LEN must divide rollout length"
     );
-    let chunks_per_rollout = rollout_steps / PPO_CHUNK_LEN;
-    let total_chunks = chunks_per_rollout * NPROCS;
-    let mut chunk_mem_indices_host = Vec::with_capacity((total_chunks * PPO_CHUNK_LEN) as usize);
+    let chunks_per_rollout = rollout_steps / rollout.ppo_chunk_len;
+    let total_chunks = chunks_per_rollout * rollout.nprocs;
+    let mut chunk_mem_indices_host =
+        Vec::with_capacity((total_chunks * rollout.ppo_chunk_len) as usize);
     for chunk_id in 0..total_chunks {
-        let env_idx = chunk_id % NPROCS;
-        let chunk_start = (chunk_id / NPROCS) * PPO_CHUNK_LEN;
-        for offset in 0..PPO_CHUNK_LEN {
-            chunk_mem_indices_host.push((chunk_start + offset) * NPROCS + env_idx);
+        let env_idx = chunk_id % rollout.nprocs;
+        let chunk_start = (chunk_id / rollout.nprocs) * rollout.ppo_chunk_len;
+        for offset in 0..rollout.ppo_chunk_len {
+            chunk_mem_indices_host.push((chunk_start + offset) * rollout.nprocs + env_idx);
         }
     }
     let chunk_mem_indices = Tensor::from_slice(&chunk_mem_indices_host)
         .to_kind(Kind::Int64)
         .to_device(device)
-        .view([total_chunks, PPO_CHUNK_LEN]);
+        .view([total_chunks, rollout.ppo_chunk_len]);
 
     let raw_pd_dim = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
     let pd_dim = trading_model.price_input_dim();
@@ -361,7 +427,7 @@ pub async fn train(
     let uniform_reset_live_fill = trading_model.uniform_stream_bootstrap_live_fill();
 
     let s_chunk_start_layouts = Tensor::zeros(
-        &[chunks_per_rollout * NPROCS, pd_dim],
+        &[chunks_per_rollout * rollout.nprocs, pd_dim],
         (replay_obs_kind, device),
     );
     let s_step_deltas = Tensor::zeros(&[memory_size, TICKERS_COUNT], (replay_obs_kind, device));
@@ -400,18 +466,24 @@ pub async fn train(
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu) = env.reset();
-        let mut obs_price = Tensor::zeros(&[NPROCS, raw_pd_dim], (Kind::Float, device));
-        let mut obs_static =
-            Tensor::zeros(&[NPROCS, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
+        let mut obs_price = Tensor::zeros(&[rollout.nprocs, raw_pd_dim], (Kind::Float, device));
+        let mut obs_static = Tensor::zeros(
+            &[rollout.nprocs, STATIC_OBSERVATIONS as i64],
+            (Kind::Float, device),
+        );
         let ring_len = PRICE_DELTAS_PER_TICKER as i64;
         let base_idx = Tensor::arange(ring_len, (Kind::Int64, device));
         let mut ring_pos = ring_len - 1;
-        let mut ring_buf = Tensor::zeros(&[NPROCS, TICKERS_COUNT, ring_len], (Kind::Float, device));
-        let mut step_deltas = Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
+        let mut ring_buf = Tensor::zeros(
+            &[rollout.nprocs, TICKERS_COUNT, ring_len],
+            (Kind::Float, device),
+        );
+        let mut step_deltas =
+            Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (Kind::Float, device));
         obs_price.copy_(&obs_price_cpu);
         obs_static.copy_(&obs_static_cpu);
-        ring_buf.copy_(&obs_price.view([NPROCS, TICKERS_COUNT, ring_len]));
-        let mut stream_state = trading_model.init_stream_state_batched(NPROCS);
+        ring_buf.copy_(&obs_price.view([rollout.nprocs, TICKERS_COUNT, ring_len]));
+        let mut stream_state = trading_model.init_stream_state_batched(rollout.nprocs);
         let stream_layout = trading_model.uniform_stream_layout_from_raw_input(&obs_price);
         let mut streamed_output = Some(tch::no_grad(|| {
             autocast(true, || {
@@ -419,15 +491,18 @@ pub async fn train(
             })
         }));
         let mut step_reward_per_ticker =
-            Tensor::zeros(&[NPROCS, TICKERS_COUNT], (Kind::Float, device));
-        let mut step_is_done = Tensor::zeros(&[NPROCS], (Kind::Float, device));
+            Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (Kind::Float, device));
+        let mut step_is_done = Tensor::zeros(&[rollout.nprocs], (Kind::Float, device));
         let mut reset_layout_batches: Vec<Tensor> = Vec::new();
         let mut reset_layout_count = 0i64;
         let mut reset_slots_host = vec![0i64; memory_size as usize];
-        let mut cpu_step_batch =
-            CpuStepBatch::new(NPROCS as usize, ACTION_COUNT as usize, raw_pd_dim as usize);
+        let mut cpu_step_batch = CpuStepBatch::new(
+            rollout.nprocs as usize,
+            ACTION_COUNT as usize,
+            raw_pd_dim as usize,
+        );
         for step in 0..rollout_steps as usize {
-            let mem_idx = step as i64 * NPROCS;
+            let mem_idx = step as i64 * rollout.nprocs;
             let (values, action_mean, action_std, latent_actions, target_weights, action_log_prob) =
                 sample_rollout_actions_from_output(
                     streamed_output
@@ -444,17 +519,19 @@ pub async fn train(
                 let _ =
                     debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
-            if step as i64 % PPO_CHUNK_LEN == 0 {
-                let chunk_row = (step as i64 / PPO_CHUNK_LEN) * NPROCS;
+            if step as i64 % rollout.ppo_chunk_len == 0 {
+                let chunk_row = (step as i64 / rollout.ppo_chunk_len) * rollout.nprocs;
                 let boundary_layout = stream_state
                     .uniform_layout
-                    .view([NPROCS, pd_dim])
+                    .view([rollout.nprocs, pd_dim])
                     .to_kind(replay_obs_kind);
                 let _ = s_chunk_start_layouts
-                    .narrow(0, chunk_row, NPROCS)
+                    .narrow(0, chunk_row, rollout.nprocs)
                     .copy_(&boundary_layout);
             }
-            let _ = s_static_obs.narrow(0, mem_idx, NPROCS).copy_(&obs_static);
+            let _ = s_static_obs
+                .narrow(0, mem_idx, rollout.nprocs)
+                .copy_(&obs_static);
 
             let target_weights_cpu = target_weights.to_device(Device::Cpu).to_kind(Kind::Float);
             let actions_len = cpu_step_batch.actions_f32.len();
@@ -468,7 +545,9 @@ pub async fn train(
             );
             let reset_indices = &cpu_step_batch.reset_indices;
             let reset_price_deltas = &cpu_step_batch.reset_price_deltas;
-            let _ = s_step_deltas.narrow(0, mem_idx, NPROCS).copy_(&step_deltas);
+            let _ = s_step_deltas
+                .narrow(0, mem_idx, rollout.nprocs)
+                .copy_(&step_deltas);
 
             ring_pos = (ring_pos + 1) % ring_len;
             let _ = ring_buf
@@ -508,12 +587,14 @@ pub async fn train(
 
             if !reset_indices.is_empty() {
                 let ordered = ring_buf.index_select(2, &idx);
-                obs_price.copy_(&ordered.view([NPROCS, raw_pd_dim]));
+                obs_price.copy_(&ordered.view([rollout.nprocs, raw_pd_dim]));
             }
 
-            let _ = s_actions.narrow(0, mem_idx, NPROCS).copy_(&latent_actions);
+            let _ = s_actions
+                .narrow(0, mem_idx, rollout.nprocs)
+                .copy_(&latent_actions);
             let _ = s_old_log_probs
-                .narrow(0, mem_idx, NPROCS)
+                .narrow(0, mem_idx, rollout.nprocs)
                 .copy_(&action_log_prob);
 
             let portfolio_reward =
@@ -526,10 +607,12 @@ pub async fn train(
                 let _ = debug_tensor_stats("step_is_done", &step_is_done, episode as i64, step);
             }
             let _ = s_rewards
-                .narrow(0, mem_idx, NPROCS)
+                .narrow(0, mem_idx, rollout.nprocs)
                 .copy_(&portfolio_reward);
-            let _ = s_dones.narrow(0, mem_idx, NPROCS).copy_(&step_is_done);
-            let _ = s_values.narrow(0, mem_idx, NPROCS).copy_(&values);
+            let _ = s_dones
+                .narrow(0, mem_idx, rollout.nprocs)
+                .copy_(&step_is_done);
+            let _ = s_values.narrow(0, mem_idx, rollout.nprocs).copy_(&values);
 
             streamed_output = Some(tch::no_grad(|| {
                 autocast(true, || {
@@ -559,6 +642,7 @@ pub async fn train(
             &s_dones,
             &bootstrap_value,
             rollout_steps,
+            rollout.nprocs,
             0.99,
             0.95,
             device,
@@ -582,43 +666,48 @@ pub async fn train(
             )
         });
 
-        let total_samples = rollout_steps * NPROCS;
-        let minibatch_size = minibatch_samples_from_total(total_samples);
-        let chunk_batch_size = ((minibatch_size + PPO_CHUNK_LEN - 1) / PPO_CHUNK_LEN).max(1);
-        // Per-chunk reset slot ids laid out as [total_chunks, PPO_CHUNK_LEN], matching
+        let total_samples = rollout_steps * rollout.nprocs;
+        let minibatch_size = minibatch_samples_from_total(total_samples, rollout.nprocs);
+        let chunk_batch_size =
+            ((minibatch_size + rollout.ppo_chunk_len - 1) / rollout.ppo_chunk_len).max(1);
+        // Per-chunk reset slot ids laid out as [total_chunks, chunk_len], matching
         // `chunk_mem_indices_host` ordering. Entry 0 == no reset; >0 == 1-indexed slot.
         // Precomputed host-side so the inner sub-chunk loop never needs a device->host
         // sync to decide whether a reset occurred at the current step.
         let mut resets_by_chunk_flat: Vec<i64> =
-            Vec::with_capacity((total_chunks * PPO_CHUNK_LEN) as usize);
+            Vec::with_capacity((total_chunks * rollout.ppo_chunk_len) as usize);
         for &mem_idx in &chunk_mem_indices_host {
             resets_by_chunk_flat.push(reset_slots_host[mem_idx as usize]);
         }
         println!(
             "ppo update: total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
-            total_samples, minibatch_size, PPO_CHUNK_LEN, chunk_batch_size
+            total_samples, minibatch_size, rollout.ppo_chunk_len, chunk_batch_size
         );
         // Full-rollout advantage normalization (not per-minibatch)
         let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
         let chunk_mem_indices_flat = chunk_mem_indices.reshape([-1]);
-        let s_static_obs_by_chunk = s_static_obs
-            .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, PPO_CHUNK_LEN, so_dim]);
+        let s_static_obs_by_chunk = s_static_obs.index_select(0, &chunk_mem_indices_flat).view([
+            total_chunks,
+            rollout.ppo_chunk_len,
+            so_dim,
+        ]);
         let s_step_deltas_by_chunk = s_step_deltas
             .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, PPO_CHUNK_LEN, TICKERS_COUNT]);
-        let s_actions_by_chunk = s_actions
-            .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, PPO_CHUNK_LEN, ACTION_COUNT]);
+            .view([total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT]);
+        let s_actions_by_chunk = s_actions.index_select(0, &chunk_mem_indices_flat).view([
+            total_chunks,
+            rollout.ppo_chunk_len,
+            ACTION_COUNT,
+        ]);
         let s_old_log_probs_by_chunk = s_old_log_probs
             .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, PPO_CHUNK_LEN]);
+            .view([total_chunks, rollout.ppo_chunk_len]);
         let returns_by_chunk = returns
             .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, PPO_CHUNK_LEN]);
+            .view([total_chunks, rollout.ppo_chunk_len]);
         let adv_norm_by_chunk = adv_norm
             .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, PPO_CHUNK_LEN]);
+            .view([total_chunks, rollout.ppo_chunk_len]);
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -642,10 +731,21 @@ pub async fn train(
 
         let mut last_minibatch_approx_kl = 0.0f64;
         let mut perm_host: Vec<i64> = (0..total_chunks).collect();
+        let mut perm_gpu = Tensor::zeros([total_chunks], (Kind::Int64, device));
+        let mut mb_reset_rows: Vec<Vec<usize>> = (0..rollout.ppo_chunk_len as usize)
+            .map(|_| Vec::new())
+            .collect();
+        let mut mb_reset_slots: Vec<Vec<i64>> = (0..rollout.ppo_chunk_len as usize)
+            .map(|_| Vec::new())
+            .collect();
         let mut rng = rand::rng();
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             perm_host.shuffle(&mut rng);
+            let perm_cpu = Tensor::from_slice(&perm_host)
+                .to_kind(Kind::Int64)
+                .to_device(device);
+            perm_gpu.copy_(&perm_cpu);
 
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
@@ -657,9 +757,7 @@ pub async fn train(
                 let mb_end = (mb_start + chunk_batch_size).min(total_chunks);
                 let chunk_count = mb_end - mb_start;
                 let chunk_ids_host = &perm_host[mb_start as usize..mb_end as usize];
-                let chunk_ids = Tensor::from_slice(chunk_ids_host)
-                    .to_kind(Kind::Int64)
-                    .to_device(device);
+                let chunk_ids = perm_gpu.narrow(0, mb_start, chunk_count);
                 let boundary_layout = s_chunk_start_layouts.index_select(0, &chunk_ids);
                 let so_chunk = s_static_obs_by_chunk.index_select(0, &chunk_ids);
                 let step_deltas_chunk = s_step_deltas_by_chunk.index_select(0, &chunk_ids);
@@ -667,18 +765,16 @@ pub async fn train(
                 let ret_mb_by_chunk = returns_by_chunk.index_select(0, &chunk_ids);
                 let old_log_probs_by_chunk = s_old_log_probs_by_chunk.index_select(0, &chunk_ids);
                 let act_mb_by_chunk = s_actions_by_chunk.index_select(0, &chunk_ids);
-                let so_steps = so_chunk.unbind(1);
-                let step_delta_steps = step_deltas_chunk.unbind(1);
-                let adv_subchunks = adv_mb_by_chunk.split(SUB_CHUNK_LEN, 1);
-                let ret_subchunks = ret_mb_by_chunk.split(SUB_CHUNK_LEN, 1);
-                let old_log_prob_subchunks = old_log_probs_by_chunk.split(SUB_CHUNK_LEN, 1);
-                let act_subchunks = act_mb_by_chunk.split(SUB_CHUNK_LEN, 1);
 
-                let mut mb_reset_rows: Vec<Vec<usize>> = vec![Vec::new(); PPO_CHUNK_LEN as usize];
-                let mut mb_reset_slots: Vec<Vec<i64>> = vec![Vec::new(); PPO_CHUNK_LEN as usize];
+                for rows in &mut mb_reset_rows {
+                    rows.clear();
+                }
+                for slots in &mut mb_reset_slots {
+                    slots.clear();
+                }
                 for (row_in_mb, &chunk_id) in chunk_ids_host.iter().enumerate() {
-                    let base = (chunk_id * PPO_CHUNK_LEN) as usize;
-                    for pos in 0..PPO_CHUNK_LEN as usize {
+                    let base = (chunk_id * rollout.ppo_chunk_len) as usize;
+                    for pos in 0..rollout.ppo_chunk_len as usize {
                         let slot = resets_by_chunk_flat[base + pos];
                         if slot > 0 {
                             mb_reset_rows[pos].push(row_in_mb);
@@ -686,11 +782,14 @@ pub async fn train(
                         }
                     }
                 }
-                let mut mb_reset_env_idx_tensors = Vec::with_capacity(PPO_CHUNK_LEN as usize);
-                let mut mb_reset_row_idx_tensors = Vec::with_capacity(PPO_CHUNK_LEN as usize);
-                let mut mb_reset_live_fill_tensors = Vec::with_capacity(PPO_CHUNK_LEN as usize);
-                let mut mb_reset_layouts = Vec::with_capacity(PPO_CHUNK_LEN as usize);
-                for pos in 0..PPO_CHUNK_LEN as usize {
+                let mut mb_reset_env_idx_tensors =
+                    Vec::with_capacity(rollout.ppo_chunk_len as usize);
+                let mut mb_reset_row_idx_tensors =
+                    Vec::with_capacity(rollout.ppo_chunk_len as usize);
+                let mut mb_reset_live_fill_tensors =
+                    Vec::with_capacity(rollout.ppo_chunk_len as usize);
+                let mut mb_reset_layouts = Vec::with_capacity(rollout.ppo_chunk_len as usize);
+                for pos in 0..rollout.ppo_chunk_len as usize {
                     let rows = &mb_reset_rows[pos];
                     if rows.is_empty() {
                         mb_reset_env_idx_tensors.push(None);
@@ -730,47 +829,49 @@ pub async fn train(
 
                 let mut fwd_start = Instant::now();
                 let mut chunk_state = trading_model.init_stream_state_batched(chunk_count);
-                let num_sub_chunks = PPO_CHUNK_LEN / SUB_CHUNK_LEN;
-                let sub_chunk_sample_count = chunk_count * SUB_CHUNK_LEN;
+                let num_sub_chunks = rollout.ppo_chunk_len / rollout.sub_chunk_len;
+                let minibatch_sample_count = chunk_count * rollout.ppo_chunk_len;
+                let sub_chunk_sample_count = chunk_count * rollout.sub_chunk_len;
                 let mut global_pos: i64 = 0;
                 let mut minibatch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
                 let mut minibatch_kl_count = 0i64;
 
                 for sub_idx in 0..num_sub_chunks {
                     let mut sub_value_logits: Vec<Tensor> =
-                        Vec::with_capacity(SUB_CHUNK_LEN as usize);
+                        Vec::with_capacity(rollout.sub_chunk_len as usize);
                     let mut sub_action_mean: Vec<Tensor> =
-                        Vec::with_capacity(SUB_CHUNK_LEN as usize);
+                        Vec::with_capacity(rollout.sub_chunk_len as usize);
                     let mut sub_action_std: Vec<Tensor> =
-                        Vec::with_capacity(SUB_CHUNK_LEN as usize);
+                        Vec::with_capacity(rollout.sub_chunk_len as usize);
+                    let sub_start = sub_idx * rollout.sub_chunk_len;
 
-                    for _ in 0..SUB_CHUNK_LEN {
+                    for _ in 0..rollout.sub_chunk_len {
                         let output = if global_pos == 0 {
-                            let first_static = &so_steps[0];
+                            let first_static = so_chunk.select(1, 0);
                             autocast(true, || {
                                 trading_model.step_on_device(
                                     &boundary_layout,
-                                    first_static,
+                                    &first_static,
                                     &mut chunk_state,
                                 )
                             })
                         } else {
-                            let prev_step_deltas = &step_delta_steps[(global_pos - 1) as usize];
-                            let current_static = &so_steps[global_pos as usize];
+                            let prev_step_deltas = step_deltas_chunk.select(1, global_pos - 1);
+                            let current_static = so_chunk.select(1, global_pos);
                             let step_reset_rows = &mb_reset_rows[(global_pos - 1) as usize];
                             if step_reset_rows.is_empty() {
                                 autocast(true, || {
                                     trading_model.step_on_device(
-                                        prev_step_deltas,
-                                        current_static,
+                                        &prev_step_deltas,
+                                        &current_static,
                                         &mut chunk_state,
                                     )
                                 })
                             } else {
                                 let _ = autocast(true, || {
                                     trading_model.step_on_device(
-                                        prev_step_deltas,
-                                        current_static,
+                                        &prev_step_deltas,
+                                        &current_static,
                                         &mut chunk_state,
                                     )
                                 });
@@ -786,7 +887,7 @@ pub async fn train(
                                 );
                                 autocast(true, || {
                                     trading_model.forward_stream_state_on_device(
-                                        current_static,
+                                        &current_static,
                                         &mut chunk_state,
                                     )
                                 })
@@ -810,12 +911,19 @@ pub async fn train(
                         .reshape([sub_chunk_sample_count, ACTION_COUNT]);
 
                     // Slice sub-chunk-matching rows from the full-minibatch flat tensors.
-                    // Layout is chunk-major: [chunk_count, PPO_CHUNK_LEN, ...] flattened.
-                    let sub_adv = adv_subchunks[sub_idx as usize].reshape([-1]);
-                    let sub_ret = ret_subchunks[sub_idx as usize].reshape([-1]);
-                    let sub_old_log_probs =
-                        old_log_prob_subchunks[sub_idx as usize].reshape([-1]);
-                    let sub_act = act_subchunks[sub_idx as usize].reshape([-1, ACTION_COUNT]);
+                    // Layout is chunk-major: [chunk_count, chunk_len, ...] flattened.
+                    let sub_adv = adv_mb_by_chunk
+                        .narrow(1, sub_start, rollout.sub_chunk_len)
+                        .reshape([-1]);
+                    let sub_ret = ret_mb_by_chunk
+                        .narrow(1, sub_start, rollout.sub_chunk_len)
+                        .reshape([-1]);
+                    let sub_old_log_probs = old_log_probs_by_chunk
+                        .narrow(1, sub_start, rollout.sub_chunk_len)
+                        .reshape([-1]);
+                    let sub_act = act_mb_by_chunk
+                        .narrow(1, sub_start, rollout.sub_chunk_len)
+                        .reshape([-1, ACTION_COUNT]);
 
                     let latent_actions_mb = sub_act;
 
@@ -840,11 +948,11 @@ pub async fn train(
 
                     let (action_log_probs, dist_entropy_per_sample, action_var) =
                         transformed_action_log_prob_entropy_and_var(
-                        &latent_actions_mb,
-                        &action_mean_perturbed,
-                        &action_std,
-                        LOG_2PI,
-                    );
+                            &latent_actions_mb,
+                            &action_mean_perturbed,
+                            &action_std,
+                            LOG_2PI,
+                        );
 
                     if DEBUG_NUMERICS {
                         let _ = debug_tensor_stats(
@@ -921,8 +1029,7 @@ pub async fn train(
                     // Scale loss by this sub-chunk's fraction of the full minibatch so that
                     // gradients accumulated across all sub-chunks of all chunks equal the
                     // gradient that a single mean-over-minibatch backward would produce.
-                    let scale = (sub_chunk_sample_count as f64)
-                        / ((chunk_batch_size * PPO_CHUNK_LEN) as f64);
+                    let scale = (sub_chunk_sample_count as f64) / (minibatch_sample_count as f64);
                     let scaled_sub_loss = (sub_ppo_loss + alpha_loss) * scale;
 
                     fwd_time_us += fwd_start.elapsed().as_micros() as u64;
@@ -1082,8 +1189,8 @@ pub async fn train(
 
         let log_std_stats = compute_action_std_stats(
             &trading_model,
-            &s_chunk_start_layouts.narrow(0, 0, NPROCS),
-            &s_static_obs.narrow(0, 0, NPROCS),
+            &s_chunk_start_layouts.narrow(0, 0, rollout.nprocs),
+            &s_static_obs.narrow(0, 0, rollout.nprocs),
             &rpo_rho,
             device,
         );
