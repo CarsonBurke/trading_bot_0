@@ -693,7 +693,6 @@ pub struct TradingModel {
     patch_stream_proj: nn::Linear,
     gqa_kv_head_index: Tensor,
     input_ln: RMSNorm,
-    final_ln: RMSNorm,
     gqa_layers: Vec<GqaBlock>,
     exogenous_ticker_block: ExogenousTickerBlock,
     exo_mlp: ExoMLP,
@@ -846,7 +845,6 @@ impl TradingModel {
             },
         );
         let input_ln = RMSNorm::new(&(p / "input_ln"), spec.model_dim, 1e-6);
-        let final_ln = RMSNorm::new(&(p / "final_ln"), spec.model_dim, 1e-6);
         let gqa_kv_head_index = Tensor::arange(GQA_NUM_KV_HEADS, (Kind::Int64, p.device()));
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
@@ -964,7 +962,6 @@ impl TradingModel {
             patch_stream_proj,
             gqa_kv_head_index,
             input_ln,
-            final_ln,
             gqa_layers,
             exogenous_ticker_block,
             exo_mlp,

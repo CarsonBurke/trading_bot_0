@@ -26,7 +26,6 @@ impl TradingModel {
             }
             x = self.maybe_apply_endogenous_ticker(&x, i);
         }
-        x = self.final_ln.forward(&x);
         debug_fused("model_x_gqa", &x);
 
         self.head_with_temporal_pool(&x, batch_size, false).0
@@ -85,7 +84,6 @@ impl TradingModel {
             x = self.maybe_apply_endogenous_ticker(&x, layer_idx);
             debug_fused_layer("x_gqa_out", layer_idx, &x);
         }
-        x = self.final_ln.forward(&x);
         debug_fused("model_x_gqa", &x);
 
         let (out, debug) = self.head_with_temporal_pool(&x, batch_size, true);

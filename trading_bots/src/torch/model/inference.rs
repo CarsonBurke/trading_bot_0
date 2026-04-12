@@ -210,7 +210,6 @@ impl TradingModel {
             }
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
-        x_suffix = self.final_ln.forward(&x_suffix);
         self.head_from_uniform_suffix(&x_suffix, batch_size)
     }
 
