@@ -57,8 +57,7 @@ impl EndogenousTickerBlock {
 
     fn forward(&self, x: &Tensor, model_dim: i64, _ff_dim: i64) -> Tensor {
         let (batch, num_items, _) = x.size3().unwrap();
-        let x_norm = self.ticker_ln.forward(x);
-        let qkv = x_norm.apply(&self.ticker_qkv);
+        let qkv = self.ticker_ln.forward_linear(x, &self.ticker_qkv);
         let parts = qkv.split(model_dim, -1);
         // QKNorm (single-head, head_dim == model_dim)
         let q = self.q_norm.forward(&parts[0]).unsqueeze(1);
@@ -78,10 +77,10 @@ impl EndogenousTickerBlock {
         .apply(&self.ticker_out)
         .reshape([batch, num_items, model_dim]);
         let x = x + self.ticker_out_ln.forward(&ctx);
-        let mlp_in = self.mlp_ln.forward(&x);
-        let mlp_proj = mlp_in.apply(&self.mlp_fc1);
-        let mlp_parts = mlp_proj.chunk(2, -1);
-        let mlp = (mlp_parts[0].silu() * &mlp_parts[1]).apply(&self.mlp_fc2);
+        let mlp = swiglu_linear(
+            &self.mlp_ln.forward_linear(&x, &self.mlp_fc1),
+            &self.mlp_fc2,
+        );
         x + self.mlp_out_ln.forward(&mlp)
     }
 }
@@ -145,6 +144,7 @@ struct GqaBlock {
     ffn_fc1: nn::Linear,
     ffn_fc2: nn::Linear,
     ffn_out_ln: RMSNorm,
+    uniform_suffix_attn_mask: Tensor,
 }
 
 impl GqaBlock {
@@ -162,6 +162,26 @@ impl GqaBlock {
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
         let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim, init_scale);
         let ffn_out_ln = RMSNorm::new(&(p / "ffn_out_ln"), model_dim, 1e-6);
+        let uniform_suffix_len = NUM_HEAD_CLS_TOKENS + 1;
+        let uniform_prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
+        let visible_prefix = Tensor::ones(
+            [uniform_suffix_len, uniform_prefix_len],
+            (Kind::Bool, p.device()),
+        );
+        let visible_suffix = Tensor::ones(
+            [uniform_suffix_len, uniform_suffix_len],
+            (Kind::Bool, p.device()),
+        )
+        .tril(0);
+        let uniform_suffix_attn_mask = Tensor::zeros(
+            [uniform_suffix_len, uniform_prefix_len + uniform_suffix_len],
+            (p.kind(), p.device()),
+        )
+        .masked_fill(
+            &Tensor::cat(&[&visible_prefix, &visible_suffix], 1).logical_not(),
+            f64::NEG_INFINITY,
+        )
+        .set_requires_grad(false);
         Self {
             attn_ln,
             attn_qkv,
@@ -175,6 +195,7 @@ impl GqaBlock {
             ffn_fc1,
             ffn_fc2,
             ffn_out_ln,
+            uniform_suffix_attn_mask,
         }
     }
 
@@ -208,8 +229,7 @@ impl GqaBlock {
     ) -> (Tensor, Tensor, Tensor) {
         let (b, s, d) = x.size3().unwrap();
         let head_dim = d / GQA_NUM_Q_HEADS;
-        let x_norm = self.attn_ln.forward(x);
-        let qkv = x_norm.apply(&self.attn_qkv);
+        let qkv = self.attn_ln.forward_linear(x, &self.attn_qkv);
         let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
         let q = parts[0]
             .reshape([b, s, GQA_NUM_Q_HEADS, head_dim])
@@ -228,10 +248,7 @@ impl GqaBlock {
     }
 
     fn apply_ffn(&self, x: &Tensor) -> Tensor {
-        let ffn_in = self.ffn_ln.forward(x);
-        let ffn_proj = ffn_in.apply(&self.ffn_fc1);
-        let ffn_parts = ffn_proj.chunk(2, -1);
-        let ffn_out = (ffn_parts[0].silu() * &ffn_parts[1]).apply(&self.ffn_fc2);
+        let ffn_out = swiglu_linear(&self.ffn_ln.forward_linear(x, &self.ffn_fc1), &self.ffn_fc2);
         x + self.ffn_out_ln.forward(&ffn_out)
     }
 
@@ -270,29 +287,21 @@ impl GqaBlock {
         let (q, suffix_k, suffix_v) = self.project_qkv(x_suffix, rope, prefix_len);
         let suffix_k = suffix_k.index_select(1, kv_index);
         let suffix_v = suffix_v.index_select(1, kv_index);
-        let suffix_len = q.size()[2];
-        let mut out_parts = Vec::with_capacity(suffix_len as usize);
-        for suffix_pos in 0..suffix_len {
-            let q_pos = q.narrow(2, suffix_pos, 1);
-            let visible_k = Tensor::cat(&[prefix_k, &suffix_k.narrow(2, 0, suffix_pos + 1)], 2);
-            let visible_v = Tensor::cat(&[prefix_v, &suffix_v.narrow(2, 0, suffix_pos + 1)], 2);
-            let out_pos = Tensor::scaled_dot_product_attention(
-                &q_pos,
-                &visible_k,
-                &visible_v,
-                None::<&Tensor>,
-                0.0,
-                false,
-                None,
-                false,
-            );
-            out_parts.push(out_pos);
-        }
-        let out_part_refs: Vec<&Tensor> = out_parts.iter().collect();
-        let out = Tensor::cat(&out_part_refs, 2)
-            .permute([0, 2, 1, 3])
-            .contiguous()
-            .reshape(x_suffix.size());
+        let k = Tensor::cat(&[prefix_k, &suffix_k], 2);
+        let v = Tensor::cat(&[prefix_v, &suffix_v], 2);
+        let out = Tensor::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            Some(&self.uniform_suffix_attn_mask),
+            0.0,
+            false,
+            None,
+            false,
+        )
+        .permute([0, 2, 1, 3])
+        .contiguous()
+        .reshape(x_suffix.size());
         let x = x_suffix + self.attn_out_ln.forward(&out.apply(&self.attn_out));
         self.apply_ffn(&x)
     }
@@ -334,9 +343,9 @@ impl ExogenousTickerBlock {
 
     fn forward(&self, x: &Tensor, exo_kv: &Tensor) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
-        let x_norm = self.ln_q.forward(x);
-        let q = x_norm
-            .apply(&self.q_proj)
+        let q = self
+            .ln_q
+            .forward_linear(x, &self.q_proj)
             .reshape([b, s, CA_NUM_HEADS, CA_HEAD_DIM])
             .permute([0, 2, 1, 3]);
         let q = self.q_norm.forward(&q);
@@ -392,12 +401,29 @@ impl ExoMLP {
     fn forward(&self, x: &Tensor) -> Tensor {
         let h = self
             .in_ln
-            .forward(x)
-            .apply(&self.fc1)
+            .forward_linear(x, &self.fc1)
             .silu()
             .apply(&self.fc2);
         x + self.out_ln.forward(&h)
     }
+}
+
+fn swiglu_linear(x: &Tensor, out_proj: &nn::Linear) -> Tensor {
+    let parts = x.chunk(2, -1);
+    let gated = parts[0].silu() * &parts[1];
+    let weight = if out_proj.ws.kind() == gated.kind() {
+        out_proj.ws.shallow_clone()
+    } else {
+        out_proj.ws.to_kind(gated.kind())
+    };
+    let bias = out_proj.bs.as_ref().map(|b| {
+        if b.kind() == gated.kind() {
+            b.shallow_clone()
+        } else {
+            b.to_kind(gated.kind())
+        }
+    });
+    gated.linear(&weight, bias.as_ref())
 }
 
 fn xavier_normal_std(in_features: i64, out_features: i64) -> f64 {
@@ -643,6 +669,8 @@ pub struct StreamState {
     pub uniform_prefix_v: Vec<Tensor>,
     /// Static features associated with the currently conditioned prefix cache.
     pub uniform_cached_static_features: Option<Tensor>,
+    /// Exogenous tokens associated with the currently conditioned prefix cache.
+    pub uniform_cached_exo_tokens: Option<Tensor>,
 }
 
 pub struct TradingModel {
@@ -657,7 +685,6 @@ pub struct TradingModel {
     patch_config_ids: Tensor,
     patch_stream_proj: nn::Linear,
     gqa_kv_head_index: Tensor,
-    uniform_patch_shift_idx: Tensor,
     input_ln: RMSNorm,
     final_ln: RMSNorm,
     gqa_layers: Vec<GqaBlock>,
@@ -814,8 +841,6 @@ impl TradingModel {
         let input_ln = RMSNorm::new(&(p / "input_ln"), spec.model_dim, 1e-6);
         let final_ln = RMSNorm::new(&(p / "final_ln"), spec.model_dim, 1e-6);
         let gqa_kv_head_index = Tensor::arange(GQA_NUM_KV_HEADS, (Kind::Int64, p.device()));
-        let uniform_patch_shift_idx =
-            Tensor::arange(UNIFORM_STREAM_PATCH_COUNT - 1, (Kind::Int64, p.device())) + 1;
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
             for (cfg_idx, &(days, patch_size)) in patch_configs.iter().enumerate() {
@@ -931,7 +956,6 @@ impl TradingModel {
             patch_config_ids,
             patch_stream_proj,
             gqa_kv_head_index,
-            uniform_patch_shift_idx,
             input_ln,
             final_ln,
             gqa_layers,

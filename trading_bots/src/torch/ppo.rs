@@ -533,9 +533,16 @@ pub async fn train(
                 .narrow(0, mem_idx, rollout.nprocs)
                 .copy_(&obs_static);
 
-            let target_weights_cpu = target_weights.to_device(Device::Cpu).to_kind(Kind::Float);
-            let actions_len = cpu_step_batch.actions_f32.len();
-            target_weights_cpu.copy_data(&mut cpu_step_batch.actions_f32, actions_len);
+            let mut action_host_view = unsafe {
+                Tensor::from_blob(
+                    cpu_step_batch.actions_f32.as_ptr() as *const u8,
+                    &[rollout.nprocs, ACTION_COUNT],
+                    &[],
+                    Kind::Float,
+                    Device::Cpu,
+                )
+            };
+            let _ = action_host_view.copy_(&target_weights.to_kind(Kind::Float));
             env.step_from_actions_f32_into(
                 &mut cpu_step_batch,
                 &mut step_deltas,
@@ -896,10 +903,6 @@ pub async fn train(
                         sub_value_logits.push(output.0);
                         sub_action_mean.push(output.1);
                         sub_action_std.push(output.2);
-                        // Upcast cached state back to Float (weight dtype) while
-                        // preserving the autograd graph, mirroring the pre-refactor
-                        // per-step `+ 0.0` dtype-promotion trick.
-                        trading_model.upcast_stream_state_inplace(&mut chunk_state);
                         global_pos += 1;
                     }
 

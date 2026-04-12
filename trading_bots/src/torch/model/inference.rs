@@ -19,86 +19,48 @@ impl StreamState {
         self.uniform_prefix_k.clear();
         self.uniform_prefix_v.clear();
         self.uniform_cached_static_features = None;
+        self.uniform_cached_exo_tokens = None;
         self.initialized = false;
     }
 }
 
 impl TradingModel {
+    fn ensure_stream_cache_kind(
+        &self,
+        state: &mut StreamState,
+        hidden: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+    ) {
+        if state.uniform_layer0_prefix_hidden.kind() != hidden.kind() {
+            state.uniform_layer0_prefix_hidden =
+                state.uniform_layer0_prefix_hidden.to_kind(hidden.kind());
+        }
+        if state.uniform_layer0_prefix_k.kind() != k.kind() {
+            state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.to_kind(k.kind());
+        }
+        if state.uniform_layer0_prefix_v.kind() != v.kind() {
+            state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.to_kind(v.kind());
+        }
+    }
+
     pub fn detach_stream_state(&self, state: &mut StreamState) {
         if self.variant != super::ModelVariant::Uniform256Stream {
             return;
         }
-        // Detach AND upcast to Float. Under autocast the cached state becomes Half,
-        // and downstream model ops (some non-autocast-eligible linears) expect Float
-        // inputs against Float weights. The pre-refactor `+ 0.0` trick implicitly
-        // upcast via f64 scalar promotion; preserve that contract here.
-        let target = self.patch_embed_weight.kind();
-        state.uniform_layout = state.uniform_layout.detach().to_kind(target);
-        state.uniform_patch_tokens = state.uniform_patch_tokens.detach().to_kind(target);
-        state.uniform_layer0_prefix_hidden =
-            state.uniform_layer0_prefix_hidden.detach().to_kind(target);
-        state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach().to_kind(target);
-        state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach().to_kind(target);
-        state.uniform_prefix_k = state
-            .uniform_prefix_k
-            .iter()
-            .map(|t| t.detach().to_kind(target))
-            .collect();
-        state.uniform_prefix_v = state
-            .uniform_prefix_v
-            .iter()
-            .map(|t| t.detach().to_kind(target))
-            .collect();
+        state.uniform_layout = state.uniform_layout.detach();
+        state.uniform_patch_tokens = state.uniform_patch_tokens.detach();
+        state.uniform_layer0_prefix_hidden = state.uniform_layer0_prefix_hidden.detach();
+        state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach();
+        state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach();
+        state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t.detach()).collect();
+        state.uniform_prefix_v = state.uniform_prefix_v.iter().map(|t| t.detach()).collect();
         state.uniform_cached_static_features = state
             .uniform_cached_static_features
             .as_ref()
-            .map(|t| t.detach().to_kind(target));
-    }
-
-    /// Upcast the float-valued cached stream-state tensors back to the weight dtype
-    /// (Float32) without breaking the autograd graph. Mirrors the pre-refactor
-    /// per-step `+ 0.0` trick, which implicitly promoted Half -> Float via f64
-    /// Scalar type promotion. Needed inside a training sub-chunk because autocast
-    /// causes model forward outputs (written into cached state) to be Half, while
-    /// some subsequent ops (fused rmsnorm, eager-mode linears reached via paths
-    /// that escape autocast dispatch) require Float inputs.
-    pub fn upcast_stream_state_inplace(&self, state: &mut StreamState) {
-        if self.variant != super::ModelVariant::Uniform256Stream {
-            return;
-        }
-        let target = self.patch_embed_weight.kind();
-        if state.uniform_layout.kind() != target {
-            state.uniform_layout = state.uniform_layout.to_kind(target);
-        }
-        if state.uniform_patch_tokens.kind() != target {
-            state.uniform_patch_tokens = state.uniform_patch_tokens.to_kind(target);
-        }
-        if state.uniform_layer0_prefix_hidden.kind() != target {
-            state.uniform_layer0_prefix_hidden = state.uniform_layer0_prefix_hidden.to_kind(target);
-        }
-        if state.uniform_layer0_prefix_k.kind() != target {
-            state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.to_kind(target);
-        }
-        if state.uniform_layer0_prefix_v.kind() != target {
-            state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.to_kind(target);
-        }
-        if state.uniform_prefix_k.iter().any(|t| t.kind() != target) {
-            state.uniform_prefix_k = state
-                .uniform_prefix_k
-                .iter()
-                .map(|t| t.to_kind(target))
-                .collect();
-            state.uniform_prefix_v = state
-                .uniform_prefix_v
-                .iter()
-                .map(|t| t.to_kind(target))
-                .collect();
-        }
-        if let Some(t) = state.uniform_cached_static_features.as_ref() {
-            if t.kind() != target {
-                state.uniform_cached_static_features = Some(t.to_kind(target));
-            }
-        }
+            .map(|t| t.detach());
+        state.uniform_cached_exo_tokens =
+            state.uniform_cached_exo_tokens.as_ref().map(|t| t.detach());
     }
 
     fn recompute_live_token(&self, state: &StreamState) -> Tensor {
@@ -128,6 +90,7 @@ impl TradingModel {
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
         state.uniform_cached_static_features = None;
+        state.uniform_cached_exo_tokens = None;
     }
 
     fn prefill_uniform_prefix_base_cache_indexed(&self, state: &mut StreamState, row_idx: &Tensor) {
@@ -138,22 +101,18 @@ impl TradingModel {
         );
         let x = self.input_ln.forward(&x);
         let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x, &self.rope);
+        let k = k.index_select(1, &self.gqa_kv_head_index);
+        let v = v.index_select(1, &self.gqa_kv_head_index);
+        self.ensure_stream_cache_kind(state, &x_next, &k, &v);
         state.uniform_layer0_prefix_hidden = state
             .uniform_layer0_prefix_hidden
             .index_copy(0, row_idx, &x_next);
-        state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.index_copy(
-            0,
-            row_idx,
-            &k.index_select(1, &self.gqa_kv_head_index),
-        );
-        state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.index_copy(
-            0,
-            row_idx,
-            &v.index_select(1, &self.gqa_kv_head_index),
-        );
+        state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.index_copy(0, row_idx, &k);
+        state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.index_copy(0, row_idx, &v);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
         state.uniform_cached_static_features = None;
+        state.uniform_cached_exo_tokens = None;
     }
 
     fn conditioned_prefix_cache_is_fresh(
@@ -163,6 +122,7 @@ impl TradingModel {
     ) -> bool {
         state.uniform_prefix_k.len() == self.gqa_layers.len()
             && state.uniform_prefix_v.len() == self.gqa_layers.len()
+            && state.uniform_cached_exo_tokens.is_some()
             && state
                 .uniform_cached_static_features
                 .as_ref()
@@ -192,6 +152,7 @@ impl TradingModel {
             x = x_next;
         }
         state.uniform_cached_static_features = Some(static_features.shallow_clone());
+        state.uniform_cached_exo_tokens = Some(exo_tokens.shallow_clone());
     }
 
     fn uniform_stream_cached_forward(
@@ -199,13 +160,19 @@ impl TradingModel {
         static_features: &Tensor,
         state: &mut StreamState,
     ) -> ModelOutput {
-        self.upcast_stream_state_inplace(state);
         let batch_size = state.uniform_live_fill.size()[0];
-        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
-        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
-        if !self.conditioned_prefix_cache_is_fresh(static_features, state) {
+        let exo_tokens = if self.conditioned_prefix_cache_is_fresh(static_features, state) {
+            state
+                .uniform_cached_exo_tokens
+                .as_ref()
+                .unwrap()
+                .shallow_clone()
+        } else {
+            let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
+            let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
             self.rebuild_uniform_conditioned_prefix_cache(static_features, &exo_tokens, state);
-        }
+            exo_tokens
+        };
         let batch_tokens = batch_size * TICKERS_COUNT;
         let live_token =
             state
@@ -535,6 +502,7 @@ impl TradingModel {
             uniform_prefix_k: Vec::new(),
             uniform_prefix_v: Vec::new(),
             uniform_cached_static_features: None,
+            uniform_cached_exo_tokens: None,
             initialized: false,
         }
     }
@@ -599,6 +567,7 @@ impl TradingModel {
             uniform_prefix_k: Vec::new(),
             uniform_prefix_v: Vec::new(),
             uniform_cached_static_features: None,
+            uniform_cached_exo_tokens: None,
             initialized: false,
         }
     }
@@ -650,8 +619,6 @@ impl TradingModel {
                 return self.init_from_full_on_device(&new_deltas, &static_features, state);
             }
 
-            self.upcast_stream_state_inplace(state);
-
             let new_deltas = if new_deltas.dim() == 1 {
                 new_deltas.unsqueeze(0)
             } else {
@@ -670,7 +637,11 @@ impl TradingModel {
             let flat_layout = state
                 .uniform_layout
                 .view([rows, super::UNIFORM_STREAM_LAYOUT_LEN]);
-            let shifted_valid = flat_layout.narrow(1, 1, history_len - 1).shallow_clone();
+            let mut shifted_valid = Tensor::zeros(
+                [rows, history_len - 1],
+                (flat_layout.kind(), flat_layout.device()),
+            );
+            let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
             let _ = flat_layout
                 .narrow(1, 0, history_len - 1)
                 .copy_(&shifted_valid);

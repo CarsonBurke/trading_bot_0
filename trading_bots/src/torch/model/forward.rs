@@ -136,7 +136,7 @@ static DEBUG_INITIALIZED: AtomicBool = AtomicBool::new(false);
 fn is_debug_enabled() -> bool {
     if !DEBUG_INITIALIZED.load(Ordering::Relaxed) {
         let enabled = crate::torch::ppo::DEBUG_NUMERICS
-            || env::var("MAMBA_FUSED_DEBUG").ok().as_deref() == Some("1");
+            || env::var("MODEL_FUSED_DEBUG").ok().as_deref() == Some("1");
         DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
         DEBUG_INITIALIZED.store(true, Ordering::Relaxed);
     }
