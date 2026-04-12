@@ -74,8 +74,9 @@ impl EndogenousTickerBlock {
             false,
         )
         .squeeze_dim(1)
-        .apply(&self.ticker_out)
-        .reshape([batch, num_items, model_dim]);
+        .reshape([batch * num_items, model_dim]);
+        let ctx =
+            linear_with_same_dtype(&ctx, &self.ticker_out).reshape([batch, num_items, model_dim]);
         let x = x + self.ticker_out_ln.forward(&ctx);
         let mlp = swiglu_linear(
             &self.mlp_ln.forward_linear(&x, &self.mlp_fc1),
@@ -217,7 +218,9 @@ impl GqaBlock {
         .permute([0, 2, 1, 3])
         .contiguous()
         .reshape([b, s, _d]);
-        let out = self.attn_out_ln.forward(&out.apply(&self.attn_out));
+        let out = self
+            .attn_out_ln
+            .forward(&linear_with_same_dtype(&out, &self.attn_out));
         self.apply_ffn(&(x + out))
     }
 
@@ -271,7 +274,9 @@ impl GqaBlock {
         .permute([0, 2, 1, 3])
         .contiguous()
         .reshape(x.size());
-        let x = x + self.attn_out_ln.forward(&out.apply(&self.attn_out));
+        let x = x + self
+            .attn_out_ln
+            .forward(&linear_with_same_dtype(&out, &self.attn_out));
         (self.apply_ffn(&x), k, v)
     }
 
@@ -302,7 +307,10 @@ impl GqaBlock {
         .permute([0, 2, 1, 3])
         .contiguous()
         .reshape(x_suffix.size());
-        let x = x_suffix + self.attn_out_ln.forward(&out.apply(&self.attn_out));
+        let x = x_suffix
+            + self
+                .attn_out_ln
+                .forward(&linear_with_same_dtype(&out, &self.attn_out));
         self.apply_ffn(&x)
     }
 }
@@ -350,13 +358,11 @@ impl ExogenousTickerBlock {
             .permute([0, 2, 1, 3]);
         let q = self.q_norm.forward(&q);
         let exo_len = exo_kv.size()[1];
-        let k = exo_kv
-            .apply(&self.k_proj)
+        let k = linear_with_same_dtype(exo_kv, &self.k_proj)
             .reshape([b, exo_len, CA_NUM_HEADS, CA_HEAD_DIM])
             .permute([0, 2, 1, 3]);
         let k = self.k_norm.forward(&k);
-        let v = exo_kv
-            .apply(&self.v_proj)
+        let v = linear_with_same_dtype(exo_kv, &self.v_proj)
             .reshape([b, exo_len, CA_NUM_HEADS, CA_HEAD_DIM])
             .permute([0, 2, 1, 3]);
         let out = Tensor::scaled_dot_product_attention(
@@ -371,8 +377,8 @@ impl ExogenousTickerBlock {
         )
         .permute([0, 2, 1, 3])
         .contiguous()
-        .reshape([b, s, CA_NUM_HEADS * CA_HEAD_DIM])
-        .apply(&self.out_proj);
+        .reshape([b, s, CA_NUM_HEADS * CA_HEAD_DIM]);
+        let out = linear_with_same_dtype(&out, &self.out_proj);
         x + self.out_ln.forward(&out)
     }
 }
@@ -399,31 +405,32 @@ impl ExoMLP {
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let h = self
-            .in_ln
-            .forward_linear(x, &self.fc1)
-            .silu()
-            .apply(&self.fc2);
+        let h = self.in_ln.forward_linear(x, &self.fc1).silu();
+        let h = linear_with_same_dtype(&h, &self.fc2);
         x + self.out_ln.forward(&h)
     }
+}
+
+pub(super) fn linear_with_same_dtype(x: &Tensor, linear: &nn::Linear) -> Tensor {
+    let weight = if linear.ws.kind() == x.kind() {
+        linear.ws.shallow_clone()
+    } else {
+        linear.ws.to_kind(x.kind())
+    };
+    let bias = linear.bs.as_ref().map(|b| {
+        if b.kind() == x.kind() {
+            b.shallow_clone()
+        } else {
+            b.to_kind(x.kind())
+        }
+    });
+    x.linear(&weight, bias.as_ref())
 }
 
 fn swiglu_linear(x: &Tensor, out_proj: &nn::Linear) -> Tensor {
     let parts = x.chunk(2, -1);
     let gated = parts[0].silu() * &parts[1];
-    let weight = if out_proj.ws.kind() == gated.kind() {
-        out_proj.ws.shallow_clone()
-    } else {
-        out_proj.ws.to_kind(gated.kind())
-    };
-    let bias = out_proj.bs.as_ref().map(|b| {
-        if b.kind() == gated.kind() {
-            b.shallow_clone()
-        } else {
-            b.to_kind(gated.kind())
-        }
-    });
-    gated.linear(&weight, bias.as_ref())
+    linear_with_same_dtype(&gated, out_proj)
 }
 
 fn xavier_normal_std(in_features: i64, out_features: i64) -> f64 {
@@ -1160,7 +1167,7 @@ impl TradingModel {
             ],
             -1,
         ); // [batch, patch_size + 1]
-        input.apply(&self.patch_stream_proj)
+        linear_with_same_dtype(&input, &self.patch_stream_proj)
     }
 
     fn patch_embed_stream(&self, deltas: &Tensor) -> Tensor {

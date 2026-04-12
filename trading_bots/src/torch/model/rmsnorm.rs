@@ -25,19 +25,7 @@ impl RMSNorm {
 
     pub(super) fn forward_linear(&self, x: &Tensor, linear: &Linear) -> Tensor {
         let x = self.forward(x);
-        let weight = if linear.ws.kind() == x.kind() {
-            linear.ws.shallow_clone()
-        } else {
-            linear.ws.to_kind(x.kind())
-        };
-        let bias = linear.bs.as_ref().map(|b| {
-            if b.kind() == x.kind() {
-                b.shallow_clone()
-            } else {
-                b.to_kind(x.kind())
-            }
-        });
-        x.linear(&weight, bias.as_ref())
+        super::linear_with_same_dtype(&x, linear)
     }
 
     pub(super) fn weight(&self) -> &Tensor {

@@ -1,6 +1,8 @@
 use tch::{Kind, Tensor};
 
-use super::{DebugMetrics, ModelOutput, TradingModel, LOG_STD_MAX, LOG_STD_MIN};
+use super::{
+    linear_with_same_dtype, DebugMetrics, ModelOutput, TradingModel, LOG_STD_MAX, LOG_STD_MIN,
+};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
@@ -13,11 +15,8 @@ impl TradingModel {
         let actor_cls = x_time.select(2, 1);
         let critic_cls = x_time.select(2, 2);
 
-        let policy_mean_log_var = actor_cls.apply(&self.policy_mean_log_var).sum_dim_intlist(
-            [1].as_slice(),
-            false,
-            Kind::Float,
-        );
+        let policy_mean_log_var = linear_with_same_dtype(&actor_cls, &self.policy_mean_log_var)
+            .sum_dim_intlist([1].as_slice(), false, Kind::Float);
         let action_mean = policy_mean_log_var.narrow(1, 0, policy_mean_log_var.size()[1] / 2);
         let action_log_var = policy_mean_log_var.narrow(
             1,
@@ -28,9 +27,10 @@ impl TradingModel {
             .clamp(2.0 * LOG_STD_MIN, 2.0 * LOG_STD_MAX)
             .g_mul_scalar(0.5)
             .exp();
-        let value_logits = critic_cls
-            .reshape([batch_size, TICKERS_COUNT * self.model_dim])
-            .apply(&self.value_proj);
+        let value_logits = linear_with_same_dtype(
+            &critic_cls.reshape([batch_size, TICKERS_COUNT * self.model_dim]),
+            &self.value_proj,
+        );
         (
             value_logits.to_kind(Kind::Float),
             action_mean.to_kind(Kind::Float),
@@ -49,11 +49,8 @@ impl TradingModel {
         let actor_cls = x_time.select(2, temporal_len - 3);
         let critic_cls = x_time.select(2, temporal_len - 2);
 
-        let policy_mean_log_var = actor_cls.apply(&self.policy_mean_log_var).sum_dim_intlist(
-            [1].as_slice(),
-            false,
-            Kind::Float,
-        );
+        let policy_mean_log_var = linear_with_same_dtype(&actor_cls, &self.policy_mean_log_var)
+            .sum_dim_intlist([1].as_slice(), false, Kind::Float);
         let action_mean = policy_mean_log_var.narrow(1, 0, policy_mean_log_var.size()[1] / 2);
         let action_log_var = policy_mean_log_var.narrow(
             1,
@@ -66,9 +63,10 @@ impl TradingModel {
             .exp();
 
         // Value logits: [batch, NUM_BINS] for two-hot distributional critic
-        let value_logits = critic_cls
-            .reshape([batch_size, TICKERS_COUNT * self.model_dim])
-            .apply(&self.value_proj);
+        let value_logits = linear_with_same_dtype(
+            &critic_cls.reshape([batch_size, TICKERS_COUNT * self.model_dim]),
+            &self.value_proj,
+        );
 
         let value_logits = value_logits.to_kind(Kind::Float);
         let action_mean = action_mean.to_kind(Kind::Float);
