@@ -37,6 +37,9 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = ModelVariant::Uniform256Stream)]
         model_size: ModelVariant,
 
+        #[arg(long, default_value_t = false)]
+        xsa_temporal: bool,
+
         #[arg(long)]
         run: Option<String>,
     },
@@ -61,6 +64,9 @@ enum Commands {
 
         #[arg(long, value_enum, default_value_t = ModelVariant::Uniform256Stream)]
         model_size: ModelVariant,
+
+        #[arg(long, default_value_t = false)]
+        xsa_temporal: bool,
     },
     Paper {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
@@ -80,6 +86,9 @@ enum Commands {
 
         #[arg(long, value_enum, default_value_t = ModelVariant::Uniform256Stream)]
         model_size: ModelVariant,
+
+        #[arg(long, default_value_t = false)]
+        xsa_temporal: bool,
     },
 }
 
@@ -93,9 +102,10 @@ async fn main() {
         Some(Commands::Train {
             weights,
             model_size,
+            xsa_temporal,
             run,
         }) => {
-            torch::ppo::train(weights.as_deref(), *model_size, run.clone()).await;
+            torch::ppo::train(weights.as_deref(), *model_size, *xsa_temporal, run.clone()).await;
         }
         Some(Commands::Infer {
             weights,
@@ -105,6 +115,7 @@ async fn main() {
             tickers,
             random_start,
             model_size,
+            xsa_temporal,
         }) => {
             torch::infer::run_inference(
                 weights,
@@ -114,6 +125,7 @@ async fn main() {
                 tickers.clone(),
                 *random_start,
                 *model_size,
+                *xsa_temporal,
             )
             .expect("inference failed");
         }
@@ -124,6 +136,7 @@ async fn main() {
             max_steps,
             temperature,
             model_size,
+            xsa_temporal,
         }) => {
             torch::ibkr_infer::run_ibkr_paper_trading(
                 weights,
@@ -132,11 +145,12 @@ async fn main() {
                 *max_steps,
                 *temperature,
                 *model_size,
+                *xsa_temporal,
             )
             .expect("paper trading failed");
         }
         None => {
-            torch::ppo::train(None, ModelVariant::Uniform256Stream, None).await;
+            torch::ppo::train(None, ModelVariant::Uniform256Stream, false, None).await;
         }
     }
 

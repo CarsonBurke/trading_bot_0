@@ -146,10 +146,11 @@ struct GqaBlock {
     ffn_fc2: nn::Linear,
     ffn_out_ln: RMSNorm,
     uniform_suffix_attn_mask: Tensor,
+    xsa_temporal: bool,
 }
 
 impl GqaBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64, xsa_temporal: bool) -> Self {
         let head_dim = model_dim / GQA_NUM_Q_HEADS;
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
         let qkv_dim = model_dim + 2 * kv_dim;
@@ -197,7 +198,26 @@ impl GqaBlock {
             ffn_fc2,
             ffn_out_ln,
             uniform_suffix_attn_mask,
+            xsa_temporal,
         }
+    }
+
+    fn maybe_apply_xsa(&self, attn_out: &Tensor, self_v: &Tensor) -> Tensor {
+        if !self.xsa_temporal {
+            return attn_out.shallow_clone();
+        }
+
+        let self_v_dir = self_v
+            / self_v
+                .to_kind(Kind::Float)
+                .square()
+                .sum_dim_intlist([-1].as_slice(), true, Kind::Float)
+                .clamp_min(1e-6)
+                .sqrt()
+                .to_kind(self_v.kind());
+        attn_out
+            - (attn_out * &self_v_dir).sum_dim_intlist([-1].as_slice(), true, attn_out.kind())
+                * self_v_dir
     }
 
     fn forward(&self, x: &Tensor, rope: &RotaryEmbedding, causal: bool) -> Tensor {
@@ -214,10 +234,12 @@ impl GqaBlock {
             causal,
             None,
             true,
-        )
-        .permute([0, 2, 1, 3])
-        .contiguous()
-        .reshape([b, s, _d]);
+        );
+        let out = self
+            .maybe_apply_xsa(&out, &v)
+            .permute([0, 2, 1, 3])
+            .contiguous()
+            .reshape([b, s, _d]);
         let out = self
             .attn_out_ln
             .forward(&linear_with_same_dtype(&out, &self.attn_out));
@@ -270,10 +292,12 @@ impl GqaBlock {
             true,
             None,
             true,
-        )
-        .permute([0, 2, 1, 3])
-        .contiguous()
-        .reshape(x.size());
+        );
+        let out = self
+            .maybe_apply_xsa(&out, &v)
+            .permute([0, 2, 1, 3])
+            .contiguous()
+            .reshape(x.size());
         let x = x + self
             .attn_out_ln
             .forward(&linear_with_same_dtype(&out, &self.attn_out));
@@ -303,10 +327,12 @@ impl GqaBlock {
             false,
             None,
             false,
-        )
-        .permute([0, 2, 1, 3])
-        .contiguous()
-        .reshape(x_suffix.size());
+        );
+        let out = self
+            .maybe_apply_xsa(&out, &suffix_v)
+            .permute([0, 2, 1, 3])
+            .contiguous()
+            .reshape(x_suffix.size());
         let x = x_suffix
             + self
                 .attn_out_ln
@@ -631,12 +657,14 @@ pub struct DebugMetrics {
 #[derive(Clone, Copy)]
 pub struct TradingModelConfig {
     pub variant: ModelVariant,
+    pub xsa_temporal: bool,
 }
 
 impl Default for TradingModelConfig {
     fn default() -> Self {
         Self {
             variant: ModelVariant::Base,
+            xsa_temporal: false,
         }
     }
 }
@@ -705,6 +733,7 @@ pub struct TradingModel {
     endogenous_ticker_block: EndogenousTickerBlock,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
+    xsa_temporal: bool,
     device: tch::Device,
 }
 
@@ -743,6 +772,10 @@ impl TradingModel {
 
     pub fn variant(&self) -> ModelVariant {
         self.variant
+    }
+
+    pub fn xsa_temporal(&self) -> bool {
+        self.xsa_temporal
     }
 
     pub fn patch_seq_len(&self) -> i64 {
@@ -866,6 +899,7 @@ impl TradingModel {
                     spec.model_dim,
                     spec.ff_dim,
                     init_scale,
+                    config.xsa_temporal,
                 )
             })
             .collect::<Vec<_>>();
@@ -974,6 +1008,7 @@ impl TradingModel {
             endogenous_ticker_block,
             policy_mean_log_var,
             value_proj,
+            xsa_temporal: config.xsa_temporal,
             device: p.device(),
         }
     }

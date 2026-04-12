@@ -282,12 +282,14 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     max_steps: usize,
     _temperature: f64,
     model_variant: ModelVariant,
+    xsa_temporal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== IBKR Paper Trading ===");
     println!("Weight path: {:?}", weight_path.as_ref());
     println!("Symbols: {:?}", symbols);
     println!("Update interval: {}s", update_interval_secs);
     println!("Max steps: {}", max_steps);
+    println!("Temporal XSA: {}", xsa_temporal);
 
     let client = Client::connect(api::CONNECTION_URL, 100)?;
     println!("Connected to IBKR");
@@ -336,7 +338,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     drop(account_subscription);
 
     let device = Device::cuda_if_available();
-    let (_vs, model) = load_model(weight_path, device, model_variant)?;
+    let (_vs, model) = load_model(weight_path, device, model_variant, xsa_temporal)?;
     let mut stream_state = model.init_stream_state();
 
     let ticker_count = symbols.len();

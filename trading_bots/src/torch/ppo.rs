@@ -277,6 +277,7 @@ fn compute_action_std_stats(
 pub async fn train(
     weights_path: Option<&str>,
     model_variant: ModelVariant,
+    xsa_temporal: bool,
     run_name: Option<String>,
 ) {
     let rollout = rollout_geometry();
@@ -310,6 +311,7 @@ pub async fn train(
     let device = tch::Device::cuda_if_available();
     println!("device is cuda: {}", device.is_cuda());
     configure_cuda();
+    println!("temporal xsa: {}", xsa_temporal);
     println!(
         "ppo rollout geometry: nprocs={} seq_len={} total_samples={} chunk_len={} sub_chunk_len={}",
         rollout.nprocs,
@@ -323,6 +325,7 @@ pub async fn train(
         &vs.root(),
         TradingModelConfig {
             variant: model_variant,
+            xsa_temporal,
             ..TradingModelConfig::default()
         },
     );
