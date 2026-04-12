@@ -44,17 +44,11 @@ pub fn transformed_action_log_prob_entropy_and_var(
     let var = std.pow_tensor_scalar(2);
     let log_std = std.log();
     let mahal = diff.pow_tensor_scalar(2) / &var;
-    let gaussian = (-(mahal + log_2pi) * 0.5 - &log_std).sum_dim_intlist(
-        [-1].as_slice(),
-        false,
-        Kind::Float,
-    );
+    let gaussian =
+        (-(mahal + log_2pi) * 0.5 - &log_std).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
     let log_prob = gaussian - sigmoid_log_det(latent);
-    let entropy = (&log_std + 0.5 * (1.0 + log_2pi)).sum_dim_intlist(
-        [-1].as_slice(),
-        false,
-        Kind::Float,
-    );
+    let entropy =
+        (&log_std + 0.5 * (1.0 + log_2pi)).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
     (log_prob, entropy, var)
 }
 

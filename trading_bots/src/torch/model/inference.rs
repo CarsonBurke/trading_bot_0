@@ -131,14 +131,16 @@ impl TradingModel {
     }
 
     fn prefill_uniform_prefix_base_cache_indexed(&self, state: &mut StreamState, row_idx: &Tensor) {
-        let x = state
-            .uniform_patch_tokens
-            .index_select(0, row_idx)
-            .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
+        let x = state.uniform_patch_tokens.index_select(0, row_idx).narrow(
+            1,
+            0,
+            super::UNIFORM_STREAM_PATCH_COUNT - 1,
+        );
         let x = self.input_ln.forward(&x);
         let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x, &self.rope);
-        state.uniform_layer0_prefix_hidden =
-            state.uniform_layer0_prefix_hidden.index_copy(0, row_idx, &x_next);
+        state.uniform_layer0_prefix_hidden = state
+            .uniform_layer0_prefix_hidden
+            .index_copy(0, row_idx, &x_next);
         state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.index_copy(
             0,
             row_idx,
