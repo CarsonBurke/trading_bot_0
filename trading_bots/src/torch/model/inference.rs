@@ -16,6 +16,7 @@ impl StreamState {
         let _ = self.uniform_layer0_prefix_hidden.zero_();
         let _ = self.uniform_layer0_prefix_k.zero_();
         let _ = self.uniform_layer0_prefix_v.zero_();
+        let _ = self.uniform_final_prefix_hidden.zero_();
         self.uniform_prefix_k.clear();
         self.uniform_prefix_v.clear();
         self.uniform_cached_static_features = None;
@@ -53,6 +54,7 @@ impl TradingModel {
         state.uniform_layer0_prefix_hidden = state.uniform_layer0_prefix_hidden.detach();
         state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach();
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach();
+        state.uniform_final_prefix_hidden = state.uniform_final_prefix_hidden.detach();
         state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t.detach()).collect();
         state.uniform_prefix_v = state.uniform_prefix_v.iter().map(|t| t.detach()).collect();
         state.uniform_cached_static_features = state
@@ -89,6 +91,7 @@ impl TradingModel {
         state.uniform_layer0_prefix_v = v.index_select(1, &self.gqa_kv_head_index);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
+        let _ = state.uniform_final_prefix_hidden.zero_();
         state.uniform_cached_static_features = None;
         state.uniform_cached_exo_tokens = None;
     }
@@ -111,6 +114,7 @@ impl TradingModel {
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.index_copy(0, row_idx, &v);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
+        let _ = state.uniform_final_prefix_hidden.zero_();
         state.uniform_cached_static_features = None;
         state.uniform_cached_exo_tokens = None;
     }
@@ -151,6 +155,7 @@ impl TradingModel {
                 .push(v.index_select(1, &self.gqa_kv_head_index));
             x = x_next;
         }
+        state.uniform_final_prefix_hidden = self.final_ln.forward(&x);
         state.uniform_cached_static_features = Some(static_features.shallow_clone());
         state.uniform_cached_exo_tokens = Some(exo_tokens.shallow_clone());
     }
@@ -210,7 +215,14 @@ impl TradingModel {
             }
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
-        self.head_from_uniform_suffix(&x_suffix, batch_size)
+        let prefix_hidden = if state.uniform_final_prefix_hidden.kind() == x_suffix.kind() {
+            state.uniform_final_prefix_hidden.shallow_clone()
+        } else {
+            state.uniform_final_prefix_hidden.to_kind(x_suffix.kind())
+        };
+        let x_suffix = self.final_ln.forward(&x_suffix);
+        let full_tokens = Tensor::cat(&[&prefix_hidden, &x_suffix], 1);
+        self.head_from_uniform_suffix(&full_tokens, batch_size)
     }
 
     pub fn forward_stream_state_on_device(
@@ -498,6 +510,14 @@ impl TradingModel {
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
+            uniform_final_prefix_hidden: Tensor::zeros(
+                [
+                    TICKERS_COUNT,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
             uniform_prefix_k: Vec::new(),
             uniform_prefix_v: Vec::new(),
             uniform_cached_static_features: None,
@@ -560,6 +580,14 @@ impl TradingModel {
                     super::GQA_NUM_KV_HEADS,
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim / super::GQA_NUM_Q_HEADS,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
+            uniform_final_prefix_hidden: Tensor::zeros(
+                [
+                    batch_size * TICKERS_COUNT,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim,
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),

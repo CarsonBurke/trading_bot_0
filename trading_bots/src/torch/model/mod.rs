@@ -437,6 +437,82 @@ impl ExoMLP {
     }
 }
 
+struct PmaReadoutBlock {
+    cross_attn: ExogenousTickerBlock,
+    ffn_ln: RMSNorm,
+    ffn_fc1: nn::Linear,
+    ffn_fc2: nn::Linear,
+    ffn_out_ln: RMSNorm,
+}
+
+impl PmaReadoutBlock {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64) -> Self {
+        let cross_attn = ExogenousTickerBlock {
+            q_proj: linear_truncated(
+                &(p / "cross_attn"),
+                "ca_q",
+                model_dim,
+                CA_NUM_HEADS * CA_HEAD_DIM,
+            ),
+            k_proj: linear_truncated(
+                &(p / "cross_attn"),
+                "ca_k",
+                model_dim,
+                CA_NUM_HEADS * CA_HEAD_DIM,
+            ),
+            v_proj: linear_truncated(
+                &(p / "cross_attn"),
+                "ca_v",
+                model_dim,
+                CA_NUM_HEADS * CA_HEAD_DIM,
+            ),
+            out_proj: nn::linear(
+                (p / "cross_attn") / "ca_out",
+                CA_NUM_HEADS * CA_HEAD_DIM,
+                model_dim,
+                nn::LinearConfig {
+                    ws_init: Init::Const(0.0),
+                    bs_init: Some(Init::Const(0.0)),
+                    bias: true,
+                },
+            ),
+            ln_q: RMSNorm::new(&((p / "cross_attn") / "ln_q"), model_dim, 1e-6),
+            q_norm: RMSNorm::new(&((p / "cross_attn") / "ca_q_norm"), CA_HEAD_DIM, 1e-6),
+            k_norm: RMSNorm::new(&((p / "cross_attn") / "ca_k_norm"), CA_HEAD_DIM, 1e-6),
+            out_ln: RMSNorm::new(&((p / "cross_attn") / "out_ln"), model_dim, 1e-6),
+        };
+        let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
+        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
+        let ffn_fc2 = nn::linear(
+            p / "ffn_fc2",
+            ff_dim,
+            model_dim,
+            nn::LinearConfig {
+                ws_init: Init::Const(0.0),
+                bs_init: Some(Init::Const(0.0)),
+                bias: true,
+            },
+        );
+        let ffn_out_ln = RMSNorm::new(&(p / "ffn_out_ln"), model_dim, 1e-6);
+        Self {
+            cross_attn,
+            ffn_ln,
+            ffn_fc1,
+            ffn_fc2,
+            ffn_out_ln,
+        }
+    }
+
+    fn forward(&self, queries: &Tensor, source: &Tensor) -> Tensor {
+        let x = self.cross_attn.forward(queries, source);
+        let ffn_out = swiglu_linear(
+            &self.ffn_ln.forward_linear(&x, &self.ffn_fc1),
+            &self.ffn_fc2,
+        );
+        x + self.ffn_out_ln.forward(&ffn_out)
+    }
+}
+
 pub(super) fn linear_with_same_dtype(x: &Tensor, linear: &nn::Linear) -> Tensor {
     let weight = if linear.ws.kind() == x.kind() {
         linear.ws.shallow_clone()
@@ -702,6 +778,8 @@ pub struct StreamState {
     pub uniform_prefix_k: Vec<Tensor>,
     /// Per-layer cached prefix V for uniform streamed rollout.
     pub uniform_prefix_v: Vec<Tensor>,
+    /// Final backbone hidden states for the cached uniform-stream prefix.
+    pub uniform_final_prefix_hidden: Tensor,
     /// Static features associated with the currently conditioned prefix cache.
     pub uniform_cached_static_features: Option<Tensor>,
     /// Exogenous tokens associated with the currently conditioned prefix cache.
@@ -721,6 +799,7 @@ pub struct TradingModel {
     patch_stream_proj: nn::Linear,
     gqa_kv_head_index: Tensor,
     input_ln: RMSNorm,
+    final_ln: RMSNorm,
     gqa_layers: Vec<GqaBlock>,
     exogenous_ticker_block: ExogenousTickerBlock,
     exo_mlp: ExoMLP,
@@ -730,6 +809,7 @@ pub struct TradingModel {
     actor_cls_token: Tensor,
     critic_cls_token: Tensor,
     sde_cls_token: Tensor,
+    readout_block: PmaReadoutBlock,
     endogenous_ticker_block: EndogenousTickerBlock,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
@@ -780,6 +860,10 @@ impl TradingModel {
 
     pub fn patch_seq_len(&self) -> i64 {
         self.seq_len
+    }
+
+    fn readout_queries(&self, x: &Tensor) -> Tensor {
+        x.narrow(1, x.size()[1] - NUM_HEAD_CLS_TOKENS, NUM_HEAD_CLS_TOKENS)
     }
 
     fn uniform_stream_layout_from_raw(&self, deltas: &Tensor) -> Tensor {
@@ -878,6 +962,7 @@ impl TradingModel {
             },
         );
         let input_ln = RMSNorm::new(&(p / "input_ln"), spec.model_dim, 1e-6);
+        let final_ln = RMSNorm::new(&(p / "final_ln"), spec.model_dim, 1e-6);
         let gqa_kv_head_index = Tensor::arange(GQA_NUM_KV_HEADS, (Kind::Int64, p.device()));
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
@@ -906,6 +991,12 @@ impl TradingModel {
         let exogenous_ticker_block =
             ExogenousTickerBlock::new(&(p / "cross_attn_0"), spec.model_dim, init_scale);
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
+        let readout_block = PmaReadoutBlock::new(
+            &(p / "pma_readout"),
+            spec.model_dim,
+            spec.ff_dim,
+            init_scale,
+        );
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
         let rope = RotaryEmbedding::new(seq_len + NUM_HEAD_CLS_TOKENS, head_dim, p.device());
         let exo_feat_w = p.var(
@@ -996,6 +1087,7 @@ impl TradingModel {
             patch_stream_proj,
             gqa_kv_head_index,
             input_ln,
+            final_ln,
             gqa_layers,
             exogenous_ticker_block,
             exo_mlp,
@@ -1005,6 +1097,7 @@ impl TradingModel {
             actor_cls_token,
             critic_cls_token,
             sde_cls_token,
+            readout_block,
             endogenous_ticker_block,
             policy_mean_log_var,
             value_proj,
