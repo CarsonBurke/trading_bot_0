@@ -3,10 +3,11 @@
 mod results;
 
 use std::time::Instant;
-use tch::{nn, Device, Kind, Tensor};
+use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
 use trading_bot_0::torch::{
     constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT},
     model::{ModelVariant, TradingModel, TradingModelConfig},
+    muon::{Muon, MuonConfig},
 };
 
 use results::{BenchmarkResult, BenchmarkRun, BenchmarkSuite};
@@ -26,6 +27,7 @@ fn main() {
 
     println!("=== Trading Bot Benchmarks ===\n");
 
+    run_optimizer_benchmarks(&mut suite, device);
     run_model_benchmarks(&mut suite, device);
 
     suite.save().expect("Failed to save benchmark results");
@@ -162,5 +164,89 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
             ));
         }
     }
+    println!();
+}
+
+fn build_bench_mlp(vs: &nn::Path, dim: i64, depth: usize) -> impl Module {
+    let mut seq = nn::seq();
+    for i in 0..depth {
+        seq = seq
+            .add(nn::linear(vs / format!("fc{}", i), dim, dim, Default::default()))
+            .add_fn(|x| x.gelu("none"));
+    }
+    seq.add(nn::linear(vs / "head", dim, 1, Default::default()))
+}
+
+fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
+    println!("--- Optimizer Step Benchmarks (Muon vs AdamW) ---");
+    let dim = 256i64;
+    let depth = 6;
+    let batch = 64i64;
+    let iters = 200;
+    let warmup = 20;
+
+    // --- AdamW ---
+    {
+        let vs = nn::VarStore::new(device);
+        let net = build_bench_mlp(&vs.root(), dim, depth);
+        let mut opt = nn::AdamW::default()
+            .build(&vs, 3e-3)
+            .expect("adamw build");
+        let x = Tensor::randn(&[batch, dim], (Kind::Float, device));
+
+        for _ in 0..warmup {
+            let loss = net.forward(&x).sum(Kind::Float);
+            opt.backward_step(&loss);
+        }
+        sync_device(device);
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let loss = net.forward(&x).sum(Kind::Float);
+            opt.backward_step(&loss);
+        }
+        sync_device(device);
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("  AdamW  fwd+bwd+step: {:.3} ms/iter", ms);
+        suite.add(BenchmarkResult::new(
+            "optim_adamw_fwd_bwd_step",
+            ms,
+            BenchmarkRun { batch, seq_len: dim, dtype: "Float".into() },
+        ));
+    }
+
+    // --- Muon ---
+    {
+        let vs = nn::VarStore::new(device);
+        let net = build_bench_mlp(&vs.root(), dim, depth);
+        let trainable = vs.trainable_variables();
+        let mut muon = Muon::new(&trainable, MuonConfig::default());
+        let x = Tensor::randn(&[batch, dim], (Kind::Float, device));
+
+        for _ in 0..warmup {
+            let loss = net.forward(&x).sum(Kind::Float);
+            loss.backward();
+            muon.step();
+            muon.zero_grad();
+        }
+        sync_device(device);
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let loss = net.forward(&x).sum(Kind::Float);
+            loss.backward();
+            muon.step();
+            muon.zero_grad();
+        }
+        sync_device(device);
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("  Muon   fwd+bwd+step: {:.3} ms/iter", ms);
+        suite.add(BenchmarkResult::new(
+            "optim_muon_fwd_bwd_step",
+            ms,
+            BenchmarkRun { batch, seq_len: dim, dtype: "Float".into() },
+        ));
+    }
+
     println!();
 }
