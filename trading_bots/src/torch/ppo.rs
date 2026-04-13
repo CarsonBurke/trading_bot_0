@@ -21,8 +21,8 @@ const LEARNING_RATE: f64 = 3e-4;
 pub const DEFAULT_NPROCS: i64 = 16;
 const DEFAULT_SEQ_LEN: i64 = 4000;
 const DEFAULT_TOTAL_SAMPLES: i64 = DEFAULT_NPROCS * DEFAULT_SEQ_LEN;
-const DEFAULT_PPO_CHUNK_LEN: i64 = 50;
-const DEFAULT_SUB_CHUNK_LEN: i64 = 25;
+const DEFAULT_PPO_CHUNK_LEN: i64 = 60;
+const DEFAULT_SUB_CHUNK_LEN: i64 = 20;
 const DEFAULT_PPO_MINIBATCH_RATIO: f64 = 0.1;
 const OPTIM_EPOCHS: i64 = 3;
 const PPO_CLIP_LOW: f64 = 0.2;
@@ -1124,10 +1124,11 @@ pub async fn train(
 
             let mean_epoch_kl = epoch_kl_gpu.double_value(&[]) / epoch_kl_count as f64;
             println!(
-                "Epoch {}/{}: KL {:.4}",
+                "Epoch {}/{}: KL {:.4} (last mb {:.4})",
                 _epoch + 1,
                 OPTIM_EPOCHS,
-                mean_epoch_kl
+                mean_epoch_kl,
+                last_minibatch_approx_kl
             );
             if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
                 break 'epoch_loop;
