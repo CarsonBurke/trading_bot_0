@@ -8,10 +8,13 @@ pub mod ibkr_infer;
 pub mod infer;
 pub mod load;
 pub mod model;
+pub mod muon;
 pub mod ppo;
 
 #[cfg(test)]
 mod hl_gauss_tests;
+#[cfg(test)]
+mod muon_tests;
 #[cfg(test)]
 mod ppo_tests;
 #[cfg(test)]
