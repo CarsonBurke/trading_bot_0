@@ -19,39 +19,41 @@ struct EndogenousTickerBlock {
     ticker_ln: RMSNorm,
     ticker_qkv: nn::Linear,
     ticker_out: nn::Linear,
-    ticker_out_ln: RMSNorm,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
+    q_gain: Tensor,
+    attn_scale: Tensor,
+    mlp_scale: Tensor,
     mlp_fc1: nn::Linear,
     mlp_fc2: nn::Linear,
     mlp_ln: RMSNorm,
-    mlp_out_ln: RMSNorm,
 }
 
 impl EndogenousTickerBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, _init_scale: f64) -> Self {
         let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
         let ticker_qkv = linear_truncated(p, "ticker_qkv", model_dim, 3 * model_dim);
-        let ticker_out =
-            linear_residual_out(p, "ticker_out", model_dim, model_dim, 0.1 * init_scale);
-        let ticker_out_ln = RMSNorm::new(&(p / "ticker_out_ln"), model_dim, 1e-6);
+        let ticker_out = linear_residual_out(p, "ticker_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "q_norm"), model_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "k_norm"), model_dim, 1e-6);
-        let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, 2 * ff_dim);
-        let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim, init_scale);
+        let q_gain = p.var("q_gain", &[1], Init::Const(QK_GAIN_INIT));
+        let attn_scale = p.var("attn_scale", &[model_dim], Init::Const(1.0));
+        let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));
+        let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, ff_dim);
+        let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim);
         let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
-        let mlp_out_ln = RMSNorm::new(&(p / "mlp_out_ln"), model_dim, 1e-6);
         Self {
             ticker_ln,
             ticker_qkv,
             ticker_out,
-            ticker_out_ln,
             q_norm,
             k_norm,
+            q_gain,
+            attn_scale,
+            mlp_scale,
             mlp_fc1,
             mlp_fc2,
             mlp_ln,
-            mlp_out_ln,
         }
     }
 
@@ -61,6 +63,7 @@ impl EndogenousTickerBlock {
         let parts = qkv.split(model_dim, -1);
         // QKNorm (single-head, head_dim == model_dim)
         let q = self.q_norm.forward(&parts[0]).unsqueeze(1);
+        let q = &q * self.q_gain.to_kind(q.kind()).view([1, 1, 1, 1]);
         let k = self.k_norm.forward(&parts[1]).unsqueeze(1);
         let v = parts[2].unsqueeze(1);
         let ctx = Tensor::scaled_dot_product_attention(
@@ -77,12 +80,14 @@ impl EndogenousTickerBlock {
         .reshape([batch * num_items, model_dim]);
         let ctx =
             linear_with_same_dtype(&ctx, &self.ticker_out).reshape([batch, num_items, model_dim]);
-        let x = x + self.ticker_out_ln.forward(&ctx);
-        let mlp = swiglu_linear(
+        let ctx = &ctx * self.attn_scale.to_kind(ctx.kind()).view([1, 1, -1]);
+        let x = x + ctx;
+        let mlp = leaky_relu_sq_linear(
             &self.mlp_ln.forward_linear(&x, &self.mlp_fc1),
             &self.mlp_fc2,
         );
-        x + self.mlp_out_ln.forward(&mlp)
+        let mlp = &mlp * self.mlp_scale.to_kind(mlp.kind()).view([1, 1, -1]);
+        x + mlp
     }
 }
 
@@ -90,6 +95,8 @@ const GQA_NUM_Q_HEADS: i64 = 3;
 const GQA_NUM_KV_HEADS: i64 = 3;
 const CA_NUM_HEADS: i64 = 2;
 const CA_HEAD_DIM: i64 = 96; // 192 / 2
+const QK_GAIN_INIT: f64 = 3.0;
+const ROPE_DIMS: i64 = 16;
 
 fn rotate_half(x: &Tensor) -> Tensor {
     let last_dim = *x.size().last().unwrap();
@@ -100,35 +107,42 @@ fn rotate_half(x: &Tensor) -> Tensor {
 }
 
 struct RotaryEmbedding {
-    cos_cached: Tensor, // [max_seq_len, head_dim]
-    sin_cached: Tensor, // [max_seq_len, head_dim]
+    cos_cached: Tensor, // [max_seq_len, rope_dims]
+    sin_cached: Tensor, // [max_seq_len, rope_dims]
+    rope_dims: i64,
 }
 
 impl RotaryEmbedding {
-    fn new(max_seq_len: i64, head_dim: i64, device: tch::Device) -> Self {
-        let half_dim = head_dim / 2;
-        let exponents = Tensor::arange(half_dim, (Kind::Float, device)) * (2.0 / head_dim as f64);
-        let inv_freq = (exponents * -(10000.0_f64.ln())).exp(); // [half_dim]
-        let positions = Tensor::arange(max_seq_len, (Kind::Float, device)); // [max_seq_len]
-        let angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0); // [max_seq_len, half_dim]
+    fn new(max_seq_len: i64, head_dim: i64, rope_dims: i64, device: tch::Device) -> Self {
+        let rd = rope_dims.min(head_dim);
+        let half_rd = rd / 2;
+        let exponents = Tensor::arange(half_rd, (Kind::Float, device)) * (2.0 / rd as f64);
+        let inv_freq = (exponents * -(10000.0_f64.ln())).exp();
+        let positions = Tensor::arange(max_seq_len, (Kind::Float, device));
+        let angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0);
         let cos_half = angles.cos();
         let sin_half = angles.sin();
         Self {
             cos_cached: Tensor::cat(&[&cos_half, &cos_half], -1).set_requires_grad(false),
             sin_cached: Tensor::cat(&[&sin_half, &sin_half], -1).set_requires_grad(false),
+            rope_dims: rd,
         }
-    }
-
-    fn apply(&self, x: &Tensor) -> Tensor {
-        self.apply_from(x, 0)
     }
 
     fn apply_from(&self, x: &Tensor, offset: i64) -> Tensor {
         // x: [batch, heads, seq_len, head_dim]
         let seq_len = x.size()[2];
+        let head_dim = *x.size().last().unwrap();
         let cos = self.cos_cached.narrow(0, offset, seq_len).to_kind(x.kind());
         let sin = self.sin_cached.narrow(0, offset, seq_len).to_kind(x.kind());
-        x * &cos + rotate_half(x) * &sin
+        if self.rope_dims < head_dim {
+            let x_rope = x.narrow(-1, 0, self.rope_dims);
+            let x_pass = x.narrow(-1, self.rope_dims, head_dim - self.rope_dims);
+            let rotated = &x_rope * &cos + rotate_half(&x_rope) * &sin;
+            Tensor::cat(&[&rotated, &x_pass], -1)
+        } else {
+            x * &cos + rotate_half(x) * &sin
+        }
     }
 }
 
@@ -136,34 +150,49 @@ struct GqaBlock {
     attn_ln: RMSNorm,
     attn_qkv: nn::Linear,
     attn_out: nn::Linear,
-    attn_out_ln: RMSNorm,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
+    q_gain: Tensor,
+    attn_scale: Tensor,
+    mlp_scale: Tensor,
     q_dim: i64,
     kv_dim: i64,
+    resid_mix: Tensor,
+    ln_scale_factor: f64,
     ffn_ln: RMSNorm,
     ffn_fc1: nn::Linear,
     ffn_fc2: nn::Linear,
-    ffn_out_ln: RMSNorm,
     uniform_suffix_attn_mask: Tensor,
     xsa_temporal: bool,
 }
 
 impl GqaBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64, xsa_temporal: bool) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, _init_scale: f64, xsa_temporal: bool, layer_idx: usize) -> Self {
         let head_dim = model_dim / GQA_NUM_Q_HEADS;
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
         let qkv_dim = model_dim + 2 * kv_dim;
         let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
         let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
-        let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim, 0.1 * init_scale);
-        let attn_out_ln = RMSNorm::new(&(p / "attn_out_ln"), model_dim, 1e-6);
+        let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "q_norm"), head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "k_norm"), head_dim, 1e-6);
+        let q_gain = p.var("q_gain", &[GQA_NUM_Q_HEADS], Init::Const(QK_GAIN_INIT));
+        let attn_scale = p.var("attn_scale", &[model_dim], Init::Const(1.0));
+        let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));
+        let ln_scale_factor = 1.0 / ((layer_idx + 1) as f64).sqrt();
+        let resid_mix = p.var_copy(
+            "resid_mix",
+            &Tensor::stack(
+                &[
+                    &Tensor::ones([model_dim], (Kind::Float, p.device())),
+                    &Tensor::zeros([model_dim], (Kind::Float, p.device())),
+                ],
+                0,
+            ),
+        );
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
-        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
-        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim, init_scale);
-        let ffn_out_ln = RMSNorm::new(&(p / "ffn_out_ln"), model_dim, 1e-6);
+        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, ff_dim);
+        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
         let uniform_suffix_len = NUM_HEAD_CLS_TOKENS + 1;
         let uniform_prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
         let visible_prefix = Tensor::ones(
@@ -188,15 +217,18 @@ impl GqaBlock {
             attn_ln,
             attn_qkv,
             attn_out,
-            attn_out_ln,
             q_norm,
             k_norm,
+            q_gain,
+            attn_scale,
+            mlp_scale,
             q_dim: model_dim,
             kv_dim,
+            resid_mix,
+            ln_scale_factor,
             ffn_ln,
             ffn_fc1,
             ffn_fc2,
-            ffn_out_ln,
             uniform_suffix_attn_mask,
             xsa_temporal,
         }
@@ -220,10 +252,12 @@ impl GqaBlock {
                 * self_v_dir
     }
 
-    fn forward(&self, x: &Tensor, rope: &RotaryEmbedding, causal: bool) -> Tensor {
+    fn forward(&self, x: &Tensor, x0: &Tensor, rope: &RotaryEmbedding, causal: bool) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
+        let mix = self.resid_mix.to_kind(x.kind());
+        let x = x * mix.get(0).view([1, 1, -1]) + x0 * mix.get(1).view([1, 1, -1]);
 
-        let (q, k, v) = self.project_qkv(x, rope, 0);
+        let (q, k, v) = self.project_qkv(&x, rope, 0);
 
         let out = Tensor::scaled_dot_product_attention(
             &q,
@@ -240,10 +274,9 @@ impl GqaBlock {
             .permute([0, 2, 1, 3])
             .contiguous()
             .reshape([b, s, _d]);
-        let out = self
-            .attn_out_ln
-            .forward(&linear_with_same_dtype(&out, &self.attn_out));
-        self.apply_ffn(&(x + out))
+        let out = linear_with_same_dtype(&out, &self.attn_out);
+        let out = &out * self.attn_scale.to_kind(out.kind()).view([1, 1, -1]);
+        self.apply_ffn(&(&x + out))
     }
 
     fn project_qkv(
@@ -254,7 +287,8 @@ impl GqaBlock {
     ) -> (Tensor, Tensor, Tensor) {
         let (b, s, d) = x.size3().unwrap();
         let head_dim = d / GQA_NUM_Q_HEADS;
-        let qkv = self.attn_ln.forward_linear(x, &self.attn_qkv);
+        let normed = self.attn_ln.forward(x) * self.ln_scale_factor;
+        let qkv = linear_with_same_dtype(&normed, &self.attn_qkv);
         let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
         let q = parts[0]
             .reshape([b, s, GQA_NUM_Q_HEADS, head_dim])
@@ -269,20 +303,26 @@ impl GqaBlock {
         let k = self.k_norm.forward(&k);
         let q = rope.apply_from(&q, rope_offset);
         let k = rope.apply_from(&k, rope_offset);
+        let q = &q * self.q_gain.to_kind(q.kind()).view([1, GQA_NUM_Q_HEADS, 1, 1]);
         (q, k, v)
     }
 
     fn apply_ffn(&self, x: &Tensor) -> Tensor {
-        let ffn_out = swiglu_linear(&self.ffn_ln.forward_linear(x, &self.ffn_fc1), &self.ffn_fc2);
-        x + self.ffn_out_ln.forward(&ffn_out)
+        let normed = self.ffn_ln.forward(x) * self.ln_scale_factor;
+        let ffn_out = leaky_relu_sq_linear(&linear_with_same_dtype(&normed, &self.ffn_fc1), &self.ffn_fc2);
+        let ffn_out = &ffn_out * self.mlp_scale.to_kind(ffn_out.kind()).view([1, 1, -1]);
+        x + ffn_out
     }
 
     fn forward_prefix_and_cache(
         &self,
         x: &Tensor,
+        x0: &Tensor,
         rope: &RotaryEmbedding,
     ) -> (Tensor, Tensor, Tensor) {
-        let (q, k, v) = self.project_qkv(x, rope, 0);
+        let mix = self.resid_mix.to_kind(x.kind());
+        let x = x * mix.get(0).view([1, 1, -1]) + x0 * mix.get(1).view([1, 1, -1]);
+        let (q, k, v) = self.project_qkv(&x, rope, 0);
         let out = Tensor::scaled_dot_product_attention(
             &q,
             &k,
@@ -298,22 +338,26 @@ impl GqaBlock {
             .permute([0, 2, 1, 3])
             .contiguous()
             .reshape(x.size());
-        let x = x + self
-            .attn_out_ln
-            .forward(&linear_with_same_dtype(&out, &self.attn_out));
+        let attn_out = linear_with_same_dtype(&out, &self.attn_out);
+        let attn_out = &attn_out * self.attn_scale.to_kind(attn_out.kind()).view([1, 1, -1]);
+        let x = &x + attn_out;
         (self.apply_ffn(&x), k, v)
     }
 
     fn forward_suffix_with_cache(
         &self,
         x_suffix: &Tensor,
+        x0_suffix: &Tensor,
         prefix_k: &Tensor,
         prefix_v: &Tensor,
         rope: &RotaryEmbedding,
         kv_index: &Tensor,
         prefix_len: i64,
     ) -> Tensor {
-        let (q, suffix_k, suffix_v) = self.project_qkv(x_suffix, rope, prefix_len);
+        let mix = self.resid_mix.to_kind(x_suffix.kind());
+        let x_suffix =
+            x_suffix * mix.get(0).view([1, 1, -1]) + x0_suffix * mix.get(1).view([1, 1, -1]);
+        let (q, suffix_k, suffix_v) = self.project_qkv(&x_suffix, rope, prefix_len);
         let suffix_k = suffix_k.index_select(1, kv_index);
         let suffix_v = suffix_v.index_select(1, kv_index);
         let k = Tensor::cat(&[prefix_k, &suffix_k], 2);
@@ -333,10 +377,9 @@ impl GqaBlock {
             .permute([0, 2, 1, 3])
             .contiguous()
             .reshape(x_suffix.size());
-        let x = x_suffix
-            + self
-                .attn_out_ln
-                .forward(&linear_with_same_dtype(&out, &self.attn_out));
+        let attn_out = linear_with_same_dtype(&out, &self.attn_out);
+        let attn_out = &attn_out * self.attn_scale.to_kind(attn_out.kind()).view([1, 1, -1]);
+        let x = &x_suffix + attn_out;
         self.apply_ffn(&x)
     }
 }
@@ -347,35 +390,55 @@ struct ExogenousTickerBlock {
     v_proj: nn::Linear,
     out_proj: nn::Linear,
     ln_q: RMSNorm,
+    ln_kv: RMSNorm,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
-    out_ln: RMSNorm,
+    q_gain: Tensor,
+    attn_scale: Tensor,
 }
 
 impl ExogenousTickerBlock {
-    fn new(p: &nn::Path, model_dim: i64, init_scale: f64) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, _init_scale: f64) -> Self {
         let ca_dim = CA_NUM_HEADS * CA_HEAD_DIM;
         let ln_q = RMSNorm::new(&(p / "ln_q"), model_dim, 1e-6);
+        let ln_kv = RMSNorm::new(&(p / "ln_kv"), model_dim, 1e-6);
         let q_norm = RMSNorm::new(&(p / "ca_q_norm"), CA_HEAD_DIM, 1e-6);
         let k_norm = RMSNorm::new(&(p / "ca_k_norm"), CA_HEAD_DIM, 1e-6);
+        let q_gain = p.var("ca_q_gain", &[CA_NUM_HEADS], Init::Const(QK_GAIN_INIT));
+        let attn_scale = p.var("ca_attn_scale", &[model_dim], Init::Const(1.0));
         let q_proj = linear_truncated(p, "ca_q", model_dim, ca_dim);
         let k_proj = linear_truncated(p, "ca_k", model_dim, ca_dim);
         let v_proj = linear_truncated(p, "ca_v", model_dim, ca_dim);
-        let out_proj = linear_residual_out(p, "ca_out", ca_dim, model_dim, 0.1 * init_scale);
-        let out_ln = RMSNorm::new(&(p / "out_ln"), model_dim, 1e-6);
+        let out_proj = linear_residual_out(p, "ca_out", ca_dim, model_dim);
         Self {
             q_proj,
             k_proj,
             v_proj,
             out_proj,
             ln_q,
+            ln_kv,
             q_norm,
             k_norm,
-            out_ln,
+            q_gain,
+            attn_scale,
         }
     }
 
-    fn forward(&self, x: &Tensor, exo_kv: &Tensor) -> Tensor {
+    fn project_source(&self, exo_kv: &Tensor) -> (Tensor, Tensor) {
+        let b = exo_kv.size()[0];
+        let exo_kv = self.ln_kv.forward(exo_kv);
+        let exo_len = exo_kv.size()[1];
+        let k = linear_with_same_dtype(&exo_kv, &self.k_proj)
+            .reshape([b, exo_len, CA_NUM_HEADS, CA_HEAD_DIM])
+            .permute([0, 2, 1, 3]);
+        let k = self.k_norm.forward(&k);
+        let v = linear_with_same_dtype(&exo_kv, &self.v_proj)
+            .reshape([b, exo_len, CA_NUM_HEADS, CA_HEAD_DIM])
+            .permute([0, 2, 1, 3]);
+        (k, v)
+    }
+
+    fn forward_with_projected_source(&self, x: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
         let q = self
             .ln_q
@@ -383,18 +446,11 @@ impl ExogenousTickerBlock {
             .reshape([b, s, CA_NUM_HEADS, CA_HEAD_DIM])
             .permute([0, 2, 1, 3]);
         let q = self.q_norm.forward(&q);
-        let exo_len = exo_kv.size()[1];
-        let k = linear_with_same_dtype(exo_kv, &self.k_proj)
-            .reshape([b, exo_len, CA_NUM_HEADS, CA_HEAD_DIM])
-            .permute([0, 2, 1, 3]);
-        let k = self.k_norm.forward(&k);
-        let v = linear_with_same_dtype(exo_kv, &self.v_proj)
-            .reshape([b, exo_len, CA_NUM_HEADS, CA_HEAD_DIM])
-            .permute([0, 2, 1, 3]);
+        let q = &q * self.q_gain.to_kind(q.kind()).view([1, CA_NUM_HEADS, 1, 1]);
         let out = Tensor::scaled_dot_product_attention(
             &q,
-            &k,
-            &v,
+            k,
+            v,
             None::<&Tensor>,
             0.0,
             false,
@@ -405,111 +461,81 @@ impl ExogenousTickerBlock {
         .contiguous()
         .reshape([b, s, CA_NUM_HEADS * CA_HEAD_DIM]);
         let out = linear_with_same_dtype(&out, &self.out_proj);
-        x + self.out_ln.forward(&out)
+        let out = &out * self.attn_scale.to_kind(out.kind()).view([1, 1, -1]);
+        x + out
     }
+
 }
 
 struct ExoMLP {
     in_ln: RMSNorm,
     fc1: nn::Linear,
     fc2: nn::Linear,
-    out_ln: RMSNorm,
 }
 
 impl ExoMLP {
-    fn new(p: &nn::Path, model_dim: i64, init_scale: f64) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, _init_scale: f64) -> Self {
         let in_ln = RMSNorm::new(&(p / "in_ln"), model_dim, 1e-6);
         let fc1 = linear_truncated(p, "exo_mlp_fc1", model_dim, model_dim);
-        let fc2 = linear_residual_out(p, "exo_mlp_fc2", model_dim, model_dim, init_scale);
-        let out_ln = RMSNorm::new(&(p / "out_ln"), model_dim, 1e-6);
-        Self {
-            in_ln,
-            fc1,
-            fc2,
-            out_ln,
-        }
+        let fc2 = linear_residual_out(p, "exo_mlp_fc2", model_dim, model_dim);
+        Self { in_ln, fc1, fc2 }
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
         let h = self.in_ln.forward_linear(x, &self.fc1).silu();
         let h = linear_with_same_dtype(&h, &self.fc2);
-        x + self.out_ln.forward(&h)
+        x + h
     }
 }
 
-struct PmaReadoutBlock {
+struct CrossAttnFfnBlock {
     cross_attn: ExogenousTickerBlock,
     ffn_ln: RMSNorm,
     ffn_fc1: nn::Linear,
     ffn_fc2: nn::Linear,
-    ffn_out_ln: RMSNorm,
+    mlp_scale: Tensor,
 }
 
-impl PmaReadoutBlock {
+impl CrossAttnFfnBlock {
     fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64) -> Self {
-        let cross_attn = ExogenousTickerBlock {
-            q_proj: linear_truncated(
-                &(p / "cross_attn"),
-                "ca_q",
-                model_dim,
-                CA_NUM_HEADS * CA_HEAD_DIM,
-            ),
-            k_proj: linear_truncated(
-                &(p / "cross_attn"),
-                "ca_k",
-                model_dim,
-                CA_NUM_HEADS * CA_HEAD_DIM,
-            ),
-            v_proj: linear_truncated(
-                &(p / "cross_attn"),
-                "ca_v",
-                model_dim,
-                CA_NUM_HEADS * CA_HEAD_DIM,
-            ),
-            out_proj: nn::linear(
-                (p / "cross_attn") / "ca_out",
-                CA_NUM_HEADS * CA_HEAD_DIM,
-                model_dim,
-                nn::LinearConfig {
-                    ws_init: Init::Const(0.0),
-                    bs_init: Some(Init::Const(0.0)),
-                    bias: true,
-                },
-            ),
-            ln_q: RMSNorm::new(&((p / "cross_attn") / "ln_q"), model_dim, 1e-6),
-            q_norm: RMSNorm::new(&((p / "cross_attn") / "ca_q_norm"), CA_HEAD_DIM, 1e-6),
-            k_norm: RMSNorm::new(&((p / "cross_attn") / "ca_k_norm"), CA_HEAD_DIM, 1e-6),
-            out_ln: RMSNorm::new(&((p / "cross_attn") / "out_ln"), model_dim, 1e-6),
-        };
+        let cross_attn = ExogenousTickerBlock::new(&(p / "cross_attn"), model_dim, init_scale);
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
-        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, 2 * ff_dim);
-        let ffn_fc2 = nn::linear(
-            p / "ffn_fc2",
-            ff_dim,
-            model_dim,
-            nn::LinearConfig {
-                ws_init: Init::Const(0.0),
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
-            },
-        );
-        let ffn_out_ln = RMSNorm::new(&(p / "ffn_out_ln"), model_dim, 1e-6);
+        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, ff_dim);
+        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
+        let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));
         Self {
             cross_attn,
             ffn_ln,
             ffn_fc1,
             ffn_fc2,
-            ffn_out_ln,
+            mlp_scale,
         }
     }
 
     fn forward(&self, queries: &Tensor, source: &Tensor) -> Tensor {
-        let x = self.cross_attn.forward(queries, source);
-        let ffn_out = swiglu_linear(
+        let (source_k, source_v) = self.project_source(source);
+        self.forward_with_projected_source(queries, &source_k, &source_v)
+    }
+
+    fn project_source(&self, source: &Tensor) -> (Tensor, Tensor) {
+        self.cross_attn.project_source(source)
+    }
+
+    fn forward_with_projected_source(
+        &self,
+        queries: &Tensor,
+        source_k: &Tensor,
+        source_v: &Tensor,
+    ) -> Tensor {
+        let x = self
+            .cross_attn
+            .forward_with_projected_source(queries, source_k, source_v);
+        let ffn_out = leaky_relu_sq_linear(
             &self.ffn_ln.forward_linear(&x, &self.ffn_fc1),
             &self.ffn_fc2,
         );
-        x + self.ffn_out_ln.forward(&ffn_out)
+        let ffn_out = &ffn_out * self.mlp_scale.to_kind(ffn_out.kind()).view([1, 1, -1]);
+        x + ffn_out
     }
 }
 
@@ -529,10 +555,9 @@ pub(super) fn linear_with_same_dtype(x: &Tensor, linear: &nn::Linear) -> Tensor 
     x.linear(&weight, bias.as_ref())
 }
 
-fn swiglu_linear(x: &Tensor, out_proj: &nn::Linear) -> Tensor {
-    let parts = x.chunk(2, -1);
-    let gated = parts[0].silu() * &parts[1];
-    linear_with_same_dtype(&gated, out_proj)
+fn leaky_relu_sq_linear(x: &Tensor, out_proj: &nn::Linear) -> Tensor {
+    let h = x.maximum(&(x * 0.5)).square();
+    linear_with_same_dtype(&h, out_proj)
 }
 
 fn xavier_normal_std(in_features: i64, out_features: i64) -> f64 {
@@ -556,30 +581,20 @@ fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i6
         in_features,
         out_features,
         nn::LinearConfig {
-            ws_init: truncated_normal_init(in_features, out_features),
+            ws_init: Init::Orthogonal { gain: 1.0 },
             bs_init: Some(Init::Const(0.0)),
             bias: true,
         },
     )
 }
 
-fn linear_residual_out(
-    p: &nn::Path,
-    name: &str,
-    in_features: i64,
-    out_features: i64,
-    scale: f64,
-) -> nn::Linear {
-    let base_std = truncated_normal_std(in_features, out_features);
+fn linear_residual_out(p: &nn::Path, name: &str, in_features: i64, out_features: i64) -> nn::Linear {
     nn::linear(
         p / name,
         in_features,
         out_features,
         nn::LinearConfig {
-            ws_init: Init::Randn {
-                mean: 0.0,
-                stdev: base_std * scale,
-            },
+            ws_init: Init::Const(0.0),
             bs_init: Some(Init::Const(0.0)),
             bias: true,
         },
@@ -587,10 +602,10 @@ fn linear_residual_out(
 }
 
 const BASE_MODEL_DIM: i64 = 192;
-const BASE_FF_DIM: i64 = 768;
+const BASE_FF_DIM: i64 = 384;
 const BASE_GQA_LAYERS: usize = 3;
 const ABLATION_SMALL_MODEL_DIM: i64 = 96;
-const ABLATION_SMALL_FF_DIM: i64 = 384;
+const ABLATION_SMALL_FF_DIM: i64 = 192;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
 const UNIFORM_STREAM_PATCH_COUNT: i64 = 256;
 const UNIFORM_STREAM_PATCH_SIZE: i64 = 34;
@@ -778,8 +793,14 @@ pub struct StreamState {
     pub uniform_prefix_k: Vec<Tensor>,
     /// Per-layer cached prefix V for uniform streamed rollout.
     pub uniform_prefix_v: Vec<Tensor>,
+    /// Prefix x0 embedding (post-input_ln) for x0 residual mixing.
+    pub uniform_prefix_x0: Tensor,
     /// Final backbone hidden states for the cached uniform-stream prefix.
     pub uniform_final_prefix_hidden: Tensor,
+    /// Readout prefix K cache for uniform streamed rollout.
+    pub uniform_readout_prefix_k: Tensor,
+    /// Readout prefix V cache for uniform streamed rollout.
+    pub uniform_readout_prefix_v: Tensor,
     /// Static features associated with the currently conditioned prefix cache.
     pub uniform_cached_static_features: Option<Tensor>,
     /// Exogenous tokens associated with the currently conditioned prefix cache.
@@ -801,15 +822,17 @@ pub struct TradingModel {
     input_ln: RMSNorm,
     final_ln: RMSNorm,
     gqa_layers: Vec<GqaBlock>,
-    exogenous_ticker_block: ExogenousTickerBlock,
+    exogenous_ticker_block: CrossAttnFfnBlock,
     exo_mlp: ExoMLP,
+    exo_embed_ln: RMSNorm,
     rope: RotaryEmbedding,
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
     actor_cls_token: Tensor,
     critic_cls_token: Tensor,
     sde_cls_token: Tensor,
-    readout_block: PmaReadoutBlock,
+    readout_block: CrossAttnFfnBlock,
+    readout_head_ln: RMSNorm,
     endogenous_ticker_block: EndogenousTickerBlock,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
@@ -985,20 +1008,23 @@ impl TradingModel {
                     spec.ff_dim,
                     init_scale,
                     config.xsa_temporal,
+                    i,
                 )
             })
             .collect::<Vec<_>>();
         let exogenous_ticker_block =
-            ExogenousTickerBlock::new(&(p / "cross_attn_0"), spec.model_dim, init_scale);
+            CrossAttnFfnBlock::new(&(p / "cross_attn_0"), spec.model_dim, spec.ff_dim, init_scale);
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
-        let readout_block = PmaReadoutBlock::new(
+        let exo_embed_ln = RMSNorm::new(&(p / "exo_embed_ln"), spec.model_dim, 1e-6);
+        let readout_block = CrossAttnFfnBlock::new(
             &(p / "pma_readout"),
             spec.model_dim,
             spec.ff_dim,
             init_scale,
         );
+        let readout_head_ln = RMSNorm::new(&(p / "readout_head_ln"), spec.model_dim, 1e-6);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
-        let rope = RotaryEmbedding::new(seq_len + NUM_HEAD_CLS_TOKENS, head_dim, p.device());
+        let rope = RotaryEmbedding::new(seq_len + NUM_HEAD_CLS_TOKENS, head_dim, ROPE_DIMS, p.device());
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -1091,6 +1117,7 @@ impl TradingModel {
             gqa_layers,
             exogenous_ticker_block,
             exo_mlp,
+            exo_embed_ln,
             rope,
             exo_feat_w,
             exo_feat_b,
@@ -1098,6 +1125,7 @@ impl TradingModel {
             critic_cls_token,
             sde_cls_token,
             readout_block,
+            readout_head_ln,
             endogenous_ticker_block,
             policy_mean_log_var,
             value_proj,
@@ -1172,7 +1200,7 @@ impl TradingModel {
         batch_size: i64,
     ) -> Tensor {
         let exo_kv = self.build_exo_kv(global_static, per_ticker_static, batch_size);
-        self.exo_mlp.forward(&exo_kv)
+        self.exo_mlp.forward(&self.exo_embed_ln.forward(&exo_kv))
     }
 
     fn patch_latent_stem_on_device(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {

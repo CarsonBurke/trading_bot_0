@@ -18,9 +18,10 @@ impl TradingModel {
         let x_stem = self.patch_latent_stem_on_device(price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
+        let x0 = x_stem.shallow_clone();
         let mut x = x_stem;
         for (i, layer) in self.gqa_layers.iter().enumerate() {
-            x = layer.forward(&x, &self.rope, true);
+            x = layer.forward(&x, &x0, &self.rope, true);
             if i == 0 {
                 x = self.exogenous_ticker_block.forward(&x, &exo_tokens);
             }
@@ -74,10 +75,11 @@ impl TradingModel {
         let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
+        let x0 = x_stem.shallow_clone();
         let mut x = x_stem;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
             debug_fused_layer("x_gqa_in", layer_idx, &x);
-            x = layer.forward(&x, &self.rope, true);
+            x = layer.forward(&x, &x0, &self.rope, true);
             if layer_idx == 0 {
                 x = self.exogenous_ticker_block.forward(&x, &exo_tokens);
             }

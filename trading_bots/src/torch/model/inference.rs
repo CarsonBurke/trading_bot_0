@@ -16,7 +16,10 @@ impl StreamState {
         let _ = self.uniform_layer0_prefix_hidden.zero_();
         let _ = self.uniform_layer0_prefix_k.zero_();
         let _ = self.uniform_layer0_prefix_v.zero_();
+        let _ = self.uniform_prefix_x0.zero_();
         let _ = self.uniform_final_prefix_hidden.zero_();
+        let _ = self.uniform_readout_prefix_k.zero_();
+        let _ = self.uniform_readout_prefix_v.zero_();
         self.uniform_prefix_k.clear();
         self.uniform_prefix_v.clear();
         self.uniform_cached_static_features = None;
@@ -29,10 +32,14 @@ impl TradingModel {
     fn ensure_stream_cache_kind(
         &self,
         state: &mut StreamState,
+        x0: &Tensor,
         hidden: &Tensor,
         k: &Tensor,
         v: &Tensor,
     ) {
+        if state.uniform_prefix_x0.kind() != x0.kind() {
+            state.uniform_prefix_x0 = state.uniform_prefix_x0.to_kind(x0.kind());
+        }
         if state.uniform_layer0_prefix_hidden.kind() != hidden.kind() {
             state.uniform_layer0_prefix_hidden =
                 state.uniform_layer0_prefix_hidden.to_kind(hidden.kind());
@@ -54,7 +61,10 @@ impl TradingModel {
         state.uniform_layer0_prefix_hidden = state.uniform_layer0_prefix_hidden.detach();
         state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach();
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach();
+        state.uniform_prefix_x0 = state.uniform_prefix_x0.detach();
         state.uniform_final_prefix_hidden = state.uniform_final_prefix_hidden.detach();
+        state.uniform_readout_prefix_k = state.uniform_readout_prefix_k.detach();
+        state.uniform_readout_prefix_v = state.uniform_readout_prefix_v.detach();
         state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t.detach()).collect();
         state.uniform_prefix_v = state.uniform_prefix_v.iter().map(|t| t.detach()).collect();
         state.uniform_cached_static_features = state
@@ -84,14 +94,18 @@ impl TradingModel {
             .uniform_patch_tokens
             .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1)
             .shallow_clone();
-        let x = self.input_ln.forward(&x);
-        let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x, &self.rope);
+        let x0 = self.input_ln.forward(&x);
+        let (x_next, k, v) =
+            self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
+        state.uniform_prefix_x0 = x0;
         state.uniform_layer0_prefix_hidden = x_next;
         state.uniform_layer0_prefix_k = k.index_select(1, &self.gqa_kv_head_index);
         state.uniform_layer0_prefix_v = v.index_select(1, &self.gqa_kv_head_index);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
         let _ = state.uniform_final_prefix_hidden.zero_();
+        let _ = state.uniform_readout_prefix_k.zero_();
+        let _ = state.uniform_readout_prefix_v.zero_();
         state.uniform_cached_static_features = None;
         state.uniform_cached_exo_tokens = None;
     }
@@ -102,11 +116,15 @@ impl TradingModel {
             0,
             super::UNIFORM_STREAM_PATCH_COUNT - 1,
         );
-        let x = self.input_ln.forward(&x);
-        let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x, &self.rope);
+        let x0 = self.input_ln.forward(&x);
+        let (x_next, k, v) =
+            self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
         let k = k.index_select(1, &self.gqa_kv_head_index);
         let v = v.index_select(1, &self.gqa_kv_head_index);
-        self.ensure_stream_cache_kind(state, &x_next, &k, &v);
+        self.ensure_stream_cache_kind(state, &x0, &x_next, &k, &v);
+        state.uniform_prefix_x0 = state
+            .uniform_prefix_x0
+            .index_copy(0, row_idx, &x0);
         state.uniform_layer0_prefix_hidden = state
             .uniform_layer0_prefix_hidden
             .index_copy(0, row_idx, &x_next);
@@ -115,6 +133,8 @@ impl TradingModel {
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
         let _ = state.uniform_final_prefix_hidden.zero_();
+        let _ = state.uniform_readout_prefix_k.zero_();
+        let _ = state.uniform_readout_prefix_v.zero_();
         state.uniform_cached_static_features = None;
         state.uniform_cached_exo_tokens = None;
     }
@@ -140,13 +160,14 @@ impl TradingModel {
         exo_tokens: &Tensor,
         state: &mut StreamState,
     ) {
+        let x0 = &state.uniform_prefix_x0;
         let mut x = self
             .exogenous_ticker_block
             .forward(&state.uniform_layer0_prefix_hidden, exo_tokens);
         state.uniform_prefix_k = vec![state.uniform_layer0_prefix_k.shallow_clone()];
         state.uniform_prefix_v = vec![state.uniform_layer0_prefix_v.shallow_clone()];
         for layer in self.gqa_layers.iter().skip(1) {
-            let (x_next, k, v) = layer.forward_prefix_and_cache(&x, &self.rope);
+            let (x_next, k, v) = layer.forward_prefix_and_cache(&x, x0, &self.rope);
             state
                 .uniform_prefix_k
                 .push(k.index_select(1, &self.gqa_kv_head_index));
@@ -156,6 +177,10 @@ impl TradingModel {
             x = x_next;
         }
         state.uniform_final_prefix_hidden = self.final_ln.forward(&x);
+        let (readout_prefix_k, readout_prefix_v) =
+            self.readout_block.project_source(&state.uniform_final_prefix_hidden);
+        state.uniform_readout_prefix_k = readout_prefix_k;
+        state.uniform_readout_prefix_v = readout_prefix_v;
         state.uniform_cached_static_features = Some(static_features.shallow_clone());
         state.uniform_cached_exo_tokens = Some(exo_tokens.shallow_clone());
     }
@@ -196,14 +221,16 @@ impl TradingModel {
             .sde_cls_token
             .to_kind(kind)
             .expand([batch_tokens, 1, self.model_dim], false);
-        let mut x_suffix = self.input_ln.forward(&Tensor::cat(
+        let x0_suffix = self.input_ln.forward(&Tensor::cat(
             &[&live_token, &actor_cls, &critic_cls, &sde_cls],
             1,
         ));
+        let mut x_suffix = x0_suffix.shallow_clone();
         let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
             x_suffix = layer.forward_suffix_with_cache(
                 &x_suffix,
+                &x0_suffix,
                 &state.uniform_prefix_k[layer_idx],
                 &state.uniform_prefix_v[layer_idx],
                 &self.rope,
@@ -215,14 +242,13 @@ impl TradingModel {
             }
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
-        let prefix_hidden = if state.uniform_final_prefix_hidden.kind() == x_suffix.kind() {
-            state.uniform_final_prefix_hidden.shallow_clone()
-        } else {
-            state.uniform_final_prefix_hidden.to_kind(x_suffix.kind())
-        };
         let x_suffix = self.final_ln.forward(&x_suffix);
-        let full_tokens = Tensor::cat(&[&prefix_hidden, &x_suffix], 1);
-        self.head_from_uniform_suffix(&full_tokens, batch_size)
+        self.head_from_uniform_suffix_with_prefix_cache(
+            &x_suffix,
+            batch_size,
+            &state.uniform_readout_prefix_k,
+            &state.uniform_readout_prefix_v,
+        )
     }
 
     pub fn forward_stream_state_on_device(
@@ -510,11 +536,37 @@ impl TradingModel {
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
+            uniform_prefix_x0: Tensor::zeros(
+                [
+                    TICKERS_COUNT,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
             uniform_final_prefix_hidden: Tensor::zeros(
                 [
                     TICKERS_COUNT,
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
+            uniform_readout_prefix_k: Tensor::zeros(
+                [
+                    TICKERS_COUNT,
+                    super::CA_NUM_HEADS,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    super::CA_HEAD_DIM,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
+            uniform_readout_prefix_v: Tensor::zeros(
+                [
+                    TICKERS_COUNT,
+                    super::CA_NUM_HEADS,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    super::CA_HEAD_DIM,
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
@@ -583,11 +635,37 @@ impl TradingModel {
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
+            uniform_prefix_x0: Tensor::zeros(
+                [
+                    batch_size * TICKERS_COUNT,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
             uniform_final_prefix_hidden: Tensor::zeros(
                 [
                     batch_size * TICKERS_COUNT,
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
+            uniform_readout_prefix_k: Tensor::zeros(
+                [
+                    batch_size * TICKERS_COUNT,
+                    super::CA_NUM_HEADS,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    super::CA_HEAD_DIM,
+                ],
+                (self.patch_embed_weight.kind(), self.device),
+            ),
+            uniform_readout_prefix_v: Tensor::zeros(
+                [
+                    batch_size * TICKERS_COUNT,
+                    super::CA_NUM_HEADS,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    super::CA_HEAD_DIM,
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
