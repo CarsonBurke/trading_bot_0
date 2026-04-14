@@ -2,7 +2,7 @@ use rand::seq::SliceRandom;
 use std::env;
 use std::path::Path;
 use std::time::Instant;
-use tch::{autocast, nn, nn::OptimizerConfig, Device, Kind, Tensor};
+use tch::{autocast, nn, Device, Kind, Tensor};
 
 use crate::torch::action_space::{
     sigmoid_target_weight, transformed_action_log_prob, transformed_action_log_prob_entropy_and_var,
@@ -15,8 +15,12 @@ use crate::torch::env::{CpuStepBatch, VecEnv};
 use crate::torch::hl_gauss::HlGaussBins;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelConfig};
+use crate::torch::muon::{Muon, MuonConfig};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
+/// NorMuon LR for 2D weight matrices (orthogonalized updates, RMS-match scaling).
+const MUON_LR: f64 = 2e-3;
+/// AdamW LR for 1D params (biases, norms) and the standalone rho scalar.
 const LEARNING_RATE: f64 = 3e-4;
 pub const DEFAULT_NPROCS: i64 = 16;
 const DEFAULT_SEQ_LEN: i64 = 4000;
@@ -378,12 +382,16 @@ pub async fn train(
     let gens_path = run_dir.gens.to_string_lossy().to_string();
     println!("Run dir: {}", run_dir.root.display());
 
-    let mut opt = nn::AdamW::default()
-        .wd(0.0)
-        .eps(1e-5)
-        .build(&vs, LEARNING_RATE)
-        .expect("failed to build AdamW optimizer");
     let trainable_vars = vs.trainable_variables();
+    let mut opt = Muon::new(
+        &trainable_vars,
+        MuonConfig {
+            lr: MUON_LR,
+            adamw_lr: LEARNING_RATE,
+            adamw_eps: 1e-5,
+            ..MuonConfig::default()
+        },
+    );
 
     let mut env = VecEnv::new(
         true,
@@ -1130,7 +1138,7 @@ pub async fn train(
                 mean_epoch_kl,
                 last_minibatch_approx_kl
             );
-            if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
+            if last_minibatch_approx_kl > TARGET_KL * KL_STOP_MULTIPLIER {
                 break 'epoch_loop;
             }
         }
