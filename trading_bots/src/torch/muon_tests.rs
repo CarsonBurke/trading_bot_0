@@ -80,7 +80,7 @@ mod tests {
         let mut opt = Muon::new(
             &trainable,
             MuonConfig {
-                lr: 0.02,
+                lr: 5e-3,
                 adamw_lr: 1e-3,
                 ..MuonConfig::default()
             },
@@ -106,6 +106,70 @@ mod tests {
             }
         }
         losses
+    }
+
+    /// Exercises the bf16 path of `batched_newtonschulz5`: the production
+    /// trading bot runs after `vs.bfloat16()` so every ShapeGroup stores its
+    /// momentum in bf16. This path has different code from fp32 (shallow vs
+    /// kind-convert, in-place vs out-of-place ops) and can silently diverge
+    /// if the NS5 implementation aliases caller storage.
+    fn train_muon_bf16(device: Device, seed: i64) -> Vec<f64> {
+        tch::manual_seed(seed);
+        let mut vs = nn::VarStore::new(device);
+        let net = build_mlp(&vs.root());
+        vs.bfloat16();
+        let trainable = vs.trainable_variables();
+        let mut opt = Muon::new(
+            &trainable,
+            MuonConfig {
+                lr: 5e-3,
+                adamw_lr: 1e-3,
+                ..MuonConfig::default()
+            },
+        );
+
+        tch::manual_seed(seed + 1000);
+        let (x_all_f32, y_all_f32) = make_dataset(device);
+        let x_all = x_all_f32.to_kind(Kind::BFloat16);
+        let y_all = y_all_f32.to_kind(Kind::BFloat16);
+        let mut losses = Vec::with_capacity(TRAIN_STEPS);
+
+        for step in 0..TRAIN_STEPS {
+            let idx = Tensor::randint(DATASET_SIZE, [BATCH_SIZE], (Kind::Int64, device));
+            let xb = x_all.index_select(0, &idx);
+            let yb = y_all.index_select(0, &idx);
+
+            let pred = net.forward(&xb);
+            let loss = (&pred - &yb).square().mean(Kind::Float);
+            loss.backward();
+            opt.step();
+            opt.zero_grad();
+
+            if step % 50 == 0 || step == TRAIN_STEPS - 1 {
+                losses.push(eval_loss(&net, &x_all, &y_all));
+            }
+        }
+        losses
+    }
+
+    #[test]
+    fn muon_converges_bf16() {
+        let device = Device::Cpu;
+        let losses = train_muon_bf16(device, 42);
+        let first = losses[0];
+        let last = *losses.last().unwrap();
+        println!(
+            "Muon bf16: loss {:.6} -> {:.6} ({:.1}x reduction)",
+            first,
+            last,
+            first / last
+        );
+        assert!(
+            last < first * 0.2,
+            "Muon bf16 failed to converge: {:.6} -> {:.6}",
+            first,
+            last
+        );
     }
 
     #[test]
