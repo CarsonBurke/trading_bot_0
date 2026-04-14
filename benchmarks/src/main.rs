@@ -18,6 +18,26 @@ fn sync_device(device: Device) {
     }
 }
 
+/// Query CUDA memory used via nvidia-smi. Returns MiB, or None on CPU/error.
+/// Reports *reserved* memory (caching allocator), so measurements should be
+/// taken as deltas across a known-new allocation boundary.
+fn gpu_mem_mib(device: Device) -> Option<f64> {
+    let Device::Cuda(id) = device else { return None };
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &id.to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
+}
+
 fn main() {
     let device = Device::cuda_if_available();
     if device == Device::Cpu {
@@ -187,18 +207,30 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
 
     // --- AdamW ---
     {
-        let vs = nn::VarStore::new(device);
+        let mut vs = nn::VarStore::new(device);
         let net = build_bench_mlp(&vs.root(), dim, depth);
+        vs.bfloat16();
+        let trainable = vs.trainable_variables();
+        let x = Tensor::randn(&[batch, dim], (Kind::BFloat16, device));
+
+        // Baseline: model + grads + one step's activations already allocated,
+        // so the delta isolates optimizer state (not transient activations).
+        let loss = net.forward(&x).sum(Kind::Float);
+        loss.backward();
+        sync_device(device);
+        let mem_pre_opt = gpu_mem_mib(device);
+
         let mut opt = nn::AdamW::default()
             .build(&vs, 3e-3)
             .expect("adamw build");
-        let x = Tensor::randn(&[batch, dim], (Kind::Float, device));
-
         for _ in 0..warmup {
             let loss = net.forward(&x).sum(Kind::Float);
             opt.backward_step(&loss);
         }
         sync_device(device);
+        // Measure after warmup — allocator has stabilized.
+        let mem_post_opt = gpu_mem_mib(device);
+        let opt_vram = mem_pre_opt.zip(mem_post_opt).map(|(a, b)| b - a);
 
         let start = Instant::now();
         for _ in 0..iters {
@@ -207,22 +239,40 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         }
         sync_device(device);
         let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-        println!("  AdamW  fwd+bwd+step: {:.3} ms/iter", ms);
+        // AdamW keeps m + v per param, same dtype as params.
+        let adamw_state_bytes: usize = trainable
+            .iter()
+            .map(|t| 2 * t.numel() * t.kind().elt_size_in_bytes())
+            .sum();
+        let analytic_mib = adamw_state_bytes as f64 / 1024.0 / 1024.0;
+        let empirical = opt_vram
+            .map(|v| format!(", nvidia-smi: {:+.1} MiB", v))
+            .unwrap_or_default();
+        println!(
+            "  AdamW  fwd+bwd+step: {:.3} ms/iter  | state: {:.2} MiB{}",
+            ms, analytic_mib, empirical
+        );
         suite.add(BenchmarkResult::new(
             "optim_adamw_fwd_bwd_step",
             ms,
-            BenchmarkRun { batch, seq_len: dim, dtype: "Float".into() },
+            BenchmarkRun { batch, seq_len: dim, dtype: "BFloat16".into() },
         ));
     }
 
     // --- Muon ---
     {
-        let vs = nn::VarStore::new(device);
+        let mut vs = nn::VarStore::new(device);
         let net = build_bench_mlp(&vs.root(), dim, depth);
+        vs.bfloat16();
         let trainable = vs.trainable_variables();
-        let mut muon = Muon::new(&trainable, MuonConfig::default());
-        let x = Tensor::randn(&[batch, dim], (Kind::Float, device));
+        let x = Tensor::randn(&[batch, dim], (Kind::BFloat16, device));
 
+        let loss = net.forward(&x).sum(Kind::Float);
+        loss.backward();
+        sync_device(device);
+        let mem_pre_opt = gpu_mem_mib(device);
+
+        let mut muon = Muon::new(&trainable, MuonConfig::default());
         for _ in 0..warmup {
             let loss = net.forward(&x).sum(Kind::Float);
             loss.backward();
@@ -230,6 +280,8 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
             muon.zero_grad();
         }
         sync_device(device);
+        let mem_post_opt = gpu_mem_mib(device);
+        let opt_vram = mem_pre_opt.zip(mem_post_opt).map(|(a, b)| b - a);
 
         let start = Instant::now();
         for _ in 0..iters {
@@ -240,11 +292,18 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         }
         sync_device(device);
         let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-        println!("  Muon   fwd+bwd+step: {:.3} ms/iter", ms);
+        let analytic_mib = muon.state_bytes() as f64 / 1024.0 / 1024.0;
+        let empirical = opt_vram
+            .map(|v| format!(", nvidia-smi: {:+.1} MiB", v))
+            .unwrap_or_default();
+        println!(
+            "  Muon   fwd+bwd+step: {:.3} ms/iter  | state: {:.2} MiB{}",
+            ms, analytic_mib, empirical
+        );
         suite.add(BenchmarkResult::new(
             "optim_muon_fwd_bwd_step",
             ms,
-            BenchmarkRun { batch, seq_len: dim, dtype: "Float".into() },
+            BenchmarkRun { batch, seq_len: dim, dtype: "BFloat16".into() },
         ));
     }
 
