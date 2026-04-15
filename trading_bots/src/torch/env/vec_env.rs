@@ -3,7 +3,6 @@ use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::model::ModelVariant;
-use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use tch::{Device, Tensor};
 
@@ -438,16 +437,19 @@ impl VecEnv {
         self.step_incremental(&actions_flat, out_static_obs)
     }
 
-    fn step_into_ring_cpu(&mut self, all_actions: &[f64]) -> (Vec<usize>, Vec<f32>) {
+    fn step_into_ring_cpu_into(
+        &mut self,
+        all_actions: &[f64],
+        reset_indices: &mut Vec<usize>,
+        reset_price_deltas: &mut Vec<f32>,
+    ) {
         let action_dim = ACTION_COUNT as usize;
         debug_assert_eq!(all_actions.len(), self.envs.len() * action_dim);
 
         let static_obs_dim = STATIC_OBSERVATIONS;
         let step_deltas_dim = TICKERS_COUNT as usize;
-        let price_deltas_dim = TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
-
-        let mut reset_indices = Vec::new();
-        let mut reset_price_deltas = Vec::new();
+        reset_indices.clear();
+        reset_price_deltas.clear();
         let step_results = self
             .envs
             .par_iter_mut()
@@ -504,19 +506,19 @@ impl VecEnv {
                     .copy_from_slice(&static_obs);
             }
         }
-
-        (reset_indices, reset_price_deltas)
     }
 
-    pub fn step_into_ring_flat(
+    pub fn step_into_ring_flat_into(
         &mut self,
         all_actions: &[f64],
         out_step_deltas: &mut Tensor,
         out_static_obs: &mut Tensor,
         out_reward_per_ticker: &mut Tensor,
         out_is_done: &mut Tensor,
-    ) -> (Vec<usize>, Vec<f32>) {
-        let (reset_indices, reset_price_deltas) = self.step_into_ring_cpu(all_actions);
+        reset_indices: &mut Vec<usize>,
+        reset_price_deltas: &mut Vec<f32>,
+    ) {
+        self.step_into_ring_cpu_into(all_actions, reset_indices, reset_price_deltas);
 
         let deltas_cpu =
             self.tensor_from_f32(&self.step_deltas_buf, &[self.nprocs_i64(), TICKERS_COUNT]);
@@ -534,8 +536,6 @@ impl VecEnv {
         );
         out_reward_per_ticker.copy_(&rpt_cpu);
         out_is_done.copy_(&self.tensor_from_f32(&self.is_done_buf, &[self.nprocs_i64()]));
-
-        (reset_indices, reset_price_deltas)
     }
 
     pub fn step_from_actions_f32_into(
@@ -553,17 +553,15 @@ impl VecEnv {
         for (dst, src) in batch.actions_f64.iter_mut().zip(batch.actions_f32.iter()) {
             *dst = *src as f64;
         }
-        batch.reset_indices.clear();
-        batch.reset_price_deltas.clear();
-        let (reset_indices, reset_price_deltas) = self.step_into_ring_flat(
+        self.step_into_ring_flat_into(
             &batch.actions_f64,
             out_step_deltas,
             out_static_obs,
             out_reward_per_ticker,
             out_is_done,
+            &mut batch.reset_indices,
+            &mut batch.reset_price_deltas,
         );
-        batch.reset_indices = reset_indices;
-        batch.reset_price_deltas = reset_price_deltas;
     }
 
     pub fn max_step(&self) -> usize {
