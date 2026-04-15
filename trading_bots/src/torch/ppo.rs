@@ -537,6 +537,9 @@ pub async fn train(
                 Device::Cpu,
             )
         };
+        // Persistent CPU staging for reset env indices (one i64 per env, reused each step).
+        let mut reset_env_indices_host: Vec<i64> = vec![0i64; rollout.nprocs as usize];
+        let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
         for step in 0..rollout_steps as usize {
             let mem_idx = step as i64 * rollout.nprocs;
             let (values, action_mean, action_std, latent_actions, target_weights, action_log_prob) =
@@ -585,21 +588,41 @@ pub async fn train(
             let mut reset_replay = None;
             if !reset_indices.is_empty() {
                 let reset_count = reset_indices.len() as i64;
-                let reset_raw_batch = Tensor::from_slice(reset_price_deltas)
-                    .view([reset_count, raw_pd_dim])
-                    .to_device(device);
+                // `from_blob` over the VecEnv-owned CPU buffer avoids a Vec->Tensor
+                // copy before the H->D transfer (single non-blocking copy to GPU).
+                let reset_raw_view = unsafe {
+                    Tensor::from_blob(
+                        reset_price_deltas.as_ptr() as *const u8,
+                        &[reset_count, raw_pd_dim],
+                        &[],
+                        Kind::Float,
+                        Device::Cpu,
+                    )
+                };
+                let reset_raw_batch = reset_raw_view.to_device(device);
                 let reset_layouts_batch =
                     trading_model.uniform_stream_layout_from_raw_input(&reset_raw_batch);
-                let reset_env_indices: Vec<i64> = reset_indices
-                    .iter()
-                    .map(|&env_idx| env_idx as i64)
-                    .collect();
-                let reset_env_tensor = Tensor::from_slice(&reset_env_indices)
-                    .to_kind(Kind::Int64)
-                    .to_device(device);
-                let reset_row_idx = (&reset_env_tensor.unsqueeze(1) * TICKERS_COUNT
-                    + Tensor::arange(TICKERS_COUNT, (Kind::Int64, device)))
-                .reshape([-1]);
+                // Persistent CPU staging for env indices; write then view via from_blob.
+                for (slot, &env_idx) in reset_env_indices_host
+                    .iter_mut()
+                    .zip(reset_indices.iter())
+                    .take(reset_count as usize)
+                {
+                    *slot = env_idx as i64;
+                }
+                let reset_env_host_view = unsafe {
+                    Tensor::from_blob(
+                        reset_env_indices_host.as_ptr() as *const u8,
+                        &[reset_count],
+                        &[],
+                        Kind::Int64,
+                        Device::Cpu,
+                    )
+                };
+                let reset_env_tensor = reset_env_host_view.to_device(device);
+                let reset_row_idx =
+                    (&reset_env_tensor.unsqueeze(1) * TICKERS_COUNT + &ticker_offsets)
+                        .reshape([-1]);
                 reset_replay = Some((
                     reset_env_tensor,
                     reset_row_idx,
@@ -719,7 +742,6 @@ pub async fn train(
         let reset_slots = Tensor::from_slice(&reset_slots_host)
             .to_kind(Kind::Int64)
             .to_device(device);
-        let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
         println!(
             "ppo update: total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
             total_samples, minibatch_size, rollout.ppo_chunk_len, chunk_batch_size
@@ -796,6 +818,9 @@ pub async fn train(
 
             let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
             let mut epoch_kl_count = 0i64;
+            // Track last minibatch's KL mean on-device; fetch once at end of epoch
+            // to avoid a host/device sync on every minibatch.
+            let mut last_minibatch_kl_mean_gpu: Option<Tensor> = None;
 
             for (chunk_i, mb_start) in (0..total_chunks)
                 .step_by(chunk_batch_size as usize)
@@ -1100,11 +1125,28 @@ pub async fn train(
                 }
                 opt.zero_grad();
 
-                last_minibatch_approx_kl =
-                    minibatch_kl_gpu.double_value(&[]) / minibatch_kl_count as f64;
+                last_minibatch_kl_mean_gpu =
+                    Some(&minibatch_kl_gpu / minibatch_kl_count as f64);
             }
 
-            let mean_epoch_kl = epoch_kl_gpu.double_value(&[]) / epoch_kl_count as f64;
+            // Single end-of-epoch host sync covering both the epoch-mean KL and
+            // the last-minibatch KL used for early stopping. Avoids per-minibatch
+            // D2H stalls that previously blocked the training pipeline.
+            let mean_epoch_kl = if let Some(last_mb) = last_minibatch_kl_mean_gpu {
+                let stacked = Tensor::stack(
+                    &[&(&epoch_kl_gpu / epoch_kl_count.max(1) as f64), &last_mb],
+                    0,
+                )
+                .to_kind(Kind::Double)
+                .to_device(tch::Device::Cpu);
+                let vec = Vec::<f64>::try_from(stacked).unwrap_or_else(|_| vec![0.0, 0.0]);
+                // Preserve prior-epoch value if this epoch somehow had zero minibatches.
+                last_minibatch_approx_kl = vec[1];
+                vec[0]
+            } else {
+                // Epoch had no minibatches; keep prior `last_minibatch_approx_kl`.
+                0.0
+            };
             println!(
                 "Epoch {}/{}: KL {:.4} (last mb {:.4})",
                 _epoch + 1,
