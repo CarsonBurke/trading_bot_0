@@ -209,22 +209,19 @@ impl TradingModel {
                 .uniform_patch_tokens
                 .narrow(1, super::UNIFORM_STREAM_PATCH_COUNT - 1, 1);
         let kind = live_token.kind();
-        let actor_cls = self
-            .actor_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        let critic_cls = self
-            .critic_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        let sde_cls = self
-            .sde_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        let x0_suffix = self.input_ln.forward(&Tensor::cat(
-            &[&live_token, &actor_cls, &critic_cls, &sde_cls],
+        let cls_triplet = Tensor::cat(
+            &[
+                &self.actor_cls_token,
+                &self.critic_cls_token,
+                &self.sde_cls_token,
+            ],
             1,
-        ));
+        )
+        .to_kind(kind)
+        .expand([batch_tokens, 3, self.model_dim], false);
+        let x0_suffix = self
+            .input_ln
+            .forward(&Tensor::cat(&[&live_token, &cls_triplet], 1));
         let mut x_suffix = x0_suffix.shallow_clone();
         let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
@@ -275,22 +272,19 @@ impl TradingModel {
                 .uniform_patch_tokens
                 .narrow(1, super::UNIFORM_STREAM_PATCH_COUNT - 1, 1);
         let kind = live_token.kind();
-        let actor_cls = self
-            .actor_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        let critic_cls = self
-            .critic_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        let sde_cls = self
-            .sde_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        let x0_suffix = self.input_ln.forward(&Tensor::cat(
-            &[&live_token, &actor_cls, &critic_cls, &sde_cls],
+        let cls_triplet = Tensor::cat(
+            &[
+                &self.actor_cls_token,
+                &self.critic_cls_token,
+                &self.sde_cls_token,
+            ],
             1,
-        ));
+        )
+        .to_kind(kind)
+        .expand([batch_tokens, 3, self.model_dim], false);
+        let x0_suffix = self
+            .input_ln
+            .forward(&Tensor::cat(&[&live_token, &cls_triplet], 1));
         let mut x_suffix = x0_suffix.shallow_clone();
         let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {

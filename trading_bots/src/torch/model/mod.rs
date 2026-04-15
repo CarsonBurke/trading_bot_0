@@ -1248,22 +1248,18 @@ impl TradingModel {
 
         let kind = deltas.kind();
         let patch_tokens = self.patch_embed(&deltas);
-        let actor_cls = self
-            .actor_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        let critic_cls = self
-            .critic_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        let sde_cls = self
-            .sde_cls_token
-            .to_kind(kind)
-            .expand([batch_tokens, 1, self.model_dim], false);
-        self.input_ln.forward(&Tensor::cat(
-            &[&patch_tokens, &actor_cls, &critic_cls, &sde_cls],
+        let cls_triplet = Tensor::cat(
+            &[
+                &self.actor_cls_token,
+                &self.critic_cls_token,
+                &self.sde_cls_token,
+            ],
             1,
-        ))
+        )
+        .to_kind(kind)
+        .expand([batch_tokens, 3, self.model_dim], false);
+        self.input_ln
+            .forward(&Tensor::cat(&[&patch_tokens, &cls_triplet], 1))
     }
 
     /// Per-config enrichment (avoids [batch, 256, 8636] expand), then fused
