@@ -430,13 +430,12 @@ pub async fn train(
         .to_kind(Kind::Int64)
         .to_device(device)
         .view([total_chunks, rollout.ppo_chunk_len]);
+    let chunk_mem_indices_flat = chunk_mem_indices.reshape([-1]);
 
     let raw_pd_dim = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
     let pd_dim = trading_model.price_input_dim();
     let so_dim = STATIC_OBSERVATIONS as i64;
     let replay_obs_kind = trading_model.input_kind();
-    let uniform_reset_live_fill = trading_model.uniform_stream_bootstrap_live_fill();
-
     let s_chunk_start_layouts = Tensor::zeros(
         &[chunks_per_rollout * rollout.nprocs, pd_dim],
         (replay_obs_kind, device),
@@ -448,6 +447,26 @@ pub async fn train(
     let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
     let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device));
+    let mut s_static_obs_by_chunk = Tensor::zeros(
+        &[total_chunks, rollout.ppo_chunk_len, so_dim],
+        (replay_obs_kind, device),
+    );
+    let mut s_step_deltas_by_chunk = Tensor::zeros(
+        &[total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT],
+        (replay_obs_kind, device),
+    );
+    let mut s_actions_by_chunk = Tensor::zeros(
+        &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
+        (Kind::Float, device),
+    );
+    let mut s_old_log_probs_by_chunk =
+        Tensor::zeros(&[total_chunks, rollout.ppo_chunk_len], (Kind::Float, device));
+    let mut returns_by_chunk =
+        Tensor::zeros(&[total_chunks, rollout.ppo_chunk_len], (Kind::Float, device));
+    let mut adv_norm_by_chunk =
+        Tensor::zeros(&[total_chunks, rollout.ppo_chunk_len], (Kind::Float, device));
+    let mut reset_slots_by_chunk =
+        Tensor::zeros(&[total_chunks, rollout.ppo_chunk_len], (Kind::Int64, device));
 
     if start_episode > 0 {
         let meta_path = format!(
@@ -477,28 +496,25 @@ pub async fn train(
 
     for episode in start_episode..1000000 {
         let (obs_price_cpu, obs_static_cpu) = env.reset();
-        let mut obs_price = Tensor::zeros(&[rollout.nprocs, raw_pd_dim], (Kind::Float, device));
         let mut obs_static = Tensor::zeros(
             &[rollout.nprocs, STATIC_OBSERVATIONS as i64],
-            (Kind::Float, device),
+            (replay_obs_kind, device),
         );
-        let ring_len = PRICE_DELTAS_PER_TICKER as i64;
-        let base_idx = Tensor::arange(ring_len, (Kind::Int64, device));
-        let mut ring_pos = ring_len - 1;
-        let mut ring_buf = Tensor::zeros(
-            &[rollout.nprocs, TICKERS_COUNT, ring_len],
-            (Kind::Float, device),
+        let mut step_deltas = Tensor::zeros(
+            &[rollout.nprocs, TICKERS_COUNT],
+            (replay_obs_kind, device),
         );
-        let mut step_deltas =
-            Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (Kind::Float, device));
-        obs_price.copy_(&obs_price_cpu);
         obs_static.copy_(&obs_static_cpu);
-        ring_buf.copy_(&obs_price.view([rollout.nprocs, TICKERS_COUNT, ring_len]));
-        let mut stream_state = trading_model.init_stream_state_batched(rollout.nprocs);
+        let obs_price = obs_price_cpu.to_device(device);
+        let mut stream_state = trading_model.init_replay_stream_state_batched(rollout.nprocs);
         let stream_layout = trading_model.uniform_stream_layout_from_raw_input(&obs_price);
         let mut streamed_output = Some(tch::no_grad(|| {
             autocast(true, || {
-                trading_model.step_on_device(&stream_layout, &obs_static, &mut stream_state)
+                trading_model.step_on_device_for_replay(
+                    &stream_layout,
+                    &obs_static,
+                    &mut stream_state,
+                )
             })
         }));
         let mut step_reward_per_ticker =
@@ -566,13 +582,7 @@ pub async fn train(
             let _ = s_step_deltas
                 .narrow(0, mem_idx, rollout.nprocs)
                 .copy_(&step_deltas);
-
-            ring_pos = (ring_pos + 1) % ring_len;
-            let _ = ring_buf
-                .narrow(2, ring_pos, 1)
-                .copy_(&step_deltas.unsqueeze(-1));
-
-            let idx = (&base_idx + (ring_pos + 1)).remainder(ring_len);
+            let mut reset_replay = None;
             if !reset_indices.is_empty() {
                 let reset_count = reset_indices.len() as i64;
                 let reset_raw_batch = Tensor::from_slice(reset_price_deltas)
@@ -580,13 +590,6 @@ pub async fn train(
                     .to_device(device);
                 let reset_layouts_batch =
                     trading_model.uniform_stream_layout_from_raw_input(&reset_raw_batch);
-                let reset_ring_ordered =
-                    reset_raw_batch.view([reset_count, TICKERS_COUNT, ring_len]);
-                let mut reset_ring_batch = Tensor::zeros(
-                    &[reset_count, TICKERS_COUNT, ring_len],
-                    (Kind::Float, device),
-                );
-                let _ = reset_ring_batch.index_copy_(2, &idx, &reset_ring_ordered);
                 let reset_env_indices: Vec<i64> = reset_indices
                     .iter()
                     .map(|&env_idx| env_idx as i64)
@@ -594,18 +597,20 @@ pub async fn train(
                 let reset_env_tensor = Tensor::from_slice(&reset_env_indices)
                     .to_kind(Kind::Int64)
                     .to_device(device);
-                let _ = ring_buf.index_copy_(0, &reset_env_tensor, &reset_ring_batch);
+                let reset_row_idx = (&reset_env_tensor.unsqueeze(1) * TICKERS_COUNT
+                    + Tensor::arange(TICKERS_COUNT, (Kind::Int64, device)))
+                .reshape([-1]);
+                reset_replay = Some((
+                    reset_env_tensor,
+                    reset_row_idx,
+                    reset_layouts_batch.shallow_clone(),
+                ));
                 for (reset_i, env_idx) in reset_indices.iter().enumerate() {
                     reset_slots_host[(mem_idx + *env_idx as i64) as usize] =
                         reset_layout_count + reset_i as i64 + 1;
                 }
                 reset_layout_count += reset_count;
                 reset_layout_batches.push(reset_layouts_batch.to_kind(replay_obs_kind));
-            }
-
-            if !reset_indices.is_empty() {
-                let ordered = ring_buf.index_select(2, &idx);
-                obs_price.copy_(&ordered.view([rollout.nprocs, raw_pd_dim]));
             }
 
             let _ = s_actions
@@ -635,11 +640,29 @@ pub async fn train(
             streamed_output = Some(tch::no_grad(|| {
                 autocast(true, || {
                     if reset_indices.is_empty() {
-                        trading_model.step_on_device(&step_deltas, &obs_static, &mut stream_state)
+                        trading_model.step_on_device_for_replay(
+                            &step_deltas,
+                            &obs_static,
+                            &mut stream_state,
+                        )
                     } else {
-                        let stream_layout =
-                            trading_model.uniform_stream_layout_from_raw_input(&obs_price);
-                        trading_model.step_on_device(&stream_layout, &obs_static, &mut stream_state)
+                        let _ = trading_model.step_on_device_for_replay(
+                            &step_deltas,
+                            &obs_static,
+                            &mut stream_state,
+                        );
+                        let (reset_env_tensor, reset_row_idx, reset_layouts_batch) =
+                            reset_replay.as_ref().expect("reset replay payload missing");
+                        trading_model.reset_uniform_stream_envs_from_layout_indexed(
+                            &mut stream_state,
+                            reset_env_tensor,
+                            reset_row_idx,
+                            reset_layouts_batch,
+                        );
+                        trading_model.forward_stream_state_on_device_for_replay(
+                            &obs_static,
+                            &mut stream_state,
+                        )
                     }
                 })
             }));
@@ -647,9 +670,9 @@ pub async fn train(
 
         // Bootstrap value from final observation state (decode two-hot logits)
         let bootstrap_value = tch::no_grad(|| {
-            let bootstrap_price = trading_model.uniform_stream_snapshot(&stream_state);
             let (value_logits, _, _) = autocast(true, || {
-                trading_model.forward_on_device(&bootstrap_price, &obs_static, false)
+                trading_model
+                    .forward_stream_state_on_device_for_replay(&obs_static, &mut stream_state)
             });
             hl_gauss.decode(&value_logits)
         });
@@ -688,19 +711,11 @@ pub async fn train(
         let minibatch_size = minibatch_samples_from_total(total_samples, rollout.nprocs);
         let chunk_batch_size =
             ((minibatch_size + rollout.ppo_chunk_len - 1) / rollout.ppo_chunk_len).max(1);
-        // Per-chunk reset slot ids laid out as [total_chunks, chunk_len], matching
-        // `chunk_mem_indices_host` ordering. Entry 0 == no reset; >0 == 1-indexed slot.
-        // Precomputed host-side so the inner sub-chunk loop never needs a device->host
-        // sync to decide whether a reset occurred at the current step.
-        let mut resets_by_chunk_flat: Vec<i64> =
-            Vec::with_capacity((total_chunks * rollout.ppo_chunk_len) as usize);
-        for &mem_idx in &chunk_mem_indices_host {
-            resets_by_chunk_flat.push(reset_slots_host[mem_idx as usize]);
-        }
-        let reset_slots_by_chunk = Tensor::from_slice(&resets_by_chunk_flat)
+        // Keep reset slots flat and gather only the current minibatch to avoid
+        // carrying a second chunk-major copy of the rollout on device.
+        let reset_slots = Tensor::from_slice(&reset_slots_host)
             .to_kind(Kind::Int64)
-            .to_device(device)
-            .view([total_chunks, rollout.ppo_chunk_len]);
+            .to_device(device);
         let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
         println!(
             "ppo update: total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
@@ -708,29 +723,41 @@ pub async fn train(
         );
         // Full-rollout advantage normalization (not per-minibatch)
         let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
-        let chunk_mem_indices_flat = chunk_mem_indices.reshape([-1]);
-        let s_static_obs_by_chunk = s_static_obs.index_select(0, &chunk_mem_indices_flat).view([
-            total_chunks,
-            rollout.ppo_chunk_len,
-            so_dim,
-        ]);
-        let s_step_deltas_by_chunk = s_step_deltas
-            .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT]);
-        let s_actions_by_chunk = s_actions.index_select(0, &chunk_mem_indices_flat).view([
-            total_chunks,
-            rollout.ppo_chunk_len,
-            ACTION_COUNT,
-        ]);
-        let s_old_log_probs_by_chunk = s_old_log_probs
-            .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, rollout.ppo_chunk_len]);
-        let returns_by_chunk = returns
-            .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, rollout.ppo_chunk_len]);
-        let adv_norm_by_chunk = adv_norm
-            .index_select(0, &chunk_mem_indices_flat)
-            .view([total_chunks, rollout.ppo_chunk_len]);
+        let _ = s_static_obs_by_chunk.copy_(
+            &s_static_obs
+                .index_select(0, &chunk_mem_indices_flat)
+                .view([total_chunks, rollout.ppo_chunk_len, so_dim]),
+        );
+        let _ = s_step_deltas_by_chunk.copy_(
+            &s_step_deltas
+                .index_select(0, &chunk_mem_indices_flat)
+                .view([total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT]),
+        );
+        let _ = s_actions_by_chunk.copy_(
+            &s_actions
+                .index_select(0, &chunk_mem_indices_flat)
+                .view([total_chunks, rollout.ppo_chunk_len, ACTION_COUNT]),
+        );
+        let _ = s_old_log_probs_by_chunk.copy_(
+            &s_old_log_probs
+                .index_select(0, &chunk_mem_indices_flat)
+                .view([total_chunks, rollout.ppo_chunk_len]),
+        );
+        let _ = returns_by_chunk.copy_(
+            &returns
+                .index_select(0, &chunk_mem_indices_flat)
+                .view([total_chunks, rollout.ppo_chunk_len]),
+        );
+        let _ = adv_norm_by_chunk.copy_(
+            &adv_norm
+                .index_select(0, &chunk_mem_indices_flat)
+                .view([total_chunks, rollout.ppo_chunk_len]),
+        );
+        let _ = reset_slots_by_chunk.copy_(
+            &reset_slots
+                .index_select(0, &chunk_mem_indices_flat)
+                .view([total_chunks, rollout.ppo_chunk_len]),
+        );
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -779,12 +806,13 @@ pub async fn train(
                 let step_deltas_chunk = s_step_deltas_by_chunk.index_select(0, &chunk_ids);
                 let adv_mb_by_chunk = adv_norm_by_chunk.index_select(0, &chunk_ids);
                 let ret_mb_by_chunk = returns_by_chunk.index_select(0, &chunk_ids);
-                let old_log_probs_by_chunk = s_old_log_probs_by_chunk.index_select(0, &chunk_ids);
+                let old_log_probs_by_chunk =
+                    s_old_log_probs_by_chunk.index_select(0, &chunk_ids);
                 let act_mb_by_chunk = s_actions_by_chunk.index_select(0, &chunk_ids);
                 let reset_slots_chunk = reset_slots_by_chunk.index_select(0, &chunk_ids);
 
                 let mut fwd_start = Instant::now();
-                let mut chunk_state = trading_model.init_stream_state_batched(chunk_count);
+                let mut chunk_state = trading_model.init_replay_stream_state_batched(chunk_count);
                 let num_sub_chunks = rollout.ppo_chunk_len / rollout.sub_chunk_len;
                 let minibatch_sample_count = chunk_count * rollout.ppo_chunk_len;
                 let sub_chunk_sample_count = chunk_count * rollout.sub_chunk_len;
@@ -805,7 +833,7 @@ pub async fn train(
                         let output = if global_pos == 0 {
                             let first_static = so_chunk.select(1, 0);
                             autocast(true, || {
-                                trading_model.step_on_device(
+                                trading_model.step_on_device_for_replay(
                                     &boundary_layout,
                                     &first_static,
                                     &mut chunk_state,
@@ -819,7 +847,7 @@ pub async fn train(
                                 step_reset_slots.gt(0).nonzero().squeeze_dim(1);
                             if step_reset_env_idx.size()[0] == 0 {
                                 autocast(true, || {
-                                    trading_model.step_on_device(
+                                    trading_model.step_on_device_for_replay(
                                         &prev_step_deltas,
                                         &current_static,
                                         &mut chunk_state,
@@ -834,13 +862,8 @@ pub async fn train(
                                     .reshape([-1]);
                                 let reset_layouts =
                                     reset_layout_bank.index_select(0, &reset_slot_ids);
-                                let reset_live_fill = Tensor::full(
-                                    [reset_slot_ids.size()[0]],
-                                    uniform_reset_live_fill,
-                                    (Kind::Int64, device),
-                                );
                                 let _ = autocast(true, || {
-                                    trading_model.step_on_device(
+                                    trading_model.step_on_device_for_replay(
                                         &prev_step_deltas,
                                         &current_static,
                                         &mut chunk_state,
@@ -851,10 +874,9 @@ pub async fn train(
                                     &step_reset_env_idx,
                                     &reset_row_idx,
                                     &reset_layouts,
-                                    &reset_live_fill,
                                 );
                                 autocast(true, || {
-                                    trading_model.forward_stream_state_on_device(
+                                    trading_model.forward_stream_state_on_device_for_replay(
                                         &current_static,
                                         &mut chunk_state,
                                     )
@@ -1160,7 +1182,7 @@ pub async fn train(
             device,
         );
         let return_range_stats = hl_gauss.range_stats(&returns);
-        // Single GPU->CPU transfer for all scalars
+        // Compute all metrics on GPU, single transfer to CPU.
         let all_scalars = Tensor::cat(
             &[
                 mean_policy_loss_t.view([1]),

@@ -17,7 +17,6 @@ impl StreamState {
         let _ = self.uniform_layer0_prefix_k.zero_();
         let _ = self.uniform_layer0_prefix_v.zero_();
         let _ = self.uniform_prefix_x0.zero_();
-        let _ = self.uniform_final_prefix_hidden.zero_();
         let _ = self.uniform_readout_prefix_k.zero_();
         let _ = self.uniform_readout_prefix_v.zero_();
         self.uniform_prefix_k.clear();
@@ -62,7 +61,6 @@ impl TradingModel {
         state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach();
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach();
         state.uniform_prefix_x0 = state.uniform_prefix_x0.detach();
-        state.uniform_final_prefix_hidden = state.uniform_final_prefix_hidden.detach();
         state.uniform_readout_prefix_k = state.uniform_readout_prefix_k.detach();
         state.uniform_readout_prefix_v = state.uniform_readout_prefix_v.detach();
         state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t.detach()).collect();
@@ -102,7 +100,6 @@ impl TradingModel {
         state.uniform_layer0_prefix_v = v.index_select(1, &self.gqa_kv_head_index);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
-        let _ = state.uniform_final_prefix_hidden.zero_();
         let _ = state.uniform_readout_prefix_k.zero_();
         let _ = state.uniform_readout_prefix_v.zero_();
         state.uniform_cached_static_features = None;
@@ -128,7 +125,6 @@ impl TradingModel {
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.index_copy(0, row_idx, &v);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
-        let _ = state.uniform_final_prefix_hidden.zero_();
         let _ = state.uniform_readout_prefix_k.zero_();
         let _ = state.uniform_readout_prefix_v.zero_();
         state.uniform_cached_static_features = None;
@@ -172,14 +168,87 @@ impl TradingModel {
                 .push(v.index_select(1, &self.gqa_kv_head_index));
             x = x_next;
         }
-        state.uniform_final_prefix_hidden = self.final_ln.forward(&x);
-        let (readout_prefix_k, readout_prefix_v) = self
-            .readout_block
-            .project_source(&state.uniform_final_prefix_hidden);
+        let final_prefix_hidden = self.final_ln.forward(&x);
+        let (readout_prefix_k, readout_prefix_v) =
+            self.readout_block.project_source(&final_prefix_hidden);
         state.uniform_readout_prefix_k = readout_prefix_k;
         state.uniform_readout_prefix_v = readout_prefix_v;
         state.uniform_cached_static_features = Some(static_features.shallow_clone());
         state.uniform_cached_exo_tokens = Some(exo_tokens.shallow_clone());
+    }
+
+    fn uniform_stream_replay_forward(
+        &self,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        let batch_size = state.uniform_live_fill.size()[0];
+        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+        let x0 = &state.uniform_prefix_x0;
+        let mut prefix_hidden = self
+            .exogenous_ticker_block
+            .forward(&state.uniform_layer0_prefix_hidden, &exo_tokens);
+        let mut prefix_k = Vec::with_capacity(self.gqa_layers.len());
+        let mut prefix_v = Vec::with_capacity(self.gqa_layers.len());
+        prefix_k.push(state.uniform_layer0_prefix_k.shallow_clone());
+        prefix_v.push(state.uniform_layer0_prefix_v.shallow_clone());
+        for layer in self.gqa_layers.iter().skip(1) {
+            let (x_next, k, v) = layer.forward_prefix_and_cache(&prefix_hidden, x0, &self.rope);
+            prefix_k.push(k.index_select(1, &self.gqa_kv_head_index));
+            prefix_v.push(v.index_select(1, &self.gqa_kv_head_index));
+            prefix_hidden = x_next;
+        }
+        let final_prefix_hidden = self.final_ln.forward(&prefix_hidden);
+        let (readout_prefix_k, readout_prefix_v) =
+            self.readout_block.project_source(&final_prefix_hidden);
+
+        let batch_tokens = batch_size * TICKERS_COUNT;
+        let live_token =
+            state
+                .uniform_patch_tokens
+                .narrow(1, super::UNIFORM_STREAM_PATCH_COUNT - 1, 1);
+        let kind = live_token.kind();
+        let actor_cls = self
+            .actor_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        let critic_cls = self
+            .critic_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        let sde_cls = self
+            .sde_cls_token
+            .to_kind(kind)
+            .expand([batch_tokens, 1, self.model_dim], false);
+        let x0_suffix = self.input_ln.forward(&Tensor::cat(
+            &[&live_token, &actor_cls, &critic_cls, &sde_cls],
+            1,
+        ));
+        let mut x_suffix = x0_suffix.shallow_clone();
+        let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
+        for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
+            x_suffix = layer.forward_suffix_with_cache(
+                &x_suffix,
+                &x0_suffix,
+                &prefix_k[layer_idx],
+                &prefix_v[layer_idx],
+                &self.rope,
+                &self.gqa_kv_head_index,
+                prefix_len,
+            );
+            if layer_idx == 0 {
+                x_suffix = self.exogenous_ticker_block.forward(&x_suffix, &exo_tokens);
+            }
+            x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
+        }
+        let x_suffix = self.final_ln.forward(&x_suffix);
+        self.head_from_uniform_suffix_with_prefix_cache(
+            &x_suffix,
+            batch_size,
+            &readout_prefix_k,
+            &readout_prefix_v,
+        )
     }
 
     fn uniform_stream_cached_forward(
@@ -359,7 +428,6 @@ impl TradingModel {
         env_idx: &Tensor,
         row_idx: &Tensor,
         layouts: &Tensor,
-        reset_live_fill: &Tensor,
     ) {
         if self.variant != super::ModelVariant::Uniform256Stream || env_idx.size()[0] == 0 {
             return;
@@ -388,12 +456,6 @@ impl TradingModel {
         ]);
         let patch_tokens =
             self.patch_embed(&layouts.view([layouts.size()[0], super::UNIFORM_STREAM_LAYOUT_LEN]));
-        let reset_live_fill =
-            if reset_live_fill.device() == self.device && reset_live_fill.kind() == Kind::Int64 {
-                reset_live_fill.shallow_clone()
-            } else {
-                reset_live_fill.to_kind(Kind::Int64).to_device(self.device)
-            };
         state.uniform_layout = state.uniform_layout.index_copy(
             0,
             row_idx,
@@ -405,9 +467,9 @@ impl TradingModel {
             &patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
         );
         // PPO replay uses the device tensor directly; the host mirror has no read sites here.
-        state.uniform_live_fill = state
+        let _ = state
             .uniform_live_fill
-            .index_copy(0, env_idx, &reset_live_fill);
+            .index_fill_(0, env_idx, super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
         self.prefill_uniform_prefix_base_cache_indexed(state, row_idx);
     }
 
@@ -472,21 +534,69 @@ impl TradingModel {
             .view([batch_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64])
     }
 
-    pub fn init_stream_state(&self) -> StreamState {
+    fn build_stream_state(&self, batch_size: i64, cache_conditioned_prefix: bool) -> StreamState {
+        let uniform_rows = batch_size * TICKERS_COUNT;
+        let (delta_ring, patch_buf) = if self.variant == super::ModelVariant::Uniform256Stream {
+            (
+                Tensor::zeros(
+                    [0, PRICE_DELTAS_PER_TICKER as i64],
+                    (Kind::Float, self.device),
+                ),
+                Tensor::zeros([0, self.finest_patch_size], (Kind::Float, self.device)),
+            )
+        } else {
+            (
+                Tensor::zeros(
+                    &[uniform_rows, PRICE_DELTAS_PER_TICKER as i64],
+                    (Kind::Float, self.device),
+                ),
+                Tensor::zeros(
+                    &[uniform_rows, self.finest_patch_size],
+                    (Kind::Float, self.device),
+                ),
+            )
+        };
+        let (uniform_readout_prefix_k, uniform_readout_prefix_v) = if cache_conditioned_prefix {
+            (
+                Tensor::zeros(
+                    [
+                        uniform_rows,
+                        super::CA_NUM_HEADS,
+                        super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                        super::CA_HEAD_DIM,
+                    ],
+                    (self.patch_embed_weight.kind(), self.device),
+                ),
+                Tensor::zeros(
+                    [
+                        uniform_rows,
+                        super::CA_NUM_HEADS,
+                        super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                        super::CA_HEAD_DIM,
+                    ],
+                    (self.patch_embed_weight.kind(), self.device),
+                ),
+            )
+        } else {
+            (
+                Tensor::zeros(
+                    [0, super::CA_NUM_HEADS, 0, super::CA_HEAD_DIM],
+                    (self.patch_embed_weight.kind(), self.device),
+                ),
+                Tensor::zeros(
+                    [0, super::CA_NUM_HEADS, 0, super::CA_HEAD_DIM],
+                    (self.patch_embed_weight.kind(), self.device),
+                ),
+            )
+        };
         StreamState {
-            delta_ring: Tensor::zeros(
-                &[TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64],
-                (Kind::Float, self.device),
-            ),
+            delta_ring,
             ring_pos: 0,
-            patch_buf: Tensor::zeros(
-                &[TICKERS_COUNT, self.finest_patch_size],
-                (Kind::Float, self.device),
-            ),
+            patch_buf,
             patch_pos: 0,
             uniform_layout: Tensor::full(
                 [
-                    TICKERS_COUNT,
+                    uniform_rows,
                     super::UNIFORM_STREAM_PATCH_COUNT,
                     super::UNIFORM_STREAM_PATCH_SIZE,
                 ],
@@ -495,106 +605,7 @@ impl TradingModel {
             ),
             uniform_patch_tokens: Tensor::zeros(
                 [
-                    TICKERS_COUNT,
-                    super::UNIFORM_STREAM_PATCH_COUNT,
-                    self.model_dim,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_live_fill: Tensor::zeros([1], (Kind::Int64, self.device)),
-            uniform_live_fill_host: vec![0; 1],
-            uniform_layer0_prefix_hidden: Tensor::zeros(
-                [
-                    TICKERS_COUNT,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_layer0_prefix_k: Tensor::zeros(
-                [
-                    TICKERS_COUNT,
-                    super::GQA_NUM_KV_HEADS,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim / super::GQA_NUM_Q_HEADS,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_layer0_prefix_v: Tensor::zeros(
-                [
-                    TICKERS_COUNT,
-                    super::GQA_NUM_KV_HEADS,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim / super::GQA_NUM_Q_HEADS,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_prefix_x0: Tensor::zeros(
-                [
-                    TICKERS_COUNT,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_final_prefix_hidden: Tensor::zeros(
-                [
-                    TICKERS_COUNT,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_readout_prefix_k: Tensor::zeros(
-                [
-                    TICKERS_COUNT,
-                    super::CA_NUM_HEADS,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    super::CA_HEAD_DIM,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_readout_prefix_v: Tensor::zeros(
-                [
-                    TICKERS_COUNT,
-                    super::CA_NUM_HEADS,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    super::CA_HEAD_DIM,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_prefix_k: Vec::new(),
-            uniform_prefix_v: Vec::new(),
-            uniform_cached_static_features: None,
-            uniform_cached_exo_tokens: None,
-            initialized: false,
-        }
-    }
-
-    pub fn init_stream_state_batched(&self, batch_size: i64) -> StreamState {
-        StreamState {
-            delta_ring: Tensor::zeros(
-                &[batch_size * TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64],
-                (Kind::Float, self.device),
-            ),
-            ring_pos: 0,
-            patch_buf: Tensor::zeros(
-                &[batch_size * TICKERS_COUNT, self.finest_patch_size],
-                (Kind::Float, self.device),
-            ),
-            patch_pos: 0,
-            uniform_layout: Tensor::full(
-                [
-                    batch_size * TICKERS_COUNT,
-                    super::UNIFORM_STREAM_PATCH_COUNT,
-                    super::UNIFORM_STREAM_PATCH_SIZE,
-                ],
-                f64::NAN,
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_patch_tokens: Tensor::zeros(
-                [
-                    batch_size * TICKERS_COUNT,
+                    uniform_rows,
                     super::UNIFORM_STREAM_PATCH_COUNT,
                     self.model_dim,
                 ],
@@ -604,7 +615,7 @@ impl TradingModel {
             uniform_live_fill_host: vec![0; batch_size as usize],
             uniform_layer0_prefix_hidden: Tensor::zeros(
                 [
-                    batch_size * TICKERS_COUNT,
+                    uniform_rows,
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim,
                 ],
@@ -612,7 +623,7 @@ impl TradingModel {
             ),
             uniform_layer0_prefix_k: Tensor::zeros(
                 [
-                    batch_size * TICKERS_COUNT,
+                    uniform_rows,
                     super::GQA_NUM_KV_HEADS,
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim / super::GQA_NUM_Q_HEADS,
@@ -621,7 +632,7 @@ impl TradingModel {
             ),
             uniform_layer0_prefix_v: Tensor::zeros(
                 [
-                    batch_size * TICKERS_COUNT,
+                    uniform_rows,
                     super::GQA_NUM_KV_HEADS,
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim / super::GQA_NUM_Q_HEADS,
@@ -630,44 +641,113 @@ impl TradingModel {
             ),
             uniform_prefix_x0: Tensor::zeros(
                 [
-                    batch_size * TICKERS_COUNT,
+                    uniform_rows,
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim,
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
-            uniform_final_prefix_hidden: Tensor::zeros(
-                [
-                    batch_size * TICKERS_COUNT,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_readout_prefix_k: Tensor::zeros(
-                [
-                    batch_size * TICKERS_COUNT,
-                    super::CA_NUM_HEADS,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    super::CA_HEAD_DIM,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
-            uniform_readout_prefix_v: Tensor::zeros(
-                [
-                    batch_size * TICKERS_COUNT,
-                    super::CA_NUM_HEADS,
-                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                    super::CA_HEAD_DIM,
-                ],
-                (self.patch_embed_weight.kind(), self.device),
-            ),
+            uniform_readout_prefix_k,
+            uniform_readout_prefix_v,
             uniform_prefix_k: Vec::new(),
             uniform_prefix_v: Vec::new(),
             uniform_cached_static_features: None,
             uniform_cached_exo_tokens: None,
             initialized: false,
         }
+    }
+
+    fn init_uniform_from_full_on_device(&self, price: &Tensor, state: &mut StreamState) {
+        let batch_size = price.size()[0];
+        let expected_layout = TICKERS_COUNT * super::UNIFORM_STREAM_LAYOUT_LEN;
+        assert_eq!(
+            price.size()[1],
+            expected_layout,
+            "Uniform256Stream init expects anchored layout input"
+        );
+        let layout = price.view([
+            batch_size * TICKERS_COUNT,
+            super::UNIFORM_STREAM_PATCH_COUNT,
+            super::UNIFORM_STREAM_PATCH_SIZE,
+        ]);
+        let live_fill = layout
+            .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1)
+            .isnan()
+            .logical_not()
+            .sum_dim_intlist([1].as_slice(), false, Kind::Int64);
+        state.uniform_layout = layout;
+        state.uniform_patch_tokens = self.patch_embed(
+            &state
+                .uniform_layout
+                .view([batch_size * TICKERS_COUNT, super::UNIFORM_STREAM_LAYOUT_LEN]),
+        );
+        state.uniform_live_fill = live_fill.shallow_clone();
+        state.uniform_live_fill_host =
+            Vec::<i64>::try_from(live_fill.to_device(tch::Device::Cpu)).unwrap();
+        state.initialized = true;
+        self.prefill_uniform_prefix_base_cache(state);
+    }
+
+    fn step_uniform_stream_state_on_device(
+        &self,
+        new_deltas: &Tensor,
+        static_features: &Tensor,
+        state: &mut StreamState,
+        replay_mode: bool,
+    ) -> ModelOutput {
+        let new_deltas = if new_deltas.dim() == 1 {
+            new_deltas.unsqueeze(0)
+        } else {
+            new_deltas.shallow_clone()
+        };
+        let batch_size = new_deltas.size()[0];
+        let state_batch_size = state.uniform_live_fill.size()[0];
+        assert_eq!(
+            state_batch_size, batch_size,
+            "stream state batch size mismatch"
+        );
+
+        let rows = batch_size * TICKERS_COUNT;
+        let row_deltas = new_deltas.reshape([rows, 1]);
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
+        let flat_layout = state
+            .uniform_layout
+            .view([rows, super::UNIFORM_STREAM_LAYOUT_LEN]);
+        let mut shifted_valid = Tensor::zeros(
+            [rows, history_len - 1],
+            (flat_layout.kind(), flat_layout.device()),
+        );
+        let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
+        let _ = flat_layout
+            .narrow(1, 0, history_len - 1)
+            .copy_(&shifted_valid);
+        let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
+        state.uniform_patch_tokens = self.patch_embed(&flat_layout);
+        state
+            .uniform_live_fill_host
+            .fill(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        let _ = state
+            .uniform_live_fill
+            .fill_(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        state.initialized = true;
+        self.prefill_uniform_prefix_base_cache(state);
+        if replay_mode {
+            self.uniform_stream_replay_forward(static_features, state)
+        } else {
+            self.uniform_stream_cached_forward(static_features, state)
+        }
+    }
+
+    pub fn init_stream_state(&self) -> StreamState {
+        self.build_stream_state(1, true)
+    }
+
+    pub fn init_stream_state_batched(&self, batch_size: i64) -> StreamState {
+        self.build_stream_state(batch_size, true)
+    }
+
+    pub fn init_replay_stream_state_batched(&self, batch_size: i64) -> StreamState {
+        self.build_stream_state(batch_size, false)
     }
 
     pub fn step(
@@ -716,44 +796,12 @@ impl TradingModel {
             if is_full {
                 return self.init_from_full_on_device(&new_deltas, &static_features, state);
             }
-
-            let new_deltas = if new_deltas.dim() == 1 {
-                new_deltas.unsqueeze(0)
-            } else {
-                new_deltas.shallow_clone()
-            };
-            let batch_size = new_deltas.size()[0];
-            let state_batch_size = state.delta_ring.size()[0] / TICKERS_COUNT;
-            assert_eq!(
-                state_batch_size, batch_size,
-                "stream state batch size mismatch"
+            return self.step_uniform_stream_state_on_device(
+                &new_deltas,
+                &static_features,
+                state,
+                false,
             );
-
-            let rows = batch_size * TICKERS_COUNT;
-            let row_deltas = new_deltas.reshape([rows, 1]);
-            let history_len = PRICE_DELTAS_PER_TICKER as i64;
-            let flat_layout = state
-                .uniform_layout
-                .view([rows, super::UNIFORM_STREAM_LAYOUT_LEN]);
-            let mut shifted_valid = Tensor::zeros(
-                [rows, history_len - 1],
-                (flat_layout.kind(), flat_layout.device()),
-            );
-            let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
-            let _ = flat_layout
-                .narrow(1, 0, history_len - 1)
-                .copy_(&shifted_valid);
-            let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
-            state.uniform_patch_tokens = self.patch_embed(&flat_layout);
-            state
-                .uniform_live_fill_host
-                .fill(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
-            let _ = state
-                .uniform_live_fill
-                .fill_(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
-            state.initialized = true;
-            self.prefill_uniform_prefix_base_cache(state);
-            return self.uniform_stream_cached_forward(&static_features, state);
         }
 
         if is_full {
@@ -802,6 +850,78 @@ impl TradingModel {
         )
     }
 
+    pub fn forward_stream_state_on_device_for_replay(
+        &self,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        let static_features = if static_features.dim() == 1 {
+            static_features.unsqueeze(0)
+        } else {
+            static_features.shallow_clone()
+        };
+        let static_features = self.cast_inputs(&static_features);
+        if self.variant == super::ModelVariant::Uniform256Stream {
+            return self.uniform_stream_replay_forward(&static_features, state);
+        }
+        self.forward_stream_state_on_device(&static_features, state)
+    }
+
+    pub fn step_on_device_for_replay(
+        &self,
+        new_deltas: &Tensor,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        if new_deltas.device() != self.device || static_features.device() != self.device {
+            panic!(
+                "step_on_device_for_replay requires tensors on {:?}",
+                self.device
+            );
+        }
+        let new_deltas = self.cast_inputs(new_deltas);
+        let static_features = self.cast_inputs(static_features);
+
+        let raw_full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
+        let layout_full_obs = self.price_input_dim();
+        let is_full = match new_deltas.dim() {
+            1 => {
+                let width = new_deltas.size()[0];
+                width == raw_full_obs || width == layout_full_obs
+            }
+            2 => {
+                let width = new_deltas.size()[1];
+                width == raw_full_obs || width == layout_full_obs
+            }
+            _ => false,
+        };
+        let static_features = if static_features.dim() == 1 {
+            static_features.unsqueeze(0)
+        } else {
+            static_features.shallow_clone()
+        };
+
+        if self.variant == super::ModelVariant::Uniform256Stream {
+            if is_full {
+                let price = if new_deltas.dim() == 1 {
+                    new_deltas.unsqueeze(0)
+                } else {
+                    new_deltas.shallow_clone()
+                };
+                self.init_uniform_from_full_on_device(&price, state);
+                return self.uniform_stream_replay_forward(&static_features, state);
+            }
+            return self.step_uniform_stream_state_on_device(
+                &new_deltas,
+                &static_features,
+                state,
+                true,
+            );
+        }
+
+        self.step_on_device(&new_deltas, &static_features, state)
+    }
+
     fn init_from_full_on_device(
         &self,
         price_deltas: &Tensor,
@@ -828,36 +948,7 @@ impl TradingModel {
         let static_features = self.cast_inputs(&static_features);
 
         if self.variant == super::ModelVariant::Uniform256Stream {
-            let batch_size = price.size()[0];
-            let expected_layout = TICKERS_COUNT * super::UNIFORM_STREAM_LAYOUT_LEN;
-            assert_eq!(
-                price.size()[1],
-                expected_layout,
-                "Uniform256Stream init expects anchored layout input"
-            );
-            let layout = price.view([
-                batch_size * TICKERS_COUNT,
-                super::UNIFORM_STREAM_PATCH_COUNT,
-                super::UNIFORM_STREAM_PATCH_SIZE,
-            ]);
-            let live_fill = layout
-                .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1)
-                .isnan()
-                .logical_not()
-                .sum_dim_intlist([1].as_slice(), false, Kind::Int64);
-            state.uniform_layout = layout;
-            let patch_tokens = self.patch_embed(
-                &state
-                    .uniform_layout
-                    .view([batch_size * TICKERS_COUNT, super::UNIFORM_STREAM_LAYOUT_LEN]),
-            );
-            state.uniform_patch_tokens = patch_tokens;
-            state.uniform_live_fill = live_fill.shallow_clone();
-            state.uniform_live_fill_host =
-                Vec::<i64>::try_from(live_fill.to_device(tch::Device::Cpu)).unwrap();
-            state.initialized = true;
-            self.prefill_uniform_prefix_base_cache(state);
-
+            self.init_uniform_from_full_on_device(&price, state);
             return self.uniform_stream_cached_forward(&static_features, state);
         }
 

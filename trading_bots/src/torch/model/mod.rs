@@ -813,8 +813,6 @@ pub struct StreamState {
     pub uniform_prefix_v: Vec<Tensor>,
     /// Prefix x0 embedding (post-input_ln) for x0 residual mixing.
     pub uniform_prefix_x0: Tensor,
-    /// Final backbone hidden states for the cached uniform-stream prefix.
-    pub uniform_final_prefix_hidden: Tensor,
     /// Readout prefix K cache for uniform streamed rollout.
     pub uniform_readout_prefix_k: Tensor,
     /// Readout prefix V cache for uniform streamed rollout.
