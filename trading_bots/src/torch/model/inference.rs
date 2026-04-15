@@ -95,8 +95,7 @@ impl TradingModel {
             .narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1)
             .shallow_clone();
         let x0 = self.input_ln.forward(&x);
-        let (x_next, k, v) =
-            self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
+        let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
         state.uniform_prefix_x0 = x0;
         state.uniform_layer0_prefix_hidden = x_next;
         state.uniform_layer0_prefix_k = k.index_select(1, &self.gqa_kv_head_index);
@@ -117,14 +116,11 @@ impl TradingModel {
             super::UNIFORM_STREAM_PATCH_COUNT - 1,
         );
         let x0 = self.input_ln.forward(&x);
-        let (x_next, k, v) =
-            self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
+        let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
         let k = k.index_select(1, &self.gqa_kv_head_index);
         let v = v.index_select(1, &self.gqa_kv_head_index);
         self.ensure_stream_cache_kind(state, &x0, &x_next, &k, &v);
-        state.uniform_prefix_x0 = state
-            .uniform_prefix_x0
-            .index_copy(0, row_idx, &x0);
+        state.uniform_prefix_x0 = state.uniform_prefix_x0.index_copy(0, row_idx, &x0);
         state.uniform_layer0_prefix_hidden = state
             .uniform_layer0_prefix_hidden
             .index_copy(0, row_idx, &x_next);
@@ -177,8 +173,9 @@ impl TradingModel {
             x = x_next;
         }
         state.uniform_final_prefix_hidden = self.final_ln.forward(&x);
-        let (readout_prefix_k, readout_prefix_v) =
-            self.readout_block.project_source(&state.uniform_final_prefix_hidden);
+        let (readout_prefix_k, readout_prefix_v) = self
+            .readout_block
+            .project_source(&state.uniform_final_prefix_hidden);
         state.uniform_readout_prefix_k = readout_prefix_k;
         state.uniform_readout_prefix_v = readout_prefix_v;
         state.uniform_cached_static_features = Some(static_features.shallow_clone());
@@ -359,14 +356,12 @@ impl TradingModel {
     pub(crate) fn reset_uniform_stream_envs_from_layout_indexed(
         &self,
         state: &mut StreamState,
-        env_indices: &[usize],
         env_idx: &Tensor,
         row_idx: &Tensor,
         layouts: &Tensor,
         reset_live_fill: &Tensor,
-        reset_live_fill_value: i64,
     ) {
-        if self.variant != super::ModelVariant::Uniform256Stream || env_indices.is_empty() {
+        if self.variant != super::ModelVariant::Uniform256Stream || env_idx.size()[0] == 0 {
             return;
         }
         let layouts = if layouts.dim() == 1 {
@@ -383,7 +378,7 @@ impl TradingModel {
         );
         assert_eq!(
             layouts.size()[0] as usize,
-            env_indices.len(),
+            env_idx.size()[0] as usize,
             "layout/reset batch mismatch"
         );
         let layouts = layouts.view([
@@ -409,12 +404,10 @@ impl TradingModel {
             row_idx,
             &patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
         );
+        // PPO replay uses the device tensor directly; the host mirror has no read sites here.
         state.uniform_live_fill = state
             .uniform_live_fill
             .index_copy(0, env_idx, &reset_live_fill);
-        for &env_idx in env_indices {
-            state.uniform_live_fill_host[env_idx] = reset_live_fill_value;
-        }
         self.prefill_uniform_prefix_base_cache_indexed(state, row_idx);
     }
 
