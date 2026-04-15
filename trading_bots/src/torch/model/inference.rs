@@ -861,6 +861,62 @@ impl TradingModel {
         self.forward_stream_state_on_device(&static_features, state)
     }
 
+    /// Advance the uniform stream state by one delta step without running the
+    /// post-layer-0 forward or the head. Used by replay callers that will
+    /// reset some envs immediately afterwards, so the replay forward's output
+    /// would be discarded. Non-reset envs still have their layout shifted,
+    /// patch tokens recomputed, and layer-0 prefix cache refreshed; reset envs
+    /// are subsequently overridden via `reset_uniform_stream_envs_from_layout_indexed`.
+    pub fn advance_replay_stream_state(&self, new_deltas: &Tensor, state: &mut StreamState) {
+        assert_eq!(
+            self.variant,
+            super::ModelVariant::Uniform256Stream,
+            "advance_replay_stream_state requires uniform stream variant"
+        );
+        if new_deltas.device() != self.device {
+            panic!(
+                "advance_replay_stream_state requires tensors on {:?}",
+                self.device
+            );
+        }
+        let new_deltas = self.cast_inputs(new_deltas);
+        let new_deltas = if new_deltas.dim() == 1 {
+            new_deltas.unsqueeze(0)
+        } else {
+            new_deltas.shallow_clone()
+        };
+        let batch_size = new_deltas.size()[0];
+        let state_batch_size = state.uniform_live_fill.size()[0];
+        assert_eq!(
+            state_batch_size, batch_size,
+            "stream state batch size mismatch"
+        );
+        let rows = batch_size * TICKERS_COUNT;
+        let row_deltas = new_deltas.reshape([rows, 1]);
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
+        let flat_layout = state
+            .uniform_layout
+            .view([rows, super::UNIFORM_STREAM_LAYOUT_LEN]);
+        let mut shifted_valid = Tensor::zeros(
+            [rows, history_len - 1],
+            (flat_layout.kind(), flat_layout.device()),
+        );
+        let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
+        let _ = flat_layout
+            .narrow(1, 0, history_len - 1)
+            .copy_(&shifted_valid);
+        let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
+        state.uniform_patch_tokens = self.patch_embed(&flat_layout);
+        state
+            .uniform_live_fill_host
+            .fill(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        let _ = state
+            .uniform_live_fill
+            .fill_(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        state.initialized = true;
+        self.prefill_uniform_prefix_base_cache(state);
+    }
+
     pub fn step_on_device_for_replay(
         &self,
         new_deltas: &Tensor,

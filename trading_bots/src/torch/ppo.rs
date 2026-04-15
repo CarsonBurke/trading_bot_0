@@ -646,9 +646,12 @@ pub async fn train(
                             &mut stream_state,
                         )
                     } else {
-                        let _ = trading_model.step_on_device_for_replay(
+                        // Advance state (layout shift + patch embed + layer-0 prefill)
+                        // without running the full forward — the reset below will
+                        // clobber reset-env state, and a single forward afterward
+                        // covers all envs. Saves one full replay forward per reset step.
+                        trading_model.advance_replay_stream_state(
                             &step_deltas,
-                            &obs_static,
                             &mut stream_state,
                         );
                         let (reset_env_tensor, reset_row_idx, reset_layouts_batch) =
@@ -862,10 +865,9 @@ pub async fn train(
                                     .reshape([-1]);
                                 let reset_layouts =
                                     reset_layout_bank.index_select(0, &reset_slot_ids);
-                                let _ = autocast(true, || {
-                                    trading_model.step_on_device_for_replay(
+                                autocast(true, || {
+                                    trading_model.advance_replay_stream_state(
                                         &prev_step_deltas,
-                                        &current_static,
                                         &mut chunk_state,
                                     )
                                 });
