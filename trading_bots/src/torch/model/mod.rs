@@ -167,7 +167,14 @@ struct GqaBlock {
 }
 
 impl GqaBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, _init_scale: f64, xsa_temporal: bool, layer_idx: usize) -> Self {
+    fn new(
+        p: &nn::Path,
+        model_dim: i64,
+        ff_dim: i64,
+        _init_scale: f64,
+        xsa_temporal: bool,
+        layer_idx: usize,
+    ) -> Self {
         let head_dim = model_dim / GQA_NUM_Q_HEADS;
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
         let qkv_dim = model_dim + 2 * kv_dim;
@@ -303,13 +310,20 @@ impl GqaBlock {
         let k = self.k_norm.forward(&k);
         let q = rope.apply_from(&q, rope_offset);
         let k = rope.apply_from(&k, rope_offset);
-        let q = &q * self.q_gain.to_kind(q.kind()).view([1, GQA_NUM_Q_HEADS, 1, 1]);
+        let q = &q
+            * self
+                .q_gain
+                .to_kind(q.kind())
+                .view([1, GQA_NUM_Q_HEADS, 1, 1]);
         (q, k, v)
     }
 
     fn apply_ffn(&self, x: &Tensor) -> Tensor {
         let normed = self.ffn_ln.forward(x) * self.ln_scale_factor;
-        let ffn_out = leaky_relu_sq_linear(&linear_with_same_dtype(&normed, &self.ffn_fc1), &self.ffn_fc2);
+        let ffn_out = leaky_relu_sq_linear(
+            &linear_with_same_dtype(&normed, &self.ffn_fc1),
+            &self.ffn_fc2,
+        );
         let ffn_out = &ffn_out * self.mlp_scale.to_kind(ffn_out.kind()).view([1, 1, -1]);
         x + ffn_out
     }
@@ -464,7 +478,6 @@ impl ExogenousTickerBlock {
         let out = &out * self.attn_scale.to_kind(out.kind()).view([1, 1, -1]);
         x + out
     }
-
 }
 
 struct ExoMLP {
@@ -588,7 +601,12 @@ fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i6
     )
 }
 
-fn linear_residual_out(p: &nn::Path, name: &str, in_features: i64, out_features: i64) -> nn::Linear {
+fn linear_residual_out(
+    p: &nn::Path,
+    name: &str,
+    in_features: i64,
+    out_features: i64,
+) -> nn::Linear {
     nn::linear(
         p / name,
         in_features,
@@ -1012,8 +1030,12 @@ impl TradingModel {
                 )
             })
             .collect::<Vec<_>>();
-        let exogenous_ticker_block =
-            CrossAttnFfnBlock::new(&(p / "cross_attn_0"), spec.model_dim, spec.ff_dim, init_scale);
+        let exogenous_ticker_block = CrossAttnFfnBlock::new(
+            &(p / "cross_attn_0"),
+            spec.model_dim,
+            spec.ff_dim,
+            init_scale,
+        );
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
         let exo_embed_ln = RMSNorm::new(&(p / "exo_embed_ln"), spec.model_dim, 1e-6);
         let readout_block = CrossAttnFfnBlock::new(
@@ -1024,7 +1046,12 @@ impl TradingModel {
         );
         let readout_head_ln = RMSNorm::new(&(p / "readout_head_ln"), spec.model_dim, 1e-6);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
-        let rope = RotaryEmbedding::new(seq_len + NUM_HEAD_CLS_TOKENS, head_dim, ROPE_DIMS, p.device());
+        let rope = RotaryEmbedding::new(
+            seq_len + NUM_HEAD_CLS_TOKENS,
+            head_dim,
+            ROPE_DIMS,
+            p.device(),
+        );
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],

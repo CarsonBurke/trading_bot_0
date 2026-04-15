@@ -90,7 +90,9 @@ fn newtonschulz5(g: &Tensor) -> Tensor {
     let orig_kind = g.kind();
     // g may alias caller storage (shallow_clone / transpose view); compute the
     // normalized copy out-of-place so in-place ops below don't mutate it.
-    let nrm = g.frobenius_norm([0i64, 1].as_slice(), false).clamp_min(1e-7);
+    let nrm = g
+        .frobenius_norm([0i64, 1].as_slice(), false)
+        .clamp_min(1e-7);
     let x2d = if orig_kind == Kind::BFloat16 {
         g / &nrm
     } else {
@@ -203,7 +205,9 @@ impl Muon {
             // `o`, so all subsequent scalings run in place.
             let denom = (entry.row_sq_mean.sqrt() + eps).unsqueeze(-1);
             let _ = o.g_div_(&denom);
-            let frob = o.frobenius_norm([-2i64, -1].as_slice(), true).clamp_min(1e-12);
+            let frob = o
+                .frobenius_norm([-2i64, -1].as_slice(), true)
+                .clamp_min(1e-12);
             let neg_eta = (neg_eta_coef * entry.sqrt_mn) / frob;
             let _ = o.g_mul_(&neg_eta);
 

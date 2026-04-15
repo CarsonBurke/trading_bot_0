@@ -29,8 +29,7 @@ impl TradingModel {
         let center = (LOG_STD_MIN + LOG_STD_MAX) * 0.5;
         let half_range = (LOG_STD_MAX - LOG_STD_MIN) * 0.5;
         let raw_log_std = &action_log_var * 0.5;
-        let action_log_std =
-            ((raw_log_std - center) / half_range).tanh() * half_range + center;
+        let action_log_std = ((raw_log_std - center) / half_range).tanh() * half_range + center;
         let action_std = action_log_std.exp();
         let value_logits = linear_with_same_dtype(&critic_cls, &self.value_proj);
         (
