@@ -162,7 +162,6 @@ struct GqaBlock {
     ffn_ln: RMSNorm,
     ffn_fc1: nn::Linear,
     ffn_fc2: nn::Linear,
-    uniform_suffix_attn_mask: Tensor,
     xsa_temporal: bool,
 }
 
@@ -200,26 +199,6 @@ impl GqaBlock {
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, ff_dim);
         let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
-        let uniform_suffix_len = NUM_HEAD_CLS_TOKENS + 1;
-        let uniform_prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
-        let visible_prefix = Tensor::ones(
-            [uniform_suffix_len, uniform_prefix_len],
-            (Kind::Bool, p.device()),
-        );
-        let visible_suffix = Tensor::ones(
-            [uniform_suffix_len, uniform_suffix_len],
-            (Kind::Bool, p.device()),
-        )
-        .tril(0);
-        let uniform_suffix_attn_mask = Tensor::zeros(
-            [uniform_suffix_len, uniform_prefix_len + uniform_suffix_len],
-            (p.kind(), p.device()),
-        )
-        .masked_fill(
-            &Tensor::cat(&[&visible_prefix, &visible_suffix], 1).logical_not(),
-            f64::NEG_INFINITY,
-        )
-        .set_requires_grad(false);
         Self {
             attn_ln,
             attn_qkv,
@@ -236,7 +215,6 @@ impl GqaBlock {
             ffn_ln,
             ffn_fc1,
             ffn_fc2,
-            uniform_suffix_attn_mask,
             xsa_temporal,
         }
     }
@@ -380,7 +358,7 @@ impl GqaBlock {
             &q,
             &k,
             &v,
-            Some(&self.uniform_suffix_attn_mask),
+            None::<&Tensor>,
             0.0,
             false,
             None,
@@ -637,8 +615,6 @@ pub(super) const LOG_STD_MAX: f64 = 0.04879016416943201;
 const INTER_TICKER_AFTER: usize = 1;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
-pub(super) const NUM_HEAD_CLS_TOKENS: i64 = 3;
-
 fn residual_init_scale(num_residual_sublayers: usize) -> f64 {
     1.0 / (2.0 * num_residual_sublayers as f64).sqrt()
 }
@@ -813,10 +789,6 @@ pub struct StreamState {
     pub uniform_prefix_v: Vec<Tensor>,
     /// Prefix x0 embedding (post-input_ln) for x0 residual mixing.
     pub uniform_prefix_x0: Tensor,
-    /// Readout prefix K cache for uniform streamed rollout.
-    pub uniform_readout_prefix_k: Tensor,
-    /// Readout prefix V cache for uniform streamed rollout.
-    pub uniform_readout_prefix_v: Tensor,
     /// Static features associated with the currently conditioned prefix cache.
     pub uniform_cached_static_features: Option<Tensor>,
     /// Exogenous tokens associated with the currently conditioned prefix cache.
@@ -844,11 +816,6 @@ pub struct TradingModel {
     rope: RotaryEmbedding,
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
-    actor_cls_token: Tensor,
-    critic_cls_token: Tensor,
-    sde_cls_token: Tensor,
-    readout_block: CrossAttnFfnBlock,
-    readout_head_ln: RMSNorm,
     endogenous_ticker_block: EndogenousTickerBlock,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
@@ -899,10 +866,6 @@ impl TradingModel {
 
     pub fn patch_seq_len(&self) -> i64 {
         self.seq_len
-    }
-
-    fn readout_queries(&self, x: &Tensor) -> Tensor {
-        x.narrow(1, x.size()[1] - NUM_HEAD_CLS_TOKENS, NUM_HEAD_CLS_TOKENS)
     }
 
     fn uniform_stream_layout_from_raw(&self, deltas: &Tensor) -> Tensor {
@@ -1036,20 +999,8 @@ impl TradingModel {
         );
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
         let exo_embed_ln = RMSNorm::new(&(p / "exo_embed_ln"), spec.model_dim, 1e-6);
-        let readout_block = CrossAttnFfnBlock::new(
-            &(p / "pma_readout"),
-            spec.model_dim,
-            spec.ff_dim,
-            init_scale,
-        );
-        let readout_head_ln = RMSNorm::new(&(p / "readout_head_ln"), spec.model_dim, 1e-6);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
-        let rope = RotaryEmbedding::new(
-            seq_len + NUM_HEAD_CLS_TOKENS,
-            head_dim,
-            ROPE_DIMS,
-            p.device(),
-        );
+        let rope = RotaryEmbedding::new(seq_len, head_dim, ROPE_DIMS, p.device());
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -1062,31 +1013,6 @@ impl TradingModel {
             "exo_feat_b",
             &[NUM_EXO_TOKENS, spec.model_dim],
             Init::Const(0.0),
-        );
-        let cls_std = xavier_normal_std(1, spec.model_dim);
-        let actor_cls_token = p.var(
-            "actor_cls_token",
-            &[1, 1, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: cls_std,
-            },
-        );
-        let critic_cls_token = p.var(
-            "critic_cls_token",
-            &[1, 1, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: cls_std,
-            },
-        );
-        let sde_cls_token = p.var(
-            "sde_cls_token",
-            &[1, 1, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: cls_std,
-            },
         );
         let endogenous_ticker_block = EndogenousTickerBlock::new(
             &(p / "inter_ticker_0"),
@@ -1146,11 +1072,6 @@ impl TradingModel {
             rope,
             exo_feat_w,
             exo_feat_b,
-            actor_cls_token,
-            critic_cls_token,
-            sde_cls_token,
-            readout_block,
-            readout_head_ln,
             endogenous_ticker_block,
             policy_mean_log_var,
             value_proj,
@@ -1179,24 +1100,21 @@ impl TradingModel {
         let seq = x.size()[1];
         let batch_size = bt / TICKERS_COUNT;
         let x_4d = x.view([batch_size, TICKERS_COUNT, seq, self.model_dim]);
-        let cls = x_4d.narrow(2, seq - NUM_HEAD_CLS_TOKENS, NUM_HEAD_CLS_TOKENS);
-        let cls_for_mix = cls.permute([0, 2, 1, 3]).reshape([
-            batch_size * NUM_HEAD_CLS_TOKENS,
-            TICKERS_COUNT,
-            self.model_dim,
-        ]);
-        let enriched_cls = self
+        let live = x_4d.narrow(2, seq - 1, 1);
+        let live_for_mix =
+            live.permute([0, 2, 1, 3])
+                .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
+        let enriched_live = self
             .endogenous_ticker_block
-            .forward(&cls_for_mix, self.model_dim, self.ff_dim)
-            .reshape([
-                batch_size,
-                NUM_HEAD_CLS_TOKENS,
-                TICKERS_COUNT,
-                self.model_dim,
-            ])
+            .forward(&live_for_mix, self.model_dim, self.ff_dim)
+            .reshape([batch_size, 1, TICKERS_COUNT, self.model_dim])
             .permute([0, 2, 1, 3]);
-        let non_cls = x_4d.narrow(2, 0, seq - NUM_HEAD_CLS_TOKENS);
-        Tensor::cat(&[&non_cls, &enriched_cls], 2).reshape([bt, seq, self.model_dim])
+        if seq == 1 {
+            enriched_live.reshape([bt, seq, self.model_dim])
+        } else {
+            let past = x_4d.narrow(2, 0, seq - 1);
+            Tensor::cat(&[&past, &enriched_live], 2).reshape([bt, seq, self.model_dim])
+        }
     }
 
     /// Build exogenous KV bank: [batch*tickers, NUM_EXO_TOKENS, MODEL_DIM]
@@ -1246,20 +1164,8 @@ impl TradingModel {
                 .view([batch_tokens, PRICE_DELTAS_PER_TICKER as i64])
         };
 
-        let kind = deltas.kind();
         let patch_tokens = self.patch_embed(&deltas);
-        let cls_triplet = Tensor::cat(
-            &[
-                &self.actor_cls_token,
-                &self.critic_cls_token,
-                &self.sde_cls_token,
-            ],
-            1,
-        )
-        .to_kind(kind)
-        .expand([batch_tokens, 3, self.model_dim], false);
-        self.input_ln
-            .forward(&Tensor::cat(&[&patch_tokens, &cls_triplet], 1))
+        self.input_ln.forward(&patch_tokens)
     }
 
     /// Per-config enrichment (avoids [batch, 256, 8636] expand), then fused

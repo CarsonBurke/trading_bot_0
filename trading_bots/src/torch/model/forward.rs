@@ -30,7 +30,7 @@ impl TradingModel {
         x = self.final_ln.forward(&x);
         debug_fused("model_x_gqa", &x);
 
-        self.head_with_temporal_pool(&x, batch_size, false).0
+        self.head_from_final_hidden(&x, batch_size)
     }
 
     pub fn forward(
@@ -90,17 +90,16 @@ impl TradingModel {
         x = self.final_ln.forward(&x);
         debug_fused("model_x_gqa", &x);
 
-        let (out, debug) = self.head_with_temporal_pool(&x, batch_size, true);
         (
-            out,
-            debug.unwrap_or(DebugMetrics {
+            self.head_from_final_hidden(&x, batch_size),
+            DebugMetrics {
                 temporal_tau: 0.0,
                 temporal_attn_entropy: 0.0,
                 temporal_attn_max: 0.0,
                 temporal_attn_eff_len: 0.0,
                 temporal_attn_center: 0.0,
                 temporal_attn_last_weight: 0.0,
-            }),
+            },
         )
     }
 

@@ -17,8 +17,6 @@ impl StreamState {
         let _ = self.uniform_layer0_prefix_k.zero_();
         let _ = self.uniform_layer0_prefix_v.zero_();
         let _ = self.uniform_prefix_x0.zero_();
-        let _ = self.uniform_readout_prefix_k.zero_();
-        let _ = self.uniform_readout_prefix_v.zero_();
         self.uniform_prefix_k.clear();
         self.uniform_prefix_v.clear();
         self.uniform_cached_static_features = None;
@@ -61,8 +59,6 @@ impl TradingModel {
         state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach();
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach();
         state.uniform_prefix_x0 = state.uniform_prefix_x0.detach();
-        state.uniform_readout_prefix_k = state.uniform_readout_prefix_k.detach();
-        state.uniform_readout_prefix_v = state.uniform_readout_prefix_v.detach();
         state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t.detach()).collect();
         state.uniform_prefix_v = state.uniform_prefix_v.iter().map(|t| t.detach()).collect();
         state.uniform_cached_static_features = state
@@ -100,8 +96,6 @@ impl TradingModel {
         state.uniform_layer0_prefix_v = v.index_select(1, &self.gqa_kv_head_index);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
-        let _ = state.uniform_readout_prefix_k.zero_();
-        let _ = state.uniform_readout_prefix_v.zero_();
         state.uniform_cached_static_features = None;
         state.uniform_cached_exo_tokens = None;
     }
@@ -125,8 +119,6 @@ impl TradingModel {
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.index_copy(0, row_idx, &v);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
-        let _ = state.uniform_readout_prefix_k.zero_();
-        let _ = state.uniform_readout_prefix_v.zero_();
         state.uniform_cached_static_features = None;
         state.uniform_cached_exo_tokens = None;
     }
@@ -168,11 +160,6 @@ impl TradingModel {
                 .push(v.index_select(1, &self.gqa_kv_head_index));
             x = x_next;
         }
-        let final_prefix_hidden = self.final_ln.forward(&x);
-        let (readout_prefix_k, readout_prefix_v) =
-            self.readout_block.project_source(&final_prefix_hidden);
-        state.uniform_readout_prefix_k = readout_prefix_k;
-        state.uniform_readout_prefix_v = readout_prefix_v;
         state.uniform_cached_static_features = Some(static_features.shallow_clone());
         state.uniform_cached_exo_tokens = Some(exo_tokens.shallow_clone());
     }
@@ -199,29 +186,12 @@ impl TradingModel {
             prefix_v.push(v.index_select(1, &self.gqa_kv_head_index));
             prefix_hidden = x_next;
         }
-        let final_prefix_hidden = self.final_ln.forward(&prefix_hidden);
-        let (readout_prefix_k, readout_prefix_v) =
-            self.readout_block.project_source(&final_prefix_hidden);
 
-        let batch_tokens = batch_size * TICKERS_COUNT;
         let live_token =
             state
                 .uniform_patch_tokens
                 .narrow(1, super::UNIFORM_STREAM_PATCH_COUNT - 1, 1);
-        let kind = live_token.kind();
-        let cls_triplet = Tensor::cat(
-            &[
-                &self.actor_cls_token,
-                &self.critic_cls_token,
-                &self.sde_cls_token,
-            ],
-            1,
-        )
-        .to_kind(kind)
-        .expand([batch_tokens, 3, self.model_dim], false);
-        let x0_suffix = self
-            .input_ln
-            .forward(&Tensor::cat(&[&live_token, &cls_triplet], 1));
+        let x0_suffix = self.input_ln.forward(&live_token);
         let mut x_suffix = x0_suffix.shallow_clone();
         let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
@@ -240,12 +210,7 @@ impl TradingModel {
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
         let x_suffix = self.final_ln.forward(&x_suffix);
-        self.head_from_uniform_suffix_with_prefix_cache(
-            &x_suffix,
-            batch_size,
-            &readout_prefix_k,
-            &readout_prefix_v,
-        )
+        self.head_from_final_hidden(&x_suffix, batch_size)
     }
 
     fn uniform_stream_cached_forward(
@@ -266,25 +231,11 @@ impl TradingModel {
             self.rebuild_uniform_conditioned_prefix_cache(static_features, &exo_tokens, state);
             exo_tokens
         };
-        let batch_tokens = batch_size * TICKERS_COUNT;
         let live_token =
             state
                 .uniform_patch_tokens
                 .narrow(1, super::UNIFORM_STREAM_PATCH_COUNT - 1, 1);
-        let kind = live_token.kind();
-        let cls_triplet = Tensor::cat(
-            &[
-                &self.actor_cls_token,
-                &self.critic_cls_token,
-                &self.sde_cls_token,
-            ],
-            1,
-        )
-        .to_kind(kind)
-        .expand([batch_tokens, 3, self.model_dim], false);
-        let x0_suffix = self
-            .input_ln
-            .forward(&Tensor::cat(&[&live_token, &cls_triplet], 1));
+        let x0_suffix = self.input_ln.forward(&live_token);
         let mut x_suffix = x0_suffix.shallow_clone();
         let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
@@ -303,12 +254,7 @@ impl TradingModel {
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
         let x_suffix = self.final_ln.forward(&x_suffix);
-        self.head_from_uniform_suffix_with_prefix_cache(
-            &x_suffix,
-            batch_size,
-            &state.uniform_readout_prefix_k,
-            &state.uniform_readout_prefix_v,
-        )
+        self.head_from_final_hidden(&x_suffix, batch_size)
     }
 
     pub fn forward_stream_state_on_device(
@@ -528,7 +474,7 @@ impl TradingModel {
             .view([batch_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64])
     }
 
-    fn build_stream_state(&self, batch_size: i64, cache_conditioned_prefix: bool) -> StreamState {
+    fn build_stream_state(&self, batch_size: i64, _cache_conditioned_prefix: bool) -> StreamState {
         let uniform_rows = batch_size * TICKERS_COUNT;
         let (delta_ring, patch_buf) = if self.variant == super::ModelVariant::Uniform256Stream {
             (
@@ -547,39 +493,6 @@ impl TradingModel {
                 Tensor::zeros(
                     &[uniform_rows, self.finest_patch_size],
                     (Kind::Float, self.device),
-                ),
-            )
-        };
-        let (uniform_readout_prefix_k, uniform_readout_prefix_v) = if cache_conditioned_prefix {
-            (
-                Tensor::zeros(
-                    [
-                        uniform_rows,
-                        super::CA_NUM_HEADS,
-                        super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                        super::CA_HEAD_DIM,
-                    ],
-                    (self.patch_embed_weight.kind(), self.device),
-                ),
-                Tensor::zeros(
-                    [
-                        uniform_rows,
-                        super::CA_NUM_HEADS,
-                        super::UNIFORM_STREAM_PATCH_COUNT - 1,
-                        super::CA_HEAD_DIM,
-                    ],
-                    (self.patch_embed_weight.kind(), self.device),
-                ),
-            )
-        } else {
-            (
-                Tensor::zeros(
-                    [0, super::CA_NUM_HEADS, 0, super::CA_HEAD_DIM],
-                    (self.patch_embed_weight.kind(), self.device),
-                ),
-                Tensor::zeros(
-                    [0, super::CA_NUM_HEADS, 0, super::CA_HEAD_DIM],
-                    (self.patch_embed_weight.kind(), self.device),
                 ),
             )
         };
@@ -641,8 +554,6 @@ impl TradingModel {
                 ],
                 (self.patch_embed_weight.kind(), self.device),
             ),
-            uniform_readout_prefix_k,
-            uniform_readout_prefix_v,
             uniform_prefix_k: Vec::new(),
             uniform_prefix_v: Vec::new(),
             uniform_cached_static_features: None,
@@ -659,11 +570,13 @@ impl TradingModel {
             expected_layout,
             "Uniform256Stream init expects anchored layout input"
         );
-        let layout = price.view([
-            batch_size * TICKERS_COUNT,
-            super::UNIFORM_STREAM_PATCH_COUNT,
-            super::UNIFORM_STREAM_PATCH_SIZE,
-        ]);
+        let layout = price
+            .view([
+                batch_size * TICKERS_COUNT,
+                super::UNIFORM_STREAM_PATCH_COUNT,
+                super::UNIFORM_STREAM_PATCH_SIZE,
+            ])
+            .copy();
         let live_fill = layout
             .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1)
             .isnan()
@@ -861,6 +774,26 @@ impl TradingModel {
         self.forward_stream_state_on_device(&static_features, state)
     }
 
+    /// Pure-tensor helper: given a layout of shape `[rows, UNIFORM_STREAM_LAYOUT_LEN]`
+    /// and new deltas of shape `[rows, 1]` (one delta per ticker row), return a
+    /// NEW layout tensor with the oldest delta dropped, the remaining history
+    /// shifted left by one, and the new delta appended at position
+    /// `PRICE_DELTAS_PER_TICKER - 1`. Trailing padding past `PRICE_DELTAS_PER_TICKER`
+    /// is preserved. Does not mutate `layout`.
+    pub(crate) fn shift_layout_append_delta(&self, layout: &Tensor, row_deltas: &Tensor) -> Tensor {
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
+        let rows = layout.size()[0];
+        let layout_len = layout.size()[1];
+        let kept = layout.narrow(1, 1, history_len - 1);
+        let appended = row_deltas.view([rows, 1]).to_kind(layout.kind());
+        if layout_len > history_len {
+            let pad = layout.narrow(1, history_len, layout_len - history_len);
+            Tensor::cat(&[&kept, &appended, &pad], 1)
+        } else {
+            Tensor::cat(&[&kept, &appended], 1)
+        }
+    }
+
     /// Advance the uniform stream state by one delta step without running the
     /// post-layer-0 forward or the head. Used by replay callers that will
     /// reset some envs immediately afterwards, so the replay forward's output
@@ -893,10 +826,12 @@ impl TradingModel {
         );
         let rows = batch_size * TICKERS_COUNT;
         let row_deltas = new_deltas.reshape([rows, 1]);
-        let history_len = PRICE_DELTAS_PER_TICKER as i64;
         let flat_layout = state
             .uniform_layout
             .view([rows, super::UNIFORM_STREAM_LAYOUT_LEN]);
+        // Apply shift+append in-place on the state's layout storage. This is the
+        // streaming-rollout hot path; we avoid an extra copy by mutating directly.
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
         let mut shifted_valid = Tensor::zeros(
             [rows, history_len - 1],
             (flat_layout.kind(), flat_layout.device()),
@@ -915,6 +850,83 @@ impl TradingModel {
             .fill_(super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
         state.initialized = true;
         self.prefill_uniform_prefix_base_cache(state);
+    }
+
+    /// Stateless batched replay forward over B pre-built windows.
+    ///
+    /// `layouts` has shape `[B * TICKERS_COUNT, UNIFORM_STREAM_LAYOUT_LEN]` (per-ticker flat
+    /// layout rows, concatenated across B windows), and `static_features` has shape
+    /// `[B, STATIC_OBS]`. The returned ModelOutput has batch `B`.
+    ///
+    /// Semantically equivalent to calling `uniform_stream_replay_forward` once per
+    /// window with the appropriate state prefilled; intended for batching PPO
+    /// minibatch sub-chunks where the state threading between time steps can be
+    /// flattened into the batch dimension.
+    pub(crate) fn windowed_replay_forward(
+        &self,
+        layouts: &Tensor,
+        static_features: &Tensor,
+        batch_size: i64,
+    ) -> ModelOutput {
+        assert_eq!(
+            self.variant,
+            super::ModelVariant::Uniform256Stream,
+            "windowed_replay_forward requires uniform stream variant"
+        );
+        let layouts = self.cast_inputs(layouts);
+        let patch_tokens = self.patch_embed(&layouts);
+        let static_features = self.cast_inputs(static_features);
+        let static_features = if static_features.dim() == 1 {
+            static_features.unsqueeze(0)
+        } else {
+            static_features.shallow_clone()
+        };
+        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+
+        // Prefix layer-0 prefill: first PATCH_COUNT - 1 tokens per row.
+        let prefix_patch = patch_tokens.narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
+        let x0 = self.input_ln.forward(&prefix_patch);
+        let (layer0_hidden, layer0_k_raw, layer0_v_raw) =
+            self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
+        let layer0_k = layer0_k_raw.index_select(1, &self.gqa_kv_head_index);
+        let layer0_v = layer0_v_raw.index_select(1, &self.gqa_kv_head_index);
+
+        let mut prefix_hidden = self
+            .exogenous_ticker_block
+            .forward(&layer0_hidden, &exo_tokens);
+        let mut prefix_k = Vec::with_capacity(self.gqa_layers.len());
+        let mut prefix_v = Vec::with_capacity(self.gqa_layers.len());
+        prefix_k.push(layer0_k);
+        prefix_v.push(layer0_v);
+        for layer in self.gqa_layers.iter().skip(1) {
+            let (x_next, k, v) = layer.forward_prefix_and_cache(&prefix_hidden, &x0, &self.rope);
+            prefix_k.push(k.index_select(1, &self.gqa_kv_head_index));
+            prefix_v.push(v.index_select(1, &self.gqa_kv_head_index));
+            prefix_hidden = x_next;
+        }
+
+        let live_token = patch_tokens.narrow(1, super::UNIFORM_STREAM_PATCH_COUNT - 1, 1);
+        let x0_suffix = self.input_ln.forward(&live_token);
+        let mut x_suffix = x0_suffix.shallow_clone();
+        let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
+        for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
+            x_suffix = layer.forward_suffix_with_cache(
+                &x_suffix,
+                &x0_suffix,
+                &prefix_k[layer_idx],
+                &prefix_v[layer_idx],
+                &self.rope,
+                &self.gqa_kv_head_index,
+                prefix_len,
+            );
+            if layer_idx == 0 {
+                x_suffix = self.exogenous_ticker_block.forward(&x_suffix, &exo_tokens);
+            }
+            x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
+        }
+        let x_suffix = self.final_ln.forward(&x_suffix);
+        self.head_from_final_hidden(&x_suffix, batch_size)
     }
 
     pub fn step_on_device_for_replay(
