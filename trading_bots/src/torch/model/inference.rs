@@ -407,9 +407,11 @@ impl TradingModel {
             &patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
         );
         // PPO replay uses the device tensor directly; the host mirror has no read sites here.
-        let _ = state
-            .uniform_live_fill
-            .index_fill_(0, env_idx, super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        let _ = state.uniform_live_fill.index_fill_(
+            0,
+            env_idx,
+            super::UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL,
+        );
         self.prefill_uniform_prefix_base_cache_indexed(state, row_idx);
     }
 

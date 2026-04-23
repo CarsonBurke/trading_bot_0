@@ -92,18 +92,17 @@ mod tests {
             [sub_chunk_len, batch, STATIC_OBSERVATIONS as i64],
             (Kind::Float, Device::Cpu),
         );
-        let delta_seq =
-            Tensor::randn([sub_chunk_len, batch, TICKERS_COUNT], (Kind::Float, Device::Cpu));
+        let delta_seq = Tensor::randn(
+            [sub_chunk_len, batch, TICKERS_COUNT],
+            (Kind::Float, Device::Cpu),
+        );
 
         // Sequential path: step_on_device_for_replay one step at a time.
         let mut seq_outputs = Vec::with_capacity(sub_chunk_len as usize);
         let mut state = model.init_replay_stream_state_batched(batch);
         // Step 0 uses the boundary layout directly (is_full init path).
-        let s0 = model.step_on_device_for_replay(
-            &boundary_layout,
-            &static_seq.select(0, 0),
-            &mut state,
-        );
+        let s0 =
+            model.step_on_device_for_replay(&boundary_layout, &static_seq.select(0, 0), &mut state);
         seq_outputs.push(s0);
         for t in 1..sub_chunk_len {
             let st = model.step_on_device_for_replay(
@@ -191,8 +190,10 @@ mod tests {
             [sub_chunk_len, batch, STATIC_OBSERVATIONS as i64],
             (Kind::Float, Device::Cpu),
         );
-        let delta_seq =
-            Tensor::randn([sub_chunk_len, batch, TICKERS_COUNT], (Kind::Float, Device::Cpu));
+        let delta_seq = Tensor::randn(
+            [sub_chunk_len, batch, TICKERS_COUNT],
+            (Kind::Float, Device::Cpu),
+        );
 
         // Reset bank: one reset layout for env 0, applied at step reset_at-1 (so it
         // materializes in window reset_at).
@@ -206,11 +207,8 @@ mod tests {
         // Sequential path with reset.
         let mut seq_outputs = Vec::with_capacity(sub_chunk_len as usize);
         let mut state = model.init_replay_stream_state_batched(batch);
-        let s0 = model.step_on_device_for_replay(
-            &boundary_layout,
-            &static_seq.select(0, 0),
-            &mut state,
-        );
+        let s0 =
+            model.step_on_device_for_replay(&boundary_layout, &static_seq.select(0, 0), &mut state);
         seq_outputs.push(s0);
         for t in 1..sub_chunk_len {
             let prev_deltas = delta_seq.select(0, t - 1);
@@ -276,11 +274,8 @@ mod tests {
             .permute([1, 0, 2])
             .contiguous()
             .view([batch * sub_chunk_len, STATIC_OBSERVATIONS as i64]);
-        let batched = model.windowed_replay_forward(
-            &windowed_stack,
-            &static_windowed,
-            batch * sub_chunk_len,
-        );
+        let batched =
+            model.windowed_replay_forward(&windowed_stack, &static_windowed, batch * sub_chunk_len);
 
         let value_logits_bt = batched.0.view([batch, sub_chunk_len, -1]);
         let action_mean_bt = batched.1.view([batch, sub_chunk_len, -1]);

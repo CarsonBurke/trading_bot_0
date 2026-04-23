@@ -440,14 +440,22 @@ pub async fn train(
         &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
         (Kind::Float, device),
     );
-    let mut s_old_log_probs_by_chunk =
-        Tensor::zeros(&[total_chunks, rollout.ppo_chunk_len], (Kind::Float, device));
-    let mut returns_by_chunk =
-        Tensor::zeros(&[total_chunks, rollout.ppo_chunk_len], (Kind::Float, device));
-    let mut adv_norm_by_chunk =
-        Tensor::zeros(&[total_chunks, rollout.ppo_chunk_len], (Kind::Float, device));
-    let mut reset_slots_by_chunk =
-        Tensor::zeros(&[total_chunks, rollout.ppo_chunk_len], (Kind::Int64, device));
+    let mut s_old_log_probs_by_chunk = Tensor::zeros(
+        &[total_chunks, rollout.ppo_chunk_len],
+        (Kind::Float, device),
+    );
+    let mut returns_by_chunk = Tensor::zeros(
+        &[total_chunks, rollout.ppo_chunk_len],
+        (Kind::Float, device),
+    );
+    let mut adv_norm_by_chunk = Tensor::zeros(
+        &[total_chunks, rollout.ppo_chunk_len],
+        (Kind::Float, device),
+    );
+    let mut reset_slots_by_chunk = Tensor::zeros(
+        &[total_chunks, rollout.ppo_chunk_len],
+        (Kind::Int64, device),
+    );
 
     if start_episode > 0 {
         let meta_path = format!(
@@ -481,10 +489,8 @@ pub async fn train(
             &[rollout.nprocs, STATIC_OBSERVATIONS as i64],
             (replay_obs_kind, device),
         );
-        let mut step_deltas = Tensor::zeros(
-            &[rollout.nprocs, TICKERS_COUNT],
-            (replay_obs_kind, device),
-        );
+        let mut step_deltas =
+            Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (replay_obs_kind, device));
         obs_static.copy_(&obs_static_cpu);
         let obs_price = obs_price_cpu.to_device(device);
         let mut stream_state = trading_model.init_replay_stream_state_batched(rollout.nprocs);
@@ -601,9 +607,9 @@ pub async fn train(
                     )
                 };
                 let reset_env_tensor = reset_env_host_view.to_device(device);
-                let reset_row_idx =
-                    (&reset_env_tensor.unsqueeze(1) * TICKERS_COUNT + &ticker_offsets)
-                        .reshape([-1]);
+                let reset_row_idx = (&reset_env_tensor.unsqueeze(1) * TICKERS_COUNT
+                    + &ticker_offsets)
+                    .reshape([-1]);
                 reset_replay = Some((
                     reset_env_tensor,
                     reset_row_idx,
@@ -654,10 +660,7 @@ pub async fn train(
                         // without running the full forward — the reset below will
                         // clobber reset-env state, and a single forward afterward
                         // covers all envs. Saves one full replay forward per reset step.
-                        trading_model.advance_replay_stream_state(
-                            &step_deltas,
-                            &mut stream_state,
-                        );
+                        trading_model.advance_replay_stream_state(&step_deltas, &mut stream_state);
                         let (reset_env_tensor, reset_row_idx, reset_layouts_batch) =
                             reset_replay.as_ref().expect("reset replay payload missing");
                         trading_model.reset_uniform_stream_envs_from_layout_indexed(
@@ -730,20 +733,23 @@ pub async fn train(
         // Full-rollout advantage normalization (not per-minibatch)
         let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
         let _ = s_static_obs_by_chunk.copy_(
-            &s_static_obs
-                .index_select(0, &chunk_mem_indices_flat)
-                .view([total_chunks, rollout.ppo_chunk_len, so_dim]),
+            &s_static_obs.index_select(0, &chunk_mem_indices_flat).view([
+                total_chunks,
+                rollout.ppo_chunk_len,
+                so_dim,
+            ]),
         );
         let _ = s_step_deltas_by_chunk.copy_(
             &s_step_deltas
                 .index_select(0, &chunk_mem_indices_flat)
                 .view([total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT]),
         );
-        let _ = s_actions_by_chunk.copy_(
-            &s_actions
-                .index_select(0, &chunk_mem_indices_flat)
-                .view([total_chunks, rollout.ppo_chunk_len, ACTION_COUNT]),
-        );
+        let _ =
+            s_actions_by_chunk.copy_(&s_actions.index_select(0, &chunk_mem_indices_flat).view([
+                total_chunks,
+                rollout.ppo_chunk_len,
+                ACTION_COUNT,
+            ]));
         let _ = s_old_log_probs_by_chunk.copy_(
             &s_old_log_probs
                 .index_select(0, &chunk_mem_indices_flat)
@@ -815,8 +821,7 @@ pub async fn train(
                 let step_deltas_chunk = s_step_deltas_by_chunk.index_select(0, &chunk_ids);
                 let adv_mb_by_chunk = adv_norm_by_chunk.index_select(0, &chunk_ids);
                 let ret_mb_by_chunk = returns_by_chunk.index_select(0, &chunk_ids);
-                let old_log_probs_by_chunk =
-                    s_old_log_probs_by_chunk.index_select(0, &chunk_ids);
+                let old_log_probs_by_chunk = s_old_log_probs_by_chunk.index_select(0, &chunk_ids);
                 let act_mb_by_chunk = s_actions_by_chunk.index_select(0, &chunk_ids);
                 let reset_slots_chunk = reset_slots_by_chunk.index_select(0, &chunk_ids);
 
@@ -850,11 +855,10 @@ pub async fn train(
                         if reset_chunk_idx.size()[0] > 0 {
                             let reset_slot_ids =
                                 step_reset_slots.index_select(0, &reset_chunk_idx) - 1;
-                            let reset_layouts =
-                                reset_layout_bank.index_select(0, &reset_slot_ids);
-                            let reset_row_idx =
-                                (&reset_chunk_idx.unsqueeze(1) * TICKERS_COUNT + &ticker_offsets)
-                                    .reshape([-1]);
+                            let reset_layouts = reset_layout_bank.index_select(0, &reset_slot_ids);
+                            let reset_row_idx = (&reset_chunk_idx.unsqueeze(1) * TICKERS_COUNT
+                                + &ticker_offsets)
+                                .reshape([-1]);
                             current_layout = current_layout.index_copy(
                                 0,
                                 &reset_row_idx,
@@ -994,8 +998,7 @@ pub async fn train(
                     .g_add_(&(&action_loss.detach() * minibatch_sample_count as f64));
                 let _ = total_value_loss_weighted
                     .g_add_(&(&value_loss.detach() * minibatch_sample_count as f64));
-                let _ = total_kl_weighted
-                    .g_add_(&(&approx_kl_val * minibatch_sample_count as f64));
+                let _ = total_kl_weighted.g_add_(&(&approx_kl_val * minibatch_sample_count as f64));
                 let _ = total_entropy_weighted
                     .g_add_(&(&dist_entropy_detached * minibatch_sample_count as f64));
                 entropy_min = entropy_min.min_other(&dist_entropy_detached);
