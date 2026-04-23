@@ -3,6 +3,7 @@ use chrono::Local;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub struct RunDir {
     pub root: PathBuf,
@@ -78,7 +79,7 @@ impl RunDir {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
             .collect();
-        dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        sort_run_entries_newest_first(&mut dirs);
 
         for entry in dirs {
             let root = entry.path();
@@ -101,22 +102,24 @@ impl RunDir {
 
     /// Scan runs newest-to-oldest, return the first whose gens dir is non-empty.
     pub fn latest_with_data(runs_path: &str) -> Option<Self> {
+        if let Ok(run) = Self::latest(runs_path) {
+            if has_generation_data(&run.gens) {
+                return Some(run);
+            }
+        }
+
         let runs = Path::new(runs_path);
         let mut dirs: Vec<_> = fs::read_dir(runs)
             .ok()?
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
             .collect();
-        dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        sort_run_entries_newest_first(&mut dirs);
 
         for entry in dirs {
             let root = entry.path();
             let gens = root.join("gens");
-            let has_data = fs::read_dir(&gens)
-                .ok()
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
-            if has_data {
+            if has_generation_data(&gens) {
                 let weights = root.join("weights");
                 let log_file = root.join("training.log");
                 return Some(Self {
@@ -156,4 +159,40 @@ impl RunDir {
             log_file,
         })
     }
+}
+
+fn sort_run_entries_newest_first(entries: &mut [fs::DirEntry]) {
+    entries.sort_by(|a, b| {
+        let key = |entry: &fs::DirEntry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let activity = newest_run_activity(&entry.path());
+            (activity, name)
+        };
+
+        key(b).cmp(&key(a))
+    });
+}
+
+fn newest_run_activity(path: &Path) -> Option<SystemTime> {
+    let mut latest = fs::metadata(path).ok()?.modified().ok();
+
+    for child in ["training.log", "gens", "weights"] {
+        let modified = match fs::metadata(path.join(child))
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+        {
+            Some(modified) => modified,
+            None => continue,
+        };
+        latest = Some(latest.map_or(modified, |current| current.max(modified)));
+    }
+
+    latest
+}
+
+fn has_generation_data(gens: &Path) -> bool {
+    fs::read_dir(gens)
+        .ok()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }

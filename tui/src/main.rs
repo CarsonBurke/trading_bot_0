@@ -8,8 +8,8 @@ use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use shared::paths::{RUNS_PATH, WEIGHTS_PATH};
 use shared::run_dir::RunDir;
 use std::{
-    io,
-    path::PathBuf,
+    fs, io,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -125,6 +125,35 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+fn newest_run_activity(path: &Path) -> Option<std::time::SystemTime> {
+    let mut latest = fs::metadata(path).ok()?.modified().ok();
+
+    for child in ["training.log", "gens", "weights"] {
+        let modified = match fs::metadata(path.join(child))
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+        {
+            Some(modified) => modified,
+            None => continue,
+        };
+        latest = Some(latest.map_or(modified, |current| current.max(modified)));
+    }
+
+    latest
+}
+
+fn sort_run_dirs_newest_first(dirs: &mut [std::fs::DirEntry]) {
+    dirs.sort_by(|a, b| {
+        let key = |entry: &std::fs::DirEntry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let activity = newest_run_activity(&entry.path());
+            (activity, name)
+        };
+
+        key(b).cmp(&key(a))
+    });
 }
 
 impl App {
@@ -379,7 +408,6 @@ impl App {
     }
 
     fn open_run_selector(&mut self, purpose: RunSelectorPurpose) {
-        use std::fs;
         let runs_dir = std::path::Path::new(RUNS_PATH);
         let mut dirs: Vec<_> = fs::read_dir(runs_dir)
             .into_iter()
@@ -387,7 +415,7 @@ impl App {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
             .collect();
-        dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        sort_run_dirs_newest_first(&mut dirs);
 
         let active_name = self
             .process_manager
@@ -437,7 +465,10 @@ impl App {
             })
             .collect();
 
-        let selected = runs.iter().position(|r| r.is_active).unwrap_or(0);
+        let selected = match purpose {
+            RunSelectorPurpose::View => 0,
+            RunSelectorPurpose::Train => runs.iter().position(|r| r.is_active).unwrap_or(0),
+        };
         self.dialog_mode = DialogMode::RunSelector {
             selected,
             runs,
