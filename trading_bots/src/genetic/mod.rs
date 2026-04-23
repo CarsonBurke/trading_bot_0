@@ -33,6 +33,7 @@ pub struct GeneticArgs {
     pub test_tickers: TickerSet,
     pub heavy_report_every: usize,
     pub seed: u64,
+    pub skip_additional_downloads: bool,
 }
 
 impl Default for GeneticArgs {
@@ -48,6 +49,7 @@ impl Default for GeneticArgs {
             test_tickers: TickerSet::Test,
             heavy_report_every: 5,
             seed: 7,
+            skip_additional_downloads: false,
         }
     }
 }

@@ -61,6 +61,9 @@ enum Commands {
 
         #[arg(long, default_value_t = 7)]
         seed: u64,
+
+        #[arg(long, default_value_t = false)]
+        skip_additional_downloads: bool,
     },
     Train {
         #[arg(short, long)]
@@ -142,6 +145,7 @@ async fn main() {
             test_tickers,
             heavy_report_every,
             seed,
+            skip_additional_downloads,
         }) => {
             genetic::run(genetic::GeneticArgs {
                 family: *family,
@@ -154,6 +158,7 @@ async fn main() {
                 test_tickers: *test_tickers,
                 heavy_report_every: *heavy_report_every,
                 seed: *seed,
+                skip_additional_downloads: *skip_additional_downloads,
             })
             .expect("genetic training failed");
         }

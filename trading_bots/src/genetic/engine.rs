@@ -9,7 +9,10 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
-use crate::data::historical::get_historical_data;
+use crate::data::{
+    historical::{get_historical_bars_result, set_ibkr_download_enabled},
+    universe::minimum_history_bars,
+};
 
 use super::{
     backtest::{evaluate_family, MarketDataset},
@@ -70,11 +73,13 @@ struct Candidate<G> {
 }
 
 pub fn run(args: GeneticArgs) -> Result<()> {
+    set_ibkr_download_enabled(!args.skip_additional_downloads);
     let run_dir = RunDir::create_fresh(RUNS_PATH, args.run.as_deref())?;
     let datasets = load_datasets(
         args.train_tickers,
         args.validation_tickers,
         args.test_tickers,
+        args.skip_additional_downloads,
     )?;
     let config = TrainingConfig {
         family: args.family,
@@ -292,10 +297,11 @@ fn load_datasets(
     train_set: TickerSet,
     validation_set: TickerSet,
     test_set: TickerSet,
+    cache_only: bool,
 ) -> Result<DatasetBundle> {
-    let train = load_market(train_set)?;
-    let validation = load_market(validation_set)?;
-    let test = load_market(test_set)?;
+    let train = load_market(train_set, cache_only)?;
+    let validation = load_market(validation_set, cache_only)?;
+    let test = load_market(test_set, cache_only)?;
     Ok(DatasetBundle {
         train,
         validation,
@@ -303,23 +309,53 @@ fn load_datasets(
     })
 }
 
-fn load_market(set: TickerSet) -> Result<MarketDataset> {
-    let tickers = set.resolved_tickers();
-    if tickers.is_empty() {
-        bail!("no eligible tickers resolved for {}", set.label());
+fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
+    let split_label = set.label();
+    let min_bars = minimum_history_bars();
+    let source_tickers = if cache_only {
+        set.cached_eligible_tickers(min_bars)
+    } else {
+        set.tickers()
+    };
+    let mut tickers = Vec::new();
+    let mut bars = Vec::new();
+
+    for ticker in source_tickers {
+        match get_historical_bars_result(&ticker).with_context(|| {
+            format!(
+                "failed loading {} historical data for {}",
+                split_label, ticker
+            )
+        })? {
+            Some(ticker_bars) if ticker_bars.len() >= min_bars => {
+                tickers.push(ticker);
+                bars.push(ticker_bars);
+            }
+            Some(ticker_bars) => {
+                eprintln!(
+                    "Skipping {} from {}: only {} bars, need at least {}",
+                    ticker,
+                    split_label,
+                    ticker_bars.len(),
+                    min_bars
+                );
+            }
+            None => {
+                eprintln!(
+                    "Skipping {} from {}: downloaded data was empty or unusable",
+                    ticker, split_label
+                );
+            }
+        }
     }
-    let ticker_refs = tickers
-        .iter()
-        .map(|ticker| ticker.as_str())
-        .collect::<Vec<_>>();
-    let bars = get_historical_data(Some(&ticker_refs));
+
     if bars.is_empty() {
-        bail!("no historical bars found for {}", set.label());
+        bail!("no historical bars found for {}", split_label);
     }
     let bars = align_bars_to_common_trailing_window(bars)
-        .with_context(|| format!("failed to align historical bars for {}", set.label()))?;
+        .with_context(|| format!("failed to align historical bars for {}", split_label))?;
     Ok(MarketDataset {
-        split_name: set.label().to_string(),
+        split_name: split_label.to_string(),
         tickers,
         bars,
     })
