@@ -360,14 +360,12 @@ impl App {
     }
 
     fn start_training(&mut self, weights_path: Option<String>) -> Result<()> {
-        let result = self
-            .process_manager
-            .start_training(
-                self.training_kind,
-                weights_path,
-                &self.training_model_size,
-                self.genetic_family,
-            );
+        let result = self.process_manager.start_training(
+            self.training_kind,
+            weights_path,
+            &self.training_model_size,
+            self.genetic_family,
+        );
         self.sync_gens_path();
         result
     }

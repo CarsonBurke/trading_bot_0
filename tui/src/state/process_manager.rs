@@ -2,6 +2,7 @@ use anyhow::Result;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,27 +57,26 @@ impl ProcessManagerState {
 
         self.last_training_check = now;
 
-        if self.training_process.is_some() {
-            self.cached_training_running = true;
-            return true;
-        }
-
-        if let Ok(output) = Command::new("pgrep").args(["-f", "trading_bots"]).output() {
-            if !output.stdout.is_empty() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for pid in stdout.lines() {
-                    if let Ok(pid_num) = pid.trim().parse::<u32>() {
-                        if let Some(cmdline) = training_cmdline(pid_num) {
-                            if is_training_cmdline(&cmdline) {
-                                self.cached_training_running = true;
-                                self.active_run = RunDir::latest_with_data(RUNS_PATH)
-                                    .or_else(|| RunDir::latest(RUNS_PATH).ok());
-                                return true;
-                            }
-                        }
-                    }
+        if let Some(ref mut child) = self.training_process {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.training_process = None;
+                }
+                Ok(None) => {
+                    self.cached_training_running = true;
+                    return true;
+                }
+                Err(_) => {
+                    self.training_process = None;
                 }
             }
+        }
+
+        if !list_training_pids().is_empty() {
+            self.cached_training_running = true;
+            self.active_run =
+                RunDir::latest_with_data(RUNS_PATH).or_else(|| RunDir::latest(RUNS_PATH).ok());
+            return true;
         }
 
         self.cached_training_running = false;
@@ -195,24 +195,12 @@ impl ProcessManagerState {
 
     pub fn stop_training(&mut self) -> Result<()> {
         if let Some(mut child) = self.training_process.take() {
-            let _ = child.kill();
+            terminate_process_tree(child.id());
+            let _ = child.try_wait();
         }
 
-        if let Ok(output) = Command::new("pgrep").args(["-f", "trading_bots"]).output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for pid in stdout.lines() {
-                let Ok(pid_num) = pid.trim().parse::<u32>() else {
-                    continue;
-                };
-                let Some(cmdline) = training_cmdline(pid_num) else {
-                    continue;
-                };
-                if is_training_cmdline(&cmdline) {
-                    let _ = Command::new("kill")
-                        .args(["-TERM", &pid_num.to_string()])
-                        .output();
-                }
-            }
+        for pid in list_training_pids() {
+            terminate_process_tree(pid);
         }
 
         self.cached_training_running = false;
@@ -228,18 +216,57 @@ impl ProcessManagerState {
     }
 }
 
-fn training_cmdline(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "args="])
-        .output()
-        .ok()?;
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+fn list_training_pids() -> Vec<u32> {
+    let Ok(output) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
+        return Vec::new();
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let split_idx = trimmed.find(char::is_whitespace)?;
+            let (pid, cmdline) = trimmed.split_at(split_idx);
+            let pid = pid.parse::<u32>().ok()?;
+            let cmdline = cmdline.trim();
+            is_training_cmdline(cmdline).then_some(pid)
+        })
+        .collect()
+}
+
+fn terminate_process_tree(pid: u32) {
+    let pid_str = pid.to_string();
+    let _ = Command::new("pkill")
+        .args(["-TERM", "-P", &pid_str])
+        .output();
+    let _ = Command::new("kill").args(["-TERM", &pid_str]).output();
+
+    thread::sleep(Duration::from_millis(150));
+
+    if process_exists(pid) {
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-P", &pid_str])
+            .output();
+        let _ = Command::new("kill").args(["-KILL", &pid_str]).output();
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn is_training_cmdline(cmdline: &str) -> bool {
-    !cmdline.contains("tui")
+    !cmdline.contains("trading-bot-tui")
+        && !cmdline.contains("ps -eo")
+        && !cmdline.contains("pgrep -f")
         && (cmdline.contains(" train ")
             || cmdline.ends_with(" train")
             || cmdline.contains(" genetic ")
-            || cmdline.ends_with(" genetic"))
+            || cmdline.ends_with(" genetic")
+            || cmdline.contains("trading_bot_0 train")
+            || cmdline.contains("trading_bot_0 genetic"))
 }
