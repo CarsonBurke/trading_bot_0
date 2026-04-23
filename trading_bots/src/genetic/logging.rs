@@ -59,6 +59,7 @@ pub struct GaHistory {
     pub train_p95: Vec<f64>,
     pub train_worst: Vec<f64>,
     pub train_best: Vec<f64>,
+    pub mutation_entropy: Vec<f64>,
 }
 
 impl GaHistory {
@@ -68,6 +69,7 @@ impl GaHistory {
         validation_metrics: &BacktestMetrics,
         best_validation_score: f64,
         train_population: PopulationStats,
+        mutation_entropy: f64,
     ) {
         self.train_fitness.push(train_metrics.score);
         self.validation_fitness.push(validation_metrics.score);
@@ -97,6 +99,7 @@ impl GaHistory {
         self.train_p95.push(train_population.p95);
         self.train_worst.push(train_population.worst);
         self.train_best.push(train_population.best);
+        self.mutation_entropy.push(mutation_entropy);
     }
 
     pub fn write_reports(&self, output_dir: &Path) -> Result<()> {
@@ -182,6 +185,12 @@ impl GaHistory {
                 ("worst", &self.train_worst),
                 ("best", &self.train_best),
             ],
+        )?;
+        write_multi_line_report(
+            output_dir,
+            "ga_mutation_entropy",
+            "Mutation Entropy",
+            &[("mutation_entropy", &self.mutation_entropy)],
         )?;
         Ok(())
     }

@@ -29,9 +29,10 @@ pub struct TrainingConfig {
     pub family: GeneticFamily,
     pub generations: usize,
     pub population: usize,
-    pub survivors: usize,
+    pub survivor_ratio: f64,
     pub heavy_report_every: usize,
     pub seed: u64,
+    pub mutation_entropy: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -85,9 +86,10 @@ pub fn run(args: GeneticArgs) -> Result<()> {
         family: args.family,
         generations: args.generations,
         population: args.population,
-        survivors: args.survivors,
+        survivor_ratio: args.survivor_ratio,
         heavy_report_every: args.heavy_report_every,
         seed: args.seed,
+        mutation_entropy: args.mutation_entropy,
     };
     let session_paths = SessionPaths {
         root: run_dir.root,
@@ -135,8 +137,11 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
     if config.population < 2 {
         bail!("population must be at least 2");
     }
-    if config.survivors == 0 || config.survivors >= config.population {
-        bail!("survivors must be in 1..population");
+    if !(0.0..1.0).contains(&config.survivor_ratio) {
+        bail!("survivor_ratio must be in 0..1");
+    }
+    if config.mutation_entropy <= 0.0 {
+        bail!("mutation_entropy must be > 0");
     }
 
     fs::create_dir_all(&session_paths.gens)?;
@@ -144,11 +149,12 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
 
     let mut logger = SessionLogger::new(&session_paths.root, &session_paths.log_file)?;
     logger.log_line(&format!(
-        "starting genetic run family={:?} generations={} population={} survivors={} seed={} train={:?} validation={:?} test={:?}",
+        "starting genetic run family={:?} generations={} population={} survivor_ratio={:.3} mutation_entropy={:.3} seed={} train={:?} validation={:?} test={:?}",
         config.family,
         config.generations,
         config.population,
-        config.survivors,
+        config.survivor_ratio,
+        config.mutation_entropy,
         config.seed,
         datasets.train.tickers,
         datasets.validation.tickers,
@@ -166,12 +172,14 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
     let mut best_validation_genome = population[0].clone();
     let mut best_validation_train_metrics = BacktestMetrics::default();
     let mut best_validation_metrics = BacktestMetrics::default();
+    let survivor_count = survivor_count(config.population, config.survivor_ratio);
+    let mut generations_since_validation_improvement = 0usize;
 
     for generation in 0..config.generations {
         let population_seed = rng.random::<u64>();
         let candidates = evaluate_population(family, &population, &datasets.train, population_seed);
         let mut ranked = candidates;
-        ranked.sort_by(|left, right| {
+        ranked.sort_unstable_by(|left, right| {
             right
                 .train_metrics
                 .score
@@ -196,6 +204,7 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
             best_validation_genome = champion.genome.clone();
             best_validation_train_metrics = champion.train_metrics.clone();
             best_validation_metrics = validation_outcome.metrics.clone();
+            generations_since_validation_improvement = 0;
             persist_checkpoint(
                 family,
                 &session_paths.weights,
@@ -206,23 +215,32 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
             )?;
         }
 
+        let adaptive_mutation_entropy = adaptive_mutation_entropy(
+            config.mutation_entropy,
+            &train_population_stats,
+            generations_since_validation_improvement,
+        );
         history.record_generation(
             &champion.train_metrics,
             &validation_outcome.metrics,
             best_validation_score,
             train_population_stats.clone(),
+            adaptive_mutation_entropy,
         );
         let generation_dir = session_paths.gens.join(generation.to_string());
         history.write_reports(&generation_dir)?;
 
         logger.log_line(&format!(
-            "gen={} train_score={:.3} valid_score={:.3} train_return={:.2}% valid_return={:.2}% best_valid={:.3}",
+            "gen={} train_score={:.3} valid_score={:.3} train_return={:.2}% valid_return={:.2}% best_valid={:.3} survivor_count={} mutation_entropy={:.3} plateau={}",
             generation,
             champion.train_metrics.score,
             validation_outcome.metrics.score,
             champion.train_metrics.return_pct,
             validation_outcome.metrics.return_pct,
-            best_validation_score
+            best_validation_score,
+            survivor_count,
+            adaptive_mutation_entropy,
+            generations_since_validation_improvement,
         ))?;
 
         let write_heavy = generation == 0
@@ -230,10 +248,10 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
             || generation % config.heavy_report_every.max(1) == 0
             || generation == best_validation_generation;
         if write_heavy {
-            let train_trace =
-                evaluate_family(family, &champion.genome, &datasets.train, true).trace;
-            let valid_trace =
-                evaluate_family(family, &champion.genome, &datasets.validation, true).trace;
+            let (train_trace, valid_trace) = rayon::join(
+                || evaluate_family(family, &champion.genome, &datasets.train, true).trace,
+                || evaluate_family(family, &champion.genome, &datasets.validation, true).trace,
+            );
             if let Some(trace) = train_trace.as_ref() {
                 write_split_trace(&generation_dir, "train", &datasets.train.tickers, trace)?;
             }
@@ -256,8 +274,10 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
             &ranked,
             &mut rng,
             config.population,
-            config.survivors,
+            survivor_count,
+            adaptive_mutation_entropy,
         );
+        generations_since_validation_improvement += 1;
     }
 
     let final_test = evaluate_family(family, &best_validation_genome, &datasets.test, true);
@@ -354,11 +374,7 @@ fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
     }
     let bars = align_bars_to_common_trailing_window(bars)
         .with_context(|| format!("failed to align historical bars for {}", split_label))?;
-    Ok(MarketDataset {
-        split_name: split_label.to_string(),
-        tickers,
-        bars,
-    })
+    Ok(MarketDataset::new(split_label.to_string(), tickers, bars))
 }
 
 fn align_bars_to_common_trailing_window(
@@ -406,14 +422,17 @@ fn evolve_population<F: StrategyFamilySpec>(
     rng: &mut StdRng,
     population_size: usize,
     survivors: usize,
+    mutation_entropy: f64,
 ) -> Vec<F::Genome> {
     let survivors = &ranked[..survivors];
     let elite_keep = (survivors.len() / 8).max(2).min(survivors.len());
-    let mut next = survivors
-        .iter()
-        .take(elite_keep)
-        .map(|candidate| candidate.genome.clone())
-        .collect::<Vec<_>>();
+    let mut next = Vec::with_capacity(population_size);
+    next.extend(
+        survivors
+            .iter()
+            .take(elite_keep)
+            .map(|candidate| candidate.genome.clone()),
+    );
 
     while next.len() < population_size {
         if next.len() % 13 == 0 {
@@ -423,11 +442,32 @@ fn evolve_population<F: StrategyFamilySpec>(
         let left = tournament_pick(survivors, rng);
         let right = tournament_pick(survivors, rng);
         let mut child = family.crossover(&left.genome, &right.genome, rng);
-        family.mutate(&mut child, rng);
+        family.mutate(&mut child, rng, mutation_entropy);
         next.push(child);
     }
 
     next
+}
+
+fn survivor_count(population: usize, survivor_ratio: f64) -> usize {
+    ((population as f64 * survivor_ratio).ceil() as usize).clamp(2, population.saturating_sub(1))
+}
+
+fn adaptive_mutation_entropy(
+    base_entropy: f64,
+    population: &super::metrics::PopulationStats,
+    plateau_generations: usize,
+) -> f64 {
+    let normalized_spread = population.spread.abs() / population.p50.abs().max(10.0);
+    let diversity_boost = if normalized_spread < 0.08 {
+        1.35
+    } else if normalized_spread < 0.16 {
+        1.15
+    } else {
+        1.0
+    };
+    let plateau_boost = 1.0 + (plateau_generations.min(12) as f64 * 0.035);
+    (base_entropy * diversity_boost * plateau_boost).clamp(0.25, 4.0)
 }
 
 fn tournament_pick<'a, G>(population: &'a [Candidate<G>], rng: &mut StdRng) -> &'a Candidate<G> {

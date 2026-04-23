@@ -36,55 +36,116 @@ pub struct PopulationStats {
     pub p95: f64,
     pub worst: f64,
     pub best: f64,
+    pub spread: f64,
 }
 
-pub fn compute_metrics(
-    total_assets: &[f64],
-    benchmark_assets: &[f64],
-    trades: TradeSummary,
-) -> BacktestMetrics {
-    let final_assets = total_assets.last().copied().unwrap_or(STARTING_CASH);
-    let benchmark_final = benchmark_assets.last().copied().unwrap_or(STARTING_CASH);
-    let return_pct = pct_change(STARTING_CASH, final_assets);
-    let benchmark_return_pct = pct_change(STARTING_CASH, benchmark_final);
-    let outperformance_pct = return_pct - benchmark_return_pct;
-    let max_drawdown_pct = max_drawdown_pct(total_assets);
-    let sharpe = sharpe_like(total_assets);
-    let sortino = sortino_like(total_assets);
-    let calmar = if max_drawdown_pct <= f64::EPSILON {
-        return_pct.max(0.0)
-    } else {
-        return_pct / max_drawdown_pct
-    };
-    let trade_count = trades.buy_count + trades.sell_count;
-    let win_rate = if trades.sell_count == 0 {
-        0.0
-    } else {
-        trades.profitable_sells as f64 / trades.sell_count as f64
-    };
+#[derive(Clone, Debug)]
+pub(crate) struct BacktestMetricAccumulator {
+    previous_asset: Option<f64>,
+    final_assets: f64,
+    peak_assets: f64,
+    max_drawdown_pct: f64,
+    return_sum: f64,
+    return_sum_sq: f64,
+    return_count: usize,
+    downside_sum: f64,
+    downside_sum_sq: f64,
+    downside_count: usize,
+}
 
-    let score = outperformance_pct + 0.35 * return_pct - 1.15 * max_drawdown_pct
-        + 10.0 * sharpe.clamp(-2.0, 2.0)
-        + 6.0 * sortino.clamp(-2.0, 2.0)
-        + 4.0 * calmar.clamp(-2.0, 2.0)
-        - 0.01 * trade_count as f64;
+impl Default for BacktestMetricAccumulator {
+    fn default() -> Self {
+        Self {
+            previous_asset: None,
+            final_assets: STARTING_CASH,
+            peak_assets: STARTING_CASH,
+            max_drawdown_pct: 0.0,
+            return_sum: 0.0,
+            return_sum_sq: 0.0,
+            return_count: 0,
+            downside_sum: 0.0,
+            downside_sum_sq: 0.0,
+            downside_count: 0,
+        }
+    }
+}
 
-    BacktestMetrics {
-        score,
-        final_assets,
-        return_pct,
-        benchmark_return_pct,
-        outperformance_pct,
-        max_drawdown_pct,
-        sharpe,
-        sortino,
-        calmar,
-        turnover: trades.turnover,
-        trade_count,
-        buy_count: trades.buy_count,
-        sell_count: trades.sell_count,
-        win_rate,
-        total_commissions: 0.0,
+impl BacktestMetricAccumulator {
+    pub fn observe(&mut self, asset: f64) {
+        if let Some(previous) = self.previous_asset {
+            if previous.abs() > f64::EPSILON {
+                let step_return = (asset / previous) - 1.0;
+                self.return_sum += step_return;
+                self.return_sum_sq += step_return * step_return;
+                self.return_count += 1;
+                if step_return < 0.0 {
+                    self.downside_sum += step_return;
+                    self.downside_sum_sq += step_return * step_return;
+                    self.downside_count += 1;
+                }
+            }
+        }
+
+        self.peak_assets = self.peak_assets.max(asset);
+        if self.peak_assets > 0.0 {
+            let drawdown = ((self.peak_assets - asset) / self.peak_assets) * 100.0;
+            self.max_drawdown_pct = self.max_drawdown_pct.max(drawdown);
+        }
+        self.final_assets = asset;
+        self.previous_asset = Some(asset);
+    }
+
+    pub fn finish(self, benchmark_final: f64, trades: TradeSummary) -> BacktestMetrics {
+        let return_pct = pct_change(STARTING_CASH, self.final_assets);
+        let benchmark_return_pct = pct_change(STARTING_CASH, benchmark_final);
+        let outperformance_pct = return_pct - benchmark_return_pct;
+        let sharpe = ratio_from_moments(self.return_sum, self.return_sum_sq, self.return_count);
+        let mean_return = if self.return_count == 0 {
+            0.0
+        } else {
+            self.return_sum / self.return_count as f64
+        };
+        let downside_std =
+            std_dev_from_moments(self.downside_sum, self.downside_sum_sq, self.downside_count);
+        let sortino = if downside_std <= f64::EPSILON {
+            0.0
+        } else {
+            mean_return / downside_std
+        };
+        let calmar = if self.max_drawdown_pct <= f64::EPSILON {
+            return_pct.max(0.0)
+        } else {
+            return_pct / self.max_drawdown_pct
+        };
+        let trade_count = trades.buy_count + trades.sell_count;
+        let win_rate = if trades.sell_count == 0 {
+            0.0
+        } else {
+            trades.profitable_sells as f64 / trades.sell_count as f64
+        };
+        let score = outperformance_pct + 0.35 * return_pct - 1.15 * self.max_drawdown_pct
+            + 10.0 * sharpe.clamp(-2.0, 2.0)
+            + 6.0 * sortino.clamp(-2.0, 2.0)
+            + 4.0 * calmar.clamp(-2.0, 2.0)
+            - 0.01 * trade_count as f64;
+
+        BacktestMetrics {
+            score,
+            final_assets: self.final_assets,
+            return_pct,
+            benchmark_return_pct,
+            outperformance_pct,
+            max_drawdown_pct: self.max_drawdown_pct,
+            sharpe,
+            sortino,
+            calmar,
+            turnover: trades.turnover,
+            trade_count,
+            buy_count: trades.buy_count,
+            sell_count: trades.sell_count,
+            win_rate,
+            total_commissions: 0.0,
+        }
     }
 }
 
@@ -93,12 +154,16 @@ pub fn population_stats(mut values: Vec<f64>) -> PopulationStats {
         return PopulationStats::default();
     }
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let p05 = percentile(&values, 0.05);
+    let p50 = percentile(&values, 0.50);
+    let p95 = percentile(&values, 0.95);
     PopulationStats {
-        p05: percentile(&values, 0.05),
-        p50: percentile(&values, 0.50),
-        p95: percentile(&values, 0.95),
+        p05,
+        p50,
+        p95,
         worst: *values.first().unwrap_or(&0.0),
         best: *values.last().unwrap_or(&0.0),
+        spread: p95 - p05,
     }
 }
 
@@ -118,60 +183,12 @@ fn pct_change(start: f64, end: f64) -> f64 {
     }
 }
 
-fn max_drawdown_pct(assets: &[f64]) -> f64 {
-    let mut peak = STARTING_CASH;
-    let mut max_drawdown = 0.0_f64;
-    for &asset in assets {
-        peak = peak.max(asset);
-        if peak > 0.0 {
-            let drawdown = ((peak - asset) / peak) * 100.0;
-            max_drawdown = max_drawdown.max(drawdown);
-        }
-    }
-    max_drawdown
-}
-
-fn sharpe_like(assets: &[f64]) -> f64 {
-    let returns = step_returns(assets);
-    ratio(&returns)
-}
-
-fn sortino_like(assets: &[f64]) -> f64 {
-    let returns = step_returns(assets);
-    let downside: Vec<f64> = returns.iter().copied().filter(|ret| *ret < 0.0).collect();
-    if downside.is_empty() {
+fn ratio_from_moments(sum: f64, sum_sq: f64, count: usize) -> f64 {
+    if count == 0 {
         return 0.0;
     }
-    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-    let downside_std = std_dev(&downside);
-    if downside_std <= f64::EPSILON {
-        0.0
-    } else {
-        mean / downside_std
-    }
-}
-
-fn step_returns(assets: &[f64]) -> Vec<f64> {
-    assets
-        .windows(2)
-        .filter_map(|window| {
-            let previous = window[0];
-            let next = window[1];
-            if previous.abs() <= f64::EPSILON {
-                None
-            } else {
-                Some((next / previous) - 1.0)
-            }
-        })
-        .collect()
-}
-
-fn ratio(returns: &[f64]) -> f64 {
-    if returns.is_empty() {
-        return 0.0;
-    }
-    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-    let std = std_dev(returns);
+    let mean = sum / count as f64;
+    let std = std_dev_from_moments(sum, sum_sq, count);
     if std <= f64::EPSILON {
         0.0
     } else {
@@ -179,18 +196,11 @@ fn ratio(returns: &[f64]) -> f64 {
     }
 }
 
-fn std_dev(values: &[f64]) -> f64 {
-    if values.len() < 2 {
+fn std_dev_from_moments(sum: f64, sum_sq: f64, count: usize) -> f64 {
+    if count < 2 {
         return 0.0;
     }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let variance = values
-        .iter()
-        .map(|value| {
-            let delta = value - mean;
-            delta * delta
-        })
-        .sum::<f64>()
-        / values.len() as f64;
-    variance.sqrt()
+    let mean = sum / count as f64;
+    let variance = (sum_sq / count as f64) - (mean * mean);
+    variance.max(0.0).sqrt()
 }

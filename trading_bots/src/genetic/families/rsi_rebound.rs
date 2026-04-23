@@ -52,9 +52,14 @@ impl StrategyFamilySpec for Family {
         Genome { genes }
     }
 
-    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng) {
+    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng, entropy: f64) {
         for gene in Gene::ALL {
-            genome.genes[gene] = jitter(genome.genes[gene], spec(gene).mutation, spec(gene), rng);
+            genome.genes[gene] = jitter(
+                genome.genes[gene],
+                spec(gene).mutation * entropy.max(0.0),
+                spec(gene),
+                rng,
+            );
         }
     }
 
@@ -108,14 +113,18 @@ impl StrategyFamilySpec for Family {
         ctx.decider_rsi <= highest * (1.0 - genome.genes[Gene::ReboundSellThreshold].max(0.0))
     }
 
-    fn buy_fraction(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+    fn buy_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
         let oversold = ((50.0 - ctx.amount_rsi).max(0.0) / 50.0).clamp(0.0, 1.0);
-        (genome.genes[Gene::BuyPercent] * (0.5 + oversold)).clamp(0.0, 1.0)
+        let fraction = (genome.genes[Gene::BuyPercent] * (0.5 + oversold)).clamp(0.0, 1.0);
+        let equal_weight_headroom =
+            (ctx.equal_weight_position_value() - ctx.position_value).max(0.0);
+        ctx.cash.min(equal_weight_headroom * fraction)
     }
 
-    fn sell_fraction(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+    fn sell_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
         let overbought = ((ctx.amount_rsi - 50.0).max(0.0) / 50.0).clamp(0.0, 1.0);
-        (genome.genes[Gene::SellPercent] * (0.5 + overbought)).clamp(0.0, 1.0)
+        let fraction = (genome.genes[Gene::SellPercent] * (0.5 + overbought)).clamp(0.0, 1.0);
+        ctx.position_value * fraction
     }
 }
 

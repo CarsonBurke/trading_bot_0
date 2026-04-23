@@ -47,6 +47,10 @@ impl DecisionContext {
         }
         ((self.price / self.position_avg_price) - 1.0) * 100.0
     }
+
+    pub fn equal_weight_position_value(self) -> f64 {
+        self.assets / self.ticker_count.max(1) as f64
+    }
 }
 
 pub trait StrategyFamilySpec: Sync {
@@ -54,7 +58,7 @@ pub trait StrategyFamilySpec: Sync {
 
     fn kind(&self) -> GeneticFamily;
     fn seed_genome(&self, rng: &mut StdRng) -> Self::Genome;
-    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng);
+    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng, entropy: f64);
     fn crossover(
         &self,
         left: &Self::Genome,
@@ -64,8 +68,8 @@ pub trait StrategyFamilySpec: Sync {
     fn indicator_config(&self, genome: &Self::Genome) -> IndicatorConfig;
     fn allow_buy(&self, genome: &Self::Genome, ctx: &DecisionContext) -> bool;
     fn allow_sell(&self, genome: &Self::Genome, ctx: &DecisionContext) -> bool;
-    fn buy_fraction(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64;
-    fn sell_fraction(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64;
+    fn buy_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64;
+    fn sell_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64;
 
     fn describe(&self, genome: &Self::Genome) -> String {
         serde_json::to_string_pretty(genome).unwrap_or_else(|_| format!("{genome:?}"))

@@ -27,13 +27,14 @@ pub struct GeneticArgs {
     pub run: Option<String>,
     pub generations: usize,
     pub population: usize,
-    pub survivors: usize,
+    pub survivor_ratio: f64,
     pub train_tickers: TickerSet,
     pub validation_tickers: TickerSet,
     pub test_tickers: TickerSet,
     pub heavy_report_every: usize,
     pub seed: u64,
     pub skip_additional_downloads: bool,
+    pub mutation_entropy: f64,
 }
 
 impl Default for GeneticArgs {
@@ -43,13 +44,14 @@ impl Default for GeneticArgs {
             run: None,
             generations: 600,
             population: 192,
-            survivors: 48,
+            survivor_ratio: 0.25,
             train_tickers: TickerSet::Train,
             validation_tickers: TickerSet::Validation,
             test_tickers: TickerSet::Test,
             heavy_report_every: 5,
             seed: 7,
             skip_additional_downloads: false,
+            mutation_entropy: 1.0,
         }
     }
 }

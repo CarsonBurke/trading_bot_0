@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     family::{DecisionContext, StrategyFamilySpec},
-    metrics::{compute_metrics, BacktestMetrics, TradeSummary, STARTING_CASH},
+    metrics::{BacktestMetricAccumulator, BacktestMetrics, TradeSummary, STARTING_CASH},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,6 +22,26 @@ pub struct MarketDataset {
     pub split_name: String,
     pub tickers: Vec<String>,
     pub bars: MappedHistorical,
+    pub close_prices: Vec<Vec<f64>>,
+    pub benchmark_assets: Vec<f64>,
+}
+
+impl MarketDataset {
+    pub fn new(
+        split_name: impl Into<String>,
+        tickers: Vec<String>,
+        bars: MappedHistorical,
+    ) -> Self {
+        let close_prices = bars.iter().map(convert_historical).collect::<Vec<_>>();
+        let benchmark_assets = benchmark_curve_from_prices(&close_prices);
+        Self {
+            split_name: split_name.into(),
+            tickers,
+            bars,
+            close_prices,
+            benchmark_assets,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,49 +67,63 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
     market: &MarketDataset,
     capture_trace: bool,
 ) -> BacktestOutcome {
-    let indexes = market.bars.first().map(|bars| bars.len()).unwrap_or(0);
+    let ticker_count = market.bars.len();
+    let indexes = market
+        .close_prices
+        .first()
+        .map(|prices| prices.len())
+        .unwrap_or(0);
     let indicator_cfg = family.indicator_config(genome);
 
-    let prices_by_ticker: Vec<Vec<f64>> = market.bars.iter().map(convert_historical).collect();
-    let decider_rsi_by_ticker = compute_rsi_map(&prices_by_ticker, indicator_cfg.decider_rsi_alpha);
-    let amount_rsi_by_ticker = compute_rsi_map(&prices_by_ticker, indicator_cfg.amount_rsi_alpha);
-    let price_ema_by_ticker = compute_ema_map(&prices_by_ticker, indicator_cfg.price_ema_alpha);
+    let decider_rsi_by_ticker =
+        compute_rsi_map(&market.close_prices, indicator_cfg.decider_rsi_alpha);
+    let amount_rsi_by_ticker =
+        compute_rsi_map(&market.close_prices, indicator_cfg.amount_rsi_alpha);
+    let price_ema_by_ticker = compute_ema_map(&market.close_prices, indicator_cfg.price_ema_alpha);
     let fast_ema_by_ticker = indicator_cfg
         .fast_ema_alpha
-        .map(|alpha| compute_ema_map(&prices_by_ticker, alpha));
+        .map(|alpha| compute_ema_map(&market.close_prices, alpha));
     let slow_ema_by_ticker = indicator_cfg
         .slow_ema_alpha
-        .map(|alpha| compute_ema_map(&prices_by_ticker, alpha));
+        .map(|alpha| compute_ema_map(&market.close_prices, alpha));
 
-    let benchmark_assets = benchmark_curve(&market.bars);
-    let mut account = Account::new(STARTING_CASH, market.bars.len());
-    let mut total_assets = Vec::with_capacity(indexes);
-    let mut cash_curve = Vec::with_capacity(indexes);
-    let mut positioned_by_ticker = vec![Vec::with_capacity(indexes); market.bars.len()];
-    let mut buys_by_ticker = vec![Vec::new(); market.bars.len()];
-    let mut sells_by_ticker = vec![Vec::new(); market.bars.len()];
+    let mut account = Account::new(STARTING_CASH, ticker_count);
+    let mut metric_accumulator = BacktestMetricAccumulator::default();
+    let mut total_assets = capture_trace.then(|| Vec::with_capacity(indexes));
+    let mut cash_curve = capture_trace.then(|| Vec::with_capacity(indexes));
+    let mut positioned_by_ticker =
+        capture_trace.then(|| vec![Vec::with_capacity(indexes); ticker_count]);
+    let mut buys_by_ticker = capture_trace.then(|| vec![Vec::new(); ticker_count]);
+    let mut sells_by_ticker = capture_trace.then(|| vec![Vec::new(); ticker_count]);
     let mut states = market
-        .bars
+        .close_prices
         .iter()
-        .map(|bars| TickerRuntimeState::new(bars[0].close))
+        .map(|prices| TickerRuntimeState::new(prices[0]))
         .collect::<Vec<_>>();
     let mut trade_summary = TradeSummary::default();
 
     for index in 0..indexes {
         let mut positioned_total = 0.0;
-        for (ticker_idx, bars) in market.bars.iter().enumerate() {
-            let price = bars[index].close;
+        for ticker_idx in 0..ticker_count {
+            let price = market.close_prices[ticker_idx][index];
             let positioned = account.positions[ticker_idx].value_with_price(price);
-            positioned_by_ticker[ticker_idx].push(positioned);
+            if let Some(positioned_by_ticker) = positioned_by_ticker.as_mut() {
+                positioned_by_ticker[ticker_idx].push(positioned);
+            }
             positioned_total += positioned;
         }
 
         let assets = account.cash + positioned_total;
-        cash_curve.push(account.cash);
-        total_assets.push(assets);
+        metric_accumulator.observe(assets);
+        if let Some(cash_curve) = cash_curve.as_mut() {
+            cash_curve.push(account.cash);
+        }
+        if let Some(total_assets) = total_assets.as_mut() {
+            total_assets.push(assets);
+        }
 
-        for (ticker_idx, bars) in market.bars.iter().enumerate() {
-            let price = bars[index].close;
+        for ticker_idx in 0..ticker_count {
+            let price = market.close_prices[ticker_idx][index];
             let position = account.positions[ticker_idx];
             let state = &mut states[ticker_idx];
             state.observe(
@@ -125,56 +159,92 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
             };
 
             if family.allow_sell(genome, &ctx) {
-                let fraction = family.sell_fraction(genome, &ctx).clamp(0.0, 1.0);
-                if try_sell(
-                    ticker_idx,
-                    index,
-                    price,
-                    fraction,
-                    &mut account,
-                    &mut states,
-                    &mut sells_by_ticker,
-                    &mut trade_summary,
-                ) {
+                let sell_budget = family
+                    .sell_budget(genome, &ctx)
+                    .clamp(0.0, ctx.position_value);
+                let sold = if let Some(sells_by_ticker) = sells_by_ticker.as_mut() {
+                    try_sell(
+                        ticker_idx,
+                        index,
+                        price,
+                        sell_budget,
+                        &mut account,
+                        &mut states,
+                        Some(&mut sells_by_ticker[ticker_idx]),
+                        &mut trade_summary,
+                    )
+                } else {
+                    try_sell(
+                        ticker_idx,
+                        index,
+                        price,
+                        sell_budget,
+                        &mut account,
+                        &mut states,
+                        None,
+                        &mut trade_summary,
+                    )
+                };
+                if sold {
                     continue;
                 }
             }
 
             if family.allow_buy(genome, &ctx) {
-                let fraction = family.buy_fraction(genome, &ctx).clamp(0.0, 1.0);
-                let max_position_value = assets / market.bars.len() as f64;
-                let buy_budget = account.cash.min(
-                    (max_position_value - account.positions[ticker_idx].value_with_price(price))
-                        .max(0.0)
-                        * fraction,
-                );
-                if try_buy(
-                    ticker_idx,
-                    index,
-                    price,
-                    buy_budget,
-                    assets,
-                    &mut account,
-                    &mut states,
-                    &mut buys_by_ticker,
-                    &mut trade_summary,
-                ) {
+                let buy_budget = family.buy_budget(genome, &ctx).clamp(0.0, ctx.cash);
+                let bought = if let Some(buys_by_ticker) = buys_by_ticker.as_mut() {
+                    try_buy(
+                        ticker_idx,
+                        index,
+                        price,
+                        buy_budget,
+                        assets,
+                        &mut account,
+                        &mut states,
+                        Some(&mut buys_by_ticker[ticker_idx]),
+                        &mut trade_summary,
+                    )
+                } else {
+                    try_buy(
+                        ticker_idx,
+                        index,
+                        price,
+                        buy_budget,
+                        assets,
+                        &mut account,
+                        &mut states,
+                        None,
+                        &mut trade_summary,
+                    )
+                };
+                if bought {
                     continue;
                 }
             }
         }
     }
 
-    let metrics = compute_metrics(&total_assets, &benchmark_assets, trade_summary);
-    let trace = capture_trace.then_some(BacktestTrace {
-        total_assets,
-        cash: cash_curve,
-        benchmark_assets,
-        prices_by_ticker,
-        positioned_by_ticker,
-        buys_by_ticker,
-        sells_by_ticker,
-    });
+    let metrics = metric_accumulator.finish(
+        market
+            .benchmark_assets
+            .last()
+            .copied()
+            .unwrap_or(STARTING_CASH),
+        trade_summary,
+    );
+    let trace = if capture_trace {
+        Some(BacktestTrace {
+            total_assets: total_assets.unwrap_or_default(),
+            cash: cash_curve.unwrap_or_default(),
+            benchmark_assets: market.benchmark_assets.clone(),
+            prices_by_ticker: market.close_prices.clone(),
+            positioned_by_ticker: positioned_by_ticker.unwrap_or_default(),
+            buys_by_ticker: buys_by_ticker.unwrap_or_default(),
+            sells_by_ticker: sells_by_ticker.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
 
     BacktestOutcome { metrics, trace }
 }
@@ -186,7 +256,6 @@ pub fn write_trace_reports(
     trace: &BacktestTrace,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(output_dir)?;
-    let sleeve_cash = equal_cash_sleeve_curve(&trace.cash, tickers.len());
 
     let assets_report = Report {
         title: format!("{split_name} Assets"),
@@ -220,18 +289,8 @@ pub fn write_trace_reports(
     for (ticker_idx, ticker) in tickers.iter().enumerate() {
         let ticker_dir = output_dir.join(ticker);
         std::fs::create_dir_all(&ticker_dir)?;
-        let sleeve_total = sleeve_cash
-            .iter()
-            .zip(trace.positioned_by_ticker[ticker_idx].iter())
-            .map(|(cash, positioned)| cash + positioned)
-            .collect::<Vec<_>>();
-        let ticker_benchmark = ticker_benchmark_curve(
-            &trace.prices_by_ticker[ticker_idx],
-            sleeve_total
-                .first()
-                .copied()
-                .unwrap_or(STARTING_CASH / tickers.len().max(1) as f64),
-        );
+        let position_value = trace.positioned_by_ticker[ticker_idx].clone();
+        let zero_cash = vec![0.0; position_value.len()];
 
         let buy_sell_report = Report {
             title: format!("{split_name} {ticker} Buy/Sell"),
@@ -259,15 +318,15 @@ pub fn write_trace_reports(
         )?;
 
         let assets_report = Report {
-            title: format!("{split_name} {ticker} Sleeve Assets"),
+            title: format!("{split_name} {ticker} Position Value"),
             x_label: Some("Step".to_string()),
             y_label: Some("Assets".to_string()),
             scale: ScaleKind::Linear,
             kind: ReportKind::Assets {
-                total: to_f32(&sleeve_total),
-                cash: to_f32(&sleeve_cash),
-                positioned: Some(to_f32(&trace.positioned_by_ticker[ticker_idx])),
-                benchmark: Some(to_f32(&ticker_benchmark)),
+                total: to_f32(&position_value),
+                cash: to_f32(&zero_cash),
+                positioned: Some(to_f32(&position_value)),
+                benchmark: None,
             },
         };
         write_report(
@@ -305,10 +364,10 @@ pub fn write_trace_reports(
         );
         let _ = assets_chart(
             &chart_dir,
-            &sleeve_total,
-            &sleeve_cash,
-            Some(&trace.positioned_by_ticker[ticker_idx]),
-            Some(&ticker_benchmark),
+            &position_value,
+            &zero_cash,
+            Some(&position_value),
+            None,
         );
     }
 
@@ -327,41 +386,25 @@ fn compute_ema_map(data: &[Vec<f64>], alpha: f64) -> Vec<Vec<f64>> {
         .collect()
 }
 
-fn benchmark_curve(bars: &MappedHistorical) -> Vec<f64> {
-    if bars.is_empty() {
+fn benchmark_curve_from_prices(prices_by_ticker: &[Vec<f64>]) -> Vec<f64> {
+    if prices_by_ticker.is_empty() {
         return vec![STARTING_CASH];
     }
-    let allocation = STARTING_CASH / bars.len() as f64;
-    let quantities: Vec<f64> = bars
+    let allocation = STARTING_CASH / prices_by_ticker.len() as f64;
+    let quantities: Vec<f64> = prices_by_ticker
         .iter()
-        .map(|ticker_bars| allocation / ticker_bars[0].close)
+        .map(|ticker_prices| allocation / ticker_prices[0])
         .collect();
 
-    (0..bars[0].len())
+    (0..prices_by_ticker[0].len())
         .map(|index| {
             quantities
                 .iter()
                 .enumerate()
-                .map(|(ticker_idx, quantity)| quantity * bars[ticker_idx][index].close)
+                .map(|(ticker_idx, quantity)| quantity * prices_by_ticker[ticker_idx][index])
                 .sum::<f64>()
         })
         .collect()
-}
-
-fn ticker_benchmark_curve(prices: &[f64], initial_value: f64) -> Vec<f64> {
-    if prices.is_empty() {
-        return vec![initial_value];
-    }
-    let initial_price = prices[0];
-    prices
-        .iter()
-        .map(|price| initial_value * price / initial_price)
-        .collect()
-}
-
-fn equal_cash_sleeve_curve(cash: &[f64], ticker_count: usize) -> Vec<f64> {
-    let divisor = ticker_count.max(1) as f64;
-    cash.iter().map(|cash_value| cash_value / divisor).collect()
 }
 
 fn try_buy(
@@ -372,7 +415,7 @@ fn try_buy(
     assets: f64,
     account: &mut Account,
     states: &mut [TickerRuntimeState],
-    buys_by_ticker: &mut [Vec<u32>],
+    buy_markers: Option<&mut Vec<u32>>,
     trade_summary: &mut TradeSummary,
 ) -> bool {
     if !is_min_transaction(assets, buy_budget) {
@@ -386,7 +429,9 @@ fn try_buy(
     account.positions[ticker_idx].add(price, quantity);
     account.cash -= total_buy;
     states[ticker_idx].record_buy(price);
-    buys_by_ticker[ticker_idx].push(index as u32);
+    if let Some(buy_markers) = buy_markers {
+        buy_markers.push(index as u32);
+    }
     trade_summary.turnover += total_buy;
     trade_summary.buy_count += 1;
     true
@@ -396,10 +441,10 @@ fn try_sell(
     ticker_idx: usize,
     index: usize,
     price: f64,
-    sell_fraction: f64,
+    sell_budget: f64,
     account: &mut Account,
     states: &mut [TickerRuntimeState],
-    sells_by_ticker: &mut [Vec<u32>],
+    sell_markers: Option<&mut Vec<u32>>,
     trade_summary: &mut TradeSummary,
 ) -> bool {
     let position = &mut account.positions[ticker_idx];
@@ -407,7 +452,6 @@ fn try_sell(
         return false;
     }
     let position_value = position.value_with_price(price);
-    let sell_budget = position_value * sell_fraction;
     let (total_sell, quantity) = round_to_stock_fractional(price, sell_budget.min(position_value));
     if quantity <= 0.0 {
         return false;
@@ -421,7 +465,9 @@ fn try_sell(
     }
     account.cash += total_sell;
     states[ticker_idx].record_sell(price);
-    sells_by_ticker[ticker_idx].push(index as u32);
+    if let Some(sell_markers) = sell_markers {
+        sell_markers.push(index as u32);
+    }
     trade_summary.turnover += total_sell;
     trade_summary.sell_count += 1;
     if profitable {
@@ -432,6 +478,104 @@ fn try_sell(
 
 fn to_f32(values: &[f64]) -> Vec<f32> {
     values.iter().map(|value| *value as f32).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use ibapi::market_data::historical::Bar;
+    use rand::rngs::StdRng;
+    use serde::{Deserialize, Serialize};
+    use time::{Duration, OffsetDateTime};
+
+    use super::*;
+    use crate::genetic::family::{GeneticFamily, IndicatorConfig};
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct ConcentratedGenome;
+
+    struct ConcentratedFamily;
+
+    impl StrategyFamilySpec for ConcentratedFamily {
+        type Genome = ConcentratedGenome;
+
+        fn kind(&self) -> GeneticFamily {
+            GeneticFamily::TrendBreakout
+        }
+
+        fn seed_genome(&self, _rng: &mut StdRng) -> Self::Genome {
+            ConcentratedGenome
+        }
+
+        fn mutate(&self, _genome: &mut Self::Genome, _rng: &mut StdRng, _entropy: f64) {}
+
+        fn crossover(
+            &self,
+            _left: &Self::Genome,
+            _right: &Self::Genome,
+            _rng: &mut StdRng,
+        ) -> Self::Genome {
+            ConcentratedGenome
+        }
+
+        fn indicator_config(&self, _genome: &Self::Genome) -> IndicatorConfig {
+            IndicatorConfig {
+                decider_rsi_alpha: 0.05,
+                amount_rsi_alpha: 0.05,
+                price_ema_alpha: 0.05,
+                fast_ema_alpha: None,
+                slow_ema_alpha: None,
+            }
+        }
+
+        fn allow_buy(&self, _genome: &Self::Genome, ctx: &DecisionContext) -> bool {
+            ctx.index == 0 && ctx.position_quantity <= 0.0
+        }
+
+        fn allow_sell(&self, _genome: &Self::Genome, _ctx: &DecisionContext) -> bool {
+            false
+        }
+
+        fn buy_budget(&self, _genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+            ctx.cash * 0.8
+        }
+
+        fn sell_budget(&self, _genome: &Self::Genome, _ctx: &DecisionContext) -> f64 {
+            0.0
+        }
+    }
+
+    fn bars(base: f64) -> Vec<Bar> {
+        (0..8)
+            .map(|index| Bar {
+                date: OffsetDateTime::UNIX_EPOCH + Duration::minutes(index as i64 * 5),
+                open: base + index as f64,
+                high: base + index as f64 + 1.0,
+                low: base + index as f64 - 1.0,
+                close: base + index as f64,
+                volume: 1_000.0,
+                wap: base + index as f64,
+                count: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn family_buy_budget_can_exceed_old_equal_weight_cap() {
+        let market = MarketDataset::new(
+            "train",
+            vec!["AAA".to_string(), "BBB".to_string()],
+            vec![bars(100.0), bars(80.0)],
+        );
+        let outcome = evaluate_family(&ConcentratedFamily, &ConcentratedGenome, &market, true);
+        let trace = outcome.trace.expect("expected trace");
+        let first_ticker_position = trace.positioned_by_ticker[0][1];
+        let old_equal_weight_cap = STARTING_CASH / market.tickers.len() as f64;
+
+        assert!(
+            first_ticker_position > old_equal_weight_cap,
+            "expected concentrated allocation above old equal-weight cap: {first_ticker_position} <= {old_equal_weight_cap}"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

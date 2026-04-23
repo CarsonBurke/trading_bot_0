@@ -44,8 +44,8 @@ enum Commands {
         #[arg(long, default_value_t = 192)]
         population: usize,
 
-        #[arg(long, default_value_t = 48)]
-        survivors: usize,
+        #[arg(long, default_value_t = 0.25)]
+        survivor_ratio: f64,
 
         #[arg(long, value_enum, default_value_t = genetic::TickerSet::Train)]
         train_tickers: genetic::TickerSet,
@@ -64,6 +64,9 @@ enum Commands {
 
         #[arg(long, default_value_t = false)]
         skip_additional_downloads: bool,
+
+        #[arg(long, default_value_t = 1.0)]
+        mutation_entropy: f64,
     },
     Train {
         #[arg(short, long)]
@@ -139,26 +142,28 @@ async fn main() {
             run,
             generations,
             population,
-            survivors,
+            survivor_ratio,
             train_tickers,
             validation_tickers,
             test_tickers,
             heavy_report_every,
             seed,
             skip_additional_downloads,
+            mutation_entropy,
         }) => {
             genetic::run(genetic::GeneticArgs {
                 family: *family,
                 run: run.clone(),
                 generations: *generations,
                 population: *population,
-                survivors: *survivors,
+                survivor_ratio: *survivor_ratio,
                 train_tickers: *train_tickers,
                 validation_tickers: *validation_tickers,
                 test_tickers: *test_tickers,
                 heavy_report_every: *heavy_report_every,
                 seed: *seed,
                 skip_additional_downloads: *skip_additional_downloads,
+                mutation_entropy: *mutation_entropy,
             })
             .expect("genetic training failed");
         }

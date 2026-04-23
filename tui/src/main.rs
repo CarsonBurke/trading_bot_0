@@ -219,6 +219,7 @@ impl App {
             "ga_trade_count",
             "ga_generalization_gap",
             "ga_distribution",
+            "ga_mutation_entropy",
             "ga_train_assets",
             "ga_validation_assets",
             "ga_test_assets",

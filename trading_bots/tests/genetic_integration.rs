@@ -58,11 +58,11 @@ fn market(split: &str, tickers: &[&str], seed_offset: f64) -> MarketDataset {
         })
         .collect();
 
-    MarketDataset {
-        split_name: split.to_string(),
-        tickers: tickers.iter().map(|ticker| ticker.to_string()).collect(),
+    MarketDataset::new(
+        split.to_string(),
+        tickers.iter().map(|ticker| ticker.to_string()).collect(),
         bars,
-    }
+    )
 }
 
 fn fixture_bundle() -> DatasetBundle {
@@ -92,9 +92,10 @@ fn base_config(family: GeneticFamily, seed: u64) -> TrainingConfig {
         family,
         generations: 4,
         population: 12,
-        survivors: 4,
+        survivor_ratio: 4.0 / 12.0,
         heavy_report_every: 2,
         seed,
+        mutation_entropy: 1.0,
     }
 }
 
@@ -116,6 +117,7 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
     let checkpoint = paths.weights.join("ga_best_validation.json");
     let summary_json = paths.root.join("ga_summary.json");
     let fitness_report = paths.gens.join("0/ga_fitness.report.bin");
+    let mutation_entropy_report = paths.gens.join("0/ga_mutation_entropy.report.bin");
     let test_assets_report = paths.gens.join("3/ga_test_assets.report.bin");
     let ticker_assets_report = paths.gens.join("3/TST_A/assets.report.bin");
     assert!(
@@ -132,6 +134,11 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
         fitness_report.exists(),
         "missing report at {}",
         fitness_report.display()
+    );
+    assert!(
+        mutation_entropy_report.exists(),
+        "missing report at {}",
+        mutation_entropy_report.display()
     );
     assert!(
         test_assets_report.exists(),
@@ -170,13 +177,10 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
             benchmark,
         } => {
             let positioned = positioned.expect("expected positioned series");
-            let benchmark = benchmark.expect("expected benchmark series");
-            let expected_sleeve_start = 10_000.0_f32 / 3.0_f32;
-            assert!((total[0] - expected_sleeve_start).abs() < 1e-2);
-            assert!((cash[0] - expected_sleeve_start).abs() < 1e-2);
+            assert!(benchmark.is_none());
+            assert!(total[0].abs() < 1e-6);
+            assert!(cash[0].abs() < 1e-6);
             assert!(positioned[0].abs() < 1e-6);
-            assert!((benchmark[0] - expected_sleeve_start).abs() < 1e-2);
-            assert!(total[0] < 10_000.0);
         }
         other => panic!("expected assets report, got {other:?}"),
     }

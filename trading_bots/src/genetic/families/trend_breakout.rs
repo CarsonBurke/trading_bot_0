@@ -62,9 +62,14 @@ impl StrategyFamilySpec for Family {
         Genome { genes }
     }
 
-    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng) {
+    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng, entropy: f64) {
         for gene in Gene::ALL {
-            genome.genes[gene] = jitter(genome.genes[gene], spec(gene).mutation, spec(gene), rng);
+            genome.genes[gene] = jitter(
+                genome.genes[gene],
+                spec(gene).mutation * entropy.max(0.0),
+                spec(gene),
+                rng,
+            );
         }
         if genome.genes[Gene::FastEmaAlpha] <= genome.genes[Gene::SlowEmaAlpha] {
             genome.genes[Gene::FastEmaAlpha] =
@@ -149,7 +154,7 @@ impl StrategyFamilySpec for Family {
         ctx.amount_rsi >= genome.genes[Gene::MaxExitRsi] * 100.0
     }
 
-    fn buy_fraction(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+    fn buy_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
         let Some(fast_ema) = ctx.fast_ema else {
             return 0.0;
         };
@@ -161,13 +166,18 @@ impl StrategyFamilySpec for Family {
         let trend_term = (trend_spread / genome.genes[Gene::TrendSpreadMinPct].max(1e-6)).min(2.0);
         let pullback_term =
             (pullback / genome.genes[Gene::PullbackMaxPct].max(1e-6)).clamp(0.2, 1.0);
-        (genome.genes[Gene::BuyPercent] * trend_term * pullback_term).clamp(0.0, 1.0)
+        let fraction =
+            (genome.genes[Gene::BuyPercent] * trend_term * pullback_term).clamp(0.0, 1.0);
+        let equal_weight_headroom =
+            (ctx.equal_weight_position_value() - ctx.position_value).max(0.0);
+        ctx.cash.min(equal_weight_headroom * fraction)
     }
 
-    fn sell_fraction(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+    fn sell_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
         let pnl_pct = ctx.unrealized_pnl_pct().max(0.0) / 100.0;
         let pnl_term = (pnl_pct / genome.genes[Gene::TakeProfitPct].max(1e-6)).clamp(0.5, 2.0);
-        (genome.genes[Gene::SellPercent] * pnl_term).clamp(0.0, 1.0)
+        let fraction = (genome.genes[Gene::SellPercent] * pnl_term).clamp(0.0, 1.0);
+        ctx.position_value * fraction
     }
 }
 

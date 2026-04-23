@@ -58,9 +58,14 @@ impl StrategyFamilySpec for Family {
         Genome { genes }
     }
 
-    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng) {
+    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng, entropy: f64) {
         for gene in Gene::ALL {
-            genome.genes[gene] = jitter(genome.genes[gene], spec(gene).mutation, spec(gene), rng);
+            genome.genes[gene] = jitter(
+                genome.genes[gene],
+                spec(gene).mutation * entropy.max(0.0),
+                spec(gene),
+                rng,
+            );
         }
     }
 
@@ -125,16 +130,20 @@ impl StrategyFamilySpec for Family {
         ctx.price * (1.0 + genome.genes[Gene::ReboundSellPriceThreshold]) < ctx.local_maximum
     }
 
-    fn buy_fraction(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+    fn buy_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
         let distance = percent_diff(ctx.local_maximum, ctx.price);
         let scale = distance / genome.genes[Gene::BuyDistanceWeightAmount].max(1e-6);
-        (genome.genes[Gene::BuyPercent] * scale).clamp(0.0, 1.0)
+        let fraction = (genome.genes[Gene::BuyPercent] * scale).clamp(0.0, 1.0);
+        let equal_weight_headroom =
+            (ctx.equal_weight_position_value() - ctx.position_value).max(0.0);
+        ctx.cash.min(equal_weight_headroom * fraction)
     }
 
-    fn sell_fraction(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+    fn sell_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
         let distance = percent_diff(ctx.price, ctx.local_minimum);
         let scale = distance / genome.genes[Gene::SellDistanceWeightAmount].max(1e-6);
-        (genome.genes[Gene::SellPercent] * scale).clamp(0.0, 1.0)
+        let fraction = (genome.genes[Gene::SellPercent] * scale).clamp(0.0, 1.0);
+        ctx.position_value * fraction
     }
 }
 
