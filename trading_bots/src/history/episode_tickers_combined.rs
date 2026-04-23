@@ -68,6 +68,7 @@ impl EpisodeHistory {
     ) {
         let episode_dir = format!("{}/{}", base_path, episode);
         create_folder_if_not_exists(&episode_dir);
+        let sleeve_cash = equal_cash_sleeve_curve(&self.cash, tickers.len());
 
         let num_steps = self.cash.len();
         let mut total_assets_per_step = vec![0.0; num_steps];
@@ -136,11 +137,18 @@ impl EpisodeHistory {
             let _ = write_report(&format!("{ticker_dir}/buy_sell.report.bin"), &report);
 
             let positioned_assets = &self.positioned[ticker_index];
+            let sleeve_total = sleeve_cash
+                .iter()
+                .zip(positioned_assets.iter())
+                .map(|(cash, positioned)| cash + positioned)
+                .collect::<Vec<_>>();
 
             let ticker_benchmark =
                 if !ticker_prices.is_empty() && num_steps > 0 && start_offset < ticker_prices.len()
                 {
-                    let initial_value = total_assets_per_step[0];
+                    let initial_value = sleeve_total.first().copied().unwrap_or_else(|| {
+                        self.cash.first().copied().unwrap_or(0.0) / tickers.len().max(1) as f64
+                    });
                     let initial_price = ticker_prices[start_offset];
                     let end_idx = (start_offset + num_steps).min(ticker_prices.len());
                     Some(
@@ -154,13 +162,13 @@ impl EpisodeHistory {
                 };
 
             let report = Report {
-                title: "Assets".to_string(),
+                title: "Sleeve Assets".to_string(),
                 x_label: Some("Step".to_string()),
                 y_label: Some("Assets".to_string()),
                 scale: ScaleKind::Linear,
                 kind: ReportKind::Assets {
-                    total: f64_to_f32(&total_assets_per_step),
-                    cash: f64_to_f32(&self.cash),
+                    total: f64_to_f32(&sleeve_total),
+                    cash: f64_to_f32(&sleeve_cash),
                     positioned: Some(f64_to_f32(positioned_assets)),
                     benchmark: ticker_benchmark.as_ref().map(|b| f64_to_f32(b)),
                 },
@@ -274,4 +282,9 @@ impl EpisodeHistory {
 
 fn f64_to_f32(values: &[f64]) -> Vec<f32> {
     values.iter().map(|v| *v as f32).collect()
+}
+
+fn equal_cash_sleeve_curve(cash: &[f64], ticker_count: usize) -> Vec<f64> {
+    let divisor = ticker_count.max(1) as f64;
+    cash.iter().map(|cash_value| cash_value / divisor).collect()
 }

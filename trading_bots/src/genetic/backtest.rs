@@ -186,6 +186,7 @@ pub fn write_trace_reports(
     trace: &BacktestTrace,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(output_dir)?;
+    let sleeve_cash = equal_cash_sleeve_curve(&trace.cash, tickers.len());
 
     let assets_report = Report {
         title: format!("{split_name} Assets"),
@@ -219,6 +220,18 @@ pub fn write_trace_reports(
     for (ticker_idx, ticker) in tickers.iter().enumerate() {
         let ticker_dir = output_dir.join(ticker);
         std::fs::create_dir_all(&ticker_dir)?;
+        let sleeve_total = sleeve_cash
+            .iter()
+            .zip(trace.positioned_by_ticker[ticker_idx].iter())
+            .map(|(cash, positioned)| cash + positioned)
+            .collect::<Vec<_>>();
+        let ticker_benchmark = ticker_benchmark_curve(
+            &trace.prices_by_ticker[ticker_idx],
+            sleeve_total
+                .first()
+                .copied()
+                .unwrap_or(STARTING_CASH / tickers.len().max(1) as f64),
+        );
 
         let buy_sell_report = Report {
             title: format!("{split_name} {ticker} Buy/Sell"),
@@ -246,15 +259,15 @@ pub fn write_trace_reports(
         )?;
 
         let assets_report = Report {
-            title: format!("{split_name} {ticker} Assets"),
+            title: format!("{split_name} {ticker} Sleeve Assets"),
             x_label: Some("Step".to_string()),
             y_label: Some("Assets".to_string()),
             scale: ScaleKind::Linear,
             kind: ReportKind::Assets {
-                total: to_f32(&trace.total_assets),
-                cash: to_f32(&trace.cash),
+                total: to_f32(&sleeve_total),
+                cash: to_f32(&sleeve_cash),
                 positioned: Some(to_f32(&trace.positioned_by_ticker[ticker_idx])),
-                benchmark: Some(to_f32(&trace.benchmark_assets)),
+                benchmark: Some(to_f32(&ticker_benchmark)),
             },
         };
         write_report(
@@ -292,10 +305,10 @@ pub fn write_trace_reports(
         );
         let _ = assets_chart(
             &chart_dir,
-            &trace.total_assets,
-            &trace.cash,
+            &sleeve_total,
+            &sleeve_cash,
             Some(&trace.positioned_by_ticker[ticker_idx]),
-            Some(&trace.benchmark_assets),
+            Some(&ticker_benchmark),
         );
     }
 
@@ -333,6 +346,22 @@ fn benchmark_curve(bars: &MappedHistorical) -> Vec<f64> {
                 .sum::<f64>()
         })
         .collect()
+}
+
+fn ticker_benchmark_curve(prices: &[f64], initial_value: f64) -> Vec<f64> {
+    if prices.is_empty() {
+        return vec![initial_value];
+    }
+    let initial_price = prices[0];
+    prices
+        .iter()
+        .map(|price| initial_value * price / initial_price)
+        .collect()
+}
+
+fn equal_cash_sleeve_curve(cash: &[f64], ticker_count: usize) -> Vec<f64> {
+    let divisor = ticker_count.max(1) as f64;
+    cash.iter().map(|cash_value| cash_value / divisor).collect()
 }
 
 fn try_buy(

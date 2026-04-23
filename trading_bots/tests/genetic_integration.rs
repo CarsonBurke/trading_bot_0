@@ -117,6 +117,7 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
     let summary_json = paths.root.join("ga_summary.json");
     let fitness_report = paths.gens.join("0/ga_fitness.report.bin");
     let test_assets_report = paths.gens.join("3/ga_test_assets.report.bin");
+    let ticker_assets_report = paths.gens.join("3/TST_A/assets.report.bin");
     assert!(
         checkpoint.exists(),
         "missing checkpoint at {}",
@@ -137,6 +138,11 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
         "missing test assets report at {}",
         test_assets_report.display()
     );
+    assert!(
+        ticker_assets_report.exists(),
+        "missing ticker assets report at {}",
+        ticker_assets_report.display()
+    );
 
     let report = read_report(fitness_report.to_string_lossy().as_ref()).unwrap();
     match report.kind {
@@ -154,6 +160,26 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
 
     let checkpoint_body = fs::read_to_string(&checkpoint).unwrap();
     assert!(checkpoint_body.contains("TrendBreakout"));
+
+    let ticker_assets = read_report(ticker_assets_report.to_string_lossy().as_ref()).unwrap();
+    match ticker_assets.kind {
+        ReportKind::Assets {
+            total,
+            cash,
+            positioned,
+            benchmark,
+        } => {
+            let positioned = positioned.expect("expected positioned series");
+            let benchmark = benchmark.expect("expected benchmark series");
+            let expected_sleeve_start = 10_000.0_f32 / 3.0_f32;
+            assert!((total[0] - expected_sleeve_start).abs() < 1e-2);
+            assert!((cash[0] - expected_sleeve_start).abs() < 1e-2);
+            assert!(positioned[0].abs() < 1e-6);
+            assert!((benchmark[0] - expected_sleeve_start).abs() < 1e-2);
+            assert!(total[0] < 10_000.0);
+        }
+        other => panic!("expected assets report, got {other:?}"),
+    }
 }
 
 #[test]
