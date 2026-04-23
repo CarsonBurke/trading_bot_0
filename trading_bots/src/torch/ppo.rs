@@ -177,40 +177,60 @@ fn sample_rollout_actions_from_output(
     )
 }
 
-/// Compute GAE advantages and returns from rollout data.
-fn compute_gae(
-    s_rewards: &Tensor,
-    s_values: &Tensor,
-    s_dones: &Tensor,
+/// Compute GAE advantages and returns from chunk-major rollout data.
+pub(crate) fn compute_gae_chunked(
+    rewards_by_chunk: &Tensor,
+    values_by_chunk: &Tensor,
+    dones_by_chunk: &Tensor,
     bootstrap_value: &Tensor,
     rollout_steps: i64,
     nprocs: i64,
+    ppo_chunk_len: i64,
     gamma: f64,
     gae_lambda: f64,
     device: tch::Device,
 ) -> (Tensor, Tensor) {
-    let memory_size = rollout_steps * nprocs;
-    let advantages = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let returns = Tensor::zeros(&[memory_size], (Kind::Float, device));
+    let chunks_per_rollout = rollout_steps / ppo_chunk_len;
+    let total_chunks = chunks_per_rollout * nprocs;
+    let advantages = Tensor::zeros(&[total_chunks, ppo_chunk_len], (Kind::Float, device));
+    let returns = Tensor::zeros(&[total_chunks, ppo_chunk_len], (Kind::Float, device));
 
     tch::no_grad(|| {
         let mut last_gae = Tensor::zeros(&[nprocs], (Kind::Float, device));
         for t in (0..rollout_steps).rev() {
-            let mem_idx = t * nprocs;
+            let chunk_block = t / ppo_chunk_len;
+            let chunk_offset = t % ppo_chunk_len;
+            let chunk_row = chunk_block * nprocs;
             let next_values = if t == rollout_steps - 1 {
                 bootstrap_value.shallow_clone()
             } else {
-                s_values.narrow(0, (t + 1) * nprocs, nprocs)
+                let next_chunk_block = (t + 1) / ppo_chunk_len;
+                let next_chunk_offset = (t + 1) % ppo_chunk_len;
+                values_by_chunk
+                    .narrow(0, next_chunk_block * nprocs, nprocs)
+                    .select(1, next_chunk_offset)
             };
-            let cur_values = s_values.narrow(0, mem_idx, nprocs);
-            let rewards = s_rewards.narrow(0, mem_idx, nprocs);
-            let dones = s_dones.narrow(0, mem_idx, nprocs);
+            let cur_values = values_by_chunk
+                .narrow(0, chunk_row, nprocs)
+                .select(1, chunk_offset);
+            let rewards = rewards_by_chunk
+                .narrow(0, chunk_row, nprocs)
+                .select(1, chunk_offset);
+            let dones = dones_by_chunk
+                .narrow(0, chunk_row, nprocs)
+                .select(1, chunk_offset);
 
             let delta = rewards + (1.0 - &dones) * gamma * &next_values - &cur_values;
             last_gae = delta + (1.0 - &dones) * gamma * gae_lambda * &last_gae;
-            let _ = advantages.narrow(0, mem_idx, nprocs).copy_(&last_gae);
+            let _ = advantages
+                .narrow(0, chunk_row, nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&last_gae.unsqueeze(1));
             let step_returns = &last_gae + &cur_values;
-            let _ = returns.narrow(0, mem_idx, nprocs).copy_(&step_returns);
+            let _ = returns
+                .narrow(0, chunk_row, nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&step_returns.unsqueeze(1));
         }
     });
 
@@ -277,8 +297,8 @@ pub async fn train(
     let rollout = rollout_geometry();
     assert_eq!(
         model_variant,
-        ModelVariant::Uniform256Stream,
-        "PPO rollout collection is streaming-only; train with --model-size uniform-256-stream"
+        ModelVariant::UniformStream,
+        "PPO rollout collection is streaming-only; train with --model-size uniform-stream"
     );
     if let Some(threads) = env::var("TORCH_NUM_THREADS")
         .ok()
@@ -390,7 +410,6 @@ pub async fn train(
     let hl_gauss = HlGaussBins::default_for(device);
 
     let rollout_steps = rollout.seq_len;
-    let memory_size = rollout_steps * rollout.nprocs;
     assert_eq!(
         rollout_steps % rollout.ppo_chunk_len,
         0,
@@ -398,20 +417,6 @@ pub async fn train(
     );
     let chunks_per_rollout = rollout_steps / rollout.ppo_chunk_len;
     let total_chunks = chunks_per_rollout * rollout.nprocs;
-    let mut chunk_mem_indices_host =
-        Vec::with_capacity((total_chunks * rollout.ppo_chunk_len) as usize);
-    for chunk_id in 0..total_chunks {
-        let env_idx = chunk_id % rollout.nprocs;
-        let chunk_start = (chunk_id / rollout.nprocs) * rollout.ppo_chunk_len;
-        for offset in 0..rollout.ppo_chunk_len {
-            chunk_mem_indices_host.push((chunk_start + offset) * rollout.nprocs + env_idx);
-        }
-    }
-    let chunk_mem_indices = Tensor::from_slice(&chunk_mem_indices_host)
-        .to_kind(Kind::Int64)
-        .to_device(device)
-        .view([total_chunks, rollout.ppo_chunk_len]);
-    let chunk_mem_indices_flat = chunk_mem_indices.reshape([-1]);
 
     let raw_pd_dim = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
     let pd_dim = trading_model.price_input_dim();
@@ -421,40 +426,33 @@ pub async fn train(
         &[chunks_per_rollout * rollout.nprocs, pd_dim],
         (replay_obs_kind, device),
     );
-    let s_step_deltas = Tensor::zeros(&[memory_size, TICKERS_COUNT], (replay_obs_kind, device));
-    let s_static_obs = Tensor::zeros(&[memory_size, so_dim], (replay_obs_kind, device));
-    let s_actions = Tensor::zeros(&[memory_size, ACTION_COUNT], (Kind::Float, device));
-    let s_old_log_probs = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let s_rewards = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let s_dones = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let s_values = Tensor::zeros(&[memory_size], (Kind::Float, device));
-    let mut s_static_obs_by_chunk = Tensor::zeros(
+    let s_static_obs = Tensor::zeros(
         &[total_chunks, rollout.ppo_chunk_len, so_dim],
         (replay_obs_kind, device),
     );
-    let mut s_step_deltas_by_chunk = Tensor::zeros(
+    let s_step_deltas = Tensor::zeros(
         &[total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT],
         (replay_obs_kind, device),
     );
-    let mut s_actions_by_chunk = Tensor::zeros(
+    let s_actions = Tensor::zeros(
         &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
         (Kind::Float, device),
     );
-    let mut s_old_log_probs_by_chunk = Tensor::zeros(
+    let s_old_log_probs = Tensor::zeros(
         &[total_chunks, rollout.ppo_chunk_len],
         (Kind::Float, device),
     );
-    let mut returns_by_chunk = Tensor::zeros(
+    let s_rewards = Tensor::zeros(
         &[total_chunks, rollout.ppo_chunk_len],
         (Kind::Float, device),
     );
-    let mut adv_norm_by_chunk = Tensor::zeros(
+    let s_dones = Tensor::zeros(
         &[total_chunks, rollout.ppo_chunk_len],
         (Kind::Float, device),
     );
-    let mut reset_slots_by_chunk = Tensor::zeros(
+    let s_values = Tensor::zeros(
         &[total_chunks, rollout.ppo_chunk_len],
-        (Kind::Int64, device),
+        (Kind::Float, device),
     );
 
     if start_episode > 0 {
@@ -507,9 +505,9 @@ pub async fn train(
         let mut step_reward_per_ticker =
             Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (Kind::Float, device));
         let mut step_is_done = Tensor::zeros(&[rollout.nprocs], (Kind::Float, device));
-        let mut reset_layout_batches: Vec<Tensor> = Vec::new();
+        let mut reset_layout_batches_cpu: Vec<Tensor> = Vec::new();
         let mut reset_layout_count = 0i64;
-        let mut reset_slots_host = vec![0i64; memory_size as usize];
+        let mut reset_slots_host = vec![0i64; (total_chunks * rollout.ppo_chunk_len) as usize];
         let mut cpu_step_batch = CpuStepBatch::new(
             rollout.nprocs as usize,
             ACTION_COUNT as usize,
@@ -528,7 +526,8 @@ pub async fn train(
         let mut reset_env_indices_host: Vec<i64> = vec![0i64; rollout.nprocs as usize];
         let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
         for step in 0..rollout_steps as usize {
-            let mem_idx = step as i64 * rollout.nprocs;
+            let chunk_row = (step as i64 / rollout.ppo_chunk_len) * rollout.nprocs;
+            let chunk_offset = step as i64 % rollout.ppo_chunk_len;
             let (values, action_mean, action_std, latent_actions, target_weights, action_log_prob) =
                 sample_rollout_actions_from_output(
                     streamed_output
@@ -546,7 +545,6 @@ pub async fn train(
                     debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
             if step as i64 % rollout.ppo_chunk_len == 0 {
-                let chunk_row = (step as i64 / rollout.ppo_chunk_len) * rollout.nprocs;
                 let boundary_layout = stream_state
                     .uniform_layout
                     .view([rollout.nprocs, pd_dim])
@@ -556,8 +554,9 @@ pub async fn train(
                     .copy_(&boundary_layout);
             }
             let _ = s_static_obs
-                .narrow(0, mem_idx, rollout.nprocs)
-                .copy_(&obs_static);
+                .narrow(0, chunk_row, rollout.nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&obs_static.unsqueeze(1));
 
             let _ = action_host_view.copy_(&target_weights.to_kind(Kind::Float));
             env.step_from_actions_f32_into(
@@ -570,8 +569,9 @@ pub async fn train(
             let reset_indices = &cpu_step_batch.reset_indices;
             let reset_price_deltas = &cpu_step_batch.reset_price_deltas;
             let _ = s_step_deltas
-                .narrow(0, mem_idx, rollout.nprocs)
-                .copy_(&step_deltas);
+                .narrow(0, chunk_row, rollout.nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&step_deltas.unsqueeze(1));
             let mut reset_replay = None;
             if !reset_indices.is_empty() {
                 let reset_count = reset_indices.len() as i64;
@@ -616,19 +616,26 @@ pub async fn train(
                     reset_layouts_batch.shallow_clone(),
                 ));
                 for (reset_i, env_idx) in reset_indices.iter().enumerate() {
-                    reset_slots_host[(mem_idx + *env_idx as i64) as usize] =
-                        reset_layout_count + reset_i as i64 + 1;
+                    let slot_idx = ((chunk_row + *env_idx as i64) * rollout.ppo_chunk_len
+                        + chunk_offset) as usize;
+                    reset_slots_host[slot_idx] = reset_layout_count + reset_i as i64 + 1;
                 }
                 reset_layout_count += reset_count;
-                reset_layout_batches.push(reset_layouts_batch.to_kind(replay_obs_kind));
+                reset_layout_batches_cpu.push(
+                    reset_layouts_batch
+                        .to_kind(replay_obs_kind)
+                        .to_device(tch::Device::Cpu),
+                );
             }
 
             let _ = s_actions
-                .narrow(0, mem_idx, rollout.nprocs)
-                .copy_(&latent_actions);
+                .narrow(0, chunk_row, rollout.nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&latent_actions.unsqueeze(1));
             let _ = s_old_log_probs
-                .narrow(0, mem_idx, rollout.nprocs)
-                .copy_(&action_log_prob);
+                .narrow(0, chunk_row, rollout.nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&action_log_prob.unsqueeze(1));
 
             let portfolio_reward =
                 step_reward_per_ticker.mean_dim([1].as_slice(), false, Kind::Float);
@@ -640,12 +647,17 @@ pub async fn train(
                 let _ = debug_tensor_stats("step_is_done", &step_is_done, episode as i64, step);
             }
             let _ = s_rewards
-                .narrow(0, mem_idx, rollout.nprocs)
-                .copy_(&portfolio_reward);
+                .narrow(0, chunk_row, rollout.nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&portfolio_reward.unsqueeze(1));
             let _ = s_dones
-                .narrow(0, mem_idx, rollout.nprocs)
-                .copy_(&step_is_done);
-            let _ = s_values.narrow(0, mem_idx, rollout.nprocs).copy_(&values);
+                .narrow(0, chunk_row, rollout.nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&step_is_done.unsqueeze(1));
+            let _ = s_values
+                .narrow(0, chunk_row, rollout.nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&values.unsqueeze(1));
 
             streamed_output = Some(tch::no_grad(|| {
                 autocast(true, || {
@@ -687,21 +699,22 @@ pub async fn train(
             hl_gauss.decode(&value_logits)
         });
 
-        let (advantages, returns) = compute_gae(
+        let (advantages, returns) = compute_gae_chunked(
             &s_rewards,
             &s_values,
             &s_dones,
             &bootstrap_value,
             rollout_steps,
             rollout.nprocs,
+            rollout.ppo_chunk_len,
             0.99,
             0.95,
             device,
         );
-        let reset_layout_bank = if reset_layout_batches.is_empty() {
-            Tensor::zeros(&[0, pd_dim], (replay_obs_kind, device))
+        let reset_layout_bank_cpu = if reset_layout_batches_cpu.is_empty() {
+            Tensor::zeros(&[0, pd_dim], (replay_obs_kind, tch::Device::Cpu))
         } else {
-            let reset_layout_refs: Vec<&Tensor> = reset_layout_batches.iter().collect();
+            let reset_layout_refs: Vec<&Tensor> = reset_layout_batches_cpu.iter().collect();
             Tensor::cat(&reset_layout_refs, 0)
         };
 
@@ -723,8 +736,9 @@ pub async fn train(
             ((minibatch_size + rollout.ppo_chunk_len - 1) / rollout.ppo_chunk_len).max(1);
         // Keep reset slots flat and gather only the current minibatch to avoid
         // carrying a second chunk-major copy of the rollout on device.
-        let reset_slots = Tensor::from_slice(&reset_slots_host)
+        let reset_slots_by_chunk = Tensor::from_slice(&reset_slots_host)
             .to_kind(Kind::Int64)
+            .view([total_chunks, rollout.ppo_chunk_len])
             .to_device(device);
         println!(
             "ppo update: total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
@@ -732,44 +746,6 @@ pub async fn train(
         );
         // Full-rollout advantage normalization (not per-minibatch)
         let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
-        let _ = s_static_obs_by_chunk.copy_(
-            &s_static_obs.index_select(0, &chunk_mem_indices_flat).view([
-                total_chunks,
-                rollout.ppo_chunk_len,
-                so_dim,
-            ]),
-        );
-        let _ = s_step_deltas_by_chunk.copy_(
-            &s_step_deltas
-                .index_select(0, &chunk_mem_indices_flat)
-                .view([total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT]),
-        );
-        let _ =
-            s_actions_by_chunk.copy_(&s_actions.index_select(0, &chunk_mem_indices_flat).view([
-                total_chunks,
-                rollout.ppo_chunk_len,
-                ACTION_COUNT,
-            ]));
-        let _ = s_old_log_probs_by_chunk.copy_(
-            &s_old_log_probs
-                .index_select(0, &chunk_mem_indices_flat)
-                .view([total_chunks, rollout.ppo_chunk_len]),
-        );
-        let _ = returns_by_chunk.copy_(
-            &returns
-                .index_select(0, &chunk_mem_indices_flat)
-                .view([total_chunks, rollout.ppo_chunk_len]),
-        );
-        let _ = adv_norm_by_chunk.copy_(
-            &adv_norm
-                .index_select(0, &chunk_mem_indices_flat)
-                .view([total_chunks, rollout.ppo_chunk_len]),
-        );
-        let _ = reset_slots_by_chunk.copy_(
-            &reset_slots
-                .index_select(0, &chunk_mem_indices_flat)
-                .view([total_chunks, rollout.ppo_chunk_len]),
-        );
 
         let mut total_kl_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -817,12 +793,12 @@ pub async fn train(
                 let chunk_count = mb_end - mb_start;
                 let chunk_ids = perm_gpu.narrow(0, mb_start, chunk_count);
                 let boundary_layout = s_chunk_start_layouts.index_select(0, &chunk_ids);
-                let so_chunk = s_static_obs_by_chunk.index_select(0, &chunk_ids);
-                let step_deltas_chunk = s_step_deltas_by_chunk.index_select(0, &chunk_ids);
-                let adv_mb_by_chunk = adv_norm_by_chunk.index_select(0, &chunk_ids);
-                let ret_mb_by_chunk = returns_by_chunk.index_select(0, &chunk_ids);
-                let old_log_probs_by_chunk = s_old_log_probs_by_chunk.index_select(0, &chunk_ids);
-                let act_mb_by_chunk = s_actions_by_chunk.index_select(0, &chunk_ids);
+                let so_chunk = s_static_obs.index_select(0, &chunk_ids);
+                let step_deltas_chunk = s_step_deltas.index_select(0, &chunk_ids);
+                let adv_mb_by_chunk = adv_norm.index_select(0, &chunk_ids);
+                let ret_mb_by_chunk = returns.index_select(0, &chunk_ids);
+                let old_log_probs_by_chunk = s_old_log_probs.index_select(0, &chunk_ids);
+                let act_mb_by_chunk = s_actions.index_select(0, &chunk_ids);
                 let reset_slots_chunk = reset_slots_by_chunk.index_select(0, &chunk_ids);
 
                 let fwd_start = Instant::now();
@@ -855,7 +831,10 @@ pub async fn train(
                         if reset_chunk_idx.size()[0] > 0 {
                             let reset_slot_ids =
                                 step_reset_slots.index_select(0, &reset_chunk_idx) - 1;
-                            let reset_layouts = reset_layout_bank.index_select(0, &reset_slot_ids);
+                            let reset_slot_ids_cpu = reset_slot_ids.to_device(tch::Device::Cpu);
+                            let reset_layouts = reset_layout_bank_cpu
+                                .index_select(0, &reset_slot_ids_cpu)
+                                .to_device(device);
                             let reset_row_idx = (&reset_chunk_idx.unsqueeze(1) * TICKERS_COUNT
                                 + &ticker_offsets)
                                 .reshape([-1]);
@@ -1151,7 +1130,7 @@ pub async fn train(
         let log_std_stats = compute_action_std_stats(
             &trading_model,
             &s_chunk_start_layouts.narrow(0, 0, rollout.nprocs),
-            &s_static_obs.narrow(0, 0, rollout.nprocs),
+            &s_static_obs.narrow(0, 0, rollout.nprocs).select(1, 0),
             &rpo_rho,
             device,
         );
