@@ -126,6 +126,18 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
                 decider_rsi_by_ticker[ticker_idx][index],
                 position.quantity > 0.0,
             );
+            let benchmark_return_since_entry_pct =
+                state.benchmark_return_since_entry_pct(market.benchmark_assets[index]);
+            let excess_return_since_entry_pct = if position.quantity > 0.0 {
+                Some(((price / position.avg_price.max(1e-6)) - 1.0) * 100.0)
+                    .zip(benchmark_return_since_entry_pct)
+                    .map(|(ticker_return_pct, benchmark_return_pct)| {
+                        ticker_return_pct - benchmark_return_pct
+                    })
+            } else {
+                None
+            };
+            state.observe_relative_performance(index, excess_return_since_entry_pct);
 
             contexts.push(DecisionContext {
                 index,
@@ -150,6 +162,12 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
                 position_value: position_values[ticker_idx],
                 position_avg_price: position.avg_price,
                 position_quantity: position.quantity,
+                bars_since_entry: state.bars_since_entry(index),
+                benchmark_return_since_entry_pct,
+                excess_return_since_entry_pct,
+                excess_return_peak_pct: state.peak_excess_return_since_entry_pct,
+                excess_return_delta_pct: state.excess_return_delta_pct,
+                underperformance_streak: Some(state.underperformance_streak),
                 assets,
                 cash: account.cash,
             });
@@ -161,6 +179,7 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
             index,
             assets,
             &prices_at_index,
+            market.benchmark_assets[index],
             &contexts,
             &mut account,
             &mut states,
@@ -394,6 +413,7 @@ fn rebalance_to_targets<F: StrategyFamilySpec>(
     index: usize,
     assets: f64,
     prices: &[f64],
+    benchmark_assets: f64,
     contexts: &[DecisionContext],
     account: &mut Account,
     states: &mut [TickerRuntimeState],
@@ -409,7 +429,7 @@ fn rebalance_to_targets<F: StrategyFamilySpec>(
         .iter()
         .map(|ctx| family.asset_desirability(genome, ctx).max(0.0))
         .collect::<Vec<_>>();
-    let cash_score = family.cash_desirability(genome).max(0.0);
+    let cash_score = family.cash_desirability(genome, contexts).max(0.0);
     let total_score = cash_score + asset_scores.iter().sum::<f64>();
     if total_score <= f64::EPSILON {
         return;
@@ -498,6 +518,7 @@ fn rebalance_to_targets<F: StrategyFamilySpec>(
                 prices[ticker_idx],
                 budget,
                 assets,
+                benchmark_assets,
                 account,
                 states,
                 Some(&mut buy_markers[ticker_idx]),
@@ -510,6 +531,7 @@ fn rebalance_to_targets<F: StrategyFamilySpec>(
                 prices[ticker_idx],
                 budget,
                 assets,
+                benchmark_assets,
                 account,
                 states,
                 None,
@@ -525,6 +547,7 @@ fn try_buy(
     price: f64,
     buy_budget: f64,
     assets: f64,
+    benchmark_assets: f64,
     account: &mut Account,
     states: &mut [TickerRuntimeState],
     buy_markers: Option<&mut Vec<u32>>,
@@ -544,9 +567,10 @@ fn try_buy(
         return false;
     }
 
+    let was_flat = account.positions[ticker_idx].quantity <= 0.0;
     account.positions[ticker_idx].add(price, quantity);
     account.cash -= total_cost;
-    states[ticker_idx].record_buy(price);
+    states[ticker_idx].record_buy(price, benchmark_assets, was_flat);
     if let Some(buy_markers) = buy_markers {
         buy_markers.push(index as u32);
     }
@@ -584,7 +608,7 @@ fn try_sell(
         position.avg_price = 0.0;
     }
     account.cash += total_sell - commission;
-    states[ticker_idx].record_sell(price);
+    states[ticker_idx].record_sell(price, position.quantity <= 0.0);
     if let Some(sell_markers) = sell_markers {
         sell_markers.push(index as u32);
     }
@@ -656,7 +680,7 @@ mod tests {
             }
         }
 
-        fn cash_desirability(&self, _genome: &Self::Genome) -> f64 {
+        fn cash_desirability(&self, _genome: &Self::Genome, _contexts: &[DecisionContext]) -> f64 {
             0.0
         }
     }
@@ -703,6 +727,12 @@ struct TickerRuntimeState {
     last_sell_price: Option<f64>,
     lowest_rsi_since_flat: Option<f64>,
     highest_rsi_since_long: Option<f64>,
+    position_open_benchmark_assets: Option<f64>,
+    position_entry_index: Option<usize>,
+    last_excess_return_since_entry_pct: Option<f64>,
+    peak_excess_return_since_entry_pct: Option<f64>,
+    excess_return_delta_pct: Option<f64>,
+    underperformance_streak: usize,
 }
 
 impl TickerRuntimeState {
@@ -714,6 +744,12 @@ impl TickerRuntimeState {
             last_sell_price: None,
             lowest_rsi_since_flat: None,
             highest_rsi_since_long: None,
+            position_open_benchmark_assets: None,
+            position_entry_index: None,
+            last_excess_return_since_entry_pct: None,
+            peak_excess_return_since_entry_pct: None,
+            excess_return_delta_pct: None,
+            underperformance_streak: 0,
         }
     }
 
@@ -735,19 +771,78 @@ impl TickerRuntimeState {
         }
     }
 
-    fn record_buy(&mut self, price: f64) {
+    fn record_buy(&mut self, price: f64, benchmark_assets: f64, was_flat: bool) {
         self.last_buy_price = Some(price);
         self.last_sell_price = None;
         self.lowest_rsi_since_flat = None;
         self.local_minimum = price;
         self.local_maximum = price;
+        if was_flat {
+            self.position_open_benchmark_assets = Some(benchmark_assets);
+            self.position_entry_index = None;
+            self.last_excess_return_since_entry_pct = None;
+            self.peak_excess_return_since_entry_pct = None;
+            self.excess_return_delta_pct = None;
+            self.underperformance_streak = 0;
+        }
     }
 
-    fn record_sell(&mut self, price: f64) {
+    fn record_sell(&mut self, price: f64, fully_closed: bool) {
         self.last_sell_price = Some(price);
         self.last_buy_price = None;
         self.highest_rsi_since_long = None;
         self.local_minimum = price;
         self.local_maximum = price;
+        if fully_closed {
+            self.position_open_benchmark_assets = None;
+            self.position_entry_index = None;
+            self.last_excess_return_since_entry_pct = None;
+            self.peak_excess_return_since_entry_pct = None;
+            self.excess_return_delta_pct = None;
+            self.underperformance_streak = 0;
+        }
+    }
+
+    fn benchmark_return_since_entry_pct(&self, benchmark_assets: f64) -> Option<f64> {
+        self.position_open_benchmark_assets.map(|entry_benchmark_assets| {
+            ((benchmark_assets / entry_benchmark_assets.max(f64::EPSILON)) - 1.0) * 100.0
+        })
+    }
+
+    fn observe_relative_performance(&mut self, index: usize, excess_return_since_entry_pct: Option<f64>) {
+        match excess_return_since_entry_pct {
+            Some(excess_return_pct) => {
+                if self.position_entry_index.is_none() {
+                    self.position_entry_index = Some(index);
+                }
+                self.excess_return_delta_pct = Some(
+                    excess_return_pct
+                        - self
+                            .last_excess_return_since_entry_pct
+                            .unwrap_or(excess_return_pct),
+                );
+                self.peak_excess_return_since_entry_pct = Some(
+                    self.peak_excess_return_since_entry_pct
+                        .map(|current| current.max(excess_return_pct))
+                        .unwrap_or(excess_return_pct),
+                );
+                self.last_excess_return_since_entry_pct = Some(excess_return_pct);
+                if excess_return_pct < 0.0 {
+                    self.underperformance_streak += 1;
+                } else {
+                    self.underperformance_streak = 0;
+                }
+            }
+            None => {
+                self.last_excess_return_since_entry_pct = None;
+                self.excess_return_delta_pct = None;
+                self.peak_excess_return_since_entry_pct = None;
+                self.underperformance_streak = 0;
+            }
+        }
+    }
+
+    fn bars_since_entry(&self, index: usize) -> Option<usize> {
+        self.position_entry_index.map(|entry_index| index.saturating_sub(entry_index))
     }
 }

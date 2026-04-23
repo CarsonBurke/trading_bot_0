@@ -4,6 +4,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum GeneticFamily {
     PriceRebound,
+    PriceReboundCashBreadth,
+    PriceReboundCashLeaderGap,
+    PriceReboundCashWeakRegime,
     RsiRebound,
     TrendBreakout,
 }
@@ -37,6 +40,12 @@ pub struct DecisionContext {
     pub position_value: f64,
     pub position_avg_price: f64,
     pub position_quantity: f64,
+    pub bars_since_entry: Option<usize>,
+    pub benchmark_return_since_entry_pct: Option<f64>,
+    pub excess_return_since_entry_pct: Option<f64>,
+    pub excess_return_peak_pct: Option<f64>,
+    pub excess_return_delta_pct: Option<f64>,
+    pub underperformance_streak: Option<usize>,
     pub assets: f64,
     pub cash: f64,
 }
@@ -51,6 +60,32 @@ impl DecisionContext {
 
     pub fn equal_weight_position_value(self) -> f64 {
         self.assets / self.ticker_count.max(1) as f64
+    }
+
+    pub fn benchmark_return_since_entry_pct(self) -> f64 {
+        self.benchmark_return_since_entry_pct.unwrap_or(0.0)
+    }
+
+    pub fn excess_return_since_entry_pct(self) -> f64 {
+        self.excess_return_since_entry_pct
+            .unwrap_or_else(|| self.unrealized_pnl_pct())
+    }
+
+    pub fn excess_return_peak_pct(self) -> f64 {
+        self.excess_return_peak_pct
+            .unwrap_or_else(|| self.excess_return_since_entry_pct())
+    }
+
+    pub fn excess_return_delta_pct(self) -> f64 {
+        self.excess_return_delta_pct.unwrap_or(0.0)
+    }
+
+    pub fn underperformance_streak(self) -> usize {
+        self.underperformance_streak.unwrap_or(0)
+    }
+
+    pub fn bars_since_entry(self) -> usize {
+        self.bars_since_entry.unwrap_or(0)
     }
 
     pub fn current_weight(self) -> f64 {
@@ -84,7 +119,7 @@ pub trait StrategyFamilySpec: Sync {
     ) -> Self::Genome;
     fn indicator_config(&self, genome: &Self::Genome) -> IndicatorConfig;
     fn asset_desirability(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64;
-    fn cash_desirability(&self, _genome: &Self::Genome) -> f64 {
+    fn cash_desirability(&self, _genome: &Self::Genome, _contexts: &[DecisionContext]) -> f64 {
         1.0
     }
     fn min_target_weight(&self, _genome: &Self::Genome, _ctx: &DecisionContext) -> f64 {

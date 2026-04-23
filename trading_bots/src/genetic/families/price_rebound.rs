@@ -39,16 +39,48 @@ enum Gene {
     SellTrendWeight,
     SellRsiFadeWeight,
     SellAdverseWeight,
-    NeutralBand,
     MaxTargetWeight,
     FreshEntryScale,
-    HoldWeight,
     HoldFloorFraction,
     CorePositionFraction,
+    CashBias,
+    OverTargetPenaltyWeight,
+    SetupReboundWeight,
+    SetupPullbackWeight,
+    ActiveBuySetupWeight,
+    ActiveBuyConvictionWeight,
+    TargetSetupWeight,
+    TargetBuyWeight,
+    TargetSellWeight,
+    TargetReentryWeight,
+    TargetTakeProfitWeight,
+    MarketFitSetupWeight,
+    MarketFitBuyWeight,
+    MarketFitRelativeWeight,
+    TargetRelativeWeight,
+    RelativeForgivenessPct,
+    RelativeGraceBars,
+    RelativeLagStreakThreshold,
+    RelativeLagStreakScale,
+    RelativeMomentumWeight,
+    RelativeRecoveryWeight,
+    RelativeDrawdownWeight,
+    RelativeStrengthThreshold,
+    RelativeStrengthScale,
+    RelativeDeltaThreshold,
+    RelativeDeltaScale,
+    RelativeDrawdownThreshold,
+    RelativeDrawdownScale,
+    SignalConvictionThreshold,
+    SignalConvictionScale,
+    HoldConvictionThreshold,
+    HoldConvictionScale,
+    MaxWeightConvictionThreshold,
+    MaxWeightConvictionScale,
 }
 
 impl Gene {
-    const ALL: [Self; 37] = [
+    const ALL: [Self; 69] = [
         Self::PriceEmaAlpha,
         Self::FastEmaAlpha,
         Self::SlowEmaAlpha,
@@ -80,12 +112,44 @@ impl Gene {
         Self::SellTrendWeight,
         Self::SellRsiFadeWeight,
         Self::SellAdverseWeight,
-        Self::NeutralBand,
         Self::MaxTargetWeight,
         Self::FreshEntryScale,
-        Self::HoldWeight,
         Self::HoldFloorFraction,
         Self::CorePositionFraction,
+        Self::CashBias,
+        Self::OverTargetPenaltyWeight,
+        Self::SetupReboundWeight,
+        Self::SetupPullbackWeight,
+        Self::ActiveBuySetupWeight,
+        Self::ActiveBuyConvictionWeight,
+        Self::TargetSetupWeight,
+        Self::TargetBuyWeight,
+        Self::TargetSellWeight,
+        Self::TargetReentryWeight,
+        Self::TargetTakeProfitWeight,
+        Self::MarketFitSetupWeight,
+        Self::MarketFitBuyWeight,
+        Self::MarketFitRelativeWeight,
+        Self::TargetRelativeWeight,
+        Self::RelativeForgivenessPct,
+        Self::RelativeGraceBars,
+        Self::RelativeLagStreakThreshold,
+        Self::RelativeLagStreakScale,
+        Self::RelativeMomentumWeight,
+        Self::RelativeRecoveryWeight,
+        Self::RelativeDrawdownWeight,
+        Self::RelativeStrengthThreshold,
+        Self::RelativeStrengthScale,
+        Self::RelativeDeltaThreshold,
+        Self::RelativeDeltaScale,
+        Self::RelativeDrawdownThreshold,
+        Self::RelativeDrawdownScale,
+        Self::SignalConvictionThreshold,
+        Self::SignalConvictionScale,
+        Self::HoldConvictionThreshold,
+        Self::HoldConvictionScale,
+        Self::MaxWeightConvictionThreshold,
+        Self::MaxWeightConvictionScale,
     ];
 }
 
@@ -94,126 +158,153 @@ pub struct Genome {
     genes: EnumMap<Gene, f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CashVariant {
+    Static,
+    Breadth,
+    LeaderGap,
+    WeakRegime,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Family;
 
-impl StrategyFamilySpec for Family {
-    type Genome = Genome;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CashBreadthFamily;
 
-    fn kind(&self) -> GeneticFamily {
-        GeneticFamily::PriceRebound
-    }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CashLeaderGapFamily;
 
-    fn seed_genome(&self, rng: &mut StdRng) -> Self::Genome {
-        let mut genes = EnumMap::default();
-        for gene in Gene::ALL {
-            genes[gene] = jitter(spec(gene).init, spec(gene).mutation, spec(gene), rng);
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CashWeakRegimeFamily;
+
+macro_rules! impl_price_rebound_family {
+    ($name:ident, $kind:expr, $cash_variant:expr) => {
+        impl StrategyFamilySpec for $name {
+            type Genome = Genome;
+
+            fn kind(&self) -> GeneticFamily {
+                $kind
+            }
+
+            fn seed_genome(&self, rng: &mut StdRng) -> Self::Genome {
+                let mut genes = EnumMap::default();
+                for gene in Gene::ALL {
+                    genes[gene] = jitter(spec(gene).init, spec(gene).mutation, spec(gene), rng);
+                }
+                Genome { genes }
+            }
+
+            fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng, entropy: f64) {
+                for gene in Gene::ALL {
+                    genome.genes[gene] = jitter(
+                        genome.genes[gene],
+                        spec(gene).mutation * entropy.max(0.0),
+                        spec(gene),
+                        rng,
+                    );
+                }
+            }
+
+            fn crossover(
+                &self,
+                left: &Self::Genome,
+                right: &Self::Genome,
+                rng: &mut StdRng,
+            ) -> Self::Genome {
+                let mut genes = EnumMap::default();
+                for gene in Gene::ALL {
+                    let weight = rng.random_range(0.25..0.75);
+                    genes[gene] = clamp(
+                        left.genes[gene] * weight + right.genes[gene] * (1.0 - weight),
+                        spec(gene),
+                    );
+                }
+                Genome { genes }
+            }
+
+            fn indicator_config(&self, genome: &Self::Genome) -> IndicatorConfig {
+                IndicatorConfig {
+                    decider_rsi_alpha: 0.02,
+                    amount_rsi_alpha: 0.02,
+                    price_ema_alpha: genome.genes[Gene::PriceEmaAlpha],
+                    fast_ema_alpha: Some(genome.genes[Gene::FastEmaAlpha]),
+                    slow_ema_alpha: Some(genome.genes[Gene::SlowEmaAlpha]),
+                }
+            }
+
+            fn asset_desirability(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+                let pnl_pct = ctx.unrealized_pnl_pct() / 100.0;
+                if pnl_pct <= -genome.genes[Gene::StopLossPct] {
+                    return 0.0;
+                }
+
+                let over_target_penalty = (ctx.current_weight()
+                    / self.max_target_weight(genome, ctx).max(1e-6))
+                .clamp(0.0, 1.0);
+                let desirability = target_signal(genome, ctx)
+                    - over_target_penalty * genome.genes[Gene::OverTargetPenaltyWeight];
+                desirability.max(0.0)
+            }
+
+            fn cash_desirability(
+                &self,
+                genome: &Self::Genome,
+                contexts: &[DecisionContext],
+            ) -> f64 {
+                cash_desirability($cash_variant, genome, contexts)
+            }
+
+            fn min_target_weight(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+                if ctx.position_quantity <= 0.0 {
+                    return 0.0;
+                }
+                if (ctx.unrealized_pnl_pct() / 100.0) <= -genome.genes[Gene::StopLossPct] {
+                    return 0.0;
+                }
+                let signal = target_signal(genome, ctx);
+                let hold_conviction = normalized_signal(
+                    signal,
+                    genome.genes[Gene::HoldConvictionThreshold],
+                    genome.genes[Gene::HoldConvictionScale],
+                )
+                .clamp(0.0, 1.0);
+                let floor_fraction =
+                    genome.genes[Gene::HoldFloorFraction] * hold_conviction * hold_conviction;
+                ctx.current_weight() * floor_fraction
+            }
+
+            fn max_target_weight(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+                let cap = genome.genes[Gene::MaxTargetWeight];
+                let conviction = normalized_signal(
+                    target_signal(genome, ctx),
+                    genome.genes[Gene::MaxWeightConvictionThreshold],
+                    genome.genes[Gene::MaxWeightConvictionScale],
+                )
+                .clamp(0.0, 1.0);
+                let curve = 1.0 + genome.genes[Gene::FreshEntryScale] * 6.0;
+                cap * conviction.powf(curve)
+            }
         }
-        Genome { genes }
-    }
-
-    fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng, entropy: f64) {
-        for gene in Gene::ALL {
-            genome.genes[gene] = jitter(
-                genome.genes[gene],
-                spec(gene).mutation * entropy.max(0.0),
-                spec(gene),
-                rng,
-            );
-        }
-    }
-
-    fn crossover(
-        &self,
-        left: &Self::Genome,
-        right: &Self::Genome,
-        rng: &mut StdRng,
-    ) -> Self::Genome {
-        let mut genes = EnumMap::default();
-        for gene in Gene::ALL {
-            let weight = rng.random_range(0.25..0.75);
-            genes[gene] = clamp(
-                left.genes[gene] * weight + right.genes[gene] * (1.0 - weight),
-                spec(gene),
-            );
-        }
-        Genome { genes }
-    }
-
-    fn indicator_config(&self, genome: &Self::Genome) -> IndicatorConfig {
-        IndicatorConfig {
-            decider_rsi_alpha: 0.02,
-            amount_rsi_alpha: 0.02,
-            price_ema_alpha: genome.genes[Gene::PriceEmaAlpha],
-            fast_ema_alpha: Some(genome.genes[Gene::FastEmaAlpha]),
-            slow_ema_alpha: Some(genome.genes[Gene::SlowEmaAlpha]),
-        }
-    }
-
-    fn asset_desirability(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
-        let pnl_pct = ctx.unrealized_pnl_pct() / 100.0;
-        if pnl_pct <= -genome.genes[Gene::StopLossPct] {
-            return 0.0;
-        }
-
-        let active_buy = active_buy_score(genome, ctx);
-        let active_sell = active_sell_score(genome, ctx);
-        let buy_edge = directional_edge(active_buy, active_sell, genome.genes[Gene::NeutralBand]);
-        let sell_edge = directional_edge(active_sell, active_buy, genome.genes[Gene::NeutralBand]);
-        let hold_signal = hold_signal(genome, ctx, sell_edge, buy_edge);
-        let hold_term = hold_signal * genome.genes[Gene::HoldWeight];
-        let reentry_penalty = reentry_penalty(genome, ctx);
-
-        let over_target_penalty =
-            (ctx.current_weight() / self.max_target_weight(genome, ctx).max(1e-6)).clamp(0.0, 1.0);
-        let take_profit_pressure = if pnl_pct > 0.0 {
-            normalized_signal(
-                pnl_pct,
-                genome.genes[Gene::TakeProfitPct] * 0.5,
-                genome.genes[Gene::TakeProfitPct],
-            ) * active_sell.min(1.0)
-                * 0.4
-        } else {
-            0.0
-        };
-        let desirability = hold_term
-            + buy_edge * (1.0 - reentry_penalty) * genome.genes[Gene::BuyPercent] * 1.15
-            - sell_edge * genome.genes[Gene::SellPercent] * 0.65
-            - over_target_penalty * 0.25
-            - take_profit_pressure;
-        desirability.max(0.0)
-    }
-
-    fn cash_desirability(&self, genome: &Self::Genome) -> f64 {
-        0.05 + genome.genes[Gene::CorePositionFraction] * 0.2
-    }
-
-    fn min_target_weight(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
-        if ctx.position_quantity <= 0.0 {
-            return 0.0;
-        }
-        if (ctx.unrealized_pnl_pct() / 100.0) <= -genome.genes[Gene::StopLossPct] {
-            return 0.0;
-        }
-        let active_buy = active_buy_score(genome, ctx);
-        let active_sell = active_sell_score(genome, ctx);
-        let sell_edge = directional_edge(active_sell, active_buy, genome.genes[Gene::NeutralBand]);
-        let floor_fraction = genome.genes[Gene::HoldFloorFraction]
-            * (1.0 - (sell_edge / 2.0).clamp(0.0, 1.0))
-            * (hold_signal(genome, ctx, sell_edge, active_buy) / 2.0).clamp(0.0, 1.0);
-        ctx.current_weight() * floor_fraction
-    }
-
-    fn max_target_weight(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
-        let cap = genome.genes[Gene::MaxTargetWeight];
-        if ctx.position_quantity > 0.0 {
-            return cap;
-        }
-        let conviction = active_buy_score(genome, ctx).clamp(0.0, 1.0);
-        let entry_scale = genome.genes[Gene::FreshEntryScale];
-        cap * (entry_scale + (1.0 - entry_scale) * conviction)
-    }
+    };
 }
+
+impl_price_rebound_family!(Family, GeneticFamily::PriceRebound, CashVariant::Static);
+impl_price_rebound_family!(
+    CashBreadthFamily,
+    GeneticFamily::PriceReboundCashBreadth,
+    CashVariant::Breadth
+);
+impl_price_rebound_family!(
+    CashLeaderGapFamily,
+    GeneticFamily::PriceReboundCashLeaderGap,
+    CashVariant::LeaderGap
+);
+impl_price_rebound_family!(
+    CashWeakRegimeFamily,
+    GeneticFamily::PriceReboundCashWeakRegime,
+    CashVariant::WeakRegime
+);
 
 #[derive(Clone, Copy)]
 struct GeneSpec {
@@ -346,12 +437,6 @@ fn spec(gene: Gene) -> GeneSpec {
         Gene::SellTrendWeight => weight_spec(1.1),
         Gene::SellRsiFadeWeight => weight_spec(0.9),
         Gene::SellAdverseWeight => weight_spec(1.0),
-        Gene::NeutralBand => GeneSpec {
-            min: 0.02,
-            max: 0.8,
-            init: 0.16,
-            mutation: 0.05,
-        },
         Gene::MaxTargetWeight => GeneSpec {
             min: 0.05,
             max: 0.5,
@@ -359,16 +444,10 @@ fn spec(gene: Gene) -> GeneSpec {
             mutation: 0.04,
         },
         Gene::FreshEntryScale => GeneSpec {
-            min: 0.05,
-            max: 0.8,
-            init: 0.3,
-            mutation: 0.05,
-        },
-        Gene::HoldWeight => GeneSpec {
-            min: 0.0,
-            max: 3.0,
-            init: 1.0,
-            mutation: 0.15,
+            min: 0.02,
+            max: 0.24,
+            init: 0.08,
+            mutation: 0.02,
         },
         Gene::HoldFloorFraction => GeneSpec {
             min: 0.0,
@@ -381,6 +460,130 @@ fn spec(gene: Gene) -> GeneSpec {
             max: 0.8,
             init: 0.22,
             mutation: 0.05,
+        },
+        Gene::CashBias => GeneSpec {
+            min: 0.0,
+            max: 0.3,
+            init: 0.05,
+            mutation: 0.02,
+        },
+        Gene::OverTargetPenaltyWeight => GeneSpec {
+            min: 0.0,
+            max: 0.6,
+            init: 0.18,
+            mutation: 0.04,
+        },
+        Gene::SetupReboundWeight => weight_spec(0.55),
+        Gene::SetupPullbackWeight => weight_spec(0.45),
+        Gene::ActiveBuySetupWeight => weight_spec(0.45),
+        Gene::ActiveBuyConvictionWeight => weight_spec(0.55),
+        Gene::TargetSetupWeight => weight_spec(0.28),
+        Gene::TargetBuyWeight => weight_spec(0.98),
+        Gene::TargetSellWeight => weight_spec(0.72),
+        Gene::TargetReentryWeight => weight_spec(0.28),
+        Gene::TargetTakeProfitWeight => weight_spec(0.28),
+        Gene::MarketFitSetupWeight => weight_spec(0.34),
+        Gene::MarketFitBuyWeight => weight_spec(0.46),
+        Gene::MarketFitRelativeWeight => weight_spec(0.35),
+        Gene::TargetRelativeWeight => weight_spec(0.7),
+        Gene::RelativeForgivenessPct => GeneSpec {
+            min: 0.0,
+            max: 0.08,
+            init: 0.02,
+            mutation: 0.008,
+        },
+        Gene::RelativeGraceBars => GeneSpec {
+            min: 0.0,
+            max: 40.0,
+            init: 8.0,
+            mutation: 3.0,
+        },
+        Gene::RelativeLagStreakThreshold => GeneSpec {
+            min: 0.0,
+            max: 20.0,
+            init: 2.0,
+            mutation: 1.5,
+        },
+        Gene::RelativeLagStreakScale => GeneSpec {
+            min: 0.5,
+            max: 20.0,
+            init: 5.0,
+            mutation: 1.5,
+        },
+        Gene::RelativeMomentumWeight => weight_spec(0.55),
+        Gene::RelativeRecoveryWeight => weight_spec(0.45),
+        Gene::RelativeDrawdownWeight => weight_spec(0.75),
+        Gene::RelativeStrengthThreshold => GeneSpec {
+            min: 0.0,
+            max: 0.12,
+            init: 0.01,
+            mutation: 0.01,
+        },
+        Gene::RelativeStrengthScale => GeneSpec {
+            min: 0.01,
+            max: 0.25,
+            init: 0.04,
+            mutation: 0.015,
+        },
+        Gene::RelativeDeltaThreshold => GeneSpec {
+            min: 0.0,
+            max: 0.05,
+            init: 0.002,
+            mutation: 0.004,
+        },
+        Gene::RelativeDeltaScale => GeneSpec {
+            min: 0.002,
+            max: 0.12,
+            init: 0.02,
+            mutation: 0.008,
+        },
+        Gene::RelativeDrawdownThreshold => GeneSpec {
+            min: 0.0,
+            max: 0.12,
+            init: 0.01,
+            mutation: 0.01,
+        },
+        Gene::RelativeDrawdownScale => GeneSpec {
+            min: 0.01,
+            max: 0.3,
+            init: 0.05,
+            mutation: 0.015,
+        },
+        Gene::SignalConvictionThreshold => GeneSpec {
+            min: 0.0,
+            max: 0.6,
+            init: 0.04,
+            mutation: 0.03,
+        },
+        Gene::SignalConvictionScale => GeneSpec {
+            min: 0.05,
+            max: 1.5,
+            init: 0.42,
+            mutation: 0.06,
+        },
+        Gene::HoldConvictionThreshold => GeneSpec {
+            min: 0.0,
+            max: 1.2,
+            init: 0.32,
+            mutation: 0.05,
+        },
+        Gene::HoldConvictionScale => GeneSpec {
+            min: 0.1,
+            max: 1.5,
+            init: 0.72,
+            mutation: 0.06,
+        },
+        Gene::MaxWeightConvictionThreshold => GeneSpec {
+            min: 0.0,
+            max: 1.2,
+            init: 0.34,
+            mutation: 0.05,
+        },
+        Gene::MaxWeightConvictionScale => GeneSpec {
+            min: 0.1,
+            max: 1.5,
+            init: 0.76,
+            mutation: 0.06,
         },
     }
 }
@@ -428,7 +631,10 @@ fn active_buy_score(genome: &Genome, ctx: &DecisionContext) -> f64 {
     let buy = buy_score(genome, ctx);
     let threshold = genome.genes[Gene::BuyScoreThreshold];
     let conviction = normalized_signal(buy, threshold * 0.75, (1.0 - threshold).max(1e-6));
-    weighted_score(&[(setup, 0.45), (conviction, 0.55)])
+    weighted_score(&[
+        (setup, genome.genes[Gene::ActiveBuySetupWeight]),
+        (conviction, genome.genes[Gene::ActiveBuyConvictionWeight]),
+    ])
 }
 
 fn sell_score(genome: &Genome, ctx: &DecisionContext) -> f64 {
@@ -447,11 +653,8 @@ fn sell_score(genome: &Genome, ctx: &DecisionContext) -> f64 {
         0.0,
         0.12,
     );
-    let pnl_signal = normalized_signal(
-        (ctx.unrealized_pnl_pct() / 100.0).max(0.0),
-        0.0,
-        genome.genes[Gene::TakeProfitPct],
-    );
+    let benchmark_lag = relative_underperformance_signal(genome, ctx);
+    let relative_drawdown = relative_drawdown_signal(genome, ctx);
     let trend_breakdown = trend_breakdown_signal(ctx, genome.genes[Gene::SellDistanceWeightAmount]);
     let rsi_fade = ctx.highest_rsi_since_long.map_or(0.0, |highest_rsi| {
         normalized_signal(((highest_rsi - ctx.amount_rsi).max(0.0)) / 100.0, 0.0, 0.12)
@@ -470,7 +673,13 @@ fn sell_score(genome: &Genome, ctx: &DecisionContext) -> f64 {
         (trailing_fade, genome.genes[Gene::SellTrailWeight]),
         (ema_premium, genome.genes[Gene::SellEmaWeight]),
         (rsi_overbought, genome.genes[Gene::SellRsiWeight]),
-        (pnl_signal, genome.genes[Gene::SellPnlWeight]),
+        (
+            weighted_score(&[
+                (benchmark_lag, genome.genes[Gene::SellPnlWeight]),
+                (relative_drawdown, genome.genes[Gene::RelativeDrawdownWeight]),
+            ]),
+            1.0,
+        ),
         (trend_breakdown, genome.genes[Gene::SellTrendWeight]),
         (rsi_fade, genome.genes[Gene::SellRsiFadeWeight]),
         (adverse_excursion, genome.genes[Gene::SellAdverseWeight]),
@@ -481,33 +690,6 @@ fn active_sell_score(genome: &Genome, ctx: &DecisionContext) -> f64 {
     let sell = sell_score(genome, ctx);
     let threshold = genome.genes[Gene::SellScoreThreshold];
     normalized_signal(sell, threshold * 0.8, (1.0 - threshold).max(1e-6))
-}
-
-fn hold_signal(genome: &Genome, ctx: &DecisionContext, sell_edge: f64, buy_edge: f64) -> f64 {
-    if ctx.position_quantity <= 0.0 {
-        return 0.0;
-    }
-    let pnl_pct = ctx.unrealized_pnl_pct() / 100.0;
-    let sell_relief = 1.0 - (sell_edge / 2.0).clamp(0.0, 1.0);
-    let neutral_hold = 1.0 - ((buy_edge - sell_edge).abs() / 1.5).clamp(0.0, 1.0);
-    let trend_support = trend_alignment_signal(ctx, genome.genes[Gene::BuyDistanceWeightAmount]);
-    let follow_through = normalized_signal(
-        pnl_pct.max(0.0),
-        0.0,
-        genome.genes[Gene::BuyDistanceWeightAmount] * 1.5,
-    );
-    let profit_support = if pnl_pct > 0.0 {
-        normalized_signal(pnl_pct, 0.0, genome.genes[Gene::TakeProfitPct]) * 0.35
-    } else {
-        0.0
-    };
-    (0.25
-        + sell_relief * 0.45
-        + neutral_hold * 0.35
-        + trend_support * 0.30
-        + follow_through * 0.35
-        + profit_support)
-        .clamp(0.0, 2.0)
 }
 
 fn buy_setup_score(genome: &Genome, ctx: &DecisionContext) -> f64 {
@@ -521,7 +703,10 @@ fn buy_setup_score(genome: &Genome, ctx: &DecisionContext) -> f64 {
         genome.genes[Gene::MaxReboundBuyPriceThreshold] * 0.35,
         genome.genes[Gene::BuyDistanceWeightAmount] * 1.2,
     );
-    weighted_score(&[(rebound, 0.55), (pullback, 0.45)])
+    weighted_score(&[
+        (rebound, genome.genes[Gene::SetupReboundWeight]),
+        (pullback, genome.genes[Gene::SetupPullbackWeight]),
+    ])
 }
 
 fn reentry_penalty(genome: &Genome, ctx: &DecisionContext) -> f64 {
@@ -533,8 +718,154 @@ fn reentry_penalty(genome: &Genome, ctx: &DecisionContext) -> f64 {
     (1.0 - (distance / cooldown).clamp(0.0, 1.0)) * 0.85
 }
 
-fn directional_edge(primary: f64, opposing: f64, neutral_band: f64) -> f64 {
-    normalized_signal(primary - opposing, neutral_band, 0.9)
+fn target_signal(genome: &Genome, ctx: &DecisionContext) -> f64 {
+    let setup_signal = buy_setup_score(genome, ctx);
+    let buy_signal = active_buy_score(genome, ctx);
+    let sell_signal = active_sell_score(genome, ctx);
+    let reentry_penalty = reentry_penalty(genome, ctx);
+    let relative_outperformance = relative_outperformance_signal(genome, ctx);
+    let relative_momentum = relative_momentum_signal(genome, ctx);
+    let relative_recovery = relative_recovery_signal(genome, ctx);
+    let relative_drawdown = relative_drawdown_signal(genome, ctx);
+    let supportive = setup_signal * genome.genes[Gene::TargetSetupWeight]
+        + buy_signal
+            * (1.0 - reentry_penalty)
+            * genome.genes[Gene::BuyPercent]
+            * genome.genes[Gene::TargetBuyWeight]
+        + relative_outperformance * genome.genes[Gene::TargetRelativeWeight]
+        + relative_momentum * genome.genes[Gene::RelativeMomentumWeight]
+        + relative_recovery * genome.genes[Gene::RelativeRecoveryWeight];
+    let opposing = sell_signal * genome.genes[Gene::SellPercent] * genome.genes[Gene::TargetSellWeight]
+        + reentry_penalty * genome.genes[Gene::TargetReentryWeight]
+        + relative_drawdown * genome.genes[Gene::RelativeDrawdownWeight] * 0.35;
+    let balance = supportive - opposing;
+    let market_fit = weighted_score(&[
+        (setup_signal.min(1.6), genome.genes[Gene::MarketFitSetupWeight]),
+        (buy_signal.min(1.6), genome.genes[Gene::MarketFitBuyWeight]),
+        (
+            (relative_outperformance + relative_momentum + relative_recovery).min(1.6),
+            genome.genes[Gene::MarketFitRelativeWeight],
+        ),
+    ]);
+    let conviction = normalized_signal(
+        balance,
+        genome.genes[Gene::SignalConvictionThreshold],
+        genome.genes[Gene::SignalConvictionScale],
+    );
+
+    (conviction * market_fit).clamp(0.0, 2.5)
+}
+
+fn relative_outperformance_signal(genome: &Genome, ctx: &DecisionContext) -> f64 {
+    let forgiveness = relative_forgiveness(genome, ctx);
+    normalized_signal(
+        ((ctx.excess_return_since_entry_pct() / 100.0) + forgiveness).max(0.0),
+        genome.genes[Gene::RelativeStrengthThreshold],
+        genome.genes[Gene::RelativeStrengthScale],
+    )
+}
+
+fn relative_underperformance_signal(genome: &Genome, ctx: &DecisionContext) -> f64 {
+    let forgiveness = relative_forgiveness(genome, ctx);
+    let streak_signal = normalized_signal(
+        ctx.underperformance_streak() as f64,
+        genome.genes[Gene::RelativeLagStreakThreshold],
+        genome.genes[Gene::RelativeLagStreakScale],
+    );
+    normalized_signal(
+        ((-ctx.excess_return_since_entry_pct() / 100.0) - forgiveness).max(0.0),
+        genome.genes[Gene::RelativeStrengthThreshold],
+        genome.genes[Gene::RelativeStrengthScale],
+    ) * streak_signal
+}
+
+fn relative_momentum_signal(genome: &Genome, ctx: &DecisionContext) -> f64 {
+    normalized_signal(
+        (ctx.excess_return_delta_pct() / 100.0).max(0.0),
+        genome.genes[Gene::RelativeDeltaThreshold],
+        genome.genes[Gene::RelativeDeltaScale],
+    )
+}
+
+fn relative_recovery_signal(genome: &Genome, ctx: &DecisionContext) -> f64 {
+    let lagged = normalized_signal(
+        (-ctx.excess_return_since_entry_pct() / 100.0).max(0.0),
+        0.0,
+        genome.genes[Gene::RelativeStrengthScale] * 1.5,
+    );
+    relative_momentum_signal(genome, ctx) * lagged
+}
+
+fn relative_drawdown_signal(genome: &Genome, ctx: &DecisionContext) -> f64 {
+    normalized_signal(
+        ((ctx.excess_return_peak_pct() - ctx.excess_return_since_entry_pct()) / 100.0).max(0.0),
+        genome.genes[Gene::RelativeDrawdownThreshold],
+        genome.genes[Gene::RelativeDrawdownScale],
+    )
+}
+
+fn relative_forgiveness(genome: &Genome, ctx: &DecisionContext) -> f64 {
+    let grace_bars = genome.genes[Gene::RelativeGraceBars].max(1.0);
+    let early_life_scale = (1.0 - (ctx.bars_since_entry() as f64 / grace_bars)).clamp(0.0, 1.0);
+    genome.genes[Gene::RelativeForgivenessPct] * (0.35 + early_life_scale * 0.65)
+}
+
+fn cash_desirability(cash_variant: CashVariant, genome: &Genome, contexts: &[DecisionContext]) -> f64 {
+    let base = genome.genes[Gene::CashBias] + genome.genes[Gene::CorePositionFraction] * 0.2;
+    if contexts.is_empty() {
+        return base;
+    }
+
+    let mut signals = contexts
+        .iter()
+        .map(|ctx| target_signal(genome, ctx))
+        .collect::<Vec<_>>();
+    signals.sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));
+
+    let count = signals.len() as f64;
+    let top = signals[0];
+    let second = signals.get(1).copied().unwrap_or(0.0);
+    let mean = signals.iter().sum::<f64>() / count.max(1.0);
+    let strong_fraction = signals.iter().filter(|signal| **signal >= 0.65).count() as f64 / count;
+    let live_fraction = signals.iter().filter(|signal| **signal >= 0.35).count() as f64 / count;
+    let variance = signals
+        .iter()
+        .map(|signal| {
+            let centered = signal - mean;
+            centered * centered
+        })
+        .sum::<f64>()
+        / count.max(1.0);
+    let dispersion = variance.sqrt();
+    let held_relative_drag = contexts
+        .iter()
+        .filter(|ctx| ctx.position_quantity > 0.0)
+        .map(|ctx| (-ctx.excess_return_since_entry_pct() / 100.0).max(0.0))
+        .sum::<f64>()
+        / contexts
+            .iter()
+            .filter(|ctx| ctx.position_quantity > 0.0)
+            .count()
+            .max(1) as f64;
+
+    let cash_pressure = match cash_variant {
+        CashVariant::Static => 0.0,
+        CashVariant::Breadth => {
+            (1.0 - strong_fraction) * 0.85 + (0.45 - mean).max(0.0) * 0.75
+        }
+        CashVariant::LeaderGap => {
+            let leader_gap = (top - second).max(0.0);
+            (0.85 - top).max(0.0) * 0.9 + (0.35 - leader_gap).max(0.0) * 1.1
+        }
+        CashVariant::WeakRegime => {
+            (1.0 - live_fraction) * 0.7
+                + (0.35 - dispersion).max(0.0) * 0.9
+                + (0.5 - mean).max(0.0) * 0.8
+                + held_relative_drag * 0.8
+        }
+    };
+
+    (base + cash_pressure).clamp(0.0, 3.0)
 }
 
 fn trend_alignment_signal(ctx: &DecisionContext, scale: f64) -> f64 {

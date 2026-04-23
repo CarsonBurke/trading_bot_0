@@ -15,7 +15,13 @@ pub use backtest::MarketDataset;
 pub use engine::{run_family_with_markets, DatasetBundle, SessionPaths, TrainingConfig};
 #[allow(unused_imports)]
 pub use families::{
-    price_rebound::Family as PriceReboundFamily, rsi_rebound::Family as RsiReboundFamily,
+    price_rebound::{
+        CashBreadthFamily as PriceReboundCashBreadthFamily,
+        CashLeaderGapFamily as PriceReboundCashLeaderGapFamily,
+        CashWeakRegimeFamily as PriceReboundCashWeakRegimeFamily,
+        Family as PriceReboundFamily,
+    },
+    rsi_rebound::Family as RsiReboundFamily,
     trend_breakout::Family as TrendBreakoutFamily,
 };
 pub use family::GeneticFamily;

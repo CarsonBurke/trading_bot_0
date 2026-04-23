@@ -107,6 +107,30 @@ pub fn run(args: GeneticArgs) -> Result<()> {
                 session_paths,
             )?;
         }
+        GeneticFamily::PriceReboundCashBreadth => {
+            run_family_with_markets(
+                &families::price_rebound::CashBreadthFamily,
+                config,
+                datasets,
+                session_paths,
+            )?;
+        }
+        GeneticFamily::PriceReboundCashLeaderGap => {
+            run_family_with_markets(
+                &families::price_rebound::CashLeaderGapFamily,
+                config,
+                datasets,
+                session_paths,
+            )?;
+        }
+        GeneticFamily::PriceReboundCashWeakRegime => {
+            run_family_with_markets(
+                &families::price_rebound::CashWeakRegimeFamily,
+                config,
+                datasets,
+                session_paths,
+            )?;
+        }
         GeneticFamily::RsiRebound => {
             run_family_with_markets(
                 &families::rsi_rebound::Family,

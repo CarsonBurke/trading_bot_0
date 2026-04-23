@@ -156,7 +156,7 @@ impl StrategyFamilySpec for Family {
         desirability.max(0.0)
     }
 
-    fn cash_desirability(&self, genome: &Self::Genome) -> f64 {
+    fn cash_desirability(&self, genome: &Self::Genome, _contexts: &[DecisionContext]) -> f64 {
         0.35 + (1.0 - genome.genes[Gene::BuyPercent]).max(0.0) * 0.75
     }
 }
