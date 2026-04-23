@@ -1,9 +1,10 @@
 pub mod paths {
-    pub const DATA_PATH: &str = "../long_data";
-    pub const WEIGHTS_PATH: &str = "../weights";
-    pub const TRAINING_PATH: &str = "../training";
-    pub const INFER_PATH: &str = "../infer";
-    pub const RUNS_PATH: &str = "../training/runs";
+    pub const WORKSPACE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    pub const DATA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../long_data");
+    pub const WEIGHTS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../weights");
+    pub const TRAINING_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../training");
+    pub const INFER_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../infer");
+    pub const RUNS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../training/runs");
 }
 
 pub mod run_dir;
