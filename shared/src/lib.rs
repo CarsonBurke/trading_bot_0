@@ -37,7 +37,7 @@ pub mod constants {
 
     pub const STEPS_PER_EPISODE: usize = 4_000;
     pub const ACTION_THRESHOLD: f64 = 0.001;
-    pub const COMMISSION_RATE: f64 = 0.005;
+    pub const COMMISSION_RATE: f64 = 0.0035;
     pub const RETROACTIVE_BUY_REWARD: bool = false;
 }
 

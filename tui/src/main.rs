@@ -216,6 +216,7 @@ impl App {
             "ga_max_drawdown",
             "ga_sharpe",
             "ga_turnover",
+            "ga_total_commissions",
             "ga_trade_count",
             "ga_generalization_gap",
             "ga_distribution",

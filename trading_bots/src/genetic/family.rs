@@ -21,6 +21,7 @@ pub struct IndicatorConfig {
 pub struct DecisionContext {
     pub index: usize,
     pub ticker_count: usize,
+    pub ticker_idx: usize,
     pub price: f64,
     pub decider_rsi: f64,
     pub amount_rsi: f64,
@@ -51,6 +52,22 @@ impl DecisionContext {
     pub fn equal_weight_position_value(self) -> f64 {
         self.assets / self.ticker_count.max(1) as f64
     }
+
+    pub fn current_weight(self) -> f64 {
+        if self.assets <= f64::EPSILON {
+            0.0
+        } else {
+            self.position_value / self.assets
+        }
+    }
+
+    pub fn cash_weight(self) -> f64 {
+        if self.assets <= f64::EPSILON {
+            0.0
+        } else {
+            self.cash / self.assets
+        }
+    }
 }
 
 pub trait StrategyFamilySpec: Sync {
@@ -66,10 +83,16 @@ pub trait StrategyFamilySpec: Sync {
         rng: &mut StdRng,
     ) -> Self::Genome;
     fn indicator_config(&self, genome: &Self::Genome) -> IndicatorConfig;
-    fn allow_buy(&self, genome: &Self::Genome, ctx: &DecisionContext) -> bool;
-    fn allow_sell(&self, genome: &Self::Genome, ctx: &DecisionContext) -> bool;
-    fn buy_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64;
-    fn sell_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64;
+    fn asset_desirability(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64;
+    fn cash_desirability(&self, _genome: &Self::Genome) -> f64 {
+        1.0
+    }
+    fn min_target_weight(&self, _genome: &Self::Genome, _ctx: &DecisionContext) -> f64 {
+        0.0
+    }
+    fn max_target_weight(&self, _genome: &Self::Genome, _ctx: &DecisionContext) -> f64 {
+        1.0
+    }
 
     fn describe(&self, genome: &Self::Genome) -> String {
         serde_json::to_string_pretty(genome).unwrap_or_else(|_| format!("{genome:?}"))

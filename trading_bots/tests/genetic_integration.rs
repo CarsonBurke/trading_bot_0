@@ -118,6 +118,7 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
     let summary_json = paths.root.join("ga_summary.json");
     let fitness_report = paths.gens.join("0/ga_fitness.report.bin");
     let mutation_entropy_report = paths.gens.join("0/ga_mutation_entropy.report.bin");
+    let commissions_report = paths.gens.join("0/ga_total_commissions.report.bin");
     let test_assets_report = paths.gens.join("3/ga_test_assets.report.bin");
     let ticker_assets_report = paths.gens.join("3/TST_A/assets.report.bin");
     assert!(
@@ -139,6 +140,11 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
         mutation_entropy_report.exists(),
         "missing report at {}",
         mutation_entropy_report.display()
+    );
+    assert!(
+        commissions_report.exists(),
+        "missing report at {}",
+        commissions_report.display()
     );
     assert!(
         test_assets_report.exists(),
@@ -167,6 +173,23 @@ fn trend_breakout_run_writes_checkpoint_and_tui_reports() {
 
     let checkpoint_body = fs::read_to_string(&checkpoint).unwrap();
     assert!(checkpoint_body.contains("TrendBreakout"));
+
+    let commissions = read_report(commissions_report.to_string_lossy().as_ref()).unwrap();
+    match commissions.kind {
+        ReportKind::MultiLine { series } => {
+            let labels = series
+                .iter()
+                .map(|series| series.label.as_str())
+                .collect::<Vec<_>>();
+            assert!(labels.contains(&"train"));
+            assert!(labels.contains(&"validation"));
+            assert!(series
+                .iter()
+                .flat_map(|series| series.values.iter())
+                .any(|value| *value > 0.0));
+        }
+        other => panic!("expected multiline commissions report, got {other:?}"),
+    }
 
     let ticker_assets = read_report(ticker_assets_report.to_string_lossy().as_ref()).unwrap();
     match ticker_assets.kind {

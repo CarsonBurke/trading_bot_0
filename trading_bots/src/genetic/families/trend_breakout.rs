@@ -108,76 +108,56 @@ impl StrategyFamilySpec for Family {
         }
     }
 
-    fn allow_buy(&self, genome: &Self::Genome, ctx: &DecisionContext) -> bool {
+    fn asset_desirability(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
         let Some(fast_ema) = ctx.fast_ema else {
-            return false;
+            return 0.0;
         };
         let Some(slow_ema) = ctx.slow_ema else {
-            return false;
+            return 0.0;
         };
         if fast_ema <= slow_ema {
-            return false;
+            return 0.0;
         }
         let trend_spread = (fast_ema - slow_ema) / slow_ema.max(1e-6);
         if trend_spread < genome.genes[Gene::TrendSpreadMinPct] {
-            return false;
+            return 0.0;
         }
         if ctx.price <= slow_ema || ctx.price < fast_ema * 0.995 {
-            return false;
+            return 0.0;
         }
         let pullback = percent_diff(ctx.local_maximum, ctx.price);
         if pullback < genome.genes[Gene::PullbackMinPct]
             || pullback > genome.genes[Gene::PullbackMaxPct]
         {
-            return false;
+            return 0.0;
         }
-        ctx.decider_rsi >= genome.genes[Gene::MinEntryRsi] * 100.0
-    }
-
-    fn allow_sell(&self, genome: &Self::Genome, ctx: &DecisionContext) -> bool {
-        if ctx.position_quantity <= 0.0 {
-            return false;
-        }
+        let rsi_gate = ctx.decider_rsi - genome.genes[Gene::MinEntryRsi] * 100.0;
         let pnl_pct = ctx.unrealized_pnl_pct() / 100.0;
-        let Some(fast_ema) = ctx.fast_ema else {
-            return false;
-        };
         if pnl_pct <= -genome.genes[Gene::StopLossPct] {
-            return true;
+            return 0.0;
         }
+        let trend_term =
+            (trend_spread / genome.genes[Gene::TrendSpreadMinPct].max(1e-6)).clamp(0.0, 2.5);
+        let pullback_term =
+            (pullback / genome.genes[Gene::PullbackMaxPct].max(1e-6)).clamp(0.0, 1.0);
+        let rsi_term = (rsi_gate / 25.0).clamp(0.0, 1.5);
+
+        let mut desirability =
+            genome.genes[Gene::BuyPercent] * (0.4 + trend_term + pullback_term + rsi_term);
         if pnl_pct >= genome.genes[Gene::TakeProfitPct] {
-            return true;
+            desirability *= 0.35;
         }
         if ctx.price < fast_ema * (1.0 - genome.genes[Gene::TrendExitPct]) {
-            return true;
+            desirability *= 0.15;
         }
-        ctx.amount_rsi >= genome.genes[Gene::MaxExitRsi] * 100.0
+        if ctx.amount_rsi >= genome.genes[Gene::MaxExitRsi] * 100.0 {
+            desirability *= 0.25;
+        }
+        desirability.max(0.0)
     }
 
-    fn buy_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
-        let Some(fast_ema) = ctx.fast_ema else {
-            return 0.0;
-        };
-        let Some(slow_ema) = ctx.slow_ema else {
-            return 0.0;
-        };
-        let trend_spread = ((fast_ema - slow_ema) / slow_ema.max(1e-6)).max(0.0);
-        let pullback = percent_diff(ctx.local_maximum, ctx.price);
-        let trend_term = (trend_spread / genome.genes[Gene::TrendSpreadMinPct].max(1e-6)).min(2.0);
-        let pullback_term =
-            (pullback / genome.genes[Gene::PullbackMaxPct].max(1e-6)).clamp(0.2, 1.0);
-        let fraction =
-            (genome.genes[Gene::BuyPercent] * trend_term * pullback_term).clamp(0.0, 1.0);
-        let equal_weight_headroom =
-            (ctx.equal_weight_position_value() - ctx.position_value).max(0.0);
-        ctx.cash.min(equal_weight_headroom * fraction)
-    }
-
-    fn sell_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
-        let pnl_pct = ctx.unrealized_pnl_pct().max(0.0) / 100.0;
-        let pnl_term = (pnl_pct / genome.genes[Gene::TakeProfitPct].max(1e-6)).clamp(0.5, 2.0);
-        let fraction = (genome.genes[Gene::SellPercent] * pnl_term).clamp(0.0, 1.0);
-        ctx.position_value * fraction
+    fn cash_desirability(&self, genome: &Self::Genome) -> f64 {
+        0.35 + (1.0 - genome.genes[Gene::BuyPercent]).max(0.0) * 0.75
     }
 }
 

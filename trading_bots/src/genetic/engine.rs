@@ -179,7 +179,7 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
         let population_seed = rng.random::<u64>();
         let candidates = evaluate_population(family, &population, &datasets.train, population_seed);
         let mut ranked = candidates;
-        ranked.sort_unstable_by(|left, right| {
+        ranked.par_sort_unstable_by(|left, right| {
             right
                 .train_metrics
                 .score
@@ -248,21 +248,36 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
             || generation % config.heavy_report_every.max(1) == 0
             || generation == best_validation_generation;
         if write_heavy {
-            let (train_trace, valid_trace) = rayon::join(
-                || evaluate_family(family, &champion.genome, &datasets.train, true).trace,
-                || evaluate_family(family, &champion.genome, &datasets.validation, true).trace,
+            let (train_write, valid_write) = rayon::join(
+                || -> Result<()> {
+                    if let Some(trace) =
+                        evaluate_family(family, &champion.genome, &datasets.train, true).trace
+                    {
+                        write_split_trace(
+                            &generation_dir,
+                            "train",
+                            &datasets.train.tickers,
+                            &trace,
+                        )?;
+                    }
+                    Ok(())
+                },
+                || -> Result<()> {
+                    if let Some(trace) =
+                        evaluate_family(family, &champion.genome, &datasets.validation, true).trace
+                    {
+                        write_split_trace(
+                            &generation_dir,
+                            "validation",
+                            &datasets.validation.tickers,
+                            &trace,
+                        )?;
+                    }
+                    Ok(())
+                },
             );
-            if let Some(trace) = train_trace.as_ref() {
-                write_split_trace(&generation_dir, "train", &datasets.train.tickers, trace)?;
-            }
-            if let Some(trace) = valid_trace.as_ref() {
-                write_split_trace(
-                    &generation_dir,
-                    "validation",
-                    &datasets.validation.tickers,
-                    trace,
-                )?;
-            }
+            train_write?;
+            valid_write?;
         }
 
         if generation + 1 == config.generations {

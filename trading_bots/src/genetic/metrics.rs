@@ -27,6 +27,7 @@ pub struct TradeSummary {
     pub buy_count: usize,
     pub sell_count: usize,
     pub profitable_sells: usize,
+    pub total_commissions: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -123,11 +124,7 @@ impl BacktestMetricAccumulator {
         } else {
             trades.profitable_sells as f64 / trades.sell_count as f64
         };
-        let score = outperformance_pct + 0.35 * return_pct - 1.15 * self.max_drawdown_pct
-            + 10.0 * sharpe.clamp(-2.0, 2.0)
-            + 6.0 * sortino.clamp(-2.0, 2.0)
-            + 4.0 * calmar.clamp(-2.0, 2.0)
-            - 0.01 * trade_count as f64;
+        let score = outperformance_pct;
 
         BacktestMetrics {
             score,
@@ -144,7 +141,7 @@ impl BacktestMetricAccumulator {
             buy_count: trades.buy_count,
             sell_count: trades.sell_count,
             win_rate,
-            total_commissions: 0.0,
+            total_commissions: trades.total_commissions,
         }
     }
 }

@@ -90,41 +90,28 @@ impl StrategyFamilySpec for Family {
         }
     }
 
-    fn allow_buy(&self, genome: &Self::Genome, ctx: &DecisionContext) -> bool {
+    fn asset_desirability(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
         if ctx.decider_rsi > genome.genes[Gene::MaxRsiBuy] * 100.0 {
-            return false;
+            return 0.0;
         }
         let Some(lowest) = ctx.lowest_rsi_since_flat else {
-            return false;
+            return 0.0;
         };
-        ctx.decider_rsi >= lowest * (1.0 + genome.genes[Gene::ReboundBuyThreshold].max(0.0))
-    }
-
-    fn allow_sell(&self, genome: &Self::Genome, ctx: &DecisionContext) -> bool {
-        if ctx.position_quantity <= 0.0 || ctx.position_avg_price >= ctx.price {
-            return false;
-        }
-        if ctx.decider_rsi < genome.genes[Gene::MinRsiSell] * 100.0 {
-            return false;
-        }
-        let Some(highest) = ctx.highest_rsi_since_long else {
-            return false;
-        };
-        ctx.decider_rsi <= highest * (1.0 - genome.genes[Gene::ReboundSellThreshold].max(0.0))
-    }
-
-    fn buy_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+        let rebound =
+            ctx.decider_rsi - lowest * (1.0 + genome.genes[Gene::ReboundBuyThreshold].max(0.0));
         let oversold = ((50.0 - ctx.amount_rsi).max(0.0) / 50.0).clamp(0.0, 1.0);
-        let fraction = (genome.genes[Gene::BuyPercent] * (0.5 + oversold)).clamp(0.0, 1.0);
-        let equal_weight_headroom =
-            (ctx.equal_weight_position_value() - ctx.position_value).max(0.0);
-        ctx.cash.min(equal_weight_headroom * fraction)
+        let profit_penalty = if ctx.unrealized_pnl_pct() > 0.0 {
+            ((ctx.unrealized_pnl_pct() / 100.0) / 0.2).clamp(0.0, 1.0) * 0.35
+        } else {
+            0.0
+        };
+        (genome.genes[Gene::BuyPercent] * ((rebound / 20.0).clamp(0.0, 1.5) + oversold + 0.25)
+            - profit_penalty)
+            .max(0.0)
     }
 
-    fn sell_budget(&self, genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
-        let overbought = ((ctx.amount_rsi - 50.0).max(0.0) / 50.0).clamp(0.0, 1.0);
-        let fraction = (genome.genes[Gene::SellPercent] * (0.5 + overbought)).clamp(0.0, 1.0);
-        ctx.position_value * fraction
+    fn cash_desirability(&self, genome: &Self::Genome) -> f64 {
+        0.4 + (1.0 - genome.genes[Gene::BuyPercent]).max(0.0) * 0.5
     }
 }
 

@@ -51,6 +51,8 @@ pub struct GaHistory {
     pub validation_sharpe: Vec<f64>,
     pub train_turnover: Vec<f64>,
     pub validation_turnover: Vec<f64>,
+    pub train_total_commissions: Vec<f64>,
+    pub validation_total_commissions: Vec<f64>,
     pub train_trade_count: Vec<f64>,
     pub validation_trade_count: Vec<f64>,
     pub validation_minus_train: Vec<f64>,
@@ -88,6 +90,10 @@ impl GaHistory {
         self.validation_sharpe.push(validation_metrics.sharpe);
         self.train_turnover.push(train_metrics.turnover);
         self.validation_turnover.push(validation_metrics.turnover);
+        self.train_total_commissions
+            .push(train_metrics.total_commissions);
+        self.validation_total_commissions
+            .push(validation_metrics.total_commissions);
         self.train_trade_count
             .push(train_metrics.trade_count as f64);
         self.validation_trade_count
@@ -166,6 +172,15 @@ impl GaHistory {
             &[
                 ("train", &self.train_trade_count),
                 ("validation", &self.validation_trade_count),
+            ],
+        )?;
+        write_multi_line_report(
+            output_dir,
+            "ga_total_commissions",
+            "Total Commissions",
+            &[
+                ("train", &self.train_total_commissions),
+                ("validation", &self.validation_total_commissions),
             ],
         )?;
         write_multi_line_report(
