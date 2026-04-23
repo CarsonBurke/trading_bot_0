@@ -22,7 +22,9 @@ fn sync_device(device: Device) {
 /// Reports *reserved* memory (caching allocator), so measurements should be
 /// taken as deltas across a known-new allocation boundary.
 fn gpu_mem_mib(device: Device) -> Option<f64> {
-    let Device::Cuda(id) = device else { return None };
+    let Device::Cuda(id) = device else {
+        return None;
+    };
     let out = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.used",
@@ -191,7 +193,12 @@ fn build_bench_mlp(vs: &nn::Path, dim: i64, depth: usize) -> impl Module {
     let mut seq = nn::seq();
     for i in 0..depth {
         seq = seq
-            .add(nn::linear(vs / format!("fc{}", i), dim, dim, Default::default()))
+            .add(nn::linear(
+                vs / format!("fc{}", i),
+                dim,
+                dim,
+                Default::default(),
+            ))
             .add_fn(|x| x.gelu("none"));
     }
     seq.add(nn::linear(vs / "head", dim, 1, Default::default()))
@@ -220,9 +227,7 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         sync_device(device);
         let mem_pre_opt = gpu_mem_mib(device);
 
-        let mut opt = nn::AdamW::default()
-            .build(&vs, 3e-3)
-            .expect("adamw build");
+        let mut opt = nn::AdamW::default().build(&vs, 3e-3).expect("adamw build");
         for _ in 0..warmup {
             let loss = net.forward(&x).sum(Kind::Float);
             opt.backward_step(&loss);
@@ -255,7 +260,11 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         suite.add(BenchmarkResult::new(
             "optim_adamw_fwd_bwd_step",
             ms,
-            BenchmarkRun { batch, seq_len: dim, dtype: "BFloat16".into() },
+            BenchmarkRun {
+                batch,
+                seq_len: dim,
+                dtype: "BFloat16".into(),
+            },
         ));
     }
 
@@ -303,7 +312,11 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         suite.add(BenchmarkResult::new(
             "optim_muon_fwd_bwd_step",
             ms,
-            BenchmarkRun { batch, seq_len: dim, dtype: "BFloat16".into() },
+            BenchmarkRun {
+                batch,
+                seq_len: dim,
+                dtype: "BFloat16".into(),
+            },
         ));
     }
 
