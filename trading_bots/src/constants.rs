@@ -1,21 +1,4 @@
-/* pub const TICKERS: [&str; 32] = [
-    // iShares S&P500 ETF
-    "SPY", "TSLA", "AAPL", "MSFT", "AMD", "INTC", "NVDA", "IBM", "GOOG", "META", "AMZN", "NFLX",
-    "TSM", "QCOM", "ORCL", "PFE", "SOUN", "SMCI", "LLY", "CE", "GCT", "UNH", "LODE", "KULR",
-    "LUNR", "NABL", "DVN", "BASE", "NET", "CRWD", "JD", "NEXT",
-]; */
-/* pub const TICKERS: [&str; 1] = [
-    // iShares S&P500 ETF
-    "NVDA",
-]; */
-pub const TICKERS: [&str; 7] = [
-    // iShares S&P500 ETF
-    "SPY", "TSLA", "AAPL", "MSFT", "AMD", "INTC", "NVDA",
-];
-// pub const TICKERS: [&str; 1] = [
-//     // iShares S&P500 ETF
-//     "NVDA",
-// ];
+pub const TICKERS: &[&str] = crate::data::universe::TARGET_UNIVERSE_TICKERS;
 pub const CHART_IMAGE_FORMAT: &str = "png";
 
 pub mod rsi {

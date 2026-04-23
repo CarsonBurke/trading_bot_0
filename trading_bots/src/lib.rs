@@ -7,6 +7,7 @@ pub mod agent;
 pub mod charts;
 pub mod constants;
 pub mod data;
+pub mod genetic;
 pub mod history;
 pub mod neural_net;
 pub mod strategies;

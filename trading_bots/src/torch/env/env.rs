@@ -2,8 +2,7 @@ use rand::seq::{IndexedRandom, SliceRandom};
 use rand::Rng;
 use shared::constants::{
     ACTION_COUNT as ACTION_COUNT_USIZE, ACTION_HISTORY_LEN as ACTION_HISTORY_LEN_USIZE,
-    AVAILABLE_TICKERS_COUNT, STATIC_OBSERVATIONS as STATIC_OBSERVATIONS_USIZE,
-    TICKERS_COUNT as TICKERS_COUNT_USIZE,
+    STATIC_OBSERVATIONS as STATIC_OBSERVATIONS_USIZE, TICKERS_COUNT as TICKERS_COUNT_USIZE,
 };
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -16,6 +15,7 @@ use super::macro_ind::MacroIndicators;
 use super::momentum::MomentumIndicators;
 use crate::{
     data::historical::{get_historical_data, get_historical_series},
+    data::universe::training_universe,
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::constants::{
         ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS,
@@ -25,11 +25,6 @@ use crate::{
     utils::{create_folder_if_not_exists, get_mapped_price_deltas, get_price_deltas},
 };
 use std::sync::Arc;
-
-const AVAILABLE_TICKERS: [&str; AVAILABLE_TICKERS_COUNT] = [
-    "TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD", "ADBE", "GOOG", "META", "NKE", "DELL", "CMCSA",
-    "FDX",
-];
 
 pub struct Env {
     pub env_id: usize,
@@ -82,8 +77,7 @@ impl Env {
         gens_path: Option<String>,
     ) -> Self {
         let rng = &mut rand::rng();
-        let tickers = AVAILABLE_TICKERS
-            .to_vec()
+        let tickers = training_universe()
             .choose_multiple(rng, TICKERS_COUNT as usize)
             .map(|ticker| ticker.to_string())
             .collect();
@@ -349,8 +343,7 @@ impl Env {
     /// Reset for VecEnv - returns raw vectors instead of tensors
     pub fn reset_single(&mut self) -> (Vec<f32>, Vec<f32>) {
         let rng = &mut rand::rng();
-        let tickers: Vec<String> = AVAILABLE_TICKERS
-            .to_vec()
+        let tickers: Vec<String> = training_universe()
             .choose_multiple(rng, TICKERS_COUNT as usize)
             .map(|ticker| ticker.to_string())
             .collect();

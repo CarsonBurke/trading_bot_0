@@ -12,6 +12,7 @@ mod agent;
 mod charts;
 mod constants;
 mod data;
+mod genetic;
 mod history;
 mod neural_net;
 mod strategies;
@@ -30,6 +31,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Genetic {
+        #[arg(long, value_enum, default_value_t = genetic::GeneticFamily::TrendBreakout)]
+        family: genetic::GeneticFamily,
+
+        #[arg(long)]
+        run: Option<String>,
+
+        #[arg(long, default_value_t = 600)]
+        generations: usize,
+
+        #[arg(long, default_value_t = 192)]
+        population: usize,
+
+        #[arg(long, default_value_t = 48)]
+        survivors: usize,
+
+        #[arg(long, value_enum, default_value_t = genetic::TickerSet::Train)]
+        train_tickers: genetic::TickerSet,
+
+        #[arg(long, value_enum, default_value_t = genetic::TickerSet::Validation)]
+        validation_tickers: genetic::TickerSet,
+
+        #[arg(long, value_enum, default_value_t = genetic::TickerSet::Test)]
+        test_tickers: genetic::TickerSet,
+
+        #[arg(long, default_value_t = 5)]
+        heavy_report_every: usize,
+
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+    },
     Train {
         #[arg(short, long)]
         weights: Option<String>,
@@ -99,6 +131,32 @@ async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
+        Some(Commands::Genetic {
+            family,
+            run,
+            generations,
+            population,
+            survivors,
+            train_tickers,
+            validation_tickers,
+            test_tickers,
+            heavy_report_every,
+            seed,
+        }) => {
+            genetic::run(genetic::GeneticArgs {
+                family: *family,
+                run: run.clone(),
+                generations: *generations,
+                population: *population,
+                survivors: *survivors,
+                train_tickers: *train_tickers,
+                validation_tickers: *validation_tickers,
+                test_tickers: *test_tickers,
+                heavy_report_every: *heavy_report_every,
+                seed: *seed,
+            })
+            .expect("genetic training failed");
+        }
         Some(Commands::Train {
             weights,
             model_size,

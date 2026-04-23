@@ -10,7 +10,7 @@ pub mod run_dir;
 
 pub mod constants {
     pub const TICKERS_COUNT: usize = 1;
-    pub const AVAILABLE_TICKERS_COUNT: usize = 13;
+    pub const AVAILABLE_TICKERS_COUNT: usize = 100;
     pub const ACTION_COUNT: usize = TICKERS_COUNT; // single ticker weight; cash is the residual
     pub const ACTION_HISTORY_LEN: usize = 0;
     pub const PRICE_DELTAS_PER_TICKER: usize = 8693;

@@ -38,9 +38,6 @@ pub struct VecEnv {
     static_obs_buf: Vec<f32>,
 }
 
-/// Available tickers for random selection
-const AVAILABLE_TICKERS: &[&str] = &["TSLA", "AAPL", "MSFT", "NVDA", "INTC", "AMD"];
-
 impl VecEnv {
     fn nprocs_i64(&self) -> i64 {
         self.nprocs as i64
