@@ -23,8 +23,15 @@ mod utils;
 
 use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
+use state::{GeneticFamily as TuiGeneticFamily, TrainingKind};
 
 const TRAINING_MODEL_SIZES: [&str; 3] = ["uniform-256-stream", "base", "ablation-small"];
+const TRAINING_KINDS: [TrainingKind; 2] = [TrainingKind::Rl, TrainingKind::Genetic];
+const GENETIC_FAMILIES: [TuiGeneticFamily; 3] = [
+    TuiGeneticFamily::TrendBreakout,
+    TuiGeneticFamily::PriceRebound,
+    TuiGeneticFamily::RsiRebound,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
@@ -90,6 +97,8 @@ pub struct App {
     pub episodes_input: String,
     pub weights_path: Option<String>,
     pub training_model_size: String,
+    pub training_kind: TrainingKind,
+    pub genetic_family: TuiGeneticFamily,
     pub latest_meta_charts: Vec<PathBuf>,
     last_refresh: Instant,
     pub generation_browser: GenerationBrowserState,
@@ -152,6 +161,8 @@ impl App {
             episodes_input: String::new(),
             weights_path: None,
             training_model_size: "uniform-256-stream".to_string(),
+            training_kind: TrainingKind::Rl,
+            genetic_family: TuiGeneticFamily::TrendBreakout,
             latest_meta_charts: Vec::new(),
             last_refresh: Instant::now(),
             generation_browser,
@@ -199,6 +210,18 @@ impl App {
             "policy_entropy",
             "approx_kl",
             "gate_stats",
+            "ga_fitness",
+            "ga_return_pct",
+            "ga_outperformance",
+            "ga_max_drawdown",
+            "ga_sharpe",
+            "ga_turnover",
+            "ga_trade_count",
+            "ga_generalization_gap",
+            "ga_distribution",
+            "ga_train_assets",
+            "ga_validation_assets",
+            "ga_test_assets",
         ];
 
         // Ticker-specific chart base names
@@ -302,7 +325,7 @@ impl App {
     pub fn get_current_episode(&self) -> Option<usize> {
         for line in self.logs_page.training_output.iter().rev() {
             // Look for actual episode completion logs: "Episode N - Total Assets..."
-            // Skip PPO progress logs: "[Ep N] Episodes: ..."
+            // Skip RL progress logs: "[Ep N] Episodes: ..."
             if line.contains("Episode") && line.contains("Total Assets") && !line.starts_with("[Ep")
             {
                 if let Some(ep_str) = line.split("Episode").nth(1) {
@@ -339,7 +362,12 @@ impl App {
     fn start_training(&mut self, weights_path: Option<String>) -> Result<()> {
         let result = self
             .process_manager
-            .start_training(weights_path, &self.training_model_size);
+            .start_training(
+                self.training_kind,
+                weights_path,
+                &self.training_model_size,
+                self.genetic_family,
+            );
         self.sync_gens_path();
         result
     }
@@ -441,6 +469,24 @@ impl App {
             .map(|idx| (idx + 1) % TRAINING_MODEL_SIZES.len())
             .unwrap_or(0);
         self.training_model_size = TRAINING_MODEL_SIZES[next_idx].to_string();
+    }
+
+    fn toggle_training_kind(&mut self) {
+        let next_idx = TRAINING_KINDS
+            .iter()
+            .position(|kind| *kind == self.training_kind)
+            .map(|idx| (idx + 1) % TRAINING_KINDS.len())
+            .unwrap_or(0);
+        self.training_kind = TRAINING_KINDS[next_idx];
+    }
+
+    fn toggle_genetic_family(&mut self) {
+        let next_idx = GENETIC_FAMILIES
+            .iter()
+            .position(|family| *family == self.genetic_family)
+            .map(|idx| (idx + 1) % GENETIC_FAMILIES.len())
+            .unwrap_or(0);
+        self.genetic_family = GENETIC_FAMILIES[next_idx];
     }
 
     fn start_inference(
@@ -925,12 +971,30 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
-                                            app.open_run_selector(RunSelectorPurpose::Train);
+                                            if app.training_kind == TrainingKind::Rl {
+                                                app.open_run_selector(RunSelectorPurpose::Train);
+                                            } else {
+                                                app.start_training(None)?;
+                                            }
                                         }
                                     }
                                     KeyCode::Char('p') => {
-                                        if !app.is_training_running() {
+                                        if !app.is_training_running()
+                                            && app.training_kind == TrainingKind::Rl
+                                        {
                                             app.toggle_training_model_size();
+                                        }
+                                    }
+                                    KeyCode::Char('t') => {
+                                        if !app.is_training_running() {
+                                            app.toggle_training_kind();
+                                        }
+                                    }
+                                    KeyCode::Char('g') => {
+                                        if !app.is_training_running()
+                                            && app.training_kind == TrainingKind::Genetic
+                                        {
+                                            app.toggle_genetic_family();
                                         }
                                     }
                                     KeyCode::Char('f') => {

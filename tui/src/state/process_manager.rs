@@ -4,6 +4,29 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingKind {
+    Rl,
+    Genetic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneticFamily {
+    PriceRebound,
+    RsiRebound,
+    TrendBreakout,
+}
+
+impl GeneticFamily {
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::PriceRebound => "price-rebound",
+            Self::RsiRebound => "rsi-rebound",
+            Self::TrendBreakout => "trend-breakout",
+        }
+    }
+}
+
 pub struct ProcessManagerState {
     pub inference_process: Option<Child>,
     pub training_process: Option<Child>,
@@ -38,21 +61,16 @@ impl ProcessManagerState {
             return true;
         }
 
-        if let Ok(output) = Command::new("pgrep")
-            .args(["-f", "trading.*train"])
-            .output()
-        {
+        if let Ok(output) = Command::new("pgrep").args(["-f", "trading_bots"]).output() {
             if !output.stdout.is_empty() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for pid in stdout.lines() {
                     if let Ok(pid_num) = pid.trim().parse::<u32>() {
-                        if let Ok(cmdline_output) = Command::new("ps")
-                            .args(["-p", &pid_num.to_string(), "-o", "args="])
-                            .output()
-                        {
-                            let cmdline = String::from_utf8_lossy(&cmdline_output.stdout);
-                            if cmdline.contains("train") && !cmdline.contains("tui") {
+                        if let Some(cmdline) = training_cmdline(pid_num) {
+                            if is_training_cmdline(&cmdline) {
                                 self.cached_training_running = true;
+                                self.active_run = RunDir::latest_with_data(RUNS_PATH)
+                                    .or_else(|| RunDir::latest(RUNS_PATH).ok());
                                 return true;
                             }
                         }
@@ -69,7 +87,13 @@ impl ProcessManagerState {
         self.is_training_running() || self.inference_process.is_some()
     }
 
-    pub fn start_training(&mut self, weights: Option<String>, model_size: &str) -> Result<()> {
+    pub fn start_training(
+        &mut self,
+        kind: TrainingKind,
+        weights: Option<String>,
+        model_size: &str,
+        genetic_family: GeneticFamily,
+    ) -> Result<()> {
         if self.is_anything_running() {
             return Ok(());
         }
@@ -101,13 +125,21 @@ impl ProcessManagerState {
         cmd.current_dir("../trading_bots")
             .arg("run")
             .arg("--release")
-            .arg("--")
-            .arg("train")
-            .arg("--model-size")
-            .arg(model_size);
+            .arg("--");
 
-        if let Some(w) = weights {
-            cmd.arg("--weights").arg(w);
+        match kind {
+            TrainingKind::Rl => {
+                cmd.arg("train").arg("--model-size").arg(model_size);
+
+                if let Some(w) = weights {
+                    cmd.arg("--weights").arg(w);
+                }
+            }
+            TrainingKind::Genetic => {
+                cmd.arg("genetic")
+                    .arg("--family")
+                    .arg(genetic_family.as_cli_str());
+            }
         }
 
         if let Some(name) = run_dir.root.file_name().and_then(|n| n.to_str()) {
@@ -166,9 +198,22 @@ impl ProcessManagerState {
             let _ = child.kill();
         }
 
-        let _ = Command::new("pkill")
-            .args(["-f", "trading.*train"])
-            .output();
+        if let Ok(output) = Command::new("pgrep").args(["-f", "trading_bots"]).output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for pid in stdout.lines() {
+                let Ok(pid_num) = pid.trim().parse::<u32>() else {
+                    continue;
+                };
+                let Some(cmdline) = training_cmdline(pid_num) else {
+                    continue;
+                };
+                if is_training_cmdline(&cmdline) {
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &pid_num.to_string()])
+                        .output();
+                }
+            }
+        }
 
         self.cached_training_running = false;
         Ok(())
@@ -181,4 +226,20 @@ impl ProcessManagerState {
             }
         }
     }
+}
+
+fn training_cmdline(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn is_training_cmdline(cmdline: &str) -> bool {
+    !cmdline.contains("tui")
+        && (cmdline.contains(" train ")
+            || cmdline.ends_with(" train")
+            || cmdline.contains(" genetic ")
+            || cmdline.ends_with(" genetic"))
 }

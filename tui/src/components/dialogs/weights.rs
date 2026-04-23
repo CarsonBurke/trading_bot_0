@@ -50,11 +50,11 @@ pub fn render(f: &mut Frame, app: &App, for_training: bool, for_inference: bool)
             Span::styled(default_text, Style::default().fg(theme::GREEN)),
         ]),
         Line::from(vec![
-            Span::styled("Training model: ", Style::default().fg(theme::SUBTEXT0)),
-            Span::styled(
-                app.training_model_size.clone(),
-                Style::default().fg(theme::BLUE),
-            ),
+            Span::styled("Trainer: ", Style::default().fg(theme::SUBTEXT0)),
+            Span::styled("rl", Style::default().fg(theme::BLUE)),
+            Span::raw("  |  "),
+            Span::styled("Model: ", Style::default().fg(theme::SUBTEXT0)),
+            Span::styled(app.training_model_size.clone(), Style::default().fg(theme::BLUE)),
             Span::raw("  (toggle with "),
             Span::styled("p", Style::default().fg(theme::TEAL)),
             Span::raw(" on main page)"),
