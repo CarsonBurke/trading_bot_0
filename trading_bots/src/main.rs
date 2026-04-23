@@ -72,7 +72,7 @@ enum Commands {
         #[arg(short, long)]
         weights: Option<String>,
 
-        #[arg(long, value_enum, default_value_t = ModelVariant::Uniform256Stream)]
+        #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
         model_size: ModelVariant,
 
         #[arg(long, default_value_t = false)]
@@ -100,7 +100,7 @@ enum Commands {
         #[arg(short, long, default_value_t = true)]
         random_start: bool,
 
-        #[arg(long, value_enum, default_value_t = ModelVariant::Uniform256Stream)]
+        #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
         model_size: ModelVariant,
 
         #[arg(long, default_value_t = false)]
@@ -122,7 +122,7 @@ enum Commands {
         #[arg(short, long, default_value_t = 0.8)]
         temperature: f64,
 
-        #[arg(long, value_enum, default_value_t = ModelVariant::Uniform256Stream)]
+        #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
         model_size: ModelVariant,
 
         #[arg(long, default_value_t = false)]
@@ -218,7 +218,7 @@ async fn main() {
             .expect("paper trading failed");
         }
         None => {
-            torch::ppo::train(None, ModelVariant::Uniform256Stream, false, None).await;
+            torch::ppo::train(None, ModelVariant::UniformStream, false, None).await;
         }
     }
 

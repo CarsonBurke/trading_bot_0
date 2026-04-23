@@ -64,7 +64,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
 
     for &variant in &[
         ModelVariant::Base,
-        ModelVariant::Uniform256Stream,
+        ModelVariant::UniformStream,
         ModelVariant::AblationSmall,
     ] {
         let mut vs = nn::VarStore::new(device);
@@ -78,14 +78,14 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         vs.bfloat16();
         println!("  Variant: {}", variant.as_str());
         let price_deltas_dim = model.price_input_dim();
-        let reported_seq_len = if variant == ModelVariant::Uniform256Stream {
+        let reported_seq_len = if variant == ModelVariant::UniformStream {
             price_deltas_dim / TICKERS_COUNT
         } else {
             PRICE_DELTAS_PER_TICKER as i64
         };
 
         for &batch in &[1, 4, 8] {
-            let price_deltas = if variant == ModelVariant::Uniform256Stream {
+            let price_deltas = if variant == ModelVariant::UniformStream {
                 let raw = Tensor::randn(&[batch, raw_price_deltas_dim], (dtype, device));
                 model.uniform_stream_layout_from_raw_input(&raw)
             } else {
@@ -118,7 +118,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
                 ));
             });
 
-            if variant == ModelVariant::Uniform256Stream {
+            if variant == ModelVariant::UniformStream {
                 let raw_full_price = Tensor::randn(&[batch, raw_price_deltas_dim], (dtype, device));
                 let full_price = model.uniform_stream_layout_from_raw_input(&raw_full_price);
                 let static_features = Tensor::randn(&[batch, static_obs_dim], (dtype, device));
@@ -152,7 +152,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
                 });
             }
 
-            let price_deltas = if variant == ModelVariant::Uniform256Stream {
+            let price_deltas = if variant == ModelVariant::UniformStream {
                 let raw = Tensor::randn(&[batch, raw_price_deltas_dim], (dtype, device));
                 model.uniform_stream_layout_from_raw_input(&raw).detach()
             } else {

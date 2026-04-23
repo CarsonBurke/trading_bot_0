@@ -25,7 +25,7 @@ use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
 use state::{GeneticFamily as TuiGeneticFamily, TrainingKind};
 
-const TRAINING_MODEL_SIZES: [&str; 3] = ["uniform-256-stream", "base", "ablation-small"];
+const TRAINING_MODEL_SIZES: [&str; 3] = ["uniform-stream", "base", "ablation-small"];
 const TRAINING_KINDS: [TrainingKind; 2] = [TrainingKind::Rl, TrainingKind::Genetic];
 const GENETIC_FAMILIES: [TuiGeneticFamily; 3] = [
     TuiGeneticFamily::TrendBreakout,
@@ -189,7 +189,7 @@ impl App {
             ticker_input: String::new(),
             episodes_input: String::new(),
             weights_path: None,
-            training_model_size: "uniform-256-stream".to_string(),
+            training_model_size: "uniform-stream".to_string(),
             training_kind: TrainingKind::Rl,
             genetic_family: TuiGeneticFamily::TrendBreakout,
             latest_meta_charts: Vec::new(),

@@ -14,7 +14,7 @@ pub mod constants {
     pub const AVAILABLE_TICKERS_COUNT: usize = 100;
     pub const ACTION_COUNT: usize = TICKERS_COUNT; // single ticker weight; cash is the residual
     pub const ACTION_HISTORY_LEN: usize = 0;
-    pub const PRICE_DELTAS_PER_TICKER: usize = 8693;
+    pub const PRICE_DELTAS_PER_TICKER: usize = 6000;
 
     // Global (7): step_progress, cash_percent, pnl, drawdown, commissions, last_reward, last_fill_ratio
     // Macro (14): gdp_growth, unemployment, jobs_growth, cpi_yoy, core_cpi_yoy, fed_funds, treasury_10y, yield_spread, consumer_sentiment, initial_claims

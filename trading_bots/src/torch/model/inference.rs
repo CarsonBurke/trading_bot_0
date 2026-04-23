@@ -50,7 +50,7 @@ impl TradingModel {
     }
 
     pub fn detach_stream_state(&self, state: &mut StreamState) {
-        if self.variant != super::ModelVariant::Uniform256Stream {
+        if self.variant != super::ModelVariant::UniformStream {
             return;
         }
         state.uniform_layout = state.uniform_layout.detach();
@@ -92,8 +92,8 @@ impl TradingModel {
         let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
         state.uniform_prefix_x0 = x0;
         state.uniform_layer0_prefix_hidden = x_next;
-        state.uniform_layer0_prefix_k = k.index_select(1, &self.gqa_kv_head_index);
-        state.uniform_layer0_prefix_v = v.index_select(1, &self.gqa_kv_head_index);
+        state.uniform_layer0_prefix_k = k;
+        state.uniform_layer0_prefix_v = v;
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
         state.uniform_cached_static_features = None;
@@ -108,8 +108,6 @@ impl TradingModel {
         );
         let x0 = self.input_ln.forward(&x);
         let (x_next, k, v) = self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
-        let k = k.index_select(1, &self.gqa_kv_head_index);
-        let v = v.index_select(1, &self.gqa_kv_head_index);
         self.ensure_stream_cache_kind(state, &x0, &x_next, &k, &v);
         state.uniform_prefix_x0 = state.uniform_prefix_x0.index_copy(0, row_idx, &x0);
         state.uniform_layer0_prefix_hidden = state
@@ -152,12 +150,8 @@ impl TradingModel {
         state.uniform_prefix_v = vec![state.uniform_layer0_prefix_v.shallow_clone()];
         for layer in self.gqa_layers.iter().skip(1) {
             let (x_next, k, v) = layer.forward_prefix_and_cache(&x, x0, &self.rope);
-            state
-                .uniform_prefix_k
-                .push(k.index_select(1, &self.gqa_kv_head_index));
-            state
-                .uniform_prefix_v
-                .push(v.index_select(1, &self.gqa_kv_head_index));
+            state.uniform_prefix_k.push(k);
+            state.uniform_prefix_v.push(v);
             x = x_next;
         }
         state.uniform_cached_static_features = Some(static_features.shallow_clone());
@@ -182,8 +176,8 @@ impl TradingModel {
         prefix_v.push(state.uniform_layer0_prefix_v.shallow_clone());
         for layer in self.gqa_layers.iter().skip(1) {
             let (x_next, k, v) = layer.forward_prefix_and_cache(&prefix_hidden, x0, &self.rope);
-            prefix_k.push(k.index_select(1, &self.gqa_kv_head_index));
-            prefix_v.push(v.index_select(1, &self.gqa_kv_head_index));
+            prefix_k.push(k);
+            prefix_v.push(v);
             prefix_hidden = x_next;
         }
 
@@ -201,7 +195,6 @@ impl TradingModel {
                 &prefix_k[layer_idx],
                 &prefix_v[layer_idx],
                 &self.rope,
-                &self.gqa_kv_head_index,
                 prefix_len,
             );
             if layer_idx == 0 {
@@ -245,7 +238,6 @@ impl TradingModel {
                 &state.uniform_prefix_k[layer_idx],
                 &state.uniform_prefix_v[layer_idx],
                 &self.rope,
-                &self.gqa_kv_head_index,
                 prefix_len,
             );
             if layer_idx == 0 {
@@ -268,7 +260,7 @@ impl TradingModel {
             static_features.shallow_clone()
         };
         let static_features = self.cast_inputs(&static_features);
-        if self.variant == super::ModelVariant::Uniform256Stream {
+        if self.variant == super::ModelVariant::UniformStream {
             return self.uniform_stream_cached_forward(&static_features, state);
         }
         let batch_size = state.delta_ring.size()[0] / TICKERS_COUNT;
@@ -282,7 +274,7 @@ impl TradingModel {
         env_indices: &[usize],
         layouts: &Tensor,
     ) {
-        if self.variant != super::ModelVariant::Uniform256Stream || env_indices.is_empty() {
+        if self.variant != super::ModelVariant::UniformStream || env_indices.is_empty() {
             return;
         }
         let layouts = if layouts.dim() == 1 {
@@ -369,7 +361,7 @@ impl TradingModel {
         row_idx: &Tensor,
         layouts: &Tensor,
     ) {
-        if self.variant != super::ModelVariant::Uniform256Stream || env_idx.size()[0] == 0 {
+        if self.variant != super::ModelVariant::UniformStream || env_idx.size()[0] == 0 {
             return;
         }
         let layouts = if layouts.dim() == 1 {
@@ -431,7 +423,7 @@ impl TradingModel {
         env_indices: &[usize],
         reset_price_deltas: &[f32],
     ) {
-        if self.variant != super::ModelVariant::Uniform256Stream || env_indices.is_empty() {
+        if self.variant != super::ModelVariant::UniformStream || env_indices.is_empty() {
             return;
         }
         let raw_pd_dim = (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64) as usize;
@@ -478,7 +470,7 @@ impl TradingModel {
 
     fn build_stream_state(&self, batch_size: i64, _cache_conditioned_prefix: bool) -> StreamState {
         let uniform_rows = batch_size * TICKERS_COUNT;
-        let (delta_ring, patch_buf) = if self.variant == super::ModelVariant::Uniform256Stream {
+        let (delta_ring, patch_buf) = if self.variant == super::ModelVariant::UniformStream {
             (
                 Tensor::zeros(
                     [0, PRICE_DELTAS_PER_TICKER as i64],
@@ -570,7 +562,7 @@ impl TradingModel {
         assert_eq!(
             price.size()[1],
             expected_layout,
-            "Uniform256Stream init expects anchored layout input"
+            "UniformStream init expects anchored layout input"
         );
         let layout = price
             .view([
@@ -701,7 +693,7 @@ impl TradingModel {
             static_features.shallow_clone()
         };
 
-        if self.variant == super::ModelVariant::Uniform256Stream {
+        if self.variant == super::ModelVariant::UniformStream {
             if is_full {
                 return self.init_from_full_on_device(&new_deltas, &static_features, state);
             }
@@ -770,7 +762,7 @@ impl TradingModel {
             static_features.shallow_clone()
         };
         let static_features = self.cast_inputs(&static_features);
-        if self.variant == super::ModelVariant::Uniform256Stream {
+        if self.variant == super::ModelVariant::UniformStream {
             return self.uniform_stream_replay_forward(&static_features, state);
         }
         self.forward_stream_state_on_device(&static_features, state)
@@ -805,7 +797,7 @@ impl TradingModel {
     pub fn advance_replay_stream_state(&self, new_deltas: &Tensor, state: &mut StreamState) {
         assert_eq!(
             self.variant,
-            super::ModelVariant::Uniform256Stream,
+            super::ModelVariant::UniformStream,
             "advance_replay_stream_state requires uniform stream variant"
         );
         if new_deltas.device() != self.device {
@@ -872,7 +864,7 @@ impl TradingModel {
     ) -> ModelOutput {
         assert_eq!(
             self.variant,
-            super::ModelVariant::Uniform256Stream,
+            super::ModelVariant::UniformStream,
             "windowed_replay_forward requires uniform stream variant"
         );
         let layouts = self.cast_inputs(layouts);
@@ -891,20 +883,18 @@ impl TradingModel {
         let x0 = self.input_ln.forward(&prefix_patch);
         let (layer0_hidden, layer0_k_raw, layer0_v_raw) =
             self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
-        let layer0_k = layer0_k_raw.index_select(1, &self.gqa_kv_head_index);
-        let layer0_v = layer0_v_raw.index_select(1, &self.gqa_kv_head_index);
 
         let mut prefix_hidden = self
             .exogenous_ticker_block
             .forward(&layer0_hidden, &exo_tokens);
         let mut prefix_k = Vec::with_capacity(self.gqa_layers.len());
         let mut prefix_v = Vec::with_capacity(self.gqa_layers.len());
-        prefix_k.push(layer0_k);
-        prefix_v.push(layer0_v);
+        prefix_k.push(layer0_k_raw);
+        prefix_v.push(layer0_v_raw);
         for layer in self.gqa_layers.iter().skip(1) {
             let (x_next, k, v) = layer.forward_prefix_and_cache(&prefix_hidden, &x0, &self.rope);
-            prefix_k.push(k.index_select(1, &self.gqa_kv_head_index));
-            prefix_v.push(v.index_select(1, &self.gqa_kv_head_index));
+            prefix_k.push(k);
+            prefix_v.push(v);
             prefix_hidden = x_next;
         }
 
@@ -919,7 +909,6 @@ impl TradingModel {
                 &prefix_k[layer_idx],
                 &prefix_v[layer_idx],
                 &self.rope,
-                &self.gqa_kv_head_index,
                 prefix_len,
             );
             if layer_idx == 0 {
@@ -965,7 +954,7 @@ impl TradingModel {
             static_features.shallow_clone()
         };
 
-        if self.variant == super::ModelVariant::Uniform256Stream {
+        if self.variant == super::ModelVariant::UniformStream {
             if is_full {
                 let price = if new_deltas.dim() == 1 {
                     new_deltas.unsqueeze(0)
@@ -1011,7 +1000,7 @@ impl TradingModel {
         let price = self.cast_inputs(&price);
         let static_features = self.cast_inputs(&static_features);
 
-        if self.variant == super::ModelVariant::Uniform256Stream {
+        if self.variant == super::ModelVariant::UniformStream {
             self.init_uniform_from_full_on_device(&price, state);
             return self.uniform_stream_cached_forward(&static_features, state);
         }

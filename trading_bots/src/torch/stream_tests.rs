@@ -23,7 +23,7 @@ mod tests {
         let model = TradingModel::new_with_config(
             &vs.root(),
             TradingModelConfig {
-                variant: ModelVariant::Uniform256Stream,
+                variant: ModelVariant::UniformStream,
                 xsa_temporal: false,
             },
         );
@@ -78,7 +78,7 @@ mod tests {
         let model = TradingModel::new_with_config(
             &vs.root(),
             TradingModelConfig {
-                variant: ModelVariant::Uniform256Stream,
+                variant: ModelVariant::UniformStream,
                 xsa_temporal: false,
             },
         );
@@ -176,7 +176,7 @@ mod tests {
         let model = TradingModel::new_with_config(
             &vs.root(),
             TradingModelConfig {
-                variant: ModelVariant::Uniform256Stream,
+                variant: ModelVariant::UniformStream,
                 xsa_temporal: false,
             },
         );
@@ -299,7 +299,7 @@ mod tests {
         let model = TradingModel::new_with_config(
             &vs.root(),
             TradingModelConfig {
-                variant: ModelVariant::Uniform256Stream,
+                variant: ModelVariant::UniformStream,
                 xsa_temporal: true,
             },
         );

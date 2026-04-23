@@ -413,7 +413,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                     deltas.clear();
                 }
                 full_obs_raw_gpu.copy_(&price_deltas_tensor);
-                if model.variant() == ModelVariant::Uniform256Stream {
+                if model.variant() == ModelVariant::UniformStream {
                     let layout = model.uniform_stream_layout_from_raw_input(&full_obs_raw_gpu);
                     full_obs_gpu.copy_(&layout);
                 } else {

@@ -97,7 +97,7 @@ pub fn run_inference<P: AsRef<Path>>(
         let mut static_obs_tensor =
             Tensor::zeros([STATIC_OBSERVATIONS as i64], (Kind::Float, device));
         price_deltas_raw.copy_(&Tensor::from_slice(&price_deltas));
-        if model.variant() == ModelVariant::Uniform256Stream {
+        if model.variant() == ModelVariant::UniformStream {
             let layout = model.uniform_stream_layout_from_raw_input(&price_deltas_raw);
             price_deltas_full.copy_(&layout.squeeze_dim(0));
         } else {

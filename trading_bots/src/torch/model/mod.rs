@@ -91,10 +91,10 @@ impl EndogenousTickerBlock {
     }
 }
 
-const GQA_NUM_Q_HEADS: i64 = 3;
-const GQA_NUM_KV_HEADS: i64 = 3;
+const GQA_NUM_Q_HEADS: i64 = 4;
+const GQA_NUM_KV_HEADS: i64 = 4;
 const CA_NUM_HEADS: i64 = 2;
-const CA_HEAD_DIM: i64 = 96; // 192 / 2
+const CA_HEAD_DIM: i64 = 128;
 const QK_GAIN_INIT: f64 = 3.0;
 const ROPE_DIMS: i64 = 16;
 
@@ -343,27 +343,21 @@ impl GqaBlock {
         prefix_k: &Tensor,
         prefix_v: &Tensor,
         rope: &RotaryEmbedding,
-        kv_index: &Tensor,
         prefix_len: i64,
     ) -> Tensor {
         let mix = self.resid_mix.to_kind(x_suffix.kind());
         let x_suffix =
             x_suffix * mix.get(0).view([1, 1, -1]) + x0_suffix * mix.get(1).view([1, 1, -1]);
         let (q, suffix_k, suffix_v) = self.project_qkv(&x_suffix, rope, prefix_len);
-        let suffix_k = suffix_k.index_select(1, kv_index);
-        let suffix_v = suffix_v.index_select(1, kv_index);
-        let k = Tensor::cat(&[prefix_k, &suffix_k], 2);
-        let v = Tensor::cat(&[prefix_v, &suffix_v], 2);
-        let out = Tensor::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            None::<&Tensor>,
-            0.0,
-            false,
-            None,
-            false,
-        );
+        let scale = 1.0 / (q.size()[3] as f64).sqrt();
+        let prefix_scores = q.matmul(&prefix_k.transpose(-2, -1)) * scale;
+        let suffix_scores =
+            (&q * &suffix_k).sum_dim_intlist([-1].as_slice(), true, q.kind()) * scale;
+        let scores = Tensor::cat(&[&prefix_scores, &suffix_scores], -1);
+        let weights = scores.softmax(-1, q.kind());
+        let prefix_weights = weights.narrow(-1, 0, prefix_len);
+        let suffix_weight = weights.narrow(-1, prefix_len, 1);
+        let out = prefix_weights.matmul(prefix_v) + suffix_weight * &suffix_v;
         let out = self
             .maybe_apply_xsa(&out, &suffix_v)
             .permute([0, 2, 1, 3])
@@ -597,16 +591,16 @@ fn linear_residual_out(
     )
 }
 
-const BASE_MODEL_DIM: i64 = 192;
-const BASE_FF_DIM: i64 = 384;
+const BASE_MODEL_DIM: i64 = 256;
+const BASE_FF_DIM: i64 = 512;
 const BASE_GQA_LAYERS: usize = 3;
 const ABLATION_SMALL_MODEL_DIM: i64 = 96;
 const ABLATION_SMALL_FF_DIM: i64 = 192;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
-const UNIFORM_STREAM_PATCH_COUNT: i64 = 256;
-const UNIFORM_STREAM_PATCH_SIZE: i64 = 34;
+const UNIFORM_STREAM_PATCH_COUNT: i64 = 120;
+const UNIFORM_STREAM_PATCH_SIZE: i64 = 50;
 const UNIFORM_STREAM_LAYOUT_LEN: i64 = UNIFORM_STREAM_PATCH_COUNT * UNIFORM_STREAM_PATCH_SIZE;
-const UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES: i64 = 255;
+const UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES: i64 = UNIFORM_STREAM_PATCH_COUNT - 1;
 const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 = PRICE_DELTAS_PER_TICKER as i64
     - UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
 pub(super) const LOG_STD_INIT: f64 = -1.0;
@@ -620,36 +614,40 @@ fn residual_init_scale(num_residual_sublayers: usize) -> f64 {
 }
 
 const BASE_PATCH_CONFIGS: &[(i64, i64)] = &[
-    (4608, 128),
-    (2048, 64),
-    (1024, 32),
-    (512, 16),
-    (256, 8),
-    (128, 4),
-    (116, 2),
-    (1, 1),
+    (3072, 128),
+    (1536, 64),
+    (768, 32),
+    (384, 16),
+    (128, 8),
+    (64, 4),
+    (46, 2),
+    (2, 1),
 ];
 
-const fn uniform_256_patch_configs() -> [(i64, i64); 256] {
-    let mut configs = [(0i64, 0i64); 256];
+const fn uniform_stream_patch_configs() -> [(i64, i64); UNIFORM_STREAM_PATCH_COUNT as usize] {
+    let mut configs = [(0i64, 0i64); UNIFORM_STREAM_PATCH_COUNT as usize];
     let mut idx = 0usize;
-    while idx < 256 {
+    while idx < UNIFORM_STREAM_PATCH_COUNT as usize {
         configs[idx] = (UNIFORM_STREAM_PATCH_SIZE, UNIFORM_STREAM_PATCH_SIZE);
         idx += 1;
     }
     configs
 }
 
-const UNIFORM_256_STREAM_PATCH_CONFIGS: &[(i64, i64)] = &uniform_256_patch_configs();
+const UNIFORM_STREAM_PATCH_CONFIGS: &[(i64, i64)] = &uniform_stream_patch_configs();
 
-const ABLATION_SMALL_PATCH_CONFIGS: &[(i64, i64)] = &[(8192, 256), (384, 8), (117, 1)];
+const ABLATION_SMALL_PATCH_CONFIGS: &[(i64, i64)] = &[(5632, 256), (360, 8), (8, 1)];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum ModelVariant {
     Base,
-    #[value(name = "uniform-256-stream", alias = "uniform256-stream")]
-    Uniform256Stream,
+    #[value(
+        name = "uniform-stream",
+        alias = "uniform-256-stream",
+        alias = "uniform256-stream"
+    )]
+    UniformStream,
     AblationSmall,
 }
 
@@ -657,7 +655,7 @@ impl ModelVariant {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Base => "base",
-            Self::Uniform256Stream => "uniform-256-stream",
+            Self::UniformStream => "uniform-stream",
             Self::AblationSmall => "ablation-small",
         }
     }
@@ -679,11 +677,11 @@ fn model_spec(variant: ModelVariant) -> ModelSpec {
             gqa_layers: BASE_GQA_LAYERS,
             patch_configs: BASE_PATCH_CONFIGS,
         },
-        ModelVariant::Uniform256Stream => ModelSpec {
+        ModelVariant::UniformStream => ModelSpec {
             model_dim: BASE_MODEL_DIM,
             ff_dim: BASE_FF_DIM,
             gqa_layers: BASE_GQA_LAYERS,
-            patch_configs: UNIFORM_256_STREAM_PATCH_CONFIGS,
+            patch_configs: UNIFORM_STREAM_PATCH_CONFIGS,
         },
         ModelVariant::AblationSmall => ModelSpec {
             model_dim: ABLATION_SMALL_MODEL_DIM,
@@ -769,9 +767,9 @@ pub struct StreamState {
     pub patch_pos: i64,
     /// Whether initialized with full sequence
     pub initialized: bool,
-    /// Uniform stream bucket layout: [batch*TICKERS_COUNT, 256, 34]
+    /// Uniform stream bucket layout: [batch*TICKERS_COUNT, patch_count, patch_size]
     pub uniform_layout: Tensor,
-    /// Cached patch tokens for uniform streamed rollout: [batch*TICKERS_COUNT, 256, model_dim]
+    /// Cached patch tokens for uniform streamed rollout: [batch*TICKERS_COUNT, patch_count, model_dim]
     pub uniform_patch_tokens: Tensor,
     /// Live fill per env for the tail bucket: [batch]
     pub uniform_live_fill: Tensor,
@@ -806,7 +804,6 @@ pub struct TradingModel {
     patch_embed_bias: Tensor,
     patch_config_ids: Tensor,
     patch_stream_proj: nn::Linear,
-    gqa_kv_head_index: Tensor,
     input_ln: RMSNorm,
     final_ln: RMSNorm,
     gqa_layers: Vec<GqaBlock>,
@@ -826,7 +823,7 @@ pub struct TradingModel {
 impl TradingModel {
     pub fn price_input_dim(&self) -> i64 {
         match self.variant {
-            ModelVariant::Uniform256Stream => TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN,
+            ModelVariant::UniformStream => TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN,
             _ => TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         }
     }
@@ -889,8 +886,8 @@ impl TradingModel {
     pub fn uniform_stream_layout_from_raw_input(&self, price_deltas: &Tensor) -> Tensor {
         assert_eq!(
             self.variant,
-            ModelVariant::Uniform256Stream,
-            "uniform_stream_layout_from_raw_input is only valid for Uniform256Stream",
+            ModelVariant::UniformStream,
+            "uniform_stream_layout_from_raw_input is only valid for UniformStream",
         );
         let price = if price_deltas.dim() == 1 {
             price_deltas.unsqueeze(0)
@@ -919,7 +916,7 @@ impl TradingModel {
         let init_scale = residual_init_scale(num_residual_sublayers);
         let patch_configs = spec.patch_configs;
         let (total_days, seq_len) = compute_patch_totals(patch_configs);
-        if config.variant == ModelVariant::Uniform256Stream {
+        if config.variant == ModelVariant::UniformStream {
             assert!(
                 total_days >= PRICE_DELTAS_PER_TICKER as i64,
                 "uniform stream layout must cover the raw observation history"
@@ -955,7 +952,7 @@ impl TradingModel {
         );
         let patch_stream_proj = nn::linear(
             p / "patch_stream_proj",
-            UNIFORM_STREAM_PATCH_SIZE + 1, // 34 values + fill_fraction
+            UNIFORM_STREAM_PATCH_SIZE + 1, // patch values + fill_fraction
             spec.model_dim,
             nn::LinearConfig {
                 ws_init: truncated_normal_init(UNIFORM_STREAM_PATCH_SIZE + 1, spec.model_dim),
@@ -965,7 +962,6 @@ impl TradingModel {
         );
         let input_ln = RMSNorm::new(&(p / "input_ln"), spec.model_dim, 1e-6);
         let final_ln = RMSNorm::new(&(p / "final_ln"), spec.model_dim, 1e-6);
-        let gqa_kv_head_index = Tensor::arange(GQA_NUM_KV_HEADS, (Kind::Int64, p.device()));
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
             for (cfg_idx, &(days, patch_size)) in patch_configs.iter().enumerate() {
@@ -1062,7 +1058,6 @@ impl TradingModel {
             patch_embed_bias,
             patch_config_ids,
             patch_stream_proj,
-            gqa_kv_head_index,
             input_ln,
             final_ln,
             gqa_layers,
@@ -1148,12 +1143,12 @@ impl TradingModel {
 
     fn patch_latent_stem_on_device(&self, price_deltas: &Tensor, batch_size: i64) -> Tensor {
         let batch_tokens = batch_size * TICKERS_COUNT;
-        let deltas = if self.variant == ModelVariant::Uniform256Stream {
+        let deltas = if self.variant == ModelVariant::UniformStream {
             let expected_layout = TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN;
             assert_eq!(
                 price_deltas.size()[1],
                 expected_layout,
-                "Uniform256Stream full forward expects anchored layout input"
+                "UniformStream full forward expects anchored layout input"
             );
             price_deltas
                 .view([batch_size, TICKERS_COUNT, UNIFORM_STREAM_LAYOUT_LEN])
@@ -1168,10 +1163,10 @@ impl TradingModel {
         self.input_ln.forward(&patch_tokens)
     }
 
-    /// Per-config enrichment (avoids [batch, 256, 8636] expand), then fused
-    /// einsum projection across all 256 tokens in a single kernel.
+    /// Per-config enrichment avoids expanding each patch to the full history width,
+    /// then projects all tokens in one fused einsum.
     fn patch_embed(&self, deltas: &Tensor) -> Tensor {
-        if self.variant == ModelVariant::Uniform256Stream {
+        if self.variant == ModelVariant::UniformStream {
             return self.patch_embed_stream(deltas);
         }
         let device = deltas.device();
@@ -1213,7 +1208,7 @@ impl TradingModel {
         }
         let enriched = Tensor::cat(&enriched_parts.iter().collect::<Vec<_>>(), 1).to_kind(kind);
 
-        // Phase 2: fused projection — single einsum over all 256 tokens
+        // Phase 2: fused projection over all tokens.
         let weight_per_patch = self
             .patch_embed_weight
             .index_select(0, &self.patch_config_ids);
