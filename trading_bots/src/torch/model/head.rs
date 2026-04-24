@@ -16,7 +16,10 @@ impl TradingModel {
             1,
             policy_mean_log_var.size()[1] / 2,
             policy_mean_log_var.size()[1] / 2,
-        );
+        ) + self
+            .policy_log_var_offset
+            .to_kind(Kind::Float)
+            .view([1, -1]);
         let center = (LOG_STD_MIN + LOG_STD_MAX) * 0.5;
         let half_range = (LOG_STD_MAX - LOG_STD_MIN) * 0.5;
         let raw_log_std = &action_log_var * 0.5;

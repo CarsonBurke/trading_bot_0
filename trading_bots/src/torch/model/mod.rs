@@ -162,18 +162,10 @@ struct GqaBlock {
     ffn_ln: RMSNorm,
     ffn_fc1: nn::Linear,
     ffn_fc2: nn::Linear,
-    xsa_temporal: bool,
 }
 
 impl GqaBlock {
-    fn new(
-        p: &nn::Path,
-        model_dim: i64,
-        ff_dim: i64,
-        _init_scale: f64,
-        xsa_temporal: bool,
-        layer_idx: usize,
-    ) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, _init_scale: f64, layer_idx: usize) -> Self {
         let head_dim = model_dim / GQA_NUM_Q_HEADS;
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
         let qkv_dim = model_dim + 2 * kv_dim;
@@ -215,26 +207,7 @@ impl GqaBlock {
             ffn_ln,
             ffn_fc1,
             ffn_fc2,
-            xsa_temporal,
         }
-    }
-
-    fn maybe_apply_xsa(&self, attn_out: &Tensor, self_v: &Tensor) -> Tensor {
-        if !self.xsa_temporal {
-            return attn_out.shallow_clone();
-        }
-
-        let self_v_dir = self_v
-            / self_v
-                .to_kind(Kind::Float)
-                .square()
-                .sum_dim_intlist([-1].as_slice(), true, Kind::Float)
-                .clamp_min(1e-6)
-                .sqrt()
-                .to_kind(self_v.kind());
-        attn_out
-            - (attn_out * &self_v_dir).sum_dim_intlist([-1].as_slice(), true, attn_out.kind())
-                * self_v_dir
     }
 
     fn forward(&self, x: &Tensor, x0: &Tensor, rope: &RotaryEmbedding, causal: bool) -> Tensor {
@@ -254,11 +227,7 @@ impl GqaBlock {
             None,
             true,
         );
-        let out = self
-            .maybe_apply_xsa(&out, &v)
-            .permute([0, 2, 1, 3])
-            .contiguous()
-            .reshape([b, s, _d]);
+        let out = out.permute([0, 2, 1, 3]).contiguous().reshape([b, s, _d]);
         let out = linear_with_same_dtype(&out, &self.attn_out);
         let out = &out * self.attn_scale.to_kind(out.kind()).view([1, 1, -1]);
         self.apply_ffn(&(&x + out))
@@ -325,11 +294,7 @@ impl GqaBlock {
             None,
             true,
         );
-        let out = self
-            .maybe_apply_xsa(&out, &v)
-            .permute([0, 2, 1, 3])
-            .contiguous()
-            .reshape(x.size());
+        let out = out.permute([0, 2, 1, 3]).contiguous().reshape(x.size());
         let attn_out = linear_with_same_dtype(&out, &self.attn_out);
         let attn_out = &attn_out * self.attn_scale.to_kind(attn_out.kind()).view([1, 1, -1]);
         let x = &x + attn_out;
@@ -349,17 +314,19 @@ impl GqaBlock {
         let x_suffix =
             x_suffix * mix.get(0).view([1, 1, -1]) + x0_suffix * mix.get(1).view([1, 1, -1]);
         let (q, suffix_k, suffix_v) = self.project_qkv(&x_suffix, rope, prefix_len);
-        let scale = 1.0 / (q.size()[3] as f64).sqrt();
-        let prefix_scores = q.matmul(&prefix_k.transpose(-2, -1)) * scale;
-        let suffix_scores =
-            (&q * &suffix_k).sum_dim_intlist([-1].as_slice(), true, q.kind()) * scale;
-        let scores = Tensor::cat(&[&prefix_scores, &suffix_scores], -1);
-        let weights = scores.softmax(-1, Kind::Float).to_kind(q.kind());
-        let prefix_weights = weights.narrow(-1, 0, prefix_len);
-        let suffix_weight = weights.narrow(-1, prefix_len, 1);
-        let out = prefix_weights.matmul(prefix_v) + suffix_weight * &suffix_v;
-        let out = self
-            .maybe_apply_xsa(&out, &suffix_v)
+        let all_k = Tensor::cat(&[prefix_k, &suffix_k], -2);
+        let all_v = Tensor::cat(&[prefix_v, &suffix_v], -2);
+        let out = Tensor::scaled_dot_product_attention(
+            &q,
+            &all_k,
+            &all_v,
+            None::<&Tensor>,
+            0.0,
+            false,
+            None,
+            true,
+        );
+        let out = out
             .permute([0, 2, 1, 3])
             .contiguous()
             .reshape(x_suffix.size());
@@ -567,8 +534,8 @@ fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i6
         out_features,
         nn::LinearConfig {
             ws_init: Init::Orthogonal { gain: 1.0 },
-            bs_init: Some(Init::Const(0.0)),
-            bias: true,
+            bs_init: None,
+            bias: false,
         },
     )
 }
@@ -585,8 +552,8 @@ fn linear_residual_out(
         out_features,
         nn::LinearConfig {
             ws_init: Init::Const(0.0),
-            bs_init: Some(Init::Const(0.0)),
-            bias: true,
+            bs_init: None,
+            bias: false,
         },
     )
 }
@@ -606,6 +573,7 @@ const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 = PRICE_DELTAS_PER_TICKER as i64
 pub(super) const LOG_STD_INIT: f64 = -1.0;
 pub(super) const LOG_STD_MIN: f64 = -2.995732273553991;
 pub(super) const LOG_STD_MAX: f64 = 0.04879016416943201;
+const VALUE_HEAD_INIT_GAIN: f64 = 0.25;
 const INTER_TICKER_AFTER: usize = 1;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
@@ -740,14 +708,12 @@ pub struct DebugMetrics {
 #[derive(Clone, Copy)]
 pub struct TradingModelConfig {
     pub variant: ModelVariant,
-    pub xsa_temporal: bool,
 }
 
 impl Default for TradingModelConfig {
     fn default() -> Self {
         Self {
             variant: ModelVariant::Base,
-            xsa_temporal: false,
         }
     }
 }
@@ -801,7 +767,6 @@ pub struct TradingModel {
     model_dim: i64,
     ff_dim: i64,
     patch_embed_weight: Tensor,
-    patch_embed_bias: Tensor,
     patch_config_ids: Tensor,
     patch_stream_proj: nn::Linear,
     input_ln: RMSNorm,
@@ -815,8 +780,8 @@ pub struct TradingModel {
     exo_feat_b: Tensor,
     endogenous_ticker_block: EndogenousTickerBlock,
     policy_mean_log_var: nn::Linear,
+    policy_log_var_offset: Tensor,
     value_proj: nn::Linear,
-    xsa_temporal: bool,
     device: tch::Device,
 }
 
@@ -855,10 +820,6 @@ impl TradingModel {
 
     pub fn variant(&self) -> ModelVariant {
         self.variant
-    }
-
-    pub fn xsa_temporal(&self) -> bool {
-        self.xsa_temporal
     }
 
     pub fn patch_seq_len(&self) -> i64 {
@@ -960,19 +921,14 @@ impl TradingModel {
                 stdev: xavier_std,
             },
         );
-        let patch_embed_bias = p.var(
-            "patch_embed_bias",
-            &[num_configs, spec.model_dim],
-            Init::Const(0.0),
-        );
         let patch_stream_proj = nn::linear(
             p / "patch_stream_proj",
             UNIFORM_STREAM_PATCH_SIZE + 1, // patch values + fill_fraction
             spec.model_dim,
             nn::LinearConfig {
                 ws_init: truncated_normal_init(UNIFORM_STREAM_PATCH_SIZE + 1, spec.model_dim),
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
+                bs_init: None,
+                bias: false,
             },
         );
         let input_ln = RMSNorm::new(&(p / "input_ln"), spec.model_dim, 1e-6);
@@ -997,7 +953,6 @@ impl TradingModel {
                     spec.model_dim,
                     spec.ff_dim,
                     init_scale,
-                    config.xsa_temporal,
                     i,
                 )
             })
@@ -1041,28 +996,26 @@ impl TradingModel {
                     mean: 0.0,
                     stdev: 0.01,
                 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
+                bs_init: None,
+                bias: false,
             },
         );
-        if let Some(bias) = &policy_mean_log_var.bs {
-            tch::no_grad(|| {
-                let _ = bias
-                    .narrow(0, ACTION_COUNT, ACTION_COUNT)
-                    .fill_(2.0 * LOG_STD_INIT);
-            });
-        }
+        let policy_log_var_offset = p.var(
+            "policy_log_var_offset",
+            &[ACTION_COUNT],
+            Init::Const(2.0 * LOG_STD_INIT),
+        );
         let value_proj = nn::linear(
             p / "value_proj",
             flat_all_tickers,
             NUM_BINS,
             nn::LinearConfig {
                 ws_init: Init::Uniform {
-                    lo: -1.0 / (flat_all_tickers as f64).sqrt(),
-                    up: 1.0 / (flat_all_tickers as f64).sqrt(),
+                    lo: -VALUE_HEAD_INIT_GAIN / (flat_all_tickers as f64).sqrt(),
+                    up: VALUE_HEAD_INIT_GAIN / (flat_all_tickers as f64).sqrt(),
                 },
-                bs_init: Some(Init::Const(0.0)),
-                bias: true,
+                bs_init: None,
+                bias: false,
             },
         );
         Self {
@@ -1073,7 +1026,6 @@ impl TradingModel {
             model_dim: spec.model_dim,
             ff_dim: spec.ff_dim,
             patch_embed_weight,
-            patch_embed_bias,
             patch_config_ids,
             patch_stream_proj,
             input_ln,
@@ -1087,8 +1039,8 @@ impl TradingModel {
             exo_feat_b,
             endogenous_ticker_block,
             policy_mean_log_var,
+            policy_log_var_offset,
             value_proj,
-            xsa_temporal: config.xsa_temporal,
             device: p.device(),
         }
     }
@@ -1230,15 +1182,12 @@ impl TradingModel {
         let weight_per_patch = self
             .patch_embed_weight
             .index_select(0, &self.patch_config_ids);
-        let bias_per_patch = self
-            .patch_embed_bias
-            .index_select(0, &self.patch_config_ids);
         let out = Tensor::einsum(
             "blm,lmd->bld",
             &[&enriched, &weight_per_patch],
             None::<&[i64]>,
         );
-        out + bias_per_patch.unsqueeze(0)
+        out
     }
 
     fn patch_embed_stream_batch(&self, patch_vals: &Tensor, fill_counts: &Tensor) -> Tensor {
