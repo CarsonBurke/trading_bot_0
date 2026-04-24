@@ -15,14 +15,14 @@ use super::macro_ind::MacroIndicators;
 use super::momentum::MomentumIndicators;
 use crate::{
     data::historical::{get_historical_data, get_historical_series},
-    data::universe::training_universe,
+    data::universe::cached_eligible_training_universe,
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::constants::{
-        ACTION_COUNT, ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS,
-        STEPS_PER_EPISODE, TICKERS_COUNT,
+        ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, STEPS_PER_EPISODE,
+        TICKERS_COUNT,
     },
     types::Account,
-    utils::{create_folder_if_not_exists, get_mapped_price_deltas, get_price_deltas},
+    utils::{create_folder_if_not_exists, get_price_deltas},
 };
 use std::sync::Arc;
 
@@ -60,6 +60,20 @@ pub struct Env {
 
 pub const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
 
+fn sample_training_tickers(rng: &mut impl Rng) -> Vec<String> {
+    let universe = cached_eligible_training_universe();
+    assert!(
+        universe.len() >= TICKERS_COUNT as usize,
+        "need at least {} cached eligible tickers, found {}",
+        TICKERS_COUNT,
+        universe.len()
+    );
+    universe
+        .choose_multiple(rng, TICKERS_COUNT as usize)
+        .cloned()
+        .collect()
+}
+
 impl Env {
     pub const STARTING_CASH: f64 = 10_000.0;
 
@@ -77,10 +91,7 @@ impl Env {
         gens_path: Option<String>,
     ) -> Self {
         let rng = &mut rand::rng();
-        let tickers = training_universe()
-            .choose_multiple(rng, TICKERS_COUNT as usize)
-            .map(|ticker| ticker.to_string())
-            .collect();
+        let tickers = sample_training_tickers(rng);
 
         Self::new_with_tickers_and_recording(tickers, random_start, record_history_io, gens_path)
     }
@@ -290,7 +301,7 @@ impl Env {
         }
     }
 
-    pub fn reset(&mut self) -> (Tensor, Tensor) {
+    fn reset_existing_episode_state(&mut self) {
         let max_start = self
             .total_data_length
             .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
@@ -330,6 +341,10 @@ impl Env {
         // Shuffle ticker permutation for this episode
         let mut rng = rand::rng();
         self.ticker_perm.shuffle(&mut rng);
+    }
+
+    pub fn reset(&mut self) -> (Tensor, Tensor) {
+        self.reset_existing_episode_state();
 
         let (price_deltas, static_obs) = self.get_next_obs();
         let price_deltas_tensor = Tensor::from_slice(&price_deltas)
@@ -342,147 +357,12 @@ impl Env {
 
     /// Reset for VecEnv - returns raw vectors instead of tensors
     pub fn reset_single(&mut self) -> (Vec<f32>, Vec<f32>) {
-        let rng = &mut rand::rng();
-        let tickers: Vec<String> = training_universe()
-            .choose_multiple(rng, TICKERS_COUNT as usize)
-            .map(|ticker| ticker.to_string())
-            .collect();
-
-        // Reload price data and indicators for new tickers
-        let ticker_refs = tickers.iter().map(|t| t.as_str()).collect::<Vec<&str>>();
-        let mapped_bars = get_historical_data(Some(&ticker_refs));
-        self.prices.clear();
-        self.price_deltas.clear();
-        self.prices.reserve(tickers.len());
-        self.price_deltas.reserve(tickers.len());
-        for (i, ticker) in tickers.iter().enumerate() {
-            if let Some((cached_prices, cached_deltas)) = get_historical_series(ticker) {
-                self.prices.push(cached_prices);
-                self.price_deltas.push(cached_deltas);
-            } else {
-                self.prices
-                    .push(mapped_bars[i].iter().map(|bar| bar.close).collect());
-                self.price_deltas.push(get_price_deltas(&mapped_bars[i]));
-            }
-        }
-        self.total_data_length = self.prices[0].len();
-
-        // Reload momentum indicators (cached)
-        self.momentum = tickers
-            .iter()
-            .zip(self.prices.iter())
-            .map(|(ticker, p)| MomentumIndicators::get_or_compute(ticker, p))
-            .collect();
-
-        // Reload earnings indicators (cached)
-        let bar_dates: Vec<Vec<String>> = mapped_bars
-            .iter()
-            .map(|bars| {
-                bars.iter()
-                    .map(|b| {
-                        format!(
-                            "{:04}-{:02}-{:02}",
-                            b.date.year(),
-                            b.date.month() as u8,
-                            b.date.day()
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-        self.earnings = tickers
-            .iter()
-            .enumerate()
-            .map(|(i, ticker)| {
-                if let Some(cached) = EarningsIndicators::get_cached(ticker, self.prices[i].len()) {
-                    cached
-                } else {
-                    let reports = crate::data::get_earnings_data_any(ticker);
-                    EarningsIndicators::get_or_compute(
-                        ticker,
-                        &reports,
-                        &bar_dates[i],
-                        &self.prices[i],
-                    )
-                }
-            })
-            .collect();
-
-        self.tickers = tickers;
-
-        let max_start = self
-            .total_data_length
-            .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
-
-        self.episode_start_offset = if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
-            let mut rng = rand::rng();
-            rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
-        } else {
-            PRICE_DELTAS_PER_TICKER
-        };
-
-        self.step = 0;
-        self.max_step =
-            (self.total_data_length - self.episode_start_offset).min(STEPS_PER_EPISODE) - 2;
-
-        self.account = Account::new(Self::STARTING_CASH, self.tickers.len());
-        self.episode_start = Instant::now();
-        self.episode_history = EpisodeHistory::new(self.tickers.len());
-        self.action_history.clear();
-
-        self.peak_assets = Self::STARTING_CASH;
-        self.last_reward = 0.0;
-        self.last_fill_ratio = 1.0;
-        self.trade_activity_ema.fill(0.0);
-        self.steps_since_trade.fill(0);
-        self.position_open_step.fill(None);
-        let n = self.tickers.len();
-        self.target_weights = vec![0.0; n + 1];
-        self.target_weights[n] = 1.0;
-        self.realized_weights = vec![0.0; n + 1];
-        self.realized_weights[n] = 1.0;
-
-        let mut rng = rand::rng();
-        self.ticker_perm.shuffle(&mut rng);
-
+        self.reset_existing_episode_state();
         self.get_next_obs()
     }
 
     pub fn reset_step_single(&mut self) -> (Vec<f32>, Vec<f32>) {
-        let max_start = self
-            .total_data_length
-            .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
-
-        self.episode_start_offset = if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
-            let mut rng = rand::rng();
-            rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
-        } else {
-            PRICE_DELTAS_PER_TICKER
-        };
-
-        self.step = 0;
-        self.max_step =
-            (self.total_data_length - self.episode_start_offset).min(STEPS_PER_EPISODE) - 2;
-
-        self.account = Account::new(Self::STARTING_CASH, self.tickers.len());
-        self.episode_start = Instant::now();
-        self.episode_history = EpisodeHistory::new(self.tickers.len());
-        self.action_history.clear();
-
-        self.peak_assets = Self::STARTING_CASH;
-        self.last_reward = 0.0;
-        self.last_fill_ratio = 1.0;
-        self.trade_activity_ema.fill(0.0);
-        self.steps_since_trade.fill(0);
-        self.position_open_step.fill(None);
-        let n = self.tickers.len();
-        self.target_weights = vec![0.0; n + 1];
-        self.target_weights[n] = 1.0;
-        self.realized_weights = vec![0.0; n + 1];
-        self.realized_weights[n] = 1.0;
-
-        let mut rng = rand::rng();
-        self.ticker_perm.shuffle(&mut rng);
+        self.reset_existing_episode_state();
 
         let (step_deltas, static_obs) = self.get_next_step_obs();
         (step_deltas.to_vec(), static_obs.to_vec())
