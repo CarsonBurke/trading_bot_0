@@ -38,8 +38,9 @@ pub struct ProcessManagerState {
 
 impl ProcessManagerState {
     pub fn new() -> Self {
-        let active_run =
-            RunDir::latest_with_data(RUNS_PATH).or_else(|| RunDir::latest(RUNS_PATH).ok());
+        let active_run = detect_active_training_run(None)
+            .or_else(|| RunDir::latest_with_data(RUNS_PATH))
+            .or_else(|| RunDir::latest(RUNS_PATH).ok());
         Self {
             inference_process: None,
             training_process: None,
@@ -64,6 +65,9 @@ impl ProcessManagerState {
                 }
                 Ok(None) => {
                     self.cached_training_running = true;
+                    self.active_run = detect_active_training_run(Some(child.id()))
+                        .or_else(|| self.active_run.take())
+                        .or_else(|| RunDir::latest(RUNS_PATH).ok());
                     return true;
                 }
                 Err(_) => {
@@ -75,7 +79,9 @@ impl ProcessManagerState {
         if !list_training_pids().is_empty() {
             self.cached_training_running = true;
             self.active_run =
-                RunDir::latest_with_data(RUNS_PATH).or_else(|| RunDir::latest(RUNS_PATH).ok());
+                detect_active_training_run(self.training_process.as_ref().map(|c| c.id()))
+                    .or_else(|| RunDir::latest_with_data(RUNS_PATH))
+                    .or_else(|| RunDir::latest(RUNS_PATH).ok());
             return true;
         }
 
@@ -217,6 +223,13 @@ impl ProcessManagerState {
 }
 
 fn list_training_pids() -> Vec<u32> {
+    list_training_processes()
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+fn list_training_processes() -> Vec<(u32, String)> {
     let Ok(output) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
         return Vec::new();
     };
@@ -229,9 +242,59 @@ fn list_training_pids() -> Vec<u32> {
             let (pid, cmdline) = trimmed.split_at(split_idx);
             let pid = pid.parse::<u32>().ok()?;
             let cmdline = cmdline.trim();
-            is_training_cmdline(cmdline).then_some(pid)
+            is_training_cmdline(cmdline).then_some((pid, cmdline.to_string()))
         })
         .collect()
+}
+
+fn detect_active_training_run(preferred_pid: Option<u32>) -> Option<RunDir> {
+    let mut processes = list_training_processes();
+    processes.sort_by_key(|(pid, _)| *pid);
+
+    if let Some(pid) = preferred_pid {
+        if let Some((_, cmdline)) = processes.iter().find(|(candidate, _)| *candidate == pid) {
+            if let Some(run_dir) = parse_run_dir_from_cmdline(cmdline) {
+                return Some(run_dir);
+            }
+        }
+    }
+
+    for (_, cmdline) in processes.into_iter().rev() {
+        if let Some(run_dir) = parse_run_dir_from_cmdline(&cmdline) {
+            return Some(run_dir);
+        }
+    }
+
+    None
+}
+
+fn parse_run_dir_from_cmdline(cmdline: &str) -> Option<RunDir> {
+    let run_name = cmdline
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|window| (window[0] == "--run").then_some(window[1]))
+        .or_else(|| {
+            cmdline
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix("--run="))
+        })?;
+
+    run_dir_from_name(run_name)
+}
+
+fn run_dir_from_name(name: &str) -> Option<RunDir> {
+    let root = Path::new(RUNS_PATH).join(name);
+    let gens = root.join("gens");
+    let weights = root.join("weights");
+    let log_file = root.join("training.log");
+
+    (root.is_dir() && gens.is_dir() && weights.is_dir()).then_some(RunDir {
+        root,
+        gens,
+        weights,
+        log_file,
+    })
 }
 
 fn terminate_process_tree(pid: u32) {

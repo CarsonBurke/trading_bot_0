@@ -462,7 +462,7 @@ impl App {
                     num(b).cmp(&num(a))
                 });
                 let is_active = active_name.as_deref() == Some(&name);
-                if gen_count == 0 && weights.is_empty() {
+                if gen_count == 0 && weights.is_empty() && !is_active {
                     return None;
                 }
                 Some(RunInfo {
