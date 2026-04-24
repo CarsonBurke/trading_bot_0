@@ -19,7 +19,7 @@ use crate::torch::muon::{Muon, MuonConfig};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 /// NorMuon LR for 2D weight matrices (orthogonalized updates, RMS-match scaling).
-const MUON_LR: f64 = 2e-3;
+const MUON_LR: f64 = 3e-4;
 /// AdamW LR for 1D params (biases, norms) and the standalone rho scalar.
 const LEARNING_RATE: f64 = 3e-4;
 pub const DEFAULT_NPROCS: i64 = 16;

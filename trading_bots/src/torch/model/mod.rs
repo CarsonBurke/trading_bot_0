@@ -95,7 +95,7 @@ const GQA_NUM_Q_HEADS: i64 = 4;
 const GQA_NUM_KV_HEADS: i64 = 4;
 const CA_NUM_HEADS: i64 = 2;
 const CA_HEAD_DIM: i64 = 128;
-const QK_GAIN_INIT: f64 = 3.0;
+const QK_GAIN_INIT: f64 = 1.5;
 const ROPE_DIMS: i64 = 16;
 
 fn rotate_half(x: &Tensor) -> Tensor {
@@ -354,7 +354,7 @@ impl GqaBlock {
         let suffix_scores =
             (&q * &suffix_k).sum_dim_intlist([-1].as_slice(), true, q.kind()) * scale;
         let scores = Tensor::cat(&[&prefix_scores, &suffix_scores], -1);
-        let weights = scores.softmax(-1, q.kind());
+        let weights = scores.softmax(-1, Kind::Float).to_kind(q.kind());
         let prefix_weights = weights.narrow(-1, 0, prefix_len);
         let suffix_weight = weights.narrow(-1, prefix_len, 1);
         let out = prefix_weights.matmul(prefix_v) + suffix_weight * &suffix_v;
@@ -910,6 +910,13 @@ impl TradingModel {
 
     pub fn new_with_config(p: &nn::Path, config: TradingModelConfig) -> Self {
         let spec = model_spec(config.variant);
+        assert_eq!(
+            spec.model_dim % GQA_NUM_Q_HEADS,
+            0,
+            "model_dim must divide evenly across GQA query heads"
+        );
+        assert!(GQA_NUM_KV_HEADS > 0, "GQA must have at least one KV head");
+        assert_eq!(ROPE_DIMS % 2, 0, "RoPE dimensions must be even");
         let gqa_layers_count = spec.gqa_layers;
         // SA + FFN per layer = 2 sublayers each, plus 1 CA sublayer after layer 0
         let num_residual_sublayers = gqa_layers_count * 2 + 1;
@@ -917,9 +924,17 @@ impl TradingModel {
         let patch_configs = spec.patch_configs;
         let (total_days, seq_len) = compute_patch_totals(patch_configs);
         if config.variant == ModelVariant::UniformStream {
-            assert!(
-                total_days >= PRICE_DELTAS_PER_TICKER as i64,
-                "uniform stream layout must cover the raw observation history"
+            assert_eq!(
+                UNIFORM_STREAM_LAYOUT_LEN, PRICE_DELTAS_PER_TICKER as i64,
+                "uniform stream layout must exactly match the raw observation history"
+            );
+            assert_eq!(
+                UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL, UNIFORM_STREAM_PATCH_SIZE,
+                "uniform stream bootstrap must fill the live patch exactly"
+            );
+            assert_eq!(
+                total_days, UNIFORM_STREAM_LAYOUT_LEN,
+                "uniform stream patch configs must sum to the layout length"
             );
         } else {
             assert!(
@@ -1042,7 +1057,10 @@ impl TradingModel {
             flat_all_tickers,
             NUM_BINS,
             nn::LinearConfig {
-                ws_init: Init::Const(0.0),
+                ws_init: Init::Uniform {
+                    lo: -1.0 / (flat_all_tickers as f64).sqrt(),
+                    up: 1.0 / (flat_all_tickers as f64).sqrt(),
+                },
                 bs_init: Some(Init::Const(0.0)),
                 bias: true,
             },
