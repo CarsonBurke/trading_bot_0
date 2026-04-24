@@ -21,6 +21,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let is_training = app.is_training_running();
     let current_episode = app.get_current_episode();
+    let has_progress = app.has_training_progress();
 
     let mut title_spans = vec![Span::styled(
         " Inference Episodes ",
@@ -31,6 +32,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     title_spans.extend(episode_status::episode_status_spans(
         is_training,
         current_episode,
+        has_progress,
     ));
 
     let title =

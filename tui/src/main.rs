@@ -373,6 +373,15 @@ impl App {
         None
     }
 
+    pub fn has_training_progress(&self) -> bool {
+        self.logs_page.training_output.iter().rev().any(|line| {
+            line.contains("ppo update:")
+                || line.contains("Epoch ")
+                || line.contains("Policy:")
+                || (line.contains("Episode") && line.contains("Total Assets"))
+        })
+    }
+
     fn maybe_refresh(&mut self) -> Result<()> {
         let now = Instant::now();
         if now.duration_since(self.last_refresh) >= Duration::from_secs(1) {
@@ -1342,7 +1351,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         AppMode::ChartViewer => {
             let is_training = app.is_training_running();
             let current_episode = app.get_current_episode();
-            app.chart_viewer.render(f, is_training, current_episode);
+            let has_progress = app.has_training_progress();
+            app.chart_viewer
+                .render(f, is_training, current_episode, has_progress);
         }
         AppMode::Logs => pages::logs_page::render(f, app),
         AppMode::ModelObservations => pages::model_observations_page::render(f, app),

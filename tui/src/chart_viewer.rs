@@ -578,13 +578,19 @@ impl ChartViewer {
         self.viewing_mode == ViewingMode::MetaCharts
     }
 
-    pub fn render(&mut self, f: &mut Frame, is_training: bool, current_episode: Option<usize>) {
+    pub fn render(
+        &mut self,
+        f: &mut Frame,
+        is_training: bool,
+        current_episode: Option<usize>,
+        has_progress: bool,
+    ) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
             .split(f.area());
 
-        self.render_list(f, chunks[0], is_training, current_episode);
+        self.render_list(f, chunks[0], is_training, current_episode, has_progress);
         self.render_preview(f, chunks[1]);
     }
 
@@ -594,6 +600,7 @@ impl ChartViewer {
         area: Rect,
         is_training: bool,
         current_episode: Option<usize>,
+        has_progress: bool,
     ) {
         let show_filter = self.viewing_mode == ViewingMode::MetaCharts;
 
@@ -629,6 +636,7 @@ impl ChartViewer {
                 title_spans.extend(episode_status::episode_status_spans(
                     is_training,
                     current_episode,
+                    has_progress,
                 ));
                 Paragraph::new(Line::from(title_spans))
             }
@@ -642,6 +650,7 @@ impl ChartViewer {
                 title_spans.extend(episode_status::episode_status_spans(
                     is_training,
                     current_episode,
+                    has_progress,
                 ));
                 Paragraph::new(Line::from(title_spans))
             }
@@ -655,6 +664,7 @@ impl ChartViewer {
                 title_spans.extend(episode_status::episode_status_spans(
                     is_training,
                     current_episode,
+                    has_progress,
                 ));
                 Paragraph::new(Line::from(title_spans))
             }

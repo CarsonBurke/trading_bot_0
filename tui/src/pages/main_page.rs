@@ -20,6 +20,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let is_training_for_title = app.is_training_running();
     let current_episode_for_title = app.get_current_episode();
+    let has_progress_for_title = app.has_training_progress();
 
     let mut title_spans = vec![Span::styled(
         " Trading Bot TUI ",
@@ -30,6 +31,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     title_spans.extend(episode_status::episode_status_spans(
         is_training_for_title,
         current_episode_for_title,
+        has_progress_for_title,
     ));
     title_spans.push(Span::raw("  "));
     title_spans.push(Span::styled(
