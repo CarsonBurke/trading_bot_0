@@ -13,6 +13,10 @@ const RMS_MATCH_COEF: f64 = 0.2;
 
 pub struct MuonConfig {
     pub lr: f64,
+    pub use_muon_for_2d: bool,
+    /// Optional per-parameter mask for callers that only want Muon on a named
+    /// subset of 2D matrices. Non-selected params use AdamW.
+    pub muon_mask: Option<Vec<bool>>,
     /// EMA coef for first moment (momentum before NS5).
     pub beta1: f64,
     /// EMA coef for per-row second moment of NS5 output.
@@ -32,6 +36,8 @@ impl Default for MuonConfig {
             // NorMuon effective per-entry step is ~0.2*lr, shape-invariant.
             // Comparable to AdamW lr=1e-3 at NorMuon lr=5e-3.
             lr: 5e-3,
+            use_muon_for_2d: true,
+            muon_mask: None,
             beta1: 0.95,
             beta2: 0.95,
             eps: 1e-8,
@@ -120,11 +126,23 @@ fn newtonschulz5(g: &Tensor) -> Tensor {
 impl Muon {
     pub fn new(trainable_vars: &[Tensor], cfg: MuonConfig) -> Self {
         let params: Vec<Tensor> = trainable_vars.iter().map(|t| t.shallow_clone()).collect();
+        if let Some(mask) = &cfg.muon_mask {
+            assert_eq!(
+                mask.len(),
+                params.len(),
+                "MuonConfig::muon_mask must match trainable_vars length"
+            );
+        }
         let mut entries_2d = Vec::new();
         let mut adamw_indices = Vec::new();
 
         for (i, p) in params.iter().enumerate() {
-            if p.dim() == 2 {
+            let selected_for_muon = cfg
+                .muon_mask
+                .as_ref()
+                .map(|mask| mask[i])
+                .unwrap_or(cfg.use_muon_for_2d && p.dim() == 2);
+            if cfg.use_muon_for_2d && selected_for_muon && p.dim() == 2 {
                 let size = p.size();
                 let (m, n) = (size[0], size[1]);
                 let kind = p.kind();
@@ -141,11 +159,18 @@ impl Muon {
             }
         }
 
-        println!(
-            "NorMuon optimizer: {} 2D params (per-param NS5), {} other params (AdamW)",
-            entries_2d.len(),
-            adamw_indices.len()
-        );
+        if cfg.use_muon_for_2d {
+            println!(
+                "NorMuon optimizer: {} 2D params (per-param NS5), {} other params (AdamW)",
+                entries_2d.len(),
+                adamw_indices.len()
+            );
+        } else {
+            println!(
+                "AdamW optimizer: {} params (Muon disabled for root-cause logging)",
+                adamw_indices.len()
+            );
+        }
 
         Self {
             cfg,

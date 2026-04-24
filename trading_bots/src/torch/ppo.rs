@@ -22,6 +22,7 @@ use shared::{paths::RUNS_PATH, run_dir::RunDir};
 const MUON_LR: f64 = 3e-4;
 /// AdamW LR for 1D params (biases, norms) and the standalone rho scalar.
 const LEARNING_RATE: f64 = 3e-4;
+const USE_MUON: bool = true;
 pub const DEFAULT_NPROCS: i64 = 16;
 const DEFAULT_SEQ_LEN: i64 = 2000;
 const DEFAULT_TOTAL_SAMPLES: i64 = DEFAULT_NPROCS * DEFAULT_SEQ_LEN;
@@ -134,6 +135,37 @@ fn clip_grad_norm_on_device(
     })
 }
 
+fn named_trainable_variables(vs: &nn::VarStore) -> Vec<(String, Tensor)> {
+    let mut vars: Vec<(String, Tensor)> = vs
+        .variables()
+        .into_iter()
+        .filter(|(_, tensor)| tensor.requires_grad())
+        .collect();
+    vars.sort_by(|a, b| a.0.cmp(&b.0));
+    vars
+}
+
+fn is_gqa_block_weight(name: &str, tensor: &Tensor) -> bool {
+    if tensor.dim() != 2 {
+        return false;
+    }
+
+    let Some(rest) = name.strip_prefix("gqa_") else {
+        return false;
+    };
+    let Some((layer_idx, suffix)) = rest.split_once('.') else {
+        return false;
+    };
+    if !layer_idx.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    matches!(
+        suffix,
+        "attn_qkv.weight" | "attn_out.weight" | "ffn_fc1.weight" | "ffn_fc2.weight"
+    )
+}
+
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
     let has_inf = t.isinf().any().int64_value(&[]) != 0;
@@ -148,6 +180,94 @@ fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool
         return false;
     }
     true
+}
+
+fn tensor_is_finite(t: &Tensor) -> bool {
+    t.isfinite().all().int64_value(&[]) != 0
+}
+
+fn tensor_summary(name: &str, t: &Tensor) -> String {
+    let mean = t.mean(Kind::Float).double_value(&[]);
+    let min = t.min().double_value(&[]);
+    let max = t.max().double_value(&[]);
+    format!(
+        "{} shape={:?} mean={:.6} min={:.6} max={:.6}",
+        name,
+        t.size(),
+        mean,
+        min,
+        max
+    )
+}
+
+fn log_first_non_finite_tensor(
+    logged: &mut bool,
+    stage: &str,
+    episode: usize,
+    epoch: i64,
+    chunk_i: usize,
+    tensors: &[(&str, &Tensor)],
+) {
+    if *logged {
+        return;
+    }
+    for (name, tensor) in tensors {
+        if !tensor_is_finite(tensor) {
+            println!(
+                "NUMERIC ROOT CAUSE: stage={} episode={} epoch={} chunk={} {}",
+                stage,
+                episode,
+                epoch + 1,
+                chunk_i,
+                tensor_summary(name, tensor)
+            );
+            for (other_name, other_tensor) in tensors {
+                println!("  {}", tensor_summary(other_name, other_tensor));
+            }
+            *logged = true;
+            return;
+        }
+    }
+}
+
+fn log_first_non_finite_var(
+    logged: &mut bool,
+    stage: &str,
+    episode: usize,
+    epoch: i64,
+    chunk_i: usize,
+    vars: &[Tensor],
+    use_grad: bool,
+) {
+    if *logged {
+        return;
+    }
+    for (idx, var) in vars.iter().enumerate() {
+        let candidate = if use_grad {
+            var.grad()
+        } else {
+            var.shallow_clone()
+        };
+        if !candidate.defined() || tensor_is_finite(&candidate) {
+            continue;
+        }
+        println!(
+            "NUMERIC ROOT CAUSE: stage={} episode={} epoch={} chunk={} param_idx={} param_shape={:?}",
+            stage,
+            episode,
+            epoch + 1,
+            chunk_i,
+            idx,
+            var.size()
+        );
+        println!(
+            "  {}",
+            tensor_summary(if use_grad { "grad" } else { "param" }, &candidate)
+        );
+        println!("  {}", tensor_summary("param_snapshot", var));
+        *logged = true;
+        return;
+    }
 }
 
 fn sample_rollout_actions_from_output(
@@ -322,7 +442,6 @@ fn compute_action_std_stats(
 pub async fn train(
     weights_path: Option<&str>,
     model_variant: ModelVariant,
-    xsa_temporal: bool,
     run_name: Option<String>,
 ) {
     let rollout = rollout_geometry();
@@ -351,7 +470,6 @@ pub async fn train(
     let device = tch::Device::cuda_if_available();
     println!("device is cuda: {}", device.is_cuda());
     configure_cuda();
-    println!("temporal xsa: {}", xsa_temporal);
     println!(
         "ppo rollout geometry: nprocs={} seq_len={} total_samples={} chunk_len={}",
         rollout.nprocs, rollout.seq_len, rollout.total_samples, rollout.ppo_chunk_len
@@ -361,7 +479,6 @@ pub async fn train(
         &vs.root(),
         TradingModelConfig {
             variant: model_variant,
-            xsa_temporal,
             ..TradingModelConfig::default()
         },
     );
@@ -414,13 +531,35 @@ pub async fn train(
     let gens_path = run_dir.gens.to_string_lossy().to_string();
     println!("Run dir: {}", run_dir.root.display());
 
-    let trainable_vars = vs.trainable_variables();
+    let named_trainable_vars = named_trainable_variables(&vs);
+    let trainable_vars: Vec<Tensor> = named_trainable_vars
+        .iter()
+        .map(|(_, tensor)| tensor.shallow_clone())
+        .collect();
+    let muon_mask: Vec<bool> = named_trainable_vars
+        .iter()
+        .map(|(name, tensor)| is_gqa_block_weight(name, tensor))
+        .collect();
+    if USE_MUON {
+        let muon_names: Vec<&str> = named_trainable_vars
+            .iter()
+            .zip(muon_mask.iter())
+            .filter_map(|((name, _), selected)| selected.then_some(name.as_str()))
+            .collect();
+        println!(
+            "Muon param scope: {} GQA block matrices; AdamW handles heads, embeddings, exogenous, and control tensors",
+            muon_names.len()
+        );
+        println!("Muon params: {}", muon_names.join(", "));
+    }
     let mut opt = Muon::new(
         &trainable_vars,
         MuonConfig {
             lr: MUON_LR,
+            use_muon_for_2d: USE_MUON,
+            muon_mask: Some(muon_mask),
             adamw_lr: LEARNING_RATE,
-            adamw_eps: 1e-5,
+            adamw_eps: 1e-6,
             ..MuonConfig::default()
         },
     );
@@ -794,6 +933,7 @@ pub async fn train(
 
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
+        let mut logged_numeric_root_cause = false;
 
         let mut last_minibatch_approx_kl = 0.0f64;
         let mut perm_host: Vec<i64> = (0..total_chunks).collect();
@@ -963,6 +1103,25 @@ pub async fn train(
                 let ratio = log_ratio.exp();
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_LOW, 1.0 + PPO_CLIP_HIGH);
 
+                log_first_non_finite_tensor(
+                    &mut logged_numeric_root_cause,
+                    "forward",
+                    episode,
+                    _epoch,
+                    chunk_i,
+                    &[
+                        ("action_mean", &action_mean),
+                        ("action_std", &action_std),
+                        ("action_log_probs", &action_log_probs),
+                        ("old_log_probs", &old_log_probs_flat),
+                        ("log_ratio", &log_ratio),
+                        ("ratio", &ratio),
+                        ("new_value_logits", &new_value_logits),
+                        ("adv_flat", &adv_flat),
+                        ("ret_flat", &ret_flat),
+                    ],
+                );
+
                 let action_loss =
                     -Tensor::min_other(&(&ratio * &adv_flat), &(&ratio_clipped * &adv_flat))
                         .mean(Kind::Float);
@@ -997,12 +1156,38 @@ pub async fn train(
                     Tensor::zeros([], (Kind::Float, device))
                 };
 
-                let total_loss = ppo_loss + alpha_loss;
+                let total_loss = ppo_loss.shallow_clone() + alpha_loss.shallow_clone();
+
+                log_first_non_finite_tensor(
+                    &mut logged_numeric_root_cause,
+                    "loss",
+                    episode,
+                    _epoch,
+                    chunk_i,
+                    &[
+                        ("action_loss", &action_loss),
+                        ("value_loss", &value_loss),
+                        ("dist_entropy", &dist_entropy),
+                        ("ppo_loss", &ppo_loss),
+                        ("alpha_loss", &alpha_loss),
+                        ("total_loss", &total_loss),
+                    ],
+                );
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
                 total_loss.backward();
                 bwd_time_us += bwd_start.elapsed().as_micros() as u64;
+
+                log_first_non_finite_var(
+                    &mut logged_numeric_root_cause,
+                    "grads_after_backward",
+                    episode,
+                    _epoch,
+                    chunk_i,
+                    &trainable_vars,
+                    true,
+                );
 
                 let approx_kl_val =
                     tch::no_grad(|| (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float));
@@ -1056,6 +1241,15 @@ pub async fn train(
                 grad_norm_count += 1;
 
                 opt.step();
+                log_first_non_finite_var(
+                    &mut logged_numeric_root_cause,
+                    "params_after_step",
+                    episode,
+                    _epoch,
+                    chunk_i,
+                    &trainable_vars,
+                    false,
+                );
                 if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let max_delta_rho = MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
                     tch::no_grad(|| {
