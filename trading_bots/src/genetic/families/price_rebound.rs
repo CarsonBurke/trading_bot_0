@@ -676,7 +676,10 @@ fn sell_score(genome: &Genome, ctx: &DecisionContext) -> f64 {
         (
             weighted_score(&[
                 (benchmark_lag, genome.genes[Gene::SellPnlWeight]),
-                (relative_drawdown, genome.genes[Gene::RelativeDrawdownWeight]),
+                (
+                    relative_drawdown,
+                    genome.genes[Gene::RelativeDrawdownWeight],
+                ),
             ]),
             1.0,
         ),
@@ -735,12 +738,16 @@ fn target_signal(genome: &Genome, ctx: &DecisionContext) -> f64 {
         + relative_outperformance * genome.genes[Gene::TargetRelativeWeight]
         + relative_momentum * genome.genes[Gene::RelativeMomentumWeight]
         + relative_recovery * genome.genes[Gene::RelativeRecoveryWeight];
-    let opposing = sell_signal * genome.genes[Gene::SellPercent] * genome.genes[Gene::TargetSellWeight]
-        + reentry_penalty * genome.genes[Gene::TargetReentryWeight]
-        + relative_drawdown * genome.genes[Gene::RelativeDrawdownWeight] * 0.35;
+    let opposing =
+        sell_signal * genome.genes[Gene::SellPercent] * genome.genes[Gene::TargetSellWeight]
+            + reentry_penalty * genome.genes[Gene::TargetReentryWeight]
+            + relative_drawdown * genome.genes[Gene::RelativeDrawdownWeight] * 0.35;
     let balance = supportive - opposing;
     let market_fit = weighted_score(&[
-        (setup_signal.min(1.6), genome.genes[Gene::MarketFitSetupWeight]),
+        (
+            setup_signal.min(1.6),
+            genome.genes[Gene::MarketFitSetupWeight],
+        ),
         (buy_signal.min(1.6), genome.genes[Gene::MarketFitBuyWeight]),
         (
             (relative_outperformance + relative_momentum + relative_recovery).min(1.6),
@@ -810,7 +817,11 @@ fn relative_forgiveness(genome: &Genome, ctx: &DecisionContext) -> f64 {
     genome.genes[Gene::RelativeForgivenessPct] * (0.35 + early_life_scale * 0.65)
 }
 
-fn cash_desirability(cash_variant: CashVariant, genome: &Genome, contexts: &[DecisionContext]) -> f64 {
+fn cash_desirability(
+    cash_variant: CashVariant,
+    genome: &Genome,
+    contexts: &[DecisionContext],
+) -> f64 {
     let base = genome.genes[Gene::CashBias] + genome.genes[Gene::CorePositionFraction] * 0.2;
     if contexts.is_empty() {
         return base;
@@ -850,9 +861,7 @@ fn cash_desirability(cash_variant: CashVariant, genome: &Genome, contexts: &[Dec
 
     let cash_pressure = match cash_variant {
         CashVariant::Static => 0.0,
-        CashVariant::Breadth => {
-            (1.0 - strong_fraction) * 0.85 + (0.45 - mean).max(0.0) * 0.75
-        }
+        CashVariant::Breadth => (1.0 - strong_fraction) * 0.85 + (0.45 - mean).max(0.0) * 0.75,
         CashVariant::LeaderGap => {
             let leader_gap = (top - second).max(0.0);
             (0.85 - top).max(0.0) * 0.9 + (0.35 - leader_gap).max(0.0) * 1.1

@@ -804,12 +804,17 @@ impl TickerRuntimeState {
     }
 
     fn benchmark_return_since_entry_pct(&self, benchmark_assets: f64) -> Option<f64> {
-        self.position_open_benchmark_assets.map(|entry_benchmark_assets| {
-            ((benchmark_assets / entry_benchmark_assets.max(f64::EPSILON)) - 1.0) * 100.0
-        })
+        self.position_open_benchmark_assets
+            .map(|entry_benchmark_assets| {
+                ((benchmark_assets / entry_benchmark_assets.max(f64::EPSILON)) - 1.0) * 100.0
+            })
     }
 
-    fn observe_relative_performance(&mut self, index: usize, excess_return_since_entry_pct: Option<f64>) {
+    fn observe_relative_performance(
+        &mut self,
+        index: usize,
+        excess_return_since_entry_pct: Option<f64>,
+    ) {
         match excess_return_since_entry_pct {
             Some(excess_return_pct) => {
                 if self.position_entry_index.is_none() {
@@ -843,6 +848,7 @@ impl TickerRuntimeState {
     }
 
     fn bars_since_entry(&self, index: usize) -> Option<usize> {
-        self.position_entry_index.map(|entry_index| index.saturating_sub(entry_index))
+        self.position_entry_index
+            .map(|entry_index| index.saturating_sub(entry_index))
     }
 }

@@ -18,8 +18,7 @@ pub use families::{
     price_rebound::{
         CashBreadthFamily as PriceReboundCashBreadthFamily,
         CashLeaderGapFamily as PriceReboundCashLeaderGapFamily,
-        CashWeakRegimeFamily as PriceReboundCashWeakRegimeFamily,
-        Family as PriceReboundFamily,
+        CashWeakRegimeFamily as PriceReboundCashWeakRegimeFamily, Family as PriceReboundFamily,
     },
     rsi_rebound::Family as RsiReboundFamily,
     trend_breakout::Family as TrendBreakoutFamily,
