@@ -13,7 +13,6 @@ pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: Device,
     model_variant: ModelVariant,
-    xsa_temporal: bool,
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
     configure_cuda();
     let mut vs = nn::VarStore::new(device);
@@ -21,7 +20,6 @@ pub fn load_model<P: AsRef<Path>>(
         &vs.root(),
         TradingModelConfig {
             variant: model_variant,
-            xsa_temporal,
             ..TradingModelConfig::default()
         },
     );
@@ -61,7 +59,6 @@ pub fn run_inference<P: AsRef<Path>>(
     tickers: Option<Vec<String>>,
     random_start: bool,
     model_variant: ModelVariant,
-    xsa_temporal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting inference run...");
     println!("Loading model from: {:?}", weight_path.as_ref());
@@ -72,8 +69,7 @@ pub fn run_inference<P: AsRef<Path>>(
     let deterministic = true;
     let temperature = 0.0;
 
-    println!("Temporal XSA: {}", xsa_temporal);
-    let (_vs, model) = load_model(&weight_path, device, model_variant, xsa_temporal)?;
+    let (_vs, model) = load_model(&weight_path, device, model_variant)?;
 
     let mut env = match tickers {
         Some(t) => Env::new_with_tickers(t, random_start),
