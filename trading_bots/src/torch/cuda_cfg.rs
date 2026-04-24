@@ -14,8 +14,8 @@ pub fn configure_cuda() {
         unsafe {
             // SDP backends
             torch_sys::at_sdp_set_use_flash(1);
-            torch_sys::at_sdp_set_use_mem_efficient(1);
-            torch_sys::at_sdp_set_use_math(1);
+            torch_sys::at_sdp_set_use_mem_efficient(0);
+            torch_sys::at_sdp_set_use_math(0);
             torch_sys::at_sdp_set_use_cudnn(0);
 
             let flash = torch_sys::at_sdp_use_flash() != 0;
@@ -23,11 +23,11 @@ pub fn configure_cuda() {
             let math = torch_sys::at_sdp_use_math() != 0;
             let cudnn = torch_sys::at_sdp_use_cudnn() != 0;
             assert!(
-                flash && mem && math && !cudnn,
+                flash && !mem && !math && !cudnn,
                 "failed to configure SDPA backends: flash={flash} mem={mem} math={math} cudnn={cudnn}"
             );
         }
 
-        println!("CUDA configured: SDPA flash+mem+math");
+        println!("CUDA configured: SDPA flash only");
     });
 }
