@@ -97,7 +97,7 @@ impl ProcessManagerState {
         &mut self,
         kind: TrainingKind,
         weights: Option<String>,
-        model_size: &str,
+        _model_size: &str,
         genetic_family: GeneticFamily,
     ) -> Result<()> {
         if self.is_anything_running() {
@@ -135,7 +135,7 @@ impl ProcessManagerState {
 
         match kind {
             TrainingKind::Rl => {
-                cmd.arg("train").arg("--model-size").arg(model_size);
+                cmd.arg("train").arg("--model-size").arg("uniform-stream");
 
                 if let Some(w) = weights {
                     cmd.arg("--weights").arg(w);

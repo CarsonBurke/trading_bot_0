@@ -25,7 +25,7 @@ use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
 use state::{GeneticFamily as TuiGeneticFamily, TrainingKind};
 
-const TRAINING_MODEL_SIZES: [&str; 3] = ["uniform-stream", "base", "ablation-small"];
+const TRAINING_MODEL_SIZES: [&str; 1] = ["uniform-stream"];
 const TRAINING_KINDS: [TrainingKind; 2] = [TrainingKind::Rl, TrainingKind::Genetic];
 const GENETIC_FAMILIES: [TuiGeneticFamily; 3] = [
     TuiGeneticFamily::TrendBreakout,
