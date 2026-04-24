@@ -2,8 +2,11 @@
 mod tests {
     use tch::{Device, Kind, Tensor};
 
+    use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
     use crate::torch::hl_gauss::HlGaussBins;
-    use crate::torch::ppo::{compute_gae_chunked, hl_gauss_value_loss};
+    use crate::torch::ppo::{
+        build_no_reset_windowed_layouts, compute_gae_chunked, hl_gauss_value_loss,
+    };
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() < tol
@@ -120,5 +123,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn no_reset_windowed_layouts_match_iterative_shift_append() {
+        let chunk_count = 3i64;
+        let chunk_len = 5i64;
+        let flat_layout_len = PRICE_DELTAS_PER_TICKER as i64;
+        let pd_dim = TICKERS_COUNT * flat_layout_len;
+        let boundary_layout = Tensor::arange(chunk_count * pd_dim, (Kind::Float, Device::Cpu))
+            .view([chunk_count, pd_dim]);
+        let step_deltas_chunk = (Tensor::arange(
+            chunk_count * chunk_len * TICKERS_COUNT,
+            (Kind::Float, Device::Cpu),
+        ) + 10_000.0)
+            .view([chunk_count, chunk_len, TICKERS_COUNT]);
+
+        let actual = build_no_reset_windowed_layouts(
+            &boundary_layout,
+            &step_deltas_chunk,
+            chunk_count,
+            chunk_len,
+            flat_layout_len,
+        );
+
+        let layout_rows = chunk_count * TICKERS_COUNT;
+        let mut current = boundary_layout.view([layout_rows, flat_layout_len]);
+        let mut expected_rows = Vec::with_capacity(chunk_len as usize);
+        expected_rows.push(current.shallow_clone());
+        for t in 1..chunk_len {
+            let row_deltas = step_deltas_chunk.select(1, t - 1).reshape([layout_rows, 1]);
+            current = Tensor::cat(
+                &[&current.narrow(1, 1, flat_layout_len - 1), &row_deltas],
+                1,
+            );
+            expected_rows.push(current.shallow_clone());
+        }
+        let expected = Tensor::stack(&expected_rows, 0)
+            .view([chunk_len, chunk_count, TICKERS_COUNT, flat_layout_len])
+            .permute([1, 0, 2, 3])
+            .contiguous()
+            .view([chunk_count * chunk_len * TICKERS_COUNT, flat_layout_len]);
+
+        let max_diff = (&actual - &expected).abs().max().double_value(&[]);
+        assert!(
+            approx_eq(max_diff, 0.0, 1e-6),
+            "windowed layout mismatch, max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn no_reset_windowed_layouts_handle_single_step_chunks() {
+        let chunk_count = 2i64;
+        let chunk_len = 1i64;
+        let flat_layout_len = PRICE_DELTAS_PER_TICKER as i64;
+        let pd_dim = TICKERS_COUNT * flat_layout_len;
+        let boundary_layout = Tensor::arange(chunk_count * pd_dim, (Kind::Float, Device::Cpu))
+            .view([chunk_count, pd_dim]);
+        let step_deltas_chunk = Tensor::zeros(
+            [chunk_count, chunk_len, TICKERS_COUNT],
+            (Kind::Float, Device::Cpu),
+        );
+
+        let actual = build_no_reset_windowed_layouts(
+            &boundary_layout,
+            &step_deltas_chunk,
+            chunk_count,
+            chunk_len,
+            flat_layout_len,
+        );
+        let expected = boundary_layout.view([chunk_count * TICKERS_COUNT, flat_layout_len]);
+
+        let max_diff = (&actual - &expected).abs().max().double_value(&[]);
+        assert!(
+            approx_eq(max_diff, 0.0, 1e-6),
+            "single-step window mismatch, max_diff={max_diff}"
+        );
     }
 }

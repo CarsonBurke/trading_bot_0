@@ -177,6 +177,37 @@ fn sample_rollout_actions_from_output(
     )
 }
 
+pub(crate) fn build_no_reset_windowed_layouts(
+    boundary_layout: &Tensor,
+    step_deltas_chunk: &Tensor,
+    chunk_count: i64,
+    ppo_chunk_len: i64,
+    flat_layout_len: i64,
+) -> Tensor {
+    let layout_rows = chunk_count * TICKERS_COUNT;
+    let boundary_rows = boundary_layout.view([layout_rows, flat_layout_len]);
+    let appended_deltas = if ppo_chunk_len > 1 {
+        step_deltas_chunk
+            .narrow(1, 0, ppo_chunk_len - 1)
+            .permute([0, 2, 1])
+            .contiguous()
+            .view([layout_rows, ppo_chunk_len - 1])
+            .to_kind(boundary_rows.kind())
+    } else {
+        Tensor::zeros(
+            [layout_rows, 0],
+            (boundary_rows.kind(), boundary_rows.device()),
+        )
+    };
+    let extended = Tensor::cat(&[&boundary_rows, &appended_deltas], 1);
+    extended
+        .unfold(1, flat_layout_len, 1)
+        .view([chunk_count, TICKERS_COUNT, ppo_chunk_len, flat_layout_len])
+        .permute([0, 2, 1, 3])
+        .contiguous()
+        .view([chunk_count * ppo_chunk_len * TICKERS_COUNT, flat_layout_len])
+}
+
 /// Compute GAE advantages and returns from chunk-major rollout data.
 pub(crate) fn compute_gae_chunked(
     rewards_by_chunk: &Tensor,
@@ -481,50 +512,47 @@ pub async fn train(
         }
     }
 
+    let (obs_price_cpu, obs_static_cpu) = env.reset();
+    let mut obs_static = Tensor::zeros(
+        &[rollout.nprocs, STATIC_OBSERVATIONS as i64],
+        (replay_obs_kind, device),
+    );
+    let mut step_deltas =
+        Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (replay_obs_kind, device));
+    obs_static.copy_(&obs_static_cpu);
+    let obs_price = obs_price_cpu.to_device(device);
+    let mut stream_state = trading_model.init_replay_stream_state_batched(rollout.nprocs);
+    let stream_layout = trading_model.uniform_stream_layout_from_raw_input(&obs_price);
+    let mut streamed_output = Some(tch::no_grad(|| {
+        autocast(true, || {
+            trading_model.step_on_device_for_replay(&stream_layout, &obs_static, &mut stream_state)
+        })
+    }));
+    let mut step_reward_per_ticker =
+        Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (Kind::Float, device));
+    let mut step_is_done = Tensor::zeros(&[rollout.nprocs], (Kind::Float, device));
+    let mut cpu_step_batch = CpuStepBatch::new(
+        rollout.nprocs as usize,
+        ACTION_COUNT as usize,
+        raw_pd_dim as usize,
+    );
+    let mut action_host_view = unsafe {
+        Tensor::from_blob(
+            cpu_step_batch.actions_f32.as_ptr() as *const u8,
+            &[rollout.nprocs, ACTION_COUNT],
+            &[],
+            Kind::Float,
+            Device::Cpu,
+        )
+    };
+    // Persistent CPU staging for reset env indices (one i64 per env, reused each step).
+    let mut reset_env_indices_host: Vec<i64> = vec![0i64; rollout.nprocs as usize];
+    let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
+
     for episode in start_episode..1000000 {
-        let (obs_price_cpu, obs_static_cpu) = env.reset();
-        let mut obs_static = Tensor::zeros(
-            &[rollout.nprocs, STATIC_OBSERVATIONS as i64],
-            (replay_obs_kind, device),
-        );
-        let mut step_deltas =
-            Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (replay_obs_kind, device));
-        obs_static.copy_(&obs_static_cpu);
-        let obs_price = obs_price_cpu.to_device(device);
-        let mut stream_state = trading_model.init_replay_stream_state_batched(rollout.nprocs);
-        let stream_layout = trading_model.uniform_stream_layout_from_raw_input(&obs_price);
-        let mut streamed_output = Some(tch::no_grad(|| {
-            autocast(true, || {
-                trading_model.step_on_device_for_replay(
-                    &stream_layout,
-                    &obs_static,
-                    &mut stream_state,
-                )
-            })
-        }));
-        let mut step_reward_per_ticker =
-            Tensor::zeros(&[rollout.nprocs, TICKERS_COUNT], (Kind::Float, device));
-        let mut step_is_done = Tensor::zeros(&[rollout.nprocs], (Kind::Float, device));
         let mut reset_layout_batches_cpu: Vec<Tensor> = Vec::new();
         let mut reset_layout_count = 0i64;
         let mut reset_slots_host = vec![0i64; (total_chunks * rollout.ppo_chunk_len) as usize];
-        let mut cpu_step_batch = CpuStepBatch::new(
-            rollout.nprocs as usize,
-            ACTION_COUNT as usize,
-            raw_pd_dim as usize,
-        );
-        let mut action_host_view = unsafe {
-            Tensor::from_blob(
-                cpu_step_batch.actions_f32.as_ptr() as *const u8,
-                &[rollout.nprocs, ACTION_COUNT],
-                &[],
-                Kind::Float,
-                Device::Cpu,
-            )
-        };
-        // Persistent CPU staging for reset env indices (one i64 per env, reused each step).
-        let mut reset_env_indices_host: Vec<i64> = vec![0i64; rollout.nprocs as usize];
-        let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
         for step in 0..rollout_steps as usize {
             let chunk_row = (step as i64 / rollout.ppo_chunk_len) * rollout.nprocs;
             let chunk_offset = step as i64 % rollout.ppo_chunk_len;
@@ -811,58 +839,67 @@ pub async fn train(
                 // minibatch. Each window is its own 255-token causal prefix +
                 // live-token suffix, so streaming semantics are preserved per window.
                 let flat_layout_len = boundary_layout.size()[1] / TICKERS_COUNT;
-                let layout_rows = chunk_count * TICKERS_COUNT;
-                let mut current_layout = boundary_layout.view([layout_rows, flat_layout_len]);
-                let mut windowed_rows: Vec<Tensor> =
-                    Vec::with_capacity(rollout.ppo_chunk_len as usize);
-                for t in 0..rollout.ppo_chunk_len {
-                    if t == 0 {
-                        // Window 0: boundary layout unchanged (mirrors the `is_full`
-                        // init path in step_on_device_for_replay).
-                        windowed_rows.push(current_layout.shallow_clone());
-                    } else {
-                        let prev_step_deltas = step_deltas_chunk.select(1, t - 1); // [chunk_count, TICKERS]
-                        let row_deltas = prev_step_deltas.reshape([layout_rows, 1]);
-                        current_layout =
-                            trading_model.shift_layout_append_delta(&current_layout, &row_deltas);
-                        // Reset after shift-append to preserve bank layouts verbatim.
-                        let step_reset_slots = reset_slots_chunk.select(1, t - 1); // [chunk_count]
-                        let reset_chunk_idx = step_reset_slots.gt(0).nonzero().squeeze_dim(1);
-                        if reset_chunk_idx.size()[0] > 0 {
-                            let reset_slot_ids =
-                                step_reset_slots.index_select(0, &reset_chunk_idx) - 1;
-                            let reset_slot_ids_cpu = reset_slot_ids.to_device(tch::Device::Cpu);
-                            let reset_layouts = reset_layout_bank_cpu
-                                .index_select(0, &reset_slot_ids_cpu)
-                                .to_device(device);
-                            let reset_row_idx = (&reset_chunk_idx.unsqueeze(1) * TICKERS_COUNT
-                                + &ticker_offsets)
-                                .reshape([-1]);
-                            current_layout = current_layout.index_copy(
-                                0,
-                                &reset_row_idx,
-                                &reset_layouts.view([-1, flat_layout_len]),
-                            );
+                let has_reset_slots =
+                    reset_layout_count > 0 && reset_slots_chunk.max().int64_value(&[]) > 0;
+                let windowed = if has_reset_slots {
+                    let layout_rows = chunk_count * TICKERS_COUNT;
+                    let mut current_layout = boundary_layout.view([layout_rows, flat_layout_len]);
+                    let mut windowed_rows: Vec<Tensor> =
+                        Vec::with_capacity(rollout.ppo_chunk_len as usize);
+                    for t in 0..rollout.ppo_chunk_len {
+                        if t == 0 {
+                            // Window 0: boundary layout unchanged (mirrors the `is_full`
+                            // init path in step_on_device_for_replay).
+                            windowed_rows.push(current_layout.shallow_clone());
+                        } else {
+                            let prev_step_deltas = step_deltas_chunk.select(1, t - 1); // [chunk_count, TICKERS]
+                            let row_deltas = prev_step_deltas.reshape([layout_rows, 1]);
+                            current_layout = trading_model
+                                .shift_layout_append_delta(&current_layout, &row_deltas);
+                            // Reset after shift-append to preserve bank layouts verbatim.
+                            let step_reset_slots = reset_slots_chunk.select(1, t - 1); // [chunk_count]
+                            let reset_chunk_idx = step_reset_slots.gt(0).nonzero().squeeze_dim(1);
+                            if reset_chunk_idx.size()[0] > 0 {
+                                let reset_slot_ids =
+                                    step_reset_slots.index_select(0, &reset_chunk_idx) - 1;
+                                let reset_slot_ids_cpu = reset_slot_ids.to_device(tch::Device::Cpu);
+                                let reset_layouts = reset_layout_bank_cpu
+                                    .index_select(0, &reset_slot_ids_cpu)
+                                    .to_device(device);
+                                let reset_row_idx = (&reset_chunk_idx.unsqueeze(1) * TICKERS_COUNT
+                                    + &ticker_offsets)
+                                    .reshape([-1]);
+                                current_layout = current_layout.index_copy(
+                                    0,
+                                    &reset_row_idx,
+                                    &reset_layouts.view([-1, flat_layout_len]),
+                                );
+                            }
+                            windowed_rows.push(current_layout.shallow_clone());
                         }
-                        windowed_rows.push(current_layout.shallow_clone());
                     }
-                }
-
-                // Stack into [T, chunk_count*TICKERS, LAYOUT_LEN], permute to
-                // [chunk_count, T, TICKERS, LAYOUT_LEN], then flatten for the forward.
-                let windowed = Tensor::stack(&windowed_rows, 0)
-                    .view([
-                        rollout.ppo_chunk_len,
+                    Tensor::stack(&windowed_rows, 0)
+                        .view([
+                            rollout.ppo_chunk_len,
+                            chunk_count,
+                            TICKERS_COUNT,
+                            flat_layout_len,
+                        ])
+                        .permute([1, 0, 2, 3])
+                        .contiguous()
+                        .view([
+                            chunk_count * rollout.ppo_chunk_len * TICKERS_COUNT,
+                            flat_layout_len,
+                        ])
+                } else {
+                    build_no_reset_windowed_layouts(
+                        &boundary_layout,
+                        &step_deltas_chunk,
                         chunk_count,
-                        TICKERS_COUNT,
+                        rollout.ppo_chunk_len,
                         flat_layout_len,
-                    ])
-                    .permute([1, 0, 2, 3])
-                    .contiguous()
-                    .view([
-                        chunk_count * rollout.ppo_chunk_len * TICKERS_COUNT,
-                        flat_layout_len,
-                    ]);
+                    )
+                };
                 let static_flat = so_chunk.reshape([minibatch_sample_count, so_dim]);
 
                 let (new_value_logits, action_mean, action_std) = autocast(true, || {
