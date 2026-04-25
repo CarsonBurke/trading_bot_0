@@ -590,9 +590,6 @@ const UNIFORM_STREAM_LAYOUT_LEN: i64 = UNIFORM_STREAM_PATCH_COUNT * UNIFORM_STRE
 const UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES: i64 = UNIFORM_STREAM_PATCH_COUNT - 1;
 const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 = PRICE_DELTAS_PER_TICKER as i64
     - UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
-pub(super) const LOG_STD_INIT: f64 = -1.0;
-pub(super) const LOG_STD_MIN: f64 = -2.995732273553991;
-pub(super) const LOG_STD_MAX: f64 = 0.04879016416943201;
 const INTER_TICKER_AFTER: usize = 1;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
@@ -799,7 +796,6 @@ pub struct TradingModel {
     exo_feat_b: Tensor,
     endogenous_ticker_block: EndogenousTickerBlock,
     policy_mean_log_var: nn::Linear,
-    policy_log_var_offset: Tensor,
     value_proj: nn::Linear,
     device: tch::Device,
 }
@@ -1013,11 +1009,15 @@ impl TradingModel {
             spec.ff_dim,
             init_scale,
         );
+        assert_eq!(
+            ACTION_COUNT, TICKERS_COUNT,
+            "per-ticker actor head requires one action per ticker"
+        );
         let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
         let policy_mean_log_var = nn::linear(
             p / "policy_mean_log_var",
             spec.model_dim,
-            ACTION_COUNT * 2,
+            2,
             nn::LinearConfig {
                 ws_init: Init::Randn {
                     mean: 0.0,
@@ -1026,11 +1026,6 @@ impl TradingModel {
                 bs_init: None,
                 bias: false,
             },
-        );
-        let policy_log_var_offset = p.var(
-            "policy_log_var_offset",
-            &[ACTION_COUNT],
-            Init::Const(2.0 * LOG_STD_INIT),
         );
         let value_proj = nn::linear(
             p / "value_proj",
@@ -1066,7 +1061,6 @@ impl TradingModel {
             exo_feat_b,
             endogenous_ticker_block,
             policy_mean_log_var,
-            policy_log_var_offset,
             value_proj,
             device: p.device(),
         }
