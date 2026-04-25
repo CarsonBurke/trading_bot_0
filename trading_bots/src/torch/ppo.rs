@@ -1,4 +1,5 @@
 use rand::seq::SliceRandom;
+use std::cmp::Ordering;
 use std::env;
 use std::path::Path;
 use std::time::Instant;
@@ -169,13 +170,28 @@ fn tensor_summary(name: &str, t: &Tensor) -> String {
     let mean = t.mean(Kind::Float).double_value(&[]);
     let min = t.min().double_value(&[]);
     let max = t.max().double_value(&[]);
+    let abs_max = t.abs().max().double_value(&[]);
+    let nan_count = t
+        .isnan()
+        .to_kind(Kind::Int64)
+        .sum(Kind::Int64)
+        .int64_value(&[]);
+    let inf_count = t
+        .isinf()
+        .to_kind(Kind::Int64)
+        .sum(Kind::Int64)
+        .int64_value(&[]);
     format!(
-        "{} shape={:?} mean={:.6} min={:.6} max={:.6}",
+        "{} shape={:?} kind={:?} mean={:.6} min={:.6} max={:.6} abs_max={:.6} nan={} inf={}",
         name,
         t.size(),
+        t.kind(),
         mean,
         min,
-        max
+        max,
+        abs_max,
+        nan_count,
+        inf_count
     )
 }
 
@@ -186,9 +202,9 @@ fn log_first_non_finite_tensor(
     epoch: i64,
     chunk_i: usize,
     tensors: &[(&str, &Tensor)],
-) {
+) -> bool {
     if *logged {
-        return;
+        return false;
     }
     for (name, tensor) in tensors {
         if !tensor_is_finite(tensor) {
@@ -204,9 +220,10 @@ fn log_first_non_finite_tensor(
                 println!("  {}", tensor_summary(other_name, other_tensor));
             }
             *logged = true;
-            return;
+            return true;
         }
     }
+    false
 }
 
 fn log_first_non_finite_var(
@@ -215,13 +232,13 @@ fn log_first_non_finite_var(
     episode: usize,
     epoch: i64,
     chunk_i: usize,
-    vars: &[Tensor],
+    vars: &[(String, Tensor)],
     use_grad: bool,
-) {
+) -> bool {
     if *logged {
-        return;
+        return false;
     }
-    for (idx, var) in vars.iter().enumerate() {
+    for (idx, (name, var)) in vars.iter().enumerate() {
         let candidate = if use_grad {
             var.grad()
         } else {
@@ -231,12 +248,13 @@ fn log_first_non_finite_var(
             continue;
         }
         println!(
-            "NUMERIC ROOT CAUSE: stage={} episode={} epoch={} chunk={} param_idx={} param_shape={:?}",
+            "NUMERIC ROOT CAUSE: stage={} episode={} epoch={} chunk={} param_idx={} param_name={} param_shape={:?}",
             stage,
             episode,
             epoch + 1,
             chunk_i,
             idx,
+            name,
             var.size()
         );
         println!(
@@ -245,7 +263,55 @@ fn log_first_non_finite_var(
         );
         println!("  {}", tensor_summary("param_snapshot", var));
         *logged = true;
-        return;
+        return true;
+    }
+    false
+}
+
+fn log_named_var_extremes(
+    stage: &str,
+    episode: usize,
+    epoch: i64,
+    chunk_i: usize,
+    vars: &[(String, Tensor)],
+    use_grad: bool,
+    top_n: usize,
+) {
+    let mut rows = Vec::with_capacity(vars.len());
+    let mut non_finite = 0usize;
+    for (name, var) in vars {
+        let candidate = if use_grad {
+            var.grad()
+        } else {
+            var.shallow_clone()
+        };
+        if !candidate.defined() {
+            continue;
+        }
+        if !tensor_is_finite(&candidate) {
+            non_finite += 1;
+        }
+        let abs_max = candidate.abs().max().double_value(&[]);
+        let sort_key = if abs_max.is_finite() {
+            abs_max
+        } else {
+            f64::INFINITY
+        };
+        rows.push((sort_key, tensor_summary(name, &candidate)));
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    println!(
+        "NUMERIC SNAPSHOT: stage={} episode={} epoch={} chunk={} tensor={} non_finite={} top_abs={}",
+        stage,
+        episode,
+        epoch + 1,
+        chunk_i,
+        if use_grad { "grad" } else { "param" },
+        non_finite,
+        top_n.min(rows.len())
+    );
+    for (_, summary) in rows.into_iter().take(top_n) {
+        println!("  {}", summary);
     }
 }
 
@@ -895,7 +961,12 @@ pub async fn train(
 
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
-        let mut logged_numeric_root_cause = false;
+        let mut logged_replay_input_non_finite = false;
+        let mut logged_forward_non_finite = false;
+        let mut logged_loss_non_finite = false;
+        let mut logged_grad_non_finite = false;
+        let mut logged_param_non_finite = false;
+        let mut logged_forward_probe = false;
 
         let mut last_minibatch_approx_kl = 0.0f64;
         let mut perm_host: Vec<i64> = (0..total_chunks).collect();
@@ -1004,6 +1075,38 @@ pub async fn train(
                 };
                 let static_flat = so_chunk.reshape([minibatch_sample_count, so_dim]);
 
+                // Flatten rollout-captured targets to minibatch-flat form (chunk-major).
+                let adv_flat = adv_mb_by_chunk.reshape([-1]);
+                let ret_flat = ret_mb_by_chunk.reshape([-1]);
+                let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
+                let act_flat = act_mb_by_chunk.reshape([-1, ACTION_COUNT]);
+
+                if log_first_non_finite_tensor(
+                    &mut logged_replay_input_non_finite,
+                    "replay_inputs",
+                    episode,
+                    _epoch,
+                    chunk_i,
+                    &[
+                        ("windowed", &windowed),
+                        ("static_flat", &static_flat),
+                        ("actions", &act_flat),
+                        ("old_log_probs", &old_log_probs_flat),
+                        ("advantages", &adv_flat),
+                        ("returns", &ret_flat),
+                    ],
+                ) {
+                    log_named_var_extremes(
+                        "params_at_replay_input_failure",
+                        episode,
+                        _epoch,
+                        chunk_i,
+                        &named_trainable_vars,
+                        false,
+                        12,
+                    );
+                }
+
                 let (new_value_logits, action_mean, action_std) = autocast(false, || {
                     trading_model.windowed_replay_forward(
                         &windowed,
@@ -1011,12 +1114,6 @@ pub async fn train(
                         minibatch_sample_count,
                     )
                 });
-
-                // Flatten rollout-captured targets to minibatch-flat form (chunk-major).
-                let adv_flat = adv_mb_by_chunk.reshape([-1]);
-                let ret_flat = ret_mb_by_chunk.reshape([-1]);
-                let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
-                let act_flat = act_mb_by_chunk.reshape([-1, ACTION_COUNT]);
 
                 let (rpo_alpha, action_mean_perturbed) = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
@@ -1065,8 +1162,8 @@ pub async fn train(
                 let ratio = log_ratio.exp();
                 let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_LOW, 1.0 + PPO_CLIP_HIGH);
 
-                log_first_non_finite_tensor(
-                    &mut logged_numeric_root_cause,
+                if log_first_non_finite_tensor(
+                    &mut logged_forward_non_finite,
                     "forward",
                     episode,
                     _epoch,
@@ -1082,7 +1179,31 @@ pub async fn train(
                         ("adv_flat", &adv_flat),
                         ("ret_flat", &ret_flat),
                     ],
-                );
+                ) {
+                    log_named_var_extremes(
+                        "params_at_forward_failure",
+                        episode,
+                        _epoch,
+                        chunk_i,
+                        &named_trainable_vars,
+                        false,
+                        12,
+                    );
+                    if !logged_forward_probe {
+                        logged_forward_probe = true;
+                        TradingModel::set_replay_numeric_probe(true);
+                        tch::no_grad(|| {
+                            let _ = autocast(false, || {
+                                trading_model.windowed_replay_forward(
+                                    &windowed,
+                                    &static_flat,
+                                    minibatch_sample_count,
+                                )
+                            });
+                        });
+                        TradingModel::set_replay_numeric_probe(false);
+                    }
+                }
 
                 let action_loss =
                     -Tensor::min_other(&(&ratio * &adv_flat), &(&ratio_clipped * &adv_flat))
@@ -1120,8 +1241,8 @@ pub async fn train(
 
                 let total_loss = ppo_loss.shallow_clone() + alpha_loss.shallow_clone();
 
-                log_first_non_finite_tensor(
-                    &mut logged_numeric_root_cause,
+                if log_first_non_finite_tensor(
+                    &mut logged_loss_non_finite,
                     "loss",
                     episode,
                     _epoch,
@@ -1134,22 +1255,42 @@ pub async fn train(
                         ("alpha_loss", &alpha_loss),
                         ("total_loss", &total_loss),
                     ],
-                );
+                ) {
+                    log_named_var_extremes(
+                        "params_at_loss_failure",
+                        episode,
+                        _epoch,
+                        chunk_i,
+                        &named_trainable_vars,
+                        false,
+                        12,
+                    );
+                }
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
                 total_loss.backward();
                 bwd_time_us += bwd_start.elapsed().as_micros() as u64;
 
-                log_first_non_finite_var(
-                    &mut logged_numeric_root_cause,
+                if log_first_non_finite_var(
+                    &mut logged_grad_non_finite,
                     "grads_after_backward",
                     episode,
                     _epoch,
                     chunk_i,
-                    &trainable_vars,
+                    &named_trainable_vars,
                     true,
-                );
+                ) {
+                    log_named_var_extremes(
+                        "grads_after_backward_top_abs",
+                        episode,
+                        _epoch,
+                        chunk_i,
+                        &named_trainable_vars,
+                        true,
+                        12,
+                    );
+                }
 
                 let approx_kl_val =
                     tch::no_grad(|| (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float));
@@ -1203,15 +1344,25 @@ pub async fn train(
                 grad_norm_count += 1;
 
                 opt.step();
-                log_first_non_finite_var(
-                    &mut logged_numeric_root_cause,
+                if log_first_non_finite_var(
+                    &mut logged_param_non_finite,
                     "params_after_step",
                     episode,
                     _epoch,
                     chunk_i,
-                    &trainable_vars,
+                    &named_trainable_vars,
                     false,
-                );
+                ) {
+                    log_named_var_extremes(
+                        "params_after_step_top_abs",
+                        episode,
+                        _epoch,
+                        chunk_i,
+                        &named_trainable_vars,
+                        false,
+                        12,
+                    );
+                }
                 if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
                     let max_delta_rho = MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
                     tch::no_grad(|| {

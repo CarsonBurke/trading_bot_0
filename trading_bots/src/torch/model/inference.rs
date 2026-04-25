@@ -1,7 +1,49 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use tch::{Kind, Tensor};
 
 use super::{ModelOutput, StreamState, TradingModel};
 use crate::torch::constants::{ACTION_COUNT, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
+
+static REPLAY_NUMERIC_PROBE: AtomicBool = AtomicBool::new(false);
+
+fn probe_replay_tensor(tag: &str, t: &Tensor) {
+    if !replay_numeric_probe_enabled() {
+        return;
+    }
+    if t.isfinite().all().int64_value(&[]) != 0 {
+        return;
+    }
+    let nan_count = t
+        .isnan()
+        .to_kind(Kind::Int64)
+        .sum(Kind::Int64)
+        .int64_value(&[]);
+    let inf_count = t
+        .isinf()
+        .to_kind(Kind::Int64)
+        .sum(Kind::Int64)
+        .int64_value(&[]);
+    let mean = t.mean(Kind::Float).double_value(&[]);
+    let min = t.min().double_value(&[]);
+    let max = t.max().double_value(&[]);
+    let abs_max = t.abs().max().double_value(&[]);
+    println!(
+        "NUMERIC REPLAY PROBE: {} shape={:?} kind={:?} mean={:.6} min={:.6} max={:.6} abs_max={:.6} nan={} inf={}",
+        tag,
+        t.size(),
+        t.kind(),
+        mean,
+        min,
+        max,
+        abs_max,
+        nan_count,
+        inf_count
+    );
+}
+
+fn replay_numeric_probe_enabled() -> bool {
+    REPLAY_NUMERIC_PROBE.load(Ordering::Relaxed)
+}
 
 impl StreamState {
     pub fn reset(&mut self) {
@@ -26,6 +68,10 @@ impl StreamState {
 }
 
 impl TradingModel {
+    pub(crate) fn set_replay_numeric_probe(enabled: bool) {
+        REPLAY_NUMERIC_PROBE.store(enabled, Ordering::Relaxed);
+    }
+
     fn ensure_stream_cache_kind(
         &self,
         state: &mut StreamState,
@@ -868,8 +914,11 @@ impl TradingModel {
             super::ModelVariant::UniformStream,
             "windowed_replay_forward requires uniform stream variant"
         );
+        probe_replay_tensor("layouts_in", layouts);
+        probe_replay_tensor("static_features_in", static_features);
         let layouts = self.cast_inputs(layouts);
         let patch_tokens = self.patch_embed(&layouts);
+        probe_replay_tensor("patch_tokens", &patch_tokens);
         let static_features = self.cast_inputs(static_features);
         let static_features = if static_features.dim() == 1 {
             static_features.unsqueeze(0)
@@ -878,32 +927,57 @@ impl TradingModel {
         };
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
         let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+        probe_replay_tensor("global_static", &global_static);
+        probe_replay_tensor("per_ticker_static", &per_ticker_static);
+        probe_replay_tensor("exo_tokens", &exo_tokens);
 
         // Prefix layer-0 prefill: first PATCH_COUNT - 1 tokens per row.
         let prefix_patch = patch_tokens.narrow(1, 0, super::UNIFORM_STREAM_PATCH_COUNT - 1);
         let x0 = self.input_ln.forward(&prefix_patch);
+        probe_replay_tensor("prefix_patch", &prefix_patch);
+        probe_replay_tensor("prefix_x0", &x0);
         let (layer0_hidden, layer0_k_raw, layer0_v_raw) =
             self.gqa_layers[0].forward_prefix_and_cache(&x0, &x0, &self.rope);
+        probe_replay_tensor("prefix_l0_hidden", &layer0_hidden);
+        probe_replay_tensor("prefix_l0_k", &layer0_k_raw);
+        probe_replay_tensor("prefix_l0_v", &layer0_v_raw);
 
         let mut prefix_hidden = self
             .exogenous_ticker_block
             .forward(&layer0_hidden, &exo_tokens);
+        probe_replay_tensor("prefix_after_exogenous", &prefix_hidden);
         let mut prefix_k = Vec::with_capacity(self.gqa_layers.len());
         let mut prefix_v = Vec::with_capacity(self.gqa_layers.len());
         prefix_k.push(layer0_k_raw);
         prefix_v.push(layer0_v_raw);
-        for layer in self.gqa_layers.iter().skip(1) {
+        for (layer_idx, layer) in self.gqa_layers.iter().enumerate().skip(1) {
             let (x_next, k, v) = layer.forward_prefix_and_cache(&prefix_hidden, &x0, &self.rope);
             prefix_k.push(k);
             prefix_v.push(v);
             prefix_hidden = x_next;
+            if replay_numeric_probe_enabled() {
+                probe_replay_tensor(&format!("prefix_l{}_hidden", layer_idx), &prefix_hidden);
+                probe_replay_tensor(
+                    &format!("prefix_l{}_k", layer_idx),
+                    prefix_k.last().unwrap(),
+                );
+                probe_replay_tensor(
+                    &format!("prefix_l{}_v", layer_idx),
+                    prefix_v.last().unwrap(),
+                );
+            }
         }
 
         let live_token = patch_tokens.narrow(1, super::UNIFORM_STREAM_PATCH_COUNT - 1, 1);
         let x0_suffix = self.input_ln.forward(&live_token);
         let mut x_suffix = x0_suffix.shallow_clone();
+        probe_replay_tensor("live_token", &live_token);
+        probe_replay_tensor("suffix_x0", &x0_suffix);
         let prefix_len = super::UNIFORM_STREAM_PATCH_COUNT - 1;
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
+            if replay_numeric_probe_enabled() {
+                probe_replay_tensor(&format!("suffix_l{}_in", layer_idx), &x_suffix);
+            }
             x_suffix = layer.forward_suffix_with_cache(
                 &x_suffix,
                 &x0_suffix,
@@ -914,11 +988,20 @@ impl TradingModel {
             );
             if layer_idx == 0 {
                 x_suffix = self.exogenous_ticker_block.forward(&x_suffix, &exo_tokens);
+                probe_replay_tensor("suffix_after_exogenous", &x_suffix);
             }
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
+            if replay_numeric_probe_enabled() {
+                probe_replay_tensor(&format!("suffix_l{}_out", layer_idx), &x_suffix);
+            }
         }
         let x_suffix = self.final_ln.forward(&x_suffix);
-        self.head_from_final_hidden(&x_suffix, batch_size)
+        probe_replay_tensor("suffix_final_ln", &x_suffix);
+        let output = self.head_from_final_hidden(&x_suffix, batch_size);
+        probe_replay_tensor("head_value_logits", &output.0);
+        probe_replay_tensor("head_action_mean", &output.1);
+        probe_replay_tensor("head_action_std", &output.2);
+        output
     }
 
     pub fn step_on_device_for_replay(
