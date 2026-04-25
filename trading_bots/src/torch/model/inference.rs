@@ -470,6 +470,7 @@ impl TradingModel {
 
     fn build_stream_state(&self, batch_size: i64, _cache_conditioned_prefix: bool) -> StreamState {
         let uniform_rows = batch_size * TICKERS_COUNT;
+        let activation_kind = self.activation_kind();
         let (delta_ring, patch_buf) = if self.variant == super::ModelVariant::UniformStream {
             (
                 Tensor::zeros(
@@ -502,7 +503,7 @@ impl TradingModel {
                     super::UNIFORM_STREAM_PATCH_SIZE,
                 ],
                 f64::NAN,
-                (self.patch_embed_weight.kind(), self.device),
+                (activation_kind, self.device),
             ),
             uniform_patch_tokens: Tensor::zeros(
                 [
@@ -510,7 +511,7 @@ impl TradingModel {
                     super::UNIFORM_STREAM_PATCH_COUNT,
                     self.model_dim,
                 ],
-                (self.patch_embed_weight.kind(), self.device),
+                (activation_kind, self.device),
             ),
             uniform_live_fill: Tensor::zeros([batch_size], (Kind::Int64, self.device)),
             uniform_live_fill_host: vec![0; batch_size as usize],
@@ -520,7 +521,7 @@ impl TradingModel {
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim,
                 ],
-                (self.patch_embed_weight.kind(), self.device),
+                (activation_kind, self.device),
             ),
             uniform_layer0_prefix_k: Tensor::zeros(
                 [
@@ -529,7 +530,7 @@ impl TradingModel {
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim / super::GQA_NUM_Q_HEADS,
                 ],
-                (self.patch_embed_weight.kind(), self.device),
+                (activation_kind, self.device),
             ),
             uniform_layer0_prefix_v: Tensor::zeros(
                 [
@@ -538,7 +539,7 @@ impl TradingModel {
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim / super::GQA_NUM_Q_HEADS,
                 ],
-                (self.patch_embed_weight.kind(), self.device),
+                (activation_kind, self.device),
             ),
             uniform_prefix_x0: Tensor::zeros(
                 [
@@ -546,7 +547,7 @@ impl TradingModel {
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
                     self.model_dim,
                 ],
-                (self.patch_embed_weight.kind(), self.device),
+                (activation_kind, self.device),
             ),
             uniform_prefix_k: Vec::new(),
             uniform_prefix_v: Vec::new(),

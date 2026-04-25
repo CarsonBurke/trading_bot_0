@@ -314,8 +314,18 @@ impl GqaBlock {
         let x_suffix =
             x_suffix * mix.get(0).view([1, 1, -1]) + x0_suffix * mix.get(1).view([1, 1, -1]);
         let (q, suffix_k, suffix_v) = self.project_qkv(&x_suffix, rope, prefix_len);
-        let all_k = Tensor::cat(&[prefix_k, &suffix_k], -2);
-        let all_v = Tensor::cat(&[prefix_v, &suffix_v], -2);
+        let prefix_k = if prefix_k.kind() == suffix_k.kind() {
+            prefix_k.shallow_clone()
+        } else {
+            prefix_k.to_kind(suffix_k.kind())
+        };
+        let prefix_v = if prefix_v.kind() == suffix_v.kind() {
+            prefix_v.shallow_clone()
+        } else {
+            prefix_v.to_kind(suffix_v.kind())
+        };
+        let all_k = Tensor::cat(&[&prefix_k, &suffix_k], -2);
+        let all_v = Tensor::cat(&[&prefix_v, &suffix_v], -2);
         let out = Tensor::scaled_dot_product_attention(
             &q,
             &all_k,
@@ -400,10 +410,20 @@ impl ExogenousTickerBlock {
             .permute([0, 2, 1, 3]);
         let q = self.q_norm.forward(&q);
         let q = &q * self.q_gain.to_kind(q.kind()).view([1, CA_NUM_HEADS, 1, 1]);
+        let k = if k.kind() == q.kind() {
+            k.shallow_clone()
+        } else {
+            k.to_kind(q.kind())
+        };
+        let v = if v.kind() == q.kind() {
+            v.shallow_clone()
+        } else {
+            v.to_kind(q.kind())
+        };
         let out = Tensor::scaled_dot_product_attention(
             &q,
-            k,
-            v,
+            &k,
+            &v,
             None::<&Tensor>,
             0.0,
             false,
@@ -573,7 +593,6 @@ const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 = PRICE_DELTAS_PER_TICKER as i64
 pub(super) const LOG_STD_INIT: f64 = -1.0;
 pub(super) const LOG_STD_MIN: f64 = -2.995732273553991;
 pub(super) const LOG_STD_MAX: f64 = 0.04879016416943201;
-const VALUE_HEAD_INIT_GAIN: f64 = 0.25;
 const INTER_TICKER_AFTER: usize = 1;
 const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 const PATCH_SCALAR_FEATS: i64 = 3;
@@ -810,11 +829,19 @@ impl TradingModel {
     }
 
     fn cast_inputs(&self, input: &Tensor) -> Tensor {
-        let target_kind = self.patch_embed_weight.kind();
+        let target_kind = self.activation_kind();
         if input.kind() == target_kind {
             input.shallow_clone()
         } else {
             input.to_kind(target_kind)
+        }
+    }
+
+    fn activation_kind(&self) -> Kind {
+        if self.device.is_cuda() {
+            Kind::BFloat16
+        } else {
+            Kind::Float
         }
     }
 
@@ -1011,8 +1038,8 @@ impl TradingModel {
             NUM_BINS,
             nn::LinearConfig {
                 ws_init: Init::Uniform {
-                    lo: -VALUE_HEAD_INIT_GAIN / (flat_all_tickers as f64).sqrt(),
-                    up: VALUE_HEAD_INIT_GAIN / (flat_all_tickers as f64).sqrt(),
+                    lo: -1.0 / (flat_all_tickers as f64).sqrt(),
+                    up: 1.0 / (flat_all_tickers as f64).sqrt(),
                 },
                 bs_init: None,
                 bias: false,
@@ -1097,7 +1124,9 @@ impl TradingModel {
         let all_feats = Tensor::cat(&[global_exp, per_ticker_static.shallow_clone()], -1);
         let all_feats = all_feats.reshape([batch_size * TICKERS_COUNT, NUM_EXO_TOKENS]);
         let feats_expanded = all_feats.unsqueeze(-1);
-        feats_expanded * &self.exo_feat_w + &self.exo_feat_b
+        let exo_feat_w = self.exo_feat_w.to_kind(feats_expanded.kind());
+        let exo_feat_b = self.exo_feat_b.to_kind(feats_expanded.kind());
+        feats_expanded * &exo_feat_w + &exo_feat_b
     }
 
     /// Build exo tokens with MLP refinement: [batch*tickers, NUM_EXO_TOKENS, MODEL_DIM]
@@ -1181,7 +1210,8 @@ impl TradingModel {
         // Phase 2: fused projection over all tokens.
         let weight_per_patch = self
             .patch_embed_weight
-            .index_select(0, &self.patch_config_ids);
+            .index_select(0, &self.patch_config_ids)
+            .to_kind(kind);
         let out = Tensor::einsum(
             "blm,lmd->bld",
             &[&enriched, &weight_per_patch],
@@ -1191,7 +1221,7 @@ impl TradingModel {
     }
 
     fn patch_embed_stream_batch(&self, patch_vals: &Tensor, fill_counts: &Tensor) -> Tensor {
-        let target_kind = self.patch_embed_weight.kind();
+        let target_kind = patch_vals.kind();
         let patch_size = UNIFORM_STREAM_PATCH_SIZE;
         // Build position mask from fill counts — don't read NaN positions
         let positions = Tensor::arange(patch_size, (Kind::Int64, patch_vals.device()));

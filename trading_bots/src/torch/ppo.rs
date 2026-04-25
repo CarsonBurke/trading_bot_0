@@ -398,7 +398,7 @@ fn compute_action_std_stats(
     device: tch::Device,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, _, action_std) = autocast(true, || {
+        let (_, _, action_std) = autocast(false, || {
             model.forward_on_device(price_deltas, static_obs, false)
         });
         let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
@@ -625,7 +625,7 @@ pub async fn train(
     let mut stream_state = trading_model.init_replay_stream_state_batched(rollout.nprocs);
     let stream_layout = trading_model.uniform_stream_layout_from_raw_input(&obs_price);
     let mut streamed_output = Some(tch::no_grad(|| {
-        autocast(true, || {
+        autocast(false, || {
             trading_model.step_on_device_for_replay(&stream_layout, &obs_static, &mut stream_state)
         })
     }));
@@ -789,7 +789,7 @@ pub async fn train(
                 .copy_(&values.unsqueeze(1));
 
             streamed_output = Some(tch::no_grad(|| {
-                autocast(true, || {
+                autocast(false, || {
                     if reset_indices.is_empty() {
                         trading_model.step_on_device_for_replay(
                             &step_deltas,
@@ -821,7 +821,7 @@ pub async fn train(
 
         // Bootstrap value from final observation state (decode two-hot logits)
         let bootstrap_value = tch::no_grad(|| {
-            let (value_logits, _, _) = autocast(true, || {
+            let (value_logits, _, _) = autocast(false, || {
                 trading_model
                     .forward_stream_state_on_device_for_replay(&obs_static, &mut stream_state)
             });
@@ -1004,7 +1004,7 @@ pub async fn train(
                 };
                 let static_flat = so_chunk.reshape([minibatch_sample_count, so_dim]);
 
-                let (new_value_logits, action_mean, action_std) = autocast(true, || {
+                let (new_value_logits, action_mean, action_std) = autocast(false, || {
                     trading_model.windowed_replay_forward(
                         &windowed,
                         &static_flat,
