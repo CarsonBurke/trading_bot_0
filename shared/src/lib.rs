@@ -35,7 +35,8 @@ pub mod constants {
     pub const OBSERVATION_SPACE: usize =
         (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
 
-    pub const STEPS_PER_EPISODE: usize = 4_000;
+    pub const EPISODE_TRANSITIONS: usize = 4_020;
+    pub const STEPS_PER_EPISODE: usize = EPISODE_TRANSITIONS + 1;
     pub const ACTION_THRESHOLD: f64 = 0.001;
     pub const COMMISSION_RATE: f64 = 0.0035;
     pub const RETROACTIVE_BUY_REWARD: bool = false;

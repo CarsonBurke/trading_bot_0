@@ -10,7 +10,7 @@ use crate::torch::action_space::{
     transformed_action_log_prob_entropy_and_var, transformed_action_log_prob_per_dim,
 };
 use crate::torch::constants::{
-    ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
+    ACTION_COUNT, EPISODE_TRANSITIONS, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::cuda_cfg::configure_cuda;
 use crate::torch::env::{CpuStepBatch, VecEnv};
@@ -26,8 +26,7 @@ const MUON_LR: f64 = 3e-4;
 const LEARNING_RATE: f64 = 3e-4;
 const USE_MUON: bool = true;
 pub const DEFAULT_NPROCS: i64 = 16;
-const DEFAULT_SEQ_LEN: i64 = 2000;
-const DEFAULT_TOTAL_SAMPLES: i64 = DEFAULT_NPROCS * DEFAULT_SEQ_LEN;
+const DEFAULT_SEQ_LEN: i64 = EPISODE_TRANSITIONS as i64;
 const DEFAULT_PPO_CHUNK_LEN: i64 = 60;
 const DEFAULT_PPO_MINIBATCH_RATIO: f64 = 1.0 / 16.0;
 const OPTIM_EPOCHS: i64 = 3;
@@ -111,11 +110,11 @@ fn rollout_geometry() -> RolloutGeometry {
 
     let seq_len = if let Some(seq_len) = parse_positive_i64_env("PPO_SEQ_LEN") {
         align_up(seq_len.max(ppo_chunk_len), ppo_chunk_len)
-    } else {
-        let target_total_samples =
-            parse_positive_i64_env("PPO_TOTAL_SAMPLES").unwrap_or(DEFAULT_TOTAL_SAMPLES);
+    } else if let Some(target_total_samples) = parse_positive_i64_env("PPO_TOTAL_SAMPLES") {
         let target_seq_len = (target_total_samples + nprocs - 1) / nprocs;
         align_up(target_seq_len.max(ppo_chunk_len), ppo_chunk_len)
+    } else {
+        DEFAULT_SEQ_LEN
     };
 
     RolloutGeometry {
