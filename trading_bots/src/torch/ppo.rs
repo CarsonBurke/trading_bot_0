@@ -145,27 +145,6 @@ fn named_trainable_variables(vs: &nn::VarStore) -> Vec<(String, Tensor)> {
     vars
 }
 
-fn is_gqa_block_weight(name: &str, tensor: &Tensor) -> bool {
-    if tensor.dim() != 2 {
-        return false;
-    }
-
-    let Some(rest) = name.strip_prefix("gqa_") else {
-        return false;
-    };
-    let Some((layer_idx, suffix)) = rest.split_once('.') else {
-        return false;
-    };
-    if !layer_idx.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-
-    matches!(
-        suffix,
-        "attn_qkv.weight" | "attn_out.weight" | "ffn_fc1.weight" | "ffn_fc2.weight"
-    )
-}
-
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
     let has_inf = t.isinf().any().int64_value(&[]) != 0;
@@ -536,28 +515,11 @@ pub async fn train(
         .iter()
         .map(|(_, tensor)| tensor.shallow_clone())
         .collect();
-    let muon_mask: Vec<bool> = named_trainable_vars
-        .iter()
-        .map(|(name, tensor)| is_gqa_block_weight(name, tensor))
-        .collect();
-    if USE_MUON {
-        let muon_names: Vec<&str> = named_trainable_vars
-            .iter()
-            .zip(muon_mask.iter())
-            .filter_map(|((name, _), selected)| selected.then_some(name.as_str()))
-            .collect();
-        println!(
-            "Muon param scope: {} GQA block matrices; AdamW handles heads, embeddings, exogenous, and control tensors",
-            muon_names.len()
-        );
-        println!("Muon params: {}", muon_names.join(", "));
-    }
     let mut opt = Muon::new(
         &trainable_vars,
         MuonConfig {
             lr: MUON_LR,
             use_muon_for_2d: USE_MUON,
-            muon_mask: Some(muon_mask),
             adamw_lr: LEARNING_RATE,
             adamw_eps: 1e-6,
             ..MuonConfig::default()
