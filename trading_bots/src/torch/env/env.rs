@@ -61,6 +61,18 @@ pub struct Env {
 
 pub const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
 
+#[derive(Clone)]
+pub(crate) struct EnvMarketSnapshot {
+    pub tickers: Vec<String>,
+    prices: Vec<Vec<f64>>,
+    price_deltas: Vec<Vec<f64>>,
+    momentum: Vec<Arc<MomentumIndicators>>,
+    earnings: Vec<Arc<EarningsIndicators>>,
+    macro_ind: Arc<MacroIndicators>,
+    total_data_length: usize,
+    pub ticker_perm: Vec<usize>,
+}
+
 struct EnvMarketData {
     prices: Vec<Vec<f64>>,
     price_deltas: Vec<Vec<f64>>,
@@ -70,7 +82,7 @@ struct EnvMarketData {
     total_data_length: usize,
 }
 
-fn sample_training_tickers(rng: &mut impl Rng) -> Vec<String> {
+pub(crate) fn sample_training_tickers(rng: &mut impl Rng) -> Vec<String> {
     let universe = cached_eligible_training_universe();
     assert!(
         universe.len() >= TICKERS_COUNT as usize,
@@ -348,9 +360,7 @@ impl Env {
         self.episode += 1;
     }
 
-    fn resample_training_tickers(&mut self) {
-        let mut rng = rand::rng();
-        let tickers = sample_training_tickers(&mut rng);
+    fn set_training_tickers(&mut self, tickers: Vec<String>) {
         if tickers == self.tickers {
             return;
         }
@@ -372,6 +382,55 @@ impl Env {
         self.position_open_step = vec![None; num_tickers];
     }
 
+    fn resample_training_tickers(&mut self) {
+        let mut rng = rand::rng();
+        let tickers = sample_training_tickers(&mut rng);
+        self.set_training_tickers(tickers);
+    }
+
+    pub(crate) fn market_snapshot(&self) -> EnvMarketSnapshot {
+        EnvMarketSnapshot {
+            tickers: self.tickers.clone(),
+            prices: self.prices.clone(),
+            price_deltas: self.price_deltas.clone(),
+            momentum: self.momentum.clone(),
+            earnings: self.earnings.clone(),
+            macro_ind: self.macro_ind.clone(),
+            total_data_length: self.total_data_length,
+            ticker_perm: self.ticker_perm.clone(),
+        }
+    }
+
+    fn apply_market_snapshot(&mut self, snapshot: &EnvMarketSnapshot) {
+        let num_tickers = snapshot.tickers.len();
+
+        self.tickers.clone_from(&snapshot.tickers);
+        self.prices.clone_from(&snapshot.prices);
+        self.price_deltas.clone_from(&snapshot.price_deltas);
+        self.momentum.clone_from(&snapshot.momentum);
+        self.earnings.clone_from(&snapshot.earnings);
+        self.macro_ind = snapshot.macro_ind.clone();
+        self.total_data_length = snapshot.total_data_length;
+        self.max_step = self.total_data_length - 2;
+        self.ticker_perm.clone_from(&snapshot.ticker_perm);
+        self.trade_activity_ema.resize(num_tickers, 0.0);
+        self.steps_since_trade.resize(num_tickers, 0);
+        self.position_open_step.resize(num_tickers, None);
+    }
+
+    pub(crate) fn sample_episode_start_offset(&self) -> usize {
+        let max_start = self
+            .total_data_length
+            .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
+
+        if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
+            let mut rng = rand::rng();
+            rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
+        } else {
+            PRICE_DELTAS_PER_TICKER
+        }
+    }
+
     pub(super) fn has_next_transition(&self) -> bool {
         self.step <= self.max_step
     }
@@ -389,16 +448,11 @@ impl Env {
             self.resample_training_tickers();
         }
 
-        let max_start = self
-            .total_data_length
-            .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
+        self.reset_existing_episode_state_at(self.sample_episode_start_offset());
+    }
 
-        self.episode_start_offset = if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
-            let mut rng = rand::rng();
-            rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
-        } else {
-            PRICE_DELTAS_PER_TICKER
-        };
+    fn reset_existing_episode_state_at(&mut self, episode_start_offset: usize) {
+        self.episode_start_offset = episode_start_offset;
 
         self.step = 0;
         self.max_step =
@@ -428,6 +482,44 @@ impl Env {
         // Shuffle ticker permutation for this episode
         let mut rng = rand::rng();
         self.ticker_perm.shuffle(&mut rng);
+    }
+
+    pub(crate) fn reset_single_to_episode(
+        &mut self,
+        market: &EnvMarketSnapshot,
+        episode_start_offset: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        self.apply_market_snapshot(market);
+        self.reset_existing_episode_state_at(episode_start_offset);
+        self.ticker_perm.clone_from(&market.ticker_perm);
+        self.get_next_obs()
+    }
+
+    pub(crate) fn reset_single_resampled_training_episode(&mut self) -> (Vec<f32>, Vec<f32>) {
+        self.resample_training_tickers();
+        self.reset_existing_episode_state_at(self.sample_episode_start_offset());
+        self.get_next_obs()
+    }
+
+    pub(crate) fn reset_step_single_to_episode(
+        &mut self,
+        market: &EnvMarketSnapshot,
+        episode_start_offset: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        self.apply_market_snapshot(market);
+        self.reset_existing_episode_state_at(episode_start_offset);
+        self.ticker_perm.clone_from(&market.ticker_perm);
+
+        let (step_deltas, static_obs) = self.get_next_step_obs();
+        (step_deltas.to_vec(), static_obs.to_vec())
+    }
+
+    pub(crate) fn reset_step_single_resampled_training_episode(&mut self) -> (Vec<f32>, Vec<f32>) {
+        self.resample_training_tickers();
+        self.reset_existing_episode_state_at(self.sample_episode_start_offset());
+
+        let (step_deltas, static_obs) = self.get_next_step_obs();
+        (step_deltas.to_vec(), static_obs.to_vec())
     }
 
     pub fn reset(&mut self) -> (Tensor, Tensor) {

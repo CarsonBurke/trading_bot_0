@@ -1,10 +1,25 @@
-use super::env::Env;
+use super::env::{Env, EnvMarketSnapshot};
 use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
 use crate::torch::model::ModelVariant;
 use rayon::prelude::*;
 use tch::{Device, Tensor};
+
+const ENV_RESET_GROUPS: usize = 2;
+
+#[derive(Clone)]
+struct EnvGroupEpisode {
+    market: EnvMarketSnapshot,
+    start_offset: usize,
+}
+
+struct RingStepResult {
+    reward_per_ticker: [f32; TICKERS_COUNT as usize],
+    is_done: f32,
+    step_deltas: [f32; TICKERS_COUNT as usize],
+    static_obs: [f32; STATIC_OBSERVATIONS],
+}
 
 pub struct CpuStepBatch {
     pub actions_f32: Vec<f32>,
@@ -65,6 +80,19 @@ impl VecEnv {
         gens_path: String,
         nprocs: usize,
     ) -> Self {
+        let env_group_count = ENV_RESET_GROUPS.min(nprocs).max(1);
+        assert_eq!(
+            nprocs % env_group_count,
+            0,
+            "PPO_NPROCS={} must divide evenly into {} env reset groups",
+            nprocs,
+            env_group_count
+        );
+        eprintln!(
+            "env reset groups: groups={} group_size={}",
+            env_group_count,
+            nprocs / env_group_count
+        );
         let mut envs = Vec::with_capacity(nprocs);
         envs.push(Env::new_with_recording(random_start, true, Some(gens_path)));
         eprintln!("first env");
@@ -96,6 +124,131 @@ impl VecEnv {
         }
     }
 
+    fn env_group_count(&self) -> usize {
+        ENV_RESET_GROUPS.min(self.nprocs).max(1)
+    }
+
+    fn env_group_size(&self) -> usize {
+        self.nprocs / self.env_group_count()
+    }
+
+    fn group_bounds(&self, group_idx: usize) -> (usize, usize) {
+        let group_size = self.env_group_size();
+        let start = group_idx * group_size;
+        (start, start + group_size)
+    }
+
+    fn current_group_episode(&self, env_idx: usize) -> EnvGroupEpisode {
+        EnvGroupEpisode {
+            market: self.envs[env_idx].market_snapshot(),
+            start_offset: self.envs[env_idx].episode_start_offset,
+        }
+    }
+
+    fn has_used_market_episode(used_specs: &[EnvGroupEpisode], spec: &EnvGroupEpisode) -> bool {
+        used_specs.iter().any(|used| {
+            used.market.tickers == spec.market.tickers && used.start_offset == spec.start_offset
+        })
+    }
+
+    fn reset_group_full_obs(&mut self, group_idx: usize, used_specs: &mut Vec<EnvGroupEpisode>) {
+        let (group_start, group_end) = self.group_bounds(group_idx);
+        let (mut leader_price_deltas, mut leader_static_obs) =
+            self.envs[group_start].reset_single_resampled_training_episode();
+        let mut spec = self.current_group_episode(group_start);
+        let mut attempts = 0;
+        while Self::has_used_market_episode(used_specs, &spec) && attempts < 128 {
+            let reset = self.envs[group_start].reset_single_resampled_training_episode();
+            leader_price_deltas = reset.0;
+            leader_static_obs = reset.1;
+            spec = self.current_group_episode(group_start);
+            attempts += 1;
+        }
+        assert!(
+            !Self::has_used_market_episode(used_specs, &spec),
+            "failed to sample distinct env reset group after {} attempts",
+            attempts
+        );
+        used_specs.push(spec.clone());
+
+        self.write_full_obs(group_start, &leader_price_deltas, &leader_static_obs);
+        for env_idx in group_start + 1..group_end {
+            let (price_deltas, static_obs) =
+                self.envs[env_idx].reset_single_to_episode(&spec.market, spec.start_offset);
+            self.write_full_obs(env_idx, &price_deltas, &static_obs);
+        }
+    }
+
+    fn reset_group_step_obs(&mut self, group_idx: usize, used_specs: &mut Vec<EnvGroupEpisode>) {
+        let (group_start, group_end) = self.group_bounds(group_idx);
+        let (mut leader_step_deltas, mut leader_static_obs) =
+            self.envs[group_start].reset_step_single_resampled_training_episode();
+        let mut spec = self.current_group_episode(group_start);
+        let mut attempts = 0;
+        while Self::has_used_market_episode(used_specs, &spec) && attempts < 128 {
+            let reset = self.envs[group_start].reset_step_single_resampled_training_episode();
+            leader_step_deltas = reset.0;
+            leader_static_obs = reset.1;
+            spec = self.current_group_episode(group_start);
+            attempts += 1;
+        }
+        assert!(
+            !Self::has_used_market_episode(used_specs, &spec),
+            "failed to sample distinct env reset group after {} attempts",
+            attempts
+        );
+        used_specs.push(spec.clone());
+
+        self.write_step_obs(group_start, &leader_step_deltas, &leader_static_obs);
+        for env_idx in group_start + 1..group_end {
+            let (step_deltas, static_obs) =
+                self.envs[env_idx].reset_step_single_to_episode(&spec.market, spec.start_offset);
+            self.write_step_obs(env_idx, &step_deltas, &static_obs);
+        }
+    }
+
+    fn write_full_obs(&mut self, env_idx: usize, price_deltas: &[f32], static_obs: &[f32]) {
+        let pd_dim = TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
+        let pd_offset = env_idx * pd_dim;
+        let so_offset = env_idx * STATIC_OBSERVATIONS;
+        self.price_deltas_buf[pd_offset..pd_offset + pd_dim].copy_from_slice(price_deltas);
+        self.static_obs_buf[so_offset..so_offset + STATIC_OBSERVATIONS].copy_from_slice(static_obs);
+        let step_offset = env_idx * TICKERS_COUNT as usize;
+        let tail_base = PRICE_DELTAS_PER_TICKER - 1;
+        for t in 0..TICKERS_COUNT as usize {
+            self.step_deltas_buf[step_offset + t] =
+                price_deltas[t * PRICE_DELTAS_PER_TICKER + tail_base];
+        }
+    }
+
+    fn write_step_obs(&mut self, env_idx: usize, step_deltas: &[f32], static_obs: &[f32]) {
+        let step_offset = env_idx * TICKERS_COUNT as usize;
+        let so_offset = env_idx * STATIC_OBSERVATIONS;
+        self.step_deltas_buf[step_offset..step_offset + TICKERS_COUNT as usize]
+            .copy_from_slice(step_deltas);
+        self.static_obs_buf[so_offset..so_offset + STATIC_OBSERVATIONS].copy_from_slice(static_obs);
+    }
+
+    fn write_reset_ring_obs(
+        &mut self,
+        env_idx: usize,
+        price_deltas: &[f32],
+        static_obs: &[f32],
+        reset_indices: &mut Vec<usize>,
+        reset_price_deltas: &mut Vec<f32>,
+    ) {
+        let tail_base = PRICE_DELTAS_PER_TICKER - 1;
+        let step_offset = env_idx * TICKERS_COUNT as usize;
+        let so_offset = env_idx * STATIC_OBSERVATIONS;
+        for t in 0..TICKERS_COUNT as usize {
+            let idx = t * PRICE_DELTAS_PER_TICKER + tail_base;
+            self.step_deltas_buf[step_offset + t] = price_deltas[idx];
+        }
+        self.static_obs_buf[so_offset..so_offset + STATIC_OBSERVATIONS].copy_from_slice(static_obs);
+        reset_indices.push(env_idx);
+        reset_price_deltas.extend(price_deltas);
+    }
+
     pub fn reset(&mut self) -> (Tensor, Tensor) {
         assert_eq!(
             self.envs.len(),
@@ -104,27 +257,20 @@ impl VecEnv {
             self.envs.len(),
             self.nprocs
         );
-        let mut all_price_deltas = Vec::new();
-        let mut all_static_obs = Vec::new();
-
-        for env in &mut self.envs {
-            let (pd, so) = env.reset_single();
-            all_price_deltas.extend(pd);
-            all_static_obs.extend(so);
+        let mut used_specs = Vec::with_capacity(self.env_group_count());
+        for group_idx in 0..self.env_group_count() {
+            self.reset_group_full_obs(group_idx, &mut used_specs);
         }
 
-        self.price_deltas_buf.copy_from_slice(&all_price_deltas);
-        self.static_obs_buf.copy_from_slice(&all_static_obs);
-
-        let price_deltas = Tensor::from_slice(&all_price_deltas).view([
+        let price_deltas = Tensor::from_slice(&self.price_deltas_buf).view([
             self.nprocs_i64(),
             TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
         ]);
-        let static_obs = Tensor::from_slice(&all_static_obs)
+        let static_obs = Tensor::from_slice(&self.static_obs_buf)
             .view([self.nprocs_i64(), STATIC_OBSERVATIONS as i64]);
 
         self.done_mask.fill(false);
-        self.last_static_obs.clone_from(&all_static_obs);
+        self.last_static_obs.clone_from(&self.static_obs_buf);
 
         (price_deltas, static_obs)
     }
@@ -137,22 +283,18 @@ impl VecEnv {
             self.envs.len(),
             self.nprocs
         );
-        let mut all_step_deltas = Vec::new();
-        let mut all_static_obs = Vec::new();
-
-        for env in &mut self.envs {
-            let (d, so) = env.reset_step_single();
-            all_step_deltas.extend(d);
-            all_static_obs.extend(so);
+        let mut used_specs = Vec::with_capacity(self.env_group_count());
+        for group_idx in 0..self.env_group_count() {
+            self.reset_group_step_obs(group_idx, &mut used_specs);
         }
 
         let step_deltas =
-            Tensor::from_slice(&all_step_deltas).view([self.nprocs_i64(), TICKERS_COUNT]);
-        let static_obs = Tensor::from_slice(&all_static_obs)
+            Tensor::from_slice(&self.step_deltas_buf).view([self.nprocs_i64(), TICKERS_COUNT]);
+        let static_obs = Tensor::from_slice(&self.static_obs_buf)
             .view([self.nprocs_i64(), STATIC_OBSERVATIONS as i64]);
 
         self.done_mask.fill(false);
-        self.last_static_obs.clone_from(&all_static_obs);
+        self.last_static_obs.clone_from(&self.static_obs_buf);
         self.last_step_deltas.fill(0.0);
 
         (step_deltas, static_obs)
@@ -160,25 +302,23 @@ impl VecEnv {
 
     pub fn reset_incremental(&mut self) -> (Vec<Vec<f32>>, Tensor) {
         assert_eq!(self.envs.len(), self.nprocs);
-        let mut all_deltas_per_env: Vec<Vec<f32>> = Vec::with_capacity(self.nprocs);
-        let mut all_static_obs = Vec::new();
-
-        for env in &mut self.envs {
-            let (pd, so) = env.reset_single();
-            all_deltas_per_env.push(pd);
-            all_static_obs.extend(so);
+        let mut used_specs = Vec::with_capacity(self.env_group_count());
+        for group_idx in 0..self.env_group_count() {
+            self.reset_group_full_obs(group_idx, &mut used_specs);
         }
 
-        let static_obs = Tensor::from_slice(&all_static_obs)
+        let static_obs = Tensor::from_slice(&self.static_obs_buf)
             .view([self.nprocs_i64(), STATIC_OBSERVATIONS as i64]);
 
-        let mut deltas_flat = Vec::with_capacity(self.nprocs * TICKERS_COUNT as usize);
-        for deltas in &all_deltas_per_env {
-            deltas_flat.extend_from_slice(deltas);
+        let pd_dim = TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
+        let mut all_deltas_per_env: Vec<Vec<f32>> = Vec::with_capacity(self.nprocs);
+        for env_idx in 0..self.nprocs {
+            let offset = env_idx * pd_dim;
+            all_deltas_per_env.push(self.price_deltas_buf[offset..offset + pd_dim].to_vec());
         }
         self.done_mask.fill(false);
-        self.last_static_obs.clone_from(&all_static_obs);
-        self.last_step_deltas.clone_from(&deltas_flat);
+        self.last_static_obs.clone_from(&self.static_obs_buf);
+        self.last_step_deltas.clone_from(&self.step_deltas_buf);
 
         (all_deltas_per_env, static_obs)
     }
@@ -443,8 +583,6 @@ impl VecEnv {
         let action_dim = ACTION_COUNT as usize;
         debug_assert_eq!(all_actions.len(), self.envs.len() * action_dim);
 
-        let static_obs_dim = STATIC_OBSERVATIONS;
-        let step_deltas_dim = TICKERS_COUNT as usize;
         reset_indices.clear();
         reset_price_deltas.clear();
         let step_results = self
@@ -455,52 +593,107 @@ impl VecEnv {
                 let action_start = i * action_dim;
                 let action_slice = &all_actions[action_start..action_start + action_dim];
                 let step = env.step_step_single(action_slice);
-                if step.is_done == 1.0 {
-                    let (price_deltas, static_obs) = env.reset_single();
-                    (
-                        i,
-                        step.reward_per_ticker,
-                        step.is_done,
-                        None,
-                        static_obs.try_into().unwrap(),
-                        Some(price_deltas),
-                    )
-                } else {
-                    (
-                        i,
-                        step.reward_per_ticker,
-                        step.is_done,
-                        Some(step.step_deltas),
-                        step.static_obs,
-                        None,
-                    )
-                }
+                (
+                    i,
+                    RingStepResult {
+                        reward_per_ticker: step.reward_per_ticker,
+                        is_done: step.is_done,
+                        step_deltas: step.step_deltas,
+                        static_obs: step.static_obs,
+                    },
+                )
             })
             .collect::<Vec<_>>();
 
-        let tail_base = PRICE_DELTAS_PER_TICKER - 1;
-        for (i, reward_per_ticker, is_done, step_deltas, static_obs, reset_price) in step_results {
-            let reward_start = i * TICKERS_COUNT as usize;
-            self.reward_per_ticker_buf[reward_start..reward_start + TICKERS_COUNT as usize]
-                .copy_from_slice(&reward_per_ticker);
-            self.is_done_buf[i] = is_done;
+        let mut ordered_results: Vec<Option<RingStepResult>> =
+            (0..self.nprocs).map(|_| None).collect();
+        for (env_idx, result) in step_results {
+            ordered_results[env_idx] = Some(result);
+        }
 
-            let step_offset = i * step_deltas_dim;
-            let so_offset = i * static_obs_dim;
-            if let Some(price_deltas) = reset_price {
-                for t in 0..TICKERS_COUNT as usize {
-                    let idx = t * PRICE_DELTAS_PER_TICKER + tail_base;
-                    self.step_deltas_buf[step_offset + t] = price_deltas[idx];
+        let mut used_specs = Vec::with_capacity(self.env_group_count());
+        for group_idx in 0..self.env_group_count() {
+            let (group_start, group_end) = self.group_bounds(group_idx);
+            let group_done = (group_start..group_end).any(|env_idx| {
+                ordered_results[env_idx]
+                    .as_ref()
+                    .expect("missing env step result")
+                    .is_done
+                    == 1.0
+            });
+
+            if group_done {
+                let all_done = (group_start..group_end).all(|env_idx| {
+                    ordered_results[env_idx]
+                        .as_ref()
+                        .expect("missing env step result")
+                        .is_done
+                        == 1.0
+                });
+                assert!(
+                    all_done,
+                    "env reset group {} desynced: partial terminal reset",
+                    group_idx
+                );
+
+                let (mut leader_price_deltas, mut leader_static_obs) =
+                    self.envs[group_start].reset_single_resampled_training_episode();
+                let mut spec = self.current_group_episode(group_start);
+                let mut attempts = 0;
+                while Self::has_used_market_episode(&used_specs, &spec) && attempts < 128 {
+                    let reset = self.envs[group_start].reset_single_resampled_training_episode();
+                    leader_price_deltas = reset.0;
+                    leader_static_obs = reset.1;
+                    spec = self.current_group_episode(group_start);
+                    attempts += 1;
                 }
-                self.static_obs_buf[so_offset..so_offset + static_obs_dim]
-                    .copy_from_slice(&static_obs);
-                reset_indices.push(i);
-                reset_price_deltas.extend(price_deltas);
-            } else if let Some(step_deltas) = step_deltas {
-                self.step_deltas_buf[step_offset..step_offset + step_deltas_dim]
-                    .copy_from_slice(&step_deltas);
-                self.static_obs_buf[so_offset..so_offset + static_obs_dim]
-                    .copy_from_slice(&static_obs);
+                assert!(
+                    !Self::has_used_market_episode(&used_specs, &spec),
+                    "failed to sample distinct env reset group after {} attempts",
+                    attempts
+                );
+                used_specs.push(spec.clone());
+
+                for env_idx in group_start..group_end {
+                    let result = ordered_results[env_idx]
+                        .as_ref()
+                        .expect("missing env step result");
+                    let reward_start = env_idx * TICKERS_COUNT as usize;
+                    self.reward_per_ticker_buf[reward_start..reward_start + TICKERS_COUNT as usize]
+                        .copy_from_slice(&result.reward_per_ticker);
+                    self.is_done_buf[env_idx] = result.is_done;
+                }
+
+                self.write_reset_ring_obs(
+                    group_start,
+                    &leader_price_deltas,
+                    &leader_static_obs,
+                    reset_indices,
+                    reset_price_deltas,
+                );
+                for env_idx in group_start + 1..group_end {
+                    let (price_deltas, static_obs) =
+                        self.envs[env_idx].reset_single_to_episode(&spec.market, spec.start_offset);
+                    self.write_reset_ring_obs(
+                        env_idx,
+                        &price_deltas,
+                        &static_obs,
+                        reset_indices,
+                        reset_price_deltas,
+                    );
+                }
+            } else {
+                for env_idx in group_start..group_end {
+                    let result = ordered_results[env_idx]
+                        .as_ref()
+                        .expect("missing env step result");
+                    let reward_start = env_idx * TICKERS_COUNT as usize;
+                    self.reward_per_ticker_buf[reward_start..reward_start + TICKERS_COUNT as usize]
+                        .copy_from_slice(&result.reward_per_ticker);
+                    self.is_done_buf[env_idx] = result.is_done;
+                    self.write_step_obs(env_idx, &result.step_deltas, &result.static_obs);
+                }
+                used_specs.push(self.current_group_episode(group_start));
             }
         }
     }
