@@ -777,6 +777,8 @@ pub async fn train(
             rollout.nprocs,
             rollout_steps * rollout.nprocs
         );
+        let rollout_collect_start = Instant::now();
+        let mut terminal_resets = 0i64;
         let mut reset_layout_batches_cpu: Vec<Tensor> = Vec::new();
         let mut reset_layout_count = 0i64;
         let mut reset_slots_host = vec![0i64; (total_chunks * rollout.ppo_chunk_len) as usize];
@@ -837,6 +839,7 @@ pub async fn train(
             let mut reset_replay = None;
             if !reset_indices.is_empty() {
                 let reset_count = reset_indices.len() as i64;
+                terminal_resets += reset_count;
                 // `from_blob` over the VecEnv-owned CPU buffer avoids a Vec->Tensor
                 // copy before the H->D transfer (single non-blocking copy to GPU).
                 let reset_raw_view = unsafe {
@@ -959,6 +962,13 @@ pub async fn train(
                 })
             }));
         }
+        println!(
+            "rollout {}: collected samples={} terminal_resets={} time {:.2}s",
+            episode,
+            rollout_steps * rollout.nprocs,
+            terminal_resets,
+            rollout_collect_start.elapsed().as_secs_f32()
+        );
 
         // Bootstrap value from final observation state (decode two-hot logits)
         let bootstrap_value = tch::no_grad(|| {
