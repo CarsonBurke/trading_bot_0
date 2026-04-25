@@ -769,6 +769,8 @@ pub struct StreamState {
     pub uniform_prefix_v: Vec<Tensor>,
     /// Prefix x0 embedding (post-input_ln) for x0 residual mixing.
     pub uniform_prefix_x0: Tensor,
+    /// Conditioned prefix hidden state after all GQA layers, before final_ln.
+    pub uniform_conditioned_prefix_hidden: Tensor,
     /// Static features associated with the currently conditioned prefix cache.
     pub uniform_cached_static_features: Option<Tensor>,
     /// Exogenous tokens associated with the currently conditioned prefix cache.
@@ -795,6 +797,8 @@ pub struct TradingModel {
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
     endogenous_ticker_block: EndogenousTickerBlock,
+    readout_queries: Tensor,
+    readout_block: CrossAttnFfnBlock,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
     device: tch::Device,
@@ -1009,6 +1013,20 @@ impl TradingModel {
             spec.ff_dim,
             init_scale,
         );
+        let readout_queries = p.var(
+            "actor_critic_readout_queries",
+            &[2, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: 0.01,
+            },
+        );
+        let readout_block = CrossAttnFfnBlock::new(
+            &(p / "actor_critic_readout"),
+            spec.model_dim,
+            spec.ff_dim,
+            init_scale,
+        );
         assert_eq!(
             ACTION_COUNT, TICKERS_COUNT,
             "per-ticker actor head requires one action per ticker"
@@ -1060,6 +1078,8 @@ impl TradingModel {
             exo_feat_w,
             exo_feat_b,
             endogenous_ticker_block,
+            readout_queries,
+            readout_block,
             policy_mean_log_var,
             value_proj,
             device: p.device(),

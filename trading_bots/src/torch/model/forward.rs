@@ -30,7 +30,7 @@ impl TradingModel {
         x = self.final_ln.forward(&x);
         debug_fused("model_x_gqa", &x);
 
-        self.head_from_final_hidden(&x, batch_size)
+        self.head_from_readout_source(&x, batch_size)
     }
 
     pub fn forward(
@@ -91,7 +91,7 @@ impl TradingModel {
         debug_fused("model_x_gqa", &x);
 
         (
-            self.head_from_final_hidden(&x, batch_size),
+            self.head_from_readout_source(&x, batch_size),
             DebugMetrics {
                 temporal_tau: 0.0,
                 temporal_attn_entropy: 0.0,

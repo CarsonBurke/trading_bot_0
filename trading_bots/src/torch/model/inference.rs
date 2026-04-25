@@ -59,6 +59,7 @@ impl StreamState {
         let _ = self.uniform_layer0_prefix_k.zero_();
         let _ = self.uniform_layer0_prefix_v.zero_();
         let _ = self.uniform_prefix_x0.zero_();
+        let _ = self.uniform_conditioned_prefix_hidden.zero_();
         self.uniform_prefix_k.clear();
         self.uniform_prefix_v.clear();
         self.uniform_cached_static_features = None;
@@ -93,6 +94,11 @@ impl TradingModel {
         if state.uniform_layer0_prefix_v.kind() != v.kind() {
             state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.to_kind(v.kind());
         }
+        if state.uniform_conditioned_prefix_hidden.kind() != hidden.kind() {
+            state.uniform_conditioned_prefix_hidden = state
+                .uniform_conditioned_prefix_hidden
+                .to_kind(hidden.kind());
+        }
     }
 
     pub fn detach_stream_state(&self, state: &mut StreamState) {
@@ -105,6 +111,7 @@ impl TradingModel {
         state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach();
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach();
         state.uniform_prefix_x0 = state.uniform_prefix_x0.detach();
+        state.uniform_conditioned_prefix_hidden = state.uniform_conditioned_prefix_hidden.detach();
         state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t.detach()).collect();
         state.uniform_prefix_v = state.uniform_prefix_v.iter().map(|t| t.detach()).collect();
         state.uniform_cached_static_features = state
@@ -142,6 +149,7 @@ impl TradingModel {
         state.uniform_layer0_prefix_v = v;
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
+        let _ = state.uniform_conditioned_prefix_hidden.zero_();
         state.uniform_cached_static_features = None;
         state.uniform_cached_exo_tokens = None;
     }
@@ -163,6 +171,9 @@ impl TradingModel {
         state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.index_copy(0, row_idx, &v);
         state.uniform_prefix_k.clear();
         state.uniform_prefix_v.clear();
+        let _ = state
+            .uniform_conditioned_prefix_hidden
+            .index_fill_(0, row_idx, 0.0);
         state.uniform_cached_static_features = None;
         state.uniform_cached_exo_tokens = None;
     }
@@ -200,6 +211,7 @@ impl TradingModel {
             state.uniform_prefix_v.push(v);
             x = x_next;
         }
+        state.uniform_conditioned_prefix_hidden = x.shallow_clone();
         state.uniform_cached_static_features = Some(static_features.shallow_clone());
         state.uniform_cached_exo_tokens = Some(exo_tokens.shallow_clone());
     }
@@ -248,8 +260,10 @@ impl TradingModel {
             }
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
-        let x_suffix = self.final_ln.forward(&x_suffix);
-        self.head_from_final_hidden(&x_suffix, batch_size)
+        let readout_source = self
+            .final_ln
+            .forward(&Tensor::cat(&[&prefix_hidden, &x_suffix], 1));
+        self.head_from_readout_source(&readout_source, batch_size)
     }
 
     fn uniform_stream_cached_forward(
@@ -291,8 +305,11 @@ impl TradingModel {
             }
             x_suffix = self.maybe_apply_endogenous_ticker(&x_suffix, layer_idx);
         }
-        let x_suffix = self.final_ln.forward(&x_suffix);
-        self.head_from_final_hidden(&x_suffix, batch_size)
+        let readout_source = self.final_ln.forward(&Tensor::cat(
+            &[&state.uniform_conditioned_prefix_hidden, &x_suffix],
+            1,
+        ));
+        self.head_from_readout_source(&readout_source, batch_size)
     }
 
     pub fn forward_stream_state_on_device(
@@ -588,6 +605,14 @@ impl TradingModel {
                 (activation_kind, self.device),
             ),
             uniform_prefix_x0: Tensor::zeros(
+                [
+                    uniform_rows,
+                    super::UNIFORM_STREAM_PATCH_COUNT - 1,
+                    self.model_dim,
+                ],
+                (activation_kind, self.device),
+            ),
+            uniform_conditioned_prefix_hidden: Tensor::zeros(
                 [
                     uniform_rows,
                     super::UNIFORM_STREAM_PATCH_COUNT - 1,
@@ -996,9 +1021,11 @@ impl TradingModel {
                 probe_replay_tensor(&format!("suffix_l{}_out", layer_idx), &x_suffix);
             }
         }
-        let x_suffix = self.final_ln.forward(&x_suffix);
-        probe_replay_tensor("suffix_final_ln", &x_suffix);
-        let output = self.head_from_final_hidden(&x_suffix, batch_size);
+        let readout_source = self
+            .final_ln
+            .forward(&Tensor::cat(&[&prefix_hidden, &x_suffix], 1));
+        probe_replay_tensor("readout_source_final_ln", &readout_source);
+        let output = self.head_from_readout_source(&readout_source, batch_size);
         probe_replay_tensor("head_value_logits", &output.0);
         probe_replay_tensor("head_action_mean", &output.1);
         probe_replay_tensor("head_action_std", &output.2);
