@@ -104,18 +104,36 @@ fn align_up(value: i64, multiple: i64) -> i64 {
     ((value + multiple - 1) / multiple) * multiple
 }
 
+fn largest_divisor_at_most(value: i64, max_divisor: i64) -> i64 {
+    for divisor in (1..=max_divisor.min(value)).rev() {
+        if value % divisor == 0 {
+            return divisor;
+        }
+    }
+    1
+}
+
+fn default_chunk_len_for_seq_len(seq_len: i64) -> i64 {
+    if seq_len % DEFAULT_PPO_CHUNK_LEN == 0 {
+        DEFAULT_PPO_CHUNK_LEN
+    } else {
+        largest_divisor_at_most(seq_len, DEFAULT_PPO_CHUNK_LEN)
+    }
+}
+
 fn rollout_geometry() -> RolloutGeometry {
     let nprocs = parse_positive_i64_env("PPO_NPROCS").unwrap_or(DEFAULT_NPROCS);
-    let ppo_chunk_len = parse_positive_i64_env("PPO_CHUNK_LEN").unwrap_or(DEFAULT_PPO_CHUNK_LEN);
 
-    let seq_len = if let Some(seq_len) = parse_positive_i64_env("PPO_SEQ_LEN") {
-        align_up(seq_len.max(ppo_chunk_len), ppo_chunk_len)
+    let requested_seq_len = if let Some(seq_len) = parse_positive_i64_env("PPO_SEQ_LEN") {
+        seq_len
     } else if let Some(target_total_samples) = parse_positive_i64_env("PPO_TOTAL_SAMPLES") {
-        let target_seq_len = (target_total_samples + nprocs - 1) / nprocs;
-        align_up(target_seq_len.max(ppo_chunk_len), ppo_chunk_len)
+        (target_total_samples + nprocs - 1) / nprocs
     } else {
         DEFAULT_SEQ_LEN
     };
+    let ppo_chunk_len = parse_positive_i64_env("PPO_CHUNK_LEN")
+        .unwrap_or_else(|| default_chunk_len_for_seq_len(requested_seq_len));
+    let seq_len = align_up(requested_seq_len.max(ppo_chunk_len), ppo_chunk_len);
 
     RolloutGeometry {
         nprocs,
