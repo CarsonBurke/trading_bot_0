@@ -25,6 +25,8 @@ pub struct MuonConfig {
     pub adamw_betas: (f64, f64),
     pub adamw_eps: f64,
     pub adamw_wd: f64,
+    /// Parameter name fragments that should use AdamW even if they are 2D.
+    pub force_adamw_name_substrings: Vec<String>,
 }
 
 impl Default for MuonConfig {
@@ -42,6 +44,7 @@ impl Default for MuonConfig {
             adamw_betas: (0.9, 0.999),
             adamw_eps: 1e-8,
             adamw_wd: 0.0,
+            force_adamw_name_substrings: Vec::new(),
         }
     }
 }
@@ -121,12 +124,27 @@ fn newtonschulz5(g: &Tensor) -> Tensor {
 
 impl Muon {
     pub fn new(trainable_vars: &[Tensor], cfg: MuonConfig) -> Self {
-        let params: Vec<Tensor> = trainable_vars.iter().map(|t| t.shallow_clone()).collect();
+        let named: Vec<(String, Tensor)> = trainable_vars
+            .iter()
+            .map(|t| (String::new(), t.shallow_clone()))
+            .collect();
+        Self::new_named(&named, cfg)
+    }
+
+    pub fn new_named(trainable_vars: &[(String, Tensor)], cfg: MuonConfig) -> Self {
+        let params: Vec<Tensor> = trainable_vars
+            .iter()
+            .map(|(_, t)| t.shallow_clone())
+            .collect();
         let mut entries_2d = Vec::new();
         let mut adamw_indices = Vec::new();
 
-        for (i, p) in params.iter().enumerate() {
-            if cfg.use_muon_for_2d && p.dim() == 2 {
+        for (i, (name, p)) in trainable_vars.iter().enumerate() {
+            let force_adamw = cfg
+                .force_adamw_name_substrings
+                .iter()
+                .any(|needle| name.contains(needle));
+            if cfg.use_muon_for_2d && p.dim() == 2 && !force_adamw {
                 let size = p.size();
                 let (m, n) = (size[0], size[1]);
                 let kind = p.kind();

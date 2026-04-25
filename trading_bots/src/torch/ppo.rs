@@ -581,13 +581,17 @@ pub async fn train(
         .iter()
         .map(|(_, tensor)| tensor.shallow_clone())
         .collect();
-    let mut opt = Muon::new(
-        &trainable_vars,
+    let mut opt = Muon::new_named(
+        &named_trainable_vars,
         MuonConfig {
             lr: MUON_LR,
             use_muon_for_2d: USE_MUON,
             adamw_lr: LEARNING_RATE,
             adamw_eps: 1e-6,
+            force_adamw_name_substrings: vec![
+                "policy_mean_log_var".to_string(),
+                "value_proj".to_string(),
+            ],
             ..MuonConfig::default()
         },
     );
@@ -717,6 +721,13 @@ pub async fn train(
     let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
 
     for episode in start_episode..1000000 {
+        println!(
+            "rollout {}: collecting steps={} envs={} total_samples={}",
+            episode,
+            rollout_steps,
+            rollout.nprocs,
+            rollout_steps * rollout.nprocs
+        );
         let mut reset_layout_batches_cpu: Vec<Tensor> = Vec::new();
         let mut reset_layout_count = 0i64;
         let mut reset_slots_host = vec![0i64; (total_chunks * rollout.ppo_chunk_len) as usize];
@@ -936,8 +947,8 @@ pub async fn train(
             .view([total_chunks, rollout.ppo_chunk_len])
             .to_device(device);
         println!(
-            "ppo update: total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
-            total_samples, minibatch_size, rollout.ppo_chunk_len, chunk_batch_size
+            "rollout {}: ppo update total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
+            episode, total_samples, minibatch_size, rollout.ppo_chunk_len, chunk_batch_size
         );
         // Full-rollout advantage normalization (not per-minibatch)
         let adv_norm = (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
