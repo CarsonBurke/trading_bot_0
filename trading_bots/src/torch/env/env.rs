@@ -60,6 +60,15 @@ pub struct Env {
 
 pub const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
 
+struct EnvMarketData {
+    prices: Vec<Vec<f64>>,
+    price_deltas: Vec<Vec<f64>>,
+    momentum: Vec<Arc<MomentumIndicators>>,
+    earnings: Vec<Arc<EarningsIndicators>>,
+    macro_ind: Arc<MacroIndicators>,
+    total_data_length: usize,
+}
+
 fn sample_training_tickers(rng: &mut impl Rng) -> Vec<String> {
     let universe = cached_eligible_training_universe();
     assert!(
@@ -72,6 +81,94 @@ fn sample_training_tickers(rng: &mut impl Rng) -> Vec<String> {
         .choose_multiple(rng, TICKERS_COUNT as usize)
         .cloned()
         .collect()
+}
+
+fn load_market_data(tickers: &[String], log_progress: bool) -> EnvMarketData {
+    if log_progress {
+        eprint!("  hist..");
+    }
+    let ticker_refs = tickers
+        .iter()
+        .map(|ticker| ticker.as_str())
+        .collect::<Vec<&str>>();
+    let mapped_bars = get_historical_data(Some(&ticker_refs));
+    let mut prices = Vec::with_capacity(tickers.len());
+    let mut price_deltas = Vec::with_capacity(tickers.len());
+    for (i, ticker) in tickers.iter().enumerate() {
+        if let Some((cached_prices, cached_deltas)) = get_historical_series(ticker) {
+            prices.push(cached_prices);
+            price_deltas.push(cached_deltas);
+        } else {
+            prices.push(mapped_bars[i].iter().map(|bar| bar.close).collect());
+            price_deltas.push(get_price_deltas(&mapped_bars[i]));
+        }
+    }
+
+    if log_progress {
+        eprint!("mom..");
+    }
+    let momentum: Vec<Arc<MomentumIndicators>> = tickers
+        .iter()
+        .zip(prices.iter())
+        .map(|(ticker, p)| MomentumIndicators::get_or_compute(ticker, p))
+        .collect();
+
+    let total_data_length = prices[0].len();
+
+    if log_progress {
+        eprint!("dates..");
+    }
+    let bar_dates: Vec<Vec<String>> = mapped_bars
+        .iter()
+        .map(|bars| {
+            bars.iter()
+                .map(|b| {
+                    format!(
+                        "{:04}-{:02}-{:02}",
+                        b.date.year(),
+                        b.date.month() as u8,
+                        b.date.day()
+                    )
+                })
+                .collect()
+        })
+        .collect();
+
+    if log_progress {
+        eprint!("earn..");
+    }
+    let mut earnings: Vec<Arc<EarningsIndicators>> = Vec::with_capacity(tickers.len());
+    for (i, ticker) in tickers.iter().enumerate() {
+        if log_progress {
+            eprint!("{}..", ticker);
+        }
+        let reports = crate::data::get_earnings_data_any(ticker);
+        if log_progress {
+            eprint!("r");
+        }
+        let ind = EarningsIndicators::get_or_compute(ticker, &reports, &bar_dates[i], &prices[i]);
+        if log_progress {
+            eprint!("i");
+        }
+        earnings.push(ind);
+    }
+
+    if log_progress {
+        eprint!("macro..");
+    }
+    let macro_ind = MacroIndicators::get_or_compute(&bar_dates[0]);
+    if log_progress {
+        eprintln!("done");
+    }
+
+    EnvMarketData {
+        prices,
+        price_deltas,
+        momentum,
+        earnings,
+        macro_ind,
+        total_data_length,
+    }
 }
 
 impl Env {
@@ -102,69 +199,7 @@ impl Env {
         record_history_io: bool,
         gens_path: Option<String>,
     ) -> Self {
-        eprint!("  hist..");
-        let ticker_refs = tickers
-            .iter()
-            .map(|ticker| ticker.as_str())
-            .collect::<Vec<&str>>();
-        let mapped_bars = get_historical_data(Some(&ticker_refs));
-        let mut prices = Vec::with_capacity(tickers.len());
-        let mut price_deltas = Vec::with_capacity(tickers.len());
-        for (i, ticker) in tickers.iter().enumerate() {
-            if let Some((cached_prices, cached_deltas)) = get_historical_series(ticker) {
-                prices.push(cached_prices);
-                price_deltas.push(cached_deltas);
-            } else {
-                prices.push(mapped_bars[i].iter().map(|bar| bar.close).collect());
-                price_deltas.push(get_price_deltas(&mapped_bars[i]));
-            }
-        }
-
-        eprint!("mom..");
-        // Get or compute momentum indicators (cached per ticker)
-        let momentum: Vec<Arc<MomentumIndicators>> = tickers
-            .iter()
-            .zip(prices.iter())
-            .map(|(ticker, p)| MomentumIndicators::get_or_compute(ticker, p))
-            .collect();
-
-        let total_data_length = prices[0].len();
-
-        eprint!("dates..");
-        // Extract bar dates for earnings alignment
-        let bar_dates: Vec<Vec<String>> = mapped_bars
-            .iter()
-            .map(|bars| {
-                bars.iter()
-                    .map(|b| {
-                        format!(
-                            "{:04}-{:02}-{:02}",
-                            b.date.year(),
-                            b.date.month() as u8,
-                            b.date.day()
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-
-        eprint!("earn..");
-        // Get or compute earnings indicators (cached per ticker)
-        let mut earnings: Vec<Arc<EarningsIndicators>> = Vec::with_capacity(tickers.len());
-        for (i, ticker) in tickers.iter().enumerate() {
-            eprint!("{}..", ticker);
-            let reports = crate::data::get_earnings_data_any(ticker);
-            eprint!("r");
-            let ind =
-                EarningsIndicators::get_or_compute(ticker, &reports, &bar_dates[i], &prices[i]);
-            eprint!("i");
-            earnings.push(ind);
-        }
-
-        eprint!("macro..");
-        // Get or compute macro indicators (cached, shared across envs)
-        let macro_ind = MacroIndicators::get_or_compute(&bar_dates[0]);
-        eprintln!("done");
+        let market_data = load_market_data(&tickers, true);
 
         let num_tickers = tickers.len();
         let mut target_weights = vec![0.0; num_tickers + 1];
@@ -175,9 +210,9 @@ impl Env {
         Self {
             env_id: 0,
             step: 0,
-            max_step: total_data_length - 2,
-            prices,
-            price_deltas,
+            max_step: market_data.total_data_length - 2,
+            prices: market_data.prices,
+            price_deltas: market_data.price_deltas,
             account: Account::default(),
             episode_history: EpisodeHistory::new(num_tickers),
             meta_history: MetaHistory::default(),
@@ -186,7 +221,7 @@ impl Env {
             episode_start: Instant::now(),
             action_history: VecDeque::with_capacity(ACTION_HISTORY_LEN),
             episode_start_offset: 0,
-            total_data_length,
+            total_data_length: market_data.total_data_length,
             random_start,
             peak_assets: Self::STARTING_CASH,
             last_reward: 0.0,
@@ -197,9 +232,9 @@ impl Env {
             ticker_perm: (0..num_tickers).collect(),
             target_weights,
             realized_weights,
-            momentum,
-            earnings,
-            macro_ind,
+            momentum: market_data.momentum,
+            earnings: market_data.earnings,
+            macro_ind: market_data.macro_ind,
             record_history_io,
             gens_path,
         }
@@ -289,6 +324,30 @@ impl Env {
         self.episode += 1;
     }
 
+    fn resample_training_tickers(&mut self) {
+        let mut rng = rand::rng();
+        let tickers = sample_training_tickers(&mut rng);
+        if tickers == self.tickers {
+            return;
+        }
+
+        let market_data = load_market_data(&tickers, false);
+        let num_tickers = tickers.len();
+
+        self.tickers = tickers;
+        self.prices = market_data.prices;
+        self.price_deltas = market_data.price_deltas;
+        self.momentum = market_data.momentum;
+        self.earnings = market_data.earnings;
+        self.macro_ind = market_data.macro_ind;
+        self.total_data_length = market_data.total_data_length;
+        self.max_step = self.total_data_length - 2;
+        self.ticker_perm = (0..num_tickers).collect();
+        self.trade_activity_ema = vec![0.0; num_tickers];
+        self.steps_since_trade = vec![0; num_tickers];
+        self.position_open_step = vec![None; num_tickers];
+    }
+
     pub(super) fn has_next_transition(&self) -> bool {
         self.step <= self.max_step
     }
@@ -302,6 +361,10 @@ impl Env {
     }
 
     fn reset_existing_episode_state(&mut self) {
+        if self.random_start && self.episode > 0 {
+            self.resample_training_tickers();
+        }
+
         let max_start = self
             .total_data_length
             .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
