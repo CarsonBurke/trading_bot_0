@@ -42,6 +42,7 @@ pub struct Env {
     pub episode_start_offset: usize,
     total_data_length: usize,
     random_start: bool,
+    resample_tickers_on_reset: bool,
     pub peak_assets: f64,
     pub last_reward: f64,
     pub last_fill_ratio: f64,
@@ -179,7 +180,7 @@ impl Env {
     }
 
     pub fn new_with_tickers(tickers: Vec<String>, random_start: bool) -> Self {
-        Self::new_with_tickers_and_recording(tickers, random_start, true, None)
+        Self::new_with_tickers_recording_and_resampling(tickers, random_start, true, None, false)
     }
 
     pub fn new_with_recording(
@@ -190,7 +191,13 @@ impl Env {
         let rng = &mut rand::rng();
         let tickers = sample_training_tickers(rng);
 
-        Self::new_with_tickers_and_recording(tickers, random_start, record_history_io, gens_path)
+        Self::new_with_tickers_recording_and_resampling(
+            tickers,
+            random_start,
+            record_history_io,
+            gens_path,
+            random_start,
+        )
     }
 
     pub fn new_with_tickers_and_recording(
@@ -198,6 +205,22 @@ impl Env {
         random_start: bool,
         record_history_io: bool,
         gens_path: Option<String>,
+    ) -> Self {
+        Self::new_with_tickers_recording_and_resampling(
+            tickers,
+            random_start,
+            record_history_io,
+            gens_path,
+            false,
+        )
+    }
+
+    fn new_with_tickers_recording_and_resampling(
+        tickers: Vec<String>,
+        random_start: bool,
+        record_history_io: bool,
+        gens_path: Option<String>,
+        resample_tickers_on_reset: bool,
     ) -> Self {
         let market_data = load_market_data(&tickers, true);
 
@@ -223,6 +246,7 @@ impl Env {
             episode_start_offset: 0,
             total_data_length: market_data.total_data_length,
             random_start,
+            resample_tickers_on_reset,
             peak_assets: Self::STARTING_CASH,
             last_reward: 0.0,
             last_fill_ratio: 1.0,
@@ -361,7 +385,7 @@ impl Env {
     }
 
     fn reset_existing_episode_state(&mut self) {
-        if self.random_start && self.episode > 0 {
+        if self.resample_tickers_on_reset && self.episode > 0 {
             self.resample_training_tickers();
         }
 
