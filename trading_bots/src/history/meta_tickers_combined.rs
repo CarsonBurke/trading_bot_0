@@ -34,6 +34,7 @@ pub struct MetaHistory {
     pub policy_entropy_min: Vec<f64>,
     pub policy_entropy_max: Vec<f64>,
     pub approx_kl: Vec<f64>,
+    pub reverse_kl: Vec<f64>,
     pub gate_mean: Vec<f64>,
     pub gate_std: Vec<f64>,
     pub return_min: Vec<f64>,
@@ -94,6 +95,10 @@ impl MetaHistory {
 
     pub fn record_approx_kl(&mut self, kl: f64) {
         self.approx_kl.push(kl);
+    }
+
+    pub fn record_reverse_kl(&mut self, kl: f64) {
+        self.reverse_kl.push(kl);
     }
 
     pub fn record_gate_stats(&mut self, mean: f64, std: f64) {
@@ -201,6 +206,7 @@ impl MetaHistory {
         self.policy_entropy_max = load_multiline(&entropy_path, "max");
 
         self.approx_kl = load_simple(&format!("{base_dir}/approx_kl.report.bin"));
+        self.reverse_kl = load_simple(&format!("{base_dir}/reverse_kl.report.bin"));
         let gate_path = format!("{base_dir}/gate_stats.report.bin");
         self.gate_mean = load_multiline(&gate_path, "mean");
         self.gate_std = load_multiline(&gate_path, "std");
@@ -402,13 +408,23 @@ impl MetaHistory {
         }
         if !self.approx_kl.is_empty() {
             let r = Self::report(
-                "Approx KL",
+                "Policy KL",
                 "Episode",
                 Some("KL"),
                 ScaleKind::Linear,
                 simple(&self.approx_kl),
             );
             let _ = write_report(&format!("{base_dir}/approx_kl.report.bin"), &r);
+        }
+        if !self.reverse_kl.is_empty() {
+            let r = Self::report(
+                "Reverse KL",
+                "Episode",
+                Some("KL"),
+                ScaleKind::Linear,
+                simple(&self.reverse_kl),
+            );
+            let _ = write_report(&format!("{base_dir}/reverse_kl.report.bin"), &r);
         }
         if !self.policy_entropy_mean.is_empty() {
             let r = Self::report(

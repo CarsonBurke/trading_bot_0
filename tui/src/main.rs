@@ -238,6 +238,7 @@ impl App {
             "policy_loss",
             "policy_entropy",
             "approx_kl",
+            "reverse_kl",
             "gate_stats",
             "ga_fitness",
             "ga_return_pct",

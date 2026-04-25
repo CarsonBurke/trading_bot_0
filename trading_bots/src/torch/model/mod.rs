@@ -709,8 +709,8 @@ pub fn patch_ends_for_variant(variant: ModelVariant) -> Vec<i64> {
     ends
 }
 
-/// (values, action_mean, action_std)
-pub type ModelOutput = (Tensor, Tensor, Tensor);
+/// (value_logits, action_mean, action_std, action_log_var)
+pub type ModelOutput = (Tensor, Tensor, Tensor, Tensor);
 
 pub struct DebugMetrics {
     pub temporal_tau: f64,

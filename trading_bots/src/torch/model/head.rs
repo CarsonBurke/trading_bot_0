@@ -22,6 +22,7 @@ impl TradingModel {
             value_logits.to_kind(Kind::Float),
             action_mean.to_kind(Kind::Float),
             action_std.to_kind(Kind::Float),
+            action_log_var.to_kind(Kind::Float),
         )
     }
 }
