@@ -326,28 +326,20 @@ impl GqaBlock {
         };
         let all_k = Tensor::cat(&[&prefix_k, &suffix_k], -2);
         let all_v = Tensor::cat(&[&prefix_v, &suffix_v], -2);
-        let suffix_len = x_suffix.size()[1];
-        let total_len = prefix_len + suffix_len;
-        let q_pos = Tensor::arange(suffix_len, (Kind::Int64, x_suffix.device())).unsqueeze(1);
-        let k_pos = Tensor::arange(total_len, (Kind::Int64, x_suffix.device())).unsqueeze(0);
-        let allowed = k_pos.le_tensor(&(q_pos + prefix_len));
-        let zeros = Tensor::zeros([suffix_len, total_len], (q.kind(), x_suffix.device()));
-        let neg = Tensor::full(
-            [suffix_len, total_len],
-            -1.0e9,
-            (q.kind(), x_suffix.device()),
-        );
-        let attn_mask = zeros.where_self(&allowed, &neg).unsqueeze(0).unsqueeze(0);
+        let (b, heads, suffix_len, head_dim) = q.size4().unwrap();
+        let q_prefix = Tensor::zeros([b, heads, prefix_len, head_dim], (q.kind(), q.device()));
+        let q = Tensor::cat(&[&q_prefix, &q], -2);
         let out = Tensor::scaled_dot_product_attention(
             &q,
             &all_k,
             &all_v,
-            Some(&attn_mask),
+            None::<&Tensor>,
             0.0,
-            false,
+            true,
             None,
             true,
-        );
+        )
+        .narrow(2, prefix_len, suffix_len);
         let out = out
             .permute([0, 2, 1, 3])
             .contiguous()
