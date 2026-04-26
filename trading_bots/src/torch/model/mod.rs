@@ -301,7 +301,7 @@ impl GqaBlock {
         (self.apply_ffn(&x), k, v)
     }
 
-    fn forward_suffix_with_cache(
+    fn forward_causal_suffix_with_cache(
         &self,
         x_suffix: &Tensor,
         x0_suffix: &Tensor,
@@ -326,11 +326,23 @@ impl GqaBlock {
         };
         let all_k = Tensor::cat(&[&prefix_k, &suffix_k], -2);
         let all_v = Tensor::cat(&[&prefix_v, &suffix_v], -2);
+        let suffix_len = x_suffix.size()[1];
+        let total_len = prefix_len + suffix_len;
+        let q_pos = Tensor::arange(suffix_len, (Kind::Int64, x_suffix.device())).unsqueeze(1);
+        let k_pos = Tensor::arange(total_len, (Kind::Int64, x_suffix.device())).unsqueeze(0);
+        let allowed = k_pos.le_tensor(&(q_pos + prefix_len));
+        let zeros = Tensor::zeros([suffix_len, total_len], (q.kind(), x_suffix.device()));
+        let neg = Tensor::full(
+            [suffix_len, total_len],
+            -1.0e9,
+            (q.kind(), x_suffix.device()),
+        );
+        let attn_mask = zeros.where_self(&allowed, &neg).unsqueeze(0).unsqueeze(0);
         let out = Tensor::scaled_dot_product_attention(
             &q,
             &all_k,
             &all_v,
-            None::<&Tensor>,
+            Some(&attn_mask),
             0.0,
             false,
             None,
@@ -362,6 +374,10 @@ struct ExogenousTickerBlock {
 
 impl ExogenousTickerBlock {
     fn new(p: &nn::Path, model_dim: i64, _init_scale: f64) -> Self {
+        Self::new_with_output_init(p, model_dim, true)
+    }
+
+    fn new_with_output_init(p: &nn::Path, model_dim: i64, residual_zero_out: bool) -> Self {
         let ca_dim = CA_NUM_HEADS * CA_HEAD_DIM;
         let ln_q = RMSNorm::new(&(p / "ln_q"), model_dim, 1e-6);
         let ln_kv = RMSNorm::new(&(p / "ln_kv"), model_dim, 1e-6);
@@ -372,7 +388,11 @@ impl ExogenousTickerBlock {
         let q_proj = linear_truncated(p, "ca_q", model_dim, ca_dim);
         let k_proj = linear_truncated(p, "ca_k", model_dim, ca_dim);
         let v_proj = linear_truncated(p, "ca_v", model_dim, ca_dim);
-        let out_proj = linear_residual_out(p, "ca_out", ca_dim, model_dim);
+        let out_proj = if residual_zero_out {
+            linear_residual_out(p, "ca_out", ca_dim, model_dim)
+        } else {
+            linear_truncated(p, "ca_out", ca_dim, model_dim)
+        };
         Self {
             q_proj,
             k_proj,
@@ -471,6 +491,15 @@ struct CrossAttnFfnBlock {
 impl CrossAttnFfnBlock {
     fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, init_scale: f64) -> Self {
         let cross_attn = ExogenousTickerBlock::new(&(p / "cross_attn"), model_dim, init_scale);
+        Self::new_with_cross_attn(p, model_dim, ff_dim, cross_attn)
+    }
+
+    fn new_with_cross_attn(
+        p: &nn::Path,
+        model_dim: i64,
+        ff_dim: i64,
+        cross_attn: ExogenousTickerBlock,
+    ) -> Self {
         let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, ff_dim);
         let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
@@ -584,6 +613,7 @@ const BASE_GQA_LAYERS: usize = 3;
 const ABLATION_SMALL_MODEL_DIM: i64 = 96;
 const ABLATION_SMALL_FF_DIM: i64 = 192;
 const ABLATION_SMALL_GQA_LAYERS: usize = 1;
+const ACTOR_CRITIC_CLS_COUNT: i64 = 2;
 const UNIFORM_STREAM_PATCH_COUNT: i64 = 120;
 const UNIFORM_STREAM_PATCH_SIZE: i64 = 50;
 const UNIFORM_STREAM_LAYOUT_LEN: i64 = UNIFORM_STREAM_PATCH_COUNT * UNIFORM_STREAM_PATCH_SIZE;
@@ -769,8 +799,6 @@ pub struct StreamState {
     pub uniform_prefix_v: Vec<Tensor>,
     /// Prefix x0 embedding (post-input_ln) for x0 residual mixing.
     pub uniform_prefix_x0: Tensor,
-    /// Conditioned prefix hidden state after all GQA layers, before final_ln.
-    pub uniform_conditioned_prefix_hidden: Tensor,
     /// Static features associated with the currently conditioned prefix cache.
     pub uniform_cached_static_features: Option<Tensor>,
     /// Exogenous tokens associated with the currently conditioned prefix cache.
@@ -797,8 +825,7 @@ pub struct TradingModel {
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
     endogenous_ticker_block: EndogenousTickerBlock,
-    readout_queries: Tensor,
-    readout_block: CrossAttnFfnBlock,
+    actor_critic_cls_tokens: Tensor,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
     device: tch::Device,
@@ -993,7 +1020,12 @@ impl TradingModel {
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
         let exo_embed_ln = RMSNorm::new(&(p / "exo_embed_ln"), spec.model_dim, 1e-6);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
-        let rope = RotaryEmbedding::new(seq_len, head_dim, ROPE_DIMS, p.device());
+        let rope = RotaryEmbedding::new(
+            seq_len + ACTOR_CRITIC_CLS_COUNT,
+            head_dim,
+            ROPE_DIMS,
+            p.device(),
+        );
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -1013,19 +1045,10 @@ impl TradingModel {
             spec.ff_dim,
             init_scale,
         );
-        let readout_queries = p.var(
-            "actor_critic_readout_queries",
+        let actor_critic_cls_tokens = p.var(
+            "actor_critic_cls_tokens",
             &[2, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 0.01,
-            },
-        );
-        let readout_block = CrossAttnFfnBlock::new(
-            &(p / "actor_critic_readout"),
-            spec.model_dim,
-            spec.ff_dim,
-            init_scale,
+            Init::Orthogonal { gain: 0.01 },
         );
         assert_eq!(
             ACTION_COUNT, TICKERS_COUNT,
@@ -1078,8 +1101,7 @@ impl TradingModel {
             exo_feat_w,
             exo_feat_b,
             endogenous_ticker_block,
-            readout_queries,
-            readout_block,
+            actor_critic_cls_tokens,
             policy_mean_log_var,
             value_proj,
             device: p.device(),
@@ -1106,7 +1128,12 @@ impl TradingModel {
         let seq = x.size()[1];
         let batch_size = bt / TICKERS_COUNT;
         let x_4d = x.view([batch_size, TICKERS_COUNT, seq, self.model_dim]);
-        let live = x_4d.narrow(2, seq - 1, 1);
+        let live_idx = if seq > self.seq_len {
+            self.seq_len - 1
+        } else {
+            seq - 1
+        };
+        let live = x_4d.narrow(2, live_idx, 1);
         let live_for_mix =
             live.permute([0, 2, 1, 3])
                 .reshape([batch_size, TICKERS_COUNT, self.model_dim]);
@@ -1117,9 +1144,13 @@ impl TradingModel {
             .permute([0, 2, 1, 3]);
         if seq == 1 {
             enriched_live.reshape([bt, seq, self.model_dim])
-        } else {
+        } else if live_idx + 1 == seq {
             let past = x_4d.narrow(2, 0, seq - 1);
             Tensor::cat(&[&past, &enriched_live], 2).reshape([bt, seq, self.model_dim])
+        } else {
+            let before = x_4d.narrow(2, 0, live_idx);
+            let after = x_4d.narrow(2, live_idx + 1, seq - live_idx - 1);
+            Tensor::cat(&[&before, &enriched_live, &after], 2).reshape([bt, seq, self.model_dim])
         }
     }
 
@@ -1273,5 +1304,49 @@ impl TradingModel {
             UNIFORM_STREAM_PATCH_COUNT,
             self.model_dim,
         ])
+    }
+
+    pub(super) fn actor_critic_cls_from_live(&self, live: &Tensor) -> Tensor {
+        let rows = live.size()[0];
+        let live = if live.dim() == 2 {
+            live.unsqueeze(1)
+        } else {
+            live.shallow_clone()
+        };
+        live.expand([rows, ACTOR_CRITIC_CLS_COUNT, self.model_dim], false)
+            + self
+                .actor_critic_cls_tokens
+                .to_kind(live.kind())
+                .unsqueeze(0)
+                .expand([rows, ACTOR_CRITIC_CLS_COUNT, self.model_dim], false)
+    }
+
+    pub(super) fn append_actor_critic_cls(&self, x: &Tensor) -> Tensor {
+        let seq = x.size()[1];
+        let live = x.narrow(1, seq - 1, 1);
+        let cls = self.actor_critic_cls_from_live(&live);
+        Tensor::cat(&[x, &cls], 1)
+    }
+
+    pub(super) fn backbone_with_actor_critic_cls(
+        &self,
+        patch_hidden: &Tensor,
+        exo_tokens: &Tensor,
+        batch_size: i64,
+    ) -> ModelOutput {
+        let x0 = self.append_actor_critic_cls(patch_hidden);
+        let mut x = x0.shallow_clone();
+        for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
+            x = layer.forward(&x, &x0, &self.rope, true);
+            if layer_idx == 0 {
+                x = self.exogenous_ticker_block.forward(&x, exo_tokens);
+            }
+            x = self.maybe_apply_endogenous_ticker(&x, layer_idx);
+        }
+        let x = self.final_ln.forward(&x);
+        let seq = x.size()[1];
+        let actor = x.select(1, seq - 2);
+        let critic = x.select(1, seq - 1);
+        self.head_from_actor_critic_cls(&actor, &critic, batch_size)
     }
 }

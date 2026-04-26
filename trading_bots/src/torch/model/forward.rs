@@ -18,19 +18,10 @@ impl TradingModel {
         let x_stem = self.patch_latent_stem_on_device(price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
-        let x0 = x_stem.shallow_clone();
-        let mut x = x_stem;
-        for (i, layer) in self.gqa_layers.iter().enumerate() {
-            x = layer.forward(&x, &x0, &self.rope, true);
-            if i == 0 {
-                x = self.exogenous_ticker_block.forward(&x, &exo_tokens);
-            }
-            x = self.maybe_apply_endogenous_ticker(&x, i);
-        }
-        x = self.final_ln.forward(&x);
-        debug_fused("model_x_gqa", &x);
-
-        self.head_from_readout_source(&x, batch_size)
+        let output = self.backbone_with_actor_critic_cls(&x_stem, &exo_tokens, batch_size);
+        debug_fused("model_value_logits", &output.0);
+        debug_fused("model_action_mean", &output.1);
+        output
     }
 
     pub fn forward(
@@ -75,8 +66,8 @@ impl TradingModel {
         let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
-        let x0 = x_stem.shallow_clone();
-        let mut x = x_stem;
+        let x0 = self.append_actor_critic_cls(&x_stem);
+        let mut x = x0.shallow_clone();
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
             debug_fused_layer("x_gqa_in", layer_idx, &x);
             x = layer.forward(&x, &x0, &self.rope, true);
@@ -89,9 +80,12 @@ impl TradingModel {
         }
         x = self.final_ln.forward(&x);
         debug_fused("model_x_gqa", &x);
+        let seq = x.size()[1];
+        let actor = x.select(1, seq - 2);
+        let critic = x.select(1, seq - 1);
 
         (
-            self.head_from_readout_source(&x, batch_size),
+            self.head_from_actor_critic_cls(&actor, &critic, batch_size),
             DebugMetrics {
                 temporal_tau: 0.0,
                 temporal_attn_entropy: 0.0,

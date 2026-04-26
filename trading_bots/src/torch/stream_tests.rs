@@ -15,6 +15,59 @@ mod tests {
         );
     }
 
+    fn assert_not_close(lhs: &Tensor, rhs: &Tensor, name: &str) {
+        let max_diff = (lhs - rhs).abs().max().double_value(&[]);
+        assert!(max_diff > 1e-6, "{} max diff: {}", name, max_diff);
+    }
+
+    #[test]
+    fn fresh_uniform_stream_model_outputs_depend_on_price_history() {
+        tch::manual_seed(20260425);
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(
+            &vs.root(),
+            TradingModelConfig {
+                variant: ModelVariant::UniformStream,
+            },
+        );
+
+        let raw_0 = Tensor::randn(
+            [1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
+            (Kind::Float, Device::Cpu),
+        );
+        let raw_1 = &raw_0
+            + 0.25
+                * Tensor::randn(
+                    [1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
+                    (Kind::Float, Device::Cpu),
+                );
+        let static_features =
+            Tensor::randn([1, STATIC_OBSERVATIONS as i64], (Kind::Float, Device::Cpu));
+
+        let out_0 = model.forward_on_device(
+            &model.uniform_stream_layout_from_raw_input(&raw_0),
+            &static_features,
+            false,
+        );
+        let out_1 = model.forward_on_device(
+            &model.uniform_stream_layout_from_raw_input(&raw_1),
+            &static_features,
+            false,
+        );
+
+        assert_not_close(
+            &out_0.0,
+            &out_1.0,
+            "value logits should depend on price history",
+        );
+        assert_not_close(
+            &out_0.1,
+            &out_1.1,
+            "action mean should depend on price history",
+        );
+    }
+
     #[test]
     fn uniform_stream_step_matches_full_forward_after_static_change() {
         tch::manual_seed(42);

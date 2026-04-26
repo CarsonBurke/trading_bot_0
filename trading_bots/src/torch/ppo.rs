@@ -648,6 +648,7 @@ pub async fn train(
             adamw_lr: LEARNING_RATE,
             adamw_eps: 1e-6,
             force_adamw_name_substrings: vec![
+                "actor_critic_cls_tokens".to_string(),
                 "policy_mean_log_var".to_string(),
                 "value_proj".to_string(),
             ],
