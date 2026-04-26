@@ -14,6 +14,7 @@ typedef torch::Scalar *scalar;
 typedef torch::optim::Optimizer *optimizer;
 typedef torch::jit::script::Module *module;
 typedef torch::jit::IValue *ivalue;
+typedef void *cuda_graph;
 #define PROTECT(x) \
   try { \
     x \
@@ -26,6 +27,7 @@ typedef void *optimizer;
 typedef void *scalar;
 typedef void *module;
 typedef void *ivalue;
+typedef void *cuda_graph;
 #endif
 
 char *get_and_reset_last_err(); // thread-local
@@ -62,6 +64,14 @@ void at_sdp_set_use_math(bool b);
 bool at_sdp_use_math();
 void at_sdp_set_use_cudnn(bool b);
 bool at_sdp_use_cudnn();
+
+cuda_graph at_cuda_graph_new();
+bool at_cuda_graph_is_available();
+void at_cuda_graph_free(cuda_graph graph);
+void at_cuda_graph_capture_begin(cuda_graph graph, int64_t device_index);
+void at_cuda_graph_capture_end(cuda_graph graph);
+void at_cuda_graph_replay(cuda_graph graph, int64_t device_index);
+void at_cuda_empty_cache();
 
 void at_backward(tensor, int, int);
 int at_requires_grad(tensor);

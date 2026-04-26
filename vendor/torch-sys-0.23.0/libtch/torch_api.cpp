@@ -7,9 +7,15 @@
 #include<torch/csrc/jit/runtime/graph_executor.h>
 #include<torch/torch.h>
 #include<ATen/autocast_mode.h>
+#ifdef TCH_CUDA_GRAPHS
+#include<ATen/cuda/CUDAGraph.h>
+#include<c10/cuda/CUDAGuard.h>
+#include<c10/cuda/CUDAStream.h>
+#endif
 #include<torch/script.h>
 #include<torch/csrc/jit/passes/tensorexpr_fuser.h>
 #include<torch/csrc/jit/codegen/cuda/interface.h>
+#include<memory>
 #include<stdexcept>
 #include<vector>
 #include "torch_api.h"
@@ -24,6 +30,15 @@
 #include "stb_image_resize.h"
 
 thread_local char *torch_last_err = nullptr;
+
+#ifdef TCH_CUDA_GRAPHS
+struct TchCudaGraph {
+  at::cuda::CUDAGraph graph;
+  c10::DeviceIndex device_index = -1;
+  std::unique_ptr<c10::cuda::CUDAStream> capture_stream;
+  std::unique_ptr<c10::cuda::CUDAStreamGuard> capture_guard;
+};
+#endif
 
 char *get_and_reset_last_err() {
     char *tmp = torch_last_err;
@@ -357,6 +372,90 @@ void at_copy_(tensor dst, tensor src) {
   PROTECT(
     dst->copy_(*src);
   )
+}
+
+cuda_graph at_cuda_graph_new() {
+#ifdef TCH_CUDA_GRAPHS
+  PROTECT(return new TchCudaGraph();)
+#else
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+  return nullptr;
+}
+
+bool at_cuda_graph_is_available() {
+#ifdef TCH_CUDA_GRAPHS
+  return true;
+#else
+  return false;
+#endif
+}
+
+void at_cuda_graph_free(cuda_graph graph) {
+#ifdef TCH_CUDA_GRAPHS
+  PROTECT(delete reinterpret_cast<TchCudaGraph*>(graph);)
+#else
+  (void)graph;
+#endif
+}
+
+void at_cuda_graph_capture_begin(cuda_graph graph, int64_t device_index) {
+#ifdef TCH_CUDA_GRAPHS
+  PROTECT(
+    auto *g = reinterpret_cast<TchCudaGraph*>(graph);
+    if (g->capture_guard) {
+      throw std::runtime_error("CUDA graph capture is already active");
+    }
+    g->device_index = static_cast<c10::DeviceIndex>(device_index);
+    c10::cuda::CUDAGuard device_guard(c10::Device(c10::DeviceType::CUDA, g->device_index));
+    g->capture_stream = std::make_unique<c10::cuda::CUDAStream>(
+        c10::cuda::getStreamFromPool(false, g->device_index));
+    g->capture_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(*g->capture_stream);
+    g->graph.capture_begin();
+  )
+#else
+  (void)graph;
+  (void)device_index;
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+}
+
+void at_cuda_graph_capture_end(cuda_graph graph) {
+#ifdef TCH_CUDA_GRAPHS
+  PROTECT(
+    auto *g = reinterpret_cast<TchCudaGraph*>(graph);
+    g->graph.capture_end();
+    g->capture_guard.reset();
+    g->capture_stream.reset();
+  )
+#else
+  (void)graph;
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+}
+
+void at_cuda_graph_replay(cuda_graph graph, int64_t device_index) {
+#ifdef TCH_CUDA_GRAPHS
+  PROTECT(
+    auto *g = reinterpret_cast<TchCudaGraph*>(graph);
+    c10::DeviceIndex requested_device_index = static_cast<c10::DeviceIndex>(device_index);
+    if (g->device_index >= 0 && g->device_index != requested_device_index) {
+      throw std::runtime_error("CUDA graph replay requested on a different device than capture");
+    }
+    c10::cuda::CUDAGuard device_guard(c10::Device(c10::DeviceType::CUDA, requested_device_index));
+    g->graph.replay();
+  )
+#else
+  (void)graph;
+  (void)device_index;
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+}
+
+void at_cuda_empty_cache() {
+#ifdef TCH_CUDA_GRAPHS
+  PROTECT(c10::cuda::CUDACachingAllocator::emptyCache();)
+#endif
 }
 
 namespace {
