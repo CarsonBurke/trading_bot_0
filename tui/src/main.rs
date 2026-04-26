@@ -386,6 +386,7 @@ impl App {
     fn maybe_refresh(&mut self) -> Result<()> {
         let now = Instant::now();
         if now.duration_since(self.last_refresh) >= Duration::from_secs(1) {
+            self.process_manager.poll_training_process();
             self.generation_browser.load_generations()?;
             self.inference_browser.load_inferences()?;
             self.load_latest_meta_charts()?;

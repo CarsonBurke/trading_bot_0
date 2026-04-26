@@ -1,9 +1,12 @@
 use anyhow::Result;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrainingKind {
@@ -57,11 +60,24 @@ impl ProcessManagerState {
         }
 
         self.last_training_check = now;
+        self.refresh_training_process()
+    }
+
+    pub fn poll_training_process(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_training_check) >= Duration::from_millis(500) {
+            self.last_training_check = now;
+            self.refresh_training_process();
+        }
+    }
+
+    fn refresh_training_process(&mut self) -> bool {
+        let mut exit_status = None;
 
         if let Some(ref mut child) = self.training_process {
             match child.try_wait() {
-                Ok(Some(_)) => {
-                    self.training_process = None;
+                Ok(Some(status)) => {
+                    exit_status = Some((child.id(), status));
                 }
                 Ok(None) => {
                     self.cached_training_running = true;
@@ -74,6 +90,15 @@ impl ProcessManagerState {
                     self.training_process = None;
                 }
             }
+        }
+
+        if let Some((pid, status)) = exit_status {
+            self.training_process = None;
+            append_training_exit_status(
+                self.active_run.as_ref().map(|run| run.log_file.as_path()),
+                pid,
+                status,
+            );
         }
 
         if !list_training_pids().is_empty() {
@@ -295,6 +320,41 @@ fn run_dir_from_name(name: &str) -> Option<RunDir> {
         weights,
         log_file,
     })
+}
+
+fn append_training_exit_status(log_file: Option<&Path>, pid: u32, status: ExitStatus) {
+    let Some(log_file) = log_file else {
+        return;
+    };
+
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+    else {
+        return;
+    };
+
+    use std::io::Write;
+    let _ = writeln!(
+        file,
+        "\ntraining process exited: pid={} {}",
+        pid,
+        format_exit_status(status)
+    );
+}
+
+fn format_exit_status(status: ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit_code={} success={}", code, status.success());
+    }
+
+    #[cfg(unix)]
+    if let Some(signal) = status.signal() {
+        return format!("signal={} core_dumped={}", signal, status.core_dumped());
+    }
+
+    format!("status={status}")
 }
 
 fn terminate_process_tree(pid: u32) {
