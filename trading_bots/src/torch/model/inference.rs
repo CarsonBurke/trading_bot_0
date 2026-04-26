@@ -115,20 +115,6 @@ impl TradingModel {
             state.uniform_cached_exo_tokens.as_ref().map(|t| t.detach());
     }
 
-    fn recompute_live_token(&self, state: &StreamState) -> Tensor {
-        let live_patch = state
-            .uniform_layout
-            .select(1, super::UNIFORM_STREAM_PATCH_COUNT - 1);
-        let rows = live_patch.size()[0];
-        let batch_size = state.uniform_live_fill.size()[0];
-        let fill_counts = state
-            .uniform_live_fill
-            .unsqueeze(1)
-            .expand([batch_size, TICKERS_COUNT], false)
-            .reshape([rows]);
-        self.patch_embed_stream_batch(&live_patch, &fill_counts)
-    }
-
     fn prefill_uniform_prefix_base_cache(&self, state: &mut StreamState) {
         let x = state
             .uniform_patch_tokens
