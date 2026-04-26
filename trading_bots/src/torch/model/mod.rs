@@ -1265,9 +1265,8 @@ impl TradingModel {
         let mask = positions
             .unsqueeze(0)
             .less_tensor(&fill_counts.unsqueeze(-1)); // [batch, patch_size]
-        let clean = patch_vals
-            .to_kind(Kind::Float)
-            .where_self(&mask, &Tensor::from(0.0f32).to_device(patch_vals.device()));
+        let patch_vals_float = patch_vals.to_kind(Kind::Float);
+        let clean = patch_vals_float * mask.to_kind(Kind::Float);
         let fill_fraction = fill_counts.to_kind(Kind::Float).unsqueeze(-1) / patch_size as f64;
         let input = Tensor::cat(
             &[
