@@ -68,9 +68,10 @@ impl TradingModel {
 
         let x0 = self.append_actor_critic_cls(&x_stem);
         let mut x = x0.shallow_clone();
+        let rope_positions = self.actor_critic_rope_positions(x0.size()[1]);
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
             debug_fused_layer("x_gqa_in", layer_idx, &x);
-            x = layer.forward(&x, &x0, &self.rope, true);
+            x = layer.forward_with_rope_positions(&x, &x0, &self.rope, &rope_positions, true);
             if layer_idx == 0 {
                 x = self.exogenous_ticker_block.forward(&x, &exo_tokens);
             }

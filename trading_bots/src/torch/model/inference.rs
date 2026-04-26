@@ -199,7 +199,7 @@ impl TradingModel {
         prefix_len: i64,
         batch_size: i64,
     ) -> ModelOutput {
-        let cls_x0 = self.actor_critic_cls_tokens(live_x0.size()[0], live_x0.kind());
+        let cls_x0 = self.actor_critic_cls_from_live(live_x0);
         let suffix_x0 = Tensor::cat(&[live_x0, &cls_x0], 1);
         let mut suffix = suffix_x0.shallow_clone();
 

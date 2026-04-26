@@ -20,6 +20,24 @@ mod tests {
         assert!(max_diff > 1e-6, "{} max diff: {}", name, max_diff);
     }
 
+    fn make_live_cls_projections_distinct(vs: &nn::VarStore) {
+        let vars = vs.variables();
+        let actor = vars
+            .get("actor_live_proj.weight")
+            .expect("missing actor live projection");
+        let critic = vars
+            .get("critic_live_proj.weight")
+            .expect("missing critic live projection");
+        tch::no_grad(|| {
+            let dim = actor.size()[0];
+            let eye = Tensor::eye(dim, (actor.kind(), actor.device()));
+            let mut actor = actor.shallow_clone();
+            let mut critic = critic.shallow_clone();
+            let _ = actor.copy_(&(&eye * 0.5));
+            let _ = critic.copy_(&(&eye * 1.5));
+        });
+    }
+
     #[test]
     fn fresh_uniform_stream_model_outputs_depend_on_price_history() {
         tch::manual_seed(20260425);
@@ -79,6 +97,7 @@ mod tests {
                 variant: ModelVariant::UniformStream,
             },
         );
+        make_live_cls_projections_distinct(&vs);
 
         let raw = Tensor::randn(
             [1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
@@ -133,6 +152,7 @@ mod tests {
                 variant: ModelVariant::UniformStream,
             },
         );
+        make_live_cls_projections_distinct(&vs);
 
         let raw = Tensor::randn(
             [batch, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
@@ -230,6 +250,7 @@ mod tests {
                 variant: ModelVariant::UniformStream,
             },
         );
+        make_live_cls_projections_distinct(&vs);
 
         let raw = Tensor::randn(
             [batch, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],

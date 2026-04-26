@@ -135,13 +135,31 @@ impl RotaryEmbedding {
         let head_dim = *x.size().last().unwrap();
         let cos = self.cos_cached.narrow(0, offset, seq_len).to_kind(x.kind());
         let sin = self.sin_cached.narrow(0, offset, seq_len).to_kind(x.kind());
+        self.apply_with_cached(x, &cos, &sin, head_dim)
+    }
+
+    fn apply_positions(&self, x: &Tensor, positions: &Tensor) -> Tensor {
+        let head_dim = *x.size().last().unwrap();
+        let positions = positions.to_kind(Kind::Int64).to_device(x.device());
+        let cos = self
+            .cos_cached
+            .index_select(0, &positions)
+            .to_kind(x.kind());
+        let sin = self
+            .sin_cached
+            .index_select(0, &positions)
+            .to_kind(x.kind());
+        self.apply_with_cached(x, &cos, &sin, head_dim)
+    }
+
+    fn apply_with_cached(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, head_dim: i64) -> Tensor {
         if self.rope_dims < head_dim {
             let x_rope = x.narrow(-1, 0, self.rope_dims);
             let x_pass = x.narrow(-1, self.rope_dims, head_dim - self.rope_dims);
-            let rotated = &x_rope * &cos + rotate_half(&x_rope) * &sin;
+            let rotated = &x_rope * cos + rotate_half(&x_rope) * sin;
             Tensor::cat(&[&rotated, &x_pass], -1)
         } else {
-            x * &cos + rotate_half(x) * &sin
+            x * cos + rotate_half(x) * sin
         }
     }
 }
@@ -210,12 +228,19 @@ impl GqaBlock {
         }
     }
 
-    fn forward(&self, x: &Tensor, x0: &Tensor, rope: &RotaryEmbedding, causal: bool) -> Tensor {
+    fn forward_with_rope_positions(
+        &self,
+        x: &Tensor,
+        x0: &Tensor,
+        rope: &RotaryEmbedding,
+        positions: &Tensor,
+        causal: bool,
+    ) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
         let mix = self.resid_mix.to_kind(x.kind());
         let x = x * mix.get(0).view([1, 1, -1]) + x0 * mix.get(1).view([1, 1, -1]);
 
-        let (q, k, v) = self.project_qkv(&x, rope, 0);
+        let (q, k, v) = self.project_qkv_with_positions(&x, rope, positions);
 
         let out = Tensor::scaled_dot_product_attention(
             &q,
@@ -257,6 +282,38 @@ impl GqaBlock {
         let k = self.k_norm.forward(&k);
         let q = rope.apply_from(&q, rope_offset);
         let k = rope.apply_from(&k, rope_offset);
+        let q = &q
+            * self
+                .q_gain
+                .to_kind(q.kind())
+                .view([1, GQA_NUM_Q_HEADS, 1, 1]);
+        (q, k, v)
+    }
+
+    fn project_qkv_with_positions(
+        &self,
+        x: &Tensor,
+        rope: &RotaryEmbedding,
+        positions: &Tensor,
+    ) -> (Tensor, Tensor, Tensor) {
+        let (b, s, d) = x.size3().unwrap();
+        let head_dim = d / GQA_NUM_Q_HEADS;
+        let normed = self.attn_ln.forward(x) * self.ln_scale_factor;
+        let qkv = linear_with_same_dtype(&normed, &self.attn_qkv);
+        let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
+        let q = parts[0]
+            .reshape([b, s, GQA_NUM_Q_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+        let k = parts[1]
+            .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+        let v = parts[2]
+            .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
+            .permute([0, 2, 1, 3]);
+        let q = self.q_norm.forward(&q);
+        let k = self.k_norm.forward(&k);
+        let q = rope.apply_positions(&q, positions);
+        let k = rope.apply_positions(&k, positions);
         let q = &q
             * self
                 .q_gain
@@ -313,7 +370,13 @@ impl GqaBlock {
         let mix = self.resid_mix.to_kind(x_suffix.kind());
         let x_suffix =
             x_suffix * mix.get(0).view([1, 1, -1]) + x0_suffix * mix.get(1).view([1, 1, -1]);
-        let (q, suffix_k, suffix_v) = self.project_qkv(&x_suffix, rope, prefix_len);
+        let suffix_positions = Tensor::full(
+            [x_suffix.size()[1]],
+            prefix_len,
+            (Kind::Int64, x_suffix.device()),
+        );
+        let (q, suffix_k, suffix_v) =
+            self.project_qkv_with_positions(&x_suffix, rope, &suffix_positions);
         let prefix_k = if prefix_k.kind() == suffix_k.kind() {
             prefix_k.shallow_clone()
         } else {
@@ -591,6 +654,25 @@ fn linear_orthogonal(
     )
 }
 
+fn linear_identity(p: &nn::Path, name: &str, dim: i64) -> nn::Linear {
+    let linear = nn::linear(
+        p / name,
+        dim,
+        dim,
+        nn::LinearConfig {
+            ws_init: Init::Const(0.0),
+            bs_init: None,
+            bias: false,
+        },
+    );
+    tch::no_grad(|| {
+        let eye = Tensor::eye(dim, (linear.ws.kind(), linear.ws.device()));
+        let mut ws = linear.ws.shallow_clone();
+        let _ = ws.copy_(&eye);
+    });
+    linear
+}
+
 fn linear_residual_out(
     p: &nn::Path,
     name: &str,
@@ -827,7 +909,8 @@ pub struct TradingModel {
     exo_feat_w: Tensor,
     exo_feat_b: Tensor,
     endogenous_ticker_block: EndogenousTickerBlock,
-    actor_critic_cls_tokens: Tensor,
+    actor_live_proj: nn::Linear,
+    critic_live_proj: nn::Linear,
     policy_mean_log_var: nn::Linear,
     value_proj: nn::Linear,
     device: tch::Device,
@@ -1022,12 +1105,7 @@ impl TradingModel {
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
         let exo_embed_ln = RMSNorm::new(&(p / "exo_embed_ln"), spec.model_dim, 1e-6);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
-        let rope = RotaryEmbedding::new(
-            seq_len + ACTOR_CRITIC_CLS_COUNT,
-            head_dim,
-            ROPE_DIMS,
-            p.device(),
-        );
+        let rope = RotaryEmbedding::new(seq_len, head_dim, ROPE_DIMS, p.device());
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -1047,11 +1125,8 @@ impl TradingModel {
             spec.ff_dim,
             init_scale,
         );
-        let actor_critic_cls_tokens = p.var(
-            "actor_critic_cls_tokens",
-            &[2, spec.model_dim],
-            Init::Orthogonal { gain: 0.01 },
-        );
+        let actor_live_proj = linear_identity(p, "actor_live_proj", spec.model_dim);
+        let critic_live_proj = linear_identity(p, "critic_live_proj", spec.model_dim);
         assert_eq!(
             ACTION_COUNT, TICKERS_COUNT,
             "per-ticker actor head requires one action per ticker"
@@ -1103,7 +1178,8 @@ impl TradingModel {
             exo_feat_w,
             exo_feat_b,
             endogenous_ticker_block,
-            actor_critic_cls_tokens,
+            actor_live_proj,
+            critic_live_proj,
             policy_mean_log_var,
             value_proj,
             device: p.device(),
@@ -1307,15 +1383,31 @@ impl TradingModel {
         ])
     }
 
-    pub(super) fn actor_critic_cls_tokens(&self, rows: i64, kind: Kind) -> Tensor {
-        self.actor_critic_cls_tokens
-            .to_kind(kind)
-            .unsqueeze(0)
-            .expand([rows, ACTOR_CRITIC_CLS_COUNT, self.model_dim], false)
+    fn actor_critic_rope_positions(&self, total_seq_len: i64) -> Tensor {
+        let patch_seq_len = total_seq_len - ACTOR_CRITIC_CLS_COUNT;
+        let patch_positions = Tensor::arange(patch_seq_len, (Kind::Int64, self.device));
+        let cls_positions = Tensor::full(
+            [ACTOR_CRITIC_CLS_COUNT],
+            patch_seq_len - 1,
+            (Kind::Int64, self.device),
+        );
+        Tensor::cat(&[&patch_positions, &cls_positions], 0)
+    }
+
+    pub(super) fn actor_critic_cls_from_live(&self, live: &Tensor) -> Tensor {
+        let live = if live.dim() == 2 {
+            live.unsqueeze(1)
+        } else {
+            live.shallow_clone()
+        };
+        let actor = linear_with_same_dtype(&live, &self.actor_live_proj);
+        let critic = linear_with_same_dtype(&live, &self.critic_live_proj);
+        Tensor::cat(&[&actor, &critic], 1)
     }
 
     pub(super) fn append_actor_critic_cls(&self, x: &Tensor) -> Tensor {
-        let cls = self.actor_critic_cls_tokens(x.size()[0], x.kind());
+        let live = x.narrow(1, x.size()[1] - 1, 1);
+        let cls = self.actor_critic_cls_from_live(&live);
         Tensor::cat(&[x, &cls], 1)
     }
 
@@ -1327,8 +1419,9 @@ impl TradingModel {
     ) -> ModelOutput {
         let x0 = self.append_actor_critic_cls(patch_hidden);
         let mut x = x0.shallow_clone();
+        let rope_positions = self.actor_critic_rope_positions(x0.size()[1]);
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
-            x = layer.forward(&x, &x0, &self.rope, true);
+            x = layer.forward_with_rope_positions(&x, &x0, &self.rope, &rope_positions, true);
             if layer_idx == 0 {
                 x = self.exogenous_ticker_block.forward(&x, exo_tokens);
             }
