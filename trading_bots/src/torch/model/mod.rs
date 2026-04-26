@@ -171,7 +171,7 @@ impl GqaBlock {
         let qkv_dim = model_dim + 2 * kv_dim;
         let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
         let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
-        let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim);
+        let attn_out = linear_orthogonal(p, "attn_out", model_dim, model_dim, _init_scale);
         let q_norm = RMSNorm::new(&(p / "q_norm"), head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "k_norm"), head_dim, 1e-6);
         let q_gain = p.var("q_gain", &[GQA_NUM_Q_HEADS], Init::Const(QK_GAIN_INIT));
@@ -569,12 +569,22 @@ fn truncated_normal_init(in_features: i64, out_features: i64) -> Init {
 }
 
 fn linear_truncated(p: &nn::Path, name: &str, in_features: i64, out_features: i64) -> nn::Linear {
+    linear_orthogonal(p, name, in_features, out_features, 1.0)
+}
+
+fn linear_orthogonal(
+    p: &nn::Path,
+    name: &str,
+    in_features: i64,
+    out_features: i64,
+    gain: f64,
+) -> nn::Linear {
     nn::linear(
         p / name,
         in_features,
         out_features,
         nn::LinearConfig {
-            ws_init: Init::Orthogonal { gain: 1.0 },
+            ws_init: Init::Orthogonal { gain },
             bs_init: None,
             bias: false,
         },
