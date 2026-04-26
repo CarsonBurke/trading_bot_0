@@ -155,7 +155,7 @@ fn load_market_data(tickers: &[String], log_progress: bool) -> EnvMarketData {
         if log_progress {
             eprint!("{}..", ticker);
         }
-        let reports = crate::data::get_earnings_data_any(ticker);
+        let reports = crate::data::get_cached_earnings_data_any(ticker);
         if log_progress {
             eprint!("r");
         }
