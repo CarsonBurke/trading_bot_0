@@ -499,6 +499,34 @@ fn compute_explained_variance(rollout_values: &Tensor, returns: &Tensor) -> Tens
     })
 }
 
+fn compute_value_diagnostics(rollout_values: &Tensor, returns: &Tensor) -> Tensor {
+    tch::no_grad(|| {
+        let values = rollout_values.to_kind(Kind::Float);
+        let returns = returns.to_kind(Kind::Float);
+        let residuals = &values - &returns;
+        let value_mean = values.mean(Kind::Float);
+        let return_mean = returns.mean(Kind::Float);
+        let value_centered = &values - &value_mean;
+        let return_centered = &returns - &return_mean;
+        let value_std = value_centered.square().mean(Kind::Float).sqrt();
+        let return_std = return_centered.square().mean(Kind::Float).sqrt();
+        let residual_rmse = residuals.square().mean(Kind::Float).sqrt();
+        let corr = (&value_centered * &return_centered).mean(Kind::Float)
+            / ((&value_std * &return_std).clamp_min(1e-8));
+        Tensor::stack(
+            &[
+                value_mean,
+                value_std,
+                return_mean,
+                return_std,
+                residual_rmse,
+                corr,
+            ],
+            0,
+        )
+    })
+}
+
 pub(crate) fn hl_gauss_value_loss(
     hl_gauss: &HlGaussBins,
     value_logits: &Tensor,
@@ -1650,6 +1678,11 @@ pub async fn train(
         } else {
             Tensor::zeros([], (Kind::Float, device))
         };
+        let value_diag_t = if total_sample_count > 0 {
+            compute_value_diagnostics(&s_values, &returns)
+        } else {
+            Tensor::zeros([6], (Kind::Float, device))
+        };
 
         let entropy_mean_t = if total_sample_count > 0 {
             &total_entropy_weighted / total_sample_count as f64
@@ -1680,11 +1713,12 @@ pub async fn train(
                 entropy_min.view([1]),
                 entropy_max.view([1]),
                 return_range_stats.view([6]),
+                value_diag_t.view([6]),
             ],
             0,
         );
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 22]);
+            .unwrap_or_else(|_| vec![0.0; 28]);
         let mean_policy_loss = all_scalars_vec[0];
         let mean_value_loss = all_scalars_vec[1];
         let mean_reverse_kl = all_scalars_vec[2];
@@ -1713,6 +1747,21 @@ pub async fn train(
             all_scalars_vec[19],
             all_scalars_vec[20],
             all_scalars_vec[21],
+        );
+        let (
+            value_pred_mean,
+            value_pred_std,
+            value_target_mean,
+            value_target_std,
+            value_residual_rmse,
+            value_return_corr,
+        ) = (
+            all_scalars_vec[22],
+            all_scalars_vec[23],
+            all_scalars_vec[24],
+            all_scalars_vec[25],
+            all_scalars_vec[26],
+            all_scalars_vec[27],
         );
 
         let primary = env.primary_mut();
@@ -1754,6 +1803,15 @@ pub async fn train(
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), ReverseKL: {:.4}, GradNorm: {:.4}",
             mean_policy_loss, mean_value_loss, explained_var, mean_reverse_kl, mean_grad_norm
+        );
+        println!(
+            "  ValueDiag: pred μ/σ {:.3}/{:.3}, target μ/σ {:.3}/{:.3}, RMSE {:.3}, Corr {:.3}",
+            value_pred_mean,
+            value_pred_std,
+            value_target_mean,
+            value_target_std,
+            value_residual_rmse,
+            value_return_corr
         );
 
         if episode > 0 && episode % 50 == 0 {
