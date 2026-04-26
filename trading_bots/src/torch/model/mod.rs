@@ -1298,25 +1298,15 @@ impl TradingModel {
         ])
     }
 
-    pub(super) fn actor_critic_cls_from_live(&self, live: &Tensor) -> Tensor {
-        let rows = live.size()[0];
-        let live = if live.dim() == 2 {
-            live.unsqueeze(1)
-        } else {
-            live.shallow_clone()
-        };
-        live.expand([rows, ACTOR_CRITIC_CLS_COUNT, self.model_dim], false)
-            + self
-                .actor_critic_cls_tokens
-                .to_kind(live.kind())
-                .unsqueeze(0)
-                .expand([rows, ACTOR_CRITIC_CLS_COUNT, self.model_dim], false)
+    pub(super) fn actor_critic_cls_tokens(&self, rows: i64, kind: Kind) -> Tensor {
+        self.actor_critic_cls_tokens
+            .to_kind(kind)
+            .unsqueeze(0)
+            .expand([rows, ACTOR_CRITIC_CLS_COUNT, self.model_dim], false)
     }
 
     pub(super) fn append_actor_critic_cls(&self, x: &Tensor) -> Tensor {
-        let seq = x.size()[1];
-        let live = x.narrow(1, seq - 1, 1);
-        let cls = self.actor_critic_cls_from_live(&live);
+        let cls = self.actor_critic_cls_tokens(x.size()[0], x.kind());
         Tensor::cat(&[x, &cls], 1)
     }
 
