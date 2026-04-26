@@ -650,6 +650,7 @@ pub async fn train(
             force_adamw_name_substrings: vec![
                 "actor_critic_cls_tokens".to_string(),
                 "policy_mean_log_var".to_string(),
+                "resid_mix".to_string(),
                 "value_proj".to_string(),
             ],
             ..MuonConfig::default()
