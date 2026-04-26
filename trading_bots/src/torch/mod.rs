@@ -1,6 +1,7 @@
 pub mod action_space;
 pub mod constants;
 pub mod cuda_cfg;
+pub mod cuda_graph;
 pub mod ensemble;
 pub mod env;
 pub mod hl_gauss;
