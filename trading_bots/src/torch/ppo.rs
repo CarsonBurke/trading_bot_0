@@ -21,10 +21,13 @@ use crate::torch::model::{ModelOutput, ModelVariant, TradingModel, TradingModelC
 use crate::torch::muon::{Muon, MuonConfig};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
-/// NorMuon LR for 2D weight matrices (orthogonalized updates, RMS-match scaling).
+/// Muon LR for 2D weight matrices (row-normalized NS5 updates).
 const MUON_LR: f64 = 3e-4;
 /// AdamW LR for 1D params (biases, norms) and the standalone rho scalar.
 const LEARNING_RATE: f64 = 3e-4;
+const MUON_MOMENTUM: f64 = 0.99;
+const MUON_MOMENTUM_WARMUP_START: f64 = 0.92;
+const MUON_MOMENTUM_WARMUP_STEPS: i64 = 50;
 const USE_MUON: bool = true;
 pub const DEFAULT_NPROCS: i64 = 16;
 const DEFAULT_SEQ_LEN: i64 = EPISODE_TRANSITIONS as i64;
@@ -198,6 +201,21 @@ fn named_trainable_variables(vs: &nn::VarStore) -> Vec<(String, Tensor)> {
         .collect();
     vars.sort_by(|a, b| a.0.cmp(&b.0));
     vars
+}
+
+fn muon_momentum_for_step(step: i64) -> f64 {
+    let frac = if MUON_MOMENTUM_WARMUP_STEPS > 0 {
+        (step as f64 / MUON_MOMENTUM_WARMUP_STEPS as f64).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    (1.0 - frac) * MUON_MOMENTUM_WARMUP_START + frac * MUON_MOMENTUM
+}
+
+fn step_optimizer(opt: &mut Muon, optimizer_step: &mut i64) {
+    opt.set_momentum(muon_momentum_for_step(*optimizer_step));
+    opt.step();
+    *optimizer_step += 1;
 }
 
 fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
@@ -995,8 +1013,12 @@ pub async fn train(
         MuonConfig {
             lr: MUON_LR,
             use_muon_for_2d: USE_MUON,
+            momentum: MUON_MOMENTUM_WARMUP_START,
             adamw_lr: LEARNING_RATE,
-            adamw_eps: 1e-6,
+            adamw_betas: (0.9, 0.95),
+            adamw_eps: 1e-8,
+            weight_decay: 0.0,
+            adamw_wd: 0.0,
             force_adamw_name_substrings: vec![
                 "actor_live_proj".to_string(),
                 "critic_live_proj".to_string(),
@@ -1007,6 +1029,7 @@ pub async fn train(
             ..MuonConfig::default()
         },
     );
+    let mut optimizer_step = 0i64;
 
     let mut env = VecEnv::new(
         true,
@@ -1676,7 +1699,7 @@ pub async fn train(
                         grad_norm_sum += &batch_grad_norm;
                         grad_norm_count += 1;
 
-                        opt.step();
+                        step_optimizer(&mut opt, &mut optimizer_step);
                         if log_first_non_finite_var(
                             &mut logged_param_non_finite,
                             "params_after_step",
@@ -2006,7 +2029,7 @@ pub async fn train(
                 grad_norm_sum += &batch_grad_norm;
                 grad_norm_count += 1;
 
-                opt.step();
+                step_optimizer(&mut opt, &mut optimizer_step);
                 if log_first_non_finite_var(
                     &mut logged_param_non_finite,
                     "params_after_step",

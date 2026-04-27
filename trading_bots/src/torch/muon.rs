@@ -1,6 +1,5 @@
-//! NorMuon optimizer (Neuron-wise Normalized Muon).
-//! arXiv:2510.05491v1 — Muon + per-row adaptive LR via second moment of NS5 output.
-//! Named `muon`/`Muon` in the API for continuity; the algorithm is NorMuon.
+//! Reference-aligned Muon optimizer: momentum/Nesterov, optional row-normalized
+//! updates, Newton-Schulz 5 orthogonalization, and AdamW for non-matrix params.
 
 use std::collections::HashMap;
 use tch::{Kind, Tensor};
@@ -9,15 +8,13 @@ const NS_A: f64 = 3.4445;
 const NS_B: f64 = -4.7750;
 const NS_C: f64 = 2.0315;
 const NS_STEPS: usize = 5;
-const RMS_MATCH_COEF: f64 = 0.2;
 
 pub struct MuonConfig {
     pub lr: f64,
     pub use_muon_for_2d: bool,
-    /// EMA coef for first moment (momentum before NS5).
-    pub beta1: f64,
-    /// EMA coef for per-row second moment of NS5 output.
-    pub beta2: f64,
+    pub momentum: f64,
+    pub nesterov: bool,
+    pub row_normalize: bool,
     pub eps: f64,
     pub weight_decay: f64,
     /// AdamW LR for scalar/1D params (biases, norms, embeddings).
@@ -32,16 +29,15 @@ pub struct MuonConfig {
 impl Default for MuonConfig {
     fn default() -> Self {
         Self {
-            // NorMuon effective per-entry step is ~0.2*lr, shape-invariant.
-            // Comparable to AdamW lr=1e-3 at NorMuon lr=5e-3.
             lr: 5e-3,
             use_muon_for_2d: true,
-            beta1: 0.95,
-            beta2: 0.95,
-            eps: 1e-8,
+            momentum: 0.99,
+            nesterov: true,
+            row_normalize: true,
+            eps: 1e-7,
             weight_decay: 0.0,
             adamw_lr: 3e-4,
-            adamw_betas: (0.9, 0.999),
+            adamw_betas: (0.9, 0.95),
             adamw_eps: 1e-8,
             adamw_wd: 0.0,
             force_adamw_name_substrings: Vec::new(),
@@ -49,20 +45,15 @@ impl Default for MuonConfig {
     }
 }
 
-/// Per-2D-param state. Each 2D param holds its own momentum and row second-moment.
+/// Per-2D-param state. Each 2D param holds its own momentum.
 /// We deliberately do *not* stack same-shape params into a batched state tensor:
 /// the N× VRAM multiplier from batching NS5's intermediates dwarfs any step-time
 /// savings on realistic models. Keeping state per-param caps NS5's peak working
 /// set at a single [m, n] matrix's worth of transients.
 struct Entry2D {
     idx: usize,
-    transposed: bool,
-    /// sqrt(m * n) — used in RMS-match LR scale.
-    sqrt_mn: f64,
-    /// First-moment EMA, shape [m, n].
+    /// Momentum buffer, shape [m, n].
     momentum: Tensor,
-    /// Per-row second-moment EMA, shape [m] (m = output neurons).
-    row_sq_mean: Tensor,
 }
 
 struct AdamWParamState {
@@ -79,7 +70,7 @@ pub struct Muon {
     params: Vec<Tensor>,
 }
 
-/// Single-matrix Newton-Schulz iteration. Input: [p, q] with p <= q.
+/// Single-matrix Newton-Schulz iteration.
 /// Runs NS_STEPS iterations in bf16 for speed; returns in the input's kind.
 ///
 /// Each iteration is:  x ← NS_A·x + NS_B·(a·x) + NS_C·((a·a)·x), where a = x·xᵀ.
@@ -93,16 +84,17 @@ pub struct Muon {
 /// changing the algorithm.
 fn newtonschulz5(g: &Tensor) -> Tensor {
     let orig_kind = g.kind();
-    // g may alias caller storage (shallow_clone / transpose view); compute the
-    // normalized copy out-of-place so in-place ops below don't mutate it.
-    let nrm = g
+    let transposed = g.size()[0] > g.size()[1];
+    let x2d = if orig_kind == Kind::BFloat16 {
+        g.shallow_clone()
+    } else {
+        g.to_kind(Kind::BFloat16)
+    };
+    let nrm = x2d
         .frobenius_norm([0i64, 1].as_slice(), false)
         .clamp_min(1e-7);
-    let x2d = if orig_kind == Kind::BFloat16 {
-        g / &nrm
-    } else {
-        g.to_kind(Kind::BFloat16) / &nrm
-    };
+    let x2d = &x2d / &nrm;
+    let x2d = if transposed { x2d.transpose(0, 1) } else { x2d };
     let mut x = x2d.unsqueeze(0); // [1, p, q] view — baddbmm needs 3D
 
     for _ in 0..NS_STEPS {
@@ -115,6 +107,11 @@ fn newtonschulz5(g: &Tensor) -> Tensor {
     }
 
     let x = x.squeeze_dim(0);
+    let x = if transposed {
+        x.transpose(0, 1).contiguous()
+    } else {
+        x
+    };
     if orig_kind == Kind::BFloat16 {
         x
     } else {
@@ -151,10 +148,7 @@ impl Muon {
                 let device = p.device();
                 entries_2d.push(Entry2D {
                     idx: i,
-                    transposed: m > n,
-                    sqrt_mn: ((m * n) as f64).sqrt(),
                     momentum: Tensor::zeros([m, n], (kind, device)),
-                    row_sq_mean: Tensor::zeros([m], (kind, device)),
                 });
             } else {
                 adamw_indices.push(i);
@@ -163,7 +157,7 @@ impl Muon {
 
         if cfg.use_muon_for_2d {
             println!(
-                "NorMuon optimizer: {} 2D params (per-param NS5), {} other params (AdamW)",
+                "Muon optimizer: {} 2D params (row-normalized NS5), {} other params (AdamW)",
                 entries_2d.len(),
                 adamw_indices.len()
             );
@@ -193,12 +187,12 @@ impl Muon {
     }
 
     fn step_all_normuon(&mut self) {
-        let beta1 = self.cfg.beta1;
-        let beta2 = self.cfg.beta2;
+        let momentum = self.cfg.momentum;
+        let nesterov = self.cfg.nesterov;
+        let row_normalize = self.cfg.row_normalize;
         let eps = self.cfg.eps;
         let lr = self.cfg.lr;
         let wd = self.cfg.weight_decay;
-        let neg_eta_coef = -RMS_MATCH_COEF * lr;
         let wd_factor = if wd > 0.0 { Some(1.0 - lr * wd) } else { None };
 
         for entry in &mut self.entries_2d {
@@ -207,43 +201,36 @@ impl Muon {
                 continue;
             }
 
-            // EMA momentum: M = β1*M + (1-β1)*g (in place).
-            let _ = entry.momentum.lerp_(&grad, 1.0 - beta1);
+            let _ = entry.momentum.g_mul_scalar_(momentum);
+            let _ = entry.momentum.g_add_(&grad);
 
-            // NS5 on the [p, q] orientation with p <= q, then rotate back.
-            let ns_input = if entry.transposed {
-                entry.momentum.transpose(0, 1)
+            let mut update = if nesterov {
+                &grad + &entry.momentum * momentum
             } else {
                 entry.momentum.shallow_clone()
             };
-            let u = newtonschulz5(&ns_input);
-            let mut o = if entry.transposed {
-                u.transpose(0, 1).contiguous()
-            } else {
-                u
-            };
+            if row_normalize {
+                let row_norms = update
+                    .to_kind(Kind::Float)
+                    .square()
+                    .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float)
+                    .sqrt()
+                    .clamp_min(eps);
+                update = &update / &row_norms.to_kind(update.kind());
+            }
 
-            // Row second-moment update.
-            let sq_mean = o.square().mean_dim([-1i64].as_slice(), false, o.kind());
-            let _ = entry.row_sq_mean.lerp_(&sq_mean, 1.0 - beta2);
-
-            // Row-normalize, then RMS-match the Frobenius norm to produce a
-            // shape-invariant effective step of ~0.2*lr per entry. We own
-            // `o`, so all subsequent scalings run in place.
-            let denom = (entry.row_sq_mean.sqrt() + eps).unsqueeze(-1);
-            let _ = o.g_div_(&denom);
-            let frob = o
-                .frobenius_norm([-2i64, -1].as_slice(), true)
-                .clamp_min(1e-12);
-            let neg_eta = (neg_eta_coef * entry.sqrt_mn) / frob;
-            let _ = o.g_mul_(&neg_eta);
+            let mut update = newtonschulz5(&update);
+            let size = update.size();
+            let aspect_scale = (1.0_f64).max(size[0] as f64 / size[1] as f64).sqrt();
+            let _ = update.g_mul_scalar_(aspect_scale);
 
             // Apply to param.
             let mut p = self.params[entry.idx].shallow_clone();
             if let Some(k) = wd_factor {
                 let _ = p.g_mul_scalar_(k);
             }
-            let _ = p.g_add_(&o);
+            let update = update.to_kind(p.kind()) * (-lr);
+            let _ = p.g_add_(&update);
         }
     }
 
@@ -302,19 +289,23 @@ impl Muon {
         self.cfg.lr = lr;
     }
 
+    pub fn set_momentum(&mut self, momentum: f64) {
+        self.cfg.momentum = momentum;
+    }
+
     pub fn set_adamw_lr(&mut self, lr: f64) {
         self.cfg.adamw_lr = lr;
     }
 
     /// Total bytes of optimizer state currently allocated.
-    /// 2D params: `momentum` + `row_sq_mean` per param.
+    /// 2D params: `momentum` per param.
     /// 1D params: AdamW `m` + `v` per param (lazy — zero until first step).
     pub fn state_bytes(&self) -> usize {
         let tensor_bytes = |t: &Tensor| t.numel() * t.kind().elt_size_in_bytes();
         let muon: usize = self
             .entries_2d
             .iter()
-            .map(|e| tensor_bytes(&e.momentum) + tensor_bytes(&e.row_sq_mean))
+            .map(|e| tensor_bytes(&e.momentum))
             .sum();
         let adamw: usize = self
             .adamw_state
