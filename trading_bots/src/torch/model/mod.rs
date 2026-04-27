@@ -189,7 +189,7 @@ impl GqaBlock {
         let qkv_dim = model_dim + 2 * kv_dim;
         let attn_ln = RMSNorm::new(&(p / "attn_ln"), model_dim, 1e-6);
         let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
-        let attn_out = linear_orthogonal(p, "attn_out", model_dim, model_dim, _init_scale);
+        let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "q_norm"), head_dim, 1e-6);
         let k_norm = RMSNorm::new(&(p / "k_norm"), head_dim, 1e-6);
         let q_gain = p.var("q_gain", &[GQA_NUM_Q_HEADS], Init::Const(QK_GAIN_INIT));
