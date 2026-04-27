@@ -95,7 +95,7 @@ const GQA_NUM_Q_HEADS: i64 = 4;
 const GQA_NUM_KV_HEADS: i64 = 4;
 const CA_NUM_HEADS: i64 = 2;
 const CA_HEAD_DIM: i64 = 128;
-const QK_GAIN_INIT: f64 = 1.5;
+const QK_GAIN_INIT: f64 = 5.0;
 const ROPE_DIMS: i64 = 16;
 
 fn rotate_half(x: &Tensor) -> Tensor {
