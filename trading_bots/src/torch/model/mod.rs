@@ -529,8 +529,7 @@ impl ExoMLP {
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let h = self.in_ln.forward_linear(x, &self.fc1).silu();
-        let h = linear_with_same_dtype(&h, &self.fc2);
+        let h = leaky_relu_sq_linear(&self.in_ln.forward_linear(x, &self.fc1), &self.fc2);
         x + h
     }
 }
