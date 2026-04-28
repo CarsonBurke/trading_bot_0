@@ -176,14 +176,13 @@ struct GqaBlock {
     q_dim: i64,
     kv_dim: i64,
     resid_mix: Tensor,
-    ln_scale_factor: f64,
     ffn_ln: RMSNorm,
     ffn_fc1: nn::Linear,
     ffn_fc2: nn::Linear,
 }
 
 impl GqaBlock {
-    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, _init_scale: f64, layer_idx: usize) -> Self {
+    fn new(p: &nn::Path, model_dim: i64, ff_dim: i64, _init_scale: f64, _layer_idx: usize) -> Self {
         let head_dim = model_dim / GQA_NUM_Q_HEADS;
         let kv_dim = GQA_NUM_KV_HEADS * head_dim;
         let qkv_dim = model_dim + 2 * kv_dim;
@@ -195,7 +194,6 @@ impl GqaBlock {
         let q_gain = p.var("q_gain", &[GQA_NUM_Q_HEADS], Init::Const(QK_GAIN_INIT));
         let attn_scale = p.var("attn_scale", &[model_dim], Init::Const(1.0));
         let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));
-        let ln_scale_factor = 1.0 / ((layer_idx + 1) as f64).sqrt();
         let resid_mix = p.var_copy(
             "resid_mix",
             &Tensor::stack(
@@ -221,7 +219,6 @@ impl GqaBlock {
             q_dim: model_dim,
             kv_dim,
             resid_mix,
-            ln_scale_factor,
             ffn_ln,
             ffn_fc1,
             ffn_fc2,
@@ -266,7 +263,7 @@ impl GqaBlock {
     ) -> (Tensor, Tensor, Tensor) {
         let (b, s, d) = x.size3().unwrap();
         let head_dim = d / GQA_NUM_Q_HEADS;
-        let normed = self.attn_ln.forward(x) * self.ln_scale_factor;
+        let normed = self.attn_ln.forward(x);
         let qkv = linear_with_same_dtype(&normed, &self.attn_qkv);
         let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
         let q = parts[0]
@@ -298,7 +295,7 @@ impl GqaBlock {
     ) -> (Tensor, Tensor, Tensor) {
         let (b, s, d) = x.size3().unwrap();
         let head_dim = d / GQA_NUM_Q_HEADS;
-        let normed = self.attn_ln.forward(x) * self.ln_scale_factor;
+        let normed = self.attn_ln.forward(x);
         let qkv = linear_with_same_dtype(&normed, &self.attn_qkv);
         let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
         let q = parts[0]
@@ -323,7 +320,7 @@ impl GqaBlock {
     }
 
     fn apply_ffn(&self, x: &Tensor) -> Tensor {
-        let normed = self.ffn_ln.forward(x) * self.ln_scale_factor;
+        let normed = self.ffn_ln.forward(x);
         let ffn_out = leaky_relu_sq_linear(
             &linear_with_same_dtype(&normed, &self.ffn_fc1),
             &self.ffn_fc2,
