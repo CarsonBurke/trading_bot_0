@@ -1141,19 +1141,7 @@ impl TradingModel {
                 bias: false,
             },
         );
-        let value_proj = nn::linear(
-            p / "value_proj",
-            flat_all_tickers,
-            NUM_BINS,
-            nn::LinearConfig {
-                ws_init: Init::Uniform {
-                    lo: -1.0 / (flat_all_tickers as f64).sqrt(),
-                    up: 1.0 / (flat_all_tickers as f64).sqrt(),
-                },
-                bs_init: None,
-                bias: false,
-            },
-        );
+        let value_proj = linear_orthogonal(p, "value_proj", flat_all_tickers, NUM_BINS, 0.1);
         Self {
             variant: config.variant,
             patch_configs,
