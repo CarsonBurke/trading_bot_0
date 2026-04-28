@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 use tch::{nn, Device, Kind, Tensor};
 
-use crate::torch::action_space::sigmoid_target_weight;
+use crate::torch::action_space::{beta_mean, sample_beta_action};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::cuda_cfg::configure_cuda;
 use crate::torch::env::Env;
@@ -30,25 +30,23 @@ pub fn load_model<P: AsRef<Path>>(
 }
 
 pub fn sample_actions(
-    action_mean: &Tensor,
-    action_noise_std: &Tensor,
+    action_alpha: &Tensor,
+    action_beta: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let action_mean = action_mean.to_kind(Kind::Float);
-    let action_noise_std = action_noise_std.to_kind(Kind::Float);
+    let action_alpha = action_alpha.to_kind(Kind::Float);
+    let action_beta = action_beta.to_kind(Kind::Float);
 
-    let latent_actions = if deterministic {
-        action_mean
+    if deterministic {
+        beta_mean(&action_alpha, &action_beta)
+    } else if temperature > 0.0 && (temperature - 1.0).abs() > f64::EPSILON {
+        let adjusted_alpha = ((&action_alpha - 1.0) / temperature).clamp_min(0.0) + 1.0;
+        let adjusted_beta = ((&action_beta - 1.0) / temperature).clamp_min(0.0) + 1.0;
+        sample_beta_action(&adjusted_alpha, &adjusted_beta)
     } else {
-        let batch = action_mean.size()[0];
-        let action_dim = action_mean.size()[1];
-        let scale = if temperature > 0.0 { temperature } else { 1.0 };
-        let noise = Tensor::randn(&[batch, action_dim], (Kind::Float, action_mean.device()));
-        &action_mean + &action_noise_std * scale * noise
-    };
-
-    sigmoid_target_weight(&latent_actions)
+        sample_beta_action(&action_alpha, &action_beta)
+    }
 }
 
 pub fn run_inference<P: AsRef<Path>>(
@@ -108,18 +106,17 @@ pub fn run_inference<P: AsRef<Path>>(
             env.step = step;
 
             // First call uses full history, then we switch to incremental per-ticker deltas.
-            let (action_mean, action_noise_std) = tch::no_grad(|| {
+            let (action_alpha, action_beta) = tch::no_grad(|| {
                 let price_input = if use_full {
                     &price_deltas_full
                 } else {
                     &price_deltas_incremental
                 };
-                let (_, action_mean, action_noise_std, _) =
+                let (_, action_alpha, action_beta, _) =
                     model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
-                (action_mean, action_noise_std)
+                (action_alpha, action_beta)
             });
-            let actions =
-                sample_actions(&action_mean, &action_noise_std, deterministic, temperature);
+            let actions = sample_actions(&action_alpha, &action_beta, deterministic, temperature);
 
             let actions_vec: Vec<f64> = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let step_result = env.step_step_single(&actions_vec);

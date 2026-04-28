@@ -6,8 +6,8 @@ use std::time::Instant;
 use tch::{autocast, nn, Device, Kind, Tensor};
 
 use crate::torch::action_space::{
-    gaussian_kl_old_new_from_log_var, sigmoid_target_weight, transformed_action_log_prob,
-    transformed_action_log_prob_entropy_and_var, transformed_action_log_prob_per_dim,
+    beta_entropy, beta_kl_old_new, beta_log_prob, beta_log_prob_per_dim, beta_variance,
+    sample_beta_action,
 };
 use crate::torch::constants::{
     ACTION_COUNT, EPISODE_TRANSITIONS, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
@@ -44,10 +44,8 @@ const PMPO_REVERSE_KL_COEF: f64 = 0.3;
 const PMPO_POS_TO_NEG_WEIGHT: f64 = 0.5;
 const MAX_GRAD_NORM: f64 = 0.5;
 pub(crate) const DEBUG_NUMERICS: bool = false;
-const LOG_2PI: f64 = 1.8378770664093453;
-
-// RPO: Random Policy Optimization - adds bounded noise to action mean during training and intentionally not during rollout
-// Alpha is learned via induced KL targeting. Set all to 0.0 to disable.
+// RPO is disabled for the bounded Beta policy; these constants are kept only for
+// old metadata compatibility.
 const RPO_ALPHA_MIN: f64 = 0.01;
 const RPO_ALPHA_MAX: f64 = 0.0;
 const RPO_ALPHA_INIT: f64 = 0.0; // CleanRL impl found 0.1 reliably improved results in all test envs over PPO
@@ -391,25 +389,20 @@ fn sample_rollout_actions_from_output(
     output: ModelOutput,
     hl_gauss: &HlGaussBins,
 ) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
-    let (value_logits, action_mean, action_std, action_log_var) = output;
+    let (value_logits, action_alpha, action_beta, action_std) = output;
 
     // Decode critic logits to scalar values for GAE.
     let values = hl_gauss.decode(&value_logits);
 
-    let batch = action_mean.size()[0];
-    let z = Tensor::randn(&[batch, ACTION_COUNT], (Kind::Float, action_mean.device()));
-    let noise = &action_std * &z;
-    let latent_actions = &action_mean + &noise;
-    let target_weights = sigmoid_target_weight(&latent_actions);
-    let action_log_prob =
-        transformed_action_log_prob(&latent_actions, &action_mean, &action_std, LOG_2PI);
+    let target_weights = sample_beta_action(&action_alpha, &action_beta);
+    let action_log_prob = beta_log_prob(&target_weights, &action_alpha, &action_beta);
 
     (
         values,
-        action_mean,
+        action_alpha,
+        action_beta,
         action_std,
-        action_log_var,
-        latent_actions,
+        target_weights.shallow_clone(),
         target_weights,
         action_log_prob,
     )
@@ -573,8 +566,8 @@ struct PmpoMinibatchCudaGraph {
     static_flat: Tensor,
     actions: Tensor,
     old_log_probs: Tensor,
-    old_action_mean: Tensor,
-    old_action_log_var: Tensor,
+    old_action_alpha: Tensor,
+    old_action_beta: Tensor,
     advantages: Tensor,
     returns: Tensor,
     approx_kl: Option<Tensor>,
@@ -592,8 +585,8 @@ impl PmpoMinibatchCudaGraph {
         static_flat: &Tensor,
         actions: &Tensor,
         old_log_probs: &Tensor,
-        old_action_mean: &Tensor,
-        old_action_log_var: &Tensor,
+        old_action_alpha: &Tensor,
+        old_action_beta: &Tensor,
         advantages: &Tensor,
         returns: &Tensor,
         sample_count: i64,
@@ -606,8 +599,8 @@ impl PmpoMinibatchCudaGraph {
             static_flat: Tensor::zeros_like(static_flat),
             actions: Tensor::zeros_like(actions),
             old_log_probs: Tensor::zeros_like(old_log_probs),
-            old_action_mean: Tensor::zeros_like(old_action_mean),
-            old_action_log_var: Tensor::zeros_like(old_action_log_var),
+            old_action_alpha: Tensor::zeros_like(old_action_alpha),
+            old_action_beta: Tensor::zeros_like(old_action_beta),
             advantages: Tensor::zeros_like(advantages),
             returns: Tensor::zeros_like(returns),
             approx_kl: None,
@@ -625,8 +618,8 @@ impl PmpoMinibatchCudaGraph {
         static_flat: &Tensor,
         actions: &Tensor,
         old_log_probs: &Tensor,
-        old_action_mean: &Tensor,
-        old_action_log_var: &Tensor,
+        old_action_alpha: &Tensor,
+        old_action_beta: &Tensor,
         advantages: &Tensor,
         returns: &Tensor,
         sample_count: i64,
@@ -636,8 +629,8 @@ impl PmpoMinibatchCudaGraph {
             && self.static_flat.size() == static_flat.size()
             && self.actions.size() == actions.size()
             && self.old_log_probs.size() == old_log_probs.size()
-            && self.old_action_mean.size() == old_action_mean.size()
-            && self.old_action_log_var.size() == old_action_log_var.size()
+            && self.old_action_alpha.size() == old_action_alpha.size()
+            && self.old_action_beta.size() == old_action_beta.size()
             && self.advantages.size() == advantages.size()
             && self.returns.size() == returns.size()
     }
@@ -648,8 +641,8 @@ impl PmpoMinibatchCudaGraph {
         static_flat: &Tensor,
         actions: &Tensor,
         old_log_probs: &Tensor,
-        old_action_mean: &Tensor,
-        old_action_log_var: &Tensor,
+        old_action_alpha: &Tensor,
+        old_action_beta: &Tensor,
         advantages: &Tensor,
         returns: &Tensor,
     ) {
@@ -657,8 +650,8 @@ impl PmpoMinibatchCudaGraph {
         self.static_flat.copy_(static_flat);
         self.actions.copy_(actions);
         self.old_log_probs.copy_(old_log_probs);
-        self.old_action_mean.copy_(old_action_mean);
-        self.old_action_log_var.copy_(old_action_log_var);
+        self.old_action_alpha.copy_(old_action_alpha);
+        self.old_action_beta.copy_(old_action_beta);
         self.advantages.copy_(advantages);
         self.returns.copy_(returns);
     }
@@ -673,8 +666,8 @@ impl PmpoMinibatchCudaGraph {
         static_flat: &Tensor,
         actions: &Tensor,
         old_log_probs: &Tensor,
-        old_action_mean: &Tensor,
-        old_action_log_var: &Tensor,
+        old_action_alpha: &Tensor,
+        old_action_beta: &Tensor,
         advantages: &Tensor,
         returns: &Tensor,
     ) -> PmpoMinibatchMetrics {
@@ -683,8 +676,8 @@ impl PmpoMinibatchCudaGraph {
             static_flat,
             actions,
             old_log_probs,
-            old_action_mean,
-            old_action_log_var,
+            old_action_alpha,
+            old_action_beta,
             advantages,
             returns,
         );
@@ -698,8 +691,8 @@ impl PmpoMinibatchCudaGraph {
                 self.sample_count,
                 &self.actions,
                 &self.old_log_probs,
-                &self.old_action_mean,
-                &self.old_action_log_var,
+                &self.old_action_alpha,
+                &self.old_action_beta,
                 &self.advantages,
                 &self.returns,
             );
@@ -718,8 +711,8 @@ impl PmpoMinibatchCudaGraph {
                 self.sample_count,
                 &self.actions,
                 &self.old_log_probs,
-                &self.old_action_mean,
-                &self.old_action_log_var,
+                &self.old_action_alpha,
+                &self.old_action_beta,
                 &self.advantages,
                 &self.returns,
             );
@@ -776,24 +769,23 @@ fn compute_pmpo_minibatch_outputs(
     sample_count: i64,
     actions: &Tensor,
     old_log_probs: &Tensor,
-    old_action_mean: &Tensor,
-    old_action_log_var: &Tensor,
+    old_action_alpha: &Tensor,
+    old_action_beta: &Tensor,
     advantages: &Tensor,
     returns: &Tensor,
 ) -> PmpoMinibatchOutputs {
-    let (new_value_logits, action_mean, action_std, action_log_var) = autocast(false, || {
+    let (new_value_logits, action_alpha, action_beta, _action_std) = autocast(false, || {
         model.windowed_replay_forward(windowed, static_flat, sample_count)
     });
-    let (action_log_probs, dist_entropy_per_sample, _) =
-        transformed_action_log_prob_entropy_and_var(actions, &action_mean, &action_std, LOG_2PI);
-    let action_log_probs_per_dim =
-        transformed_action_log_prob_per_dim(actions, &action_mean, &action_std, LOG_2PI);
+    let action_log_probs = beta_log_prob(actions, &action_alpha, &action_beta);
+    let dist_entropy_per_sample = beta_entropy(&action_alpha, &action_beta);
+    let action_log_probs_per_dim = beta_log_prob_per_dim(actions, &action_alpha, &action_beta);
     let log_ratio = &action_log_probs - old_log_probs;
-    let reverse_kl_loss = gaussian_kl_old_new_from_log_var(
-        old_action_mean,
-        old_action_log_var,
-        &action_mean,
-        &action_log_var,
+    let reverse_kl_loss = beta_kl_old_new(
+        old_action_alpha,
+        old_action_beta,
+        &action_alpha,
+        &action_beta,
     )
     .mean(Kind::Float);
 
@@ -875,29 +867,23 @@ fn cuda_graph_updates_enabled(policy_objective: PolicyObjective, device: Device)
     true
 }
 
-/// Compute action std and RPO alpha stats from a sample batch.
+/// Compute Beta action std and concentration stats from a sample batch.
 fn compute_action_std_stats(
     model: &TradingModel,
     price_deltas: &Tensor,
     static_obs: &Tensor,
-    rpo_rho: &Tensor,
-    device: tch::Device,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, _, action_std, _) = autocast(false, || {
+        let (_, action_alpha, action_beta, action_std) = autocast(false, || {
             model.forward_on_device(price_deltas, static_obs, false)
         });
-        let rpo_alpha_val = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-            (RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid()).squeeze()
-        } else {
-            Tensor::zeros([], (Kind::Float, device))
-        };
+        let concentration_sum = (&action_alpha + &action_beta).mean(Kind::Float);
         Tensor::stack(
             &[
                 action_std.mean(Kind::Float),
                 action_std.min(),
                 action_std.max(),
-                rpo_alpha_val,
+                concentration_sum,
             ],
             0,
         )
@@ -1022,7 +1008,7 @@ pub async fn train(
             force_adamw_name_substrings: vec![
                 "actor_live_proj".to_string(),
                 "critic_live_proj".to_string(),
-                "policy_mean_log_var".to_string(),
+                "policy_alpha_beta".to_string(),
                 "resid_mix".to_string(),
                 "value_proj".to_string(),
             ],
@@ -1075,11 +1061,11 @@ pub async fn train(
         &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
         (Kind::Float, device),
     );
-    let s_old_action_mean = Tensor::zeros(
+    let s_old_action_alpha = Tensor::ones(
         &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
         (Kind::Float, device),
     );
-    let s_old_action_log_var = Tensor::zeros(
+    let s_old_action_beta = Tensor::ones(
         &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
         (Kind::Float, device),
     );
@@ -1182,10 +1168,10 @@ pub async fn train(
             let chunk_offset = step as i64 % rollout.ppo_chunk_len;
             let (
                 values,
-                action_mean,
+                action_alpha,
+                action_beta,
                 action_std,
-                action_log_var,
-                latent_actions,
+                actions,
                 target_weights,
                 action_log_prob,
             ) = sample_rollout_actions_from_output(
@@ -1196,9 +1182,10 @@ pub async fn train(
             );
 
             if DEBUG_NUMERICS {
-                let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
+                let _ = debug_tensor_stats("action_alpha", &action_alpha, episode as i64, step);
+                let _ = debug_tensor_stats("action_beta", &action_beta, episode as i64, step);
                 let _ = debug_tensor_stats("action_std", &action_std, episode as i64, step);
-                let _ = debug_tensor_stats("latent_actions", &latent_actions, episode as i64, step);
+                let _ = debug_tensor_stats("actions", &actions, episode as i64, step);
                 let _ = debug_tensor_stats("target_weights", &target_weights, episode as i64, step);
                 let _ =
                     debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
@@ -1291,15 +1278,15 @@ pub async fn train(
             let _ = s_actions
                 .narrow(0, chunk_row, rollout.nprocs)
                 .narrow(1, chunk_offset, 1)
-                .copy_(&latent_actions.unsqueeze(1));
-            let _ = s_old_action_mean
+                .copy_(&actions.unsqueeze(1));
+            let _ = s_old_action_alpha
                 .narrow(0, chunk_row, rollout.nprocs)
                 .narrow(1, chunk_offset, 1)
-                .copy_(&action_mean.unsqueeze(1));
-            let _ = s_old_action_log_var
+                .copy_(&action_alpha.unsqueeze(1));
+            let _ = s_old_action_beta
                 .narrow(0, chunk_row, rollout.nprocs)
                 .narrow(1, chunk_offset, 1)
-                .copy_(&action_log_var.unsqueeze(1));
+                .copy_(&action_beta.unsqueeze(1));
             let _ = s_old_log_probs
                 .narrow(0, chunk_row, rollout.nprocs)
                 .narrow(1, chunk_offset, 1)
@@ -1490,8 +1477,8 @@ pub async fn train(
                 let ret_mb_by_chunk = returns.index_select(0, &chunk_ids);
                 let old_log_probs_by_chunk = s_old_log_probs.index_select(0, &chunk_ids);
                 let act_mb_by_chunk = s_actions.index_select(0, &chunk_ids);
-                let old_action_mean_by_chunk = s_old_action_mean.index_select(0, &chunk_ids);
-                let old_action_log_var_by_chunk = s_old_action_log_var.index_select(0, &chunk_ids);
+                let old_action_alpha_by_chunk = s_old_action_alpha.index_select(0, &chunk_ids);
+                let old_action_beta_by_chunk = s_old_action_beta.index_select(0, &chunk_ids);
                 let reset_slots_chunk = reset_slots_by_chunk.index_select(0, &chunk_ids);
 
                 let fwd_start = Instant::now();
@@ -1572,9 +1559,8 @@ pub async fn train(
                 let ret_flat = ret_mb_by_chunk.reshape([-1]);
                 let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
                 let act_flat = act_mb_by_chunk.reshape([-1, ACTION_COUNT]);
-                let old_action_mean_flat = old_action_mean_by_chunk.reshape([-1, ACTION_COUNT]);
-                let old_action_log_var_flat =
-                    old_action_log_var_by_chunk.reshape([-1, ACTION_COUNT]);
+                let old_action_alpha_flat = old_action_alpha_by_chunk.reshape([-1, ACTION_COUNT]);
+                let old_action_beta_flat = old_action_beta_by_chunk.reshape([-1, ACTION_COUNT]);
 
                 if log_first_non_finite_tensor(
                     &mut logged_replay_input_non_finite,
@@ -1587,8 +1573,8 @@ pub async fn train(
                         ("static_flat", &static_flat),
                         ("actions", &act_flat),
                         ("old_log_probs", &old_log_probs_flat),
-                        ("old_action_mean", &old_action_mean_flat),
-                        ("old_action_log_var", &old_action_log_var_flat),
+                        ("old_action_alpha", &old_action_alpha_flat),
+                        ("old_action_beta", &old_action_beta_flat),
                         ("advantages", &adv_flat),
                         ("returns", &ret_flat),
                     ],
@@ -1612,8 +1598,8 @@ pub async fn train(
                             &static_flat,
                             &act_flat,
                             &old_log_probs_flat,
-                            &old_action_mean_flat,
-                            &old_action_log_var_flat,
+                            &old_action_alpha_flat,
+                            &old_action_beta_flat,
                             &adv_flat,
                             &ret_flat,
                             minibatch_sample_count,
@@ -1625,8 +1611,8 @@ pub async fn train(
                             &static_flat,
                             &act_flat,
                             &old_log_probs_flat,
-                            &old_action_mean_flat,
-                            &old_action_log_var_flat,
+                            &old_action_alpha_flat,
+                            &old_action_beta_flat,
                             &adv_flat,
                             &ret_flat,
                             minibatch_sample_count,
@@ -1643,8 +1629,8 @@ pub async fn train(
                             &static_flat,
                             &act_flat,
                             &old_log_probs_flat,
-                            &old_action_mean_flat,
-                            &old_action_log_var_flat,
+                            &old_action_alpha_flat,
+                            &old_action_beta_flat,
                             &adv_flat,
                             &ret_flat,
                         );
@@ -1738,7 +1724,7 @@ pub async fn train(
                     }
                 }
 
-                let (new_value_logits, action_mean, action_std, action_log_var) =
+                let (new_value_logits, action_alpha, action_beta, action_std) =
                     autocast(false, || {
                         trading_model.windowed_replay_forward(
                             &windowed,
@@ -1747,52 +1733,24 @@ pub async fn train(
                         )
                     });
 
-                let (rpo_alpha, action_mean_perturbed) = if policy_objective == PolicyObjective::Ppo
-                    && RPO_ALPHA_MAX > RPO_ALPHA_MIN
-                {
-                    let alpha = RPO_ALPHA_MIN + (RPO_ALPHA_MAX - RPO_ALPHA_MIN) * rpo_rho.sigmoid();
-                    let alpha_detached = alpha.detach();
-                    let rpo_noise = Tensor::empty(
-                        [minibatch_sample_count, ACTION_COUNT],
-                        (Kind::Float, device),
-                    )
-                    .uniform_(-1.0, 1.0)
-                        * &alpha_detached;
-                    (alpha, &action_mean + rpo_noise)
-                } else {
-                    (
-                        Tensor::zeros(&[1], (Kind::Float, device)),
-                        action_mean.shallow_clone(),
-                    )
-                };
-
-                let (action_log_probs, dist_entropy_per_sample, action_var) =
-                    transformed_action_log_prob_entropy_and_var(
-                        &act_flat,
-                        &action_mean_perturbed,
-                        &action_std,
-                        LOG_2PI,
-                    );
+                let action_log_probs = beta_log_prob(&act_flat, &action_alpha, &action_beta);
+                let dist_entropy_per_sample = beta_entropy(&action_alpha, &action_beta);
+                let action_var = beta_variance(&action_alpha, &action_beta);
                 let action_log_probs_per_dim = if policy_objective == PolicyObjective::Pmpo {
-                    transformed_action_log_prob_per_dim(
-                        &act_flat,
-                        &action_mean_perturbed,
-                        &action_std,
-                        LOG_2PI,
-                    )
+                    beta_log_prob_per_dim(&act_flat, &action_alpha, &action_beta)
                 } else {
                     Tensor::zeros([0], (Kind::Float, device))
                 };
 
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("latent_actions_mb", &act_flat, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("actions_mb", &act_flat, _epoch, chunk_i);
                     let _ = debug_tensor_stats(
                         "old_log_probs_mb",
                         &old_log_probs_flat,
                         _epoch,
                         chunk_i,
                     );
-                    let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_alpha", &action_alpha, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
                 }
 
@@ -1813,13 +1771,13 @@ pub async fn train(
                     _epoch,
                     chunk_i,
                     &[
-                        ("action_mean", &action_mean),
+                        ("action_alpha", &action_alpha),
                         ("action_std", &action_std),
-                        ("action_log_var", &action_log_var),
+                        ("action_beta", &action_beta),
                         ("action_log_probs", &action_log_probs),
                         ("old_log_probs", &old_log_probs_flat),
-                        ("old_action_mean", &old_action_mean_flat),
-                        ("old_action_log_var", &old_action_log_var_flat),
+                        ("old_action_alpha", &old_action_alpha_flat),
+                        ("old_action_beta", &old_action_beta_flat),
                         ("log_ratio", &log_ratio),
                         ("ratio", &ratio),
                         ("new_value_logits", &new_value_logits),
@@ -1854,11 +1812,11 @@ pub async fn train(
 
                 let reverse_kl_loss = match policy_objective {
                     PolicyObjective::Ppo => Tensor::zeros([], (Kind::Float, device)),
-                    PolicyObjective::Pmpo => gaussian_kl_old_new_from_log_var(
-                        &old_action_mean_flat,
-                        &old_action_log_var_flat,
-                        &action_mean,
-                        &action_log_var,
+                    PolicyObjective::Pmpo => beta_kl_old_new(
+                        &old_action_alpha_flat,
+                        &old_action_beta_flat,
+                        &action_alpha,
+                        &action_beta,
                     )
                     .mean(Kind::Float),
                 };
@@ -1910,6 +1868,8 @@ pub async fn train(
 
                 let alpha_loss =
                     if policy_objective == PolicyObjective::Ppo && RPO_ALPHA_MAX > RPO_ALPHA_MIN {
+                        let rpo_alpha =
+                            Tensor::zeros(&[1], (Kind::Float, device)).set_requires_grad(true);
                         let inv_var_mean = action_var
                             .detach()
                             .clamp_min(1e-4)
@@ -2185,8 +2145,6 @@ pub async fn train(
             &trading_model,
             &s_chunk_start_layouts.narrow(0, 0, rollout.nprocs),
             &s_static_obs.narrow(0, 0, rollout.nprocs).select(1, 0),
-            &rpo_rho,
-            device,
         );
         let return_range_stats = hl_gauss.range_stats(&returns);
         // Compute all metrics on GPU, single transfer to CPU.
@@ -2259,7 +2217,7 @@ pub async fn train(
         primary
             .meta_history
             .record_advantage_stats(adv_mean, adv_min, adv_max);
-        // Record action std stats in place of logit noise stats
+        // Existing report slot now carries Beta std min/mean/max and concentration.
         primary.meta_history.record_logit_noise_stats(
             log_std_stats_vec[0],
             log_std_stats_vec[1],

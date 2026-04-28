@@ -942,9 +942,9 @@ impl TradingModel {
         probe_replay_tensor("patch_hidden", &patch_hidden);
         let output = self.backbone_with_actor_critic_cls(&patch_hidden, &exo_tokens, batch_size);
         probe_replay_tensor("head_value_logits", &output.0);
-        probe_replay_tensor("head_action_mean", &output.1);
-        probe_replay_tensor("head_action_std", &output.2);
-        probe_replay_tensor("head_action_log_var", &output.3);
+        probe_replay_tensor("head_action_alpha", &output.1);
+        probe_replay_tensor("head_action_beta", &output.2);
+        probe_replay_tensor("head_action_std", &output.3);
         output
     }
 

@@ -819,7 +819,7 @@ pub fn patch_ends_for_variant(variant: ModelVariant) -> Vec<i64> {
     ends
 }
 
-/// (value_logits, action_mean, action_std, action_log_var)
+/// (value_logits, action_alpha, action_beta, action_std)
 pub type ModelOutput = (Tensor, Tensor, Tensor, Tensor);
 
 pub struct DebugMetrics {
@@ -907,7 +907,7 @@ pub struct TradingModel {
     endogenous_ticker_block: EndogenousTickerBlock,
     actor_live_proj: nn::Linear,
     critic_live_proj: nn::Linear,
-    policy_mean_log_var: nn::Linear,
+    policy_alpha_beta: nn::Linear,
     value_proj: nn::Linear,
     device: tch::Device,
 }
@@ -1128,8 +1128,8 @@ impl TradingModel {
             "per-ticker actor head requires one action per ticker"
         );
         let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
-        let policy_mean_log_var = nn::linear(
-            p / "policy_mean_log_var",
+        let policy_alpha_beta = nn::linear(
+            p / "policy_alpha_beta",
             spec.model_dim,
             2,
             nn::LinearConfig {
@@ -1164,7 +1164,7 @@ impl TradingModel {
             endogenous_ticker_block,
             actor_live_proj,
             critic_live_proj,
-            policy_mean_log_var,
+            policy_alpha_beta,
             value_proj,
             device: p.device(),
         }
