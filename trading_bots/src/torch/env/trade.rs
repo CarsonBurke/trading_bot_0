@@ -1,6 +1,6 @@
 use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE};
 
-use super::env::{Env, TRADE_EMA_ALPHA};
+use super::single::{Env, TRADE_EMA_ALPHA};
 
 impl Env {
     pub fn sync_realized_weights(&mut self, absolute_step: usize) {

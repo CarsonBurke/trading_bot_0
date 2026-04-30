@@ -5,7 +5,7 @@ use shared::constants::{
     STATIC_OBSERVATIONS as STATIC_OBSERVATIONS_USIZE, TICKERS_COUNT as TICKERS_COUNT_USIZE,
 };
 
-use super::env::Env;
+use super::single::Env;
 
 impl Env {
     fn build_static_obs_array(&self, absolute_step: usize) -> [f32; STATIC_OBSERVATIONS_USIZE] {

@@ -163,7 +163,7 @@ async fn main() {
             model_size,
             run,
         }) => {
-            torch::ppo::train(weights.as_deref(), *model_size, run.clone()).await;
+            torch::train::train(weights.as_deref(), *model_size, run.clone()).await;
         }
         Some(Commands::Infer {
             weights,
@@ -193,7 +193,7 @@ async fn main() {
             temperature,
             model_size,
         }) => {
-            torch::ibkr_infer::run_ibkr_paper_trading(
+            torch::infer::run_ibkr_paper_trading(
                 weights,
                 symbols.clone(),
                 *interval,
@@ -204,7 +204,7 @@ async fn main() {
             .expect("paper trading failed");
         }
         None => {
-            torch::ppo::train(None, ModelVariant::UniformStream, None).await;
+            torch::train::train(None, ModelVariant::UniformStream, None).await;
         }
     }
 

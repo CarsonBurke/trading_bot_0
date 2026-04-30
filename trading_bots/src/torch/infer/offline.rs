@@ -4,7 +4,7 @@ use tch::{nn, Device, Kind, Tensor};
 
 use crate::torch::action_space::{beta_mean, sample_beta_action};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
-use crate::torch::cuda_cfg::configure_cuda;
+use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};

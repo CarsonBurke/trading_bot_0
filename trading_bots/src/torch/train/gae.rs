@@ -1,42 +1,107 @@
+use tch::{Kind, Tensor};
+
+use crate::torch::constants::TICKERS_COUNT;
+
+pub(crate) fn build_no_reset_windowed_layouts(
+    boundary_layout: &Tensor,
+    step_deltas_chunk: &Tensor,
+    chunk_count: i64,
+    ppo_chunk_len: i64,
+    flat_layout_len: i64,
+) -> Tensor {
+    let layout_rows = chunk_count * TICKERS_COUNT;
+    let boundary_rows = boundary_layout.view([layout_rows, flat_layout_len]);
+    let appended_deltas = if ppo_chunk_len > 1 {
+        step_deltas_chunk
+            .narrow(1, 0, ppo_chunk_len - 1)
+            .permute([0, 2, 1])
+            .contiguous()
+            .view([layout_rows, ppo_chunk_len - 1])
+            .to_kind(boundary_rows.kind())
+    } else {
+        Tensor::zeros(
+            [layout_rows, 0],
+            (boundary_rows.kind(), boundary_rows.device()),
+        )
+    };
+    let extended = Tensor::cat(&[&boundary_rows, &appended_deltas], 1);
+    extended
+        .unfold(1, flat_layout_len, 1)
+        .view([chunk_count, TICKERS_COUNT, ppo_chunk_len, flat_layout_len])
+        .permute([0, 2, 1, 3])
+        .contiguous()
+        .view([chunk_count * ppo_chunk_len * TICKERS_COUNT, flat_layout_len])
+}
+
+/// Compute GAE advantages and returns from chunk-major rollout data.
+pub(crate) fn compute_gae_chunked(
+    rewards_by_chunk: &Tensor,
+    values_by_chunk: &Tensor,
+    dones_by_chunk: &Tensor,
+    bootstrap_value: &Tensor,
+    rollout_steps: i64,
+    nprocs: i64,
+    ppo_chunk_len: i64,
+    gamma: f64,
+    gae_lambda: f64,
+    device: tch::Device,
+) -> (Tensor, Tensor) {
+    let chunks_per_rollout = rollout_steps / ppo_chunk_len;
+    let total_chunks = chunks_per_rollout * nprocs;
+    let advantages = Tensor::zeros(&[total_chunks, ppo_chunk_len], (Kind::Float, device));
+    let returns = Tensor::zeros(&[total_chunks, ppo_chunk_len], (Kind::Float, device));
+
+    tch::no_grad(|| {
+        let mut last_gae = Tensor::zeros(&[nprocs], (Kind::Float, device));
+        for t in (0..rollout_steps).rev() {
+            let chunk_block = t / ppo_chunk_len;
+            let chunk_offset = t % ppo_chunk_len;
+            let chunk_row = chunk_block * nprocs;
+            let next_values = if t == rollout_steps - 1 {
+                bootstrap_value.shallow_clone()
+            } else {
+                let next_chunk_block = (t + 1) / ppo_chunk_len;
+                let next_chunk_offset = (t + 1) % ppo_chunk_len;
+                values_by_chunk
+                    .narrow(0, next_chunk_block * nprocs, nprocs)
+                    .select(1, next_chunk_offset)
+            };
+            let cur_values = values_by_chunk
+                .narrow(0, chunk_row, nprocs)
+                .select(1, chunk_offset);
+            let rewards = rewards_by_chunk
+                .narrow(0, chunk_row, nprocs)
+                .select(1, chunk_offset);
+            let dones = dones_by_chunk
+                .narrow(0, chunk_row, nprocs)
+                .select(1, chunk_offset);
+
+            let delta = rewards + (1.0 - &dones) * gamma * &next_values - &cur_values;
+            last_gae = delta + (1.0 - &dones) * gamma * gae_lambda * &last_gae;
+            let _ = advantages
+                .narrow(0, chunk_row, nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&last_gae.unsqueeze(1));
+            let step_returns = &last_gae + &cur_values;
+            let _ = returns
+                .narrow(0, chunk_row, nprocs)
+                .narrow(1, chunk_offset, 1)
+                .copy_(&step_returns.unsqueeze(1));
+        }
+    });
+
+    (advantages.detach(), returns.detach())
+}
+
 #[cfg(test)]
 mod tests {
     use tch::{Device, Kind, Tensor};
 
+    use super::{build_no_reset_windowed_layouts, compute_gae_chunked};
     use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
-    use crate::torch::hl_gauss::HlGaussBins;
-    use crate::torch::ppo::{
-        build_no_reset_windowed_layouts, compute_gae_chunked, hl_gauss_value_loss,
-    };
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() < tol
-    }
-
-    #[test]
-    fn hl_gauss_value_loss_matches_cross_entropy() {
-        let hl_gauss = HlGaussBins::new(-3.0, 3.0, 21, tch::Device::Cpu);
-        let logits = Tensor::zeros([1, 21], (Kind::Float, tch::Device::Cpu));
-        let _ = logits.get(0).get(10).fill_(0.3);
-        let _ = logits.get(0).get(11).fill_(0.1);
-
-        let returns = Tensor::from_slice(&[0.15f32]);
-
-        let loss = hl_gauss_value_loss(&hl_gauss, &logits, &returns);
-
-        let return_bins = hl_gauss.encode(&returns);
-        let reference = -(&return_bins * logits.log_softmax(-1, Kind::Float)).sum_dim_intlist(
-            [-1].as_slice(),
-            false,
-            Kind::Float,
-        );
-
-        let actual = loss.double_value(&[0]);
-        let expected = reference.double_value(&[0]);
-
-        assert!(
-            approx_eq(actual, expected, 1e-6),
-            "value loss mismatch: expected {expected}, got {actual}"
-        );
     }
 
     #[test]

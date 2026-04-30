@@ -7,7 +7,7 @@ use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
 use trading_bot_0::torch::{
     constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT},
     model::{ModelVariant, TradingModel, TradingModelConfig},
-    muon::{Muon, MuonConfig},
+    optim::{Muon, MuonConfig},
 };
 
 use results::{BenchmarkResult, BenchmarkRun, BenchmarkSuite};

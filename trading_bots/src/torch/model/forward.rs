@@ -1,7 +1,7 @@
 use std::env;
 use tch::Tensor;
 
-use super::{DebugMetrics, ModelOutput, StreamState, TradingModel};
+use super::trading_model::{DebugMetrics, ModelOutput, StreamState, TradingModel};
 
 impl TradingModel {
     fn forward_prepared_on_device(
@@ -131,7 +131,7 @@ static DEBUG_INITIALIZED: AtomicBool = AtomicBool::new(false);
 #[inline]
 fn is_debug_enabled() -> bool {
     if !DEBUG_INITIALIZED.load(Ordering::Relaxed) {
-        let enabled = crate::torch::ppo::DEBUG_NUMERICS
+        let enabled = crate::torch::train::config::DEBUG_NUMERICS
             || env::var("MODEL_FUSED_DEBUG").ok().as_deref() == Some("1");
         DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
         DEBUG_INITIALIZED.store(true, Ordering::Relaxed);

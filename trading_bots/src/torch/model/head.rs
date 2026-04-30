@@ -1,11 +1,12 @@
 use tch::{Kind, Tensor};
 
-use super::{linear_with_same_dtype, ModelOutput, TradingModel};
+use super::init::linear_with_same_dtype;
+use super::trading_model::{ModelOutput, TradingModel};
 use crate::torch::action_space::{beta_concentration_from_head, beta_std};
 use crate::torch::constants::TICKERS_COUNT;
 
 impl TradingModel {
-    pub(super) fn head_from_actor_critic_cls(
+    pub(in crate::torch::model) fn head_from_actor_critic_cls(
         &self,
         actor: &Tensor,
         critic: &Tensor,

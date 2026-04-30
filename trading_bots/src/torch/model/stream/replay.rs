@@ -1,3 +1,253 @@
+use tch::Tensor;
+
+use super::super::config::{
+    ModelVariant, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL, UNIFORM_STREAM_LAYOUT_LEN,
+    UNIFORM_STREAM_PATCH_COUNT,
+};
+use super::super::trading_model::{ModelOutput, StreamState, TradingModel};
+use super::probe::probe_replay_tensor;
+use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
+
+impl TradingModel {
+    pub(super) fn uniform_stream_replay_forward(
+        &self,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        let batch_size = state.uniform_live_fill.size()[0];
+        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+        let x0 = &state.uniform_prefix_x0;
+        let mut prefix_hidden = self
+            .exogenous_ticker_block
+            .forward(&state.uniform_layer0_prefix_hidden, &exo_tokens);
+        let mut prefix_k = Vec::with_capacity(self.gqa_layers.len());
+        let mut prefix_v = Vec::with_capacity(self.gqa_layers.len());
+        prefix_k.push(state.uniform_layer0_prefix_k.shallow_clone());
+        prefix_v.push(state.uniform_layer0_prefix_v.shallow_clone());
+        for layer in self.gqa_layers.iter().skip(1) {
+            let (x_next, k, v) = layer.forward_prefix_and_cache(&prefix_hidden, x0, &self.rope);
+            prefix_k.push(k);
+            prefix_v.push(v);
+            prefix_hidden = x_next;
+        }
+
+        let live_token =
+            state
+                .uniform_patch_tokens
+                .narrow(1, UNIFORM_STREAM_PATCH_COUNT - 1, 1);
+        let x0_suffix = self.input_ln.forward(&live_token);
+        let prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
+        let _ = prefix_hidden;
+        self.head_from_cached_live_and_cls(
+            &x0_suffix,
+            &prefix_k,
+            &prefix_v,
+            &exo_tokens,
+            prefix_len,
+            batch_size,
+        )
+    }
+
+    pub fn forward_stream_state_on_device_for_replay(
+        &self,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        let static_features = if static_features.dim() == 1 {
+            static_features.unsqueeze(0)
+        } else {
+            static_features.shallow_clone()
+        };
+        let static_features = self.cast_inputs(&static_features);
+        if self.variant == ModelVariant::UniformStream {
+            return self.uniform_stream_replay_forward(&static_features, state);
+        }
+        self.forward_stream_state_on_device(&static_features, state)
+    }
+
+    /// Pure-tensor helper: given a layout of shape `[rows, UNIFORM_STREAM_LAYOUT_LEN]`
+    /// and new deltas of shape `[rows, 1]` (one delta per ticker row), return a
+    /// NEW layout tensor with the oldest delta dropped, the remaining history
+    /// shifted left by one, and the new delta appended at position
+    /// `PRICE_DELTAS_PER_TICKER - 1`. Trailing padding past `PRICE_DELTAS_PER_TICKER`
+    /// is preserved. Does not mutate `layout`.
+    pub(crate) fn shift_layout_append_delta(&self, layout: &Tensor, row_deltas: &Tensor) -> Tensor {
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
+        let rows = layout.size()[0];
+        let layout_len = layout.size()[1];
+        let kept = layout.narrow(1, 1, history_len - 1);
+        let appended = row_deltas.view([rows, 1]).to_kind(layout.kind());
+        if layout_len > history_len {
+            let pad = layout.narrow(1, history_len, layout_len - history_len);
+            Tensor::cat(&[&kept, &appended, &pad], 1)
+        } else {
+            Tensor::cat(&[&kept, &appended], 1)
+        }
+    }
+
+    /// Advance the uniform stream state by one delta step without running the
+    /// post-layer-0 forward or the head. Used by replay callers that will
+    /// reset some envs immediately afterwards, so the replay forward's output
+    /// would be discarded. Non-reset envs still have their layout shifted,
+    /// patch tokens recomputed, and layer-0 prefix cache refreshed; reset envs
+    /// are subsequently overridden via `reset_uniform_stream_envs_from_layout_indexed`.
+    pub fn advance_replay_stream_state(&self, new_deltas: &Tensor, state: &mut StreamState) {
+        assert_eq!(
+            self.variant,
+            ModelVariant::UniformStream,
+            "advance_replay_stream_state requires uniform stream variant"
+        );
+        if new_deltas.device() != self.device {
+            panic!(
+                "advance_replay_stream_state requires tensors on {:?}",
+                self.device
+            );
+        }
+        let new_deltas = self.cast_inputs(new_deltas);
+        let new_deltas = if new_deltas.dim() == 1 {
+            new_deltas.unsqueeze(0)
+        } else {
+            new_deltas.shallow_clone()
+        };
+        let batch_size = new_deltas.size()[0];
+        let state_batch_size = state.uniform_live_fill.size()[0];
+        assert_eq!(
+            state_batch_size, batch_size,
+            "stream state batch size mismatch"
+        );
+        let rows = batch_size * TICKERS_COUNT;
+        let row_deltas = new_deltas.reshape([rows, 1]);
+        let flat_layout = state
+            .uniform_layout
+            .view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
+        // Apply shift+append in-place on the state's layout storage. This is the
+        // streaming-rollout hot path; we avoid an extra copy by mutating directly.
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
+        let mut shifted_valid = Tensor::zeros(
+            [rows, history_len - 1],
+            (flat_layout.kind(), flat_layout.device()),
+        );
+        let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
+        let _ = flat_layout
+            .narrow(1, 0, history_len - 1)
+            .copy_(&shifted_valid);
+        let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
+        state.uniform_patch_tokens = self.patch_embed(&flat_layout);
+        state
+            .uniform_live_fill_host
+            .fill(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        let _ = state
+            .uniform_live_fill
+            .fill_(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        state.initialized = true;
+        self.prefill_uniform_prefix_base_cache(state);
+    }
+
+    /// Stateless batched replay forward over B pre-built windows.
+    ///
+    /// `layouts` has shape `[B * TICKERS_COUNT, UNIFORM_STREAM_LAYOUT_LEN]` (per-ticker flat
+    /// layout rows, concatenated across B windows), and `static_features` has shape
+    /// `[B, STATIC_OBS]`. The returned ModelOutput has batch `B`.
+    ///
+    /// Semantically equivalent to calling `uniform_stream_replay_forward` once per
+    /// window with the appropriate state prefilled; intended for batching PPO
+    /// minibatch sub-chunks where the state threading between time steps can be
+    /// flattened into the batch dimension.
+    pub(crate) fn windowed_replay_forward(
+        &self,
+        layouts: &Tensor,
+        static_features: &Tensor,
+        batch_size: i64,
+    ) -> ModelOutput {
+        assert_eq!(
+            self.variant,
+            ModelVariant::UniformStream,
+            "windowed_replay_forward requires uniform stream variant"
+        );
+        probe_replay_tensor("layouts_in", layouts);
+        probe_replay_tensor("static_features_in", static_features);
+        let layouts = self.cast_inputs(layouts);
+        let patch_tokens = self.patch_embed(&layouts);
+        probe_replay_tensor("patch_tokens", &patch_tokens);
+        let static_features = self.cast_inputs(static_features);
+        let static_features = if static_features.dim() == 1 {
+            static_features.unsqueeze(0)
+        } else {
+            static_features.shallow_clone()
+        };
+        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+        probe_replay_tensor("global_static", &global_static);
+        probe_replay_tensor("per_ticker_static", &per_ticker_static);
+        probe_replay_tensor("exo_tokens", &exo_tokens);
+
+        let patch_hidden = self.input_ln.forward(&patch_tokens);
+        probe_replay_tensor("patch_hidden", &patch_hidden);
+        let output = self.backbone_with_actor_critic_cls(&patch_hidden, &exo_tokens, batch_size);
+        probe_replay_tensor("head_value_logits", &output.0);
+        probe_replay_tensor("head_action_alpha", &output.1);
+        probe_replay_tensor("head_action_beta", &output.2);
+        probe_replay_tensor("head_action_std", &output.3);
+        output
+    }
+
+    pub fn step_on_device_for_replay(
+        &self,
+        new_deltas: &Tensor,
+        static_features: &Tensor,
+        state: &mut StreamState,
+    ) -> ModelOutput {
+        if new_deltas.device() != self.device || static_features.device() != self.device {
+            panic!(
+                "step_on_device_for_replay requires tensors on {:?}",
+                self.device
+            );
+        }
+        let new_deltas = self.cast_inputs(new_deltas);
+        let static_features = self.cast_inputs(static_features);
+
+        let raw_full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
+        let layout_full_obs = self.price_input_dim();
+        let is_full = match new_deltas.dim() {
+            1 => {
+                let width = new_deltas.size()[0];
+                width == raw_full_obs || width == layout_full_obs
+            }
+            2 => {
+                let width = new_deltas.size()[1];
+                width == raw_full_obs || width == layout_full_obs
+            }
+            _ => false,
+        };
+        let static_features = if static_features.dim() == 1 {
+            static_features.unsqueeze(0)
+        } else {
+            static_features.shallow_clone()
+        };
+
+        if self.variant == ModelVariant::UniformStream {
+            if is_full {
+                let price = if new_deltas.dim() == 1 {
+                    new_deltas.unsqueeze(0)
+                } else {
+                    new_deltas.shallow_clone()
+                };
+                self.init_uniform_from_full_on_device(&price, state);
+                return self.uniform_stream_replay_forward(&static_features, state);
+            }
+            return self.step_uniform_stream_state_on_device(
+                &new_deltas,
+                &static_features,
+                state,
+                true,
+            );
+        }
+
+        self.step_on_device(&new_deltas, &static_features, state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tch::{nn, Device, Kind, Tensor};

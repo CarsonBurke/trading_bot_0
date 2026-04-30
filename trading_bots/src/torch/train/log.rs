@@ -1,0 +1,204 @@
+use tch::{Kind, Tensor};
+
+use super::config::PolicyObjective;
+use super::numeric_debug::{compute_action_std_stats, compute_explained_variance, compute_value_diagnostics};
+use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
+
+impl Trainer {
+    pub(super) fn log_episode(
+        &mut self,
+        _episode: usize,
+        adv_data: &AdvantageData,
+        metrics: &UpdateMetrics,
+    ) {
+        let device = self.device;
+        let max_param_norm = tch::no_grad(|| {
+            let norms: Vec<Tensor> = self.trainable_vars.iter().map(|v| v.norm()).collect();
+            if norms.is_empty() {
+                0.0f64
+            } else {
+                Tensor::stack(&norms, 0).max().double_value(&[])
+            }
+        });
+        if max_param_norm > 1000.0 {
+            println!(
+                "WARNING: Large parameter norm detected: {:.2}",
+                max_param_norm
+            );
+        }
+
+        // Compute all metrics on GPU, single transfer to CPU
+        let (
+            mean_policy_loss_t,
+            mean_value_loss_t,
+            mean_reverse_kl_t,
+            mean_grad_norm_t,
+            clip_frac_t,
+        ) = if metrics.total_sample_count > 0 {
+            let n = metrics.total_sample_count as f64;
+            let mean_policy = &metrics.total_policy_loss_weighted / n;
+            let mean_value = &metrics.total_value_loss_weighted / n;
+            let mean_reverse_kl = &metrics.total_reverse_kl_weighted / n;
+            let grad_norm = if metrics.grad_norm_count > 0 {
+                &metrics.grad_norm_sum / (metrics.grad_norm_count as f64)
+            } else {
+                Tensor::zeros([], (Kind::Float, device))
+            };
+            let clip = if metrics.total_ratio_samples > 0 {
+                &metrics.total_clipped / (metrics.total_ratio_samples as f64)
+            } else {
+                Tensor::zeros([], (Kind::Float, device))
+            };
+            (mean_policy, mean_value, mean_reverse_kl, grad_norm, clip)
+        } else {
+            (
+                Tensor::zeros([], (Kind::Float, device)),
+                Tensor::zeros([], (Kind::Float, device)),
+                Tensor::zeros([], (Kind::Float, device)),
+                Tensor::zeros([], (Kind::Float, device)),
+                Tensor::zeros([], (Kind::Float, device)),
+            )
+        };
+
+        let explained_var_t = if metrics.total_sample_count > 0 {
+            compute_explained_variance(&self.s_values, &adv_data.returns)
+        } else {
+            Tensor::zeros([], (Kind::Float, device))
+        };
+        let value_diag_t = if metrics.total_sample_count > 0 {
+            compute_value_diagnostics(&self.s_values, &adv_data.returns)
+        } else {
+            Tensor::zeros([6], (Kind::Float, device))
+        };
+
+        let entropy_mean_t = if metrics.total_sample_count > 0 {
+            &metrics.total_entropy_weighted / metrics.total_sample_count as f64
+        } else {
+            Tensor::zeros([], (Kind::Float, device))
+        };
+
+        let log_std_stats = compute_action_std_stats(
+            &self.trading_model,
+            &self.s_chunk_start_layouts.narrow(0, 0, self.rollout.nprocs),
+            &self.s_static_obs.narrow(0, 0, self.rollout.nprocs).select(1, 0),
+        );
+        let return_range_stats = self.hl_gauss.range_stats(&adv_data.returns);
+        // Compute all metrics on GPU, single transfer to CPU.
+        let all_scalars = Tensor::cat(
+            &[
+                mean_policy_loss_t.view([1]),
+                mean_value_loss_t.view([1]),
+                mean_reverse_kl_t.view([1]),
+                explained_var_t.view([1]),
+                mean_grad_norm_t.view([1]),
+                clip_frac_t.view([1]),
+                adv_data.adv_stats.view([3]),
+                log_std_stats.view([4]),
+                entropy_mean_t.view([1]),
+                metrics.entropy_min.view([1]),
+                metrics.entropy_max.view([1]),
+                return_range_stats.view([6]),
+                value_diag_t.view([6]),
+            ],
+            0,
+        );
+        let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
+            .unwrap_or_else(|_| vec![0.0; 28]);
+        let mean_policy_loss = all_scalars_vec[0];
+        let mean_value_loss = all_scalars_vec[1];
+        let mean_reverse_kl = all_scalars_vec[2];
+        let explained_var = all_scalars_vec[3];
+        let mean_grad_norm = all_scalars_vec[4];
+        let clip_frac = all_scalars_vec[5];
+        let (adv_mean, adv_min, adv_max) =
+            (all_scalars_vec[6], all_scalars_vec[7], all_scalars_vec[8]);
+        let log_std_stats_vec = &all_scalars_vec[9..13];
+        let (entropy_mean, entropy_min_val, entropy_max_val) = (
+            all_scalars_vec[13],
+            all_scalars_vec[14],
+            all_scalars_vec[15],
+        );
+        let (
+            return_min,
+            return_max,
+            support_min,
+            support_max,
+            below_support_frac,
+            above_support_frac,
+        ) = (
+            all_scalars_vec[16],
+            all_scalars_vec[17],
+            all_scalars_vec[18],
+            all_scalars_vec[19],
+            all_scalars_vec[20],
+            all_scalars_vec[21],
+        );
+        let (
+            value_pred_mean,
+            value_pred_std,
+            value_target_mean,
+            value_target_std,
+            value_residual_rmse,
+            value_return_corr,
+        ) = (
+            all_scalars_vec[22],
+            all_scalars_vec[23],
+            all_scalars_vec[24],
+            all_scalars_vec[25],
+            all_scalars_vec[26],
+            all_scalars_vec[27],
+        );
+
+        let policy_objective = self.policy_objective;
+        let last_minibatch_approx_kl = metrics.last_minibatch_approx_kl;
+        let primary = self.env.primary_mut();
+        primary
+            .meta_history
+            .record_advantage_stats(adv_mean, adv_min, adv_max);
+        // Existing report slot now carries Beta std min/mean/max and concentration.
+        primary.meta_history.record_logit_noise_stats(
+            log_std_stats_vec[0],
+            log_std_stats_vec[1],
+            log_std_stats_vec[2],
+            log_std_stats_vec[3],
+        );
+        primary.meta_history.record_clip_fraction(clip_frac);
+        primary.meta_history.record_policy_loss(mean_policy_loss);
+        primary.meta_history.record_value_loss(mean_value_loss);
+        primary.meta_history.record_explained_var(explained_var);
+        primary.meta_history.record_grad_norm(mean_grad_norm);
+        primary
+            .meta_history
+            .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
+        let recorded_policy_kl = match policy_objective {
+            PolicyObjective::Ppo => last_minibatch_approx_kl,
+            PolicyObjective::Pmpo => mean_reverse_kl,
+        };
+        primary.meta_history.record_approx_kl(recorded_policy_kl);
+        if policy_objective == PolicyObjective::Pmpo {
+            primary.meta_history.record_reverse_kl(mean_reverse_kl);
+        }
+        primary.meta_history.record_hl_gauss_range_stats(
+            return_min,
+            return_max,
+            support_min,
+            support_max,
+            below_support_frac,
+            above_support_frac,
+        );
+
+        println!(
+            "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), ReverseKL: {:.4}, GradNorm: {:.4}",
+            mean_policy_loss, mean_value_loss, explained_var, mean_reverse_kl, mean_grad_norm
+        );
+        println!(
+            "  ValueDiag: pred μ/σ {:.3}/{:.3}, target μ/σ {:.3}/{:.3}, RMSE {:.3}, Corr {:.3}",
+            value_pred_mean,
+            value_pred_std,
+            value_target_mean,
+            value_target_std,
+            value_residual_rmse,
+            value_return_corr
+        );
+    }
+}
