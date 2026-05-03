@@ -1,13 +1,11 @@
 mod advantages;
 pub(crate) mod config;
-mod cuda_graph_minibatch;
 pub(crate) mod gae;
 mod geometry;
 mod log;
 mod loop_;
 mod numeric_debug;
 mod optimizer_glue;
-mod pmpo;
 mod rollout;
 mod sample;
 mod trainer;

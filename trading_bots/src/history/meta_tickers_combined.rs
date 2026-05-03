@@ -15,15 +15,16 @@ pub struct MetaHistory {
     pub explained_var: Vec<f64>,
     pub grad_norm: Vec<f64>,
     pub total_commissions: Vec<f64>,
-    pub logit_noise_mean: Vec<f64>,
-    pub logit_noise_min: Vec<f64>,
-    pub logit_noise_max: Vec<f64>,
-    pub rpo_alpha: Vec<f64>,
+    pub policy_scale_mean: Vec<f64>,
+    pub policy_scale_min: Vec<f64>,
+    pub policy_scale_max: Vec<f64>,
+    pub action_log_std_mean: Vec<f64>,
     pub mean_advantage: Vec<f64>,
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
     pub logit_scale: Vec<f64>,
-    pub clip_fraction: Vec<f64>,
+    pub spo_bound_fraction: Vec<f64>,
+    pub spo_penalty: Vec<f64>,
     pub temporal_tau: Vec<f64>,
     pub temporal_attn_entropy: Vec<f64>,
     pub temporal_attn_max: Vec<f64>,
@@ -34,7 +35,6 @@ pub struct MetaHistory {
     pub policy_entropy_min: Vec<f64>,
     pub policy_entropy_max: Vec<f64>,
     pub approx_kl: Vec<f64>,
-    pub reverse_kl: Vec<f64>,
     pub gate_mean: Vec<f64>,
     pub gate_std: Vec<f64>,
     pub return_min: Vec<f64>,
@@ -70,11 +70,11 @@ impl MetaHistory {
         self.grad_norm.push(grad_norm);
     }
 
-    pub fn record_logit_noise_stats(&mut self, mean: f64, min: f64, max: f64, rpo_alpha: f64) {
-        self.logit_noise_mean.push(mean);
-        self.logit_noise_min.push(min);
-        self.logit_noise_max.push(max);
-        self.rpo_alpha.push(rpo_alpha);
+    pub fn record_policy_scale_stats(&mut self, mean: f64, min: f64, max: f64, log_std_mean: f64) {
+        self.policy_scale_mean.push(mean);
+        self.policy_scale_min.push(min);
+        self.policy_scale_max.push(max);
+        self.action_log_std_mean.push(log_std_mean);
     }
 
     pub fn record_advantage_stats(&mut self, mean: f64, min: f64, max: f64) {
@@ -83,8 +83,12 @@ impl MetaHistory {
         self.max_advantage.push(max);
     }
 
-    pub fn record_clip_fraction(&mut self, clip_fraction: f64) {
-        self.clip_fraction.push(clip_fraction);
+    pub fn record_spo_bound_fraction(&mut self, spo_bound_fraction: f64) {
+        self.spo_bound_fraction.push(spo_bound_fraction);
+    }
+
+    pub fn record_spo_penalty(&mut self, spo_penalty: f64) {
+        self.spo_penalty.push(spo_penalty);
     }
 
     pub fn record_policy_entropy(&mut self, mean: f64, min: f64, max: f64) {
@@ -95,10 +99,6 @@ impl MetaHistory {
 
     pub fn record_approx_kl(&mut self, kl: f64) {
         self.approx_kl.push(kl);
-    }
-
-    pub fn record_reverse_kl(&mut self, kl: f64) {
-        self.reverse_kl.push(kl);
     }
 
     pub fn record_gate_stats(&mut self, mean: f64, std: f64) {
@@ -178,14 +178,25 @@ impl MetaHistory {
         self.grad_norm = load_simple(&format!("{base_dir}/grad_norm_log.report.bin"));
         self.total_commissions = load_simple(&format!("{base_dir}/total_commissions.report.bin"));
         self.logit_scale = load_simple(&format!("{base_dir}/logit_scale.report.bin"));
-        self.clip_fraction = load_simple(&format!("{base_dir}/clip_fraction.report.bin"));
+        self.spo_bound_fraction = load_simple(&format!("{base_dir}/spo_bound_fraction.report.bin"));
+        if self.spo_bound_fraction.is_empty() {
+            self.spo_bound_fraction = load_simple(&format!("{base_dir}/clip_fraction.report.bin"));
+        }
+        self.spo_penalty = load_simple(&format!("{base_dir}/spo_penalty.report.bin"));
 
         // MultiLine reports
-        let logit_path = format!("{base_dir}/logit_noise.report.bin");
-        self.logit_noise_mean = load_multiline(&logit_path, "mean");
-        self.logit_noise_min = load_multiline(&logit_path, "min");
-        self.logit_noise_max = load_multiline(&logit_path, "max");
-        self.rpo_alpha = load_multiline(&logit_path, "rpo_alpha");
+        let policy_scale_path = format!("{base_dir}/policy_scale.report.bin");
+        self.policy_scale_mean = load_multiline(&policy_scale_path, "mean");
+        self.policy_scale_min = load_multiline(&policy_scale_path, "min");
+        self.policy_scale_max = load_multiline(&policy_scale_path, "max");
+        self.action_log_std_mean = load_multiline(&policy_scale_path, "log_std_mean");
+        if self.policy_scale_mean.is_empty() {
+            let old_path = format!("{base_dir}/logit_noise.report.bin");
+            self.policy_scale_mean = load_multiline(&old_path, "mean");
+            self.policy_scale_min = load_multiline(&old_path, "min");
+            self.policy_scale_max = load_multiline(&old_path, "max");
+            self.action_log_std_mean = load_multiline(&old_path, "log_std_mean");
+        }
 
         let adv_path = format!("{base_dir}/advantage_stats_log.report.bin");
         self.mean_advantage = load_multiline(&adv_path, "mean");
@@ -206,7 +217,6 @@ impl MetaHistory {
         self.policy_entropy_max = load_multiline(&entropy_path, "max");
 
         self.approx_kl = load_simple(&format!("{base_dir}/approx_kl.report.bin"));
-        self.reverse_kl = load_simple(&format!("{base_dir}/reverse_kl.report.bin"));
         let gate_path = format!("{base_dir}/gate_stats.report.bin");
         self.gate_mean = load_multiline(&gate_path, "mean");
         self.gate_std = load_multiline(&gate_path, "std");
@@ -332,9 +342,9 @@ impl MetaHistory {
             );
             let _ = write_report(&format!("{base_dir}/total_commissions.report.bin"), &r);
         }
-        if !self.logit_noise_mean.is_empty() {
+        if !self.policy_scale_mean.is_empty() {
             let r = Self::report(
-                "Logit Noise",
+                "Policy Scale",
                 "Episode",
                 None,
                 ScaleKind::Linear,
@@ -342,24 +352,24 @@ impl MetaHistory {
                     series: vec![
                         ReportSeries {
                             label: "mean".to_string(),
-                            values: f64_to_f32(&self.logit_noise_mean),
+                            values: f64_to_f32(&self.policy_scale_mean),
                         },
                         ReportSeries {
                             label: "min".to_string(),
-                            values: f64_to_f32(&self.logit_noise_min),
+                            values: f64_to_f32(&self.policy_scale_min),
                         },
                         ReportSeries {
                             label: "max".to_string(),
-                            values: f64_to_f32(&self.logit_noise_max),
+                            values: f64_to_f32(&self.policy_scale_max),
                         },
                         ReportSeries {
-                            label: "rpo_alpha".to_string(),
-                            values: f64_to_f32(&self.rpo_alpha),
+                            label: "log_std_mean".to_string(),
+                            values: f64_to_f32(&self.action_log_std_mean),
                         },
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/logit_noise.report.bin"), &r);
+            let _ = write_report(&format!("{base_dir}/policy_scale.report.bin"), &r);
         }
         if !self.mean_advantage.is_empty() {
             let r = Self::report(
@@ -396,15 +406,25 @@ impl MetaHistory {
             );
             let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &r);
         }
-        if !self.clip_fraction.is_empty() {
+        if !self.spo_bound_fraction.is_empty() {
             let r = Self::report(
-                "Clip Fraction",
+                "SPO Bound Fraction",
                 "Episode",
                 Some("Fraction"),
                 ScaleKind::Linear,
-                simple(&self.clip_fraction),
+                simple(&self.spo_bound_fraction),
             );
-            let _ = write_report(&format!("{base_dir}/clip_fraction.report.bin"), &r);
+            let _ = write_report(&format!("{base_dir}/spo_bound_fraction.report.bin"), &r);
+        }
+        if !self.spo_penalty.is_empty() {
+            let r = Self::report(
+                "SPO Penalty",
+                "Episode",
+                Some("Penalty"),
+                ScaleKind::Linear,
+                simple(&self.spo_penalty),
+            );
+            let _ = write_report(&format!("{base_dir}/spo_penalty.report.bin"), &r);
         }
         if !self.approx_kl.is_empty() {
             let r = Self::report(
@@ -415,16 +435,6 @@ impl MetaHistory {
                 simple(&self.approx_kl),
             );
             let _ = write_report(&format!("{base_dir}/approx_kl.report.bin"), &r);
-        }
-        if !self.reverse_kl.is_empty() {
-            let r = Self::report(
-                "Reverse KL",
-                "Episode",
-                Some("KL"),
-                ScaleKind::Linear,
-                simple(&self.reverse_kl),
-            );
-            let _ = write_report(&format!("{base_dir}/reverse_kl.report.bin"), &r);
         }
         if !self.policy_entropy_mean.is_empty() {
             let r = Self::report(

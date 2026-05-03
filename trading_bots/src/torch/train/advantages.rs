@@ -66,21 +66,16 @@ impl Trainer {
         println!(
             "rollout {}: {} update total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
             episode,
-            self.policy_objective.as_str(),
+            "ppo",
             total_samples,
             minibatch_size,
             self.rollout.ppo_chunk_len,
             chunk_batch_size
         );
-        // Full-rollout advantage normalization (not per-minibatch)
-        let adv_norm =
-            (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8);
-
         AdvantageData {
             advantages,
             returns,
             adv_stats,
-            adv_norm,
             reset_layout_bank_cpu,
             reset_slots_by_chunk,
             chunk_batch_size,
@@ -88,4 +83,3 @@ impl Trainer {
         }
     }
 }
-

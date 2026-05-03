@@ -2,8 +2,7 @@ use tch::{Kind, Tensor};
 
 use super::super::blocks::gqa::{GQA_NUM_KV_HEADS, GQA_NUM_Q_HEADS};
 use super::super::config::{
-    ModelVariant, UNIFORM_STREAM_LAYOUT_LEN, UNIFORM_STREAM_PATCH_COUNT,
-    UNIFORM_STREAM_PATCH_SIZE,
+    ModelVariant, UNIFORM_STREAM_LAYOUT_LEN, UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
 };
 use super::super::trading_model::{StreamState, TradingModel};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
@@ -132,21 +131,13 @@ impl TradingModel {
                 (activation_kind, self.device),
             ),
             uniform_patch_tokens: Tensor::zeros(
-                [
-                    uniform_rows,
-                    UNIFORM_STREAM_PATCH_COUNT,
-                    self.model_dim,
-                ],
+                [uniform_rows, UNIFORM_STREAM_PATCH_COUNT, self.model_dim],
                 (activation_kind, self.device),
             ),
             uniform_live_fill: Tensor::zeros([batch_size], (Kind::Int64, self.device)),
             uniform_live_fill_host: vec![0; batch_size as usize],
             uniform_layer0_prefix_hidden: Tensor::zeros(
-                [
-                    uniform_rows,
-                    UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim,
-                ],
+                [uniform_rows, UNIFORM_STREAM_PATCH_COUNT - 1, self.model_dim],
                 (activation_kind, self.device),
             ),
             uniform_layer0_prefix_k: Tensor::zeros(
@@ -168,11 +159,7 @@ impl TradingModel {
                 (activation_kind, self.device),
             ),
             uniform_prefix_x0: Tensor::zeros(
-                [
-                    uniform_rows,
-                    UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim,
-                ],
+                [uniform_rows, UNIFORM_STREAM_PATCH_COUNT - 1, self.model_dim],
                 (activation_kind, self.device),
             ),
             uniform_prefix_k: Vec::new(),

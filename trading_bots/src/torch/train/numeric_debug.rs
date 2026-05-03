@@ -172,23 +172,22 @@ pub(crate) fn log_named_var_extremes(
     }
 }
 
-/// Compute Beta action std and concentration stats from a sample batch.
+/// Compute squashed Gaussian policy scale stats from a sample batch.
 pub(crate) fn compute_action_std_stats(
     model: &TradingModel,
     price_deltas: &Tensor,
     static_obs: &Tensor,
 ) -> Tensor {
     tch::no_grad(|| {
-        let (_, action_alpha, action_beta, action_std) = autocast(false, || {
+        let (_, _, action_log_std, action_std) = autocast(false, || {
             model.forward_on_device(price_deltas, static_obs, false)
         });
-        let concentration_sum = (&action_alpha + &action_beta).mean(Kind::Float);
         Tensor::stack(
             &[
                 action_std.mean(Kind::Float),
                 action_std.min(),
                 action_std.max(),
-                concentration_sum,
+                action_log_std.mean(Kind::Float),
             ],
             0,
         )

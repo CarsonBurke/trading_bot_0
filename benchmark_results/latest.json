@@ -1,74 +1,92 @@
 {
-  "timestamp": "2026-04-11T19:14:38.026839261Z",
-  "git_commit": "eae0f57d",
+  "timestamp": "2026-05-02T20:57:43.079895503Z",
+  "git_commit": "19da4216",
   "cuda_version": null,
   "results": [
     {
+      "name": "optim_adamw_fwd_bwd_step",
+      "time_ms": 0.52791447,
+      "config": {
+        "batch": 64,
+        "seq_len": 256,
+        "dtype": "BFloat16"
+      }
+    },
+    {
+      "name": "optim_muon_fwd_bwd_step",
+      "time_ms": 1.7554791,
+      "config": {
+        "batch": 64,
+        "seq_len": 256,
+        "dtype": "BFloat16"
+      }
+    },
+    {
       "name": "model_base_forward_infer_b1",
-      "time_ms": 0.79738592,
+      "time_ms": 0.94278138,
       "config": {
         "batch": 1,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_base_fwd_bwd_train_b1",
-      "time_ms": 3.50101898,
+      "time_ms": 4.0747244,
       "config": {
         "batch": 1,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_base_forward_infer_b4",
-      "time_ms": 0.80374661,
+      "time_ms": 1.0193323300000001,
       "config": {
         "batch": 4,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_base_fwd_bwd_train_b4",
-      "time_ms": 2.83311965,
+      "time_ms": 3.44680455,
       "config": {
         "batch": 4,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_base_forward_infer_b8",
-      "time_ms": 0.80924498,
+      "time_ms": 1.11804653,
       "config": {
         "batch": 8,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_base_fwd_bwd_train_b8",
-      "time_ms": 2.90937303,
+      "time_ms": 3.78384996,
       "config": {
         "batch": 8,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_uniform-256-stream_forward_infer_b1",
-      "time_ms": 0.6396163100000001,
+      "name": "model_uniform-stream_forward_infer_b1",
+      "time_ms": 0.70592849,
       "config": {
         "batch": 1,
-        "seq_len": 8704,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_uniform-256-stream_stream_step_b1",
-      "time_ms": 1.2302927600000002,
+      "name": "model_uniform-stream_stream_step_b1",
+      "time_ms": 1.24764768,
       "config": {
         "batch": 1,
         "seq_len": 1,
@@ -76,26 +94,26 @@
       }
     },
     {
-      "name": "model_uniform-256-stream_fwd_bwd_train_b1",
-      "time_ms": 2.86078538,
+      "name": "model_uniform-stream_fwd_bwd_train_b1",
+      "time_ms": 3.06834799,
       "config": {
         "batch": 1,
-        "seq_len": 8704,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_uniform-256-stream_forward_infer_b4",
-      "time_ms": 0.6427215099999999,
+      "name": "model_uniform-stream_forward_infer_b4",
+      "time_ms": 0.7571673299999999,
       "config": {
         "batch": 4,
-        "seq_len": 8704,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_uniform-256-stream_stream_step_b4",
-      "time_ms": 1.07047309,
+      "name": "model_uniform-stream_stream_step_b4",
+      "time_ms": 1.3736457399999997,
       "config": {
         "batch": 4,
         "seq_len": 1,
@@ -103,26 +121,26 @@
       }
     },
     {
-      "name": "model_uniform-256-stream_fwd_bwd_train_b4",
-      "time_ms": 2.77641327,
+      "name": "model_uniform-stream_fwd_bwd_train_b4",
+      "time_ms": 3.11329798,
       "config": {
         "batch": 4,
-        "seq_len": 8704,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_uniform-256-stream_forward_infer_b8",
-      "time_ms": 0.64700274,
+      "name": "model_uniform-stream_forward_infer_b8",
+      "time_ms": 0.84437275,
       "config": {
         "batch": 8,
-        "seq_len": 8704,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
-      "name": "model_uniform-256-stream_stream_step_b8",
-      "time_ms": 1.08232325,
+      "name": "model_uniform-stream_stream_step_b8",
+      "time_ms": 1.4624369799999999,
       "config": {
         "batch": 8,
         "seq_len": 1,
@@ -130,65 +148,65 @@
       }
     },
     {
-      "name": "model_uniform-256-stream_fwd_bwd_train_b8",
-      "time_ms": 2.87567884,
+      "name": "model_uniform-stream_fwd_bwd_train_b8",
+      "time_ms": 3.12472622,
       "config": {
         "batch": 8,
-        "seq_len": 8704,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_ablation-small_forward_infer_b1",
-      "time_ms": 0.38511621000000007,
+      "time_ms": 0.47631038000000003,
       "config": {
         "batch": 1,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_ablation-small_fwd_bwd_train_b1",
-      "time_ms": 1.6545028400000001,
+      "time_ms": 1.8626835099999999,
       "config": {
         "batch": 1,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_ablation-small_forward_infer_b4",
-      "time_ms": 0.39502721,
+      "time_ms": 0.46325347,
       "config": {
         "batch": 4,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_ablation-small_fwd_bwd_train_b4",
-      "time_ms": 1.43934652,
+      "time_ms": 1.82433168,
       "config": {
         "batch": 4,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_ablation-small_forward_infer_b8",
-      "time_ms": 0.37287485000000004,
+      "time_ms": 0.47342971,
       "config": {
         "batch": 8,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     },
     {
       "name": "model_ablation-small_fwd_bwd_train_b8",
-      "time_ms": 1.4193540199999999,
+      "time_ms": 2.00623577,
       "config": {
         "batch": 8,
-        "seq_len": 8693,
+        "seq_len": 6000,
         "dtype": "BFloat16"
       }
     }

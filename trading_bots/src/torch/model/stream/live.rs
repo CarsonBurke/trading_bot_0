@@ -26,10 +26,9 @@ impl TradingModel {
             self.rebuild_uniform_conditioned_prefix_cache(static_features, &exo_tokens, state);
             exo_tokens
         };
-        let live_token =
-            state
-                .uniform_patch_tokens
-                .narrow(1, UNIFORM_STREAM_PATCH_COUNT - 1, 1);
+        let live_token = state
+            .uniform_patch_tokens
+            .narrow(1, UNIFORM_STREAM_PATCH_COUNT - 1, 1);
         let x0_suffix = self.input_ln.forward(&live_token);
         let prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
         self.head_from_cached_live_and_cls(
@@ -192,11 +191,9 @@ impl TradingModel {
             &patch_tokens.to_kind(state.uniform_patch_tokens.kind()),
         );
         // PPO replay uses the device tensor directly; the host mirror has no read sites here.
-        let _ = state.uniform_live_fill.index_fill_(
-            0,
-            env_idx,
-            UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL,
-        );
+        let _ = state
+            .uniform_live_fill
+            .index_fill_(0, env_idx, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
         self.prefill_uniform_prefix_base_cache_indexed(state, row_idx);
     }
 
@@ -296,9 +293,7 @@ impl TradingModel {
         let rows = batch_size * TICKERS_COUNT;
         let row_deltas = new_deltas.reshape([rows, 1]);
         let history_len = PRICE_DELTAS_PER_TICKER as i64;
-        let flat_layout = state
-            .uniform_layout
-            .view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
+        let flat_layout = state.uniform_layout.view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
         let mut shifted_valid = Tensor::zeros(
             [rows, history_len - 1],
             (flat_layout.kind(), flat_layout.device()),

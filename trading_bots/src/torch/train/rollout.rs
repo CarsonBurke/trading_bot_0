@@ -1,7 +1,7 @@
 use std::time::Instant;
 use tch::{autocast, Device, Kind, Tensor};
 
-use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT};
+use crate::torch::constants::TICKERS_COUNT;
 
 use super::config::DEBUG_NUMERICS;
 use super::numeric_debug::debug_tensor_stats;
@@ -28,10 +28,10 @@ impl Trainer {
             let chunk_offset = step as i64 % self.rollout.ppo_chunk_len;
             let (
                 values,
-                action_alpha,
-                action_beta,
+                action_mean,
+                action_log_std,
                 action_std,
-                actions,
+                action_latents,
                 target_weights,
                 action_log_prob,
             ) = sample_rollout_actions_from_output(
@@ -42,10 +42,10 @@ impl Trainer {
             );
 
             if DEBUG_NUMERICS {
-                let _ = debug_tensor_stats("action_alpha", &action_alpha, episode as i64, step);
-                let _ = debug_tensor_stats("action_beta", &action_beta, episode as i64, step);
+                let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
+                let _ = debug_tensor_stats("action_log_std", &action_log_std, episode as i64, step);
                 let _ = debug_tensor_stats("action_std", &action_std, episode as i64, step);
-                let _ = debug_tensor_stats("actions", &actions, episode as i64, step);
+                let _ = debug_tensor_stats("action_latents", &action_latents, episode as i64, step);
                 let _ = debug_tensor_stats("target_weights", &target_weights, episode as i64, step);
                 let _ =
                     debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
@@ -144,40 +144,26 @@ impl Trainer {
             }
 
             let _ = self
-                .s_actions
+                .s_action_latents
                 .narrow(0, chunk_row, self.rollout.nprocs)
                 .narrow(1, chunk_offset, 1)
-                .copy_(&actions.unsqueeze(1));
-            let _ = self
-                .s_old_action_alpha
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&action_alpha.unsqueeze(1));
-            let _ = self
-                .s_old_action_beta
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&action_beta.unsqueeze(1));
+                .copy_(&action_latents.unsqueeze(1));
             let _ = self
                 .s_old_log_probs
                 .narrow(0, chunk_row, self.rollout.nprocs)
                 .narrow(1, chunk_offset, 1)
                 .copy_(&action_log_prob.unsqueeze(1));
 
-            let portfolio_reward = self
-                .step_reward_per_ticker
-                .mean_dim([1].as_slice(), false, Kind::Float);
+            let portfolio_reward =
+                self.step_reward_per_ticker
+                    .mean_dim([1].as_slice(), false, Kind::Float);
 
             if DEBUG_NUMERICS {
                 let _ =
                     debug_tensor_stats("portfolio_reward", &portfolio_reward, episode as i64, step);
                 let _ = debug_tensor_stats("values", &values, episode as i64, step);
-                let _ = debug_tensor_stats(
-                    "step_is_done",
-                    &self.step_is_done,
-                    episode as i64,
-                    step,
-                );
+                let _ =
+                    debug_tensor_stats("step_is_done", &self.step_is_done, episode as i64, step);
             }
             let _ = self
                 .s_rewards
@@ -221,10 +207,8 @@ impl Trainer {
                             reset_row_idx,
                             reset_layouts_batch,
                         );
-                        trading_model.forward_stream_state_on_device_for_replay(
-                            obs_static,
-                            stream_state,
-                        )
+                        trading_model
+                            .forward_stream_state_on_device_for_replay(obs_static, stream_state)
                     }
                 })
             }));

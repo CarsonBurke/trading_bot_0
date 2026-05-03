@@ -15,9 +15,9 @@ pub(in crate::torch::model) const UNIFORM_STREAM_LAYOUT_LEN: i64 =
     UNIFORM_STREAM_PATCH_COUNT * UNIFORM_STREAM_PATCH_SIZE;
 pub(in crate::torch::model) const UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES: i64 =
     UNIFORM_STREAM_PATCH_COUNT - 1;
-pub(in crate::torch::model) const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 =
-    PRICE_DELTAS_PER_TICKER as i64
-        - UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
+pub(in crate::torch::model) const UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL: i64 = PRICE_DELTAS_PER_TICKER
+    as i64
+    - UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
 pub(in crate::torch::model) const INTER_TICKER_AFTER: usize = 1;
 pub(in crate::torch::model) const NUM_EXO_TOKENS: i64 = STATIC_OBSERVATIONS as i64;
 pub(in crate::torch::model) const PATCH_SCALAR_FEATS: i64 = 3;

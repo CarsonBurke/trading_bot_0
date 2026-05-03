@@ -1,7 +1,8 @@
 use tch::{Kind, Tensor};
 
-use super::config::PolicyObjective;
-use super::numeric_debug::{compute_action_std_stats, compute_explained_variance, compute_value_diagnostics};
+use super::numeric_debug::{
+    compute_action_std_stats, compute_explained_variance, compute_value_diagnostics,
+};
 use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
 
 impl Trainer {
@@ -31,25 +32,31 @@ impl Trainer {
         let (
             mean_policy_loss_t,
             mean_value_loss_t,
-            mean_reverse_kl_t,
+            mean_spo_penalty_t,
             mean_grad_norm_t,
-            clip_frac_t,
+            spo_bound_fraction_t,
         ) = if metrics.total_sample_count > 0 {
             let n = metrics.total_sample_count as f64;
             let mean_policy = &metrics.total_policy_loss_weighted / n;
             let mean_value = &metrics.total_value_loss_weighted / n;
-            let mean_reverse_kl = &metrics.total_reverse_kl_weighted / n;
+            let mean_spo_penalty = &metrics.total_spo_penalty_weighted / n;
             let grad_norm = if metrics.grad_norm_count > 0 {
                 &metrics.grad_norm_sum / (metrics.grad_norm_count as f64)
             } else {
                 Tensor::zeros([], (Kind::Float, device))
             };
-            let clip = if metrics.total_ratio_samples > 0 {
-                &metrics.total_clipped / (metrics.total_ratio_samples as f64)
+            let spo_bound_fraction = if metrics.total_ratio_samples > 0 {
+                &metrics.total_spo_bound_violations / (metrics.total_ratio_samples as f64)
             } else {
                 Tensor::zeros([], (Kind::Float, device))
             };
-            (mean_policy, mean_value, mean_reverse_kl, grad_norm, clip)
+            (
+                mean_policy,
+                mean_value,
+                mean_spo_penalty,
+                grad_norm,
+                spo_bound_fraction,
+            )
         } else {
             (
                 Tensor::zeros([], (Kind::Float, device)),
@@ -80,7 +87,10 @@ impl Trainer {
         let log_std_stats = compute_action_std_stats(
             &self.trading_model,
             &self.s_chunk_start_layouts.narrow(0, 0, self.rollout.nprocs),
-            &self.s_static_obs.narrow(0, 0, self.rollout.nprocs).select(1, 0),
+            &self
+                .s_static_obs
+                .narrow(0, 0, self.rollout.nprocs)
+                .select(1, 0),
         );
         let return_range_stats = self.hl_gauss.range_stats(&adv_data.returns);
         // Compute all metrics on GPU, single transfer to CPU.
@@ -88,10 +98,10 @@ impl Trainer {
             &[
                 mean_policy_loss_t.view([1]),
                 mean_value_loss_t.view([1]),
-                mean_reverse_kl_t.view([1]),
+                mean_spo_penalty_t.view([1]),
                 explained_var_t.view([1]),
                 mean_grad_norm_t.view([1]),
-                clip_frac_t.view([1]),
+                spo_bound_fraction_t.view([1]),
                 adv_data.adv_stats.view([3]),
                 log_std_stats.view([4]),
                 entropy_mean_t.view([1]),
@@ -106,10 +116,10 @@ impl Trainer {
             .unwrap_or_else(|_| vec![0.0; 28]);
         let mean_policy_loss = all_scalars_vec[0];
         let mean_value_loss = all_scalars_vec[1];
-        let mean_reverse_kl = all_scalars_vec[2];
+        let mean_spo_penalty = all_scalars_vec[2];
         let explained_var = all_scalars_vec[3];
         let mean_grad_norm = all_scalars_vec[4];
-        let clip_frac = all_scalars_vec[5];
+        let spo_bound_fraction = all_scalars_vec[5];
         let (adv_mean, adv_min, adv_max) =
             (all_scalars_vec[6], all_scalars_vec[7], all_scalars_vec[8]);
         let log_std_stats_vec = &all_scalars_vec[9..13];
@@ -149,20 +159,21 @@ impl Trainer {
             all_scalars_vec[27],
         );
 
-        let policy_objective = self.policy_objective;
         let last_minibatch_approx_kl = metrics.last_minibatch_approx_kl;
         let primary = self.env.primary_mut();
         primary
             .meta_history
             .record_advantage_stats(adv_mean, adv_min, adv_max);
-        // Existing report slot now carries Beta std min/mean/max and concentration.
-        primary.meta_history.record_logit_noise_stats(
+        primary.meta_history.record_policy_scale_stats(
             log_std_stats_vec[0],
             log_std_stats_vec[1],
             log_std_stats_vec[2],
             log_std_stats_vec[3],
         );
-        primary.meta_history.record_clip_fraction(clip_frac);
+        primary
+            .meta_history
+            .record_spo_bound_fraction(spo_bound_fraction);
+        primary.meta_history.record_spo_penalty(mean_spo_penalty);
         primary.meta_history.record_policy_loss(mean_policy_loss);
         primary.meta_history.record_value_loss(mean_value_loss);
         primary.meta_history.record_explained_var(explained_var);
@@ -170,14 +181,9 @@ impl Trainer {
         primary
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
-        let recorded_policy_kl = match policy_objective {
-            PolicyObjective::Ppo => last_minibatch_approx_kl,
-            PolicyObjective::Pmpo => mean_reverse_kl,
-        };
-        primary.meta_history.record_approx_kl(recorded_policy_kl);
-        if policy_objective == PolicyObjective::Pmpo {
-            primary.meta_history.record_reverse_kl(mean_reverse_kl);
-        }
+        primary
+            .meta_history
+            .record_approx_kl(last_minibatch_approx_kl);
         primary.meta_history.record_hl_gauss_range_stats(
             return_min,
             return_max,
@@ -188,8 +194,8 @@ impl Trainer {
         );
 
         println!(
-            "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), ReverseKL: {:.4}, GradNorm: {:.4}",
-            mean_policy_loss, mean_value_loss, explained_var, mean_reverse_kl, mean_grad_norm
+            "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), SPO penalty: {:.4}, GradNorm: {:.4}",
+            mean_policy_loss, mean_value_loss, explained_var, mean_spo_penalty, mean_grad_norm
         );
         println!(
             "  ValueDiag: pred μ/σ {:.3}/{:.3}, target μ/σ {:.3}/{:.3}, RMSE {:.3}, Corr {:.3}",

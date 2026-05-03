@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 use tch::{nn, Device, Kind, Tensor};
 
-use crate::torch::action_space::{beta_mean, sample_beta_action};
+use crate::torch::action_space::{sample_squashed_gaussian_action, tanh_target_weight};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::env::Env;
@@ -30,30 +30,29 @@ pub fn load_model<P: AsRef<Path>>(
 }
 
 pub fn sample_actions(
-    action_alpha: &Tensor,
-    action_beta: &Tensor,
+    action_mean: &Tensor,
+    action_log_std: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let action_alpha = action_alpha.to_kind(Kind::Float);
-    let action_beta = action_beta.to_kind(Kind::Float);
+    let action_mean = action_mean.to_kind(Kind::Float);
+    let action_log_std = action_log_std.to_kind(Kind::Float);
 
     if deterministic {
-        beta_mean(&action_alpha, &action_beta)
-    } else if temperature > 0.0 && (temperature - 1.0).abs() > f64::EPSILON {
-        let adjusted_alpha = ((&action_alpha - 1.0) / temperature).clamp_min(0.0) + 1.0;
-        let adjusted_beta = ((&action_beta - 1.0) / temperature).clamp_min(0.0) + 1.0;
-        sample_beta_action(&adjusted_alpha, &adjusted_beta)
+        tanh_target_weight(&action_mean)
     } else {
-        sample_beta_action(&action_alpha, &action_beta)
+        let std_scale = if temperature > 0.0 { temperature } else { 1.0 };
+        let std = action_log_std.exp() * std_scale;
+        let (_, target_weights) = sample_squashed_gaussian_action(&action_mean, &std);
+        target_weights
     }
 }
 
 pub fn run_inference<P: AsRef<Path>>(
     weight_path: P,
     num_episodes: usize,
-    _deterministic: bool,
-    _temperature: f64,
+    deterministic: bool,
+    temperature: f64,
     tickers: Option<Vec<String>>,
     random_start: bool,
     model_variant: ModelVariant,
@@ -63,9 +62,6 @@ pub fn run_inference<P: AsRef<Path>>(
 
     let device = Device::cuda_if_available();
     println!("Using device: {:?}", device);
-
-    let deterministic = true;
-    let temperature = 0.0;
 
     let (_vs, model) = load_model(&weight_path, device, model_variant)?;
 
@@ -106,17 +102,17 @@ pub fn run_inference<P: AsRef<Path>>(
             env.step = step;
 
             // First call uses full history, then we switch to incremental per-ticker deltas.
-            let (action_alpha, action_beta) = tch::no_grad(|| {
+            let (action_mean, action_log_std) = tch::no_grad(|| {
                 let price_input = if use_full {
                     &price_deltas_full
                 } else {
                     &price_deltas_incremental
                 };
-                let (_, action_alpha, action_beta, _) =
+                let (_, action_mean, action_log_std, _) =
                     model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
-                (action_alpha, action_beta)
+                (action_mean, action_log_std)
             });
-            let actions = sample_actions(&action_alpha, &action_beta, deterministic, temperature);
+            let actions = sample_actions(&action_mean, &action_log_std, deterministic, temperature);
 
             let actions_vec: Vec<f64> = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let step_result = env.step_step_single(&actions_vec);

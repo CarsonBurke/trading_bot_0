@@ -32,10 +32,9 @@ impl TradingModel {
             prefix_hidden = x_next;
         }
 
-        let live_token =
-            state
-                .uniform_patch_tokens
-                .narrow(1, UNIFORM_STREAM_PATCH_COUNT - 1, 1);
+        let live_token = state
+            .uniform_patch_tokens
+            .narrow(1, UNIFORM_STREAM_PATCH_COUNT - 1, 1);
         let x0_suffix = self.input_ln.forward(&live_token);
         let prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
         let _ = prefix_hidden;
@@ -118,9 +117,7 @@ impl TradingModel {
         );
         let rows = batch_size * TICKERS_COUNT;
         let row_deltas = new_deltas.reshape([rows, 1]);
-        let flat_layout = state
-            .uniform_layout
-            .view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
+        let flat_layout = state.uniform_layout.view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
         // Apply shift+append in-place on the state's layout storage. This is the
         // streaming-rollout hot path; we avoid an extra copy by mutating directly.
         let history_len = PRICE_DELTAS_PER_TICKER as i64;
@@ -186,8 +183,8 @@ impl TradingModel {
         probe_replay_tensor("patch_hidden", &patch_hidden);
         let output = self.backbone_with_actor_critic_cls(&patch_hidden, &exo_tokens, batch_size);
         probe_replay_tensor("head_value_logits", &output.0);
-        probe_replay_tensor("head_action_alpha", &output.1);
-        probe_replay_tensor("head_action_beta", &output.2);
+        probe_replay_tensor("head_action_mean", &output.1);
+        probe_replay_tensor("head_action_log_std", &output.2);
         probe_replay_tensor("head_action_std", &output.3);
         output
     }
@@ -468,18 +465,18 @@ mod tests {
         // Reshape batched outputs to [T, batch, ...] and compare per step.
         let bt = batch * sub_chunk_len;
         let value_logits_bt = batched.0.view([batch, sub_chunk_len, -1]);
-        let action_alpha_bt = batched.1.view([batch, sub_chunk_len, -1]);
-        let action_beta_bt = batched.2.view([batch, sub_chunk_len, -1]);
+        let action_mean_bt = batched.1.view([batch, sub_chunk_len, -1]);
+        let action_log_std_bt = batched.2.view([batch, sub_chunk_len, -1]);
         let action_std_bt = batched.3.view([batch, sub_chunk_len, -1]);
         for t in 0..sub_chunk_len {
             let seq = &seq_outputs[t as usize];
             let batched_v = value_logits_bt.select(1, t).contiguous();
-            let batched_a = action_alpha_bt.select(1, t).contiguous();
-            let batched_b = action_beta_bt.select(1, t).contiguous();
+            let batched_a = action_mean_bt.select(1, t).contiguous();
+            let batched_b = action_log_std_bt.select(1, t).contiguous();
             let batched_s = action_std_bt.select(1, t).contiguous();
             assert_close(&seq.0, &batched_v, &format!("value_logits t={}", t));
-            assert_close(&seq.1, &batched_a, &format!("action_alpha t={}", t));
-            assert_close(&seq.2, &batched_b, &format!("action_beta t={}", t));
+            assert_close(&seq.1, &batched_a, &format!("action_mean t={}", t));
+            assert_close(&seq.2, &batched_b, &format!("action_log_std t={}", t));
             assert_close(&seq.3, &batched_s, &format!("action_std t={}", t));
         }
         let _ = bt;
@@ -604,18 +601,18 @@ mod tests {
             model.windowed_replay_forward(&windowed_stack, &static_windowed, batch * sub_chunk_len);
 
         let value_logits_bt = batched.0.view([batch, sub_chunk_len, -1]);
-        let action_alpha_bt = batched.1.view([batch, sub_chunk_len, -1]);
-        let action_beta_bt = batched.2.view([batch, sub_chunk_len, -1]);
+        let action_mean_bt = batched.1.view([batch, sub_chunk_len, -1]);
+        let action_log_std_bt = batched.2.view([batch, sub_chunk_len, -1]);
         let action_std_bt = batched.3.view([batch, sub_chunk_len, -1]);
         for t in 0..sub_chunk_len {
             let seq = &seq_outputs[t as usize];
             let bv = value_logits_bt.select(1, t).contiguous();
-            let ba = action_alpha_bt.select(1, t).contiguous();
-            let bb = action_beta_bt.select(1, t).contiguous();
+            let ba = action_mean_bt.select(1, t).contiguous();
+            let bb = action_log_std_bt.select(1, t).contiguous();
             let bs = action_std_bt.select(1, t).contiguous();
             assert_close(&seq.0, &bv, &format!("reset value_logits t={}", t));
-            assert_close(&seq.1, &ba, &format!("reset action_alpha t={}", t));
-            assert_close(&seq.2, &bb, &format!("reset action_beta t={}", t));
+            assert_close(&seq.1, &ba, &format!("reset action_mean t={}", t));
+            assert_close(&seq.2, &bb, &format!("reset action_log_std t={}", t));
             assert_close(&seq.3, &bs, &format!("reset action_std t={}", t));
         }
     }

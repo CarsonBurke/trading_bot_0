@@ -4,39 +4,131 @@ use crate::torch::optim::muon::Muon;
 
 use super::config::{MUON_MOMENTUM, MUON_MOMENTUM_WARMUP_START, MUON_MOMENTUM_WARMUP_STEPS};
 
-pub(crate) fn clip_grad_norm_on_device(
-    trainable_vars: &[Tensor],
-    max_grad_norm: f64,
-    device: Device,
-) -> Tensor {
+const ACTOR_GRAD_CLIP_PATTERNS: &[&str] = &["policy_mean_log_var"];
+const CRITIC_GRAD_CLIP_PATTERNS: &[&str] = &["value_proj"];
+
+pub(crate) struct GradClipGroups {
+    pub(crate) actor: Vec<Tensor>,
+    pub(crate) critic: Vec<Tensor>,
+    pub(crate) shared: Vec<Tensor>,
+}
+
+pub(crate) fn grad_clip_groups(named_vars: &[(String, Tensor)]) -> GradClipGroups {
+    let mut actor = Vec::new();
+    let mut critic = Vec::new();
+    let mut shared = Vec::new();
+
+    for (name, tensor) in named_vars {
+        if ACTOR_GRAD_CLIP_PATTERNS
+            .iter()
+            .any(|pattern| name.contains(pattern))
+        {
+            actor.push(tensor.shallow_clone());
+        } else if CRITIC_GRAD_CLIP_PATTERNS
+            .iter()
+            .any(|pattern| name.contains(pattern))
+        {
+            critic.push(tensor.shallow_clone());
+        } else {
+            shared.push(tensor.shallow_clone());
+        }
+    }
+
+    GradClipGroups {
+        actor,
+        critic,
+        shared,
+    }
+}
+
+fn clip_grad_tensors_on_device(grads: &mut [Tensor], max_grad_norm: f64, device: Device) -> Tensor {
     tch::no_grad(|| {
         let mut total_norm_sq = Tensor::zeros([], (Kind::Float, device));
-        let mut has_grads = false;
-        for v in trainable_vars {
-            let g = v.grad();
-            if g.defined() {
-                total_norm_sq += g.square().sum(Kind::Float);
-                has_grads = true;
+        for grad in grads.iter() {
+            if !grad.defined() {
+                continue;
             }
-        }
-        if !has_grads {
-            return Tensor::zeros([], (Kind::Float, device));
+            total_norm_sq += grad.square().sum(Kind::Float);
         }
 
         let total_norm = total_norm_sq.sqrt();
         let clip_coef = Tensor::from(max_grad_norm as f32).to_device(device) / (&total_norm + 1e-6);
         let clip_coef = clip_coef.clamp_max(1.0);
 
-        for v in trainable_vars {
-            let mut g = v.grad();
-            if g.defined() {
-                let coef = clip_coef.to_kind(g.kind());
-                let _ = g.g_mul_(&coef);
+        for grad in grads {
+            if !grad.defined() {
+                continue;
             }
+            let coef = clip_coef.to_kind(grad.kind());
+            let _ = grad.g_mul_(&coef);
         }
 
         total_norm
     })
+}
+
+fn clear_grads(params: &[Tensor]) {
+    for param in params {
+        let mut param = param.shallow_clone();
+        param.zero_grad();
+    }
+}
+
+fn accumulate_grad_surrogate(surrogate: Tensor, params: &[Tensor], grads: &[Tensor]) -> Tensor {
+    params
+        .iter()
+        .zip(grads.iter())
+        .fold(surrogate, |acc, (param, grad)| {
+            if !grad.defined() {
+                return acc;
+            }
+            acc + (param * &grad.detach()).sum(Kind::Float)
+        })
+}
+
+pub(crate) fn backward_actor_critic_with_separate_clips(
+    groups: &GradClipGroups,
+    trainable_vars: &[Tensor],
+    actor_loss: &Tensor,
+    critic_loss: &Tensor,
+    max_grad_norm: f64,
+    device: Device,
+) -> (Tensor, Tensor) {
+    if max_grad_norm <= 0.0 {
+        (actor_loss + critic_loss).backward();
+        let zero = Tensor::zeros([], (Kind::Float, device));
+        return (zero.shallow_clone(), zero);
+    }
+
+    let mut actor_params: Vec<Tensor> = groups
+        .actor
+        .iter()
+        .chain(groups.shared.iter())
+        .map(Tensor::shallow_clone)
+        .collect();
+    let mut critic_params: Vec<Tensor> = groups
+        .critic
+        .iter()
+        .chain(groups.shared.iter())
+        .map(Tensor::shallow_clone)
+        .collect();
+
+    let mut actor_grads = Tensor::run_backward(&[actor_loss], &actor_params, true, false);
+    let actor_norm = clip_grad_tensors_on_device(&mut actor_grads, max_grad_norm, device);
+    let mut critic_grads = Tensor::run_backward(&[critic_loss], &critic_params, false, false);
+    let critic_norm = clip_grad_tensors_on_device(&mut critic_grads, max_grad_norm, device);
+
+    clear_grads(trainable_vars);
+    let surrogate = Tensor::zeros([], (Kind::Float, device));
+    let surrogate = accumulate_grad_surrogate(surrogate, &actor_params, &actor_grads);
+    let surrogate = accumulate_grad_surrogate(surrogate, &critic_params, &critic_grads);
+    surrogate.backward();
+
+    // Keep the param vectors mutable until after backward so their gradient slots stay live.
+    actor_params.clear();
+    critic_params.clear();
+
+    (actor_norm, critic_norm)
 }
 
 pub(crate) fn named_trainable_variables(vs: &nn::VarStore) -> Vec<(String, Tensor)> {
@@ -62,4 +154,133 @@ pub(crate) fn step_optimizer(opt: &mut Muon, optimizer_step: &mut i64) {
     opt.set_momentum(muon_momentum_for_step(*optimizer_step));
     opt.step();
     *optimizer_step += 1;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backward_actor_critic_with_separate_clips, grad_clip_groups, GradClipGroups};
+    use crate::torch::model::{TradingModel, TradingModelConfig};
+    use crate::torch::train::optimizer_glue::named_trainable_variables;
+    use std::collections::HashMap;
+    use tch::nn;
+    use tch::{Device, Kind, Tensor};
+
+    #[test]
+    fn separate_actor_critic_clip_adds_shared_grads_after_independent_clips() {
+        let device = Device::Cpu;
+        let actor = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let critic = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let shared = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let groups = GradClipGroups {
+            actor: vec![actor.shallow_clone()],
+            critic: vec![critic.shallow_clone()],
+            shared: vec![shared.shallow_clone()],
+        };
+        let trainable = vec![
+            actor.shallow_clone(),
+            critic.shallow_clone(),
+            shared.shallow_clone(),
+        ];
+        let actor_loss = &actor * 3.0 + &shared * 4.0;
+        let critic_loss = &critic * 30.0 + &shared * 40.0;
+
+        let (actor_norm, critic_norm) = backward_actor_critic_with_separate_clips(
+            &groups,
+            &trainable,
+            &actor_loss.sum(Kind::Float),
+            &critic_loss.sum(Kind::Float),
+            1.0,
+            device,
+        );
+
+        assert!((actor_norm.double_value(&[]) - 5.0).abs() < 1e-6);
+        assert!((critic_norm.double_value(&[]) - 50.0).abs() < 1e-6);
+        assert!((actor.grad().double_value(&[0]) - 0.6).abs() < 1e-6);
+        assert!((critic.grad().double_value(&[0]) - 0.6).abs() < 1e-6);
+        assert!((shared.grad().double_value(&[0]) - 1.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn separate_actor_critic_clip_skips_unused_branch_grads() {
+        let device = Device::Cpu;
+        let actor = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let critic = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let actor_shared = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let critic_shared = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let groups = GradClipGroups {
+            actor: vec![actor.shallow_clone()],
+            critic: vec![critic.shallow_clone()],
+            shared: vec![actor_shared.shallow_clone(), critic_shared.shallow_clone()],
+        };
+        let trainable = vec![
+            actor.shallow_clone(),
+            critic.shallow_clone(),
+            actor_shared.shallow_clone(),
+            critic_shared.shallow_clone(),
+        ];
+        let actor_loss = &actor * 3.0 + &actor_shared * 4.0;
+        let critic_loss = &critic * 30.0 + &critic_shared * 40.0;
+
+        let (actor_norm, critic_norm) = backward_actor_critic_with_separate_clips(
+            &groups,
+            &trainable,
+            &actor_loss.sum(Kind::Float),
+            &critic_loss.sum(Kind::Float),
+            1.0,
+            device,
+        );
+
+        assert!((actor_norm.double_value(&[]) - 5.0).abs() < 1e-6);
+        assert!((critic_norm.double_value(&[]) - 50.0).abs() < 1e-6);
+        assert!((actor.grad().double_value(&[0]) - 0.6).abs() < 1e-6);
+        assert!((actor_shared.grad().double_value(&[0]) - 0.8).abs() < 1e-6);
+        assert!((critic.grad().double_value(&[0]) - 0.6).abs() < 1e-6);
+        assert!((critic_shared.grad().double_value(&[0]) - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn real_model_grad_clip_groups_match_actor_critic_topology() {
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let named = named_trainable_variables(&vs);
+        let groups = grad_clip_groups(&named);
+        let mut by_id = HashMap::new();
+        for tensor in &groups.actor {
+            by_id.insert(tensor.data_ptr() as usize, "actor");
+        }
+        for tensor in &groups.critic {
+            by_id.insert(tensor.data_ptr() as usize, "critic");
+        }
+        for tensor in &groups.shared {
+            by_id.insert(tensor.data_ptr() as usize, "shared");
+        }
+
+        let group_for = |name: &str| {
+            let tensor = named
+                .iter()
+                .find(|(param_name, _)| param_name == name)
+                .unwrap_or_else(|| panic!("missing parameter {name}"));
+            by_id[&(tensor.1.data_ptr() as usize)]
+        };
+
+        assert_eq!(group_for("policy_mean_log_var.weight"), "actor");
+        assert_eq!(group_for("value_proj.weight"), "critic");
+        assert_eq!(group_for("actor_live_proj.weight"), "shared");
+        assert_eq!(group_for("critic_live_proj.weight"), "shared");
+        assert_eq!(group_for("patch_embed_weight"), "shared");
+    }
 }

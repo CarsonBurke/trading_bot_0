@@ -2,26 +2,34 @@ use rand::seq::SliceRandom;
 use std::time::Instant;
 use tch::{autocast, Kind, Tensor};
 
-use crate::torch::action_space::{
-    beta_entropy, beta_kl_old_new, beta_log_prob, beta_log_prob_per_dim, beta_variance,
-};
+use crate::torch::action_space::{gaussian_entropy, squashed_gaussian_log_prob};
 use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT};
 use crate::torch::model::TradingModel;
 
 use super::config::{
-    PolicyObjective, ALPHA_LOSS_COEF, DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER,
-    MAX_GRAD_NORM, OPTIM_EPOCHS, PMPO_POS_TO_NEG_WEIGHT, PMPO_REVERSE_KL_COEF, PPO_CLIP_HIGH,
-    PPO_CLIP_LOW, RPO_ALPHA_MAX, RPO_ALPHA_MIN, RPO_TARGET_KL, TARGET_KL, VALUE_LOSS_COEF,
+    DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER, MAX_GRAD_NORM, OPTIM_EPOCHS, SPO_EPS_HIGH,
+    SPO_EPS_LOW, TARGET_KL, VALUE_LOSS_COEF,
 };
-use super::cuda_graph_minibatch::PmpoMinibatchCudaGraph;
 use super::gae::build_no_reset_windowed_layouts;
 use super::numeric_debug::{
     debug_tensor_stats, log_first_non_finite_tensor, log_first_non_finite_var,
     log_named_var_extremes,
 };
-use super::optimizer_glue::{clip_grad_norm_on_device, step_optimizer};
+use super::optimizer_glue::{backward_actor_critic_with_separate_clips, step_optimizer};
 use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
 use super::value_loss::hl_gauss_value_loss;
+
+fn spo_asym_policy_loss(advantage: &Tensor, ratio: &Tensor) -> (Tensor, Tensor, Tensor) {
+    let ratio_diff = ratio - 1.0;
+    let with_adv = (advantage * &ratio_diff).gt(0.0);
+    let spo_eps = Tensor::where_scalar(&with_adv, SPO_EPS_HIGH, SPO_EPS_LOW)
+        .to_kind(Kind::Float)
+        .to_device(ratio.device());
+    let pg_surrogate = advantage * ratio;
+    let spo_penalty = advantage.abs() * ratio_diff.pow_tensor_scalar(2) / (&spo_eps * 2.0);
+    let action_loss = (&spo_penalty - &pg_surrogate).mean(Kind::Float);
+    (action_loss, spo_penalty, spo_eps)
+}
 
 impl Trainer {
     pub(super) fn update_policy(
@@ -29,15 +37,16 @@ impl Trainer {
         episode: usize,
         adv_data: &AdvantageData,
     ) -> UpdateMetrics {
+        const LOG_2PI: f64 = 1.8378770664093453;
         let device = self.device;
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut total_reverse_kl_weighted = Tensor::zeros([], (Kind::Float, device));
+        let mut total_spo_penalty_weighted = Tensor::zeros([], (Kind::Float, device));
         // Explained variance: EV = 1 - Var(residuals) / Var(targets)
         let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut total_sample_count = 0i64;
         let mut grad_norm_count = 0i64;
-        let mut total_clipped = Tensor::zeros([], (Kind::Float, device));
+        let mut total_spo_bound_violations = Tensor::zeros([], (Kind::Float, device));
         let mut total_ratio_samples = 0i64;
         let mut total_entropy_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut entropy_min = Tensor::from(f64::INFINITY)
@@ -49,7 +58,6 @@ impl Trainer {
 
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
-        let mut graph_update_time_us = 0u64;
         let mut logged_replay_input_non_finite = false;
         let mut logged_forward_non_finite = false;
         let mut logged_loss_non_finite = false;
@@ -85,16 +93,10 @@ impl Trainer {
                 let boundary_layout = self.s_chunk_start_layouts.index_select(0, &chunk_ids);
                 let so_chunk = self.s_static_obs.index_select(0, &chunk_ids);
                 let step_deltas_chunk = self.s_step_deltas.index_select(0, &chunk_ids);
-                let adv_mb_by_chunk = match self.policy_objective {
-                    PolicyObjective::Ppo => adv_data.adv_norm.index_select(0, &chunk_ids),
-                    PolicyObjective::Pmpo => adv_data.advantages.index_select(0, &chunk_ids),
-                };
+                let adv_mb_by_chunk = adv_data.advantages.index_select(0, &chunk_ids);
                 let ret_mb_by_chunk = adv_data.returns.index_select(0, &chunk_ids);
                 let old_log_probs_by_chunk = self.s_old_log_probs.index_select(0, &chunk_ids);
-                let act_mb_by_chunk = self.s_actions.index_select(0, &chunk_ids);
-                let old_action_alpha_by_chunk =
-                    self.s_old_action_alpha.index_select(0, &chunk_ids);
-                let old_action_beta_by_chunk = self.s_old_action_beta.index_select(0, &chunk_ids);
+                let action_latents_by_chunk = self.s_action_latents.index_select(0, &chunk_ids);
                 let reset_slots_chunk = adv_data.reset_slots_by_chunk.index_select(0, &chunk_ids);
 
                 let fwd_start = Instant::now();
@@ -107,12 +109,11 @@ impl Trainer {
                 // minibatch. Each window is its own 255-token causal prefix +
                 // live-token suffix, so streaming semantics are preserved per window.
                 let flat_layout_len = boundary_layout.size()[1] / TICKERS_COUNT;
-                let has_reset_slots = adv_data.reset_layout_count > 0
-                    && reset_slots_chunk.max().int64_value(&[]) > 0;
+                let has_reset_slots =
+                    adv_data.reset_layout_count > 0 && reset_slots_chunk.max().int64_value(&[]) > 0;
                 let windowed = if has_reset_slots {
                     let layout_rows = chunk_count * TICKERS_COUNT;
-                    let mut current_layout =
-                        boundary_layout.view([layout_rows, flat_layout_len]);
+                    let mut current_layout = boundary_layout.view([layout_rows, flat_layout_len]);
                     let mut windowed_rows: Vec<Tensor> =
                         Vec::with_capacity(self.rollout.ppo_chunk_len as usize);
                     for t in 0..self.rollout.ppo_chunk_len {
@@ -128,13 +129,11 @@ impl Trainer {
                                 .shift_layout_append_delta(&current_layout, &row_deltas);
                             // Reset after shift-append to preserve bank layouts verbatim.
                             let step_reset_slots = reset_slots_chunk.select(1, t - 1); // [chunk_count]
-                            let reset_chunk_idx =
-                                step_reset_slots.gt(0).nonzero().squeeze_dim(1);
+                            let reset_chunk_idx = step_reset_slots.gt(0).nonzero().squeeze_dim(1);
                             if reset_chunk_idx.size()[0] > 0 {
                                 let reset_slot_ids =
                                     step_reset_slots.index_select(0, &reset_chunk_idx) - 1;
-                                let reset_slot_ids_cpu =
-                                    reset_slot_ids.to_device(tch::Device::Cpu);
+                                let reset_slot_ids_cpu = reset_slot_ids.to_device(tch::Device::Cpu);
                                 let reset_layouts = adv_data
                                     .reset_layout_bank_cpu
                                     .index_select(0, &reset_slot_ids_cpu)
@@ -176,13 +175,12 @@ impl Trainer {
                 let static_flat = so_chunk.reshape([minibatch_sample_count, self.so_dim]);
 
                 // Flatten rollout-captured targets to minibatch-flat form (chunk-major).
-                let adv_flat = adv_mb_by_chunk.reshape([-1]);
+                let adv_raw_flat = adv_mb_by_chunk.reshape([-1]);
+                let adv_flat = (&adv_raw_flat - adv_raw_flat.mean(Kind::Float))
+                    / (adv_raw_flat.std(true) + 1e-8);
                 let ret_flat = ret_mb_by_chunk.reshape([-1]);
                 let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
-                let act_flat = act_mb_by_chunk.reshape([-1, ACTION_COUNT]);
-                let old_action_alpha_flat =
-                    old_action_alpha_by_chunk.reshape([-1, ACTION_COUNT]);
-                let old_action_beta_flat = old_action_beta_by_chunk.reshape([-1, ACTION_COUNT]);
+                let action_latents_flat = action_latents_by_chunk.reshape([-1, ACTION_COUNT]);
 
                 if log_first_non_finite_tensor(
                     &mut logged_replay_input_non_finite,
@@ -193,10 +191,8 @@ impl Trainer {
                     &[
                         ("windowed", &windowed),
                         ("static_flat", &static_flat),
-                        ("actions", &act_flat),
+                        ("action_latents", &action_latents_flat),
                         ("old_log_probs", &old_log_probs_flat),
-                        ("old_action_alpha", &old_action_alpha_flat),
-                        ("old_action_beta", &old_action_beta_flat),
                         ("advantages", &adv_flat),
                         ("returns", &ret_flat),
                     ],
@@ -212,128 +208,7 @@ impl Trainer {
                     );
                 }
 
-                if self.use_cuda_graph_updates && self.policy_objective == PolicyObjective::Pmpo {
-                    if self.pmpo_cuda_graph.is_none() {
-                        self.pmpo_cuda_graph = Some(PmpoMinibatchCudaGraph::new(
-                            device,
-                            &windowed,
-                            &static_flat,
-                            &act_flat,
-                            &old_log_probs_flat,
-                            &old_action_alpha_flat,
-                            &old_action_beta_flat,
-                            &adv_flat,
-                            &ret_flat,
-                            minibatch_sample_count,
-                        ));
-                    }
-                    let graph_matches = self.pmpo_cuda_graph.as_ref().is_some_and(|graph| {
-                        graph.matches(
-                            &windowed,
-                            &static_flat,
-                            &act_flat,
-                            &old_log_probs_flat,
-                            &old_action_alpha_flat,
-                            &old_action_beta_flat,
-                            &adv_flat,
-                            &ret_flat,
-                            minibatch_sample_count,
-                        )
-                    });
-                    if graph_matches {
-                        let graph_start = Instant::now();
-                        let metrics = self.pmpo_cuda_graph.as_mut().unwrap().capture_or_replay(
-                            &self.trading_model,
-                            &self.hl_gauss,
-                            &self.trainable_vars,
-                            device,
-                            &windowed,
-                            &static_flat,
-                            &act_flat,
-                            &old_log_probs_flat,
-                            &old_action_alpha_flat,
-                            &old_action_beta_flat,
-                            &adv_flat,
-                            &ret_flat,
-                        );
-                        graph_update_time_us += graph_start.elapsed().as_micros() as u64;
-
-                        if log_first_non_finite_var(
-                            &mut logged_grad_non_finite,
-                            "grads_after_backward",
-                            episode,
-                            _epoch,
-                            chunk_i,
-                            &self.named_trainable_vars,
-                            true,
-                        ) {
-                            log_named_var_extremes(
-                                "grads_after_backward_top_abs",
-                                episode,
-                                _epoch,
-                                chunk_i,
-                                &self.named_trainable_vars,
-                                true,
-                                12,
-                            );
-                        }
-
-                        let approx_kl_val = metrics.approx_kl.shallow_clone();
-                        let dist_entropy_detached = metrics.dist_entropy.detach();
-                        let _ = epoch_kl_gpu
-                            .g_add_(&(&approx_kl_val * minibatch_sample_count as f64));
-                        let _ = total_policy_loss_weighted.g_add_(
-                            &(&metrics.action_loss.detach() * minibatch_sample_count as f64),
-                        );
-                        let _ = total_value_loss_weighted.g_add_(
-                            &(&metrics.value_loss.detach() * minibatch_sample_count as f64),
-                        );
-                        let _ = total_reverse_kl_weighted.g_add_(
-                            &(&metrics.reverse_kl_loss.detach()
-                                * minibatch_sample_count as f64),
-                        );
-                        let _ = total_entropy_weighted
-                            .g_add_(&(&dist_entropy_detached * minibatch_sample_count as f64));
-                        entropy_min = entropy_min.min_other(&dist_entropy_detached);
-                        entropy_max = entropy_max.max_other(&dist_entropy_detached);
-                        epoch_kl_count += minibatch_sample_count;
-                        total_sample_count += minibatch_sample_count;
-                        let _ = total_clipped.g_add_(&metrics.clipped);
-                        total_ratio_samples += minibatch_sample_count;
-
-                        let batch_grad_norm =
-                            clip_grad_norm_on_device(&self.trainable_vars, MAX_GRAD_NORM, device);
-                        grad_norm_sum += &batch_grad_norm;
-                        grad_norm_count += 1;
-
-                        step_optimizer(&mut self.opt, &mut self.optimizer_step);
-                        if log_first_non_finite_var(
-                            &mut logged_param_non_finite,
-                            "params_after_step",
-                            episode,
-                            _epoch,
-                            chunk_i,
-                            &self.named_trainable_vars,
-                            false,
-                        ) {
-                            log_named_var_extremes(
-                                "params_after_step_top_abs",
-                                episode,
-                                _epoch,
-                                chunk_i,
-                                &self.named_trainable_vars,
-                                false,
-                                12,
-                            );
-                        }
-                        self.rpo_rho_step();
-                        self.opt.zero_grad();
-                        last_minibatch_kl_mean_gpu = Some(approx_kl_val.shallow_clone());
-                        continue;
-                    }
-                }
-
-                let (new_value_logits, action_alpha, action_beta, action_std) =
+                let (new_value_logits, action_mean, action_log_std, action_std) =
                     autocast(false, || {
                         self.trading_model.windowed_replay_forward(
                             &windowed,
@@ -342,41 +217,41 @@ impl Trainer {
                         )
                     });
 
-                let action_log_probs = beta_log_prob(&act_flat, &action_alpha, &action_beta);
-                let dist_entropy_per_sample = beta_entropy(&action_alpha, &action_beta);
-                let action_var = beta_variance(&action_alpha, &action_beta);
-                let action_log_probs_per_dim =
-                    if self.policy_objective == PolicyObjective::Pmpo {
-                        beta_log_prob_per_dim(&act_flat, &action_alpha, &action_beta)
-                    } else {
-                        Tensor::zeros([0], (Kind::Float, device))
-                    };
+                let action_log_probs = squashed_gaussian_log_prob(
+                    &action_latents_flat,
+                    &action_mean,
+                    &action_std,
+                    LOG_2PI,
+                );
+                let dist_entropy_per_sample = gaussian_entropy(&action_std, LOG_2PI);
 
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("actions_mb", &act_flat, _epoch, chunk_i);
+                    let _ = debug_tensor_stats(
+                        "action_latents_mb",
+                        &action_latents_flat,
+                        _epoch,
+                        chunk_i,
+                    );
                     let _ = debug_tensor_stats(
                         "old_log_probs_mb",
                         &old_log_probs_flat,
                         _epoch,
                         chunk_i,
                     );
-                    let _ = debug_tensor_stats("action_alpha", &action_alpha, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_log_std", &action_log_std, _epoch, chunk_i);
                     let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_flat;
 
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats(
-                        "action_log_probs",
-                        &action_log_probs,
-                        _epoch,
-                        chunk_i,
-                    );
+                    let _ =
+                        debug_tensor_stats("action_log_probs", &action_log_probs, _epoch, chunk_i);
                     let _ = debug_tensor_stats("log_ratio", &log_ratio, _epoch, chunk_i);
                 }
                 let ratio = log_ratio.exp();
-                let ratio_clipped = ratio.clamp(1.0 - PPO_CLIP_LOW, 1.0 + PPO_CLIP_HIGH);
+                let ratio_diff = &ratio - 1.0;
 
                 if log_first_non_finite_tensor(
                     &mut logged_forward_non_finite,
@@ -385,13 +260,11 @@ impl Trainer {
                     _epoch,
                     chunk_i,
                     &[
-                        ("action_alpha", &action_alpha),
+                        ("action_mean", &action_mean),
+                        ("action_log_std", &action_log_std),
                         ("action_std", &action_std),
-                        ("action_beta", &action_beta),
                         ("action_log_probs", &action_log_probs),
                         ("old_log_probs", &old_log_probs_flat),
-                        ("old_action_alpha", &old_action_alpha_flat),
-                        ("old_action_beta", &old_action_beta_flat),
                         ("log_ratio", &log_ratio),
                         ("ratio", &ratio),
                         ("new_value_logits", &new_value_logits),
@@ -424,56 +297,15 @@ impl Trainer {
                     }
                 }
 
-                let reverse_kl_loss = match self.policy_objective {
-                    PolicyObjective::Ppo => Tensor::zeros([], (Kind::Float, device)),
-                    PolicyObjective::Pmpo => beta_kl_old_new(
-                        &old_action_alpha_flat,
-                        &old_action_beta_flat,
-                        &action_alpha,
-                        &action_beta,
-                    )
-                    .mean(Kind::Float),
-                };
-
-                let action_loss = match self.policy_objective {
-                    PolicyObjective::Ppo => {
-                        -Tensor::min_other(&(&ratio * &adv_flat), &(&ratio_clipped * &adv_flat))
-                            .mean(Kind::Float)
-                    }
-                    PolicyObjective::Pmpo => {
-                        let adv_weight = adv_flat.tanh().abs().unsqueeze(-1);
-                        let signed_log_probs = &action_log_probs_per_dim * adv_weight;
-                        let pos_mask = adv_flat
-                            .ge(0.0)
-                            .to_kind(Kind::Float)
-                            .unsqueeze(-1)
-                            .expand_as(&signed_log_probs);
-                        let neg_mask = adv_flat
-                            .lt(0.0)
-                            .to_kind(Kind::Float)
-                            .unsqueeze(-1)
-                            .expand_as(&signed_log_probs);
-                        let pos_count = pos_mask.sum(Kind::Float).clamp_min(1.0);
-                        let neg_count = neg_mask.sum(Kind::Float).clamp_min(1.0);
-                        let pos_loss =
-                            (&signed_log_probs * &pos_mask).sum(Kind::Float) / pos_count;
-                        let neg_loss =
-                            (&signed_log_probs * &neg_mask).sum(Kind::Float) / neg_count;
-                        -PMPO_POS_TO_NEG_WEIGHT * pos_loss
-                            + (1.0 - PMPO_POS_TO_NEG_WEIGHT) * neg_loss
-                            + &reverse_kl_loss * PMPO_REVERSE_KL_COEF
-                    }
-                };
+                let (action_loss, spo_penalty, spo_eps) = spo_asym_policy_loss(&adv_flat, &ratio);
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_flat, _epoch, chunk_i);
-                    let _ = debug_tensor_stats(
-                        "new_value_logits",
-                        &new_value_logits,
-                        _epoch,
-                        chunk_i,
-                    );
+                    let _ =
+                        debug_tensor_stats("new_value_logits", &new_value_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_flat, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("spo_eps", &spo_eps, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("spo_penalty", &spo_penalty, _epoch, chunk_i);
                 }
 
                 let value_loss = hl_gauss_value_loss(&self.hl_gauss, &new_value_logits, &ret_flat)
@@ -482,28 +314,9 @@ impl Trainer {
                 let dist_entropy = dist_entropy_per_sample.mean(Kind::Float);
                 let dist_entropy_detached = dist_entropy.detach();
 
-                let ppo_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF
-                    + action_loss.shallow_clone()
-                    - &dist_entropy * ENTROPY_COEF;
-
-                let alpha_loss = if self.policy_objective == PolicyObjective::Ppo
-                    && RPO_ALPHA_MAX > RPO_ALPHA_MIN
-                {
-                    let rpo_alpha =
-                        Tensor::zeros(&[1], (Kind::Float, device)).set_requires_grad(true);
-                    let inv_var_mean = action_var
-                        .detach()
-                        .clamp_min(1e-4)
-                        .reciprocal()
-                        .mean(Kind::Float);
-                    let d = ACTION_COUNT as f64;
-                    let induced_kl = rpo_alpha.pow_tensor_scalar(2) * (d / 6.0) * inv_var_mean;
-                    (induced_kl - RPO_TARGET_KL).pow_tensor_scalar(2.0) * ALPHA_LOSS_COEF
-                } else {
-                    Tensor::zeros([], (Kind::Float, device))
-                };
-
-                let total_loss = ppo_loss.shallow_clone() + alpha_loss.shallow_clone();
+                let actor_loss = action_loss.shallow_clone() - &dist_entropy * ENTROPY_COEF;
+                let critic_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF;
+                let total_loss = actor_loss.shallow_clone() + critic_loss.shallow_clone();
 
                 if log_first_non_finite_tensor(
                     &mut logged_loss_non_finite,
@@ -514,10 +327,9 @@ impl Trainer {
                     &[
                         ("action_loss", &action_loss),
                         ("value_loss", &value_loss),
-                        ("reverse_kl_loss", &reverse_kl_loss),
                         ("dist_entropy", &dist_entropy),
-                        ("ppo_loss", &ppo_loss),
-                        ("alpha_loss", &alpha_loss),
+                        ("actor_loss", &actor_loss),
+                        ("critic_loss", &critic_loss),
                         ("total_loss", &total_loss),
                     ],
                 ) {
@@ -534,7 +346,14 @@ impl Trainer {
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
-                total_loss.backward();
+                let (actor_grad_norm, critic_grad_norm) = backward_actor_critic_with_separate_clips(
+                    &self.grad_clip_groups,
+                    &self.trainable_vars,
+                    &actor_loss,
+                    &critic_loss,
+                    MAX_GRAD_NORM,
+                    device,
+                );
                 bwd_time_us += bwd_start.elapsed().as_micros() as u64;
 
                 if log_first_non_finite_var(
@@ -567,8 +386,9 @@ impl Trainer {
                     .g_add_(&(&action_loss.detach() * minibatch_sample_count as f64));
                 let _ = total_value_loss_weighted
                     .g_add_(&(&value_loss.detach() * minibatch_sample_count as f64));
-                let _ = total_reverse_kl_weighted
-                    .g_add_(&(&reverse_kl_loss.detach() * minibatch_sample_count as f64));
+                let _ = total_spo_penalty_weighted.g_add_(
+                    &(spo_penalty.detach().mean(Kind::Float) * minibatch_sample_count as f64),
+                );
                 let _ = total_entropy_weighted
                     .g_add_(&(&dist_entropy_detached * minibatch_sample_count as f64));
                 entropy_min = entropy_min.min_other(&dist_entropy_detached);
@@ -576,11 +396,12 @@ impl Trainer {
                 epoch_kl_count += minibatch_sample_count;
                 total_sample_count += minibatch_sample_count;
 
-                let _ = total_clipped.g_add_(&tch::no_grad(|| {
-                    let dev = &ratio - 1.0;
-                    let clipped_lo = dev.le(-PPO_CLIP_LOW).to_kind(Kind::Float);
-                    let clipped_hi = dev.ge(PPO_CLIP_HIGH).to_kind(Kind::Float);
-                    (clipped_lo + clipped_hi).sum(Kind::Float)
+                let _ = total_spo_bound_violations.g_add_(&tch::no_grad(|| {
+                    ratio_diff
+                        .abs()
+                        .gt_tensor(&spo_eps)
+                        .to_kind(Kind::Float)
+                        .sum(Kind::Float)
                 }));
                 total_ratio_samples += minibatch_sample_count;
 
@@ -604,8 +425,9 @@ impl Trainer {
                     }
                 }
 
-                let batch_grad_norm =
-                    clip_grad_norm_on_device(&self.trainable_vars, MAX_GRAD_NORM, device);
+                let batch_grad_norm = Tensor::stack(&[actor_grad_norm, critic_grad_norm], 0)
+                    .max()
+                    .to_kind(Kind::Float);
                 grad_norm_sum += &batch_grad_norm;
                 grad_norm_count += 1;
 
@@ -629,7 +451,6 @@ impl Trainer {
                         12,
                     );
                 }
-                self.rpo_rho_step();
                 self.opt.zero_grad();
 
                 // One forward/backward per minibatch now: the minibatch's KL is
@@ -662,42 +483,69 @@ impl Trainer {
                 mean_epoch_kl,
                 last_minibatch_approx_kl
             );
-            if self.policy_objective == PolicyObjective::Ppo
-                && (mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER
-                    || last_minibatch_approx_kl > TARGET_KL * KL_STOP_MULTIPLIER)
+            if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER
+                || last_minibatch_approx_kl > TARGET_KL * KL_STOP_MULTIPLIER
             {
                 break 'epoch_loop;
             }
         }
 
-        if graph_update_time_us > 0 {
-            println!(
-                "fwd: {:.1}ms  bwd: {:.1}ms  graph_update: {:.1}ms",
-                fwd_time_us as f64 / 1000.0,
-                bwd_time_us as f64 / 1000.0,
-                graph_update_time_us as f64 / 1000.0
-            );
-        } else {
-            println!(
-                "fwd: {:.1}ms  bwd: {:.1}ms",
-                fwd_time_us as f64 / 1000.0,
-                bwd_time_us as f64 / 1000.0
-            );
-        }
+        println!(
+            "fwd: {:.1}ms  bwd: {:.1}ms",
+            fwd_time_us as f64 / 1000.0,
+            bwd_time_us as f64 / 1000.0
+        );
 
         UpdateMetrics {
             total_policy_loss_weighted,
             total_value_loss_weighted,
-            total_reverse_kl_weighted,
+            total_spo_penalty_weighted,
             grad_norm_sum,
             total_sample_count,
             grad_norm_count,
-            total_clipped,
+            total_spo_bound_violations,
             total_ratio_samples,
             total_entropy_weighted,
             entropy_min,
             entropy_max,
             last_minibatch_approx_kl,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{spo_asym_policy_loss, SPO_EPS_HIGH, SPO_EPS_LOW};
+    use tch::Tensor;
+
+    #[test]
+    fn spo_asym_policy_loss_uses_half_strength_asymmetric_bounds() {
+        let advantage = Tensor::from_slice(&[2.0f32, 2.0, -2.0, -2.0]);
+        let ratio = Tensor::from_slice(&[1.2f32, 0.8, 0.8, 1.2]);
+
+        let (loss, penalty, eps) = spo_asym_policy_loss(&advantage, &ratio);
+
+        assert!((eps.double_value(&[0]) - SPO_EPS_HIGH).abs() < 1e-6);
+        assert!((eps.double_value(&[1]) - SPO_EPS_LOW).abs() < 1e-6);
+        assert!((eps.double_value(&[2]) - SPO_EPS_HIGH).abs() < 1e-6);
+        assert!((eps.double_value(&[3]) - SPO_EPS_LOW).abs() < 1e-6);
+
+        let expected_penalties = [
+            2.0 * 0.2f64.powi(2) / (2.0 * SPO_EPS_HIGH),
+            2.0 * 0.2f64.powi(2) / (2.0 * SPO_EPS_LOW),
+            2.0 * 0.2f64.powi(2) / (2.0 * SPO_EPS_HIGH),
+            2.0 * 0.2f64.powi(2) / (2.0 * SPO_EPS_LOW),
+        ];
+        for (i, expected) in expected_penalties.iter().enumerate() {
+            assert!((penalty.double_value(&[i as i64]) - expected).abs() < 1e-6);
+        }
+
+        let expected_loss = expected_penalties
+            .into_iter()
+            .zip([2.4, 1.6, -1.6, -2.4])
+            .map(|(p, surrogate)| p - surrogate)
+            .sum::<f64>()
+            / 4.0;
+        assert!((loss.double_value(&[]) - expected_loss).abs() < 1e-6);
     }
 }

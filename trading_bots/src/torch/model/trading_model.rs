@@ -17,12 +17,11 @@ use super::init::{
 use super::rmsnorm::RMSNorm;
 use super::rope::{RotaryEmbedding, ROPE_DIMS};
 use crate::torch::constants::{
-    ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER,
-    TICKERS_COUNT,
+    ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
 use crate::torch::value::hl_gauss::NUM_BINS;
 
-/// (value_logits, action_alpha, action_beta, action_std)
+/// (value_logits, action_mean, action_log_std, action_std)
 pub type ModelOutput = (Tensor, Tensor, Tensor, Tensor);
 
 pub struct DebugMetrics {
@@ -110,7 +109,7 @@ pub struct TradingModel {
     pub(in crate::torch::model) endogenous_ticker_block: EndogenousTickerBlock,
     pub(in crate::torch::model) actor_live_proj: nn::Linear,
     pub(in crate::torch::model) critic_live_proj: nn::Linear,
-    pub(in crate::torch::model) policy_alpha_beta: nn::Linear,
+    pub(in crate::torch::model) policy_mean_log_var: nn::Linear,
     pub(in crate::torch::model) value_proj: nn::Linear,
     pub(in crate::torch::model) device: tch::Device,
 }
@@ -168,7 +167,10 @@ impl TradingModel {
         self.seq_len
     }
 
-    pub(in crate::torch::model) fn uniform_stream_layout_from_raw(&self, deltas: &Tensor) -> Tensor {
+    pub(in crate::torch::model) fn uniform_stream_layout_from_raw(
+        &self,
+        deltas: &Tensor,
+    ) -> Tensor {
         let device = deltas.device();
         let batch = deltas.size()[0];
         let layout = Tensor::full(
@@ -176,8 +178,8 @@ impl TradingModel {
             f64::NAN,
             (Kind::Float, device),
         );
-        let full_prefix = super::config::UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES
-            * UNIFORM_STREAM_PATCH_SIZE;
+        let full_prefix =
+            super::config::UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES * UNIFORM_STREAM_PATCH_SIZE;
         let _ = layout
             .narrow(1, 0, full_prefix)
             .copy_(&deltas.narrow(1, 0, full_prefix));
@@ -339,8 +341,8 @@ impl TradingModel {
             "per-ticker actor head requires one action per ticker"
         );
         let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
-        let policy_alpha_beta = nn::linear(
-            p / "policy_alpha_beta",
+        let policy_mean_log_var = nn::linear(
+            p / "policy_mean_log_var",
             spec.model_dim,
             2,
             nn::LinearConfig {
@@ -375,7 +377,7 @@ impl TradingModel {
             endogenous_ticker_block,
             actor_live_proj,
             critic_live_proj,
-            policy_alpha_beta,
+            policy_mean_log_var,
             value_proj,
             device: p.device(),
         }
@@ -594,7 +596,10 @@ impl TradingModel {
         ])
     }
 
-    pub(in crate::torch::model) fn actor_critic_rope_positions(&self, total_seq_len: i64) -> Tensor {
+    pub(in crate::torch::model) fn actor_critic_rope_positions(
+        &self,
+        total_seq_len: i64,
+    ) -> Tensor {
         let patch_seq_len = total_seq_len - ACTOR_CRITIC_CLS_COUNT;
         let patch_positions = Tensor::arange(patch_seq_len, (Kind::Int64, self.device));
         let cls_positions = Tensor::full(

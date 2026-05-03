@@ -47,7 +47,11 @@ impl RotaryEmbedding {
         self.apply_with_cached(x, &cos, &sin, head_dim)
     }
 
-    pub(in crate::torch::model) fn apply_positions(&self, x: &Tensor, positions: &Tensor) -> Tensor {
+    pub(in crate::torch::model) fn apply_positions(
+        &self,
+        x: &Tensor,
+        positions: &Tensor,
+    ) -> Tensor {
         let head_dim = *x.size().last().unwrap();
         let positions = positions.to_kind(Kind::Int64).to_device(x.device());
         let cos = self

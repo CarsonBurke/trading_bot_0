@@ -15,14 +15,9 @@ use crate::torch::optim::muon::{Muon, MuonConfig};
 use crate::torch::value::hl_gauss::HlGaussBins;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
-use super::config::{
-    PolicyObjective, LEARNING_RATE, MAX_DELTA_ALPHA, MUON_LR, MUON_MOMENTUM_WARMUP_START,
-    RPO_ALPHA_INIT, RPO_ALPHA_MAX, RPO_ALPHA_MIN, USE_MUON,
-};
-use super::cuda_graph_minibatch::PmpoMinibatchCudaGraph;
+use super::config::{LEARNING_RATE, MUON_LR, MUON_MOMENTUM_WARMUP_START, USE_MUON};
 use super::geometry::{rollout_geometry, RolloutGeometry};
-use super::optimizer_glue::named_trainable_variables;
-use super::pmpo::cuda_graph_updates_enabled;
+use super::optimizer_glue::{grad_clip_groups, named_trainable_variables, GradClipGroups};
 
 pub(super) struct RolloutData {
     pub(super) reset_layout_batches_cpu: Vec<Tensor>,
@@ -34,7 +29,6 @@ pub(super) struct AdvantageData {
     pub(super) advantages: Tensor,
     pub(super) returns: Tensor,
     pub(super) adv_stats: Tensor,
-    pub(super) adv_norm: Tensor,
     pub(super) reset_layout_bank_cpu: Tensor,
     pub(super) reset_slots_by_chunk: Tensor,
     pub(super) chunk_batch_size: i64,
@@ -44,11 +38,11 @@ pub(super) struct AdvantageData {
 pub(super) struct UpdateMetrics {
     pub(super) total_policy_loss_weighted: Tensor,
     pub(super) total_value_loss_weighted: Tensor,
-    pub(super) total_reverse_kl_weighted: Tensor,
+    pub(super) total_spo_penalty_weighted: Tensor,
     pub(super) grad_norm_sum: Tensor,
     pub(super) total_sample_count: i64,
     pub(super) grad_norm_count: i64,
-    pub(super) total_clipped: Tensor,
+    pub(super) total_spo_bound_violations: Tensor,
     pub(super) total_ratio_samples: i64,
     pub(super) total_entropy_weighted: Tensor,
     pub(super) entropy_min: Tensor,
@@ -61,16 +55,13 @@ pub(super) struct Trainer {
     pub(super) trading_model: TradingModel,
     pub(super) trainable_vars: Vec<Tensor>,
     pub(super) named_trainable_vars: Vec<(String, Tensor)>,
+    pub(super) grad_clip_groups: GradClipGroups,
     pub(super) opt: Muon,
     pub(super) optimizer_step: i64,
     pub(super) env: VecEnv,
     pub(super) device: Device,
     pub(super) rollout: RolloutGeometry,
-    pub(super) policy_objective: PolicyObjective,
-    pub(super) use_cuda_graph_updates: bool,
     pub(super) hl_gauss: HlGaussBins,
-    pub(super) rpo_rho: Tensor,
-    pub(super) pmpo_cuda_graph: Option<PmpoMinibatchCudaGraph>,
     pub(super) run_dir: RunDir,
     pub(super) start_episode: usize,
     // Geometry-derived constants
@@ -84,9 +75,7 @@ pub(super) struct Trainer {
     pub(super) s_chunk_start_layouts: Tensor,
     pub(super) s_static_obs: Tensor,
     pub(super) s_step_deltas: Tensor,
-    pub(super) s_actions: Tensor,
-    pub(super) s_old_action_alpha: Tensor,
-    pub(super) s_old_action_beta: Tensor,
+    pub(super) s_action_latents: Tensor,
     pub(super) s_old_log_probs: Tensor,
     pub(super) s_rewards: Tensor,
     pub(super) s_dones: Tensor,
@@ -136,16 +125,9 @@ impl Trainer {
         let device = tch::Device::cuda_if_available();
         println!("device is cuda: {}", device.is_cuda());
         configure_cuda();
-        let policy_objective = PolicyObjective::from_env();
-        let use_cuda_graph_updates = cuda_graph_updates_enabled(policy_objective, device);
         println!(
-            "ppo rollout geometry: nprocs={} seq_len={} total_samples={} chunk_len={} objective={} cuda_graph_updates={}",
-            rollout.nprocs,
-            rollout.seq_len,
-            rollout.total_samples,
-            rollout.ppo_chunk_len,
-            policy_objective.as_str(),
-            use_cuda_graph_updates
+            "ppo rollout geometry: nprocs={} seq_len={} total_samples={} chunk_len={} objective=ppo",
+            rollout.nprocs, rollout.seq_len, rollout.total_samples, rollout.ppo_chunk_len,
         );
         let mut vs = nn::VarStore::new(device);
         let trading_model = TradingModel::new_with_config(
@@ -155,17 +137,6 @@ impl Trainer {
                 ..TradingModelConfig::default()
             },
         );
-
-        // RPO alpha via sigmoid: alpha = alpha_min + (alpha_max - alpha_min) * sigmoid(rho)
-        // Keep rho outside VarStore so AdamW only updates model parameters.
-        let mut rpo_rho = if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-            let p_init = (RPO_ALPHA_INIT - RPO_ALPHA_MIN) / (RPO_ALPHA_MAX - RPO_ALPHA_MIN);
-            let p_init = p_init.clamp(1e-6, 1.0 - 1e-6);
-            let rho_init = (p_init / (1.0 - p_init)).ln();
-            Tensor::full([1], rho_init, (Kind::Float, device)).set_requires_grad(true)
-        } else {
-            Tensor::zeros(&[1], (Kind::Float, device))
-        };
 
         let (start_episode, run_dir) = if let Some(path) = weights_path {
             println!("Loading weights from {}", path);
@@ -206,6 +177,7 @@ impl Trainer {
         println!("Run dir: {}", run_dir.root.display());
 
         let named_trainable_vars = named_trainable_variables(&vs);
+        let grad_clip_groups = grad_clip_groups(&named_trainable_vars);
         let trainable_vars: Vec<Tensor> = named_trainable_vars
             .iter()
             .map(|(_, tensor)| tensor.shallow_clone())
@@ -224,7 +196,7 @@ impl Trainer {
                 force_adamw_name_substrings: vec![
                     "actor_live_proj".to_string(),
                     "critic_live_proj".to_string(),
-                    "policy_alpha_beta".to_string(),
+                    "policy_mean_log_var".to_string(),
                     "resid_mix".to_string(),
                     "value_proj".to_string(),
                 ],
@@ -273,15 +245,7 @@ impl Trainer {
             &[total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT],
             (replay_obs_kind, device),
         );
-        let s_actions = Tensor::zeros(
-            &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
-            (Kind::Float, device),
-        );
-        let s_old_action_alpha = Tensor::ones(
-            &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
-            (Kind::Float, device),
-        );
-        let s_old_action_beta = Tensor::ones(
+        let s_action_latents = Tensor::zeros(
             &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
             (Kind::Float, device),
         );
@@ -301,33 +265,6 @@ impl Trainer {
             &[total_chunks, rollout.ppo_chunk_len],
             (Kind::Float, device),
         );
-
-        if start_episode > 0 {
-            let meta_path = format!(
-                "{}/ppo_ep{}.rpo.json",
-                run_dir.weights.display(),
-                start_episode
-            );
-            let meta_path = if Path::new(&meta_path).exists() {
-                meta_path
-            } else {
-                format!("../weights/ppo_ep{}.rpo.json", start_episode)
-            };
-            if let Ok(json) = std::fs::read_to_string(&meta_path) {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
-                    if policy_objective == PolicyObjective::Ppo && RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                        if let Some(rho) = parsed["rpo_rho"].as_f64() {
-                            tch::no_grad(|| {
-                                let _ = rpo_rho.copy_(
-                                    &Tensor::from_slice(&[rho as f32]).to_device(device),
-                                );
-                            });
-                            println!("Loaded RPO rho: {:.6}", rho);
-                        }
-                    }
-                }
-            }
-        }
 
         let (obs_price_cpu, obs_static_cpu) = env.reset();
         let mut obs_static = Tensor::zeros(
@@ -369,23 +306,19 @@ impl Trainer {
         // Persistent CPU staging for reset env indices (one i64 per env, reused each step).
         let reset_env_indices_host: Vec<i64> = vec![0i64; rollout.nprocs as usize];
         let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
-        let pmpo_cuda_graph: Option<PmpoMinibatchCudaGraph> = None;
 
         Self {
             vs,
             trading_model,
             trainable_vars,
             named_trainable_vars,
+            grad_clip_groups,
             opt,
             optimizer_step,
             env,
             device,
             rollout,
-            policy_objective,
-            use_cuda_graph_updates,
             hl_gauss,
-            rpo_rho,
-            pmpo_cuda_graph,
             run_dir,
             start_episode,
             rollout_steps,
@@ -397,9 +330,7 @@ impl Trainer {
             s_chunk_start_layouts,
             s_static_obs,
             s_step_deltas,
-            s_actions,
-            s_old_action_alpha,
-            s_old_action_beta,
+            s_action_latents,
             s_old_log_probs,
             s_rewards,
             s_dones,
@@ -434,38 +365,7 @@ impl Trainer {
                 println!("Error while saving weights: {}", err);
             } else {
                 println!("Saved model weights: {}", path);
-                let meta_path = format!(
-                    "{}/ppo_ep{}.rpo.json",
-                    self.run_dir.weights.display(),
-                    episode
-                );
-                let json = serde_json::json!({
-                    "rpo_rho": if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-                        Some(self.rpo_rho.double_value(&[]))
-                    } else {
-                        None
-                    },
-                });
-                if let Err(err) = std::fs::write(&meta_path, json.to_string()) {
-                    println!("Error saving RPO state: {}", err);
-                }
             }
-        }
-    }
-
-    /// Apply RPO rho gradient step. No-op when RPO is disabled.
-    pub(super) fn rpo_rho_step(&mut self) {
-        if RPO_ALPHA_MAX > RPO_ALPHA_MIN {
-            let max_delta_rho = MAX_DELTA_ALPHA / (0.25 * (RPO_ALPHA_MAX - RPO_ALPHA_MIN));
-            tch::no_grad(|| {
-                let mut rho_grad = self.rpo_rho.grad();
-                if rho_grad.defined() {
-                    let rho_step =
-                        (-LEARNING_RATE * &rho_grad).clamp(-max_delta_rho, max_delta_rho);
-                    let _ = self.rpo_rho.g_add_(&rho_step);
-                    let _ = rho_grad.zero_();
-                }
-            });
         }
     }
 }
