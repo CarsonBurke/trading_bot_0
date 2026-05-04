@@ -225,6 +225,11 @@ impl TradingModel {
             super::blocks::gqa::GQA_NUM_KV_HEADS > 0,
             "GQA must have at least one KV head"
         );
+        assert_eq!(
+            GQA_NUM_Q_HEADS % super::blocks::gqa::GQA_NUM_KV_HEADS,
+            0,
+            "GQA query heads must divide evenly across KV heads"
+        );
         assert_eq!(ROPE_DIMS % 2, 0, "RoPE dimensions must be even");
         let gqa_layers_count = spec.gqa_layers;
         // SA + FFN per layer = 2 sublayers each, plus 1 CA sublayer after layer 0
