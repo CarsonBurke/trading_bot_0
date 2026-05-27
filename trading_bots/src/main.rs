@@ -1,25 +1,7 @@
-// For burn Wgpu
-#![recursion_limit = "256"]
-#![feature(f16)]
-#![feature(stdarch_x86_avx512_bf16)]
-#![allow(dead_code)]
-
-use crate::torch::model::ModelVariant;
 use clap::{Parser, Subcommand};
 use colored::{self, Colorize};
-
-mod agent;
-mod charts;
-mod constants;
-mod data;
-mod genetic;
-mod history;
-mod neural_net;
-mod strategies;
-mod torch;
-mod types;
-mod utils;
-// mod gym;
+use trading_bot_0::torch::model::ModelVariant;
+use trading_bot_0::{genetic, torch};
 
 #[derive(Parser)]
 #[command(name = "trading_bot")]
