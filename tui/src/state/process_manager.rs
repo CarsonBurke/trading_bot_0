@@ -122,7 +122,6 @@ impl ProcessManagerState {
         &mut self,
         kind: TrainingKind,
         weights: Option<String>,
-        _model_size: &str,
         genetic_family: GeneticFamily,
     ) -> Result<()> {
         if self.is_anything_running() {
@@ -215,7 +214,7 @@ impl ProcessManagerState {
             .arg(episodes.to_string());
 
         if let Some(t) = ticker {
-            cmd.arg("--ticker").arg(t);
+            cmd.arg("--tickers").arg(t);
         }
 
         let child = cmd.spawn()?;

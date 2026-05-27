@@ -83,8 +83,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Span::raw(": Start Training  "),
             Span::styled("t", Style::default().fg(Color::Cyan)),
             Span::raw(": Toggle Trainer  "),
-            Span::styled("p", Style::default().fg(Color::Cyan)),
-            Span::raw(": Toggle RL Model  "),
             Span::styled("g", Style::default().fg(Color::Magenta)),
             Span::raw(": Toggle GA Family  "),
             Span::styled("f", Style::default().fg(Color::Blue)),

@@ -25,7 +25,6 @@ use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
 use state::{GeneticFamily as TuiGeneticFamily, TrainingKind};
 
-const TRAINING_MODEL_SIZES: [&str; 1] = ["uniform-stream"];
 const TRAINING_KINDS: [TrainingKind; 2] = [TrainingKind::Rl, TrainingKind::Genetic];
 const GENETIC_FAMILIES: [TuiGeneticFamily; 3] = [
     TuiGeneticFamily::TrendBreakout,
@@ -405,7 +404,6 @@ impl App {
         let result = self.process_manager.start_training(
             self.training_kind,
             weights_path,
-            &self.training_model_size,
             self.genetic_family,
         );
         self.sync_gens_path();
@@ -502,15 +500,6 @@ impl App {
         self.generation_browser.load_generations()?;
         self.load_latest_meta_charts()?;
         Ok(())
-    }
-
-    fn toggle_training_model_size(&mut self) {
-        let next_idx = TRAINING_MODEL_SIZES
-            .iter()
-            .position(|size| *size == self.training_model_size)
-            .map(|idx| (idx + 1) % TRAINING_MODEL_SIZES.len())
-            .unwrap_or(0);
-        self.training_model_size = TRAINING_MODEL_SIZES[next_idx].to_string();
     }
 
     fn toggle_training_kind(&mut self) {
@@ -1018,13 +1007,6 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                             } else {
                                                 app.start_training(None)?;
                                             }
-                                        }
-                                    }
-                                    KeyCode::Char('p') => {
-                                        if !app.is_training_running()
-                                            && app.training_kind == TrainingKind::Rl
-                                        {
-                                            app.toggle_training_model_size();
                                         }
                                     }
                                     KeyCode::Char('t') => {
