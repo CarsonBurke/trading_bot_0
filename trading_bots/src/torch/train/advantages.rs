@@ -63,6 +63,11 @@ impl Trainer {
             .to_kind(Kind::Int64)
             .view([self.total_chunks, self.rollout.ppo_chunk_len])
             .to_device(self.device);
+        let reset_chunks_have_slots = rollout_data
+            .reset_slots_host
+            .chunks(self.rollout.ppo_chunk_len as usize)
+            .map(|slots| slots.iter().any(|slot| *slot > 0))
+            .collect();
         println!(
             "rollout {}: {} update total_samples={} minibatch_size={} chunk_len={} chunk_batch={}",
             episode,
@@ -78,6 +83,7 @@ impl Trainer {
             adv_stats,
             reset_layout_bank_cpu,
             reset_slots_by_chunk,
+            reset_chunks_have_slots,
             chunk_batch_size,
             reset_layout_count: rollout_data.reset_layout_count,
         }

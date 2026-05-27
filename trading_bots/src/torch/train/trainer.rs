@@ -31,6 +31,7 @@ pub(super) struct AdvantageData {
     pub(super) adv_stats: Tensor,
     pub(super) reset_layout_bank_cpu: Tensor,
     pub(super) reset_slots_by_chunk: Tensor,
+    pub(super) reset_chunks_have_slots: Vec<bool>,
     pub(super) chunk_batch_size: i64,
     pub(super) reset_layout_count: i64,
 }

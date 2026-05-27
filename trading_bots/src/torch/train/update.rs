@@ -89,6 +89,7 @@ impl Trainer {
             {
                 let mb_end = (mb_start + adv_data.chunk_batch_size).min(self.total_chunks);
                 let chunk_count = mb_end - mb_start;
+                let chunk_ids_host = &perm_host[mb_start as usize..mb_end as usize];
                 let chunk_ids = perm_gpu.narrow(0, mb_start, chunk_count);
                 let boundary_layout = self.s_chunk_start_layouts.index_select(0, &chunk_ids);
                 let so_chunk = self.s_static_obs.index_select(0, &chunk_ids);
@@ -109,8 +110,10 @@ impl Trainer {
                 // minibatch. Each window is its own 255-token causal prefix +
                 // live-token suffix, so streaming semantics are preserved per window.
                 let flat_layout_len = boundary_layout.size()[1] / TICKERS_COUNT;
-                let has_reset_slots =
-                    adv_data.reset_layout_count > 0 && reset_slots_chunk.max().int64_value(&[]) > 0;
+                let has_reset_slots = adv_data.reset_layout_count > 0
+                    && chunk_ids_host
+                        .iter()
+                        .any(|id| adv_data.reset_chunks_have_slots[*id as usize]);
                 let windowed = if has_reset_slots {
                     let layout_rows = chunk_count * TICKERS_COUNT;
                     let mut current_layout = boundary_layout.view([layout_rows, flat_layout_len]);
