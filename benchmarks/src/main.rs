@@ -18,6 +18,19 @@ fn sync_device(device: Device) {
     }
 }
 
+fn trainable_var_store_tensors(vs: &nn::VarStore) -> Vec<Tensor> {
+    vs.variables()
+        .into_values()
+        .filter(|tensor| tensor.requires_grad())
+        .collect()
+}
+
+fn zero_grads(tensors: &mut [Tensor]) {
+    for tensor in tensors {
+        tensor.zero_grad();
+    }
+}
+
 /// Query CUDA memory used via nvidia-smi. Returns MiB, or None on CPU/error.
 /// Reports *reserved* memory (caching allocator), so measurements should be
 /// taken as deltas across a known-new allocation boundary.
@@ -76,6 +89,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
             },
         );
         vs.bfloat16();
+        let mut trainable_tensors = trainable_var_store_tensors(&vs);
         println!("  Variant: {}", variant.as_str());
         let price_deltas_dim = model.price_input_dim();
         let reported_seq_len = if variant == ModelVariant::UniformStream {
@@ -162,6 +176,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
 
             let start = Instant::now();
             for _ in 0..iters {
+                zero_grads(&mut trainable_tensors);
                 let (values, action_mean, action_log_std, action_std) =
                     model.forward(&price_deltas, &static_features, true);
                 let loss = values.sum(Kind::Float)
