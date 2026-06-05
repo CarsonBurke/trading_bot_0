@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn roundtrip_via_log_decode_is_reasonable() {
         let bins = HlGaussBins::default_for(tch::Device::Cpu);
-        let values = Tensor::from_slice(&[0.0f32, 3.0, -3.0, 0.5, -0.5]);
+        let values = Tensor::from_slice(&[0.0f32, 1.5, -1.5, 0.5, -0.5]);
         let encoded = bins.encode(&values);
         let logits = encoded.clamp_min(1e-30).log();
         let decoded = bins.decode(&logits);
@@ -264,11 +264,11 @@ mod tests {
     #[test]
     fn cross_entropy_of_matching_distribution_is_lower() {
         let bins = HlGaussBins::default_for(tch::Device::Cpu);
-        let value = Tensor::from_slice(&[2.5f32]);
+        let value = Tensor::from_slice(&[0.5f32]);
         let target = bins.encode(&value);
 
         let matching_logits = target.clamp_min(1e-30).log();
-        let wrong_value = Tensor::from_slice(&[20.0f32]);
+        let wrong_value = Tensor::from_slice(&[-1.5f32]);
         let wrong_target = bins.encode(&wrong_value);
         let wrong_logits = wrong_target.clamp_min(1e-30).log();
 
