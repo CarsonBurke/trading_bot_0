@@ -109,7 +109,6 @@ impl Env {
         let (reward, reward_per_ticker) =
             self.get_unrealized_pnl_reward_breakdown(absolute_step, pre_total_assets);
 
-        self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
             self.peak_assets = self.account.total_assets;
         }
@@ -180,7 +179,6 @@ impl Env {
         let (reward, reward_per_ticker) =
             self.get_unrealized_pnl_reward_breakdown(absolute_step, pre_total_assets);
 
-        self.last_reward = reward;
         if self.account.total_assets > self.peak_assets {
             self.peak_assets = self.account.total_assets;
         }

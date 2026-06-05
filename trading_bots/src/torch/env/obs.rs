@@ -25,7 +25,6 @@ impl Env {
             0.0
         });
         push((self.episode_history.total_commissions / Self::STARTING_CASH) as f32);
-        push(self.last_reward as f32);
         push(self.last_fill_ratio as f32);
 
         // Macro indicators

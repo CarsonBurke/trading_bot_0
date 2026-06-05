@@ -39,12 +39,12 @@ pub(super) struct AdvantageData {
 pub(super) struct UpdateMetrics {
     pub(super) total_policy_loss_weighted: Tensor,
     pub(super) total_value_loss_weighted: Tensor,
-    pub(super) total_spo_penalty_weighted: Tensor,
+    pub(super) total_clip_gap_weighted: Tensor,
     pub(super) actor_grad_norm_sum: Tensor,
     pub(super) critic_grad_norm_sum: Tensor,
     pub(super) total_sample_count: i64,
     pub(super) grad_norm_count: i64,
-    pub(super) total_spo_bound_violations: Tensor,
+    pub(super) total_clip_violations: Tensor,
     pub(super) total_ratio_samples: i64,
     pub(super) total_entropy_weighted: Tensor,
     pub(super) entropy_min: Tensor,
@@ -196,8 +196,6 @@ impl Trainer {
                 weight_decay: 0.0,
                 adamw_wd: 0.0,
                 force_adamw_name_substrings: vec![
-                    "actor_token".to_string(),
-                    "critic_token".to_string(),
                     "policy_concentration".to_string(),
                     "resid_mix".to_string(),
                     "value_proj".to_string(),

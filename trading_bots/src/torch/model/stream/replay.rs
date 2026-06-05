@@ -237,40 +237,6 @@ mod tests {
         assert!(max_diff > 1e-6, "{} max diff: {}", name, max_diff);
     }
 
-    /// The readout's `out_proj` is zero-initialized (zero-init residual), so a fresh
-    /// model's actor/critic summaries equal the constant seed tokens and are
-    /// price-independent by design. Make `out_proj` nonzero to emulate a trained
-    /// readout that actually routes price-dependent patch hidden states into both
-    /// summaries.
-    fn activate_readout_out_proj(vs: &nn::VarStore) {
-        let vars = vs.variables();
-        let out = vars
-            .get("readout.out_proj.weight")
-            .expect("missing readout out_proj");
-        tch::no_grad(|| {
-            let mut out = out.shallow_clone();
-            let init = 0.1
-                * Tensor::randn(out.size().as_slice(), (out.kind(), out.device()));
-            let _ = out.copy_(&init);
-        });
-    }
-
-    fn make_live_cls_projections_distinct(vs: &nn::VarStore) {
-        let vars = vs.variables();
-        let actor = vars
-            .get("actor_token")
-            .expect("missing actor readout token");
-        let critic = vars
-            .get("critic_token")
-            .expect("missing critic readout token");
-        tch::no_grad(|| {
-            let mut actor = actor.shallow_clone();
-            let mut critic = critic.shallow_clone();
-            let _ = actor.fill_(0.5);
-            let _ = critic.fill_(-0.5);
-        });
-    }
-
     #[test]
     fn fresh_uniform_stream_model_outputs_depend_on_price_history() {
         tch::manual_seed(20260425);
@@ -282,7 +248,6 @@ mod tests {
                 variant: ModelVariant::UniformStream,
             },
         );
-        activate_readout_out_proj(&vs);
 
         let raw_0 = Tensor::randn(
             [1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
@@ -331,7 +296,6 @@ mod tests {
                 variant: ModelVariant::UniformStream,
             },
         );
-        make_live_cls_projections_distinct(&vs);
 
         let raw = Tensor::randn(
             [1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
@@ -386,7 +350,6 @@ mod tests {
                 variant: ModelVariant::UniformStream,
             },
         );
-        make_live_cls_projections_distinct(&vs);
 
         let raw = Tensor::randn(
             [batch, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
@@ -484,7 +447,6 @@ mod tests {
                 variant: ModelVariant::UniformStream,
             },
         );
-        make_live_cls_projections_distinct(&vs);
 
         let raw = Tensor::randn(
             [batch, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],

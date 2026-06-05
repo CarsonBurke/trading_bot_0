@@ -89,7 +89,6 @@ impl Env {
             random_start,
             resample_tickers_on_reset,
             peak_assets: Self::STARTING_CASH,
-            last_reward: 0.0,
             last_fill_ratio: 1.0,
             trade_activity_ema: vec![0.0; num_tickers],
             steps_since_trade: vec![0; num_tickers],
@@ -293,7 +292,6 @@ impl Env {
         self.action_history.clear();
 
         self.peak_assets = Self::STARTING_CASH;
-        self.last_reward = 0.0;
         self.last_fill_ratio = 1.0;
         self.trade_activity_ema.fill(0.0);
         self.steps_since_trade.fill(0);

@@ -107,7 +107,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                 "PnL",
                                 "Drawdown",
                                 "Commissions",
-                                "Last Reward",
                                 "Fill Ratio",
                             ];
 
@@ -133,13 +132,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                         }
                                         4 => theme::YELLOW,
                                         5 => {
-                                            if val >= 0.0 {
-                                                theme::GREEN
-                                            } else {
-                                                theme::RED
-                                            }
-                                        }
-                                        6 => {
                                             if val >= 0.9 {
                                                 theme::GREEN
                                             } else {
@@ -150,9 +142,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                     };
 
                                     let display_val = match i {
-                                        0 | 1 | 6 => format!("{:6.2}%", val * 100.0),
+                                        0 | 1 | 5 => format!("{:6.2}%", val * 100.0),
                                         2 | 3 => format!("{:+7.2}%", val * 100.0),
-                                        4 | 5 => format!("{:8.4}", val),
                                         _ => format!("{:8.4}", val),
                                     };
 

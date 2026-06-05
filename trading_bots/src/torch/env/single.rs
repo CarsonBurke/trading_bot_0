@@ -37,7 +37,6 @@ pub struct Env {
     pub(super) random_start: bool,
     pub(super) resample_tickers_on_reset: bool,
     pub peak_assets: f64,
-    pub last_reward: f64,
     pub last_fill_ratio: f64,
     pub trade_activity_ema: Vec<f64>,
     pub steps_since_trade: Vec<usize>,

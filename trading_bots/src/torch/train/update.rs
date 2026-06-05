@@ -7,8 +7,8 @@ use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT};
 use crate::torch::model::TradingModel;
 
 use super::config::{
-    DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER, MAX_GRAD_NORM, OPTIM_EPOCHS, SPO_EPS_HIGH,
-    SPO_EPS_LOW, TARGET_KL, VALUE_LOSS_COEF,
+    CLIP_EPS_HIGH, CLIP_EPS_LOW, DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER, MAX_GRAD_NORM,
+    OPTIM_EPOCHS, TARGET_KL, VALUE_LOSS_COEF,
 };
 use super::gae::build_no_reset_windowed_layouts;
 use super::numeric_debug::{
@@ -19,16 +19,16 @@ use super::optimizer_glue::{backward_actor_critic_with_separate_clips, step_opti
 use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
 use super::value_loss::hl_gauss_value_loss;
 
-fn spo_asym_policy_loss(advantage: &Tensor, ratio: &Tensor) -> (Tensor, Tensor, Tensor) {
-    let ratio_diff = ratio - 1.0;
-    let with_adv = (advantage * &ratio_diff).gt(0.0);
-    let spo_eps = Tensor::where_scalar(&with_adv, SPO_EPS_HIGH, SPO_EPS_LOW)
-        .to_kind(Kind::Float)
-        .to_device(ratio.device());
-    let pg_surrogate = advantage * ratio;
-    let spo_penalty = advantage.abs() * ratio_diff.pow_tensor_scalar(2) / (&spo_eps * 2.0);
-    let action_loss = (&spo_penalty - &pg_surrogate).mean(Kind::Float);
-    (action_loss, spo_penalty, spo_eps)
+/// DAPO clip-higher asymmetric PPO objective.
+/// Returns the policy loss and the per-sample clip gap |ratio - clamp(ratio)|,
+/// a detached diagnostic of how much the clip is engaging.
+fn asym_clip_policy_loss(advantage: &Tensor, ratio: &Tensor) -> (Tensor, Tensor) {
+    let pg_loss1 = -(advantage * ratio);
+    let clipped = ratio.clamp(1.0 - CLIP_EPS_LOW, 1.0 + CLIP_EPS_HIGH);
+    let pg_loss2 = -(advantage * &clipped);
+    let action_loss = pg_loss1.max_other(&pg_loss2).mean(Kind::Float);
+    let clip_gap = tch::no_grad(|| (ratio - &clipped).abs());
+    (action_loss, clip_gap)
 }
 
 impl Trainer {
@@ -40,13 +40,13 @@ impl Trainer {
         let device = self.device;
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
-        let mut total_spo_penalty_weighted = Tensor::zeros([], (Kind::Float, device));
+        let mut total_clip_gap_weighted = Tensor::zeros([], (Kind::Float, device));
         // Explained variance: EV = 1 - Var(residuals) / Var(targets)
         let mut actor_grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut critic_grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut total_sample_count = 0i64;
         let mut grad_norm_count = 0i64;
-        let mut total_spo_bound_violations = Tensor::zeros([], (Kind::Float, device));
+        let mut total_clip_violations = Tensor::zeros([], (Kind::Float, device));
         let mut total_ratio_samples = 0i64;
         let mut total_entropy_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut entropy_min = Tensor::from(f64::INFINITY)
@@ -288,15 +288,13 @@ impl Trainer {
                     }
                 }
 
-                let (action_loss, spo_penalty, spo_eps) = spo_asym_policy_loss(&adv_flat, &ratio);
+                let (action_loss, clip_gap) = asym_clip_policy_loss(&adv_flat, &ratio);
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_flat, _epoch, chunk_i);
                     let _ =
                         debug_tensor_stats("new_value_logits", &new_value_logits, _epoch, chunk_i);
                     let _ = debug_tensor_stats("adv_mb", &adv_flat, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("spo_eps", &spo_eps, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("spo_penalty", &spo_penalty, _epoch, chunk_i);
                 }
 
                 let value_loss = hl_gauss_value_loss(&self.hl_gauss, &new_value_logits, &ret_flat)
@@ -377,9 +375,8 @@ impl Trainer {
                     .g_add_(&(&action_loss.detach() * minibatch_sample_count as f64));
                 let _ = total_value_loss_weighted
                     .g_add_(&(&value_loss.detach() * minibatch_sample_count as f64));
-                let _ = total_spo_penalty_weighted.g_add_(
-                    &(spo_penalty.detach().mean(Kind::Float) * minibatch_sample_count as f64),
-                );
+                let _ = total_clip_gap_weighted
+                    .g_add_(&(clip_gap.mean(Kind::Float) * minibatch_sample_count as f64));
                 let _ = total_entropy_weighted
                     .g_add_(&(&dist_entropy_detached * minibatch_sample_count as f64));
                 entropy_min = entropy_min.min_other(&dist_entropy_detached);
@@ -387,10 +384,10 @@ impl Trainer {
                 epoch_kl_count += minibatch_sample_count;
                 total_sample_count += minibatch_sample_count;
 
-                let _ = total_spo_bound_violations.g_add_(&tch::no_grad(|| {
+                let _ = total_clip_violations.g_add_(&tch::no_grad(|| {
                     ratio_diff
-                        .abs()
-                        .gt_tensor(&spo_eps)
+                        .gt(CLIP_EPS_HIGH)
+                        .logical_or(&ratio_diff.lt(-CLIP_EPS_LOW))
                         .to_kind(Kind::Float)
                         .sum(Kind::Float)
                 }));
@@ -488,12 +485,12 @@ impl Trainer {
         UpdateMetrics {
             total_policy_loss_weighted,
             total_value_loss_weighted,
-            total_spo_penalty_weighted,
+            total_clip_gap_weighted,
             actor_grad_norm_sum,
             critic_grad_norm_sum,
             total_sample_count,
             grad_norm_count,
-            total_spo_bound_violations,
+            total_clip_violations,
             total_ratio_samples,
             total_entropy_weighted,
             entropy_min,
@@ -505,37 +502,29 @@ impl Trainer {
 
 #[cfg(test)]
 mod tests {
-    use super::{spo_asym_policy_loss, SPO_EPS_HIGH, SPO_EPS_LOW};
+    use super::{asym_clip_policy_loss, CLIP_EPS_HIGH, CLIP_EPS_LOW};
     use tch::Tensor;
 
     #[test]
-    fn spo_asym_policy_loss_uses_half_strength_asymmetric_bounds() {
+    fn asym_clip_policy_loss_uses_dapo_clip_higher_bounds() {
+        // Ratios straddle both bounds: 0.7 < 1-LOW=0.80, 1.4 > 1+HIGH=1.28.
         let advantage = Tensor::from_slice(&[2.0f32, 2.0, -2.0, -2.0]);
-        let ratio = Tensor::from_slice(&[1.2f32, 0.8, 0.8, 1.2]);
+        let ratio = Tensor::from_slice(&[1.4f32, 0.7, 1.4, 0.7]);
 
-        let (loss, penalty, eps) = spo_asym_policy_loss(&advantage, &ratio);
+        let (loss, clip_gap) = asym_clip_policy_loss(&advantage, &ratio);
 
-        assert!((eps.double_value(&[0]) - SPO_EPS_HIGH).abs() < 1e-6);
-        assert!((eps.double_value(&[1]) - SPO_EPS_LOW).abs() < 1e-6);
-        assert!((eps.double_value(&[2]) - SPO_EPS_HIGH).abs() < 1e-6);
-        assert!((eps.double_value(&[3]) - SPO_EPS_LOW).abs() < 1e-6);
+        let lo = 1.0 - CLIP_EPS_LOW;
+        let hi = 1.0 + CLIP_EPS_HIGH;
+        let clamp = |r: f64| r.clamp(lo, hi);
+        let pg = |a: f64, r: f64| (-a * r).max(-a * clamp(r));
+        let samples = [(2.0, 1.4), (2.0, 0.7), (-2.0, 1.4), (-2.0, 0.7)];
 
-        let expected_penalties = [
-            2.0 * 0.2f64.powi(2) / (2.0 * SPO_EPS_HIGH),
-            2.0 * 0.2f64.powi(2) / (2.0 * SPO_EPS_LOW),
-            2.0 * 0.2f64.powi(2) / (2.0 * SPO_EPS_HIGH),
-            2.0 * 0.2f64.powi(2) / (2.0 * SPO_EPS_LOW),
-        ];
-        for (i, expected) in expected_penalties.iter().enumerate() {
-            assert!((penalty.double_value(&[i as i64]) - expected).abs() < 1e-6);
-        }
-
-        let expected_loss = expected_penalties
-            .into_iter()
-            .zip([2.4, 1.6, -1.6, -2.4])
-            .map(|(p, surrogate)| p - surrogate)
-            .sum::<f64>()
-            / 4.0;
+        let expected_loss = samples.iter().map(|&(a, r)| pg(a, r)).sum::<f64>() / 4.0;
         assert!((loss.double_value(&[]) - expected_loss).abs() < 1e-6);
+
+        for (i, &(_, r)) in samples.iter().enumerate() {
+            let expected_gap = (r - clamp(r)).abs();
+            assert!((clip_gap.double_value(&[i as i64]) - expected_gap).abs() < 1e-6);
+        }
     }
 }

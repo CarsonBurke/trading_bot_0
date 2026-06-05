@@ -3,7 +3,7 @@ use tch::{Kind, Tensor};
 pub const BETA_SAMPLE_EPS: f64 = 1e-6;
 
 pub fn beta_concentration(raw: &Tensor) -> Tensor {
-    raw.clamp(-20.0, 8.0).exp() + 1.0
+    raw.softplus() + 1.0
 }
 
 pub fn sample_beta_action(alpha: &Tensor, beta: &Tensor) -> Tensor {
@@ -37,8 +37,33 @@ pub fn beta_mean(alpha: &Tensor, beta: &Tensor) -> Tensor {
 
 #[cfg(test)]
 mod tests {
-    use super::{beta_entropy, beta_log_prob, beta_mean};
+    use super::{beta_concentration, beta_entropy, beta_log_prob, beta_mean};
     use tch::Tensor;
+
+    #[test]
+    fn beta_concentration_is_one_plus_softplus() {
+        // raw=0 -> 1 + softplus(0) = 1 + ln(2) ≈ 1.6931, i.e. Beta(1.693, 1.693).
+        let zero = beta_concentration(&Tensor::from_slice(&[0.0f32])).double_value(&[0]);
+        assert!((zero - (1.0 + 2.0f64.ln())).abs() < 1e-4);
+
+        // Monotonic increasing in raw and always >= 1.0.
+        let raws = [-50.0f32, -3.0, -1.0, 0.0, 1.0, 3.0, 50.0];
+        let out = beta_concentration(&Tensor::from_slice(&raws));
+        let mut prev = f64::NEG_INFINITY;
+        for i in 0..raws.len() {
+            let v = out.double_value(&[i as i64]);
+            assert!(v >= 1.0, "concentration {v} below 1.0");
+            assert!(v.is_finite(), "concentration not finite for raw {}", raws[i]);
+            assert!(v > prev, "not monotonic at index {i}: {v} <= {prev}");
+            prev = v;
+        }
+
+        // Tails: large negative -> ~1.0 (no NaN); large positive -> ~1+raw (no overflow).
+        let neg = beta_concentration(&Tensor::from_slice(&[-50.0f32])).double_value(&[0]);
+        assert!((neg - 1.0).abs() < 1e-4);
+        let pos = beta_concentration(&Tensor::from_slice(&[50.0f32])).double_value(&[0]);
+        assert!((pos - 51.0).abs() < 1e-4);
+    }
 
     fn lgamma(x: f64) -> f64 {
         // ln Gamma via integer/half-integer closed forms used in the tests.

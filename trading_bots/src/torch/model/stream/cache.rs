@@ -46,14 +46,14 @@ impl TradingModel {
         state.uniform_cached_exo_tokens = None;
     }
 
-    /// Live/replay readout. The bidirectional readout attends over EVERY patch's
-    /// post-`final_ln` hidden state, and the causal trunk makes each such state
-    /// immutable once the patch is seen. The prefix K/V cache only holds per-layer
-    /// attention K/V, not the post-trunk hidden states, so reconstructing all
-    /// patches' finalized hidden states from it would be as costly as a full
-    /// forward. We therefore run the full stateless backbone over the cached patch
-    /// tokens, which is correct by construction and bit-for-bit identical to
-    /// `forward`/`windowed_replay_forward` (the streaming-vs-full parity gate).
+    /// Live/replay readout. The heads consume the last patch's post-`final_ln`
+    /// hidden state, which depends on every prior patch through the causal trunk.
+    /// The prefix K/V cache only holds per-layer attention K/V, not the post-trunk
+    /// hidden state, so reconstructing the finalized last-patch state from it would
+    /// be as costly as a full forward. We therefore run the full stateless backbone
+    /// over the cached patch tokens, which is correct by construction and
+    /// bit-for-bit identical to `forward`/`windowed_replay_forward` (the
+    /// streaming-vs-full parity gate).
     pub(super) fn readout_from_cached_patches(
         &self,
         exo_tokens: &Tensor,

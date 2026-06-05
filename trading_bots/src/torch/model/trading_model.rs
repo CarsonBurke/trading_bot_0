@@ -5,14 +5,13 @@ use super::blocks::cross_attn::CrossAttnFfnBlock;
 use super::blocks::endogenous::EndogenousTickerBlock;
 use super::blocks::exogenous::ExoMLP;
 use super::blocks::gqa::{GqaBlock, GQA_NUM_Q_HEADS};
-use super::blocks::readout::ActorCriticReadout;
 use super::config::{
     compute_patch_totals, model_spec, ModelVariant, INTER_TICKER_AFTER, NUM_EXO_TOKENS,
     PATCH_SCALAR_FEATS, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL, UNIFORM_STREAM_LAYOUT_LEN,
     UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
 };
 use super::init::{
-    linear_orthogonal_with_bias, linear_with_same_dtype, residual_init_scale,
+    linear_orthogonal, linear_orthogonal_with_bias, linear_with_same_dtype, residual_init_scale,
     truncated_normal_init, xavier_normal_std,
 };
 use super::rmsnorm::RMSNorm;
@@ -108,9 +107,6 @@ pub struct TradingModel {
     pub(in crate::torch::model) exo_feat_w: Tensor,
     pub(in crate::torch::model) exo_feat_b: Tensor,
     pub(in crate::torch::model) endogenous_ticker_block: EndogenousTickerBlock,
-    pub(in crate::torch::model) actor_token: Tensor,
-    pub(in crate::torch::model) critic_token: Tensor,
-    pub(in crate::torch::model) readout: ActorCriticReadout,
     pub(in crate::torch::model) policy_concentration: nn::Linear,
     pub(in crate::torch::model) value_proj: nn::Linear,
     pub(in crate::torch::model) device: tch::Device,
@@ -341,41 +337,13 @@ impl TradingModel {
             spec.ff_dim,
             init_scale,
         );
-        let actor_token = p.var(
-            "actor_token",
-            &[1, 1, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 0.02,
-            },
-        );
-        let critic_token = p.var(
-            "critic_token",
-            &[1, 1, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 0.02,
-            },
-        );
-        let readout = ActorCriticReadout::new(&(p / "readout"), spec.model_dim);
         assert_eq!(
             ACTION_COUNT, TICKERS_COUNT,
             "per-ticker actor head requires one action per ticker"
         );
         let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
-        let policy_concentration = nn::linear(
-            p / "policy_concentration",
-            spec.model_dim,
-            2,
-            nn::LinearConfig {
-                ws_init: Init::Randn {
-                    mean: 0.0,
-                    stdev: 0.01,
-                },
-                bs_init: None,
-                bias: false,
-            },
-        );
+        let policy_concentration =
+            linear_orthogonal(p, "policy_concentration", spec.model_dim, 2, 0.01);
         let value_proj =
             linear_orthogonal_with_bias(p, "value_proj", flat_all_tickers, NUM_BINS, 0.1);
         Self {
@@ -398,9 +366,6 @@ impl TradingModel {
             exo_feat_w,
             exo_feat_b,
             endogenous_ticker_block,
-            actor_token,
-            critic_token,
-            readout,
             policy_concentration,
             value_proj,
             device: p.device(),
@@ -620,38 +585,6 @@ impl TradingModel {
         ])
     }
 
-    /// Expand the two distinct seed tokens to `[rows, 1, model_dim]` each, cast to
-    /// the activation dtype of `reference`.
-    pub(in crate::torch::model) fn actor_critic_seed_tokens(
-        &self,
-        rows: i64,
-        reference: &Tensor,
-    ) -> (Tensor, Tensor) {
-        let actor = self
-            .actor_token
-            .to_kind(reference.kind())
-            .expand(&[rows, 1, self.model_dim], false);
-        let critic = self
-            .critic_token
-            .to_kind(reference.kind())
-            .expand(&[rows, 1, self.model_dim], false);
-        (actor, critic)
-    }
-
-    /// Run the shared bidirectional readout over the causal patch hidden states and
-    /// split into per-token actor/critic summaries `[rows, model_dim]`.
-    pub(in crate::torch::model) fn readout_summaries(
-        &self,
-        patch_hidden: &Tensor,
-    ) -> (Tensor, Tensor) {
-        let rows = patch_hidden.size()[0];
-        let (actor_exp, critic_exp) = self.actor_critic_seed_tokens(rows, patch_hidden);
-        let query = Tensor::cat(&[&actor_exp, &critic_exp], 1);
-        let kv = Tensor::cat(&[patch_hidden, &actor_exp, &critic_exp], 1);
-        let summaries = self.readout.forward(&query, &kv);
-        (summaries.select(1, 0), summaries.select(1, 1))
-    }
-
     /// Stage 1: causal patch trunk over patches only (RoPE positions 0..S-1).
     /// Returns post-`final_ln` hidden states `[rows, S, model_dim]`.
     pub(in crate::torch::model) fn causal_patch_trunk(
@@ -679,7 +612,7 @@ impl TradingModel {
         batch_size: i64,
     ) -> ModelOutput {
         let trunk = self.causal_patch_trunk(patch_hidden, exo_tokens);
-        let (actor, critic) = self.readout_summaries(&trunk);
-        self.head_from_actor_critic_cls(&actor, &critic, batch_size)
+        let last_patch = trunk.select(1, trunk.size()[1] - 1);
+        self.head_from_actor_critic_cls(&last_patch, &last_patch, batch_size)
     }
 }

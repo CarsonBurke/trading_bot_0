@@ -24,8 +24,8 @@ pub struct MetaHistory {
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
     pub logit_scale: Vec<f64>,
-    pub spo_bound_fraction: Vec<f64>,
-    pub spo_penalty: Vec<f64>,
+    pub clip_fraction: Vec<f64>,
+    pub clip_gap: Vec<f64>,
     pub temporal_tau: Vec<f64>,
     pub temporal_attn_entropy: Vec<f64>,
     pub temporal_attn_max: Vec<f64>,
@@ -91,12 +91,12 @@ impl MetaHistory {
         self.max_advantage.push(max);
     }
 
-    pub fn record_spo_bound_fraction(&mut self, spo_bound_fraction: f64) {
-        self.spo_bound_fraction.push(spo_bound_fraction);
+    pub fn record_clip_fraction(&mut self, clip_fraction: f64) {
+        self.clip_fraction.push(clip_fraction);
     }
 
-    pub fn record_spo_penalty(&mut self, spo_penalty: f64) {
-        self.spo_penalty.push(spo_penalty);
+    pub fn record_clip_gap(&mut self, clip_gap: f64) {
+        self.clip_gap.push(clip_gap);
     }
 
     pub fn record_policy_entropy(&mut self, mean: f64, min: f64, max: f64) {
@@ -187,11 +187,12 @@ impl MetaHistory {
         self.critic_grad_norm = load_simple(&format!("{base_dir}/critic_grad_norm.report.bin"));
         self.total_commissions = load_simple(&format!("{base_dir}/total_commissions.report.bin"));
         self.logit_scale = load_simple(&format!("{base_dir}/logit_scale.report.bin"));
-        self.spo_bound_fraction = load_simple(&format!("{base_dir}/spo_bound_fraction.report.bin"));
-        if self.spo_bound_fraction.is_empty() {
-            self.spo_bound_fraction = load_simple(&format!("{base_dir}/clip_fraction.report.bin"));
+        self.clip_fraction = load_simple(&format!("{base_dir}/clip_fraction.report.bin"));
+        if self.clip_fraction.is_empty() {
+            self.clip_fraction =
+                load_simple(&format!("{base_dir}/spo_bound_fraction.report.bin"));
         }
-        self.spo_penalty = load_simple(&format!("{base_dir}/spo_penalty.report.bin"));
+        self.clip_gap = load_simple(&format!("{base_dir}/clip_gap.report.bin"));
 
         // MultiLine reports
         let beta_policy_path = format!("{base_dir}/beta_policy.report.bin");
@@ -418,25 +419,25 @@ impl MetaHistory {
             );
             let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &r);
         }
-        if !self.spo_bound_fraction.is_empty() {
+        if !self.clip_fraction.is_empty() {
             let r = Self::report(
-                "SPO Bound Fraction",
+                "Clip Fraction",
                 "Episode",
                 Some("Fraction"),
                 ScaleKind::Linear,
-                simple(&self.spo_bound_fraction),
+                simple(&self.clip_fraction),
             );
-            let _ = write_report(&format!("{base_dir}/spo_bound_fraction.report.bin"), &r);
+            let _ = write_report(&format!("{base_dir}/clip_fraction.report.bin"), &r);
         }
-        if !self.spo_penalty.is_empty() {
+        if !self.clip_gap.is_empty() {
             let r = Self::report(
-                "SPO Penalty",
+                "Clip Gap",
                 "Episode",
-                Some("Penalty"),
+                Some("Gap"),
                 ScaleKind::Linear,
-                simple(&self.spo_penalty),
+                simple(&self.clip_gap),
             );
-            let _ = write_report(&format!("{base_dir}/spo_penalty.report.bin"), &r);
+            let _ = write_report(&format!("{base_dir}/clip_gap.report.bin"), &r);
         }
         if !self.approx_kl.is_empty() {
             let r = Self::report(
