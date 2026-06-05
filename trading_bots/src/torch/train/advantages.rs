@@ -46,7 +46,7 @@ impl Trainer {
             self.rollout_steps,
             self.rollout.nprocs,
             self.rollout.ppo_chunk_len,
-            0.99,
+            0.995,
             0.95,
             self.device,
         );
