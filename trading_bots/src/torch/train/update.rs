@@ -42,7 +42,8 @@ impl Trainer {
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_spo_penalty_weighted = Tensor::zeros([], (Kind::Float, device));
         // Explained variance: EV = 1 - Var(residuals) / Var(targets)
-        let mut grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
+        let mut actor_grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
+        let mut critic_grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut total_sample_count = 0i64;
         let mut grad_norm_count = 0i64;
         let mut total_spo_bound_violations = Tensor::zeros([], (Kind::Float, device));
@@ -415,10 +416,8 @@ impl Trainer {
                     }
                 }
 
-                let batch_grad_norm = Tensor::stack(&[actor_grad_norm, critic_grad_norm], 0)
-                    .max()
-                    .to_kind(Kind::Float);
-                grad_norm_sum += &batch_grad_norm;
+                actor_grad_norm_sum += actor_grad_norm.to_kind(Kind::Float);
+                critic_grad_norm_sum += critic_grad_norm.to_kind(Kind::Float);
                 grad_norm_count += 1;
 
                 step_optimizer(&mut self.opt, &mut self.optimizer_step);
@@ -490,7 +489,8 @@ impl Trainer {
             total_policy_loss_weighted,
             total_value_loss_weighted,
             total_spo_penalty_weighted,
-            grad_norm_sum,
+            actor_grad_norm_sum,
+            critic_grad_norm_sum,
             total_sample_count,
             grad_norm_count,
             total_spo_bound_violations,

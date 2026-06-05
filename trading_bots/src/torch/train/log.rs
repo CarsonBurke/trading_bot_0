@@ -33,17 +33,25 @@ impl Trainer {
             mean_policy_loss_t,
             mean_value_loss_t,
             mean_spo_penalty_t,
-            mean_grad_norm_t,
+            mean_actor_grad_norm_t,
+            mean_critic_grad_norm_t,
             spo_bound_fraction_t,
         ) = if metrics.total_sample_count > 0 {
             let n = metrics.total_sample_count as f64;
             let mean_policy = &metrics.total_policy_loss_weighted / n;
             let mean_value = &metrics.total_value_loss_weighted / n;
             let mean_spo_penalty = &metrics.total_spo_penalty_weighted / n;
-            let grad_norm = if metrics.grad_norm_count > 0 {
-                &metrics.grad_norm_sum / (metrics.grad_norm_count as f64)
+            let (actor_grad_norm, critic_grad_norm) = if metrics.grad_norm_count > 0 {
+                let d = metrics.grad_norm_count as f64;
+                (
+                    &metrics.actor_grad_norm_sum / d,
+                    &metrics.critic_grad_norm_sum / d,
+                )
             } else {
-                Tensor::zeros([], (Kind::Float, device))
+                (
+                    Tensor::zeros([], (Kind::Float, device)),
+                    Tensor::zeros([], (Kind::Float, device)),
+                )
             };
             let spo_bound_fraction = if metrics.total_ratio_samples > 0 {
                 &metrics.total_spo_bound_violations / (metrics.total_ratio_samples as f64)
@@ -54,11 +62,13 @@ impl Trainer {
                 mean_policy,
                 mean_value,
                 mean_spo_penalty,
-                grad_norm,
+                actor_grad_norm,
+                critic_grad_norm,
                 spo_bound_fraction,
             )
         } else {
             (
+                Tensor::zeros([], (Kind::Float, device)),
                 Tensor::zeros([], (Kind::Float, device)),
                 Tensor::zeros([], (Kind::Float, device)),
                 Tensor::zeros([], (Kind::Float, device)),
@@ -100,7 +110,8 @@ impl Trainer {
                 mean_value_loss_t.view([1]),
                 mean_spo_penalty_t.view([1]),
                 explained_var_t.view([1]),
-                mean_grad_norm_t.view([1]),
+                mean_actor_grad_norm_t.view([1]),
+                mean_critic_grad_norm_t.view([1]),
                 spo_bound_fraction_t.view([1]),
                 adv_data.adv_stats.view([3]),
                 beta_policy_stats.view([4]),
@@ -113,20 +124,21 @@ impl Trainer {
             0,
         );
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 28]);
+            .unwrap_or_else(|_| vec![0.0; 29]);
         let mean_policy_loss = all_scalars_vec[0];
         let mean_value_loss = all_scalars_vec[1];
         let mean_spo_penalty = all_scalars_vec[2];
         let explained_var = all_scalars_vec[3];
-        let mean_grad_norm = all_scalars_vec[4];
-        let spo_bound_fraction = all_scalars_vec[5];
+        let mean_actor_grad_norm = all_scalars_vec[4];
+        let mean_critic_grad_norm = all_scalars_vec[5];
+        let spo_bound_fraction = all_scalars_vec[6];
         let (adv_mean, adv_min, adv_max) =
-            (all_scalars_vec[6], all_scalars_vec[7], all_scalars_vec[8]);
-        let beta_policy_stats_vec = &all_scalars_vec[9..13];
+            (all_scalars_vec[7], all_scalars_vec[8], all_scalars_vec[9]);
+        let beta_policy_stats_vec = &all_scalars_vec[10..14];
         let (entropy_mean, entropy_min_val, entropy_max_val) = (
-            all_scalars_vec[13],
             all_scalars_vec[14],
             all_scalars_vec[15],
+            all_scalars_vec[16],
         );
         let (
             return_min,
@@ -136,12 +148,12 @@ impl Trainer {
             below_support_frac,
             above_support_frac,
         ) = (
-            all_scalars_vec[16],
             all_scalars_vec[17],
             all_scalars_vec[18],
             all_scalars_vec[19],
             all_scalars_vec[20],
             all_scalars_vec[21],
+            all_scalars_vec[22],
         );
         let (
             value_pred_mean,
@@ -151,12 +163,12 @@ impl Trainer {
             value_residual_rmse,
             value_return_corr,
         ) = (
-            all_scalars_vec[22],
             all_scalars_vec[23],
             all_scalars_vec[24],
             all_scalars_vec[25],
             all_scalars_vec[26],
             all_scalars_vec[27],
+            all_scalars_vec[28],
         );
 
         let last_minibatch_approx_kl = metrics.last_minibatch_approx_kl;
@@ -177,7 +189,9 @@ impl Trainer {
         primary.meta_history.record_policy_loss(mean_policy_loss);
         primary.meta_history.record_value_loss(mean_value_loss);
         primary.meta_history.record_explained_var(explained_var);
-        primary.meta_history.record_grad_norm(mean_grad_norm);
+        primary
+            .meta_history
+            .record_grad_norm(mean_actor_grad_norm, mean_critic_grad_norm);
         primary
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
@@ -194,8 +208,8 @@ impl Trainer {
         );
 
         println!(
-            "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), SPO penalty: {:.4}, GradNorm: {:.4}",
-            mean_policy_loss, mean_value_loss, explained_var, mean_spo_penalty, mean_grad_norm
+            "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), SPO penalty: {:.4}, ActorGradNorm: {:.4}, CriticGradNorm: {:.4}",
+            mean_policy_loss, mean_value_loss, explained_var, mean_spo_penalty, mean_actor_grad_norm, mean_critic_grad_norm
         );
         println!(
             "  ValueDiag: pred μ/σ {:.3}/{:.3}, target μ/σ {:.3}/{:.3}, RMSE {:.3}, Corr {:.3}",

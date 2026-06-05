@@ -13,7 +13,8 @@ pub struct MetaHistory {
     pub policy_loss: Vec<f64>,
     pub value_loss: Vec<f64>,
     pub explained_var: Vec<f64>,
-    pub grad_norm: Vec<f64>,
+    pub actor_grad_norm: Vec<f64>,
+    pub critic_grad_norm: Vec<f64>,
     pub total_commissions: Vec<f64>,
     pub beta_alpha_mean: Vec<f64>,
     pub beta_action_mean: Vec<f64>,
@@ -66,8 +67,9 @@ impl MetaHistory {
         self.explained_var.push(ev);
     }
 
-    pub fn record_grad_norm(&mut self, grad_norm: f64) {
-        self.grad_norm.push(grad_norm);
+    pub fn record_grad_norm(&mut self, actor_grad_norm: f64, critic_grad_norm: f64) {
+        self.actor_grad_norm.push(actor_grad_norm);
+        self.critic_grad_norm.push(critic_grad_norm);
     }
 
     pub fn record_beta_policy_stats(
@@ -181,7 +183,8 @@ impl MetaHistory {
         self.policy_loss = load_simple(&format!("{base_dir}/policy_loss.report.bin"));
         self.value_loss = load_simple(&format!("{base_dir}/value_loss.report.bin"));
         self.explained_var = load_simple(&format!("{base_dir}/explained_var.report.bin"));
-        self.grad_norm = load_simple(&format!("{base_dir}/grad_norm_log.report.bin"));
+        self.actor_grad_norm = load_simple(&format!("{base_dir}/actor_grad_norm.report.bin"));
+        self.critic_grad_norm = load_simple(&format!("{base_dir}/critic_grad_norm.report.bin"));
         self.total_commissions = load_simple(&format!("{base_dir}/total_commissions.report.bin"));
         self.logit_scale = load_simple(&format!("{base_dir}/logit_scale.report.bin"));
         self.spo_bound_fraction = load_simple(&format!("{base_dir}/spo_bound_fraction.report.bin"));
@@ -321,15 +324,25 @@ impl MetaHistory {
             );
             let _ = write_report(&format!("{base_dir}/explained_var.report.bin"), &r);
         }
-        if !self.grad_norm.is_empty() {
+        if !self.actor_grad_norm.is_empty() {
             let r = Self::report(
-                "Grad Norm (Log)",
+                "Actor Grad Norm",
                 "Episode",
                 Some("Grad Norm"),
                 ScaleKind::Linear,
-                simple(&self.grad_norm),
+                simple(&self.actor_grad_norm),
             );
-            let _ = write_report(&format!("{base_dir}/grad_norm_log.report.bin"), &r);
+            let _ = write_report(&format!("{base_dir}/actor_grad_norm.report.bin"), &r);
+        }
+        if !self.critic_grad_norm.is_empty() {
+            let r = Self::report(
+                "Critic Grad Norm",
+                "Episode",
+                Some("Grad Norm"),
+                ScaleKind::Linear,
+                simple(&self.critic_grad_norm),
+            );
+            let _ = write_report(&format!("{base_dir}/critic_grad_norm.report.bin"), &r);
         }
         if !self.total_commissions.is_empty() {
             let r = Self::report(
