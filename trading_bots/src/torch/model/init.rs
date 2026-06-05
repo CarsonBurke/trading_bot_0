@@ -65,6 +65,25 @@ pub(in crate::torch::model) fn linear_orthogonal(
     )
 }
 
+pub(in crate::torch::model) fn linear_orthogonal_with_bias(
+    p: &nn::Path,
+    name: &str,
+    in_features: i64,
+    out_features: i64,
+    gain: f64,
+) -> nn::Linear {
+    nn::linear(
+        p / name,
+        in_features,
+        out_features,
+        nn::LinearConfig {
+            ws_init: Init::Orthogonal { gain },
+            bs_init: Some(Init::Const(0.0)),
+            bias: true,
+        },
+    )
+}
+
 pub(in crate::torch::model) fn linear_residual_out(
     p: &nn::Path,
     name: &str,

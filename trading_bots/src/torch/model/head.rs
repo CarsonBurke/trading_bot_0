@@ -21,8 +21,7 @@ impl TradingModel {
         let beta = beta_concentration(&raw_beta);
 
         let critic_in = critic.view([batch_size, TICKERS_COUNT * self.model_dim]);
-        let value_logits = linear_with_same_dtype(&critic_in, &self.value_proj)
-            + self.value_bias.to_kind(critic_in.kind());
+        let value_logits = linear_with_same_dtype(&critic_in, &self.value_proj);
 
         (
             value_logits.to_kind(Kind::Float),

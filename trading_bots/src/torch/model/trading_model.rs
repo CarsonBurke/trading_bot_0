@@ -12,17 +12,15 @@ use super::config::{
     UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
 };
 use super::init::{
-    linear_orthogonal, linear_with_same_dtype, residual_init_scale, truncated_normal_init,
-    xavier_normal_std,
+    linear_orthogonal_with_bias, linear_with_same_dtype, residual_init_scale,
+    truncated_normal_init, xavier_normal_std,
 };
 use super::rmsnorm::RMSNorm;
 use super::rope::{RotaryEmbedding, ROPE_DIMS};
 use crate::torch::constants::{
     ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
-use crate::torch::value::hl_gauss::{
-    CRITIC_INIT_TAU, NUM_BINS, SYMLOG_SUPPORT_MAX, SYMLOG_SUPPORT_MIN,
-};
+use crate::torch::value::hl_gauss::NUM_BINS;
 
 /// (value_logits, action_alpha, action_beta)
 pub type ModelOutput = (Tensor, Tensor, Tensor);
@@ -115,7 +113,6 @@ pub struct TradingModel {
     pub(in crate::torch::model) readout: ActorCriticReadout,
     pub(in crate::torch::model) policy_concentration: nn::Linear,
     pub(in crate::torch::model) value_proj: nn::Linear,
-    pub(in crate::torch::model) value_bias: Tensor,
     pub(in crate::torch::model) device: tch::Device,
 }
 
@@ -379,20 +376,8 @@ impl TradingModel {
                 bias: false,
             },
         );
-        let value_proj = linear_orthogonal(p, "value_proj", flat_all_tickers, NUM_BINS, 0.1);
-        let value_bias = p.var("value_bias", &[NUM_BINS], Init::Const(0.0));
-        tch::no_grad(|| {
-            let edges = Tensor::linspace(
-                SYMLOG_SUPPORT_MIN,
-                SYMLOG_SUPPORT_MAX,
-                NUM_BINS + 1,
-                (Kind::Float, p.device()),
-            );
-            let centers =
-                (edges.narrow(0, 0, NUM_BINS) + edges.narrow(0, 1, NUM_BINS)) * 0.5;
-            let init = (&centers / CRITIC_INIT_TAU).square() * -0.5;
-            let _ = value_bias.shallow_clone().copy_(&init);
-        });
+        let value_proj =
+            linear_orthogonal_with_bias(p, "value_proj", flat_all_tickers, NUM_BINS, 0.1);
         Self {
             variant: config.variant,
             patch_configs,
@@ -418,7 +403,6 @@ impl TradingModel {
             readout,
             policy_concentration,
             value_proj,
-            value_bias,
             device: p.device(),
         }
     }
@@ -656,7 +640,10 @@ impl TradingModel {
 
     /// Run the shared bidirectional readout over the causal patch hidden states and
     /// split into per-token actor/critic summaries `[rows, model_dim]`.
-    pub(in crate::torch::model) fn readout_summaries(&self, patch_hidden: &Tensor) -> (Tensor, Tensor) {
+    pub(in crate::torch::model) fn readout_summaries(
+        &self,
+        patch_hidden: &Tensor,
+    ) -> (Tensor, Tensor) {
         let rows = patch_hidden.size()[0];
         let (actor_exp, critic_exp) = self.actor_critic_seed_tokens(rows, patch_hidden);
         let query = Tensor::cat(&[&actor_exp, &critic_exp], 1);

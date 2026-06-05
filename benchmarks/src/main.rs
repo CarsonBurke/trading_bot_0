@@ -1,5 +1,8 @@
 #![feature(f16)]
 
+mod optim_grid;
+mod optim_loss;
+mod optim_transformer;
 mod results;
 
 use std::time::Instant;
@@ -58,9 +61,27 @@ fn main() {
     if device == Device::Cpu {
         eprintln!("Warning: CUDA not detected, running on CPU (will be slow)");
     }
-    let mut suite = BenchmarkSuite::new();
-
     println!("=== Trading Bot Benchmarks ===\n");
+
+    // `optim-sweep` runs only the AdamW-vs-NorMuon loss-convergence sweep
+    // (a hyperparameter search, not a latency/VRAM bench), and does not touch
+    // the saved benchmark suite. The default run keeps the fast latency suite.
+    let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("optim-sweep") {
+        optim_loss::run(device);
+        println!("\n=== Optimizer Sweep Complete ===");
+        return;
+    }
+
+    // `optim-grid` runs the FULL NorMuon hyperparameter grid search (does not
+    // touch the saved benchmark suite).
+    if mode.as_deref() == Some("optim-grid") {
+        optim_grid::run(device);
+        println!("\n=== Optimizer Grid Search Complete ===");
+        return;
+    }
+
+    let mut suite = BenchmarkSuite::new();
 
     run_optimizer_benchmarks(&mut suite, device);
     run_model_benchmarks(&mut suite, device);
@@ -177,11 +198,8 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
             let start = Instant::now();
             for _ in 0..iters {
                 zero_grads(&mut trainable_tensors);
-                let (values, alpha, beta) =
-                    model.forward(&price_deltas, &static_features, true);
-                let loss = values.sum(Kind::Float)
-                    + alpha.sum(Kind::Float)
-                    + beta.sum(Kind::Float);
+                let (values, alpha, beta) = model.forward(&price_deltas, &static_features, true);
+                let loss = values.sum(Kind::Float) + alpha.sum(Kind::Float) + beta.sum(Kind::Float);
                 loss.backward();
             }
             sync_device(device);

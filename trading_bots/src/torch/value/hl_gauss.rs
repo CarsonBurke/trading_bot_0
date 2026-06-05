@@ -7,9 +7,6 @@ pub const NUM_BINS: i64 = 255;
 pub const SYMLOG_SUPPORT_MIN: f64 = -3.0;
 pub const SYMLOG_SUPPORT_MAX: f64 = 3.0;
 
-/// Std (in symlog space) of the gaussian the critic head bias is peaked at at init.
-pub const CRITIC_INIT_TAU: f64 = 0.5;
-
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
 const SIGMA_RATIO: f64 = 0.5;
 

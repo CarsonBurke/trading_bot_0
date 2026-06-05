@@ -2,11 +2,18 @@ use std::env;
 
 use crate::torch::constants::EPISODE_TRANSITIONS;
 
-/// Muon LR for 2D weight matrices (row-normalized NS5 updates).
-pub(crate) const MUON_LR: f64 = 3e-4;
+/// NorMuon LR for 2D weight matrices (NS5 + per-row second-moment updates).
+/// 5e-3 is the offline grid optimum on a transformer LM (benchmarks/optim-grid,
+/// SDPA + paper-matching NorMuon/AdamW routing); the MLP-tuned 3e-3 under-shoots
+/// on a real transformer. ~4x below the NorMuon reference's 0.02, which overshoots
+/// at our scale. Watch policy KL on the first RL run; RL may tolerate less.
+pub(crate) const MUON_LR: f64 = 5e-3;
 /// AdamW LR for 1D params (biases, norms) and the standalone rho scalar.
 pub(crate) const LEARNING_RATE: f64 = 3e-4;
-pub(crate) const MUON_MOMENTUM: f64 = 0.99;
+/// Warmup endpoint; reference NorMuon default. The grid showed 0.99 is the worst
+/// beta1 (over-smooths, caps usable LR); 0.95 matches the reference and is
+/// grid-competitive with 0.90.
+pub(crate) const MUON_MOMENTUM: f64 = 0.95;
 pub(crate) const MUON_MOMENTUM_WARMUP_START: f64 = 0.92;
 pub(crate) const MUON_MOMENTUM_WARMUP_STEPS: i64 = 50;
 pub(crate) const USE_MUON: bool = true;
