@@ -4,8 +4,8 @@ use tch::{Kind, Tensor};
 pub const NUM_BINS: i64 = 255;
 
 /// Symlog-space bounds of the critic value support.
-pub const SYMLOG_SUPPORT_MIN: f64 = -1.0;
-pub const SYMLOG_SUPPORT_MAX: f64 = 1.0;
+pub const SYMLOG_SUPPORT_MIN: f64 = -3.0;
+pub const SYMLOG_SUPPORT_MAX: f64 = 3.0;
 
 /// Std (in symlog space) of the gaussian the critic head bias is peaked at at init.
 pub const CRITIC_INIT_TAU: f64 = 0.5;
