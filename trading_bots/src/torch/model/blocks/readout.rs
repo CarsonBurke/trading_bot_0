@@ -9,15 +9,18 @@ use crate::torch::model::rmsnorm::RMSNorm;
 /// Shared bidirectional cross-attention readout. Actor/critic seed tokens form the
 /// query set; keys/values are the causal patch hidden states with both seed tokens
 /// appended, so each summary attends over every patch plus both tokens (bidirectional
-/// actor<->critic communication). Nonzero (orthogonal) `out_proj` makes the attended
-/// patch summary O(1) and state-dependent from step 1, so the residual
-/// `query_tokens + out` carries price information into the actor/critic heads at init.
+/// actor<->critic communication). The attention output is RMSNorm'd (gainless
+/// `out_norm`) before the nonzero (orthogonal) `out_proj`, mirroring iterthink's
+/// `out_proj(out_norm(x))`; this makes the attended patch summary O(1) and
+/// state-dependent from step 1, so the residual `query_tokens + out` carries price
+/// information into the actor/critic heads at init.
 pub(in crate::torch::model) struct ActorCriticReadout {
     ln_kv: RMSNorm,
     ln_q: RMSNorm,
     q_proj: nn::Linear,
     k_proj: nn::Linear,
     v_proj: nn::Linear,
+    out_norm: RMSNorm,
     out_proj: nn::Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
@@ -33,6 +36,7 @@ impl ActorCriticReadout {
         let q_proj = linear_truncated(p, "q_proj", model_dim, ca_dim);
         let k_proj = linear_truncated(p, "k_proj", model_dim, ca_dim);
         let v_proj = linear_truncated(p, "v_proj", model_dim, ca_dim);
+        let out_norm = RMSNorm::new(&(p / "out_norm"), ca_dim, 1e-6);
         let out_proj = linear_truncated(p, "out_proj", ca_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "q_norm"), CA_HEAD_DIM, 1e-6);
         let k_norm = RMSNorm::new(&(p / "k_norm"), CA_HEAD_DIM, 1e-6);
@@ -44,6 +48,7 @@ impl ActorCriticReadout {
             q_proj,
             k_proj,
             v_proj,
+            out_norm,
             out_proj,
             q_norm,
             k_norm,
@@ -97,7 +102,7 @@ impl ActorCriticReadout {
         .permute([0, 2, 1, 3])
         .contiguous()
         .reshape([b, q_len, CA_NUM_HEADS * CA_HEAD_DIM]);
-        let out = linear_with_same_dtype(&attn, &self.out_proj);
+        let out = linear_with_same_dtype(&self.out_norm.forward(&attn), &self.out_proj);
         let out = &out * self.attn_scale.to_kind(out.kind()).view([1, 1, -1]);
         query_tokens + out
     }
