@@ -27,8 +27,20 @@ impl RunDir {
         let weights = root.join("weights");
         let log_file = root.join("training.log");
 
+        if root.exists() {
+            bail!("run dir already exists: {}", root.display());
+        }
+        fs::create_dir(&root).context("failed to create run dir")?;
         fs::create_dir_all(&gens)?;
         fs::create_dir_all(&weights)?;
+        fs::write(
+            root.join("meta.json"),
+            format!(
+                "{{\n  \"commit\": \"{}\"\n}}\n",
+                current_git_commit().unwrap_or_default()
+            ),
+        )
+        .context("failed to write run metadata")?;
 
         // Atomically update latest symlink (relative target)
         let latest = runs.join("latest");
@@ -195,4 +207,20 @@ fn has_generation_data(gens: &Path) -> bool {
         .ok()
         .map(|mut entries| entries.next().is_some())
         .unwrap_or(false)
+}
+
+fn current_git_commit() -> Option<String> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
 }
