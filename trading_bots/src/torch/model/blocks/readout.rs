@@ -3,14 +3,15 @@ use tch::{nn, Tensor};
 
 use crate::torch::model::blocks::cross_attn::{CA_HEAD_DIM, CA_NUM_HEADS};
 use crate::torch::model::blocks::gqa::QK_GAIN_INIT;
-use crate::torch::model::init::{linear_residual_out, linear_truncated, linear_with_same_dtype};
+use crate::torch::model::init::{linear_truncated, linear_with_same_dtype};
 use crate::torch::model::rmsnorm::RMSNorm;
 
 /// Shared bidirectional cross-attention readout. Actor/critic seed tokens form the
 /// query set; keys/values are the causal patch hidden states with both seed tokens
 /// appended, so each summary attends over every patch plus both tokens (bidirectional
-/// actor<->critic communication). Zero-init `out_proj` makes the summaries equal the
-/// distinct seed tokens at init, then gradients make them state-dependent.
+/// actor<->critic communication). Nonzero (orthogonal) `out_proj` makes the attended
+/// patch summary O(1) and state-dependent from step 1, so the residual
+/// `query_tokens + out` carries price information into the actor/critic heads at init.
 pub(in crate::torch::model) struct ActorCriticReadout {
     ln_kv: RMSNorm,
     ln_q: RMSNorm,
@@ -32,7 +33,7 @@ impl ActorCriticReadout {
         let q_proj = linear_truncated(p, "q_proj", model_dim, ca_dim);
         let k_proj = linear_truncated(p, "k_proj", model_dim, ca_dim);
         let v_proj = linear_truncated(p, "v_proj", model_dim, ca_dim);
-        let out_proj = linear_residual_out(p, "out_proj", ca_dim, model_dim);
+        let out_proj = linear_truncated(p, "out_proj", ca_dim, model_dim);
         let q_norm = RMSNorm::new(&(p / "q_norm"), CA_HEAD_DIM, 1e-6);
         let k_norm = RMSNorm::new(&(p / "k_norm"), CA_HEAD_DIM, 1e-6);
         let q_gain = p.var("q_gain", &[CA_NUM_HEADS], Init::Const(QK_GAIN_INIT));
