@@ -5,14 +5,15 @@ use super::blocks::cross_attn::CrossAttnFfnBlock;
 use super::blocks::endogenous::EndogenousTickerBlock;
 use super::blocks::exogenous::ExoMLP;
 use super::blocks::gqa::{GqaBlock, GQA_NUM_Q_HEADS};
+use super::blocks::readout::ActorCriticReadout;
 use super::config::{
-    compute_patch_totals, model_spec, ModelVariant, ACTOR_CRITIC_CLS_COUNT, INTER_TICKER_AFTER,
-    NUM_EXO_TOKENS, PATCH_SCALAR_FEATS, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL,
-    UNIFORM_STREAM_LAYOUT_LEN, UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
+    compute_patch_totals, model_spec, ModelVariant, INTER_TICKER_AFTER, NUM_EXO_TOKENS,
+    PATCH_SCALAR_FEATS, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL, UNIFORM_STREAM_LAYOUT_LEN,
+    UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
 };
 use super::init::{
-    linear_identity, linear_orthogonal, linear_with_same_dtype, residual_init_scale,
-    truncated_normal_init, xavier_normal_std,
+    linear_orthogonal, linear_with_same_dtype, residual_init_scale, truncated_normal_init,
+    xavier_normal_std,
 };
 use super::rmsnorm::RMSNorm;
 use super::rope::{RotaryEmbedding, ROPE_DIMS};
@@ -107,8 +108,9 @@ pub struct TradingModel {
     pub(in crate::torch::model) exo_feat_w: Tensor,
     pub(in crate::torch::model) exo_feat_b: Tensor,
     pub(in crate::torch::model) endogenous_ticker_block: EndogenousTickerBlock,
-    pub(in crate::torch::model) actor_live_proj: nn::Linear,
-    pub(in crate::torch::model) critic_live_proj: nn::Linear,
+    pub(in crate::torch::model) actor_token: Tensor,
+    pub(in crate::torch::model) critic_token: Tensor,
+    pub(in crate::torch::model) readout: ActorCriticReadout,
     pub(in crate::torch::model) policy_concentration: nn::Linear,
     pub(in crate::torch::model) value_proj: nn::Linear,
     pub(in crate::torch::model) device: tch::Device,
@@ -339,8 +341,23 @@ impl TradingModel {
             spec.ff_dim,
             init_scale,
         );
-        let actor_live_proj = linear_identity(p, "actor_live_proj", spec.model_dim);
-        let critic_live_proj = linear_identity(p, "critic_live_proj", spec.model_dim);
+        let actor_token = p.var(
+            "actor_token",
+            &[1, 1, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: 0.02,
+            },
+        );
+        let critic_token = p.var(
+            "critic_token",
+            &[1, 1, spec.model_dim],
+            Init::Randn {
+                mean: 0.0,
+                stdev: 0.02,
+            },
+        );
+        let readout = ActorCriticReadout::new(&(p / "readout"), spec.model_dim);
         assert_eq!(
             ACTION_COUNT, TICKERS_COUNT,
             "per-ticker actor head requires one action per ticker"
@@ -380,8 +397,9 @@ impl TradingModel {
             exo_feat_w,
             exo_feat_b,
             endogenous_ticker_block,
-            actor_live_proj,
-            critic_live_proj,
+            actor_token,
+            critic_token,
+            readout,
             policy_concentration,
             value_proj,
             device: p.device(),
@@ -601,35 +619,53 @@ impl TradingModel {
         ])
     }
 
-    pub(in crate::torch::model) fn actor_critic_rope_positions(
+    /// Expand the two distinct seed tokens to `[rows, 1, model_dim]` each, cast to
+    /// the activation dtype of `reference`.
+    pub(in crate::torch::model) fn actor_critic_seed_tokens(
         &self,
-        total_seq_len: i64,
+        rows: i64,
+        reference: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let actor = self
+            .actor_token
+            .to_kind(reference.kind())
+            .expand(&[rows, 1, self.model_dim], false);
+        let critic = self
+            .critic_token
+            .to_kind(reference.kind())
+            .expand(&[rows, 1, self.model_dim], false);
+        (actor, critic)
+    }
+
+    /// Run the shared bidirectional readout over the causal patch hidden states and
+    /// split into per-token actor/critic summaries `[rows, model_dim]`.
+    pub(in crate::torch::model) fn readout_summaries(&self, patch_hidden: &Tensor) -> (Tensor, Tensor) {
+        let rows = patch_hidden.size()[0];
+        let (actor_exp, critic_exp) = self.actor_critic_seed_tokens(rows, patch_hidden);
+        let query = Tensor::cat(&[&actor_exp, &critic_exp], 1);
+        let kv = Tensor::cat(&[patch_hidden, &actor_exp, &critic_exp], 1);
+        let summaries = self.readout.forward(&query, &kv);
+        (summaries.select(1, 0), summaries.select(1, 1))
+    }
+
+    /// Stage 1: causal patch trunk over patches only (RoPE positions 0..S-1).
+    /// Returns post-`final_ln` hidden states `[rows, S, model_dim]`.
+    pub(in crate::torch::model) fn causal_patch_trunk(
+        &self,
+        patch_hidden: &Tensor,
+        exo_tokens: &Tensor,
     ) -> Tensor {
-        let patch_seq_len = total_seq_len - ACTOR_CRITIC_CLS_COUNT;
-        let patch_positions = Tensor::arange(patch_seq_len, (Kind::Int64, self.device));
-        let cls_positions = Tensor::full(
-            [ACTOR_CRITIC_CLS_COUNT],
-            patch_seq_len - 1,
-            (Kind::Int64, self.device),
-        );
-        Tensor::cat(&[&patch_positions, &cls_positions], 0)
-    }
-
-    pub(in crate::torch::model) fn actor_critic_cls_from_live(&self, live: &Tensor) -> Tensor {
-        let live = if live.dim() == 2 {
-            live.unsqueeze(1)
-        } else {
-            live.shallow_clone()
-        };
-        let actor = linear_with_same_dtype(&live, &self.actor_live_proj);
-        let critic = linear_with_same_dtype(&live, &self.critic_live_proj);
-        Tensor::cat(&[&actor, &critic], 1)
-    }
-
-    pub(in crate::torch::model) fn append_actor_critic_cls(&self, x: &Tensor) -> Tensor {
-        let live = x.narrow(1, x.size()[1] - 1, 1);
-        let cls = self.actor_critic_cls_from_live(&live);
-        Tensor::cat(&[x, &cls], 1)
+        let x0 = patch_hidden.shallow_clone();
+        let mut x = x0.shallow_clone();
+        let rope_positions = Tensor::arange(x0.size()[1], (Kind::Int64, self.device));
+        for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
+            x = layer.forward_with_rope_positions(&x, &x0, &self.rope, &rope_positions, true);
+            if layer_idx == 0 {
+                x = self.exogenous_ticker_block.forward(&x, exo_tokens);
+            }
+            x = self.maybe_apply_endogenous_ticker(&x, layer_idx);
+        }
+        self.final_ln.forward(&x)
     }
 
     pub(in crate::torch::model) fn backbone_with_actor_critic_cls(
@@ -638,20 +674,8 @@ impl TradingModel {
         exo_tokens: &Tensor,
         batch_size: i64,
     ) -> ModelOutput {
-        let x0 = self.append_actor_critic_cls(patch_hidden);
-        let mut x = x0.shallow_clone();
-        let rope_positions = self.actor_critic_rope_positions(x0.size()[1]);
-        for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
-            x = layer.forward_with_rope_positions(&x, &x0, &self.rope, &rope_positions, true);
-            if layer_idx == 0 {
-                x = self.exogenous_ticker_block.forward(&x, exo_tokens);
-            }
-            x = self.maybe_apply_endogenous_ticker(&x, layer_idx);
-        }
-        let x = self.final_ln.forward(&x);
-        let seq = x.size()[1];
-        let actor = x.select(1, seq - 2);
-        let critic = x.select(1, seq - 1);
+        let trunk = self.causal_patch_trunk(patch_hidden, exo_tokens);
+        let (actor, critic) = self.readout_summaries(&trunk);
         self.head_from_actor_critic_cls(&actor, &critic, batch_size)
     }
 }

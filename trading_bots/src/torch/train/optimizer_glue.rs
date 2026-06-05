@@ -279,8 +279,9 @@ mod tests {
 
         assert_eq!(group_for("policy_concentration.weight"), "actor");
         assert_eq!(group_for("value_proj.weight"), "critic");
-        assert_eq!(group_for("actor_live_proj.weight"), "shared");
-        assert_eq!(group_for("critic_live_proj.weight"), "shared");
+        assert_eq!(group_for("actor_token"), "shared");
+        assert_eq!(group_for("critic_token"), "shared");
+        assert_eq!(group_for("readout.q_proj.weight"), "shared");
         assert_eq!(group_for("patch_embed_weight"), "shared");
     }
 }

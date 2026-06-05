@@ -67,27 +67,11 @@ impl TradingModel {
         let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
-        let x0 = self.append_actor_critic_cls(&x_stem);
-        let mut x = x0.shallow_clone();
-        let rope_positions = self.actor_critic_rope_positions(x0.size()[1]);
-        for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
-            debug_fused_layer("x_gqa_in", layer_idx, &x);
-            x = layer.forward_with_rope_positions(&x, &x0, &self.rope, &rope_positions, true);
-            if layer_idx == 0 {
-                x = self.exogenous_ticker_block.forward(&x, &exo_tokens);
-            }
-            debug_fused_layer("gqa_out", layer_idx, &x);
-            x = self.maybe_apply_endogenous_ticker(&x, layer_idx);
-            debug_fused_layer("x_gqa_out", layer_idx, &x);
-        }
-        x = self.final_ln.forward(&x);
-        debug_fused("model_x_gqa", &x);
-        let seq = x.size()[1];
-        let actor = x.select(1, seq - 2);
-        let critic = x.select(1, seq - 1);
+        let output = self.backbone_with_actor_critic_cls(&x_stem, &exo_tokens, batch_size);
+        debug_fused("model_value_logits", &output.0);
 
         (
-            self.head_from_actor_critic_cls(&actor, &critic, batch_size),
+            output,
             DebugMetrics {
                 temporal_tau: 0.0,
                 temporal_attn_entropy: 0.0,
@@ -151,25 +135,6 @@ fn debug_fused(tag: &str, t: &Tensor) {
         eprintln!(
             "debug {} nan={} inf={} shape={:?}",
             tag,
-            has_nan,
-            has_inf,
-            t.size()
-        );
-    }
-}
-
-#[inline]
-fn debug_fused_layer(tag: &str, layer_idx: usize, t: &Tensor) {
-    if !is_debug_enabled() {
-        return;
-    }
-    let has_nan = t.isnan().any().int64_value(&[]) != 0;
-    let has_inf = t.isinf().any().int64_value(&[]) != 0;
-    if has_nan || has_inf {
-        eprintln!(
-            "debug {}_l{} nan={} inf={} shape={:?}",
-            tag,
-            layer_idx,
             has_nan,
             has_inf,
             t.size()

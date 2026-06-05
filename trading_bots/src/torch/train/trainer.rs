@@ -196,8 +196,8 @@ impl Trainer {
                 weight_decay: 0.0,
                 adamw_wd: 0.0,
                 force_adamw_name_substrings: vec![
-                    "actor_live_proj".to_string(),
-                    "critic_live_proj".to_string(),
+                    "actor_token".to_string(),
+                    "critic_token".to_string(),
                     "policy_concentration".to_string(),
                     "resid_mix".to_string(),
                     "value_proj".to_string(),

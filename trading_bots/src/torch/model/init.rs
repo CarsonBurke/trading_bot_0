@@ -65,25 +65,6 @@ pub(in crate::torch::model) fn linear_orthogonal(
     )
 }
 
-pub(in crate::torch::model) fn linear_identity(p: &nn::Path, name: &str, dim: i64) -> nn::Linear {
-    let linear = nn::linear(
-        p / name,
-        dim,
-        dim,
-        nn::LinearConfig {
-            ws_init: Init::Const(0.0),
-            bs_init: None,
-            bias: false,
-        },
-    );
-    tch::no_grad(|| {
-        let eye = Tensor::eye(dim, (linear.ws.kind(), linear.ws.device()));
-        let mut ws = linear.ws.shallow_clone();
-        let _ = ws.copy_(&eye);
-    });
-    linear
-}
-
 pub(in crate::torch::model) fn linear_residual_out(
     p: &nn::Path,
     name: &str,

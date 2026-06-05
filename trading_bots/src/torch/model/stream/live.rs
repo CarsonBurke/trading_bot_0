@@ -14,31 +14,9 @@ impl TradingModel {
         state: &mut StreamState,
     ) -> ModelOutput {
         let batch_size = state.uniform_live_fill.size()[0];
-        let exo_tokens = if self.conditioned_prefix_cache_is_fresh(static_features, state) {
-            state
-                .uniform_cached_exo_tokens
-                .as_ref()
-                .unwrap()
-                .shallow_clone()
-        } else {
-            let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
-            let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
-            self.rebuild_uniform_conditioned_prefix_cache(static_features, &exo_tokens, state);
-            exo_tokens
-        };
-        let live_token = state
-            .uniform_patch_tokens
-            .narrow(1, UNIFORM_STREAM_PATCH_COUNT - 1, 1);
-        let x0_suffix = self.input_ln.forward(&live_token);
-        let prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
-        self.head_from_cached_live_and_cls(
-            &x0_suffix,
-            &state.uniform_prefix_k,
-            &state.uniform_prefix_v,
-            &exo_tokens,
-            prefix_len,
-            batch_size,
-        )
+        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+        self.readout_from_cached_patches(&exo_tokens, batch_size, state)
     }
 
     pub fn forward_stream_state_on_device(

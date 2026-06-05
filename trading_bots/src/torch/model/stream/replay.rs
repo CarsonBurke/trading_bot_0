@@ -2,7 +2,6 @@ use tch::Tensor;
 
 use super::super::config::{
     ModelVariant, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL, UNIFORM_STREAM_LAYOUT_LEN,
-    UNIFORM_STREAM_PATCH_COUNT,
 };
 use super::super::trading_model::{ModelOutput, StreamState, TradingModel};
 use super::probe::probe_replay_tensor;
@@ -17,35 +16,7 @@ impl TradingModel {
         let batch_size = state.uniform_live_fill.size()[0];
         let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
         let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
-        let x0 = &state.uniform_prefix_x0;
-        let mut prefix_hidden = self
-            .exogenous_ticker_block
-            .forward(&state.uniform_layer0_prefix_hidden, &exo_tokens);
-        let mut prefix_k = Vec::with_capacity(self.gqa_layers.len());
-        let mut prefix_v = Vec::with_capacity(self.gqa_layers.len());
-        prefix_k.push(state.uniform_layer0_prefix_k.shallow_clone());
-        prefix_v.push(state.uniform_layer0_prefix_v.shallow_clone());
-        for layer in self.gqa_layers.iter().skip(1) {
-            let (x_next, k, v) = layer.forward_prefix_and_cache(&prefix_hidden, x0, &self.rope);
-            prefix_k.push(k);
-            prefix_v.push(v);
-            prefix_hidden = x_next;
-        }
-
-        let live_token = state
-            .uniform_patch_tokens
-            .narrow(1, UNIFORM_STREAM_PATCH_COUNT - 1, 1);
-        let x0_suffix = self.input_ln.forward(&live_token);
-        let prefix_len = UNIFORM_STREAM_PATCH_COUNT - 1;
-        let _ = prefix_hidden;
-        self.head_from_cached_live_and_cls(
-            &x0_suffix,
-            &prefix_k,
-            &prefix_v,
-            &exo_tokens,
-            prefix_len,
-            batch_size,
-        )
+        self.readout_from_cached_patches(&exo_tokens, batch_size, state)
     }
 
     pub fn forward_stream_state_on_device_for_replay(
@@ -266,21 +237,37 @@ mod tests {
         assert!(max_diff > 1e-6, "{} max diff: {}", name, max_diff);
     }
 
+    /// The readout's `out_proj` is zero-initialized (zero-init residual), so a fresh
+    /// model's actor/critic summaries equal the constant seed tokens and are
+    /// price-independent by design. Make `out_proj` nonzero to emulate a trained
+    /// readout that actually routes price-dependent patch hidden states into both
+    /// summaries.
+    fn activate_readout_out_proj(vs: &nn::VarStore) {
+        let vars = vs.variables();
+        let out = vars
+            .get("readout.out_proj.weight")
+            .expect("missing readout out_proj");
+        tch::no_grad(|| {
+            let mut out = out.shallow_clone();
+            let init = 0.1
+                * Tensor::randn(out.size().as_slice(), (out.kind(), out.device()));
+            let _ = out.copy_(&init);
+        });
+    }
+
     fn make_live_cls_projections_distinct(vs: &nn::VarStore) {
         let vars = vs.variables();
         let actor = vars
-            .get("actor_live_proj.weight")
-            .expect("missing actor live projection");
+            .get("actor_token")
+            .expect("missing actor readout token");
         let critic = vars
-            .get("critic_live_proj.weight")
-            .expect("missing critic live projection");
+            .get("critic_token")
+            .expect("missing critic readout token");
         tch::no_grad(|| {
-            let dim = actor.size()[0];
-            let eye = Tensor::eye(dim, (actor.kind(), actor.device()));
             let mut actor = actor.shallow_clone();
             let mut critic = critic.shallow_clone();
-            let _ = actor.copy_(&(&eye * 0.5));
-            let _ = critic.copy_(&(&eye * 1.5));
+            let _ = actor.fill_(0.5);
+            let _ = critic.fill_(-0.5);
         });
     }
 
@@ -295,6 +282,7 @@ mod tests {
                 variant: ModelVariant::UniformStream,
             },
         );
+        activate_readout_out_proj(&vs);
 
         let raw_0 = Tensor::randn(
             [1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64],
