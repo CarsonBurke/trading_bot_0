@@ -3,7 +3,7 @@ use tch::{Kind, Tensor};
 pub const BETA_SAMPLE_EPS: f64 = 1e-6;
 
 pub fn beta_concentration(raw: &Tensor) -> Tensor {
-    raw.softplus() + 1.0
+    raw.clamp(-20.0, 8.0).exp() + 1.0
 }
 
 pub fn sample_beta_action(alpha: &Tensor, beta: &Tensor) -> Tensor {
