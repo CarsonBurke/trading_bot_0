@@ -76,7 +76,7 @@ pub(super) struct Trainer {
     pub(super) s_chunk_start_layouts: Tensor,
     pub(super) s_static_obs: Tensor,
     pub(super) s_step_deltas: Tensor,
-    pub(super) s_action_latents: Tensor,
+    pub(super) s_actions: Tensor,
     pub(super) s_old_log_probs: Tensor,
     pub(super) s_rewards: Tensor,
     pub(super) s_dones: Tensor,
@@ -197,7 +197,7 @@ impl Trainer {
                 force_adamw_name_substrings: vec![
                     "actor_live_proj".to_string(),
                     "critic_live_proj".to_string(),
-                    "policy_mean_log_var".to_string(),
+                    "policy_concentration".to_string(),
                     "resid_mix".to_string(),
                     "value_proj".to_string(),
                 ],
@@ -246,7 +246,7 @@ impl Trainer {
             &[total_chunks, rollout.ppo_chunk_len, TICKERS_COUNT],
             (replay_obs_kind, device),
         );
-        let s_action_latents = Tensor::zeros(
+        let s_actions = Tensor::zeros(
             &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
             (Kind::Float, device),
         );
@@ -331,7 +331,7 @@ impl Trainer {
             s_chunk_start_layouts,
             s_static_obs,
             s_step_deltas,
-            s_action_latents,
+            s_actions,
             s_old_log_probs,
             s_rewards,
             s_dones,

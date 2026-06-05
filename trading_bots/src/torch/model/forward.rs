@@ -20,7 +20,8 @@ impl TradingModel {
 
         let output = self.backbone_with_actor_critic_cls(&x_stem, &exo_tokens, batch_size);
         debug_fused("model_value_logits", &output.0);
-        debug_fused("model_action_mean", &output.1);
+        debug_fused("model_alpha", &output.1);
+        debug_fused("model_beta", &output.2);
         output
     }
 

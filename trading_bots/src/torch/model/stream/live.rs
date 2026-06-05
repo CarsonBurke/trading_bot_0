@@ -408,15 +408,14 @@ impl TradingModel {
             return self.forward_on_device(&price_deltas, &static_features, false);
         }
 
-        // Not enough deltas for a new patch yet; return zeros
+        // Not enough deltas for a new patch yet; return a uniform Beta (alpha=beta=1)
         (
             Tensor::zeros(
                 &[1, crate::torch::value::hl_gauss::NUM_BINS],
                 (Kind::Float, self.device),
             ),
-            Tensor::zeros(&[1, ACTION_COUNT], (Kind::Float, self.device)),
             Tensor::ones(&[1, ACTION_COUNT], (Kind::Float, self.device)),
-            Tensor::zeros(&[1, ACTION_COUNT], (Kind::Float, self.device)),
+            Tensor::ones(&[1, ACTION_COUNT], (Kind::Float, self.device)),
         )
     }
 

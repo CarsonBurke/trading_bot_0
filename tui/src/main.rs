@@ -228,7 +228,7 @@ impl App {
             "outperformance",
             "advantage_stats_log",
             "total_commissions",
-            "policy_scale",
+            "beta_policy",
             "grad_norm_log",
             "target_weights",
             "spo_bound_fraction",

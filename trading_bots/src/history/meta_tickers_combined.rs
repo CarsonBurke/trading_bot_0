@@ -15,10 +15,10 @@ pub struct MetaHistory {
     pub explained_var: Vec<f64>,
     pub grad_norm: Vec<f64>,
     pub total_commissions: Vec<f64>,
-    pub policy_scale_mean: Vec<f64>,
-    pub policy_scale_min: Vec<f64>,
-    pub policy_scale_max: Vec<f64>,
-    pub action_log_std_mean: Vec<f64>,
+    pub beta_alpha_mean: Vec<f64>,
+    pub beta_action_mean: Vec<f64>,
+    pub beta_beta_mean: Vec<f64>,
+    pub beta_concentration_mean: Vec<f64>,
     pub mean_advantage: Vec<f64>,
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
@@ -70,11 +70,17 @@ impl MetaHistory {
         self.grad_norm.push(grad_norm);
     }
 
-    pub fn record_policy_scale_stats(&mut self, mean: f64, min: f64, max: f64, log_std_mean: f64) {
-        self.policy_scale_mean.push(mean);
-        self.policy_scale_min.push(min);
-        self.policy_scale_max.push(max);
-        self.action_log_std_mean.push(log_std_mean);
+    pub fn record_beta_policy_stats(
+        &mut self,
+        alpha_mean: f64,
+        action_mean: f64,
+        beta_mean: f64,
+        concentration_mean: f64,
+    ) {
+        self.beta_alpha_mean.push(alpha_mean);
+        self.beta_action_mean.push(action_mean);
+        self.beta_beta_mean.push(beta_mean);
+        self.beta_concentration_mean.push(concentration_mean);
     }
 
     pub fn record_advantage_stats(&mut self, mean: f64, min: f64, max: f64) {
@@ -185,18 +191,11 @@ impl MetaHistory {
         self.spo_penalty = load_simple(&format!("{base_dir}/spo_penalty.report.bin"));
 
         // MultiLine reports
-        let policy_scale_path = format!("{base_dir}/policy_scale.report.bin");
-        self.policy_scale_mean = load_multiline(&policy_scale_path, "mean");
-        self.policy_scale_min = load_multiline(&policy_scale_path, "min");
-        self.policy_scale_max = load_multiline(&policy_scale_path, "max");
-        self.action_log_std_mean = load_multiline(&policy_scale_path, "log_std_mean");
-        if self.policy_scale_mean.is_empty() {
-            let old_path = format!("{base_dir}/logit_noise.report.bin");
-            self.policy_scale_mean = load_multiline(&old_path, "mean");
-            self.policy_scale_min = load_multiline(&old_path, "min");
-            self.policy_scale_max = load_multiline(&old_path, "max");
-            self.action_log_std_mean = load_multiline(&old_path, "log_std_mean");
-        }
+        let beta_policy_path = format!("{base_dir}/beta_policy.report.bin");
+        self.beta_alpha_mean = load_multiline(&beta_policy_path, "alpha_mean");
+        self.beta_action_mean = load_multiline(&beta_policy_path, "action_mean");
+        self.beta_beta_mean = load_multiline(&beta_policy_path, "beta_mean");
+        self.beta_concentration_mean = load_multiline(&beta_policy_path, "concentration");
 
         let adv_path = format!("{base_dir}/advantage_stats_log.report.bin");
         self.mean_advantage = load_multiline(&adv_path, "mean");
@@ -342,34 +341,34 @@ impl MetaHistory {
             );
             let _ = write_report(&format!("{base_dir}/total_commissions.report.bin"), &r);
         }
-        if !self.policy_scale_mean.is_empty() {
+        if !self.beta_alpha_mean.is_empty() {
             let r = Self::report(
-                "Policy Scale",
+                "Beta Policy",
                 "Episode",
                 None,
                 ScaleKind::Linear,
                 ReportKind::MultiLine {
                     series: vec![
                         ReportSeries {
-                            label: "mean".to_string(),
-                            values: f64_to_f32(&self.policy_scale_mean),
+                            label: "alpha_mean".to_string(),
+                            values: f64_to_f32(&self.beta_alpha_mean),
                         },
                         ReportSeries {
-                            label: "min".to_string(),
-                            values: f64_to_f32(&self.policy_scale_min),
+                            label: "action_mean".to_string(),
+                            values: f64_to_f32(&self.beta_action_mean),
                         },
                         ReportSeries {
-                            label: "max".to_string(),
-                            values: f64_to_f32(&self.policy_scale_max),
+                            label: "beta_mean".to_string(),
+                            values: f64_to_f32(&self.beta_beta_mean),
                         },
                         ReportSeries {
-                            label: "log_std_mean".to_string(),
-                            values: f64_to_f32(&self.action_log_std_mean),
+                            label: "concentration".to_string(),
+                            values: f64_to_f32(&self.beta_concentration_mean),
                         },
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/policy_scale.report.bin"), &r);
+            let _ = write_report(&format!("{base_dir}/beta_policy.report.bin"), &r);
         }
         if !self.mean_advantage.is_empty() {
             let r = Self::report(

@@ -1,99 +1,89 @@
 use tch::{Kind, Tensor};
 
-pub const SQUASHED_GAUSSIAN_STD_MIN: f64 = 1e-3;
-const LOG_2: f64 = 0.6931471805599453;
+pub const BETA_SAMPLE_EPS: f64 = 1e-6;
 
-pub fn gaussian_log_prob(diff: &Tensor, std: &Tensor, log_2pi: f64) -> Tensor {
-    let var = std.pow_tensor_scalar(2);
-    let log_std = std.log();
-    let mahal = diff.pow_tensor_scalar(2) / &var;
-    let per_dim: Tensor = -(mahal + log_2pi) * 0.5 - &log_std;
+pub fn beta_concentration(raw: &Tensor) -> Tensor {
+    raw.softplus() + 1.0
+}
+
+pub fn sample_beta_action(alpha: &Tensor, beta: &Tensor) -> Tensor {
+    let ga = alpha.internal_standard_gamma();
+    let gb = beta.internal_standard_gamma();
+    (&ga / (&ga + &gb)).clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
+}
+
+fn beta_log_norm(alpha: &Tensor, beta: &Tensor) -> Tensor {
+    alpha.lgamma() + beta.lgamma() - (alpha + beta).lgamma()
+}
+
+pub fn beta_log_prob(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Tensor {
+    let x = x.clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS);
+    let one_minus_x: Tensor = 1.0 - &x;
+    let log_norm = beta_log_norm(alpha, beta);
+    let per_dim = (alpha - 1.0) * x.log() + (beta - 1.0) * one_minus_x.log() - log_norm;
     per_dim.sum_dim_intlist([-1].as_slice(), false, Kind::Float)
 }
 
-pub fn gaussian_entropy(std: &Tensor, log_2pi: f64) -> Tensor {
-    (std.log() + 0.5 * (1.0 + log_2pi)).sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+pub fn beta_entropy(alpha: &Tensor, beta: &Tensor) -> Tensor {
+    let log_norm = beta_log_norm(alpha, beta);
+    let per_dim = log_norm - (alpha - 1.0) * alpha.digamma() - (beta - 1.0) * beta.digamma()
+        + (alpha + beta - 2.0) * (alpha + beta).digamma();
+    per_dim.sum_dim_intlist([-1].as_slice(), false, Kind::Float)
 }
 
-pub fn gaussian_std_from_log_var(log_var: &Tensor) -> Tensor {
-    (log_var * 0.5).exp() + SQUASHED_GAUSSIAN_STD_MIN
-}
-
-pub fn tanh_target_weight(latent: &Tensor) -> Tensor {
-    (latent.tanh() + 1.0) * 0.5
-}
-
-pub fn sample_squashed_gaussian_action(mean: &Tensor, std: &Tensor) -> (Tensor, Tensor) {
-    let latent = mean + mean.randn_like() * std;
-    let target_weight = tanh_target_weight(&latent);
-    (latent, target_weight)
-}
-
-pub fn tanh_unit_log_det(latent: &Tensor) -> Tensor {
-    let log_one_minus_tanh_sq = ((latent * -2.0).softplus() + latent - LOG_2) * -2.0;
-    log_one_minus_tanh_sq.sum_dim_intlist([-1].as_slice(), false, Kind::Float)
-}
-
-pub fn squashed_gaussian_log_prob(
-    latent: &Tensor,
-    mean: &Tensor,
-    std: &Tensor,
-    log_2pi: f64,
-) -> Tensor {
-    gaussian_log_prob(&(latent - mean), std, log_2pi) - tanh_unit_log_det(latent)
+pub fn beta_mean(alpha: &Tensor, beta: &Tensor) -> Tensor {
+    alpha / (alpha + beta)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        gaussian_std_from_log_var, squashed_gaussian_log_prob, tanh_target_weight,
-        tanh_unit_log_det,
-    };
-    use tch::{Kind, Tensor};
+    use super::{beta_entropy, beta_log_prob, beta_mean};
+    use tch::Tensor;
 
-    #[test]
-    fn tanh_target_weight_maps_zero_to_half() {
-        let latent = Tensor::zeros([1, 1], (Kind::Float, tch::Device::Cpu));
-        let weight = tanh_target_weight(&latent).double_value(&[]);
-
-        assert!((weight - 0.5).abs() < 1e-6);
+    fn lgamma(x: f64) -> f64 {
+        // ln Gamma via integer/half-integer closed forms used in the tests.
+        // For the chosen test points all arguments are integers, so use factorials.
+        let n = x.round() as i64;
+        assert!((x - n as f64).abs() < 1e-12 && n >= 1);
+        (1..n).map(|k| (k as f64).ln()).sum()
     }
 
     #[test]
-    fn tanh_unit_log_det_drops_ratio_invariant_affine_constant() {
-        let latent = Tensor::zeros([1, 1], (Kind::Float, tch::Device::Cpu));
-        let log_det = tanh_unit_log_det(&latent).double_value(&[0]);
-
-        assert!(log_det.abs() < 1e-6);
+    fn beta_log_prob_matches_hand_computed_scalar() {
+        // alpha=2, beta=2, x=0.5 -> pdf = 1.5 -> log_pdf = ln(1.5) ≈ 0.405465
+        let alpha = Tensor::from_slice(&[2.0f32]).view([1, 1]);
+        let beta = Tensor::from_slice(&[2.0f32]).view([1, 1]);
+        let x = Tensor::from_slice(&[0.5f32]).view([1, 1]);
+        let lp = beta_log_prob(&x, &alpha, &beta).double_value(&[0]);
+        assert!((lp - 1.5f64.ln()).abs() < 1e-5);
     }
 
     #[test]
-    fn gaussian_std_from_log_var_uses_dreamer_style_variance() {
-        let log_var = Tensor::from_slice(&[-100.0f32, 0.0, 1.0]).view([1, 3]);
-        let std = gaussian_std_from_log_var(&log_var);
-
-        assert!((std.double_value(&[0, 0]) - 1e-3).abs() < 1e-6);
-        assert!((std.double_value(&[0, 1]) - (1.0 + 1e-3)).abs() < 1e-6);
-        assert!((std.double_value(&[0, 2]) - (0.5f64.exp() + 1e-3)).abs() < 1e-6);
+    fn beta_entropy_matches_closed_form() {
+        // Closed form for alpha=beta=2: digamma(2)=1-gamma, digamma(4)=11/6-gamma.
+        let alpha = Tensor::from_slice(&[2.0f32]).view([1, 1]);
+        let beta = Tensor::from_slice(&[2.0f32]).view([1, 1]);
+        let ent = beta_entropy(&alpha, &beta).double_value(&[0]);
+        let log_norm = lgamma(2.0) + lgamma(2.0) - lgamma(4.0);
+        let psi2 = digamma_int(2);
+        let psi4 = digamma_int(4);
+        let expected = log_norm - 1.0 * psi2 - 1.0 * psi2 + 2.0 * psi4;
+        assert!((ent - expected).abs() < 1e-5);
     }
 
     #[test]
-    fn squashed_gaussian_log_prob_matches_manual_sum() {
-        let latent = Tensor::from_slice(&[0.2f32, -0.4]).view([1, 2]);
-        let mean = Tensor::from_slice(&[0.1f32, -0.1]).view([1, 2]);
-        let std = Tensor::from_slice(&[0.9f32, 1.2]).view([1, 2]);
-        let total = squashed_gaussian_log_prob(&latent, &mean, &std, 1.8378770664093453);
-        let expected = [(0.2f64, 0.1f64, 0.9f64), (-0.4f64, -0.1f64, 1.2f64)]
-            .into_iter()
-            .map(|(z, mu, sigma)| {
-                let diff = z - mu;
-                let gaussian = -0.5 * ((diff / sigma).powi(2) + (2.0 * core::f64::consts::PI).ln())
-                    - sigma.ln();
-                let squash_correction = 2.0 * (2.0f64.ln() - z - (-2.0 * z).exp().ln_1p());
-                gaussian - squash_correction
-            })
-            .sum::<f64>();
+    fn beta_mean_is_alpha_over_alpha_plus_beta() {
+        let alpha = Tensor::from_slice(&[3.0f32, 1.0]).view([1, 2]);
+        let beta = Tensor::from_slice(&[1.0f32, 3.0]).view([1, 2]);
+        let mean = beta_mean(&alpha, &beta);
+        assert!((mean.double_value(&[0, 0]) - 0.75).abs() < 1e-6);
+        assert!((mean.double_value(&[0, 1]) - 0.25).abs() < 1e-6);
+    }
 
-        assert!((total.double_value(&[0]) - expected).abs() < 1e-6);
+    fn digamma_int(n: i64) -> f64 {
+        // psi(n) = -gamma + sum_{k=1}^{n-1} 1/k for positive integer n.
+        const EULER_MASCHERONI: f64 = 0.5772156649015329;
+        let harmonic: f64 = (1..n).map(|k| 1.0 / k as f64).sum();
+        -EULER_MASCHERONI + harmonic
     }
 }

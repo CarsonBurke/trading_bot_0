@@ -1,7 +1,7 @@
 use tch::{Kind, Tensor};
 
 use super::numeric_debug::{
-    compute_action_std_stats, compute_explained_variance, compute_value_diagnostics,
+    compute_beta_policy_stats, compute_explained_variance, compute_value_diagnostics,
 };
 use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
 
@@ -84,7 +84,7 @@ impl Trainer {
             Tensor::zeros([], (Kind::Float, device))
         };
 
-        let log_std_stats = compute_action_std_stats(
+        let beta_policy_stats = compute_beta_policy_stats(
             &self.trading_model,
             &self.s_chunk_start_layouts.narrow(0, 0, self.rollout.nprocs),
             &self
@@ -103,7 +103,7 @@ impl Trainer {
                 mean_grad_norm_t.view([1]),
                 spo_bound_fraction_t.view([1]),
                 adv_data.adv_stats.view([3]),
-                log_std_stats.view([4]),
+                beta_policy_stats.view([4]),
                 entropy_mean_t.view([1]),
                 metrics.entropy_min.view([1]),
                 metrics.entropy_max.view([1]),
@@ -122,7 +122,7 @@ impl Trainer {
         let spo_bound_fraction = all_scalars_vec[5];
         let (adv_mean, adv_min, adv_max) =
             (all_scalars_vec[6], all_scalars_vec[7], all_scalars_vec[8]);
-        let log_std_stats_vec = &all_scalars_vec[9..13];
+        let beta_policy_stats_vec = &all_scalars_vec[9..13];
         let (entropy_mean, entropy_min_val, entropy_max_val) = (
             all_scalars_vec[13],
             all_scalars_vec[14],
@@ -164,11 +164,11 @@ impl Trainer {
         primary
             .meta_history
             .record_advantage_stats(adv_mean, adv_min, adv_max);
-        primary.meta_history.record_policy_scale_stats(
-            log_std_stats_vec[0],
-            log_std_stats_vec[1],
-            log_std_stats_vec[2],
-            log_std_stats_vec[3],
+        primary.meta_history.record_beta_policy_stats(
+            beta_policy_stats_vec[0],
+            beta_policy_stats_vec[1],
+            beta_policy_stats_vec[2],
+            beta_policy_stats_vec[3],
         );
         primary
             .meta_history

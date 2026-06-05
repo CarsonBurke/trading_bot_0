@@ -26,27 +26,18 @@ impl Trainer {
         for step in 0..self.rollout_steps as usize {
             let chunk_row = (step as i64 / self.rollout.ppo_chunk_len) * self.rollout.nprocs;
             let chunk_offset = step as i64 % self.rollout.ppo_chunk_len;
-            let (
-                values,
-                action_mean,
-                action_log_std,
-                action_std,
-                action_latents,
-                target_weights,
-                action_log_prob,
-            ) = sample_rollout_actions_from_output(
-                self.streamed_output
-                    .take()
-                    .expect("streamed rollout output missing"),
-                &self.hl_gauss,
-            );
+            let (values, alpha, beta, actions, action_log_prob) =
+                sample_rollout_actions_from_output(
+                    self.streamed_output
+                        .take()
+                        .expect("streamed rollout output missing"),
+                    &self.hl_gauss,
+                );
 
             if DEBUG_NUMERICS {
-                let _ = debug_tensor_stats("action_mean", &action_mean, episode as i64, step);
-                let _ = debug_tensor_stats("action_log_std", &action_log_std, episode as i64, step);
-                let _ = debug_tensor_stats("action_std", &action_std, episode as i64, step);
-                let _ = debug_tensor_stats("action_latents", &action_latents, episode as i64, step);
-                let _ = debug_tensor_stats("target_weights", &target_weights, episode as i64, step);
+                let _ = debug_tensor_stats("alpha", &alpha, episode as i64, step);
+                let _ = debug_tensor_stats("beta", &beta, episode as i64, step);
+                let _ = debug_tensor_stats("actions", &actions, episode as i64, step);
                 let _ =
                     debug_tensor_stats("action_log_prob", &action_log_prob, episode as i64, step);
             }
@@ -69,7 +60,7 @@ impl Trainer {
 
             let _ = self
                 .action_host_view
-                .copy_(&target_weights.to_kind(Kind::Float));
+                .copy_(&actions.to_kind(Kind::Float));
             self.env.step_from_actions_f32_into(
                 &mut self.cpu_step_batch,
                 &mut self.step_deltas,
@@ -144,10 +135,10 @@ impl Trainer {
             }
 
             let _ = self
-                .s_action_latents
+                .s_actions
                 .narrow(0, chunk_row, self.rollout.nprocs)
                 .narrow(1, chunk_offset, 1)
-                .copy_(&action_latents.unsqueeze(1));
+                .copy_(&actions.unsqueeze(1));
             let _ = self
                 .s_old_log_probs
                 .narrow(0, chunk_row, self.rollout.nprocs)

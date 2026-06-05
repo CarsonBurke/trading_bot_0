@@ -4,7 +4,7 @@ use crate::torch::optim::muon::Muon;
 
 use super::config::{MUON_MOMENTUM, MUON_MOMENTUM_WARMUP_START, MUON_MOMENTUM_WARMUP_STEPS};
 
-const ACTOR_GRAD_CLIP_PATTERNS: &[&str] = &["policy_mean_log_var"];
+const ACTOR_GRAD_CLIP_PATTERNS: &[&str] = &["policy_concentration"];
 const CRITIC_GRAD_CLIP_PATTERNS: &[&str] = &["value_proj"];
 
 pub(crate) struct GradClipGroups {
@@ -277,7 +277,7 @@ mod tests {
             by_id[&(tensor.1.data_ptr() as usize)]
         };
 
-        assert_eq!(group_for("policy_mean_log_var.weight"), "actor");
+        assert_eq!(group_for("policy_concentration.weight"), "actor");
         assert_eq!(group_for("value_proj.weight"), "critic");
         assert_eq!(group_for("actor_live_proj.weight"), "shared");
         assert_eq!(group_for("critic_live_proj.weight"), "shared");

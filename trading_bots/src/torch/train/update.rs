@@ -2,7 +2,7 @@ use rand::seq::SliceRandom;
 use std::time::Instant;
 use tch::{autocast, Kind, Tensor};
 
-use crate::torch::action_space::{gaussian_entropy, squashed_gaussian_log_prob};
+use crate::torch::action_space::{beta_entropy, beta_log_prob};
 use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT};
 use crate::torch::model::TradingModel;
 
@@ -37,7 +37,6 @@ impl Trainer {
         episode: usize,
         adv_data: &AdvantageData,
     ) -> UpdateMetrics {
-        const LOG_2PI: f64 = 1.8378770664093453;
         let device = self.device;
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -97,7 +96,7 @@ impl Trainer {
                 let adv_mb_by_chunk = adv_data.advantages.index_select(0, &chunk_ids);
                 let ret_mb_by_chunk = adv_data.returns.index_select(0, &chunk_ids);
                 let old_log_probs_by_chunk = self.s_old_log_probs.index_select(0, &chunk_ids);
-                let action_latents_by_chunk = self.s_action_latents.index_select(0, &chunk_ids);
+                let actions_by_chunk = self.s_actions.index_select(0, &chunk_ids);
                 let reset_slots_chunk = adv_data.reset_slots_by_chunk.index_select(0, &chunk_ids);
 
                 let fwd_start = Instant::now();
@@ -183,7 +182,7 @@ impl Trainer {
                     / (adv_raw_flat.std(true) + 1e-8);
                 let ret_flat = ret_mb_by_chunk.reshape([-1]);
                 let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
-                let action_latents_flat = action_latents_by_chunk.reshape([-1, ACTION_COUNT]);
+                let actions_flat = actions_by_chunk.reshape([-1, ACTION_COUNT]);
 
                 if log_first_non_finite_tensor(
                     &mut logged_replay_input_non_finite,
@@ -194,7 +193,7 @@ impl Trainer {
                     &[
                         ("windowed", &windowed),
                         ("static_flat", &static_flat),
-                        ("action_latents", &action_latents_flat),
+                        ("actions", &actions_flat),
                         ("old_log_probs", &old_log_probs_flat),
                         ("advantages", &adv_flat),
                         ("returns", &ret_flat),
@@ -211,39 +210,28 @@ impl Trainer {
                     );
                 }
 
-                let (new_value_logits, action_mean, action_log_std, action_std) =
-                    autocast(false, || {
-                        self.trading_model.windowed_replay_forward(
-                            &windowed,
-                            &static_flat,
-                            minibatch_sample_count,
-                        )
-                    });
+                let (new_value_logits, action_alpha, action_beta) = autocast(false, || {
+                    self.trading_model.windowed_replay_forward(
+                        &windowed,
+                        &static_flat,
+                        minibatch_sample_count,
+                    )
+                });
 
-                let action_log_probs = squashed_gaussian_log_prob(
-                    &action_latents_flat,
-                    &action_mean,
-                    &action_std,
-                    LOG_2PI,
-                );
-                let dist_entropy_per_sample = gaussian_entropy(&action_std, LOG_2PI);
+                let action_log_probs =
+                    beta_log_prob(&actions_flat, &action_alpha, &action_beta);
+                let dist_entropy_per_sample = beta_entropy(&action_alpha, &action_beta);
 
                 if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats(
-                        "action_latents_mb",
-                        &action_latents_flat,
-                        _epoch,
-                        chunk_i,
-                    );
+                    let _ = debug_tensor_stats("actions_mb", &actions_flat, _epoch, chunk_i);
                     let _ = debug_tensor_stats(
                         "old_log_probs_mb",
                         &old_log_probs_flat,
                         _epoch,
                         chunk_i,
                     );
-                    let _ = debug_tensor_stats("action_mean", &action_mean, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_log_std", &action_log_std, _epoch, chunk_i);
-                    let _ = debug_tensor_stats("action_std", &action_std, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_alpha", &action_alpha, _epoch, chunk_i);
+                    let _ = debug_tensor_stats("action_beta", &action_beta, _epoch, chunk_i);
                 }
 
                 let log_ratio = &action_log_probs - &old_log_probs_flat;
@@ -263,9 +251,8 @@ impl Trainer {
                     _epoch,
                     chunk_i,
                     &[
-                        ("action_mean", &action_mean),
-                        ("action_log_std", &action_log_std),
-                        ("action_std", &action_std),
+                        ("action_alpha", &action_alpha),
+                        ("action_beta", &action_beta),
                         ("action_log_probs", &action_log_probs),
                         ("old_log_probs", &old_log_probs_flat),
                         ("log_ratio", &log_ratio),

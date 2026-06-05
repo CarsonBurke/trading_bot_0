@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 use tch::{nn, Device, Kind, Tensor};
 
-use crate::torch::action_space::{sample_squashed_gaussian_action, tanh_target_weight};
+use crate::torch::action_space::{beta_mean, sample_beta_action};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::env::Env;
@@ -30,21 +30,21 @@ pub fn load_model<P: AsRef<Path>>(
 }
 
 pub fn sample_actions(
-    action_mean: &Tensor,
-    action_log_std: &Tensor,
+    alpha: &Tensor,
+    beta: &Tensor,
     deterministic: bool,
     temperature: f64,
 ) -> Tensor {
-    let action_mean = action_mean.to_kind(Kind::Float);
-    let action_log_std = action_log_std.to_kind(Kind::Float);
+    let alpha = alpha.to_kind(Kind::Float);
+    let beta = beta.to_kind(Kind::Float);
 
     if deterministic {
-        tanh_target_weight(&action_mean)
+        beta_mean(&alpha, &beta)
     } else {
-        let std_scale = if temperature > 0.0 { temperature } else { 1.0 };
-        let std = action_log_std.exp() * std_scale;
-        let (_, target_weights) = sample_squashed_gaussian_action(&action_mean, &std);
-        target_weights
+        let temp = if temperature > 0.0 { temperature } else { 1.0 };
+        let alpha = (&alpha / temp).clamp_min(1e-3);
+        let beta = (&beta / temp).clamp_min(1e-3);
+        sample_beta_action(&alpha, &beta)
     }
 }
 
@@ -102,17 +102,17 @@ pub fn run_inference<P: AsRef<Path>>(
             env.step = step;
 
             // First call uses full history, then we switch to incremental per-ticker deltas.
-            let (action_mean, action_log_std) = tch::no_grad(|| {
+            let (alpha, beta) = tch::no_grad(|| {
                 let price_input = if use_full {
                     &price_deltas_full
                 } else {
                     &price_deltas_incremental
                 };
-                let (_, action_mean, action_log_std, _) =
+                let (_, alpha, beta) =
                     model.step_on_device(price_input, &static_obs_tensor, &mut stream_state);
-                (action_mean, action_log_std)
+                (alpha, beta)
             });
-            let actions = sample_actions(&action_mean, &action_log_std, deterministic, temperature);
+            let actions = sample_actions(&alpha, &beta, deterministic, temperature);
 
             let actions_vec: Vec<f64> = Vec::<f64>::try_from(actions.flatten(0, -1)).unwrap();
             let step_result = env.step_step_single(&actions_vec);

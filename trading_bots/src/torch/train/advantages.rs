@@ -15,7 +15,7 @@ impl Trainer {
         let obs_static = &self.obs_static;
         let stream_state = &mut self.stream_state;
         let bootstrap_value = tch::no_grad(|| {
-            let (value_logits, _, _, _) = autocast(false, || {
+            let (value_logits, _, _) = autocast(false, || {
                 trading_model.forward_stream_state_on_device_for_replay(obs_static, stream_state)
             });
             self.hl_gauss.decode(&value_logits)

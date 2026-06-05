@@ -183,9 +183,8 @@ impl TradingModel {
         probe_replay_tensor("patch_hidden", &patch_hidden);
         let output = self.backbone_with_actor_critic_cls(&patch_hidden, &exo_tokens, batch_size);
         probe_replay_tensor("head_value_logits", &output.0);
-        probe_replay_tensor("head_action_mean", &output.1);
-        probe_replay_tensor("head_action_log_std", &output.2);
-        probe_replay_tensor("head_action_std", &output.3);
+        probe_replay_tensor("head_alpha", &output.1);
+        probe_replay_tensor("head_beta", &output.2);
         output
     }
 
@@ -359,7 +358,6 @@ mod tests {
         assert_close(&streamed_0.0, &full_0.0, "init values");
         assert_close(&streamed_0.1, &full_0.1, "init alpha");
         assert_close(&streamed_0.2, &full_0.2, "init beta");
-        assert_close(&streamed_0.3, &full_0.3, "init std");
 
         let next_delta = Tensor::randn([1, TICKERS_COUNT], (Kind::Float, Device::Cpu));
         let static_1 = Tensor::randn([1, STATIC_OBSERVATIONS as i64], (Kind::Float, Device::Cpu));
@@ -380,7 +378,6 @@ mod tests {
         assert_close(&streamed_1.0, &full_1.0, "step values");
         assert_close(&streamed_1.1, &full_1.1, "step alpha");
         assert_close(&streamed_1.2, &full_1.2, "step beta");
-        assert_close(&streamed_1.3, &full_1.3, "step std");
     }
 
     /// Equivalence gate for the batched sub-chunk forward refactor: run a small
@@ -465,19 +462,16 @@ mod tests {
         // Reshape batched outputs to [T, batch, ...] and compare per step.
         let bt = batch * sub_chunk_len;
         let value_logits_bt = batched.0.view([batch, sub_chunk_len, -1]);
-        let action_mean_bt = batched.1.view([batch, sub_chunk_len, -1]);
-        let action_log_std_bt = batched.2.view([batch, sub_chunk_len, -1]);
-        let action_std_bt = batched.3.view([batch, sub_chunk_len, -1]);
+        let alpha_bt = batched.1.view([batch, sub_chunk_len, -1]);
+        let beta_bt = batched.2.view([batch, sub_chunk_len, -1]);
         for t in 0..sub_chunk_len {
             let seq = &seq_outputs[t as usize];
             let batched_v = value_logits_bt.select(1, t).contiguous();
-            let batched_a = action_mean_bt.select(1, t).contiguous();
-            let batched_b = action_log_std_bt.select(1, t).contiguous();
-            let batched_s = action_std_bt.select(1, t).contiguous();
+            let batched_a = alpha_bt.select(1, t).contiguous();
+            let batched_b = beta_bt.select(1, t).contiguous();
             assert_close(&seq.0, &batched_v, &format!("value_logits t={}", t));
-            assert_close(&seq.1, &batched_a, &format!("action_mean t={}", t));
-            assert_close(&seq.2, &batched_b, &format!("action_log_std t={}", t));
-            assert_close(&seq.3, &batched_s, &format!("action_std t={}", t));
+            assert_close(&seq.1, &batched_a, &format!("alpha t={}", t));
+            assert_close(&seq.2, &batched_b, &format!("beta t={}", t));
         }
         let _ = bt;
     }
@@ -601,19 +595,16 @@ mod tests {
             model.windowed_replay_forward(&windowed_stack, &static_windowed, batch * sub_chunk_len);
 
         let value_logits_bt = batched.0.view([batch, sub_chunk_len, -1]);
-        let action_mean_bt = batched.1.view([batch, sub_chunk_len, -1]);
-        let action_log_std_bt = batched.2.view([batch, sub_chunk_len, -1]);
-        let action_std_bt = batched.3.view([batch, sub_chunk_len, -1]);
+        let alpha_bt = batched.1.view([batch, sub_chunk_len, -1]);
+        let beta_bt = batched.2.view([batch, sub_chunk_len, -1]);
         for t in 0..sub_chunk_len {
             let seq = &seq_outputs[t as usize];
             let bv = value_logits_bt.select(1, t).contiguous();
-            let ba = action_mean_bt.select(1, t).contiguous();
-            let bb = action_log_std_bt.select(1, t).contiguous();
-            let bs = action_std_bt.select(1, t).contiguous();
+            let ba = alpha_bt.select(1, t).contiguous();
+            let bb = beta_bt.select(1, t).contiguous();
             assert_close(&seq.0, &bv, &format!("reset value_logits t={}", t));
-            assert_close(&seq.1, &ba, &format!("reset action_mean t={}", t));
-            assert_close(&seq.2, &bb, &format!("reset action_log_std t={}", t));
-            assert_close(&seq.3, &bs, &format!("reset action_std t={}", t));
+            assert_close(&seq.1, &ba, &format!("reset alpha t={}", t));
+            assert_close(&seq.2, &bb, &format!("reset beta t={}", t));
         }
     }
 }

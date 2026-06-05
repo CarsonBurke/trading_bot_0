@@ -177,12 +177,11 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
             let start = Instant::now();
             for _ in 0..iters {
                 zero_grads(&mut trainable_tensors);
-                let (values, action_mean, action_log_std, action_std) =
+                let (values, alpha, beta) =
                     model.forward(&price_deltas, &static_features, true);
                 let loss = values.sum(Kind::Float)
-                    + action_mean.sum(Kind::Float)
-                    + action_log_std.sum(Kind::Float)
-                    + action_std.sum(Kind::Float);
+                    + alpha.sum(Kind::Float)
+                    + beta.sum(Kind::Float);
                 loss.backward();
             }
             sync_device(device);
