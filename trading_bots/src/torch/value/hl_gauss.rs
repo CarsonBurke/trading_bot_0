@@ -50,7 +50,7 @@ impl HlGaussBins {
     }
 
     pub fn default_for(device: tch::Device) -> Self {
-        Self::new(-6.0, 6.0, NUM_BINS, device)
+        Self::new(-1.0, 1.0, NUM_BINS, device)
     }
 
     pub fn range_stats(&self, values: &Tensor) -> Tensor {
