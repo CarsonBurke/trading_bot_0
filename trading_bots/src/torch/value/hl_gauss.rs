@@ -3,6 +3,13 @@ use tch::{Kind, Tensor};
 /// Number of bins for the critic value distribution.
 pub const NUM_BINS: i64 = 255;
 
+/// Symlog-space bounds of the critic value support.
+pub const SYMLOG_SUPPORT_MIN: f64 = -1.0;
+pub const SYMLOG_SUPPORT_MAX: f64 = 1.0;
+
+/// Std (in symlog space) of the gaussian the critic head bias is peaked at at init.
+pub const CRITIC_INIT_TAU: f64 = 0.5;
+
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
 const SIGMA_RATIO: f64 = 0.5;
 
@@ -50,7 +57,7 @@ impl HlGaussBins {
     }
 
     pub fn default_for(device: tch::Device) -> Self {
-        Self::new(-1.0, 1.0, NUM_BINS, device)
+        Self::new(SYMLOG_SUPPORT_MIN, SYMLOG_SUPPORT_MAX, NUM_BINS, device)
     }
 
     pub fn range_stats(&self, values: &Tensor) -> Tensor {

@@ -20,7 +20,9 @@ use super::rope::{RotaryEmbedding, ROPE_DIMS};
 use crate::torch::constants::{
     ACTION_COUNT, GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
 };
-use crate::torch::value::hl_gauss::NUM_BINS;
+use crate::torch::value::hl_gauss::{
+    CRITIC_INIT_TAU, NUM_BINS, SYMLOG_SUPPORT_MAX, SYMLOG_SUPPORT_MIN,
+};
 
 /// (value_logits, action_alpha, action_beta)
 pub type ModelOutput = (Tensor, Tensor, Tensor);
@@ -113,6 +115,7 @@ pub struct TradingModel {
     pub(in crate::torch::model) readout: ActorCriticReadout,
     pub(in crate::torch::model) policy_concentration: nn::Linear,
     pub(in crate::torch::model) value_proj: nn::Linear,
+    pub(in crate::torch::model) value_bias: Tensor,
     pub(in crate::torch::model) device: tch::Device,
 }
 
@@ -377,6 +380,19 @@ impl TradingModel {
             },
         );
         let value_proj = linear_orthogonal(p, "value_proj", flat_all_tickers, NUM_BINS, 0.1);
+        let value_bias = p.var("value_bias", &[NUM_BINS], Init::Const(0.0));
+        tch::no_grad(|| {
+            let edges = Tensor::linspace(
+                SYMLOG_SUPPORT_MIN,
+                SYMLOG_SUPPORT_MAX,
+                NUM_BINS + 1,
+                (Kind::Float, p.device()),
+            );
+            let centers =
+                (edges.narrow(0, 0, NUM_BINS) + edges.narrow(0, 1, NUM_BINS)) * 0.5;
+            let init = (&centers / CRITIC_INIT_TAU).square() * -0.5;
+            let _ = value_bias.shallow_clone().copy_(&init);
+        });
         Self {
             variant: config.variant,
             patch_configs,
@@ -402,6 +418,7 @@ impl TradingModel {
             readout,
             policy_concentration,
             value_proj,
+            value_bias,
             device: p.device(),
         }
     }
