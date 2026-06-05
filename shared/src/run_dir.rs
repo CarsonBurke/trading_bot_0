@@ -16,7 +16,7 @@ impl RunDir {
     pub fn create_fresh(runs_path: &str, name: Option<&str>) -> Result<Self> {
         let dir_name = match name {
             Some(n) => n.to_string(),
-            None => Local::now().format("%Y-%m-%d_%H-%M-%S").to_string(),
+            None => Local::now().format("%Y-%m-%d_%H-%M-%S-%f").to_string(),
         };
 
         let runs = Path::new(runs_path);
@@ -28,6 +28,15 @@ impl RunDir {
         let log_file = root.join("training.log");
 
         if root.exists() {
+            let run_dir = Self {
+                root: root.clone(),
+                gens: gens.clone(),
+                weights: weights.clone(),
+                log_file: log_file.clone(),
+            };
+            if is_prepared_empty_run(&run_dir)? {
+                return Ok(run_dir);
+            }
             bail!("run dir already exists: {}", root.display());
         }
         fs::create_dir(&root).context("failed to create run dir")?;
@@ -207,6 +216,30 @@ fn has_generation_data(gens: &Path) -> bool {
         .ok()
         .map(|mut entries| entries.next().is_some())
         .unwrap_or(false)
+}
+
+fn is_prepared_empty_run(run_dir: &RunDir) -> Result<bool> {
+    if !run_dir.root.is_dir() || !run_dir.gens.is_dir() || !run_dir.weights.is_dir() {
+        return Ok(false);
+    }
+    if has_generation_data(&run_dir.gens) || has_generation_data(&run_dir.weights) {
+        return Ok(false);
+    }
+
+    for entry in fs::read_dir(&run_dir.root)
+        .with_context(|| format!("failed to read run dir {}", run_dir.root.display()))?
+    {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if !matches!(
+            name.as_ref(),
+            "gens" | "weights" | "meta.json" | "training.log"
+        ) {
+            return Ok(false);
+        }
+    }
+
+    Ok(run_dir.root.join("meta.json").is_file())
 }
 
 fn current_git_commit() -> Option<String> {
