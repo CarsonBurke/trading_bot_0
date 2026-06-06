@@ -3,7 +3,7 @@ use tch::{nn, Tensor};
 
 use crate::torch::model::blocks::gqa::QK_GAIN_INIT;
 use crate::torch::model::init::{
-    leaky_relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
+    relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
 };
 use crate::torch::model::rmsnorm::RMSNorm;
 
@@ -84,7 +84,7 @@ impl EndogenousTickerBlock {
             linear_with_same_dtype(&ctx, &self.ticker_out).reshape([batch, num_items, model_dim]);
         let ctx = &ctx * self.attn_scale.to_kind(ctx.kind()).view([1, 1, -1]);
         let x = x + ctx;
-        let mlp = leaky_relu_sq_linear(
+        let mlp = relu_sq_linear(
             &self.mlp_ln.forward_linear(&x, &self.mlp_fc1),
             &self.mlp_fc2,
         );

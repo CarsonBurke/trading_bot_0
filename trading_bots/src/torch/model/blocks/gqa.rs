@@ -2,7 +2,7 @@ use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
 use crate::torch::model::init::{
-    leaky_relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
+    relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
 };
 use crate::torch::model::rmsnorm::RMSNorm;
 use crate::torch::model::rope::RotaryEmbedding;
@@ -174,7 +174,7 @@ impl GqaBlock {
 
     fn apply_ffn(&self, x: &Tensor) -> Tensor {
         let normed = self.ffn_ln.forward(x);
-        let ffn_out = leaky_relu_sq_linear(
+        let ffn_out = relu_sq_linear(
             &linear_with_same_dtype(&normed, &self.ffn_fc1),
             &self.ffn_fc2,
         );

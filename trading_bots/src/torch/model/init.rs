@@ -17,8 +17,8 @@ pub(in crate::torch::model) fn linear_with_same_dtype(x: &Tensor, linear: &nn::L
     x.linear(&weight, bias.as_ref())
 }
 
-pub(in crate::torch::model) fn leaky_relu_sq_linear(x: &Tensor, out_proj: &nn::Linear) -> Tensor {
-    let h = x.maximum(&(x * 0.5)).square();
+pub(in crate::torch::model) fn relu_sq_linear(x: &Tensor, out_proj: &nn::Linear) -> Tensor {
+    let h = x.relu().square();
     linear_with_same_dtype(&h, out_proj)
 }
 

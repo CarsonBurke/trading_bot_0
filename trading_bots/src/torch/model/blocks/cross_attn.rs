@@ -2,7 +2,7 @@ use tch::nn::Init;
 use tch::{nn, Tensor};
 
 use crate::torch::model::blocks::exogenous::ExogenousTickerBlock;
-use crate::torch::model::init::{leaky_relu_sq_linear, linear_residual_out, linear_truncated};
+use crate::torch::model::init::{relu_sq_linear, linear_residual_out, linear_truncated};
 use crate::torch::model::rmsnorm::RMSNorm;
 
 pub(in crate::torch::model) const CA_NUM_HEADS: i64 = 2;
@@ -64,7 +64,7 @@ impl CrossAttnFfnBlock {
         let x = self
             .cross_attn
             .forward_with_projected_source(queries, source_k, source_v);
-        let ffn_out = leaky_relu_sq_linear(
+        let ffn_out = relu_sq_linear(
             &self.ffn_ln.forward_linear(&x, &self.ffn_fc1),
             &self.ffn_fc2,
         );

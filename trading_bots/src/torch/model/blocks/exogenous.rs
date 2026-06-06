@@ -4,7 +4,7 @@ use tch::{nn, Tensor};
 use crate::torch::model::blocks::cross_attn::{CA_HEAD_DIM, CA_NUM_HEADS};
 use crate::torch::model::blocks::gqa::QK_GAIN_INIT;
 use crate::torch::model::init::{
-    leaky_relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
+    relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
 };
 use crate::torch::model::rmsnorm::RMSNorm;
 
@@ -132,7 +132,7 @@ impl ExoMLP {
     }
 
     pub(in crate::torch::model) fn forward(&self, x: &Tensor) -> Tensor {
-        let h = leaky_relu_sq_linear(&self.in_ln.forward_linear(x, &self.fc1), &self.fc2);
+        let h = relu_sq_linear(&self.in_ln.forward_linear(x, &self.fc1), &self.fc2);
         x + h
     }
 }
