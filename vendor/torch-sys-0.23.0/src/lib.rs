@@ -26,6 +26,11 @@ pub struct C_tensor {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct C_cuda_graph {
+    _private: [u8; 0],
+}
+
 extern "C" {
     pub fn at_new_tensor() -> *mut C_tensor;
     pub fn at_shallow_clone(arg: *mut C_tensor) -> *mut C_tensor;
@@ -85,6 +90,13 @@ extern "C" {
     pub fn at_sdp_use_math() -> c_int;
     pub fn at_sdp_set_use_cudnn(b: c_int);
     pub fn at_sdp_use_cudnn() -> c_int;
+    pub fn at_cuda_graph_new() -> *mut C_cuda_graph;
+    pub fn at_cuda_graph_is_available() -> bool;
+    pub fn at_cuda_graph_free(graph: *mut C_cuda_graph);
+    pub fn at_cuda_graph_capture_begin(graph: *mut C_cuda_graph, device_index: i64);
+    pub fn at_cuda_graph_capture_end(graph: *mut C_cuda_graph);
+    pub fn at_cuda_graph_replay(graph: *mut C_cuda_graph, device_index: i64);
+    pub fn at_cuda_empty_cache();
     pub fn at_device(arg: *mut C_tensor) -> c_int;
     pub fn at_tensor_of_data(
         vs: *const c_void,

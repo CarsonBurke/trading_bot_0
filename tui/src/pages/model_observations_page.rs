@@ -34,6 +34,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let is_training = app.is_training_running();
     let current_episode = app.get_current_episode();
+    let has_progress = app.has_training_progress();
 
     let mut title_spans = vec![Span::styled(
         " Model Observations ",
@@ -44,6 +45,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     title_spans.extend(episode_status::episode_status_spans(
         is_training,
         current_episode,
+        has_progress,
     ));
 
     let title = Paragraph::new(Line::from(title_spans)).block(
@@ -105,7 +107,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                 "PnL",
                                 "Drawdown",
                                 "Commissions",
-                                "Last Reward",
                                 "Fill Ratio",
                             ];
 
@@ -131,13 +132,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                         }
                                         4 => theme::YELLOW,
                                         5 => {
-                                            if val >= 0.0 {
-                                                theme::GREEN
-                                            } else {
-                                                theme::RED
-                                            }
-                                        }
-                                        6 => {
                                             if val >= 0.9 {
                                                 theme::GREEN
                                             } else {
@@ -148,9 +142,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                     };
 
                                     let display_val = match i {
-                                        0 | 1 | 6 => format!("{:6.2}%", val * 100.0),
+                                        0 | 1 | 5 => format!("{:6.2}%", val * 100.0),
                                         2 | 3 => format!("{:+7.2}%", val * 100.0),
-                                        4 | 5 => format!("{:8.4}", val),
                                         _ => format!("{:8.4}", val),
                                     };
 
@@ -520,9 +513,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 );
             }
         } else {
-            let msg = Paragraph::new(format!("No observations file found at {}", obs_path.display()))
-                .block(left_block)
-                .style(Style::default().fg(theme::SUBTEXT0));
+            let msg = Paragraph::new(format!(
+                "No observations file found at {}",
+                obs_path.display()
+            ))
+            .block(left_block)
+            .style(Style::default().fg(theme::SUBTEXT0));
             f.render_widget(msg, content_chunks[0]);
             f.render_widget(
                 Block::default()

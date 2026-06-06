@@ -1,14 +1,16 @@
 #![feature(f16)]
 
+mod optim_grid;
+mod optim_loss;
+mod optim_transformer;
 mod results;
 
 use std::time::Instant;
-use tch::{nn, Device, Kind, Tensor};
+use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
 use trading_bot_0::torch::{
     constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT},
-    mamba_fused,
     model::{ModelVariant, TradingModel, TradingModelConfig},
-    ssm::{Mamba2, Mamba2Config},
+    optim::{Muon, MuonConfig},
 };
 
 use results::{BenchmarkResult, BenchmarkRun, BenchmarkSuite};
@@ -19,124 +21,39 @@ fn sync_device(device: Device) {
     }
 }
 
-fn run_component_timing(mamba: &Mamba2, x: &Tensor, device: Device, iters: usize) {
-    tch::no_grad(|| {
-        let (batch, seqlen, d_model) = x.size3().unwrap();
-        let dtype = x.kind();
+fn trainable_var_store_tensors(vs: &nn::VarStore) -> Vec<Tensor> {
+    vs.variables()
+        .into_values()
+        .filter(|tensor| tensor.requires_grad())
+        .collect()
+}
 
-        // Setup: create dummy tensors matching Mamba dimensions
-        let config = Mamba2Config {
-            d_model: 256,
-            headdim: 64,
-            d_state: 128,
-            chunk_size: 256,
-            ..Default::default()
-        };
-        let d_inner = config.d_inner();
-        let d_ssm = d_inner;
-        let ngroups = config.ngroups;
-        let d_state = config.d_state;
-        let nheads = d_ssm / config.headdim;
-        let d_in_proj = 2 * d_inner + 2 * ngroups * d_state + nheads;
+fn zero_grads(tensors: &mut [Tensor]) {
+    for tensor in tensors {
+        tensor.zero_grad();
+    }
+}
 
-        // Time input projection (d_model -> d_in_proj)
-        let w_in = Tensor::randn(&[d_in_proj, d_model], (dtype, device));
-        let mut in_proj_time = 0.0;
-        for _ in 0..iters {
-            let start = Instant::now();
-            let _ = x.matmul(&w_in.tr());
-            sync_device(device);
-            in_proj_time += start.elapsed().as_secs_f64();
-        }
-        in_proj_time = in_proj_time * 1000.0 / iters as f64;
-
-        // Time Conv1D
-        let conv_dim = d_ssm + 2 * ngroups * d_state;
-        let xbc = Tensor::randn(&[batch, seqlen, conv_dim], (dtype, device));
-        let xbc_t = xbc.transpose(1, 2);
-        let conv_w = Tensor::randn(&[conv_dim, 1, config.d_conv], (dtype, device));
-        let conv_b = Tensor::randn(&[conv_dim], (dtype, device));
-        let mut conv_time = 0.0;
-        for _ in 0..iters {
-            let start = Instant::now();
-            let _ = xbc_t.conv1d(&conv_w, Some(&conv_b), 1, config.d_conv - 1, 1, conv_dim);
-            sync_device(device);
-            conv_time += start.elapsed().as_secs_f64();
-        }
-        conv_time = conv_time * 1000.0 / iters as f64;
-
-        // Time output projection (d_inner -> d_model)
-        let y_dummy = Tensor::randn(&[batch, seqlen, d_inner], (dtype, device));
-        let w_out = Tensor::randn(&[d_model, d_inner], (dtype, device));
-        let mut out_proj_time = 0.0;
-        for _ in 0..iters {
-            let start = Instant::now();
-            let _ = y_dummy.matmul(&w_out.tr());
-            sync_device(device);
-            out_proj_time += start.elapsed().as_secs_f64();
-        }
-        out_proj_time = out_proj_time * 1000.0 / iters as f64;
-
-        // Time RMSNorm + gating
-        let norm_w = Tensor::randn(&[d_ssm], (dtype, device));
-        let y_norm = Tensor::randn(&[batch, seqlen, d_ssm], (dtype, device));
-        let z_gate = Tensor::randn(&[batch, seqlen, d_ssm], (dtype, device));
-        let mut norm_time = 0.0;
-        for _ in 0..iters {
-            let start = Instant::now();
-            let y_f32 = y_norm.to_kind(tch::Kind::Float);
-            let rms = (y_f32
-                .pow_tensor_scalar(2)
-                .mean_dim(-1, true, tch::Kind::Float)
-                + 1e-6)
-                .sqrt();
-            let normed = (y_f32 / rms * &norm_w.to_kind(tch::Kind::Float)).to_kind(dtype);
-            let _ = normed * z_gate.silu();
-            sync_device(device);
-            norm_time += start.elapsed().as_secs_f64();
-        }
-        norm_time = norm_time * 1000.0 / iters as f64;
-
-        // Time the full forward pass
-        let mut fused_time = 0.0;
-        for _ in 0..iters {
-            let start = Instant::now();
-            let _ = mamba.forward_with_dt_scale(x, None);
-            sync_device(device);
-            fused_time += start.elapsed().as_secs_f64();
-        }
-        fused_time = fused_time * 1000.0 / iters as f64;
-
-        // Estimate scan time (includes the CUDA kernel for chunk scan)
-        let scan_time = fused_time - in_proj_time - conv_time - norm_time - out_proj_time;
-
-        println!(
-            "  Input Projection:        {:.3} ms/iter ({:.1}%)",
-            in_proj_time,
-            100.0 * in_proj_time / fused_time
-        );
-        println!(
-            "  Conv1D:                  {:.3} ms/iter ({:.1}%)",
-            conv_time,
-            100.0 * conv_time / fused_time
-        );
-        println!(
-            "  Chunk Scan (CUDA):       {:.3} ms/iter ({:.1}%)",
-            scan_time,
-            100.0 * scan_time / fused_time
-        );
-        println!(
-            "  RMSNorm + Gate:          {:.3} ms/iter ({:.1}%)",
-            norm_time,
-            100.0 * norm_time / fused_time
-        );
-        println!(
-            "  Output Projection:       {:.3} ms/iter ({:.1}%)",
-            out_proj_time,
-            100.0 * out_proj_time / fused_time
-        );
-        println!("  Total:                   {:.3} ms/iter", fused_time);
-    });
+/// Query CUDA memory used via nvidia-smi. Returns MiB, or None on CPU/error.
+/// Reports *reserved* memory (caching allocator), so measurements should be
+/// taken as deltas across a known-new allocation boundary.
+fn gpu_mem_mib(device: Device) -> Option<f64> {
+    let Device::Cuda(id) = device else {
+        return None;
+    };
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &id.to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
 }
 
 fn main() {
@@ -144,136 +61,33 @@ fn main() {
     if device == Device::Cpu {
         eprintln!("Warning: CUDA not detected, running on CPU (will be slow)");
     }
-    let mut suite = BenchmarkSuite::new();
-
     println!("=== Trading Bot Benchmarks ===\n");
 
-    run_mamba_benchmarks(&mut suite, device);
+    // `optim-sweep` runs only the AdamW-vs-NorMuon loss-convergence sweep
+    // (a hyperparameter search, not a latency/VRAM bench), and does not touch
+    // the saved benchmark suite. The default run keeps the fast latency suite.
+    let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("optim-sweep") {
+        optim_loss::run(device);
+        println!("\n=== Optimizer Sweep Complete ===");
+        return;
+    }
+
+    // `optim-grid` runs the FULL NorMuon hyperparameter grid search (does not
+    // touch the saved benchmark suite).
+    if mode.as_deref() == Some("optim-grid") {
+        optim_grid::run(device);
+        println!("\n=== Optimizer Grid Search Complete ===");
+        return;
+    }
+
+    let mut suite = BenchmarkSuite::new();
+
+    run_optimizer_benchmarks(&mut suite, device);
     run_model_benchmarks(&mut suite, device);
 
     suite.save().expect("Failed to save benchmark results");
     println!("\n=== Benchmarks Complete ===");
-}
-
-fn run_mamba_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
-    println!("--- Mamba2 SSM Benchmarks ---");
-    let mut vs = nn::VarStore::new(device);
-    let dtype = Kind::BFloat16;
-
-    let config = Mamba2Config {
-        d_model: 256,
-        headdim: 64,
-        d_state: 128,
-        chunk_size: 256,
-        ..Default::default()
-    };
-    let mamba = Mamba2::new(&vs.root(), config);
-    vs.bfloat16();
-
-    let batch = 4;
-    let seqlen = 4096;
-    let x = Tensor::randn(&[batch, seqlen, 256], (dtype, device)).set_requires_grad(true);
-    let mut state = mamba.init_state(batch, device);
-
-    println!("  Batch: {}, SeqLen: {}, Dtype: {:?}", batch, seqlen, dtype);
-
-    // Warmup
-    for _ in 0..20 {
-        let _ = mamba.forward_with_dt_scale(&x, None);
-    }
-    sync_device(device);
-
-    // Component timing breakdown
-    println!("\n  === Component Timing Breakdown ===");
-    println!("  Note: For detailed CUDA kernel profiling, use CUDA_LAUNCH_BLOCKING=1 and nvprof");
-    run_component_timing(&mamba, &x, device, 100);
-
-    // Forward (Training)
-    let iters = 200;
-    let start = Instant::now();
-    for _ in 0..iters {
-        let _ = mamba.forward_with_dt_scale(&x, None);
-    }
-    sync_device(device);
-    let fwd_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-    println!("\n  Forward (Training):      {:.3} ms/iter", fwd_ms);
-    suite.add(BenchmarkResult::new(
-        "mamba2_forward_train",
-        fwd_ms,
-        BenchmarkRun {
-            batch,
-            seq_len: seqlen,
-            dtype: format!("{:?}", dtype),
-        },
-    ));
-
-    // Forward + Backward
-    let start = Instant::now();
-    for _ in 0..iters {
-        let y = mamba.forward_with_dt_scale(&x, None);
-        y.sum(Kind::Float).backward();
-    }
-    sync_device(device);
-    let fwd_bwd_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-    println!("  Forward + Backward:      {:.3} ms/iter", fwd_bwd_ms);
-    suite.add(BenchmarkResult::new(
-        "mamba2_fwd_bwd_train",
-        fwd_bwd_ms,
-        BenchmarkRun {
-            batch,
-            seq_len: seqlen,
-            dtype: format!("{:?}", dtype),
-        },
-    ));
-
-    // Memory stats
-    let stats = mamba_fused::cuda_memory_stats();
-    let peak_mem_mb = stats.get(3).unwrap_or(&0) / (1024 * 1024);
-    println!("  Peak Memory:             {} MB", peak_mem_mb);
-
-    // Inference (Prefill)
-    tch::no_grad(|| {
-        let start = Instant::now();
-        for _ in 0..iters {
-            let _ = mamba.forward_with_state_dt_scale(&x, &mut state, None);
-        }
-        sync_device(device);
-        let prefill_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-        println!("  Inference (Prefill):     {:.3} ms/iter", prefill_ms);
-        suite.add(BenchmarkResult::new(
-            "mamba2_infer_prefill",
-            prefill_ms,
-            BenchmarkRun {
-                batch,
-                seq_len: seqlen,
-                dtype: format!("{:?}", dtype),
-            },
-        ));
-    });
-
-    // Inference (Step)
-    let x_step = Tensor::randn(&[batch, 1, 256], (dtype, device));
-    tch::no_grad(|| {
-        let step_iters = 2000;
-        let start = Instant::now();
-        for _ in 0..step_iters {
-            let _ = mamba.step(&x_step, &mut state);
-        }
-        sync_device(device);
-        let step_ms = start.elapsed().as_secs_f64() * 1000.0 / step_iters as f64;
-        println!("  Inference (Step):        {:.3} ms/iter", step_ms);
-        suite.add(BenchmarkResult::new(
-            "mamba2_infer_step",
-            step_ms,
-            BenchmarkRun {
-                batch,
-                seq_len: 1,
-                dtype: format!("{:?}", dtype),
-            },
-        ));
-    });
-
-    println!();
 }
 
 fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
@@ -284,7 +98,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
 
     for &variant in &[
         ModelVariant::Base,
-        ModelVariant::Uniform256Stream,
+        ModelVariant::UniformStream,
         ModelVariant::AblationSmall,
     ] {
         let mut vs = nn::VarStore::new(device);
@@ -296,16 +110,17 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
             },
         );
         vs.bfloat16();
+        let mut trainable_tensors = trainable_var_store_tensors(&vs);
         println!("  Variant: {}", variant.as_str());
         let price_deltas_dim = model.price_input_dim();
-        let reported_seq_len = if variant == ModelVariant::Uniform256Stream {
+        let reported_seq_len = if variant == ModelVariant::UniformStream {
             price_deltas_dim / TICKERS_COUNT
         } else {
             PRICE_DELTAS_PER_TICKER as i64
         };
 
         for &batch in &[1, 4, 8] {
-            let price_deltas = if variant == ModelVariant::Uniform256Stream {
+            let price_deltas = if variant == ModelVariant::UniformStream {
                 let raw = Tensor::randn(&[batch, raw_price_deltas_dim], (dtype, device));
                 model.uniform_stream_layout_from_raw_input(&raw)
             } else {
@@ -338,7 +153,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
                 ));
             });
 
-            if variant == ModelVariant::Uniform256Stream {
+            if variant == ModelVariant::UniformStream {
                 let raw_full_price = Tensor::randn(&[batch, raw_price_deltas_dim], (dtype, device));
                 let full_price = model.uniform_stream_layout_from_raw_input(&raw_full_price);
                 let static_features = Tensor::randn(&[batch, static_obs_dim], (dtype, device));
@@ -351,11 +166,15 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
                 tch::no_grad(|| {
                     let start = Instant::now();
                     for _ in 0..iters {
-                        let _ = model.step_on_device(&step_deltas, &static_features, &mut stream_state);
+                        let _ =
+                            model.step_on_device(&step_deltas, &static_features, &mut stream_state);
                     }
                     sync_device(device);
                     let step_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-                    println!("    Stream Step (batch={}):    {:.3} ms/iter", batch, step_ms);
+                    println!(
+                        "    Stream Step (batch={}):    {:.3} ms/iter",
+                        batch, step_ms
+                    );
                     suite.add(BenchmarkResult::new(
                         &format!("model_{}_stream_step_b{}", variant.as_str(), batch),
                         step_ms,
@@ -368,7 +187,7 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
                 });
             }
 
-            let price_deltas = if variant == ModelVariant::Uniform256Stream {
+            let price_deltas = if variant == ModelVariant::UniformStream {
                 let raw = Tensor::randn(&[batch, raw_price_deltas_dim], (dtype, device));
                 model.uniform_stream_layout_from_raw_input(&raw).detach()
             } else {
@@ -378,11 +197,9 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
 
             let start = Instant::now();
             for _ in 0..iters {
-                let (values, action_mean, action_noise_std) =
-                    model.forward(&price_deltas, &static_features, true);
-                let loss = values.sum(Kind::Float)
-                    + action_mean.sum(Kind::Float)
-                    + action_noise_std.sum(Kind::Float);
+                zero_grads(&mut trainable_tensors);
+                let (values, alpha, beta) = model.forward(&price_deltas, &static_features, true);
+                let loss = values.sum(Kind::Float) + alpha.sum(Kind::Float) + beta.sum(Kind::Float);
                 loss.backward();
             }
             sync_device(device);
@@ -402,10 +219,139 @@ fn run_model_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
             ));
         }
     }
+    println!();
+}
 
-    // Memory stats after model benchmarks
-    let stats = mamba_fused::cuda_memory_stats();
-    let peak_mem_mb = stats.get(3).unwrap_or(&0) / (1024 * 1024);
-    println!("  Peak Memory:             {} MB", peak_mem_mb);
+fn build_bench_mlp(vs: &nn::Path, dim: i64, depth: usize) -> impl Module {
+    let mut seq = nn::seq();
+    for i in 0..depth {
+        seq = seq
+            .add(nn::linear(
+                vs / format!("fc{}", i),
+                dim,
+                dim,
+                Default::default(),
+            ))
+            .add_fn(|x| x.gelu("none"));
+    }
+    seq.add(nn::linear(vs / "head", dim, 1, Default::default()))
+}
+
+fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
+    println!("--- Optimizer Step Benchmarks (Muon vs AdamW) ---");
+    let dim = 256i64;
+    let depth = 6;
+    let batch = 64i64;
+    let iters = 200;
+    let warmup = 20;
+
+    // --- AdamW ---
+    {
+        let mut vs = nn::VarStore::new(device);
+        let net = build_bench_mlp(&vs.root(), dim, depth);
+        vs.bfloat16();
+        let trainable = vs.trainable_variables();
+        let x = Tensor::randn(&[batch, dim], (Kind::BFloat16, device));
+
+        // Baseline: model + grads + one step's activations already allocated,
+        // so the delta isolates optimizer state (not transient activations).
+        let loss = net.forward(&x).sum(Kind::Float);
+        loss.backward();
+        sync_device(device);
+        let mem_pre_opt = gpu_mem_mib(device);
+
+        let mut opt = nn::AdamW::default().build(&vs, 3e-3).expect("adamw build");
+        for _ in 0..warmup {
+            let loss = net.forward(&x).sum(Kind::Float);
+            opt.backward_step(&loss);
+        }
+        sync_device(device);
+        // Measure after warmup — allocator has stabilized.
+        let mem_post_opt = gpu_mem_mib(device);
+        let opt_vram = mem_pre_opt.zip(mem_post_opt).map(|(a, b)| b - a);
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let loss = net.forward(&x).sum(Kind::Float);
+            opt.backward_step(&loss);
+        }
+        sync_device(device);
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        // AdamW keeps m + v per param, same dtype as params.
+        let adamw_state_bytes: usize = trainable
+            .iter()
+            .map(|t| 2 * t.numel() * t.kind().elt_size_in_bytes())
+            .sum();
+        let analytic_mib = adamw_state_bytes as f64 / 1024.0 / 1024.0;
+        let empirical = opt_vram
+            .map(|v| format!(", nvidia-smi: {:+.1} MiB", v))
+            .unwrap_or_default();
+        println!(
+            "  AdamW  fwd+bwd+step: {:.3} ms/iter  | state: {:.2} MiB{}",
+            ms, analytic_mib, empirical
+        );
+        suite.add(BenchmarkResult::new(
+            "optim_adamw_fwd_bwd_step",
+            ms,
+            BenchmarkRun {
+                batch,
+                seq_len: dim,
+                dtype: "BFloat16".into(),
+            },
+        ));
+    }
+
+    // --- Muon ---
+    {
+        let mut vs = nn::VarStore::new(device);
+        let net = build_bench_mlp(&vs.root(), dim, depth);
+        vs.bfloat16();
+        let trainable = vs.trainable_variables();
+        let x = Tensor::randn(&[batch, dim], (Kind::BFloat16, device));
+
+        let loss = net.forward(&x).sum(Kind::Float);
+        loss.backward();
+        sync_device(device);
+        let mem_pre_opt = gpu_mem_mib(device);
+
+        let mut muon = Muon::new(&trainable, MuonConfig::default());
+        for _ in 0..warmup {
+            let loss = net.forward(&x).sum(Kind::Float);
+            loss.backward();
+            muon.step();
+            muon.zero_grad();
+        }
+        sync_device(device);
+        let mem_post_opt = gpu_mem_mib(device);
+        let opt_vram = mem_pre_opt.zip(mem_post_opt).map(|(a, b)| b - a);
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let loss = net.forward(&x).sum(Kind::Float);
+            loss.backward();
+            muon.step();
+            muon.zero_grad();
+        }
+        sync_device(device);
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        let analytic_mib = muon.state_bytes() as f64 / 1024.0 / 1024.0;
+        let empirical = opt_vram
+            .map(|v| format!(", nvidia-smi: {:+.1} MiB", v))
+            .unwrap_or_default();
+        println!(
+            "  Muon   fwd+bwd+step: {:.3} ms/iter  | state: {:.2} MiB{}",
+            ms, analytic_mib, empirical
+        );
+        suite.add(BenchmarkResult::new(
+            "optim_muon_fwd_bwd_step",
+            ms,
+            BenchmarkRun {
+                batch,
+                seq_len: dim,
+                dtype: "BFloat16".into(),
+            },
+        ));
+    }
+
     println!();
 }

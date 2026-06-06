@@ -5,7 +5,7 @@ use shared::constants::{
     STATIC_OBSERVATIONS as STATIC_OBSERVATIONS_USIZE, TICKERS_COUNT as TICKERS_COUNT_USIZE,
 };
 
-use super::env::Env;
+use super::single::Env;
 
 impl Env {
     fn build_static_obs_array(&self, absolute_step: usize) -> [f32; STATIC_OBSERVATIONS_USIZE] {
@@ -25,7 +25,6 @@ impl Env {
             0.0
         });
         push((self.episode_history.total_commissions / Self::STARTING_CASH) as f32);
-        push(self.last_reward as f32);
         push(self.last_fill_ratio as f32);
 
         // Macro indicators

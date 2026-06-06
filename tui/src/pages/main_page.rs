@@ -20,6 +20,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let is_training_for_title = app.is_training_running();
     let current_episode_for_title = app.get_current_episode();
+    let has_progress_for_title = app.has_training_progress();
 
     let mut title_spans = vec![Span::styled(
         " Trading Bot TUI ",
@@ -30,12 +31,38 @@ pub fn render(f: &mut Frame, app: &mut App) {
     title_spans.extend(episode_status::episode_status_spans(
         is_training_for_title,
         current_episode_for_title,
+        has_progress_for_title,
     ));
     title_spans.push(Span::raw("  "));
     title_spans.push(Span::styled(
-        format!("model: {}", app.training_model_size),
+        format!(
+            "trainer: {}",
+            match app.training_kind {
+                crate::state::TrainingKind::Rl => "rl",
+                crate::state::TrainingKind::Genetic => "genetic",
+            }
+        ),
         Style::default().fg(theme::TEAL),
     ));
+    title_spans.push(Span::raw("  "));
+    if app.training_kind == crate::state::TrainingKind::Rl {
+        title_spans.push(Span::styled(
+            format!("model: {}", app.training_model_size),
+            Style::default().fg(theme::BLUE),
+        ));
+    } else {
+        title_spans.push(Span::styled(
+            format!(
+                "family: {}",
+                match app.genetic_family {
+                    crate::state::GeneticFamily::PriceRebound => "price-rebound",
+                    crate::state::GeneticFamily::RsiRebound => "rsi-rebound",
+                    crate::state::GeneticFamily::TrendBreakout => "trend-breakout",
+                }
+            ),
+            Style::default().fg(theme::BLUE),
+        ));
+    }
 
     let title = Paragraph::new(Line::from(title_spans)).block(
         Block::default()
@@ -54,8 +81,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Line::from(vec![
             Span::styled("s", Style::default().fg(Color::Green)),
             Span::raw(": Start Training  "),
-            Span::styled("p", Style::default().fg(Color::Cyan)),
-            Span::raw(": Toggle Model Size  "),
+            Span::styled("t", Style::default().fg(Color::Cyan)),
+            Span::raw(": Toggle Trainer  "),
+            Span::styled("g", Style::default().fg(Color::Magenta)),
+            Span::raw(": Toggle GA Family  "),
             Span::styled("f", Style::default().fg(Color::Blue)),
             Span::raw(": Run Inference  "),
             Span::styled("x", Style::default().fg(Color::Red)),

@@ -9,9 +9,10 @@ use crate::theme;
 pub fn episode_status_spans(
     is_training: bool,
     current_episode: Option<usize>,
+    has_progress: bool,
 ) -> Vec<Span<'static>> {
     let (status_text, status_icon) = if is_training {
-        if current_episode.is_some() {
+        if current_episode.is_some() || has_progress {
             ("Training", "●")
         } else {
             ("Starting", "●")
@@ -28,6 +29,8 @@ pub fn episode_status_spans(
     let episode_display = if is_training {
         if let Some(ep) = current_episode {
             format!("{} ", ep)
+        } else if has_progress {
+            "In progress... ".to_string()
         } else {
             "Starting... ".to_string()
         }

@@ -6,4 +6,4 @@ pub mod process_manager;
 pub use generation_browser::GenerationBrowserState;
 pub use inference_browser::InferenceBrowserState;
 pub use logs_page::LogsPageState;
-pub use process_manager::ProcessManagerState;
+pub use process_manager::{GeneticFamily, ProcessManagerState, TrainingKind};

@@ -1,25 +1,26 @@
 pub mod paths {
-    pub const DATA_PATH: &str = "../long_data";
-    pub const WEIGHTS_PATH: &str = "../weights";
-    pub const TRAINING_PATH: &str = "../training";
-    pub const INFER_PATH: &str = "../infer";
-    pub const RUNS_PATH: &str = "../training/runs";
+    pub const WORKSPACE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    pub const DATA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../long_data");
+    pub const WEIGHTS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../weights");
+    pub const TRAINING_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../training");
+    pub const INFER_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../infer");
+    pub const RUNS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../training/runs");
 }
 
 pub mod run_dir;
 
 pub mod constants {
     pub const TICKERS_COUNT: usize = 1;
-    pub const AVAILABLE_TICKERS_COUNT: usize = 13;
+    pub const AVAILABLE_TICKERS_COUNT: usize = 100;
     pub const ACTION_COUNT: usize = TICKERS_COUNT; // single ticker weight; cash is the residual
     pub const ACTION_HISTORY_LEN: usize = 0;
-    pub const PRICE_DELTAS_PER_TICKER: usize = 8693;
+    pub const PRICE_DELTAS_PER_TICKER: usize = 6000;
 
-    // Global (7): step_progress, cash_percent, pnl, drawdown, commissions, last_reward, last_fill_ratio
+    // Global (6): step_progress, cash_percent, pnl, drawdown, commissions, last_fill_ratio
     // Macro (14): gdp_growth, unemployment, jobs_growth, cpi_yoy, core_cpi_yoy, fed_funds, treasury_10y, yield_spread, consumer_sentiment, initial_claims
     //             + steps_to_jobs, steps_to_cpi, steps_to_fomc, steps_to_gdp
     pub const GLOBAL_MACRO_OBS: usize = 14;
-    pub const GLOBAL_STATIC_OBS: usize = 7 + GLOBAL_MACRO_OBS;
+    pub const GLOBAL_STATIC_OBS: usize = 6 + GLOBAL_MACRO_OBS;
     // Per-ticker (25 total):
     // Portfolio (6): position_pct, unrealized_pnl, trade_ema, steps_since, position_age, target_weight
     // Multi-scale momentum (4): mom_5, mom_20, mom_60, mom_120
@@ -34,9 +35,10 @@ pub mod constants {
     pub const OBSERVATION_SPACE: usize =
         (TICKERS_COUNT * PRICE_DELTAS_PER_TICKER) + STATIC_OBSERVATIONS;
 
-    pub const STEPS_PER_EPISODE: usize = 4_000;
+    pub const EPISODE_TRANSITIONS: usize = 2000;
+    pub const STEPS_PER_EPISODE: usize = EPISODE_TRANSITIONS + 1;
     pub const ACTION_THRESHOLD: f64 = 0.001;
-    pub const COMMISSION_RATE: f64 = 0.005;
+    pub const COMMISSION_RATE: f64 = 0.0035;
     pub const RETROACTIVE_BUY_REWARD: bool = false;
 }
 

@@ -13,17 +13,19 @@ pub struct MetaHistory {
     pub policy_loss: Vec<f64>,
     pub value_loss: Vec<f64>,
     pub explained_var: Vec<f64>,
-    pub grad_norm: Vec<f64>,
+    pub actor_grad_norm: Vec<f64>,
+    pub critic_grad_norm: Vec<f64>,
     pub total_commissions: Vec<f64>,
-    pub logit_noise_mean: Vec<f64>,
-    pub logit_noise_min: Vec<f64>,
-    pub logit_noise_max: Vec<f64>,
-    pub rpo_alpha: Vec<f64>,
+    pub beta_alpha_mean: Vec<f64>,
+    pub beta_action_mean: Vec<f64>,
+    pub beta_beta_mean: Vec<f64>,
+    pub beta_concentration_mean: Vec<f64>,
     pub mean_advantage: Vec<f64>,
     pub min_advantage: Vec<f64>,
     pub max_advantage: Vec<f64>,
     pub logit_scale: Vec<f64>,
     pub clip_fraction: Vec<f64>,
+    pub clip_gap: Vec<f64>,
     pub temporal_tau: Vec<f64>,
     pub temporal_attn_entropy: Vec<f64>,
     pub temporal_attn_max: Vec<f64>,
@@ -36,6 +38,12 @@ pub struct MetaHistory {
     pub approx_kl: Vec<f64>,
     pub gate_mean: Vec<f64>,
     pub gate_std: Vec<f64>,
+    pub return_min: Vec<f64>,
+    pub return_max: Vec<f64>,
+    pub support_min: Vec<f64>,
+    pub support_max: Vec<f64>,
+    pub return_below_support_frac: Vec<f64>,
+    pub return_above_support_frac: Vec<f64>,
 }
 
 impl MetaHistory {
@@ -59,15 +67,22 @@ impl MetaHistory {
         self.explained_var.push(ev);
     }
 
-    pub fn record_grad_norm(&mut self, grad_norm: f64) {
-        self.grad_norm.push(grad_norm);
+    pub fn record_grad_norm(&mut self, actor_grad_norm: f64, critic_grad_norm: f64) {
+        self.actor_grad_norm.push(actor_grad_norm);
+        self.critic_grad_norm.push(critic_grad_norm);
     }
 
-    pub fn record_logit_noise_stats(&mut self, mean: f64, min: f64, max: f64, rpo_alpha: f64) {
-        self.logit_noise_mean.push(mean);
-        self.logit_noise_min.push(min);
-        self.logit_noise_max.push(max);
-        self.rpo_alpha.push(rpo_alpha);
+    pub fn record_beta_policy_stats(
+        &mut self,
+        alpha_mean: f64,
+        action_mean: f64,
+        beta_mean: f64,
+        concentration_mean: f64,
+    ) {
+        self.beta_alpha_mean.push(alpha_mean);
+        self.beta_action_mean.push(action_mean);
+        self.beta_beta_mean.push(beta_mean);
+        self.beta_concentration_mean.push(concentration_mean);
     }
 
     pub fn record_advantage_stats(&mut self, mean: f64, min: f64, max: f64) {
@@ -78,6 +93,10 @@ impl MetaHistory {
 
     pub fn record_clip_fraction(&mut self, clip_fraction: f64) {
         self.clip_fraction.push(clip_fraction);
+    }
+
+    pub fn record_clip_gap(&mut self, clip_gap: f64) {
+        self.clip_gap.push(clip_gap);
     }
 
     pub fn record_policy_entropy(&mut self, mean: f64, min: f64, max: f64) {
@@ -93,6 +112,23 @@ impl MetaHistory {
     pub fn record_gate_stats(&mut self, mean: f64, std: f64) {
         self.gate_mean.push(mean);
         self.gate_std.push(std);
+    }
+
+    pub fn record_hl_gauss_range_stats(
+        &mut self,
+        return_min: f64,
+        return_max: f64,
+        support_min: f64,
+        support_max: f64,
+        below_frac: f64,
+        above_frac: f64,
+    ) {
+        self.return_min.push(return_min);
+        self.return_max.push(return_max);
+        self.support_min.push(support_min);
+        self.support_max.push(support_max);
+        self.return_below_support_frac.push(below_frac);
+        self.return_above_support_frac.push(above_frac);
     }
 
     pub fn record_temporal_debug(
@@ -147,17 +183,23 @@ impl MetaHistory {
         self.policy_loss = load_simple(&format!("{base_dir}/policy_loss.report.bin"));
         self.value_loss = load_simple(&format!("{base_dir}/value_loss.report.bin"));
         self.explained_var = load_simple(&format!("{base_dir}/explained_var.report.bin"));
-        self.grad_norm = load_simple(&format!("{base_dir}/grad_norm_log.report.bin"));
+        self.actor_grad_norm = load_simple(&format!("{base_dir}/actor_grad_norm.report.bin"));
+        self.critic_grad_norm = load_simple(&format!("{base_dir}/critic_grad_norm.report.bin"));
         self.total_commissions = load_simple(&format!("{base_dir}/total_commissions.report.bin"));
         self.logit_scale = load_simple(&format!("{base_dir}/logit_scale.report.bin"));
         self.clip_fraction = load_simple(&format!("{base_dir}/clip_fraction.report.bin"));
+        if self.clip_fraction.is_empty() {
+            self.clip_fraction =
+                load_simple(&format!("{base_dir}/spo_bound_fraction.report.bin"));
+        }
+        self.clip_gap = load_simple(&format!("{base_dir}/clip_gap.report.bin"));
 
         // MultiLine reports
-        let logit_path = format!("{base_dir}/logit_noise.report.bin");
-        self.logit_noise_mean = load_multiline(&logit_path, "mean");
-        self.logit_noise_min = load_multiline(&logit_path, "min");
-        self.logit_noise_max = load_multiline(&logit_path, "max");
-        self.rpo_alpha = load_multiline(&logit_path, "rpo_alpha");
+        let beta_policy_path = format!("{base_dir}/beta_policy.report.bin");
+        self.beta_alpha_mean = load_multiline(&beta_policy_path, "alpha_mean");
+        self.beta_action_mean = load_multiline(&beta_policy_path, "action_mean");
+        self.beta_beta_mean = load_multiline(&beta_policy_path, "beta_mean");
+        self.beta_concentration_mean = load_multiline(&beta_policy_path, "concentration");
 
         let adv_path = format!("{base_dir}/advantage_stats_log.report.bin");
         self.mean_advantage = load_multiline(&adv_path, "mean");
@@ -181,6 +223,13 @@ impl MetaHistory {
         let gate_path = format!("{base_dir}/gate_stats.report.bin");
         self.gate_mean = load_multiline(&gate_path, "mean");
         self.gate_std = load_multiline(&gate_path, "std");
+        let hl_gauss_path = format!("{base_dir}/hl_gauss_return_range.report.bin");
+        self.return_min = load_multiline(&hl_gauss_path, "return_min");
+        self.return_max = load_multiline(&hl_gauss_path, "return_max");
+        self.support_min = load_multiline(&hl_gauss_path, "support_min");
+        self.support_max = load_multiline(&hl_gauss_path, "support_max");
+        self.return_below_support_frac = load_multiline(&hl_gauss_path, "below_frac");
+        self.return_above_support_frac = load_multiline(&hl_gauss_path, "above_frac");
 
         println!(
             "Loaded meta history from episode {} ({} data points)",
@@ -276,15 +325,25 @@ impl MetaHistory {
             );
             let _ = write_report(&format!("{base_dir}/explained_var.report.bin"), &r);
         }
-        if !self.grad_norm.is_empty() {
+        if !self.actor_grad_norm.is_empty() {
             let r = Self::report(
-                "Grad Norm (Log)",
+                "Actor Grad Norm",
                 "Episode",
                 Some("Grad Norm"),
                 ScaleKind::Linear,
-                simple(&self.grad_norm),
+                simple(&self.actor_grad_norm),
             );
-            let _ = write_report(&format!("{base_dir}/grad_norm_log.report.bin"), &r);
+            let _ = write_report(&format!("{base_dir}/actor_grad_norm.report.bin"), &r);
+        }
+        if !self.critic_grad_norm.is_empty() {
+            let r = Self::report(
+                "Critic Grad Norm",
+                "Episode",
+                Some("Grad Norm"),
+                ScaleKind::Linear,
+                simple(&self.critic_grad_norm),
+            );
+            let _ = write_report(&format!("{base_dir}/critic_grad_norm.report.bin"), &r);
         }
         if !self.total_commissions.is_empty() {
             let r = Self::report(
@@ -296,34 +355,34 @@ impl MetaHistory {
             );
             let _ = write_report(&format!("{base_dir}/total_commissions.report.bin"), &r);
         }
-        if !self.logit_noise_mean.is_empty() {
+        if !self.beta_alpha_mean.is_empty() {
             let r = Self::report(
-                "Logit Noise",
+                "Beta Policy",
                 "Episode",
                 None,
                 ScaleKind::Linear,
                 ReportKind::MultiLine {
                     series: vec![
                         ReportSeries {
-                            label: "mean".to_string(),
-                            values: f64_to_f32(&self.logit_noise_mean),
+                            label: "alpha_mean".to_string(),
+                            values: f64_to_f32(&self.beta_alpha_mean),
                         },
                         ReportSeries {
-                            label: "min".to_string(),
-                            values: f64_to_f32(&self.logit_noise_min),
+                            label: "action_mean".to_string(),
+                            values: f64_to_f32(&self.beta_action_mean),
                         },
                         ReportSeries {
-                            label: "max".to_string(),
-                            values: f64_to_f32(&self.logit_noise_max),
+                            label: "beta_mean".to_string(),
+                            values: f64_to_f32(&self.beta_beta_mean),
                         },
                         ReportSeries {
-                            label: "rpo_alpha".to_string(),
-                            values: f64_to_f32(&self.rpo_alpha),
+                            label: "concentration".to_string(),
+                            values: f64_to_f32(&self.beta_concentration_mean),
                         },
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/logit_noise.report.bin"), &r);
+            let _ = write_report(&format!("{base_dir}/beta_policy.report.bin"), &r);
         }
         if !self.mean_advantage.is_empty() {
             let r = Self::report(
@@ -370,9 +429,19 @@ impl MetaHistory {
             );
             let _ = write_report(&format!("{base_dir}/clip_fraction.report.bin"), &r);
         }
+        if !self.clip_gap.is_empty() {
+            let r = Self::report(
+                "Clip Gap",
+                "Episode",
+                Some("Gap"),
+                ScaleKind::Linear,
+                simple(&self.clip_gap),
+            );
+            let _ = write_report(&format!("{base_dir}/clip_gap.report.bin"), &r);
+        }
         if !self.approx_kl.is_empty() {
             let r = Self::report(
-                "Approx KL",
+                "Policy KL",
                 "Episode",
                 Some("KL"),
                 ScaleKind::Linear,
@@ -462,6 +531,43 @@ impl MetaHistory {
                 },
             );
             let _ = write_report(&format!("{base_dir}/gate_stats.report.bin"), &r);
+        }
+        if !self.return_min.is_empty() {
+            let r = Self::report(
+                "HL-Gauss Return Range",
+                "Episode",
+                None,
+                ScaleKind::Linear,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "return_min".to_string(),
+                            values: f64_to_f32(&self.return_min),
+                        },
+                        ReportSeries {
+                            label: "return_max".to_string(),
+                            values: f64_to_f32(&self.return_max),
+                        },
+                        ReportSeries {
+                            label: "support_min".to_string(),
+                            values: f64_to_f32(&self.support_min),
+                        },
+                        ReportSeries {
+                            label: "support_max".to_string(),
+                            values: f64_to_f32(&self.support_max),
+                        },
+                        ReportSeries {
+                            label: "below_frac".to_string(),
+                            values: f64_to_f32(&self.return_below_support_frac),
+                        },
+                        ReportSeries {
+                            label: "above_frac".to_string(),
+                            values: f64_to_f32(&self.return_above_support_frac),
+                        },
+                    ],
+                },
+            );
+            let _ = write_report(&format!("{base_dir}/hl_gauss_return_range.report.bin"), &r);
         }
     }
 }

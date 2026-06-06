@@ -1,34 +1,25 @@
-use tch::nn::{self, Init};
-use tch::{Kind, Tensor};
+use tch::nn::{self, Linear};
+use tch::Tensor;
 
-use crate::torch::mamba_fused;
+use super::init::linear_with_same_dtype;
 
-pub(super) struct RMSNorm {
-    weight: Tensor,
+pub(in crate::torch::model) struct RMSNorm {
+    dim: i64,
     eps: f64,
 }
 
 impl RMSNorm {
-    pub(super) fn new(p: &nn::Path, dim: i64, eps: f64) -> Self {
-        let weight = p.var("weight", &[dim], Init::Const(1.0));
-        Self { weight, eps }
+    pub(in crate::torch::model) fn new(_p: &nn::Path, dim: i64, eps: f64) -> Self {
+        Self { dim, eps }
     }
 
-    pub(super) fn forward(&self, x: &Tensor) -> Tensor {
-        if matches!(x.device(), tch::Device::Cuda(_)) {
-            let weight = self.weight.to_device(x.device()).to_kind(Kind::Float);
-            return mamba_fused::rmsnorm_forward(x, &weight, self.eps);
-        }
-        let x_f32 = x.to_kind(Kind::Float);
-        let rms = (x_f32.pow_tensor_scalar(2).mean_dim(-1, true, Kind::Float) + self.eps).sqrt();
-        (x_f32 / rms * &self.weight).to_kind(x.kind())
+    pub(in crate::torch::model) fn forward(&self, x: &Tensor) -> Tensor {
+        x.internal_fused_rms_norm([self.dim], None::<&Tensor>, Some(self.eps))
+            .0
     }
 
-    pub(super) fn weight(&self) -> &Tensor {
-        &self.weight
-    }
-
-    pub(super) fn eps(&self) -> f64 {
-        self.eps
+    pub(in crate::torch::model) fn forward_linear(&self, x: &Tensor, linear: &Linear) -> Tensor {
+        let x = self.forward(x);
+        linear_with_same_dtype(&x, linear)
     }
 }

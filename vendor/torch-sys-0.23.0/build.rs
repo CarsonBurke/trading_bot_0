@@ -59,6 +59,7 @@ struct SystemInfo {
     libtorch_include_dirs: Vec<PathBuf>,
     libtorch_lib_dir: PathBuf,
     link_type: LinkType,
+    has_cuda_runtime_headers: bool,
 }
 
 #[cfg(feature = "ureq")]
@@ -250,6 +251,7 @@ impl SystemInfo {
             libtorch_lib_dir = Some(lib.join("lib"));
             env_var_rerun("LIBTORCH_CXX11_ABI").unwrap_or_else(|_| "1".to_owned())
         };
+        let has_cuda_runtime_headers = add_cuda_include_dirs(&mut libtorch_include_dirs);
         let libtorch_lib_dir = libtorch_lib_dir.expect("no libtorch lib dir found");
         let link_type = match env_var_rerun("LIBTORCH_STATIC").as_deref() {
             Err(_) | Ok("0") | Ok("false") | Ok("FALSE") => LinkType::Dynamic,
@@ -262,6 +264,7 @@ impl SystemInfo {
             libtorch_include_dirs,
             libtorch_lib_dir,
             link_type,
+            has_cuda_runtime_headers,
         })
     }
 
@@ -355,7 +358,7 @@ impl SystemInfo {
         }
     }
 
-    fn make(&self) {
+    fn make(&self, enable_cuda_graphs: bool) {
         println!("cargo:rerun-if-changed=libtch/torch_python.cpp");
         println!("cargo:rerun-if-changed=libtch/torch_python.h");
         println!("cargo:rerun-if-changed=libtch/torch_api_generated.cpp");
@@ -376,7 +379,8 @@ impl SystemInfo {
                 // as DEP_TORCH_SYS_LIBTORCH_LIB, see:
                 // https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key
                 println!("cargo:libtorch_lib={}", self.libtorch_lib_dir.display());
-                cc::Build::new()
+                let mut build = cc::Build::new();
+                build
                     .cpp(true)
                     .pic(true)
                     .warnings(false)
@@ -385,22 +389,29 @@ impl SystemInfo {
                     .flag("-std=c++17")
                     .flag(format!("-D_GLIBCXX_USE_CXX11_ABI={}", self.cxx11_abi))
                     .flag("-DGLOG_USE_GLOG_EXPORT")
-                    .files(&c_files)
-                    .compile("tch");
+                    .files(&c_files);
+                if enable_cuda_graphs {
+                    build.define("TCH_CUDA_GRAPHS", None);
+                }
+                build.compile("tch");
             }
             Os::Windows => {
                 // TODO: Pass "/link" "LIBPATH:{}" to cl.exe in order to emulate rpath.
                 //       Not yet supported by cc=rs.
                 //       https://github.com/alexcrichton/cc-rs/issues/323
-                cc::Build::new()
+                let mut build = cc::Build::new();
+                build
                     .cpp(true)
                     .pic(true)
                     .warnings(false)
                     .includes(&self.libtorch_include_dirs)
                     .flag("/std:c++17")
                     .flag("/p:DefineConstants=GLOG_USE_GLOG_EXPORT")
-                    .files(&c_files)
-                    .compile("tch");
+                    .files(&c_files);
+                if enable_cuda_graphs {
+                    build.define("TCH_CUDA_GRAPHS", None);
+                }
+                build.compile("tch");
             }
         };
     }
@@ -414,6 +425,52 @@ impl SystemInfo {
             }
         }
     }
+
+    fn link_cuda_runtime(&self) {
+        if self.os != Os::Linux {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&self.libtorch_lib_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let filename = entry.file_name();
+            let filename = filename.to_string_lossy();
+            if filename.starts_with("libcudart") && filename.contains(".so") {
+                println!("cargo:rustc-link-lib=dylib:+verbatim={filename}");
+                return;
+            }
+        }
+    }
+}
+
+fn add_cuda_include_dirs(include_dirs: &mut Vec<PathBuf>) -> bool {
+    let mut candidates = Vec::new();
+    for key in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(path) = env_var_rerun(key) {
+            let root = PathBuf::from(path);
+            candidates.push(root.join("include"));
+            candidates.push(root.join("targets/x86_64-linux/include"));
+        }
+    }
+    candidates.extend([
+        PathBuf::from("/opt/cuda/include"),
+        PathBuf::from("/opt/cuda/targets/x86_64-linux/include"),
+        PathBuf::from("/usr/local/cuda/include"),
+        PathBuf::from("/usr/local/cuda/targets/x86_64-linux/include"),
+    ]);
+    let mut found = include_dirs
+        .iter()
+        .any(|include| include.join("cuda_runtime.h").exists());
+    for include in candidates {
+        if include.join("cuda_runtime.h").exists() {
+            found = true;
+            if !include_dirs.iter().any(|p| p == &include) {
+                include_dirs.push(include);
+            }
+        }
+    }
+    found
 }
 
 fn main() -> anyhow::Result<()> {
@@ -449,11 +506,12 @@ fn main() -> anyhow::Result<()> {
             || si_lib.join("torch_cuda_cu.dll").exists();
         let use_cuda_cpp = si_lib.join("libtorch_cuda_cpp.so").exists()
             || si_lib.join("torch_cuda_cpp.dll").exists();
+        let has_cuda = use_cuda || use_cuda_cu || use_cuda_cpp;
         let use_hip =
             si_lib.join("libtorch_hip.so").exists() || si_lib.join("torch_hip.dll").exists();
         println!("cargo:rustc-link-search=native={}", si_lib.display());
 
-        system_info.make();
+        system_info.make(has_cuda && system_info.has_cuda_runtime_headers);
 
         println!("cargo:rustc-link-lib=static=tch");
         if use_cuda {
@@ -496,6 +554,10 @@ fn main() -> anyhow::Result<()> {
         system_info.link("torch_cpu");
         system_info.link("torch");
         system_info.link("c10");
+        if has_cuda {
+            system_info.link("c10_cuda");
+            system_info.link_cuda_runtime();
+        }
         if use_hip {
             system_info.link("c10_hip");
         }

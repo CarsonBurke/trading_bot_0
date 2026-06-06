@@ -8,8 +8,8 @@ use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use shared::paths::{RUNS_PATH, WEIGHTS_PATH};
 use shared::run_dir::RunDir;
 use std::{
-    io,
-    path::PathBuf,
+    fs, io,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -23,8 +23,14 @@ mod utils;
 
 use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
+use state::{GeneticFamily as TuiGeneticFamily, TrainingKind};
 
-const TRAINING_MODEL_SIZES: [&str; 3] = ["uniform-256-stream", "base", "ablation-small"];
+const TRAINING_KINDS: [TrainingKind; 2] = [TrainingKind::Rl, TrainingKind::Genetic];
+const GENETIC_FAMILIES: [TuiGeneticFamily; 3] = [
+    TuiGeneticFamily::TrendBreakout,
+    TuiGeneticFamily::PriceRebound,
+    TuiGeneticFamily::RsiRebound,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
@@ -90,6 +96,8 @@ pub struct App {
     pub episodes_input: String,
     pub weights_path: Option<String>,
     pub training_model_size: String,
+    pub training_kind: TrainingKind,
+    pub genetic_family: TuiGeneticFamily,
     pub latest_meta_charts: Vec<PathBuf>,
     last_refresh: Instant,
     pub generation_browser: GenerationBrowserState,
@@ -116,6 +124,35 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+fn newest_run_activity(path: &Path) -> Option<std::time::SystemTime> {
+    let mut latest = fs::metadata(path).ok()?.modified().ok();
+
+    for child in ["training.log", "gens", "weights"] {
+        let modified = match fs::metadata(path.join(child))
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+        {
+            Some(modified) => modified,
+            None => continue,
+        };
+        latest = Some(latest.map_or(modified, |current| current.max(modified)));
+    }
+
+    latest
+}
+
+fn sort_run_dirs_newest_first(dirs: &mut [std::fs::DirEntry]) {
+    dirs.sort_by(|a, b| {
+        let key = |entry: &std::fs::DirEntry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let activity = newest_run_activity(&entry.path());
+            (activity, name)
+        };
+
+        key(b).cmp(&key(a))
+    });
 }
 
 impl App {
@@ -151,7 +188,9 @@ impl App {
             ticker_input: String::new(),
             episodes_input: String::new(),
             weights_path: None,
-            training_model_size: "uniform-256-stream".to_string(),
+            training_model_size: "uniform-stream".to_string(),
+            training_kind: TrainingKind::Rl,
+            genetic_family: TuiGeneticFamily::TrendBreakout,
             latest_meta_charts: Vec::new(),
             last_refresh: Instant::now(),
             generation_browser,
@@ -189,16 +228,32 @@ impl App {
             "outperformance",
             "advantage_stats_log",
             "total_commissions",
-            "logit_noise",
-            "grad_norm_log",
+            "beta_policy",
+            "actor_grad_norm",
+            "critic_grad_norm",
             "target_weights",
             "clip_fraction",
+            "clip_gap",
             "explained_var",
             "value_loss",
             "policy_loss",
             "policy_entropy",
             "approx_kl",
             "gate_stats",
+            "ga_fitness",
+            "ga_return_pct",
+            "ga_outperformance",
+            "ga_max_drawdown",
+            "ga_sharpe",
+            "ga_turnover",
+            "ga_total_commissions",
+            "ga_trade_count",
+            "ga_generalization_gap",
+            "ga_distribution",
+            "ga_mutation_entropy",
+            "ga_train_assets",
+            "ga_validation_assets",
+            "ga_test_assets",
         ];
 
         // Ticker-specific chart base names
@@ -302,7 +357,7 @@ impl App {
     pub fn get_current_episode(&self) -> Option<usize> {
         for line in self.logs_page.training_output.iter().rev() {
             // Look for actual episode completion logs: "Episode N - Total Assets..."
-            // Skip PPO progress logs: "[Ep N] Episodes: ..."
+            // Skip RL progress logs: "[Ep N] Episodes: ..."
             if line.contains("Episode") && line.contains("Total Assets") && !line.starts_with("[Ep")
             {
                 if let Some(ep_str) = line.split("Episode").nth(1) {
@@ -319,9 +374,19 @@ impl App {
         None
     }
 
+    pub fn has_training_progress(&self) -> bool {
+        self.logs_page.training_output.iter().rev().any(|line| {
+            line.contains("ppo update:")
+                || line.contains("Epoch ")
+                || line.contains("Policy:")
+                || (line.contains("Episode") && line.contains("Total Assets"))
+        })
+    }
+
     fn maybe_refresh(&mut self) -> Result<()> {
         let now = Instant::now();
         if now.duration_since(self.last_refresh) >= Duration::from_secs(1) {
+            self.process_manager.poll_training_process();
             self.generation_browser.load_generations()?;
             self.inference_browser.load_inferences()?;
             self.load_latest_meta_charts()?;
@@ -337,9 +402,11 @@ impl App {
     }
 
     fn start_training(&mut self, weights_path: Option<String>) -> Result<()> {
-        let result = self
-            .process_manager
-            .start_training(weights_path, &self.training_model_size);
+        let result = self.process_manager.start_training(
+            self.training_kind,
+            weights_path,
+            self.genetic_family,
+        );
         self.sync_gens_path();
         result
     }
@@ -351,7 +418,6 @@ impl App {
     }
 
     fn open_run_selector(&mut self, purpose: RunSelectorPurpose) {
-        use std::fs;
         let runs_dir = std::path::Path::new(RUNS_PATH);
         let mut dirs: Vec<_> = fs::read_dir(runs_dir)
             .into_iter()
@@ -359,7 +425,7 @@ impl App {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
             .collect();
-        dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        sort_run_dirs_newest_first(&mut dirs);
 
         let active_name = self
             .process_manager
@@ -383,11 +449,7 @@ impl App {
                     .into_iter()
                     .flatten()
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map_or(false, |ext| ext == "ot")
-                    })
+                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "ot"))
                     .map(|e| e.file_name().to_string_lossy().to_string())
                     .collect();
                 weights.sort_by(|a, b| {
@@ -401,15 +463,27 @@ impl App {
                     num(b).cmp(&num(a))
                 });
                 let is_active = active_name.as_deref() == Some(&name);
-                if gen_count == 0 && weights.is_empty() {
+                if gen_count == 0 && weights.is_empty() && !is_active {
                     return None;
                 }
-                Some(RunInfo { name, gen_count, weights, is_active })
+                Some(RunInfo {
+                    name,
+                    gen_count,
+                    weights,
+                    is_active,
+                })
             })
             .collect();
 
-        let selected = runs.iter().position(|r| r.is_active).unwrap_or(0);
-        self.dialog_mode = DialogMode::RunSelector { selected, runs, purpose };
+        let selected = match purpose {
+            RunSelectorPurpose::View => 0,
+            RunSelectorPurpose::Train => runs.iter().position(|r| r.is_active).unwrap_or(0),
+        };
+        self.dialog_mode = DialogMode::RunSelector {
+            selected,
+            runs,
+            purpose,
+        };
     }
 
     fn switch_to_run(&mut self, name: &str) -> Result<()> {
@@ -429,13 +503,22 @@ impl App {
         Ok(())
     }
 
-    fn toggle_training_model_size(&mut self) {
-        let next_idx = TRAINING_MODEL_SIZES
+    fn toggle_training_kind(&mut self) {
+        let next_idx = TRAINING_KINDS
             .iter()
-            .position(|size| *size == self.training_model_size)
-            .map(|idx| (idx + 1) % TRAINING_MODEL_SIZES.len())
+            .position(|kind| *kind == self.training_kind)
+            .map(|idx| (idx + 1) % TRAINING_KINDS.len())
             .unwrap_or(0);
-        self.training_model_size = TRAINING_MODEL_SIZES[next_idx].to_string();
+        self.training_kind = TRAINING_KINDS[next_idx];
+    }
+
+    fn toggle_genetic_family(&mut self) {
+        let next_idx = GENETIC_FAMILIES
+            .iter()
+            .position(|family| *family == self.genetic_family)
+            .map(|idx| (idx + 1) % GENETIC_FAMILIES.len())
+            .unwrap_or(0);
+        self.genetic_family = GENETIC_FAMILIES[next_idx];
     }
 
     fn start_inference(
@@ -450,13 +533,12 @@ impl App {
         } else {
             format!("{}/{}", WEIGHTS_PATH, weights)
         };
-        self.process_manager
-            .start_inference(
-                weights_path,
-                ticker,
-                episodes.unwrap_or(10),
-                self.training_model_size.clone(),
-            )
+        self.process_manager.start_inference(
+            weights_path,
+            ticker,
+            episodes.unwrap_or(10),
+            self.training_model_size.clone(),
+        )
     }
 
     fn stop_training(&mut self) -> Result<()> {
@@ -568,7 +650,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                 }
                                 KeyCode::Char('j') | KeyCode::Down => {
                                     if count > 0 {
-                                        let (run_name, weights) = (run_name.clone(), weights.clone());
+                                        let (run_name, weights) =
+                                            (run_name.clone(), weights.clone());
                                         app.dialog_mode = DialogMode::WeightsSelector {
                                             run_name,
                                             selected: (selected + 1) % count,
@@ -578,10 +661,15 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                 }
                                 KeyCode::Char('k') | KeyCode::Up => {
                                     if count > 0 {
-                                        let (run_name, weights) = (run_name.clone(), weights.clone());
+                                        let (run_name, weights) =
+                                            (run_name.clone(), weights.clone());
                                         app.dialog_mode = DialogMode::WeightsSelector {
                                             run_name,
-                                            selected: if selected == 0 { count - 1 } else { selected - 1 },
+                                            selected: if selected == 0 {
+                                                count - 1
+                                            } else {
+                                                selected - 1
+                                            },
                                             weights,
                                         };
                                     }
@@ -793,7 +881,11 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                 _ => {}
                             }
                         }
-                        DialogMode::RunSelector { selected, runs, purpose } => {
+                        DialogMode::RunSelector {
+                            selected,
+                            runs,
+                            purpose,
+                        } => {
                             let count = runs.len();
                             match key.code {
                                 KeyCode::Esc => {
@@ -911,12 +1003,23 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
-                                            app.open_run_selector(RunSelectorPurpose::Train);
+                                            if app.training_kind == TrainingKind::Rl {
+                                                app.open_run_selector(RunSelectorPurpose::Train);
+                                            } else {
+                                                app.start_training(None)?;
+                                            }
                                         }
                                     }
-                                    KeyCode::Char('p') => {
+                                    KeyCode::Char('t') => {
                                         if !app.is_training_running() {
-                                            app.toggle_training_model_size();
+                                            app.toggle_training_kind();
+                                        }
+                                    }
+                                    KeyCode::Char('g') => {
+                                        if !app.is_training_running()
+                                            && app.training_kind == TrainingKind::Genetic
+                                        {
+                                            app.toggle_genetic_family();
                                         }
                                     }
                                     KeyCode::Char('f') => {
@@ -1233,7 +1336,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         AppMode::ChartViewer => {
             let is_training = app.is_training_running();
             let current_episode = app.get_current_episode();
-            app.chart_viewer.render(f, is_training, current_episode);
+            let has_progress = app.has_training_progress();
+            app.chart_viewer
+                .render(f, is_training, current_episode, has_progress);
         }
         AppMode::Logs => pages::logs_page::render(f, app),
         AppMode::ModelObservations => pages::model_observations_page::render(f, app),
@@ -1261,10 +1366,18 @@ fn ui(f: &mut Frame, app: &mut App) {
         DialogMode::PageJump { selected } => {
             components::dialogs::page_jump::render(f, *selected, app.mode);
         }
-        DialogMode::RunSelector { selected, runs, purpose } => {
+        DialogMode::RunSelector {
+            selected,
+            runs,
+            purpose,
+        } => {
             components::dialogs::run_selector::render(f, *selected, runs, purpose);
         }
-        DialogMode::WeightsSelector { run_name, selected, weights } => {
+        DialogMode::WeightsSelector {
+            run_name,
+            selected,
+            weights,
+        } => {
             components::dialogs::run_selector::render_weights(f, run_name, *selected, weights);
         }
         DialogMode::None => {}

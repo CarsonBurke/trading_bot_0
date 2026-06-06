@@ -1,6 +1,6 @@
 use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE};
 
-use super::env::{Env, TRADE_EMA_ALPHA};
+use super::single::{Env, TRADE_EMA_ALPHA};
 
 impl Env {
     pub fn sync_realized_weights(&mut self, absolute_step: usize) {
@@ -80,7 +80,7 @@ impl Env {
                 continue;
             }
 
-            total_buy_demand += desired_amount * (1.0 + COMMISSION_RATE);
+            total_buy_demand += desired_amount + (desired_amount / price) * COMMISSION_RATE;
             buy_intents.push(BuyIntent {
                 ticker_index,
                 price,
@@ -233,7 +233,7 @@ impl Env {
         // 5. Execute buys with proportional scaling if insufficient cash
         let total_buy_demand: f64 = buy_intents
             .iter()
-            .map(|i| i.delta_value * (1.0 + COMMISSION_RATE))
+            .map(|i| i.delta_value + (i.delta_value / i.price) * COMMISSION_RATE)
             .sum();
         let available_cash = self.account.cash;
         let fill_ratio = if total_buy_demand > 0.0 {
@@ -355,7 +355,7 @@ impl Env {
         // 4. Execute buys with proportional scaling if insufficient cash
         let total_buy_demand: f64 = buy_intents
             .iter()
-            .map(|i| i.delta_value * (1.0 + COMMISSION_RATE))
+            .map(|i| i.delta_value + (i.delta_value / i.price) * COMMISSION_RATE)
             .sum();
         let available_cash = self.account.cash;
         let fill_ratio = if total_buy_demand > 0.0 {

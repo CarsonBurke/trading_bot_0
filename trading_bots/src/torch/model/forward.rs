@@ -1,39 +1,28 @@
 use std::env;
 use tch::Tensor;
 
-use super::{DebugMetrics, ModelOutput, StreamState, TradingModel};
+use super::trading_model::{DebugMetrics, ModelOutput, StreamState, TradingModel};
 
 impl TradingModel {
-    pub(super) fn tail_condition(
+    fn forward_prepared_on_device(
         &self,
-        global_static: &Tensor,
-        per_ticker_static: &Tensor,
-        batch_size: i64,
-        kind: tch::Kind,
-    ) -> Tensor {
-        let exo_kv = self.build_exo_kv(global_static, per_ticker_static, batch_size);
-        exo_kv
-            .mean_dim([1].as_slice(), false, tch::Kind::Float)
-            .to_kind(kind)
-            .unsqueeze(1)
-    }
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+    ) -> ModelOutput {
+        debug_fused("model_price_deltas", price_deltas);
+        debug_fused("model_static_features", static_features);
+        let batch_size = price_deltas.size()[0];
 
-    pub(super) fn apply_tail_condition(
-        &self,
-        x: &Tensor,
-        global_static: &Tensor,
-        per_ticker_static: &Tensor,
-        batch_size: i64,
-    ) -> Tensor {
-        let seq = x.size()[1];
-        let tail = self.tail_condition(global_static, per_ticker_static, batch_size, x.kind());
-        let prefix = x.narrow(1, 0, seq - super::NUM_HEAD_CLS_TOKENS);
-        let suffix = x.narrow(
-            1,
-            seq - super::NUM_HEAD_CLS_TOKENS,
-            super::NUM_HEAD_CLS_TOKENS,
-        ) + &tail;
-        Tensor::cat(&[&prefix, &suffix], 1)
+        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+        let x_stem = self.patch_latent_stem_on_device(price_deltas, batch_size);
+        debug_fused("model_x_stem", &x_stem);
+
+        let output = self.backbone_with_actor_critic_cls(&x_stem, &exo_tokens, batch_size);
+        debug_fused("model_value_logits", &output.0);
+        debug_fused("model_alpha", &output.1);
+        debug_fused("model_beta", &output.2);
+        output
     }
 
     pub fn forward(
@@ -42,9 +31,9 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> ModelOutput {
-        let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
-        let static_features = self.cast_inputs(&static_features.to_device(self.device));
-        self.forward_on_device(&price_deltas, &static_features, _train)
+        let price_deltas = self.cast_inputs(&self.maybe_to_device(price_deltas, self.device));
+        let static_features = self.cast_inputs(&self.maybe_to_device(static_features, self.device));
+        self.forward_prepared_on_device(&price_deltas, &static_features)
     }
 
     pub fn forward_on_device(
@@ -58,25 +47,7 @@ impl TradingModel {
         }
         let price_deltas = self.cast_inputs(price_deltas);
         let static_features = self.cast_inputs(static_features);
-
-        debug_fused("model_price_deltas", &price_deltas);
-        debug_fused("model_static_features", &static_features);
-        let batch_size = price_deltas.size()[0];
-
-        let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
-        let x_stem =
-            self.apply_tail_condition(&x_stem, &global_static, &per_ticker_static, batch_size);
-        debug_fused("model_x_stem", &x_stem);
-
-        let mut x = x_stem;
-        for (i, layer) in self.gqa_layers.iter().enumerate() {
-            x = layer.forward(&x, &self.rope, true);
-            x = self.maybe_apply_inter_ticker(&x, i);
-        }
-        debug_fused("model_x_gqa", &x);
-
-        self.head_with_temporal_pool(&x, batch_size, false).0
+        self.forward_prepared_on_device(&price_deltas, &static_features)
     }
 
     pub fn forward_with_debug(
@@ -85,39 +56,30 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> (ModelOutput, DebugMetrics) {
-        let price_deltas = self.cast_inputs(&price_deltas.to_device(self.device));
-        let static_features = self.cast_inputs(&static_features.to_device(self.device));
+        let price_deltas = self.cast_inputs(&self.maybe_to_device(price_deltas, self.device));
+        let static_features = self.cast_inputs(&self.maybe_to_device(static_features, self.device));
         debug_fused("model_price_deltas", &price_deltas);
         debug_fused("model_static_features", &static_features);
         let batch_size = price_deltas.size()[0];
 
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
-        let x_stem = self.patch_latent_stem(&price_deltas, batch_size);
-        let x_stem =
-            self.apply_tail_condition(&x_stem, &global_static, &per_ticker_static, batch_size);
+        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
+        let x_stem = self.patch_latent_stem_on_device(&price_deltas, batch_size);
         debug_fused("model_x_stem", &x_stem);
 
-        let mut x = x_stem;
-        for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
-            debug_fused_layer("x_gqa_in", layer_idx, &x);
-            x = layer.forward(&x, &self.rope, true);
-            debug_fused_layer("gqa_out", layer_idx, &x);
-            x = self.maybe_apply_inter_ticker(&x, layer_idx);
-            debug_fused_layer("x_gqa_out", layer_idx, &x);
-        }
-        debug_fused("model_x_gqa", &x);
+        let output = self.backbone_with_actor_critic_cls(&x_stem, &exo_tokens, batch_size);
+        debug_fused("model_value_logits", &output.0);
 
-        let (out, debug) = self.head_with_temporal_pool(&x, batch_size, true);
         (
-            out,
-            debug.unwrap_or(DebugMetrics {
+            output,
+            DebugMetrics {
                 temporal_tau: 0.0,
                 temporal_attn_entropy: 0.0,
                 temporal_attn_max: 0.0,
                 temporal_attn_eff_len: 0.0,
                 temporal_attn_center: 0.0,
                 temporal_attn_last_weight: 0.0,
-            }),
+            },
         )
     }
 
@@ -154,8 +116,8 @@ static DEBUG_INITIALIZED: AtomicBool = AtomicBool::new(false);
 #[inline]
 fn is_debug_enabled() -> bool {
     if !DEBUG_INITIALIZED.load(Ordering::Relaxed) {
-        let enabled = crate::torch::ppo::DEBUG_NUMERICS
-            || env::var("MAMBA_FUSED_DEBUG").ok().as_deref() == Some("1");
+        let enabled = crate::torch::train::config::DEBUG_NUMERICS
+            || env::var("MODEL_FUSED_DEBUG").ok().as_deref() == Some("1");
         DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
         DEBUG_INITIALIZED.store(true, Ordering::Relaxed);
     }
@@ -173,25 +135,6 @@ fn debug_fused(tag: &str, t: &Tensor) {
         eprintln!(
             "debug {} nan={} inf={} shape={:?}",
             tag,
-            has_nan,
-            has_inf,
-            t.size()
-        );
-    }
-}
-
-#[inline]
-fn debug_fused_layer(tag: &str, layer_idx: usize, t: &Tensor) {
-    if !is_debug_enabled() {
-        return;
-    }
-    let has_nan = t.isnan().any().int64_value(&[]) != 0;
-    let has_inf = t.isinf().any().int64_value(&[]) != 0;
-    if has_nan || has_inf {
-        eprintln!(
-            "debug {}_l{} nan={} inf={} shape={:?}",
-            tag,
-            layer_idx,
             has_nan,
             has_inf,
             t.size()
