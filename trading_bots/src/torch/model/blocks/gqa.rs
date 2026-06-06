@@ -82,13 +82,17 @@ impl GqaBlock {
         &self,
         x: &Tensor,
         x0: &Tensor,
+        role_bias: &Tensor,
         rope: &RotaryEmbedding,
         positions: &Tensor,
+        attn_mask: Option<&Tensor>,
         causal: bool,
     ) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
         let mix = self.resid_mix.to_kind(x.kind());
-        let x = x * mix.get(0).view([1, 1, -1]) + x0 * mix.get(1).view([1, 1, -1]);
+        let x = x * mix.get(0).view([1, 1, -1])
+            + x0 * mix.get(1).view([1, 1, -1])
+            + role_bias.to_kind(x.kind());
 
         let (q, k, v) = self.project_qkv_with_positions(&x, rope, positions);
 
@@ -96,9 +100,9 @@ impl GqaBlock {
             &q,
             &k,
             &v,
-            None::<&Tensor>,
+            attn_mask,
             0.0,
-            causal,
+            causal && attn_mask.is_none(),
             None,
             true,
         );
