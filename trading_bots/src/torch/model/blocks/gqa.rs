@@ -9,7 +9,7 @@ use crate::torch::model::rope::RotaryEmbedding;
 
 pub(in crate::torch::model) const GQA_NUM_Q_HEADS: i64 = 4;
 pub(in crate::torch::model) const GQA_NUM_KV_HEADS: i64 = 1;
-pub(in crate::torch::model) const QK_GAIN_INIT: f64 = 5.0;
+pub(in crate::torch::model) const QK_GAIN_INIT: f64 = 1.0;
 
 pub(in crate::torch::model) struct GqaBlock {
     attn_ln: RMSNorm,
