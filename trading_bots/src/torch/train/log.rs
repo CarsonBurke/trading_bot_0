@@ -2,6 +2,7 @@ use tch::{Kind, Tensor};
 
 use super::numeric_debug::{
     compute_beta_policy_stats, compute_explained_variance, compute_value_diagnostics,
+    compute_value_diagnostics_symlog,
 };
 use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
 
@@ -85,7 +86,12 @@ impl Trainer {
         let value_diag_t = if metrics.total_sample_count > 0 {
             compute_value_diagnostics(&self.s_values, &adv_data.returns)
         } else {
-            Tensor::zeros([6], (Kind::Float, device))
+            Tensor::zeros([7], (Kind::Float, device))
+        };
+        let value_diag_symlog_t = if metrics.total_sample_count > 0 {
+            compute_value_diagnostics_symlog(&self.s_values, &adv_data.returns)
+        } else {
+            Tensor::zeros([7], (Kind::Float, device))
         };
 
         let entropy_mean_t = if metrics.total_sample_count > 0 {
@@ -120,12 +126,13 @@ impl Trainer {
                 metrics.entropy_min.view([1]),
                 metrics.entropy_max.view([1]),
                 return_range_stats.view([6]),
-                value_diag_t.view([6]),
+                value_diag_t.view([7]),
+                value_diag_symlog_t.view([7]),
             ],
             0,
         );
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 33]);
+            .unwrap_or_else(|_| vec![0.0; 41]);
         let mean_policy_loss = all_scalars_vec[0];
         let mean_value_loss = all_scalars_vec[1];
         let mean_clip_gap = all_scalars_vec[2];
@@ -176,6 +183,23 @@ impl Trainer {
             all_scalars_vec[30],
             all_scalars_vec[31],
             all_scalars_vec[32],
+        );
+        let (
+            value_pred_mean_symlog,
+            value_pred_std_symlog,
+            value_target_mean_symlog,
+            value_target_std_symlog,
+            value_residual_rmse_symlog,
+            value_return_corr_symlog,
+            value_explained_var_symlog,
+        ) = (
+            all_scalars_vec[34],
+            all_scalars_vec[35],
+            all_scalars_vec[36],
+            all_scalars_vec[37],
+            all_scalars_vec[38],
+            all_scalars_vec[39],
+            all_scalars_vec[40],
         );
 
         let mean_epoch_approx_kl = metrics.mean_epoch_approx_kl;
@@ -234,6 +258,16 @@ impl Trainer {
             value_target_std,
             value_residual_rmse,
             value_return_corr
+        );
+        println!(
+            "  ValueDiag(symlog): pred μ/σ {:.3}/{:.3}, target μ/σ {:.3}/{:.3}, RMSE {:.3}, Corr {:.3}, EV {:.3}",
+            value_pred_mean_symlog,
+            value_pred_std_symlog,
+            value_target_mean_symlog,
+            value_target_std_symlog,
+            value_residual_rmse_symlog,
+            value_return_corr_symlog,
+            value_explained_var_symlog
         );
     }
 }

@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use tch::{autocast, Kind, Tensor};
 
 use crate::torch::model::TradingModel;
+use crate::torch::value::hl_gauss::symlog_tensor;
 
 pub(crate) fn debug_tensor_stats(name: &str, t: &Tensor, episode: i64, step: usize) -> bool {
     let has_nan = t.isnan().any().int64_value(&[]) != 0;
@@ -198,31 +199,47 @@ pub(crate) fn compute_beta_policy_stats(
     })
 }
 
+fn value_diag_core(pred: &Tensor, target: &Tensor) -> Tensor {
+    let residuals = pred - target;
+    let value_mean = pred.mean(Kind::Float);
+    let return_mean = target.mean(Kind::Float);
+    let value_centered = pred - &value_mean;
+    let return_centered = target - &return_mean;
+    let value_std = value_centered.square().mean(Kind::Float).sqrt();
+    let return_std = return_centered.square().mean(Kind::Float).sqrt();
+    let residual_rmse = residuals.square().mean(Kind::Float).sqrt();
+    let return_var = return_centered.square().mean(Kind::Float);
+    let explained_var =
+        Tensor::from(1.0) - residuals.square().mean(Kind::Float) / return_var.clamp_min(1e-8);
+    let corr = (&value_centered * &return_centered).mean(Kind::Float)
+        / ((&value_std * &return_std).clamp_min(1e-8));
+    Tensor::stack(
+        &[
+            value_mean,
+            value_std,
+            return_mean,
+            return_std,
+            residual_rmse,
+            corr,
+            explained_var,
+        ],
+        0,
+    )
+}
+
 pub(crate) fn compute_value_diagnostics(rollout_values: &Tensor, returns: &Tensor) -> Tensor {
     tch::no_grad(|| {
-        let values = rollout_values.to_kind(Kind::Float);
-        let returns = returns.to_kind(Kind::Float);
-        let residuals = &values - &returns;
-        let value_mean = values.mean(Kind::Float);
-        let return_mean = returns.mean(Kind::Float);
-        let value_centered = &values - &value_mean;
-        let return_centered = &returns - &return_mean;
-        let value_std = value_centered.square().mean(Kind::Float).sqrt();
-        let return_std = return_centered.square().mean(Kind::Float).sqrt();
-        let residual_rmse = residuals.square().mean(Kind::Float).sqrt();
-        let corr = (&value_centered * &return_centered).mean(Kind::Float)
-            / ((&value_std * &return_std).clamp_min(1e-8));
-        Tensor::stack(
-            &[
-                value_mean,
-                value_std,
-                return_mean,
-                return_std,
-                residual_rmse,
-                corr,
-            ],
-            0,
-        )
+        let pred = rollout_values.to_kind(Kind::Float);
+        let target = returns.to_kind(Kind::Float);
+        value_diag_core(&pred, &target)
+    })
+}
+
+pub(crate) fn compute_value_diagnostics_symlog(rollout_values: &Tensor, returns: &Tensor) -> Tensor {
+    tch::no_grad(|| {
+        let pred = symlog_tensor(&rollout_values.to_kind(Kind::Float));
+        let target = symlog_tensor(&returns.to_kind(Kind::Float));
+        value_diag_core(&pred, &target)
     })
 }
 

@@ -25,7 +25,7 @@ pub fn symlog(x: f64) -> f64 {
     x.signum() * (x.abs() + 1.0).ln()
 }
 
-fn symlog_tensor(x: &Tensor) -> Tensor {
+pub(crate) fn symlog_tensor(x: &Tensor) -> Tensor {
     x.sign() * (x.abs() + 1.0).log()
 }
 
