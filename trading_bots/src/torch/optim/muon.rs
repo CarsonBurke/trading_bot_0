@@ -134,6 +134,39 @@ fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     }
 }
 
+/// NorMuon per-row second-moment rescale, all math in fp32. Scaling each row by
+/// `step_size_i * ratio` keeps the total Frobenius norm of the update
+/// (approximately) equal to its pre-divide value, because `ratio` is exactly the
+/// global correction `||U||_F / ||diag(step_size) U||_F`. The `lerp_` writes the
+/// raw second-moment EMA in place.
+fn normuon_rescale(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) -> Tensor {
+    let uf = update.to_kind(Kind::Float);
+    let cols = update.size()[1] as f64;
+    // Per-row sum of squares over fan-in: [rows, 1].
+    let row_sq_sum = uf
+        .square()
+        .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float);
+    // Per-row MEAN of squares (note the /cols): [rows, 1].
+    let v_mean = &row_sq_sum / cols;
+    // Frobenius^2 of the post-NS update, BEFORE the per-row divide: [1, 1].
+    let vnorm_sq = row_sq_sum.sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
+    // Raw EMA from 0, no bias correction: v = v*beta2 + v_mean*(1-beta2).
+    let _ = second_momentum.lerp_(&v_mean, 1.0 - beta2);
+    // Per-row step size = 1/(sqrt(v)+1e-10): [rows, 1].
+    let step_size = (second_momentum.sqrt() + 1e-10).reciprocal();
+    // Analytic post-divide Frobenius^2 = sum_i step_size_i^2 * row_sq_sum_i.
+    let vnorm_new_sq = (&step_size * &step_size * &row_sq_sum).sum_dim_intlist(
+        [-2i64].as_slice(),
+        true,
+        Kind::Float,
+    );
+    // Frobenius-preservation ratio: [1, 1].
+    let ratio = vnorm_sq.sqrt() / (vnorm_new_sq.sqrt() + 1e-10);
+    // Fused per-row scale, cast back to update kind: [rows, 1].
+    let scale = (&step_size * &ratio).to_kind(update.kind());
+    update * &scale
+}
+
 impl Muon {
     pub fn new(trainable_vars: &[Tensor], cfg: MuonConfig) -> Self {
         let named: Vec<(String, Tensor)> = trainable_vars
@@ -231,33 +264,8 @@ impl Muon {
             // Newton-Schulz orthogonalization; returns [rows, cols] orientation.
             let update = newtonschulz5(&update, self.cfg.ns_steps);
 
-            // ---- NorMuon: per-row second-moment rescale, all math in fp32. ----
-            let uf = update.to_kind(Kind::Float);
-            let cols = update.size()[1] as f64;
-            // Per-row sum of squares over fan-in: [rows, 1].
-            let row_sq_sum = uf
-                .square()
-                .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float);
-            // Per-row MEAN of squares (note the /cols): [rows, 1].
-            let v_mean = &row_sq_sum / cols;
-            // Frobenius^2 of the post-NS update, BEFORE the per-row divide: [1, 1].
-            let vnorm_sq = row_sq_sum.sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
-            // Raw EMA from 0, no bias correction: v = v*beta2 + v_mean*(1-beta2).
-            let _ = entry.second_momentum.lerp_(&v_mean, 1.0 - beta2);
-            // Per-row step size = 1/(sqrt(v)+1e-10): [rows, 1].
-            let step_size = (entry.second_momentum.sqrt() + 1e-10).reciprocal();
-            // Analytic post-divide Frobenius^2 = sum_i step_size_i^2 * row_sq_sum_i.
-            let vnorm_new_sq = (&step_size * &step_size * &row_sq_sum).sum_dim_intlist(
-                [-2i64].as_slice(),
-                true,
-                Kind::Float,
-            );
-            // Frobenius-preservation ratio: [1, 1].
-            let ratio = vnorm_sq.sqrt() / (vnorm_new_sq.sqrt() + 1e-10);
-            // Fused per-row scale, cast back to update kind: [rows, 1].
-            let scale = (&step_size * &ratio).to_kind(update.kind());
-            let update = update * &scale;
-            // ------------------------------------------------------------------
+            // NorMuon: per-row second-moment rescale, all math in fp32.
+            let update = normuon_rescale(&update, &mut entry.second_momentum, beta2);
 
             // Aspect-ratio scale max(1, rows/cols)^0.5 (after NorMuon rescale).
             let size = update.size();
@@ -367,7 +375,7 @@ impl Muon {
 mod tests {
     use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
 
-    use super::{Muon, MuonConfig};
+    use super::{normuon_rescale, Muon, MuonConfig};
 
     const HIDDEN: i64 = 128;
     const TRAIN_STEPS: usize = 500;
@@ -619,31 +627,6 @@ mod tests {
             adamw_final
         );
         assert!(muon_final < 0.5, "Muon did not converge: {:.6}", muon_final);
-    }
-
-    /// Standalone replication of the NorMuon per-row rescale, used to assert the
-    /// Frobenius-preservation invariant: scaling each row by
-    /// `step_size_i * ratio` must keep the total Frobenius norm of the update
-    /// (approximately) equal to its pre-divide value, because `ratio` is exactly
-    /// the global correction `||U||_F / ||diag(step_size) U||_F`.
-    fn normuon_rescale(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) -> Tensor {
-        let uf = update.to_kind(Kind::Float);
-        let cols = update.size()[1] as f64;
-        let row_sq_sum = uf
-            .square()
-            .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float);
-        let v_mean = &row_sq_sum / cols;
-        let vnorm_sq = row_sq_sum.sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
-        let _ = second_momentum.lerp_(&v_mean, 1.0 - beta2);
-        let step_size = (second_momentum.sqrt() + 1e-10).reciprocal();
-        let vnorm_new_sq = (&step_size * &step_size * &row_sq_sum).sum_dim_intlist(
-            [-2i64].as_slice(),
-            true,
-            Kind::Float,
-        );
-        let ratio = vnorm_sq.sqrt() / (vnorm_new_sq.sqrt() + 1e-10);
-        let scale = (&step_size * &ratio).to_kind(update.kind());
-        update * &scale
     }
 
     #[test]
