@@ -71,7 +71,7 @@ impl Trainer {
         });
 
         // Rank-Gaussian shaping over the full per-update advantage population.
-        // Computed once; per-minibatch standardization in update.rs refines it.
+        // This is the sole advantage normalization; minibatches consume it as-is.
         let advantages = tch::no_grad(|| rank_gaussian_normalize(&advantages));
 
         // Post-shaping advantage stats: this is what the policy actually trains on.

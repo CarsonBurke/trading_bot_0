@@ -179,9 +179,8 @@ impl Trainer {
                 let static_flat = so_chunk.reshape([minibatch_sample_count, self.so_dim]);
 
                 // Flatten rollout-captured targets to minibatch-flat form (chunk-major).
-                let adv_raw_flat = adv_mb_by_chunk.reshape([-1]);
-                let adv_flat = (&adv_raw_flat - adv_raw_flat.mean(Kind::Float))
-                    / (adv_raw_flat.std(true) + 1e-8);
+                // Advantages are already rank-Gaussian normalized over the full population.
+                let adv_flat = adv_mb_by_chunk.reshape([-1]);
                 let ret_flat = ret_mb_by_chunk.reshape([-1]);
                 let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
                 let actions_flat = actions_by_chunk.reshape([-1, ACTION_COUNT]);
