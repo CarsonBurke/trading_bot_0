@@ -1,9 +1,10 @@
 use tch::nn::Init;
 use tch::{nn, Tensor};
 
+use crate::torch::model::blocks::ffn::ScaledFfn;
 use crate::torch::model::blocks::gqa::QK_GAIN_INIT;
 use crate::torch::model::init::{
-    relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
+    linear_residual_out, linear_truncated, linear_with_same_dtype,
 };
 use crate::torch::model::rmsnorm::RMSNorm;
 
@@ -15,10 +16,7 @@ pub(in crate::torch::model) struct EndogenousTickerBlock {
     k_norm: RMSNorm,
     q_gain: Tensor,
     attn_scale: Tensor,
-    mlp_scale: Tensor,
-    mlp_fc1: nn::Linear,
-    mlp_fc2: nn::Linear,
-    mlp_ln: RMSNorm,
+    ffn: ScaledFfn,
 }
 
 impl EndogenousTickerBlock {
@@ -30,10 +28,7 @@ impl EndogenousTickerBlock {
         let k_norm = RMSNorm::new(model_dim, 1e-6);
         let q_gain = p.var("q_gain", &[1], Init::Const(QK_GAIN_INIT));
         let attn_scale = p.var("attn_scale", &[model_dim], Init::Const(1.0));
-        let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));
-        let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, ff_dim);
-        let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim);
-        let mlp_ln = RMSNorm::new(model_dim, 1e-6);
+        let ffn = ScaledFfn::new_named(p, model_dim, ff_dim, "mlp_fc1", "mlp_fc2", "mlp_scale");
         Self {
             ticker_ln,
             ticker_qkv,
@@ -42,10 +37,7 @@ impl EndogenousTickerBlock {
             k_norm,
             q_gain,
             attn_scale,
-            mlp_scale,
-            mlp_fc1,
-            mlp_fc2,
-            mlp_ln,
+            ffn,
         }
     }
 
@@ -79,11 +71,6 @@ impl EndogenousTickerBlock {
             linear_with_same_dtype(&ctx, &self.ticker_out).reshape([batch, num_items, model_dim]);
         let ctx = &ctx * self.attn_scale.to_kind(ctx.kind()).view([1, 1, -1]);
         let x = x + ctx;
-        let mlp = relu_sq_linear(
-            &self.mlp_ln.forward_linear(&x, &self.mlp_fc1),
-            &self.mlp_fc2,
-        );
-        let mlp = &mlp * self.mlp_scale.to_kind(mlp.kind()).view([1, 1, -1]);
-        x + mlp
+        self.ffn.forward(&x)
     }
 }

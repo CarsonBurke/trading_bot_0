@@ -1,8 +1,9 @@
 use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
+use crate::torch::model::blocks::ffn::ScaledFfn;
 use crate::torch::model::init::{
-    relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
+    linear_residual_out, linear_truncated, linear_with_same_dtype,
 };
 use crate::torch::model::rmsnorm::RMSNorm;
 use crate::torch::model::rope::RotaryEmbedding;
@@ -19,13 +20,10 @@ pub(in crate::torch::model) struct GqaBlock {
     k_norm: RMSNorm,
     q_gain: Tensor,
     attn_scale: Tensor,
-    mlp_scale: Tensor,
     q_dim: i64,
     kv_dim: i64,
     resid_mix: Tensor,
-    ffn_ln: RMSNorm,
-    ffn_fc1: nn::Linear,
-    ffn_fc2: nn::Linear,
+    ffn: ScaledFfn,
 }
 
 impl GqaBlock {
@@ -45,7 +43,6 @@ impl GqaBlock {
         let k_norm = RMSNorm::new(head_dim, 1e-6);
         let q_gain = p.var("q_gain", &[GQA_NUM_Q_HEADS], Init::Const(QK_GAIN_INIT));
         let attn_scale = p.var("attn_scale", &[model_dim], Init::Const(1.0));
-        let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));
         let resid_mix = p.var_copy(
             "resid_mix",
             &Tensor::stack(
@@ -56,9 +53,7 @@ impl GqaBlock {
                 0,
             ),
         );
-        let ffn_ln = RMSNorm::new(model_dim, 1e-6);
-        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, ff_dim);
-        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
+        let ffn = ScaledFfn::new(p, model_dim, ff_dim);
         Self {
             attn_ln,
             attn_qkv,
@@ -67,13 +62,10 @@ impl GqaBlock {
             k_norm,
             q_gain,
             attn_scale,
-            mlp_scale,
             q_dim: model_dim,
             kv_dim,
             resid_mix,
-            ffn_ln,
-            ffn_fc1,
-            ffn_fc2,
+            ffn,
         }
     }
 
@@ -141,12 +133,6 @@ impl GqaBlock {
     }
 
     fn apply_ffn(&self, x: &Tensor) -> Tensor {
-        let normed = self.ffn_ln.forward(x);
-        let ffn_out = relu_sq_linear(
-            &linear_with_same_dtype(&normed, &self.ffn_fc1),
-            &self.ffn_fc2,
-        );
-        let ffn_out = &ffn_out * self.mlp_scale.to_kind(ffn_out.kind()).view([1, 1, -1]);
-        x + ffn_out
+        self.ffn.forward(x)
     }
 }

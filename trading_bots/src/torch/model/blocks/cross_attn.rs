@@ -1,19 +1,14 @@
-use tch::nn::Init;
 use tch::{nn, Tensor};
 
 use crate::torch::model::blocks::exogenous::ExogenousTickerBlock;
-use crate::torch::model::init::{relu_sq_linear, linear_residual_out, linear_truncated};
-use crate::torch::model::rmsnorm::RMSNorm;
+use crate::torch::model::blocks::ffn::ScaledFfn;
 
 pub(in crate::torch::model) const CA_NUM_HEADS: i64 = 2;
 pub(in crate::torch::model) const CA_HEAD_DIM: i64 = 128;
 
 pub(in crate::torch::model) struct CrossAttnFfnBlock {
     cross_attn: ExogenousTickerBlock,
-    ffn_ln: RMSNorm,
-    ffn_fc1: nn::Linear,
-    ffn_fc2: nn::Linear,
-    mlp_scale: Tensor,
+    ffn: ScaledFfn,
 }
 
 impl CrossAttnFfnBlock {
@@ -28,17 +23,8 @@ impl CrossAttnFfnBlock {
         ff_dim: i64,
         cross_attn: ExogenousTickerBlock,
     ) -> Self {
-        let ffn_ln = RMSNorm::new(model_dim, 1e-6);
-        let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, ff_dim);
-        let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
-        let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));
-        Self {
-            cross_attn,
-            ffn_ln,
-            ffn_fc1,
-            ffn_fc2,
-            mlp_scale,
-        }
+        let ffn = ScaledFfn::new(p, model_dim, ff_dim);
+        Self { cross_attn, ffn }
     }
 
     pub(in crate::torch::model) fn forward(&self, queries: &Tensor, source: &Tensor) -> Tensor {
@@ -59,11 +45,6 @@ impl CrossAttnFfnBlock {
         let x = self
             .cross_attn
             .forward_with_projected_source(queries, source_k, source_v);
-        let ffn_out = relu_sq_linear(
-            &self.ffn_ln.forward_linear(&x, &self.ffn_fc1),
-            &self.ffn_fc2,
-        );
-        let ffn_out = &ffn_out * self.mlp_scale.to_kind(ffn_out.kind()).view([1, 1, -1]);
-        x + ffn_out
+        self.ffn.forward(&x)
     }
 }
