@@ -65,6 +65,7 @@ impl Trainer {
         let mut logged_param_non_finite = false;
         let mut logged_forward_probe = false;
 
+        let mut mean_epoch_approx_kl = 0.0f64;
         let mut last_minibatch_approx_kl = 0.0f64;
         let mut perm_host: Vec<i64> = (0..self.total_chunks).collect();
         let mut perm_gpu = Tensor::zeros([self.total_chunks], (Kind::Int64, device));
@@ -440,13 +441,13 @@ impl Trainer {
                 self.opt.zero_grad();
 
                 // One forward/backward per minibatch now: the minibatch's KL is
-                // exactly approx_kl_val. Track the last one for end-of-epoch early stop.
+                // exactly approx_kl_val. Track the last one for end-of-epoch diagnostics.
                 last_minibatch_kl_mean_gpu = Some(approx_kl_val.shallow_clone());
             }
 
-            // Single end-of-epoch host sync covering both the epoch-mean KL and
-            // the last-minibatch KL used for early stopping. Avoids per-minibatch
-            // D2H stalls that previously blocked the training pipeline.
+            // Single end-of-epoch host sync covering both the epoch-mean KL used
+            // for early stopping and the last-minibatch KL diagnostic. Avoids
+            // per-minibatch D2H stalls that previously blocked the training pipeline.
             let mean_epoch_kl = if let Some(last_mb) = last_minibatch_kl_mean_gpu {
                 let stacked = Tensor::stack(
                     &[&(&epoch_kl_gpu / epoch_kl_count.max(1) as f64), &last_mb],
@@ -462,6 +463,7 @@ impl Trainer {
                 // Epoch had no minibatches; keep prior `last_minibatch_approx_kl`.
                 0.0
             };
+            mean_epoch_approx_kl = mean_epoch_kl;
             println!(
                 "Epoch {}/{}: RatioKL {:.4} (last mb {:.4})",
                 _epoch + 1,
@@ -469,9 +471,7 @@ impl Trainer {
                 mean_epoch_kl,
                 last_minibatch_approx_kl
             );
-            if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER
-                || last_minibatch_approx_kl > TARGET_KL * KL_STOP_MULTIPLIER
-            {
+            if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
                 break 'epoch_loop;
             }
         }
@@ -495,6 +495,7 @@ impl Trainer {
             total_entropy_weighted,
             entropy_min,
             entropy_max,
+            mean_epoch_approx_kl,
             last_minibatch_approx_kl,
         }
     }

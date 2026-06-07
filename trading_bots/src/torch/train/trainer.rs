@@ -29,6 +29,7 @@ pub(super) struct AdvantageData {
     pub(super) advantages: Tensor,
     pub(super) returns: Tensor,
     pub(super) adv_stats: Tensor,
+    pub(super) adv_stats_shaped: Tensor,
     pub(super) reset_layout_bank_cpu: Tensor,
     pub(super) reset_slots_by_chunk: Tensor,
     pub(super) reset_chunks_have_slots: Vec<bool>,
@@ -49,6 +50,7 @@ pub(super) struct UpdateMetrics {
     pub(super) total_entropy_weighted: Tensor,
     pub(super) entropy_min: Tensor,
     pub(super) entropy_max: Tensor,
+    pub(super) mean_epoch_approx_kl: f64,
     pub(super) last_minibatch_approx_kl: f64,
 }
 

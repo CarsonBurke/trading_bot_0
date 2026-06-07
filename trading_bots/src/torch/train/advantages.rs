@@ -74,6 +74,19 @@ impl Trainer {
         // Computed once; per-minibatch standardization in update.rs refines it.
         let advantages = tch::no_grad(|| rank_gaussian_normalize(&advantages));
 
+        // Post-shaping advantage stats: this is what the policy actually trains on.
+        let adv_stats_shaped = tch::no_grad(|| {
+            Tensor::stack(
+                &[
+                    advantages.mean(Kind::Float),
+                    advantages.std(false),
+                    advantages.min(),
+                    advantages.max(),
+                ],
+                0,
+            )
+        });
+
         let total_samples = self.rollout_steps * self.rollout.nprocs;
         let minibatch_size = minibatch_samples_from_total(total_samples, self.rollout.nprocs);
         let chunk_batch_size =
@@ -102,6 +115,7 @@ impl Trainer {
             advantages,
             returns,
             adv_stats,
+            adv_stats_shaped,
             reset_layout_bank_cpu,
             reset_slots_by_chunk,
             reset_chunks_have_slots,

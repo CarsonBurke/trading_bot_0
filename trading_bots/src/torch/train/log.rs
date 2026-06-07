@@ -114,6 +114,7 @@ impl Trainer {
                 mean_critic_grad_norm_t.view([1]),
                 clip_fraction_t.view([1]),
                 adv_data.adv_stats.view([3]),
+                adv_data.adv_stats_shaped.view([4]),
                 beta_policy_stats.view([4]),
                 entropy_mean_t.view([1]),
                 metrics.entropy_min.view([1]),
@@ -124,7 +125,7 @@ impl Trainer {
             0,
         );
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 29]);
+            .unwrap_or_else(|_| vec![0.0; 33]);
         let mean_policy_loss = all_scalars_vec[0];
         let mean_value_loss = all_scalars_vec[1];
         let mean_clip_gap = all_scalars_vec[2];
@@ -134,11 +135,17 @@ impl Trainer {
         let clip_fraction = all_scalars_vec[6];
         let (adv_mean, adv_min, adv_max) =
             (all_scalars_vec[7], all_scalars_vec[8], all_scalars_vec[9]);
-        let beta_policy_stats_vec = &all_scalars_vec[10..14];
+        let (adv_shaped_mean, adv_shaped_std, adv_shaped_min, adv_shaped_max) = (
+            all_scalars_vec[10],
+            all_scalars_vec[11],
+            all_scalars_vec[12],
+            all_scalars_vec[13],
+        );
+        let beta_policy_stats_vec = &all_scalars_vec[14..18];
         let (entropy_mean, entropy_min_val, entropy_max_val) = (
-            all_scalars_vec[14],
-            all_scalars_vec[15],
-            all_scalars_vec[16],
+            all_scalars_vec[18],
+            all_scalars_vec[19],
+            all_scalars_vec[20],
         );
         let (
             return_min,
@@ -148,12 +155,12 @@ impl Trainer {
             below_support_frac,
             above_support_frac,
         ) = (
-            all_scalars_vec[17],
-            all_scalars_vec[18],
-            all_scalars_vec[19],
-            all_scalars_vec[20],
             all_scalars_vec[21],
             all_scalars_vec[22],
+            all_scalars_vec[23],
+            all_scalars_vec[24],
+            all_scalars_vec[25],
+            all_scalars_vec[26],
         );
         let (
             value_pred_mean,
@@ -163,15 +170,15 @@ impl Trainer {
             value_residual_rmse,
             value_return_corr,
         ) = (
-            all_scalars_vec[23],
-            all_scalars_vec[24],
-            all_scalars_vec[25],
-            all_scalars_vec[26],
             all_scalars_vec[27],
             all_scalars_vec[28],
+            all_scalars_vec[29],
+            all_scalars_vec[30],
+            all_scalars_vec[31],
+            all_scalars_vec[32],
         );
 
-        let last_minibatch_approx_kl = metrics.last_minibatch_approx_kl;
+        let mean_epoch_approx_kl = metrics.mean_epoch_approx_kl;
         let primary = self.env.primary_mut();
         primary
             .meta_history
@@ -195,7 +202,7 @@ impl Trainer {
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
         primary
             .meta_history
-            .record_approx_kl(last_minibatch_approx_kl);
+            .record_approx_kl(mean_epoch_approx_kl);
         primary.meta_history.record_hl_gauss_range_stats(
             return_min,
             return_max,
@@ -208,6 +215,16 @@ impl Trainer {
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), ClipGap: {:.4}, ActorGradNorm: {:.4}, CriticGradNorm: {:.4}",
             mean_policy_loss, mean_value_loss, explained_var, mean_clip_gap, mean_actor_grad_norm, mean_critic_grad_norm
+        );
+        println!(
+            "  Adv raw: μ {:.4}, min {:.4}, max {:.4} | shaped: μ {:.4}, σ {:.4}, min {:.4}, max {:.4}",
+            adv_mean,
+            adv_min,
+            adv_max,
+            adv_shaped_mean,
+            adv_shaped_std,
+            adv_shaped_min,
+            adv_shaped_max
         );
         println!(
             "  ValueDiag: pred μ/σ {:.3}/{:.3}, target μ/σ {:.3}/{:.3}, RMSE {:.3}, Corr {:.3}",
