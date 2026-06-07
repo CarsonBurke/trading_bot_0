@@ -145,6 +145,66 @@ impl TradingModel {
         }
     }
 
+    pub(in crate::torch::model) fn ensure_batched(&self, t: &Tensor) -> Tensor {
+        if t.dim() == 1 {
+            t.unsqueeze(0)
+        } else {
+            t.shallow_clone()
+        }
+    }
+
+    pub(in crate::torch::model) fn is_full_obs(&self, new_deltas: &Tensor) -> bool {
+        let raw_full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
+        let layout_full_obs = self.price_input_dim();
+        match new_deltas.dim() {
+            1 => {
+                let width = new_deltas.size()[0];
+                width == raw_full_obs || width == layout_full_obs
+            }
+            2 => {
+                let width = new_deltas.size()[1];
+                width == raw_full_obs || width == layout_full_obs
+            }
+            _ => false,
+        }
+    }
+
+    pub(in crate::torch::model) fn live_fill_from_layout(layout3d: &Tensor) -> Tensor {
+        layout3d
+            .select(1, UNIFORM_STREAM_PATCH_COUNT - 1)
+            .isnan()
+            .logical_not()
+            .sum_dim_intlist([1].as_slice(), false, Kind::Int64)
+    }
+
+    pub(in crate::torch::model) fn advance_layout_and_reembed_inplace(
+        &self,
+        state: &mut StreamState,
+        new_deltas: &Tensor,
+    ) {
+        let rows = new_deltas.size()[0] * TICKERS_COUNT;
+        let row_deltas = new_deltas.reshape([rows, 1]);
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
+        let flat_layout = state.uniform_layout.view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
+        let mut shifted_valid = Tensor::zeros(
+            [rows, history_len - 1],
+            (flat_layout.kind(), flat_layout.device()),
+        );
+        let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
+        let _ = flat_layout
+            .narrow(1, 0, history_len - 1)
+            .copy_(&shifted_valid);
+        let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
+        state.uniform_patch_tokens = self.patch_embed(&flat_layout);
+        state
+            .uniform_live_fill_host
+            .fill(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        let _ = state
+            .uniform_live_fill
+            .fill_(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        state.initialized = true;
+    }
+
     pub fn variant(&self) -> ModelVariant {
         self.variant
     }
@@ -181,11 +241,7 @@ impl TradingModel {
             ModelVariant::UniformStream,
             "uniform_stream_layout_from_raw_input is only valid for UniformStream",
         );
-        let price = if price_deltas.dim() == 1 {
-            price_deltas.unsqueeze(0)
-        } else {
-            price_deltas.shallow_clone()
-        };
+        let price = self.ensure_batched(price_deltas);
         let price = self.cast_inputs(&self.maybe_to_device(&price, self.device));
         let batch_size = price.size()[0];
         self.uniform_stream_layout_from_raw(

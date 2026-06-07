@@ -24,11 +24,7 @@ impl TradingModel {
         static_features: &Tensor,
         state: &mut StreamState,
     ) -> ModelOutput {
-        let static_features = if static_features.dim() == 1 {
-            static_features.unsqueeze(0)
-        } else {
-            static_features.shallow_clone()
-        };
+        let static_features = self.ensure_batched(static_features);
         let static_features = self.cast_inputs(&static_features);
         if self.variant == ModelVariant::UniformStream {
             return self.uniform_stream_cached_forward(&static_features, state);
@@ -47,11 +43,7 @@ impl TradingModel {
         if self.variant != ModelVariant::UniformStream || env_indices.is_empty() {
             return;
         }
-        let layouts = if layouts.dim() == 1 {
-            layouts.unsqueeze(0)
-        } else {
-            layouts.shallow_clone()
-        };
+        let layouts = self.ensure_batched(layouts);
         let layouts = self.cast_inputs(&layouts);
         let expected = TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN;
         assert_eq!(
@@ -71,11 +63,7 @@ impl TradingModel {
         ]);
         let patch_tokens =
             self.patch_embed(&layouts.view([layouts.size()[0], UNIFORM_STREAM_LAYOUT_LEN]));
-        let live_fill = layouts
-            .select(1, UNIFORM_STREAM_PATCH_COUNT - 1)
-            .isnan()
-            .logical_not()
-            .sum_dim_intlist([1].as_slice(), false, Kind::Int64);
+        let live_fill = Self::live_fill_from_layout(&layouts);
         let live_fill_host = Vec::<i64>::try_from(live_fill.to_device(tch::Device::Cpu)).unwrap();
         let row_indices = env_indices
             .iter()
@@ -133,11 +121,7 @@ impl TradingModel {
         if self.variant != ModelVariant::UniformStream || env_idx.size()[0] == 0 {
             return;
         }
-        let layouts = if layouts.dim() == 1 {
-            layouts.unsqueeze(0)
-        } else {
-            layouts.shallow_clone()
-        };
+        let layouts = self.ensure_batched(layouts);
         let layouts = self.cast_inputs(&layouts);
         let expected = TICKERS_COUNT * UNIFORM_STREAM_LAYOUT_LEN;
         assert_eq!(
@@ -228,11 +212,7 @@ impl TradingModel {
                 UNIFORM_STREAM_PATCH_SIZE,
             ])
             .copy();
-        let live_fill = layout
-            .select(1, UNIFORM_STREAM_PATCH_COUNT - 1)
-            .isnan()
-            .logical_not()
-            .sum_dim_intlist([1].as_slice(), false, Kind::Int64);
+        let live_fill = Self::live_fill_from_layout(&layout);
         state.uniform_layout = layout;
         state.uniform_patch_tokens = self.patch_embed(
             &state
@@ -252,11 +232,7 @@ impl TradingModel {
         state: &mut StreamState,
         replay_mode: bool,
     ) -> ModelOutput {
-        let new_deltas = if new_deltas.dim() == 1 {
-            new_deltas.unsqueeze(0)
-        } else {
-            new_deltas.shallow_clone()
-        };
+        let new_deltas = self.ensure_batched(new_deltas);
         let batch_size = new_deltas.size()[0];
         let state_batch_size = state.uniform_live_fill.size()[0];
         assert_eq!(
@@ -264,27 +240,7 @@ impl TradingModel {
             "stream state batch size mismatch"
         );
 
-        let rows = batch_size * TICKERS_COUNT;
-        let row_deltas = new_deltas.reshape([rows, 1]);
-        let history_len = PRICE_DELTAS_PER_TICKER as i64;
-        let flat_layout = state.uniform_layout.view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
-        let mut shifted_valid = Tensor::zeros(
-            [rows, history_len - 1],
-            (flat_layout.kind(), flat_layout.device()),
-        );
-        let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
-        let _ = flat_layout
-            .narrow(1, 0, history_len - 1)
-            .copy_(&shifted_valid);
-        let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
-        state.uniform_patch_tokens = self.patch_embed(&flat_layout);
-        state
-            .uniform_live_fill_host
-            .fill(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
-        let _ = state
-            .uniform_live_fill
-            .fill_(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
-        state.initialized = true;
+        self.advance_layout_and_reembed_inplace(state, &new_deltas);
         if replay_mode {
             self.uniform_stream_replay_forward(static_features, state)
         } else {
@@ -315,24 +271,8 @@ impl TradingModel {
         let new_deltas = self.cast_inputs(new_deltas);
         let static_features = self.cast_inputs(static_features);
 
-        let raw_full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
-        let layout_full_obs = self.price_input_dim();
-        let is_full = match new_deltas.dim() {
-            1 => {
-                let width = new_deltas.size()[0];
-                width == raw_full_obs || width == layout_full_obs
-            }
-            2 => {
-                let width = new_deltas.size()[1];
-                width == raw_full_obs || width == layout_full_obs
-            }
-            _ => false,
-        };
-        let static_features = if static_features.dim() == 1 {
-            static_features.unsqueeze(0)
-        } else {
-            static_features.shallow_clone()
-        };
+        let is_full = self.is_full_obs(&new_deltas);
+        let static_features = self.ensure_batched(&static_features);
 
         if self.variant == ModelVariant::UniformStream {
             if is_full {
@@ -404,16 +344,8 @@ impl TradingModel {
                 self.device
             );
         }
-        let price = if price_deltas.dim() == 1 {
-            price_deltas.unsqueeze(0)
-        } else {
-            price_deltas.shallow_clone()
-        };
-        let static_features = if static_features.dim() == 1 {
-            static_features.unsqueeze(0)
-        } else {
-            static_features.shallow_clone()
-        };
+        let price = self.ensure_batched(price_deltas);
+        let static_features = self.ensure_batched(static_features);
         let price = self.cast_inputs(&price);
         let static_features = self.cast_inputs(&static_features);
 
