@@ -91,7 +91,6 @@ pub struct TradingModel {
     pub(in crate::torch::model) gqa_layers: Vec<GqaBlock>,
     pub(in crate::torch::model) exogenous_ticker_block: CrossAttnFfnBlock,
     pub(in crate::torch::model) exo_mlp: ExoMLP,
-    pub(in crate::torch::model) exo_embed_ln: RMSNorm,
     pub(in crate::torch::model) rope: RotaryEmbedding,
     pub(in crate::torch::model) exo_feat_w: Tensor,
     pub(in crate::torch::model) exo_feat_b: Tensor,
@@ -306,7 +305,6 @@ impl TradingModel {
             init_scale,
         );
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
-        let exo_embed_ln = RMSNorm::new(&(p / "exo_embed_ln"), spec.model_dim, 1e-6);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
         // Bidirectional trunk runs over exactly S patch positions.
         let rope = RotaryEmbedding::new(seq_len, head_dim, ROPE_DIMS, p.device());
@@ -355,7 +353,6 @@ impl TradingModel {
             gqa_layers,
             exogenous_ticker_block,
             exo_mlp,
-            exo_embed_ln,
             rope,
             exo_feat_w,
             exo_feat_b,
@@ -441,7 +438,7 @@ impl TradingModel {
         batch_size: i64,
     ) -> Tensor {
         let exo_kv = self.build_exo_kv(global_static, per_ticker_static, batch_size);
-        self.exo_mlp.forward(&self.exo_embed_ln.forward(&exo_kv))
+        self.exo_mlp.forward(&exo_kv)
     }
 
     pub(in crate::torch::model) fn patch_latent_stem_on_device(
