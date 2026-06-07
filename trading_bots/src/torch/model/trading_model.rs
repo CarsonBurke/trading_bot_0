@@ -12,8 +12,8 @@ use super::config::{
     UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
 };
 use super::init::{
-    linear_orthogonal, linear_orthogonal_with_bias, linear_with_same_dtype, residual_init_scale,
-    truncated_normal_init, xavier_normal_std,
+    linear_orthogonal, linear_orthogonal_with_bias, linear_with_same_dtype, truncated_normal_init,
+    xavier_normal_std,
 };
 use super::rmsnorm::RMSNorm;
 use super::rope::{RotaryEmbedding, ROPE_DIMS};
@@ -218,9 +218,6 @@ impl TradingModel {
         );
         assert_eq!(ROPE_DIMS % 2, 0, "RoPE dimensions must be even");
         let gqa_layers_count = spec.gqa_layers;
-        // SA + FFN per layer = 2 sublayers each, plus 1 CA sublayer after layer 0
-        let num_residual_sublayers = gqa_layers_count * 2 + 1;
-        let init_scale = residual_init_scale(num_residual_sublayers);
         let patch_configs = spec.patch_configs;
         let (total_days, seq_len) = compute_patch_totals(patch_configs);
         if config.variant == ModelVariant::UniformStream {
@@ -260,7 +257,7 @@ impl TradingModel {
                 stdev: xavier_std,
             },
         );
-        let pma = PmaReadout::new(&(p / "pma_readout"), spec.model_dim, spec.ff_dim, init_scale);
+        let pma = PmaReadout::new(&(p / "pma_readout"), spec.model_dim, spec.ff_dim);
         let patch_stream_proj = nn::linear(
             p / "patch_stream_proj",
             UNIFORM_STREAM_PATCH_SIZE + 1, // patch values + fill_fraction
@@ -271,9 +268,9 @@ impl TradingModel {
                 bias: false,
             },
         );
-        let input_ln = RMSNorm::new(&(p / "input_ln"), spec.model_dim, 1e-6);
-        let final_ln = RMSNorm::new(&(p / "final_ln"), spec.model_dim, 1e-6);
-        let readout_ln = RMSNorm::new(&(p / "readout_ln"), spec.model_dim, 1e-6);
+        let input_ln = RMSNorm::new(spec.model_dim, 1e-6);
+        let final_ln = RMSNorm::new(spec.model_dim, 1e-6);
+        let readout_ln = RMSNorm::new(spec.model_dim, 1e-6);
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
             for (cfg_idx, &(days, patch_size)) in patch_configs.iter().enumerate() {
@@ -288,23 +285,11 @@ impl TradingModel {
         };
 
         let gqa_layers = (0..gqa_layers_count)
-            .map(|i| {
-                GqaBlock::new(
-                    &(p / format!("gqa_{}", i)),
-                    spec.model_dim,
-                    spec.ff_dim,
-                    init_scale,
-                    i,
-                )
-            })
+            .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim, i))
             .collect::<Vec<_>>();
-        let exogenous_ticker_block = CrossAttnFfnBlock::new(
-            &(p / "cross_attn_0"),
-            spec.model_dim,
-            spec.ff_dim,
-            init_scale,
-        );
-        let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
+        let exogenous_ticker_block =
+            CrossAttnFfnBlock::new(&(p / "cross_attn_0"), spec.model_dim, spec.ff_dim);
+        let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
         // Bidirectional trunk runs over exactly S patch positions.
         let rope = RotaryEmbedding::new(seq_len, head_dim, ROPE_DIMS, p.device());
@@ -321,12 +306,8 @@ impl TradingModel {
             &[NUM_EXO_TOKENS, spec.model_dim],
             Init::Const(0.0),
         );
-        let endogenous_ticker_block = EndogenousTickerBlock::new(
-            &(p / "inter_ticker_0"),
-            spec.model_dim,
-            spec.ff_dim,
-            init_scale,
-        );
+        let endogenous_ticker_block =
+            EndogenousTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
         assert_eq!(
             ACTION_COUNT, TICKERS_COUNT,
             "per-ticker actor head requires one action per ticker"
@@ -467,8 +448,9 @@ impl TradingModel {
         self.input_ln.forward(&patch_tokens)
     }
 
-    /// Per-config enrichment avoids expanding each patch to the full history width,
-    /// then projects all tokens in one fused einsum.
+    /// Multi-scale BENCHMARK-only path; the default/live training path is
+    /// `patch_embed_stream` (UniformStream). Per-config enrichment avoids expanding
+    /// each patch to the full history width, then projects all tokens in one fused einsum.
     pub(in crate::torch::model) fn patch_embed(&self, deltas: &Tensor) -> Tensor {
         if self.variant == ModelVariant::UniformStream {
             return self.patch_embed_stream(deltas);

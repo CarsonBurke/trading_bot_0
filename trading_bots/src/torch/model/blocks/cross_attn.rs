@@ -17,13 +17,8 @@ pub(in crate::torch::model) struct CrossAttnFfnBlock {
 }
 
 impl CrossAttnFfnBlock {
-    pub(in crate::torch::model) fn new(
-        p: &nn::Path,
-        model_dim: i64,
-        ff_dim: i64,
-        init_scale: f64,
-    ) -> Self {
-        let cross_attn = ExogenousTickerBlock::new(&(p / "cross_attn"), model_dim, init_scale);
+    pub(in crate::torch::model) fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
+        let cross_attn = ExogenousTickerBlock::new(&(p / "cross_attn"), model_dim);
         Self::new_with_cross_attn(p, model_dim, ff_dim, cross_attn)
     }
 
@@ -33,7 +28,7 @@ impl CrossAttnFfnBlock {
         ff_dim: i64,
         cross_attn: ExogenousTickerBlock,
     ) -> Self {
-        let ffn_ln = RMSNorm::new(&(p / "ffn_ln"), model_dim, 1e-6);
+        let ffn_ln = RMSNorm::new(model_dim, 1e-6);
         let ffn_fc1 = linear_truncated(p, "ffn_fc1", model_dim, ff_dim);
         let ffn_fc2 = linear_residual_out(p, "ffn_fc2", ff_dim, model_dim);
         let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));

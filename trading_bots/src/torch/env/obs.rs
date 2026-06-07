@@ -1,6 +1,4 @@
-use crate::torch::constants::{
-    GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT,
-};
+use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
 use shared::constants::{
     STATIC_OBSERVATIONS as STATIC_OBSERVATIONS_USIZE, TICKERS_COUNT as TICKERS_COUNT_USIZE,
 };
@@ -46,7 +44,7 @@ impl Env {
 
         let position_percents = self.account.position_percents(&self.prices, absolute_step);
 
-        for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
+        for &real_idx in self.ticker_perm.iter() {
             let m = &self.momentum[real_idx];
             let e = &self.earnings[real_idx];
 

@@ -101,7 +101,3 @@ pub(in crate::torch::model) fn linear_residual_out(
         },
     )
 }
-
-pub(in crate::torch::model) fn residual_init_scale(num_residual_sublayers: usize) -> f64 {
-    1.0 / (2.0 * num_residual_sublayers as f64).sqrt()
-}

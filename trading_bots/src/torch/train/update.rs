@@ -41,7 +41,6 @@ impl Trainer {
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_clip_gap_weighted = Tensor::zeros([], (Kind::Float, device));
-        // Explained variance: EV = 1 - Var(residuals) / Var(targets)
         let mut actor_grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut critic_grad_norm_sum = Tensor::zeros([], (Kind::Float, device));
         let mut total_sample_count = 0i64;
@@ -495,7 +494,6 @@ impl Trainer {
             entropy_min,
             entropy_max,
             mean_epoch_approx_kl,
-            last_minibatch_approx_kl,
         }
     }
 }

@@ -51,7 +51,6 @@ pub(super) struct UpdateMetrics {
     pub(super) entropy_min: Tensor,
     pub(super) entropy_max: Tensor,
     pub(super) mean_epoch_approx_kl: f64,
-    pub(super) last_minibatch_approx_kl: f64,
 }
 
 pub(super) struct Trainer {

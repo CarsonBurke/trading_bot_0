@@ -22,23 +22,18 @@ pub(in crate::torch::model) struct EndogenousTickerBlock {
 }
 
 impl EndogenousTickerBlock {
-    pub(in crate::torch::model) fn new(
-        p: &nn::Path,
-        model_dim: i64,
-        ff_dim: i64,
-        _init_scale: f64,
-    ) -> Self {
-        let ticker_ln = RMSNorm::new(&(p / "ticker_ln"), model_dim, 1e-6);
+    pub(in crate::torch::model) fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
+        let ticker_ln = RMSNorm::new(model_dim, 1e-6);
         let ticker_qkv = linear_truncated(p, "ticker_qkv", model_dim, 3 * model_dim);
         let ticker_out = linear_residual_out(p, "ticker_out", model_dim, model_dim);
-        let q_norm = RMSNorm::new(&(p / "q_norm"), model_dim, 1e-6);
-        let k_norm = RMSNorm::new(&(p / "k_norm"), model_dim, 1e-6);
+        let q_norm = RMSNorm::new(model_dim, 1e-6);
+        let k_norm = RMSNorm::new(model_dim, 1e-6);
         let q_gain = p.var("q_gain", &[1], Init::Const(QK_GAIN_INIT));
         let attn_scale = p.var("attn_scale", &[model_dim], Init::Const(1.0));
         let mlp_scale = p.var("mlp_scale", &[model_dim], Init::Const(1.0));
         let mlp_fc1 = linear_truncated(p, "mlp_fc1", model_dim, ff_dim);
         let mlp_fc2 = linear_residual_out(p, "mlp_fc2", ff_dim, model_dim);
-        let mlp_ln = RMSNorm::new(&(p / "mlp_ln"), model_dim, 1e-6);
+        let mlp_ln = RMSNorm::new(model_dim, 1e-6);
         Self {
             ticker_ln,
             ticker_qkv,

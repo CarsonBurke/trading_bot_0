@@ -10,11 +10,6 @@ pub const SYMLOG_SUPPORT_MAX: f64 = 3.0;
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
 const SIGMA_RATIO: f64 = 0.5;
 
-/// Symmetric exponential: sign(x) * (exp(|x|) - 1)
-fn symexp(x: f64) -> f64 {
-    x.signum() * (x.abs().exp() - 1.0)
-}
-
 fn symexp_tensor(x: &Tensor) -> Tensor {
     x.sign() * (x.abs().exp() - 1.0)
 }
@@ -31,8 +26,6 @@ pub(crate) fn symlog_tensor(x: &Tensor) -> Tensor {
 
 /// Histogram bins for critic targets and decoding.
 pub struct HlGaussBins {
-    /// Bin centers in raw value space, kept for debug/tests.
-    pub(crate) bin_values: Tensor,
     support: Tensor,
     centers: Tensor,
     sigma: f64,
@@ -42,11 +35,9 @@ impl HlGaussBins {
     pub fn new(log_min: f64, log_max: f64, num_bins: i64, device: tch::Device) -> Self {
         let support = Tensor::linspace(log_min, log_max, num_bins + 1, (Kind::Float, device));
         let centers = (&support.narrow(0, 0, num_bins) + &support.narrow(0, 1, num_bins)) * 0.5;
-        let bin_values = symexp_tensor(&centers);
         let bin_width = (log_max - log_min) / num_bins as f64;
         let sigma = SIGMA_RATIO * bin_width;
         Self {
-            bin_values,
             support,
             centers,
             sigma,
@@ -134,7 +125,7 @@ impl HlGaussBins {
 mod tests {
     use tch::{Kind, Tensor};
 
-    use super::{symlog, HlGaussBins};
+    use super::{symexp_tensor, symlog, HlGaussBins};
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() < tol
@@ -285,10 +276,11 @@ mod tests {
     #[test]
     fn bins_are_monotonically_increasing() {
         let bins = HlGaussBins::default_for(tch::Device::Cpu);
-        let n = bins.bin_values.size()[0];
+        let bin_values = symexp_tensor(&bins.centers);
+        let n = bin_values.size()[0];
         for i in 1..n {
-            let prev = bins.bin_values.get(i - 1).double_value(&[]);
-            let curr = bins.bin_values.get(i).double_value(&[]);
+            let prev = bin_values.get(i - 1).double_value(&[]);
+            let curr = bin_values.get(i).double_value(&[]);
             assert!(
                 curr > prev,
                 "bin {i} ({curr}) not greater than bin {} ({prev})",
@@ -300,10 +292,11 @@ mod tests {
     #[test]
     fn bins_are_symmetric_around_zero() {
         let bins = HlGaussBins::default_for(tch::Device::Cpu);
-        let n = bins.bin_values.size()[0];
-        let first = bins.bin_values.get(0).double_value(&[]);
-        let last = bins.bin_values.get(n - 1).double_value(&[]);
-        let center = bins.bin_values.get(n / 2).double_value(&[]);
+        let bin_values = symexp_tensor(&bins.centers);
+        let n = bin_values.size()[0];
+        let first = bin_values.get(0).double_value(&[]);
+        let last = bin_values.get(n - 1).double_value(&[]);
+        let center = bin_values.get(n / 2).double_value(&[]);
         assert!(
             approx_eq(first, -last, 1e-4),
             "bins not symmetric: first={first}, last={last}"

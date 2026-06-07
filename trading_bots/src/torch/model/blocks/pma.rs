@@ -17,12 +17,7 @@ pub(in crate::torch::model) struct PmaReadout {
 }
 
 impl PmaReadout {
-    pub(in crate::torch::model) fn new(
-        p: &nn::Path,
-        model_dim: i64,
-        ff_dim: i64,
-        init_scale: f64,
-    ) -> Self {
+    pub(in crate::torch::model) fn new(p: &nn::Path, model_dim: i64, ff_dim: i64) -> Self {
         let seeds = p.var(
             "pma_seeds",
             &[2, model_dim],
@@ -35,7 +30,6 @@ impl PmaReadout {
         // history) reaches the readout at initialization, rather than the seeds
         // passing through a zeroed residual unchanged. The FFN out-proj keeps its
         // residual-zero init (identity at start), matching the codebase idiom.
-        let _ = init_scale;
         let pma_path = p / "pma";
         let cross_attn = ExogenousTickerBlock::new_with_output_init(
             &(&pma_path / "cross_attn"),
