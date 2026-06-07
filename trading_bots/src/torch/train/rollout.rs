@@ -52,11 +52,13 @@ impl Trainer {
                     .narrow(0, chunk_row, self.rollout.nprocs)
                     .copy_(&boundary_layout);
             }
-            let _ = self
-                .s_static_obs
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&self.obs_static.unsqueeze(1));
+            write_chunk_slot(
+                &self.s_static_obs,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &self.obs_static,
+            );
 
             let _ = self
                 .action_host_view
@@ -70,11 +72,13 @@ impl Trainer {
             );
             let reset_indices = &self.cpu_step_batch.reset_indices;
             let reset_price_deltas = &self.cpu_step_batch.reset_price_deltas;
-            let _ = self
-                .s_step_deltas
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&self.step_deltas.unsqueeze(1));
+            write_chunk_slot(
+                &self.s_step_deltas,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &self.step_deltas,
+            );
             let mut reset_replay = None;
             if !reset_indices.is_empty() {
                 let reset_count = reset_indices.len() as i64;
@@ -134,16 +138,20 @@ impl Trainer {
                 );
             }
 
-            let _ = self
-                .s_actions
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&actions.unsqueeze(1));
-            let _ = self
-                .s_old_log_probs
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&action_log_prob.unsqueeze(1));
+            write_chunk_slot(
+                &self.s_actions,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &actions,
+            );
+            write_chunk_slot(
+                &self.s_old_log_probs,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &action_log_prob,
+            );
 
             let portfolio_reward =
                 self.step_reward_per_ticker
@@ -156,21 +164,27 @@ impl Trainer {
                 let _ =
                     debug_tensor_stats("step_is_done", &self.step_is_done, episode as i64, step);
             }
-            let _ = self
-                .s_rewards
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&portfolio_reward.unsqueeze(1));
-            let _ = self
-                .s_dones
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&self.step_is_done.unsqueeze(1));
-            let _ = self
-                .s_values
-                .narrow(0, chunk_row, self.rollout.nprocs)
-                .narrow(1, chunk_offset, 1)
-                .copy_(&values.unsqueeze(1));
+            write_chunk_slot(
+                &self.s_rewards,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &portfolio_reward,
+            );
+            write_chunk_slot(
+                &self.s_dones,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &self.step_is_done,
+            );
+            write_chunk_slot(
+                &self.s_values,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &values,
+            );
 
             let trading_model = &self.trading_model;
             let step_deltas = &self.step_deltas;
@@ -219,4 +233,11 @@ impl Trainer {
             reset_slots_host,
         }
     }
+}
+
+fn write_chunk_slot(dst: &Tensor, chunk_row: i64, nprocs: i64, chunk_offset: i64, src: &Tensor) {
+    let _ = dst
+        .narrow(0, chunk_row, nprocs)
+        .narrow(1, chunk_offset, 1)
+        .copy_(&src.unsqueeze(1));
 }

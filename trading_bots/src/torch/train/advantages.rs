@@ -1,7 +1,7 @@
 use tch::{autocast, Kind, Tensor};
 
 use super::gae::compute_gae_chunked;
-use super::geometry::minibatch_samples_from_total;
+use super::geometry::{chunk_batch_from_minibatch, minibatch_samples_from_total};
 use super::trainer::{AdvantageData, RolloutData, Trainer};
 
 const RANK_GAUSS_CLAMP: f64 = 0.999;
@@ -90,7 +90,7 @@ impl Trainer {
         let total_samples = self.rollout_steps * self.rollout.nprocs;
         let minibatch_size = minibatch_samples_from_total(total_samples, self.rollout.nprocs);
         let chunk_batch_size =
-            ((minibatch_size + self.rollout.ppo_chunk_len - 1) / self.rollout.ppo_chunk_len).max(1);
+            chunk_batch_from_minibatch(minibatch_size, self.rollout.ppo_chunk_len);
         // Keep reset slots flat and gather only the current minibatch to avoid
         // carrying a second chunk-major copy of the rollout on device.
         let reset_slots_by_chunk = Tensor::from_slice(&rollout_data.reset_slots_host)
