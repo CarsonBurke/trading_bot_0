@@ -121,7 +121,6 @@ impl TradingModel {
             state.uniform_live_fill_host[*env_idx] =
                 live_fill_host[(reset_i as i64 * TICKERS_COUNT) as usize];
         }
-        self.prefill_uniform_prefix_base_cache_indexed(state, &row_idx);
     }
 
     pub(crate) fn reset_uniform_stream_envs_from_layout_indexed(
@@ -172,7 +171,6 @@ impl TradingModel {
         let _ = state
             .uniform_live_fill
             .index_fill_(0, env_idx, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
-        self.prefill_uniform_prefix_base_cache_indexed(state, row_idx);
     }
 
     pub fn reset_uniform_stream_envs(
@@ -213,7 +211,6 @@ impl TradingModel {
                 .fill_(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
             state.uniform_live_fill_host[*env_idx] = UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL;
         }
-        self.prefill_uniform_prefix_base_cache(state);
     }
 
     pub(super) fn init_uniform_from_full_on_device(&self, price: &Tensor, state: &mut StreamState) {
@@ -246,7 +243,6 @@ impl TradingModel {
         state.uniform_live_fill_host =
             Vec::<i64>::try_from(live_fill.to_device(tch::Device::Cpu)).unwrap();
         state.initialized = true;
-        self.prefill_uniform_prefix_base_cache(state);
     }
 
     pub(super) fn step_uniform_stream_state_on_device(
@@ -289,7 +285,6 @@ impl TradingModel {
             .uniform_live_fill
             .fill_(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
         state.initialized = true;
-        self.prefill_uniform_prefix_base_cache(state);
         if replay_mode {
             self.uniform_stream_replay_forward(static_features, state)
         } else {

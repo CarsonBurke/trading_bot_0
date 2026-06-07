@@ -78,21 +78,18 @@ impl GqaBlock {
         }
     }
 
-    pub(in crate::torch::model) fn forward_with_rope_positions(
+    /// Bidirectional self-attention over the full patch sequence: no causal mask,
+    /// full all-to-all attention. RoPE positions are supplied explicitly.
+    pub(in crate::torch::model) fn forward_bidirectional(
         &self,
         x: &Tensor,
         x0: &Tensor,
-        role_bias: &Tensor,
         rope: &RotaryEmbedding,
         positions: &Tensor,
-        attn_mask: Option<&Tensor>,
-        causal: bool,
     ) -> Tensor {
         let (b, s, _d) = x.size3().unwrap();
         let mix = self.resid_mix.to_kind(x.kind());
-        let x = x * mix.get(0).view([1, 1, -1])
-            + x0 * mix.get(1).view([1, 1, -1])
-            + role_bias.to_kind(x.kind());
+        let x = x * mix.get(0).view([1, 1, -1]) + x0 * mix.get(1).view([1, 1, -1]);
 
         let (q, k, v) = self.project_qkv_with_positions(&x, rope, positions);
 
@@ -100,9 +97,9 @@ impl GqaBlock {
             &q,
             &k,
             &v,
-            attn_mask,
+            None::<&Tensor>,
             0.0,
-            causal && attn_mask.is_none(),
+            false,
             None,
             true,
         );
@@ -110,38 +107,6 @@ impl GqaBlock {
         let out = linear_with_same_dtype(&out, &self.attn_out);
         let out = &out * self.attn_scale.to_kind(out.kind()).view([1, 1, -1]);
         self.apply_ffn(&(&x + out))
-    }
-
-    fn project_qkv(
-        &self,
-        x: &Tensor,
-        rope: &RotaryEmbedding,
-        rope_offset: i64,
-    ) -> (Tensor, Tensor, Tensor) {
-        let (b, s, d) = x.size3().unwrap();
-        let head_dim = d / GQA_NUM_Q_HEADS;
-        let normed = self.attn_ln.forward(x);
-        let qkv = linear_with_same_dtype(&normed, &self.attn_qkv);
-        let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
-        let q = parts[0]
-            .reshape([b, s, GQA_NUM_Q_HEADS, head_dim])
-            .permute([0, 2, 1, 3]);
-        let k = parts[1]
-            .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
-            .permute([0, 2, 1, 3]);
-        let v = parts[2]
-            .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
-            .permute([0, 2, 1, 3]);
-        let q = self.q_norm.forward(&q);
-        let k = self.k_norm.forward(&k);
-        let q = rope.apply_from(&q, rope_offset);
-        let k = rope.apply_from(&k, rope_offset);
-        let q = &q
-            * self
-                .q_gain
-                .to_kind(q.kind())
-                .view([1, GQA_NUM_Q_HEADS, 1, 1]);
-        (q, k, v)
     }
 
     fn project_qkv_with_positions(
@@ -185,31 +150,4 @@ impl GqaBlock {
         let ffn_out = &ffn_out * self.mlp_scale.to_kind(ffn_out.kind()).view([1, 1, -1]);
         x + ffn_out
     }
-
-    pub(in crate::torch::model) fn forward_prefix_and_cache(
-        &self,
-        x: &Tensor,
-        x0: &Tensor,
-        rope: &RotaryEmbedding,
-    ) -> (Tensor, Tensor, Tensor) {
-        let mix = self.resid_mix.to_kind(x.kind());
-        let x = x * mix.get(0).view([1, 1, -1]) + x0 * mix.get(1).view([1, 1, -1]);
-        let (q, k, v) = self.project_qkv(&x, rope, 0);
-        let out = Tensor::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            None::<&Tensor>,
-            0.0,
-            true,
-            None,
-            true,
-        );
-        let out = out.permute([0, 2, 1, 3]).contiguous().reshape(x.size());
-        let attn_out = linear_with_same_dtype(&out, &self.attn_out);
-        let attn_out = &attn_out * self.attn_scale.to_kind(attn_out.kind()).view([1, 1, -1]);
-        let x = &x + attn_out;
-        (self.apply_ffn(&x), k, v)
-    }
-
 }

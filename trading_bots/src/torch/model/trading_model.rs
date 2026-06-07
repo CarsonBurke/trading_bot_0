@@ -5,6 +5,7 @@ use super::blocks::cross_attn::CrossAttnFfnBlock;
 use super::blocks::endogenous::EndogenousTickerBlock;
 use super::blocks::exogenous::ExoMLP;
 use super::blocks::gqa::{GqaBlock, GQA_NUM_Q_HEADS};
+use super::blocks::pma::PmaReadout;
 use super::config::{
     compute_patch_totals, model_spec, ModelVariant, INTER_TICKER_AFTER, NUM_EXO_TOKENS,
     PATCH_SCALAR_FEATS, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL, UNIFORM_STREAM_LAYOUT_LEN,
@@ -49,7 +50,9 @@ impl Default for TradingModelConfig {
 /// Streaming state for inference
 /// - Ring buffer holds full delta history
 /// - Patch buffer accumulates deltas until full patch ready
-/// - No model state needed (GQA is stateless, uses full forward pass)
+/// - No model state needed: the bidirectional trunk recomputes full
+///   self-attention over the S patch window each step (no causal prefix cache),
+///   so streamed/replay readouts are identical to the batched `forward`.
 pub struct StreamState {
     /// Ring buffer: [TICKERS_COUNT, PRICE_DELTAS_PER_TICKER]
     pub delta_ring: Tensor,
@@ -69,22 +72,6 @@ pub struct StreamState {
     pub uniform_live_fill: Tensor,
     /// Host mirror of live fill to avoid per-step device syncs during streamed rollout.
     pub uniform_live_fill_host: Vec<i64>,
-    /// Prefix hidden state after layer-0 self-attention/FFN, before exogenous cross-attention.
-    pub uniform_layer0_prefix_hidden: Tensor,
-    /// Layer-0 prefix K cache for uniform streamed rollout.
-    pub uniform_layer0_prefix_k: Tensor,
-    /// Layer-0 prefix V cache for uniform streamed rollout.
-    pub uniform_layer0_prefix_v: Tensor,
-    /// Per-layer cached prefix K for uniform streamed rollout.
-    pub uniform_prefix_k: Vec<Tensor>,
-    /// Per-layer cached prefix V for uniform streamed rollout.
-    pub uniform_prefix_v: Vec<Tensor>,
-    /// Prefix x0 embedding (post-input_ln) for x0 residual mixing.
-    pub uniform_prefix_x0: Tensor,
-    /// Static features associated with the currently conditioned prefix cache.
-    pub uniform_cached_static_features: Option<Tensor>,
-    /// Exogenous tokens associated with the currently conditioned prefix cache.
-    pub uniform_cached_exo_tokens: Option<Tensor>,
 }
 
 pub struct TradingModel {
@@ -95,11 +82,12 @@ pub struct TradingModel {
     pub(in crate::torch::model) model_dim: i64,
     pub(in crate::torch::model) ff_dim: i64,
     pub(in crate::torch::model) patch_embed_weight: Tensor,
-    pub(in crate::torch::model) role_embeds: Tensor,
+    pub(in crate::torch::model) pma: PmaReadout,
     pub(in crate::torch::model) patch_config_ids: Tensor,
     pub(in crate::torch::model) patch_stream_proj: nn::Linear,
     pub(in crate::torch::model) input_ln: RMSNorm,
     pub(in crate::torch::model) final_ln: RMSNorm,
+    pub(in crate::torch::model) readout_ln: RMSNorm,
     pub(in crate::torch::model) gqa_layers: Vec<GqaBlock>,
     pub(in crate::torch::model) exogenous_ticker_block: CrossAttnFfnBlock,
     pub(in crate::torch::model) exo_mlp: ExoMLP,
@@ -273,14 +261,7 @@ impl TradingModel {
                 stdev: xavier_std,
             },
         );
-        let role_embeds = p.var(
-            "role_embeds",
-            &[2, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 0.02,
-            },
-        );
+        let pma = PmaReadout::new(&(p / "pma_readout"), spec.model_dim, spec.ff_dim, init_scale);
         let patch_stream_proj = nn::linear(
             p / "patch_stream_proj",
             UNIFORM_STREAM_PATCH_SIZE + 1, // patch values + fill_fraction
@@ -293,6 +274,7 @@ impl TradingModel {
         );
         let input_ln = RMSNorm::new(&(p / "input_ln"), spec.model_dim, 1e-6);
         let final_ln = RMSNorm::new(&(p / "final_ln"), spec.model_dim, 1e-6);
+        let readout_ln = RMSNorm::new(&(p / "readout_ln"), spec.model_dim, 1e-6);
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
             for (cfg_idx, &(days, patch_size)) in patch_configs.iter().enumerate() {
@@ -326,9 +308,8 @@ impl TradingModel {
         let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
         let exo_embed_ln = RMSNorm::new(&(p / "exo_embed_ln"), spec.model_dim, 1e-6);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
-        // +1 trunk position: the actor/critic decision forks replace the last
-        // patch and extend the sequence to S+1.
-        let rope = RotaryEmbedding::new(seq_len + 1, head_dim, ROPE_DIMS, p.device());
+        // Bidirectional trunk runs over exactly S patch positions.
+        let rope = RotaryEmbedding::new(seq_len, head_dim, ROPE_DIMS, p.device());
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -365,11 +346,12 @@ impl TradingModel {
             model_dim: spec.model_dim,
             ff_dim: spec.ff_dim,
             patch_embed_weight,
-            role_embeds,
+            pma,
             patch_config_ids,
             patch_stream_proj,
             input_ln,
             final_ln,
+            readout_ln,
             gqa_layers,
             exogenous_ticker_block,
             exo_mlp,
@@ -412,14 +394,8 @@ impl TradingModel {
         let seq = x.size()[1];
         let batch_size = bt / TICKERS_COUNT;
         let x_4d = x.view([batch_size, TICKERS_COUNT, seq, self.model_dim]);
-        // Fork layout: the last two positions are the actor/critic decision forks
-        // (which replace the live patch). Mix the last *real* patch (S-2) across
-        // tickers; never mix a fork, so role identities stay intact.
-        let live_idx = if seq > self.seq_len {
-            self.seq_len - 2
-        } else {
-            seq - 1
-        };
+        // Mix the latest patch across tickers (no-op for TICKERS_COUNT == 1).
+        let live_idx = seq - 1;
         let live = x_4d.narrow(2, live_idx, 1);
         let live_for_mix =
             live.permute([0, 2, 1, 3])
@@ -431,13 +407,9 @@ impl TradingModel {
             .permute([0, 2, 1, 3]);
         if seq == 1 {
             enriched_live.reshape([bt, seq, self.model_dim])
-        } else if live_idx + 1 == seq {
+        } else {
             let past = x_4d.narrow(2, 0, seq - 1);
             Tensor::cat(&[&past, &enriched_live], 2).reshape([bt, seq, self.model_dim])
-        } else {
-            let before = x_4d.narrow(2, 0, live_idx);
-            let after = x_4d.narrow(2, live_idx + 1, seq - live_idx - 1);
-            Tensor::cat(&[&before, &enriched_live, &after], 2).reshape([bt, seq, self.model_dim])
         }
     }
 
@@ -600,42 +572,22 @@ impl TradingModel {
         ])
     }
 
-    /// Stage 1: causal trunk over the first S-1 patches plus two head-specific
-    /// decision forks that REPLACE the last patch. Each fork is seeded from the
-    /// latest patch embedding `e_{S-1}` plus its learned role identity, and the
-    /// role identity is re-injected at every block. Actor at index S-1, critic at
-    /// index S. Returns post-`final_ln` hidden states `[rows, S+1, model_dim]`.
-    pub(in crate::torch::model) fn causal_patch_trunk(
+    /// Bidirectional trunk over all S patch embeddings: full all-to-all
+    /// self-attention (no causal mask, no fork tokens), RoPE positions
+    /// `arange(S)`. Portfolio cross-attention is injected after layer 0.
+    /// Returns post-`final_ln` hidden states `[rows, S, model_dim]` — the PMA
+    /// key/value source.
+    pub(in crate::torch::model) fn patch_trunk(
         &self,
         patch_hidden: &Tensor,
         exo_tokens: &Tensor,
     ) -> Tensor {
         let num_patches = patch_hidden.size()[1];
-        let kind = patch_hidden.kind();
-        let role = self.role_embeds.to_kind(kind);
-        let e_last = patch_hidden.select(1, num_patches - 1).unsqueeze(1);
-        let forks = &e_last + role.unsqueeze(0);
-        let past = patch_hidden.narrow(1, 0, num_patches - 1);
-        let x0 = Tensor::cat(&[&past, &forks], 1);
-        let seq_len = num_patches + 1;
-        let zeros_patches = Tensor::zeros(
-            [1, num_patches - 1, self.model_dim],
-            (kind, self.device),
-        );
-        let role_bias = Tensor::cat(&[&zeros_patches, &role.unsqueeze(0)], 1);
-        let mut x = x0.shallow_clone();
-        let rope_positions = Tensor::arange(seq_len, (Kind::Int64, self.device));
-        let attn_mask = self.fork_attention_mask(seq_len, kind);
+        let x0 = patch_hidden.shallow_clone();
+        let mut x = patch_hidden.shallow_clone();
+        let rope_positions = Tensor::arange(num_patches, (Kind::Int64, self.device));
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
-            x = layer.forward_with_rope_positions(
-                &x,
-                &x0,
-                &role_bias,
-                &self.rope,
-                &rope_positions,
-                Some(&attn_mask),
-                true,
-            );
+            x = layer.forward_bidirectional(&x, &x0, &self.rope, &rope_positions);
             if layer_idx == 0 {
                 x = self.exogenous_ticker_block.forward(&x, exo_tokens);
             }
@@ -644,28 +596,16 @@ impl TradingModel {
         self.final_ln.forward(&x)
     }
 
-    fn fork_attention_mask(&self, seq_len: i64, kind: Kind) -> Tensor {
-        let idx = Tensor::arange(seq_len, (Kind::Int64, self.device));
-        let query_idx = idx.view([seq_len, 1]);
-        let key_idx = idx.view([1, seq_len]);
-        let causal_block = key_idx.gt_tensor(&query_idx);
-        let fork_cross_block = query_idx
-            .eq(seq_len - 1)
-            .logical_and(&key_idx.eq(seq_len - 2));
-        Tensor::zeros([seq_len, seq_len], (kind, self.device))
-            .masked_fill(&causal_block.logical_or(&fork_cross_block), f64::NEG_INFINITY)
-    }
-
     pub(in crate::torch::model) fn backbone_with_actor_critic_cls(
         &self,
         patch_hidden: &Tensor,
         exo_tokens: &Tensor,
         batch_size: i64,
     ) -> ModelOutput {
-        let trunk = self.causal_patch_trunk(patch_hidden, exo_tokens);
-        let len = trunk.size()[1];
-        let actor_read = trunk.select(1, len - 2);
-        let critic_read = trunk.select(1, len - 1);
+        let encoded = self.patch_trunk(patch_hidden, exo_tokens);
+        let pooled = self.readout_ln.forward(&self.pma.forward(&encoded));
+        let actor_read = pooled.select(1, 0);
+        let critic_read = pooled.select(1, 1);
         self.head_from_actor_critic_cls(&actor_read, &critic_read, batch_size)
     }
 }

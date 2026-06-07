@@ -109,7 +109,6 @@ impl TradingModel {
             .uniform_live_fill
             .fill_(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
         state.initialized = true;
-        self.prefill_uniform_prefix_base_cache(state);
     }
 
     /// Stateless batched replay forward over B pre-built windows.
