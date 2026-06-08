@@ -24,6 +24,17 @@ pub(crate) fn symlog_tensor(x: &Tensor) -> Tensor {
     x.sign() * (x.abs() + 1.0).log()
 }
 
+/// Shared intermediates derived from raw scalar values prior to symlog encoding
+/// or range analysis: float-cast values, their flattened view, and the
+/// device/kind-aligned support with its edge scalars.
+struct PreparedValues {
+    values: Tensor,
+    flat_values: Tensor,
+    support: Tensor,
+    min_support: Tensor,
+    max_support: Tensor,
+}
+
 /// Histogram bins for critic targets and decoding.
 pub struct HlGaussBins {
     support: Tensor,
@@ -48,32 +59,38 @@ impl HlGaussBins {
         Self::new(SYMLOG_SUPPORT_MIN, SYMLOG_SUPPORT_MAX, NUM_BINS, device)
     }
 
-    fn prepare(&self, values: &Tensor) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+    fn prepare(&self, values: &Tensor) -> PreparedValues {
         let values = values.to_kind(Kind::Float);
         let flat_values = values.reshape([-1]);
         let support = self.support.to_device(values.device()).to_kind(Kind::Float);
         let min_support = support.get(0);
         let max_support = support.get(support.size()[0] - 1);
-        (values, flat_values, support, min_support, max_support)
+        PreparedValues {
+            values,
+            flat_values,
+            support,
+            min_support,
+            max_support,
+        }
     }
 
     pub fn range_stats(&self, values: &Tensor) -> Tensor {
-        let (_values, flat_values, _support, min_support, max_support) = self.prepare(values);
-        let symlog_values = symlog_tensor(&flat_values);
+        let p = self.prepare(values);
+        let symlog_values = symlog_tensor(&p.flat_values);
         let below_frac = symlog_values
-            .lt_tensor(&min_support)
+            .lt_tensor(&p.min_support)
             .to_kind(Kind::Float)
             .mean(Kind::Float);
         let above_frac = symlog_values
-            .gt_tensor(&max_support)
+            .gt_tensor(&p.max_support)
             .to_kind(Kind::Float)
             .mean(Kind::Float);
         Tensor::stack(
             &[
-                flat_values.min(),
-                flat_values.max(),
-                symexp_tensor(&min_support),
-                symexp_tensor(&max_support),
+                p.flat_values.min(),
+                p.flat_values.max(),
+                symexp_tensor(&p.min_support),
+                symexp_tensor(&p.max_support),
                 below_frac,
                 above_frac,
             ],
@@ -84,7 +101,13 @@ impl HlGaussBins {
     /// Encode scalar values [... ] into normalized hl-gauss target distributions
     /// [..., NUM_BINS] in symlog space.
     pub fn encode(&self, values: &Tensor) -> Tensor {
-        let (values, flat_values, support, min_support, max_support) = self.prepare(values);
+        let PreparedValues {
+            values,
+            flat_values,
+            support,
+            min_support,
+            max_support,
+        } = self.prepare(values);
         let t = symlog_tensor(&flat_values).clamp_tensor(Some(&min_support), Some(&max_support));
         let scaled = (&support - &t.unsqueeze(-1)) / (self.sigma * SQRT_2);
         let cdf = scaled.erf();
