@@ -1,9 +1,11 @@
+#![allow(dead_code)]
+//! Experimental trade-execution functions kept as intentionally-unmaintained references for reuse.
+
 use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE};
 
 use super::single::{Env, TRADE_EMA_ALPHA};
 
 impl Env {
-    #[allow(dead_code)]
     pub fn trade_by_delta_percent(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let mut total_commission = 0.0;
 
@@ -107,10 +109,8 @@ impl Env {
         total_commission
     }
 
-    #[allow(dead_code)]
     const WEIGHT_DELTA_MIN_TRADE_FRAC: f64 = 0.005;
 
-    #[allow(dead_code)]
     pub fn trade_by_weight_delta(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let n_tickers = self.tickers.len();
         let min_trade_frac = Self::WEIGHT_DELTA_MIN_TRADE_FRAC;
@@ -254,7 +254,6 @@ impl Env {
         total_commission
     }
 
-    #[allow(dead_code)]
     fn trade_buy_sell_to(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let mut total_commissions = 0.0;
 
@@ -311,12 +310,9 @@ impl Env {
         total_commissions
     }
 
-    #[allow(dead_code)]
     const DELTA_REBALANCE_RATE: f64 = 1.0;
-    #[allow(dead_code)]
     const DELTA_MIN_TRADE_FRAC: f64 = 0.005;
 
-    #[allow(dead_code)]
     fn trade_by_delta(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
         let n_tickers = self.tickers.len();
         let mut total_commissions = 0.0;

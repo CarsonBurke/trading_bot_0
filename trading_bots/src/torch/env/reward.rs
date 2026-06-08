@@ -4,7 +4,6 @@ use shared::constants::TICKERS_COUNT;
 pub(crate) const REWARD_SCALE: f64 = 20.0;
 
 impl Env {
-    #[allow(dead_code)]
     pub fn get_unrealized_pnl_reward_breakdown(
         &self,
         absolute_step: usize,

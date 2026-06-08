@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+//! Experimental reward functions kept as intentionally-unmaintained references for reuse.
+
 use super::reward::REWARD_SCALE;
 use super::single::Env;
 use crate::types::Position;
@@ -54,7 +57,6 @@ impl Env {
         (reward, per_ticker_rewards, 0.0)
     }
 
-    #[allow(dead_code)]
     pub fn get_shadow_benchmark_reward_breakdown(
         &self,
         absolute_step: usize,
@@ -103,7 +105,6 @@ impl Env {
         (strategy_log_return, per_ticker_rewards, cash_reward)
     }
 
-    #[allow(dead_code)]
     pub fn get_hybrid_reward_breakdown(
         &self,
         absolute_step: usize,
@@ -155,7 +156,6 @@ impl Env {
         (base_reward, per_ticker_rewards, cash_penalty)
     }
 
-    #[allow(dead_code)]
     pub fn get_cash_upswing_penalty_reward_breakdown(
         &self,
         absolute_step: usize,
@@ -205,7 +205,6 @@ impl Env {
         (strategy_log_return, per_ticker_rewards, cash_penalty)
     }
 
-    #[allow(dead_code)]
     pub fn get_unrealized_pnl_reward(&self, absolute_step: usize, _commissions: f64) -> f64 {
         if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
@@ -223,18 +222,14 @@ impl Env {
         }
     }
 
-    #[allow(dead_code)]
     const HINDSIGHT_REWARD_SCALE: f64 = 1.0;
-    #[allow(dead_code)]
     const HINDSIGHT_COMMISSION_PENALTY: f64 = 10.0;
     // Asymmetric scaling: in bull markets (best_return > 0), scale negative
     // allocation_quality more harshly. This breaks the symmetry where bear market
     // protection (+1) dominates over bull market opportunity cost (-1).
     // 1.0 = symmetric (original), >1.0 = penalize missing upside more
-    #[allow(dead_code)]
     const BULL_DOWNSIDE_SCALE: f64 = 1.5;
 
-    #[allow(dead_code)]
     pub fn get_hindsight_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if !self.has_next_transition() || self.account.total_assets <= 0.0 {
             return 0.0;
@@ -285,18 +280,14 @@ impl Env {
         (scaled_quality + commission_penalty) * Self::HINDSIGHT_REWARD_SCALE
     }
 
-    #[allow(dead_code)]
     const ACTION_OUTCOME_SCALE: f64 = 100.0;
-    #[allow(dead_code)]
     const ACTION_OUTCOME_COMMISSION_PENALTY: f64 = 5.0;
     // Conviction bonus: rewards concentrated bets that pay off.
     // Conviction = how far from uniform allocation (measured by max weight deviation).
     // Only applies when portfolio return is positive - wrong conviction is already
     // penalized by negative base return.
-    #[allow(dead_code)]
     const CONVICTION_BONUS: f64 = 1.0;
 
-    #[allow(dead_code)]
     pub fn get_action_outcome_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if !self.has_next_transition() || self.account.total_assets <= 0.0 {
             return 0.0;
@@ -352,10 +343,8 @@ impl Env {
         base_reward + conviction_bonus + commission_penalty
     }
 
-    #[allow(dead_code)]
     const COMMISSIONS_PENALTY_LAMBDA: f64 = 0.01;
 
-    #[allow(dead_code)]
     pub fn get_index_benchmark_pnl_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
@@ -388,7 +377,6 @@ impl Env {
     }
 
     #[deprecated]
-    #[allow(dead_code)]
     fn get_excess_returns_reward(&self, absolute_step: usize) -> f64 {
         if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
@@ -411,10 +399,8 @@ impl Env {
         }
     }
 
-    #[allow(dead_code)]
     const SHARPE_LAMBDA: f64 = 100.0;
 
-    #[allow(dead_code)]
     fn get_sharpe_ratio_adjusted_reward(&self, absolute_step: usize) -> f64 {
         if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
@@ -434,10 +420,8 @@ impl Env {
         }
     }
 
-    #[allow(dead_code)]
     const SORTINO_LAMBDA: f64 = 100.0;
 
-    #[allow(dead_code)]
     fn get_sortino_ratio_adjusted_reward(&self, absolute_step: usize) -> f64 {
         if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
@@ -462,10 +446,8 @@ impl Env {
         }
     }
 
-    #[allow(dead_code)]
     const RISK_ADJUSTED_REWARD_LAMBDA: f64 = 0.01;
 
-    #[allow(dead_code)]
     fn get_risk_adjusted_reward(&self, absolute_step: usize, commissions: f64) -> f64 {
         if self.has_next_transition() && self.account.total_assets > 0.0 {
             let next_absolute_step = absolute_step + 1;
