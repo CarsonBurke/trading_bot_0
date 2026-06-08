@@ -102,7 +102,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             left_lines.push(Line::from(""));
 
                             let global_labels = [
-                                "Step Progress",
                                 "Cash %",
                                 "PnL",
                                 "Drawdown",
@@ -114,8 +113,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                 if i < obs_vec.len() {
                                     let val = obs_vec[i].as_f64().unwrap_or(0.0);
                                     let color = match i {
-                                        0 => theme::BLUE,
-                                        1 => theme::GREEN,
+                                        0 => theme::GREEN,
+                                        1 => {
+                                            if val >= 0.0 {
+                                                theme::GREEN
+                                            } else {
+                                                theme::RED
+                                            }
+                                        }
                                         2 => {
                                             if val >= 0.0 {
                                                 theme::GREEN
@@ -123,15 +128,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                                 theme::RED
                                             }
                                         }
-                                        3 => {
-                                            if val >= 0.0 {
-                                                theme::GREEN
-                                            } else {
-                                                theme::RED
-                                            }
-                                        }
-                                        4 => theme::YELLOW,
-                                        5 => {
+                                        3 => theme::YELLOW,
+                                        4 => {
                                             if val >= 0.9 {
                                                 theme::GREEN
                                             } else {
@@ -142,8 +140,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                     };
 
                                     let display_val = match i {
-                                        0 | 1 | 5 => format!("{:6.2}%", val * 100.0),
-                                        2 | 3 => format!("{:+7.2}%", val * 100.0),
+                                        0 | 4 => format!("{:6.2}%", val * 100.0),
+                                        1 | 2 => format!("{:+7.2}%", val * 100.0),
                                         _ => format!("{:8.4}", val),
                                     };
 
