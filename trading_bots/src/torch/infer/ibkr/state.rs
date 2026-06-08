@@ -7,7 +7,7 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::env::earnings::EarningsIndicators;
 use crate::torch::env::macro_ind::MacroIndicators;
 use crate::torch::env::momentum::MomentumIndicators;
-use crate::torch::env::obs::{build_static_obs, GlobalObsInputs, TickerObsInputs};
+use crate::torch::env::obs::{build_static_obs, realized_weight, GlobalObsInputs, TickerObsInputs};
 use crate::types::Account;
 
 pub(super) const MAX_ACCOUNT_VALUE: Option<f64> = Some(10_000.0);
@@ -151,7 +151,10 @@ impl LiveMarketState {
             position_age: self.position_open_step[ticker_idx]
                 .map(|s| (self.step_count.saturating_sub(s) as f64 / 500.0).min(1.0))
                 .unwrap_or(0.0),
-            realized_weight: position_percent,
+            realized_weight: realized_weight(
+                position.value_with_price(current_price),
+                self.account.total_assets,
+            ),
             mom_5: momentum.mom_5[last],
             mom_20,
             mom_60: momentum.mom_60[last],

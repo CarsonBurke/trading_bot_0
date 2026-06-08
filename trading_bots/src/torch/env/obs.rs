@@ -62,6 +62,17 @@ pub struct TickerObsInputs {
     pub eps_surprise: f64,
 }
 
+/// Realized portfolio weight of a position, shared by training and live
+/// inference so the two paths cannot drift. Guards against non-positive total
+/// assets and clamps to a valid weight.
+pub fn realized_weight(position_value: f64, total_assets: f64) -> f64 {
+    if total_assets <= 0.0 {
+        0.0
+    } else {
+        (position_value / total_assets).clamp(0.0, 1.0)
+    }
+}
+
 /// Canonical static-observation builder shared by training and live inference.
 /// `tickers` must be supplied in ticker-permutation order.
 pub fn build_static_obs(

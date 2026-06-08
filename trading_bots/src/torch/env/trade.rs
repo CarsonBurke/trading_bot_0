@@ -1,4 +1,5 @@
 use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE};
+use crate::torch::env::obs::realized_weight;
 
 use super::single::{Env, TRADE_EMA_ALPHA};
 
@@ -6,18 +7,12 @@ impl Env {
     pub fn sync_realized_weights(&mut self, absolute_step: usize) {
         let n_tickers = self.tickers.len();
         let total_assets = self.account.total_assets;
-        if total_assets <= 0.0 {
-            self.realized_weights.fill(0.0);
-            return;
-        }
-
-        let inv_total_assets = 1.0 / total_assets;
         for ticker_index in 0..n_tickers {
             let price = self.prices[ticker_index][absolute_step];
             let value = self.account.positions[ticker_index].value_with_price(price);
-            self.realized_weights[ticker_index] = (value * inv_total_assets).clamp(0.0, 1.0);
+            self.realized_weights[ticker_index] = realized_weight(value, total_assets);
         }
-        self.realized_weights[n_tickers] = (self.account.cash * inv_total_assets).clamp(0.0, 1.0);
+        self.realized_weights[n_tickers] = realized_weight(self.account.cash, total_assets);
     }
 
     pub fn trade_by_target_weights(&mut self, actions: &[f64], absolute_step: usize) -> f64 {
