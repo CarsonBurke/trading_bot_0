@@ -1,5 +1,6 @@
 use shared::constants::{
     ACTION_COUNT as ACTION_COUNT_USIZE, ACTION_HISTORY_LEN as ACTION_HISTORY_LEN_USIZE,
+    TICKERS_COUNT as TICKERS_COUNT_USIZE,
 };
 
 use tch::Tensor;
@@ -73,8 +74,7 @@ impl Env {
         (step_deltas.to_vec(), static_obs.to_vec())
     }
 
-    /// Single-environment step for VecEnv
-    pub fn step_single(&mut self, actions: &[f64]) -> SingleStep {
+    fn execute_step_core(&mut self, actions: &[f64]) -> StepCoreResult {
         let absolute_step = self.episode_start_offset + self.step;
         self.account.update_total(&self.prices, absolute_step);
 
@@ -134,6 +134,21 @@ impl Env {
         }
 
         self.step += 1;
+        StepCoreResult {
+            reward,
+            reward_per_ticker,
+            is_done,
+        }
+    }
+
+    /// Single-environment step for VecEnv
+    pub fn step_single(&mut self, actions: &[f64]) -> SingleStep {
+        let StepCoreResult {
+            reward,
+            reward_per_ticker,
+            is_done,
+        } = self.execute_step_core(actions);
+
         let (price_deltas, static_obs) = self.get_next_obs();
         SingleStep {
             reward,
@@ -145,65 +160,12 @@ impl Env {
     }
 
     pub fn step_step_single(&mut self, actions: &[f64]) -> SingleStepStep {
-        let absolute_step = self.episode_start_offset + self.step;
-        self.account.update_total(&self.prices, absolute_step);
+        let StepCoreResult {
+            reward,
+            reward_per_ticker,
+            is_done,
+        } = self.execute_step_core(actions);
 
-        for ema in &mut self.trade_activity_ema {
-            *ema *= 1.0 - TRADE_EMA_ALPHA;
-        }
-        for steps in &mut self.steps_since_trade {
-            *steps += 1;
-        }
-
-        let pre_total_assets = self.account.total_assets;
-
-        let mut real_actions = [0.0; ACTION_COUNT_USIZE];
-        for (perm_idx, &real_idx) in self.ticker_perm.iter().enumerate() {
-            real_actions[real_idx] = actions[perm_idx];
-        }
-
-        if self.step == 0 {
-            self.episode_history.action_step0 = Some(real_actions.to_vec());
-        }
-
-        if ACTION_HISTORY_LEN_USIZE > 0 {
-            self.action_history.push_back(real_actions.to_vec());
-            if self.action_history.len() > ACTION_HISTORY_LEN {
-                self.action_history.pop_front();
-            }
-        }
-
-        let _commissions = self.trade_by_target_weights(&real_actions, absolute_step);
-        self.account.update_total(&self.prices, absolute_step);
-        self.sync_realized_weights(absolute_step);
-        let (reward, reward_per_ticker) =
-            self.get_unrealized_pnl_reward_breakdown(absolute_step, pre_total_assets);
-
-        if self.account.total_assets > self.peak_assets {
-            self.peak_assets = self.account.total_assets;
-        }
-
-        let is_done = self.get_is_done();
-
-        for (index, _) in self.tickers.iter().enumerate() {
-            self.episode_history.positioned[index].push(
-                self.account.positions[index].value_with_price(self.prices[index][absolute_step]),
-            );
-            self.episode_history.raw_actions[index].push(real_actions[index]);
-            self.episode_history.target_weights[index].push(self.target_weights[index]);
-        }
-        self.episode_history.cash.push(self.account.cash);
-        self.episode_history.rewards.push(reward);
-        self.episode_history
-            .cash_weight
-            .push(self.target_weights[self.tickers.len()]);
-
-        if is_done == 1.0 {
-            self.episode_history.action_final = Some(real_actions.to_vec());
-            self.handle_episode_end(absolute_step);
-        }
-
-        self.step += 1;
         let (step_deltas, static_obs) = self.get_next_step_obs();
         SingleStepStep {
             reward,
@@ -213,4 +175,10 @@ impl Env {
             is_done,
         }
     }
+}
+
+struct StepCoreResult {
+    reward: f64,
+    reward_per_ticker: [f32; TICKERS_COUNT_USIZE],
+    is_done: f32,
 }
