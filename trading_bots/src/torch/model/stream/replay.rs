@@ -3,20 +3,9 @@ use tch::Tensor;
 use super::super::config::ModelVariant;
 use super::super::trading_model::{ModelOutput, StreamState, TradingModel};
 use super::probe::probe_replay_tensor;
-use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
+use crate::torch::constants::PRICE_DELTAS_PER_TICKER;
 
 impl TradingModel {
-    pub(super) fn uniform_stream_replay_forward(
-        &self,
-        static_features: &Tensor,
-        state: &mut StreamState,
-    ) -> ModelOutput {
-        let batch_size = state.uniform_live_fill.size()[0];
-        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
-        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
-        self.readout_from_cached_patches(&exo_tokens, batch_size, state)
-    }
-
     pub fn forward_stream_state_on_device_for_replay(
         &self,
         static_features: &Tensor,
@@ -25,7 +14,7 @@ impl TradingModel {
         let static_features = self.ensure_batched(static_features);
         let static_features = self.cast_inputs(&static_features);
         if self.variant == ModelVariant::UniformStream {
-            return self.uniform_stream_replay_forward(&static_features, state);
+            return self.cached_readout_forward(&static_features, state);
         }
         self.forward_stream_state_on_device(&static_features, state)
     }
@@ -87,7 +76,7 @@ impl TradingModel {
     /// layout rows, concatenated across B windows), and `static_features` has shape
     /// `[B, STATIC_OBS]`. The returned ModelOutput has batch `B`.
     ///
-    /// Semantically equivalent to calling `uniform_stream_replay_forward` once per
+    /// Semantically equivalent to calling `cached_readout_forward` once per
     /// window with the appropriate state prefilled; intended for batching PPO
     /// minibatch sub-chunks where the state threading between time steps can be
     /// flattened into the batch dimension.
@@ -146,14 +135,9 @@ impl TradingModel {
             if is_full {
                 let price = self.ensure_batched(&new_deltas);
                 self.init_uniform_from_full_on_device(&price, state);
-                return self.uniform_stream_replay_forward(&static_features, state);
+                return self.cached_readout_forward(&static_features, state);
             }
-            return self.step_uniform_stream_state_on_device(
-                &new_deltas,
-                &static_features,
-                state,
-                true,
-            );
+            return self.step_uniform_stream_state_on_device(&new_deltas, &static_features, state);
         }
 
         self.step_on_device(&new_deltas, &static_features, state)

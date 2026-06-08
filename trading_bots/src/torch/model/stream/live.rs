@@ -8,7 +8,7 @@ use super::super::trading_model::{ModelOutput, StreamState, TradingModel};
 use crate::torch::constants::{ACTION_COUNT, PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
 
 impl TradingModel {
-    pub(super) fn uniform_stream_cached_forward(
+    pub(super) fn cached_readout_forward(
         &self,
         static_features: &Tensor,
         state: &mut StreamState,
@@ -27,7 +27,7 @@ impl TradingModel {
         let static_features = self.ensure_batched(static_features);
         let static_features = self.cast_inputs(&static_features);
         if self.variant == ModelVariant::UniformStream {
-            return self.uniform_stream_cached_forward(&static_features, state);
+            return self.cached_readout_forward(&static_features, state);
         }
         let batch_size = state.delta_ring.size()[0] / TICKERS_COUNT;
         let price = self.ordered_price_from_ring(state, batch_size);
@@ -230,7 +230,6 @@ impl TradingModel {
         new_deltas: &Tensor,
         static_features: &Tensor,
         state: &mut StreamState,
-        replay_mode: bool,
     ) -> ModelOutput {
         let new_deltas = self.ensure_batched(new_deltas);
         let batch_size = new_deltas.size()[0];
@@ -241,11 +240,7 @@ impl TradingModel {
         );
 
         self.advance_layout_and_reembed_inplace(state, &new_deltas);
-        if replay_mode {
-            self.uniform_stream_replay_forward(static_features, state)
-        } else {
-            self.uniform_stream_cached_forward(static_features, state)
-        }
+        self.cached_readout_forward(static_features, state)
     }
 
     pub fn step(
@@ -278,12 +273,7 @@ impl TradingModel {
             if is_full {
                 return self.init_from_full_on_device(&new_deltas, &static_features, state);
             }
-            return self.step_uniform_stream_state_on_device(
-                &new_deltas,
-                &static_features,
-                state,
-                false,
-            );
+            return self.step_uniform_stream_state_on_device(&new_deltas, &static_features, state);
         }
 
         if is_full {
@@ -351,7 +341,7 @@ impl TradingModel {
 
         if self.variant == ModelVariant::UniformStream {
             self.init_uniform_from_full_on_device(&price, state);
-            return self.uniform_stream_cached_forward(&static_features, state);
+            return self.cached_readout_forward(&static_features, state);
         }
 
         let reshaped = price.view([TICKERS_COUNT, PRICE_DELTAS_PER_TICKER as i64]);
