@@ -17,6 +17,13 @@ pub struct LoadSummary {
     pub shape_mismatches: Vec<ShapeMismatch>,
 }
 
+fn format_shape_mismatch(mismatch: &ShapeMismatch) -> String {
+    format!(
+        "{} {:?} -> {:?}",
+        mismatch.name, mismatch.checkpoint_shape, mismatch.model_shape
+    )
+}
+
 impl LoadSummary {
     pub fn require_complete(&self) -> Result<(), Box<dyn Error>> {
         if self.missing.is_empty() && self.shape_mismatches.is_empty() {
@@ -34,12 +41,7 @@ impl LoadSummary {
             .shape_mismatches
             .iter()
             .take(8)
-            .map(|mismatch| {
-                format!(
-                    "{} {:?} -> {:?}",
-                    mismatch.name, mismatch.checkpoint_shape, mismatch.model_shape
-                )
-            })
+            .map(format_shape_mismatch)
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -114,12 +116,7 @@ pub fn load_var_store_partial<P: AsRef<Path>>(
         let preview = shape_mismatches
             .iter()
             .take(8)
-            .map(|mismatch| {
-                format!(
-                    "{} {:?} -> {:?}",
-                    mismatch.name, mismatch.checkpoint_shape, mismatch.model_shape
-                )
-            })
+            .map(format_shape_mismatch)
             .collect::<Vec<_>>()
             .join(", ");
         println!("Skipped shape-mismatched tensors: {}", preview);

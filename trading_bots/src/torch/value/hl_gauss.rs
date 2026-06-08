@@ -48,12 +48,17 @@ impl HlGaussBins {
         Self::new(SYMLOG_SUPPORT_MIN, SYMLOG_SUPPORT_MAX, NUM_BINS, device)
     }
 
-    pub fn range_stats(&self, values: &Tensor) -> Tensor {
+    fn prepare(&self, values: &Tensor) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
         let values = values.to_kind(Kind::Float);
         let flat_values = values.reshape([-1]);
         let support = self.support.to_device(values.device()).to_kind(Kind::Float);
         let min_support = support.get(0);
         let max_support = support.get(support.size()[0] - 1);
+        (values, flat_values, support, min_support, max_support)
+    }
+
+    pub fn range_stats(&self, values: &Tensor) -> Tensor {
+        let (_values, flat_values, _support, min_support, max_support) = self.prepare(values);
         let symlog_values = symlog_tensor(&flat_values);
         let below_frac = symlog_values
             .lt_tensor(&min_support)
@@ -79,11 +84,7 @@ impl HlGaussBins {
     /// Encode scalar values [... ] into normalized hl-gauss target distributions
     /// [..., NUM_BINS] in symlog space.
     pub fn encode(&self, values: &Tensor) -> Tensor {
-        let values = values.to_kind(Kind::Float);
-        let flat_values = values.reshape([-1]);
-        let support = self.support.to_device(values.device()).to_kind(Kind::Float);
-        let min_support = support.get(0);
-        let max_support = support.get(support.size()[0] - 1);
+        let (values, flat_values, support, min_support, max_support) = self.prepare(values);
         let t = symlog_tensor(&flat_values).clamp_tensor(Some(&min_support), Some(&max_support));
         let scaled = (&support - &t.unsqueeze(-1)) / (self.sigma * SQRT_2);
         let cdf = scaled.erf();
