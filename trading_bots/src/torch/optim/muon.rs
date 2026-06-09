@@ -89,14 +89,16 @@ pub struct Muon {
 /// Runs NS_STEPS iterations in bf16 for speed; returns in the input's kind.
 ///
 /// Each iteration is:  x ← NS_A·x + NS_B·(a·x) + NS_C·((a·a)·x), where a = x·xᵀ.
-/// We fuse this into two `baddbmm` calls (on [1,p,q] views) to cut the number
-/// of transient allocations per iter roughly in half vs naïve arithmetic.
-/// tch's 2D `addmm` doesn't accept scalar beta/alpha, so we lift to 3D.
+/// Factoring the two correction terms over the shared right-multiply by `x`,
+///   NS_B·(a·x) + NS_C·((a·a)·x) = (NS_B·a + NS_C·(a·a))·x = b·x,
+/// collapses the iteration to **three** matmuls (x·xᵀ, a·a, b·x) instead of the
+/// four a naïve expansion needs, expressed as two `baddbmm` calls on [1,p,q]
+/// views. tch's 2D `addmm` doesn't accept scalar beta/alpha, so we lift to 3D.
 ///
-/// Peak live tensors during iter: `x` ([p,q]) + `a` ([p,p]) + `b` ([p,p]) +
-/// `tmp` ([p,q]) = ~2·[p,q] + 2·[p,p]. For p == q this is ~4·[p,q]. This is
-/// the inherent working-set cost of NS5 and cannot be eliminated without
-/// changing the algorithm.
+/// Peak live tensors during iter: `x` ([p,q]) + `a` ([p,p]) + `b` ([p,p]) =
+/// ~[p,q] + 2·[p,p]. For p == q this is ~3·[p,q]. This is the inherent
+/// working-set cost of NS5 and cannot be eliminated without changing the
+/// algorithm.
 fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     let orig_kind = g.kind();
     let transposed = g.size()[0] > g.size()[1];
@@ -105,20 +107,17 @@ fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     } else {
         g.to_kind(Kind::BFloat16)
     };
-    let nrm = x2d
-        .frobenius_norm([0i64, 1].as_slice(), false)
-        .clamp_min(1e-7);
+    let nrm = x2d.norm().clamp_min(1e-7);
     let x2d = &x2d / &nrm;
     let x2d = if transposed { x2d.transpose(0, 1) } else { x2d };
     let mut x = x2d.unsqueeze(0); // [1, p, q] view — baddbmm needs 3D
 
     for _ in 0..ns_steps {
         let a = x.matmul(&x.transpose(-2, -1));
-        let b = a.matmul(&a);
-        // tmp = NS_A·x + NS_B·(a·x)
-        let tmp = x.baddbmm(&a, &x, NS_A, NS_B);
-        // x = tmp + NS_C·(b·x)
-        x = tmp.baddbmm(&b, &x, 1.0, NS_C);
+        // b = NS_B·a + NS_C·(a·a)  — fold both corrections into one matrix.
+        let b = a.baddbmm(&a, &a, NS_B, NS_C);
+        // x = NS_A·x + b·x
+        x = x.baddbmm(&b, &x, NS_A, 1.0);
     }
 
     let x = x.squeeze_dim(0);
@@ -155,11 +154,8 @@ fn normuon_rescale(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) ->
     // Per-row step size = 1/(sqrt(v)+1e-10): [rows, 1].
     let step_size = (second_momentum.sqrt() + 1e-10).reciprocal();
     // Analytic post-divide Frobenius^2 = sum_i step_size_i^2 * row_sq_sum_i.
-    let vnorm_new_sq = (&step_size * &step_size * &row_sq_sum).sum_dim_intlist(
-        [-2i64].as_slice(),
-        true,
-        Kind::Float,
-    );
+    let vnorm_new_sq =
+        (step_size.square() * &row_sq_sum).sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
     // Frobenius-preservation ratio: [1, 1].
     let ratio = vnorm_sq.sqrt() / (vnorm_new_sq.sqrt() + 1e-10);
     // Fused per-row scale, cast back to update kind: [rows, 1].
@@ -267,17 +263,17 @@ impl Muon {
             // NorMuon: per-row second-moment rescale, all math in fp32.
             let update = normuon_rescale(&update, &mut entry.second_momentum, beta2);
 
-            // Aspect-ratio scale max(1, rows/cols)^0.5 (after NorMuon rescale).
+            // Aspect-ratio scale max(1, rows/cols)^0.5 (after NorMuon rescale),
+            // folded into the LR so the update is scaled in a single pass.
             let size = update.size();
             let aspect_scale = (1.0_f64).max(size[0] as f64 / size[1] as f64).sqrt();
-            let update = update.g_mul_scalar(aspect_scale);
 
             // Apply to param: decoupled weight decay, then the update.
             let mut p = self.params[entry.idx].shallow_clone();
             if let Some(k) = wd_factor {
                 let _ = p.g_mul_scalar_(k);
             }
-            let update = update.to_kind(p.kind()) * (-lr);
+            let update = update.to_kind(p.kind()) * (-lr * aspect_scale);
             let _ = p.g_add_(&update);
         }
     }
