@@ -493,6 +493,11 @@ impl Trainer {
             entropy_min,
             entropy_max,
             mean_epoch_approx_kl,
+            last_minibatch_approx_kl,
+            lr_scale: 1.0,
+            kl_lr_scale_next: 1.0,
+            kl_lr_ema: 0.0,
+            kl_lr_signal: last_minibatch_approx_kl,
         }
     }
 }

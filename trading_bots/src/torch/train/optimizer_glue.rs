@@ -2,10 +2,13 @@ use tch::{nn, Device, Kind, Tensor};
 
 use crate::torch::optim::muon::Muon;
 
-use super::config::{MUON_MOMENTUM, MUON_MOMENTUM_WARMUP_START, MUON_MOMENTUM_WARMUP_STEPS};
+use super::config::{
+    LEARNING_RATE, MUON_LR, MUON_MOMENTUM, MUON_MOMENTUM_WARMUP_START, MUON_MOMENTUM_WARMUP_STEPS,
+};
 
 const ACTOR_GRAD_CLIP_PATTERNS: &[&str] = &["policy_concentration"];
 const CRITIC_GRAD_CLIP_PATTERNS: &[&str] = &["value_proj"];
+const KL_LR_SCALE_EXPONENT: f64 = 0.5;
 
 pub(crate) struct GradClipGroups {
     pub(crate) actor: Vec<Tensor>,
@@ -150,6 +153,99 @@ pub(crate) fn muon_momentum_for_step(step: i64) -> f64 {
     (1.0 - frac) * MUON_MOMENTUM_WARMUP_START + frac * MUON_MOMENTUM
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct KlLrController {
+    target: f64,
+    ema_alpha: f64,
+    min_scale: f64,
+    max_scale: f64,
+    ema: f64,
+    scale: f64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) struct KlLrControllerState {
+    version: u32,
+    ema: f64,
+    scale: f64,
+}
+
+impl KlLrController {
+    pub(crate) fn new(target: f64, half_life: f64, min_scale: f64, max_scale: f64) -> Self {
+        assert!(target.is_finite() && target > 0.0);
+        assert!(half_life.is_finite() && half_life > 0.0);
+        assert!(min_scale.is_finite() && min_scale > 0.0);
+        assert!(max_scale.is_finite() && max_scale >= min_scale);
+        Self {
+            target,
+            ema_alpha: kl_lr_ema_alpha(half_life),
+            min_scale,
+            max_scale,
+            ema: target,
+            scale: 1.0,
+        }
+    }
+
+    pub(crate) fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    pub(crate) fn ema(&self) -> f64 {
+        self.ema
+    }
+
+    pub(crate) fn restore(&mut self, ema: f64, scale: f64) {
+        if ema.is_finite() && ema > 0.0 {
+            self.ema = ema;
+        }
+        if scale.is_finite() && scale > 0.0 {
+            self.scale = scale.clamp(self.min_scale, self.max_scale);
+        }
+    }
+
+    pub(crate) fn state(&self) -> KlLrControllerState {
+        KlLrControllerState {
+            version: 1,
+            ema: self.ema,
+            scale: self.scale,
+        }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: KlLrControllerState) -> bool {
+        if state.version != 1
+            || !state.ema.is_finite()
+            || state.ema <= 0.0
+            || !state.scale.is_finite()
+            || state.scale <= 0.0
+        {
+            return false;
+        }
+        self.restore(state.ema, state.scale);
+        true
+    }
+
+    pub(crate) fn observe(&mut self, observed_kl: f64) {
+        if !observed_kl.is_finite() {
+            return;
+        }
+        let signal = observed_kl.max(0.0);
+        self.ema = self.ema_alpha * signal + (1.0 - self.ema_alpha) * self.ema;
+        self.scale = (self.scale * (self.target / self.ema.max(1e-12)).powf(KL_LR_SCALE_EXPONENT))
+            .clamp(self.min_scale, self.max_scale);
+    }
+}
+
+pub(crate) fn kl_lr_ema_alpha(half_life: f64) -> f64 {
+    assert!(half_life.is_finite() && half_life > 0.0);
+    1.0 - 0.5f64.powf(1.0 / half_life)
+}
+
+pub(crate) fn apply_lr_scale(opt: &mut Muon, lr_scale: f64) {
+    assert!(lr_scale.is_finite() && lr_scale > 0.0);
+    opt.set_lr(MUON_LR * lr_scale);
+    opt.set_adamw_lr(LEARNING_RATE * lr_scale);
+}
+
 pub(crate) fn step_optimizer(opt: &mut Muon, optimizer_step: &mut i64) {
     opt.set_momentum(muon_momentum_for_step(*optimizer_step));
     opt.step();
@@ -158,12 +254,92 @@ pub(crate) fn step_optimizer(opt: &mut Muon, optimizer_step: &mut i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{backward_actor_critic_with_separate_clips, grad_clip_groups, GradClipGroups};
+    use super::{
+        backward_actor_critic_with_separate_clips, grad_clip_groups, kl_lr_ema_alpha,
+        GradClipGroups, KlLrController,
+    };
     use crate::torch::model::{TradingModel, TradingModelConfig};
     use crate::torch::train::optimizer_glue::named_trainable_variables;
     use std::collections::HashMap;
     use tch::nn;
     use tch::{Device, Kind, Tensor};
+
+    #[test]
+    fn kl_lr_ema_alpha_matches_half_life() {
+        let alpha = kl_lr_ema_alpha(20.0);
+        let mut value = 1.0;
+        for _ in 0..20 {
+            value *= 1.0 - alpha;
+        }
+
+        assert!((value - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn kl_lr_controller_tracks_target_and_clamps() {
+        let mut controller = KlLrController::new(0.02, 20.0, 0.1, 10.0);
+        controller.observe(0.02);
+        assert!((controller.ema() - 0.02).abs() < 1e-12);
+        assert!((controller.scale() - 1.0).abs() < 1e-12);
+
+        let mut high_kl_no_clamp = KlLrController::new(0.02, 0.01, 0.1, 10.0);
+        high_kl_no_clamp.observe(0.08);
+        assert!((high_kl_no_clamp.scale() - 0.5).abs() < 1e-12);
+
+        let mut low_kl_no_clamp = KlLrController::new(0.02, 0.01, 0.1, 10.0);
+        low_kl_no_clamp.observe(0.005);
+        assert!((low_kl_no_clamp.scale() - 2.0).abs() < 1e-12);
+
+        let mut low_kl = KlLrController::new(0.02, 0.01, 0.1, 10.0);
+        low_kl.observe(0.0);
+        assert!((low_kl.scale() - 10.0).abs() < 1e-9);
+
+        let mut high_kl = KlLrController::new(0.02, 0.01, 0.1, 10.0);
+        high_kl.observe(100.0);
+        assert!((high_kl.scale() - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn kl_lr_controller_ignores_non_finite_kl() {
+        let mut controller = KlLrController::new(0.02, 20.0, 0.1, 10.0);
+        controller.observe(f64::NAN);
+        assert!((controller.ema() - 0.02).abs() < 1e-12);
+        assert!((controller.scale() - 1.0).abs() < 1e-12);
+
+        controller.observe(f64::INFINITY);
+        assert!((controller.ema() - 0.02).abs() < 1e-12);
+        assert!((controller.scale() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn kl_lr_controller_restore_clamps_and_ignores_invalid_state() {
+        let mut controller = KlLrController::new(0.02, 20.0, 0.1, 10.0);
+        controller.restore(0.05, 20.0);
+        assert!((controller.ema() - 0.05).abs() < 1e-12);
+        assert!((controller.scale() - 10.0).abs() < 1e-12);
+
+        controller.restore(f64::NAN, f64::NEG_INFINITY);
+        assert!((controller.ema() - 0.05).abs() < 1e-12);
+        assert!((controller.scale() - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn kl_lr_controller_state_roundtrips_and_validates() {
+        let mut controller = KlLrController::new(0.02, 20.0, 0.1, 10.0);
+        controller.restore(0.04, 2.5);
+        let json = serde_json::to_string(&controller.state()).unwrap();
+
+        let state = serde_json::from_str(&json).unwrap();
+        let mut restored = KlLrController::new(0.02, 20.0, 0.1, 10.0);
+        assert!(restored.restore_state(state));
+        assert!((restored.ema() - 0.04).abs() < 1e-12);
+        assert!((restored.scale() - 2.5).abs() < 1e-12);
+
+        let invalid = serde_json::from_str(r#"{"version":2,"ema":0.04,"scale":2.5}"#).unwrap();
+        assert!(!restored.restore_state(invalid));
+        assert!((restored.ema() - 0.04).abs() < 1e-12);
+        assert!((restored.scale() - 2.5).abs() < 1e-12);
+    }
 
     #[test]
     fn separate_actor_critic_clip_adds_shared_grads_after_independent_clips() {

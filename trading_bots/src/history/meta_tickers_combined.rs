@@ -36,6 +36,10 @@ pub struct MetaHistory {
     pub policy_entropy_min: Vec<f64>,
     pub policy_entropy_max: Vec<f64>,
     pub approx_kl: Vec<f64>,
+    pub kl_lr_scale: Vec<f64>,
+    pub kl_lr_scale_next: Vec<f64>,
+    pub kl_lr_ema: Vec<f64>,
+    pub kl_lr_signal: Vec<f64>,
     pub gate_mean: Vec<f64>,
     pub gate_std: Vec<f64>,
     pub return_min: Vec<f64>,
@@ -107,6 +111,19 @@ impl MetaHistory {
 
     pub fn record_approx_kl(&mut self, kl: f64) {
         self.approx_kl.push(kl);
+    }
+
+    pub fn record_kl_lr(
+        &mut self,
+        lr_scale: f64,
+        kl_lr_scale_next: f64,
+        kl_lr_ema: f64,
+        kl_lr_signal: f64,
+    ) {
+        self.kl_lr_scale.push(lr_scale);
+        self.kl_lr_scale_next.push(kl_lr_scale_next);
+        self.kl_lr_ema.push(kl_lr_ema);
+        self.kl_lr_signal.push(kl_lr_signal);
     }
 
     pub fn record_gate_stats(&mut self, mean: f64, std: f64) {
@@ -219,6 +236,11 @@ impl MetaHistory {
         self.policy_entropy_max = load_multiline(&entropy_path, "max");
 
         self.approx_kl = load_simple(&format!("{base_dir}/approx_kl.report.bin"));
+        let kl_lr_path = format!("{base_dir}/kl_lr.report.bin");
+        self.kl_lr_scale = load_multiline(&kl_lr_path, "lr_scale");
+        self.kl_lr_scale_next = load_multiline(&kl_lr_path, "scale_next");
+        self.kl_lr_ema = load_multiline(&kl_lr_path, "ema");
+        self.kl_lr_signal = load_multiline(&kl_lr_path, "signal");
         let gate_path = format!("{base_dir}/gate_stats.report.bin");
         self.gate_mean = load_multiline(&gate_path, "mean");
         self.gate_std = load_multiline(&gate_path, "std");
@@ -447,6 +469,35 @@ impl MetaHistory {
                 simple(&self.approx_kl),
             );
             let _ = write_report(&format!("{base_dir}/approx_kl.report.bin"), &r);
+        }
+        if !self.kl_lr_scale.is_empty() {
+            let r = Self::report(
+                "KL-Adaptive LR",
+                "Episode",
+                None,
+                ScaleKind::Linear,
+                ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "lr_scale".to_string(),
+                            values: f64_to_f32(&self.kl_lr_scale),
+                        },
+                        ReportSeries {
+                            label: "scale_next".to_string(),
+                            values: f64_to_f32(&self.kl_lr_scale_next),
+                        },
+                        ReportSeries {
+                            label: "ema".to_string(),
+                            values: f64_to_f32(&self.kl_lr_ema),
+                        },
+                        ReportSeries {
+                            label: "signal".to_string(),
+                            values: f64_to_f32(&self.kl_lr_signal),
+                        },
+                    ],
+                },
+            );
+            let _ = write_report(&format!("{base_dir}/kl_lr.report.bin"), &r);
         }
         if !self.policy_entropy_mean.is_empty() {
             let r = Self::report(

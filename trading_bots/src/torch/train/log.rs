@@ -9,7 +9,7 @@ use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
 impl Trainer {
     pub(super) fn log_episode(
         &mut self,
-        _episode: usize,
+        episode: usize,
         adv_data: &AdvantageData,
         metrics: &UpdateMetrics,
     ) {
@@ -233,6 +233,12 @@ impl Trainer {
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
         primary.meta_history.record_approx_kl(mean_epoch_approx_kl);
+        primary.meta_history.record_kl_lr(
+            metrics.lr_scale,
+            metrics.kl_lr_scale_next,
+            metrics.kl_lr_ema,
+            metrics.kl_lr_signal,
+        );
         primary.meta_history.record_hl_gauss_range_stats(
             return_min,
             return_max,
@@ -241,10 +247,18 @@ impl Trainer {
             below_support_frac,
             above_support_frac,
         );
+        if episode % 5 == 0 {
+            let gens_path = self.run_dir.gens.to_string_lossy();
+            primary.meta_history.write_reports(episode, &gens_path);
+        }
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), ClipGap: {:.4}, ActorGradNorm: {:.4}, CriticGradNorm: {:.4}",
             mean_policy_loss, mean_value_loss, explained_var, mean_clip_gap, mean_actor_grad_norm, mean_critic_grad_norm
+        );
+        println!(
+            "  KL-LR: scale {:.3} -> {:.3}, ema {:.4}, last_mb_signal {:.4}",
+            metrics.lr_scale, metrics.kl_lr_scale_next, metrics.kl_lr_ema, metrics.kl_lr_signal
         );
         println!(
             "  Adv raw: μ {:.4}, min {:.4}, max {:.4} | shaped: μ {:.4}, σ {:.4}, min {:.4}, max {:.4}",

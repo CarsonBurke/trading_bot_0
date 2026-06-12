@@ -1,5 +1,6 @@
 use std::env;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use tch::{autocast, nn, Device, Kind, Tensor};
 
 use crate::torch::constants::{
@@ -15,9 +16,15 @@ use crate::torch::optim::muon::{Muon, MuonConfig};
 use crate::torch::value::hl_gauss::HlGaussBins;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
-use super::config::{LEARNING_RATE, MUON_LR, MUON_MOMENTUM_WARMUP_START, USE_MUON};
+use super::config::{
+    KL_LR_EMA_HALF_LIFE, KL_LR_MAX_SCALE, KL_LR_MIN_SCALE, KL_LR_TARGET, LEARNING_RATE, MUON_LR,
+    MUON_MOMENTUM_WARMUP_START, USE_MUON,
+};
 use super::geometry::{rollout_geometry, RolloutGeometry};
-use super::optimizer_glue::{grad_clip_groups, named_trainable_variables, GradClipGroups};
+use super::optimizer_glue::{
+    apply_lr_scale, grad_clip_groups, named_trainable_variables, GradClipGroups, KlLrController,
+    KlLrControllerState,
+};
 
 pub(super) struct RolloutData {
     pub(super) reset_layout_batches_cpu: Vec<Tensor>,
@@ -51,6 +58,11 @@ pub(super) struct UpdateMetrics {
     pub(super) entropy_min: Tensor,
     pub(super) entropy_max: Tensor,
     pub(super) mean_epoch_approx_kl: f64,
+    pub(super) last_minibatch_approx_kl: f64,
+    pub(super) lr_scale: f64,
+    pub(super) kl_lr_scale_next: f64,
+    pub(super) kl_lr_ema: f64,
+    pub(super) kl_lr_signal: f64,
 }
 
 pub(super) struct Trainer {
@@ -61,6 +73,7 @@ pub(super) struct Trainer {
     pub(super) grad_clip_groups: GradClipGroups,
     pub(super) opt: Muon,
     pub(super) optimizer_step: i64,
+    pub(super) kl_lr_controller: KlLrController,
     pub(super) env: VecEnv,
     pub(super) device: Device,
     pub(super) rollout: RolloutGeometry,
@@ -94,6 +107,26 @@ pub(super) struct Trainer {
     pub(super) action_host_view: Tensor,
     pub(super) reset_env_indices_host: Vec<i64>,
     pub(super) ticker_offsets: Tensor,
+}
+
+fn kl_lr_state_path_for_weights_path(weights_path: &Path) -> PathBuf {
+    let stem = weights_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("checkpoint");
+    weights_path.with_file_name(format!("{stem}.kl_lr.json"))
+}
+
+fn read_kl_lr_controller_state(path: &Path) -> Result<KlLrControllerState, String> {
+    let json = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    serde_json::from_str(&json).map_err(|err| format!("failed to parse {}: {err}", path.display()))
+}
+
+fn write_kl_lr_controller_state(path: &Path, state: KlLrControllerState) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(&state)
+        .map_err(|err| format!("failed to encode {}: {err}", path.display()))?;
+    fs::write(path, json).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 impl Trainer {
@@ -141,6 +174,9 @@ impl Trainer {
             },
         );
 
+        let checkpoint_kl_lr_state_path = weights_path
+            .map(Path::new)
+            .map(kl_lr_state_path_for_weights_path);
         let (start_episode, run_dir) = if let Some(path) = weights_path {
             println!("Loading weights from {}", path);
             let load_summary = load_var_store_partial(&mut vs, path).unwrap();
@@ -205,6 +241,12 @@ impl Trainer {
             },
         );
         let optimizer_step = 0i64;
+        let mut kl_lr_controller = KlLrController::new(
+            KL_LR_TARGET,
+            KL_LR_EMA_HALF_LIFE,
+            KL_LR_MIN_SCALE,
+            KL_LR_MAX_SCALE,
+        );
 
         let mut env = VecEnv::new(
             true,
@@ -214,9 +256,50 @@ impl Trainer {
         );
         if start_episode > 0 {
             env.set_episode(start_episode);
-            env.primary_mut()
-                .meta_history
-                .load_from_episode(start_episode, &gens_path);
+            let meta_history = &mut env.primary_mut().meta_history;
+            meta_history.load_from_episode(start_episode, &gens_path);
+            let restored_from_sidecar = checkpoint_kl_lr_state_path
+                .as_ref()
+                .and_then(|path| match read_kl_lr_controller_state(path) {
+                    Ok(state) if kl_lr_controller.restore_state(state) => {
+                        println!(
+                            "Restored KL-LR controller from {}: scale {:.3}, ema {:.4}",
+                            path.display(),
+                            kl_lr_controller.scale(),
+                            kl_lr_controller.ema()
+                        );
+                        Some(())
+                    }
+                    Ok(_) => {
+                        println!("Ignored invalid KL-LR controller state: {}", path.display());
+                        None
+                    }
+                    Err(err) => {
+                        println!("No usable KL-LR controller state sidecar: {err}");
+                        None
+                    }
+                })
+                .is_some();
+
+            if !restored_from_sidecar {
+                let restored_ema = meta_history.kl_lr_ema.last().copied();
+                let restored_scale = meta_history
+                    .kl_lr_scale_next
+                    .last()
+                    .or_else(|| meta_history.kl_lr_scale.last())
+                    .copied();
+                kl_lr_controller.restore(
+                    restored_ema.unwrap_or(f64::NAN),
+                    restored_scale.unwrap_or(f64::NAN),
+                );
+                if restored_ema.is_some() || restored_scale.is_some() {
+                    println!(
+                        "Restored KL-LR controller from reports: scale {:.3}, ema {:.4}",
+                        kl_lr_controller.scale(),
+                        kl_lr_controller.ema()
+                    );
+                }
+            }
         }
 
         let hl_gauss = HlGaussBins::default_for(device);
@@ -316,6 +399,7 @@ impl Trainer {
             grad_clip_groups,
             opt,
             optimizer_step,
+            kl_lr_controller,
             env,
             device,
             rollout,
@@ -353,7 +437,15 @@ impl Trainer {
         for episode in self.start_episode..1000000 {
             let rollout_data = self.collect_rollout(episode);
             let advantage_data = self.compute_advantages(episode, &rollout_data);
-            let update_metrics = self.update_policy(episode, &advantage_data);
+            let lr_scale = self.kl_lr_controller.scale();
+            apply_lr_scale(&mut self.opt, lr_scale);
+            let mut update_metrics = self.update_policy(episode, &advantage_data);
+            let kl_lr_signal = update_metrics.last_minibatch_approx_kl;
+            self.kl_lr_controller.observe(kl_lr_signal);
+            update_metrics.lr_scale = lr_scale;
+            update_metrics.kl_lr_signal = kl_lr_signal;
+            update_metrics.kl_lr_ema = self.kl_lr_controller.ema();
+            update_metrics.kl_lr_scale_next = self.kl_lr_controller.scale();
             self.log_episode(episode, &advantage_data, &update_metrics);
             self.maybe_checkpoint(episode);
         }
@@ -361,11 +453,17 @@ impl Trainer {
 
     pub(super) fn maybe_checkpoint(&self, episode: usize) {
         if episode > 0 && episode % 50 == 0 {
-            let path = format!("{}/ppo_ep{}.ot", self.run_dir.weights.display(), episode);
+            let path = self.run_dir.weights.join(format!("ppo_ep{episode}.ot"));
             if let Err(err) = self.vs.save(&path) {
                 println!("Error while saving weights: {}", err);
             } else {
-                println!("Saved model weights: {}", path);
+                let kl_lr_state_path = kl_lr_state_path_for_weights_path(&path);
+                if let Err(err) =
+                    write_kl_lr_controller_state(&kl_lr_state_path, self.kl_lr_controller.state())
+                {
+                    println!("Error while saving KL-LR controller state: {}", err);
+                }
+                println!("Saved model weights: {}", path.display());
             }
         }
     }

@@ -24,7 +24,11 @@ pub(crate) const DEFAULT_PPO_MINIBATCH_RATIO: f64 = 1.0 / 16.0;
 pub(crate) const OPTIM_EPOCHS: i64 = 3;
 pub(crate) const CLIP_EPS_LOW: f64 = 0.20;
 pub(crate) const CLIP_EPS_HIGH: f64 = 0.28;
-pub(crate) const TARGET_KL: f64 = 0.03;
+pub(crate) const KL_LR_TARGET: f64 = 0.02;
+pub(crate) const KL_LR_EMA_HALF_LIFE: f64 = 50.0;
+pub(crate) const KL_LR_MIN_SCALE: f64 = 0.1;
+pub(crate) const KL_LR_MAX_SCALE: f64 = 10.0;
+pub(crate) const TARGET_KL: f64 = KL_LR_TARGET;
 pub(crate) const KL_STOP_MULTIPLIER: f64 = 1.5;
 pub(crate) const VALUE_LOSS_COEF: f64 = 1.0;
 /// Our beta distribution with log variance explores very well, and better without entropy regulation.
