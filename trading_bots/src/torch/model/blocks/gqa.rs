@@ -9,10 +9,14 @@ use crate::torch::model::rope::RotaryEmbedding;
 pub(in crate::torch::model) const GQA_NUM_Q_HEADS: i64 = 4;
 pub(in crate::torch::model) const GQA_NUM_KV_HEADS: i64 = 1;
 pub(in crate::torch::model) const QK_GAIN_INIT: f64 = 1.0;
+const MDHA_KERNEL_SIZE: usize = 3;
 
 pub(in crate::torch::model) struct GqaBlock {
     attn_ln: RMSNorm,
     attn_qkv: nn::Linear,
+    q_dconv: [Tensor; MDHA_KERNEL_SIZE],
+    k_dconv: [Tensor; MDHA_KERNEL_SIZE],
+    v_dconv: [Tensor; MDHA_KERNEL_SIZE],
     attn_out: nn::Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
@@ -36,6 +40,9 @@ impl GqaBlock {
         let qkv_dim = model_dim + 2 * kv_dim;
         let attn_ln = RMSNorm::new(model_dim, 1e-6);
         let attn_qkv = linear_truncated(p, "attn_qkv", model_dim, qkv_dim);
+        let q_dconv = mdha_dconv_vars(p, "q_dconv", model_dim);
+        let k_dconv = mdha_dconv_vars(p, "k_dconv", kv_dim);
+        let v_dconv = mdha_dconv_vars(p, "v_dconv", kv_dim);
         let attn_out = linear_residual_out(p, "attn_out", model_dim, model_dim);
         let q_norm = RMSNorm::new(head_dim, 1e-6);
         let k_norm = RMSNorm::new(head_dim, 1e-6);
@@ -55,6 +62,9 @@ impl GqaBlock {
         Self {
             attn_ln,
             attn_qkv,
+            q_dconv,
+            k_dconv,
+            v_dconv,
             attn_out,
             q_norm,
             k_norm,
@@ -109,13 +119,13 @@ impl GqaBlock {
         let normed = self.attn_ln.forward(x);
         let qkv = linear_with_same_dtype(&normed, &self.attn_qkv);
         let parts = qkv.split_with_sizes(&[self.q_dim, self.kv_dim, self.kv_dim], -1);
-        let q = parts[0]
+        let q = causal_depthwise_projection(&parts[0], &self.q_dconv)
             .reshape([b, s, GQA_NUM_Q_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
-        let k = parts[1]
+        let k = causal_depthwise_projection(&parts[1], &self.k_dconv)
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
-        let v = parts[2]
+        let v = causal_depthwise_projection(&parts[2], &self.v_dconv)
             .reshape([b, s, GQA_NUM_KV_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
         let q = self.q_norm.forward(&q);
@@ -133,4 +143,36 @@ impl GqaBlock {
     fn apply_ffn(&self, x: &Tensor) -> Tensor {
         self.ffn.forward(x)
     }
+}
+
+fn mdha_dconv_vars(p: &nn::Path, name: &str, channels: i64) -> [Tensor; MDHA_KERNEL_SIZE] {
+    std::array::from_fn(|shift| {
+        let init = if shift == 0 {
+            0.5
+        } else {
+            0.5 / MDHA_KERNEL_SIZE as f64
+        };
+        p.var(&format!("{name}_{shift}"), &[channels], Init::Const(init))
+    })
+}
+
+fn causal_shift(x: &Tensor, shift: i64) -> Tensor {
+    if shift == 0 {
+        return x.shallow_clone();
+    }
+    let (batch, seq, channels) = x.size3().unwrap();
+    if shift >= seq {
+        return Tensor::zeros([batch, seq, channels], (x.kind(), x.device()));
+    }
+    let pad = Tensor::zeros([batch, shift, channels], (x.kind(), x.device()));
+    let kept = x.narrow(1, 0, seq - shift);
+    Tensor::cat(&[pad, kept], 1)
+}
+
+fn causal_depthwise_projection(x: &Tensor, weights: &[Tensor; MDHA_KERNEL_SIZE]) -> Tensor {
+    let mut out = x * weights[0].to_kind(x.kind()).view([1, 1, -1]);
+    for (shift, weight) in weights.iter().enumerate().skip(1) {
+        out += causal_shift(x, shift as i64) * weight.to_kind(x.kind()).view([1, 1, -1]);
+    }
+    out
 }
