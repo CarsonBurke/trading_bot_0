@@ -60,9 +60,7 @@ impl Trainer {
                 &self.obs_static,
             );
 
-            let _ = self
-                .action_host_view
-                .copy_(&actions.to_kind(Kind::Float));
+            let _ = self.action_host_view.copy_(&actions.to_kind(Kind::Float));
             self.env.step_from_actions_f32_into(
                 &mut self.cpu_step_batch,
                 &mut self.step_deltas,

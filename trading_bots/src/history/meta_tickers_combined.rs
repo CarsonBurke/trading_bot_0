@@ -189,8 +189,7 @@ impl MetaHistory {
         self.logit_scale = load_simple(&format!("{base_dir}/logit_scale.report.bin"));
         self.clip_fraction = load_simple(&format!("{base_dir}/clip_fraction.report.bin"));
         if self.clip_fraction.is_empty() {
-            self.clip_fraction =
-                load_simple(&format!("{base_dir}/spo_bound_fraction.report.bin"));
+            self.clip_fraction = load_simple(&format!("{base_dir}/spo_bound_fraction.report.bin"));
         }
         self.clip_gap = load_simple(&format!("{base_dir}/clip_gap.report.bin"));
 

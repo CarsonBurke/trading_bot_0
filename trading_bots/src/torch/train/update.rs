@@ -218,8 +218,7 @@ impl Trainer {
                     )
                 });
 
-                let action_log_probs =
-                    beta_log_prob(&actions_flat, &action_alpha, &action_beta);
+                let action_log_probs = beta_log_prob(&actions_flat, &action_alpha, &action_beta);
                 let dist_entropy_per_sample = beta_entropy(&action_alpha, &action_beta);
 
                 if DEBUG_NUMERICS {

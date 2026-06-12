@@ -15,7 +15,10 @@ pub(super) fn rank_gaussian_normalize(adv: &Tensor) -> Tensor {
     if n == 0 {
         return flat;
     }
-    let ranks = flat.argsort(0, false).argsort(0, false).to_kind(Kind::Float);
+    let ranks = flat
+        .argsort(0, false)
+        .argsort(0, false)
+        .to_kind(Kind::Float);
     let quantile = (ranks + 0.5) / n as f64;
     let centered = (quantile * 2.0 - 1.0).clamp(-RANK_GAUSS_CLAMP, RANK_GAUSS_CLAMP);
     (centered.erfinv() * 2.0_f64.sqrt()).reshape(adv.size())
@@ -137,7 +140,10 @@ mod tests {
         let x = Tensor::from_slice(&ramp).to_kind(Kind::Float);
         let z = rank_gaussian_normalize(&x);
 
-        assert!(z.isfinite().all().int64_value(&[]) == 1, "output must be finite");
+        assert!(
+            z.isfinite().all().int64_value(&[]) == 1,
+            "output must be finite"
+        );
 
         let vals: Vec<f64> = z.iter::<f64>().unwrap().collect();
         for w in vals.windows(2) {
@@ -161,7 +167,10 @@ mod tests {
     fn rank_gaussian_handles_ties_without_nan() {
         let x = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 2.0, 2.0, 0.0]).to_kind(Kind::Float);
         let z = rank_gaussian_normalize(&x);
-        assert!(z.isfinite().all().int64_value(&[]) == 1, "ties must not produce NaN");
+        assert!(
+            z.isfinite().all().int64_value(&[]) == 1,
+            "ties must not produce NaN"
+        );
     }
 
     #[test]

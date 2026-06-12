@@ -235,7 +235,10 @@ pub(crate) fn compute_value_diagnostics(rollout_values: &Tensor, returns: &Tenso
     })
 }
 
-pub(crate) fn compute_value_diagnostics_symlog(rollout_values: &Tensor, returns: &Tensor) -> Tensor {
+pub(crate) fn compute_value_diagnostics_symlog(
+    rollout_values: &Tensor,
+    returns: &Tensor,
+) -> Tensor {
     tch::no_grad(|| {
         let pred = symlog_tensor(&rollout_values.to_kind(Kind::Float));
         let target = symlog_tensor(&returns.to_kind(Kind::Float));

@@ -4,7 +4,7 @@ use tch::{nn, Tensor};
 use crate::torch::model::blocks::cross_attn::{CA_HEAD_DIM, CA_NUM_HEADS};
 use crate::torch::model::blocks::gqa::QK_GAIN_INIT;
 use crate::torch::model::init::{
-    relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
+    linear_residual_out, linear_truncated, linear_with_same_dtype, relu_sq_linear,
 };
 use crate::torch::model::rmsnorm::RMSNorm;
 

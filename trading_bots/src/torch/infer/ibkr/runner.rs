@@ -241,9 +241,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 (alpha, beta)
             });
             let actions = sample_actions(
-                &alpha,
-                &beta,
-                true, // deterministic
+                &alpha, &beta, true, // deterministic
                 0.0,  // temperature
             );
 

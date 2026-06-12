@@ -2,9 +2,7 @@ use tch::nn::Init;
 use tch::{nn, Kind, Tensor};
 
 use crate::torch::model::blocks::ffn::ScaledFfn;
-use crate::torch::model::init::{
-    linear_residual_out, linear_truncated, linear_with_same_dtype,
-};
+use crate::torch::model::init::{linear_residual_out, linear_truncated, linear_with_same_dtype};
 use crate::torch::model::rmsnorm::RMSNorm;
 use crate::torch::model::rope::RotaryEmbedding;
 

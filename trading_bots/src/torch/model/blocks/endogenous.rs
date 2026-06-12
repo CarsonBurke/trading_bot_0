@@ -3,9 +3,7 @@ use tch::{nn, Tensor};
 
 use crate::torch::model::blocks::ffn::ScaledFfn;
 use crate::torch::model::blocks::gqa::QK_GAIN_INIT;
-use crate::torch::model::init::{
-    linear_residual_out, linear_truncated, linear_with_same_dtype,
-};
+use crate::torch::model::init::{linear_residual_out, linear_truncated, linear_with_same_dtype};
 use crate::torch::model::rmsnorm::RMSNorm;
 
 pub(in crate::torch::model) struct EndogenousTickerBlock {

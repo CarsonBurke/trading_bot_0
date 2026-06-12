@@ -232,9 +232,7 @@ impl Trainer {
         primary
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
-        primary
-            .meta_history
-            .record_approx_kl(mean_epoch_approx_kl);
+        primary.meta_history.record_approx_kl(mean_epoch_approx_kl);
         primary.meta_history.record_hl_gauss_range_stats(
             return_min,
             return_max,

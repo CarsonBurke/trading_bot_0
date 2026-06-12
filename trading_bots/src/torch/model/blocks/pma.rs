@@ -36,7 +36,8 @@ impl PmaReadout {
             model_dim,
             false,
         );
-        let block = CrossAttnFfnBlock::new_with_cross_attn(&pma_path, model_dim, ff_dim, cross_attn);
+        let block =
+            CrossAttnFfnBlock::new_with_cross_attn(&pma_path, model_dim, ff_dim, cross_attn);
         Self {
             seeds,
             block,

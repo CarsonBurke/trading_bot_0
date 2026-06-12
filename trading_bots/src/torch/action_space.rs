@@ -53,7 +53,11 @@ mod tests {
         for i in 0..raws.len() {
             let v = out.double_value(&[i as i64]);
             assert!(v >= 1.0, "concentration {v} below 1.0");
-            assert!(v.is_finite(), "concentration not finite for raw {}", raws[i]);
+            assert!(
+                v.is_finite(),
+                "concentration not finite for raw {}",
+                raws[i]
+            );
             assert!(v > prev, "not monotonic at index {i}: {v} <= {prev}");
             prev = v;
         }
