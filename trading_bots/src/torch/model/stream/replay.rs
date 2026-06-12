@@ -202,16 +202,8 @@ mod tests {
             false,
         );
 
-        assert_not_close(
-            &out_0.0,
-            &out_1.0,
-            "value logits should depend on price history",
-        );
-        assert_not_close(
-            &out_0.1,
-            &out_1.1,
-            "action mean should depend on price history",
-        );
+        assert_not_close(&out_0.1, &out_1.1, "alpha should depend on price history");
+        assert_not_close(&out_0.2, &out_1.2, "beta should depend on price history");
     }
 
     #[test]

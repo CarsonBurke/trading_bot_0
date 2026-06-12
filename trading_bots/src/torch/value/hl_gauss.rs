@@ -121,9 +121,12 @@ impl HlGaussBins {
         encoded.reshape(out_shape)
     }
 
-    /// Compute the expected scalar value. Probabilities/logits live on symlog-space
-    /// centers; the expectation is mapped back with symexp.
-    pub fn bins_to_scalar_value(&self, logits_or_probs: &Tensor, normalize: bool) -> Tensor {
+    /// Compute E[symexp(z)] for probabilities/logits over symlog-space centers.
+    pub fn bins_to_expected_scalar_value(
+        &self,
+        logits_or_probs: &Tensor,
+        normalize: bool,
+    ) -> Tensor {
         let weights = if normalize {
             logits_or_probs.softmax(-1, Kind::Float)
         } else {
@@ -134,14 +137,14 @@ impl HlGaussBins {
             .centers
             .to_device(logits_or_probs.device())
             .to_kind(Kind::Double);
-        let symlog_value =
-            (weights * centers).sum_dim_intlist([-1].as_slice(), false, Kind::Double);
-        symexp_tensor(&symlog_value).to_kind(Kind::Float)
+        (weights * symexp_tensor(&centers))
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Double)
+            .to_kind(Kind::Float)
     }
 
-    /// Decode logits [batch, NUM_BINS] to scalar values [batch].
+    /// Decode logits [batch, NUM_BINS] to raw scalar expected values [batch].
     pub fn decode(&self, logits: &Tensor) -> Tensor {
-        self.bins_to_scalar_value(logits, true)
+        self.bins_to_expected_scalar_value(logits, true)
     }
 }
 
@@ -156,7 +159,7 @@ mod tests {
     }
 
     fn direct_decode(bins: &HlGaussBins, encoded: &Tensor) -> Tensor {
-        bins.bins_to_scalar_value(encoded, false)
+        bins.bins_to_expected_scalar_value(encoded, false)
     }
 
     fn symexp_scalar(x: f64) -> f64 {
@@ -257,19 +260,35 @@ mod tests {
     }
 
     #[test]
-    fn bins_to_scalar_value_matches_normalize_flag() {
+    fn bins_to_expected_scalar_value_matches_normalize_flag() {
         let bins = HlGaussBins::new(-3.0, 3.0, 21, tch::Device::Cpu);
         let values = Tensor::from_slice(&[-1.5f32, 0.0, 2.25]);
         let encoded = bins.encode(&values);
 
-        let direct = bins.bins_to_scalar_value(&encoded, false);
+        let direct = bins.bins_to_expected_scalar_value(&encoded, false);
         let logits = encoded.clamp_min(1e-30).log();
-        let normalized = bins.bins_to_scalar_value(&logits, true);
+        let normalized = bins.bins_to_expected_scalar_value(&logits, true);
 
         let max_diff = (&direct - &normalized).abs().max().double_value(&[]);
         assert!(
             max_diff < 1e-5,
             "normalize flag mismatch, max diff {max_diff}"
+        );
+    }
+
+    #[test]
+    fn decode_consumes_expected_raw_scalar_not_transformed_mean() {
+        let bins = HlGaussBins::new(-3.0, 3.0, 21, tch::Device::Cpu);
+        let logits = Tensor::full([1, 21], -100.0, (Kind::Float, tch::Device::Cpu));
+        let _ = logits.get(0).get(10).fill_(0.0);
+        let _ = logits.get(0).get(20).fill_(0.0);
+
+        let decoded = bins.decode(&logits).double_value(&[0]);
+        let transformed_mean_decode = symexp_scalar((0.0 + (3.0 - 3.0 / 21.0)) * 0.5);
+
+        assert!(
+            decoded > transformed_mean_decode,
+            "expected raw decode should preserve high-bin mass: expected > {transformed_mean_decode}, got {decoded}"
         );
     }
 

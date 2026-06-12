@@ -12,7 +12,7 @@ use super::config::{
     UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
 };
 use super::init::{
-    linear_orthogonal, linear_orthogonal_with_bias, linear_with_same_dtype, truncated_normal_init,
+    linear_orthogonal, linear_with_same_dtype, linear_zero, truncated_normal_init,
     xavier_normal_std,
 };
 use super::rmsnorm::RMSNorm;
@@ -371,8 +371,7 @@ impl TradingModel {
         let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
         let policy_concentration =
             linear_orthogonal(p, "policy_concentration", spec.model_dim, 2, 0.01);
-        let value_proj =
-            linear_orthogonal_with_bias(p, "value_proj", flat_all_tickers, NUM_BINS, 0.1);
+        let value_proj = linear_zero(p, "value_proj", flat_all_tickers, NUM_BINS);
         Self {
             variant: config.variant,
             patch_configs,
@@ -622,9 +621,30 @@ impl TradingModel {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use tch::{nn, Device, Kind, Tensor};
 
     use super::{ModelVariant, TradingModel, TradingModelConfig, UNIFORM_STREAM_PATCH_SIZE};
+    use crate::torch::constants::TICKERS_COUNT;
+    use crate::torch::load::load_var_store_partial;
+    use crate::torch::value::hl_gauss::HlGaussBins;
+
+    fn temp_checkpoint_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("trading_bot_0_{name}_{}.ot", uuid::Uuid::new_v4()))
+    }
+
+    fn assert_value_head_is_unbiased_zero(model: &TradingModel) {
+        let weight_abs_max = model.value_proj.ws.abs().max().double_value(&[]);
+        assert_eq!(
+            weight_abs_max, 0.0,
+            "legacy value weights must not overwrite zero HL-Gauss head"
+        );
+        assert!(
+            model.value_proj.bs.is_none(),
+            "HL-Gauss value projection should be bias-free"
+        );
+    }
 
     #[test]
     fn stream_patch_embed_treats_nan_padding_as_zero() {
@@ -657,5 +677,363 @@ mod tests {
             out_nan.allclose(&out_zero, 1e-6, 1e-6, false),
             "NaN-padded tail should embed identically to zero-padded tail"
         );
+    }
+
+    #[test]
+    fn value_head_initializes_bias_free_to_zero_return() {
+        tch::manual_seed(20260612);
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+
+        let weight_abs_max = model.value_proj.ws.abs().max().double_value(&[]);
+        assert_eq!(
+            weight_abs_max, 0.0,
+            "value head weights should start at zero"
+        );
+
+        assert!(
+            model.value_proj.bs.is_none(),
+            "value head should follow HLGaussLayer and omit bias"
+        );
+
+        let actor = Tensor::randn([TICKERS_COUNT, model.model_dim], (Kind::Float, Device::Cpu));
+        let critic = Tensor::randn([TICKERS_COUNT, model.model_dim], (Kind::Float, Device::Cpu));
+        let (value_logits, _, _) = model.head_from_actor_critic_cls(&actor, &critic, 1);
+        let decoded = HlGaussBins::default_for(Device::Cpu).decode(&value_logits);
+        let decoded_abs_max = decoded.abs().max().double_value(&[]);
+
+        assert!(
+            decoded_abs_max < 1e-6,
+            "zero-logit value head should decode to zero, got abs max {decoded_abs_max}"
+        );
+    }
+
+    #[test]
+    fn current_model_checkpoint_roundtrips_through_partial_loader() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("model_roundtrip");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        vs.save(&path).expect("failed to save checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let _loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        summary.require_complete().unwrap();
+        assert!(summary.loaded > 0, "loader should copy checkpoint tensors");
+        assert!(
+            summary.migrated_legacy_value_head.is_empty(),
+            "current checkpoints should not need value-head migration"
+        );
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn biased_value_head_checkpoint_reports_dropped_bias() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("biased_current_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let stale_weight = Tensor::randn(model.value_proj.ws.size(), (Kind::Float, Device::Cpu));
+        let mut named_tensors = vs
+            .variables()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let tensor = match name.as_str() {
+                    "value_proj.weight" => stale_weight.shallow_clone(),
+                    _ => tensor,
+                };
+                (name, tensor)
+            })
+            .collect::<Vec<_>>();
+        named_tensors.push((
+            "value_proj.bias".to_string(),
+            Tensor::randn([model.value_proj.ws.size()[0]], (Kind::Float, Device::Cpu)),
+        ));
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save biased checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        summary.require_complete().unwrap();
+        let mut migrated = summary.migrated_legacy_value_head.clone();
+        migrated.sort();
+        assert_eq!(
+            migrated,
+            vec![
+                "value_proj.bias".to_string(),
+                "value_proj.weight".to_string()
+            ],
+            "dropped biased-head checkpoints should be surfaced as value-head migration"
+        );
+        assert_value_head_is_unbiased_zero(&loaded_model);
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn partial_current_value_head_checkpoint_remains_strict() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("partial_current_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let named_tensors = vs
+            .variables()
+            .into_iter()
+            .filter(|(name, _)| name != "value_proj.weight")
+            .collect::<Vec<_>>();
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save partial checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let _loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        assert!(
+            summary.require_complete().is_err(),
+            "partial current value head checkpoints must remain strict"
+        );
+        assert!(
+            summary
+                .missing
+                .iter()
+                .any(|missing| missing == "value_proj.weight"),
+            "missing current value_proj.weight should be reported"
+        );
+        assert!(
+            summary.migrated_legacy_value_head.is_empty(),
+            "current value_proj names alone must not trigger legacy migration"
+        );
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn legacy_scalar_value_head_checkpoint_keeps_new_unbiased_zero_head() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("legacy_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let legacy_weight = Tensor::randn(
+            [1, model.value_proj.ws.size()[1]],
+            (Kind::Float, Device::Cpu),
+        );
+        let mut named_tensors = vs
+            .variables()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let tensor = match name.as_str() {
+                    "value_proj.weight" => legacy_weight.shallow_clone(),
+                    _ => tensor,
+                };
+                (name, tensor)
+            })
+            .collect::<Vec<_>>();
+        named_tensors.push((
+            "value_proj.bias".to_string(),
+            Tensor::randn([1], (Kind::Float, Device::Cpu)),
+        ));
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save legacy checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        summary.require_complete().unwrap();
+        let mut migrated = summary.migrated_legacy_value_head.clone();
+        migrated.sort();
+        assert_eq!(
+            migrated,
+            vec![
+                "value_proj.bias".to_string(),
+                "value_proj.weight".to_string()
+            ]
+        );
+        assert_value_head_is_unbiased_zero(&loaded_model);
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn scalar_value_head_with_wrong_input_width_remains_strict() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("wrong_width_scalar_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let legacy_weight = Tensor::randn(
+            [1, model.value_proj.ws.size()[1] - 1],
+            (Kind::Float, Device::Cpu),
+        );
+        let mut named_tensors = vs
+            .variables()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let tensor = match name.as_str() {
+                    "value_proj.weight" => legacy_weight.shallow_clone(),
+                    _ => tensor,
+                };
+                (name, tensor)
+            })
+            .collect::<Vec<_>>();
+        named_tensors.push((
+            "value_proj.bias".to_string(),
+            Tensor::randn([1], (Kind::Float, Device::Cpu)),
+        ));
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save legacy checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let _loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        assert!(
+            summary.require_complete().is_err(),
+            "scalar value heads from a different critic width must remain strict"
+        );
+        assert!(
+            summary
+                .shape_mismatches
+                .iter()
+                .any(|mismatch| mismatch.name == "value_proj.weight"),
+            "wrong-width scalar value_proj.weight should be reported"
+        );
+        assert!(
+            !summary
+                .migrated_legacy_value_head
+                .iter()
+                .any(|name| name == "value_proj.weight"),
+            "wrong-width scalar value_proj.weight should not migrate"
+        );
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn renamed_legacy_value_head_checkpoint_keeps_new_unbiased_zero_head() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("renamed_legacy_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let legacy_weight = Tensor::randn(
+            [255, model.value_proj.ws.size()[1]],
+            (Kind::Float, Device::Cpu),
+        );
+        let legacy_bias = Tensor::randn([255], (Kind::Float, Device::Cpu));
+        let mut named_tensors = vs
+            .variables()
+            .into_iter()
+            .filter(|(name, _)| name != "value_proj.weight")
+            .collect::<Vec<_>>();
+        named_tensors.push(("critic_out.weight".to_string(), legacy_weight));
+        named_tensors.push(("critic_out.bias".to_string(), legacy_bias));
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save legacy checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        summary.require_complete().unwrap();
+        let mut migrated = summary.migrated_legacy_value_head.clone();
+        migrated.sort();
+        assert_eq!(migrated, vec!["value_proj.weight".to_string()]);
+        assert_value_head_is_unbiased_zero(&loaded_model);
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn nonscalar_value_head_shape_drift_remains_strict() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("mismatched_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let legacy_weight = Tensor::randn(
+            [
+                model.value_proj.ws.size()[0],
+                model.value_proj.ws.size()[1] - 1,
+            ],
+            (Kind::Float, Device::Cpu),
+        );
+        let named_tensors = vs
+            .variables()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let tensor = match name.as_str() {
+                    "value_proj.weight" => legacy_weight.shallow_clone(),
+                    _ => tensor,
+                };
+                (name, tensor)
+            })
+            .collect::<Vec<_>>();
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save legacy checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let _loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        assert!(
+            summary.require_complete().is_err(),
+            "non-scalar value-head shape drift must remain strict"
+        );
+        assert!(
+            summary.migrated_legacy_value_head.is_empty(),
+            "non-scalar value-head shape drift should not use legacy migration"
+        );
+        assert!(
+            summary
+                .shape_mismatches
+                .iter()
+                .any(|mismatch| mismatch.name == "value_proj.weight"),
+            "value_proj.weight shape drift should be reported"
+        );
+        cleanup.expect("failed to remove temporary checkpoint");
     }
 }
