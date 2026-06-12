@@ -316,10 +316,10 @@ impl TradingModel {
         let pma = PmaReadout::new(&(p / "pma_readout"), spec.model_dim, spec.ff_dim);
         let patch_stream_proj = nn::linear(
             p / "patch_stream_proj",
-            UNIFORM_STREAM_PATCH_SIZE + 1, // patch values + fill_fraction
+            UNIFORM_STREAM_PATCH_SIZE,
             spec.model_dim,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(UNIFORM_STREAM_PATCH_SIZE + 1, spec.model_dim),
+                ws_init: truncated_normal_init(UNIFORM_STREAM_PATCH_SIZE, spec.model_dim),
                 bs_init: None,
                 bias: false,
             },
@@ -563,29 +563,10 @@ impl TradingModel {
         out
     }
 
-    pub(in crate::torch::model) fn patch_embed_stream_batch(
-        &self,
-        patch_vals: &Tensor,
-        fill_counts: &Tensor,
-    ) -> Tensor {
+    pub(in crate::torch::model) fn patch_embed_stream_batch(&self, patch_vals: &Tensor) -> Tensor {
         let target_kind = patch_vals.kind();
-        let patch_size = UNIFORM_STREAM_PATCH_SIZE;
-        // Build position mask from fill counts — don't read NaN positions
-        let positions = Tensor::arange(patch_size, (Kind::Int64, patch_vals.device()));
-        let mask = positions
-            .unsqueeze(0)
-            .less_tensor(&fill_counts.unsqueeze(-1)); // [batch, patch_size]
-        let patch_vals_float = patch_vals.to_kind(Kind::Float);
-        let clean = patch_vals_float * mask.to_kind(Kind::Float);
-        let fill_fraction = fill_counts.to_kind(Kind::Float).unsqueeze(-1) / patch_size as f64;
-        let input = Tensor::cat(
-            &[
-                &clean.to_kind(target_kind),
-                &fill_fraction.to_kind(target_kind),
-            ],
-            -1,
-        ); // [batch, patch_size + 1]
-        linear_with_same_dtype(&input, &self.patch_stream_proj)
+        let clean = patch_vals.to_kind(Kind::Float).nan_to_num(0.0, 0.0, 0.0);
+        linear_with_same_dtype(&clean.to_kind(target_kind), &self.patch_stream_proj)
     }
 
     pub(in crate::torch::model) fn patch_embed_stream(&self, deltas: &Tensor) -> Tensor {
@@ -594,13 +575,7 @@ impl TradingModel {
             batch * UNIFORM_STREAM_PATCH_COUNT,
             UNIFORM_STREAM_PATCH_SIZE,
         ]);
-        // Compute fill counts per patch from valid (non-NaN) positions
-        let fill_counts = patches
-            .isnan()
-            .logical_not()
-            .to_kind(Kind::Int64)
-            .sum_dim_intlist([1].as_slice(), false, Kind::Int64);
-        self.patch_embed_stream_batch(&patches, &fill_counts).view([
+        self.patch_embed_stream_batch(&patches).view([
             batch,
             UNIFORM_STREAM_PATCH_COUNT,
             self.model_dim,
@@ -642,5 +617,45 @@ impl TradingModel {
         let actor_read = pooled.select(1, 0);
         let critic_read = pooled.select(1, 1);
         self.head_from_actor_critic_cls(&actor_read, &critic_read, batch_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tch::{nn, Device, Kind, Tensor};
+
+    use super::{ModelVariant, TradingModel, TradingModelConfig, UNIFORM_STREAM_PATCH_SIZE};
+
+    #[test]
+    fn stream_patch_embed_treats_nan_padding_as_zero() {
+        tch::manual_seed(20260612);
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(
+            &vs.root(),
+            TradingModelConfig {
+                variant: ModelVariant::UniformStream,
+            },
+        );
+
+        let base = Tensor::arange(UNIFORM_STREAM_PATCH_SIZE, (Kind::Float, Device::Cpu)) * 0.001;
+        let nan_padded = base.copy();
+        let zero_padded = base.copy();
+        let tail_start = 10;
+        let tail_len = UNIFORM_STREAM_PATCH_SIZE - tail_start;
+        let _ = nan_padded.narrow(0, tail_start, tail_len).fill_(f64::NAN);
+        let _ = zero_padded.narrow(0, tail_start, tail_len).fill_(0.0);
+
+        let out_nan = model.patch_embed_stream_batch(&nan_padded.unsqueeze(0));
+        let out_zero = model.patch_embed_stream_batch(&zero_padded.unsqueeze(0));
+
+        assert!(
+            out_nan.isfinite().all().int64_value(&[]) == 1,
+            "NaN padding must not leak into patch embeddings"
+        );
+        assert!(
+            out_nan.allclose(&out_zero, 1e-6, 1e-6, false),
+            "NaN-padded tail should embed identically to zero-padded tail"
+        );
     }
 }
