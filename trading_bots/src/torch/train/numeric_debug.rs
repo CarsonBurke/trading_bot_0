@@ -205,12 +205,15 @@ fn value_diag_core(pred: &Tensor, target: &Tensor) -> Tensor {
     let return_mean = target.mean(Kind::Float);
     let value_centered = pred - &value_mean;
     let return_centered = target - &return_mean;
+    let residual_mean = residuals.mean(Kind::Float);
+    let residual_centered = &residuals - &residual_mean;
     let value_std = value_centered.square().mean(Kind::Float).sqrt();
     let return_std = return_centered.square().mean(Kind::Float).sqrt();
     let residual_rmse = residuals.square().mean(Kind::Float).sqrt();
     let return_var = return_centered.square().mean(Kind::Float);
-    let explained_var =
-        Tensor::from(1.0) - residuals.square().mean(Kind::Float) / return_var.clamp_min(1e-8);
+    let residual_var = residual_centered.square().mean(Kind::Float);
+    let explained_var_raw = Tensor::from(1.0) - residual_var / return_var.clamp_min(1e-8);
+    let explained_var = nan_if_zero_target_variance(&explained_var_raw, &return_var);
     let corr = (&value_centered * &return_centered).mean(Kind::Float)
         / ((&value_std * &return_std).clamp_min(1e-8));
     Tensor::stack(
@@ -252,8 +255,82 @@ pub(crate) fn compute_explained_variance(rollout_values: &Tensor, returns: &Tens
     tch::no_grad(|| {
         let residuals = rollout_values - returns;
         let mean_ret = returns.mean(Kind::Float);
-        let var_ret = returns.square().mean(Kind::Float) - mean_ret.square();
-        let var_resid = residuals.square().mean(Kind::Float);
-        Tensor::from(1.0) - &var_resid / var_ret.clamp_min(1e-8)
+        let returns_centered = returns - &mean_ret;
+        let var_ret = returns_centered.square().mean(Kind::Float);
+        let mean_resid = residuals.mean(Kind::Float);
+        let residuals_centered = residuals - &mean_resid;
+        let var_resid = residuals_centered.square().mean(Kind::Float);
+        let explained_var = Tensor::from(1.0) - &var_resid / var_ret.clamp_min(1e-8);
+        nan_if_zero_target_variance(&explained_var, &var_ret)
     })
+}
+
+fn nan_if_zero_target_variance(explained_var: &Tensor, target_var: &Tensor) -> Tensor {
+    let nan = Tensor::full_like(explained_var, f64::NAN);
+    nan.where_self(&target_var.eq(0.0), explained_var)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_explained_variance, compute_value_diagnostics};
+    use tch::Tensor;
+
+    #[test]
+    fn explained_variance_matches_cleanrl_residual_variance() {
+        let returns = Tensor::from_slice(&[-1.0f32, 0.0, 1.0, 2.0]);
+        let biased_values = &returns + 10.0;
+
+        let ev = compute_explained_variance(&biased_values, &returns).double_value(&[]);
+
+        assert!(
+            (ev - 1.0).abs() < 1e-6,
+            "expected CleanRL-style EV 1.0, got {ev}"
+        );
+    }
+
+    #[test]
+    fn value_diagnostics_use_same_explained_variance_formula() {
+        let returns = Tensor::from_slice(&[-1.0f32, 0.0, 1.0, 2.0]);
+        let biased_values = &returns + 10.0;
+
+        let diag = compute_value_diagnostics(&biased_values, &returns);
+        let ev = diag.double_value(&[6]);
+
+        assert!(
+            (ev - 1.0).abs() < 1e-6,
+            "expected diagnostic EV 1.0, got {ev}"
+        );
+    }
+
+    #[test]
+    fn explained_variance_is_nan_when_returns_have_zero_variance() {
+        let returns = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0]);
+        let values = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0]);
+
+        let ev = compute_explained_variance(&values, &returns);
+
+        assert_eq!(ev.isnan().int64_value(&[]), 1);
+    }
+
+    #[test]
+    fn value_diagnostics_explained_variance_is_nan_when_returns_have_zero_variance() {
+        let returns = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0]);
+        let values = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0]);
+
+        let diag = compute_value_diagnostics(&values, &returns);
+
+        assert_eq!(diag.get(6).isnan().int64_value(&[]), 1);
+    }
+
+    #[test]
+    fn explained_variance_reduces_over_all_dimensions_like_flattened_cleanrl_batch() {
+        let returns = Tensor::from_slice(&[-1.0f32, 0.0, 1.0, 2.0]).view([2, 2]);
+        let values = Tensor::from_slice(&[-1.0f32, 1.0, 1.0, 3.0]).view([2, 2]);
+
+        let ev_2d = compute_explained_variance(&values, &returns).double_value(&[]);
+        let ev_flat = compute_explained_variance(&values.reshape([-1]), &returns.reshape([-1]))
+            .double_value(&[]);
+
+        assert!((ev_2d - ev_flat).abs() < 1e-6);
+    }
 }
