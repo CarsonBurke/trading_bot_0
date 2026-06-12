@@ -27,6 +27,7 @@ pub(crate) const CLIP_EPS_HIGH: f64 = 0.28;
 pub(crate) const TARGET_KL: f64 = 0.03;
 pub(crate) const KL_STOP_MULTIPLIER: f64 = 1.5;
 pub(crate) const VALUE_LOSS_COEF: f64 = 1.0;
+/// Our beta distribution with log variance explores very well, and better without entropy regulation.
 pub(crate) const ENTROPY_COEF: f64 = 0.0;
 pub(crate) const MAX_GRAD_NORM: f64 = 0.5;
 pub(crate) const DEBUG_NUMERICS: bool = false;
