@@ -3,12 +3,25 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::model::ModelVariant;
 use tch::{Device, Tensor};
 
-pub(super) const ENV_RESET_GROUPS: usize = 2;
-
 #[derive(Clone)]
 pub(super) struct EnvGroupEpisode {
     pub(super) market: EnvMarketSnapshot,
     pub(super) start_offset: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct EnvGroupKey {
+    pub(super) tickers: Vec<String>,
+    pub(super) start_offset: usize,
+}
+
+impl EnvGroupEpisode {
+    pub(super) fn key(&self) -> EnvGroupKey {
+        EnvGroupKey {
+            tickers: self.market.tickers.clone(),
+            start_offset: self.start_offset,
+        }
+    }
 }
 
 pub(super) struct RingStepResult {
@@ -59,7 +72,7 @@ impl VecEnv {
         gens_path: String,
         nprocs: usize,
     ) -> Self {
-        let env_group_count = ENV_RESET_GROUPS.min(nprocs).max(1);
+        let env_group_count = reset_group_count_for_nprocs(nprocs);
         assert_eq!(
             nprocs % env_group_count,
             0,
@@ -104,7 +117,7 @@ impl VecEnv {
     }
 
     pub(super) fn env_group_count(&self) -> usize {
-        ENV_RESET_GROUPS.min(self.nprocs).max(1)
+        reset_group_count_for_nprocs(self.nprocs)
     }
 
     pub(super) fn env_group_size(&self) -> usize {
@@ -124,13 +137,29 @@ impl VecEnv {
         }
     }
 
-    pub(super) fn has_used_market_episode(
-        used_specs: &[EnvGroupEpisode],
-        spec: &EnvGroupEpisode,
+    pub(super) fn current_group_key(&self, env_idx: usize) -> EnvGroupKey {
+        EnvGroupKey {
+            tickers: self.envs[env_idx].tickers.clone(),
+            start_offset: self.envs[env_idx].episode_start_offset,
+        }
+    }
+
+    pub(super) fn current_group_keys(&self) -> Vec<EnvGroupKey> {
+        (0..self.env_group_count())
+            .map(|group_idx| {
+                let (group_start, _) = self.group_bounds(group_idx);
+                self.current_group_key(group_start)
+            })
+            .collect()
+    }
+
+    pub(super) fn has_used_market_episode_key(
+        used_keys: &[EnvGroupKey],
+        key: &EnvGroupKey,
     ) -> bool {
-        used_specs.iter().any(|used| {
-            used.market.tickers == spec.market.tickers && used.start_offset == spec.start_offset
-        })
+        used_keys
+            .iter()
+            .any(|used| used.tickers == key.tickers && used.start_offset == key.start_offset)
     }
 
     pub fn max_step(&self) -> usize {
@@ -171,5 +200,44 @@ impl VecEnv {
 
     pub fn prices(&self) -> &Vec<Vec<f64>> {
         &self.envs[0].prices
+    }
+}
+
+fn reset_group_count_for_nprocs(nprocs: usize) -> usize {
+    nprocs.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reset_group_count_for_nprocs, EnvGroupKey, VecEnv};
+
+    #[test]
+    fn reset_groups_match_positive_nprocs() {
+        for nprocs in [1, 2, 8, 16, 31] {
+            assert_eq!(reset_group_count_for_nprocs(nprocs), nprocs);
+        }
+    }
+
+    #[test]
+    fn market_episode_keys_reject_active_duplicate() {
+        let used_keys = vec![EnvGroupKey {
+            tickers: vec!["AAPL".to_string(), "MSFT".to_string()],
+            start_offset: 128,
+        }];
+
+        assert!(VecEnv::has_used_market_episode_key(
+            &used_keys,
+            &EnvGroupKey {
+                tickers: vec!["AAPL".to_string(), "MSFT".to_string()],
+                start_offset: 128,
+            }
+        ));
+        assert!(!VecEnv::has_used_market_episode_key(
+            &used_keys,
+            &EnvGroupKey {
+                tickers: vec!["AAPL".to_string(), "MSFT".to_string()],
+                start_offset: 256,
+            }
+        ));
     }
 }
