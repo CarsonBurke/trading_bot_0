@@ -1,6 +1,8 @@
 use tch::nn::Init;
 use tch::{nn, Tensor};
 
+pub(in crate::torch::model) const RESIDUAL_OUT_GAIN: f64 = 0.2;
+
 pub(in crate::torch::model) fn linear_with_same_dtype(x: &Tensor, linear: &nn::Linear) -> Tensor {
     let weight = if linear.ws.kind() == x.kind() {
         linear.ws.shallow_clone()
@@ -89,14 +91,5 @@ pub(in crate::torch::model) fn linear_residual_out(
     in_features: i64,
     out_features: i64,
 ) -> nn::Linear {
-    nn::linear(
-        p / name,
-        in_features,
-        out_features,
-        nn::LinearConfig {
-            ws_init: Init::Const(0.0),
-            bs_init: None,
-            bias: false,
-        },
-    )
+    linear_orthogonal(p, name, in_features, out_features, RESIDUAL_OUT_GAIN)
 }

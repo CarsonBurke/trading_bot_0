@@ -26,10 +26,9 @@ impl PmaReadout {
                 stdev: 0.02,
             },
         );
-        // Non-zero cross-attn output init so pooled patch context (and thus price
-        // history) reaches the readout at initialization, rather than the seeds
-        // passing through a zeroed residual unchanged. The FFN out-proj keeps its
-        // residual-zero init (identity at start), matching the codebase idiom.
+        // Full-gain cross-attn output init so pooled patch context reaches the
+        // readout immediately; other residual outputs use the model-wide residual
+        // gain.
         let pma_path = p / "pma";
         let cross_attn = ExogenousTickerBlock::new_with_output_init(
             &(&pma_path / "cross_attn"),

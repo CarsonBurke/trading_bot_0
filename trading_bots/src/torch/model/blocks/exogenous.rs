@@ -29,7 +29,7 @@ impl ExogenousTickerBlock {
     pub(in crate::torch::model) fn new_with_output_init(
         p: &nn::Path,
         model_dim: i64,
-        residual_zero_out: bool,
+        use_residual_init: bool,
     ) -> Self {
         let ca_dim = CA_NUM_HEADS * CA_HEAD_DIM;
         let ln_q = RMSNorm::new(model_dim, 1e-6);
@@ -41,7 +41,7 @@ impl ExogenousTickerBlock {
         let q_proj = linear_truncated(p, "ca_q", model_dim, ca_dim);
         let k_proj = linear_truncated(p, "ca_k", model_dim, ca_dim);
         let v_proj = linear_truncated(p, "ca_v", model_dim, ca_dim);
-        let out_proj = if residual_zero_out {
+        let out_proj = if use_residual_init {
             linear_residual_out(p, "ca_out", ca_dim, model_dim)
         } else {
             linear_truncated(p, "ca_out", ca_dim, model_dim)
