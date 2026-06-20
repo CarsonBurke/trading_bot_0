@@ -9,6 +9,7 @@
 #include<ATen/autocast_mode.h>
 #ifdef TCH_CUDA_GRAPHS
 #include<ATen/cuda/CUDAGraph.h>
+#include<ATen/cuda/CUDAEvent.h>
 #include<c10/cuda/CUDAGuard.h>
 #include<c10/cuda/CUDAStream.h>
 #endif
@@ -35,23 +36,45 @@ thread_local char *torch_last_err = nullptr;
 struct TchCudaGraph {
   at::cuda::CUDAGraph graph;
   c10::DeviceIndex device_index = -1;
+  // The side stream that warmup, capture, and every replay run on. Created once
+  // (lazily, off the pool) and retained for the graph's lifetime so all three
+  // phases are serialized on a single non-default stream. cudaStreamBeginCapture
+  // is illegal on the default stream, and at::cuda::CUDAGraph::replay() launches
+  // on whatever stream is current, so we must keep this stream current across
+  // warmup/capture/replay rather than re-deriving a fresh pool stream each time.
   std::unique_ptr<c10::cuda::CUDAStream> capture_stream;
-  std::unique_ptr<c10::cuda::CUDAStreamGuard> capture_guard;
+  // Persistent guard that makes capture_stream the current stream for the whole
+  // warmup/capture/replay region (installed by at_cuda_graph_stream_begin,
+  // released by at_cuda_graph_stream_end).
+  std::unique_ptr<c10::cuda::CUDAStreamGuard> scope_guard;
+  // The stream that was current when the scope was entered (the producer of the
+  // input copies and the consumer of the graph outputs). Captured per scope so
+  // entry/exit synchronize against the exact same stream rather than assuming
+  // the default stream.
+  std::unique_ptr<c10::cuda::CUDAStream> outer_stream;
 };
 
-static void reset_cuda_graph_capture_state(TchCudaGraph *g) {
-  if (g == nullptr) {
-    return;
-  }
-  g->capture_guard.reset();
-  g->capture_stream.reset();
+// Order the `waiter` stream after the `waited_on` stream's currently-enqueued
+// work using a recorded event. This is the same cross-stream device-side
+// synchronization performed by at::cuda::CUDAStream::wait / wait_stream: no
+// host stall, just an event the waiter stream blocks on.
+static void stream_wait_stream(const c10::cuda::CUDAStream &waiter,
+                               const c10::cuda::CUDAStream &waited_on) {
+  at::cuda::CUDAEvent event;
+  event.record(waited_on);
+  event.block(waiter);
 }
 
 static void reset_cuda_graph_after_failed_capture(TchCudaGraph *g) {
-  reset_cuda_graph_capture_state(g);
   if (g == nullptr) {
     return;
   }
+  // A failed capture cannot be replayed, so tear the whole stream scope down:
+  // release the guard (restoring the previous current stream) and drop the
+  // retained capture stream so a subsequent attempt starts clean.
+  g->scope_guard.reset();
+  g->outer_stream.reset();
+  g->capture_stream.reset();
   try {
     g->graph.reset();
   } catch (...) {
@@ -418,18 +441,84 @@ void at_cuda_graph_free(cuda_graph graph) {
 #endif
 }
 
+// Enter the graph's side-stream scope: make the (lazily-created) capture stream
+// the current stream and order it after the default stream's pending producers
+// (input H2D copies and upstream rollout tensors) via an event. Every operation
+// enqueued by the caller until at_cuda_graph_stream_end -- warmup, capture body,
+// or replay -- runs on this stream, matching make_graphed_callables discipline.
+void at_cuda_graph_stream_begin(cuda_graph graph, int64_t device_index) {
+#ifdef TCH_CUDA_GRAPHS
+  try {
+    auto *g = reinterpret_cast<TchCudaGraph*>(graph);
+    if (g->scope_guard) {
+      throw std::runtime_error("CUDA graph stream scope is already active");
+    }
+    g->device_index = static_cast<c10::DeviceIndex>(device_index);
+    c10::cuda::CUDAGuard device_guard(c10::Device(c10::DeviceType::CUDA, g->device_index));
+    if (!g->capture_stream) {
+      g->capture_stream = std::make_unique<c10::cuda::CUDAStream>(
+          c10::cuda::getStreamFromPool(false, g->device_index));
+    }
+    g->outer_stream = std::make_unique<c10::cuda::CUDAStream>(
+        c10::cuda::getCurrentCUDAStream(g->device_index));
+    // Side stream waits for everything currently enqueued on the outer stream
+    // (the input copies just issued) before any scoped work runs.
+    stream_wait_stream(*g->capture_stream, *g->outer_stream);
+    g->scope_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(*g->capture_stream);
+  } catch (const exception& e) {
+    reset_cuda_graph_after_failed_capture(reinterpret_cast<TchCudaGraph*>(graph));
+    torch_last_err = strdup(e.what());
+  }
+#else
+  (void)graph;
+  (void)device_index;
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+}
+
+// Leave the side-stream scope: order the default stream after the capture
+// stream's just-enqueued work (graph outputs and gradients) so downstream
+// default-stream consumers -- the optimizer step and metric reductions -- see
+// the results, then restore the previous current stream by dropping the guard.
+void at_cuda_graph_stream_end(cuda_graph graph) {
+#ifdef TCH_CUDA_GRAPHS
+  try {
+    auto *g = reinterpret_cast<TchCudaGraph*>(graph);
+    if (!g->scope_guard || !g->capture_stream || !g->outer_stream) {
+      // The scope was already torn down (e.g. a failed capture aborted it).
+      // Treat end as an idempotent no-op so it never masks the original error.
+      return;
+    }
+    c10::cuda::CUDAGuard device_guard(c10::Device(c10::DeviceType::CUDA, g->device_index));
+    // Outer stream waits for the capture stream's just-enqueued work (graph
+    // outputs and gradients) so downstream consumers on the outer stream see it.
+    stream_wait_stream(*g->outer_stream, *g->capture_stream);
+    g->scope_guard.reset();
+    g->outer_stream.reset();
+  } catch (const exception& e) {
+    reset_cuda_graph_after_failed_capture(reinterpret_cast<TchCudaGraph*>(graph));
+    torch_last_err = strdup(e.what());
+  }
+#else
+  (void)graph;
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+}
+
 void at_cuda_graph_capture_begin(cuda_graph graph, int64_t device_index) {
 #ifdef TCH_CUDA_GRAPHS
   try {
     auto *g = reinterpret_cast<TchCudaGraph*>(graph);
-    if (g->capture_guard) {
-      throw std::runtime_error("CUDA graph capture is already active");
+    if (!g->scope_guard || !g->capture_stream) {
+      throw std::runtime_error(
+          "CUDA graph capture requires an active stream scope "
+          "(call at_cuda_graph_stream_begin first)");
     }
-    g->device_index = static_cast<c10::DeviceIndex>(device_index);
-    c10::cuda::CUDAGuard device_guard(c10::Device(c10::DeviceType::CUDA, g->device_index));
-    g->capture_stream = std::make_unique<c10::cuda::CUDAStream>(
-        c10::cuda::getStreamFromPool(false, g->device_index));
-    g->capture_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(*g->capture_stream);
+    if (static_cast<c10::DeviceIndex>(device_index) != g->device_index) {
+      throw std::runtime_error("CUDA graph capture device does not match stream scope");
+    }
+    // The scope guard already makes capture_stream the current stream, so
+    // capture_begin records on it (a non-default stream, as required).
     g->graph.capture_begin();
   } catch (const exception& e) {
     reset_cuda_graph_after_failed_capture(reinterpret_cast<TchCudaGraph*>(graph));
@@ -447,7 +536,6 @@ void at_cuda_graph_capture_end(cuda_graph graph) {
   try {
     auto *g = reinterpret_cast<TchCudaGraph*>(graph);
     g->graph.capture_end();
-    reset_cuda_graph_capture_state(g);
   } catch (const exception& e) {
     reset_cuda_graph_after_failed_capture(reinterpret_cast<TchCudaGraph*>(graph));
     torch_last_err = strdup(e.what());
@@ -479,6 +567,15 @@ void at_cuda_graph_replay(cuda_graph graph, int64_t device_index) {
     if (g->device_index >= 0 && g->device_index != requested_device_index) {
       throw std::runtime_error("CUDA graph replay requested on a different device than capture");
     }
+    if (!g->scope_guard || !g->capture_stream) {
+      throw std::runtime_error(
+          "CUDA graph replay requires an active stream scope "
+          "(call at_cuda_graph_stream_begin first)");
+    }
+    // at::cuda::CUDAGraph::replay() launches on the current stream; the scope
+    // guard makes that the capture stream, so the replay is ordered behind the
+    // stream_begin wait (inputs ready) and ahead of the stream_end wait
+    // (outputs visible to the default stream). No host-side device sync needed.
     c10::cuda::CUDAGuard device_guard(c10::Device(c10::DeviceType::CUDA, requested_device_index));
     g->graph.replay();
   )

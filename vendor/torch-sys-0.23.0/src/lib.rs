@@ -93,6 +93,8 @@ extern "C" {
     pub fn at_cuda_graph_new() -> *mut C_cuda_graph;
     pub fn at_cuda_graph_is_available() -> bool;
     pub fn at_cuda_graph_free(graph: *mut C_cuda_graph);
+    pub fn at_cuda_graph_stream_begin(graph: *mut C_cuda_graph, device_index: i64);
+    pub fn at_cuda_graph_stream_end(graph: *mut C_cuda_graph);
     pub fn at_cuda_graph_capture_begin(graph: *mut C_cuda_graph, device_index: i64);
     pub fn at_cuda_graph_capture_end(graph: *mut C_cuda_graph);
     pub fn at_cuda_graph_capture_abort(graph: *mut C_cuda_graph);

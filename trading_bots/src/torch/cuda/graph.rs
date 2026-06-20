@@ -31,7 +31,35 @@ impl CudaGraph {
         Ok(Some(Self { raw, device_index }))
     }
 
-    pub(crate) fn capture<F>(&mut self, f: F) -> Result<(), String>
+    /// Run `f` with the graph's side (capture) stream installed as the current
+    /// CUDA stream. On entry the side stream is ordered after the default
+    /// stream's pending work (so just-issued input copies are visible); on exit
+    /// the default stream is ordered after the side stream's work (so graph
+    /// outputs and gradients are visible to downstream default-stream consumers).
+    /// This replaces a per-replay full-device host synchronization with two
+    /// device-side event waits, matching `make_graphed_callables`.
+    pub(crate) fn with_stream_scope<F, R>(&self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&Self) -> R,
+    {
+        unsafe { torch_sys::at_cuda_graph_stream_begin(self.raw.as_ptr(), self.device_index) };
+        read_torch_error()?;
+
+        let result = catch_unwind(AssertUnwindSafe(|| f(self)));
+
+        // Always close the scope so the stream guard is released even if the
+        // body panicked or returned an error.
+        unsafe { torch_sys::at_cuda_graph_stream_end(self.raw.as_ptr()) };
+        let end_result = read_torch_error();
+
+        match result {
+            Err(payload) => Err(format!("stream scope body panicked: {}", panic_message(payload))),
+            Ok(value) => end_result.map(|()| value),
+        }
+    }
+
+    /// Capture `f` into the graph. Must be called inside `with_stream_scope`.
+    pub(crate) fn capture<F>(&self, f: F) -> Result<(), String>
     where
         F: FnOnce(),
     {
@@ -42,10 +70,7 @@ impl CudaGraph {
         }
         if let Err(payload) = catch_unwind(AssertUnwindSafe(f)) {
             self.abort_capture();
-            return Err(format!(
-                "capture body panicked: {}",
-                panic_message(payload)
-            ));
+            return Err(format!("capture body panicked: {}", panic_message(payload)));
         }
         unsafe { torch_sys::at_cuda_graph_capture_end(self.raw.as_ptr()) };
         let end_result = read_torch_error();
@@ -56,12 +81,14 @@ impl CudaGraph {
         Ok(())
     }
 
+    /// Replay the captured graph. Must be called inside `with_stream_scope` so
+    /// the graph launches on the capture stream.
     pub(crate) fn replay(&self) -> Result<(), String> {
         unsafe { torch_sys::at_cuda_graph_replay(self.raw.as_ptr(), self.device_index) };
         read_torch_error()
     }
 
-    fn abort_capture(&mut self) {
+    fn abort_capture(&self) {
         unsafe { torch_sys::at_cuda_graph_capture_abort(self.raw.as_ptr()) };
         let _ = read_torch_error();
     }

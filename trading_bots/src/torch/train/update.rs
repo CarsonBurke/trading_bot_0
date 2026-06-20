@@ -1,6 +1,6 @@
 use rand::seq::SliceRandom;
 use std::{env, time::Instant};
-use tch::{autocast, Cuda, Kind, Tensor};
+use tch::{autocast, Kind, Tensor};
 
 use crate::torch::action_space::{beta_entropy, beta_log_prob};
 use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT};
@@ -34,6 +34,12 @@ fn asym_clip_policy_loss(advantage: &Tensor, ratio: &Tensor) -> (Tensor, Tensor)
     (action_loss, clip_gap)
 }
 
+/// Warmup iterations run on the capture stream before capture. cuBLAS/cuDNN
+/// algorithm selection and the caching allocator typically need a few steps to
+/// reach steady state; capturing a not-yet-warm body risks capturing a
+/// one-time allocation or autotune path. PyTorch's make_graphed_callables uses 3.
+const GRAPH_WARMUP_ITERS: usize = 3;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GraphCaptureState {
     Warmup,
@@ -59,18 +65,9 @@ pub(super) struct PpoUpdateCudaGraph {
     outputs: PpoGraphOutputs,
 }
 
+/// Persistent graph output buffers; `snapshot` returns an independent set of
+/// handles to the same buffers for use as a minibatch's metrics.
 struct PpoGraphOutputs {
-    action_loss: Tensor,
-    value_loss: Tensor,
-    clip_gap_mean: Tensor,
-    dist_entropy: Tensor,
-    approx_kl: Tensor,
-    actor_grad_norm: Tensor,
-    critic_grad_norm: Tensor,
-    clip_violations: Tensor,
-}
-
-struct PpoGraphMetrics {
     action_loss: Tensor,
     value_loss: Tensor,
     clip_gap_mean: Tensor,
@@ -148,6 +145,21 @@ impl PpoUpdateCudaGraph {
         self.disabled_reason.is_none() && self.graph.is_some()
     }
 
+    /// Permanently disable the graph after a capture/replay failure: record and
+    /// log the reason, zero any partially-accumulated trainable grads, drop the
+    /// graph, and signal the caller to fall back to the eager path (`None`).
+    fn disable_and_fallback(
+        &mut self,
+        reason: String,
+        trainable_vars: &[Tensor],
+    ) -> Option<PpoGraphOutputs> {
+        println!("PPO CUDA graphs disabled: {reason}");
+        self.disabled_reason = Some(reason);
+        zero_trainable_grads(trainable_vars);
+        self.graph = None;
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
@@ -162,98 +174,102 @@ impl PpoUpdateCudaGraph {
         returns: &Tensor,
         old_log_probs: &Tensor,
         actions: &Tensor,
-    ) -> Option<PpoGraphMetrics> {
+    ) -> Option<PpoGraphOutputs> {
         if !self.is_enabled() {
             return None;
         }
 
+        // Input H2D copies run on the default stream; the graph's stream scope
+        // orders the capture/replay stream after them via an event, so no
+        // full-device host sync is needed here.
         copy_into(&self.windowed, windowed);
         copy_into(&self.static_flat, static_flat);
         copy_into(&self.advantages, advantages);
         copy_into(&self.returns, returns);
         copy_into(&self.old_log_probs, old_log_probs);
         copy_into(&self.actions, actions);
-        synchronize_device(device);
 
         match self.state {
             GraphCaptureState::Warmup => {
-                run_graph_body(
-                    trading_model,
-                    hl_gauss,
-                    grad_clip_groups,
-                    trainable_vars,
-                    device,
-                    self.minibatch_sample_count,
-                    &self.windowed,
-                    &self.static_flat,
-                    &self.advantages,
-                    &self.returns,
-                    &self.old_log_probs,
-                    &self.actions,
-                    &self.outputs,
-                );
-                synchronize_device(device);
+                // Run several warmup iterations on the capture stream so cuBLAS /
+                // cuDNN / the caching allocator reach steady state before capture.
+                // Warmup runs on the same stream capture will use, so allocator
+                // pool selection matches.
+                let graph = self.graph.as_ref().expect("enabled graph missing");
+                let scope = graph.with_stream_scope(|_| {
+                    for _ in 0..GRAPH_WARMUP_ITERS {
+                        run_graph_body(
+                            trading_model,
+                            hl_gauss,
+                            grad_clip_groups,
+                            trainable_vars,
+                            device,
+                            self.minibatch_sample_count,
+                            &self.windowed,
+                            &self.static_flat,
+                            &self.advantages,
+                            &self.returns,
+                            &self.old_log_probs,
+                            &self.actions,
+                            &self.outputs,
+                        );
+                    }
+                });
+                if let Err(err) = scope {
+                    return self
+                        .disable_and_fallback(format!("graph warmup failed: {err}"), trainable_vars);
+                }
                 self.state = GraphCaptureState::ReadyToCapture;
                 println!("PPO CUDA graph warmup complete");
-                Some(self.outputs.metrics())
+                Some(self.outputs.snapshot())
             }
             GraphCaptureState::ReadyToCapture => {
-                let graph = self.graph.as_mut().expect("enabled graph missing");
-                let capture = graph.capture(|| {
-                    run_graph_body(
-                        trading_model,
-                        hl_gauss,
-                        grad_clip_groups,
-                        trainable_vars,
-                        device,
-                        self.minibatch_sample_count,
-                        &self.windowed,
-                        &self.static_flat,
-                        &self.advantages,
-                        &self.returns,
-                        &self.old_log_probs,
-                        &self.actions,
-                        &self.outputs,
-                    );
-                });
-                match capture {
+                let graph = self.graph.as_ref().expect("enabled graph missing");
+                // Capture and the first replay both run inside one stream scope.
+                let scope = graph
+                    .with_stream_scope(|graph| {
+                        graph.capture(|| {
+                            run_graph_body(
+                                trading_model,
+                                hl_gauss,
+                                grad_clip_groups,
+                                trainable_vars,
+                                device,
+                                self.minibatch_sample_count,
+                                &self.windowed,
+                                &self.static_flat,
+                                &self.advantages,
+                                &self.returns,
+                                &self.old_log_probs,
+                                &self.actions,
+                                &self.outputs,
+                            );
+                        })?;
+                        graph.replay()
+                    })
+                    .and_then(|inner| inner);
+                match scope {
                     Ok(()) => {
                         self.state = GraphCaptureState::Captured;
                         println!("PPO CUDA graph captured");
-                        let replay = self.graph.as_ref().expect("enabled graph missing").replay();
-                        if let Err(err) = replay {
-                            self.disabled_reason =
-                                Some(format!("initial replay after capture failed: {err}"));
-                            println!(
-                                "PPO CUDA graphs disabled: initial replay after capture failed: {err}"
-                            );
-                            zero_trainable_grads(trainable_vars);
-                            self.graph = None;
-                            return None;
-                        }
-                        synchronize_device(device);
-                        Some(self.outputs.metrics())
+                        Some(self.outputs.snapshot())
                     }
                     Err(err) => {
-                        self.disabled_reason = Some(format!("capture failed: {err}"));
-                        println!("PPO CUDA graphs disabled: capture failed: {err}");
-                        zero_trainable_grads(trainable_vars);
-                        self.graph = None;
-                        None
+                        self.disable_and_fallback(format!("capture failed: {err}"), trainable_vars)
                     }
                 }
             }
             GraphCaptureState::Captured => {
-                let replay = self.graph.as_ref().expect("enabled graph missing").replay();
-                if let Err(err) = replay {
-                    self.disabled_reason = Some(format!("replay failed: {err}"));
-                    println!("PPO CUDA graphs disabled: replay failed: {err}");
-                    zero_trainable_grads(trainable_vars);
-                    self.graph = None;
-                    return None;
+                let graph = self.graph.as_ref().expect("enabled graph missing");
+                let replay = graph
+                    .with_stream_scope(|graph| graph.replay())
+                    .and_then(|inner| inner);
+                match replay {
+                    Ok(()) => Some(self.outputs.snapshot()),
+                    Err(err) => {
+                        self.disable_and_fallback(format!("replay failed: {err}"), trainable_vars)
+                    }
                 }
-                synchronize_device(device);
-                Some(self.outputs.metrics())
             }
         }
     }
@@ -273,8 +289,8 @@ impl PpoGraphOutputs {
         }
     }
 
-    fn metrics(&self) -> PpoGraphMetrics {
-        PpoGraphMetrics {
+    fn snapshot(&self) -> PpoGraphOutputs {
+        PpoGraphOutputs {
             action_loss: self.action_loss.shallow_clone(),
             value_loss: self.value_loss.shallow_clone(),
             clip_gap_mean: self.clip_gap_mean.shallow_clone(),
@@ -363,9 +379,162 @@ fn zero_trainable_grads(trainable_vars: &[Tensor]) {
     }
 }
 
-fn synchronize_device(device: tch::Device) {
-    if let tch::Device::Cuda(index) = device {
-        Cuda::synchronize(index as i64);
+/// One-shot "log the first occurrence" latches for the per-update numeric-debug
+/// ladder. Each stays set once a non-finite value has been reported so the log
+/// isn't flooded across minibatches.
+#[derive(Default)]
+struct NonFiniteLogState {
+    replay_input: bool,
+    forward: bool,
+    loss: bool,
+    grad: bool,
+    param: bool,
+    forward_probe: bool,
+}
+
+impl Trainer {
+    /// Check the replay/forward inputs for non-finite values, logging the first
+    /// occurrence (and the worst params at that point) exactly once per update.
+    fn log_non_finite_replay_inputs(
+        &self,
+        logged: &mut bool,
+        episode: usize,
+        epoch: i64,
+        chunk_i: usize,
+        windowed: &Tensor,
+        static_flat: &Tensor,
+        actions_flat: &Tensor,
+        old_log_probs_flat: &Tensor,
+        adv_flat: &Tensor,
+        ret_flat: &Tensor,
+    ) {
+        if log_first_non_finite_tensor(
+            logged,
+            "replay_inputs",
+            episode,
+            epoch,
+            chunk_i,
+            &[
+                ("windowed", windowed),
+                ("static_flat", static_flat),
+                ("actions", actions_flat),
+                ("old_log_probs", old_log_probs_flat),
+                ("advantages", adv_flat),
+                ("returns", ret_flat),
+            ],
+        ) {
+            log_named_var_extremes(
+                "params_at_replay_input_failure",
+                episode,
+                epoch,
+                chunk_i,
+                &self.named_trainable_vars,
+                false,
+                12,
+            );
+        }
+    }
+
+    /// Log the first non-finite loss component (and worst params at that point).
+    /// Shared by the graph-replay and eager paths; the loss tensors carry
+    /// identical semantics on both.
+    #[allow(clippy::too_many_arguments)]
+    fn log_non_finite_loss(
+        &self,
+        logged: &mut bool,
+        episode: usize,
+        epoch: i64,
+        chunk_i: usize,
+        action_loss: &Tensor,
+        value_loss: &Tensor,
+        dist_entropy: &Tensor,
+        actor_loss: &Tensor,
+        critic_loss: &Tensor,
+        total_loss: &Tensor,
+    ) {
+        if log_first_non_finite_tensor(
+            logged,
+            "loss",
+            episode,
+            epoch,
+            chunk_i,
+            &[
+                ("action_loss", action_loss),
+                ("value_loss", value_loss),
+                ("dist_entropy", dist_entropy),
+                ("actor_loss", actor_loss),
+                ("critic_loss", critic_loss),
+                ("total_loss", total_loss),
+            ],
+        ) {
+            log_named_var_extremes(
+                "params_at_loss_failure",
+                episode,
+                epoch,
+                chunk_i,
+                &self.named_trainable_vars,
+                false,
+                12,
+            );
+        }
+    }
+
+    /// Log the first non-finite gradient after backward.
+    fn log_non_finite_grads_after_backward(
+        &self,
+        logged: &mut bool,
+        episode: usize,
+        epoch: i64,
+        chunk_i: usize,
+    ) {
+        if log_first_non_finite_var(
+            logged,
+            "grads_after_backward",
+            episode,
+            epoch,
+            chunk_i,
+            &self.named_trainable_vars,
+            true,
+        ) {
+            log_named_var_extremes(
+                "grads_after_backward_top_abs",
+                episode,
+                epoch,
+                chunk_i,
+                &self.named_trainable_vars,
+                true,
+                12,
+            );
+        }
+    }
+
+    /// Log the first non-finite parameter after the optimizer step.
+    fn log_non_finite_params_after_step(
+        &self,
+        logged: &mut bool,
+        episode: usize,
+        epoch: i64,
+        chunk_i: usize,
+    ) {
+        if log_first_non_finite_var(
+            logged,
+            "params_after_step",
+            episode,
+            epoch,
+            chunk_i,
+            &self.named_trainable_vars,
+            false,
+        ) {
+            log_named_var_extremes(
+                "params_after_step_top_abs",
+                episode,
+                epoch,
+                chunk_i,
+                &self.named_trainable_vars,
+                false,
+                12,
+            );
+        }
     }
 }
 
@@ -396,12 +565,7 @@ impl Trainer {
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
         let mut graph_time_us = 0u64;
-        let mut logged_replay_input_non_finite = false;
-        let mut logged_forward_non_finite = false;
-        let mut logged_loss_non_finite = false;
-        let mut logged_grad_non_finite = false;
-        let mut logged_param_non_finite = false;
-        let mut logged_forward_probe = false;
+        let mut nf_log = NonFiniteLogState::default();
 
         let mut mean_epoch_approx_kl = 0.0f64;
         let mut last_minibatch_approx_kl = 0.0f64;
@@ -523,37 +687,27 @@ impl Trainer {
                 let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
                 let actions_flat = actions_by_chunk.reshape([-1, ACTION_COUNT]);
 
+                // Runs once per minibatch, shared by the graph and eager paths
+                // (the graph branch may `continue`, otherwise control falls
+                // through to eager without re-checking).
+                self.log_non_finite_replay_inputs(
+                    &mut nf_log.replay_input,
+                    episode,
+                    _epoch,
+                    chunk_i,
+                    &windowed,
+                    &static_flat,
+                    &actions_flat,
+                    &old_log_probs_flat,
+                    &adv_flat,
+                    &ret_flat,
+                );
+
                 let graph_eligible = self.device.is_cuda()
                     && !DEBUG_NUMERICS
                     && !has_reset_slots
                     && chunk_count == adv_data.chunk_batch_size;
                 if graph_eligible {
-                    if log_first_non_finite_tensor(
-                        &mut logged_replay_input_non_finite,
-                        "replay_inputs",
-                        episode,
-                        _epoch,
-                        chunk_i,
-                        &[
-                            ("windowed", &windowed),
-                            ("static_flat", &static_flat),
-                            ("actions", &actions_flat),
-                            ("old_log_probs", &old_log_probs_flat),
-                            ("advantages", &adv_flat),
-                            ("returns", &ret_flat),
-                        ],
-                    ) {
-                        log_named_var_extremes(
-                            "params_at_replay_input_failure",
-                            episode,
-                            _epoch,
-                            chunk_i,
-                            &self.named_trainable_vars,
-                            false,
-                            12,
-                        );
-                    }
-
                     let graph_start = Instant::now();
                     let mut graph = self.ppo_update_graph.take().unwrap_or_else(|| {
                         PpoUpdateCudaGraph::new(
@@ -565,21 +719,17 @@ impl Trainer {
                             self.replay_obs_kind,
                         )
                     });
-                    if !graph.matches(
+                    // The captured shapes derive solely from constructor-fixed
+                    // Trainer geometry and compile-time constants, so a persisted
+                    // graph always matches across every update in a run; the only
+                    // per-minibatch variation (the partial last minibatch) is
+                    // excluded from `graph_eligible` above.
+                    assert!(graph.matches(
                         adv_data.chunk_batch_size,
                         self.rollout.ppo_chunk_len,
                         flat_layout_len,
                         self.so_dim,
-                    ) {
-                        graph = PpoUpdateCudaGraph::new(
-                            device,
-                            adv_data.chunk_batch_size,
-                            self.rollout.ppo_chunk_len,
-                            flat_layout_len,
-                            self.so_dim,
-                            self.replay_obs_kind,
-                        );
-                    }
+                    ));
                     let graph_metrics = graph.run(
                         &self.trading_model,
                         &self.hl_gauss,
@@ -603,50 +753,24 @@ impl Trainer {
                             metrics.value_loss.shallow_clone() * VALUE_LOSS_COEF;
                         let graph_total_loss =
                             graph_actor_loss.shallow_clone() + graph_critic_loss.shallow_clone();
-                        if log_first_non_finite_tensor(
-                            &mut logged_loss_non_finite,
-                            "loss",
+                        self.log_non_finite_loss(
+                            &mut nf_log.loss,
                             episode,
                             _epoch,
                             chunk_i,
-                            &[
-                                ("action_loss", &metrics.action_loss),
-                                ("value_loss", &metrics.value_loss),
-                                ("dist_entropy", &metrics.dist_entropy),
-                                ("actor_loss", &graph_actor_loss),
-                                ("critic_loss", &graph_critic_loss),
-                                ("total_loss", &graph_total_loss),
-                            ],
-                        ) {
-                            log_named_var_extremes(
-                                "params_at_loss_failure",
-                                episode,
-                                _epoch,
-                                chunk_i,
-                                &self.named_trainable_vars,
-                                false,
-                                12,
-                            );
-                        }
-                        if log_first_non_finite_var(
-                            &mut logged_grad_non_finite,
-                            "grads_after_backward",
+                            &metrics.action_loss,
+                            &metrics.value_loss,
+                            &metrics.dist_entropy,
+                            &graph_actor_loss,
+                            &graph_critic_loss,
+                            &graph_total_loss,
+                        );
+                        self.log_non_finite_grads_after_backward(
+                            &mut nf_log.grad,
                             episode,
                             _epoch,
                             chunk_i,
-                            &self.named_trainable_vars,
-                            true,
-                        ) {
-                            log_named_var_extremes(
-                                "grads_after_backward_top_abs",
-                                episode,
-                                _epoch,
-                                chunk_i,
-                                &self.named_trainable_vars,
-                                true,
-                                12,
-                            );
-                        }
+                        );
                         let _ = epoch_kl_gpu
                             .g_add_(&(&metrics.approx_kl * minibatch_sample_count as f64));
                         let _ = total_policy_loss_weighted
@@ -667,55 +791,16 @@ impl Trainer {
                         critic_grad_norm_sum += metrics.critic_grad_norm;
                         grad_norm_count += 1;
                         step_optimizer(&mut self.opt, &mut self.optimizer_step);
-                        if log_first_non_finite_var(
-                            &mut logged_param_non_finite,
-                            "params_after_step",
+                        self.log_non_finite_params_after_step(
+                            &mut nf_log.param,
                             episode,
                             _epoch,
                             chunk_i,
-                            &self.named_trainable_vars,
-                            false,
-                        ) {
-                            log_named_var_extremes(
-                                "params_after_step_top_abs",
-                                episode,
-                                _epoch,
-                                chunk_i,
-                                &self.named_trainable_vars,
-                                false,
-                                12,
-                            );
-                        }
+                        );
                         last_minibatch_kl_mean_gpu = Some(metrics.approx_kl.detach().copy());
                         continue;
                     }
                     graph_time_us += graph_start.elapsed().as_micros() as u64;
-                }
-
-                if log_first_non_finite_tensor(
-                    &mut logged_replay_input_non_finite,
-                    "replay_inputs",
-                    episode,
-                    _epoch,
-                    chunk_i,
-                    &[
-                        ("windowed", &windowed),
-                        ("static_flat", &static_flat),
-                        ("actions", &actions_flat),
-                        ("old_log_probs", &old_log_probs_flat),
-                        ("advantages", &adv_flat),
-                        ("returns", &ret_flat),
-                    ],
-                ) {
-                    log_named_var_extremes(
-                        "params_at_replay_input_failure",
-                        episode,
-                        _epoch,
-                        chunk_i,
-                        &self.named_trainable_vars,
-                        false,
-                        12,
-                    );
                 }
 
                 let (new_value_logits, action_alpha, action_beta) = autocast(false, || {
@@ -752,7 +837,7 @@ impl Trainer {
                 let ratio_diff = &ratio - 1.0;
 
                 if log_first_non_finite_tensor(
-                    &mut logged_forward_non_finite,
+                    &mut nf_log.forward,
                     "forward",
                     episode,
                     _epoch,
@@ -778,8 +863,8 @@ impl Trainer {
                         false,
                         12,
                     );
-                    if !logged_forward_probe {
-                        logged_forward_probe = true;
+                    if !nf_log.forward_probe {
+                        nf_log.forward_probe = true;
                         TradingModel::set_replay_numeric_probe(true);
                         tch::no_grad(|| {
                             let _ = autocast(false, || {
@@ -813,31 +898,18 @@ impl Trainer {
                 let critic_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF;
                 let total_loss = actor_loss.shallow_clone() + critic_loss.shallow_clone();
 
-                if log_first_non_finite_tensor(
-                    &mut logged_loss_non_finite,
-                    "loss",
+                self.log_non_finite_loss(
+                    &mut nf_log.loss,
                     episode,
                     _epoch,
                     chunk_i,
-                    &[
-                        ("action_loss", &action_loss),
-                        ("value_loss", &value_loss),
-                        ("dist_entropy", &dist_entropy),
-                        ("actor_loss", &actor_loss),
-                        ("critic_loss", &critic_loss),
-                        ("total_loss", &total_loss),
-                    ],
-                ) {
-                    log_named_var_extremes(
-                        "params_at_loss_failure",
-                        episode,
-                        _epoch,
-                        chunk_i,
-                        &self.named_trainable_vars,
-                        false,
-                        12,
-                    );
-                }
+                    &action_loss,
+                    &value_loss,
+                    &dist_entropy,
+                    &actor_loss,
+                    &critic_loss,
+                    &total_loss,
+                );
 
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
@@ -851,25 +923,12 @@ impl Trainer {
                 );
                 bwd_time_us += bwd_start.elapsed().as_micros() as u64;
 
-                if log_first_non_finite_var(
-                    &mut logged_grad_non_finite,
-                    "grads_after_backward",
+                self.log_non_finite_grads_after_backward(
+                    &mut nf_log.grad,
                     episode,
                     _epoch,
                     chunk_i,
-                    &self.named_trainable_vars,
-                    true,
-                ) {
-                    log_named_var_extremes(
-                        "grads_after_backward_top_abs",
-                        episode,
-                        _epoch,
-                        chunk_i,
-                        &self.named_trainable_vars,
-                        true,
-                        12,
-                    );
-                }
+                );
 
                 let approx_kl_val =
                     tch::no_grad(|| (&ratio - 1.0 - &log_ratio).mean(Kind::Float));
@@ -924,25 +983,12 @@ impl Trainer {
                 grad_norm_count += 1;
 
                 step_optimizer(&mut self.opt, &mut self.optimizer_step);
-                if log_first_non_finite_var(
-                    &mut logged_param_non_finite,
-                    "params_after_step",
+                self.log_non_finite_params_after_step(
+                    &mut nf_log.param,
                     episode,
                     _epoch,
                     chunk_i,
-                    &self.named_trainable_vars,
-                    false,
-                ) {
-                    log_named_var_extremes(
-                        "params_after_step_top_abs",
-                        episode,
-                        _epoch,
-                        chunk_i,
-                        &self.named_trainable_vars,
-                        false,
-                        12,
-                    );
-                }
+                );
                 self.opt.zero_grad();
 
                 // One forward/backward per minibatch now: the minibatch's KL is
