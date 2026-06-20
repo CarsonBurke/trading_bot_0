@@ -54,7 +54,7 @@ pub struct TickerObsInputs {
     pub stoch_k: f64,
     pub zscore: f64,
     pub macd: f64,
-    pub earnings_steps_to_next: f64,
+    pub earnings_steps_since_available: f64,
     pub revenue_growth: f64,
     pub opex_growth: f64,
     pub net_profit_growth: f64,
@@ -127,7 +127,7 @@ pub fn build_static_obs(
         push((t.stoch_k * 2.0 - 1.0) as f32);
         push((t.zscore / 3.0) as f32);
         push(t.macd as f32);
-        push(t.earnings_steps_to_next as f32);
+        push(t.earnings_steps_since_available as f32);
         push(t.revenue_growth as f32);
         push(t.opex_growth as f32);
         push(t.net_profit_growth as f32);
@@ -200,7 +200,7 @@ impl Env {
                     stoch_k: m.stoch_k[absolute_step],
                     zscore: m.zscore[absolute_step],
                     macd: m.macd[absolute_step],
-                    earnings_steps_to_next: e.steps_to_next[absolute_step],
+                    earnings_steps_since_available: e.steps_since_available[absolute_step],
                     revenue_growth: e.revenue_growth[absolute_step],
                     opex_growth: e.opex_growth[absolute_step],
                     net_profit_growth: e.net_profit_growth[absolute_step],

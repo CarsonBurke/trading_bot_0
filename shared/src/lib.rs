@@ -27,7 +27,7 @@ pub mod constants {
     // Momentum quality (4): acceleration, vol_adjusted, efficiency, trend_strength
     // Oscillators (4): rsi, range_pos, stoch_k, zscore
     // Trend (1): macd
-    // Earnings (6): steps_to_next, revenue_growth, opex_growth, net_profit_growth, eps, eps_surprise
+    // Earnings (6): steps_since_available, revenue_growth, opex_growth, net_profit_growth, eps, eps_surprise
     pub const PER_TICKER_EARNINGS_OBS: usize = 6;
     pub const PER_TICKER_STATIC_OBS: usize = 19 + PER_TICKER_EARNINGS_OBS;
     pub const STATIC_OBSERVATIONS: usize =

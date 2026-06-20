@@ -168,7 +168,7 @@ impl LiveMarketState {
             stoch_k: momentum.stoch_k[last],
             zscore: momentum.zscore[last],
             macd: momentum.macd[last],
-            earnings_steps_to_next: earnings.steps_to_next[last],
+            earnings_steps_since_available: earnings.steps_since_available[last],
             revenue_growth: earnings.revenue_growth[last],
             opex_growth: earnings.opex_growth[last],
             net_profit_growth: earnings.net_profit_growth[last],

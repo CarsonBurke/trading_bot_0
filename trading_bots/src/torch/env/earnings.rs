@@ -15,7 +15,7 @@ fn get_cache() -> &'static Mutex<HashMap<String, Arc<EarningsIndicators>>> {
 /// Precomputed earnings indicators per step (from cached quarterly reports)
 #[derive(Debug)]
 pub struct EarningsIndicators {
-    pub steps_to_next: Vec<f64>,
+    pub steps_since_available: Vec<f64>,
     pub revenue_growth: Vec<f64>,
     pub opex_growth: Vec<f64>,
     pub net_profit_growth: Vec<f64>,
@@ -58,7 +58,7 @@ impl EarningsIndicators {
 
     pub fn empty(n: usize) -> Self {
         Self {
-            steps_to_next: vec![0.0; n],
+            steps_since_available: vec![0.0; n],
             revenue_growth: vec![0.0; n],
             opex_growth: vec![0.0; n],
             net_profit_growth: vec![0.0; n],
@@ -73,7 +73,7 @@ impl EarningsIndicators {
             return Self::empty(n);
         }
 
-        let mut steps_to_next = vec![0.0; n];
+        let mut steps_since_available = vec![0.0; n];
         let mut revenue_growth = vec![0.0; n];
         let mut opex_growth = vec![0.0; n];
         let mut net_profit_growth = vec![0.0; n];
@@ -110,13 +110,11 @@ impl EarningsIndicators {
                 continue;
             }
 
-            let report = available_reports[report_idx].report;
+            let entry = &available_reports[report_idx];
+            let report = entry.report;
 
-            if report_idx + 1 < available_reports.len() {
-                let next_date = available_reports[report_idx + 1].available_date;
-                let days_to_next = (next_date - bar_date).num_days().max(0) as f64;
-                steps_to_next[i] = (days_to_next / 90.0).clamp(0.0, 1.0);
-            }
+            let days_since_available = (bar_date - entry.available_date).num_days().max(0) as f64;
+            steps_since_available[i] = (days_since_available / 90.0).clamp(0.0, 1.0);
 
             revenue_growth[i] = report.revenue_growth.unwrap_or(0.0).clamp(-1.0, 1.0);
             opex_growth[i] = report.opex_growth.unwrap_or(0.0).clamp(-1.0, 1.0);
@@ -131,7 +129,7 @@ impl EarningsIndicators {
         }
 
         Self {
-            steps_to_next,
+            steps_since_available,
             revenue_growth,
             opex_growth,
             net_profit_growth,
@@ -190,12 +188,14 @@ mod tests {
         let indicators =
             EarningsIndicators::compute(&[report("2024-01-31", 0.5)], &bar_dates, &prices);
 
+        assert_eq!(indicators.steps_since_available[0], 0.0);
         assert_eq!(indicators.revenue_growth[0], 0.0);
         assert_eq!(indicators.opex_growth[0], 0.0);
         assert_eq!(indicators.net_profit_growth[0], 0.0);
         assert_eq!(indicators.eps[0], 0.0);
         assert_eq!(indicators.eps_surprise[0], 0.0);
 
+        assert_eq!(indicators.steps_since_available[1], 0.0);
         assert_eq!(indicators.revenue_growth[1], 0.5);
         assert_eq!(indicators.opex_growth[1], -0.25);
         assert_eq!(indicators.net_profit_growth[1], 0.75);
@@ -223,5 +223,33 @@ mod tests {
         assert_eq!(indicators.revenue_growth[0], 0.25);
         assert_eq!(indicators.revenue_growth[1], 0.25);
         assert_eq!(indicators.revenue_growth[2], -0.5);
+    }
+
+    #[test]
+    fn staleness_grows_from_availability_and_clamps_at_full_scale() {
+        let fiscal_date = NaiveDate::from_ymd_opt(2024, 1, 31).unwrap();
+        let availability_date = fiscal_date + Duration::days(FUNDAMENTAL_AVAILABILITY_LAG_DAYS);
+        let before_date = availability_date - Duration::days(1);
+        let just_after = availability_date + Duration::days(9);
+        let long_after = availability_date + Duration::days(120);
+        let bar_dates = vec![
+            before_date.format("%Y-%m-%d").to_string(),
+            availability_date.format("%Y-%m-%d").to_string(),
+            just_after.format("%Y-%m-%d").to_string(),
+            long_after.format("%Y-%m-%d").to_string(),
+        ];
+        let prices = vec![100.0; bar_dates.len()];
+
+        let indicators =
+            EarningsIndicators::compute(&[report("2024-01-31", 0.5)], &bar_dates, &prices);
+
+        // Before the report is available: default value.
+        assert_eq!(indicators.steps_since_available[0], 0.0);
+        // On the availability date: zero days stale.
+        assert_eq!(indicators.steps_since_available[1], 0.0);
+        // Shortly after: small, proportional staleness (9 / 90).
+        assert!((indicators.steps_since_available[2] - 0.1).abs() < 1e-12);
+        // Long after (>= 90 days): clamped to the max scale.
+        assert_eq!(indicators.steps_since_available[3], 1.0);
     }
 }
