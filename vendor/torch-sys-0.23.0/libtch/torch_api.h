@@ -70,6 +70,7 @@ bool at_cuda_graph_is_available();
 void at_cuda_graph_free(cuda_graph graph);
 void at_cuda_graph_capture_begin(cuda_graph graph, int64_t device_index);
 void at_cuda_graph_capture_end(cuda_graph graph);
+void at_cuda_graph_capture_abort(cuda_graph graph);
 void at_cuda_graph_replay(cuda_graph graph, int64_t device_index);
 void at_cuda_empty_cache();
 

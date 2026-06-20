@@ -1,10 +1,12 @@
 use rand::seq::SliceRandom;
-use std::time::Instant;
-use tch::{autocast, Kind, Tensor};
+use std::{env, time::Instant};
+use tch::{autocast, Cuda, Kind, Tensor};
 
 use crate::torch::action_space::{beta_entropy, beta_log_prob};
 use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT};
+use crate::torch::cuda::graph::CudaGraph;
 use crate::torch::model::TradingModel;
+use crate::torch::value::hl_gauss::HlGaussBins;
 
 use super::config::{
     CLIP_EPS_HIGH, CLIP_EPS_LOW, DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER, MAX_GRAD_NORM,
@@ -15,6 +17,7 @@ use super::numeric_debug::{
     debug_tensor_stats, log_first_non_finite_tensor, log_first_non_finite_var,
     log_named_var_extremes,
 };
+use super::optimizer_glue::GradClipGroups;
 use super::optimizer_glue::{backward_actor_critic_with_separate_clips, step_optimizer};
 use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
 use super::value_loss::hl_gauss_value_loss;
@@ -29,6 +32,341 @@ fn asym_clip_policy_loss(advantage: &Tensor, ratio: &Tensor) -> (Tensor, Tensor)
     let action_loss = pg_loss1.max_other(&pg_loss2).mean(Kind::Float);
     let clip_gap = tch::no_grad(|| (ratio - &clipped).abs());
     (action_loss, clip_gap)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GraphCaptureState {
+    Warmup,
+    ReadyToCapture,
+    Captured,
+}
+
+pub(super) struct PpoUpdateCudaGraph {
+    graph: Option<CudaGraph>,
+    state: GraphCaptureState,
+    disabled_reason: Option<String>,
+    chunk_batch_size: i64,
+    ppo_chunk_len: i64,
+    minibatch_sample_count: i64,
+    flat_layout_len: i64,
+    so_dim: i64,
+    windowed: Tensor,
+    static_flat: Tensor,
+    advantages: Tensor,
+    returns: Tensor,
+    old_log_probs: Tensor,
+    actions: Tensor,
+    outputs: PpoGraphOutputs,
+}
+
+struct PpoGraphOutputs {
+    action_loss: Tensor,
+    value_loss: Tensor,
+    clip_gap_mean: Tensor,
+    dist_entropy: Tensor,
+    approx_kl: Tensor,
+    actor_grad_norm: Tensor,
+    critic_grad_norm: Tensor,
+    clip_violations: Tensor,
+}
+
+struct PpoGraphMetrics {
+    action_loss: Tensor,
+    value_loss: Tensor,
+    clip_gap_mean: Tensor,
+    dist_entropy: Tensor,
+    approx_kl: Tensor,
+    actor_grad_norm: Tensor,
+    critic_grad_norm: Tensor,
+    clip_violations: Tensor,
+}
+
+impl PpoUpdateCudaGraph {
+    fn new(
+        device: tch::Device,
+        chunk_batch_size: i64,
+        ppo_chunk_len: i64,
+        flat_layout_len: i64,
+        so_dim: i64,
+        replay_obs_kind: Kind,
+    ) -> Self {
+        let graph = CudaGraph::new(device);
+        let (graph, disabled_reason) = match graph {
+            Ok(Some(graph)) if env::var("PPO_CUDA_GRAPHS").ok().as_deref() != Some("0") => {
+                (Some(graph), None)
+            }
+            Ok(Some(_)) => (None, Some("disabled by PPO_CUDA_GRAPHS=0".to_string())),
+            Ok(None) => (None, Some("CUDA Graph support is unavailable".to_string())),
+            Err(err) => (None, Some(format!("CUDA Graph init failed: {err}"))),
+        };
+        if let Some(reason) = &disabled_reason {
+            println!("PPO CUDA graphs disabled: {reason}");
+        } else {
+            println!("PPO CUDA graphs enabled for full no-reset minibatches");
+        }
+
+        let minibatch_sample_count = chunk_batch_size * ppo_chunk_len;
+        Self {
+            graph,
+            state: GraphCaptureState::Warmup,
+            disabled_reason,
+            chunk_batch_size,
+            ppo_chunk_len,
+            minibatch_sample_count,
+            flat_layout_len,
+            so_dim,
+            windowed: Tensor::zeros(
+                [minibatch_sample_count * TICKERS_COUNT, flat_layout_len],
+                (replay_obs_kind, device),
+            ),
+            static_flat: Tensor::zeros([minibatch_sample_count, so_dim], (replay_obs_kind, device)),
+            advantages: Tensor::zeros([minibatch_sample_count], (Kind::Float, device)),
+            returns: Tensor::zeros([minibatch_sample_count], (Kind::Float, device)),
+            old_log_probs: Tensor::zeros([minibatch_sample_count], (Kind::Float, device)),
+            actions: Tensor::zeros(
+                [minibatch_sample_count, ACTION_COUNT],
+                (Kind::Float, device),
+            ),
+            outputs: PpoGraphOutputs::new(device),
+        }
+    }
+
+    fn matches(
+        &self,
+        chunk_batch_size: i64,
+        ppo_chunk_len: i64,
+        flat_layout_len: i64,
+        so_dim: i64,
+    ) -> bool {
+        self.chunk_batch_size == chunk_batch_size
+            && self.ppo_chunk_len == ppo_chunk_len
+            && self.flat_layout_len == flat_layout_len
+            && self.so_dim == so_dim
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.disabled_reason.is_none() && self.graph.is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        trading_model: &TradingModel,
+        hl_gauss: &HlGaussBins,
+        grad_clip_groups: &GradClipGroups,
+        trainable_vars: &[Tensor],
+        device: tch::Device,
+        windowed: &Tensor,
+        static_flat: &Tensor,
+        advantages: &Tensor,
+        returns: &Tensor,
+        old_log_probs: &Tensor,
+        actions: &Tensor,
+    ) -> Option<PpoGraphMetrics> {
+        if !self.is_enabled() {
+            return None;
+        }
+
+        copy_into(&self.windowed, windowed);
+        copy_into(&self.static_flat, static_flat);
+        copy_into(&self.advantages, advantages);
+        copy_into(&self.returns, returns);
+        copy_into(&self.old_log_probs, old_log_probs);
+        copy_into(&self.actions, actions);
+        synchronize_device(device);
+
+        match self.state {
+            GraphCaptureState::Warmup => {
+                run_graph_body(
+                    trading_model,
+                    hl_gauss,
+                    grad_clip_groups,
+                    trainable_vars,
+                    device,
+                    self.minibatch_sample_count,
+                    &self.windowed,
+                    &self.static_flat,
+                    &self.advantages,
+                    &self.returns,
+                    &self.old_log_probs,
+                    &self.actions,
+                    &self.outputs,
+                );
+                synchronize_device(device);
+                self.state = GraphCaptureState::ReadyToCapture;
+                println!("PPO CUDA graph warmup complete");
+                Some(self.outputs.metrics())
+            }
+            GraphCaptureState::ReadyToCapture => {
+                let graph = self.graph.as_mut().expect("enabled graph missing");
+                let capture = graph.capture(|| {
+                    run_graph_body(
+                        trading_model,
+                        hl_gauss,
+                        grad_clip_groups,
+                        trainable_vars,
+                        device,
+                        self.minibatch_sample_count,
+                        &self.windowed,
+                        &self.static_flat,
+                        &self.advantages,
+                        &self.returns,
+                        &self.old_log_probs,
+                        &self.actions,
+                        &self.outputs,
+                    );
+                });
+                match capture {
+                    Ok(()) => {
+                        self.state = GraphCaptureState::Captured;
+                        println!("PPO CUDA graph captured");
+                        let replay = self.graph.as_ref().expect("enabled graph missing").replay();
+                        if let Err(err) = replay {
+                            self.disabled_reason =
+                                Some(format!("initial replay after capture failed: {err}"));
+                            println!(
+                                "PPO CUDA graphs disabled: initial replay after capture failed: {err}"
+                            );
+                            zero_trainable_grads(trainable_vars);
+                            self.graph = None;
+                            return None;
+                        }
+                        synchronize_device(device);
+                        Some(self.outputs.metrics())
+                    }
+                    Err(err) => {
+                        self.disabled_reason = Some(format!("capture failed: {err}"));
+                        println!("PPO CUDA graphs disabled: capture failed: {err}");
+                        zero_trainable_grads(trainable_vars);
+                        self.graph = None;
+                        None
+                    }
+                }
+            }
+            GraphCaptureState::Captured => {
+                let replay = self.graph.as_ref().expect("enabled graph missing").replay();
+                if let Err(err) = replay {
+                    self.disabled_reason = Some(format!("replay failed: {err}"));
+                    println!("PPO CUDA graphs disabled: replay failed: {err}");
+                    zero_trainable_grads(trainable_vars);
+                    self.graph = None;
+                    return None;
+                }
+                synchronize_device(device);
+                Some(self.outputs.metrics())
+            }
+        }
+    }
+}
+
+impl PpoGraphOutputs {
+    fn new(device: tch::Device) -> Self {
+        Self {
+            action_loss: Tensor::zeros([], (Kind::Float, device)),
+            value_loss: Tensor::zeros([], (Kind::Float, device)),
+            clip_gap_mean: Tensor::zeros([], (Kind::Float, device)),
+            dist_entropy: Tensor::zeros([], (Kind::Float, device)),
+            approx_kl: Tensor::zeros([], (Kind::Float, device)),
+            actor_grad_norm: Tensor::zeros([], (Kind::Float, device)),
+            critic_grad_norm: Tensor::zeros([], (Kind::Float, device)),
+            clip_violations: Tensor::zeros([], (Kind::Float, device)),
+        }
+    }
+
+    fn metrics(&self) -> PpoGraphMetrics {
+        PpoGraphMetrics {
+            action_loss: self.action_loss.shallow_clone(),
+            value_loss: self.value_loss.shallow_clone(),
+            clip_gap_mean: self.clip_gap_mean.shallow_clone(),
+            dist_entropy: self.dist_entropy.shallow_clone(),
+            approx_kl: self.approx_kl.shallow_clone(),
+            actor_grad_norm: self.actor_grad_norm.shallow_clone(),
+            critic_grad_norm: self.critic_grad_norm.shallow_clone(),
+            clip_violations: self.clip_violations.shallow_clone(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_graph_body(
+    trading_model: &TradingModel,
+    hl_gauss: &HlGaussBins,
+    grad_clip_groups: &GradClipGroups,
+    trainable_vars: &[Tensor],
+    device: tch::Device,
+    minibatch_sample_count: i64,
+    windowed: &Tensor,
+    static_flat: &Tensor,
+    advantages: &Tensor,
+    returns: &Tensor,
+    old_log_probs: &Tensor,
+    actions: &Tensor,
+    outputs: &PpoGraphOutputs,
+) {
+    let (new_value_logits, action_alpha, action_beta) = autocast(false, || {
+        trading_model.windowed_replay_forward(windowed, static_flat, minibatch_sample_count)
+    });
+    let action_log_probs = beta_log_prob(actions, &action_alpha, &action_beta);
+    let dist_entropy_per_sample = beta_entropy(&action_alpha, &action_beta);
+    let log_ratio = &action_log_probs - old_log_probs;
+    let ratio = log_ratio.exp();
+    let ratio_diff = &ratio - 1.0;
+    let (action_loss, clip_gap) = asym_clip_policy_loss(advantages, &ratio);
+    let value_loss = hl_gauss_value_loss(hl_gauss, &new_value_logits, returns).mean(Kind::Float);
+    let dist_entropy = dist_entropy_per_sample.mean(Kind::Float);
+    let actor_loss = action_loss.shallow_clone() - &dist_entropy * ENTROPY_COEF;
+    let critic_loss = value_loss.shallow_clone() * VALUE_LOSS_COEF;
+    let (actor_grad_norm, critic_grad_norm) = backward_actor_critic_with_separate_clips(
+        grad_clip_groups,
+        trainable_vars,
+        &actor_loss,
+        &critic_loss,
+        MAX_GRAD_NORM,
+        device,
+    );
+
+    let approx_kl = tch::no_grad(|| (&ratio - 1.0 - &log_ratio).mean(Kind::Float));
+    let clip_violations = tch::no_grad(|| {
+        ratio_diff
+            .gt(CLIP_EPS_HIGH)
+            .logical_or(&ratio_diff.lt(-CLIP_EPS_LOW))
+            .to_kind(Kind::Float)
+            .sum(Kind::Float)
+    });
+    tch::no_grad(|| {
+        copy_into(&outputs.action_loss, &action_loss.detach());
+        copy_into(&outputs.value_loss, &value_loss.detach());
+        copy_into(&outputs.clip_gap_mean, &clip_gap.mean(Kind::Float));
+        copy_into(&outputs.dist_entropy, &dist_entropy.detach());
+        copy_into(&outputs.approx_kl, &approx_kl);
+        copy_into(
+            &outputs.actor_grad_norm,
+            &actor_grad_norm.to_kind(Kind::Float),
+        );
+        copy_into(
+            &outputs.critic_grad_norm,
+            &critic_grad_norm.to_kind(Kind::Float),
+        );
+        copy_into(&outputs.clip_violations, &clip_violations);
+    });
+}
+
+fn copy_into(dst: &Tensor, src: &Tensor) {
+    let mut dst = dst.shallow_clone();
+    dst.copy_(src);
+}
+
+fn zero_trainable_grads(trainable_vars: &[Tensor]) {
+    for param in trainable_vars {
+        let mut param = param.shallow_clone();
+        param.zero_grad();
+    }
+}
+
+fn synchronize_device(device: tch::Device) {
+    if let tch::Device::Cuda(index) = device {
+        Cuda::synchronize(index as i64);
+    }
 }
 
 impl Trainer {
@@ -57,6 +395,7 @@ impl Trainer {
 
         let mut fwd_time_us = 0u64;
         let mut bwd_time_us = 0u64;
+        let mut graph_time_us = 0u64;
         let mut logged_replay_input_non_finite = false;
         let mut logged_forward_non_finite = false;
         let mut logged_loss_non_finite = false;
@@ -183,6 +522,175 @@ impl Trainer {
                 let ret_flat = ret_mb_by_chunk.reshape([-1]);
                 let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
                 let actions_flat = actions_by_chunk.reshape([-1, ACTION_COUNT]);
+
+                let graph_eligible = self.device.is_cuda()
+                    && !DEBUG_NUMERICS
+                    && !has_reset_slots
+                    && chunk_count == adv_data.chunk_batch_size;
+                if graph_eligible {
+                    if log_first_non_finite_tensor(
+                        &mut logged_replay_input_non_finite,
+                        "replay_inputs",
+                        episode,
+                        _epoch,
+                        chunk_i,
+                        &[
+                            ("windowed", &windowed),
+                            ("static_flat", &static_flat),
+                            ("actions", &actions_flat),
+                            ("old_log_probs", &old_log_probs_flat),
+                            ("advantages", &adv_flat),
+                            ("returns", &ret_flat),
+                        ],
+                    ) {
+                        log_named_var_extremes(
+                            "params_at_replay_input_failure",
+                            episode,
+                            _epoch,
+                            chunk_i,
+                            &self.named_trainable_vars,
+                            false,
+                            12,
+                        );
+                    }
+
+                    let graph_start = Instant::now();
+                    let mut graph = self.ppo_update_graph.take().unwrap_or_else(|| {
+                        PpoUpdateCudaGraph::new(
+                            device,
+                            adv_data.chunk_batch_size,
+                            self.rollout.ppo_chunk_len,
+                            flat_layout_len,
+                            self.so_dim,
+                            self.replay_obs_kind,
+                        )
+                    });
+                    if !graph.matches(
+                        adv_data.chunk_batch_size,
+                        self.rollout.ppo_chunk_len,
+                        flat_layout_len,
+                        self.so_dim,
+                    ) {
+                        graph = PpoUpdateCudaGraph::new(
+                            device,
+                            adv_data.chunk_batch_size,
+                            self.rollout.ppo_chunk_len,
+                            flat_layout_len,
+                            self.so_dim,
+                            self.replay_obs_kind,
+                        );
+                    }
+                    let graph_metrics = graph.run(
+                        &self.trading_model,
+                        &self.hl_gauss,
+                        &self.grad_clip_groups,
+                        &self.trainable_vars,
+                        device,
+                        &windowed,
+                        &static_flat,
+                        &adv_flat,
+                        &ret_flat,
+                        &old_log_probs_flat,
+                        &actions_flat,
+                    );
+                    self.ppo_update_graph = Some(graph);
+
+                    if let Some(metrics) = graph_metrics {
+                        graph_time_us += graph_start.elapsed().as_micros() as u64;
+                        let graph_actor_loss = metrics.action_loss.shallow_clone()
+                            - &metrics.dist_entropy * ENTROPY_COEF;
+                        let graph_critic_loss =
+                            metrics.value_loss.shallow_clone() * VALUE_LOSS_COEF;
+                        let graph_total_loss =
+                            graph_actor_loss.shallow_clone() + graph_critic_loss.shallow_clone();
+                        if log_first_non_finite_tensor(
+                            &mut logged_loss_non_finite,
+                            "loss",
+                            episode,
+                            _epoch,
+                            chunk_i,
+                            &[
+                                ("action_loss", &metrics.action_loss),
+                                ("value_loss", &metrics.value_loss),
+                                ("dist_entropy", &metrics.dist_entropy),
+                                ("actor_loss", &graph_actor_loss),
+                                ("critic_loss", &graph_critic_loss),
+                                ("total_loss", &graph_total_loss),
+                            ],
+                        ) {
+                            log_named_var_extremes(
+                                "params_at_loss_failure",
+                                episode,
+                                _epoch,
+                                chunk_i,
+                                &self.named_trainable_vars,
+                                false,
+                                12,
+                            );
+                        }
+                        if log_first_non_finite_var(
+                            &mut logged_grad_non_finite,
+                            "grads_after_backward",
+                            episode,
+                            _epoch,
+                            chunk_i,
+                            &self.named_trainable_vars,
+                            true,
+                        ) {
+                            log_named_var_extremes(
+                                "grads_after_backward_top_abs",
+                                episode,
+                                _epoch,
+                                chunk_i,
+                                &self.named_trainable_vars,
+                                true,
+                                12,
+                            );
+                        }
+                        let _ = epoch_kl_gpu
+                            .g_add_(&(&metrics.approx_kl * minibatch_sample_count as f64));
+                        let _ = total_policy_loss_weighted
+                            .g_add_(&(&metrics.action_loss * minibatch_sample_count as f64));
+                        let _ = total_value_loss_weighted
+                            .g_add_(&(&metrics.value_loss * minibatch_sample_count as f64));
+                        let _ = total_clip_gap_weighted
+                            .g_add_(&(&metrics.clip_gap_mean * minibatch_sample_count as f64));
+                        let _ = total_entropy_weighted
+                            .g_add_(&(&metrics.dist_entropy * minibatch_sample_count as f64));
+                        entropy_min = entropy_min.min_other(&metrics.dist_entropy);
+                        entropy_max = entropy_max.max_other(&metrics.dist_entropy);
+                        epoch_kl_count += minibatch_sample_count;
+                        total_sample_count += minibatch_sample_count;
+                        let _ = total_clip_violations.g_add_(&metrics.clip_violations);
+                        total_ratio_samples += minibatch_sample_count;
+                        actor_grad_norm_sum += metrics.actor_grad_norm;
+                        critic_grad_norm_sum += metrics.critic_grad_norm;
+                        grad_norm_count += 1;
+                        step_optimizer(&mut self.opt, &mut self.optimizer_step);
+                        if log_first_non_finite_var(
+                            &mut logged_param_non_finite,
+                            "params_after_step",
+                            episode,
+                            _epoch,
+                            chunk_i,
+                            &self.named_trainable_vars,
+                            false,
+                        ) {
+                            log_named_var_extremes(
+                                "params_after_step_top_abs",
+                                episode,
+                                _epoch,
+                                chunk_i,
+                                &self.named_trainable_vars,
+                                false,
+                                12,
+                            );
+                        }
+                        last_minibatch_kl_mean_gpu = Some(metrics.approx_kl.detach().copy());
+                        continue;
+                    }
+                    graph_time_us += graph_start.elapsed().as_micros() as u64;
+                }
 
                 if log_first_non_finite_tensor(
                     &mut logged_replay_input_non_finite,
@@ -364,7 +872,7 @@ impl Trainer {
                 }
 
                 let approx_kl_val =
-                    tch::no_grad(|| (log_ratio.exp() - 1.0 - &log_ratio).mean(Kind::Float));
+                    tch::no_grad(|| (&ratio - 1.0 - &log_ratio).mean(Kind::Float));
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
                 }
@@ -474,9 +982,10 @@ impl Trainer {
         }
 
         println!(
-            "fwd: {:.1}ms  bwd: {:.1}ms",
+            "fwd: {:.1}ms  bwd: {:.1}ms  graph: {:.1}ms",
             fwd_time_us as f64 / 1000.0,
-            bwd_time_us as f64 / 1000.0
+            bwd_time_us as f64 / 1000.0,
+            graph_time_us as f64 / 1000.0
         );
 
         UpdateMetrics {

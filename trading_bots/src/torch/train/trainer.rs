@@ -25,6 +25,7 @@ use super::optimizer_glue::{
     apply_lr_scale, grad_clip_groups, named_trainable_variables, GradClipGroups, KlLrController,
     KlLrControllerState,
 };
+use super::update::PpoUpdateCudaGraph;
 
 pub(super) struct RolloutData {
     pub(super) reset_layout_batches_cpu: Vec<Tensor>,
@@ -107,6 +108,7 @@ pub(super) struct Trainer {
     pub(super) action_host_view: Tensor,
     pub(super) reset_env_indices_host: Vec<i64>,
     pub(super) ticker_offsets: Tensor,
+    pub(super) ppo_update_graph: Option<PpoUpdateCudaGraph>,
 }
 
 fn kl_lr_state_path_for_weights_path(weights_path: &Path) -> PathBuf {
@@ -430,6 +432,7 @@ impl Trainer {
             action_host_view,
             reset_env_indices_host,
             ticker_offsets,
+            ppo_update_graph: None,
         }
     }
 

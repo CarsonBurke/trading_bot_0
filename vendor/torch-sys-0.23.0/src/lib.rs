@@ -95,6 +95,7 @@ extern "C" {
     pub fn at_cuda_graph_free(graph: *mut C_cuda_graph);
     pub fn at_cuda_graph_capture_begin(graph: *mut C_cuda_graph, device_index: i64);
     pub fn at_cuda_graph_capture_end(graph: *mut C_cuda_graph);
+    pub fn at_cuda_graph_capture_abort(graph: *mut C_cuda_graph);
     pub fn at_cuda_graph_replay(graph: *mut C_cuda_graph, device_index: i64);
     pub fn at_cuda_empty_cache();
     pub fn at_device(arg: *mut C_tensor) -> c_int;

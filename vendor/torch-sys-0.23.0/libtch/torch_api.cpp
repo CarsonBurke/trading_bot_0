@@ -38,6 +38,25 @@ struct TchCudaGraph {
   std::unique_ptr<c10::cuda::CUDAStream> capture_stream;
   std::unique_ptr<c10::cuda::CUDAStreamGuard> capture_guard;
 };
+
+static void reset_cuda_graph_capture_state(TchCudaGraph *g) {
+  if (g == nullptr) {
+    return;
+  }
+  g->capture_guard.reset();
+  g->capture_stream.reset();
+}
+
+static void reset_cuda_graph_after_failed_capture(TchCudaGraph *g) {
+  reset_cuda_graph_capture_state(g);
+  if (g == nullptr) {
+    return;
+  }
+  try {
+    g->graph.reset();
+  } catch (...) {
+  }
+}
 #endif
 
 char *get_and_reset_last_err() {
@@ -401,7 +420,7 @@ void at_cuda_graph_free(cuda_graph graph) {
 
 void at_cuda_graph_capture_begin(cuda_graph graph, int64_t device_index) {
 #ifdef TCH_CUDA_GRAPHS
-  PROTECT(
+  try {
     auto *g = reinterpret_cast<TchCudaGraph*>(graph);
     if (g->capture_guard) {
       throw std::runtime_error("CUDA graph capture is already active");
@@ -412,7 +431,10 @@ void at_cuda_graph_capture_begin(cuda_graph graph, int64_t device_index) {
         c10::cuda::getStreamFromPool(false, g->device_index));
     g->capture_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(*g->capture_stream);
     g->graph.capture_begin();
-  )
+  } catch (const exception& e) {
+    reset_cuda_graph_after_failed_capture(reinterpret_cast<TchCudaGraph*>(graph));
+    torch_last_err = strdup(e.what());
+  }
 #else
   (void)graph;
   (void)device_index;
@@ -422,12 +444,27 @@ void at_cuda_graph_capture_begin(cuda_graph graph, int64_t device_index) {
 
 void at_cuda_graph_capture_end(cuda_graph graph) {
 #ifdef TCH_CUDA_GRAPHS
-  PROTECT(
+  try {
     auto *g = reinterpret_cast<TchCudaGraph*>(graph);
     g->graph.capture_end();
-    g->capture_guard.reset();
-    g->capture_stream.reset();
-  )
+    reset_cuda_graph_capture_state(g);
+  } catch (const exception& e) {
+    reset_cuda_graph_after_failed_capture(reinterpret_cast<TchCudaGraph*>(graph));
+    torch_last_err = strdup(e.what());
+  }
+#else
+  (void)graph;
+  PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
+#endif
+}
+
+void at_cuda_graph_capture_abort(cuda_graph graph) {
+#ifdef TCH_CUDA_GRAPHS
+  try {
+    reset_cuda_graph_after_failed_capture(reinterpret_cast<TchCudaGraph*>(graph));
+  } catch (const exception& e) {
+    torch_last_err = strdup(e.what());
+  }
 #else
   (void)graph;
   PROTECT(throw std::runtime_error("CUDA graph support is unavailable in this torch-sys build");)
