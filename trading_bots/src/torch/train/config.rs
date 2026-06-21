@@ -31,6 +31,13 @@ pub(crate) const KL_LR_MAX_SCALE: f64 = 10.0;
 pub(crate) const TARGET_KL: f64 = KL_LR_TARGET;
 pub(crate) const KL_STOP_MULTIPLIER: f64 = 1.5;
 pub(crate) const VALUE_LOSS_COEF: f64 = 1.0;
+/// Per-minibatch percentile return-norm ("mbpercnorm"): scale advantages by
+/// S = max(FLOOR, P_HI - P_LO) of THIS minibatch's raw GAE returns, recomputed
+/// fresh per minibatch (no EMA). Divide-only (no mean subtraction). Matches the
+/// CleanRL reference's `ret_percnorm` with `ret_perc_scope="minibatch"`.
+pub(crate) const RET_PERC_LO: f64 = 0.05;
+pub(crate) const RET_PERC_HI: f64 = 0.95;
+pub(crate) const RET_PERC_FLOOR: f64 = 1.0;
 /// Our beta distribution with log variance explores very well, and better without entropy regulation.
 pub(crate) const ENTROPY_COEF: f64 = 0.0;
 pub(crate) const MAX_GRAD_NORM: f64 = 0.5;

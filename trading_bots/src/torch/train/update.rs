@@ -10,7 +10,7 @@ use crate::torch::value::hl_gauss::HlGaussBins;
 
 use super::config::{
     CLIP_EPS_HIGH, CLIP_EPS_LOW, DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER, MAX_GRAD_NORM,
-    OPTIM_EPOCHS, TARGET_KL, VALUE_LOSS_COEF,
+    OPTIM_EPOCHS, RET_PERC_FLOOR, RET_PERC_HI, RET_PERC_LO, TARGET_KL, VALUE_LOSS_COEF,
 };
 use super::gae::build_no_reset_windowed_layouts;
 use super::numeric_debug::{
@@ -681,11 +681,33 @@ impl Trainer {
                 let static_flat = so_chunk.reshape([minibatch_sample_count, self.so_dim]);
 
                 // Flatten rollout-captured targets to minibatch-flat form (chunk-major).
-                // Advantages are already rank-Gaussian normalized over the full population.
+                // `adv_flat`/`ret_flat` are fresh per-minibatch tensors (gather +
+                // reshape), so scaling `adv_flat` below never touches the persistent
+                // raw `adv_data.advantages`.
                 let adv_flat = adv_mb_by_chunk.reshape([-1]);
                 let ret_flat = ret_mb_by_chunk.reshape([-1]);
                 let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
                 let actions_flat = actions_by_chunk.reshape([-1, ACTION_COUNT]);
+
+                // Per-minibatch percentile return-norm ("mbpercnorm"): divide-only
+                // scale by S = clamp(P95 - P5 of THIS minibatch's raw GAE returns,
+                // FLOOR), recomputed fresh each minibatch (no EMA, no caching). The
+                // critic still regresses raw `ret_flat`; only the policy advantage
+                // is scaled. Computed eagerly here, OUTSIDE any captured graph body,
+                // so the scaled `adv_flat` is what gets copied into the CUDA-graph
+                // static input buffer (and what the eager path consumes) — no
+                // staleness, and the graph captures a correctly-scaled static buffer
+                // on every replay.
+                let adv_flat = tch::no_grad(|| {
+                    let qs = Tensor::from_slice(&[RET_PERC_LO, RET_PERC_HI])
+                        .to_kind(Kind::Float)
+                        .to_device(device);
+                    let bounds = ret_flat.quantile(&qs, None::<i64>, false, "linear");
+                    let lo = bounds.get(0);
+                    let hi = bounds.get(1);
+                    let scale = (hi - lo).clamp_min(RET_PERC_FLOOR);
+                    adv_flat / scale
+                });
 
                 // Runs once per minibatch, shared by the graph and eager paths
                 // (the graph branch may `continue`, otherwise control falls
