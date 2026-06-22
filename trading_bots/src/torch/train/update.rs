@@ -2,15 +2,16 @@ use rand::seq::SliceRandom;
 use std::{env, time::Instant};
 use tch::{autocast, Kind, Tensor};
 
-use crate::torch::action_space::{beta_entropy, beta_log_prob};
+use crate::torch::action_space::{beta_entropy, beta_log_prob, beta_reverse_kl};
 use crate::torch::constants::{ACTION_COUNT, TICKERS_COUNT};
 use crate::torch::cuda::graph::CudaGraph;
 use crate::torch::model::TradingModel;
 use crate::torch::value::hl_gauss::HlGaussBins;
 
 use super::config::{
-    CLIP_EPS_HIGH, CLIP_EPS_LOW, DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER, MAX_GRAD_NORM,
-    OPTIM_EPOCHS, RET_PERC_FLOOR, RET_PERC_HI, RET_PERC_LO, TARGET_KL, VALUE_LOSS_COEF,
+    PolicyObjective, CLIP_EPS_HIGH, CLIP_EPS_LOW, DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER,
+    MAX_GRAD_NORM, OPTIM_EPOCHS, PMPO_KL_COEF, PMPO_POS_TO_NEG_WEIGHT, POLICY_OBJECTIVE,
+    RET_PERC_FLOOR, RET_PERC_HI, RET_PERC_LO, TARGET_KL, VALUE_LOSS_COEF,
 };
 use super::gae::build_no_reset_windowed_layouts;
 use super::numeric_debug::{
@@ -32,6 +33,31 @@ fn asym_clip_policy_loss(advantage: &Tensor, ratio: &Tensor) -> (Tensor, Tensor)
     let action_loss = pg_loss1.max_other(&pg_loss2).mean(Kind::Float);
     let clip_gap = tch::no_grad(|| (ratio - &clipped).abs());
     (action_loss, clip_gap)
+}
+
+/// PMPO objective: sign-based advantage-weighted MLE + closed-form reverse-KL
+/// trust region. Uses RAW GAE `advantage` and the NEW-policy `log_probs`
+/// directly (no ratio); old α/β feed only the KL term. Returns the scalar
+/// policy loss; entropy is applied by the caller as for PPO.
+fn pmpo_policy_loss(
+    advantage: &Tensor,
+    log_probs: &Tensor,
+    old_alpha: &Tensor,
+    old_beta: &Tensor,
+    new_alpha: &Tensor,
+    new_beta: &Tensor,
+) -> Tensor {
+    // adv_weight is constant across action dims, so adv_weight * beta_log_prob
+    // equals sum_dims(logp_dim * adv_weight) — the summed log-prob is exact.
+    let adv_weight = advantage.tanh().abs();
+    let weighted = &adv_weight * log_probs;
+    let pos_mask = advantage.ge(0.0).to_kind(Kind::Float);
+    let neg_mask = 1.0 - &pos_mask;
+    let pos_loss = (&weighted * &pos_mask).sum(Kind::Float) / pos_mask.sum(Kind::Float).clamp_min(1.0);
+    let neg_loss = (&weighted * &neg_mask).sum(Kind::Float) / neg_mask.sum(Kind::Float).clamp_min(1.0);
+    let pg_loss = -PMPO_POS_TO_NEG_WEIGHT * pos_loss + (1.0 - PMPO_POS_TO_NEG_WEIGHT) * neg_loss;
+    let reverse_kl = beta_reverse_kl(old_alpha, old_beta, new_alpha, new_beta).mean(Kind::Float);
+    pg_loss + PMPO_KL_COEF * reverse_kl
 }
 
 /// Warmup iterations run on the capture stream before capture. cuBLAS/cuDNN
@@ -62,6 +88,8 @@ pub(super) struct PpoUpdateCudaGraph {
     returns: Tensor,
     old_log_probs: Tensor,
     actions: Tensor,
+    old_alphas: Tensor,
+    old_betas: Tensor,
     outputs: PpoGraphOutputs,
 }
 
@@ -124,6 +152,14 @@ impl PpoUpdateCudaGraph {
                 [minibatch_sample_count, ACTION_COUNT],
                 (Kind::Float, device),
             ),
+            old_alphas: Tensor::zeros(
+                [minibatch_sample_count, ACTION_COUNT],
+                (Kind::Float, device),
+            ),
+            old_betas: Tensor::zeros(
+                [minibatch_sample_count, ACTION_COUNT],
+                (Kind::Float, device),
+            ),
             outputs: PpoGraphOutputs::new(device),
         }
     }
@@ -174,6 +210,8 @@ impl PpoUpdateCudaGraph {
         returns: &Tensor,
         old_log_probs: &Tensor,
         actions: &Tensor,
+        old_alphas: &Tensor,
+        old_betas: &Tensor,
     ) -> Option<PpoGraphOutputs> {
         if !self.is_enabled() {
             return None;
@@ -188,6 +226,8 @@ impl PpoUpdateCudaGraph {
         copy_into(&self.returns, returns);
         copy_into(&self.old_log_probs, old_log_probs);
         copy_into(&self.actions, actions);
+        copy_into(&self.old_alphas, old_alphas);
+        copy_into(&self.old_betas, old_betas);
 
         match self.state {
             GraphCaptureState::Warmup => {
@@ -211,6 +251,8 @@ impl PpoUpdateCudaGraph {
                             &self.returns,
                             &self.old_log_probs,
                             &self.actions,
+                            &self.old_alphas,
+                            &self.old_betas,
                             &self.outputs,
                         );
                     }
@@ -242,6 +284,8 @@ impl PpoUpdateCudaGraph {
                                 &self.returns,
                                 &self.old_log_probs,
                                 &self.actions,
+                                &self.old_alphas,
+                                &self.old_betas,
                                 &self.outputs,
                             );
                         })?;
@@ -317,6 +361,8 @@ fn run_graph_body(
     returns: &Tensor,
     old_log_probs: &Tensor,
     actions: &Tensor,
+    old_alphas: &Tensor,
+    old_betas: &Tensor,
     outputs: &PpoGraphOutputs,
 ) {
     let (new_value_logits, action_alpha, action_beta) = autocast(false, || {
@@ -327,7 +373,21 @@ fn run_graph_body(
     let log_ratio = &action_log_probs - old_log_probs;
     let ratio = log_ratio.exp();
     let ratio_diff = &ratio - 1.0;
-    let (action_loss, clip_gap) = asym_clip_policy_loss(advantages, &ratio);
+    let (action_loss, clip_gap) = match POLICY_OBJECTIVE {
+        PolicyObjective::Pmpo => {
+            let loss = pmpo_policy_loss(
+                advantages,
+                &action_log_probs,
+                old_alphas,
+                old_betas,
+                &action_alpha,
+                &action_beta,
+            );
+            let clip_gap = tch::no_grad(|| Tensor::zeros_like(&ratio));
+            (loss, clip_gap)
+        }
+        PolicyObjective::Ppo => asym_clip_policy_loss(advantages, &ratio),
+    };
     let value_loss = hl_gauss_value_loss(hl_gauss, &new_value_logits, returns).mean(Kind::Float);
     let dist_entropy = dist_entropy_per_sample.mean(Kind::Float);
     let actor_loss = action_loss.shallow_clone() - &dist_entropy * ENTROPY_COEF;
@@ -341,7 +401,12 @@ fn run_graph_body(
         device,
     );
 
-    let approx_kl = tch::no_grad(|| (&ratio - 1.0 - &log_ratio).mean(Kind::Float));
+    // Analytical closed-form KL(old||new) drives the early-stop and KL-LR
+    // controller for both objectives; the ratio estimator only fed PPO's
+    // surrogate diagnostics.
+    let approx_kl = tch::no_grad(|| {
+        beta_reverse_kl(old_alphas, old_betas, &action_alpha, &action_beta).mean(Kind::Float)
+    });
     let clip_violations = tch::no_grad(|| {
         ratio_diff
             .gt(CLIP_EPS_HIGH)
@@ -601,6 +666,8 @@ impl Trainer {
                 let ret_mb_by_chunk = adv_data.returns.index_select(0, &chunk_ids);
                 let old_log_probs_by_chunk = self.s_old_log_probs.index_select(0, &chunk_ids);
                 let actions_by_chunk = self.s_actions.index_select(0, &chunk_ids);
+                let old_alphas_by_chunk = self.s_old_alphas.index_select(0, &chunk_ids);
+                let old_betas_by_chunk = self.s_old_betas.index_select(0, &chunk_ids);
                 let reset_slots_chunk = adv_data.reset_slots_by_chunk.index_select(0, &chunk_ids);
 
                 let fwd_start = Instant::now();
@@ -688,6 +755,8 @@ impl Trainer {
                 let ret_flat = ret_mb_by_chunk.reshape([-1]);
                 let old_log_probs_flat = old_log_probs_by_chunk.reshape([-1]);
                 let actions_flat = actions_by_chunk.reshape([-1, ACTION_COUNT]);
+                let old_alphas_flat = old_alphas_by_chunk.reshape([-1, ACTION_COUNT]);
+                let old_betas_flat = old_betas_by_chunk.reshape([-1, ACTION_COUNT]);
 
                 // Per-minibatch percentile return-norm ("mbpercnorm"): divide-only
                 // scale by S = clamp(P95 - P5 of THIS minibatch's raw GAE returns,
@@ -698,16 +767,22 @@ impl Trainer {
                 // static input buffer (and what the eager path consumes) — no
                 // staleness, and the graph captures a correctly-scaled static buffer
                 // on every replay.
-                let adv_flat = tch::no_grad(|| {
-                    let qs = Tensor::from_slice(&[RET_PERC_LO, RET_PERC_HI])
-                        .to_kind(Kind::Float)
-                        .to_device(device);
-                    let bounds = ret_flat.quantile(&qs, None::<i64>, false, "linear");
-                    let lo = bounds.get(0);
-                    let hi = bounds.get(1);
-                    let scale = (hi - lo).clamp_min(RET_PERC_FLOOR);
-                    adv_flat / scale
-                });
+                // PMPO consumes RAW GAE advantages (its tanh weighting subsumes
+                // scale normalization); only PPO applies the percentile norm.
+                let adv_flat = if POLICY_OBJECTIVE == PolicyObjective::Pmpo {
+                    adv_flat
+                } else {
+                    tch::no_grad(|| {
+                        let qs = Tensor::from_slice(&[RET_PERC_LO, RET_PERC_HI])
+                            .to_kind(Kind::Float)
+                            .to_device(device);
+                        let bounds = ret_flat.quantile(&qs, None::<i64>, false, "linear");
+                        let lo = bounds.get(0);
+                        let hi = bounds.get(1);
+                        let scale = (hi - lo).clamp_min(RET_PERC_FLOOR);
+                        adv_flat / scale
+                    })
+                };
 
                 // Runs once per minibatch, shared by the graph and eager paths
                 // (the graph branch may `continue`, otherwise control falls
@@ -764,6 +839,8 @@ impl Trainer {
                         &ret_flat,
                         &old_log_probs_flat,
                         &actions_flat,
+                        &old_alphas_flat,
+                        &old_betas_flat,
                     );
                     self.ppo_update_graph = Some(graph);
 
@@ -901,7 +978,21 @@ impl Trainer {
                     }
                 }
 
-                let (action_loss, clip_gap) = asym_clip_policy_loss(&adv_flat, &ratio);
+                let (action_loss, clip_gap) = match POLICY_OBJECTIVE {
+                    PolicyObjective::Pmpo => {
+                        let loss = pmpo_policy_loss(
+                            &adv_flat,
+                            &action_log_probs,
+                            &old_alphas_flat,
+                            &old_betas_flat,
+                            &action_alpha,
+                            &action_beta,
+                        );
+                        let clip_gap = tch::no_grad(|| Tensor::zeros_like(&ratio));
+                        (loss, clip_gap)
+                    }
+                    PolicyObjective::Ppo => asym_clip_policy_loss(&adv_flat, &ratio),
+                };
 
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("ret_mb", &ret_flat, _epoch, chunk_i);
@@ -952,8 +1043,17 @@ impl Trainer {
                     chunk_i,
                 );
 
-                let approx_kl_val =
-                    tch::no_grad(|| (&ratio - 1.0 - &log_ratio).mean(Kind::Float));
+                // Analytical closed-form KL(old||new) drives the early-stop and
+                // KL-LR controller for both objectives.
+                let approx_kl_val = tch::no_grad(|| {
+                    beta_reverse_kl(
+                        &old_alphas_flat,
+                        &old_betas_flat,
+                        &action_alpha,
+                        &action_beta,
+                    )
+                    .mean(Kind::Float)
+                });
                 if DEBUG_NUMERICS {
                     let _ = debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
                 }

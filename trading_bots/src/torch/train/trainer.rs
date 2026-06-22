@@ -94,6 +94,8 @@ pub(super) struct Trainer {
     pub(super) s_step_deltas: Tensor,
     pub(super) s_actions: Tensor,
     pub(super) s_old_log_probs: Tensor,
+    pub(super) s_old_alphas: Tensor,
+    pub(super) s_old_betas: Tensor,
     pub(super) s_rewards: Tensor,
     pub(super) s_dones: Tensor,
     pub(super) s_values: Tensor,
@@ -339,6 +341,14 @@ impl Trainer {
             &[total_chunks, rollout.ppo_chunk_len],
             (Kind::Float, device),
         );
+        let s_old_alphas = Tensor::zeros(
+            &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
+            (Kind::Float, device),
+        );
+        let s_old_betas = Tensor::zeros(
+            &[total_chunks, rollout.ppo_chunk_len, ACTION_COUNT],
+            (Kind::Float, device),
+        );
         let s_rewards = Tensor::zeros(
             &[total_chunks, rollout.ppo_chunk_len],
             (Kind::Float, device),
@@ -419,6 +429,8 @@ impl Trainer {
             s_step_deltas,
             s_actions,
             s_old_log_probs,
+            s_old_alphas,
+            s_old_betas,
             s_rewards,
             s_dones,
             s_values,

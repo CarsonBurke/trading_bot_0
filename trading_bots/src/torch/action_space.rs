@@ -24,6 +24,16 @@ pub fn beta_log_prob(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Tensor {
     per_dim.sum_dim_intlist([-1].as_slice(), false, Kind::Float)
 }
 
+/// Closed-form reverse KL(Beta(a1,b1) || Beta(a2,b2)), per-dim summed over the
+/// action dim, returning shape [B]. `(a1,b1)` is OLD, `(a2,b2)` is NEW.
+pub fn beta_reverse_kl(a1: &Tensor, b1: &Tensor, a2: &Tensor, b2: &Tensor) -> Tensor {
+    let per_dim = beta_log_norm(a2, b2) - beta_log_norm(a1, b1)
+        + (a1 - a2) * a1.digamma()
+        + (b1 - b2) * b1.digamma()
+        + (a2 - a1 + b2 - b1) * (a1 + b1).digamma();
+    per_dim.sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+}
+
 pub fn beta_entropy(alpha: &Tensor, beta: &Tensor) -> Tensor {
     let log_norm = beta_log_norm(alpha, beta);
     let per_dim = log_norm - (alpha - 1.0) * alpha.digamma() - (beta - 1.0) * beta.digamma()

@@ -150,6 +150,20 @@ impl Trainer {
                 chunk_offset,
                 &action_log_prob,
             );
+            write_chunk_slot(
+                &self.s_old_alphas,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &alpha,
+            );
+            write_chunk_slot(
+                &self.s_old_betas,
+                chunk_row,
+                self.rollout.nprocs,
+                chunk_offset,
+                &beta,
+            );
 
             let portfolio_reward =
                 self.step_reward_per_ticker

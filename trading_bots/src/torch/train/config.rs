@@ -24,13 +24,24 @@ pub(crate) const DEFAULT_PPO_MINIBATCH_RATIO: f64 = 1.0 / 16.0;
 pub(crate) const OPTIM_EPOCHS: i64 = 3;
 pub(crate) const CLIP_EPS_LOW: f64 = 0.20;
 pub(crate) const CLIP_EPS_HIGH: f64 = 0.28;
-pub(crate) const KL_LR_TARGET: f64 = 0.02;
+pub(crate) const KL_LR_TARGET: f64 = 0.035;
 pub(crate) const KL_LR_EMA_HALF_LIFE: f64 = 50.0;
 pub(crate) const KL_LR_MIN_SCALE: f64 = 0.01;
 pub(crate) const KL_LR_MAX_SCALE: f64 = 10.0;
 pub(crate) const TARGET_KL: f64 = KL_LR_TARGET;
-pub(crate) const KL_STOP_MULTIPLIER: f64 = 1.5;
+pub(crate) const KL_STOP_MULTIPLIER: f64 = 1.0;
 pub(crate) const VALUE_LOSS_COEF: f64 = 1.0;
+/// Policy-optimization objective, selected at compile time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PolicyObjective {
+    Ppo,
+    Pmpo,
+}
+/// PMPO (sign-based weighted-MLE + closed-form reverse-KL trust region) is the
+/// default. PMPO uses RAW GAE advantages (no per-minibatch percentile norm).
+pub(crate) const POLICY_OBJECTIVE: PolicyObjective = PolicyObjective::Pmpo;
+pub(crate) const PMPO_POS_TO_NEG_WEIGHT: f64 = 0.5;
+pub(crate) const PMPO_KL_COEF: f64 = 0.3;
 /// Per-minibatch percentile return-norm ("mbpercnorm"): scale advantages by
 /// S = max(FLOOR, P_HI - P_LO) of THIS minibatch's raw GAE returns, recomputed
 /// fresh per minibatch (no EMA). Divide-only (no mean subtraction). Matches the
