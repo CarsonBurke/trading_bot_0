@@ -9,9 +9,10 @@ use crate::torch::model::TradingModel;
 use crate::torch::value::hl_gauss::HlGaussBins;
 
 use super::config::{
-    PolicyObjective, CLIP_EPS_HIGH, CLIP_EPS_LOW, DEBUG_NUMERICS, ENTROPY_COEF, KL_STOP_MULTIPLIER,
-    MAX_GRAD_NORM, OPTIM_EPOCHS, PMPO_KL_COEF, PMPO_POS_TO_NEG_WEIGHT, POLICY_OBJECTIVE,
-    RET_PERC_FLOOR, RET_PERC_HI, RET_PERC_LO, TARGET_KL, VALUE_LOSS_COEF,
+    PolicyObjective, CLIP_EPS_HIGH, CLIP_EPS_LOW, CRITIC_PRETRAIN_EPISODES, DEBUG_NUMERICS,
+    ENTROPY_COEF, KL_STOP_MULTIPLIER, MAX_GRAD_NORM, OPTIM_EPOCHS, PMPO_KL_COEF,
+    PMPO_POS_TO_NEG_WEIGHT, POLICY_OBJECTIVE, RET_PERC_FLOOR, RET_PERC_HI, RET_PERC_LO, TARGET_KL,
+    VALUE_LOSS_COEF,
 };
 use super::gae::build_no_reset_windowed_layouts;
 use super::numeric_debug::{
@@ -399,6 +400,7 @@ fn run_graph_body(
         &critic_loss,
         MAX_GRAD_NORM,
         device,
+        false,
     );
 
     // Analytical closed-form KL(old||new) drives the early-stop and KL-LR
@@ -610,6 +612,12 @@ impl Trainer {
         adv_data: &AdvantageData,
     ) -> UpdateMetrics {
         let device = self.device;
+        // Critic-only pretraining: warm up the value function (and the shared
+        // trunk through it) before the actor turns on. While active, the actor
+        // backward is skipped, the CUDA graph is suppressed (so it captures
+        // fresh with the full actor+critic body once the actor begins), and the
+        // KL early-stop is disabled since trunk drift would spuriously trip it.
+        let critic_only = episode < CRITIC_PRETRAIN_EPISODES;
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_clip_gap_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -802,6 +810,7 @@ impl Trainer {
 
                 let graph_eligible = self.device.is_cuda()
                     && !DEBUG_NUMERICS
+                    && !critic_only
                     && !has_reset_slots
                     && chunk_count == adv_data.chunk_batch_size;
                 if graph_eligible {
@@ -1033,6 +1042,7 @@ impl Trainer {
                     &critic_loss,
                     MAX_GRAD_NORM,
                     device,
+                    critic_only,
                 );
                 bwd_time_us += bwd_start.elapsed().as_micros() as u64;
 
@@ -1144,7 +1154,7 @@ impl Trainer {
                 mean_epoch_kl,
                 last_minibatch_approx_kl
             );
-            if mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
+            if !critic_only && mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
                 break 'epoch_loop;
             }
         }

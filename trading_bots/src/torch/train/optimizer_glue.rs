@@ -96,19 +96,21 @@ pub(crate) fn backward_actor_critic_with_separate_clips(
     critic_loss: &Tensor,
     max_grad_norm: f64,
     device: Device,
+    critic_only: bool,
 ) -> (Tensor, Tensor) {
     if max_grad_norm <= 0.0 {
-        (actor_loss + critic_loss).backward();
+        if critic_only {
+            critic_loss.backward();
+        } else {
+            (actor_loss + critic_loss).backward();
+        }
         let zero = Tensor::zeros([], (Kind::Float, device));
         return (zero.shallow_clone(), zero);
     }
 
-    let mut actor_params: Vec<Tensor> = groups
-        .actor
-        .iter()
-        .chain(groups.shared.iter())
-        .map(Tensor::shallow_clone)
-        .collect();
+    // Critic params always receive the critic gradient. During critic-only
+    // pretraining the actor backward is skipped entirely, so the shared trunk
+    // is driven purely by value error and the policy head stays frozen.
     let mut critic_params: Vec<Tensor> = groups
         .critic
         .iter()
@@ -116,8 +118,20 @@ pub(crate) fn backward_actor_critic_with_separate_clips(
         .map(Tensor::shallow_clone)
         .collect();
 
-    let mut actor_grads = Tensor::run_backward(&[actor_loss], &actor_params, true, false);
-    let actor_norm = clip_grad_tensors_on_device(&mut actor_grads, max_grad_norm, device);
+    let (actor_norm, mut actor_params, actor_grads) = if critic_only {
+        (Tensor::zeros([], (Kind::Float, device)), Vec::new(), Vec::new())
+    } else {
+        let actor_params: Vec<Tensor> = groups
+            .actor
+            .iter()
+            .chain(groups.shared.iter())
+            .map(Tensor::shallow_clone)
+            .collect();
+        let mut actor_grads = Tensor::run_backward(&[actor_loss], &actor_params, true, false);
+        let actor_norm = clip_grad_tensors_on_device(&mut actor_grads, max_grad_norm, device);
+        (actor_norm, actor_params, actor_grads)
+    };
+
     let mut critic_grads = Tensor::run_backward(&[critic_loss], &critic_params, false, false);
     let critic_norm = clip_grad_tensors_on_device(&mut critic_grads, max_grad_norm, device);
 
@@ -373,6 +387,7 @@ mod tests {
             &critic_loss.sum(Kind::Float),
             1.0,
             device,
+            false,
         );
 
         assert!((actor_norm.double_value(&[]) - 5.0).abs() < 1e-6);
@@ -380,6 +395,52 @@ mod tests {
         assert!((actor.grad().double_value(&[0]) - 0.6).abs() < 1e-6);
         assert!((critic.grad().double_value(&[0]) - 0.6).abs() < 1e-6);
         assert!((shared.grad().double_value(&[0]) - 1.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn critic_only_backward_freezes_actor_and_trains_trunk() {
+        let device = Device::Cpu;
+        let actor = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let critic = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let shared = Tensor::from_slice(&[1.0f32])
+            .to_device(device)
+            .set_requires_grad(true);
+        let groups = GradClipGroups {
+            actor: vec![actor.shallow_clone()],
+            critic: vec![critic.shallow_clone()],
+            shared: vec![shared.shallow_clone()],
+        };
+        let trainable = vec![
+            actor.shallow_clone(),
+            critic.shallow_clone(),
+            shared.shallow_clone(),
+        ];
+        let actor_loss = &actor * 3.0 + &shared * 4.0;
+        let critic_loss = &critic * 30.0 + &shared * 40.0;
+
+        let (actor_norm, critic_norm) = backward_actor_critic_with_separate_clips(
+            &groups,
+            &trainable,
+            &actor_loss.sum(Kind::Float),
+            &critic_loss.sum(Kind::Float),
+            1.0,
+            device,
+            true,
+        );
+
+        // Actor backward is skipped entirely: zero reported norm and the actor
+        // head receives no gradient (slot stays undefined → head stays frozen).
+        assert!((actor_norm.double_value(&[])).abs() < 1e-12);
+        assert!(!actor.grad().defined());
+        // Trunk learns purely from the clipped critic gradient; the shared param's
+        // raw critic grad is 40, clipped by 1/critic_norm with critic_norm=50.
+        assert!((critic_norm.double_value(&[]) - 50.0).abs() < 1e-6);
+        assert!((critic.grad().double_value(&[0]) - 0.6).abs() < 1e-6);
+        assert!((shared.grad().double_value(&[0]) - 0.8).abs() < 1e-6);
     }
 
     #[test]
@@ -418,6 +479,7 @@ mod tests {
             &critic_loss.sum(Kind::Float),
             1.0,
             device,
+            false,
         );
 
         assert!((actor_norm.double_value(&[]) - 5.0).abs() < 1e-6);

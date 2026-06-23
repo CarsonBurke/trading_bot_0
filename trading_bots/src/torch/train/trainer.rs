@@ -17,8 +17,8 @@ use crate::torch::value::hl_gauss::HlGaussBins;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 use super::config::{
-    KL_LR_EMA_HALF_LIFE, KL_LR_MAX_SCALE, KL_LR_MIN_SCALE, KL_LR_TARGET, LEARNING_RATE, MUON_LR,
-    MUON_MOMENTUM_WARMUP_START, USE_MUON,
+    CRITIC_PRETRAIN_EPISODES, KL_LR_EMA_HALF_LIFE, KL_LR_MAX_SCALE, KL_LR_MIN_SCALE, KL_LR_TARGET,
+    LEARNING_RATE, MUON_LR, MUON_MOMENTUM_WARMUP_START, USE_MUON,
 };
 use super::geometry::{rollout_geometry, RolloutGeometry};
 use super::optimizer_glue::{
@@ -456,7 +456,11 @@ impl Trainer {
             apply_lr_scale(&mut self.opt, lr_scale);
             let mut update_metrics = self.update_policy(episode, &advantage_data);
             let kl_lr_signal = update_metrics.last_minibatch_approx_kl;
-            self.kl_lr_controller.observe(kl_lr_signal);
+            // During critic-only pretraining the policy KL reflects trunk drift,
+            // not actor learning, so it must not steer the KL-adaptive LR.
+            if episode >= CRITIC_PRETRAIN_EPISODES {
+                self.kl_lr_controller.observe(kl_lr_signal);
+            }
             update_metrics.lr_scale = lr_scale;
             update_metrics.kl_lr_signal = kl_lr_signal;
             update_metrics.kl_lr_ema = self.kl_lr_controller.ema();
