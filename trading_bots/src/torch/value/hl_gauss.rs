@@ -44,10 +44,29 @@ pub struct HlGaussBins {
 
 impl HlGaussBins {
     pub fn new(log_min: f64, log_max: f64, num_bins: i64, device: tch::Device) -> Self {
+        Self::new_with_sigma_ratio(log_min, log_max, num_bins, SIGMA_RATIO, device)
+    }
+
+    pub fn new_with_sigma_ratio(
+        log_min: f64,
+        log_max: f64,
+        num_bins: i64,
+        sigma_ratio: f64,
+        device: tch::Device,
+    ) -> Self {
+        assert!(num_bins > 1, "hl-gauss bin count must be greater than one");
+        assert!(
+            log_min < log_max,
+            "hl-gauss support must be strictly increasing"
+        );
+        assert!(
+            sigma_ratio.is_finite() && sigma_ratio > 0.0,
+            "hl-gauss sigma ratio must be positive and finite"
+        );
         let support = Tensor::linspace(log_min, log_max, num_bins + 1, (Kind::Float, device));
         let centers = (&support.narrow(0, 0, num_bins) + &support.narrow(0, 1, num_bins)) * 0.5;
         let bin_width = (log_max - log_min) / num_bins as f64;
-        let sigma = SIGMA_RATIO * bin_width;
+        let sigma = sigma_ratio * bin_width;
         Self {
             support,
             centers,
@@ -57,6 +76,10 @@ impl HlGaussBins {
 
     pub fn default_for(device: tch::Device) -> Self {
         Self::new(SYMLOG_SUPPORT_MIN, SYMLOG_SUPPORT_MAX, NUM_BINS, device)
+    }
+
+    pub fn num_bins(&self) -> i64 {
+        self.centers.size()[0]
     }
 
     fn prepare(&self, values: &Tensor) -> PreparedValues {
@@ -98,9 +121,7 @@ impl HlGaussBins {
         )
     }
 
-    /// Encode scalar values [... ] into normalized hl-gauss target distributions
-    /// [..., NUM_BINS] in symlog space.
-    pub fn encode(&self, values: &Tensor) -> Tensor {
+    fn encode_with_clamp(&self, values: &Tensor, clamp_to_range: bool) -> Tensor {
         let PreparedValues {
             values,
             flat_values,
@@ -108,7 +129,10 @@ impl HlGaussBins {
             min_support,
             max_support,
         } = self.prepare(values);
-        let t = symlog_tensor(&flat_values).clamp_tensor(Some(&min_support), Some(&max_support));
+        let mut t = symlog_tensor(&flat_values);
+        if clamp_to_range {
+            t = t.clamp_tensor(Some(&min_support), Some(&max_support));
+        }
         let scaled = (&support - &t.unsqueeze(-1)) / (self.sigma * SQRT_2);
         let cdf = scaled.erf();
         let bin_probs =
@@ -119,6 +143,18 @@ impl HlGaussBins {
         let mut out_shape = values.size();
         out_shape.push(self.centers.size()[0]);
         encoded.reshape(out_shape)
+    }
+
+    /// Encode scalar values [... ] into normalized hl-gauss target distributions
+    /// [..., NUM_BINS] in symlog space.
+    pub fn encode(&self, values: &Tensor) -> Tensor {
+        self.encode_with_clamp(values, true)
+    }
+
+    /// Encode using the default `hl-gauss-pytorch` semantics: transform the
+    /// target, do not clamp to support, then truncate/renormalize by the support.
+    pub fn encode_unclamped(&self, values: &Tensor) -> Tensor {
+        self.encode_with_clamp(values, false)
     }
 
     /// Compute E[symexp(z)] for probabilities/logits over symlog-space centers.
@@ -140,6 +176,41 @@ impl HlGaussBins {
         (weights * symexp_tensor(&centers))
             .sum_dim_intlist([-1].as_slice(), false, Kind::Double)
             .to_kind(Kind::Float)
+    }
+
+    pub fn decode_mean_and_variance(&self, logits: &Tensor) -> (Tensor, Tensor) {
+        let probs = logits.softmax(-1, Kind::Float).to_kind(Kind::Double);
+        let centers = self
+            .centers
+            .to_device(logits.device())
+            .to_kind(Kind::Double);
+        let raw_centers = symexp_tensor(&centers);
+        let mean = (&probs * &raw_centers).sum_dim_intlist([-1].as_slice(), false, Kind::Double);
+        let diff = raw_centers - mean.unsqueeze(-1);
+        let variance = (probs * diff.pow_tensor_scalar(2.0)).sum_dim_intlist(
+            [-1].as_slice(),
+            false,
+            Kind::Double,
+        );
+        (mean.to_kind(Kind::Float), variance.to_kind(Kind::Float))
+    }
+
+    pub fn decode_reference_mean_and_variance(&self, logits: &Tensor) -> (Tensor, Tensor) {
+        let probs = logits.softmax(-1, Kind::Float).to_kind(Kind::Double);
+        let centers = self
+            .centers
+            .to_device(logits.device())
+            .to_kind(Kind::Double);
+        let symlog_mean = (&probs * &centers).sum_dim_intlist([-1].as_slice(), false, Kind::Double);
+        let mean = symexp_tensor(&symlog_mean);
+        let raw_centers = symexp_tensor(&centers);
+        let diff = raw_centers - mean.unsqueeze(-1);
+        let variance = (probs * diff.pow_tensor_scalar(2.0)).sum_dim_intlist(
+            [-1].as_slice(),
+            false,
+            Kind::Double,
+        );
+        (mean.to_kind(Kind::Float), variance.to_kind(Kind::Float))
     }
 
     /// Decode logits [batch, NUM_BINS] to raw scalar expected values [batch].
@@ -189,6 +260,34 @@ mod tests {
         let logits = Tensor::zeros([4, 31], (Kind::Float, tch::Device::Cpu));
         let decoded = bins.decode(&logits);
         assert_eq!(decoded.size(), vec![4]);
+    }
+
+    #[test]
+    fn decode_mean_and_variance_shapes_are_nonnegative() {
+        let bins = HlGaussBins::new_with_sigma_ratio(-5.0, 5.0, 31, 2.0, tch::Device::Cpu);
+        let logits = Tensor::zeros([2, 3, 31], (Kind::Float, tch::Device::Cpu));
+        let (mean, variance) = bins.decode_mean_and_variance(&logits);
+        assert_eq!(mean.size(), vec![2, 3]);
+        assert_eq!(variance.size(), vec![2, 3]);
+        assert!(variance.min().double_value(&[]) >= 0.0);
+    }
+
+    #[test]
+    fn reference_decode_applies_inverse_after_expected_transformed_value() {
+        let bins = HlGaussBins::new(-3.0, 3.0, 21, tch::Device::Cpu);
+        let logits = Tensor::full([1, 21], -100.0, (Kind::Float, tch::Device::Cpu));
+        let _ = logits.get(0).get(10).fill_(0.0);
+        let _ = logits.get(0).get(20).fill_(0.0);
+        let expected_raw = bins.decode_mean_and_variance(&logits).0.double_value(&[0]);
+        let reference = bins
+            .decode_reference_mean_and_variance(&logits)
+            .0
+            .double_value(&[0]);
+
+        assert!(
+            (expected_raw - reference).abs() > 1e-3,
+            "broad distributions should distinguish E[symexp(z)] from symexp(E[z])"
+        );
     }
 
     #[test]
@@ -369,5 +468,27 @@ mod tests {
 
         assert!(pos_diff < 1e-6, "positive clamp mismatch: {pos_diff}");
         assert!(neg_diff < 1e-6, "negative clamp mismatch: {neg_diff}");
+    }
+
+    #[test]
+    fn unclamped_encoding_keeps_out_of_range_targets_outside_support() {
+        let bins = HlGaussBins::new(-3.0, 3.0, 21, tch::Device::Cpu);
+        let far_positive = Tensor::from_slice(&[9999.0f32]);
+        let max_edge = Tensor::from_slice(&[symexp_scalar(3.0) as f32]);
+
+        let clamped = bins.encode(&far_positive);
+        let unclamped = bins.encode_unclamped(&far_positive);
+        let max_edge_encoded = bins.encode(&max_edge);
+        let clamped_diff = (&clamped - &max_edge_encoded).abs().max().double_value(&[]);
+        let unclamped_diff = (&unclamped - &max_edge_encoded)
+            .abs()
+            .max()
+            .double_value(&[]);
+
+        assert!(clamped_diff < 1e-6, "clamped path mismatch: {clamped_diff}");
+        assert!(
+            unclamped_diff > 1e-4,
+            "unclamped path should not move the target center to the boundary"
+        );
     }
 }
