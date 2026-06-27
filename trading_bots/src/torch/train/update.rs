@@ -54,8 +54,10 @@ fn pmpo_policy_loss(
     let weighted = &adv_weight * log_probs;
     let pos_mask = advantage.ge(0.0).to_kind(Kind::Float);
     let neg_mask = 1.0 - &pos_mask;
-    let pos_loss = (&weighted * &pos_mask).sum(Kind::Float) / pos_mask.sum(Kind::Float).clamp_min(1.0);
-    let neg_loss = (&weighted * &neg_mask).sum(Kind::Float) / neg_mask.sum(Kind::Float).clamp_min(1.0);
+    let pos_loss =
+        (&weighted * &pos_mask).sum(Kind::Float) / pos_mask.sum(Kind::Float).clamp_min(1.0);
+    let neg_loss =
+        (&weighted * &neg_mask).sum(Kind::Float) / neg_mask.sum(Kind::Float).clamp_min(1.0);
     let pg_loss = -PMPO_POS_TO_NEG_WEIGHT * pos_loss + (1.0 - PMPO_POS_TO_NEG_WEIGHT) * neg_loss;
     let reverse_kl = beta_reverse_kl(old_alpha, old_beta, new_alpha, new_beta).mean(Kind::Float);
     pg_loss + PMPO_KL_COEF * reverse_kl
@@ -259,8 +261,10 @@ impl PpoUpdateCudaGraph {
                     }
                 });
                 if let Err(err) = scope {
-                    return self
-                        .disable_and_fallback(format!("graph warmup failed: {err}"), trainable_vars);
+                    return self.disable_and_fallback(
+                        format!("graph warmup failed: {err}"),
+                        trainable_vars,
+                    );
                 }
                 self.state = GraphCaptureState::ReadyToCapture;
                 println!("PPO CUDA graph warmup complete");
@@ -1115,12 +1119,7 @@ impl Trainer {
                 grad_norm_count += 1;
 
                 step_optimizer(&mut self.opt, &mut self.optimizer_step);
-                self.log_non_finite_params_after_step(
-                    &mut nf_log.param,
-                    episode,
-                    _epoch,
-                    chunk_i,
-                );
+                self.log_non_finite_params_after_step(&mut nf_log.param, episode, _epoch, chunk_i);
                 self.opt.zero_grad();
 
                 // One forward/backward per minibatch now: the minibatch's KL is

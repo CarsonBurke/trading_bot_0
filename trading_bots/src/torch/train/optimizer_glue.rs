@@ -119,7 +119,11 @@ pub(crate) fn backward_actor_critic_with_separate_clips(
         .collect();
 
     let (actor_norm, mut actor_params, actor_grads) = if critic_only {
-        (Tensor::zeros([], (Kind::Float, device)), Vec::new(), Vec::new())
+        (
+            Tensor::zeros([], (Kind::Float, device)),
+            Vec::new(),
+            Vec::new(),
+        )
     } else {
         let actor_params: Vec<Tensor> = groups
             .actor

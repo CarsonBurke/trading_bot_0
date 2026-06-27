@@ -53,7 +53,10 @@ impl CudaGraph {
         let end_result = read_torch_error();
 
         match result {
-            Err(payload) => Err(format!("stream scope body panicked: {}", panic_message(payload))),
+            Err(payload) => Err(format!(
+                "stream scope body panicked: {}",
+                panic_message(payload)
+            )),
             Ok(value) => end_result.map(|()| value),
         }
     }
