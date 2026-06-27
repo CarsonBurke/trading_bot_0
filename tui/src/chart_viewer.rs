@@ -223,6 +223,23 @@ impl ChartViewer {
                     if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
                         if let Ok(ep) = parent_name.parse::<usize>() {
                             (Some(ep), None)
+                        } else if parent_name == "samples" {
+                            let chart_parent = parent.parent();
+                            if let Some(chart_parent) = chart_parent {
+                                if let Some(ep_name) =
+                                    chart_parent.file_name().and_then(|n| n.to_str())
+                                {
+                                    if let Ok(ep) = ep_name.parse::<usize>() {
+                                        (Some(ep), Some("pretrain samples".to_string()))
+                                    } else {
+                                        (None, None)
+                                    }
+                                } else {
+                                    (None, None)
+                                }
+                            } else {
+                                (None, None)
+                            }
                         } else if is_ticker_name(parent_name) {
                             let chart_parent = parent.parent();
                             if let Some(chart_parent) = chart_parent {
