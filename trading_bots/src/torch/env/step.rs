@@ -67,6 +67,24 @@ impl Env {
         self.get_next_obs()
     }
 
+    pub(crate) fn reset_single_at_offset_for_pretrain(
+        &mut self,
+        episode_start_offset: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        self.reset_existing_episode_state_at(episode_start_offset);
+        self.get_next_obs()
+    }
+
+    pub(crate) fn reset_single_at_offset_preserving_perm_for_pretrain(
+        &mut self,
+        episode_start_offset: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let ticker_perm = self.ticker_perm.clone();
+        self.reset_existing_episode_state_at(episode_start_offset);
+        self.ticker_perm = ticker_perm;
+        self.get_next_obs()
+    }
+
     pub fn reset_step_single(&mut self) -> (Vec<f32>, Vec<f32>) {
         self.reset_existing_episode_state();
 

@@ -3,6 +3,7 @@ mod config;
 mod forward;
 mod head;
 mod init;
+mod pretrain;
 mod rmsnorm;
 mod rope;
 mod stream;

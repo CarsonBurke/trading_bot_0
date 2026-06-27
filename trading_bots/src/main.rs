@@ -60,6 +60,46 @@ enum Commands {
         #[arg(long)]
         run: Option<String>,
     },
+    Pretrain {
+        #[arg(short, long)]
+        weights: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
+        model_size: ModelVariant,
+
+        #[arg(long)]
+        run: Option<String>,
+
+        #[arg(long, default_value_t = 4)]
+        epochs: usize,
+
+        #[arg(long)]
+        steps: Option<usize>,
+
+        #[arg(long, default_value_t = 256)]
+        batch_size: usize,
+
+        #[arg(long, default_value_t = 16)]
+        k_patches: usize,
+
+        #[arg(long, default_value_t = 0.0)]
+        lambda_lat: f64,
+
+        #[arg(long, default_value_t = 100.0)]
+        target_scale: f64,
+
+        #[arg(long, default_value_t = 0)]
+        validation_batches: usize,
+
+        #[arg(long, default_value_t = 0)]
+        validate_every: usize,
+
+        #[arg(long, default_value_t = 0)]
+        checkpoint_every: usize,
+
+        #[arg(long, default_value_t = false)]
+        log_step_losses: bool,
+    },
     Infer {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
@@ -146,6 +186,41 @@ async fn main() {
             run,
         }) => {
             torch::train::train(weights.as_deref(), *model_size, run.clone()).await;
+        }
+        Some(Commands::Pretrain {
+            weights,
+            model_size,
+            run,
+            epochs,
+            steps,
+            batch_size,
+            k_patches,
+            lambda_lat,
+            target_scale,
+            validation_batches,
+            validate_every,
+            checkpoint_every,
+            log_step_losses,
+        }) => {
+            let args = torch::train::PretrainArgs {
+                weights: weights.clone(),
+                model_size: *model_size,
+                run: run.clone(),
+                epochs: *epochs,
+                steps: *steps,
+                batch_size: *batch_size,
+                k_patches: *k_patches,
+                lambda_lat: *lambda_lat,
+                target_scale: *target_scale,
+                validation_batches: *validation_batches,
+                validate_every: *validate_every,
+                checkpoint_every: *checkpoint_every,
+                log_step_losses: *log_step_losses,
+            };
+            tokio::task::spawn_blocking(move || torch::train::pretrain(args))
+                .await
+                .expect("pretraining task panicked")
+                .expect("pretraining failed");
         }
         Some(Commands::Infer {
             weights,
