@@ -31,6 +31,15 @@ pub struct MuonConfig {
     pub ns_steps: usize,
     /// Parameter name fragments that should use AdamW even if they are 2D.
     pub force_adamw_name_substrings: Vec<String>,
+    /// Benchmark/experiment mode: split attention projection matrices into
+    /// per-head 2D blocks before Newton-Schulz orthogonalization.
+    pub per_attention_head_ortho: bool,
+    /// Include attention output projections in `per_attention_head_ortho`.
+    pub per_attention_output_head_ortho: bool,
+    /// Self-attention head width used by `per_attention_head_ortho`.
+    pub attention_head_dim: i64,
+    /// Cross-attention head width used by `per_attention_head_ortho`.
+    pub cross_attention_head_dim: i64,
     /// Suppress the one-line routing-split print at construction. Benchmarks
     /// that build many optimizers set this; real training leaves it false.
     pub quiet: bool,
@@ -51,9 +60,20 @@ impl Default for MuonConfig {
             adamw_wd: 0.0,
             ns_steps: DEFAULT_NS_STEPS,
             force_adamw_name_substrings: Vec::new(),
+            per_attention_head_ortho: false,
+            per_attention_output_head_ortho: true,
+            attention_head_dim: 0,
+            cross_attention_head_dim: 0,
             quiet: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrthoLayout {
+    Matrix,
+    RowHeads { heads: i64, head_dim: i64 },
+    ColHeads { heads: i64, head_dim: i64 },
 }
 
 /// Per-2D-param state. Each 2D param holds its own momentum.
@@ -63,9 +83,11 @@ impl Default for MuonConfig {
 /// set at a single [m, n] matrix's worth of transients.
 struct Entry2D {
     idx: usize,
+    layout: OrthoLayout,
     /// First-moment EMA buffer, shape [m, n].
     momentum: Tensor,
-    /// NorMuon second-moment EMA buffer (mean-of-squares per row), shape [m, 1].
+    /// NorMuon second-moment EMA buffer (mean-of-squares per row). Matrix layout
+    /// stores [m, 1]; per-head layouts store [heads, block_rows, 1].
     /// Kept in fp32 regardless of param dtype: an EMA at gain (1-beta2)=0.05 in
     /// bf16 silently stalls because small increments round to zero.
     second_momentum: Tensor,
@@ -133,6 +155,138 @@ fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     }
 }
 
+fn batched_newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
+    let orig_kind = g.kind();
+    let transposed = g.size()[1] > g.size()[2];
+    let x3d = if orig_kind == Kind::BFloat16 {
+        g.shallow_clone()
+    } else {
+        g.to_kind(Kind::BFloat16)
+    };
+    let nrm = x3d
+        .square()
+        .sum_dim_intlist([-2i64, -1].as_slice(), true, Kind::BFloat16)
+        .sqrt()
+        .clamp_min(1e-7);
+    let x3d = &x3d / &nrm;
+    let mut x = if transposed {
+        x3d.transpose(-2, -1).contiguous()
+    } else {
+        x3d
+    };
+
+    for _ in 0..ns_steps {
+        let a = x.matmul(&x.transpose(-2, -1));
+        let b = a.baddbmm(&a, &a, NS_B, NS_C);
+        x = x.baddbmm(&b, &x, NS_A, 1.0);
+    }
+
+    let x = if transposed {
+        x.transpose(-2, -1).contiguous()
+    } else {
+        x
+    };
+    if orig_kind == Kind::BFloat16 {
+        x
+    } else {
+        x.to_kind(orig_kind)
+    }
+}
+
+fn attention_ortho_layout(name: &str, size: &[i64], cfg: &MuonConfig) -> OrthoLayout {
+    if !cfg.per_attention_head_ortho || size.len() != 2 {
+        return OrthoLayout::Matrix;
+    }
+    let Some(head_dim) = attention_head_dim_for_name(name, cfg) else {
+        return OrthoLayout::Matrix;
+    };
+
+    let rows = size[0];
+    let cols = size[1];
+    let is_output = is_attention_output_projection_name(name);
+    if is_output && !cfg.per_attention_output_head_ortho {
+        OrthoLayout::Matrix
+    } else if is_output && cols % head_dim == 0 {
+        OrthoLayout::ColHeads {
+            heads: cols / head_dim,
+            head_dim,
+        }
+    } else if name.contains("attn_qkv") && rows == 3 * cols && rows % (3 * head_dim) == 0 {
+        OrthoLayout::RowHeads {
+            heads: rows / (3 * head_dim),
+            head_dim: 3 * head_dim,
+        }
+    } else if rows % head_dim == 0 {
+        OrthoLayout::RowHeads {
+            heads: rows / head_dim,
+            head_dim,
+        }
+    } else {
+        OrthoLayout::Matrix
+    }
+}
+
+fn attention_head_dim_for_name(name: &str, cfg: &MuonConfig) -> Option<i64> {
+    if is_cross_attention_projection_name(name) {
+        (cfg.cross_attention_head_dim > 0).then_some(cfg.cross_attention_head_dim)
+    } else if is_self_attention_projection_name(name) {
+        (cfg.attention_head_dim > 0).then_some(cfg.attention_head_dim)
+    } else {
+        None
+    }
+}
+
+fn is_self_attention_projection_name(name: &str) -> bool {
+    ["attn_q", "attn_k", "attn_v", "attn_qkv", "attn_o"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn is_cross_attention_projection_name(name: &str) -> bool {
+    ["ca_q", "ca_k", "ca_v", "ca_out"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn is_attention_output_projection_name(name: &str) -> bool {
+    ["attn_o", "ca_out"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+#[cfg(test)]
+fn orthogonalize_update(update: &Tensor, layout: OrthoLayout, ns_steps: usize) -> Tensor {
+    match layout {
+        OrthoLayout::Matrix => newtonschulz5(update, ns_steps),
+        OrthoLayout::RowHeads { heads, head_dim } => {
+            let cols = update.size()[1];
+            batched_newtonschulz5(&update.reshape([heads, head_dim, cols]), ns_steps)
+                .reshape(update.size().as_slice())
+        }
+        OrthoLayout::ColHeads { heads, head_dim } => {
+            let rows = update.size()[0];
+            batched_newtonschulz5(
+                &update
+                    .reshape([rows, heads, head_dim])
+                    .permute([1, 0, 2])
+                    .contiguous(),
+                ns_steps,
+            )
+            .permute([1, 0, 2])
+            .contiguous()
+            .reshape(update.size().as_slice())
+        }
+    }
+}
+
+fn second_momentum_shape(size: &[i64], layout: OrthoLayout) -> Vec<i64> {
+    match layout {
+        OrthoLayout::Matrix => vec![size[0], 1],
+        OrthoLayout::RowHeads { heads, head_dim } => vec![heads, head_dim, 1],
+        OrthoLayout::ColHeads { heads, .. } => vec![heads, size[0], 1],
+    }
+}
+
 /// NorMuon per-row second-moment rescale, all math in fp32. Scaling each row by
 /// `step_size_i * ratio` keeps the total Frobenius norm of the update
 /// (approximately) equal to its pre-divide value, because `ratio` is exactly the
@@ -163,6 +317,64 @@ fn normuon_rescale(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) ->
     update * &scale
 }
 
+fn normuon_rescale_batched(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) -> Tensor {
+    let uf = update.to_kind(Kind::Float);
+    let cols = update.size()[2] as f64;
+    let row_sq_sum = uf
+        .square()
+        .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float);
+    let v_mean = &row_sq_sum / cols;
+    let vnorm_sq = row_sq_sum.sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
+    let _ = second_momentum.lerp_(&v_mean, 1.0 - beta2);
+    let step_size = (second_momentum.sqrt() + 1e-10).reciprocal();
+    let vnorm_new_sq =
+        (step_size.square() * &row_sq_sum).sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
+    let ratio = vnorm_sq.sqrt() / (vnorm_new_sq.sqrt() + 1e-10);
+    let scale = (&step_size * &ratio).to_kind(update.kind());
+    update * &scale
+}
+
+fn normuon_transform(
+    update: &Tensor,
+    layout: OrthoLayout,
+    second_momentum: &mut Tensor,
+    beta2: f64,
+    ns_steps: usize,
+) -> (Tensor, f64) {
+    match layout {
+        OrthoLayout::Matrix => {
+            let update = newtonschulz5(update, ns_steps);
+            let update = normuon_rescale(&update, second_momentum, beta2);
+            let size = update.size();
+            let aspect_scale = (1.0_f64).max(size[0] as f64 / size[1] as f64).sqrt();
+            (update, aspect_scale)
+        }
+        OrthoLayout::RowHeads { heads, head_dim } => {
+            let cols = update.size()[1];
+            let blocks = update.reshape([heads, head_dim, cols]);
+            let blocks = batched_newtonschulz5(&blocks, ns_steps);
+            let blocks = normuon_rescale_batched(&blocks, second_momentum, beta2);
+            let aspect_scale = (1.0_f64).max(head_dim as f64 / cols as f64).sqrt();
+            (blocks.reshape(update.size().as_slice()), aspect_scale)
+        }
+        OrthoLayout::ColHeads { heads, head_dim } => {
+            let rows = update.size()[0];
+            let blocks = update
+                .reshape([rows, heads, head_dim])
+                .permute([1, 0, 2])
+                .contiguous();
+            let blocks = batched_newtonschulz5(&blocks, ns_steps);
+            let blocks = normuon_rescale_batched(&blocks, second_momentum, beta2);
+            let aspect_scale = (1.0_f64).max(rows as f64 / head_dim as f64).sqrt();
+            let update = blocks
+                .permute([1, 0, 2])
+                .contiguous()
+                .reshape(update.size().as_slice());
+            (update, aspect_scale)
+        }
+    }
+}
+
 impl Muon {
     pub fn new(trainable_vars: &[Tensor], cfg: MuonConfig) -> Self {
         let named: Vec<(String, Tensor)> = trainable_vars
@@ -190,10 +402,15 @@ impl Muon {
                 let (m, n) = (size[0], size[1]);
                 let kind = p.kind();
                 let device = p.device();
+                let layout = attention_ortho_layout(name, &size, &cfg);
                 entries_2d.push(Entry2D {
                     idx: i,
+                    layout,
                     momentum: Tensor::zeros([m, n], (kind, device)),
-                    second_momentum: Tensor::zeros([m, 1], (Kind::Float, device)),
+                    second_momentum: Tensor::zeros(
+                        second_momentum_shape(&size, layout).as_slice(),
+                        (Kind::Float, device),
+                    ),
                 });
             } else {
                 adamw_indices.push(i);
@@ -207,6 +424,16 @@ impl Muon {
                     entries_2d.len(),
                     adamw_indices.len()
                 );
+                let head_ortho = entries_2d
+                    .iter()
+                    .filter(|entry| entry.layout != OrthoLayout::Matrix)
+                    .count();
+                if head_ortho > 0 {
+                    println!(
+                        "  attention-head ortho: {} params split into batched NS blocks (self_head_dim={}, cross_head_dim={})",
+                        head_ortho, cfg.attention_head_dim, cfg.cross_attention_head_dim
+                    );
+                }
             } else {
                 println!(
                     "AdamW optimizer: {} params (Muon disabled for root-cause logging)",
@@ -257,16 +484,13 @@ impl Muon {
                 entry.momentum.shallow_clone()
             };
 
-            // Newton-Schulz orthogonalization; returns [rows, cols] orientation.
-            let update = newtonschulz5(&update, self.cfg.ns_steps);
-
-            // NorMuon: per-row second-moment rescale, all math in fp32.
-            let update = normuon_rescale(&update, &mut entry.second_momentum, beta2);
-
-            // Aspect-ratio scale max(1, rows/cols)^0.5 (after NorMuon rescale),
-            // folded into the LR so the update is scaled in a single pass.
-            let size = update.size();
-            let aspect_scale = (1.0_f64).max(size[0] as f64 / size[1] as f64).sqrt();
+            let (update, aspect_scale) = normuon_transform(
+                &update,
+                entry.layout,
+                &mut entry.second_momentum,
+                beta2,
+                self.cfg.ns_steps,
+            );
 
             // Apply to param: decoupled weight decay, then the update.
             let mut p = self.params[entry.idx].shallow_clone();
@@ -371,7 +595,10 @@ impl Muon {
 mod tests {
     use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
 
-    use super::{normuon_rescale, Muon, MuonConfig};
+    use super::{
+        attention_ortho_layout, batched_newtonschulz5, newtonschulz5, normuon_rescale,
+        orthogonalize_update, Muon, MuonConfig, OrthoLayout,
+    };
 
     const HIDDEN: i64 = 128;
     const TRAIN_STEPS: usize = 500;
@@ -660,6 +887,97 @@ mod tests {
             "second_momentum not finite: [{}, {}]",
             v_min,
             v_max
+        );
+    }
+
+    #[test]
+    fn batched_newtonschulz_matches_independent_single_matrix_path() {
+        let _g = tch::no_grad_guard();
+        tch::manual_seed(17);
+        let device = Device::Cpu;
+        let heads = 4;
+        let update = Tensor::randn([heads, 32, 96], (Kind::Float, device));
+        let batched = batched_newtonschulz5(&update, 5);
+        let independent: Vec<Tensor> = (0..heads)
+            .map(|head| newtonschulz5(&update.get(head), 5))
+            .collect();
+        let independent = Tensor::stack(&independent, 0);
+        let max_diff = (&batched - independent).abs().max().double_value(&[]);
+        assert!(
+            max_diff < 3e-2,
+            "batched NS diverged from independent NS: max diff={max_diff:.3e}"
+        );
+    }
+
+    #[test]
+    fn attention_head_ortho_preserves_original_matrix_shape() {
+        let _g = tch::no_grad_guard();
+        tch::manual_seed(23);
+        let device = Device::Cpu;
+        let row_split = Tensor::randn([256, 256], (Kind::Float, device));
+        let col_split = Tensor::randn([256, 256], (Kind::Float, device));
+
+        let row_out = orthogonalize_update(
+            &row_split,
+            OrthoLayout::RowHeads {
+                heads: 4,
+                head_dim: 64,
+            },
+            5,
+        );
+        let col_out = orthogonalize_update(
+            &col_split,
+            OrthoLayout::ColHeads {
+                heads: 4,
+                head_dim: 64,
+            },
+            5,
+        );
+
+        assert_eq!(row_out.size(), row_split.size());
+        assert_eq!(col_out.size(), col_split.size());
+        assert!(row_out.isfinite().all().int64_value(&[]) != 0);
+        assert!(col_out.isfinite().all().int64_value(&[]) != 0);
+    }
+
+    #[test]
+    fn cross_attention_requires_explicit_cross_head_dim() {
+        let self_only = MuonConfig {
+            per_attention_head_ortho: true,
+            attention_head_dim: 64,
+            ..MuonConfig::default()
+        };
+        assert_eq!(
+            attention_ortho_layout("cross_attn.ca_q", &[256, 256], &self_only),
+            OrthoLayout::Matrix
+        );
+
+        let with_cross = MuonConfig {
+            cross_attention_head_dim: 128,
+            ..self_only
+        };
+        assert_eq!(
+            attention_ortho_layout("cross_attn.ca_q", &[256, 256], &with_cross),
+            OrthoLayout::RowHeads {
+                heads: 2,
+                head_dim: 128
+            }
+        );
+    }
+
+    #[test]
+    fn fused_qkv_groups_qkv_rows_by_attention_head() {
+        let cfg = MuonConfig {
+            per_attention_head_ortho: true,
+            attention_head_dim: 64,
+            ..MuonConfig::default()
+        };
+        assert_eq!(
+            attention_ortho_layout("block0.attn_qkv", &[768, 256], &cfg),
+            OrthoLayout::RowHeads {
+                heads: 4,
+                head_dim: 192
+            }
         );
     }
 

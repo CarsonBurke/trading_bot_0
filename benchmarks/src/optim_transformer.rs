@@ -114,6 +114,62 @@ struct Block {
     fc2: LinearW,
 }
 
+struct FusedQkvBlock {
+    norm1: RMSNorm,
+    qkv_proj: LinearW,
+    o_proj: LinearW,
+    norm2: RMSNorm,
+    fc1: LinearW,
+    fc2: LinearW,
+}
+
+impl FusedQkvBlock {
+    fn new(p: &nn::Path, i: usize) -> Self {
+        let bp = p / format!("block{}", i);
+        Self {
+            norm1: RMSNorm::new(&bp, D_MODEL, "norm1_gain"),
+            qkv_proj: LinearW::new(&bp, "attn_qkv", D_MODEL, 3 * D_MODEL),
+            o_proj: LinearW::new(&bp, "attn_o", D_MODEL, D_MODEL),
+            norm2: RMSNorm::new(&bp, D_MODEL, "norm2_gain"),
+            fc1: LinearW::new(&bp, "mlp_fc1", D_MODEL, MLP_HIDDEN),
+            fc2: LinearW::new(&bp, "mlp_fc2", MLP_HIDDEN, D_MODEL),
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let (b, t, _d) = x.size3().unwrap();
+        let h = self.norm1.forward(x);
+        let qkv = self
+            .qkv_proj
+            .forward(&h)
+            .reshape([b, t, N_HEADS, 3, HEAD_DIM])
+            .permute([0, 2, 3, 1, 4])
+            .contiguous();
+        let q = qkv.select(2, 0);
+        let k = qkv.select(2, 1);
+        let v = qkv.select(2, 2);
+        let attn = Tensor::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            None::<&Tensor>,
+            0.0,
+            true,
+            None,
+            false,
+        )
+        .permute([0, 2, 1, 3])
+        .contiguous()
+        .reshape([b, t, D_MODEL]);
+        let x = x + self.o_proj.forward(&attn);
+
+        let h = self.norm2.forward(&x);
+        let h = self.fc1.forward(&h).gelu("none");
+        let h = self.fc2.forward(&h);
+        &x + h
+    }
+}
+
 impl Block {
     fn new(p: &nn::Path, i: usize) -> Self {
         let bp = p / format!("block{}", i);
@@ -172,6 +228,65 @@ pub struct GptModel {
     blocks: Vec<Block>,
     final_norm: RMSNorm,
     lm_head: LinearW, // [VOCAB, D_MODEL]
+}
+
+pub struct FusedQkvGptModel {
+    tok_embed: Tensor,
+    pos_embed: Tensor,
+    blocks: Vec<FusedQkvBlock>,
+    final_norm: RMSNorm,
+    lm_head: LinearW,
+}
+
+impl FusedQkvGptModel {
+    pub fn new(p: &nn::Path) -> Self {
+        let tok_embed = p.var(
+            "tok_embed",
+            &[VOCAB, D_MODEL],
+            Init::Randn {
+                mean: 0.0,
+                stdev: 0.02,
+            },
+        );
+        let pos_embed = p.var(
+            "pos_embed",
+            &[SEQ_LEN, D_MODEL],
+            Init::Randn {
+                mean: 0.0,
+                stdev: 0.02,
+            },
+        );
+        let blocks = (0..N_LAYERS).map(|i| FusedQkvBlock::new(p, i)).collect();
+        let final_norm = RMSNorm::new(p, D_MODEL, "final_norm_gain");
+        let lm_head = LinearW::new(p, "lm_head", D_MODEL, VOCAB);
+        Self {
+            tok_embed,
+            pos_embed,
+            blocks,
+            final_norm,
+            lm_head,
+        }
+    }
+
+    pub fn forward(&self, tokens: &Tensor) -> Tensor {
+        let t = tokens.size()[1];
+        let tok = self
+            .tok_embed
+            .to_kind(COMPUTE_KIND)
+            .index_select(0, &tokens.reshape([-1]))
+            .reshape([tokens.size()[0], t, D_MODEL]);
+        let pos = self
+            .pos_embed
+            .narrow(0, 0, t)
+            .to_kind(COMPUTE_KIND)
+            .unsqueeze(0);
+        let mut x = tok + pos;
+        for block in &self.blocks {
+            x = block.forward(&x);
+        }
+        let x = self.final_norm.forward(&x);
+        self.lm_head.forward(&x)
+    }
 }
 
 impl GptModel {
