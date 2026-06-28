@@ -14,4 +14,4 @@ mod update;
 pub(crate) mod value_loss;
 
 pub use loop_::train;
-pub use pretrain::{pretrain, PretrainArgs};
+pub use pretrain::{pretrain, PretrainArgs, PretrainObjective};

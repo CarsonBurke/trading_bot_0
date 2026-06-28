@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use colored::{self, Colorize};
 use trading_bot_0::torch::model::ModelVariant;
+use trading_bot_0::torch::train::PretrainObjective;
 use trading_bot_0::{genetic, torch};
 
 #[derive(Parser)]
@@ -82,8 +83,20 @@ enum Commands {
         #[arg(long, default_value_t = 16)]
         k_patches: usize,
 
+        #[arg(long, default_value_t = 512)]
+        batches_per_epoch: usize,
+
+        #[arg(long, value_enum, default_value_t = PretrainObjective::MeanMse)]
+        objective: PretrainObjective,
+
         #[arg(long, default_value_t = 0.0)]
         lambda_lat: f64,
+
+        #[arg(long, default_value_t = 0.09)]
+        lambda_sigreg: f64,
+
+        #[arg(long, default_value_t = 2)]
+        probe_epochs: usize,
 
         #[arg(long, default_value_t = 100.0)]
         target_scale: f64,
@@ -195,7 +208,11 @@ async fn main() {
             steps,
             batch_size,
             k_patches,
+            batches_per_epoch,
+            objective,
             lambda_lat,
+            lambda_sigreg,
+            probe_epochs,
             target_scale,
             validation_batches,
             validate_every,
@@ -210,7 +227,11 @@ async fn main() {
                 steps: *steps,
                 batch_size: *batch_size,
                 k_patches: *k_patches,
+                batches_per_epoch: *batches_per_epoch,
+                objective: *objective,
                 lambda_lat: *lambda_lat,
+                lambda_sigreg: *lambda_sigreg,
+                probe_epochs: *probe_epochs,
                 target_scale: *target_scale,
                 validation_batches: *validation_batches,
                 validate_every: *validate_every,
