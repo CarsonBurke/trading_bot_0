@@ -692,6 +692,7 @@ fn render_candle_compare(
     let x_start = x_offset as f64;
     let x_end = x_start + x_len;
 
+    let pred_green = darken(theme::GREEN, 0.55);
     let title = normalize_title(&report.title);
     let mut chart = plotters::chart::ChartBuilder::on(root)
         .caption(title.as_str(), ("sans-serif", 20, &theme::TEXT))
@@ -703,7 +704,10 @@ fn render_candle_compare(
     let mut mesh = chart.configure_mesh();
     mesh.label_style(("sans-serif", 15, &theme::TEXT))
         .axis_style(&theme::SURFACE1)
-        .light_line_style(&theme::SURFACE0);
+        .x_labels(8)
+        .y_labels(6)
+        .bold_line_style(&theme::OVERLAY0)
+        .light_line_style(&TRANSPARENT);
     if let Some(label) = report.x_label.as_deref() {
         mesh.x_desc(label);
     }
@@ -712,84 +716,79 @@ fn render_candle_compare(
     }
     mesh.draw()?;
 
+    // Both series share the up=green / down=red language; shade (lighter full-width
+    // actual fill vs. darker inset predicted fill) distinguishes them instead of hue.
     if actual_active {
-        chart.draw_series(actual.iter().enumerate().map(|(idx, candle)| {
-            let x = x_start + idx as f64;
-            let mid = x + 0.5;
-            let color = actual_candle_color(candle);
-            PathElement::new(
-                vec![(mid, candle.low as f64), (mid, candle.high as f64)],
-                ShapeStyle::from(&color).stroke_width(1),
-            )
-        }))?;
-
         chart
             .draw_series(actual.iter().enumerate().map(|(idx, candle)| {
                 let x = x_start + idx as f64;
                 Rectangle::new(
                     [
-                        (x, candle_body_low(candle)),
-                        (x + 1.0, candle_body_high(candle)),
+                        (x + 0.12, candle_body_low(candle)),
+                        (x + 0.88, candle_body_high(candle)),
                     ],
-                    actual_candle_color(candle).filled(),
+                    direction_color(candle).filled(),
                 )
             }))?
-            .label("actual filled")
+            .label("actual (solid fill)")
             .legend(legend_rect(&theme::GREEN));
+
+        // Actual wick: solid opaque, offset ~0.15 bar left of center to separate it
+        // from the right-offset predicted wick.
+        chart.draw_series(actual.iter().enumerate().map(|(idx, candle)| {
+            let mid = x_start + idx as f64 + 0.35;
+            let color = direction_color(candle);
+            PathElement::new(
+                vec![(mid, candle.low as f64), (mid, candle.high as f64)],
+                ShapeStyle::from(&color).stroke_width(2),
+            )
+        }))?;
     } else {
         chart
             .draw_series(LineSeries::new(
                 std::iter::empty::<(f64, f64)>(),
                 ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
             ))?
-            .label("actual filled")
+            .label("actual (solid fill)")
             .legend(legend_rect(&theme::GREEN));
     }
 
     if predicted_active {
-        chart.draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
-            let x = x_start + idx as f64;
-            let mid = x + 0.5;
-            let color = predicted_candle_color(candle);
-            PathElement::new(
-                vec![(mid, candle.low as f64), (mid, candle.high as f64)],
-                ShapeStyle::from(&color).stroke_width(3),
-            )
-        }))?;
-
-        chart.draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
-            let x = x_start + idx as f64;
-            let color = predicted_candle_fill(candle);
-            Rectangle::new(
-                [
-                    (x + 0.18, candle_body_low(candle)),
-                    (x + 0.82, candle_body_high(candle)),
-                ],
-                color.filled(),
-            )
-        }))?;
-
+        // Darker filled body, inset inside the actual body so the darker predicted
+        // block reads clearly inside the lighter full-width actual fill of the same
+        // hue.
         chart
             .draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
                 let x = x_start + idx as f64;
                 Rectangle::new(
                     [
-                        (x + 0.18, candle_body_low(candle)),
-                        (x + 0.82, candle_body_high(candle)),
+                        (x + 0.28, candle_body_low(candle)),
+                        (x + 0.72, candle_body_high(candle)),
                     ],
-                    ShapeStyle::from(&predicted_candle_color(candle)).stroke_width(2),
+                    darken(direction_color(candle), 0.55).filled(),
                 )
             }))?
-            .label("predicted overlay")
-            .legend(legend_rect(&theme::BLUE));
+            .label("predicted (darker fill)")
+            .legend(legend_rect(&pred_green));
+
+        // Predicted wick: solid line offset ~0.15 bar right of center, so it reads
+        // as separate from the solid actual wick.
+        chart.draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
+            let mid = x_start + idx as f64 + 0.65;
+            let color = darken(direction_color(candle), 0.55);
+            PathElement::new(
+                vec![(mid, candle.low as f64), (mid, candle.high as f64)],
+                ShapeStyle::from(&color).stroke_width(2),
+            )
+        }))?;
     } else {
         chart
             .draw_series(LineSeries::new(
                 std::iter::empty::<(f64, f64)>(),
                 ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
             ))?
-            .label("predicted overlay")
-            .legend(legend_rect(&theme::BLUE));
+            .label("predicted (darker fill)")
+            .legend(legend_rect(&pred_green));
     }
 
     if show_legend {
@@ -805,27 +804,11 @@ fn render_candle_compare(
     Ok(())
 }
 
-fn actual_candle_color(candle: &CandleBar) -> RGBAColor {
+fn direction_color(candle: &CandleBar) -> RGBColor {
     if candle.close >= candle.open {
-        theme::GREEN.mix(0.72)
+        theme::GREEN
     } else {
-        theme::RED.mix(0.72)
-    }
-}
-
-fn predicted_candle_color(candle: &CandleBar) -> RGBAColor {
-    if candle.close >= candle.open {
-        theme::BLUE.mix(0.95)
-    } else {
-        theme::MAUVE.mix(0.95)
-    }
-}
-
-fn predicted_candle_fill(candle: &CandleBar) -> RGBAColor {
-    if candle.close >= candle.open {
-        theme::BLUE.mix(0.24)
-    } else {
-        theme::MAUVE.mix(0.24)
+        theme::RED
     }
 }
 
@@ -947,4 +930,9 @@ fn legend_rect(
     move |(x, y)| {
         plotters::element::Rectangle::new([(x, y - 5), (x + 20, y + 5)], color.mix(0.8).filled())
     }
+}
+
+fn darken(c: RGBColor, factor: f64) -> RGBColor {
+    let scale = |v: u8| (v as f64 * factor).round().clamp(0.0, 255.0) as u8;
+    RGBColor(scale(c.0), scale(c.1), scale(c.2))
 }
