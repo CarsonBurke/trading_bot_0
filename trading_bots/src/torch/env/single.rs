@@ -19,6 +19,8 @@ use crate::{
     utils::get_price_deltas,
 };
 
+pub const OHLC_BAR_FEATURES: usize = 8;
+
 pub struct Env {
     pub env_id: usize,
     pub step: usize,
@@ -26,6 +28,7 @@ pub struct Env {
     pub tickers: Vec<String>,
     pub prices: Vec<Vec<f64>>,
     pub price_deltas: Vec<Vec<f64>>,
+    pub ohlc_features: Vec<Vec<[f32; OHLC_BAR_FEATURES]>>,
     pub account: Account,
     pub episode_history: EpisodeHistory,
     pub meta_history: MetaHistory,
@@ -58,6 +61,7 @@ pub(super) struct EnvMarketSnapshot {
     pub tickers: Vec<String>,
     pub(super) prices: Vec<Vec<f64>>,
     pub(super) price_deltas: Vec<Vec<f64>>,
+    pub(super) ohlc_features: Vec<Vec<[f32; OHLC_BAR_FEATURES]>>,
     pub(super) momentum: Vec<Arc<MomentumIndicators>>,
     pub(super) earnings: Vec<Arc<EarningsIndicators>>,
     pub(super) macro_ind: Arc<MacroIndicators>,
@@ -68,6 +72,7 @@ pub(super) struct EnvMarketSnapshot {
 pub(super) struct EnvMarketData {
     pub(super) prices: Vec<Vec<f64>>,
     pub(super) price_deltas: Vec<Vec<f64>>,
+    pub(super) ohlc_features: Vec<Vec<[f32; OHLC_BAR_FEATURES]>>,
     pub(super) momentum: Vec<Arc<MomentumIndicators>>,
     pub(super) earnings: Vec<Arc<EarningsIndicators>>,
     pub(super) macro_ind: Arc<MacroIndicators>,
@@ -99,7 +104,9 @@ pub(super) fn load_market_data(tickers: &[String], log_progress: bool) -> EnvMar
     let mapped_bars = get_historical_data(Some(&ticker_refs));
     let mut prices = Vec::with_capacity(tickers.len());
     let mut price_deltas = Vec::with_capacity(tickers.len());
+    let mut ohlc_features = Vec::with_capacity(tickers.len());
     for (i, ticker) in tickers.iter().enumerate() {
+        ohlc_features.push(build_ohlc_features(&mapped_bars[i]));
         if let Some((cached_prices, cached_deltas)) = get_historical_series(ticker) {
             prices.push(cached_prices);
             price_deltas.push(cached_deltas);
@@ -169,10 +176,46 @@ pub(super) fn load_market_data(tickers: &[String], log_progress: bool) -> EnvMar
     EnvMarketData {
         prices,
         price_deltas,
+        ohlc_features,
         momentum,
         earnings,
         macro_ind,
         total_data_length,
+    }
+}
+
+fn build_ohlc_features(
+    bars: &[ibapi::market_data::historical::Bar],
+) -> Vec<[f32; OHLC_BAR_FEATURES]> {
+    bars.iter()
+        .enumerate()
+        .map(|(i, bar)| {
+            let prev_close = if i == 0 { bar.close } else { bars[i - 1].close };
+            let open = bar.open;
+            let high = bar.high.max(open).max(bar.close);
+            let low = bar.low.min(open).min(bar.close);
+            let close = bar.close;
+            let upper_base = open.max(close);
+            let lower_base = open.min(close);
+            [
+                log_ratio(open, prev_close),
+                log_ratio(high, open),
+                log_ratio(low, open),
+                log_ratio(close, open),
+                log_ratio(close, prev_close),
+                log_ratio(high, low),
+                log_ratio(high, upper_base),
+                log_ratio(lower_base, low),
+            ]
+        })
+        .collect()
+}
+
+fn log_ratio(numerator: f64, denominator: f64) -> f32 {
+    if numerator.is_finite() && denominator.is_finite() && numerator > 0.0 && denominator > 0.0 {
+        (numerator / denominator).ln() as f32
+    } else {
+        0.0
     }
 }
 

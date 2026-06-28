@@ -11,13 +11,13 @@ use tch::{autocast, nn, nn::Module, Device, Kind, Reduction, Tensor};
 use crate::data::universe::cached_eligible_training_universe;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::cuda::cfg::configure_cuda;
-use crate::torch::env::Env;
+use crate::torch::env::{Env, OHLC_BAR_FEATURES};
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
 use crate::torch::optim::muon::{Muon, MuonConfig};
 use shared::{
     paths::RUNS_PATH,
-    report::{Report, ReportKind, ReportSeries, ScaleKind},
+    report::{CandleBar, Report, ReportKind, ReportSeries, ScaleKind},
     run_dir::RunDir,
 };
 
@@ -27,7 +27,7 @@ use super::optimizer_glue::{muon_momentum_for_step, named_trainable_variables};
 const HORIZON_FEATURE_DIM: i64 = 7;
 const LEJEPA_SIGREG_PROJECTIONS: i64 = 1024;
 const LEJEPA_SIGREG_KNOTS: i64 = 17;
-const LEJEPA_BAR_FEATURES: i64 = 7;
+const LEJEPA_BAR_FEATURES: i64 = OHLC_BAR_FEATURES as i64;
 const LEJEPA_PATCH_VIT_LAYERS: usize = 3;
 const LEJEPA_AR_LAYERS: usize = 5;
 const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
@@ -105,7 +105,7 @@ struct PretrainHeads {
     lejepa_pred_proj: nn::Linear,
     lejepa_pred_projector: ProjectionMlp,
     probe_fc1: nn::Linear,
-    probe_out: nn::Linear,
+    probe_ohlc_out: nn::Linear,
     next_patch_embed: nn::Linear,
     latent_fc1: nn::Linear,
     latent_fc2: nn::Linear,
@@ -126,6 +126,8 @@ struct PretrainBatch {
     next_static_obs: Tensor,
     future_patches: Tensor,
     next_patch: Tensor,
+    ohlc_patches: Tensor,
+    next_ohlc_patch: Tensor,
 }
 
 impl PretrainBatch {
@@ -387,7 +389,12 @@ impl PretrainHeads {
             ),
         };
         let probe_fc1 = nn::linear(p / "probe_fc1", latent_dim, ff_dim, Default::default());
-        let probe_out = nn::linear(p / "probe_out", ff_dim, patch_size, Default::default());
+        let probe_ohlc_out = nn::linear(
+            p / "probe_ohlc_out",
+            ff_dim,
+            patch_size * LEJEPA_BAR_FEATURES,
+            Default::default(),
+        );
         let next_patch_embed = nn::linear(
             p / "next_patch_embed",
             patch_size,
@@ -415,7 +422,7 @@ impl PretrainHeads {
             lejepa_pred_proj,
             lejepa_pred_projector,
             probe_fc1,
-            probe_out,
+            probe_ohlc_out,
             next_patch_embed,
             latent_fc1,
             latent_fc2,
@@ -509,27 +516,29 @@ impl PretrainHeads {
         self.return_mean_from_readout(&readout, batch, tickers)
     }
 
-    fn encode_lejepa_patches(&self, layouts: &Tensor, batch_size: i64) -> Tensor {
-        let rows = layouts.size()[0];
-        let patches = layouts.size()[1] / self.patch_size;
-        let bars = layouts
-            .view([rows * patches, self.patch_size])
-            .to_kind(Kind::Float)
-            .nan_to_num(0.0, 0.0, 0.0);
-        self.encode_lejepa_patch_rows(&bars).view([
-            batch_size,
-            TICKERS_COUNT,
-            patches,
-            self.latent_dim,
-        ])
-    }
-
-    fn encode_lejepa_next_patch(&self, next_patch: &Tensor) -> Tensor {
-        let size = next_patch.size();
+    fn encode_lejepa_patches(&self, ohlc_patches: &Tensor) -> Tensor {
+        let size = ohlc_patches.size();
         let batch = size[0];
         let tickers = size[1];
-        let bars = next_patch
-            .view([batch * tickers, self.patch_size])
+        let patches = size[2];
+        let bars = ohlc_patches
+            .view([
+                batch * tickers * patches,
+                self.patch_size,
+                LEJEPA_BAR_FEATURES,
+            ])
+            .to_kind(Kind::Float)
+            .nan_to_num(0.0, 0.0, 0.0);
+        self.encode_lejepa_patch_rows(&bars)
+            .view([batch, tickers, patches, self.latent_dim])
+    }
+
+    fn encode_lejepa_next_patch(&self, next_ohlc_patch: &Tensor) -> Tensor {
+        let size = next_ohlc_patch.size();
+        let batch = size[0];
+        let tickers = size[1];
+        let bars = next_ohlc_patch
+            .view([batch * tickers, self.patch_size, LEJEPA_BAR_FEATURES])
             .to_kind(Kind::Float)
             .nan_to_num(0.0, 0.0, 0.0);
         self.encode_lejepa_patch_rows(&bars)
@@ -538,39 +547,7 @@ impl PretrainHeads {
 
     fn encode_lejepa_patch_rows(&self, bars: &Tensor) -> Tensor {
         let rows = bars.size()[0];
-        let delta = bars.unsqueeze(-1);
-        let abs_delta = bars.abs().unsqueeze(-1);
-        let squared_delta = bars.square().unsqueeze(-1);
-        let cumulative = bars.cumsum(-1, Kind::Float).unsqueeze(-1);
-        let patch_mean = bars
-            .mean_dim([1i64].as_slice(), true, Kind::Float)
-            .unsqueeze(-1)
-            .expand([rows, self.patch_size, 1], false);
-        let centered = bars - &patch_mean.squeeze_dim(-1);
-        let patch_std = centered
-            .pow_tensor_scalar(2.0)
-            .mean_dim([1i64].as_slice(), true, Kind::Float)
-            .clamp_min(1e-12)
-            .sqrt()
-            .unsqueeze(-1)
-            .expand([rows, self.patch_size, 1], false);
-        let denom = (self.patch_size - 1).max(1) as f64;
-        let position =
-            ((Tensor::arange(self.patch_size, (Kind::Float, bars.device())) / denom) * 2.0 - 1.0)
-                .view([1, self.patch_size, 1])
-                .expand([rows, self.patch_size, 1], false);
-        let features = Tensor::cat(
-            &[
-                &delta,
-                &abs_delta,
-                &squared_delta,
-                &cumulative,
-                &patch_mean,
-                &patch_std,
-                &position,
-            ],
-            -1,
-        );
+        let features = bars.to_kind(Kind::Float);
         let bar_pos = self.patch_bar_pos.to_kind(features.kind()).view([
             1,
             self.patch_size,
@@ -722,7 +699,7 @@ impl PretrainHeads {
         mlp.fc2.forward(&hidden).view(shape.as_slice())
     }
 
-    fn probe_return_mean(&self, predicted_patch_embed: &Tensor) -> Tensor {
+    fn probe_ohlc_features(&self, predicted_patch_embed: &Tensor) -> Tensor {
         let size = predicted_patch_embed.size();
         let batch = size[0];
         let tickers = size[1];
@@ -731,11 +708,9 @@ impl PretrainHeads {
             .forward(predicted_patch_embed)
             .relu()
             .view([batch * tickers, -1]);
-        let raw = self
-            .probe_out
+        self.probe_ohlc_out
             .forward(&h)
-            .view([batch, tickers, self.patch_size]);
-        raw
+            .view([batch, tickers, self.patch_size, LEJEPA_BAR_FEATURES])
     }
 
     fn predict_next_latent(&self, latent: &Tensor, next_patch: &Tensor) -> Tensor {
@@ -842,6 +817,8 @@ impl PretrainSampler {
         let so_dim = STATIC_OBSERVATIONS;
         let target_len = TICKERS_COUNT as usize * k_patches * patch_size;
         let next_patch_len = TICKERS_COUNT as usize * patch_size;
+        let ohlc_len = TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER * OHLC_BAR_FEATURES;
+        let next_ohlc_len = TICKERS_COUNT as usize * patch_size * OHLC_BAR_FEATURES;
 
         let mut obs = Vec::with_capacity(offsets.len() * pd_dim);
         let mut static_obs = Vec::with_capacity(offsets.len() * so_dim);
@@ -849,6 +826,8 @@ impl PretrainSampler {
         let mut next_static_obs = Vec::with_capacity(offsets.len() * so_dim);
         let mut future_patches = Vec::with_capacity(offsets.len() * target_len);
         let mut next_patch = Vec::with_capacity(offsets.len() * next_patch_len);
+        let mut ohlc_patches = Vec::with_capacity(offsets.len() * ohlc_len);
+        let mut next_ohlc_patch = Vec::with_capacity(offsets.len() * next_ohlc_len);
 
         for &offset in offsets {
             append_pretrain_sample(
@@ -863,6 +842,8 @@ impl PretrainSampler {
                 &mut next_static_obs,
                 &mut future_patches,
                 &mut next_patch,
+                &mut ohlc_patches,
+                &mut next_ohlc_patch,
             );
         }
 
@@ -874,6 +855,8 @@ impl PretrainSampler {
             next_static_obs,
             future_patches,
             next_patch,
+            ohlc_patches,
+            next_ohlc_patch,
             k_patches,
             patch_size,
             device,
@@ -892,6 +875,8 @@ impl PretrainSampler {
         let so_dim = STATIC_OBSERVATIONS;
         let target_len = TICKERS_COUNT as usize * k_patches * patch_size;
         let next_patch_len = TICKERS_COUNT as usize * patch_size;
+        let ohlc_len = TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER * OHLC_BAR_FEATURES;
+        let next_ohlc_len = TICKERS_COUNT as usize * patch_size * OHLC_BAR_FEATURES;
 
         let mut obs = Vec::with_capacity(samples.len() * pd_dim);
         let mut static_obs = Vec::with_capacity(samples.len() * so_dim);
@@ -899,6 +884,8 @@ impl PretrainSampler {
         let mut next_static_obs = Vec::with_capacity(samples.len() * so_dim);
         let mut future_patches = Vec::with_capacity(samples.len() * target_len);
         let mut next_patch = Vec::with_capacity(samples.len() * next_patch_len);
+        let mut ohlc_patches = Vec::with_capacity(samples.len() * ohlc_len);
+        let mut next_ohlc_patch = Vec::with_capacity(samples.len() * next_ohlc_len);
 
         for &(env_idx, offset) in samples {
             append_pretrain_sample(
@@ -913,6 +900,8 @@ impl PretrainSampler {
                 &mut next_static_obs,
                 &mut future_patches,
                 &mut next_patch,
+                &mut ohlc_patches,
+                &mut next_ohlc_patch,
             );
         }
 
@@ -924,6 +913,8 @@ impl PretrainSampler {
             next_static_obs,
             future_patches,
             next_patch,
+            ohlc_patches,
+            next_ohlc_patch,
             k_patches,
             patch_size,
             device,
@@ -938,6 +929,8 @@ impl PretrainSampler {
         next_static_obs: Vec<f32>,
         future_patches: Vec<f32>,
         next_patch: Vec<f32>,
+        ohlc_patches: Vec<f32>,
+        next_ohlc_patch: Vec<f32>,
         k_patches: usize,
         patch_size: usize,
         device: Device,
@@ -964,6 +957,23 @@ impl PretrainSampler {
             next_patch: Tensor::from_slice(&next_patch)
                 .view([batch, TICKERS_COUNT, patch_size as i64])
                 .to_device(device),
+            ohlc_patches: Tensor::from_slice(&ohlc_patches)
+                .view([
+                    batch,
+                    TICKERS_COUNT,
+                    (PRICE_DELTAS_PER_TICKER / patch_size) as i64,
+                    patch_size as i64,
+                    OHLC_BAR_FEATURES as i64,
+                ])
+                .to_device(device),
+            next_ohlc_patch: Tensor::from_slice(&next_ohlc_patch)
+                .view([
+                    batch,
+                    TICKERS_COUNT,
+                    patch_size as i64,
+                    OHLC_BAR_FEATURES as i64,
+                ])
+                .to_device(device),
         }
     }
 }
@@ -980,11 +990,15 @@ fn append_pretrain_sample(
     next_static_obs: &mut Vec<f32>,
     future_patches: &mut Vec<f32>,
     next_patch: &mut Vec<f32>,
+    ohlc_patches: &mut Vec<f32>,
+    next_ohlc_patch: &mut Vec<f32>,
 ) {
     let (obs_i, static_i) = env.reset_single_at_offset_for_pretrain(offset);
     let target_i =
         future_patches_for_current_perm(env, offset, k_patches, patch_size, target_scale);
     let next_patch_i = future_patches_for_current_perm(env, offset, 1, patch_size, 1.0);
+    let ohlc_i = ohlc_history_patches_for_current_perm(env, offset, patch_size);
+    let next_ohlc_i = next_ohlc_patch_for_current_perm(env, offset, patch_size);
     let (next_obs_i, next_static_i) =
         env.reset_single_at_offset_preserving_perm_for_pretrain(offset + patch_size);
 
@@ -992,6 +1006,8 @@ fn append_pretrain_sample(
     static_obs.extend(static_i);
     future_patches.extend(target_i);
     next_patch.extend(next_patch_i);
+    ohlc_patches.extend(ohlc_i);
+    next_ohlc_patch.extend(next_ohlc_i);
     next_obs.extend(next_obs_i);
     next_static_obs.extend(next_static_i);
 }
@@ -1180,17 +1196,17 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         BufWriter::new(File::create(run_dir.root.join("pretrain_validation.csv"))?);
     writeln!(
         train_epoch_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_nll,return_mse,return_mae,return_bias,pred_abs,target_abs,pred_std,target_std,terminal_mse,next_lat,samples,batches"
+        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,next_lat,samples,batches"
     )?;
     writeln!(
         validation_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_nll,return_mse,return_mae,return_bias,pred_abs,target_abs,pred_std,target_std,terminal_mse,next_lat,zero_mse,samples,tickers,batches"
+        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,next_lat,zero_mse,samples,tickers,batches"
     )?;
     let mut step_log = if args.log_step_losses {
         let mut log = BufWriter::new(File::create(run_dir.root.join("pretrain_train_steps.csv"))?);
         writeln!(
             log,
-            "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_nll,return_mse,return_mae,return_bias,pred_abs,target_abs,pred_std,target_std,terminal_mse,next_lat,samples"
+            "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,next_lat,samples"
         )?;
         Some(log)
     } else {
@@ -1240,18 +1256,18 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 let pred_embed_std_v = losses.pred_embed_std.double_value(&[]);
                 let target_embed_std_v = losses.target_embed_std.double_value(&[]);
                 let probe_nll_v = losses.probe_nll.double_value(&[]);
-                let return_mse_v = losses.return_mse.double_value(&[]);
-                let return_mae_v = losses.return_mae.double_value(&[]);
-                let return_bias_v = losses.return_bias.double_value(&[]);
+                let probe_mse_v = losses.probe_mse.double_value(&[]);
+                let probe_mae_v = losses.probe_mae.double_value(&[]);
+                let probe_bias_v = losses.probe_bias.double_value(&[]);
                 let pred_abs_v = losses.pred_abs.double_value(&[]);
                 let target_abs_v = losses.target_abs.double_value(&[]);
                 let pred_std_v = losses.pred_std.double_value(&[]);
                 let target_std_v = losses.target_std.double_value(&[]);
-                let terminal_mse_v = losses.terminal_mse.double_value(&[]);
+                let probe_terminal_mse_v = losses.probe_terminal_mse.double_value(&[]);
                 let lat_v = losses.next_lat.double_value(&[]);
                 writeln!(
                     log,
-                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_nll_v:.9},{return_mse_v:.9},{return_mae_v:.9},{return_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{terminal_mse_v:.9},{lat_v:.9},{batch_samples}"
+                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{lat_v:.9},{batch_samples}"
                 )?;
                 scalar_losses = Some((
                     total_v,
@@ -1262,14 +1278,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     pred_embed_std_v,
                     target_embed_std_v,
                     probe_nll_v,
-                    return_mse_v,
-                    return_mae_v,
-                    return_bias_v,
+                    probe_mse_v,
+                    probe_mae_v,
+                    probe_bias_v,
                     pred_abs_v,
                     target_abs_v,
                     pred_std_v,
                     target_std_v,
-                    terminal_mse_v,
+                    probe_terminal_mse_v,
                     lat_v,
                 ));
             }
@@ -1283,15 +1299,15 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     repr_std_min_v,
                     pred_embed_std_v,
                     target_embed_std_v,
-                    probe_nll_v,
-                    return_mse_v,
-                    return_mae_v,
-                    return_bias_v,
+                    _probe_nll_v,
+                    probe_mse_v,
+                    probe_mae_v,
+                    probe_bias_v,
                     pred_abs_v,
                     target_abs_v,
                     pred_std_v,
                     target_std_v,
-                    terminal_mse_v,
+                    probe_terminal_mse_v,
                     lat_v,
                 ) = scalar_losses.unwrap_or_else(|| {
                     (
@@ -1303,19 +1319,19 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                         losses.pred_embed_std.double_value(&[]),
                         losses.target_embed_std.double_value(&[]),
                         losses.probe_nll.double_value(&[]),
-                        losses.return_mse.double_value(&[]),
-                        losses.return_mae.double_value(&[]),
-                        losses.return_bias.double_value(&[]),
+                        losses.probe_mse.double_value(&[]),
+                        losses.probe_mae.double_value(&[]),
+                        losses.probe_bias.double_value(&[]),
                         losses.pred_abs.double_value(&[]),
                         losses.target_abs.double_value(&[]),
                         losses.pred_std.double_value(&[]),
                         losses.target_std.double_value(&[]),
-                        losses.terminal_mse.double_value(&[]),
+                        losses.probe_terminal_mse.double_value(&[]),
                         losses.next_lat.double_value(&[]),
                     )
                 });
                 println!(
-                    "pretrain epoch {epoch} step {global_step} train total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_nll={:.6} return_mse={:.6} return_mae={:.6} return_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} terminal_mse={:.6} next_lat={:.6}",
+                    "pretrain epoch {epoch} step {global_step} train total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} next_lat={:.6}",
                     total_v,
                     jepa_mse_v,
                     sigreg_v,
@@ -1323,15 +1339,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     repr_std_min_v,
                     pred_embed_std_v,
                     target_embed_std_v,
-                    probe_nll_v,
-                    return_mse_v,
-                    return_mae_v,
-                    return_bias_v,
+                    probe_mse_v,
+                    probe_mae_v,
+                    probe_bias_v,
                     pred_abs_v,
                     target_abs_v,
                     pred_std_v,
                     target_std_v,
-                    terminal_mse_v,
+                    probe_terminal_mse_v,
                     lat_v
                 );
             }
@@ -1349,7 +1364,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     device,
                 );
                 println!(
-                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_nll={:.6} return_mse={:.6} return_mae={:.6} return_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} terminal_mse={:.6} next_lat={:.6} zero_mse={:.6} samples={} tickers={} batches={}",
+                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} next_lat={:.6} zero_mse={:.6} samples={} tickers={} batches={}",
                     val.total,
                     val.jepa_mse,
                     val.sigreg,
@@ -1357,15 +1372,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.repr_std_min,
                     val.pred_embed_std,
                     val.target_embed_std,
-                    val.probe_nll,
-                    val.return_mse,
-                    val.return_mae,
-                    val.return_bias,
+                    val.probe_mse,
+                    val.probe_mae,
+                    val.probe_bias,
                     val.pred_abs,
                     val.target_abs,
                     val.pred_std,
                     val.target_std,
-                    val.terminal_mse,
+                    val.probe_terminal_mse,
                     val.next_lat,
                     val.zero_mse,
                     val.samples,
@@ -1374,7 +1388,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 );
                 writeln!(
                     validation_log,
-                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
                     val.total,
                     val.jepa_mse,
                     val.sigreg,
@@ -1382,15 +1396,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.repr_std_min,
                     val.pred_embed_std,
                     val.target_embed_std,
-                    val.probe_nll,
-                    val.return_mse,
-                    val.return_mae,
-                    val.return_bias,
+                    val.probe_mse,
+                    val.probe_mae,
+                    val.probe_bias,
                     val.pred_abs,
                     val.target_abs,
                     val.pred_std,
                     val.target_std,
-                    val.terminal_mse,
+                    val.probe_terminal_mse,
                     val.next_lat,
                     val.zero_mse,
                     val.samples,
@@ -1425,7 +1438,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
 
         let train = train_epoch_loss.finish();
         println!(
-            "pretrain epoch {epoch} train_mean total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_nll={:.6} return_mse={:.6} return_mae={:.6} return_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} terminal_mse={:.6} next_lat={:.6} samples={} batches={}",
+            "pretrain epoch {epoch} train_mean total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} next_lat={:.6} samples={} batches={}",
             train.total,
             train.jepa_mse,
             train.sigreg,
@@ -1433,22 +1446,21 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             train.repr_std_min,
             train.pred_embed_std,
             train.target_embed_std,
-            train.probe_nll,
-            train.return_mse,
-            train.return_mae,
-            train.return_bias,
+            train.probe_mse,
+            train.probe_mae,
+            train.probe_bias,
             train.pred_abs,
             train.target_abs,
             train.pred_std,
             train.target_std,
-            train.terminal_mse,
+            train.probe_terminal_mse,
             train.next_lat,
             train.samples,
             train.batches
         );
         writeln!(
             train_epoch_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{}",
+            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{}",
             train.total,
             train.jepa_mse,
             train.sigreg,
@@ -1456,15 +1468,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             train.repr_std_min,
             train.pred_embed_std,
             train.target_embed_std,
-            train.probe_nll,
-            train.return_mse,
-            train.return_mae,
-            train.return_bias,
+            train.probe_mse,
+            train.probe_mae,
+            train.probe_bias,
             train.pred_abs,
             train.target_abs,
             train.pred_std,
             train.target_std,
-            train.terminal_mse,
+            train.probe_terminal_mse,
             train.next_lat,
             train.samples,
             train.batches
@@ -1487,10 +1498,9 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 device,
             );
             println!(
-                "pretrain epoch {epoch} detached_probe_train probe_nll={:.6} return_mse={:.6} return_mae={:.6} pred_std={:.6} target_std={:.6} samples={} batches={} probe_epochs={}",
-                probe.probe_nll,
-                probe.return_mse,
-                probe.return_mae,
+                "pretrain epoch {epoch} detached_probe_train ohlc_mse={:.6} ohlc_mae={:.6} pred_std={:.6} target_std={:.6} samples={} batches={} probe_epochs={}",
+                probe.probe_mse,
+                probe.probe_mae,
                 probe.pred_std,
                 probe.target_std,
                 probe.samples,
@@ -1511,7 +1521,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             device,
         );
         println!(
-            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_nll={:.6} return_mse={:.6} return_mae={:.6} return_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} terminal_mse={:.6} next_lat={:.6} zero_mse={:.6} samples={} tickers={} batches={}",
+            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} next_lat={:.6} zero_mse={:.6} samples={} tickers={} batches={}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1519,15 +1529,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.repr_std_min,
             val.pred_embed_std,
             val.target_embed_std,
-            val.probe_nll,
-            val.return_mse,
-            val.return_mae,
-            val.return_bias,
+            val.probe_mse,
+            val.probe_mae,
+            val.probe_bias,
             val.pred_abs,
             val.target_abs,
             val.pred_std,
             val.target_std,
-            val.terminal_mse,
+            val.probe_terminal_mse,
             val.next_lat,
             val.zero_mse,
             val.samples,
@@ -1536,7 +1545,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         );
         writeln!(
             validation_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1544,15 +1553,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.repr_std_min,
             val.pred_embed_std,
             val.target_embed_std,
-            val.probe_nll,
-            val.return_mse,
-            val.return_mae,
-            val.return_bias,
+            val.probe_mse,
+            val.probe_mae,
+            val.probe_bias,
             val.pred_abs,
             val.target_abs,
             val.pred_std,
             val.target_std,
-            val.terminal_mse,
+            val.probe_terminal_mse,
             val.next_lat,
             val.zero_mse,
             val.samples,
@@ -1600,7 +1608,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         best_val = val.total;
         writeln!(
             validation_log,
-            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1608,15 +1616,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.repr_std_min,
             val.pred_embed_std,
             val.target_embed_std,
-            val.probe_nll,
-            val.return_mse,
-            val.return_mae,
-            val.return_bias,
+            val.probe_mse,
+            val.probe_mae,
+            val.probe_bias,
             val.pred_abs,
             val.target_abs,
             val.pred_std,
             val.target_std,
-            val.terminal_mse,
+            val.probe_terminal_mse,
             val.next_lat,
             val.zero_mse,
             val.samples,
@@ -1739,10 +1746,10 @@ fn mean_mse_pretrain_loss(
     let return_target = cumulative_future_returns(&batch.future_patches);
     let return_pred =
         heads.return_mean_from_readout(&forecast_readout, forecast_batch, forecast_tickers);
-    let return_mse = return_pred.mse_loss(&return_target, Reduction::Mean);
+    let probe_mse = return_pred.mse_loss(&return_target, Reduction::Mean);
     let return_err = &return_pred - &return_target;
-    let return_mae = return_err.abs().mean(Kind::Float);
-    let return_bias = return_err.mean(Kind::Float);
+    let probe_mae = return_err.abs().mean(Kind::Float);
+    let probe_bias = return_err.mean(Kind::Float);
     let pred_abs = return_pred.abs().mean(Kind::Float);
     let target_abs = return_target.abs().mean(Kind::Float);
     let pred_std = return_pred.std(false);
@@ -1750,29 +1757,29 @@ fn mean_mse_pretrain_loss(
     let terminal_idx = heads.horizon - 1;
     let terminal_pred = return_pred.select(-1, terminal_idx);
     let terminal_target = return_target.select(-1, terminal_idx);
-    let terminal_mse = terminal_pred.mse_loss(&terminal_target, Reduction::Mean);
-    let base_loss = return_mse.shallow_clone();
+    let probe_terminal_mse = terminal_pred.mse_loss(&terminal_target, Reduction::Mean);
+    let base_loss = probe_mse.shallow_clone();
 
     if lambda_lat == 0.0 {
         let next_lat = Tensor::zeros([], (Kind::Float, pred_abs.device()));
         return PretrainLoss {
             total: base_loss,
-            jepa_mse: zero_like_scalar(&return_mse),
-            sigreg: zero_like_scalar(&return_mse),
+            jepa_mse: zero_like_scalar(&probe_mse),
+            sigreg: zero_like_scalar(&probe_mse),
             repr_std_mean,
             repr_std_min,
-            pred_embed_std: zero_like_scalar(&return_mse),
-            target_embed_std: zero_like_scalar(&return_mse),
-            probe_nll: zero_like_scalar(&return_mse),
-            return_mae,
-            return_mse,
+            pred_embed_std: zero_like_scalar(&probe_mse),
+            target_embed_std: zero_like_scalar(&probe_mse),
+            probe_nll: zero_like_scalar(&probe_mse),
+            probe_mae,
+            probe_mse,
             pred_std,
             target_std,
-            return_bias,
+            probe_bias,
             pred_abs,
             target_abs,
             next_lat,
-            terminal_mse,
+            probe_terminal_mse,
         };
     }
 
@@ -1790,22 +1797,22 @@ fn mean_mse_pretrain_loss(
     let total = &base_loss + &latent_loss * lambda_lat;
     PretrainLoss {
         total,
-        jepa_mse: zero_like_scalar(&return_mse),
-        sigreg: zero_like_scalar(&return_mse),
+        jepa_mse: zero_like_scalar(&probe_mse),
+        sigreg: zero_like_scalar(&probe_mse),
         repr_std_mean,
         repr_std_min,
-        pred_embed_std: zero_like_scalar(&return_mse),
-        target_embed_std: zero_like_scalar(&return_mse),
-        probe_nll: zero_like_scalar(&return_mse),
-        return_mae,
-        return_mse,
+        pred_embed_std: zero_like_scalar(&probe_mse),
+        target_embed_std: zero_like_scalar(&probe_mse),
+        probe_nll: zero_like_scalar(&probe_mse),
+        probe_mae,
+        probe_mse,
         pred_std,
         target_std,
-        return_bias,
+        probe_bias,
         pred_abs,
         target_abs,
         next_lat: latent_loss,
-        terminal_mse,
+        probe_terminal_mse,
     }
 }
 
@@ -1817,14 +1824,12 @@ fn lejepa_pretrain_loss(
     target_scale: f64,
     train: bool,
 ) -> PretrainLoss {
-    let batch_size = batch.obs.size()[0];
-    let layout_len = model.pretrain_layout_len();
-    let layouts = model
-        .uniform_stream_layout_from_raw_input(&batch.obs)
-        .view([batch_size * TICKERS_COUNT, layout_len]);
+    let _ = model;
 
-    let patch_tokens = autocast(false, || heads.encode_lejepa_patches(&layouts, batch_size));
-    let final_target_token = autocast(false, || heads.encode_lejepa_next_patch(&batch.next_patch));
+    let patch_tokens = autocast(false, || heads.encode_lejepa_patches(&batch.ohlc_patches));
+    let final_target_token = autocast(false, || {
+        heads.encode_lejepa_next_patch(&batch.next_ohlc_patch)
+    });
     let source_target_tokens = patch_tokens.narrow(2, 1, patch_tokens.size()[2] - 1);
     let final_target_token = final_target_token.unsqueeze(2);
     let target_patch_tokens = Tensor::cat(&[&source_target_tokens, &final_target_token], 2);
@@ -1841,8 +1846,8 @@ fn lejepa_pretrain_loss(
     let pred_next_embed = predictions
         .belief
         .select(2, predictions.belief.size()[2] - 1);
-    let probe_target = scaled_next_patch_cumulative_returns(&batch.next_patch, target_scale);
-    let probe = probe_metrics(heads, &pred_next_embed.detach(), &probe_target);
+    let probe_target = scaled_next_ohlc_features(&batch.next_ohlc_patch, target_scale);
+    let probe = ohlc_probe_metrics(heads, &pred_next_embed.detach(), &probe_target);
     let next_lat = zero_like_scalar(&jepa_mse);
     PretrainLoss {
         total,
@@ -1853,15 +1858,15 @@ fn lejepa_pretrain_loss(
         pred_embed_std,
         target_embed_std,
         probe_nll: probe.probe_nll,
-        return_mae: probe.return_mae,
-        return_mse: probe.return_mse,
+        probe_mae: probe.probe_mae,
+        probe_mse: probe.probe_mse,
         pred_std: probe.pred_std,
         target_std: probe.target_std,
-        return_bias: probe.return_bias,
+        probe_bias: probe.probe_bias,
         pred_abs: probe.pred_abs,
         target_abs: probe.target_abs,
         next_lat,
-        terminal_mse: probe.terminal_mse,
+        probe_terminal_mse: probe.probe_terminal_mse,
     }
 }
 
@@ -1872,8 +1877,8 @@ fn cumulative_future_returns(future_patches: &Tensor) -> Tensor {
         .cumsum(-1, Kind::Float)
 }
 
-fn scaled_next_patch_cumulative_returns(next_patch: &Tensor, target_scale: f64) -> Tensor {
-    (next_patch * target_scale).cumsum(-1, Kind::Float)
+fn scaled_next_ohlc_features(next_ohlc_patch: &Tensor, target_scale: f64) -> Tensor {
+    next_ohlc_patch * target_scale
 }
 
 fn zero_like_scalar(reference: &Tensor) -> Tensor {
@@ -1937,45 +1942,45 @@ fn representation_std_metrics(patch_tokens: &Tensor) -> (Tensor, Tensor) {
 
 struct ProbeLoss {
     probe_nll: Tensor,
-    return_mae: Tensor,
-    return_mse: Tensor,
+    probe_mae: Tensor,
+    probe_mse: Tensor,
     pred_std: Tensor,
     target_std: Tensor,
-    return_bias: Tensor,
+    probe_bias: Tensor,
     pred_abs: Tensor,
     target_abs: Tensor,
-    terminal_mse: Tensor,
+    probe_terminal_mse: Tensor,
 }
 
-fn probe_metrics(
+fn ohlc_probe_metrics(
     heads: &PretrainHeads,
     predicted_patch_embed: &Tensor,
     target: &Tensor,
 ) -> ProbeLoss {
-    let mean = heads.probe_return_mean(predicted_patch_embed);
+    let mean = heads.probe_ohlc_features(predicted_patch_embed);
     let err = &mean - target;
-    let return_mse = mean.mse_loss(target, Reduction::Mean);
-    let return_mae = err.abs().mean(Kind::Float);
-    let return_bias = err.mean(Kind::Float);
+    let probe_mse = mean.mse_loss(target, Reduction::Mean);
+    let probe_mae = err.abs().mean(Kind::Float);
+    let probe_bias = err.mean(Kind::Float);
     let pred_abs = mean.abs().mean(Kind::Float);
     let target_abs = target.abs().mean(Kind::Float);
     let pred_std = mean.std(false);
     let target_std = target.std(false);
     let terminal_idx = target.size()[2] - 1;
-    let terminal_mse = mean
-        .select(-1, terminal_idx)
-        .mse_loss(&target.select(-1, terminal_idx), Reduction::Mean);
-    let probe_nll = zero_like_scalar(&return_mse);
+    let probe_terminal_mse = mean
+        .select(2, terminal_idx)
+        .mse_loss(&target.select(2, terminal_idx), Reduction::Mean);
+    let probe_nll = zero_like_scalar(&probe_mse);
     ProbeLoss {
         probe_nll,
-        return_mae,
-        return_mse,
+        probe_mae,
+        probe_mse,
         pred_std,
         target_std,
-        return_bias,
+        probe_bias,
         pred_abs,
         target_abs,
-        terminal_mse,
+        probe_terminal_mse,
     }
 }
 
@@ -2000,12 +2005,8 @@ fn predict_lejepa_next_patch_belief(
     heads: &PretrainHeads,
     batch: &PretrainBatch,
 ) -> Tensor {
-    let batch_size = batch.obs.size()[0];
-    let layout_len = model.pretrain_layout_len();
-    let layouts = model
-        .uniform_stream_layout_from_raw_input(&batch.obs)
-        .view([batch_size * TICKERS_COUNT, layout_len]);
-    let patch_tokens = autocast(false, || heads.encode_lejepa_patches(&layouts, batch_size));
+    let _ = model;
+    let patch_tokens = autocast(false, || heads.encode_lejepa_patches(&batch.ohlc_patches));
     heads.predict_lejepa_next_patch_belief(&patch_tokens, false)
 }
 
@@ -2018,15 +2019,15 @@ struct ValidationLoss {
     pred_embed_std: f64,
     target_embed_std: f64,
     probe_nll: f64,
-    return_mae: f64,
-    return_mse: f64,
+    probe_mae: f64,
+    probe_mse: f64,
     pred_std: f64,
     target_std: f64,
-    return_bias: f64,
+    probe_bias: f64,
     pred_abs: f64,
     target_abs: f64,
     next_lat: f64,
-    terminal_mse: f64,
+    probe_terminal_mse: f64,
     zero_mse: f64,
     samples: usize,
     tickers: usize,
@@ -2042,15 +2043,15 @@ struct PretrainLoss {
     pred_embed_std: Tensor,
     target_embed_std: Tensor,
     probe_nll: Tensor,
-    return_mae: Tensor,
-    return_mse: Tensor,
+    probe_mae: Tensor,
+    probe_mse: Tensor,
     pred_std: Tensor,
     target_std: Tensor,
-    return_bias: Tensor,
+    probe_bias: Tensor,
     pred_abs: Tensor,
     target_abs: Tensor,
     next_lat: Tensor,
-    terminal_mse: Tensor,
+    probe_terminal_mse: Tensor,
 }
 
 struct RunningLoss {
@@ -2062,15 +2063,15 @@ struct RunningLoss {
     pred_embed_std_sum: Tensor,
     target_embed_std_sum: Tensor,
     probe_nll_sum: Tensor,
-    return_mae_sum: Tensor,
-    return_mse_sum: Tensor,
+    probe_mae_sum: Tensor,
+    probe_mse_sum: Tensor,
     pred_std_sum: Tensor,
     target_std_sum: Tensor,
-    return_bias_sum: Tensor,
+    probe_bias_sum: Tensor,
     pred_abs_sum: Tensor,
     target_abs_sum: Tensor,
     next_lat_sum: Tensor,
-    terminal_mse_sum: Tensor,
+    probe_terminal_mse_sum: Tensor,
     samples: usize,
     batches: usize,
 }
@@ -2086,15 +2087,15 @@ impl RunningLoss {
             pred_embed_std_sum: Tensor::zeros([], (Kind::Float, device)),
             target_embed_std_sum: Tensor::zeros([], (Kind::Float, device)),
             probe_nll_sum: Tensor::zeros([], (Kind::Float, device)),
-            return_mae_sum: Tensor::zeros([], (Kind::Float, device)),
-            return_mse_sum: Tensor::zeros([], (Kind::Float, device)),
+            probe_mae_sum: Tensor::zeros([], (Kind::Float, device)),
+            probe_mse_sum: Tensor::zeros([], (Kind::Float, device)),
             pred_std_sum: Tensor::zeros([], (Kind::Float, device)),
             target_std_sum: Tensor::zeros([], (Kind::Float, device)),
-            return_bias_sum: Tensor::zeros([], (Kind::Float, device)),
+            probe_bias_sum: Tensor::zeros([], (Kind::Float, device)),
             pred_abs_sum: Tensor::zeros([], (Kind::Float, device)),
             target_abs_sum: Tensor::zeros([], (Kind::Float, device)),
             next_lat_sum: Tensor::zeros([], (Kind::Float, device)),
-            terminal_mse_sum: Tensor::zeros([], (Kind::Float, device)),
+            probe_terminal_mse_sum: Tensor::zeros([], (Kind::Float, device)),
             samples: 0,
             batches: 0,
         }
@@ -2111,15 +2112,15 @@ impl RunningLoss {
             self.pred_embed_std_sum += losses.pred_embed_std.detach() * weight;
             self.target_embed_std_sum += losses.target_embed_std.detach() * weight;
             self.probe_nll_sum += losses.probe_nll.detach() * weight;
-            self.return_mae_sum += losses.return_mae.detach() * weight;
-            self.return_mse_sum += losses.return_mse.detach() * weight;
+            self.probe_mae_sum += losses.probe_mae.detach() * weight;
+            self.probe_mse_sum += losses.probe_mse.detach() * weight;
             self.pred_std_sum += losses.pred_std.detach() * weight;
             self.target_std_sum += losses.target_std.detach() * weight;
-            self.return_bias_sum += losses.return_bias.detach() * weight;
+            self.probe_bias_sum += losses.probe_bias.detach() * weight;
             self.pred_abs_sum += losses.pred_abs.detach() * weight;
             self.target_abs_sum += losses.target_abs.detach() * weight;
             self.next_lat_sum += losses.next_lat.detach() * weight;
-            self.terminal_mse_sum += losses.terminal_mse.detach() * weight;
+            self.probe_terminal_mse_sum += losses.probe_terminal_mse.detach() * weight;
             self.samples += samples;
             self.batches += 1;
         });
@@ -2137,15 +2138,15 @@ impl RunningLoss {
             pred_embed_std: self.pred_embed_std_sum.double_value(&[]) / denom,
             target_embed_std: self.target_embed_std_sum.double_value(&[]) / denom,
             probe_nll: self.probe_nll_sum.double_value(&[]) / denom,
-            return_mae: self.return_mae_sum.double_value(&[]) / denom,
-            return_mse: self.return_mse_sum.double_value(&[]) / denom,
+            probe_mae: self.probe_mae_sum.double_value(&[]) / denom,
+            probe_mse: self.probe_mse_sum.double_value(&[]) / denom,
             pred_std: self.pred_std_sum.double_value(&[]) / denom,
             target_std: self.target_std_sum.double_value(&[]) / denom,
-            return_bias: self.return_bias_sum.double_value(&[]) / denom,
+            probe_bias: self.probe_bias_sum.double_value(&[]) / denom,
             pred_abs: self.pred_abs_sum.double_value(&[]) / denom,
             target_abs: self.target_abs_sum.double_value(&[]) / denom,
             next_lat: self.next_lat_sum.double_value(&[]) / denom,
-            terminal_mse: self.terminal_mse_sum.double_value(&[]) / denom,
+            probe_terminal_mse: self.probe_terminal_mse_sum.double_value(&[]) / denom,
             samples: self.samples,
             batches: self.batches,
         }
@@ -2161,23 +2162,22 @@ struct TrainEpochLoss {
     pred_embed_std: f64,
     target_embed_std: f64,
     probe_nll: f64,
-    return_mae: f64,
-    return_mse: f64,
+    probe_mae: f64,
+    probe_mse: f64,
     pred_std: f64,
     target_std: f64,
-    return_bias: f64,
+    probe_bias: f64,
     pred_abs: f64,
     target_abs: f64,
     next_lat: f64,
-    terminal_mse: f64,
+    probe_terminal_mse: f64,
     samples: usize,
     batches: usize,
 }
 
 struct ProbeTrainSummary {
-    probe_nll: f64,
-    return_mae: f64,
-    return_mse: f64,
+    probe_mae: f64,
+    probe_mse: f64,
     pred_std: f64,
     target_std: f64,
     samples: usize,
@@ -2202,20 +2202,20 @@ struct PretrainScalarHistory {
     eval_target_embed_std: Vec<f32>,
     train_probe_nll: Vec<f32>,
     eval_probe_nll: Vec<f32>,
-    train_return_mae: Vec<f32>,
-    eval_return_mae: Vec<f32>,
+    train_probe_mae: Vec<f32>,
+    eval_probe_mae: Vec<f32>,
     train_pred_std: Vec<f32>,
     eval_pred_std: Vec<f32>,
     train_target_std: Vec<f32>,
     eval_target_std: Vec<f32>,
-    train_terminal_mse: Vec<f32>,
-    eval_terminal_mse: Vec<f32>,
+    train_probe_terminal_mse: Vec<f32>,
+    eval_probe_terminal_mse: Vec<f32>,
 }
 
 impl PretrainScalarHistory {
     fn push(&mut self, train: &TrainEpochLoss, val: &ValidationLoss) {
-        self.train_mse.push(train.return_mse as f32);
-        self.eval_mse.push(val.return_mse as f32);
+        self.train_mse.push(train.probe_mse as f32);
+        self.eval_mse.push(val.probe_mse as f32);
         self.train_sigreg.push(train.sigreg as f32);
         self.eval_sigreg.push(val.sigreg as f32);
         self.train_jepa_mse.push(train.jepa_mse as f32);
@@ -2231,14 +2231,16 @@ impl PretrainScalarHistory {
         self.eval_target_embed_std.push(val.target_embed_std as f32);
         self.train_probe_nll.push(train.probe_nll as f32);
         self.eval_probe_nll.push(val.probe_nll as f32);
-        self.train_return_mae.push(train.return_mae as f32);
-        self.eval_return_mae.push(val.return_mae as f32);
+        self.train_probe_mae.push(train.probe_mae as f32);
+        self.eval_probe_mae.push(val.probe_mae as f32);
         self.train_pred_std.push(train.pred_std as f32);
         self.eval_pred_std.push(val.pred_std as f32);
         self.train_target_std.push(train.target_std as f32);
         self.eval_target_std.push(val.target_std as f32);
-        self.train_terminal_mse.push(train.terminal_mse as f32);
-        self.eval_terminal_mse.push(val.terminal_mse as f32);
+        self.train_probe_terminal_mse
+            .push(train.probe_terminal_mse as f32);
+        self.eval_probe_terminal_mse
+            .push(val.probe_terminal_mse as f32);
     }
 }
 
@@ -2251,9 +2253,9 @@ fn write_pretrain_scalar_meta_reports(
     let epoch_dir = gens_dir.join(epoch.to_string());
     fs::create_dir_all(&epoch_dir)?;
     write_pretrain_scalar_report(
-        &epoch_dir.join("pretrain_return_mse.report.bin"),
-        format!("Pretrain Return MSE - epoch {epoch} step {global_step}"),
-        "target-scaled cumulative log return MSE",
+        &epoch_dir.join("pretrain_probe_mse.report.bin"),
+        format!("Pretrain Probe MSE - epoch {epoch} step {global_step}"),
+        "target-scaled prediction MSE",
         &history.train_mse,
         &history.eval_mse,
     )?;
@@ -2300,18 +2302,11 @@ fn write_pretrain_scalar_meta_reports(
         &history.eval_target_embed_std,
     )?;
     write_pretrain_scalar_report(
-        &epoch_dir.join("pretrain_probe_nll.report.bin"),
-        format!("Pretrain Probe NLL - epoch {epoch} step {global_step}"),
-        "detached probe NLL",
-        &history.train_probe_nll,
-        &history.eval_probe_nll,
-    )?;
-    write_pretrain_scalar_report(
-        &epoch_dir.join("pretrain_return_mae.report.bin"),
-        format!("Pretrain Return MAE - epoch {epoch} step {global_step}"),
-        "target-scaled cumulative log return MAE",
-        &history.train_return_mae,
-        &history.eval_return_mae,
+        &epoch_dir.join("pretrain_probe_mae.report.bin"),
+        format!("Pretrain Probe MAE - epoch {epoch} step {global_step}"),
+        "target-scaled prediction MAE",
+        &history.train_probe_mae,
+        &history.eval_probe_mae,
     )?;
     write_pretrain_scalar_report(
         &epoch_dir.join("pretrain_pred_std.report.bin"),
@@ -2328,11 +2323,11 @@ fn write_pretrain_scalar_meta_reports(
         &history.eval_target_std,
     )?;
     write_pretrain_scalar_report(
-        &epoch_dir.join("pretrain_terminal_mse.report.bin"),
-        format!("Pretrain Terminal MSE - epoch {epoch} step {global_step}"),
-        "next patch terminal cumulative return MSE",
-        &history.train_terminal_mse,
-        &history.eval_terminal_mse,
+        &epoch_dir.join("pretrain_probe_terminal_mse.report.bin"),
+        format!("Pretrain Probe Terminal MSE - epoch {epoch} step {global_step}"),
+        "last predicted bar MSE",
+        &history.train_probe_terminal_mse,
+        &history.eval_probe_terminal_mse,
     )
 }
 
@@ -2377,7 +2372,6 @@ fn train_detached_probe(
     probe_named_vars: &[(String, Tensor)],
     device: Device,
 ) -> ProbeTrainSummary {
-    let mut nll_sum = 0.0;
     let mut mse_sum = 0.0;
     let mut mae_sum = 0.0;
     let mut pred_std_sum = 0.0;
@@ -2391,17 +2385,17 @@ fn train_detached_probe(
             let batch_samples = batch.len() as usize;
             let predicted_patch_embed =
                 tch::no_grad(|| predict_lejepa_next_patch_belief(model, heads, &batch));
-            let target = scaled_next_patch_cumulative_returns(&batch.next_patch, target_scale);
-            let probe = probe_metrics(heads, &predicted_patch_embed.detach(), &target);
-            assert_finite_loss(&probe.return_mse, probe_epoch + 1);
+            let ohlc_target = scaled_next_ohlc_features(&batch.next_ohlc_patch, target_scale);
+            let probe = ohlc_probe_metrics(heads, &predicted_patch_embed.detach(), &ohlc_target);
+            let probe_loss = probe.probe_mse.shallow_clone();
+            assert_finite_loss(&probe.probe_mse, probe_epoch + 1);
             probe_opt.zero_grad();
-            probe.return_mse.backward();
+            probe_loss.backward();
             clip_all_grads(probe_named_vars, MAX_GRAD_NORM, device);
             probe_opt.step();
 
-            nll_sum += probe.probe_nll.double_value(&[]) * batch_samples as f64;
-            mse_sum += probe.return_mse.double_value(&[]) * batch_samples as f64;
-            mae_sum += probe.return_mae.double_value(&[]) * batch_samples as f64;
+            mse_sum += probe.probe_mse.double_value(&[]) * batch_samples as f64;
+            mae_sum += probe.probe_mae.double_value(&[]) * batch_samples as f64;
             pred_std_sum += probe.pred_std.double_value(&[]) * batch_samples as f64;
             target_std_sum += probe.target_std.double_value(&[]) * batch_samples as f64;
             samples += batch_samples;
@@ -2412,9 +2406,8 @@ fn train_detached_probe(
     assert!(samples > 0, "detached probe training set is empty");
     let denom = samples as f64;
     ProbeTrainSummary {
-        probe_nll: nll_sum / denom,
-        return_mae: mae_sum / denom,
-        return_mse: mse_sum / denom,
+        probe_mae: mae_sum / denom,
+        probe_mse: mse_sum / denom,
         pred_std: pred_std_sum / denom,
         target_std: target_std_sum / denom,
         samples,
@@ -2446,15 +2439,15 @@ fn validate_full(
         let mut pred_embed_std_sum = 0.0;
         let mut target_embed_std_sum = 0.0;
         let mut probe_nll_sum = 0.0;
-        let mut return_mae_sum = 0.0;
-        let mut return_mse_sum = 0.0;
+        let mut probe_mae_sum = 0.0;
+        let mut probe_mse_sum = 0.0;
         let mut pred_std_sum = 0.0;
         let mut target_std_sum = 0.0;
-        let mut return_bias_sum = 0.0;
+        let mut probe_bias_sum = 0.0;
         let mut pred_abs_sum = 0.0;
         let mut target_abs_sum = 0.0;
         let mut next_lat_sum = 0.0;
-        let mut terminal_mse_sum = 0.0;
+        let mut probe_terminal_mse_sum = 0.0;
         let mut zero_mse_sum = 0.0;
         let mut samples = 0usize;
         let mut tickers = 0usize;
@@ -2503,10 +2496,9 @@ fn validate_full(
                 );
                 let return_target = match objective {
                     PretrainObjective::MeanMse => cumulative_future_returns(&batch.future_patches),
-                    PretrainObjective::Lejepa => scaled_next_patch_cumulative_returns(
-                        &batch.next_patch,
-                        sampler.target_scale,
-                    ),
+                    PretrainObjective::Lejepa => {
+                        scaled_next_ohlc_features(&batch.next_ohlc_patch, sampler.target_scale)
+                    }
                 };
                 let zero_mse_loss = return_target.pow_tensor_scalar(2.0).mean(Kind::Float);
                 total_sum += losses.total.double_value(&[]) * batch_samples as f64;
@@ -2519,15 +2511,16 @@ fn validate_full(
                 target_embed_std_sum +=
                     losses.target_embed_std.double_value(&[]) * batch_samples as f64;
                 probe_nll_sum += losses.probe_nll.double_value(&[]) * batch_samples as f64;
-                return_mae_sum += losses.return_mae.double_value(&[]) * batch_samples as f64;
-                return_mse_sum += losses.return_mse.double_value(&[]) * batch_samples as f64;
+                probe_mae_sum += losses.probe_mae.double_value(&[]) * batch_samples as f64;
+                probe_mse_sum += losses.probe_mse.double_value(&[]) * batch_samples as f64;
                 pred_std_sum += losses.pred_std.double_value(&[]) * batch_samples as f64;
                 target_std_sum += losses.target_std.double_value(&[]) * batch_samples as f64;
-                return_bias_sum += losses.return_bias.double_value(&[]) * batch_samples as f64;
+                probe_bias_sum += losses.probe_bias.double_value(&[]) * batch_samples as f64;
                 pred_abs_sum += losses.pred_abs.double_value(&[]) * batch_samples as f64;
                 target_abs_sum += losses.target_abs.double_value(&[]) * batch_samples as f64;
                 next_lat_sum += losses.next_lat.double_value(&[]) * batch_samples as f64;
-                terminal_mse_sum += losses.terminal_mse.double_value(&[]) * batch_samples as f64;
+                probe_terminal_mse_sum +=
+                    losses.probe_terminal_mse.double_value(&[]) * batch_samples as f64;
                 zero_mse_sum += zero_mse_loss.double_value(&[]) * batch_samples as f64;
                 samples += batch_samples;
                 batches += 1;
@@ -2544,15 +2537,15 @@ fn validate_full(
             pred_embed_std: pred_embed_std_sum / samples as f64,
             target_embed_std: target_embed_std_sum / samples as f64,
             probe_nll: probe_nll_sum / samples as f64,
-            return_mae: return_mae_sum / samples as f64,
-            return_mse: return_mse_sum / samples as f64,
+            probe_mae: probe_mae_sum / samples as f64,
+            probe_mse: probe_mse_sum / samples as f64,
             pred_std: pred_std_sum / samples as f64,
             target_std: target_std_sum / samples as f64,
-            return_bias: return_bias_sum / samples as f64,
+            probe_bias: probe_bias_sum / samples as f64,
             pred_abs: pred_abs_sum / samples as f64,
             target_abs: target_abs_sum / samples as f64,
             next_lat: next_lat_sum / samples as f64,
-            terminal_mse: terminal_mse_sum / samples as f64,
+            probe_terminal_mse: probe_terminal_mse_sum / samples as f64,
             zero_mse: zero_mse_sum / samples as f64,
             samples,
             tickers,
@@ -2566,6 +2559,8 @@ struct DiagnosticTrace {
     loss: f64,
     actual: Vec<f32>,
     predicted: Vec<f32>,
+    actual_candles: Option<Vec<CandleBar>>,
+    predicted_candles: Option<Vec<CandleBar>>,
 }
 
 fn write_pretrain_diagnostics(
@@ -2628,47 +2623,100 @@ fn write_pretrain_diagnostics(
                     sampler.target_scale,
                     device,
                 );
-                let (pred, actual_returns) = match objective {
-                    PretrainObjective::MeanMse => (
-                        predict_future_returns(model, heads, &batch),
-                        cumulative_future_returns(&batch.future_patches),
-                    ),
+                let (predicted, actual, predicted_ohlc, actual_ohlc) = match objective {
+                    PretrainObjective::MeanMse => {
+                        let pred = predict_future_returns(model, heads, &batch);
+                        let actual = cumulative_future_returns(&batch.future_patches);
+                        (
+                            tensor_to_vec_f32(&pred)?,
+                            tensor_to_vec_f32(&actual)?,
+                            None,
+                            None,
+                        )
+                    }
                     PretrainObjective::Lejepa => {
                         let predicted_patch_embed =
                             predict_lejepa_next_patch_belief(model, heads, &batch);
+                        let predicted_ohlc = heads.probe_ohlc_features(&predicted_patch_embed)
+                            / sampler.target_scale;
                         (
-                            heads.probe_return_mean(&predicted_patch_embed),
-                            scaled_next_patch_cumulative_returns(
-                                &batch.next_patch,
-                                sampler.target_scale,
-                            ),
+                            Vec::new(),
+                            Vec::new(),
+                            Some(tensor_to_vec_f32(&predicted_ohlc)?),
+                            Some(tensor_to_vec_f32(&batch.next_ohlc_patch)?),
                         )
                     }
                 };
-                let actual = tensor_to_vec_f32(&actual_returns)?;
-                let predicted = tensor_to_vec_f32(&pred)?;
 
                 for (sample_idx, &offset) in chunk.iter().enumerate() {
-                    let start = sample_idx * horizon;
-                    let end = start + horizon;
-                    let actual_sample = &actual[start..end];
-                    let pred_sample = &predicted[start..end];
                     let mut sample_abs = 0.0;
-
-                    for h in 0..horizon {
-                        let err = pred_sample[h] as f64 - actual_sample[h] as f64;
-                        abs_sum[h] += err.abs();
-                        sq_sum[h] += err * err;
-                        bias_sum[h] += err;
-                        sample_abs += err.abs();
-                    }
+                    let (actual_sample, pred_sample, actual_candles, predicted_candles) =
+                        match objective {
+                            PretrainObjective::MeanMse => {
+                                let start = sample_idx * horizon;
+                                let end = start + horizon;
+                                let actual_sample = actual[start..end].to_vec();
+                                let pred_sample = predicted[start..end].to_vec();
+                                for h in 0..horizon {
+                                    let err = pred_sample[h] as f64 - actual_sample[h] as f64;
+                                    abs_sum[h] += err.abs();
+                                    sq_sum[h] += err * err;
+                                    bias_sum[h] += err;
+                                    sample_abs += err.abs();
+                                }
+                                (actual_sample, pred_sample, None, None)
+                            }
+                            PretrainObjective::Lejepa => {
+                                let feature_start = sample_idx * horizon * OHLC_BAR_FEATURES;
+                                let feature_end = feature_start + horizon * OHLC_BAR_FEATURES;
+                                let actual_features =
+                                    &actual_ohlc.as_ref().expect("LEJEPA actual OHLC missing")
+                                        [feature_start..feature_end];
+                                let predicted_features = &predicted_ohlc
+                                    .as_ref()
+                                    .expect("LEJEPA predicted OHLC missing")
+                                    [feature_start..feature_end];
+                                for h in 0..horizon {
+                                    let start = h * OHLC_BAR_FEATURES;
+                                    let end = start + OHLC_BAR_FEATURES;
+                                    let mut bar_abs = 0.0;
+                                    let mut bar_sq = 0.0;
+                                    let mut bar_bias = 0.0;
+                                    for (&pred, &actual) in predicted_features[start..end]
+                                        .iter()
+                                        .zip(actual_features[start..end].iter())
+                                    {
+                                        let err = pred as f64 - actual as f64;
+                                        bar_abs += err.abs();
+                                        bar_sq += err * err;
+                                        bar_bias += err;
+                                    }
+                                    let denom = OHLC_BAR_FEATURES as f64;
+                                    abs_sum[h] += bar_abs / denom;
+                                    sq_sum[h] += bar_sq / denom;
+                                    bias_sum[h] += bar_bias / denom;
+                                    sample_abs += bar_abs / denom;
+                                }
+                                (
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Some(candles_from_ohlc_features(actual_features)),
+                                    Some(predicted_candles_from_ohlc_features(
+                                        predicted_features,
+                                        actual_features,
+                                    )),
+                                )
+                            }
+                        };
                     count += 1;
                     let loss = sample_abs / horizon as f64;
                     let trace = DiagnosticTrace {
                         label: format!("{}_offset_{}", ticker, offset),
                         loss,
-                        actual: actual_sample.to_vec(),
-                        predicted: pred_sample.to_vec(),
+                        actual: actual_sample,
+                        predicted: pred_sample,
+                        actual_candles,
+                        predicted_candles,
                     };
 
                     if first_traces.len() < TRACE_COUNT {
@@ -2677,6 +2725,8 @@ fn write_pretrain_diagnostics(
                             loss,
                             actual: trace.actual.clone(),
                             predicted: trace.predicted.clone(),
+                            actual_candles: trace.actual_candles.clone(),
+                            predicted_candles: trace.predicted_candles.clone(),
                         });
                     }
 
@@ -2714,7 +2764,10 @@ fn write_pretrain_diagnostics(
         &Report {
             title: format!("Pretrain Horizon Error - epoch {epoch} step {global_step}"),
             x_label: Some("forecast step".to_string()),
-            y_label: Some("target-scaled cumulative log return".to_string()),
+            y_label: Some(match objective {
+                PretrainObjective::MeanMse => "target-scaled cumulative log return".to_string(),
+                PretrainObjective::Lejepa => "OHLC feature error".to_string(),
+            }),
             scale: ScaleKind::Linear,
             kind: ReportKind::MultiLine {
                 series: vec![
@@ -2766,41 +2819,104 @@ fn write_trace_reports(
     global_step: usize,
     trace: &DiagnosticTrace,
 ) -> Result<()> {
-    let error = trace
-        .predicted
-        .iter()
-        .zip(trace.actual.iter())
-        .map(|(pred, actual)| pred - actual)
-        .collect::<Vec<_>>();
-    write_report_file(
-        &dir.join(format!("{prefix}_deltas.report.bin")),
-        &Report {
-            title: format!(
-                "Pretrain {group} Returns - epoch {epoch} step {global_step} - {} - MAE {:.5}",
-                trace.label, trace.loss
-            ),
-            x_label: Some("forecast step".to_string()),
-            y_label: Some("target-scaled cumulative log return".to_string()),
-            scale: ScaleKind::Linear,
-            kind: ReportKind::MultiLine {
-                series: vec![
-                    ReportSeries {
-                        label: "actual".to_string(),
-                        values: trace.actual.clone(),
-                    },
-                    ReportSeries {
-                        label: "predicted".to_string(),
-                        values: trace.predicted.clone(),
-                    },
-                    ReportSeries {
-                        label: "error".to_string(),
-                        values: error,
-                    },
-                ],
+    if !trace.actual.is_empty() && !trace.predicted.is_empty() {
+        let error = trace
+            .predicted
+            .iter()
+            .zip(trace.actual.iter())
+            .map(|(pred, actual)| pred - actual)
+            .collect::<Vec<_>>();
+        write_report_file(
+            &dir.join(format!("{prefix}_deltas.report.bin")),
+            &Report {
+                title: format!(
+                    "Pretrain {group} Returns - epoch {epoch} step {global_step} - {} - MAE {:.5}",
+                    trace.label, trace.loss
+                ),
+                x_label: Some("forecast step".to_string()),
+                y_label: Some("target-scaled cumulative log return".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::MultiLine {
+                    series: vec![
+                        ReportSeries {
+                            label: "actual".to_string(),
+                            values: trace.actual.clone(),
+                        },
+                        ReportSeries {
+                            label: "predicted".to_string(),
+                            values: trace.predicted.clone(),
+                        },
+                        ReportSeries {
+                            label: "error".to_string(),
+                            values: error,
+                        },
+                    ],
+                },
             },
-        },
-    )?;
+        )?;
+    }
+    if let (Some(actual), Some(predicted)) = (&trace.actual_candles, &trace.predicted_candles) {
+        write_report_file(
+            &dir.join(format!("{prefix}_candles.report.bin")),
+            &Report {
+                title: format!(
+                    "Pretrain {group} Candles - epoch {epoch} step {global_step} - {} - OHLC MAE {:.5}",
+                    trace.label, trace.loss
+                ),
+                x_label: Some("forecast bar".to_string()),
+                y_label: Some("relative price".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::CandleCompare {
+                    actual: actual.clone(),
+                    predicted: predicted.clone(),
+                },
+            },
+        )?;
+    }
     Ok(())
+}
+
+fn candles_from_ohlc_features(features: &[f32]) -> Vec<CandleBar> {
+    features
+        .chunks_exact(OHLC_BAR_FEATURES)
+        .scan(1.0f32, |prev_close, row| {
+            let candle = candle_from_ohlc_feature_row(row, *prev_close);
+            *prev_close = candle.close;
+            Some(candle)
+        })
+        .collect()
+}
+
+fn predicted_candles_from_ohlc_features(predicted: &[f32], actual: &[f32]) -> Vec<CandleBar> {
+    let mut actual_prev_close = 1.0f32;
+    predicted
+        .chunks_exact(OHLC_BAR_FEATURES)
+        .zip(actual.chunks_exact(OHLC_BAR_FEATURES))
+        .map(|(predicted_row, actual_row)| {
+            let candle = candle_from_ohlc_feature_row(predicted_row, actual_prev_close);
+            actual_prev_close = candle_from_ohlc_feature_row(actual_row, actual_prev_close).close;
+            candle
+        })
+        .collect()
+}
+
+fn candle_from_ohlc_feature_row(row: &[f32], prev_close: f32) -> CandleBar {
+    let open = prev_close.max(1e-6) * safe_exp(row[0]);
+    let high_raw = open * safe_exp(row[1]);
+    let low_raw = open * safe_exp(row[2]);
+    let close = (open * safe_exp(row[3])).max(1e-6);
+    let high = high_raw.max(open).max(close).max(low_raw);
+    let low = low_raw.min(open).min(close).min(high_raw).max(1e-6);
+    CandleBar {
+        open: open.max(1e-6),
+        high,
+        low,
+        close,
+    }
+}
+
+fn safe_exp(value: f32) -> f32 {
+    value.clamp(-2.0, 2.0).exp()
 }
 
 fn tensor_to_vec_f32(tensor: &Tensor) -> Result<Vec<f32>> {
@@ -2842,6 +2958,43 @@ fn future_patches_for_current_perm(
         }
     }
     out
+}
+
+fn ohlc_history_patches_for_current_perm(env: &Env, offset: usize, patch_size: usize) -> Vec<f32> {
+    debug_assert_eq!(
+        PRICE_DELTAS_PER_TICKER % patch_size,
+        0,
+        "LEJEPA source window must split into whole patches"
+    );
+    let start = offset + 1 - PRICE_DELTAS_PER_TICKER;
+    let end = offset + 1;
+    let mut out =
+        Vec::with_capacity(TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER * OHLC_BAR_FEATURES);
+    for &real_idx in &env.ticker_perm {
+        append_ohlc_feature_window(&env.ohlc_features[real_idx], start, end, &mut out);
+    }
+    out
+}
+
+fn next_ohlc_patch_for_current_perm(env: &Env, offset: usize, patch_size: usize) -> Vec<f32> {
+    let start = offset + 1;
+    let end = start + patch_size;
+    let mut out = Vec::with_capacity(TICKERS_COUNT as usize * patch_size * OHLC_BAR_FEATURES);
+    for &real_idx in &env.ticker_perm {
+        append_ohlc_feature_window(&env.ohlc_features[real_idx], start, end, &mut out);
+    }
+    out
+}
+
+fn append_ohlc_feature_window(
+    features: &[[f32; OHLC_BAR_FEATURES]],
+    start: usize,
+    end: usize,
+    out: &mut Vec<f32>,
+) {
+    for row in &features[start..end] {
+        out.extend_from_slice(row);
+    }
 }
 
 fn normalize_last_dim(x: &Tensor) -> Tensor {
@@ -2913,11 +3066,12 @@ fn configure_threads() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_split_offsets, cumulative_future_returns, future_patches_for_current_perm, SplitKind,
+        build_split_offsets, cumulative_future_returns, future_patches_for_current_perm,
+        next_ohlc_patch_for_current_perm, ohlc_history_patches_for_current_perm, SplitKind,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
-        env::Env,
+        env::{Env, OHLC_BAR_FEATURES},
         model::{ModelVariant, TradingModel, TradingModelConfig},
     };
     use tch::nn;
@@ -2946,6 +3100,49 @@ mod tests {
         let real_idx = env.ticker_perm[0];
         assert_eq!(patches[0], env.price_deltas[real_idx][offset + 1] as f32);
         assert_eq!(patches[3], env.price_deltas[real_idx][offset + 4] as f32);
+    }
+
+    #[test]
+    fn ohlc_history_patches_match_observation_window_and_close_returns() {
+        let mut env = Env::new(false);
+        let offset = crate::torch::constants::PRICE_DELTAS_PER_TICKER;
+        let _ = env.reset_single_at_offset_for_pretrain(offset);
+        let patches = ohlc_history_patches_for_current_perm(&env, offset, 25);
+        assert_eq!(
+            patches.len(),
+            crate::torch::constants::TICKERS_COUNT as usize
+                * PRICE_DELTAS_PER_TICKER
+                * OHLC_BAR_FEATURES
+        );
+
+        let real_idx = env.ticker_perm[0];
+        let first_bar_idx = offset + 1 - PRICE_DELTAS_PER_TICKER;
+        let last_bar_idx = offset;
+        assert_eq!(patches[4], env.price_deltas[real_idx][first_bar_idx] as f32);
+        let last_close_return_offset = (PRICE_DELTAS_PER_TICKER - 1) * OHLC_BAR_FEATURES + 4;
+        assert_eq!(
+            patches[last_close_return_offset],
+            env.price_deltas[real_idx][last_bar_idx] as f32
+        );
+    }
+
+    #[test]
+    fn next_ohlc_patch_starts_after_current_offset() {
+        let mut env = Env::new(false);
+        let offset = crate::torch::constants::PRICE_DELTAS_PER_TICKER;
+        let _ = env.reset_single_at_offset_for_pretrain(offset);
+        let patch = next_ohlc_patch_for_current_perm(&env, offset, 25);
+        assert_eq!(
+            patch.len(),
+            crate::torch::constants::TICKERS_COUNT as usize * 25 * OHLC_BAR_FEATURES
+        );
+
+        let real_idx = env.ticker_perm[0];
+        assert_eq!(patch[4], env.price_deltas[real_idx][offset + 1] as f32);
+        assert_eq!(
+            patch[24 * OHLC_BAR_FEATURES + 4],
+            env.price_deltas[real_idx][offset + 25] as f32
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use image::{DynamicImage, RgbImage};
 use plotters::coord::Shift;
 use plotters::prelude::*;
-use shared::report::{Report, ReportKind, ReportSeries, ScaleKind, TradePoint};
+use shared::report::{CandleBar, Report, ReportKind, ReportSeries, ScaleKind, TradePoint};
 use shared::theme::plotters_colors as theme;
 
 const CHART_DIMS: (u32, u32) = (2560, 780);
@@ -97,6 +97,19 @@ pub fn render_report_with_options(
                     })
                     .collect();
                 render_buy_sell(&root, report, prices, &buys, &sells, x_offset)?;
+            }
+            ReportKind::CandleCompare { actual, predicted } => {
+                let actual = skip_slice(actual, skip);
+                let predicted = skip_slice(predicted, skip);
+                render_candle_compare(
+                    &root,
+                    report,
+                    actual,
+                    predicted,
+                    x_offset,
+                    show_legend,
+                    solo_series,
+                )?;
             }
             ReportKind::Observations { .. } => {
                 return Err(anyhow!("report type not renderable"));
@@ -642,6 +655,190 @@ fn render_buy_sell(
     ))?;
 
     Ok(())
+}
+
+fn render_candle_compare(
+    root: &DrawingArea<BitMapBackend, Shift>,
+    report: &Report,
+    actual: &[CandleBar],
+    predicted: &[CandleBar],
+    x_offset: u32,
+    show_legend: bool,
+    solo_series: Option<usize>,
+) -> Result<()> {
+    if actual.is_empty() && predicted.is_empty() {
+        return Ok(());
+    }
+    let solo = match solo_series {
+        Some(idx) if idx < 2 => Some(idx),
+        _ => None,
+    };
+    let actual_active = solo.is_none() || solo == Some(0);
+    let predicted_active = solo.is_none() || solo == Some(1);
+
+    let mut values = Vec::with_capacity((actual.len() + predicted.len()) * 4);
+    if actual_active {
+        for candle in actual {
+            values.extend([candle.open, candle.high, candle.low, candle.close]);
+        }
+    }
+    if predicted_active {
+        for candle in predicted {
+            values.extend([candle.open, candle.high, candle.low, candle.close]);
+        }
+    }
+    let (y_min, y_max) = range_for(&values, false)?;
+    let x_len = actual.len().max(predicted.len()).max(1) as f64;
+    let x_start = x_offset as f64;
+    let x_end = x_start + x_len;
+
+    let title = normalize_title(&report.title);
+    let mut chart = plotters::chart::ChartBuilder::on(root)
+        .caption(title.as_str(), ("sans-serif", 20, &theme::TEXT))
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(60)
+        .build_cartesian_2d(x_start..x_end, y_min..y_max)?;
+
+    let mut mesh = chart.configure_mesh();
+    mesh.label_style(("sans-serif", 15, &theme::TEXT))
+        .axis_style(&theme::SURFACE1)
+        .light_line_style(&theme::SURFACE0);
+    if let Some(label) = report.x_label.as_deref() {
+        mesh.x_desc(label);
+    }
+    if let Some(label) = report.y_label.as_deref() {
+        mesh.y_desc(label);
+    }
+    mesh.draw()?;
+
+    if actual_active {
+        chart.draw_series(actual.iter().enumerate().map(|(idx, candle)| {
+            let x = x_start + idx as f64;
+            let mid = x + 0.5;
+            let color = actual_candle_color(candle);
+            PathElement::new(
+                vec![(mid, candle.low as f64), (mid, candle.high as f64)],
+                ShapeStyle::from(&color).stroke_width(1),
+            )
+        }))?;
+
+        chart
+            .draw_series(actual.iter().enumerate().map(|(idx, candle)| {
+                let x = x_start + idx as f64;
+                Rectangle::new(
+                    [
+                        (x, candle_body_low(candle)),
+                        (x + 1.0, candle_body_high(candle)),
+                    ],
+                    actual_candle_color(candle).filled(),
+                )
+            }))?
+            .label("actual filled")
+            .legend(legend_rect(&theme::GREEN));
+    } else {
+        chart
+            .draw_series(LineSeries::new(
+                std::iter::empty::<(f64, f64)>(),
+                ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
+            ))?
+            .label("actual filled")
+            .legend(legend_rect(&theme::GREEN));
+    }
+
+    if predicted_active {
+        chart.draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
+            let x = x_start + idx as f64;
+            let mid = x + 0.5;
+            let color = predicted_candle_color(candle);
+            PathElement::new(
+                vec![(mid, candle.low as f64), (mid, candle.high as f64)],
+                ShapeStyle::from(&color).stroke_width(3),
+            )
+        }))?;
+
+        chart.draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
+            let x = x_start + idx as f64;
+            let color = predicted_candle_fill(candle);
+            Rectangle::new(
+                [
+                    (x + 0.18, candle_body_low(candle)),
+                    (x + 0.82, candle_body_high(candle)),
+                ],
+                color.filled(),
+            )
+        }))?;
+
+        chart
+            .draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
+                let x = x_start + idx as f64;
+                Rectangle::new(
+                    [
+                        (x + 0.18, candle_body_low(candle)),
+                        (x + 0.82, candle_body_high(candle)),
+                    ],
+                    ShapeStyle::from(&predicted_candle_color(candle)).stroke_width(2),
+                )
+            }))?
+            .label("predicted overlay")
+            .legend(legend_rect(&theme::BLUE));
+    } else {
+        chart
+            .draw_series(LineSeries::new(
+                std::iter::empty::<(f64, f64)>(),
+                ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
+            ))?
+            .label("predicted overlay")
+            .legend(legend_rect(&theme::BLUE));
+    }
+
+    if show_legend {
+        chart
+            .configure_series_labels()
+            .position(LegendConfig::position())
+            .background_style(LegendConfig::background())
+            .border_style(LegendConfig::border())
+            .label_font(LegendConfig::font())
+            .draw()?;
+    }
+
+    Ok(())
+}
+
+fn actual_candle_color(candle: &CandleBar) -> RGBAColor {
+    if candle.close >= candle.open {
+        theme::GREEN.mix(0.72)
+    } else {
+        theme::RED.mix(0.72)
+    }
+}
+
+fn predicted_candle_color(candle: &CandleBar) -> RGBAColor {
+    if candle.close >= candle.open {
+        theme::BLUE.mix(0.95)
+    } else {
+        theme::MAUVE.mix(0.95)
+    }
+}
+
+fn predicted_candle_fill(candle: &CandleBar) -> RGBAColor {
+    if candle.close >= candle.open {
+        theme::BLUE.mix(0.24)
+    } else {
+        theme::MAUVE.mix(0.24)
+    }
+}
+
+fn candle_body_low(candle: &CandleBar) -> f64 {
+    let open = candle.open as f64;
+    let close = candle.close as f64;
+    open.min(close)
+}
+
+fn candle_body_high(candle: &CandleBar) -> f64 {
+    let open = candle.open as f64;
+    let close = candle.close as f64;
+    open.max(close)
 }
 
 fn compute_ema(data: &[f32], alpha: f64) -> Vec<f32> {

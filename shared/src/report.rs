@@ -21,6 +21,14 @@ pub struct TradePoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandleBar {
+    pub open: f32,
+    pub high: f32,
+    pub low: f32,
+    pub close: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReportKind {
     Simple {
         values: Vec<f32>,
@@ -39,6 +47,10 @@ pub enum ReportKind {
         prices: Vec<f32>,
         buys: Vec<TradePoint>,
         sells: Vec<TradePoint>,
+    },
+    CandleCompare {
+        actual: Vec<CandleBar>,
+        predicted: Vec<CandleBar>,
     },
     Observations {
         static_observations: Vec<Vec<f32>>,
@@ -128,6 +140,27 @@ impl ReportKind {
                     }
                     if sell_map.contains(&i) {
                         line.push_str("\tsell=1");
+                    }
+                    lines.push(line);
+                }
+                lines
+            }
+            ReportKind::CandleCompare { actual, predicted } => {
+                let max_len = actual.len().max(predicted.len());
+                let mut lines = Vec::with_capacity(max_len);
+                for i in 0..max_len {
+                    let mut line = format!("{i}");
+                    if let Some(c) = actual.get(i) {
+                        line.push_str(&format!(
+                            "\tactual=o:{:.6},h:{:.6},l:{:.6},c:{:.6}",
+                            c.open, c.high, c.low, c.close
+                        ));
+                    }
+                    if let Some(c) = predicted.get(i) {
+                        line.push_str(&format!(
+                            "\tpredicted=o:{:.6},h:{:.6},l:{:.6},c:{:.6}",
+                            c.open, c.high, c.low, c.close
+                        ));
                     }
                     lines.push(line);
                 }

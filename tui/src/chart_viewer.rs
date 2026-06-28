@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
-use shared::report::Report;
+use shared::report::{Report, ReportKind};
 use std::fs;
 use std::path::PathBuf;
 use walkdir::WalkDir;
@@ -81,12 +81,45 @@ impl ChartViewer {
     }
 
     pub fn toggle_solo_series(&mut self, n: usize) {
+        if self.current_series_count().is_some_and(|count| n >= count) {
+            self.solo_series = None;
+            self.load_current_image();
+            return;
+        }
         self.solo_series = if self.solo_series == Some(n) {
             None
         } else {
             Some(n)
         };
         self.load_current_image();
+    }
+
+    fn current_series_count(&self) -> Option<usize> {
+        let i = self.list_state.selected()?;
+        if i >= self.flattened.len() {
+            return None;
+        }
+        let (node_idx, _) = self.flattened[i];
+        let ChartNode::Chart { path, .. } = &self.nodes[node_idx] else {
+            return None;
+        };
+        let report = load_report(path).ok()?;
+        match report.kind {
+            ReportKind::Simple { ema_alpha, .. } => Some(if ema_alpha.is_some() { 2 } else { 1 }),
+            ReportKind::MultiLine { series } => Some(series.len()),
+            ReportKind::Assets {
+                positioned,
+                benchmark,
+                ..
+            } => Some(
+                2 + positioned
+                    .as_ref()
+                    .map_or(0, |p| if p.is_empty() { 0 } else { 1 })
+                    + benchmark.as_ref().map_or(0, |_| 1),
+            ),
+            ReportKind::CandleCompare { .. } => Some(2),
+            ReportKind::BuySell { .. } | ReportKind::Observations { .. } => None,
+        }
     }
 
     pub fn is_legend_visible(&self) -> bool {
@@ -203,6 +236,10 @@ impl ChartViewer {
             Option<String>,
             Vec<(PathBuf, String, Option<usize>, SystemTime)>,
         > = HashMap::new();
+        let mut pretrain_sample_groups: HashMap<
+            String,
+            Vec<(PathBuf, String, Option<usize>, SystemTime)>,
+        > = HashMap::new();
 
         for path in chart_paths {
             if path.exists() {
@@ -230,7 +267,22 @@ impl ChartViewer {
                                     chart_parent.file_name().and_then(|n| n.to_str())
                                 {
                                     if let Ok(ep) = ep_name.parse::<usize>() {
-                                        (Some(ep), Some("pretrain samples".to_string()))
+                                        if let Some((sample_key, chart_name)) =
+                                            pretrain_sample_parts(path, Some(ep))
+                                        {
+                                            pretrain_sample_groups
+                                                .entry(sample_key)
+                                                .or_insert_with(Vec::new)
+                                                .push((
+                                                    path.clone(),
+                                                    chart_name,
+                                                    Some(ep),
+                                                    modified,
+                                                ));
+                                            (Some(ep), Some("pretrain samples".to_string()))
+                                        } else {
+                                            (Some(ep), Some("pretrain samples".to_string()))
+                                        }
                                     } else {
                                         (None, None)
                                     }
@@ -270,13 +322,24 @@ impl ChartViewer {
                 if episode_num.is_none() && ticker.is_none() {
                     continue;
                 }
-
-                ticker_groups.entry(ticker).or_insert_with(Vec::new).push((
-                    path.clone(),
-                    chart_name,
-                    episode_num,
-                    modified,
-                ));
+                if ticker
+                    .as_deref()
+                    .is_some_and(|name| name != "pretrain samples")
+                {
+                    ticker_groups.entry(ticker).or_insert_with(Vec::new).push((
+                        path.clone(),
+                        chart_name,
+                        episode_num,
+                        modified,
+                    ));
+                } else if ticker.is_none() {
+                    ticker_groups.entry(ticker).or_insert_with(Vec::new).push((
+                        path.clone(),
+                        chart_name,
+                        episode_num,
+                        modified,
+                    ));
+                }
             }
         }
 
@@ -300,6 +363,50 @@ impl ChartViewer {
                 self.expanded.push(false);
                 self.root_indices.push(chart_idx);
             }
+        }
+
+        if !pretrain_sample_groups.is_empty() {
+            let mut sample_infos: Vec<(String, SystemTime)> = pretrain_sample_groups
+                .iter()
+                .map(|(name, charts)| {
+                    let most_recent = charts
+                        .iter()
+                        .map(|(_, _, _, modified)| *modified)
+                        .max()
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    (name.clone(), most_recent)
+                })
+                .collect();
+            sample_infos.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let mut sample_chart_indices = Vec::new();
+            for (sample_key, _) in sample_infos {
+                if let Some(mut charts) = pretrain_sample_groups.remove(&sample_key) {
+                    charts.sort_by(|a, b| a.1.cmp(&b.1));
+                    let sample_name = sample_key
+                        .split_once('|')
+                        .map(|(_, display)| display.to_string())
+                        .unwrap_or_else(|| sample_key.clone());
+                    for (path, chart_name, _, _) in charts {
+                        let chart_idx = self.nodes.len();
+                        self.nodes.push(ChartNode::Chart {
+                            name: format!("{sample_name} - {chart_name}"),
+                            path,
+                        });
+                        self.expanded.push(false);
+                        sample_chart_indices.push(chart_idx);
+                    }
+                }
+            }
+
+            let root_idx = self.nodes.len();
+            self.nodes.push(ChartNode::Folder {
+                name: "pretrain samples".to_string(),
+                path: PathBuf::new(),
+                children: sample_chart_indices,
+            });
+            self.expanded.push(false);
+            self.root_indices.push(root_idx);
         }
 
         // Create folders for each ticker, sorted by most recent modification time
@@ -383,28 +490,33 @@ impl ChartViewer {
             let name = entry.file_name().to_str().unwrap_or("unknown").to_string();
 
             if entry.file_type().is_dir() {
-                let mut children = Vec::new();
-                for sub_entry in WalkDir::new(&entry_path)
-                    .min_depth(1)
-                    .max_depth(1)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                {
-                    if !sub_entry.file_type().is_file() {
-                        continue;
+                let children = if name == "samples" {
+                    self.build_pretrain_sample_tree(&entry_path)
+                } else {
+                    let mut children = Vec::new();
+                    for sub_entry in WalkDir::new(&entry_path)
+                        .min_depth(1)
+                        .max_depth(1)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                    {
+                        if !sub_entry.file_type().is_file() {
+                            continue;
+                        }
+                        let file_name = sub_entry.file_name().to_str().unwrap_or("unknown");
+                        if !file_name.ends_with(".report.bin") {
+                            continue;
+                        }
+                        let chart_idx = self.nodes.len();
+                        self.nodes.push(ChartNode::Chart {
+                            name: report_display_name(file_name),
+                            path: sub_entry.path().to_path_buf(),
+                        });
+                        children.push(chart_idx);
+                        self.expanded.push(false);
                     }
-                    let file_name = sub_entry.file_name().to_str().unwrap_or("unknown");
-                    if !file_name.ends_with(".report.bin") {
-                        continue;
-                    }
-                    let chart_idx = self.nodes.len();
-                    self.nodes.push(ChartNode::Chart {
-                        name: report_display_name(file_name),
-                        path: sub_entry.path().to_path_buf(),
-                    });
-                    children.push(chart_idx);
-                    self.expanded.push(false);
-                }
+                    children
+                };
 
                 // Get modification time for sorting
                 let modified = entry
@@ -440,6 +552,72 @@ impl ChartViewer {
             .extend(folders.into_iter().map(|(idx, _)| idx));
 
         Ok(())
+    }
+
+    fn build_pretrain_sample_tree(&mut self, path: &PathBuf) -> Vec<usize> {
+        use std::collections::HashMap;
+        use std::time::SystemTime;
+
+        let mut groups: HashMap<String, Vec<(PathBuf, String, SystemTime)>> = HashMap::new();
+        for entry in WalkDir::new(path)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let entry_path = entry.path().to_path_buf();
+            let Some((sample_key, chart_name)) = pretrain_sample_parts(&entry_path, None) else {
+                continue;
+            };
+            let modified = entry
+                .path()
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            groups
+                .entry(sample_key)
+                .or_insert_with(Vec::new)
+                .push((entry_path, chart_name, modified));
+        }
+
+        let mut sample_infos = groups
+            .iter()
+            .map(|(key, charts)| {
+                let modified = charts
+                    .iter()
+                    .map(|(_, _, modified)| *modified)
+                    .max()
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                (key.clone(), modified)
+            })
+            .collect::<Vec<_>>();
+        sample_infos.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut chart_indices = Vec::new();
+        for (sample_key, _) in sample_infos {
+            let Some(mut charts) = groups.remove(&sample_key) else {
+                continue;
+            };
+            charts.sort_by(|a, b| a.1.cmp(&b.1));
+            let sample_name = sample_key
+                .split_once('|')
+                .map(|(_, display)| display.to_string())
+                .unwrap_or_else(|| sample_key.clone());
+            for (path, chart_name, _) in charts {
+                let chart_idx = self.nodes.len();
+                self.nodes.push(ChartNode::Chart {
+                    name: format!("{sample_name} - {chart_name}"),
+                    path,
+                });
+                self.expanded.push(false);
+                chart_indices.push(chart_idx);
+            }
+        }
+
+        chart_indices
     }
 
     fn rebuild_flattened(&mut self) {
@@ -913,6 +1091,35 @@ fn report_title_from_path(path: &PathBuf) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     let report: Report = postcard::from_bytes(&bytes).ok()?;
     Some(report.title)
+}
+
+fn pretrain_sample_parts(path: &PathBuf, episode: Option<usize>) -> Option<(String, String)> {
+    let file_name = path.file_name()?.to_str()?;
+    let base = file_name.strip_suffix(".report.bin")?;
+    let parts = base.split('_').collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return None;
+    }
+    let kind = parts[0];
+    if kind != "sample" && kind != "worst" {
+        return None;
+    }
+    let number = parts[1];
+    let suffix = parts[2..].join("_");
+    let folder_display = match episode {
+        Some(ep) => format!("{} {} (ep {})", kind, number, ep),
+        None => format!("{} {}", kind, number),
+    };
+    let key = match episode {
+        Some(ep) => format!("{ep}:{kind}_{number}|{folder_display}"),
+        None => format!("{kind}_{number}|{folder_display}"),
+    };
+    let chart_name = match suffix.as_str() {
+        "deltas" => "Returns".to_string(),
+        "candles" => "Candles".to_string(),
+        _ => normalize_title(&suffix.replace('_', " ")),
+    };
+    Some((key, chart_name))
 }
 
 fn render_report_to_temp(report: &Report, skip: usize, show_legend: bool) -> Result<PathBuf> {
