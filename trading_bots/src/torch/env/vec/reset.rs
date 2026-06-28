@@ -1,4 +1,4 @@
-use super::core::{EnvGroupEpisode, VecEnv};
+use super::core::{EnvGroupKey, VecEnv};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use tch::Tensor;
 
@@ -6,26 +6,28 @@ impl VecEnv {
     pub(super) fn reset_group_full_obs(
         &mut self,
         group_idx: usize,
-        used_specs: &mut Vec<EnvGroupEpisode>,
+        used_keys: &mut Vec<EnvGroupKey>,
     ) {
         let (group_start, group_end) = self.group_bounds(group_idx);
         let (mut leader_price_deltas, mut leader_static_obs) =
             self.envs[group_start].reset_single_resampled_training_episode();
         let mut spec = self.current_group_episode(group_start);
+        let mut key = spec.key();
         let mut attempts = 0;
-        while Self::has_used_market_episode(used_specs, &spec) && attempts < 128 {
+        while Self::has_used_market_episode_key(used_keys, &key) && attempts < 128 {
             let reset = self.envs[group_start].reset_single_resampled_training_episode();
             leader_price_deltas = reset.0;
             leader_static_obs = reset.1;
             spec = self.current_group_episode(group_start);
+            key = spec.key();
             attempts += 1;
         }
         assert!(
-            !Self::has_used_market_episode(used_specs, &spec),
+            !Self::has_used_market_episode_key(used_keys, &key),
             "failed to sample distinct env reset group after {} attempts",
             attempts
         );
-        used_specs.push(spec.clone());
+        used_keys.push(key);
 
         self.write_full_obs(group_start, &leader_price_deltas, &leader_static_obs);
         for env_idx in group_start + 1..group_end {
@@ -38,26 +40,28 @@ impl VecEnv {
     pub(super) fn reset_group_step_obs(
         &mut self,
         group_idx: usize,
-        used_specs: &mut Vec<EnvGroupEpisode>,
+        used_keys: &mut Vec<EnvGroupKey>,
     ) {
         let (group_start, group_end) = self.group_bounds(group_idx);
         let (mut leader_step_deltas, mut leader_static_obs) =
             self.envs[group_start].reset_step_single_resampled_training_episode();
         let mut spec = self.current_group_episode(group_start);
+        let mut key = spec.key();
         let mut attempts = 0;
-        while Self::has_used_market_episode(used_specs, &spec) && attempts < 128 {
+        while Self::has_used_market_episode_key(used_keys, &key) && attempts < 128 {
             let reset = self.envs[group_start].reset_step_single_resampled_training_episode();
             leader_step_deltas = reset.0;
             leader_static_obs = reset.1;
             spec = self.current_group_episode(group_start);
+            key = spec.key();
             attempts += 1;
         }
         assert!(
-            !Self::has_used_market_episode(used_specs, &spec),
+            !Self::has_used_market_episode_key(used_keys, &key),
             "failed to sample distinct env reset group after {} attempts",
             attempts
         );
-        used_specs.push(spec.clone());
+        used_keys.push(key);
 
         self.write_step_obs(group_start, &leader_step_deltas, &leader_static_obs);
         for env_idx in group_start + 1..group_end {
@@ -127,9 +131,9 @@ impl VecEnv {
             self.envs.len(),
             self.nprocs
         );
-        let mut used_specs = Vec::with_capacity(self.env_group_count());
+        let mut used_keys = Vec::with_capacity(self.env_group_count());
         for group_idx in 0..self.env_group_count() {
-            self.reset_group_full_obs(group_idx, &mut used_specs);
+            self.reset_group_full_obs(group_idx, &mut used_keys);
         }
 
         let price_deltas = Tensor::from_slice(&self.price_deltas_buf).view([
@@ -153,9 +157,9 @@ impl VecEnv {
             self.envs.len(),
             self.nprocs
         );
-        let mut used_specs = Vec::with_capacity(self.env_group_count());
+        let mut used_keys = Vec::with_capacity(self.env_group_count());
         for group_idx in 0..self.env_group_count() {
-            self.reset_group_step_obs(group_idx, &mut used_specs);
+            self.reset_group_step_obs(group_idx, &mut used_keys);
         }
 
         let step_deltas =
@@ -172,9 +176,9 @@ impl VecEnv {
 
     pub fn reset_incremental(&mut self) -> (Vec<Vec<f32>>, Tensor) {
         assert_eq!(self.envs.len(), self.nprocs);
-        let mut used_specs = Vec::with_capacity(self.env_group_count());
+        let mut used_keys = Vec::with_capacity(self.env_group_count());
         for group_idx in 0..self.env_group_count() {
-            self.reset_group_full_obs(group_idx, &mut used_specs);
+            self.reset_group_full_obs(group_idx, &mut used_keys);
         }
 
         let static_obs = Tensor::from_slice(&self.static_obs_buf)

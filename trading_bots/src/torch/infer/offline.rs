@@ -14,7 +14,9 @@ pub fn load_model<P: AsRef<Path>>(
     device: Device,
     model_variant: ModelVariant,
 ) -> Result<(nn::VarStore, TradingModel), Box<dyn std::error::Error>> {
-    configure_cuda();
+    if device.is_cuda() {
+        configure_cuda();
+    }
     let mut vs = nn::VarStore::new(device);
     let model = TradingModel::new_with_config(
         &vs.root(),
@@ -60,10 +62,18 @@ pub fn run_inference<P: AsRef<Path>>(
     println!("Starting inference run...");
     println!("Loading model from: {:?}", weight_path.as_ref());
 
-    let device = Device::cuda_if_available();
+    let device = if num_episodes == 0 {
+        Device::Cpu
+    } else {
+        Device::cuda_if_available()
+    };
     println!("Using device: {:?}", device);
 
     let (_vs, model) = load_model(&weight_path, device, model_variant)?;
+    if num_episodes == 0 {
+        println!("Loaded model successfully; no episodes requested.");
+        return Ok(());
+    }
 
     let mut env = match tickers {
         Some(t) => Env::new_with_tickers(t, random_start),

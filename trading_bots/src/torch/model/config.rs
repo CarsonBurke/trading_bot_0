@@ -8,8 +8,8 @@ pub(in crate::torch::model) const BASE_GQA_LAYERS: usize = 3;
 pub(in crate::torch::model) const ABLATION_SMALL_MODEL_DIM: i64 = 96;
 pub(in crate::torch::model) const ABLATION_SMALL_FF_DIM: i64 = 192;
 pub(in crate::torch::model) const ABLATION_SMALL_GQA_LAYERS: usize = 1;
-pub(in crate::torch::model) const UNIFORM_STREAM_PATCH_COUNT: i64 = 120;
-pub(in crate::torch::model) const UNIFORM_STREAM_PATCH_SIZE: i64 = 50;
+pub(in crate::torch::model) const UNIFORM_STREAM_PATCH_COUNT: i64 = 240;
+pub(in crate::torch::model) const UNIFORM_STREAM_PATCH_SIZE: i64 = 25;
 pub(in crate::torch::model) const UNIFORM_STREAM_LAYOUT_LEN: i64 =
     UNIFORM_STREAM_PATCH_COUNT * UNIFORM_STREAM_PATCH_SIZE;
 pub(in crate::torch::model) const UNIFORM_STREAM_BOOTSTRAP_FULL_PATCHES: i64 =

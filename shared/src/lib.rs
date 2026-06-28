@@ -16,18 +16,18 @@ pub mod constants {
     pub const ACTION_HISTORY_LEN: usize = 0;
     pub const PRICE_DELTAS_PER_TICKER: usize = 6000;
 
-    // Global (6): step_progress, cash_percent, pnl, drawdown, commissions, last_fill_ratio
+    // Global (5): cash_percent, pnl, drawdown, commissions, last_fill_ratio
     // Macro (14): gdp_growth, unemployment, jobs_growth, cpi_yoy, core_cpi_yoy, fed_funds, treasury_10y, yield_spread, consumer_sentiment, initial_claims
     //             + steps_to_jobs, steps_to_cpi, steps_to_fomc, steps_to_gdp
     pub const GLOBAL_MACRO_OBS: usize = 14;
-    pub const GLOBAL_STATIC_OBS: usize = 6 + GLOBAL_MACRO_OBS;
+    pub const GLOBAL_STATIC_OBS: usize = 5 + GLOBAL_MACRO_OBS;
     // Per-ticker (25 total):
     // Portfolio (6): position_pct, unrealized_pnl, trade_ema, steps_since, position_age, target_weight
     // Multi-scale momentum (4): mom_5, mom_20, mom_60, mom_120
     // Momentum quality (4): acceleration, vol_adjusted, efficiency, trend_strength
     // Oscillators (4): rsi, range_pos, stoch_k, zscore
     // Trend (1): macd
-    // Earnings (6): steps_to_next, revenue_growth, opex_growth, net_profit_growth, eps, eps_surprise
+    // Earnings (6): steps_since_available, revenue_growth, opex_growth, net_profit_growth, eps, eps_surprise
     pub const PER_TICKER_EARNINGS_OBS: usize = 6;
     pub const PER_TICKER_STATIC_OBS: usize = 19 + PER_TICKER_EARNINGS_OBS;
     pub const STATIC_OBSERVATIONS: usize =

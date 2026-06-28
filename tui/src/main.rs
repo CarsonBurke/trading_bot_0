@@ -239,6 +239,7 @@ impl App {
             "policy_loss",
             "policy_entropy",
             "approx_kl",
+            "kl_lr",
             "gate_stats",
             "ga_fitness",
             "ga_return_pct",
@@ -254,6 +255,9 @@ impl App {
             "ga_train_assets",
             "ga_validation_assets",
             "ga_test_assets",
+            "pretrain_horizon_error",
+            "pretrain_horizon_uncertainty",
+            "pretrain_horizon_std_error",
         ];
 
         // Ticker-specific chart base names
@@ -320,6 +324,41 @@ impl App {
                             if let Ok(metadata) = fs::metadata(&report_path) {
                                 if let Ok(modified) = metadata.modified() {
                                     let key = format!("{}_{}", ticker_str, base);
+                                    if latest_per_type
+                                        .get(&key)
+                                        .map(|(t, _)| modified > *t)
+                                        .unwrap_or(true)
+                                    {
+                                        latest_per_type.insert(key, (modified, report_path));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let samples_path = gen_path.join("samples");
+                if samples_path.is_dir() {
+                    if let Ok(items) = fs::read_dir(&samples_path) {
+                        for item in items.filter_map(|e| e.ok()) {
+                            if !item
+                                .file_type()
+                                .ok()
+                                .map(|ft| ft.is_file())
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            let file_name = item.file_name();
+                            let file_name = file_name.to_str().unwrap_or("");
+                            if !file_name.ends_with(".report.bin") {
+                                continue;
+                            }
+                            let report_path = item.path();
+                            if let Ok(metadata) = fs::metadata(&report_path) {
+                                if let Ok(modified) = metadata.modified() {
+                                    let base = file_name.trim_end_matches(".report.bin");
+                                    let key = format!("pretrain_samples_{base}");
                                     if latest_per_type
                                         .get(&key)
                                         .map(|(t, _)| modified > *t)

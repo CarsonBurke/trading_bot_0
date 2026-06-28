@@ -1,8 +1,8 @@
 target
 training
 weights
-infer
-data
+/infer
+/data
 long_data
 burn_custom/
 ai_*.md

@@ -1,37 +1,20 @@
 use tch::Tensor;
 
-use super::super::config::{
-    ModelVariant, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL, UNIFORM_STREAM_LAYOUT_LEN,
-};
+use super::super::config::ModelVariant;
 use super::super::trading_model::{ModelOutput, StreamState, TradingModel};
 use super::probe::probe_replay_tensor;
-use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, TICKERS_COUNT};
+use crate::torch::constants::PRICE_DELTAS_PER_TICKER;
 
 impl TradingModel {
-    pub(super) fn uniform_stream_replay_forward(
-        &self,
-        static_features: &Tensor,
-        state: &mut StreamState,
-    ) -> ModelOutput {
-        let batch_size = state.uniform_live_fill.size()[0];
-        let (global_static, per_ticker_static) = self.parse_static(static_features, batch_size);
-        let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
-        self.readout_from_cached_patches(&exo_tokens, batch_size, state)
-    }
-
     pub fn forward_stream_state_on_device_for_replay(
         &self,
         static_features: &Tensor,
         state: &mut StreamState,
     ) -> ModelOutput {
-        let static_features = if static_features.dim() == 1 {
-            static_features.unsqueeze(0)
-        } else {
-            static_features.shallow_clone()
-        };
+        let static_features = self.ensure_batched(static_features);
         let static_features = self.cast_inputs(&static_features);
         if self.variant == ModelVariant::UniformStream {
-            return self.uniform_stream_replay_forward(&static_features, state);
+            return self.cached_readout_forward(&static_features, state);
         }
         self.forward_stream_state_on_device(&static_features, state)
     }
@@ -75,41 +58,16 @@ impl TradingModel {
             );
         }
         let new_deltas = self.cast_inputs(new_deltas);
-        let new_deltas = if new_deltas.dim() == 1 {
-            new_deltas.unsqueeze(0)
-        } else {
-            new_deltas.shallow_clone()
-        };
+        let new_deltas = self.ensure_batched(&new_deltas);
         let batch_size = new_deltas.size()[0];
         let state_batch_size = state.uniform_live_fill.size()[0];
         assert_eq!(
             state_batch_size, batch_size,
             "stream state batch size mismatch"
         );
-        let rows = batch_size * TICKERS_COUNT;
-        let row_deltas = new_deltas.reshape([rows, 1]);
-        let flat_layout = state.uniform_layout.view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
         // Apply shift+append in-place on the state's layout storage. This is the
         // streaming-rollout hot path; we avoid an extra copy by mutating directly.
-        let history_len = PRICE_DELTAS_PER_TICKER as i64;
-        let mut shifted_valid = Tensor::zeros(
-            [rows, history_len - 1],
-            (flat_layout.kind(), flat_layout.device()),
-        );
-        let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
-        let _ = flat_layout
-            .narrow(1, 0, history_len - 1)
-            .copy_(&shifted_valid);
-        let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
-        state.uniform_patch_tokens = self.patch_embed(&flat_layout);
-        state
-            .uniform_live_fill_host
-            .fill(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
-        let _ = state
-            .uniform_live_fill
-            .fill_(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
-        state.initialized = true;
-        self.prefill_uniform_prefix_base_cache(state);
+        self.advance_layout_and_reembed_inplace(state, &new_deltas);
     }
 
     /// Stateless batched replay forward over B pre-built windows.
@@ -118,7 +76,7 @@ impl TradingModel {
     /// layout rows, concatenated across B windows), and `static_features` has shape
     /// `[B, STATIC_OBS]`. The returned ModelOutput has batch `B`.
     ///
-    /// Semantically equivalent to calling `uniform_stream_replay_forward` once per
+    /// Semantically equivalent to calling `cached_readout_forward` once per
     /// window with the appropriate state prefilled; intended for batching PPO
     /// minibatch sub-chunks where the state threading between time steps can be
     /// flattened into the batch dimension.
@@ -139,11 +97,7 @@ impl TradingModel {
         let patch_tokens = self.patch_embed(&layouts);
         probe_replay_tensor("patch_tokens", &patch_tokens);
         let static_features = self.cast_inputs(static_features);
-        let static_features = if static_features.dim() == 1 {
-            static_features.unsqueeze(0)
-        } else {
-            static_features.shallow_clone()
-        };
+        let static_features = self.ensure_batched(&static_features);
         let (global_static, per_ticker_static) = self.parse_static(&static_features, batch_size);
         let exo_tokens = self.build_exo_tokens(&global_static, &per_ticker_static, batch_size);
         probe_replay_tensor("global_static", &global_static);
@@ -174,41 +128,16 @@ impl TradingModel {
         let new_deltas = self.cast_inputs(new_deltas);
         let static_features = self.cast_inputs(static_features);
 
-        let raw_full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
-        let layout_full_obs = self.price_input_dim();
-        let is_full = match new_deltas.dim() {
-            1 => {
-                let width = new_deltas.size()[0];
-                width == raw_full_obs || width == layout_full_obs
-            }
-            2 => {
-                let width = new_deltas.size()[1];
-                width == raw_full_obs || width == layout_full_obs
-            }
-            _ => false,
-        };
-        let static_features = if static_features.dim() == 1 {
-            static_features.unsqueeze(0)
-        } else {
-            static_features.shallow_clone()
-        };
+        let is_full = self.is_full_obs(&new_deltas);
+        let static_features = self.ensure_batched(&static_features);
 
         if self.variant == ModelVariant::UniformStream {
             if is_full {
-                let price = if new_deltas.dim() == 1 {
-                    new_deltas.unsqueeze(0)
-                } else {
-                    new_deltas.shallow_clone()
-                };
+                let price = self.ensure_batched(&new_deltas);
                 self.init_uniform_from_full_on_device(&price, state);
-                return self.uniform_stream_replay_forward(&static_features, state);
+                return self.cached_readout_forward(&static_features, state);
             }
-            return self.step_uniform_stream_state_on_device(
-                &new_deltas,
-                &static_features,
-                state,
-                true,
-            );
+            return self.step_uniform_stream_state_on_device(&new_deltas, &static_features, state);
         }
 
         self.step_on_device(&new_deltas, &static_features, state)
@@ -273,16 +202,8 @@ mod tests {
             false,
         );
 
-        assert_not_close(
-            &out_0.0,
-            &out_1.0,
-            "value logits should depend on price history",
-        );
-        assert_not_close(
-            &out_0.1,
-            &out_1.1,
-            "action mean should depend on price history",
-        );
+        assert_not_close(&out_0.1, &out_1.1, "alpha should depend on price history");
+        assert_not_close(&out_0.2, &out_1.2, "beta should depend on price history");
     }
 
     #[test]

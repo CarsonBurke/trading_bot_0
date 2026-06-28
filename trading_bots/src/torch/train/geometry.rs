@@ -67,3 +67,7 @@ pub(crate) fn minibatch_samples_from_total(total_samples: i64, nprocs: i64) -> i
     let aligned = ((target + nprocs - 1) / nprocs).max(1) * nprocs;
     aligned.min(total_samples)
 }
+
+pub(crate) fn chunk_batch_from_minibatch(minibatch_size: i64, ppo_chunk_len: i64) -> i64 {
+    ((minibatch_size + ppo_chunk_len - 1) / ppo_chunk_len).max(1)
+}

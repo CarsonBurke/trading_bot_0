@@ -5,14 +5,15 @@ use super::blocks::cross_attn::CrossAttnFfnBlock;
 use super::blocks::endogenous::EndogenousTickerBlock;
 use super::blocks::exogenous::ExoMLP;
 use super::blocks::gqa::{GqaBlock, GQA_NUM_Q_HEADS};
+use super::blocks::pma::PmaReadout;
 use super::config::{
     compute_patch_totals, model_spec, ModelVariant, INTER_TICKER_AFTER, NUM_EXO_TOKENS,
     PATCH_SCALAR_FEATS, UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL, UNIFORM_STREAM_LAYOUT_LEN,
     UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
 };
 use super::init::{
-    linear_orthogonal, linear_orthogonal_with_bias, linear_with_same_dtype, residual_init_scale,
-    truncated_normal_init, xavier_normal_std,
+    linear_orthogonal, linear_with_same_dtype, linear_zero, truncated_normal_init,
+    xavier_normal_std,
 };
 use super::rmsnorm::RMSNorm;
 use super::rope::{RotaryEmbedding, ROPE_DIMS};
@@ -49,7 +50,9 @@ impl Default for TradingModelConfig {
 /// Streaming state for inference
 /// - Ring buffer holds full delta history
 /// - Patch buffer accumulates deltas until full patch ready
-/// - No model state needed (GQA is stateless, uses full forward pass)
+/// - No model state needed: the bidirectional trunk recomputes full
+///   self-attention over the S patch window each step (no causal prefix cache),
+///   so streamed/replay readouts are identical to the batched `forward`.
 pub struct StreamState {
     /// Ring buffer: [TICKERS_COUNT, PRICE_DELTAS_PER_TICKER]
     pub delta_ring: Tensor,
@@ -69,22 +72,6 @@ pub struct StreamState {
     pub uniform_live_fill: Tensor,
     /// Host mirror of live fill to avoid per-step device syncs during streamed rollout.
     pub uniform_live_fill_host: Vec<i64>,
-    /// Prefix hidden state after layer-0 self-attention/FFN, before exogenous cross-attention.
-    pub uniform_layer0_prefix_hidden: Tensor,
-    /// Layer-0 prefix K cache for uniform streamed rollout.
-    pub uniform_layer0_prefix_k: Tensor,
-    /// Layer-0 prefix V cache for uniform streamed rollout.
-    pub uniform_layer0_prefix_v: Tensor,
-    /// Per-layer cached prefix K for uniform streamed rollout.
-    pub uniform_prefix_k: Vec<Tensor>,
-    /// Per-layer cached prefix V for uniform streamed rollout.
-    pub uniform_prefix_v: Vec<Tensor>,
-    /// Prefix x0 embedding (post-input_ln) for x0 residual mixing.
-    pub uniform_prefix_x0: Tensor,
-    /// Static features associated with the currently conditioned prefix cache.
-    pub uniform_cached_static_features: Option<Tensor>,
-    /// Exogenous tokens associated with the currently conditioned prefix cache.
-    pub uniform_cached_exo_tokens: Option<Tensor>,
 }
 
 pub struct TradingModel {
@@ -95,15 +82,15 @@ pub struct TradingModel {
     pub(in crate::torch::model) model_dim: i64,
     pub(in crate::torch::model) ff_dim: i64,
     pub(in crate::torch::model) patch_embed_weight: Tensor,
-    pub(in crate::torch::model) role_embeds: Tensor,
+    pub(in crate::torch::model) pma: PmaReadout,
     pub(in crate::torch::model) patch_config_ids: Tensor,
     pub(in crate::torch::model) patch_stream_proj: nn::Linear,
     pub(in crate::torch::model) input_ln: RMSNorm,
     pub(in crate::torch::model) final_ln: RMSNorm,
+    pub(in crate::torch::model) readout_ln: RMSNorm,
     pub(in crate::torch::model) gqa_layers: Vec<GqaBlock>,
     pub(in crate::torch::model) exogenous_ticker_block: CrossAttnFfnBlock,
     pub(in crate::torch::model) exo_mlp: ExoMLP,
-    pub(in crate::torch::model) exo_embed_ln: RMSNorm,
     pub(in crate::torch::model) rope: RotaryEmbedding,
     pub(in crate::torch::model) exo_feat_w: Tensor,
     pub(in crate::torch::model) exo_feat_b: Tensor,
@@ -158,6 +145,66 @@ impl TradingModel {
         }
     }
 
+    pub(in crate::torch::model) fn ensure_batched(&self, t: &Tensor) -> Tensor {
+        if t.dim() == 1 {
+            t.unsqueeze(0)
+        } else {
+            t.shallow_clone()
+        }
+    }
+
+    pub(in crate::torch::model) fn is_full_obs(&self, new_deltas: &Tensor) -> bool {
+        let raw_full_obs = TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64;
+        let layout_full_obs = self.price_input_dim();
+        match new_deltas.dim() {
+            1 => {
+                let width = new_deltas.size()[0];
+                width == raw_full_obs || width == layout_full_obs
+            }
+            2 => {
+                let width = new_deltas.size()[1];
+                width == raw_full_obs || width == layout_full_obs
+            }
+            _ => false,
+        }
+    }
+
+    pub(in crate::torch::model) fn live_fill_from_layout(layout3d: &Tensor) -> Tensor {
+        layout3d
+            .select(1, UNIFORM_STREAM_PATCH_COUNT - 1)
+            .isnan()
+            .logical_not()
+            .sum_dim_intlist([1].as_slice(), false, Kind::Int64)
+    }
+
+    pub(in crate::torch::model) fn advance_layout_and_reembed_inplace(
+        &self,
+        state: &mut StreamState,
+        new_deltas: &Tensor,
+    ) {
+        let rows = new_deltas.size()[0] * TICKERS_COUNT;
+        let row_deltas = new_deltas.reshape([rows, 1]);
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
+        let flat_layout = state.uniform_layout.view([rows, UNIFORM_STREAM_LAYOUT_LEN]);
+        let mut shifted_valid = Tensor::zeros(
+            [rows, history_len - 1],
+            (flat_layout.kind(), flat_layout.device()),
+        );
+        let _ = shifted_valid.copy_(&flat_layout.narrow(1, 1, history_len - 1));
+        let _ = flat_layout
+            .narrow(1, 0, history_len - 1)
+            .copy_(&shifted_valid);
+        let _ = flat_layout.narrow(1, history_len - 1, 1).copy_(&row_deltas);
+        state.uniform_patch_tokens = self.patch_embed(&flat_layout);
+        state
+            .uniform_live_fill_host
+            .fill(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        let _ = state
+            .uniform_live_fill
+            .fill_(UNIFORM_STREAM_BOOTSTRAP_LIVE_FILL);
+        state.initialized = true;
+    }
+
     pub fn variant(&self) -> ModelVariant {
         self.variant
     }
@@ -194,11 +241,7 @@ impl TradingModel {
             ModelVariant::UniformStream,
             "uniform_stream_layout_from_raw_input is only valid for UniformStream",
         );
-        let price = if price_deltas.dim() == 1 {
-            price_deltas.unsqueeze(0)
-        } else {
-            price_deltas.shallow_clone()
-        };
+        let price = self.ensure_batched(price_deltas);
         let price = self.cast_inputs(&self.maybe_to_device(&price, self.device));
         let batch_size = price.size()[0];
         self.uniform_stream_layout_from_raw(
@@ -231,9 +274,6 @@ impl TradingModel {
         );
         assert_eq!(ROPE_DIMS % 2, 0, "RoPE dimensions must be even");
         let gqa_layers_count = spec.gqa_layers;
-        // SA + FFN per layer = 2 sublayers each, plus 1 CA sublayer after layer 0
-        let num_residual_sublayers = gqa_layers_count * 2 + 1;
-        let init_scale = residual_init_scale(num_residual_sublayers);
         let patch_configs = spec.patch_configs;
         let (total_days, seq_len) = compute_patch_totals(patch_configs);
         if config.variant == ModelVariant::UniformStream {
@@ -273,26 +313,20 @@ impl TradingModel {
                 stdev: xavier_std,
             },
         );
-        let role_embeds = p.var(
-            "role_embeds",
-            &[2, spec.model_dim],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 0.02,
-            },
-        );
+        let pma = PmaReadout::new(&(p / "pma_readout"), spec.model_dim, spec.ff_dim);
         let patch_stream_proj = nn::linear(
             p / "patch_stream_proj",
-            UNIFORM_STREAM_PATCH_SIZE + 1, // patch values + fill_fraction
+            UNIFORM_STREAM_PATCH_SIZE,
             spec.model_dim,
             nn::LinearConfig {
-                ws_init: truncated_normal_init(UNIFORM_STREAM_PATCH_SIZE + 1, spec.model_dim),
+                ws_init: truncated_normal_init(UNIFORM_STREAM_PATCH_SIZE, spec.model_dim),
                 bs_init: None,
                 bias: false,
             },
         );
-        let input_ln = RMSNorm::new(&(p / "input_ln"), spec.model_dim, 1e-6);
-        let final_ln = RMSNorm::new(&(p / "final_ln"), spec.model_dim, 1e-6);
+        let input_ln = RMSNorm::new(spec.model_dim, 1e-6);
+        let final_ln = RMSNorm::new(spec.model_dim, 1e-6);
+        let readout_ln = RMSNorm::new(spec.model_dim, 1e-6);
         let patch_config_ids = {
             let mut ids = Vec::with_capacity(seq_len as usize);
             for (cfg_idx, &(days, patch_size)) in patch_configs.iter().enumerate() {
@@ -307,28 +341,14 @@ impl TradingModel {
         };
 
         let gqa_layers = (0..gqa_layers_count)
-            .map(|i| {
-                GqaBlock::new(
-                    &(p / format!("gqa_{}", i)),
-                    spec.model_dim,
-                    spec.ff_dim,
-                    init_scale,
-                    i,
-                )
-            })
+            .map(|i| GqaBlock::new(&(p / format!("gqa_{}", i)), spec.model_dim, spec.ff_dim, i))
             .collect::<Vec<_>>();
-        let exogenous_ticker_block = CrossAttnFfnBlock::new(
-            &(p / "cross_attn_0"),
-            spec.model_dim,
-            spec.ff_dim,
-            init_scale,
-        );
-        let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim, init_scale);
-        let exo_embed_ln = RMSNorm::new(&(p / "exo_embed_ln"), spec.model_dim, 1e-6);
+        let exogenous_ticker_block =
+            CrossAttnFfnBlock::new(&(p / "cross_attn_0"), spec.model_dim, spec.ff_dim);
+        let exo_mlp = ExoMLP::new(&(p / "exo_mlp"), spec.model_dim);
         let head_dim = spec.model_dim / GQA_NUM_Q_HEADS;
-        // +1 trunk position: the actor/critic decision forks replace the last
-        // patch and extend the sequence to S+1.
-        let rope = RotaryEmbedding::new(seq_len + 1, head_dim, ROPE_DIMS, p.device());
+        // Bidirectional trunk runs over exactly S patch positions.
+        let rope = RotaryEmbedding::new(seq_len, head_dim, ROPE_DIMS, p.device());
         let exo_feat_w = p.var(
             "exo_feat_w",
             &[NUM_EXO_TOKENS, spec.model_dim],
@@ -342,12 +362,8 @@ impl TradingModel {
             &[NUM_EXO_TOKENS, spec.model_dim],
             Init::Const(0.0),
         );
-        let endogenous_ticker_block = EndogenousTickerBlock::new(
-            &(p / "inter_ticker_0"),
-            spec.model_dim,
-            spec.ff_dim,
-            init_scale,
-        );
+        let endogenous_ticker_block =
+            EndogenousTickerBlock::new(&(p / "inter_ticker_0"), spec.model_dim, spec.ff_dim);
         assert_eq!(
             ACTION_COUNT, TICKERS_COUNT,
             "per-ticker actor head requires one action per ticker"
@@ -355,8 +371,7 @@ impl TradingModel {
         let flat_all_tickers = TICKERS_COUNT * spec.model_dim;
         let policy_concentration =
             linear_orthogonal(p, "policy_concentration", spec.model_dim, 2, 0.01);
-        let value_proj =
-            linear_orthogonal_with_bias(p, "value_proj", flat_all_tickers, NUM_BINS, 0.1);
+        let value_proj = linear_zero(p, "value_proj", flat_all_tickers, NUM_BINS);
         Self {
             variant: config.variant,
             patch_configs,
@@ -365,15 +380,15 @@ impl TradingModel {
             model_dim: spec.model_dim,
             ff_dim: spec.ff_dim,
             patch_embed_weight,
-            role_embeds,
+            pma,
             patch_config_ids,
             patch_stream_proj,
             input_ln,
             final_ln,
+            readout_ln,
             gqa_layers,
             exogenous_ticker_block,
             exo_mlp,
-            exo_embed_ln,
             rope,
             exo_feat_w,
             exo_feat_b,
@@ -412,14 +427,8 @@ impl TradingModel {
         let seq = x.size()[1];
         let batch_size = bt / TICKERS_COUNT;
         let x_4d = x.view([batch_size, TICKERS_COUNT, seq, self.model_dim]);
-        // Fork layout: the last two positions are the actor/critic decision forks
-        // (which replace the live patch). Mix the last *real* patch (S-2) across
-        // tickers; never mix a fork, so role identities stay intact.
-        let live_idx = if seq > self.seq_len {
-            self.seq_len - 2
-        } else {
-            seq - 1
-        };
+        // Mix the latest patch across tickers (no-op for TICKERS_COUNT == 1).
+        let live_idx = seq - 1;
         let live = x_4d.narrow(2, live_idx, 1);
         let live_for_mix =
             live.permute([0, 2, 1, 3])
@@ -431,13 +440,9 @@ impl TradingModel {
             .permute([0, 2, 1, 3]);
         if seq == 1 {
             enriched_live.reshape([bt, seq, self.model_dim])
-        } else if live_idx + 1 == seq {
+        } else {
             let past = x_4d.narrow(2, 0, seq - 1);
             Tensor::cat(&[&past, &enriched_live], 2).reshape([bt, seq, self.model_dim])
-        } else {
-            let before = x_4d.narrow(2, 0, live_idx);
-            let after = x_4d.narrow(2, live_idx + 1, seq - live_idx - 1);
-            Tensor::cat(&[&before, &enriched_live, &after], 2).reshape([bt, seq, self.model_dim])
         }
     }
 
@@ -469,7 +474,7 @@ impl TradingModel {
         batch_size: i64,
     ) -> Tensor {
         let exo_kv = self.build_exo_kv(global_static, per_ticker_static, batch_size);
-        self.exo_mlp.forward(&self.exo_embed_ln.forward(&exo_kv))
+        self.exo_mlp.forward(&exo_kv)
     }
 
     pub(in crate::torch::model) fn patch_latent_stem_on_device(
@@ -498,8 +503,9 @@ impl TradingModel {
         self.input_ln.forward(&patch_tokens)
     }
 
-    /// Per-config enrichment avoids expanding each patch to the full history width,
-    /// then projects all tokens in one fused einsum.
+    /// Multi-scale BENCHMARK-only path; the default/live training path is
+    /// `patch_embed_stream` (UniformStream). Per-config enrichment avoids expanding
+    /// each patch to the full history width, then projects all tokens in one fused einsum.
     pub(in crate::torch::model) fn patch_embed(&self, deltas: &Tensor) -> Tensor {
         if self.variant == ModelVariant::UniformStream {
             return self.patch_embed_stream(deltas);
@@ -556,29 +562,10 @@ impl TradingModel {
         out
     }
 
-    pub(in crate::torch::model) fn patch_embed_stream_batch(
-        &self,
-        patch_vals: &Tensor,
-        fill_counts: &Tensor,
-    ) -> Tensor {
+    pub(in crate::torch::model) fn patch_embed_stream_batch(&self, patch_vals: &Tensor) -> Tensor {
         let target_kind = patch_vals.kind();
-        let patch_size = UNIFORM_STREAM_PATCH_SIZE;
-        // Build position mask from fill counts — don't read NaN positions
-        let positions = Tensor::arange(patch_size, (Kind::Int64, patch_vals.device()));
-        let mask = positions
-            .unsqueeze(0)
-            .less_tensor(&fill_counts.unsqueeze(-1)); // [batch, patch_size]
-        let patch_vals_float = patch_vals.to_kind(Kind::Float);
-        let clean = patch_vals_float * mask.to_kind(Kind::Float);
-        let fill_fraction = fill_counts.to_kind(Kind::Float).unsqueeze(-1) / patch_size as f64;
-        let input = Tensor::cat(
-            &[
-                &clean.to_kind(target_kind),
-                &fill_fraction.to_kind(target_kind),
-            ],
-            -1,
-        ); // [batch, patch_size + 1]
-        linear_with_same_dtype(&input, &self.patch_stream_proj)
+        let clean = patch_vals.to_kind(Kind::Float).nan_to_num(0.0, 0.0, 0.0);
+        linear_with_same_dtype(&clean.to_kind(target_kind), &self.patch_stream_proj)
     }
 
     pub(in crate::torch::model) fn patch_embed_stream(&self, deltas: &Tensor) -> Tensor {
@@ -587,55 +574,29 @@ impl TradingModel {
             batch * UNIFORM_STREAM_PATCH_COUNT,
             UNIFORM_STREAM_PATCH_SIZE,
         ]);
-        // Compute fill counts per patch from valid (non-NaN) positions
-        let fill_counts = patches
-            .isnan()
-            .logical_not()
-            .to_kind(Kind::Int64)
-            .sum_dim_intlist([1].as_slice(), false, Kind::Int64);
-        self.patch_embed_stream_batch(&patches, &fill_counts).view([
+        self.patch_embed_stream_batch(&patches).view([
             batch,
             UNIFORM_STREAM_PATCH_COUNT,
             self.model_dim,
         ])
     }
 
-    /// Stage 1: causal trunk over the first S-1 patches plus two head-specific
-    /// decision forks that REPLACE the last patch. Each fork is seeded from the
-    /// latest patch embedding `e_{S-1}` plus its learned role identity, and the
-    /// role identity is re-injected at every block. Actor at index S-1, critic at
-    /// index S. Returns post-`final_ln` hidden states `[rows, S+1, model_dim]`.
-    pub(in crate::torch::model) fn causal_patch_trunk(
+    /// Bidirectional trunk over all S patch embeddings: full all-to-all
+    /// self-attention (no causal mask, no fork tokens), RoPE positions
+    /// `arange(S)`. Portfolio cross-attention is injected after layer 0.
+    /// Returns post-`final_ln` hidden states `[rows, S, model_dim]` — the PMA
+    /// key/value source.
+    pub(in crate::torch::model) fn patch_trunk(
         &self,
         patch_hidden: &Tensor,
         exo_tokens: &Tensor,
     ) -> Tensor {
         let num_patches = patch_hidden.size()[1];
-        let kind = patch_hidden.kind();
-        let role = self.role_embeds.to_kind(kind);
-        let e_last = patch_hidden.select(1, num_patches - 1).unsqueeze(1);
-        let forks = &e_last + role.unsqueeze(0);
-        let past = patch_hidden.narrow(1, 0, num_patches - 1);
-        let x0 = Tensor::cat(&[&past, &forks], 1);
-        let seq_len = num_patches + 1;
-        let zeros_patches = Tensor::zeros(
-            [1, num_patches - 1, self.model_dim],
-            (kind, self.device),
-        );
-        let role_bias = Tensor::cat(&[&zeros_patches, &role.unsqueeze(0)], 1);
-        let mut x = x0.shallow_clone();
-        let rope_positions = Tensor::arange(seq_len, (Kind::Int64, self.device));
-        let attn_mask = self.fork_attention_mask(seq_len, kind);
+        let x0 = patch_hidden.shallow_clone();
+        let mut x = patch_hidden.shallow_clone();
+        let rope_positions = Tensor::arange(num_patches, (Kind::Int64, self.device));
         for (layer_idx, layer) in self.gqa_layers.iter().enumerate() {
-            x = layer.forward_with_rope_positions(
-                &x,
-                &x0,
-                &role_bias,
-                &self.rope,
-                &rope_positions,
-                Some(&attn_mask),
-                true,
-            );
+            x = layer.forward_bidirectional(&x, &x0, &self.rope, &rope_positions);
             if layer_idx == 0 {
                 x = self.exogenous_ticker_block.forward(&x, exo_tokens);
             }
@@ -644,28 +605,435 @@ impl TradingModel {
         self.final_ln.forward(&x)
     }
 
-    fn fork_attention_mask(&self, seq_len: i64, kind: Kind) -> Tensor {
-        let idx = Tensor::arange(seq_len, (Kind::Int64, self.device));
-        let query_idx = idx.view([seq_len, 1]);
-        let key_idx = idx.view([1, seq_len]);
-        let causal_block = key_idx.gt_tensor(&query_idx);
-        let fork_cross_block = query_idx
-            .eq(seq_len - 1)
-            .logical_and(&key_idx.eq(seq_len - 2));
-        Tensor::zeros([seq_len, seq_len], (kind, self.device))
-            .masked_fill(&causal_block.logical_or(&fork_cross_block), f64::NEG_INFINITY)
-    }
-
     pub(in crate::torch::model) fn backbone_with_actor_critic_cls(
         &self,
         patch_hidden: &Tensor,
         exo_tokens: &Tensor,
         batch_size: i64,
     ) -> ModelOutput {
-        let trunk = self.causal_patch_trunk(patch_hidden, exo_tokens);
-        let len = trunk.size()[1];
-        let actor_read = trunk.select(1, len - 2);
-        let critic_read = trunk.select(1, len - 1);
+        let encoded = self.patch_trunk(patch_hidden, exo_tokens);
+        let pooled = self.readout_ln.forward(&self.pma.forward(&encoded));
+        let actor_read = pooled.select(1, 0);
+        let critic_read = pooled.select(1, 1);
         self.head_from_actor_critic_cls(&actor_read, &critic_read, batch_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use tch::{nn, Device, Kind, Tensor};
+
+    use super::{ModelVariant, TradingModel, TradingModelConfig, UNIFORM_STREAM_PATCH_SIZE};
+    use crate::torch::constants::TICKERS_COUNT;
+    use crate::torch::load::load_var_store_partial;
+    use crate::torch::value::hl_gauss::HlGaussBins;
+
+    fn temp_checkpoint_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("trading_bot_0_{name}_{}.ot", uuid::Uuid::new_v4()))
+    }
+
+    fn assert_value_head_is_unbiased_zero(model: &TradingModel) {
+        let weight_abs_max = model.value_proj.ws.abs().max().double_value(&[]);
+        assert_eq!(
+            weight_abs_max, 0.0,
+            "legacy value weights must not overwrite zero HL-Gauss head"
+        );
+        assert!(
+            model.value_proj.bs.is_none(),
+            "HL-Gauss value projection should be bias-free"
+        );
+    }
+
+    #[test]
+    fn stream_patch_embed_treats_nan_padding_as_zero() {
+        tch::manual_seed(20260612);
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(
+            &vs.root(),
+            TradingModelConfig {
+                variant: ModelVariant::UniformStream,
+            },
+        );
+
+        let base = Tensor::arange(UNIFORM_STREAM_PATCH_SIZE, (Kind::Float, Device::Cpu)) * 0.001;
+        let nan_padded = base.copy();
+        let zero_padded = base.copy();
+        let tail_start = 10;
+        let tail_len = UNIFORM_STREAM_PATCH_SIZE - tail_start;
+        let _ = nan_padded.narrow(0, tail_start, tail_len).fill_(f64::NAN);
+        let _ = zero_padded.narrow(0, tail_start, tail_len).fill_(0.0);
+
+        let out_nan = model.patch_embed_stream_batch(&nan_padded.unsqueeze(0));
+        let out_zero = model.patch_embed_stream_batch(&zero_padded.unsqueeze(0));
+
+        assert!(
+            out_nan.isfinite().all().int64_value(&[]) == 1,
+            "NaN padding must not leak into patch embeddings"
+        );
+        assert!(
+            out_nan.allclose(&out_zero, 1e-6, 1e-6, false),
+            "NaN-padded tail should embed identically to zero-padded tail"
+        );
+    }
+
+    #[test]
+    fn value_head_initializes_bias_free_to_zero_return() {
+        tch::manual_seed(20260612);
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+
+        let weight_abs_max = model.value_proj.ws.abs().max().double_value(&[]);
+        assert_eq!(
+            weight_abs_max, 0.0,
+            "value head weights should start at zero"
+        );
+
+        assert!(
+            model.value_proj.bs.is_none(),
+            "value head should follow HLGaussLayer and omit bias"
+        );
+
+        let actor = Tensor::randn([TICKERS_COUNT, model.model_dim], (Kind::Float, Device::Cpu));
+        let critic = Tensor::randn([TICKERS_COUNT, model.model_dim], (Kind::Float, Device::Cpu));
+        let (value_logits, _, _) = model.head_from_actor_critic_cls(&actor, &critic, 1);
+        let decoded = HlGaussBins::default_for(Device::Cpu).decode(&value_logits);
+        let decoded_abs_max = decoded.abs().max().double_value(&[]);
+
+        assert!(
+            decoded_abs_max < 1e-6,
+            "zero-logit value head should decode to zero, got abs max {decoded_abs_max}"
+        );
+    }
+
+    #[test]
+    fn current_model_checkpoint_roundtrips_through_partial_loader() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("model_roundtrip");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        vs.save(&path).expect("failed to save checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let _loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        summary.require_complete().unwrap();
+        assert!(summary.loaded > 0, "loader should copy checkpoint tensors");
+        assert!(
+            summary.migrated_legacy_value_head.is_empty(),
+            "current checkpoints should not need value-head migration"
+        );
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn biased_value_head_checkpoint_reports_dropped_bias() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("biased_current_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let stale_weight = Tensor::randn(model.value_proj.ws.size(), (Kind::Float, Device::Cpu));
+        let mut named_tensors = vs
+            .variables()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let tensor = match name.as_str() {
+                    "value_proj.weight" => stale_weight.shallow_clone(),
+                    _ => tensor,
+                };
+                (name, tensor)
+            })
+            .collect::<Vec<_>>();
+        named_tensors.push((
+            "value_proj.bias".to_string(),
+            Tensor::randn([model.value_proj.ws.size()[0]], (Kind::Float, Device::Cpu)),
+        ));
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save biased checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        summary.require_complete().unwrap();
+        let mut migrated = summary.migrated_legacy_value_head.clone();
+        migrated.sort();
+        assert_eq!(
+            migrated,
+            vec![
+                "value_proj.bias".to_string(),
+                "value_proj.weight".to_string()
+            ],
+            "dropped biased-head checkpoints should be surfaced as value-head migration"
+        );
+        assert_value_head_is_unbiased_zero(&loaded_model);
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn partial_current_value_head_checkpoint_remains_strict() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("partial_current_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let named_tensors = vs
+            .variables()
+            .into_iter()
+            .filter(|(name, _)| name != "value_proj.weight")
+            .collect::<Vec<_>>();
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save partial checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let _loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        assert!(
+            summary.require_complete().is_err(),
+            "partial current value head checkpoints must remain strict"
+        );
+        assert!(
+            summary
+                .missing
+                .iter()
+                .any(|missing| missing == "value_proj.weight"),
+            "missing current value_proj.weight should be reported"
+        );
+        assert!(
+            summary.migrated_legacy_value_head.is_empty(),
+            "current value_proj names alone must not trigger legacy migration"
+        );
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn legacy_scalar_value_head_checkpoint_keeps_new_unbiased_zero_head() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("legacy_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let legacy_weight = Tensor::randn(
+            [1, model.value_proj.ws.size()[1]],
+            (Kind::Float, Device::Cpu),
+        );
+        let mut named_tensors = vs
+            .variables()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let tensor = match name.as_str() {
+                    "value_proj.weight" => legacy_weight.shallow_clone(),
+                    _ => tensor,
+                };
+                (name, tensor)
+            })
+            .collect::<Vec<_>>();
+        named_tensors.push((
+            "value_proj.bias".to_string(),
+            Tensor::randn([1], (Kind::Float, Device::Cpu)),
+        ));
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save legacy checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        summary.require_complete().unwrap();
+        let mut migrated = summary.migrated_legacy_value_head.clone();
+        migrated.sort();
+        assert_eq!(
+            migrated,
+            vec![
+                "value_proj.bias".to_string(),
+                "value_proj.weight".to_string()
+            ]
+        );
+        assert_value_head_is_unbiased_zero(&loaded_model);
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn scalar_value_head_with_wrong_input_width_remains_strict() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("wrong_width_scalar_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let legacy_weight = Tensor::randn(
+            [1, model.value_proj.ws.size()[1] - 1],
+            (Kind::Float, Device::Cpu),
+        );
+        let mut named_tensors = vs
+            .variables()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let tensor = match name.as_str() {
+                    "value_proj.weight" => legacy_weight.shallow_clone(),
+                    _ => tensor,
+                };
+                (name, tensor)
+            })
+            .collect::<Vec<_>>();
+        named_tensors.push((
+            "value_proj.bias".to_string(),
+            Tensor::randn([1], (Kind::Float, Device::Cpu)),
+        ));
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save legacy checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let _loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        assert!(
+            summary.require_complete().is_err(),
+            "scalar value heads from a different critic width must remain strict"
+        );
+        assert!(
+            summary
+                .shape_mismatches
+                .iter()
+                .any(|mismatch| mismatch.name == "value_proj.weight"),
+            "wrong-width scalar value_proj.weight should be reported"
+        );
+        assert!(
+            !summary
+                .migrated_legacy_value_head
+                .iter()
+                .any(|name| name == "value_proj.weight"),
+            "wrong-width scalar value_proj.weight should not migrate"
+        );
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn renamed_legacy_value_head_checkpoint_keeps_new_unbiased_zero_head() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("renamed_legacy_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let legacy_weight = Tensor::randn(
+            [255, model.value_proj.ws.size()[1]],
+            (Kind::Float, Device::Cpu),
+        );
+        let legacy_bias = Tensor::randn([255], (Kind::Float, Device::Cpu));
+        let mut named_tensors = vs
+            .variables()
+            .into_iter()
+            .filter(|(name, _)| name != "value_proj.weight")
+            .collect::<Vec<_>>();
+        named_tensors.push(("critic_out.weight".to_string(), legacy_weight));
+        named_tensors.push(("critic_out.bias".to_string(), legacy_bias));
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save legacy checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        summary.require_complete().unwrap();
+        let mut migrated = summary.migrated_legacy_value_head.clone();
+        migrated.sort();
+        assert_eq!(migrated, vec!["value_proj.weight".to_string()]);
+        assert_value_head_is_unbiased_zero(&loaded_model);
+        cleanup.expect("failed to remove temporary checkpoint");
+    }
+
+    #[test]
+    fn nonscalar_value_head_shape_drift_remains_strict() {
+        tch::manual_seed(20260612);
+
+        let path = temp_checkpoint_path("mismatched_value_head");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
+        let legacy_weight = Tensor::randn(
+            [
+                model.value_proj.ws.size()[0],
+                model.value_proj.ws.size()[1] - 1,
+            ],
+            (Kind::Float, Device::Cpu),
+        );
+        let named_tensors = vs
+            .variables()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let tensor = match name.as_str() {
+                    "value_proj.weight" => legacy_weight.shallow_clone(),
+                    _ => tensor,
+                };
+                (name, tensor)
+            })
+            .collect::<Vec<_>>();
+        let named_refs = named_tensors
+            .iter()
+            .map(|(name, tensor)| (name, tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&named_refs, &path).expect("failed to save legacy checkpoint");
+
+        let mut loaded_vs = nn::VarStore::new(Device::Cpu);
+        let _loaded_model =
+            TradingModel::new_with_config(&loaded_vs.root(), TradingModelConfig::default());
+        let summary =
+            load_var_store_partial(&mut loaded_vs, &path).expect("failed to load checkpoint");
+        let cleanup = fs::remove_file(&path);
+
+        assert!(
+            summary.require_complete().is_err(),
+            "non-scalar value-head shape drift must remain strict"
+        );
+        assert!(
+            summary.migrated_legacy_value_head.is_empty(),
+            "non-scalar value-head shape drift should not use legacy migration"
+        );
+        assert!(
+            summary
+                .shape_mismatches
+                .iter()
+                .any(|mismatch| mismatch.name == "value_proj.weight"),
+            "value_proj.weight shape drift should be reported"
+        );
+        cleanup.expect("failed to remove temporary checkpoint");
     }
 }

@@ -1,3 +1,5 @@
+> **SUPERSEDED** by `bidirectional_pma_readout_spec.md` — the causal-reuse + portfolio-relocation variant was rejected; the model is going bidirectional trunk + bidirectional PMA readout with portfolio state retained in the trunk.
+
 # Causal Attention-Pooling Readout Spec
 
 Status: proposal (no implementation). Replaces the last-embedding "fork injection"

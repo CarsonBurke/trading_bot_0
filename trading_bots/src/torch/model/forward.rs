@@ -4,6 +4,22 @@ use tch::Tensor;
 use super::trading_model::{DebugMetrics, ModelOutput, StreamState, TradingModel};
 
 impl TradingModel {
+    fn prepare_inputs(
+        &self,
+        price_deltas: &Tensor,
+        static_features: &Tensor,
+        to_device: bool,
+    ) -> (Tensor, Tensor) {
+        let prep = |input: &Tensor| {
+            if to_device {
+                self.cast_inputs(&self.maybe_to_device(input, self.device))
+            } else {
+                self.cast_inputs(input)
+            }
+        };
+        (prep(price_deltas), prep(static_features))
+    }
+
     fn forward_prepared_on_device(
         &self,
         price_deltas: &Tensor,
@@ -31,8 +47,8 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> ModelOutput {
-        let price_deltas = self.cast_inputs(&self.maybe_to_device(price_deltas, self.device));
-        let static_features = self.cast_inputs(&self.maybe_to_device(static_features, self.device));
+        let (price_deltas, static_features) =
+            self.prepare_inputs(price_deltas, static_features, true);
         self.forward_prepared_on_device(&price_deltas, &static_features)
     }
 
@@ -45,8 +61,8 @@ impl TradingModel {
         if price_deltas.device() != self.device || static_features.device() != self.device {
             panic!("forward_on_device requires tensors on {:?}", self.device);
         }
-        let price_deltas = self.cast_inputs(price_deltas);
-        let static_features = self.cast_inputs(static_features);
+        let (price_deltas, static_features) =
+            self.prepare_inputs(price_deltas, static_features, false);
         self.forward_prepared_on_device(&price_deltas, &static_features)
     }
 
@@ -56,8 +72,8 @@ impl TradingModel {
         static_features: &Tensor,
         _train: bool,
     ) -> (ModelOutput, DebugMetrics) {
-        let price_deltas = self.cast_inputs(&self.maybe_to_device(price_deltas, self.device));
-        let static_features = self.cast_inputs(&self.maybe_to_device(static_features, self.device));
+        let (price_deltas, static_features) =
+            self.prepare_inputs(price_deltas, static_features, true);
         debug_fused("model_price_deltas", &price_deltas);
         debug_fused("model_static_features", &static_features);
         let batch_size = price_deltas.size()[0];

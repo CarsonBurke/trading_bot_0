@@ -1,6 +1,8 @@
 use tch::nn::Init;
 use tch::{nn, Tensor};
 
+pub(in crate::torch::model) const RESIDUAL_OUT_GAIN: f64 = 0.2;
+
 pub(in crate::torch::model) fn linear_with_same_dtype(x: &Tensor, linear: &nn::Linear) -> Tensor {
     let weight = if linear.ws.kind() == x.kind() {
         linear.ws.shallow_clone()
@@ -65,26 +67,7 @@ pub(in crate::torch::model) fn linear_orthogonal(
     )
 }
 
-pub(in crate::torch::model) fn linear_orthogonal_with_bias(
-    p: &nn::Path,
-    name: &str,
-    in_features: i64,
-    out_features: i64,
-    gain: f64,
-) -> nn::Linear {
-    nn::linear(
-        p / name,
-        in_features,
-        out_features,
-        nn::LinearConfig {
-            ws_init: Init::Orthogonal { gain },
-            bs_init: Some(Init::Const(0.0)),
-            bias: true,
-        },
-    )
-}
-
-pub(in crate::torch::model) fn linear_residual_out(
+pub(in crate::torch::model) fn linear_zero(
     p: &nn::Path,
     name: &str,
     in_features: i64,
@@ -102,6 +85,11 @@ pub(in crate::torch::model) fn linear_residual_out(
     )
 }
 
-pub(in crate::torch::model) fn residual_init_scale(num_residual_sublayers: usize) -> f64 {
-    1.0 / (2.0 * num_residual_sublayers as f64).sqrt()
+pub(in crate::torch::model) fn linear_residual_out(
+    p: &nn::Path,
+    name: &str,
+    in_features: i64,
+    out_features: i64,
+) -> nn::Linear {
+    linear_orthogonal(p, name, in_features, out_features, RESIDUAL_OUT_GAIN)
 }

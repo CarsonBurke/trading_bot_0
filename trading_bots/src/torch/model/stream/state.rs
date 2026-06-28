@@ -1,6 +1,5 @@
 use tch::{Kind, Tensor};
 
-use super::super::blocks::gqa::{GQA_NUM_KV_HEADS, GQA_NUM_Q_HEADS};
 use super::super::config::{
     ModelVariant, UNIFORM_STREAM_LAYOUT_LEN, UNIFORM_STREAM_PATCH_COUNT, UNIFORM_STREAM_PATCH_SIZE,
 };
@@ -17,60 +16,17 @@ impl StreamState {
         let _ = self.uniform_patch_tokens.zero_();
         let _ = self.uniform_live_fill.zero_();
         self.uniform_live_fill_host.fill(0);
-        let _ = self.uniform_layer0_prefix_hidden.zero_();
-        let _ = self.uniform_layer0_prefix_k.zero_();
-        let _ = self.uniform_layer0_prefix_v.zero_();
-        let _ = self.uniform_prefix_x0.zero_();
-        self.uniform_prefix_k.clear();
-        self.uniform_prefix_v.clear();
-        self.uniform_cached_static_features = None;
-        self.uniform_cached_exo_tokens = None;
         self.initialized = false;
     }
 }
 
 impl TradingModel {
-    pub(super) fn ensure_stream_cache_kind(
-        &self,
-        state: &mut StreamState,
-        x0: &Tensor,
-        hidden: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-    ) {
-        if state.uniform_prefix_x0.kind() != x0.kind() {
-            state.uniform_prefix_x0 = state.uniform_prefix_x0.to_kind(x0.kind());
-        }
-        if state.uniform_layer0_prefix_hidden.kind() != hidden.kind() {
-            state.uniform_layer0_prefix_hidden =
-                state.uniform_layer0_prefix_hidden.to_kind(hidden.kind());
-        }
-        if state.uniform_layer0_prefix_k.kind() != k.kind() {
-            state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.to_kind(k.kind());
-        }
-        if state.uniform_layer0_prefix_v.kind() != v.kind() {
-            state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.to_kind(v.kind());
-        }
-    }
-
     pub fn detach_stream_state(&self, state: &mut StreamState) {
         if self.variant != ModelVariant::UniformStream {
             return;
         }
         state.uniform_layout = state.uniform_layout.detach();
         state.uniform_patch_tokens = state.uniform_patch_tokens.detach();
-        state.uniform_layer0_prefix_hidden = state.uniform_layer0_prefix_hidden.detach();
-        state.uniform_layer0_prefix_k = state.uniform_layer0_prefix_k.detach();
-        state.uniform_layer0_prefix_v = state.uniform_layer0_prefix_v.detach();
-        state.uniform_prefix_x0 = state.uniform_prefix_x0.detach();
-        state.uniform_prefix_k = state.uniform_prefix_k.iter().map(|t| t.detach()).collect();
-        state.uniform_prefix_v = state.uniform_prefix_v.iter().map(|t| t.detach()).collect();
-        state.uniform_cached_static_features = state
-            .uniform_cached_static_features
-            .as_ref()
-            .map(|t| t.detach());
-        state.uniform_cached_exo_tokens =
-            state.uniform_cached_exo_tokens.as_ref().map(|t| t.detach());
     }
 
     pub fn uniform_stream_snapshot(&self, state: &StreamState) -> Tensor {
@@ -93,7 +49,7 @@ impl TradingModel {
             .view([batch_size, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64])
     }
 
-    fn build_stream_state(&self, batch_size: i64, _cache_conditioned_prefix: bool) -> StreamState {
+    fn build_stream_state(&self, batch_size: i64) -> StreamState {
         let uniform_rows = batch_size * TICKERS_COUNT;
         let activation_kind = self.activation_kind();
         let (delta_ring, patch_buf) = if self.variant == ModelVariant::UniformStream {
@@ -136,49 +92,19 @@ impl TradingModel {
             ),
             uniform_live_fill: Tensor::zeros([batch_size], (Kind::Int64, self.device)),
             uniform_live_fill_host: vec![0; batch_size as usize],
-            uniform_layer0_prefix_hidden: Tensor::zeros(
-                [uniform_rows, UNIFORM_STREAM_PATCH_COUNT - 1, self.model_dim],
-                (activation_kind, self.device),
-            ),
-            uniform_layer0_prefix_k: Tensor::zeros(
-                [
-                    uniform_rows,
-                    GQA_NUM_KV_HEADS,
-                    UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim / GQA_NUM_Q_HEADS,
-                ],
-                (activation_kind, self.device),
-            ),
-            uniform_layer0_prefix_v: Tensor::zeros(
-                [
-                    uniform_rows,
-                    GQA_NUM_KV_HEADS,
-                    UNIFORM_STREAM_PATCH_COUNT - 1,
-                    self.model_dim / GQA_NUM_Q_HEADS,
-                ],
-                (activation_kind, self.device),
-            ),
-            uniform_prefix_x0: Tensor::zeros(
-                [uniform_rows, UNIFORM_STREAM_PATCH_COUNT - 1, self.model_dim],
-                (activation_kind, self.device),
-            ),
-            uniform_prefix_k: Vec::new(),
-            uniform_prefix_v: Vec::new(),
-            uniform_cached_static_features: None,
-            uniform_cached_exo_tokens: None,
             initialized: false,
         }
     }
 
     pub fn init_stream_state(&self) -> StreamState {
-        self.build_stream_state(1, true)
+        self.build_stream_state(1)
     }
 
     pub fn init_stream_state_batched(&self, batch_size: i64) -> StreamState {
-        self.build_stream_state(batch_size, true)
+        self.build_stream_state(batch_size)
     }
 
     pub fn init_replay_stream_state_batched(&self, batch_size: i64) -> StreamState {
-        self.build_stream_state(batch_size, false)
+        self.build_stream_state(batch_size)
     }
 }

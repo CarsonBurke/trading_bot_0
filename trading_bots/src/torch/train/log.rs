@@ -2,13 +2,14 @@ use tch::{Kind, Tensor};
 
 use super::numeric_debug::{
     compute_beta_policy_stats, compute_explained_variance, compute_value_diagnostics,
+    compute_value_diagnostics_symlog,
 };
 use super::trainer::{AdvantageData, Trainer, UpdateMetrics};
 
 impl Trainer {
     pub(super) fn log_episode(
         &mut self,
-        _episode: usize,
+        episode: usize,
         adv_data: &AdvantageData,
         metrics: &UpdateMetrics,
     ) {
@@ -85,7 +86,12 @@ impl Trainer {
         let value_diag_t = if metrics.total_sample_count > 0 {
             compute_value_diagnostics(&self.s_values, &adv_data.returns)
         } else {
-            Tensor::zeros([6], (Kind::Float, device))
+            Tensor::zeros([7], (Kind::Float, device))
+        };
+        let value_diag_symlog_t = if metrics.total_sample_count > 0 {
+            compute_value_diagnostics_symlog(&self.s_values, &adv_data.returns)
+        } else {
+            Tensor::zeros([7], (Kind::Float, device))
         };
 
         let entropy_mean_t = if metrics.total_sample_count > 0 {
@@ -114,32 +120,45 @@ impl Trainer {
                 mean_critic_grad_norm_t.view([1]),
                 clip_fraction_t.view([1]),
                 adv_data.adv_stats.view([3]),
+                adv_data.adv_stats_shaped.view([4]),
                 beta_policy_stats.view([4]),
                 entropy_mean_t.view([1]),
                 metrics.entropy_min.view([1]),
                 metrics.entropy_max.view([1]),
                 return_range_stats.view([6]),
-                value_diag_t.view([6]),
+                value_diag_t.view([7]),
+                value_diag_symlog_t.view([7]),
             ],
             0,
         );
+        let total_scalar_len = all_scalars.size()[0] as usize;
         let all_scalars_vec: Vec<f64> = Vec::try_from(all_scalars.to_device(tch::Device::Cpu))
-            .unwrap_or_else(|_| vec![0.0; 29]);
-        let mean_policy_loss = all_scalars_vec[0];
-        let mean_value_loss = all_scalars_vec[1];
-        let mean_clip_gap = all_scalars_vec[2];
-        let explained_var = all_scalars_vec[3];
-        let mean_actor_grad_norm = all_scalars_vec[4];
-        let mean_critic_grad_norm = all_scalars_vec[5];
-        let clip_fraction = all_scalars_vec[6];
-        let (adv_mean, adv_min, adv_max) =
-            (all_scalars_vec[7], all_scalars_vec[8], all_scalars_vec[9]);
-        let beta_policy_stats_vec = &all_scalars_vec[10..14];
-        let (entropy_mean, entropy_min_val, entropy_max_val) = (
-            all_scalars_vec[14],
-            all_scalars_vec[15],
-            all_scalars_vec[16],
-        );
+            .unwrap_or_else(|_| vec![0.0; total_scalar_len]);
+        // Cursor unpack: consume named groups in the EXACT order they were cat'd above.
+        let mut cur = 0usize;
+        let mut take = |n: usize| {
+            let s = all_scalars_vec[cur..cur + n].to_vec();
+            cur += n;
+            s
+        };
+
+        let mean_policy_loss = take(1)[0];
+        let mean_value_loss = take(1)[0];
+        let mean_clip_gap = take(1)[0];
+        let explained_var = take(1)[0];
+        let mean_actor_grad_norm = take(1)[0];
+        let mean_critic_grad_norm = take(1)[0];
+        let clip_fraction = take(1)[0];
+        let adv_stats = take(3);
+        let (adv_mean, adv_min, adv_max) = (adv_stats[0], adv_stats[1], adv_stats[2]);
+        let adv_shaped = take(4);
+        let (adv_shaped_mean, adv_shaped_std, adv_shaped_min, adv_shaped_max) =
+            (adv_shaped[0], adv_shaped[1], adv_shaped[2], adv_shaped[3]);
+        let beta_policy_stats_vec = take(4);
+        let entropy_stats = take(3);
+        let (entropy_mean, entropy_min_val, entropy_max_val) =
+            (entropy_stats[0], entropy_stats[1], entropy_stats[2]);
+        let return_range = take(6);
         let (
             return_min,
             return_max,
@@ -148,13 +167,14 @@ impl Trainer {
             below_support_frac,
             above_support_frac,
         ) = (
-            all_scalars_vec[17],
-            all_scalars_vec[18],
-            all_scalars_vec[19],
-            all_scalars_vec[20],
-            all_scalars_vec[21],
-            all_scalars_vec[22],
+            return_range[0],
+            return_range[1],
+            return_range[2],
+            return_range[3],
+            return_range[4],
+            return_range[5],
         );
+        let value_diag = take(6);
         let (
             value_pred_mean,
             value_pred_std,
@@ -163,15 +183,34 @@ impl Trainer {
             value_residual_rmse,
             value_return_corr,
         ) = (
-            all_scalars_vec[23],
-            all_scalars_vec[24],
-            all_scalars_vec[25],
-            all_scalars_vec[26],
-            all_scalars_vec[27],
-            all_scalars_vec[28],
+            value_diag[0],
+            value_diag[1],
+            value_diag[2],
+            value_diag[3],
+            value_diag[4],
+            value_diag[5],
+        );
+        let _ = take(1); // skip: redundant plain-space EV (see numeric_debug compute_explained_variance)
+        let value_diag_symlog = take(7);
+        let (
+            value_pred_mean_symlog,
+            value_pred_std_symlog,
+            value_target_mean_symlog,
+            value_target_std_symlog,
+            value_residual_rmse_symlog,
+            value_return_corr_symlog,
+            value_explained_var_symlog,
+        ) = (
+            value_diag_symlog[0],
+            value_diag_symlog[1],
+            value_diag_symlog[2],
+            value_diag_symlog[3],
+            value_diag_symlog[4],
+            value_diag_symlog[5],
+            value_diag_symlog[6],
         );
 
-        let last_minibatch_approx_kl = metrics.last_minibatch_approx_kl;
+        let mean_epoch_approx_kl = metrics.mean_epoch_approx_kl;
         let primary = self.env.primary_mut();
         primary
             .meta_history
@@ -193,9 +232,13 @@ impl Trainer {
         primary
             .meta_history
             .record_policy_entropy(entropy_mean, entropy_min_val, entropy_max_val);
-        primary
-            .meta_history
-            .record_approx_kl(last_minibatch_approx_kl);
+        primary.meta_history.record_approx_kl(mean_epoch_approx_kl);
+        primary.meta_history.record_kl_lr(
+            metrics.lr_scale,
+            metrics.kl_lr_scale_next,
+            metrics.kl_lr_ema,
+            metrics.kl_lr_signal,
+        );
         primary.meta_history.record_hl_gauss_range_stats(
             return_min,
             return_max,
@@ -204,10 +247,28 @@ impl Trainer {
             below_support_frac,
             above_support_frac,
         );
+        if episode % 5 == 0 {
+            let gens_path = self.run_dir.gens.to_string_lossy();
+            primary.meta_history.write_reports(episode, &gens_path);
+        }
 
         println!(
             "  Policy: {:.4}, Value: {:.4} (EV: {:.3}), ClipGap: {:.4}, ActorGradNorm: {:.4}, CriticGradNorm: {:.4}",
             mean_policy_loss, mean_value_loss, explained_var, mean_clip_gap, mean_actor_grad_norm, mean_critic_grad_norm
+        );
+        println!(
+            "  KL-LR: scale {:.3} -> {:.3}, ema {:.4}, last_mb_signal {:.4}",
+            metrics.lr_scale, metrics.kl_lr_scale_next, metrics.kl_lr_ema, metrics.kl_lr_signal
+        );
+        println!(
+            "  Adv raw: μ {:.4}, min {:.4}, max {:.4} | shaped: μ {:.4}, σ {:.4}, min {:.4}, max {:.4}",
+            adv_mean,
+            adv_min,
+            adv_max,
+            adv_shaped_mean,
+            adv_shaped_std,
+            adv_shaped_min,
+            adv_shaped_max
         );
         println!(
             "  ValueDiag: pred μ/σ {:.3}/{:.3}, target μ/σ {:.3}/{:.3}, RMSE {:.3}, Corr {:.3}",
@@ -217,6 +278,16 @@ impl Trainer {
             value_target_std,
             value_residual_rmse,
             value_return_corr
+        );
+        println!(
+            "  ValueDiag(symlog): pred μ/σ {:.3}/{:.3}, target μ/σ {:.3}/{:.3}, RMSE {:.3}, Corr {:.3}, EV {:.3}",
+            value_pred_mean_symlog,
+            value_pred_std_symlog,
+            value_target_mean_symlog,
+            value_target_std_symlog,
+            value_residual_rmse_symlog,
+            value_return_corr_symlog,
+            value_explained_var_symlog
         );
     }
 }

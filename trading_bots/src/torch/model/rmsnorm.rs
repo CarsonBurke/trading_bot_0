@@ -1,4 +1,4 @@
-use tch::nn::{self, Linear};
+use tch::nn::Linear;
 use tch::Tensor;
 
 use super::init::linear_with_same_dtype;
@@ -9,7 +9,7 @@ pub(in crate::torch::model) struct RMSNorm {
 }
 
 impl RMSNorm {
-    pub(in crate::torch::model) fn new(_p: &nn::Path, dim: i64, eps: f64) -> Self {
+    pub(in crate::torch::model) fn new(dim: i64, eps: f64) -> Self {
         Self { dim, eps }
     }
 

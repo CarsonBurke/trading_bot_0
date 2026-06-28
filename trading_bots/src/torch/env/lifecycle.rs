@@ -105,6 +105,7 @@ impl Env {
     }
 
     pub(super) fn handle_episode_end(&mut self, absolute_step: usize) {
+        let history_start_offset = self.episode_start_offset + 1;
         let mut index_return = 0.0;
         for ticker_idx in 0..self.tickers.len() {
             let start_price = self.prices[ticker_idx][self.episode_start_offset];
@@ -162,14 +163,14 @@ impl Env {
                     self.episode,
                     &self.tickers,
                     &self.prices,
-                    self.episode_start_offset,
+                    history_start_offset,
                 );
             } else {
                 self.episode_history.record(
                     self.episode,
                     &self.tickers,
                     &self.prices,
-                    self.episode_start_offset,
+                    history_start_offset,
                 );
             }
             self.meta_history
@@ -320,7 +321,7 @@ impl Env {
             episode,
             &self.tickers,
             &self.prices,
-            self.episode_start_offset,
+            self.episode_start_offset + 1,
         );
     }
 }

@@ -4,7 +4,7 @@ use tch::{nn, Tensor};
 use crate::torch::model::blocks::cross_attn::{CA_HEAD_DIM, CA_NUM_HEADS};
 use crate::torch::model::blocks::gqa::QK_GAIN_INIT;
 use crate::torch::model::init::{
-    relu_sq_linear, linear_residual_out, linear_truncated, linear_with_same_dtype,
+    linear_residual_out, linear_truncated, linear_with_same_dtype, relu_sq_linear,
 };
 use crate::torch::model::rmsnorm::RMSNorm;
 
@@ -22,26 +22,26 @@ pub(in crate::torch::model) struct ExogenousTickerBlock {
 }
 
 impl ExogenousTickerBlock {
-    pub(in crate::torch::model) fn new(p: &nn::Path, model_dim: i64, _init_scale: f64) -> Self {
+    pub(in crate::torch::model) fn new(p: &nn::Path, model_dim: i64) -> Self {
         Self::new_with_output_init(p, model_dim, true)
     }
 
     pub(in crate::torch::model) fn new_with_output_init(
         p: &nn::Path,
         model_dim: i64,
-        residual_zero_out: bool,
+        use_residual_init: bool,
     ) -> Self {
         let ca_dim = CA_NUM_HEADS * CA_HEAD_DIM;
-        let ln_q = RMSNorm::new(&(p / "ln_q"), model_dim, 1e-6);
-        let ln_kv = RMSNorm::new(&(p / "ln_kv"), model_dim, 1e-6);
-        let q_norm = RMSNorm::new(&(p / "ca_q_norm"), CA_HEAD_DIM, 1e-6);
-        let k_norm = RMSNorm::new(&(p / "ca_k_norm"), CA_HEAD_DIM, 1e-6);
+        let ln_q = RMSNorm::new(model_dim, 1e-6);
+        let ln_kv = RMSNorm::new(model_dim, 1e-6);
+        let q_norm = RMSNorm::new(CA_HEAD_DIM, 1e-6);
+        let k_norm = RMSNorm::new(CA_HEAD_DIM, 1e-6);
         let q_gain = p.var("ca_q_gain", &[CA_NUM_HEADS], Init::Const(QK_GAIN_INIT));
         let attn_scale = p.var("ca_attn_scale", &[model_dim], Init::Const(1.0));
         let q_proj = linear_truncated(p, "ca_q", model_dim, ca_dim);
         let k_proj = linear_truncated(p, "ca_k", model_dim, ca_dim);
         let v_proj = linear_truncated(p, "ca_v", model_dim, ca_dim);
-        let out_proj = if residual_zero_out {
+        let out_proj = if use_residual_init {
             linear_residual_out(p, "ca_out", ca_dim, model_dim)
         } else {
             linear_truncated(p, "ca_out", ca_dim, model_dim)
@@ -124,8 +124,8 @@ pub(in crate::torch::model) struct ExoMLP {
 }
 
 impl ExoMLP {
-    pub(in crate::torch::model) fn new(p: &nn::Path, model_dim: i64, _init_scale: f64) -> Self {
-        let in_ln = RMSNorm::new(&(p / "in_ln"), model_dim, 1e-6);
+    pub(in crate::torch::model) fn new(p: &nn::Path, model_dim: i64) -> Self {
+        let in_ln = RMSNorm::new(model_dim, 1e-6);
         let fc1 = linear_truncated(p, "exo_mlp_fc1", model_dim, model_dim);
         let fc2 = linear_residual_out(p, "exo_mlp_fc2", model_dim, model_dim);
         Self { in_ln, fc1, fc2 }

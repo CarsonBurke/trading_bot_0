@@ -295,7 +295,7 @@ impl VecEnv {
             ordered_results[env_idx] = Some(result);
         }
 
-        let mut used_specs = Vec::with_capacity(self.env_group_count());
+        let mut used_keys = None;
         for group_idx in 0..self.env_group_count() {
             let (group_start, group_end) = self.group_bounds(group_idx);
             let group_done = (group_start..group_end).any(|env_idx| {
@@ -320,23 +320,30 @@ impl VecEnv {
                     group_idx
                 );
 
+                if used_keys.is_none() {
+                    used_keys = Some(self.current_group_keys());
+                }
+                let used_keys = used_keys.as_mut().expect("used keys initialized");
+
                 let (mut leader_price_deltas, mut leader_static_obs) =
                     self.envs[group_start].reset_single_resampled_training_episode();
                 let mut spec = self.current_group_episode(group_start);
+                let mut key = spec.key();
                 let mut attempts = 0;
-                while Self::has_used_market_episode(&used_specs, &spec) && attempts < 128 {
+                while Self::has_used_market_episode_key(used_keys, &key) && attempts < 128 {
                     let reset = self.envs[group_start].reset_single_resampled_training_episode();
                     leader_price_deltas = reset.0;
                     leader_static_obs = reset.1;
                     spec = self.current_group_episode(group_start);
+                    key = spec.key();
                     attempts += 1;
                 }
                 assert!(
-                    !Self::has_used_market_episode(&used_specs, &spec),
+                    !Self::has_used_market_episode_key(used_keys, &key),
                     "failed to sample distinct env reset group after {} attempts",
                     attempts
                 );
-                used_specs.push(spec.clone());
+                used_keys.push(key);
 
                 for env_idx in group_start..group_end {
                     let result = ordered_results[env_idx]
@@ -377,7 +384,6 @@ impl VecEnv {
                     self.is_done_buf[env_idx] = result.is_done;
                     self.write_step_obs(env_idx, &result.step_deltas, &result.static_obs);
                 }
-                used_specs.push(self.current_group_episode(group_start));
             }
         }
     }
