@@ -1196,17 +1196,17 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         BufWriter::new(File::create(run_dir.root.join("pretrain_validation.csv"))?);
     writeln!(
         train_epoch_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,next_lat,samples,batches"
+        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples,batches"
     )?;
     writeln!(
         validation_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,next_lat,zero_mse,samples,tickers,batches"
+        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples,tickers,batches"
     )?;
     let mut step_log = if args.log_step_losses {
         let mut log = BufWriter::new(File::create(run_dir.root.join("pretrain_train_steps.csv"))?);
         writeln!(
             log,
-            "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,next_lat,samples"
+            "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples"
         )?;
         Some(log)
     } else {
@@ -1264,10 +1264,12 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 let pred_std_v = losses.pred_std.double_value(&[]);
                 let target_std_v = losses.target_std.double_value(&[]);
                 let probe_terminal_mse_v = losses.probe_terminal_mse.double_value(&[]);
+                let zero_mse_v = losses.zero_mse.double_value(&[]);
+                let probe_explained_variance_v = losses.probe_explained_variance.double_value(&[]);
                 let lat_v = losses.next_lat.double_value(&[]);
                 writeln!(
                     log,
-                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{lat_v:.9},{batch_samples}"
+                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples}"
                 )?;
                 scalar_losses = Some((
                     total_v,
@@ -1286,6 +1288,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     pred_std_v,
                     target_std_v,
                     probe_terminal_mse_v,
+                    zero_mse_v,
+                    probe_explained_variance_v,
                     lat_v,
                 ));
             }
@@ -1308,6 +1312,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     pred_std_v,
                     target_std_v,
                     probe_terminal_mse_v,
+                    zero_mse_v,
+                    probe_explained_variance_v,
                     lat_v,
                 ) = scalar_losses.unwrap_or_else(|| {
                     (
@@ -1327,11 +1333,13 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                         losses.pred_std.double_value(&[]),
                         losses.target_std.double_value(&[]),
                         losses.probe_terminal_mse.double_value(&[]),
+                        losses.zero_mse.double_value(&[]),
+                        losses.probe_explained_variance.double_value(&[]),
                         losses.next_lat.double_value(&[]),
                     )
                 });
                 println!(
-                    "pretrain epoch {epoch} step {global_step} train total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} next_lat={:.6}",
+                    "pretrain epoch {epoch} step {global_step} train total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6}",
                     total_v,
                     jepa_mse_v,
                     sigreg_v,
@@ -1347,6 +1355,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     pred_std_v,
                     target_std_v,
                     probe_terminal_mse_v,
+                    zero_mse_v,
+                    probe_explained_variance_v * 100.0,
                     lat_v
                 );
             }
@@ -1364,7 +1374,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     device,
                 );
                 println!(
-                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} next_lat={:.6} zero_mse={:.6} samples={} tickers={} batches={}",
+                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} samples={} tickers={} batches={}",
                     val.total,
                     val.jepa_mse,
                     val.sigreg,
@@ -1380,15 +1390,16 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.pred_std,
                     val.target_std,
                     val.probe_terminal_mse,
-                    val.next_lat,
                     val.zero_mse,
+                    val.probe_explained_variance * 100.0,
+                    val.next_lat,
                     val.samples,
                     val.tickers,
                     val.batches
                 );
                 writeln!(
                     validation_log,
-                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
                     val.total,
                     val.jepa_mse,
                     val.sigreg,
@@ -1404,8 +1415,9 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.pred_std,
                     val.target_std,
                     val.probe_terminal_mse,
-                    val.next_lat,
                     val.zero_mse,
+                    val.probe_explained_variance,
+                    val.next_lat,
                     val.samples,
                     val.tickers,
                     val.batches
@@ -1438,7 +1450,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
 
         let train = train_epoch_loss.finish();
         println!(
-            "pretrain epoch {epoch} train_mean total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} next_lat={:.6} samples={} batches={}",
+            "pretrain epoch {epoch} train_mean total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} samples={} batches={}",
             train.total,
             train.jepa_mse,
             train.sigreg,
@@ -1454,13 +1466,15 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             train.pred_std,
             train.target_std,
             train.probe_terminal_mse,
+            train.zero_mse,
+            train.probe_explained_variance * 100.0,
             train.next_lat,
             train.samples,
             train.batches
         );
         writeln!(
             train_epoch_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{}",
+            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{}",
             train.total,
             train.jepa_mse,
             train.sigreg,
@@ -1476,6 +1490,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             train.pred_std,
             train.target_std,
             train.probe_terminal_mse,
+            train.zero_mse,
+            train.probe_explained_variance,
             train.next_lat,
             train.samples,
             train.batches
@@ -1521,7 +1537,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             device,
         );
         println!(
-            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} next_lat={:.6} zero_mse={:.6} samples={} tickers={} batches={}",
+            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} samples={} tickers={} batches={}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1537,15 +1553,16 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.pred_std,
             val.target_std,
             val.probe_terminal_mse,
-            val.next_lat,
             val.zero_mse,
+            val.probe_explained_variance * 100.0,
+            val.next_lat,
             val.samples,
             val.tickers,
             val.batches
         );
         writeln!(
             validation_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1561,8 +1578,9 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.pred_std,
             val.target_std,
             val.probe_terminal_mse,
-            val.next_lat,
             val.zero_mse,
+            val.probe_explained_variance,
+            val.next_lat,
             val.samples,
             val.tickers,
             val.batches
@@ -1608,7 +1626,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         best_val = val.total;
         writeln!(
             validation_log,
-            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1624,8 +1642,9 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.pred_std,
             val.target_std,
             val.probe_terminal_mse,
-            val.next_lat,
             val.zero_mse,
+            val.probe_explained_variance,
+            val.next_lat,
             val.samples,
             val.tickers,
             val.batches
@@ -1758,6 +1777,8 @@ fn mean_mse_pretrain_loss(
     let terminal_pred = return_pred.select(-1, terminal_idx);
     let terminal_target = return_target.select(-1, terminal_idx);
     let probe_terminal_mse = terminal_pred.mse_loss(&terminal_target, Reduction::Mean);
+    let zero_mse = return_target.pow_tensor_scalar(2.0).mean(Kind::Float);
+    let probe_explained_variance = explained_variance_tensor(&probe_mse, &zero_mse);
     let base_loss = probe_mse.shallow_clone();
 
     if lambda_lat == 0.0 {
@@ -1780,6 +1801,8 @@ fn mean_mse_pretrain_loss(
             target_abs,
             next_lat,
             probe_terminal_mse,
+            zero_mse,
+            probe_explained_variance,
         };
     }
 
@@ -1813,6 +1836,8 @@ fn mean_mse_pretrain_loss(
         target_abs,
         next_lat: latent_loss,
         probe_terminal_mse,
+        zero_mse,
+        probe_explained_variance,
     }
 }
 
@@ -1848,6 +1873,8 @@ fn lejepa_pretrain_loss(
         .select(2, predictions.belief.size()[2] - 1);
     let probe_target = scaled_next_ohlc_features(&batch.next_ohlc_patch, target_scale);
     let probe = ohlc_probe_metrics(heads, &pred_next_embed.detach(), &probe_target);
+    let zero_mse = probe_target.pow_tensor_scalar(2.0).mean(Kind::Float);
+    let probe_explained_variance = explained_variance_tensor(&probe.probe_mse, &zero_mse);
     let next_lat = zero_like_scalar(&jepa_mse);
     PretrainLoss {
         total,
@@ -1867,6 +1894,8 @@ fn lejepa_pretrain_loss(
         target_abs: probe.target_abs,
         next_lat,
         probe_terminal_mse: probe.probe_terminal_mse,
+        zero_mse,
+        probe_explained_variance,
     }
 }
 
@@ -1883,6 +1912,18 @@ fn scaled_next_ohlc_features(next_ohlc_patch: &Tensor, target_scale: f64) -> Ten
 
 fn zero_like_scalar(reference: &Tensor) -> Tensor {
     Tensor::zeros([], (Kind::Float, reference.device()))
+}
+
+fn explained_variance_tensor(mse: &Tensor, zero_mse: &Tensor) -> Tensor {
+    Tensor::ones([], (Kind::Float, mse.device())) - mse / zero_mse.clamp_min(1e-12)
+}
+
+fn explained_variance_value(mse: f64, zero_mse: f64) -> f64 {
+    if zero_mse <= 1e-12 || !zero_mse.is_finite() || !mse.is_finite() {
+        0.0
+    } else {
+        1.0 - mse / zero_mse
+    }
 }
 
 fn sigreg_loss(patch_tokens: &Tensor) -> Tensor {
@@ -2029,6 +2070,7 @@ struct ValidationLoss {
     next_lat: f64,
     probe_terminal_mse: f64,
     zero_mse: f64,
+    probe_explained_variance: f64,
     samples: usize,
     tickers: usize,
     batches: usize,
@@ -2052,6 +2094,8 @@ struct PretrainLoss {
     target_abs: Tensor,
     next_lat: Tensor,
     probe_terminal_mse: Tensor,
+    zero_mse: Tensor,
+    probe_explained_variance: Tensor,
 }
 
 struct RunningLoss {
@@ -2072,6 +2116,7 @@ struct RunningLoss {
     target_abs_sum: Tensor,
     next_lat_sum: Tensor,
     probe_terminal_mse_sum: Tensor,
+    zero_mse_sum: Tensor,
     samples: usize,
     batches: usize,
 }
@@ -2096,6 +2141,7 @@ impl RunningLoss {
             target_abs_sum: Tensor::zeros([], (Kind::Float, device)),
             next_lat_sum: Tensor::zeros([], (Kind::Float, device)),
             probe_terminal_mse_sum: Tensor::zeros([], (Kind::Float, device)),
+            zero_mse_sum: Tensor::zeros([], (Kind::Float, device)),
             samples: 0,
             batches: 0,
         }
@@ -2121,6 +2167,7 @@ impl RunningLoss {
             self.target_abs_sum += losses.target_abs.detach() * weight;
             self.next_lat_sum += losses.next_lat.detach() * weight;
             self.probe_terminal_mse_sum += losses.probe_terminal_mse.detach() * weight;
+            self.zero_mse_sum += losses.zero_mse.detach() * weight;
             self.samples += samples;
             self.batches += 1;
         });
@@ -2129,6 +2176,8 @@ impl RunningLoss {
     fn finish(self) -> TrainEpochLoss {
         assert!(self.samples > 0, "train epoch is empty");
         let denom = self.samples as f64;
+        let probe_mse = self.probe_mse_sum.double_value(&[]) / denom;
+        let zero_mse = self.zero_mse_sum.double_value(&[]) / denom;
         TrainEpochLoss {
             total: self.total_sum.double_value(&[]) / denom,
             jepa_mse: self.jepa_mse_sum.double_value(&[]) / denom,
@@ -2139,7 +2188,7 @@ impl RunningLoss {
             target_embed_std: self.target_embed_std_sum.double_value(&[]) / denom,
             probe_nll: self.probe_nll_sum.double_value(&[]) / denom,
             probe_mae: self.probe_mae_sum.double_value(&[]) / denom,
-            probe_mse: self.probe_mse_sum.double_value(&[]) / denom,
+            probe_mse,
             pred_std: self.pred_std_sum.double_value(&[]) / denom,
             target_std: self.target_std_sum.double_value(&[]) / denom,
             probe_bias: self.probe_bias_sum.double_value(&[]) / denom,
@@ -2147,6 +2196,8 @@ impl RunningLoss {
             target_abs: self.target_abs_sum.double_value(&[]) / denom,
             next_lat: self.next_lat_sum.double_value(&[]) / denom,
             probe_terminal_mse: self.probe_terminal_mse_sum.double_value(&[]) / denom,
+            zero_mse,
+            probe_explained_variance: explained_variance_value(probe_mse, zero_mse),
             samples: self.samples,
             batches: self.batches,
         }
@@ -2171,6 +2222,8 @@ struct TrainEpochLoss {
     target_abs: f64,
     next_lat: f64,
     probe_terminal_mse: f64,
+    zero_mse: f64,
+    probe_explained_variance: f64,
     samples: usize,
     batches: usize,
 }
@@ -2204,6 +2257,8 @@ struct PretrainScalarHistory {
     eval_probe_nll: Vec<f32>,
     train_probe_mae: Vec<f32>,
     eval_probe_mae: Vec<f32>,
+    train_probe_explained_variance: Vec<f32>,
+    eval_probe_explained_variance: Vec<f32>,
     train_pred_std: Vec<f32>,
     eval_pred_std: Vec<f32>,
     train_target_std: Vec<f32>,
@@ -2233,6 +2288,10 @@ impl PretrainScalarHistory {
         self.eval_probe_nll.push(val.probe_nll as f32);
         self.train_probe_mae.push(train.probe_mae as f32);
         self.eval_probe_mae.push(val.probe_mae as f32);
+        self.train_probe_explained_variance
+            .push(train.probe_explained_variance as f32);
+        self.eval_probe_explained_variance
+            .push(val.probe_explained_variance as f32);
         self.train_pred_std.push(train.pred_std as f32);
         self.eval_pred_std.push(val.pred_std as f32);
         self.train_target_std.push(train.target_std as f32);
@@ -2307,6 +2366,13 @@ fn write_pretrain_scalar_meta_reports(
         "target-scaled prediction MAE",
         &history.train_probe_mae,
         &history.eval_probe_mae,
+    )?;
+    write_pretrain_scalar_report(
+        &epoch_dir.join("pretrain_probe_explained_variance.report.bin"),
+        format!("Pretrain Probe Explained Variance - epoch {epoch} step {global_step}"),
+        "1 - probe MSE / zero baseline MSE",
+        &history.train_probe_explained_variance,
+        &history.eval_probe_explained_variance,
     )?;
     write_pretrain_scalar_report(
         &epoch_dir.join("pretrain_pred_std.report.bin"),
@@ -2528,6 +2594,8 @@ fn validate_full(
         }
 
         assert!(samples > 0, "validation set is empty");
+        let probe_mse = probe_mse_sum / samples as f64;
+        let zero_mse = zero_mse_sum / samples as f64;
         ValidationLoss {
             total: total_sum / samples as f64,
             jepa_mse: jepa_mse_sum / samples as f64,
@@ -2538,7 +2606,7 @@ fn validate_full(
             target_embed_std: target_embed_std_sum / samples as f64,
             probe_nll: probe_nll_sum / samples as f64,
             probe_mae: probe_mae_sum / samples as f64,
-            probe_mse: probe_mse_sum / samples as f64,
+            probe_mse,
             pred_std: pred_std_sum / samples as f64,
             target_std: target_std_sum / samples as f64,
             probe_bias: probe_bias_sum / samples as f64,
@@ -2546,7 +2614,8 @@ fn validate_full(
             target_abs: target_abs_sum / samples as f64,
             next_lat: next_lat_sum / samples as f64,
             probe_terminal_mse: probe_terminal_mse_sum / samples as f64,
-            zero_mse: zero_mse_sum / samples as f64,
+            zero_mse,
+            probe_explained_variance: explained_variance_value(probe_mse, zero_mse),
             samples,
             tickers,
             batches,

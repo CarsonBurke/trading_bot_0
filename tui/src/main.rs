@@ -266,6 +266,7 @@ impl App {
             "pretrain_pred_embed_std",
             "pretrain_target_embed_std",
             "pretrain_probe_mae",
+            "pretrain_probe_explained_variance",
             "pretrain_pred_std",
             "pretrain_target_std",
             "pretrain_probe_terminal_mse",
