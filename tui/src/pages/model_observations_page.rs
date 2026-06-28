@@ -101,13 +101,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             ]));
                             left_lines.push(Line::from(""));
 
-                            let global_labels = [
-                                "Cash %",
-                                "PnL",
-                                "Drawdown",
-                                "Commissions",
-                                "Fill Ratio",
-                            ];
+                            let global_labels =
+                                ["Cash %", "PnL", "Drawdown", "Commissions", "Fill Ratio"];
 
                             for (i, label) in global_labels.iter().enumerate() {
                                 if i < obs_vec.len() {

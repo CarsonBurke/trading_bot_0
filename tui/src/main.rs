@@ -258,6 +258,18 @@ impl App {
             "pretrain_horizon_error",
             "pretrain_horizon_uncertainty",
             "pretrain_horizon_std_error",
+            "pretrain_return_mse",
+            "pretrain_sigreg",
+            "pretrain_jepa_mse",
+            "pretrain_repr_std_mean",
+            "pretrain_repr_std_min",
+            "pretrain_pred_embed_std",
+            "pretrain_target_embed_std",
+            "pretrain_probe_nll",
+            "pretrain_return_mae",
+            "pretrain_pred_std",
+            "pretrain_target_std",
+            "pretrain_terminal_mse",
         ];
 
         // Ticker-specific chart base names
