@@ -3127,16 +3127,18 @@ fn chained_candles_from_ohlc_features(features: &[f32], seed: &CandleBar) -> Vec
 }
 
 /// Reconstruct a bar's sanitized OHLC proportions from its own intra-bar feature
-/// channels, anchoring `open` at 1.0. Mirrors `build_ohlc_features`' sanitized
-/// convention: the returned `high`/`low` are the sanitized high/low
-/// (max/min over open, raw high/low, close) that serve as the denominators for
-/// the next bar's inter-bar deltas, so seeding a chain with this bar telescopes
-/// exactly into the following bars' sanitized OHLC (up to the `1/open` scale).
+/// channels for use as a chain seed. With the close-anchored decode the chain
+/// only consumes `seed.close`, so anchor `close` at 1.0 and derive
+/// open/high/low from it via the O/C, H/C, L/C channels (mirroring the decode).
+/// Seeding a chain with this bar telescopes into the following bars' sanitized
+/// OHLC up to the `1/close` scale.
 fn seed_candle_from_feature_row(row: &[f32]) -> CandleBar {
-    let open = 1.0f64;
-    let high = (open / (1.0 + row[4] as f64)).max(1e-6);
-    let low = (open / (1.0 + row[5] as f64)).max(1e-6);
-    let close = (open / (1.0 + row[6] as f64)).max(1e-6);
+    let close = 1.0f64;
+    let open = (close * (1.0 + row[6] as f64)).max(1e-6);
+    let high0 = (close * (1.0 + row[9] as f64)).max(1e-6);
+    let low0 = (close * (1.0 + row[12] as f64)).max(1e-6);
+    let high = open.max(high0).max(low0).max(close);
+    let low = open.min(high0).min(low0).min(close).max(1e-6);
     CandleBar {
         open: open as f32,
         high: high as f32,
@@ -3146,10 +3148,14 @@ fn seed_candle_from_feature_row(row: &[f32]) -> CandleBar {
 }
 
 fn candle_from_ohlc_feature_row(row: &[f32], prev: &CandleBar) -> CandleBar {
-    let open = (prev.open as f64 * (1.0 + row[0] as f64)).max(1e-6);
-    let high0 = (prev.high as f64 * (1.0 + row[1] as f64)).max(1e-6);
-    let low0 = (prev.low as f64 * (1.0 + row[2] as f64)).max(1e-6);
+    // Close-anchored decode: only the close level chains across bars, and the
+    // intra-bar open/high/low are derived from this bar's own close via its
+    // O/C, H/C, L/C channels. This bounds the per-bar high-low range instead of
+    // letting the four channels diffuse apart independently across a rollout.
     let close = (prev.close as f64 * (1.0 + row[3] as f64)).max(1e-6);
+    let open = (close * (1.0 + row[6] as f64)).max(1e-6);
+    let high0 = (close * (1.0 + row[9] as f64)).max(1e-6);
+    let low0 = (close * (1.0 + row[12] as f64)).max(1e-6);
     let high = open.max(high0).max(low0).max(close);
     let low = open.min(high0).min(low0).min(close).max(1e-6);
     CandleBar {
