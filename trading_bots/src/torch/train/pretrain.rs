@@ -3383,13 +3383,17 @@ mod tests {
         let prev = mk(100.0, 105.0, 98.0, 102.0);
         let cur = mk(102.0, 108.0, 101.0, 106.0);
         let feats = build_ohlc_features(&[prev, cur]);
+        // Close-anchored decode consumes only prev.close; the other prev fields
+        // are bogus here to prove they no longer leak into reconstruction.
         let prev_candle = CandleBar {
-            open: 100.0,
-            high: 105.0,
-            low: 98.0,
+            open: 1.0,
+            high: 999.0,
+            low: 0.001,
             close: 102.0,
         };
         let candle = candle_from_ohlc_feature_row(&feats[1], &prev_candle);
+        // close = prev.close*(1+C/prevC), then open/high/low derive from close
+        // via O/C, H/C, L/C, recovering cur's sanitized OHLC.
         assert!((candle.close - 106.0).abs() < 1e-3, "close {}", candle.close);
         assert!((candle.open - 102.0).abs() < 1e-3, "open {}", candle.open);
         assert!((candle.high - 108.0).abs() < 1e-3, "high {}", candle.high);
@@ -3429,10 +3433,10 @@ mod tests {
         let candles = chained_candles_from_ohlc_features(&windowed, &seed);
         assert_eq!(candles.len(), bars.len() - 1);
 
-        // The seed anchors bar0's open at 1.0, so reconstruction recovers each
-        // later bar's SANITIZED OHLC scaled by 1/bar0.open. Shape fidelity, not
-        // just per-row math: fails with the old {1,1,1,1} seed.
-        let scale = 1.0 / bars[0].open;
+        // The seed anchors bar0's close at 1.0, so the close-anchored chain
+        // recovers each later bar's SANITIZED OHLC scaled by 1/bar0.close.
+        // Shape fidelity, not just per-row math: fails with a flat {1,1,1,1} seed.
+        let scale = 1.0 / bars[0].close;
         for (i, candle) in candles.iter().enumerate() {
             let bar = &bars[i + 1];
             let high_san = bar.high.max(bar.open).max(bar.close);
