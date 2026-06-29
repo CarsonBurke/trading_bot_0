@@ -36,6 +36,7 @@ const LEJEPA_AR_LAYERS: usize = 5;
 const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
 const LEJEPA_ROPE_DIMS: i64 = 32;
+const LEJEPA_CYCLE_WEIGHT: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -1788,11 +1789,25 @@ fn lejepa_pretrain_loss(
     let (repr_std_mean, repr_std_min) = representation_std_metrics(&latest_token);
     let pred_embed_std = pred_bar_embeds.std(false);
     let target_embed_std = target_bar_tokens.std(false);
-    let total = &jepa_mse + &sigreg * lambda_sigreg;
 
     let pred_next_embed = predictions
         .belief
         .select(2, predictions.belief.size()[2] - 1);
+    let (decoded_mean, _) = heads.probe_ohlc_features(&pred_next_embed.detach());
+    let recon_bar = &decoded_mean / target_scale;
+    let recon_token = autocast(false, || heads.encode_bar_tokens(&recon_bar, train));
+    let cycle = recon_token
+        .view_as(&latest_token)
+        .mse_loss(&latest_token.detach(), Reduction::Mean);
+    let total = &jepa_mse + &sigreg * lambda_sigreg + &cycle * LEJEPA_CYCLE_WEIGHT;
+    if train {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CYCLE_LOG_STEP: AtomicUsize = AtomicUsize::new(0);
+        if CYCLE_LOG_STEP.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
+            println!("lejepa cycle={:.9}", cycle.double_value(&[]));
+        }
+    }
+
     let probe_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
     let probe = ohlc_probe_metrics(heads, &pred_next_embed.detach(), &probe_target);
     let zero_mse = probe_target.pow_tensor_scalar(2.0).mean(Kind::Float);
@@ -2900,34 +2915,35 @@ fn write_trace_reports(
 }
 
 fn chained_candles_from_ohlc_features(features: &[f32]) -> Vec<CandleBar> {
-    let mut running_close = 1.0f32;
+    let mut prev = CandleBar {
+        open: 1.0,
+        high: 1.0,
+        low: 1.0,
+        close: 1.0,
+    };
     features
         .chunks_exact(OHLC_BAR_FEATURES)
         .map(|row| {
-            let candle = candle_from_ohlc_feature_row(row, running_close);
-            running_close = candle.close;
+            let candle = candle_from_ohlc_feature_row(row, &prev);
+            prev = candle.clone();
             candle
         })
         .collect()
 }
 
-fn candle_from_ohlc_feature_row(row: &[f32], prev_close: f32) -> CandleBar {
-    let open = prev_close.max(1e-6) * row[0].clamp(-6.0, 6.0).exp();
-    let high_raw = open * safe_exp(row[1]);
-    let low_raw = open * safe_exp(row[2]);
-    let close = (open * safe_exp(row[3])).max(1e-6);
-    let high = high_raw.max(open).max(close).max(low_raw);
-    let low = low_raw.min(open).min(close).min(high_raw).max(1e-6);
+fn candle_from_ohlc_feature_row(row: &[f32], prev: &CandleBar) -> CandleBar {
+    let open = (prev.open as f64 * (1.0 + row[0] as f64)).max(1e-6);
+    let high0 = (prev.high as f64 * (1.0 + row[1] as f64)).max(1e-6);
+    let low0 = (prev.low as f64 * (1.0 + row[2] as f64)).max(1e-6);
+    let close = (prev.close as f64 * (1.0 + row[3] as f64)).max(1e-6);
+    let high = open.max(high0).max(low0).max(close);
+    let low = open.min(high0).min(low0).min(close).max(1e-6);
     CandleBar {
-        open: open.max(1e-6),
-        high,
-        low,
-        close,
+        open: open as f32,
+        high: high as f32,
+        low: low as f32,
+        close: close as f32,
     }
-}
-
-fn safe_exp(value: f32) -> f32 {
-    value.clamp(-2.0, 2.0).exp()
 }
 
 fn tensor_to_vec_f32(tensor: &Tensor) -> Result<Vec<f32>> {
@@ -3065,13 +3081,13 @@ fn configure_threads() {
 #[cfg(test)]
 mod tests {
     use super::{
-        bar_history_for_current_perm, build_split_offsets, cumulative_future_returns,
-        future_patches_for_current_perm, next_bars_for_current_perm, sigreg_loss, PretrainHeads,
-        SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
+        bar_history_for_current_perm, build_split_offsets, candle_from_ohlc_feature_row,
+        cumulative_future_returns, future_patches_for_current_perm, next_bars_for_current_perm,
+        sigreg_loss, CandleBar, PretrainHeads, SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
-        env::{Env, OHLC_BAR_FEATURES},
+        env::{build_ohlc_features, Env, OHLC_BAR_FEATURES},
         model::{ModelVariant, TradingModel, TradingModelConfig},
     };
     use tch::nn;
@@ -3103,7 +3119,7 @@ mod tests {
     }
 
     #[test]
-    fn bar_history_matches_observation_window_and_close_returns() {
+    fn bar_history_matches_observation_window_and_close_deltas() {
         let mut env = Env::new(false);
         let offset = crate::torch::constants::PRICE_DELTAS_PER_TICKER;
         let _ = env.reset_single_at_offset_for_pretrain(offset);
@@ -3118,12 +3134,42 @@ mod tests {
         let real_idx = env.ticker_perm[0];
         let first_bar_idx = offset + 1 - PRICE_DELTAS_PER_TICKER;
         let last_bar_idx = offset;
-        assert_eq!(bars[4], env.price_deltas[real_idx][first_bar_idx] as f32);
-        let last_close_return_offset = (PRICE_DELTAS_PER_TICKER - 1) * OHLC_BAR_FEATURES + 4;
+        assert_eq!(bars[3], env.ohlc_features[real_idx][first_bar_idx][3]);
+        let last_close_delta_offset = (PRICE_DELTAS_PER_TICKER - 1) * OHLC_BAR_FEATURES + 3;
         assert_eq!(
-            bars[last_close_return_offset],
-            env.price_deltas[real_idx][last_bar_idx] as f32
+            bars[last_close_delta_offset],
+            env.ohlc_features[real_idx][last_bar_idx][3]
         );
+    }
+
+    #[test]
+    fn ohlc_feature_round_trip_recovers_candle() {
+        use ibapi::market_data::historical::Bar;
+        use time::{Duration, OffsetDateTime};
+        let mk = |open: f64, high: f64, low: f64, close: f64| Bar {
+            date: OffsetDateTime::UNIX_EPOCH + Duration::minutes(5),
+            open,
+            high,
+            low,
+            close,
+            volume: 1_000.0,
+            wap: close,
+            count: 1,
+        };
+        let prev = mk(100.0, 105.0, 98.0, 102.0);
+        let cur = mk(102.0, 108.0, 101.0, 106.0);
+        let feats = build_ohlc_features(&[prev, cur]);
+        let prev_candle = CandleBar {
+            open: 100.0,
+            high: 105.0,
+            low: 98.0,
+            close: 102.0,
+        };
+        let candle = candle_from_ohlc_feature_row(&feats[1], &prev_candle);
+        assert!((candle.close - 106.0).abs() < 1e-3, "close {}", candle.close);
+        assert!((candle.open - 102.0).abs() < 1e-3, "open {}", candle.open);
+        assert!((candle.high - 108.0).abs() < 1e-3, "high {}", candle.high);
+        assert!((candle.low - 101.0).abs() < 1e-3, "low {}", candle.low);
     }
 
     #[test]
@@ -3140,7 +3186,7 @@ mod tests {
         );
 
         let real_idx = env.ticker_perm[0];
-        assert_eq!(bars[4], env.price_deltas[real_idx][offset + 1] as f32);
+        assert_eq!(bars[3], env.ohlc_features[real_idx][offset + 1][3]);
     }
 
     #[test]

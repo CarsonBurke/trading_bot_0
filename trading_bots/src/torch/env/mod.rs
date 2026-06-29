@@ -12,4 +12,5 @@ mod trade_experiments;
 mod vec;
 
 pub use single::{Env, OHLC_BAR_FEATURES};
+pub(crate) use single::build_ohlc_features;
 pub use vec::{CpuStepBatch, VecEnv};
