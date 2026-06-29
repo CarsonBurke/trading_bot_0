@@ -581,18 +581,31 @@ impl PretrainHeads {
         (mean, logvar)
     }
 
-    fn lejepa_imagined_rollout(&self, context_bars: &Tensor, train: bool) -> Tensor {
-        let mut tokens = self.encode_bar_tokens(context_bars, train);
+    fn lejepa_imagined_rollout(
+        &self,
+        context_bars: &Tensor,
+        target_scale: f64,
+        train: bool,
+    ) -> Tensor {
+        let mut tokens = self.encode_bar_tokens(context_bars, train).detach();
         let batch = tokens.size()[0];
         let mut imagined = Vec::with_capacity(LEJEPA_ROLLOUT_BARS as usize);
         for _ in 0..LEJEPA_ROLLOUT_BARS {
             let preds = self.predict_lejepa_bar_predictions(&tokens, train);
             let last = tokens.size()[2] - 1;
-            let next_latent = preds.projected.narrow(2, last, 1);
             let belief_last = preds.belief.narrow(2, last, 1);
-            let (mean, _logvar) = self.probe_ohlc_features(&belief_last.detach());
-            imagined.push(mean.view([batch, LEJEPA_BAR_FEATURES]));
-            tokens = Tensor::cat(&[&tokens, &next_latent], 2);
+            let (mean, logvar) = self.probe_ohlc_features(&belief_last.detach());
+            let sigma = (logvar * 0.5).exp();
+            let sampled = &mean + &sigma * Tensor::randn_like(&mean);
+            let bar_feat = &sampled / target_scale;
+            let next_token = self.encode_bar_tokens(&bar_feat, train).detach();
+            imagined.push(sampled.view([batch, LEJEPA_BAR_FEATURES]));
+            tokens = Tensor::cat(&[&tokens, &next_token], 2);
+            let len = tokens.size()[2];
+            let max_len = PRICE_DELTAS_PER_TICKER as i64;
+            if len > max_len {
+                tokens = tokens.narrow(2, len - max_len, max_len);
+            }
         }
         Tensor::stack(&imagined, 1)
     }
@@ -2634,34 +2647,32 @@ fn write_pretrain_diagnostics(
                     sampler.target_scale,
                     device,
                 );
-                let (predicted, actual, predicted_ohlc, actual_ohlc, predicted_level_sigma) =
-                    match objective {
-                        PretrainObjective::MeanMse => {
-                            let pred = predict_future_returns(model, heads, &batch);
-                            let actual = cumulative_future_returns(&batch.future_patches);
-                            (
-                                tensor_to_vec_f32(&pred)?,
-                                tensor_to_vec_f32(&actual)?,
-                                None,
-                                None,
-                                None,
-                            )
-                        }
-                        PretrainObjective::Lejepa => {
-                            let belief = predict_lejepa_next_bar_belief(model, heads, &batch);
-                            let (mean, logvar) = heads.probe_ohlc_features(&belief);
-                            let predicted_ohlc = mean / sampler.target_scale;
-                            let level_sigma =
-                                (logvar.select(3, 0) * 0.5).exp() / sampler.target_scale;
-                            (
-                                Vec::new(),
-                                Vec::new(),
-                                Some(tensor_to_vec_f32(&predicted_ohlc)?),
-                                Some(tensor_to_vec_f32(&batch.next_bars)?),
-                                Some(tensor_to_vec_f32(&level_sigma)?),
-                            )
-                        }
-                    };
+                let (predicted, actual, predicted_ohlc, actual_ohlc) = match objective {
+                    PretrainObjective::MeanMse => {
+                        let pred = predict_future_returns(model, heads, &batch);
+                        let actual = cumulative_future_returns(&batch.future_patches);
+                        (
+                            tensor_to_vec_f32(&pred)?,
+                            tensor_to_vec_f32(&actual)?,
+                            None,
+                            None,
+                        )
+                    }
+                    PretrainObjective::Lejepa => {
+                        let imagined = heads.lejepa_imagined_rollout(
+                            &batch.bar_history,
+                            sampler.target_scale,
+                            false,
+                        );
+                        let predicted_ohlc = imagined / sampler.target_scale;
+                        (
+                            Vec::new(),
+                            Vec::new(),
+                            Some(tensor_to_vec_f32(&predicted_ohlc)?),
+                            Some(tensor_to_vec_f32(&batch.next_bars)?),
+                        )
+                    }
+                };
 
                 for (sample_idx, &offset) in chunk.iter().enumerate() {
                     let mut sample_abs = 0.0;
@@ -2712,23 +2723,11 @@ fn write_pretrain_diagnostics(
                                     bias_sum[h] += bar_bias / denom;
                                     sample_abs += bar_abs / denom;
                                 }
-                                let sigma_start = sample_idx * horizon;
-                                let sigma_end = sigma_start + horizon;
-                                let level_sigma = &predicted_level_sigma
-                                    .as_ref()
-                                    .expect("LEJEPA predicted level sigma missing")
-                                    [sigma_start..sigma_end];
                                 (
                                     Vec::new(),
                                     Vec::new(),
-                                    Some(anchor_relative_candles_from_ohlc_features(
-                                        actual_features,
-                                        None,
-                                    )),
-                                    Some(anchor_relative_candles_from_ohlc_features(
-                                        predicted_features,
-                                        Some(level_sigma),
-                                    )),
+                                    Some(chained_candles_from_ohlc_features(actual_features)),
+                                    Some(chained_candles_from_ohlc_features(predicted_features)),
                                 )
                             }
                         };
@@ -2900,31 +2899,16 @@ fn write_trace_reports(
     Ok(())
 }
 
-fn anchor_relative_candles_from_ohlc_features(
-    features: &[f32],
-    level_sigma: Option<&[f32]>,
-) -> Vec<CandleBar> {
+fn chained_candles_from_ohlc_features(features: &[f32]) -> Vec<CandleBar> {
+    let mut running_close = 1.0f32;
     features
         .chunks_exact(OHLC_BAR_FEATURES)
-        .enumerate()
-        .map(|(bar, row)| {
-            let candle = candle_from_ohlc_feature_row(row, 1.0);
-            match level_sigma {
-                Some(sigma) => widen_candle_level_cone(candle, sigma[bar]),
-                None => candle,
-            }
+        .map(|row| {
+            let candle = candle_from_ohlc_feature_row(row, running_close);
+            running_close = candle.close;
+            candle
         })
         .collect()
-}
-
-fn widen_candle_level_cone(candle: CandleBar, level_sigma: f32) -> CandleBar {
-    let band = level_sigma.clamp(0.0, 6.0);
-    CandleBar {
-        open: candle.open,
-        close: candle.close,
-        high: candle.high * band.exp(),
-        low: (candle.low * (-band).exp()).max(1e-6),
-    }
 }
 
 fn candle_from_ohlc_feature_row(row: &[f32], prev_close: f32) -> CandleBar {
@@ -3083,7 +3067,7 @@ mod tests {
     use super::{
         bar_history_for_current_perm, build_split_offsets, cumulative_future_returns,
         future_patches_for_current_perm, next_bars_for_current_perm, sigreg_loss, PretrainHeads,
-        SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_PROBE_BARS,
+        SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -3151,7 +3135,7 @@ mod tests {
         assert_eq!(
             bars.len(),
             crate::torch::constants::TICKERS_COUNT as usize
-                * LEJEPA_PROBE_BARS as usize
+                * LEJEPA_ROLLOUT_BARS as usize
                 * OHLC_BAR_FEATURES
         );
 
@@ -3214,28 +3198,15 @@ mod tests {
     }
 
     #[test]
-    fn probe_heads_produce_distinct_horizon_predictions() {
+    fn probe_predicts_single_next_bar() {
         let vs = nn::VarStore::new(tch::Device::Cpu);
         let latent_dim = 256;
         let heads = PretrainHeads::new(&vs.root(), latent_dim, 16, 25);
         let batch = 4;
-        let belief = Tensor::randn([batch, latent_dim], (tch::Kind::Float, tch::Device::Cpu));
+        let belief = Tensor::randn([batch, 1, latent_dim], (tch::Kind::Float, tch::Device::Cpu));
         let (pred, logvar) = heads.probe_ohlc_features(&belief);
-        assert_eq!(
-            pred.size(),
-            vec![batch, 1, LEJEPA_PROBE_BARS, LEJEPA_BAR_FEATURES]
-        );
-        assert_eq!(
-            logvar.size(),
-            vec![batch, 1, LEJEPA_PROBE_BARS, LEJEPA_BAR_FEATURES]
-        );
-        let first_feature = pred.select(3, 0).view([batch, LEJEPA_PROBE_BARS]);
-        let horizon_var = first_feature.var_dim(1, true, false);
-        let min_var = horizon_var.min().double_value(&[]);
-        assert!(
-            min_var > 1e-8,
-            "expected non-flat horizon predictions, min across-horizon variance was {min_var}"
-        );
+        assert_eq!(pred.size(), vec![batch, 1, 1, LEJEPA_BAR_FEATURES]);
+        assert_eq!(logvar.size(), vec![batch, 1, 1, LEJEPA_BAR_FEATURES]);
 
         let sigma = (&logvar * 0.5).exp();
         assert!(
@@ -3244,12 +3215,38 @@ mod tests {
         );
         let min_sigma = sigma.min().double_value(&[]);
         assert!(min_sigma > 0.0, "predicted sigma must be positive, got {min_sigma}");
-        let level_sigma = sigma.select(3, 0).view([batch, LEJEPA_PROBE_BARS]);
-        let level_sigma_hvar = level_sigma.var_dim(1, true, false);
-        let min_sigma_hvar = level_sigma_hvar.min().double_value(&[]);
+    }
+
+    #[test]
+    fn imagined_rollout_grows_tokens_and_yields_rollout_bars() {
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let latent_dim = 256;
+        let heads = PretrainHeads::new(&vs.root(), latent_dim, 16, 25);
+        let batch = 2;
+        let context_len = 8;
+        let context = Tensor::randn(
+            [batch, 1, context_len, LEJEPA_BAR_FEATURES],
+            (tch::Kind::Float, tch::Device::Cpu),
+        );
+
+        let mut tokens = heads.encode_bar_tokens(&context, false);
+        let start_len = tokens.size()[2];
+        for step in 0..3 {
+            let preds = heads.predict_lejepa_bar_predictions(&tokens, false);
+            let last = tokens.size()[2] - 1;
+            let next_latent = preds.projected.narrow(2, last, 1);
+            tokens = Tensor::cat(&[&tokens, &next_latent], 2);
+            assert_eq!(tokens.size()[2], start_len + step + 1);
+        }
+
+        let imagined = heads.lejepa_imagined_rollout(&context, 1000.0, false);
+        assert_eq!(
+            imagined.size(),
+            vec![batch, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]
+        );
         assert!(
-            min_sigma_hvar > 1e-10,
-            "expected non-degenerate per-horizon sigma, min across-horizon variance was {min_sigma_hvar}"
+            imagined.isfinite().all().int64_value(&[]) != 0,
+            "imagined rollout must be finite"
         );
     }
 }
