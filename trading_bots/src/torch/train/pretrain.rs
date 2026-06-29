@@ -30,6 +30,7 @@ const LEJEPA_SIGREG_POSITIONS: i64 = 256;
 const LEJEPA_SIGREG_KNOTS: i64 = 17;
 const LEJEPA_BAR_FEATURES: i64 = OHLC_BAR_FEATURES as i64;
 const LEJEPA_PROBE_BARS: i64 = 50;
+const LEJEPA_PROBE_HEAD_HIDDEN: i64 = 128;
 const LEJEPA_AR_LAYERS: usize = 5;
 const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
@@ -97,9 +98,8 @@ struct PretrainHeads {
     lejepa_pred_proj: nn::Linear,
     lejepa_pred_projector: ProjectionMlp,
     rope: RotaryEmbedding,
-    probe_fc1: nn::Linear,
-    probe_ohlc_out: nn::Linear,
-    probe_horizon_embed: Tensor,
+    probe_head_fc1: Vec<nn::Linear>,
+    probe_head_out: Vec<nn::Linear>,
     next_patch_embed: nn::Linear,
     latent_fc1: nn::Linear,
     latent_fc2: nn::Linear,
@@ -313,21 +313,22 @@ impl PretrainHeads {
                 Default::default(),
             ),
         };
-        let probe_fc1 = nn::linear(p / "probe_fc1", latent_dim, ff_dim, Default::default());
-        let probe_ohlc_out = nn::linear(
-            p / "probe_ohlc_out",
-            ff_dim,
-            LEJEPA_BAR_FEATURES,
-            Default::default(),
-        );
-        let probe_horizon_embed = p.var(
-            "probe_horizon_embed",
-            &[LEJEPA_PROBE_BARS, latent_dim],
-            nn::Init::Randn {
-                mean: 0.0,
-                stdev: 0.02,
-            },
-        );
+        let mut probe_head_fc1 = Vec::with_capacity(LEJEPA_PROBE_BARS as usize);
+        let mut probe_head_out = Vec::with_capacity(LEJEPA_PROBE_BARS as usize);
+        for i in 0..LEJEPA_PROBE_BARS {
+            probe_head_fc1.push(nn::linear(
+                p / format!("probe_head{i}_fc1"),
+                latent_dim,
+                LEJEPA_PROBE_HEAD_HIDDEN,
+                Default::default(),
+            ));
+            probe_head_out.push(nn::linear(
+                p / format!("probe_head{i}_out"),
+                LEJEPA_PROBE_HEAD_HIDDEN,
+                LEJEPA_BAR_FEATURES,
+                Default::default(),
+            ));
+        }
         let next_patch_embed = nn::linear(
             p / "next_patch_embed",
             patch_size,
@@ -352,9 +353,8 @@ impl PretrainHeads {
             lejepa_pred_proj,
             lejepa_pred_projector,
             rope,
-            probe_fc1,
-            probe_ohlc_out,
-            probe_horizon_embed,
+            probe_head_fc1,
+            probe_head_out,
             next_patch_embed,
             latent_fc1,
             latent_fc2,
@@ -558,12 +558,13 @@ impl PretrainHeads {
 
     fn probe_ohlc_features(&self, belief: &Tensor) -> Tensor {
         let batch = belief.size()[0];
-        let cond = belief.view([batch, 1, self.latent_dim])
-            + self
-                .probe_horizon_embed
-                .view([1, LEJEPA_PROBE_BARS, self.latent_dim]);
-        let hidden = self.probe_fc1.forward(&cond).relu();
-        self.probe_ohlc_out.forward(&hidden).view([
+        let per_horizon: Vec<Tensor> = self
+            .probe_head_fc1
+            .iter()
+            .zip(&self.probe_head_out)
+            .map(|(fc1, out)| out.forward(&fc1.forward(belief).relu()))
+            .collect();
+        Tensor::stack(&per_horizon, 1).view([
             batch,
             1,
             LEJEPA_PROBE_BARS,
@@ -2969,7 +2970,8 @@ fn configure_threads() {
 mod tests {
     use super::{
         bar_history_for_current_perm, build_split_offsets, cumulative_future_returns,
-        future_patches_for_current_perm, next_bars_for_current_perm, SplitKind, LEJEPA_PROBE_BARS,
+        future_patches_for_current_perm, next_bars_for_current_perm, PretrainHeads, SplitKind,
+        LEJEPA_BAR_FEATURES, LEJEPA_PROBE_BARS,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -3080,5 +3082,26 @@ mod tests {
             .first()
             .expect("validation offsets should be non-empty");
         assert!(last_train + 16 * 25 <= first_validation);
+    }
+
+    #[test]
+    fn probe_heads_produce_distinct_horizon_predictions() {
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let latent_dim = 256;
+        let heads = PretrainHeads::new(&vs.root(), latent_dim, 16, 25);
+        let batch = 4;
+        let belief = Tensor::randn([batch, latent_dim], (tch::Kind::Float, tch::Device::Cpu));
+        let pred = heads.probe_ohlc_features(&belief);
+        assert_eq!(
+            pred.size(),
+            vec![batch, 1, LEJEPA_PROBE_BARS, LEJEPA_BAR_FEATURES]
+        );
+        let first_feature = pred.select(3, 0).view([batch, LEJEPA_PROBE_BARS]);
+        let horizon_var = first_feature.var_dim(1, true, false);
+        let min_var = horizon_var.min().double_value(&[]);
+        assert!(
+            min_var > 1e-8,
+            "expected non-flat horizon predictions, min across-horizon variance was {min_var}"
+        );
     }
 }
