@@ -585,20 +585,67 @@ impl PretrainHeads {
         &self,
         context_bars: &Tensor,
         target_scale: f64,
+        temperature: f64,
         train: bool,
     ) -> Tensor {
+        self.lejepa_imagined_rollout_inner(context_bars, target_scale, temperature, train, false)
+            .0
+    }
+
+    fn lejepa_imagined_rollout_inner(
+        &self,
+        context_bars: &Tensor,
+        target_scale: f64,
+        temperature: f64,
+        train: bool,
+        collect_entropy: bool,
+    ) -> (Tensor, Option<RolloutEntropy>) {
+        let deterministic = temperature == 0.0;
         let mut tokens = self.encode_bar_tokens(context_bars).detach();
         let batch = tokens.size()[0];
         let mut imagined = Vec::with_capacity(LEJEPA_ROLLOUT_BARS as usize);
+        let mut ent_means: Vec<Tensor> = Vec::new();
+        let mut ent_noise: Vec<Tensor> = Vec::new();
+        let mut ent_cos = 0.0f64;
+        let mut ent_rel = 0.0f64;
         for _ in 0..LEJEPA_ROLLOUT_BARS {
             let preds = self.predict_lejepa_bar_predictions(&tokens, train);
             let last = tokens.size()[2] - 1;
             let belief_last = preds.belief.narrow(2, last, 1);
             let (mean, logvar) = self.probe_ohlc_features(&belief_last.detach());
             let sigma = (logvar * 0.5).exp();
-            let sampled = &mean + &sigma * Tensor::randn_like(&mean);
+            let sampled = if deterministic {
+                mean.shallow_clone()
+            } else {
+                &mean + temperature * &sigma * Tensor::randn_like(&mean)
+            };
             let bar_feat = &sampled / target_scale;
             let next_token = self.encode_bar_tokens(&bar_feat).detach();
+            if collect_entropy {
+                let mean_feat = &mean / target_scale;
+                let token_mean = self.encode_bar_tokens(&mean_feat).detach();
+                let ts = next_token.view([batch, -1]);
+                let tm = token_mean.view([batch, -1]);
+                let ts_n = ts
+                    .square()
+                    .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
+                    .sqrt();
+                let tm_n = tm
+                    .square()
+                    .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
+                    .sqrt();
+                let diff_n = (&ts - &tm)
+                    .square()
+                    .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
+                    .sqrt();
+                let dot = (&ts * &tm).sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
+                let cos = (&dot / (&ts_n * &tm_n + 1e-8)).mean(Kind::Float);
+                let rel = (&diff_n / (&tm_n + 1e-8)).mean(Kind::Float);
+                ent_cos += cos.double_value(&[]);
+                ent_rel += rel.double_value(&[]);
+                ent_means.push(mean.view([batch, LEJEPA_BAR_FEATURES]));
+                ent_noise.push((&sampled - &mean).view([batch, LEJEPA_BAR_FEATURES]));
+            }
             imagined.push(sampled.view([batch, LEJEPA_BAR_FEATURES]));
             tokens = Tensor::cat(&[&tokens, &next_token], 2);
             let len = tokens.size()[2];
@@ -607,7 +654,28 @@ impl PretrainHeads {
                 tokens = tokens.narrow(2, len - max_len, max_len);
             }
         }
-        Tensor::stack(&imagined, 1)
+        let entropy = if collect_entropy {
+            let steps = LEJEPA_ROLLOUT_BARS as f64;
+            let noise_stack = Tensor::stack(&ent_noise, 1);
+            let sampled_delta_std = noise_stack.std(false).double_value(&[]);
+            let means_stack = Tensor::stack(&ent_means, 1);
+            let mu = means_stack.mean_dim([1i64].as_slice(), true, Kind::Float);
+            let mean_step_std = (&means_stack - &mu)
+                .square()
+                .mean_dim([1i64].as_slice(), false, Kind::Float)
+                .sqrt()
+                .mean(Kind::Float)
+                .double_value(&[]);
+            Some(RolloutEntropy {
+                token_cos: ent_cos / steps,
+                token_rel_l2: ent_rel / steps,
+                sampled_delta_std,
+                mean_step_std,
+            })
+        } else {
+            None
+        };
+        (Tensor::stack(&imagined, 1), entropy)
     }
 
     fn predict_next_latent(&self, latent: &Tensor, next_patch: &Tensor) -> Tensor {
@@ -2601,6 +2669,21 @@ struct DiagnosticTrace {
     predicted_candles: Option<Vec<CandleBar>>,
 }
 
+struct RolloutEntropy {
+    token_cos: f64,
+    token_rel_l2: f64,
+    sampled_delta_std: f64,
+    mean_step_std: f64,
+}
+
+struct VariantCandles {
+    label: String,
+    actual: Vec<CandleBar>,
+    det: Vec<CandleBar>,
+    smp: Vec<CandleBar>,
+    hot: Vec<CandleBar>,
+}
+
 fn write_pretrain_diagnostics(
     model: &TradingModel,
     heads: &PretrainHeads,
@@ -2630,6 +2713,12 @@ fn write_pretrain_diagnostics(
     let mut count = 0usize;
     let mut first_traces = Vec::new();
     let mut worst_traces: Vec<DiagnosticTrace> = Vec::new();
+    let mut variant_traces: Vec<VariantCandles> = Vec::new();
+    let mut ent_cos = 0.0f64;
+    let mut ent_rel = 0.0f64;
+    let mut ent_delta = 0.0f64;
+    let mut ent_mstep = 0.0f64;
+    let mut ent_n = 0usize;
 
     let k_patches = sampler.k_patches;
     let patch_size = sampler.patch_size;
@@ -2666,6 +2755,8 @@ fn write_pretrain_diagnostics(
                     target_scale,
                     device,
                 );
+                let mut det_ohlc: Option<Vec<f32>> = None;
+                let mut hot_ohlc: Option<Vec<f32>> = None;
                 let (predicted, actual, predicted_ohlc, actual_ohlc) = match objective {
                     PretrainObjective::MeanMse => {
                         let pred = predict_future_returns(model, heads, &batch);
@@ -2678,11 +2769,34 @@ fn write_pretrain_diagnostics(
                         )
                     }
                     PretrainObjective::Lejepa => {
-                        let imagined = heads.lejepa_imagined_rollout(
+                        let (imagined, entropy) = heads.lejepa_imagined_rollout_inner(
                             &batch.bar_history,
                             target_scale,
+                            1.0,
+                            false,
+                            true,
+                        );
+                        if let Some(e) = entropy {
+                            ent_cos += e.token_cos;
+                            ent_rel += e.token_rel_l2;
+                            ent_delta += e.sampled_delta_std;
+                            ent_mstep += e.mean_step_std;
+                            ent_n += 1;
+                        }
+                        let det = heads.lejepa_imagined_rollout(
+                            &batch.bar_history,
+                            target_scale,
+                            0.0,
                             false,
                         );
+                        let hot = heads.lejepa_imagined_rollout(
+                            &batch.bar_history,
+                            target_scale,
+                            4.0,
+                            false,
+                        );
+                        det_ohlc = Some(tensor_to_vec_f32(&(det / target_scale))?);
+                        hot_ohlc = Some(tensor_to_vec_f32(&(hot / target_scale))?);
                         let predicted_ohlc = imagined / target_scale;
                         (
                             Vec::new(),
@@ -2753,6 +2867,38 @@ fn write_pretrain_diagnostics(
                                 let seed = seed_candle_from_feature_row(
                                     &env.ohlc_features[seed_idx][offset],
                                 );
+                                if variant_traces.len() < TRACE_COUNT {
+                                    let det_features = &det_ohlc
+                                        .as_ref()
+                                        .expect("LEJEPA det OHLC missing")
+                                        [feature_start..feature_end];
+                                    let hot_features = &hot_ohlc
+                                        .as_ref()
+                                        .expect("LEJEPA hot OHLC missing")
+                                        [feature_start..feature_end];
+                                    variant_traces.push(VariantCandles {
+                                        label: format!(
+                                            "sample_{:02}",
+                                            variant_traces.len() + 1
+                                        ),
+                                        actual: chained_candles_from_ohlc_features(
+                                            actual_features,
+                                            &seed,
+                                        ),
+                                        det: chained_candles_from_ohlc_features(
+                                            det_features,
+                                            &seed,
+                                        ),
+                                        smp: chained_candles_from_ohlc_features(
+                                            predicted_features,
+                                            &seed,
+                                        ),
+                                        hot: chained_candles_from_ohlc_features(
+                                            hot_features,
+                                            &seed,
+                                        ),
+                                    });
+                                }
                                 (
                                     Vec::new(),
                                     Vec::new(),
@@ -2866,8 +3012,55 @@ fn write_pretrain_diagnostics(
             trace,
         )?;
     }
+    for vt in &variant_traces {
+        write_variant_candle_report(
+            &samples_dir, &vt.label, "det", epoch, global_step, &vt.actual, &vt.det,
+        )?;
+        write_variant_candle_report(
+            &samples_dir, &vt.label, "smp", epoch, global_step, &vt.actual, &vt.smp,
+        )?;
+        write_variant_candle_report(
+            &samples_dir, &vt.label, "hot", epoch, global_step, &vt.actual, &vt.hot,
+        )?;
+    }
+    if ent_n > 0 {
+        let n = ent_n as f64;
+        println!(
+            "lejepa rollout entropy: token_cos_sampled_vs_mean={:.4} token_relL2={:.4} sampled_delta_std={:.5} mean_step_std={:.5}",
+            ent_cos / n,
+            ent_rel / n,
+            ent_delta / n,
+            ent_mstep / n,
+        );
+    }
 
     Ok(())
+}
+
+fn write_variant_candle_report(
+    dir: &Path,
+    prefix: &str,
+    variant: &str,
+    epoch: usize,
+    global_step: usize,
+    actual: &[CandleBar],
+    predicted: &[CandleBar],
+) -> Result<()> {
+    write_report_file(
+        &dir.join(format!("{prefix}_{variant}_candles.report.bin")),
+        &Report {
+            title: format!(
+                "Pretrain Rollout {variant} Candles - epoch {epoch} step {global_step} - {prefix}"
+            ),
+            x_label: Some("forecast bar".to_string()),
+            y_label: Some("relative price".to_string()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::CandleCompare {
+                actual: actual.to_vec(),
+                predicted: predicted.to_vec(),
+            },
+        },
+    )
 }
 
 fn write_trace_reports(
@@ -3409,7 +3602,7 @@ mod tests {
             assert_eq!(tokens.size()[2], start_len + step + 1);
         }
 
-        let imagined = heads.lejepa_imagined_rollout(&context, 1000.0, false);
+        let imagined = heads.lejepa_imagined_rollout(&context, 1000.0, 1.0, false);
         assert_eq!(
             imagined.size(),
             vec![batch, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]
