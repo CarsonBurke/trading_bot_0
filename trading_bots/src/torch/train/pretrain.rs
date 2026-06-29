@@ -6,7 +6,7 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
-use tch::{autocast, nn, nn::Module, Device, Kind, Reduction, Tensor};
+use tch::{autocast, nn, nn::Module, nn::ModuleT, Device, Kind, Reduction, Tensor};
 
 use crate::data::universe::cached_eligible_training_universe;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
@@ -29,7 +29,7 @@ const LEJEPA_SIGREG_PROJECTIONS: i64 = 1024;
 const LEJEPA_SIGREG_POSITIONS: i64 = 256;
 const LEJEPA_SIGREG_KNOTS: i64 = 17;
 const LEJEPA_BAR_FEATURES: i64 = OHLC_BAR_FEATURES as i64;
-const LEJEPA_PROBE_BARS: i64 = 50;
+const LEJEPA_PROBE_BARS: i64 = 100;
 const LEJEPA_PROBE_LR: f64 = 1e-3;
 const LEJEPA_WEIGHT_DECAY: f64 = 1e-3;
 const LEJEPA_AR_LAYERS: usize = 5;
@@ -75,6 +75,7 @@ struct CausalLejepaLayer {
 
 struct ProjectionMlp {
     fc1: nn::Linear,
+    bn: nn::BatchNorm,
     fc2: nn::Linear,
 }
 
@@ -244,6 +245,11 @@ impl PretrainHeads {
                 LEJEPA_PROJECTOR_HIDDEN_DIM,
                 Default::default(),
             ),
+            bn: nn::batch_norm1d(
+                p / "lejepa_projector_bn",
+                LEJEPA_PROJECTOR_HIDDEN_DIM,
+                Default::default(),
+            ),
             fc2: nn::linear(
                 p / "lejepa_projector_fc2",
                 LEJEPA_PROJECTOR_HIDDEN_DIM,
@@ -304,6 +310,11 @@ impl PretrainHeads {
             fc1: nn::linear(
                 p / "lejepa_pred_projector_fc1",
                 latent_dim,
+                LEJEPA_PROJECTOR_HIDDEN_DIM,
+                Default::default(),
+            ),
+            bn: nn::batch_norm1d(
+                p / "lejepa_pred_projector_bn",
                 LEJEPA_PROJECTOR_HIDDEN_DIM,
                 Default::default(),
             ),
@@ -441,7 +452,7 @@ impl PretrainHeads {
         self.return_mean_from_readout(&readout, batch, tickers)
     }
 
-    fn encode_bar_tokens(&self, bars: &Tensor) -> Tensor {
+    fn encode_bar_tokens(&self, bars: &Tensor, train: bool) -> Tensor {
         let size = bars.size();
         let batch = size[0];
         let tickers = size[1];
@@ -455,7 +466,7 @@ impl PretrainHeads {
             &normalize_last_dim(&self.bar_enrich_fc1.forward(&normalize_last_dim(&h))).gelu("none"),
         );
         let h = h + enriched;
-        let tokens = self.projection_mlp(&h, &self.lejepa_projector);
+        let tokens = self.projection_mlp(&h, &self.lejepa_projector, train);
         tokens.view([batch, tickers, length, self.latent_dim])
     }
 
@@ -475,7 +486,7 @@ impl PretrainHeads {
             x = self.causal_lejepa_layer(&x, layer, &positions, train);
         }
         let belief = self.lejepa_pred_proj.forward(&normalize_last_dim(&x));
-        let projected = self.projection_mlp(&belief, &self.lejepa_pred_projector);
+        let projected = self.projection_mlp(&belief, &self.lejepa_pred_projector, train);
         LejepaBarPredictions {
             belief: belief.view([batch, tickers, length, self.latent_dim]),
             projected: projected.view([batch, tickers, length, self.latent_dim]),
@@ -543,12 +554,12 @@ impl PretrainHeads {
         layer.ff_out.forward(&(gate * value))
     }
 
-    fn projection_mlp(&self, x: &Tensor, mlp: &ProjectionMlp) -> Tensor {
+    fn projection_mlp(&self, x: &Tensor, mlp: &ProjectionMlp, train: bool) -> Tensor {
         let shape = x.size();
         let rows = x.numel() as i64 / self.latent_dim;
         let flat = x.view([rows, self.latent_dim]);
         let hidden = mlp.fc1.forward(&flat);
-        let hidden = normalize_last_dim(&hidden).gelu("none");
+        let hidden = mlp.bn.forward_t(&hidden, train).gelu("none");
         mlp.fc2.forward(&hidden).view(shape.as_slice())
     }
 
@@ -1705,7 +1716,7 @@ fn lejepa_pretrain_loss(
     let _ = model;
 
     let full = Tensor::cat(&[&batch.bar_history, &batch.next_bars.narrow(2, 0, 1)], 2);
-    let all_tokens = autocast(false, || heads.encode_bar_tokens(&full));
+    let all_tokens = autocast(false, || heads.encode_bar_tokens(&full, train));
     let length = batch.bar_history.size()[2];
     let bar_tokens = all_tokens.narrow(2, 0, length);
     let target_bar_tokens = all_tokens.narrow(2, 1, length);
@@ -1724,7 +1735,13 @@ fn lejepa_pretrain_loss(
         0,
     );
     let sigreg_tokens = all_tokens.index_select(2, &sample_idx);
-    let sigreg = sigreg_loss(&sigreg_tokens.reshape([-1, heads.latent_dim]));
+    let batch_tickers = sigreg_tokens.size()[0] * sigreg_tokens.size()[1];
+    let sigreg = sigreg_loss(
+        &sigreg_tokens
+            .permute([2, 0, 1, 3])
+            .contiguous()
+            .reshape([k, batch_tickers, heads.latent_dim]),
+    );
     let (repr_std_mean, repr_std_min) = representation_std_metrics(&latest_token);
     let pred_embed_std = pred_bar_embeds.std(false);
     let target_embed_std = target_bar_tokens.std(false);
@@ -1788,43 +1805,38 @@ fn explained_variance_value(mse: f64, zero_mse: f64) -> f64 {
     }
 }
 
-fn sigreg_loss(latest_token: &Tensor) -> Tensor {
-    let size = latest_token.size();
-    let rows = size[0];
-    let dim = size[1];
-    let proj = latest_token.to_kind(Kind::Float);
+fn sigreg_loss(tokens: &Tensor) -> Tensor {
+    let size = tokens.size();
+    let samples = size[1];
+    let dim = size[2];
+    let proj_in = tokens.to_kind(Kind::Float);
     let mut directions = Tensor::randn(
         [dim, LEJEPA_SIGREG_PROJECTIONS],
-        (Kind::Float, latest_token.device()),
+        (Kind::Float, tokens.device()),
     );
     directions = &directions
         / directions
             .norm_scalaropt_dim(2, [0i64].as_slice(), true)
             .clamp_min(1e-7);
-    let t = Tensor::linspace(
-        0.0,
-        3.0,
-        LEJEPA_SIGREG_KNOTS,
-        (Kind::Float, latest_token.device()),
-    );
+    let t = Tensor::linspace(0.0, 3.0, LEJEPA_SIGREG_KNOTS, (Kind::Float, tokens.device()));
     let dt = 3.0 / (LEJEPA_SIGREG_KNOTS - 1) as f64;
     let weights = Tensor::full(
         [LEJEPA_SIGREG_KNOTS],
         2.0 * dt,
-        (Kind::Float, latest_token.device()),
+        (Kind::Float, tokens.device()),
     );
     let _ = weights.narrow(0, 0, 1).fill_(dt);
     let _ = weights.narrow(0, LEJEPA_SIGREG_KNOTS - 1, 1).fill_(dt);
     let phi = (-t.square() * 0.5).exp();
     let weights = weights * &phi;
-    let x_t = proj.matmul(&directions).unsqueeze(-1) * t.view([1, 1, -1]);
-    let cos_err = x_t.cos().mean_dim([0i64].as_slice(), false, Kind::Float) - &phi;
-    let sin_err = x_t.sin().mean_dim([0i64].as_slice(), false, Kind::Float);
+    let proj = proj_in.matmul(&directions);
+    let x_t = proj.unsqueeze(-1) * t.view([1, 1, 1, -1]);
+    let cos_err = x_t.cos().mean_dim([1i64].as_slice(), false, Kind::Float) - phi.view([1, 1, -1]);
+    let sin_err = x_t.sin().mean_dim([1i64].as_slice(), false, Kind::Float);
     let err = cos_err.square() + sin_err.square();
-    (err * weights.view([1, -1]))
-        .sum_dim_intlist([-1i64].as_slice(), false, Kind::Float)
-        .mean(Kind::Float)
-        * rows as f64
+    let weighted = (err * weights.view([1, 1, -1]))
+        .sum_dim_intlist([-1i64].as_slice(), false, Kind::Float);
+    weighted.mean(Kind::Float) * samples as f64
 }
 
 fn representation_std_metrics(tokens: &Tensor) -> (Tensor, Tensor) {
@@ -1900,7 +1912,7 @@ fn predict_lejepa_next_bar_belief(
     batch: &PretrainBatch,
 ) -> Tensor {
     let _ = model;
-    let bar_tokens = autocast(false, || heads.encode_bar_tokens(&batch.bar_history));
+    let bar_tokens = autocast(false, || heads.encode_bar_tokens(&batch.bar_history, false));
     heads.predict_lejepa_next_bar_belief(&bar_tokens, false)
 }
 
@@ -2966,8 +2978,8 @@ fn configure_threads() {
 mod tests {
     use super::{
         bar_history_for_current_perm, build_split_offsets, cumulative_future_returns,
-        future_patches_for_current_perm, next_bars_for_current_perm, PretrainHeads, SplitKind,
-        LEJEPA_BAR_FEATURES, LEJEPA_PROBE_BARS,
+        future_patches_for_current_perm, next_bars_for_current_perm, sigreg_loss, PretrainHeads,
+        SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_PROBE_BARS,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -3078,6 +3090,23 @@ mod tests {
             .first()
             .expect("validation offsets should be non-empty");
         assert!(last_train + 16 * 25 <= first_validation);
+    }
+
+    #[test]
+    fn sigreg_penalizes_per_position_scale_above_unit() {
+        let _guard = tch::no_grad_guard();
+        let positions = 8i64;
+        let samples = 512i64;
+        let dim = 32i64;
+        let opts = (tch::Kind::Float, tch::Device::Cpu);
+        let unit = Tensor::randn([positions, samples, dim], opts);
+        let inflated = &unit * 3.0_f64.sqrt();
+        let unit_loss = sigreg_loss(&unit).double_value(&[]);
+        let inflated_loss = sigreg_loss(&inflated).double_value(&[]);
+        assert!(
+            inflated_loss > unit_loss * 4.0,
+            "variance-3 sigreg {inflated_loss} should dwarf unit-variance {unit_loss}"
+        );
     }
 
     #[test]
