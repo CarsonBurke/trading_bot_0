@@ -36,7 +36,6 @@ const LEJEPA_AR_LAYERS: usize = 5;
 const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
 const LEJEPA_ROPE_DIMS: i64 = 32;
-const LEJEPA_CYCLE_WEIGHT: f64 = 0.25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -1858,20 +1857,7 @@ fn lejepa_pretrain_loss(
     let pred_next_embed = predictions
         .belief
         .select(2, predictions.belief.size()[2] - 1);
-    let (decoded_mean, _) = heads.probe_ohlc_features(&pred_next_embed.detach());
-    let recon_bar = &decoded_mean / target_scale;
-    let recon_token = autocast(false, || heads.encode_bar_tokens(&recon_bar));
-    let cycle = recon_token
-        .view_as(&latest_token)
-        .mse_loss(&latest_token.detach(), Reduction::Mean);
-    let total = &jepa_mse + &sigreg * lambda_sigreg + &cycle * LEJEPA_CYCLE_WEIGHT;
-    if train {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static CYCLE_LOG_STEP: AtomicUsize = AtomicUsize::new(0);
-        if CYCLE_LOG_STEP.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
-            println!("lejepa cycle={:.9}", cycle.double_value(&[]));
-        }
-    }
+    let total = &jepa_mse + &sigreg * lambda_sigreg;
 
     let probe_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
     let probe = ohlc_probe_metrics(heads, &pred_next_embed.detach(), &probe_target);
