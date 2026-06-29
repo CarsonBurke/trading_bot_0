@@ -133,7 +133,6 @@ impl PretrainBatch {
 
 struct PretrainSampler {
     train_tickers: Vec<String>,
-    val_tickers: Vec<String>,
     train_envs: Vec<Env>,
     train_offsets_by_env: Vec<Vec<usize>>,
     train_batches_per_epoch: usize,
@@ -635,8 +634,7 @@ impl PretrainSampler {
             batches_per_epoch > 0,
             "--batches-per-epoch must be positive"
         );
-        let val_tickers = cached_eligible_training_universe().to_vec();
-        let mut train_tickers = val_tickers.clone();
+        let mut train_tickers = cached_eligible_training_universe().to_vec();
         train_tickers.shuffle(&mut rand::rng());
         let mut usable_train_tickers = Vec::with_capacity(train_tickers.len());
         let mut train_envs = Vec::with_capacity(train_tickers.len());
@@ -663,7 +661,6 @@ impl PretrainSampler {
         );
         Self {
             train_tickers: usable_train_tickers,
-            val_tickers,
             train_envs,
             train_offsets_by_env,
             train_batches_per_epoch: batches_per_epoch,
@@ -2489,16 +2486,18 @@ fn validate_full(
         let mut tickers = 0usize;
         let mut batches = 0usize;
 
-        for ticker in sampler.val_tickers.clone() {
+        let k_patches = sampler.k_patches;
+        let patch_size = sampler.patch_size;
+        let target_scale = sampler.target_scale;
+        for env in sampler.train_envs.iter_mut() {
             if max_batches.is_some_and(|limit| batches >= limit) {
                 break;
             }
 
-            let mut env = Env::new_with_tickers_and_recording(vec![ticker], false, false, None);
             let offsets = build_split_offsets(
                 env.price_deltas[0].len(),
-                sampler.k_patches,
-                sampler.patch_size,
+                k_patches,
+                patch_size,
                 SplitKind::Validation,
             );
             if offsets.is_empty() {
@@ -2512,11 +2511,11 @@ fn validate_full(
                 }
 
                 let batch = PretrainSampler::batch_from_offsets(
-                    &mut env,
+                    env,
                     chunk,
-                    sampler.k_patches,
-                    sampler.patch_size,
-                    sampler.target_scale,
+                    k_patches,
+                    patch_size,
+                    target_scale,
                     device,
                 );
                 let batch_samples = batch.len() as usize;
@@ -2527,13 +2526,13 @@ fn validate_full(
                     objective,
                     lambda_lat,
                     lambda_sigreg,
-                    sampler.target_scale,
+                    target_scale,
                     false,
                 );
                 let return_target = match objective {
                     PretrainObjective::MeanMse => cumulative_future_returns(&batch.future_patches),
                     PretrainObjective::Lejepa => {
-                        scaled_next_ohlc_features(&batch.next_bars, sampler.target_scale)
+                        scaled_next_ohlc_features(&batch.next_bars, target_scale)
                     }
                 };
                 let zero_mse_loss = return_target.pow_tensor_scalar(2.0).mean(Kind::Float);
@@ -2632,18 +2631,23 @@ fn write_pretrain_diagnostics(
     let mut first_traces = Vec::new();
     let mut worst_traces: Vec<DiagnosticTrace> = Vec::new();
 
+    let k_patches = sampler.k_patches;
+    let patch_size = sampler.patch_size;
+    let target_scale = sampler.target_scale;
     tch::no_grad(|| -> Result<()> {
         let mut batches = 0usize;
-        for ticker in sampler.val_tickers.clone() {
+        for (ticker, env) in sampler
+            .train_tickers
+            .iter()
+            .zip(sampler.train_envs.iter_mut())
+        {
             if max_batches.is_some_and(|limit| batches >= limit) {
                 break;
             }
-            let mut env =
-                Env::new_with_tickers_and_recording(vec![ticker.clone()], false, false, None);
             let offsets = build_split_offsets(
                 env.price_deltas[0].len(),
-                sampler.k_patches,
-                sampler.patch_size,
+                k_patches,
+                patch_size,
                 SplitKind::Validation,
             );
             if offsets.is_empty() {
@@ -2655,11 +2659,11 @@ fn write_pretrain_diagnostics(
                     break;
                 }
                 let batch = PretrainSampler::batch_from_offsets(
-                    &mut env,
+                    env,
                     chunk,
-                    sampler.k_patches,
-                    sampler.patch_size,
-                    sampler.target_scale,
+                    k_patches,
+                    patch_size,
+                    target_scale,
                     device,
                 );
                 let (predicted, actual, predicted_ohlc, actual_ohlc) = match objective {
@@ -2676,10 +2680,10 @@ fn write_pretrain_diagnostics(
                     PretrainObjective::Lejepa => {
                         let imagined = heads.lejepa_imagined_rollout(
                             &batch.bar_history,
-                            sampler.target_scale,
+                            target_scale,
                             false,
                         );
-                        let predicted_ohlc = imagined / sampler.target_scale;
+                        let predicted_ohlc = imagined / target_scale;
                         (
                             Vec::new(),
                             Vec::new(),
@@ -2738,11 +2742,28 @@ fn write_pretrain_diagnostics(
                                     bias_sum[h] += bar_bias / denom;
                                     sample_abs += bar_abs / denom;
                                 }
+                                // Seed both chains from the TRUE last context bar
+                                // (index `offset`), whose sanitized OHLC are the
+                                // denominators the windowed rows (bars `offset+1..`)
+                                // were built against. Reconstruct its proportions
+                                // from its own intra-bar channels so the
+                                // telescoping is exact; actual and predicted share
+                                // this real seed so their candles stay comparable.
+                                let seed_idx = env.ticker_perm[0];
+                                let seed = seed_candle_from_feature_row(
+                                    &env.ohlc_features[seed_idx][offset],
+                                );
                                 (
                                     Vec::new(),
                                     Vec::new(),
-                                    Some(chained_candles_from_ohlc_features(actual_features)),
-                                    Some(chained_candles_from_ohlc_features(predicted_features)),
+                                    Some(chained_candles_from_ohlc_features(
+                                        actual_features,
+                                        &seed,
+                                    )),
+                                    Some(chained_candles_from_ohlc_features(
+                                        predicted_features,
+                                        &seed,
+                                    )),
                                 )
                             }
                         };
@@ -2914,13 +2935,8 @@ fn write_trace_reports(
     Ok(())
 }
 
-fn chained_candles_from_ohlc_features(features: &[f32]) -> Vec<CandleBar> {
-    let mut prev = CandleBar {
-        open: 1.0,
-        high: 1.0,
-        low: 1.0,
-        close: 1.0,
-    };
+fn chained_candles_from_ohlc_features(features: &[f32], seed: &CandleBar) -> Vec<CandleBar> {
+    let mut prev = seed.clone();
     features
         .chunks_exact(OHLC_BAR_FEATURES)
         .map(|row| {
@@ -2929,6 +2945,25 @@ fn chained_candles_from_ohlc_features(features: &[f32]) -> Vec<CandleBar> {
             candle
         })
         .collect()
+}
+
+/// Reconstruct a bar's sanitized OHLC proportions from its own intra-bar feature
+/// channels, anchoring `open` at 1.0. Mirrors `build_ohlc_features`' sanitized
+/// convention: the returned `high`/`low` are the sanitized high/low
+/// (max/min over open, raw high/low, close) that serve as the denominators for
+/// the next bar's inter-bar deltas, so seeding a chain with this bar telescopes
+/// exactly into the following bars' sanitized OHLC (up to the `1/open` scale).
+fn seed_candle_from_feature_row(row: &[f32]) -> CandleBar {
+    let open = 1.0f64;
+    let high = (open / (1.0 + row[4] as f64)).max(1e-6);
+    let low = (open / (1.0 + row[5] as f64)).max(1e-6);
+    let close = (open / (1.0 + row[6] as f64)).max(1e-6);
+    CandleBar {
+        open: open as f32,
+        high: high as f32,
+        low: low as f32,
+        close: close as f32,
+    }
 }
 
 fn candle_from_ohlc_feature_row(row: &[f32], prev: &CandleBar) -> CandleBar {
@@ -3082,7 +3117,8 @@ fn configure_threads() {
 mod tests {
     use super::{
         bar_history_for_current_perm, build_split_offsets, candle_from_ohlc_feature_row,
-        cumulative_future_returns, future_patches_for_current_perm, next_bars_for_current_perm,
+        chained_candles_from_ohlc_features, cumulative_future_returns,
+        future_patches_for_current_perm, next_bars_for_current_perm, seed_candle_from_feature_row,
         sigreg_loss, CandleBar, PretrainHeads, SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
     };
     use crate::torch::{
@@ -3140,6 +3176,15 @@ mod tests {
             bars[last_close_delta_offset],
             env.ohlc_features[real_idx][last_bar_idx][3]
         );
+
+        // Cross-check against an INDEPENDENT recomputation from the raw bars, so
+        // the assertions test the feature derivation rather than the copied memory.
+        let ticker = env.tickers[real_idx].clone();
+        let raw_bars =
+            crate::data::historical::get_historical_data(Some(&[ticker.as_str()]));
+        let recomputed = build_ohlc_features(&raw_bars[0]);
+        assert_eq!(bars[3], recomputed[first_bar_idx][3]);
+        assert_eq!(bars[last_close_delta_offset], recomputed[last_bar_idx][3]);
     }
 
     #[test]
@@ -3173,6 +3218,78 @@ mod tests {
     }
 
     #[test]
+    fn chained_candles_recover_sanitized_ohlc_shapes() {
+        use ibapi::market_data::historical::Bar;
+        use time::{Duration, OffsetDateTime};
+        let mk = |open: f64, high: f64, low: f64, close: f64| Bar {
+            date: OffsetDateTime::UNIX_EPOCH + Duration::minutes(5),
+            open,
+            high,
+            low,
+            close,
+            volume: 1_000.0,
+            wap: close,
+            count: 1,
+        };
+        // >=3 real bars with distinct, non-trivial OHLC proportions.
+        let bars = vec![
+            mk(100.0, 105.0, 98.0, 102.0),
+            mk(102.0, 108.0, 101.0, 106.0),
+            mk(106.0, 107.0, 99.0, 100.0),
+            mk(100.0, 104.0, 97.0, 103.0),
+        ];
+        let feats = build_ohlc_features(&bars);
+
+        // Chain-decode the windowed bars (rows 1..n) seeded from the TRUE first
+        // bar's sanitized OHLC, exactly as the production diagnostics path does.
+        let seed = seed_candle_from_feature_row(&feats[0]);
+        let mut windowed = Vec::new();
+        for row in &feats[1..] {
+            windowed.extend_from_slice(row);
+        }
+        let candles = chained_candles_from_ohlc_features(&windowed, &seed);
+        assert_eq!(candles.len(), bars.len() - 1);
+
+        // The seed anchors bar0's open at 1.0, so reconstruction recovers each
+        // later bar's SANITIZED OHLC scaled by 1/bar0.open. Shape fidelity, not
+        // just per-row math: fails with the old {1,1,1,1} seed.
+        let scale = 1.0 / bars[0].open;
+        for (i, candle) in candles.iter().enumerate() {
+            let bar = &bars[i + 1];
+            let high_san = bar.high.max(bar.open).max(bar.close);
+            let low_san = bar.low.min(bar.open).min(bar.close);
+            assert!(
+                (candle.open as f64 - bar.open * scale).abs() < 1e-3,
+                "bar {} open {} vs {}",
+                i + 1,
+                candle.open,
+                bar.open * scale
+            );
+            assert!(
+                (candle.high as f64 - high_san * scale).abs() < 1e-3,
+                "bar {} high {} vs {}",
+                i + 1,
+                candle.high,
+                high_san * scale
+            );
+            assert!(
+                (candle.low as f64 - low_san * scale).abs() < 1e-3,
+                "bar {} low {} vs {}",
+                i + 1,
+                candle.low,
+                low_san * scale
+            );
+            assert!(
+                (candle.close as f64 - bar.close * scale).abs() < 1e-3,
+                "bar {} close {} vs {}",
+                i + 1,
+                candle.close,
+                bar.close * scale
+            );
+        }
+    }
+
+    #[test]
     fn next_bars_start_after_current_offset() {
         let mut env = Env::new(false);
         let offset = crate::torch::constants::PRICE_DELTAS_PER_TICKER;
@@ -3187,6 +3304,13 @@ mod tests {
 
         let real_idx = env.ticker_perm[0];
         assert_eq!(bars[3], env.ohlc_features[real_idx][offset + 1][3]);
+
+        // Independent recomputation from the raw bars (derivation cross-check).
+        let ticker = env.tickers[real_idx].clone();
+        let raw_bars =
+            crate::data::historical::get_historical_data(Some(&[ticker.as_str()]));
+        let recomputed = build_ohlc_features(&raw_bars[0]);
+        assert_eq!(bars[3], recomputed[offset + 1][3]);
     }
 
     #[test]
