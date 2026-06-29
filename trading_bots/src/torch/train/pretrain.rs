@@ -6,7 +6,7 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
-use tch::{autocast, nn, nn::Module, nn::ModuleT, Device, Kind, Reduction, Tensor};
+use tch::{autocast, nn, nn::Module, Device, Kind, Reduction, Tensor};
 
 use crate::data::universe::cached_eligible_training_universe;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
@@ -36,7 +36,7 @@ const LEJEPA_AR_LAYERS: usize = 5;
 const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
 const LEJEPA_ROPE_DIMS: i64 = 32;
-const LEJEPA_CYCLE_WEIGHT: f64 = 1.0;
+const LEJEPA_CYCLE_WEIGHT: f64 = 0.25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -76,7 +76,7 @@ struct CausalLejepaLayer {
 
 struct ProjectionMlp {
     fc1: nn::Linear,
-    bn: nn::BatchNorm,
+    ln: nn::LayerNorm,
     fc2: nn::Linear,
 }
 
@@ -246,9 +246,9 @@ impl PretrainHeads {
                 LEJEPA_PROJECTOR_HIDDEN_DIM,
                 Default::default(),
             ),
-            bn: nn::batch_norm1d(
-                p / "lejepa_projector_bn",
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
+            ln: nn::layer_norm(
+                p / "lejepa_projector_ln",
+                vec![LEJEPA_PROJECTOR_HIDDEN_DIM],
                 Default::default(),
             ),
             fc2: nn::linear(
@@ -314,9 +314,9 @@ impl PretrainHeads {
                 LEJEPA_PROJECTOR_HIDDEN_DIM,
                 Default::default(),
             ),
-            bn: nn::batch_norm1d(
-                p / "lejepa_pred_projector_bn",
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
+            ln: nn::layer_norm(
+                p / "lejepa_pred_projector_ln",
+                vec![LEJEPA_PROJECTOR_HIDDEN_DIM],
                 Default::default(),
             ),
             fc2: nn::linear(
@@ -457,7 +457,7 @@ impl PretrainHeads {
         self.return_mean_from_readout(&readout, batch, tickers)
     }
 
-    fn encode_bar_tokens(&self, bars: &Tensor, train: bool) -> Tensor {
+    fn encode_bar_tokens(&self, bars: &Tensor) -> Tensor {
         let size = bars.size();
         let batch = size[0];
         let tickers = size[1];
@@ -471,7 +471,7 @@ impl PretrainHeads {
             &normalize_last_dim(&self.bar_enrich_fc1.forward(&normalize_last_dim(&h))).gelu("none"),
         );
         let h = h + enriched;
-        let tokens = self.projection_mlp(&h, &self.lejepa_projector, train);
+        let tokens = self.projection_mlp(&h, &self.lejepa_projector);
         tokens.view([batch, tickers, length, self.latent_dim])
     }
 
@@ -491,7 +491,7 @@ impl PretrainHeads {
             x = self.causal_lejepa_layer(&x, layer, &positions, train);
         }
         let belief = self.lejepa_pred_proj.forward(&normalize_last_dim(&x));
-        let projected = self.projection_mlp(&belief, &self.lejepa_pred_projector, train);
+        let projected = self.projection_mlp(&belief, &self.lejepa_pred_projector);
         LejepaBarPredictions {
             belief: belief.view([batch, tickers, length, self.latent_dim]),
             projected: projected.view([batch, tickers, length, self.latent_dim]),
@@ -559,12 +559,12 @@ impl PretrainHeads {
         layer.ff_out.forward(&(gate * value))
     }
 
-    fn projection_mlp(&self, x: &Tensor, mlp: &ProjectionMlp, train: bool) -> Tensor {
+    fn projection_mlp(&self, x: &Tensor, mlp: &ProjectionMlp) -> Tensor {
         let shape = x.size();
         let rows = x.numel() as i64 / self.latent_dim;
         let flat = x.view([rows, self.latent_dim]);
         let hidden = mlp.fc1.forward(&flat);
-        let hidden = mlp.bn.forward_t(&hidden, train).gelu("none");
+        let hidden = mlp.ln.forward(&hidden).gelu("none");
         mlp.fc2.forward(&hidden).view(shape.as_slice())
     }
 
@@ -587,7 +587,7 @@ impl PretrainHeads {
         target_scale: f64,
         train: bool,
     ) -> Tensor {
-        let mut tokens = self.encode_bar_tokens(context_bars, train).detach();
+        let mut tokens = self.encode_bar_tokens(context_bars).detach();
         let batch = tokens.size()[0];
         let mut imagined = Vec::with_capacity(LEJEPA_ROLLOUT_BARS as usize);
         for _ in 0..LEJEPA_ROLLOUT_BARS {
@@ -598,7 +598,7 @@ impl PretrainHeads {
             let sigma = (logvar * 0.5).exp();
             let sampled = &mean + &sigma * Tensor::randn_like(&mean);
             let bar_feat = &sampled / target_scale;
-            let next_token = self.encode_bar_tokens(&bar_feat, train).detach();
+            let next_token = self.encode_bar_tokens(&bar_feat).detach();
             imagined.push(sampled.view([batch, LEJEPA_BAR_FEATURES]));
             tokens = Tensor::cat(&[&tokens, &next_token], 2);
             let len = tokens.size()[2];
@@ -1757,7 +1757,7 @@ fn lejepa_pretrain_loss(
     let _ = model;
 
     let full = Tensor::cat(&[&batch.bar_history, &batch.next_bars.narrow(2, 0, 1)], 2);
-    let all_tokens = autocast(false, || heads.encode_bar_tokens(&full, train));
+    let all_tokens = autocast(false, || heads.encode_bar_tokens(&full));
     let length = batch.bar_history.size()[2];
     let bar_tokens = all_tokens.narrow(2, 0, length);
     let target_bar_tokens = all_tokens.narrow(2, 1, length);
@@ -1792,7 +1792,7 @@ fn lejepa_pretrain_loss(
         .select(2, predictions.belief.size()[2] - 1);
     let (decoded_mean, _) = heads.probe_ohlc_features(&pred_next_embed.detach());
     let recon_bar = &decoded_mean / target_scale;
-    let recon_token = autocast(false, || heads.encode_bar_tokens(&recon_bar, train));
+    let recon_token = autocast(false, || heads.encode_bar_tokens(&recon_bar));
     let cycle = recon_token
         .view_as(&latest_token)
         .mse_loss(&latest_token.detach(), Reduction::Mean);
@@ -1991,7 +1991,7 @@ fn predict_lejepa_next_bar_belief(
     batch: &PretrainBatch,
 ) -> Tensor {
     let _ = model;
-    let bar_tokens = autocast(false, || heads.encode_bar_tokens(&batch.bar_history, false));
+    let bar_tokens = autocast(false, || heads.encode_bar_tokens(&batch.bar_history));
     heads.predict_lejepa_next_bar_belief(&bar_tokens, false)
 }
 
@@ -3399,7 +3399,7 @@ mod tests {
             (tch::Kind::Float, tch::Device::Cpu),
         );
 
-        let mut tokens = heads.encode_bar_tokens(&context, false);
+        let mut tokens = heads.encode_bar_tokens(&context);
         let start_len = tokens.size()[2];
         for step in 0..3 {
             let preds = heads.predict_lejepa_bar_predictions(&tokens, false);
