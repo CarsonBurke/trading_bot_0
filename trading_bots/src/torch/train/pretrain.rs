@@ -29,7 +29,7 @@ const LEJEPA_SIGREG_PROJECTIONS: i64 = 1024;
 const LEJEPA_SIGREG_POSITIONS: i64 = 256;
 const LEJEPA_SIGREG_KNOTS: i64 = 17;
 const LEJEPA_BAR_FEATURES: i64 = OHLC_BAR_FEATURES as i64;
-const LEJEPA_PROBE_BARS: i64 = 100;
+const LEJEPA_ROLLOUT_BARS: i64 = 100;
 const LEJEPA_PROBE_LR: f64 = 1e-3;
 const LEJEPA_WEIGHT_DECAY: f64 = 1e-3;
 const LEJEPA_AR_LAYERS: usize = 5;
@@ -101,7 +101,8 @@ struct PretrainHeads {
     lejepa_pred_projector: ProjectionMlp,
     rope: RotaryEmbedding,
     probe_input_ln: nn::LayerNorm,
-    probe_head: Vec<nn::Linear>,
+    probe_head: nn::Linear,
+    probe_logvar_head: nn::Linear,
     next_patch_embed: nn::Linear,
     latent_fc1: nn::Linear,
     latent_fc2: nn::Linear,
@@ -327,15 +328,18 @@ impl PretrainHeads {
         };
         let probe_input_ln =
             nn::layer_norm(p / "probe_input_ln", vec![latent_dim], Default::default());
-        let mut probe_head = Vec::with_capacity(LEJEPA_PROBE_BARS as usize);
-        for i in 0..LEJEPA_PROBE_BARS {
-            probe_head.push(nn::linear(
-                p / format!("probe_head{i}"),
-                latent_dim,
-                LEJEPA_BAR_FEATURES,
-                Default::default(),
-            ));
-        }
+        let probe_head = nn::linear(
+            p / "probe_head",
+            latent_dim,
+            LEJEPA_BAR_FEATURES,
+            Default::default(),
+        );
+        let probe_logvar_head = nn::linear(
+            p / "probe_logvar_head",
+            latent_dim,
+            LEJEPA_BAR_FEATURES,
+            Default::default(),
+        );
         let next_patch_embed = nn::linear(
             p / "next_patch_embed",
             patch_size,
@@ -362,6 +366,7 @@ impl PretrainHeads {
             rope,
             probe_input_ln,
             probe_head,
+            probe_logvar_head,
             next_patch_embed,
             latent_fc1,
             latent_fc2,
@@ -563,20 +568,33 @@ impl PretrainHeads {
         mlp.fc2.forward(&hidden).view(shape.as_slice())
     }
 
-    fn probe_ohlc_features(&self, belief: &Tensor) -> Tensor {
+    fn probe_ohlc_features(&self, belief: &Tensor) -> (Tensor, Tensor) {
         let batch = belief.size()[0];
         let normed = self.probe_input_ln.forward(belief);
-        let per_horizon: Vec<Tensor> = self
-            .probe_head
-            .iter()
-            .map(|head| head.forward(&normed))
-            .collect();
-        Tensor::stack(&per_horizon, 1).view([
-            batch,
-            1,
-            LEJEPA_PROBE_BARS,
-            LEJEPA_BAR_FEATURES,
-        ])
+        let shape = [batch, 1, 1, LEJEPA_BAR_FEATURES];
+        let mean = self.probe_head.forward(&normed).view(shape);
+        let logvar = self
+            .probe_logvar_head
+            .forward(&normed)
+            .view(shape)
+            .clamp(-7.0, 7.0);
+        (mean, logvar)
+    }
+
+    fn lejepa_imagined_rollout(&self, context_bars: &Tensor, train: bool) -> Tensor {
+        let mut tokens = self.encode_bar_tokens(context_bars, train);
+        let batch = tokens.size()[0];
+        let mut imagined = Vec::with_capacity(LEJEPA_ROLLOUT_BARS as usize);
+        for _ in 0..LEJEPA_ROLLOUT_BARS {
+            let preds = self.predict_lejepa_bar_predictions(&tokens, train);
+            let last = tokens.size()[2] - 1;
+            let next_latent = preds.projected.narrow(2, last, 1);
+            let belief_last = preds.belief.narrow(2, last, 1);
+            let (mean, _logvar) = self.probe_ohlc_features(&belief_last.detach());
+            imagined.push(mean.view([batch, LEJEPA_BAR_FEATURES]));
+            tokens = Tensor::cat(&[&tokens, &next_latent], 2);
+        }
+        Tensor::stack(&imagined, 1)
     }
 
     fn predict_next_latent(&self, latent: &Tensor, next_patch: &Tensor) -> Tensor {
@@ -684,7 +702,8 @@ impl PretrainSampler {
         let target_len = TICKERS_COUNT as usize * k_patches * patch_size;
         let next_patch_len = TICKERS_COUNT as usize * patch_size;
         let bar_history_len = TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER * OHLC_BAR_FEATURES;
-        let next_ohlc_len = TICKERS_COUNT as usize * LEJEPA_PROBE_BARS as usize * OHLC_BAR_FEATURES;
+        let next_ohlc_len =
+            TICKERS_COUNT as usize * LEJEPA_ROLLOUT_BARS as usize * OHLC_BAR_FEATURES;
 
         let mut obs = Vec::with_capacity(offsets.len() * pd_dim);
         let mut static_obs = Vec::with_capacity(offsets.len() * so_dim);
@@ -742,7 +761,8 @@ impl PretrainSampler {
         let target_len = TICKERS_COUNT as usize * k_patches * patch_size;
         let next_patch_len = TICKERS_COUNT as usize * patch_size;
         let bar_history_len = TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER * OHLC_BAR_FEATURES;
-        let next_ohlc_len = TICKERS_COUNT as usize * LEJEPA_PROBE_BARS as usize * OHLC_BAR_FEATURES;
+        let next_ohlc_len =
+            TICKERS_COUNT as usize * LEJEPA_ROLLOUT_BARS as usize * OHLC_BAR_FEATURES;
 
         let mut obs = Vec::with_capacity(samples.len() * pd_dim);
         let mut static_obs = Vec::with_capacity(samples.len() * so_dim);
@@ -835,7 +855,7 @@ impl PretrainSampler {
                 .view([
                     batch,
                     TICKERS_COUNT,
-                    LEJEPA_PROBE_BARS,
+                    LEJEPA_ROLLOUT_BARS,
                     OHLC_BAR_FEATURES as i64,
                 ])
                 .to_device(device),
@@ -888,7 +908,7 @@ fn build_split_offsets(
     let next_latent_advance = patch_size;
     let max_target_advance = horizon
         .max(next_latent_advance)
-        .max(LEJEPA_PROBE_BARS as usize);
+        .max(LEJEPA_ROLLOUT_BARS as usize);
     let max_exclusive = data_len.saturating_sub(max_target_advance);
     if max_exclusive <= min_offset {
         return Vec::new();
@@ -1378,11 +1398,17 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 device,
             );
             println!(
-                "pretrain epoch {epoch} detached_probe_train ohlc_mse={:.6} ohlc_mae={:.6} pred_std={:.6} target_std={:.6} samples={} batches={} probe_epochs={}",
+                "pretrain epoch {epoch} detached_probe_train probe_nll={:.6} ohlc_mse={:.6} ohlc_mae={:.6} pred_std={:.6} target_std={:.6} pred_sigma={:.6} pred_std_level={:.6} target_std_level={:.6} probe_ev_level={:.2}% pred_sigma_level={:.6} samples={} batches={} probe_epochs={}",
+                probe.probe_nll,
                 probe.probe_mse,
                 probe.probe_mae,
                 probe.pred_std,
                 probe.target_std,
+                probe.pred_sigma,
+                probe.pred_std_level,
+                probe.target_std_level,
+                probe.probe_ev_level * 100.0,
+                probe.pred_sigma_level,
                 probe.samples,
                 probe.batches,
                 args.probe_epochs
@@ -1548,10 +1574,14 @@ fn load_matching_pretrain_heads(head_vs: &mut nn::VarStore, model_path: &Path) -
     }
     let load_summary =
         load_var_store_partial(head_vs, &heads_path).map_err(|err| anyhow!("{err}"))?;
-    load_summary
-        .require_complete()
-        .map_err(|err| anyhow!("failed to load complete pretrain heads: {err}"))?;
-    println!("Loaded pretrain heads from {}", heads_path.display());
+    if let Err(err) = load_summary.require_complete() {
+        println!(
+            "Warm-starting pretrain heads with partial load from {} ({err}); newly added head params are freshly initialized",
+            heads_path.display()
+        );
+    } else {
+        println!("Loaded pretrain heads from {}", heads_path.display());
+    }
     Ok(())
 }
 
@@ -1786,7 +1816,7 @@ fn cumulative_future_returns(future_patches: &Tensor) -> Tensor {
 }
 
 fn scaled_next_ohlc_features(next_ohlc_patch: &Tensor, target_scale: f64) -> Tensor {
-    next_ohlc_patch * target_scale
+    next_ohlc_patch.narrow(2, 0, 1) * target_scale
 }
 
 fn zero_like_scalar(reference: &Tensor) -> Tensor {
@@ -1861,10 +1891,15 @@ struct ProbeLoss {
     pred_abs: Tensor,
     target_abs: Tensor,
     probe_terminal_mse: Tensor,
+    pred_sigma: Tensor,
+    pred_std_level: Tensor,
+    target_std_level: Tensor,
+    probe_ev_level: Tensor,
+    pred_sigma_level: Tensor,
 }
 
 fn ohlc_probe_metrics(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -> ProbeLoss {
-    let mean = heads.probe_ohlc_features(belief);
+    let (mean, logvar) = heads.probe_ohlc_features(belief);
     let err = &mean - target;
     let probe_mse = mean.mse_loss(target, Reduction::Mean);
     let probe_mae = err.abs().mean(Kind::Float);
@@ -1874,9 +1909,23 @@ fn ohlc_probe_metrics(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -
     let pred_std = mean.std(false);
     let target_std = target.std(false);
     let probe_terminal_mse = mean
-        .select(2, LEJEPA_PROBE_BARS - 1)
-        .mse_loss(&target.select(2, LEJEPA_PROBE_BARS - 1), Reduction::Mean);
-    let probe_nll = zero_like_scalar(&probe_mse);
+        .select(2, 0)
+        .mse_loss(&target.select(2, 0), Reduction::Mean);
+
+    let nll_elem = &logvar + err.pow_tensor_scalar(2.0) * logvar.neg().exp();
+    let probe_nll = nll_elem.mean(Kind::Float) * 0.5;
+    let pred_sigma = (&logvar * 0.5).exp().mean(Kind::Float);
+
+    let mean_level = mean.select(3, 0);
+    let target_level = target.select(3, 0);
+    let logvar_level = logvar.select(3, 0);
+    let pred_std_level = mean_level.std(false);
+    let target_std_level = target_level.std(false);
+    let level_mse = mean_level.mse_loss(&target_level, Reduction::Mean);
+    let level_zero_mse = target_level.pow_tensor_scalar(2.0).mean(Kind::Float);
+    let probe_ev_level = explained_variance_tensor(&level_mse, &level_zero_mse);
+    let pred_sigma_level = (&logvar_level * 0.5).exp().mean(Kind::Float);
+
     ProbeLoss {
         probe_nll,
         probe_mae,
@@ -1887,6 +1936,11 @@ fn ohlc_probe_metrics(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -
         pred_abs,
         target_abs,
         probe_terminal_mse,
+        pred_sigma,
+        pred_std_level,
+        target_std_level,
+        probe_ev_level,
+        pred_sigma_level,
     }
 }
 
@@ -2094,10 +2148,16 @@ struct TrainEpochLoss {
 }
 
 struct ProbeTrainSummary {
+    probe_nll: f64,
     probe_mae: f64,
     probe_mse: f64,
     pred_std: f64,
     target_std: f64,
+    pred_sigma: f64,
+    pred_std_level: f64,
+    target_std_level: f64,
+    probe_ev_level: f64,
+    pred_sigma_level: f64,
     samples: usize,
     batches: usize,
 }
@@ -2303,10 +2363,16 @@ fn train_detached_probe(
     probe_named_vars: &[(String, Tensor)],
     device: Device,
 ) -> ProbeTrainSummary {
+    let mut nll_sum = 0.0;
     let mut mse_sum = 0.0;
     let mut mae_sum = 0.0;
     let mut pred_std_sum = 0.0;
     let mut target_std_sum = 0.0;
+    let mut pred_sigma_sum = 0.0;
+    let mut pred_std_level_sum = 0.0;
+    let mut target_std_level_sum = 0.0;
+    let mut probe_ev_level_sum = 0.0;
+    let mut pred_sigma_level_sum = 0.0;
     let mut samples = 0usize;
     let mut batches = 0usize;
 
@@ -2317,17 +2383,23 @@ fn train_detached_probe(
             let belief = tch::no_grad(|| predict_lejepa_next_bar_belief(model, heads, &batch));
             let ohlc_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
             let probe = ohlc_probe_metrics(heads, &belief.detach(), &ohlc_target);
-            let probe_loss = probe.probe_mse.shallow_clone();
-            assert_finite_loss(&probe.probe_mse, probe_epoch + 1);
+            let probe_loss = probe.probe_nll.shallow_clone();
+            assert_finite_loss(&probe.probe_nll, probe_epoch + 1);
             probe_opt.zero_grad();
             probe_loss.backward();
             clip_all_grads(probe_named_vars, MAX_GRAD_NORM, device);
             probe_opt.step();
 
+            nll_sum += probe.probe_nll.double_value(&[]) * batch_samples as f64;
             mse_sum += probe.probe_mse.double_value(&[]) * batch_samples as f64;
             mae_sum += probe.probe_mae.double_value(&[]) * batch_samples as f64;
             pred_std_sum += probe.pred_std.double_value(&[]) * batch_samples as f64;
             target_std_sum += probe.target_std.double_value(&[]) * batch_samples as f64;
+            pred_sigma_sum += probe.pred_sigma.double_value(&[]) * batch_samples as f64;
+            pred_std_level_sum += probe.pred_std_level.double_value(&[]) * batch_samples as f64;
+            target_std_level_sum += probe.target_std_level.double_value(&[]) * batch_samples as f64;
+            probe_ev_level_sum += probe.probe_ev_level.double_value(&[]) * batch_samples as f64;
+            pred_sigma_level_sum += probe.pred_sigma_level.double_value(&[]) * batch_samples as f64;
             samples += batch_samples;
             batches += 1;
         }
@@ -2336,10 +2408,16 @@ fn train_detached_probe(
     assert!(samples > 0, "detached probe training set is empty");
     let denom = samples as f64;
     ProbeTrainSummary {
+        probe_nll: nll_sum / denom,
         probe_mae: mae_sum / denom,
         probe_mse: mse_sum / denom,
         pred_std: pred_std_sum / denom,
         target_std: target_std_sum / denom,
+        pred_sigma: pred_sigma_sum / denom,
+        pred_std_level: pred_std_level_sum / denom,
+        target_std_level: target_std_level_sum / denom,
+        probe_ev_level: probe_ev_level_sum / denom,
+        pred_sigma_level: pred_sigma_level_sum / denom,
         samples,
         batches,
     }
@@ -2517,7 +2595,7 @@ fn write_pretrain_diagnostics(
 
     let horizon = match objective {
         PretrainObjective::MeanMse => sampler.k_patches * sampler.patch_size,
-        PretrainObjective::Lejepa => LEJEPA_PROBE_BARS as usize,
+        PretrainObjective::Lejepa => LEJEPA_ROLLOUT_BARS as usize,
     };
     let mut abs_sum = vec![0.0f64; horizon];
     let mut sq_sum = vec![0.0f64; horizon];
@@ -2556,29 +2634,34 @@ fn write_pretrain_diagnostics(
                     sampler.target_scale,
                     device,
                 );
-                let (predicted, actual, predicted_ohlc, actual_ohlc) = match objective {
-                    PretrainObjective::MeanMse => {
-                        let pred = predict_future_returns(model, heads, &batch);
-                        let actual = cumulative_future_returns(&batch.future_patches);
-                        (
-                            tensor_to_vec_f32(&pred)?,
-                            tensor_to_vec_f32(&actual)?,
-                            None,
-                            None,
-                        )
-                    }
-                    PretrainObjective::Lejepa => {
-                        let belief = predict_lejepa_next_bar_belief(model, heads, &batch);
-                        let predicted_ohlc =
-                            heads.probe_ohlc_features(&belief) / sampler.target_scale;
-                        (
-                            Vec::new(),
-                            Vec::new(),
-                            Some(tensor_to_vec_f32(&predicted_ohlc)?),
-                            Some(tensor_to_vec_f32(&batch.next_bars)?),
-                        )
-                    }
-                };
+                let (predicted, actual, predicted_ohlc, actual_ohlc, predicted_level_sigma) =
+                    match objective {
+                        PretrainObjective::MeanMse => {
+                            let pred = predict_future_returns(model, heads, &batch);
+                            let actual = cumulative_future_returns(&batch.future_patches);
+                            (
+                                tensor_to_vec_f32(&pred)?,
+                                tensor_to_vec_f32(&actual)?,
+                                None,
+                                None,
+                                None,
+                            )
+                        }
+                        PretrainObjective::Lejepa => {
+                            let belief = predict_lejepa_next_bar_belief(model, heads, &batch);
+                            let (mean, logvar) = heads.probe_ohlc_features(&belief);
+                            let predicted_ohlc = mean / sampler.target_scale;
+                            let level_sigma =
+                                (logvar.select(3, 0) * 0.5).exp() / sampler.target_scale;
+                            (
+                                Vec::new(),
+                                Vec::new(),
+                                Some(tensor_to_vec_f32(&predicted_ohlc)?),
+                                Some(tensor_to_vec_f32(&batch.next_bars)?),
+                                Some(tensor_to_vec_f32(&level_sigma)?),
+                            )
+                        }
+                    };
 
                 for (sample_idx, &offset) in chunk.iter().enumerate() {
                     let mut sample_abs = 0.0;
@@ -2629,14 +2712,22 @@ fn write_pretrain_diagnostics(
                                     bias_sum[h] += bar_bias / denom;
                                     sample_abs += bar_abs / denom;
                                 }
+                                let sigma_start = sample_idx * horizon;
+                                let sigma_end = sigma_start + horizon;
+                                let level_sigma = &predicted_level_sigma
+                                    .as_ref()
+                                    .expect("LEJEPA predicted level sigma missing")
+                                    [sigma_start..sigma_end];
                                 (
                                     Vec::new(),
                                     Vec::new(),
                                     Some(anchor_relative_candles_from_ohlc_features(
                                         actual_features,
+                                        None,
                                     )),
                                     Some(anchor_relative_candles_from_ohlc_features(
                                         predicted_features,
+                                        Some(level_sigma),
                                     )),
                                 )
                             }
@@ -2809,11 +2900,31 @@ fn write_trace_reports(
     Ok(())
 }
 
-fn anchor_relative_candles_from_ohlc_features(features: &[f32]) -> Vec<CandleBar> {
+fn anchor_relative_candles_from_ohlc_features(
+    features: &[f32],
+    level_sigma: Option<&[f32]>,
+) -> Vec<CandleBar> {
     features
         .chunks_exact(OHLC_BAR_FEATURES)
-        .map(|row| candle_from_ohlc_feature_row(row, 1.0))
+        .enumerate()
+        .map(|(bar, row)| {
+            let candle = candle_from_ohlc_feature_row(row, 1.0);
+            match level_sigma {
+                Some(sigma) => widen_candle_level_cone(candle, sigma[bar]),
+                None => candle,
+            }
+        })
         .collect()
+}
+
+fn widen_candle_level_cone(candle: CandleBar, level_sigma: f32) -> CandleBar {
+    let band = level_sigma.clamp(0.0, 6.0);
+    CandleBar {
+        open: candle.open,
+        close: candle.close,
+        high: candle.high * band.exp(),
+        low: (candle.low * (-band).exp()).max(1e-6),
+    }
 }
 
 fn candle_from_ohlc_feature_row(row: &[f32], prev_close: f32) -> CandleBar {
@@ -2889,19 +3000,12 @@ fn bar_history_for_current_perm(env: &Env, offset: usize) -> Vec<f32> {
 
 fn next_bars_for_current_perm(env: &Env, offset: usize) -> Vec<f32> {
     let start = offset + 1;
-    let end = start + LEJEPA_PROBE_BARS as usize;
-    let mut out =
-        Vec::with_capacity(TICKERS_COUNT as usize * LEJEPA_PROBE_BARS as usize * OHLC_BAR_FEATURES);
+    let end = start + LEJEPA_ROLLOUT_BARS as usize;
+    let mut out = Vec::with_capacity(
+        TICKERS_COUNT as usize * LEJEPA_ROLLOUT_BARS as usize * OHLC_BAR_FEATURES,
+    );
     for &real_idx in &env.ticker_perm {
-        let features = &env.ohlc_features[real_idx];
-        let prices = &env.prices[real_idx];
-        let anchor_log_close = prices[offset].max(1e-12).ln();
-        for bar_idx in start..end {
-            let mut row = features[bar_idx];
-            let prev_log_close = prices[bar_idx - 1].max(1e-12).ln();
-            row[0] += (prev_log_close - anchor_log_close) as f32;
-            out.extend_from_slice(&row);
-        }
+        append_ohlc_feature_window(&env.ohlc_features[real_idx], start, end, &mut out);
     }
     out
 }
@@ -3116,9 +3220,13 @@ mod tests {
         let heads = PretrainHeads::new(&vs.root(), latent_dim, 16, 25);
         let batch = 4;
         let belief = Tensor::randn([batch, latent_dim], (tch::Kind::Float, tch::Device::Cpu));
-        let pred = heads.probe_ohlc_features(&belief);
+        let (pred, logvar) = heads.probe_ohlc_features(&belief);
         assert_eq!(
             pred.size(),
+            vec![batch, 1, LEJEPA_PROBE_BARS, LEJEPA_BAR_FEATURES]
+        );
+        assert_eq!(
+            logvar.size(),
             vec![batch, 1, LEJEPA_PROBE_BARS, LEJEPA_BAR_FEATURES]
         );
         let first_feature = pred.select(3, 0).view([batch, LEJEPA_PROBE_BARS]);
@@ -3127,6 +3235,21 @@ mod tests {
         assert!(
             min_var > 1e-8,
             "expected non-flat horizon predictions, min across-horizon variance was {min_var}"
+        );
+
+        let sigma = (&logvar * 0.5).exp();
+        assert!(
+            sigma.isfinite().all().int64_value(&[]) != 0,
+            "predicted sigma must be finite"
+        );
+        let min_sigma = sigma.min().double_value(&[]);
+        assert!(min_sigma > 0.0, "predicted sigma must be positive, got {min_sigma}");
+        let level_sigma = sigma.select(3, 0).view([batch, LEJEPA_PROBE_BARS]);
+        let level_sigma_hvar = level_sigma.var_dim(1, true, false);
+        let min_sigma_hvar = level_sigma_hvar.min().double_value(&[]);
+        assert!(
+            min_sigma_hvar > 1e-10,
+            "expected non-degenerate per-horizon sigma, min across-horizon variance was {min_sigma_hvar}"
         );
     }
 }
