@@ -30,7 +30,8 @@ const LEJEPA_SIGREG_POSITIONS: i64 = 256;
 const LEJEPA_SIGREG_KNOTS: i64 = 17;
 const LEJEPA_BAR_FEATURES: i64 = OHLC_BAR_FEATURES as i64;
 const LEJEPA_PROBE_BARS: i64 = 50;
-const LEJEPA_PROBE_HEAD_HIDDEN: i64 = 128;
+const LEJEPA_PROBE_LR: f64 = 1e-3;
+const LEJEPA_WEIGHT_DECAY: f64 = 1e-3;
 const LEJEPA_AR_LAYERS: usize = 5;
 const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
@@ -98,8 +99,8 @@ struct PretrainHeads {
     lejepa_pred_proj: nn::Linear,
     lejepa_pred_projector: ProjectionMlp,
     rope: RotaryEmbedding,
-    probe_head_fc1: Vec<nn::Linear>,
-    probe_head_out: Vec<nn::Linear>,
+    probe_input_ln: nn::LayerNorm,
+    probe_head: Vec<nn::Linear>,
     next_patch_embed: nn::Linear,
     latent_fc1: nn::Linear,
     latent_fc2: nn::Linear,
@@ -313,18 +314,13 @@ impl PretrainHeads {
                 Default::default(),
             ),
         };
-        let mut probe_head_fc1 = Vec::with_capacity(LEJEPA_PROBE_BARS as usize);
-        let mut probe_head_out = Vec::with_capacity(LEJEPA_PROBE_BARS as usize);
+        let probe_input_ln =
+            nn::layer_norm(p / "probe_input_ln", vec![latent_dim], Default::default());
+        let mut probe_head = Vec::with_capacity(LEJEPA_PROBE_BARS as usize);
         for i in 0..LEJEPA_PROBE_BARS {
-            probe_head_fc1.push(nn::linear(
-                p / format!("probe_head{i}_fc1"),
+            probe_head.push(nn::linear(
+                p / format!("probe_head{i}"),
                 latent_dim,
-                LEJEPA_PROBE_HEAD_HIDDEN,
-                Default::default(),
-            ));
-            probe_head_out.push(nn::linear(
-                p / format!("probe_head{i}_out"),
-                LEJEPA_PROBE_HEAD_HIDDEN,
                 LEJEPA_BAR_FEATURES,
                 Default::default(),
             ));
@@ -353,8 +349,8 @@ impl PretrainHeads {
             lejepa_pred_proj,
             lejepa_pred_projector,
             rope,
-            probe_head_fc1,
-            probe_head_out,
+            probe_input_ln,
+            probe_head,
             next_patch_embed,
             latent_fc1,
             latent_fc2,
@@ -558,11 +554,11 @@ impl PretrainHeads {
 
     fn probe_ohlc_features(&self, belief: &Tensor) -> Tensor {
         let batch = belief.size()[0];
+        let normed = self.probe_input_ln.forward(belief);
         let per_horizon: Vec<Tensor> = self
-            .probe_head_fc1
+            .probe_head
             .iter()
-            .zip(&self.probe_head_out)
-            .map(|(fc1, out)| out.forward(&fc1.forward(belief).relu()))
+            .map(|head| head.forward(&normed))
             .collect();
         Tensor::stack(&per_horizon, 1).view([
             batch,
@@ -1002,7 +998,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             adamw_betas: (0.9, 0.95),
             adamw_eps: 1e-8,
             weight_decay: 0.0,
-            adamw_wd: 0.0,
+            adamw_wd: LEJEPA_WEIGHT_DECAY,
             force_adamw_name_substrings: vec![
                 "policy_concentration".to_string(),
                 "value_proj".to_string(),
@@ -1027,7 +1023,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             lr: MUON_LR,
             use_muon_for_2d: false,
             momentum: MUON_MOMENTUM_WARMUP_START,
-            adamw_lr: LEARNING_RATE,
+            adamw_lr: LEJEPA_PROBE_LR,
             adamw_betas: (0.9, 0.95),
             adamw_eps: 1e-8,
             weight_decay: 0.0,
