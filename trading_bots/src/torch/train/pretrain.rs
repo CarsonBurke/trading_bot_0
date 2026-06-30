@@ -2797,8 +2797,6 @@ struct DiagnosticTrace {
     loss: f64,
     actual: Vec<f32>,
     predicted: Vec<f32>,
-    actual_candles: Option<Vec<CandleBar>>,
-    predicted_candles: Option<Vec<CandleBar>>,
 }
 
 struct RolloutEntropy {
@@ -2811,9 +2809,8 @@ struct RolloutEntropy {
 struct VariantCandles {
     label: String,
     actual: Vec<CandleBar>,
-    det: Vec<CandleBar>,
-    smp: Vec<CandleBar>,
-    hot: Vec<CandleBar>,
+    mean: Vec<CandleBar>,
+    sampled: Vec<CandleBar>,
 }
 
 fn write_pretrain_diagnostics(
@@ -2887,8 +2884,7 @@ fn write_pretrain_diagnostics(
                     target_scale,
                     device,
                 );
-                let mut det_ohlc: Option<Vec<f32>> = None;
-                let mut hot_ohlc: Option<Vec<f32>> = None;
+                let mut mean_ohlc: Option<Vec<f32>> = None;
                 let (predicted, actual, predicted_ohlc, actual_ohlc) = match objective {
                     PretrainObjective::MeanMse => {
                         let pred = predict_future_returns(model, heads, &batch);
@@ -2915,20 +2911,13 @@ fn write_pretrain_diagnostics(
                             ent_mstep += e.mean_step_std;
                             ent_n += 1;
                         }
-                        let det = heads.lejepa_imagined_rollout(
+                        let mean = heads.lejepa_imagined_rollout(
                             &batch.bar_history,
                             target_scale,
                             0.0,
                             false,
                         );
-                        let hot = heads.lejepa_imagined_rollout(
-                            &batch.bar_history,
-                            target_scale,
-                            4.0,
-                            false,
-                        );
-                        det_ohlc = Some(tensor_to_vec_f32(&(det / target_scale))?);
-                        hot_ohlc = Some(tensor_to_vec_f32(&(hot / target_scale))?);
+                        mean_ohlc = Some(tensor_to_vec_f32(&(mean / target_scale))?);
                         let predicted_ohlc = imagined / target_scale;
                         (
                             Vec::new(),
@@ -2941,7 +2930,7 @@ fn write_pretrain_diagnostics(
 
                 for (sample_idx, &offset) in chunk.iter().enumerate() {
                     let mut sample_abs = 0.0;
-                    let (actual_sample, pred_sample, actual_candles, predicted_candles) =
+                    let (actual_sample, pred_sample) =
                         match objective {
                             PretrainObjective::MeanMse => {
                                 let start = sample_idx * horizon;
@@ -2955,7 +2944,7 @@ fn write_pretrain_diagnostics(
                                     bias_sum[h] += err;
                                     sample_abs += err.abs();
                                 }
-                                (actual_sample, pred_sample, None, None)
+                                (actual_sample, pred_sample)
                             }
                             PretrainObjective::Lejepa => {
                                 let feature_start = sample_idx * horizon * OHLC_BAR_FEATURES;
@@ -3000,13 +2989,9 @@ fn write_pretrain_diagnostics(
                                     &env.ohlc_features[seed_idx][offset],
                                 );
                                 if variant_traces.len() < TRACE_COUNT {
-                                    let det_features = &det_ohlc
+                                    let mean_features = &mean_ohlc
                                         .as_ref()
-                                        .expect("LEJEPA det OHLC missing")
-                                        [feature_start..feature_end];
-                                    let hot_features = &hot_ohlc
-                                        .as_ref()
-                                        .expect("LEJEPA hot OHLC missing")
+                                        .expect("LEJEPA mean OHLC missing")
                                         [feature_start..feature_end];
                                     variant_traces.push(VariantCandles {
                                         label: format!(
@@ -3017,32 +3002,17 @@ fn write_pretrain_diagnostics(
                                             actual_features,
                                             &seed,
                                         ),
-                                        det: chained_candles_from_ohlc_features(
-                                            det_features,
+                                        mean: chained_candles_from_ohlc_features(
+                                            mean_features,
                                             &seed,
                                         ),
-                                        smp: chained_candles_from_ohlc_features(
+                                        sampled: chained_candles_from_ohlc_features(
                                             predicted_features,
-                                            &seed,
-                                        ),
-                                        hot: chained_candles_from_ohlc_features(
-                                            hot_features,
                                             &seed,
                                         ),
                                     });
                                 }
-                                (
-                                    Vec::new(),
-                                    Vec::new(),
-                                    Some(chained_candles_from_ohlc_features(
-                                        actual_features,
-                                        &seed,
-                                    )),
-                                    Some(chained_candles_from_ohlc_features(
-                                        predicted_features,
-                                        &seed,
-                                    )),
-                                )
+                                (Vec::new(), Vec::new())
                             }
                         };
                     count += 1;
@@ -3052,8 +3022,6 @@ fn write_pretrain_diagnostics(
                         loss,
                         actual: actual_sample,
                         predicted: pred_sample,
-                        actual_candles,
-                        predicted_candles,
                     };
 
                     if first_traces.len() < TRACE_COUNT {
@@ -3062,8 +3030,6 @@ fn write_pretrain_diagnostics(
                             loss,
                             actual: trace.actual.clone(),
                             predicted: trace.predicted.clone(),
-                            actual_candles: trace.actual_candles.clone(),
-                            predicted_candles: trace.predicted_candles.clone(),
                         });
                     }
 
@@ -3146,13 +3112,10 @@ fn write_pretrain_diagnostics(
     }
     for vt in &variant_traces {
         write_variant_candle_report(
-            &samples_dir, &vt.label, "det", epoch, global_step, &vt.actual, &vt.det,
+            &samples_dir, &vt.label, "mean", epoch, global_step, &vt.actual, &vt.mean,
         )?;
         write_variant_candle_report(
-            &samples_dir, &vt.label, "smp", epoch, global_step, &vt.actual, &vt.smp,
-        )?;
-        write_variant_candle_report(
-            &samples_dir, &vt.label, "hot", epoch, global_step, &vt.actual, &vt.hot,
+            &samples_dir, &vt.label, "sampled", epoch, global_step, &vt.actual, &vt.sampled,
         )?;
     }
     if ent_n > 0 {
@@ -3235,24 +3198,6 @@ fn write_trace_reports(
                             values: error,
                         },
                     ],
-                },
-            },
-        )?;
-    }
-    if let (Some(actual), Some(predicted)) = (&trace.actual_candles, &trace.predicted_candles) {
-        write_report_file(
-            &dir.join(format!("{prefix}_candles.report.bin")),
-            &Report {
-                title: format!(
-                    "Pretrain {group} Candles - epoch {epoch} step {global_step} - {} - OHLC MAE {:.5}",
-                    trace.label, trace.loss
-                ),
-                x_label: Some("forecast bar".to_string()),
-                y_label: Some("relative price".to_string()),
-                scale: ScaleKind::Linear,
-                kind: ReportKind::CandleCompare {
-                    actual: actual.clone(),
-                    predicted: predicted.clone(),
                 },
             },
         )?;
