@@ -30,6 +30,8 @@ const LEJEPA_SIGREG_POSITIONS: i64 = 256;
 const LEJEPA_SIGREG_KNOTS: i64 = 17;
 const LEJEPA_BAR_FEATURES: i64 = OHLC_BAR_FEATURES as i64;
 const LEJEPA_ROLLOUT_BARS: i64 = 100;
+const LEJEPA_ROLLOUT_EVAL_WINDOWS: usize = 64;
+const LEJEPA_ROLLOUT_EVAL_SAMPLES: usize = 4;
 const LEJEPA_PROBE_LR: f64 = 1e-3;
 const LEJEPA_WEIGHT_DECAY: f64 = 1e-3;
 const LEJEPA_AR_LAYERS: usize = 5;
@@ -1255,7 +1257,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     )?;
     writeln!(
         validation_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,flow_loss,samples,tickers,batches"
+        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,flow_loss,rollout_mean_mse,rollout_sampled_mse,rollout_mse_delta,rollout_mse_delta_se,rollout_mse_t,rollout_mse_n,samples,tickers,batches"
     )?;
     let mut step_log = if args.log_step_losses {
         let mut log = BufWriter::new(File::create(run_dir.root.join("pretrain_train_steps.csv"))?);
@@ -1434,7 +1436,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     device,
                 );
                 println!(
-                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} samples={} tickers={} batches={}",
+                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} samples={} tickers={} batches={}",
                     val.total,
                     val.jepa_mse,
                     val.sigreg,
@@ -1454,13 +1456,19 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.probe_explained_variance * 100.0,
                     val.next_lat,
                     val.flow_loss,
+                    val.rollout_mean_mse,
+                    val.rollout_sampled_mse,
+                    val.rollout_mse_delta,
+                    val.rollout_mse_delta_se,
+                    val.rollout_mse_t,
+                    val.rollout_mse_n,
                     val.samples,
                     val.tickers,
                     val.batches
                 );
                 writeln!(
                     validation_log,
-                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
                     val.total,
                     val.jepa_mse,
                     val.sigreg,
@@ -1480,6 +1488,12 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.probe_explained_variance,
                     val.next_lat,
                     val.flow_loss,
+                    val.rollout_mean_mse,
+                    val.rollout_sampled_mse,
+                    val.rollout_mse_delta,
+                    val.rollout_mse_delta_se,
+                    val.rollout_mse_t,
+                    val.rollout_mse_n,
                     val.samples,
                     val.tickers,
                     val.batches
@@ -1607,7 +1621,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             device,
         );
         println!(
-            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} samples={} tickers={} batches={}",
+            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} samples={} tickers={} batches={}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1627,13 +1641,19 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.probe_explained_variance * 100.0,
             val.next_lat,
             val.flow_loss,
+            val.rollout_mean_mse,
+            val.rollout_sampled_mse,
+            val.rollout_mse_delta,
+            val.rollout_mse_delta_se,
+            val.rollout_mse_t,
+            val.rollout_mse_n,
             val.samples,
             val.tickers,
             val.batches
         );
         writeln!(
             validation_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1653,6 +1673,12 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.probe_explained_variance,
             val.next_lat,
             val.flow_loss,
+            val.rollout_mean_mse,
+            val.rollout_sampled_mse,
+            val.rollout_mse_delta,
+            val.rollout_mse_delta_se,
+            val.rollout_mse_t,
+            val.rollout_mse_n,
             val.samples,
             val.tickers,
             val.batches
@@ -1698,7 +1724,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         best_val = val.total;
         writeln!(
             validation_log,
-            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1718,6 +1744,12 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.probe_explained_variance,
             val.next_lat,
             val.flow_loss,
+            val.rollout_mean_mse,
+            val.rollout_sampled_mse,
+            val.rollout_mse_delta,
+            val.rollout_mse_delta_se,
+            val.rollout_mse_t,
+            val.rollout_mse_n,
             val.samples,
             val.tickers,
             val.batches
@@ -2206,6 +2238,12 @@ struct ValidationLoss {
     zero_mse: f64,
     probe_explained_variance: f64,
     flow_loss: f64,
+    rollout_mean_mse: f64,
+    rollout_sampled_mse: f64,
+    rollout_mse_delta: f64,
+    rollout_mse_delta_se: f64,
+    rollout_mse_t: f64,
+    rollout_mse_n: f64,
     samples: usize,
     tickers: usize,
     batches: usize,
@@ -2683,6 +2721,9 @@ fn validate_full(
         let mut samples = 0usize;
         let mut tickers = 0usize;
         let mut batches = 0usize;
+        let mut rollout_ctx: Vec<Tensor> = Vec::new();
+        let mut rollout_actual: Vec<Tensor> = Vec::new();
+        let mut rollout_windows = 0usize;
 
         let k_patches = sampler.k_patches;
         let patch_size = sampler.patch_size;
@@ -2758,8 +2799,100 @@ fn validate_full(
                 flow_loss_sum += losses.flow_loss.double_value(&[]) * batch_samples as f64;
                 samples += batch_samples;
                 batches += 1;
+
+                if matches!(objective, PretrainObjective::Lejepa)
+                    && rollout_windows < LEJEPA_ROLLOUT_EVAL_WINDOWS
+                {
+                    let take = batch_samples.min(LEJEPA_ROLLOUT_EVAL_WINDOWS - rollout_windows);
+                    rollout_ctx.push(batch.bar_history.narrow(0, 0, take as i64));
+                    rollout_actual.push(batch.next_bars.narrow(0, 0, take as i64));
+                    rollout_windows += take;
+                }
             }
         }
+
+        // Mean vs sampled imagined-rollout MSE against the actual future, scored
+        // in raw OHLC space (matching the candle diagnostics). Per-window MSE
+        // reduces over horizon x 16 features; sampled is the mean of K per-draw
+        // MSEs (E[MSE(sample)]). The averaged scalars equal the global mean since
+        // every window shares the same horizon x feature count. Retaining the
+        // per-window scalars also yields a paired (sampled - mean) t-test.
+        // Chunked at `batch_size` to bound rollout VRAM; sampled loops K times to
+        // avoid K-fold tiling.
+        let (
+            rollout_mean_mse,
+            rollout_sampled_mse,
+            rollout_mse_delta,
+            rollout_mse_delta_se,
+            rollout_mse_t,
+            rollout_mse_n,
+        ) = match objective {
+            PretrainObjective::Lejepa if !rollout_ctx.is_empty() => {
+                let ctx = Tensor::cat(&rollout_ctx, 0);
+                let actual = Tensor::cat(&rollout_actual, 0)
+                    .view([-1, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]);
+                let n_total = ctx.size()[0];
+                let chunk = batch_size as i64;
+                let mut mean_mse: Vec<f64> = Vec::with_capacity(rollout_windows);
+                let mut sampled_mse: Vec<f64> = Vec::with_capacity(rollout_windows);
+                let mut start = 0;
+                while start < n_total {
+                    let len = chunk.min(n_total - start);
+                    let ctx_c = ctx.narrow(0, start, len);
+                    let actual_c = actual.narrow(0, start, len);
+                    let mean_roll =
+                        heads.lejepa_imagined_rollout(&ctx_c, target_scale, 0.0, false)
+                            / target_scale;
+                    let mean_pw = (&mean_roll - &actual_c)
+                        .pow_tensor_scalar(2.0)
+                        .mean_dim([1i64, 2].as_slice(), false, Kind::Float);
+                    let mut sampled_pw = Tensor::zeros([len], (Kind::Float, device));
+                    for _ in 0..LEJEPA_ROLLOUT_EVAL_SAMPLES {
+                        let sampled_roll =
+                            heads.lejepa_imagined_rollout(&ctx_c, target_scale, 1.0, false)
+                                / target_scale;
+                        sampled_pw += (&sampled_roll - &actual_c)
+                            .pow_tensor_scalar(2.0)
+                            .mean_dim([1i64, 2].as_slice(), false, Kind::Float);
+                    }
+                    let sampled_pw = sampled_pw / LEJEPA_ROLLOUT_EVAL_SAMPLES as f64;
+                    mean_mse.extend(
+                        tensor_to_vec_f32(&mean_pw)
+                            .expect("rollout mean mse")
+                            .into_iter()
+                            .map(|x| x as f64),
+                    );
+                    sampled_mse.extend(
+                        tensor_to_vec_f32(&sampled_pw)
+                            .expect("rollout sampled mse")
+                            .into_iter()
+                            .map(|x| x as f64),
+                    );
+                    start += len;
+                }
+                let n = mean_mse.len();
+                let mean_avg = mean_mse.iter().sum::<f64>() / n as f64;
+                let sampled_avg = sampled_mse.iter().sum::<f64>() / n as f64;
+                let diffs: Vec<f64> = sampled_mse
+                    .iter()
+                    .zip(&mean_mse)
+                    .map(|(s, m)| s - m)
+                    .collect();
+                let delta = diffs.iter().sum::<f64>() / n as f64;
+                let (se, t) = if n >= 2 {
+                    let var = diffs.iter().map(|d| (d - delta).powi(2)).sum::<f64>()
+                        / (n as f64 - 1.0);
+                    let se = (var / n as f64).sqrt();
+                    let t = if se > 0.0 { delta / se } else { 0.0 };
+                    (se, t)
+                } else {
+                    (0.0, 0.0)
+                };
+                (mean_avg, sampled_avg, delta, se, t, n as f64)
+            }
+            // NaN/0 = not-applicable: MeanMse has no flow head / imagined rollout.
+            _ => (f64::NAN, f64::NAN, 0.0, 0.0, 0.0, 0.0),
+        };
 
         assert!(samples > 0, "validation set is empty");
         let probe_mse = probe_mse_sum / samples as f64;
@@ -2785,6 +2918,12 @@ fn validate_full(
             zero_mse,
             probe_explained_variance: explained_variance_value(probe_mse, zero_mse),
             flow_loss: flow_loss_sum / samples as f64,
+            rollout_mean_mse,
+            rollout_sampled_mse,
+            rollout_mse_delta,
+            rollout_mse_delta_se,
+            rollout_mse_t,
+            rollout_mse_n,
             samples,
             tickers,
             batches,
