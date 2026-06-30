@@ -1276,6 +1276,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     'epoch_loop: for epoch in 1..=args.epochs {
         sampler.start_epoch();
         let mut train_epoch_loss = RunningLoss::new(device);
+        let mut grad_norm_acc = GradNormAccum::default();
         println!(
             "pretrain epoch {epoch}/{} tickers={} batch_size={} batches_per_epoch={}",
             args.epochs,
@@ -1301,6 +1302,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             assert_finite_loss(&losses.total, global_step);
             opt.zero_grad();
             losses.total.backward();
+            grad_norm_acc.add(&pretrain_grad_norms(&named_vars, device));
             clip_all_grads(&named_vars, MAX_GRAD_NORM, device);
             opt.set_momentum(muon_momentum_for_step(optimizer_step));
             opt.step();
@@ -1552,6 +1554,19 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             train.samples,
             train.batches
         );
+        let grad_norms = grad_norm_acc.mean();
+        println!(
+            "pretrain epoch {epoch} grad_norms grad_total={:.6} grad_flow={:.6} grad_ar={:.6} grad_encoder={:.6} grad_other={:.6} pnorm_flow={:.6} pnorm_ar={:.6} pnorm_encoder={:.6} steps={}",
+            grad_norms.grad_total,
+            grad_norms.grad_flow,
+            grad_norms.grad_ar,
+            grad_norms.grad_encoder,
+            grad_norms.grad_other,
+            grad_norms.pnorm_flow,
+            grad_norms.pnorm_ar,
+            grad_norms.pnorm_encoder,
+            grad_norm_acc.steps
+        );
         writeln!(
             train_epoch_log,
             "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{}",
@@ -1595,7 +1610,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 device,
             );
             println!(
-                "pretrain epoch {epoch} detached_probe_train probe_nll={:.6} ohlc_mse={:.6} ohlc_mae={:.6} pred_std={:.6} target_std={:.6} pred_sigma={:.6} pred_std_level={:.6} target_std_level={:.6} probe_ev_level={:.2}% pred_sigma_level={:.6} samples={} batches={} probe_epochs={}",
+                "pretrain epoch {epoch} detached_probe_train probe_nll={:.6} ohlc_mse={:.6} ohlc_mae={:.6} pred_std={:.6} target_std={:.6} pred_sigma={:.6} pred_std_level={:.6} target_std_level={:.6} probe_ev_level={:.2}% pred_sigma_level={:.6} grad_probe={:.6} pnorm_probe={:.6} samples={} batches={} probe_epochs={}",
                 probe.probe_nll,
                 probe.probe_mse,
                 probe.probe_mae,
@@ -1606,6 +1621,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 probe.target_std_level,
                 probe.probe_ev_level * 100.0,
                 probe.pred_sigma_level,
+                probe.grad_probe,
+                probe.pnorm_probe,
                 probe.samples,
                 probe.batches,
                 args.probe_epochs
@@ -1624,7 +1641,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             device,
         );
         println!(
-            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} samples={} tickers={} batches={}",
+            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} rollout_mean_dclose={:.9} rollout_mean_dclose_std={:.9} rollout_sampled_dclose={:.9} rollout_sampled_dclose_std={:.9} samples={} tickers={} batches={}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1650,6 +1667,10 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.rollout_mse_delta_se,
             val.rollout_mse_t,
             val.rollout_mse_n,
+            val.rollout_mean_dclose,
+            val.rollout_mean_dclose_std,
+            val.rollout_sampled_dclose,
+            val.rollout_sampled_dclose_std,
             val.samples,
             val.tickers,
             val.batches
@@ -2253,6 +2274,10 @@ struct ValidationLoss {
     rollout_mse_delta_se: f64,
     rollout_mse_t: f64,
     rollout_mse_n: f64,
+    rollout_mean_dclose: f64,
+    rollout_mean_dclose_std: f64,
+    rollout_sampled_dclose: f64,
+    rollout_sampled_dclose_std: f64,
     samples: usize,
     tickers: usize,
     batches: usize,
@@ -2427,6 +2452,8 @@ struct ProbeTrainSummary {
     target_std_level: f64,
     probe_ev_level: f64,
     pred_sigma_level: f64,
+    grad_probe: f64,
+    pnorm_probe: f64,
     samples: usize,
     batches: usize,
 }
@@ -2643,6 +2670,8 @@ fn train_detached_probe(
     let mut target_std_level_sum = 0.0;
     let mut probe_ev_level_sum = 0.0;
     let mut pred_sigma_level_sum = 0.0;
+    let mut grad_probe_sum = 0.0;
+    let mut pnorm_probe_sum = 0.0;
     let mut samples = 0usize;
     let mut batches = 0usize;
 
@@ -2662,6 +2691,9 @@ fn train_detached_probe(
             assert_finite_loss(&probe.probe_nll, probe_epoch + 1);
             probe_opt.zero_grad();
             probe_loss.backward();
+            let (grad_probe, pnorm_probe) = named_grad_param_l2(probe_named_vars, device);
+            grad_probe_sum += grad_probe;
+            pnorm_probe_sum += pnorm_probe;
             clip_all_grads(probe_named_vars, MAX_GRAD_NORM, device);
             probe_opt.step();
 
@@ -2693,6 +2725,8 @@ fn train_detached_probe(
         target_std_level: target_std_level_sum / denom,
         probe_ev_level: probe_ev_level_sum / denom,
         pred_sigma_level: pred_sigma_level_sum / denom,
+        grad_probe: grad_probe_sum / batches.max(1) as f64,
+        pnorm_probe: pnorm_probe_sum / batches.max(1) as f64,
         samples,
         batches,
     }
@@ -2841,6 +2875,10 @@ fn validate_full(
             rollout_mse_delta_se,
             rollout_mse_t,
             rollout_mse_n,
+            rollout_mean_dclose,
+            rollout_mean_dclose_std,
+            rollout_sampled_dclose,
+            rollout_sampled_dclose_std,
         ) = match objective {
             PretrainObjective::Lejepa if !rollout_ctx.is_empty() => {
                 let ctx = Tensor::cat(&rollout_ctx, 0);
@@ -2850,6 +2888,16 @@ fn validate_full(
                 let chunk = batch_size as i64;
                 let mut mean_mse: Vec<f64> = Vec::with_capacity(rollout_windows);
                 let mut sampled_mse: Vec<f64> = Vec::with_capacity(rollout_windows);
+                // Decoded close-delta (feature row[3]) accumulators over all
+                // rollout bars x windows (x K draws for sampled). Captured at the
+                // feature level before the multiplicative close chain to confirm
+                // the tiny per-bar bias `b` driving rollout drift.
+                let mut mean_dclose_sum = 0.0f64;
+                let mut mean_dclose_sqsum = 0.0f64;
+                let mut mean_dclose_n = 0i64;
+                let mut sampled_dclose_sum = 0.0f64;
+                let mut sampled_dclose_sqsum = 0.0f64;
+                let mut sampled_dclose_n = 0i64;
                 let mut start = 0;
                 while start < n_total {
                     let len = chunk.min(n_total - start);
@@ -2858,6 +2906,11 @@ fn validate_full(
                     let mean_roll =
                         heads.lejepa_imagined_rollout(&ctx_c, target_scale, 0.0, false)
                             / target_scale;
+                    let mean_dclose = mean_roll.narrow(2, 3, 1);
+                    mean_dclose_sum += mean_dclose.sum(Kind::Float).double_value(&[]);
+                    mean_dclose_sqsum +=
+                        mean_dclose.square().sum(Kind::Float).double_value(&[]);
+                    mean_dclose_n += mean_dclose.numel() as i64;
                     let mean_pw = (&mean_roll - &actual_c)
                         .pow_tensor_scalar(2.0)
                         .mean_dim([1i64, 2].as_slice(), false, Kind::Float);
@@ -2866,6 +2919,12 @@ fn validate_full(
                         let sampled_roll =
                             heads.lejepa_imagined_rollout(&ctx_c, target_scale, 1.0, false)
                                 / target_scale;
+                        let sampled_dclose = sampled_roll.narrow(2, 3, 1);
+                        sampled_dclose_sum +=
+                            sampled_dclose.sum(Kind::Float).double_value(&[]);
+                        sampled_dclose_sqsum +=
+                            sampled_dclose.square().sum(Kind::Float).double_value(&[]);
+                        sampled_dclose_n += sampled_dclose.numel() as i64;
                         sampled_pw += (&sampled_roll - &actual_c)
                             .pow_tensor_scalar(2.0)
                             .mean_dim([1i64, 2].as_slice(), false, Kind::Float);
@@ -2903,10 +2962,42 @@ fn validate_full(
                 } else {
                     (0.0, 0.0)
                 };
-                (mean_avg, sampled_avg, delta, se, t, n as f64)
+                let mean_dclose_avg = mean_dclose_sum / mean_dclose_n as f64;
+                let mean_dclose_std = (mean_dclose_sqsum / mean_dclose_n as f64
+                    - mean_dclose_avg.powi(2))
+                .max(0.0)
+                .sqrt();
+                let sampled_dclose_avg = sampled_dclose_sum / sampled_dclose_n as f64;
+                let sampled_dclose_std = (sampled_dclose_sqsum / sampled_dclose_n as f64
+                    - sampled_dclose_avg.powi(2))
+                .max(0.0)
+                .sqrt();
+                (
+                    mean_avg,
+                    sampled_avg,
+                    delta,
+                    se,
+                    t,
+                    n as f64,
+                    mean_dclose_avg,
+                    mean_dclose_std,
+                    sampled_dclose_avg,
+                    sampled_dclose_std,
+                )
             }
             // NaN/0 = not-applicable: MeanMse has no flow head / imagined rollout.
-            _ => (f64::NAN, f64::NAN, 0.0, 0.0, 0.0, 0.0),
+            _ => (
+                f64::NAN,
+                f64::NAN,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            ),
         };
 
         assert!(samples > 0, "validation set is empty");
@@ -2939,6 +3030,10 @@ fn validate_full(
             rollout_mse_delta_se,
             rollout_mse_t,
             rollout_mse_n,
+            rollout_mean_dclose,
+            rollout_mean_dclose_std,
+            rollout_sampled_dclose,
+            rollout_sampled_dclose_std,
             samples,
             tickers,
             batches,
@@ -3532,6 +3627,154 @@ fn clip_all_grads(named_vars: &[(String, Tensor)], max_grad_norm: f64, device: D
             let _ = grad.g_mul_(&coef);
         }
     });
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LejepaGradGroup {
+    Flow,
+    Encoder,
+    Ar,
+    Other,
+}
+
+// Routes a trainable parameter to its learning-dynamics group by name. Order
+// matters: the flow head is checked first, then the per-bar encoder/projector
+// (which also matches `lejepa_projector`), leaving the AR transformer +
+// `lejepa_pred_proj` as the remaining `lejepa_` params. Everything else (base
+// model params with no gradient during LeJEPA pretrain) is a catch-all.
+fn lejepa_grad_group(name: &str) -> LejepaGradGroup {
+    if name.contains("lejepa_flow_") {
+        LejepaGradGroup::Flow
+    } else if name.contains("bar_proj")
+        || name.contains("bar_enrich_")
+        || name.contains("lejepa_projector")
+    {
+        LejepaGradGroup::Encoder
+    } else if name.contains("lejepa_") {
+        LejepaGradGroup::Ar
+    } else {
+        LejepaGradGroup::Other
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PretrainGradNorms {
+    grad_total: f64,
+    grad_flow: f64,
+    grad_encoder: f64,
+    grad_ar: f64,
+    grad_other: f64,
+    pnorm_flow: f64,
+    pnorm_encoder: f64,
+    pnorm_ar: f64,
+}
+
+// Pure instrumentation: reads `.grad()` and weights without mutating either, so
+// it never perturbs training. Computes the global L2 grad norm per group plus
+// the weight L2 norm per group (for update-to-weight ratios). Undefined grads
+// are skipped so partially-active subgraphs are handled safely.
+fn pretrain_grad_norms(named_vars: &[(String, Tensor)], device: Device) -> PretrainGradNorms {
+    tch::no_grad(|| {
+        let mut grad_flow_sq = Tensor::zeros([], (Kind::Float, device));
+        let mut grad_encoder_sq = Tensor::zeros([], (Kind::Float, device));
+        let mut grad_ar_sq = Tensor::zeros([], (Kind::Float, device));
+        let mut grad_other_sq = Tensor::zeros([], (Kind::Float, device));
+        let mut pnorm_flow_sq = Tensor::zeros([], (Kind::Float, device));
+        let mut pnorm_encoder_sq = Tensor::zeros([], (Kind::Float, device));
+        let mut pnorm_ar_sq = Tensor::zeros([], (Kind::Float, device));
+        for (name, param) in named_vars {
+            let group = lejepa_grad_group(name);
+            let grad = param.grad();
+            if grad.defined() {
+                let sq = grad.square().sum(Kind::Float);
+                match group {
+                    LejepaGradGroup::Flow => grad_flow_sq += &sq,
+                    LejepaGradGroup::Encoder => grad_encoder_sq += &sq,
+                    LejepaGradGroup::Ar => grad_ar_sq += &sq,
+                    LejepaGradGroup::Other => grad_other_sq += &sq,
+                }
+            }
+            let psq = param.square().sum(Kind::Float);
+            match group {
+                LejepaGradGroup::Flow => pnorm_flow_sq += &psq,
+                LejepaGradGroup::Encoder => pnorm_encoder_sq += &psq,
+                LejepaGradGroup::Ar => pnorm_ar_sq += &psq,
+                LejepaGradGroup::Other => {}
+            }
+        }
+        let grad_total_sq = &grad_flow_sq + &grad_encoder_sq + &grad_ar_sq + &grad_other_sq;
+        PretrainGradNorms {
+            grad_total: grad_total_sq.sqrt().double_value(&[]),
+            grad_flow: grad_flow_sq.sqrt().double_value(&[]),
+            grad_encoder: grad_encoder_sq.sqrt().double_value(&[]),
+            grad_ar: grad_ar_sq.sqrt().double_value(&[]),
+            grad_other: grad_other_sq.sqrt().double_value(&[]),
+            pnorm_flow: pnorm_flow_sq.sqrt().double_value(&[]),
+            pnorm_encoder: pnorm_encoder_sq.sqrt().double_value(&[]),
+            pnorm_ar: pnorm_ar_sq.sqrt().double_value(&[]),
+        }
+    })
+}
+
+// Global L2 grad norm and weight L2 norm over an arbitrary param slice (used for
+// the detached probe, whose params are all `probe_`).
+fn named_grad_param_l2(named_vars: &[(String, Tensor)], device: Device) -> (f64, f64) {
+    tch::no_grad(|| {
+        let mut grad_sq = Tensor::zeros([], (Kind::Float, device));
+        let mut param_sq = Tensor::zeros([], (Kind::Float, device));
+        for (_, param) in named_vars {
+            let grad = param.grad();
+            if grad.defined() {
+                grad_sq += grad.square().sum(Kind::Float);
+            }
+            param_sq += param.square().sum(Kind::Float);
+        }
+        (
+            grad_sq.sqrt().double_value(&[]),
+            param_sq.sqrt().double_value(&[]),
+        )
+    })
+}
+
+#[derive(Default)]
+struct GradNormAccum {
+    grad_total: f64,
+    grad_flow: f64,
+    grad_encoder: f64,
+    grad_ar: f64,
+    grad_other: f64,
+    pnorm_flow: f64,
+    pnorm_encoder: f64,
+    pnorm_ar: f64,
+    steps: usize,
+}
+
+impl GradNormAccum {
+    fn add(&mut self, norms: &PretrainGradNorms) {
+        self.grad_total += norms.grad_total;
+        self.grad_flow += norms.grad_flow;
+        self.grad_encoder += norms.grad_encoder;
+        self.grad_ar += norms.grad_ar;
+        self.grad_other += norms.grad_other;
+        self.pnorm_flow += norms.pnorm_flow;
+        self.pnorm_encoder += norms.pnorm_encoder;
+        self.pnorm_ar += norms.pnorm_ar;
+        self.steps += 1;
+    }
+
+    fn mean(&self) -> PretrainGradNorms {
+        let denom = self.steps.max(1) as f64;
+        PretrainGradNorms {
+            grad_total: self.grad_total / denom,
+            grad_flow: self.grad_flow / denom,
+            grad_encoder: self.grad_encoder / denom,
+            grad_ar: self.grad_ar / denom,
+            grad_other: self.grad_other / denom,
+            pnorm_flow: self.pnorm_flow / denom,
+            pnorm_encoder: self.pnorm_encoder / denom,
+            pnorm_ar: self.pnorm_ar / denom,
+        }
+    }
 }
 
 fn assert_finite_loss(loss: &Tensor, step: usize) {
