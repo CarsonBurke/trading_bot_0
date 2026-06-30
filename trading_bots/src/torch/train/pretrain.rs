@@ -36,6 +36,10 @@ const LEJEPA_AR_LAYERS: usize = 5;
 const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
 const LEJEPA_ROPE_DIMS: i64 = 32;
+const LEJEPA_FLOW_WEIGHT: f64 = 1.0;
+const LEJEPA_FLOW_SAMPLE_STEPS: i64 = 8;
+const LEJEPA_FLOW_TIME_DIM: i64 = 64;
+const LEJEPA_FLOW_BLOCKS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -84,6 +88,19 @@ struct LejepaBarPredictions {
     projected: Tensor,
 }
 
+struct LejepaFlowBlock {
+    fc1: nn::Linear,
+    fc2: nn::Linear,
+}
+
+struct LejepaFlowHead {
+    time_fc1: nn::Linear,
+    time_fc2: nn::Linear,
+    in_proj: nn::Linear,
+    blocks: Vec<LejepaFlowBlock>,
+    out_proj: nn::Linear,
+}
+
 struct PretrainHeads {
     forecast_queries: Tensor,
     horizon_pos_proj: nn::Linear,
@@ -99,6 +116,7 @@ struct PretrainHeads {
     lejepa_layers: Vec<CausalLejepaLayer>,
     lejepa_pred_proj: nn::Linear,
     lejepa_pred_projector: ProjectionMlp,
+    lejepa_flow: LejepaFlowHead,
     rope: RotaryEmbedding,
     probe_input_ln: nn::LayerNorm,
     probe_head: nn::Linear,
@@ -325,6 +343,42 @@ impl PretrainHeads {
                 Default::default(),
             ),
         };
+        let mut lejepa_flow_blocks = Vec::with_capacity(LEJEPA_FLOW_BLOCKS);
+        for block_idx in 0..LEJEPA_FLOW_BLOCKS {
+            let block_name = format!("lejepa_flow_block_{block_idx}");
+            let block_path = p / block_name.as_str();
+            lejepa_flow_blocks.push(LejepaFlowBlock {
+                fc1: nn::linear(&block_path / "fc1", latent_dim, ff_dim, Default::default()),
+                fc2: nn::linear(&block_path / "fc2", ff_dim, latent_dim, Default::default()),
+            });
+        }
+        let lejepa_flow = LejepaFlowHead {
+            time_fc1: nn::linear(
+                p / "lejepa_flow_time_fc1",
+                LEJEPA_FLOW_TIME_DIM,
+                latent_dim,
+                Default::default(),
+            ),
+            time_fc2: nn::linear(
+                p / "lejepa_flow_time_fc2",
+                latent_dim,
+                latent_dim,
+                Default::default(),
+            ),
+            in_proj: nn::linear(
+                p / "lejepa_flow_in_proj",
+                latent_dim * 3,
+                latent_dim,
+                Default::default(),
+            ),
+            blocks: lejepa_flow_blocks,
+            out_proj: nn::linear(
+                p / "lejepa_flow_out_proj",
+                latent_dim,
+                latent_dim,
+                Default::default(),
+            ),
+        };
         let probe_input_ln =
             nn::layer_norm(p / "probe_input_ln", vec![latent_dim], Default::default());
         let probe_head = nn::linear(
@@ -362,6 +416,7 @@ impl PretrainHeads {
             lejepa_layers,
             lejepa_pred_proj,
             lejepa_pred_projector,
+            lejepa_flow,
             rope,
             probe_input_ln,
             probe_head,
@@ -580,6 +635,23 @@ impl PretrainHeads {
         (mean, logvar)
     }
 
+    fn lejepa_flow_velocity(&self, z_tau: &Tensor, tau: &Tensor, ctx: &Tensor) -> Tensor {
+        let flow = &self.lejepa_flow;
+        let time_emb = flow_time_embedding(tau, LEJEPA_FLOW_TIME_DIM);
+        let time_h = flow.time_fc2.forward(
+            &normalize_last_dim(&flow.time_fc1.forward(&time_emb)).gelu("none"),
+        );
+        let input = Tensor::cat(&[z_tau, &time_h, ctx], -1);
+        let mut h = flow.in_proj.forward(&input);
+        for block in &flow.blocks {
+            let enriched = block.fc2.forward(
+                &normalize_last_dim(&block.fc1.forward(&normalize_last_dim(&h))).gelu("none"),
+            );
+            h = h + enriched;
+        }
+        flow.out_proj.forward(&normalize_last_dim(&h))
+    }
+
     fn lejepa_imagined_rollout(
         &self,
         context_bars: &Tensor,
@@ -599,9 +671,15 @@ impl PretrainHeads {
         train: bool,
         collect_entropy: bool,
     ) -> (Tensor, Option<RolloutEntropy>) {
+        let _ = target_scale;
         let deterministic = temperature == 0.0;
         let mut tokens = self.encode_bar_tokens(context_bars).detach();
-        let batch = tokens.size()[0];
+        let size = tokens.size();
+        let batch = size[0];
+        let tickers = size[1];
+        let latent_dim = self.latent_dim;
+        let rows = batch * tickers;
+        let device = tokens.device();
         let mut imagined = Vec::with_capacity(LEJEPA_ROLLOUT_BARS as usize);
         let mut ent_means: Vec<Tensor> = Vec::new();
         let mut ent_noise: Vec<Tensor> = Vec::new();
@@ -610,42 +688,56 @@ impl PretrainHeads {
         for _ in 0..LEJEPA_ROLLOUT_BARS {
             let preds = self.predict_lejepa_bar_predictions(&tokens, train);
             let last = tokens.size()[2] - 1;
-            let belief_last = preds.belief.narrow(2, last, 1);
-            let (mean, logvar) = self.probe_ohlc_features(&belief_last.detach());
-            let sigma = (logvar * 0.5).exp();
-            let sampled = if deterministic {
-                mean.shallow_clone()
+            let belief_last = preds.belief.narrow(2, last, 1).detach();
+            let projected_last = preds.projected.narrow(2, last, 1).detach();
+            // Emission candle: probe mean of the belief. Diversity across the
+            // rollout now comes from the sampled latent making beliefs diverge.
+            let (mean, _logvar) = self.probe_ohlc_features(&belief_last);
+            imagined.push(mean.view([batch, LEJEPA_BAR_FEATURES]));
+            let next_token = if deterministic {
+                projected_last.shallow_clone()
             } else {
-                &mean + temperature * &sigma * Tensor::randn_like(&mean)
+                // Sample the next latent by integrating the conditional flow ODE.
+                let ctx = belief_last.reshape([rows, latent_dim]);
+                let prior_std = tokens.std(false);
+                let mut z = Tensor::randn([rows, latent_dim], (Kind::Float, device))
+                    * &prior_std
+                    * temperature;
+                let steps = LEJEPA_FLOW_SAMPLE_STEPS;
+                for k in 0..steps {
+                    let tau = Tensor::full(
+                        [rows, 1],
+                        k as f64 / steps as f64,
+                        (Kind::Float, device),
+                    );
+                    let v = self.lejepa_flow_velocity(&z, &tau, &ctx);
+                    z = z + v * (1.0 / steps as f64);
+                }
+                z.view([batch, tickers, 1, latent_dim])
             };
-            let bar_feat = &sampled / target_scale;
-            let next_token = self.encode_bar_tokens(&bar_feat).detach();
             if collect_entropy {
-                let mean_feat = &mean / target_scale;
-                let token_mean = self.encode_bar_tokens(&mean_feat).detach();
-                let ts = next_token.view([batch, -1]);
-                let tm = token_mean.view([batch, -1]);
-                let ts_n = ts
+                let nt = next_token.reshape([rows, latent_dim]);
+                let pm = projected_last.reshape([rows, latent_dim]);
+                let nt_n = nt
                     .square()
                     .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
                     .sqrt();
-                let tm_n = tm
+                let pm_n = pm
                     .square()
                     .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
                     .sqrt();
-                let diff_n = (&ts - &tm)
+                let diff_n = (&nt - &pm)
                     .square()
                     .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
                     .sqrt();
-                let dot = (&ts * &tm).sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
-                let cos = (&dot / (&ts_n * &tm_n + 1e-8)).mean(Kind::Float);
-                let rel = (&diff_n / (&tm_n + 1e-8)).mean(Kind::Float);
+                let dot = (&nt * &pm).sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
+                let cos = (&dot / (&nt_n * &pm_n + 1e-8)).mean(Kind::Float);
+                let rel = (&diff_n / (&pm_n + 1e-8)).mean(Kind::Float);
                 ent_cos += cos.double_value(&[]);
                 ent_rel += rel.double_value(&[]);
                 ent_means.push(mean.view([batch, LEJEPA_BAR_FEATURES]));
-                ent_noise.push((&sampled - &mean).view([batch, LEJEPA_BAR_FEATURES]));
+                ent_noise.push(&nt - &pm);
             }
-            imagined.push(sampled.view([batch, LEJEPA_BAR_FEATURES]));
             tokens = Tensor::cat(&[&tokens, &next_token], 2);
             let len = tokens.size()[2];
             let max_len = PRICE_DELTAS_PER_TICKER as i64;
@@ -1117,6 +1209,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 "bar_proj".to_string(),
                 "bar_enrich_".to_string(),
                 "lejepa_".to_string(),
+                "lejepa_flow_".to_string(),
                 "probe_".to_string(),
             ],
             ..MuonConfig::default()
@@ -1158,17 +1251,17 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         BufWriter::new(File::create(run_dir.root.join("pretrain_validation.csv"))?);
     writeln!(
         train_epoch_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples,batches"
+        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,flow_loss,samples,batches"
     )?;
     writeln!(
         validation_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples,tickers,batches"
+        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,flow_loss,samples,tickers,batches"
     )?;
     let mut step_log = if args.log_step_losses {
         let mut log = BufWriter::new(File::create(run_dir.root.join("pretrain_train_steps.csv"))?);
         writeln!(
             log,
-            "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples"
+            "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,flow_loss,samples"
         )?;
         Some(log)
     } else {
@@ -1229,9 +1322,10 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 let zero_mse_v = losses.zero_mse.double_value(&[]);
                 let probe_explained_variance_v = losses.probe_explained_variance.double_value(&[]);
                 let lat_v = losses.next_lat.double_value(&[]);
+                let flow_v = losses.flow_loss.double_value(&[]);
                 writeln!(
                     log,
-                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples}"
+                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{flow_v:.9},{batch_samples}"
                 )?;
                 scalar_losses = Some((
                     total_v,
@@ -1253,6 +1347,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     zero_mse_v,
                     probe_explained_variance_v,
                     lat_v,
+                    flow_v,
                 ));
             }
 
@@ -1277,6 +1372,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     zero_mse_v,
                     probe_explained_variance_v,
                     lat_v,
+                    flow_v,
                 ) = scalar_losses.unwrap_or_else(|| {
                     (
                         losses.total.double_value(&[]),
@@ -1298,10 +1394,11 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                         losses.zero_mse.double_value(&[]),
                         losses.probe_explained_variance.double_value(&[]),
                         losses.next_lat.double_value(&[]),
+                        losses.flow_loss.double_value(&[]),
                     )
                 });
                 println!(
-                    "pretrain epoch {epoch} step {global_step} train total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6}",
+                    "pretrain epoch {epoch} step {global_step} train total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6}",
                     total_v,
                     jepa_mse_v,
                     sigreg_v,
@@ -1319,7 +1416,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     probe_terminal_mse_v,
                     zero_mse_v,
                     probe_explained_variance_v * 100.0,
-                    lat_v
+                    lat_v,
+                    flow_v
                 );
             }
 
@@ -1336,7 +1434,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     device,
                 );
                 println!(
-                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} samples={} tickers={} batches={}",
+                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} samples={} tickers={} batches={}",
                     val.total,
                     val.jepa_mse,
                     val.sigreg,
@@ -1355,13 +1453,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.zero_mse,
                     val.probe_explained_variance * 100.0,
                     val.next_lat,
+                    val.flow_loss,
                     val.samples,
                     val.tickers,
                     val.batches
                 );
                 writeln!(
                     validation_log,
-                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
                     val.total,
                     val.jepa_mse,
                     val.sigreg,
@@ -1380,6 +1479,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.zero_mse,
                     val.probe_explained_variance,
                     val.next_lat,
+                    val.flow_loss,
                     val.samples,
                     val.tickers,
                     val.batches
@@ -1412,7 +1512,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
 
         let train = train_epoch_loss.finish();
         println!(
-            "pretrain epoch {epoch} train_mean total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} samples={} batches={}",
+            "pretrain epoch {epoch} train_mean total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} samples={} batches={}",
             train.total,
             train.jepa_mse,
             train.sigreg,
@@ -1431,12 +1531,13 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             train.zero_mse,
             train.probe_explained_variance * 100.0,
             train.next_lat,
+            train.flow_loss,
             train.samples,
             train.batches
         );
         writeln!(
             train_epoch_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{}",
+            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{}",
             train.total,
             train.jepa_mse,
             train.sigreg,
@@ -1455,6 +1556,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             train.zero_mse,
             train.probe_explained_variance,
             train.next_lat,
+            train.flow_loss,
             train.samples,
             train.batches
         )?;
@@ -1505,7 +1607,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             device,
         );
         println!(
-            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} samples={} tickers={} batches={}",
+            "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} flow={:.6} samples={} tickers={} batches={}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1524,13 +1626,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.zero_mse,
             val.probe_explained_variance * 100.0,
             val.next_lat,
+            val.flow_loss,
             val.samples,
             val.tickers,
             val.batches
         );
         writeln!(
             validation_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1549,6 +1652,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.zero_mse,
             val.probe_explained_variance,
             val.next_lat,
+            val.flow_loss,
             val.samples,
             val.tickers,
             val.batches
@@ -1594,7 +1698,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         best_val = val.total;
         writeln!(
             validation_log,
-            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
             val.total,
             val.jepa_mse,
             val.sigreg,
@@ -1613,6 +1717,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.zero_mse,
             val.probe_explained_variance,
             val.next_lat,
+            val.flow_loss,
             val.samples,
             val.tickers,
             val.batches
@@ -1755,6 +1860,7 @@ fn mean_mse_pretrain_loss(
 
     if lambda_lat == 0.0 {
         let next_lat = Tensor::zeros([], (Kind::Float, pred_abs.device()));
+        let flow_zero = zero_like_scalar(&probe_mse);
         return PretrainLoss {
             total: base_loss,
             jepa_mse: zero_like_scalar(&probe_mse),
@@ -1775,6 +1881,7 @@ fn mean_mse_pretrain_loss(
             probe_terminal_mse,
             zero_mse,
             probe_explained_variance,
+            flow_loss: flow_zero,
         };
     }
 
@@ -1790,6 +1897,7 @@ fn mean_mse_pretrain_loss(
     let pred_next_latent = heads.predict_next_latent(&latent, &batch.next_patch);
     let latent_loss = pred_next_latent.smooth_l1_loss(&next_latent, Reduction::Mean, 1.0);
     let total = &base_loss + &latent_loss * lambda_lat;
+    let flow_zero = zero_like_scalar(&probe_mse);
     PretrainLoss {
         total,
         jepa_mse: zero_like_scalar(&probe_mse),
@@ -1810,7 +1918,33 @@ fn mean_mse_pretrain_loss(
         probe_terminal_mse,
         zero_mse,
         probe_explained_variance,
+        flow_loss: flow_zero,
     }
+}
+
+fn lejepa_flow_loss(heads: &PretrainHeads, belief: &Tensor, target_tokens: &Tensor) -> Tensor {
+    let latent_dim = heads.latent_dim;
+    let z1 = target_tokens.detach();
+    let ctx = belief.detach();
+    let rows = z1.numel() as i64 / latent_dim;
+    let z1 = z1.reshape([rows, latent_dim]);
+    let ctx = ctx.reshape([rows, latent_dim]);
+    // Scale-match the Gaussian prior to the detached latent marginal: the token
+    // std is ~0.2, so a unit prior would make the field fight a large variance
+    // contraction. We match the scalar std only (no mean shift); the conditioning
+    // ctx absorbs any near-zero marginal offset.
+    let prior_std = z1.std(false);
+    let z0 = Tensor::randn_like(&z1) * &prior_std;
+    let tau = Tensor::rand([rows, 1], (Kind::Float, z1.device()));
+    let inv_tau = (&tau * -1.0) + 1.0;
+    let z_tau = &z1 * &tau + &z0 * &inv_tau;
+    let target_v = &z1 - &z0;
+    let pred_v = heads.lejepa_flow_velocity(&z_tau, &tau, &ctx);
+    let per_sample = (pred_v - target_v)
+        .square()
+        .mean_dim([-1i64].as_slice(), false, Kind::Float);
+    let ramp = tau.view([rows]) * 0.9 + 0.1;
+    (per_sample * ramp).mean(Kind::Float)
 }
 
 fn lejepa_pretrain_loss(
@@ -1857,7 +1991,8 @@ fn lejepa_pretrain_loss(
     let pred_next_embed = predictions
         .belief
         .select(2, predictions.belief.size()[2] - 1);
-    let total = &jepa_mse + &sigreg * lambda_sigreg;
+    let flow_loss = lejepa_flow_loss(heads, &predictions.belief, &target_bar_tokens);
+    let total = &jepa_mse + &sigreg * lambda_sigreg + &flow_loss * LEJEPA_FLOW_WEIGHT;
 
     let probe_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
     let probe = ohlc_probe_metrics(heads, &pred_next_embed.detach(), &probe_target);
@@ -1884,6 +2019,7 @@ fn lejepa_pretrain_loss(
         probe_terminal_mse: probe.probe_terminal_mse,
         zero_mse,
         probe_explained_variance,
+        flow_loss,
     }
 }
 
@@ -2069,6 +2205,7 @@ struct ValidationLoss {
     probe_terminal_mse: f64,
     zero_mse: f64,
     probe_explained_variance: f64,
+    flow_loss: f64,
     samples: usize,
     tickers: usize,
     batches: usize,
@@ -2094,6 +2231,7 @@ struct PretrainLoss {
     probe_terminal_mse: Tensor,
     zero_mse: Tensor,
     probe_explained_variance: Tensor,
+    flow_loss: Tensor,
 }
 
 struct RunningLoss {
@@ -2115,6 +2253,7 @@ struct RunningLoss {
     next_lat_sum: Tensor,
     probe_terminal_mse_sum: Tensor,
     zero_mse_sum: Tensor,
+    flow_loss_sum: Tensor,
     samples: usize,
     batches: usize,
 }
@@ -2140,6 +2279,7 @@ impl RunningLoss {
             next_lat_sum: Tensor::zeros([], (Kind::Float, device)),
             probe_terminal_mse_sum: Tensor::zeros([], (Kind::Float, device)),
             zero_mse_sum: Tensor::zeros([], (Kind::Float, device)),
+            flow_loss_sum: Tensor::zeros([], (Kind::Float, device)),
             samples: 0,
             batches: 0,
         }
@@ -2166,6 +2306,7 @@ impl RunningLoss {
             self.next_lat_sum += losses.next_lat.detach() * weight;
             self.probe_terminal_mse_sum += losses.probe_terminal_mse.detach() * weight;
             self.zero_mse_sum += losses.zero_mse.detach() * weight;
+            self.flow_loss_sum += losses.flow_loss.detach() * weight;
             self.samples += samples;
             self.batches += 1;
         });
@@ -2196,6 +2337,7 @@ impl RunningLoss {
             probe_terminal_mse: self.probe_terminal_mse_sum.double_value(&[]) / denom,
             zero_mse,
             probe_explained_variance: explained_variance_value(probe_mse, zero_mse),
+            flow_loss: self.flow_loss_sum.double_value(&[]) / denom,
             samples: self.samples,
             batches: self.batches,
         }
@@ -2222,6 +2364,7 @@ struct TrainEpochLoss {
     probe_terminal_mse: f64,
     zero_mse: f64,
     probe_explained_variance: f64,
+    flow_loss: f64,
     samples: usize,
     batches: usize,
 }
@@ -2536,6 +2679,7 @@ fn validate_full(
         let mut next_lat_sum = 0.0;
         let mut probe_terminal_mse_sum = 0.0;
         let mut zero_mse_sum = 0.0;
+        let mut flow_loss_sum = 0.0;
         let mut samples = 0usize;
         let mut tickers = 0usize;
         let mut batches = 0usize;
@@ -2611,6 +2755,7 @@ fn validate_full(
                 probe_terminal_mse_sum +=
                     losses.probe_terminal_mse.double_value(&[]) * batch_samples as f64;
                 zero_mse_sum += zero_mse_loss.double_value(&[]) * batch_samples as f64;
+                flow_loss_sum += losses.flow_loss.double_value(&[]) * batch_samples as f64;
                 samples += batch_samples;
                 batches += 1;
             }
@@ -2639,6 +2784,7 @@ fn validate_full(
             probe_terminal_mse: probe_terminal_mse_sum / samples as f64,
             zero_mse,
             probe_explained_variance: explained_variance_value(probe_mse, zero_mse),
+            flow_loss: flow_loss_sum / samples as f64,
             samples,
             tickers,
             batches,
@@ -3241,6 +3387,16 @@ fn append_ohlc_feature_window(
     }
 }
 
+fn flow_time_embedding(tau: &Tensor, dim: i64) -> Tensor {
+    let half = dim / 2;
+    let device = tau.device();
+    let exponent =
+        Tensor::arange(half, (Kind::Float, device)) * (-(10000f64.ln()) / half as f64);
+    let freqs = exponent.exp();
+    let args = (tau.view([-1, 1]) * 1000.0) * freqs.view([1, half]);
+    Tensor::cat(&[args.sin(), args.cos()], -1)
+}
+
 fn normalize_last_dim(x: &Tensor) -> Tensor {
     let mean = x.mean_dim([-1].as_slice(), true, Kind::Float);
     let centered = x - &mean;
@@ -3303,8 +3459,9 @@ mod tests {
     use super::{
         bar_history_for_current_perm, build_split_offsets, candle_from_ohlc_feature_row,
         chained_candles_from_ohlc_features, cumulative_future_returns,
-        future_patches_for_current_perm, next_bars_for_current_perm, seed_candle_from_feature_row,
-        sigreg_loss, CandleBar, PretrainHeads, SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
+        future_patches_for_current_perm, lejepa_flow_loss, next_bars_for_current_perm,
+        seed_candle_from_feature_row, sigreg_loss, CandleBar, PretrainHeads, SplitKind,
+        LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -3607,5 +3764,29 @@ mod tests {
             imagined.isfinite().all().int64_value(&[]) != 0,
             "imagined rollout must be finite"
         );
+    }
+
+    #[test]
+    fn flow_loss_handles_gapped_narrowed_targets() {
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let latent_dim = 256;
+        let heads = PretrainHeads::new(&vs.root(), latent_dim, 16, 25);
+        let batch = 2;
+        let length = 6;
+        let bars = Tensor::randn(
+            [batch, 1, length + 1, LEJEPA_BAR_FEATURES],
+            (tch::Kind::Float, tch::Device::Cpu),
+        );
+        // Mirrors lejepa_pretrain_loss: the flow target is a non-contiguous
+        // narrowed slice that folds a gapped position dim into rows.
+        let all_tokens = heads.encode_bar_tokens(&bars);
+        let bar_tokens = all_tokens.narrow(2, 0, length);
+        let target_bar_tokens = all_tokens.narrow(2, 1, length);
+        let predictions = heads.predict_lejepa_bar_predictions(&bar_tokens, false);
+        let flow = lejepa_flow_loss(&heads, &predictions.belief, &target_bar_tokens);
+        assert_eq!(flow.size(), Vec::<i64>::new());
+        let value = flow.double_value(&[]);
+        assert!(value.is_finite(), "flow loss must be finite, got {value}");
+        assert!(value >= 0.0, "flow loss must be non-negative, got {value}");
     }
 }
