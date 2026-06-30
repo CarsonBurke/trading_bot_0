@@ -100,6 +100,8 @@ struct LejepaFlowHead {
     in_proj: nn::Linear,
     blocks: Vec<LejepaFlowBlock>,
     out_proj: nn::Linear,
+    out_gain: Tensor,
+    out_shift: Tensor,
 }
 
 struct PretrainHeads {
@@ -359,6 +361,11 @@ impl PretrainHeads {
                 latent_dim,
                 Default::default(),
             ),
+            // Learnable affine on the non-affine pre-out_proj LayerNorm. Names
+            // carry the `lejepa_flow_` prefix so they route to the flow
+            // optimizer group and grad-norm bucket.
+            out_gain: p.ones("lejepa_flow_out_gain", &[latent_dim]),
+            out_shift: p.zeros("lejepa_flow_out_shift", &[latent_dim]),
         };
         let probe_input_ln =
             nn::layer_norm(p / "probe_input_ln", vec![latent_dim], Default::default());
@@ -628,7 +635,9 @@ impl PretrainHeads {
             );
             h = h + enriched;
         }
-        flow.out_proj.forward(&normalize_last_dim(&h))
+        let normed = normalize_last_dim(&h);
+        let normed = &normed * &flow.out_gain + &flow.out_shift;
+        flow.out_proj.forward(&normed)
     }
 
     // Deterministic rectified-flow integration from `z0` over `steps` Euler
@@ -1675,6 +1684,15 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.tickers,
             val.batches
         );
+        println!(
+            "pretrain epoch {epoch} skill ev_correct={:.6} ev_shuffled={:.6} ev_zero={:.6} belief_spread={:.6} belief_norm={:.6} batches={}",
+            val.skill_ev_correct,
+            val.skill_ev_shuffled,
+            val.skill_ev_zero,
+            val.skill_belief_spread,
+            val.skill_belief_norm,
+            val.skill_batches
+        );
         writeln!(
             validation_log,
             "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
@@ -1980,17 +1998,20 @@ fn mean_mse_pretrain_loss(
 
 fn lejepa_flow_loss(heads: &PretrainHeads, belief: &Tensor, target_tokens: &Tensor) -> Tensor {
     let latent_dim = heads.latent_dim;
-    let z1 = target_tokens.detach();
-    let rows = z1.numel() as i64 / latent_dim;
-    let z1 = z1.reshape([rows, latent_dim]);
+    let rows = target_tokens.numel() as i64 / latent_dim;
+    // Un-detached target (le-wm recipe): the flow's MSE target z1 carries
+    // gradient into the shared online encoder. SIGReg, not stop-grad, is what
+    // prevents representation collapse, so the target stays grad-enabled.
+    let z1 = target_tokens.reshape([rows, latent_dim]);
     // Un-detached causal belief: flow gradients flow back through the AR
-    // transformer + encoder. The target z1 stays stop-gradiented above.
+    // transformer + encoder.
     let ctx = belief.reshape([rows, latent_dim]);
-    // Scale-match the Gaussian prior to the detached latent marginal: the token
-    // std is ~0.2, so a unit prior would make the field fight a large variance
+    // Scale-match the Gaussian prior to the latent marginal: the token std is
+    // ~0.2, so a unit prior would make the field fight a large variance
     // contraction. We match the scalar std only (no mean shift); the conditioning
-    // ctx absorbs any near-zero marginal offset.
-    let prior_std = z1.std(false);
+    // ctx absorbs any near-zero marginal offset. The std is detached so the noise
+    // scale is a fixed prior, not a gradient path into z1.
+    let prior_std = z1.std(false).detach();
     let z0 = Tensor::randn_like(&z1) * &prior_std;
     let tau = Tensor::rand([rows, 1], (Kind::Float, z1.device()));
     let inv_tau = (&tau * -1.0) + 1.0;
@@ -2044,8 +2065,9 @@ fn lejepa_pretrain_loss(
     let (repr_std_mean, repr_std_min) = representation_std_metrics(&latest_token);
     let target_embed_std = target_bar_tokens.std(false);
 
-    // Flow is the PRIMARY next-latent predictor: rectified-flow velocity MSE
-    // conditioned on the un-detached causal belief, stop-gradiented target.
+    // Flow is the PRIMARY next-latent predictor: rectified-flow x-prediction MSE
+    // conditioned on the un-detached causal belief, with an un-detached target
+    // (le-wm recipe) so gradient also flows into the shared encoder.
     let flow_loss = lejepa_flow_loss(heads, &predictions.belief, &target_bar_tokens);
     let total = &flow_loss * LEJEPA_FLOW_WEIGHT + &sigreg * lambda_sigreg;
 
@@ -2278,6 +2300,12 @@ struct ValidationLoss {
     rollout_mean_dclose_std: f64,
     rollout_sampled_dclose: f64,
     rollout_sampled_dclose_std: f64,
+    skill_ev_correct: f64,
+    skill_ev_shuffled: f64,
+    skill_ev_zero: f64,
+    skill_belief_spread: f64,
+    skill_belief_norm: f64,
+    skill_batches: usize,
     samples: usize,
     tickers: usize,
     batches: usize,
@@ -2767,6 +2795,15 @@ fn validate_full(
         let mut probe_terminal_mse_sum = 0.0;
         let mut zero_mse_sum = 0.0;
         let mut flow_loss_sum = 0.0;
+        // Belief-ablation skill test (read-only): does the flow actually USE its
+        // belief conditioning at the rollout regime (z0=0, K integrate steps)?
+        // Accumulated per Lejepa validation batch, meaned below.
+        let mut skill_ev_correct_sum = 0.0;
+        let mut skill_ev_shuffled_sum = 0.0;
+        let mut skill_ev_zero_sum = 0.0;
+        let mut skill_belief_spread_sum = 0.0;
+        let mut skill_belief_norm_sum = 0.0;
+        let mut skill_batches = 0usize;
         let mut samples = 0usize;
         let mut tickers = 0usize;
         let mut batches = 0usize;
@@ -2857,8 +2894,74 @@ fn validate_full(
                     rollout_actual.push(batch.next_bars.narrow(0, 0, take as i64));
                     rollout_windows += take;
                 }
+
+                // Belief-ablation skill test at the ROLLOUT regime (z0=0, K Euler
+                // steps). Random-tau training loss leaks the target via the
+                // interpolant z_tau, masking whether belief matters; scoring at
+                // z0=0 removes that leakage. ev = 1 - mse/var (centered marginal
+                // variance). Comparing belief vs row-shuffled vs zero context
+                // isolates the conditioning's contribution.
+                if matches!(objective, PretrainObjective::Lejepa) {
+                    let latent_dim = heads.latent_dim;
+                    let full =
+                        Tensor::cat(&[&batch.bar_history, &batch.next_bars.narrow(2, 0, 1)], 2);
+                    let all_tokens = autocast(false, || heads.encode_bar_tokens(&full));
+                    let length = batch.bar_history.size()[2];
+                    let target = all_tokens.narrow(2, 1, length);
+                    let belief = heads
+                        .predict_lejepa_bar_predictions(&all_tokens.narrow(2, 0, length), false)
+                        .belief;
+                    let rows = target.numel() as i64 / latent_dim;
+                    let z1 = target.reshape([rows, latent_dim]);
+                    let b = belief.reshape([rows, latent_dim]);
+                    let z0 = Tensor::zeros([rows, latent_dim], (Kind::Float, device));
+                    let z1_mean = z1.mean_dim([0i64].as_slice(), true, Kind::Float);
+                    let var = (&z1 - &z1_mean).square().mean(Kind::Float).double_value(&[]);
+                    let ev = |ctx: &Tensor| -> f64 {
+                        let est =
+                            heads.lejepa_flow_integrate(ctx, &z0, LEJEPA_FLOW_SAMPLE_STEPS);
+                        let mse = est.mse_loss(&z1, Reduction::Mean).double_value(&[]);
+                        1.0 - mse / var
+                    };
+                    let perm = Tensor::randperm(rows, (Kind::Int64, device));
+                    skill_ev_correct_sum += ev(&b);
+                    skill_ev_shuffled_sum += ev(&b.index_select(0, &perm));
+                    skill_ev_zero_sum += ev(&Tensor::zeros_like(&b));
+                    let b_mean = b.mean_dim([0i64].as_slice(), true, Kind::Float);
+                    skill_belief_spread_sum += (&b - &b_mean)
+                        .square()
+                        .mean_dim([0i64].as_slice(), false, Kind::Float)
+                        .sqrt()
+                        .mean(Kind::Float)
+                        .double_value(&[]);
+                    skill_belief_norm_sum += b
+                        .norm_scalaropt_dim(2, [-1i64].as_slice(), false)
+                        .mean(Kind::Float)
+                        .double_value(&[]);
+                    skill_batches += 1;
+                }
             }
         }
+
+        // Mean skill metrics; NaN when no rollout-capable (Lejepa) batches ran.
+        let (
+            skill_ev_correct,
+            skill_ev_shuffled,
+            skill_ev_zero,
+            skill_belief_spread,
+            skill_belief_norm,
+        ) = if skill_batches > 0 {
+            let n = skill_batches as f64;
+            (
+                skill_ev_correct_sum / n,
+                skill_ev_shuffled_sum / n,
+                skill_ev_zero_sum / n,
+                skill_belief_spread_sum / n,
+                skill_belief_norm_sum / n,
+            )
+        } else {
+            (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN)
+        };
 
         // Mean vs sampled imagined-rollout MSE against the actual future, scored
         // in raw OHLC space (matching the candle diagnostics). Per-window MSE
@@ -3034,6 +3137,12 @@ fn validate_full(
             rollout_mean_dclose_std,
             rollout_sampled_dclose,
             rollout_sampled_dclose_std,
+            skill_ev_correct,
+            skill_ev_shuffled,
+            skill_ev_zero,
+            skill_belief_spread,
+            skill_belief_norm,
+            skill_batches,
             samples,
             tickers,
             batches,
