@@ -608,7 +608,13 @@ impl PretrainHeads {
         (mean, logvar)
     }
 
-    fn lejepa_flow_velocity(&self, z_tau: &Tensor, tau: &Tensor, ctx: &Tensor) -> Tensor {
+    // x-prediction (dreamer4 `pred_orig_latent`): the network predicts the clean
+    // target latent z1 directly, NOT the velocity. x-prediction is well-conditioned
+    // at all tau (the target is the clean latent everywhere), whereas a velocity
+    // target z1-z0 is noise-dominated near the prior (low tau) — exactly where ODE
+    // integration begins. Velocity is reconstructed for integration via
+    // v = (x_pred - z_tau) / (1 - tau).
+    fn lejepa_flow_predict(&self, z_tau: &Tensor, tau: &Tensor, ctx: &Tensor) -> Tensor {
         let flow = &self.lejepa_flow;
         let time_emb = flow_time_embedding(tau, LEJEPA_FLOW_TIME_DIM);
         let time_h = flow.time_fc2.forward(
@@ -632,8 +638,12 @@ impl PretrainHeads {
         let device = z0.device();
         let mut z = z0.shallow_clone();
         for k in 0..steps {
-            let tau = Tensor::full([rows, 1], k as f64 / steps as f64, (Kind::Float, device));
-            let v = self.lejepa_flow_velocity(&z, &tau, ctx);
+            let t = k as f64 / steps as f64;
+            let tau = Tensor::full([rows, 1], t, (Kind::Float, device));
+            let x_pred = self.lejepa_flow_predict(&z, &tau, ctx);
+            // x-pred -> velocity: v = (x_pred - z) / (1 - t). t in [0, (steps-1)/steps]
+            // so 1 - t >= 1/steps, no singularity.
+            let v = (&x_pred - &z) / (1.0 - t);
             z = z + v * (1.0 / steps as f64);
         }
         z
@@ -1964,9 +1974,11 @@ fn lejepa_flow_loss(heads: &PretrainHeads, belief: &Tensor, target_tokens: &Tens
     let tau = Tensor::rand([rows, 1], (Kind::Float, z1.device()));
     let inv_tau = (&tau * -1.0) + 1.0;
     let z_tau = &z1 * &tau + &z0 * &inv_tau;
-    let target_v = &z1 - &z0;
-    let pred_v = heads.lejepa_flow_velocity(&z_tau, &tau, &ctx);
-    let per_sample = (pred_v - target_v)
+    // x-prediction: regress the clean target latent z1 directly. The ramp
+    // (0.9*tau + 0.1, dreamer4 eq. 8) upweights high tau, which is where the
+    // x_pred -> velocity conversion v = (x_pred - z)/(1-t) amplifies error.
+    let pred_x1 = heads.lejepa_flow_predict(&z_tau, &tau, &ctx);
+    let per_sample = (pred_x1 - &z1)
         .square()
         .mean_dim([-1i64].as_slice(), false, Kind::Float);
     let ramp = tau.view([rows]) * 0.9 + 0.1;
@@ -2017,7 +2029,8 @@ fn lejepa_pretrain_loss(
     let total = &flow_loss * LEJEPA_FLOW_WEIGHT + &sigreg * lambda_sigreg;
 
     // jepa_mse column now = detached single-step deterministic flow prediction
-    // MSE (one Euler step from prior mean z0=0, i.e. est = v(0, tau=0, ctx));
+    // MSE: one integrate step from z0=0 at tau=0, which under x-prediction is
+    // est = x_pred(z=0, tau=0, ctx) — the flow's one-shot clean-latent estimate.
     // pred_embed_std = its std. Kept for dashboard continuity; cheap, and
     // gradients never touch this proxy.
     let (jepa_mse, pred_embed_std) = tch::no_grad(|| {
