@@ -41,7 +41,10 @@ const LEJEPA_ROPE_DIMS: i64 = 32;
 const LEJEPA_FLOW_WEIGHT: f64 = 1.0;
 const LEJEPA_FLOW_SAMPLE_STEPS: i64 = 8;
 const LEJEPA_FLOW_TIME_DIM: i64 = 64;
-const LEJEPA_FLOW_BLOCKS: usize = 2;
+const LEJEPA_FLOW_BLOCKS: usize = 3;
+const LEJEPA_FLOW_STAT_MOMENTUM: f64 = 0.99;
+// Mean/deterministic trajectory = Monte-Carlo average of K independent sampled rollouts.
+const LEJEPA_MEAN_ROLLOUT_SAMPLES: i64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -90,18 +93,23 @@ struct LejepaBarPredictions {
 }
 
 struct LejepaFlowBlock {
+    mod_fc: nn::Linear,
     fc1: nn::Linear,
     fc2: nn::Linear,
 }
 
 struct LejepaFlowHead {
-    time_fc1: nn::Linear,
-    time_fc2: nn::Linear,
+    cond_fc1: nn::Linear,
+    cond_fc2: nn::Linear,
     in_proj: nn::Linear,
     blocks: Vec<LejepaFlowBlock>,
+    final_mod: nn::Linear,
     out_proj: nn::Linear,
-    out_gain: Tensor,
-    out_shift: Tensor,
+    // Non-trainable running standardization stats over target latents (EMA with
+    // Adam-style bias correction); the flow operates entirely in this space.
+    run_mean: Tensor,
+    run_sqmean: Tensor,
+    run_count: Tensor,
 }
 
 struct PretrainHeads {
@@ -326,46 +334,70 @@ impl PretrainHeads {
             latent_dim,
             Default::default(),
         );
+        // DiT AdaLN-Zero: modulation and output projections are zero-init so the
+        // network's initial prediction is exactly 0 = the prior mean in
+        // standardized space (correct neutral start for x-prediction).
+        let zero_init = |mut lin: nn::Linear| -> nn::Linear {
+            tch::no_grad(|| {
+                let _ = lin.ws.zero_();
+                if let Some(b) = lin.bs.as_mut() {
+                    let _ = b.zero_();
+                }
+            });
+            lin
+        };
+        let cond_dim = latent_dim * 2;
+        let flow_hidden = latent_dim * 2;
         let mut lejepa_flow_blocks = Vec::with_capacity(LEJEPA_FLOW_BLOCKS);
         for block_idx in 0..LEJEPA_FLOW_BLOCKS {
             let block_name = format!("lejepa_flow_block_{block_idx}");
             let block_path = p / block_name.as_str();
             lejepa_flow_blocks.push(LejepaFlowBlock {
-                fc1: nn::linear(&block_path / "fc1", latent_dim, ff_dim, Default::default()),
-                fc2: nn::linear(&block_path / "fc2", ff_dim, latent_dim, Default::default()),
+                mod_fc: zero_init(nn::linear(
+                    &block_path / "mod",
+                    cond_dim,
+                    latent_dim * 3,
+                    Default::default(),
+                )),
+                fc1: nn::linear(&block_path / "fc1", latent_dim, flow_hidden, Default::default()),
+                fc2: nn::linear(&block_path / "fc2", flow_hidden, latent_dim, Default::default()),
             });
         }
         let lejepa_flow = LejepaFlowHead {
-            time_fc1: nn::linear(
-                p / "lejepa_flow_time_fc1",
-                LEJEPA_FLOW_TIME_DIM,
-                latent_dim,
+            cond_fc1: nn::linear(
+                p / "lejepa_flow_cond_fc1",
+                latent_dim + LEJEPA_FLOW_TIME_DIM,
+                cond_dim,
                 Default::default(),
             ),
-            time_fc2: nn::linear(
-                p / "lejepa_flow_time_fc2",
-                latent_dim,
-                latent_dim,
+            cond_fc2: nn::linear(
+                p / "lejepa_flow_cond_fc2",
+                cond_dim,
+                cond_dim,
                 Default::default(),
             ),
             in_proj: nn::linear(
                 p / "lejepa_flow_in_proj",
-                latent_dim * 3,
+                latent_dim,
                 latent_dim,
                 Default::default(),
             ),
             blocks: lejepa_flow_blocks,
-            out_proj: nn::linear(
+            final_mod: zero_init(nn::linear(
+                p / "lejepa_flow_final_mod",
+                cond_dim,
+                latent_dim * 2,
+                Default::default(),
+            )),
+            out_proj: zero_init(nn::linear(
                 p / "lejepa_flow_out_proj",
                 latent_dim,
                 latent_dim,
                 Default::default(),
-            ),
-            // Learnable affine on the non-affine pre-out_proj LayerNorm. Names
-            // carry the `lejepa_flow_` prefix so they route to the flow
-            // optimizer group and grad-norm bucket.
-            out_gain: p.ones("lejepa_flow_out_gain", &[latent_dim]),
-            out_shift: p.zeros("lejepa_flow_out_shift", &[latent_dim]),
+            )),
+            run_mean: p.zeros_no_train("lejepa_flow_run_mean", &[latent_dim]),
+            run_sqmean: p.zeros_no_train("lejepa_flow_run_sqmean", &[latent_dim]),
+            run_count: p.zeros_no_train("lejepa_flow_run_count", &[1]),
         };
         let probe_input_ln =
             nn::layer_norm(p / "probe_input_ln", vec![latent_dim], Default::default());
@@ -621,27 +653,79 @@ impl PretrainHeads {
     // target z1-z0 is noise-dominated near the prior (low tau) — exactly where ODE
     // integration begins. Velocity is reconstructed for integration via
     // v = (x_pred - z_tau) / (1 - tau).
+    // DiT AdaLN-Zero head operating in standardized latent space. Conditioning
+    // c is built once from [belief, time_emb]; each block modulates a non-affine
+    // norm with per-block (shift, scale, gate) and the final layer with
+    // (shift_f, scale_f). z_tau, tau, ctx are all standardized-space [rows, *].
     fn lejepa_flow_predict(&self, z_tau: &Tensor, tau: &Tensor, ctx: &Tensor) -> Tensor {
         let flow = &self.lejepa_flow;
+        let latent_dim = self.latent_dim;
         let time_emb = flow_time_embedding(tau, LEJEPA_FLOW_TIME_DIM);
-        let time_h = flow.time_fc2.forward(
-            &normalize_last_dim(&flow.time_fc1.forward(&time_emb)).gelu("none"),
-        );
-        let input = Tensor::cat(&[z_tau, &time_h, ctx], -1);
-        let mut h = flow.in_proj.forward(&input);
+        let cond_in = Tensor::cat(&[ctx, &time_emb], -1);
+        let c = flow
+            .cond_fc2
+            .forward(&flow.cond_fc1.forward(&cond_in).silu())
+            .silu();
+        let mut h = flow.in_proj.forward(z_tau);
         for block in &flow.blocks {
-            let enriched = block.fc2.forward(
-                &normalize_last_dim(&block.fc1.forward(&normalize_last_dim(&h))).gelu("none"),
-            );
-            h = h + enriched;
+            let mods = block.mod_fc.forward(&c);
+            let shift = mods.narrow(-1, 0, latent_dim);
+            let scale = mods.narrow(-1, latent_dim, latent_dim);
+            let gate = mods.narrow(-1, 2 * latent_dim, latent_dim);
+            let modulated = &normalize_last_dim(&h) * (&scale + 1.0) + &shift;
+            let enriched = block
+                .fc2
+                .forward(&block.fc1.forward(&modulated).gelu("none"));
+            h = h + &gate * enriched;
         }
-        let normed = normalize_last_dim(&h);
-        let normed = &normed * &flow.out_gain + &flow.out_shift;
-        flow.out_proj.forward(&normed)
+        let fmods = flow.final_mod.forward(&c);
+        let shift_f = fmods.narrow(-1, 0, latent_dim);
+        let scale_f = fmods.narrow(-1, latent_dim, latent_dim);
+        let modulated = &normalize_last_dim(&h) * (&scale_f + 1.0) + &shift_f;
+        flow.out_proj.forward(&modulated)
     }
 
-    // Deterministic rectified-flow integration from `z0` over `steps` Euler
-    // steps. With z0=0 this yields the flow's central (prior-mean) estimate.
+    // Bias-corrected (Adam-style) running mean/std of target latents, detached.
+    // Returns [1, latent_dim] broadcastable stats; identity until the first update.
+    fn flow_stats(&self) -> (Tensor, Tensor) {
+        let flow = &self.lejepa_flow;
+        let latent_dim = self.latent_dim;
+        let device = flow.run_mean.device();
+        let count = flow.run_count.double_value(&[]);
+        if count < 0.5 {
+            return (
+                Tensor::zeros([1, latent_dim], (Kind::Float, device)),
+                Tensor::ones([1, latent_dim], (Kind::Float, device)),
+            );
+        }
+        let bias_corr = 1.0 - LEJEPA_FLOW_STAT_MOMENTUM.powf(count);
+        let mean = (&flow.run_mean / bias_corr).view([1, latent_dim]).detach();
+        let sqmean = (&flow.run_sqmean / bias_corr).view([1, latent_dim]).detach();
+        let std = (sqmean - mean.square()).clamp_min(1e-6).sqrt();
+        (mean, std)
+    }
+
+    fn flow_update_stats(&self, targets: &Tensor) {
+        tch::no_grad(|| {
+            let flow = &self.lejepa_flow;
+            let m = LEJEPA_FLOW_STAT_MOMENTUM;
+            let batch_mean = targets.mean_dim([0i64].as_slice(), false, Kind::Float);
+            let batch_sqmean = targets
+                .square()
+                .mean_dim([0i64].as_slice(), false, Kind::Float);
+            let new_mean = &flow.run_mean * m + batch_mean * (1.0 - m);
+            let new_sqmean = &flow.run_sqmean * m + batch_sqmean * (1.0 - m);
+            let new_count = &flow.run_count + 1.0;
+            // Buffers are shared handles; shallow_clone yields a mutable view over
+            // the same storage so the in-place copy persists across calls.
+            flow.run_mean.shallow_clone().copy_(&new_mean);
+            flow.run_sqmean.shallow_clone().copy_(&new_sqmean);
+            flow.run_count.shallow_clone().copy_(&new_count);
+        });
+    }
+
+    // Rectified-flow integration in standardized space from `z0` over `steps`
+    // Euler steps. Caller un-standardizes the result via `flow_stats`.
     fn lejepa_flow_integrate(&self, ctx: &Tensor, z0: &Tensor, steps: i64) -> Tensor {
         let rows = z0.size()[0];
         let device = z0.device();
@@ -678,7 +762,31 @@ impl PretrainHeads {
         collect_entropy: bool,
     ) -> (Tensor, Option<RolloutEntropy>) {
         let _ = target_scale;
-        let deterministic = temperature == 0.0;
+        // Deterministic/mean trajectory = Monte-Carlo average of K independent
+        // sampled rollouts, averaged over DECODED bar features per step (never
+        // averaging latents mid-rollout). No entropy for the mean path.
+        if temperature == 0.0 {
+            let k = LEJEPA_MEAN_ROLLOUT_SAMPLES;
+            let mut acc: Option<Tensor> = None;
+            for _ in 0..k {
+                let (traj, _) = self.single_imagined_rollout(context_bars, 1.0, train, false);
+                acc = Some(match acc {
+                    Some(a) => a + traj,
+                    None => traj,
+                });
+            }
+            return (acc.expect("K >= 1") / k as f64, None);
+        }
+        self.single_imagined_rollout(context_bars, temperature, train, collect_entropy)
+    }
+
+    fn single_imagined_rollout(
+        &self,
+        context_bars: &Tensor,
+        temperature: f64,
+        train: bool,
+        collect_entropy: bool,
+    ) -> (Tensor, Option<RolloutEntropy>) {
         let mut tokens = self.encode_bar_tokens(context_bars).detach();
         let size = tokens.size();
         let batch = size[0];
@@ -686,14 +794,9 @@ impl PretrainHeads {
         let latent_dim = self.latent_dim;
         let rows = batch * tickers;
         let device = tokens.device();
-        // Fixed sampling prior std captured ONCE from the seed context, matching
-        // the training prior (z1.std). Holding it constant keeps the injected
-        // noise scale from drifting with the growing rollout sequence.
-        let prior_std = if tokens.numel() > 0 {
-            tokens.std(false).detach()
-        } else {
-            Tensor::ones([], (Kind::Float, device))
-        };
+        // Fixed standardization stats: z0 ~ N(0, I) * temperature in standardized
+        // space, un-standardized before being fed back into the token sequence.
+        let (stat_mean, stat_std) = self.flow_stats();
         let mut imagined = Vec::with_capacity(LEJEPA_ROLLOUT_BARS as usize);
         let mut ent_means: Vec<Tensor> = Vec::new();
         let mut ent_noise: Vec<Tensor> = Vec::new();
@@ -705,28 +808,23 @@ impl PretrainHeads {
             let preds = self.predict_lejepa_bar_predictions(&tokens, train);
             let last = tokens.size()[2] - 1;
             let ctx = preds.belief.narrow(2, last, 1).detach().reshape([rows, latent_dim]);
-            // Next latent = flow ODE integration. mean: z0=0 (prior mean);
-            // sampled: z0 ~ N(0, std*temperature). The flow IS the dynamics.
-            let z0 = if deterministic {
-                Tensor::zeros([rows, latent_dim], (Kind::Float, device))
-            } else {
-                Tensor::randn([rows, latent_dim], (Kind::Float, device))
-                    * &prior_std
-                    * temperature
-            };
-            let z = self.lejepa_flow_integrate(&ctx, &z0, LEJEPA_FLOW_SAMPLE_STEPS);
+            let z0 = Tensor::randn([rows, latent_dim], (Kind::Float, device)) * temperature;
+            let z_std = self.lejepa_flow_integrate(&ctx, &z0, LEJEPA_FLOW_SAMPLE_STEPS);
+            let z = &z_std * &stat_std + &stat_mean;
             let next_token = z.view([batch, tickers, 1, latent_dim]);
             // Emission candle: probe-decode the flow-predicted latent.
             let (mean, _logvar) = self.probe_ohlc_features(&next_token);
             imagined.push(mean.view([batch, LEJEPA_BAR_FEATURES]));
             if collect_entropy {
                 let nt = z.shallow_clone();
-                // Deterministic central estimate as the divergence reference.
-                let pm = self.lejepa_flow_integrate(
+                // Standardized-space central estimate (z0=0), un-standardized as
+                // the divergence reference.
+                let pm_std = self.lejepa_flow_integrate(
                     &ctx,
                     &Tensor::zeros([rows, latent_dim], (Kind::Float, device)),
                     LEJEPA_FLOW_SAMPLE_STEPS,
                 );
+                let pm = &pm_std * &stat_std + &stat_mean;
                 let nt_n = nt
                     .square()
                     .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
@@ -1996,31 +2094,37 @@ fn mean_mse_pretrain_loss(
     }
 }
 
-fn lejepa_flow_loss(heads: &PretrainHeads, belief: &Tensor, target_tokens: &Tensor) -> Tensor {
+fn lejepa_flow_loss(
+    heads: &PretrainHeads,
+    belief: &Tensor,
+    target_tokens: &Tensor,
+    train: bool,
+) -> Tensor {
     let latent_dim = heads.latent_dim;
     let rows = target_tokens.numel() as i64 / latent_dim;
-    // Un-detached target (le-wm recipe): the flow's MSE target z1 carries
-    // gradient into the shared online encoder. SIGReg, not stop-grad, is what
-    // prevents representation collapse, so the target stays grad-enabled.
+    // Un-detached target (le-wm recipe): the flow's MSE target carries gradient
+    // into the shared online encoder. SIGReg, not stop-grad, prevents collapse.
     let z1 = target_tokens.reshape([rows, latent_dim]);
     // Un-detached causal belief: flow gradients flow back through the AR
     // transformer + encoder.
     let ctx = belief.reshape([rows, latent_dim]);
-    // Scale-match the Gaussian prior to the latent marginal: the token std is
-    // ~0.2, so a unit prior would make the field fight a large variance
-    // contraction. We match the scalar std only (no mean shift); the conditioning
-    // ctx absorbs any near-zero marginal offset. The std is detached so the noise
-    // scale is a fixed prior, not a gradient path into z1.
-    let prior_std = z1.std(false).detach();
-    let z0 = Tensor::randn_like(&z1) * &prior_std;
+    if train {
+        heads.flow_update_stats(&z1);
+    }
+    // Standardized flow space (detached per-dim running stats). Prior is
+    // z0 ~ N(0, I); gradient flows to the encoder through the standardized
+    // target z1_std, but the interpolant input detaches it.
+    let (mean, std) = heads.flow_stats();
+    let z1_std = (&z1 - &mean) / &std;
+    let z0 = Tensor::randn_like(&z1_std);
     let tau = Tensor::rand([rows, 1], (Kind::Float, z1.device()));
     let inv_tau = (&tau * -1.0) + 1.0;
-    let z_tau = &z1 * &tau + &z0 * &inv_tau;
-    // x-prediction: regress the clean target latent z1 directly. The ramp
+    let z_tau = &z1_std.detach() * &tau + &z0 * &inv_tau;
+    // x-prediction: regress the clean standardized target directly. The ramp
     // (0.9*tau + 0.1, dreamer4 eq. 8) upweights high tau, which is where the
     // x_pred -> velocity conversion v = (x_pred - z)/(1-t) amplifies error.
     let pred_x1 = heads.lejepa_flow_predict(&z_tau, &tau, &ctx);
-    let per_sample = (pred_x1 - &z1)
+    let per_sample = (pred_x1 - &z1_std)
         .square()
         .mean_dim([-1i64].as_slice(), false, Kind::Float);
     let ramp = tau.view([rows]) * 0.9 + 0.1;
@@ -2068,14 +2172,13 @@ fn lejepa_pretrain_loss(
     // Flow is the PRIMARY next-latent predictor: rectified-flow x-prediction MSE
     // conditioned on the un-detached causal belief, with an un-detached target
     // (le-wm recipe) so gradient also flows into the shared encoder.
-    let flow_loss = lejepa_flow_loss(heads, &predictions.belief, &target_bar_tokens);
+    let flow_loss = lejepa_flow_loss(heads, &predictions.belief, &target_bar_tokens, train);
     let total = &flow_loss * LEJEPA_FLOW_WEIGHT + &sigreg * lambda_sigreg;
 
-    // jepa_mse column now = detached single-step deterministic flow prediction
-    // MSE: one integrate step from z0=0 at tau=0, which under x-prediction is
-    // est = x_pred(z=0, tau=0, ctx) — the flow's one-shot clean-latent estimate.
-    // pred_embed_std = its std. Kept for dashboard continuity; cheap, and
-    // gradients never touch this proxy.
+    // jepa_mse column = detached single-step deterministic flow prediction MSE:
+    // one integrate step from z0=0 at tau=0 in standardized space, un-standardized
+    // to a clean-latent estimate compared against the target. pred_embed_std = its
+    // std. Kept for dashboard continuity; cheap, and gradients never touch it.
     let (jepa_mse, pred_embed_std) = tch::no_grad(|| {
         let rows = target_bar_tokens.numel() as i64 / heads.latent_dim;
         let ctx = predictions
@@ -2083,7 +2186,9 @@ fn lejepa_pretrain_loss(
             .detach()
             .reshape([rows, heads.latent_dim]);
         let z0 = Tensor::zeros([rows, heads.latent_dim], (Kind::Float, ctx.device()));
-        let est = heads.lejepa_flow_integrate(&ctx, &z0, 1);
+        let est_std = heads.lejepa_flow_integrate(&ctx, &z0, 1);
+        let (mean, std) = heads.flow_stats();
+        let est = &est_std * &std + &mean;
         let target_flat = target_bar_tokens.reshape([rows, heads.latent_dim]);
         (est.mse_loss(&target_flat, Reduction::Mean), est.std(false))
     });
@@ -2895,12 +3000,12 @@ fn validate_full(
                     rollout_windows += take;
                 }
 
-                // Belief-ablation skill test at the ROLLOUT regime (z0=0, K Euler
-                // steps). Random-tau training loss leaks the target via the
-                // interpolant z_tau, masking whether belief matters; scoring at
-                // z0=0 removes that leakage. ev = 1 - mse/var (centered marginal
-                // variance). Comparing belief vs row-shuffled vs zero context
-                // isolates the conditioning's contribution.
+                // Belief-ablation skill test at the ROLLOUT regime (single shared
+                // z0 ~ N(0, I) noise, K Euler steps, standardized space). Random-tau
+                // training loss leaks the target via the interpolant z_tau, masking
+                // whether belief matters; a paired sampled draw removes that leakage.
+                // ev = 1 - mse/var (centered marginal variance). Comparing belief vs
+                // row-shuffled vs zero context isolates the conditioning.
                 if matches!(objective, PretrainObjective::Lejepa) {
                     let latent_dim = heads.latent_dim;
                     let full =
@@ -2914,12 +3019,15 @@ fn validate_full(
                     let rows = target.numel() as i64 / latent_dim;
                     let z1 = target.reshape([rows, latent_dim]);
                     let b = belief.reshape([rows, latent_dim]);
-                    let z0 = Tensor::zeros([rows, latent_dim], (Kind::Float, device));
+                    // One noise draw reused across variants for a paired comparison.
+                    let z0 = Tensor::randn([rows, latent_dim], (Kind::Float, device));
+                    let (stat_mean, stat_std) = heads.flow_stats();
                     let z1_mean = z1.mean_dim([0i64].as_slice(), true, Kind::Float);
                     let var = (&z1 - &z1_mean).square().mean(Kind::Float).double_value(&[]);
                     let ev = |ctx: &Tensor| -> f64 {
-                        let est =
+                        let est_std =
                             heads.lejepa_flow_integrate(ctx, &z0, LEJEPA_FLOW_SAMPLE_STEPS);
+                        let est = &est_std * &stat_std + &stat_mean;
                         let mse = est.mse_loss(&z1, Reduction::Mean).double_value(&[]);
                         1.0 - mse / var
                     };
@@ -4242,7 +4350,7 @@ mod tests {
         let bar_tokens = all_tokens.narrow(2, 0, length);
         let target_bar_tokens = all_tokens.narrow(2, 1, length);
         let predictions = heads.predict_lejepa_bar_predictions(&bar_tokens, false);
-        let flow = lejepa_flow_loss(&heads, &predictions.belief, &target_bar_tokens);
+        let flow = lejepa_flow_loss(&heads, &predictions.belief, &target_bar_tokens, true);
         assert_eq!(flow.size(), Vec::<i64>::new());
         let value = flow.double_value(&[]);
         assert!(value.is_finite(), "flow loss must be finite, got {value}");
