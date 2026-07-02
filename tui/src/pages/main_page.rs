@@ -40,28 +40,38 @@ pub fn render(f: &mut Frame, app: &mut App) {
             match app.training_kind {
                 crate::state::TrainingKind::Rl => "rl",
                 crate::state::TrainingKind::Genetic => "genetic",
+                crate::state::TrainingKind::Pretrain => "pretrain",
             }
         ),
         Style::default().fg(theme::TEAL),
     ));
     title_spans.push(Span::raw("  "));
-    if app.training_kind == crate::state::TrainingKind::Rl {
-        title_spans.push(Span::styled(
-            format!("model: {}", app.training_model_size),
-            Style::default().fg(theme::BLUE),
-        ));
-    } else {
-        title_spans.push(Span::styled(
-            format!(
-                "family: {}",
-                match app.genetic_family {
-                    crate::state::GeneticFamily::PriceRebound => "price-rebound",
-                    crate::state::GeneticFamily::RsiRebound => "rsi-rebound",
-                    crate::state::GeneticFamily::TrendBreakout => "trend-breakout",
-                }
-            ),
-            Style::default().fg(theme::BLUE),
-        ));
+    match app.training_kind {
+        crate::state::TrainingKind::Rl => {
+            title_spans.push(Span::styled(
+                format!("model: {}", app.training_model_size),
+                Style::default().fg(theme::BLUE),
+            ));
+        }
+        crate::state::TrainingKind::Genetic => {
+            title_spans.push(Span::styled(
+                format!(
+                    "family: {}",
+                    match app.genetic_family {
+                        crate::state::GeneticFamily::PriceRebound => "price-rebound",
+                        crate::state::GeneticFamily::RsiRebound => "rsi-rebound",
+                        crate::state::GeneticFamily::TrendBreakout => "trend-breakout",
+                    }
+                ),
+                Style::default().fg(theme::BLUE),
+            ));
+        }
+        crate::state::TrainingKind::Pretrain => {
+            title_spans.push(Span::styled(
+                "objective: lejepa",
+                Style::default().fg(theme::BLUE),
+            ));
+        }
     }
 
     let title = Paragraph::new(Line::from(title_spans)).block(

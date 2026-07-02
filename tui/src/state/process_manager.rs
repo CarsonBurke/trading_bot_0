@@ -12,6 +12,7 @@ use std::os::unix::process::ExitStatusExt;
 pub enum TrainingKind {
     Rl,
     Genetic,
+    Pretrain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,8 +129,9 @@ impl ProcessManagerState {
             return Ok(());
         }
 
-        let run_dir = match &weights {
-            Some(w) => {
+        let run_dir = match (kind, &weights) {
+            (TrainingKind::Pretrain, _) => RunDir::create_fresh(RUNS_PATH, None)?,
+            (_, Some(w)) => {
                 let p = Path::new(w);
                 // If weights are inside runs/*/weights/, reuse that run dir
                 if p.parent()
@@ -142,7 +144,7 @@ impl ProcessManagerState {
                     RunDir::create_fresh(RUNS_PATH, None)?
                 }
             }
-            None => RunDir::create_fresh(RUNS_PATH, None)?,
+            (_, None) => RunDir::create_fresh(RUNS_PATH, None)?,
         };
 
         let log_file = std::fs::OpenOptions::new()
@@ -152,7 +154,7 @@ impl ProcessManagerState {
             .open(&run_dir.log_file)?;
 
         let mut cmd = Command::new("cargo");
-        cmd.current_dir("../trading_bots")
+        cmd.current_dir(trading_bots_dir())
             .arg("run")
             .arg("--release")
             .arg("--");
@@ -169,6 +171,17 @@ impl ProcessManagerState {
                 cmd.arg("genetic")
                     .arg("--family")
                     .arg(genetic_family.as_cli_str());
+            }
+            TrainingKind::Pretrain => {
+                cmd.arg("pretrain")
+                    .arg("--model-size")
+                    .arg("uniform-stream")
+                    .arg("--objective")
+                    .arg("lejepa");
+
+                if let Some(w) = weights {
+                    cmd.arg("--weights").arg(w);
+                }
             }
         }
 
@@ -201,7 +214,7 @@ impl ProcessManagerState {
         }
 
         let mut cmd = Command::new("cargo");
-        cmd.current_dir("../trading_bots")
+        cmd.current_dir(trading_bots_dir())
             .arg("run")
             .arg("--release")
             .arg("--")
@@ -381,6 +394,10 @@ fn process_exists(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+fn trading_bots_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../trading_bots")
+}
+
 fn is_training_cmdline(cmdline: &str) -> bool {
     !cmdline.contains("trading-bot-tui")
         && !cmdline.contains("ps -eo")
@@ -389,6 +406,9 @@ fn is_training_cmdline(cmdline: &str) -> bool {
             || cmdline.ends_with(" train")
             || cmdline.contains(" genetic ")
             || cmdline.ends_with(" genetic")
+            || cmdline.contains(" pretrain ")
+            || cmdline.ends_with(" pretrain")
             || cmdline.contains("trading_bot_0 train")
-            || cmdline.contains("trading_bot_0 genetic"))
+            || cmdline.contains("trading_bot_0 genetic")
+            || cmdline.contains("trading_bot_0 pretrain"))
 }

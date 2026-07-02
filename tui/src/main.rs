@@ -25,7 +25,11 @@ use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
 use state::{GeneticFamily as TuiGeneticFamily, TrainingKind};
 
-const TRAINING_KINDS: [TrainingKind; 2] = [TrainingKind::Rl, TrainingKind::Genetic];
+const TRAINING_KINDS: [TrainingKind; 3] = [
+    TrainingKind::Rl,
+    TrainingKind::Genetic,
+    TrainingKind::Pretrain,
+];
 const GENETIC_FAMILIES: [TuiGeneticFamily; 3] = [
     TuiGeneticFamily::TrendBreakout,
     TuiGeneticFamily::PriceRebound,
@@ -429,6 +433,8 @@ impl App {
         self.logs_page.training_output.iter().rev().any(|line| {
             line.contains("ppo update:")
                 || line.contains("Epoch ")
+                || line.contains("pretrain epoch ")
+                || line.contains("pretrain step ")
                 || line.contains("Policy:")
                 || (line.contains("Episode") && line.contains("Total Assets"))
         })
@@ -500,7 +506,13 @@ impl App {
                     .into_iter()
                     .flatten()
                     .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "ot"))
+                    .filter(|e| {
+                        e.path().extension().map_or(false, |ext| ext == "ot")
+                            && !e
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with("pretrain_heads")
+                    })
                     .map(|e| e.file_name().to_string_lossy().to_string())
                     .collect();
                 weights.sort_by(|a, b| {
@@ -1054,7 +1066,10 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
-                                            if app.training_kind == TrainingKind::Rl {
+                                            if matches!(
+                                                app.training_kind,
+                                                TrainingKind::Rl | TrainingKind::Pretrain
+                                            ) {
                                                 app.open_run_selector(RunSelectorPurpose::Train);
                                             } else {
                                                 app.start_training(None)?;
