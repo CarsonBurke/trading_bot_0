@@ -1237,11 +1237,18 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             opt.step();
             optimizer_step += 1;
 
-            // Online probe: one optimizer step on this batch's detached latents
-            // (probe_nll built from latest_token.detach()), kept separate from the
-            // model optimizer so probe grads never flow into the encoder.
-            if args.objective == PretrainObjective::Lejepa {
-                probe_step(&mut probe_opt, &probe_named_vars, &losses.probe_nll, device);
+            // Online probe: one optimizer step summed over this batch's detached
+            // probe groups (real latest-token + teacher-forced pred_emb), kept
+            // separate from the model optimizer so probe grads never flow into the
+            // encoder.
+            if args.objective == PretrainObjective::Lejepa && !losses.probe_groups.is_empty() {
+                probe_step(
+                    &heads,
+                    &mut probe_opt,
+                    &probe_named_vars,
+                    &losses.probe_groups,
+                    device,
+                );
             }
 
             let total_v = losses.total.double_value(&[]);
@@ -1780,6 +1787,7 @@ fn mean_mse_pretrain_loss(
             probe_terminal_mse,
             zero_mse,
             probe_explained_variance,
+            probe_groups: Vec::new(),
         };
     }
 
@@ -1815,6 +1823,7 @@ fn mean_mse_pretrain_loss(
         probe_terminal_mse,
         zero_mse,
         probe_explained_variance,
+        probe_groups: Vec::new(),
     }
 }
 
@@ -1871,15 +1880,18 @@ fn lejepa_pretrain_loss(
     let pred_embed_std = pred_emb.std(false).detach();
 
     let probe_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
-    let probe = ohlc_probe_metrics(
-        heads,
-        &latest_token.detach().unsqueeze(2),
-        &probe_target,
-    );
-    // Rollouts decode predicted latents, so the probe also trains on the detached
-    // teacher-forced pred_emb (target = the bar each position predicts).
+    let real_probe_input = latest_token.detach().unsqueeze(2);
+    let probe = ohlc_probe_metrics(heads, &real_probe_input, &probe_target);
+    // Online probe trains on TWO detached groups: (1) the real latest-token ->
+    // next bar, and (2) the teacher-forced pred_emb -> the bar each position
+    // predicts (target = full[t+1] * target_scale, the same off-by-one the deleted
+    // detached probe used). Group (2) matches the predicted-latent distribution the
+    // imagined rollout decodes, closing the train/inference gap.
     let pred_probe_target = full.narrow(2, 1, length) * target_scale;
-    let probe_pred = ohlc_probe_metrics(heads, &pred_emb.detach(), &pred_probe_target);
+    let probe_groups = vec![
+        (real_probe_input, probe_target.shallow_clone()),
+        (pred_emb.detach(), pred_probe_target),
+    ];
     let zero_mse = probe_target.pow_tensor_scalar(2.0).mean(Kind::Float);
     let probe_explained_variance = explained_variance_tensor(&probe.probe_mse, &zero_mse);
     let next_lat = zero_like_scalar(&jepa_mse);
@@ -1891,7 +1903,7 @@ fn lejepa_pretrain_loss(
         repr_std_min,
         pred_embed_std,
         target_embed_std,
-        probe_nll: probe.probe_nll + probe_pred.probe_nll,
+        probe_nll: probe.probe_nll,
         probe_mae: probe.probe_mae,
         probe_mse: probe.probe_mse,
         pred_std: probe.pred_std,
@@ -1903,6 +1915,7 @@ fn lejepa_pretrain_loss(
         probe_terminal_mse: probe.probe_terminal_mse,
         zero_mse,
         probe_explained_variance,
+        probe_groups,
     }
 }
 
@@ -2103,6 +2116,9 @@ struct PretrainLoss {
     probe_terminal_mse: Tensor,
     zero_mse: Tensor,
     probe_explained_variance: Tensor,
+    // Detached (probe_input, target) groups for the online probe's single step.
+    // Empty for objectives without an online probe.
+    probe_groups: Vec<(Tensor, Tensor)>,
 }
 
 struct RunningLoss {
@@ -2425,16 +2441,36 @@ fn write_pretrain_scalar_report(
     )
 }
 
-// One online probe optimizer step on the current batch's detached-latent NLL.
-// Kept separate from the model optimizer so probe grads never reach the encoder.
+// Gaussian NLL of the probe's OHLC decode against `target`, the online probe's
+// training signal. Mirrors the nll term in `ohlc_probe_metrics` without the extra
+// diagnostic reductions, so it stays cheap over long pred_emb position dims.
+fn probe_nll(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -> Tensor {
+    let (mean, logvar) = heads.probe_ohlc_features(belief);
+    let err = &mean - target;
+    let nll_elem = &logvar + err.pow_tensor_scalar(2.0) * logvar.neg().exp();
+    nll_elem.mean(Kind::Float) * 0.5
+}
+
+// One online probe optimizer step. Sums the Gaussian NLL over a LIST of detached
+// (probe_input, target) groups — today the real latest-token group and the
+// teacher-forced pred_emb group; the flow branch can add its masked x_pred group
+// later — and takes a single optimizer step. Every input is a graph leaf via
+// `.detach()`, so probe grads never reach the encoder, and the model optimizer
+// never sees probe params (they are excluded from its named_vars).
 fn probe_step(
+    heads: &PretrainHeads,
     probe_opt: &mut Muon,
     probe_named_vars: &[(String, Tensor)],
-    probe_nll: &Tensor,
+    groups: &[(Tensor, Tensor)],
     device: Device,
 ) {
+    let loss = groups
+        .iter()
+        .map(|(input, target)| probe_nll(heads, input, target))
+        .reduce(|a, b| a + b)
+        .expect("probe_step requires at least one group");
     probe_opt.zero_grad();
-    probe_nll.backward();
+    loss.backward();
     clip_all_grads(probe_named_vars, MAX_GRAD_NORM, device);
     probe_opt.step();
 }
