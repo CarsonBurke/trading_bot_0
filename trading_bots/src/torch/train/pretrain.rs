@@ -38,6 +38,25 @@ const LEJEPA_AR_FF_DIM: i64 = 1536;
 const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
 const LEJEPA_ROPE_DIMS: i64 = 32;
+// Shortcut flow-matching head (dreamer4 shortcut forcing + JEDI latent bounding).
+const LEJEPA_K_MAX: i64 = 64;
+const LEJEPA_SIGNAL_EMBED_DIM: i64 = 32;
+const LEJEPA_STEP_EMBED_DIM: i64 = 32;
+const LEJEPA_NUM_STEP_SIZES_LOG2: i64 = 6; // log2 step size in {0..5}
+const LEJEPA_FLOW_COND_DIM: i64 = 512;
+const LEJEPA_FLOW_HIDDEN: i64 = 1024;
+const LEJEPA_FLOW_BLOCKS: usize = 3;
+const LEJEPA_ROLLOUT_STEPS: i64 = 4;
+const LEJEPA_ROLLOUT_STEP_SIZE: i64 = LEJEPA_K_MAX / LEJEPA_ROLLOUT_STEPS;
+// Mean/deterministic trajectory = Monte-Carlo average of K independent sampled rollouts.
+const LEJEPA_MEAN_ROLLOUT_SAMPLES: i64 = 4;
+const LEJEPA_ROLLOUT_EVAL_SAMPLES: usize = 4;
+// Drift-mitigation context noise: ctx = (1-mix)*tokens + mix*randn, applied to the
+// AR predictor input at both train and rollout time.
+const LEJEPA_CTX_NOISE_MIX: f64 = 0.1;
+// Batch-level Bernoulli: shortcut branch with prob 1 - 1/log2(K_MAX) = 1 - 1/6.
+const LEJEPA_PROB_SHORTCUT: f64 = 1.0 - 1.0 / 6.0;
+const LEJEPA_LATENT_BOUND: f64 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -85,6 +104,28 @@ struct LejepaBarPredictions {
     belief: Tensor,
 }
 
+// DiT AdaLN-zero block: a non-affine norm modulated by (shift, scale) and a
+// zero-init gate on the residual, all produced from the conditioning vector.
+struct LejepaFlowBlock {
+    mod_fc: nn::Linear,
+    fc1: nn::Linear,
+    fc2: nn::Linear,
+}
+
+// Shortcut flow-matching head. Discrete signal-level + step-size log2 embeddings
+// condition an x-prediction DiT that operates directly in the (tanh-bounded)
+// latent space -- no EMA standardization; SIGReg keeps tokens near-isotropic.
+struct LejepaFlowHead {
+    signal_embed: nn::Embedding,
+    step_embed: nn::Embedding,
+    cond_fc1: nn::Linear,
+    cond_fc2: nn::Linear,
+    in_proj: nn::Linear,
+    blocks: Vec<LejepaFlowBlock>,
+    final_mod: nn::Linear,
+    out_proj: nn::Linear,
+}
+
 struct PretrainHeads {
     forecast_queries: Tensor,
     horizon_pos_proj: nn::Linear,
@@ -98,7 +139,7 @@ struct PretrainHeads {
     bar_enrich_fc2: nn::Linear,
     lejepa_projector: ProjectionMlp,
     lejepa_layers: Vec<CausalLejepaLayer>,
-    lejepa_pred_proj: ProjectionMlp,
+    lejepa_flow: LejepaFlowHead,
     rope: RotaryEmbedding,
     probe_input_ln: nn::LayerNorm,
     probe_head: nn::Linear,
@@ -300,24 +341,86 @@ impl PretrainHeads {
             LEJEPA_ROPE_DIMS,
             p.device(),
         );
-        let lejepa_pred_proj = ProjectionMlp {
-            fc1: nn::linear(
-                p / "lejepa_pred_proj_fc1",
+        // AdaLN-zero: modulation, final-mod, and out_proj are zero-init so the head
+        // starts as the identity-mean predictor (x_pred == 0 before training).
+        let zero_init = |mut lin: nn::Linear| -> nn::Linear {
+            tch::no_grad(|| {
+                let _ = lin.ws.zero_();
+                if let Some(b) = lin.bs.as_mut() {
+                    let _ = b.zero_();
+                }
+            });
+            lin
+        };
+        let mut lejepa_flow_blocks = Vec::with_capacity(LEJEPA_FLOW_BLOCKS);
+        for block_idx in 0..LEJEPA_FLOW_BLOCKS {
+            let block_name = format!("lejepa_flow_block_{block_idx}");
+            let block_path = p / block_name.as_str();
+            lejepa_flow_blocks.push(LejepaFlowBlock {
+                mod_fc: zero_init(nn::linear(
+                    &block_path / "mod",
+                    LEJEPA_FLOW_COND_DIM,
+                    latent_dim * 3,
+                    Default::default(),
+                )),
+                fc1: nn::linear(
+                    &block_path / "fc1",
+                    latent_dim,
+                    LEJEPA_FLOW_HIDDEN,
+                    Default::default(),
+                ),
+                fc2: nn::linear(
+                    &block_path / "fc2",
+                    LEJEPA_FLOW_HIDDEN,
+                    latent_dim,
+                    Default::default(),
+                ),
+            });
+        }
+        let lejepa_flow = LejepaFlowHead {
+            signal_embed: nn::embedding(
+                p / "lejepa_flow_signal_embed",
+                LEJEPA_K_MAX,
+                LEJEPA_SIGNAL_EMBED_DIM,
+                Default::default(),
+            ),
+            step_embed: nn::embedding(
+                p / "lejepa_flow_step_embed",
+                LEJEPA_NUM_STEP_SIZES_LOG2,
+                LEJEPA_STEP_EMBED_DIM,
+                Default::default(),
+            ),
+            cond_fc1: nn::linear(
+                p / "lejepa_flow_cond_fc1",
+                latent_dim + LEJEPA_SIGNAL_EMBED_DIM + LEJEPA_STEP_EMBED_DIM,
+                LEJEPA_FLOW_COND_DIM,
+                Default::default(),
+            ),
+            cond_fc2: nn::linear(
+                p / "lejepa_flow_cond_fc2",
+                LEJEPA_FLOW_COND_DIM,
+                LEJEPA_FLOW_COND_DIM,
+                Default::default(),
+            ),
+            in_proj: nn::linear(
+                p / "lejepa_flow_in_proj",
                 latent_dim,
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
-                Default::default(),
-            ),
-            bn: nn::batch_norm1d(
-                p / "lejepa_pred_proj_bn",
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
-                Default::default(),
-            ),
-            fc2: nn::linear(
-                p / "lejepa_pred_proj_fc2",
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
                 latent_dim,
                 Default::default(),
             ),
+            blocks: lejepa_flow_blocks,
+            final_mod: zero_init(nn::linear(
+                p / "lejepa_flow_final_mod",
+                LEJEPA_FLOW_COND_DIM,
+                latent_dim * 2,
+                Default::default(),
+            )),
+            out_proj: zero_init(nn::linear(
+                p / "lejepa_flow_out_proj",
+                latent_dim,
+                latent_dim,
+                Default::default(),
+            )),
         };
         let probe_input_ln =
             nn::layer_norm(p / "probe_input_ln", vec![latent_dim], Default::default());
@@ -354,7 +457,7 @@ impl PretrainHeads {
             bar_enrich_fc2,
             lejepa_projector,
             lejepa_layers,
-            lejepa_pred_proj,
+            lejepa_flow,
             rope,
             probe_input_ln,
             probe_head,
@@ -464,11 +567,14 @@ impl PretrainHeads {
         );
         let h = h + enriched;
         let tokens = self.projection_mlp(&h, &self.lejepa_projector, train);
+        // JEDI differentiable latent bounding: keep encoder tokens in a fixed range
+        // so the unit-N(0,I) flow prior and the x-predictions share the same scale.
+        let tokens = latent_bound(&tokens);
         tokens.view([batch, tickers, length, self.latent_dim])
     }
 
     // AR transformer belief = final normalized representation, one per position.
-    // The next-embedding prediction `pred_proj(belief)` is applied by callers.
+    // The belief conditions the shortcut flow head to predict the next token.
     fn predict_lejepa_bar_predictions(
         &self,
         bar_tokens: &Tensor,
@@ -490,10 +596,50 @@ impl PretrainHeads {
         }
     }
 
-    // le-wm pred_proj MLP: per-token Linear -> BatchNorm1d -> GELU -> Linear over
-    // the AR belief, yielding the predicted next-embedding.
-    fn pred_emb_from_belief(&self, belief: &Tensor, train: bool) -> Tensor {
-        self.projection_mlp(belief, &self.lejepa_pred_proj, train)
+    // Shortcut flow head, x-prediction. Given a noised latent `z` at discrete
+    // `signal` level, `step_log2` step size, and belief `ctx`, predict the clean
+    // latent. AdaLN-zero DiT operating directly in tanh-bounded latent space.
+    // `z`, `ctx` are [rows, latent_dim]; `signal`, `step_log2` are int64 [rows].
+    fn lejepa_flow_predict(
+        &self,
+        z: &Tensor,
+        signal: &Tensor,
+        step_log2: &Tensor,
+        ctx: &Tensor,
+    ) -> Tensor {
+        let flow = &self.lejepa_flow;
+        let latent_dim = self.latent_dim;
+        let signal_emb = flow.signal_embed.forward(signal);
+        let step_emb = flow.step_embed.forward(step_log2);
+        let cond_in = Tensor::cat(&[ctx, &signal_emb, &step_emb], -1);
+        let c = flow
+            .cond_fc2
+            .forward(&flow.cond_fc1.forward(&cond_in).silu())
+            .silu();
+        let mut h = flow.in_proj.forward(z);
+        for block in &flow.blocks {
+            let mods = block.mod_fc.forward(&c);
+            let shift = mods.narrow(-1, 0, latent_dim);
+            let scale = mods.narrow(-1, latent_dim, latent_dim);
+            let gate = mods.narrow(-1, 2 * latent_dim, latent_dim);
+            let modulated = &normalize_last_dim(&h) * (&scale + 1.0) + &shift;
+            let enriched = block
+                .fc2
+                .forward(&block.fc1.forward(&modulated).gelu("none"));
+            h = h + &gate * enriched;
+        }
+        let fmods = flow.final_mod.forward(&c);
+        let shift_f = fmods.narrow(-1, 0, latent_dim);
+        let scale_f = fmods.narrow(-1, latent_dim, latent_dim);
+        let modulated = &normalize_last_dim(&h) * (&scale_f + 1.0) + &shift_f;
+        latent_bound(&flow.out_proj.forward(&modulated))
+    }
+
+    // x-prediction -> rectified-flow velocity: v = (x_pred - noised) / (1 - t),
+    // t = signal / K_MAX. Callers guarantee signal < K_MAX so (1 - t) >= 1/K_MAX.
+    fn lejepa_flow_velocity(&self, x_pred: &Tensor, noised: &Tensor, signal: &Tensor) -> Tensor {
+        let one_minus_t = (signal.to_kind(Kind::Float) / (-(LEJEPA_K_MAX as f64))) + 1.0;
+        (x_pred - noised) / one_minus_t.unsqueeze(-1)
     }
 
     fn causal_lejepa_layer(
@@ -569,17 +715,35 @@ impl PretrainHeads {
         (mean, logvar)
     }
 
-    fn lejepa_imagined_rollout(&self, context_bars: &Tensor, train: bool) -> Tensor {
-        self.lejepa_imagined_rollout_inner(context_bars, train, false).0
+    // Stochastic imagined rollout. `temperature == 0` yields the MEAN path: the
+    // Monte-Carlo average (over decoded bar features) of K independent sampled
+    // trajectories, each drawn at temperature 1. Any other temperature yields a
+    // single sampled trajectory scaled by that temperature.
+    fn lejepa_imagined_rollout(&self, context_bars: &Tensor, temperature: f64, train: bool) -> Tensor {
+        if temperature == 0.0 {
+            let k = LEJEPA_MEAN_ROLLOUT_SAMPLES;
+            let mut acc: Option<Tensor> = None;
+            for _ in 0..k {
+                let (traj, _) = self.single_imagined_rollout(context_bars, 1.0, train, false);
+                acc = Some(match acc {
+                    Some(a) => a + traj,
+                    None => traj,
+                });
+            }
+            return acc.expect("K >= 1") / k as f64;
+        }
+        self.single_imagined_rollout(context_bars, temperature, train, false).0
     }
 
-    // Deterministic autoregressive rollout: each step runs one AR forward,
-    // projects the last belief to the next embedding via `pred_proj`, appends it
-    // (truncating to the causal window), and probe-decodes it to an OHLC bar.
-    // No noise, integration, temperature, or Monte-Carlo averaging.
-    fn lejepa_imagined_rollout_inner(
+    // One stochastic autoregressive trajectory. Per generated frame: mix a fixed
+    // per-position context noise into the token sequence (drift mitigation), run
+    // the AR predictor to a belief, then sample the next latent with a 4-step
+    // shortcut Euler integration from a fresh N(0,I) prior (scaled by temperature).
+    // Each new latent is tanh-bounded, appended, and probe-decoded to an OHLC bar.
+    fn single_imagined_rollout(
         &self,
         context_bars: &Tensor,
+        temperature: f64,
         train: bool,
         collect_entropy: bool,
     ) -> (Tensor, Option<RolloutEntropy>) {
@@ -588,23 +752,38 @@ impl PretrainHeads {
         let batch = size[0];
         let tickers = size[1];
         let latent_dim = self.latent_dim;
+        let rows = batch * tickers;
+        let device = tokens.device();
+        // Fixed per-position context noise, grown alongside the token sequence so
+        // each frame's mixed context stays constant once it exists.
+        let mut ctx_noise = Tensor::randn_like(&tokens);
+        let step_log2_val = (LEJEPA_ROLLOUT_STEP_SIZE as f64).log2() as i64;
         let mut imagined = Vec::with_capacity(LEJEPA_ROLLOUT_BARS as usize);
         let mut ent_means: Vec<Tensor> = Vec::new();
         let mut tok_norm_sum = 0.0f64;
         let mut tok_norm_max = 0.0f64;
         for _ in 0..LEJEPA_ROLLOUT_BARS {
-            let belief = self
-                .predict_lejepa_bar_predictions(&tokens, train)
-                .belief;
+            let noisy_tokens = &tokens * (1.0 - LEJEPA_CTX_NOISE_MIX) + &ctx_noise * LEJEPA_CTX_NOISE_MIX;
+            let belief = self.predict_lejepa_bar_predictions(&noisy_tokens, train).belief;
             let last = tokens.size()[2] - 1;
-            let belief_last = belief.narrow(2, last, 1);
-            let next_token = self.pred_emb_from_belief(&belief_last, train);
+            let ctx = belief.narrow(2, last, 1).reshape([rows, latent_dim]);
+            let mut z = Tensor::randn([rows, latent_dim], (Kind::Float, device)) * temperature;
+            for k in 0..LEJEPA_ROLLOUT_STEPS {
+                let sig_val = (k * LEJEPA_ROLLOUT_STEP_SIZE).min(LEJEPA_K_MAX - 1);
+                let signal = Tensor::full([rows], sig_val, (Kind::Int64, device));
+                let step_log2 = Tensor::full([rows], step_log2_val, (Kind::Int64, device));
+                let x_pred = self.lejepa_flow_predict(&z, &signal, &step_log2, &ctx);
+                let v = self.lejepa_flow_velocity(&x_pred, &z, &signal);
+                z = z + v * (LEJEPA_ROLLOUT_STEP_SIZE as f64 / LEJEPA_K_MAX as f64);
+            }
+            // Final Euler step lands exactly on the (already latent-bounded) x_pred.
+            let next_token = z.view([batch, tickers, 1, latent_dim]);
             let (mean, _logvar) = self.probe_ohlc_features(&next_token);
             let bar = mean.view([batch, LEJEPA_BAR_FEATURES]);
             imagined.push(bar.shallow_clone());
             if collect_entropy {
-                let nt_n = next_token
-                    .reshape([batch * tickers, latent_dim])
+                let nt_n = z
+                    .reshape([rows, latent_dim])
                     .square()
                     .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
                     .sqrt();
@@ -613,10 +792,12 @@ impl PretrainHeads {
                 ent_means.push(bar);
             }
             tokens = Tensor::cat(&[&tokens, &next_token], 2);
+            ctx_noise = Tensor::cat(&[&ctx_noise, &Tensor::randn_like(&next_token)], 2);
             let len = tokens.size()[2];
             let max_len = PRICE_DELTAS_PER_TICKER as i64;
             if len > max_len {
                 tokens = tokens.narrow(2, len - max_len, max_len);
+                ctx_noise = ctx_noise.narrow(2, len - max_len, max_len);
             }
         }
         let entropy = if collect_entropy {
@@ -1848,16 +2029,26 @@ fn lejepa_pretrain_loss(
     let all_tokens = autocast(false, || heads.encode_bar_tokens(&full, train));
     let length = batch.bar_history.size()[2];
     let bar_tokens = all_tokens.narrow(2, 0, length);
-    // Un-detached shift-by-1 target (le-wm recipe): the next-embedding MSE target
-    // carries gradient into the shared online encoder. SIGReg, not stop-grad,
-    // prevents collapse.
+    // Un-detached shift-by-1 target (le-wm recipe): the clean next-token target
+    // carries gradient into the shared online encoder through both the flow's
+    // x-target and its noised input. SIGReg, not stop-grad, prevents collapse.
     let target_bar_tokens = all_tokens.narrow(2, 1, length);
     let latest_token = all_tokens.select(2, length);
-    let belief = heads.predict_lejepa_bar_predictions(&bar_tokens, train).belief;
-    // le-wm prediction loss: teacher-forced next-embedding MSE. Both pred_emb and
-    // tgt_emb come from the same online encoder with no stop-gradient.
-    let pred_emb = heads.pred_emb_from_belief(&belief, train);
-    let pred_loss = pred_emb.mse_loss(&target_bar_tokens, Reduction::Mean);
+    // Drift-mitigation noisy context: mix fixed unit noise into the predictor
+    // INPUT only (same 10% as rollout). Clean targets / SIGReg keep the noiseless
+    // encoder tokens.
+    let noisy_bar_tokens =
+        &bar_tokens * (1.0 - LEJEPA_CTX_NOISE_MIX) + Tensor::randn_like(&bar_tokens) * LEJEPA_CTX_NOISE_MIX;
+    let belief = heads
+        .predict_lejepa_bar_predictions(&noisy_bar_tokens, train)
+        .belief;
+    let latent_dim = heads.latent_dim;
+    let rows = target_bar_tokens.numel() as i64 / latent_dim;
+    // Attached belief conditioning and clean x-target both flow gradient to the
+    // encoder (le-wm recipe): the flow is the sole dynamics loss.
+    let ctx = belief.reshape([rows, latent_dim]);
+    let clean = target_bar_tokens.reshape([rows, latent_dim]);
+    let pred_loss = lejepa_flow_loss(heads, &ctx, &clean);
 
     let total_positions = all_tokens.size()[2];
     let k = LEJEPA_SIGREG_POSITIONS.min(total_positions);
@@ -1881,10 +2072,20 @@ fn lejepa_pretrain_loss(
 
     let total = &pred_loss + &sigreg * lambda_sigreg;
 
-    // jepa_mse column = the next-embedding prediction MSE (== pred_loss); detached
-    // clones for logging only, gradients never touch these.
-    let jepa_mse = pred_loss.detach();
-    let pred_embed_std = pred_emb.std(false).detach();
+    // jepa_mse column = detached one-shot flow estimate MSE (x_pred from the zero
+    // prior at signal 0), a stable dashboard proxy for the deterministic next-token
+    // prediction. Gradients never touch these.
+    let (jepa_mse, pred_embed_std) = tch::no_grad(|| {
+        let device = clean.device();
+        let zero = Tensor::zeros_like(&clean);
+        let signal0 = Tensor::zeros([rows], (Kind::Int64, device));
+        let step0 = Tensor::zeros([rows], (Kind::Int64, device));
+        let x_pred = heads.lejepa_flow_predict(&zero, &signal0, &step0, &ctx.detach());
+        (
+            x_pred.mse_loss(&clean, Reduction::Mean),
+            x_pred.std(false),
+        )
+    });
 
     let probe_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
     let probe = ohlc_probe_metrics(
@@ -1916,6 +2117,73 @@ fn lejepa_pretrain_loss(
         zero_mse,
         probe_explained_variance,
     }
+}
+
+// dreamer4 shortcut-forcing objective. Per batch, a Bernoulli(p=1-1/6) picks the
+// SHORTCUT branch (self-consistency distillation of a size-d step into two size-d/2
+// steps, flow-space MSE weighted by (1-t)^2, plus the ramp-weighted x-space MSE to
+// clean data that dreamer4 keeps on every batch), else the PLAIN branch (per-position
+// diffusion-forcing x-prediction MSE, ramp-weighted 0.9t+0.1). `ctx` (belief) and
+// `clean` (next-token target) are attached [rows, latent_dim] so gradient reaches
+// the encoder through the flow.
+fn lejepa_flow_loss(heads: &PretrainHeads, ctx: &Tensor, clean: &Tensor) -> Tensor {
+    let rows = clean.size()[0];
+    let device = clean.device();
+    let shortcut = Tensor::rand([], (Kind::Float, device)).double_value(&[]) < LEJEPA_PROB_SHORTCUT;
+    if !shortcut {
+        // Plain branch: signal ~ Uniform{0..K_MAX-1} independently per position.
+        let signal = Tensor::randint(LEJEPA_K_MAX, [rows], (Kind::Int64, device));
+        let step_log2 = Tensor::zeros([rows], (Kind::Int64, device));
+        let t = signal.to_kind(Kind::Float) / LEJEPA_K_MAX as f64;
+        let t_col = t.unsqueeze(-1);
+        let noise = Tensor::randn_like(clean);
+        let noised = &noise * (&t_col * -1.0 + 1.0) + clean * &t_col;
+        let x_pred = heads.lejepa_flow_predict(&noised, &signal, &step_log2, ctx);
+        let per_sample = (x_pred - clean)
+            .square()
+            .mean_dim([-1i64].as_slice(), false, Kind::Float);
+        let ramp = &t * 0.9 + 0.1;
+        return (per_sample * ramp).mean(Kind::Float);
+    }
+    // Shortcut branch: step size d = 2^log2 with log2 ~ Uniform{1..6}; signal ~
+    // Uniform{0..K_MAX-1} discretized down to a multiple of d.
+    let step_log2 = Tensor::randint_low(1, LEJEPA_NUM_STEP_SIZES_LOG2, [rows], (Kind::Int64, device));
+    let d_f = step_log2.to_kind(Kind::Float).exp2();
+    let raw = Tensor::randint(LEJEPA_K_MAX, [rows], (Kind::Int64, device)).to_kind(Kind::Float);
+    let sig_f = (&raw / &d_f).floor() * &d_f;
+    let sig = sig_f.to_kind(Kind::Int64);
+    let half_f = &d_f / 2.0;
+    let t1 = &sig_f / LEJEPA_K_MAX as f64;
+    let t1_col = t1.unsqueeze(-1);
+    let noise = Tensor::randn_like(clean);
+    let noised = &noise * (&t1_col * -1.0 + 1.0) + clean * &t1_col;
+    let step_log2_minus1 = &step_log2 - 1;
+    // Self-consistency target: two size-(d/2) sub-steps, averaged flow, stop-grad.
+    let target_flow = tch::no_grad(|| {
+        let x1 = heads.lejepa_flow_predict(&noised, &sig, &step_log2_minus1, ctx);
+        let flow1 = heads.lejepa_flow_velocity(&x1, &noised, &sig);
+        let denoised = &noised + &flow1 * (&half_f / LEJEPA_K_MAX as f64).unsqueeze(-1);
+        let sig2_f = &sig_f + &half_f;
+        let sig2 = sig2_f.to_kind(Kind::Int64);
+        let x2 = heads.lejepa_flow_predict(&denoised, &sig2, &step_log2_minus1, ctx);
+        let flow2 = heads.lejepa_flow_velocity(&x2, &denoised, &sig2);
+        ((flow1 + flow2) / 2.0).detach()
+    });
+    // Main full-step-d prediction: regressed toward the target in flow-space, plus
+    // the always-on x-space grounding to clean data (dreamer4 keeps both terms).
+    let x_pred = heads.lejepa_flow_predict(&noised, &sig, &step_log2, ctx);
+    let pred_flow = heads.lejepa_flow_velocity(&x_pred, &noised, &sig);
+    let weight = (&t1 * -1.0 + 1.0).square();
+    let consistency = (pred_flow - target_flow)
+        .square()
+        .mean_dim([-1i64].as_slice(), false, Kind::Float)
+        * weight;
+    let ramp = &t1 * 0.9 + 0.1;
+    let grounding = (x_pred - clean)
+        .square()
+        .mean_dim([-1i64].as_slice(), false, Kind::Float)
+        * ramp;
+    (consistency + grounding).mean(Kind::Float)
 }
 
 fn cumulative_future_returns(future_patches: &Tensor) -> Tensor {
@@ -2011,6 +2279,17 @@ struct ProbeLoss {
     target_std_level: Tensor,
     probe_ev_level: Tensor,
     pred_sigma_level: Tensor,
+}
+
+// Gaussian NLL of the probe decode over positions kept by `mask` [.., 1]. Used to
+// train the probe on flow x-predictions at signal>=32 only.
+fn masked_probe_nll(heads: &PretrainHeads, latent: &Tensor, target: &Tensor, mask: &Tensor) -> Tensor {
+    let (mean, logvar) = heads.probe_ohlc_features(latent);
+    let err = &mean - target;
+    let nll_elem = &logvar + err.pow_tensor_scalar(2.0) * logvar.neg().exp();
+    let features = *nll_elem.size().last().unwrap() as f64;
+    let denom = (mask.sum(Kind::Float) * features).clamp_min(1.0);
+    (nll_elem * mask).sum(Kind::Float) / denom * 0.5
 }
 
 fn ohlc_probe_metrics(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -> ProbeLoss {
@@ -2506,11 +2785,11 @@ fn train_detached_probe(
         sampler.start_epoch();
         while let Some(batch) = sampler.next_train_batch(batch_size) {
             let batch_samples = batch.len() as usize;
-            // The probe is trained on BOTH real encoded tokens AND teacher-forced
-            // predicted embeddings (each detached), so it decodes the same
-            // predicted-latent distribution the rollout feeds it. All encoder/AR
-            // inputs are detached so the probe never shapes them.
-            let (token, pred_emb, pred_target) = tch::no_grad(|| {
+            // The probe is trained on BOTH real encoded tokens AND detached flow
+            // x-predictions (sampled per position, masked to signal>=32 so it only
+            // decodes reasonably-clean latents), matching the rollout distribution.
+            // All encoder/AR/flow inputs are detached so the probe never shapes them.
+            let (token, pred_emb, pred_target, pred_mask) = tch::no_grad(|| {
                 autocast(false, || {
                     let real_token = heads.encode_bar_tokens(&batch.next_bars, false).narrow(2, 0, 1);
                     let full =
@@ -2518,17 +2797,35 @@ fn train_detached_probe(
                     let all_tokens = heads.encode_bar_tokens(&full, false);
                     let length = batch.bar_history.size()[2];
                     let bar_tokens = all_tokens.narrow(2, 0, length);
-                    let belief = heads.predict_lejepa_bar_predictions(&bar_tokens, false).belief;
-                    let pred_emb = heads.pred_emb_from_belief(&belief, false);
-                    // Target for pred_emb at position t = raw features of bar t+1.
+                    let latent_dim = heads.latent_dim;
+                    let noisy = &bar_tokens * (1.0 - LEJEPA_CTX_NOISE_MIX)
+                        + Tensor::randn_like(&bar_tokens) * LEJEPA_CTX_NOISE_MIX;
+                    let belief = heads.predict_lejepa_bar_predictions(&noisy, false).belief;
+                    let clean_next = all_tokens.narrow(2, 1, length);
+                    let bt = belief.size();
+                    let (b, tk) = (bt[0], bt[1]);
+                    let rows = b * tk * length;
+                    let signal = Tensor::randint(LEJEPA_K_MAX, [b, tk, length], (Kind::Int64, device));
+                    let t = (signal.to_kind(Kind::Float) / LEJEPA_K_MAX as f64).unsqueeze(-1);
+                    let noise = Tensor::randn_like(&clean_next);
+                    let noised = &noise * (&t * -1.0 + 1.0) + &clean_next * &t;
+                    let x_pred = heads
+                        .lejepa_flow_predict(
+                            &noised.reshape([rows, latent_dim]),
+                            &signal.reshape([rows]),
+                            &Tensor::zeros([rows], (Kind::Int64, device)),
+                            &belief.reshape([rows, latent_dim]),
+                        )
+                        .reshape([b, tk, length, latent_dim]);
+                    let mask = signal.ge(LEJEPA_K_MAX / 2).to_kind(Kind::Float).unsqueeze(-1);
                     let pred_target = full.narrow(2, 1, length) * target_scale;
-                    (real_token, pred_emb, pred_target)
+                    (real_token, x_pred, pred_target, mask)
                 })
             });
             let ohlc_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
             let probe = ohlc_probe_metrics(heads, &token.detach(), &ohlc_target);
-            let probe_pred = ohlc_probe_metrics(heads, &pred_emb.detach(), &pred_target);
-            let probe_loss = &probe.probe_nll + &probe_pred.probe_nll;
+            let probe_pred_nll = masked_probe_nll(heads, &pred_emb.detach(), &pred_target, &pred_mask);
+            let probe_loss = &probe.probe_nll + &probe_pred_nll;
             assert_finite_loss(&probe_loss, probe_epoch + 1);
             probe_opt.zero_grad();
             probe_loss.backward();
@@ -2607,7 +2904,7 @@ fn validate_full(
         let mut next_lat_sum = 0.0;
         let mut probe_terminal_mse_sum = 0.0;
         let mut zero_mse_sum = 0.0;
-        // Belief-ablation skill test (read-only): does `pred_proj` actually USE the
+        // Belief-ablation skill test (read-only): does the flow head actually USE the
         // AR belief? Accumulated per Lejepa validation batch, meaned below.
         let mut skill_ev_correct_sum = 0.0;
         let mut skill_ev_shuffled_sum = 0.0;
@@ -2706,8 +3003,8 @@ fn validate_full(
                 }
 
                 // Belief-ablation skill test: how much predictive info does the AR
-                // belief carry through `pred_proj`? ev = 1 - mse/var (centered
-                // marginal variance) of the next-embedding prediction. Comparing
+                // belief carry through the flow head? ev = 1 - mse/var (centered
+                // marginal variance) of the one-shot flow estimate. Comparing
                 // belief vs row-shuffled vs zero context isolates the conditioning.
                 if matches!(objective, PretrainObjective::Lejepa) {
                     let latent_dim = heads.latent_dim;
@@ -2727,8 +3024,17 @@ fn validate_full(
                         .square()
                         .mean(Kind::Float)
                         .double_value(&[]);
+                    // One-shot flow estimate (x_pred from the zero prior at signal 0)
+                    // as the deterministic next-token prediction for the ablation.
+                    let signal0 = Tensor::zeros([rows], (Kind::Int64, device));
+                    let step0 = Tensor::zeros([rows], (Kind::Int64, device));
                     let ev = |ctx: &Tensor| -> f64 {
-                        let est = heads.pred_emb_from_belief(ctx, false);
+                        let est = heads.lejepa_flow_predict(
+                            &Tensor::zeros_like(&z1),
+                            &signal0,
+                            &step0,
+                            ctx,
+                        );
                         let mse = est.mse_loss(&z1, Reduction::Mean).double_value(&[]);
                         1.0 - mse / var
                     };
@@ -2772,11 +3078,11 @@ fn validate_full(
             (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN)
         };
 
-        // Deterministic imagined-rollout MSE against the actual future in raw OHLC
-        // space (matching the candle diagnostics). Per-window MSE reduces over
-        // horizon x 16 features. The rollout has no stochasticity, so the "sampled"
-        // columns mirror the mean and the paired delta/se/t are zero. Chunked at
-        // `batch_size` to bound rollout VRAM.
+        // Stochastic imagined-rollout MSE against the actual future in raw OHLC
+        // space. The MEAN path is the Monte-Carlo average of K sampled rollouts;
+        // the SAMPLED column is the expected per-window MSE over independent draws.
+        // A paired t-test over windows reports whether averaging beats sampling.
+        // Per-window MSE reduces over horizon x 16 features; chunked at `batch_size`.
         let (
             rollout_mean_mse,
             rollout_sampled_mse,
@@ -2799,31 +3105,56 @@ fn validate_full(
                 let n_total = ctx.size()[0];
                 let chunk = batch_size as i64;
                 let mut mean_mse: Vec<f64> = Vec::with_capacity(rollout_windows);
+                let mut sampled_mse: Vec<f64> = Vec::with_capacity(rollout_windows);
                 // Decoded close-delta (feature row[3]) accumulators over all rollout
-                // bars x windows. Captured at the feature level before the
-                // multiplicative close chain to confirm the tiny per-bar bias `b`
-                // driving rollout drift.
-                let mut dclose_sum = 0.0f64;
-                let mut dclose_sqsum = 0.0f64;
-                let mut dclose_n = 0i64;
+                // bars x windows, separately for the mean and sampled paths.
+                let mut mean_dclose_sum = 0.0f64;
+                let mut mean_dclose_sqsum = 0.0f64;
+                let mut mean_dclose_n = 0i64;
+                let mut sampled_dclose_sum = 0.0f64;
+                let mut sampled_dclose_sqsum = 0.0f64;
+                let mut sampled_dclose_n = 0i64;
                 let mut start = 0;
                 while start < n_total {
                     let len = chunk.min(n_total - start);
                     let ctx_c = ctx.narrow(0, start, len);
                     let actual_c = actual.narrow(0, start, len);
-                    let roll = heads.lejepa_imagined_rollout(&ctx_c, false) / target_scale;
-                    let dclose = roll.narrow(2, 3, 1);
-                    dclose_sum += dclose.sum(Kind::Float).double_value(&[]);
-                    dclose_sqsum += dclose.square().sum(Kind::Float).double_value(&[]);
-                    dclose_n += dclose.numel() as i64;
-                    let pw = (&roll - &actual_c).pow_tensor_scalar(2.0).mean_dim(
+                    let mean_roll =
+                        heads.lejepa_imagined_rollout(&ctx_c, 0.0, false) / target_scale;
+                    let mean_dclose = mean_roll.narrow(2, 3, 1);
+                    mean_dclose_sum += mean_dclose.sum(Kind::Float).double_value(&[]);
+                    mean_dclose_sqsum += mean_dclose.square().sum(Kind::Float).double_value(&[]);
+                    mean_dclose_n += mean_dclose.numel() as i64;
+                    let mean_pw = (&mean_roll - &actual_c).pow_tensor_scalar(2.0).mean_dim(
                         [1i64, 2].as_slice(),
                         false,
                         Kind::Float,
                     );
+                    let mut sampled_pw = Tensor::zeros([len], (Kind::Float, device));
+                    for _ in 0..LEJEPA_ROLLOUT_EVAL_SAMPLES {
+                        let sampled_roll =
+                            heads.lejepa_imagined_rollout(&ctx_c, 1.0, false) / target_scale;
+                        let sampled_dclose = sampled_roll.narrow(2, 3, 1);
+                        sampled_dclose_sum += sampled_dclose.sum(Kind::Float).double_value(&[]);
+                        sampled_dclose_sqsum +=
+                            sampled_dclose.square().sum(Kind::Float).double_value(&[]);
+                        sampled_dclose_n += sampled_dclose.numel() as i64;
+                        sampled_pw += (&sampled_roll - &actual_c).pow_tensor_scalar(2.0).mean_dim(
+                            [1i64, 2].as_slice(),
+                            false,
+                            Kind::Float,
+                        );
+                    }
+                    let sampled_pw = sampled_pw / LEJEPA_ROLLOUT_EVAL_SAMPLES as f64;
                     mean_mse.extend(
-                        tensor_to_vec_f32(&pw)
-                            .expect("rollout mse")
+                        tensor_to_vec_f32(&mean_pw)
+                            .expect("rollout mean mse")
+                            .into_iter()
+                            .map(|x| x as f64),
+                    );
+                    sampled_mse.extend(
+                        tensor_to_vec_f32(&sampled_pw)
+                            .expect("rollout sampled mse")
                             .into_iter()
                             .map(|x| x as f64),
                     );
@@ -2831,13 +3162,41 @@ fn validate_full(
                 }
                 let n = mean_mse.len();
                 let mean_avg = mean_mse.iter().sum::<f64>() / n as f64;
-                let dclose_avg = dclose_sum / dclose_n as f64;
-                let dclose_std = (dclose_sqsum / dclose_n as f64 - dclose_avg.powi(2))
-                    .max(0.0)
-                    .sqrt();
+                let sampled_avg = sampled_mse.iter().sum::<f64>() / n as f64;
+                // Paired significance of (sampled - mean) MSE across windows.
+                let diffs: Vec<f64> =
+                    sampled_mse.iter().zip(&mean_mse).map(|(s, m)| s - m).collect();
+                let delta = diffs.iter().sum::<f64>() / n as f64;
+                let (se, t) = if n >= 2 {
+                    let var = diffs.iter().map(|d| (d - delta).powi(2)).sum::<f64>()
+                        / (n as f64 - 1.0);
+                    let se = (var / n as f64).sqrt();
+                    let t = if se > 0.0 { delta / se } else { 0.0 };
+                    (se, t)
+                } else {
+                    (0.0, 0.0)
+                };
+                let mean_dclose_avg = mean_dclose_sum / mean_dclose_n as f64;
+                let mean_dclose_std = (mean_dclose_sqsum / mean_dclose_n as f64
+                    - mean_dclose_avg.powi(2))
+                .max(0.0)
+                .sqrt();
+                let sampled_dclose_avg = sampled_dclose_sum / sampled_dclose_n as f64;
+                let sampled_dclose_std = (sampled_dclose_sqsum / sampled_dclose_n as f64
+                    - sampled_dclose_avg.powi(2))
+                .max(0.0)
+                .sqrt();
                 (
-                    mean_avg, mean_avg, 0.0, 0.0, 0.0, n as f64, dclose_avg, dclose_std,
-                    dclose_avg, dclose_std,
+                    mean_avg,
+                    sampled_avg,
+                    delta,
+                    se,
+                    t,
+                    n as f64,
+                    mean_dclose_avg,
+                    mean_dclose_std,
+                    sampled_dclose_avg,
+                    sampled_dclose_std,
                 )
             }
             // NaN/0 = not-applicable: MeanMse has no imagined rollout.
@@ -3004,8 +3363,11 @@ fn write_pretrain_diagnostics(
                         )
                     }
                     PretrainObjective::Lejepa => {
-                        let (imagined, entropy) = heads.lejepa_imagined_rollout_inner(
+                        // One sampled trajectory for the candle diagnostics + rollout
+                        // step-variance instrumentation.
+                        let (imagined, entropy) = heads.single_imagined_rollout(
                             &batch.bar_history,
+                            1.0,
                             false,
                             true,
                         );
@@ -3015,8 +3377,6 @@ fn write_pretrain_diagnostics(
                             ent_tnmax = ent_tnmax.max(e.tok_norm_max);
                             ent_n += 1;
                         }
-                        // Deterministic rollout: the mean and sampled candle variants
-                        // are identical.
                         let predicted_ohlc = imagined / target_scale;
                         mean_ohlc = Some(tensor_to_vec_f32(&predicted_ohlc)?);
                         (
@@ -3434,6 +3794,12 @@ fn append_ohlc_feature_window(
     }
 }
 
+// JEDI differentiable latent bounding: z = B * tanh(z / B). Keeps encoder tokens
+// and flow x-predictions within [-B, B] so they share the unit-N(0,I) prior scale.
+fn latent_bound(z: &Tensor) -> Tensor {
+    (z / LEJEPA_LATENT_BOUND).tanh() * LEJEPA_LATENT_BOUND
+}
+
 fn normalize_last_dim(x: &Tensor) -> Tensor {
     let mean = x.mean_dim([-1].as_slice(), true, Kind::Float);
     let centered = x - &mean;
@@ -3473,7 +3839,7 @@ enum LejepaGradGroup {
 
 // Routes a trainable parameter to its learning-dynamics group by name. Order
 // matters: the per-bar encoder/projector (which also matches `lejepa_projector`)
-// is checked first, leaving the AR transformer + `lejepa_pred_proj` as the
+// is checked first, leaving the AR transformer + shortcut flow head as the
 // remaining `lejepa_` params. Everything else (base model params with no
 // gradient during LeJEPA pretrain) is a catch-all.
 fn lejepa_grad_group(name: &str) -> LejepaGradGroup {
@@ -3626,7 +3992,7 @@ fn configure_threads() {
 mod tests {
     use super::{
         bar_history_for_current_perm, build_split_offsets, candle_from_ohlc_feature_row,
-        chained_candles_from_ohlc_features, cumulative_future_returns,
+        chained_candles_from_ohlc_features, cumulative_future_returns, lejepa_flow_loss,
         future_patches_for_current_perm, next_bars_for_current_perm,
         seed_candle_from_feature_row, sigreg_loss, CandleBar, PretrainHeads, SplitKind,
         LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
@@ -3921,17 +4287,7 @@ mod tests {
             (tch::Kind::Float, tch::Device::Cpu),
         );
 
-        let mut tokens = heads.encode_bar_tokens(&context, false);
-        let start_len = tokens.size()[2];
-        for step in 0..3 {
-            let preds = heads.predict_lejepa_bar_predictions(&tokens, false);
-            let last = tokens.size()[2] - 1;
-            let next_latent = heads.pred_emb_from_belief(&preds.belief.narrow(2, last, 1), false);
-            tokens = Tensor::cat(&[&tokens, &next_latent], 2);
-            assert_eq!(tokens.size()[2], start_len + step + 1);
-        }
-
-        let imagined = heads.lejepa_imagined_rollout(&context, false);
+        let imagined = heads.lejepa_imagined_rollout(&context, 1.0, false);
         assert_eq!(
             imagined.size(),
             vec![batch, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]
@@ -3943,7 +4299,7 @@ mod tests {
     }
 
     #[test]
-    fn pred_emb_handles_gapped_narrowed_targets() {
+    fn flow_loss_handles_gapped_narrowed_targets() {
         let vs = nn::VarStore::new(tch::Device::Cpu);
         let latent_dim = 256;
         let heads = PretrainHeads::new(&vs.root(), latent_dim, 16, 25);
@@ -3953,17 +4309,18 @@ mod tests {
             [batch, 1, length + 1, LEJEPA_BAR_FEATURES],
             (tch::Kind::Float, tch::Device::Cpu),
         );
-        // Mirrors lejepa_pretrain_loss: the MSE target is a non-contiguous narrowed
-        // slice that folds a gapped position dim into rows.
+        // Mirrors lejepa_pretrain_loss: belief and clean target are reshaped from a
+        // non-contiguous narrowed slice that folds a gapped position dim into rows.
         let all_tokens = heads.encode_bar_tokens(&bars, true);
         let bar_tokens = all_tokens.narrow(2, 0, length);
         let target_bar_tokens = all_tokens.narrow(2, 1, length);
-        let predictions = heads.predict_lejepa_bar_predictions(&bar_tokens, true);
-        let pred_emb = heads.pred_emb_from_belief(&predictions.belief, true);
-        assert_eq!(pred_emb.size(), target_bar_tokens.size());
-        let loss = pred_emb.mse_loss(&target_bar_tokens, tch::Reduction::Mean);
+        let belief = heads.predict_lejepa_bar_predictions(&bar_tokens, true).belief;
+        let rows = target_bar_tokens.numel() as i64 / latent_dim;
+        let ctx = belief.reshape([rows, latent_dim]);
+        let clean = target_bar_tokens.reshape([rows, latent_dim]);
+        let loss = lejepa_flow_loss(&heads, &ctx, &clean);
         let value = loss.double_value(&[]);
-        assert!(value.is_finite(), "pred loss must be finite, got {value}");
-        assert!(value >= 0.0, "pred loss must be non-negative, got {value}");
+        assert!(value.is_finite(), "flow loss must be finite, got {value}");
+        assert!(value >= 0.0, "flow loss must be non-negative, got {value}");
     }
 }
