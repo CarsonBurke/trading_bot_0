@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
-use rand::{seq::SliceRandom, Rng};
+use rand::seq::SliceRandom;
 use std::{
     fs::{self, File},
     io::{BufWriter, Write},
@@ -39,6 +39,10 @@ const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
 const LEJEPA_ROPE_DIMS: i64 = 32;
 
+/// Per-probe-epoch batch budget for the detached OHLC probe. Caps probe training so
+/// mid-epoch validation stays cheap even though model epochs are full-data passes.
+const PROBE_BATCHES_PER_EPOCH: usize = 512;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum PretrainObjective {
@@ -55,7 +59,6 @@ pub struct PretrainArgs {
     pub steps: Option<usize>,
     pub batch_size: usize,
     pub k_patches: usize,
-    pub batches_per_epoch: usize,
     pub objective: PretrainObjective,
     pub lambda_lat: f64,
     pub lambda_sigreg: f64,
@@ -133,9 +136,8 @@ impl PretrainBatch {
 struct PretrainSampler {
     train_tickers: Vec<String>,
     train_envs: Vec<Env>,
-    train_offsets_by_env: Vec<Vec<usize>>,
-    train_batches_per_epoch: usize,
-    train_batch_cursor: usize,
+    train_pairs: Vec<(usize, usize)>,
+    train_cursor: usize,
     k_patches: usize,
     patch_size: usize,
     target_scale: f64,
@@ -649,26 +651,16 @@ impl PretrainHeads {
 }
 
 impl PretrainSampler {
-    fn new(
-        k_patches: usize,
-        patch_size: usize,
-        target_scale: f64,
-        batches_per_epoch: usize,
-        device: Device,
-    ) -> Self {
+    fn new(k_patches: usize, patch_size: usize, target_scale: f64, device: Device) -> Self {
         assert_eq!(
             TICKERS_COUNT, 1,
             "full-universe pretraining currently expects one ticker per observation"
-        );
-        assert!(
-            batches_per_epoch > 0,
-            "--batches-per-epoch must be positive"
         );
         let mut train_tickers = cached_eligible_training_universe().to_vec();
         train_tickers.shuffle(&mut rand::rng());
         let mut usable_train_tickers = Vec::with_capacity(train_tickers.len());
         let mut train_envs = Vec::with_capacity(train_tickers.len());
-        let mut train_offsets_by_env = Vec::with_capacity(train_tickers.len());
+        let mut train_pairs = Vec::new();
         for ticker in train_tickers {
             let env = Env::new_with_tickers_and_recording(vec![ticker.clone()], true, false, None);
             let offsets = build_split_offsets(
@@ -680,21 +672,25 @@ impl PretrainSampler {
             if offsets.is_empty() {
                 continue;
             }
+            let env_idx = train_envs.len();
+            train_pairs.extend(offsets.into_iter().map(|offset| (env_idx, offset)));
             usable_train_tickers.push(ticker);
             train_envs.push(env);
-            train_offsets_by_env.push(offsets);
         }
         assert!(
             !usable_train_tickers.is_empty(),
             "not enough market history for pretraining: train_tickers={}",
             usable_train_tickers.len()
         );
+        assert!(
+            !train_pairs.is_empty(),
+            "no training pairs available for pretraining"
+        );
         Self {
             train_tickers: usable_train_tickers,
             train_envs,
-            train_offsets_by_env,
-            train_batches_per_epoch: batches_per_epoch,
-            train_batch_cursor: 0,
+            train_pairs,
+            train_cursor: 0,
             k_patches,
             patch_size,
             target_scale,
@@ -702,24 +698,31 @@ impl PretrainSampler {
         }
     }
 
+    /// Batches per full-data epoch, emergent from batch size (final partial chunk dropped).
+    fn batches_per_epoch(&self, batch_size: usize) -> usize {
+        self.train_pairs.len() / batch_size
+    }
+
+    /// Reshuffle all train pairs so the next epoch is a fresh full pass over the data.
     fn start_epoch(&mut self) {
-        self.train_batch_cursor = 0;
+        self.train_pairs.shuffle(&mut rand::rng());
+        self.train_cursor = 0;
+    }
+
+    /// Advance the epoch cursor by one consecutive chunk of `batch_size` pairs,
+    /// returning `None` once fewer than `batch_size` pairs remain (partial chunk dropped).
+    fn take_train_chunk(&mut self, batch_size: usize) -> Option<&[(usize, usize)]> {
+        let end = self.train_cursor + batch_size;
+        if end > self.train_pairs.len() {
+            return None;
+        }
+        let start = self.train_cursor;
+        self.train_cursor = end;
+        Some(&self.train_pairs[start..end])
     }
 
     fn next_train_batch(&mut self, batch_size: usize) -> Option<PretrainBatch> {
-        if self.train_batch_cursor >= self.train_batches_per_epoch {
-            return None;
-        }
-        self.train_batch_cursor += 1;
-        let mut rng = rand::rng();
-        let samples = (0..batch_size)
-            .map(|_| {
-                let env_idx = rng.random_range(0..self.train_envs.len());
-                let offsets = &self.train_offsets_by_env[env_idx];
-                let offset = offsets[rng.random_range(0..offsets.len())];
-                (env_idx, offset)
-            })
-            .collect::<Vec<_>>();
+        let samples = self.take_train_chunk(batch_size)?.to_vec();
         Some(Self::batch_from_env_offsets(
             &mut self.train_envs,
             &samples,
@@ -728,6 +731,17 @@ impl PretrainSampler {
             self.target_scale,
             self.device,
         ))
+    }
+
+    fn batch_for_pairs(&mut self, pairs: &[(usize, usize)]) -> PretrainBatch {
+        Self::batch_from_env_offsets(
+            &mut self.train_envs,
+            pairs,
+            self.k_patches,
+            self.patch_size,
+            self.target_scale,
+            self.device,
+        )
     }
 
     fn batch_from_offsets(
@@ -989,10 +1003,6 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     assert!(args.batch_size > 0, "--batch-size must be positive");
     assert!(args.k_patches > 0, "--k-patches must be positive");
     assert!(
-        args.batches_per_epoch > 0,
-        "--batches-per-epoch must be positive"
-    );
-    assert!(
         args.lambda_lat.is_finite() && args.lambda_lat >= 0.0,
         "--lambda-lat must be finite and non-negative"
     );
@@ -1036,13 +1046,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         args.k_patches as i64 * patch_size,
         args.k_patches as i64 * model.pretrain_patch_size()
     );
-    let mut sampler = PretrainSampler::new(
-        args.k_patches,
-        patch_size as usize,
-        args.target_scale,
-        args.batches_per_epoch,
-        device,
-    );
+    let mut sampler = PretrainSampler::new(args.k_patches, patch_size as usize, args.target_scale, device);
     let mut head_vs = nn::VarStore::new(device);
     let heads = PretrainHeads::new(
         &head_vs.root(),
@@ -1142,12 +1146,13 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         sampler.start_epoch();
         let mut train_epoch_loss = RunningLoss::new(device);
         let mut grad_norm_acc = GradNormAccum::default();
+        let batches_per_epoch = sampler.batches_per_epoch(args.batch_size);
         println!(
             "pretrain epoch {epoch}/{} tickers={} batch_size={} batches_per_epoch={}",
             args.epochs,
             sampler.train_tickers.len(),
             args.batch_size,
-            args.batches_per_epoch
+            batches_per_epoch
         );
 
         while let Some(batch) = sampler.next_train_batch(args.batch_size) {
@@ -1289,6 +1294,16 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             }
 
             if args.validate_every > 0 && global_step % args.validate_every == 0 {
+                maybe_train_detached_probe(
+                    &model,
+                    &heads,
+                    &mut sampler,
+                    &args,
+                    &mut probe_opt,
+                    &probe_named_vars,
+                    device,
+                    &format!("step {global_step}"),
+                );
                 let val = validate_full(
                     &model,
                     &heads,
@@ -1451,35 +1466,16 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             log.flush()?;
         }
 
-        if args.objective == PretrainObjective::Lejepa && args.probe_epochs > 0 && !stop_requested {
-            let probe = train_detached_probe(
+        if !stop_requested {
+            maybe_train_detached_probe(
                 &model,
                 &heads,
                 &mut sampler,
-                args.batch_size,
-                args.probe_epochs,
-                args.target_scale,
+                &args,
                 &mut probe_opt,
                 &probe_named_vars,
                 device,
-            );
-            println!(
-                "pretrain epoch {epoch} detached_probe_train probe_nll={:.6} ohlc_mse={:.6} ohlc_mae={:.6} pred_std={:.6} target_std={:.6} pred_sigma={:.6} pred_std_level={:.6} target_std_level={:.6} probe_ev_level={:.2}% pred_sigma_level={:.6} grad_probe={:.6} pnorm_probe={:.6} samples={} batches={} probe_epochs={}",
-                probe.probe_nll,
-                probe.probe_mse,
-                probe.probe_mae,
-                probe.pred_std,
-                probe.target_std,
-                probe.pred_sigma,
-                probe.pred_std_level,
-                probe.target_std_level,
-                probe.probe_ev_level * 100.0,
-                probe.pred_sigma_level,
-                probe.grad_probe,
-                probe.pnorm_probe,
-                probe.samples,
-                probe.batches,
-                args.probe_epochs
+                &format!("epoch {epoch}"),
             );
         }
 
@@ -2475,6 +2471,53 @@ fn write_pretrain_scalar_report(
     )
 }
 
+/// Train the detached OHLC probe (Lejepa only) so any subsequent validation reports
+/// probe metrics against an up-to-date probe. `label` distinguishes epoch-end vs
+/// mid-epoch (step) invocations in the log line.
+fn maybe_train_detached_probe(
+    model: &TradingModel,
+    heads: &PretrainHeads,
+    sampler: &mut PretrainSampler,
+    args: &PretrainArgs,
+    probe_opt: &mut Muon,
+    probe_named_vars: &[(String, Tensor)],
+    device: Device,
+    label: &str,
+) {
+    if args.objective != PretrainObjective::Lejepa || args.probe_epochs == 0 {
+        return;
+    }
+    let probe = train_detached_probe(
+        model,
+        heads,
+        sampler,
+        args.batch_size,
+        args.probe_epochs,
+        args.target_scale,
+        probe_opt,
+        probe_named_vars,
+        device,
+    );
+    println!(
+        "pretrain {label} detached_probe_train probe_nll={:.6} ohlc_mse={:.6} ohlc_mae={:.6} pred_std={:.6} target_std={:.6} pred_sigma={:.6} pred_std_level={:.6} target_std_level={:.6} probe_ev_level={:.2}% pred_sigma_level={:.6} grad_probe={:.6} pnorm_probe={:.6} samples={} batches={} probe_epochs={}",
+        probe.probe_nll,
+        probe.probe_mse,
+        probe.probe_mae,
+        probe.pred_std,
+        probe.target_std,
+        probe.pred_sigma,
+        probe.pred_std_level,
+        probe.target_std_level,
+        probe.probe_ev_level * 100.0,
+        probe.pred_sigma_level,
+        probe.grad_probe,
+        probe.pnorm_probe,
+        probe.samples,
+        probe.batches,
+        args.probe_epochs
+    );
+}
+
 fn train_detached_probe(
     model: &TradingModel,
     heads: &PretrainHeads,
@@ -2502,9 +2545,16 @@ fn train_detached_probe(
     let mut samples = 0usize;
     let mut batches = 0usize;
 
+    // Iterate an independent shuffled copy of the train pairs so probe training never
+    // disturbs the main epoch's in-progress full-data pass (cursor/order untouched).
+    let mut order = sampler.train_pairs.clone();
     for probe_epoch in 0..probe_epochs {
-        sampler.start_epoch();
-        while let Some(batch) = sampler.next_train_batch(batch_size) {
+        order.shuffle(&mut rand::rng());
+        for chunk in order.chunks(batch_size).take(PROBE_BATCHES_PER_EPOCH) {
+            if chunk.len() < batch_size {
+                break;
+            }
+            let batch = sampler.batch_for_pairs(chunk);
             let batch_samples = batch.len() as usize;
             // The probe is trained on BOTH real encoded tokens AND teacher-forced
             // predicted embeddings (each detached), so it decodes the same
@@ -3628,8 +3678,8 @@ mod tests {
         bar_history_for_current_perm, build_split_offsets, candle_from_ohlc_feature_row,
         chained_candles_from_ohlc_features, cumulative_future_returns,
         future_patches_for_current_perm, next_bars_for_current_perm,
-        seed_candle_from_feature_row, sigreg_loss, CandleBar, PretrainHeads, SplitKind,
-        LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
+        seed_candle_from_feature_row, sigreg_loss, CandleBar, PretrainHeads, PretrainSampler,
+        SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -3965,5 +4015,44 @@ mod tests {
         let value = loss.double_value(&[]);
         assert!(value.is_finite(), "pred loss must be finite, got {value}");
         assert!(value >= 0.0, "pred loss must be non-negative, got {value}");
+    }
+
+    fn synthetic_sampler(n: usize) -> PretrainSampler {
+        PretrainSampler {
+            train_tickers: Vec::new(),
+            train_envs: Vec::new(),
+            train_pairs: (0..n).map(|i| (0usize, i)).collect(),
+            train_cursor: 0,
+            k_patches: 1,
+            patch_size: 1,
+            target_scale: 1.0,
+            device: tch::Device::Cpu,
+        }
+    }
+
+    #[test]
+    fn sampler_epoch_yields_floor_disjoint_batches_without_repeats() {
+        use std::collections::HashSet;
+
+        let n = 101;
+        let batch_size = 7;
+        let mut sampler = synthetic_sampler(n);
+        let expected_batches = n / batch_size;
+        assert_eq!(sampler.batches_per_epoch(batch_size), expected_batches);
+
+        sampler.start_epoch();
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        let mut batches = 0usize;
+        while let Some(chunk) = sampler.take_train_chunk(batch_size) {
+            assert_eq!(chunk.len(), batch_size, "every yielded chunk is full");
+            for &pair in chunk {
+                assert!(seen.insert(pair), "pair repeated within an epoch: {pair:?}");
+            }
+            batches += 1;
+        }
+        assert_eq!(batches, expected_batches, "exactly floor(N/batch) batches");
+        assert_eq!(seen.len(), expected_batches * batch_size);
+        assert!(seen.len() <= n, "epoch covers at most N pairs");
+        assert!(n - seen.len() < batch_size, "only a partial final chunk is dropped");
     }
 }

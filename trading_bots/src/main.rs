@@ -83,9 +83,6 @@ enum Commands {
         #[arg(long, default_value_t = 16)]
         k_patches: usize,
 
-        #[arg(long, default_value_t = 512)]
-        batches_per_epoch: usize,
-
         #[arg(long, value_enum, default_value_t = PretrainObjective::MeanMse)]
         objective: PretrainObjective,
 
@@ -104,9 +101,13 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         validation_batches: usize,
 
+        /// Run validation every N global optimizer steps within an epoch (0 disables
+        /// mid-epoch validation). Validation always also runs at each epoch end.
         #[arg(long, default_value_t = 0)]
         validate_every: usize,
 
+        /// Write a checkpoint every N global optimizer steps within an epoch (0 disables
+        /// mid-epoch checkpoints).
         #[arg(long, default_value_t = 0)]
         checkpoint_every: usize,
 
@@ -208,7 +209,6 @@ async fn main() {
             steps,
             batch_size,
             k_patches,
-            batches_per_epoch,
             objective,
             lambda_lat,
             lambda_sigreg,
@@ -227,7 +227,6 @@ async fn main() {
                 steps: *steps,
                 batch_size: *batch_size,
                 k_patches: *k_patches,
-                batches_per_epoch: *batches_per_epoch,
                 objective: *objective,
                 lambda_lat: *lambda_lat,
                 lambda_sigreg: *lambda_sigreg,
