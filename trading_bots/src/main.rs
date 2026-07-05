@@ -92,9 +92,6 @@ enum Commands {
         #[arg(long, default_value_t = 0.09)]
         lambda_sigreg: f64,
 
-        #[arg(long, default_value_t = 2)]
-        probe_epochs: usize,
-
         #[arg(long, default_value_t = 100.0)]
         target_scale: f64,
 
@@ -111,8 +108,15 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         checkpoint_every: usize,
 
-        #[arg(long, default_value_t = false)]
-        log_step_losses: bool,
+        /// Evaluate one validation mini-batch every N training steps, logged as
+        /// val_* columns in the always-on step CSV (0 disables).
+        #[arg(long, default_value_t = 5)]
+        step_val_every: usize,
+
+        /// Write deterministic candle-rollout snapshot reports on fixed validation
+        /// windows every N training steps (0 disables).
+        #[arg(long, default_value_t = 500)]
+        candle_snapshot_every: usize,
     },
     Infer {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
@@ -212,12 +216,12 @@ async fn main() {
             objective,
             lambda_lat,
             lambda_sigreg,
-            probe_epochs,
             target_scale,
             validation_batches,
             validate_every,
             checkpoint_every,
-            log_step_losses,
+            step_val_every,
+            candle_snapshot_every,
         }) => {
             let args = torch::train::PretrainArgs {
                 weights: weights.clone(),
@@ -230,12 +234,12 @@ async fn main() {
                 objective: *objective,
                 lambda_lat: *lambda_lat,
                 lambda_sigreg: *lambda_sigreg,
-                probe_epochs: *probe_epochs,
                 target_scale: *target_scale,
                 validation_batches: *validation_batches,
                 validate_every: *validate_every,
                 checkpoint_every: *checkpoint_every,
-                log_step_losses: *log_step_losses,
+                step_val_every: *step_val_every,
+                candle_snapshot_every: *candle_snapshot_every,
             };
             tokio::task::spawn_blocking(move || torch::train::pretrain(args))
                 .await

@@ -282,6 +282,9 @@ impl App {
         // Track the latest file for each chart type: base_name -> (modified_time, path)
         let mut latest_per_type: HashMap<String, (SystemTime, PathBuf)> = HashMap::new();
 
+        // Candle-snapshot window reports, kept only for the most recent global_step.
+        let mut candle_snapshots: Vec<(usize, PathBuf)> = Vec::new();
+
         // Scan all generation directories
         if let Ok(entries) = fs::read_dir(&gens_path) {
             for entry in entries.filter_map(|e| e.ok()) {
@@ -387,6 +390,26 @@ impl App {
                         }
                     }
                 }
+
+                let snapshot_path = gen_path.join("candle_snapshots");
+                if snapshot_path.is_dir() {
+                    if let Ok(items) = fs::read_dir(&snapshot_path) {
+                        for item in items.filter_map(|e| e.ok()) {
+                            let file_name = item.file_name();
+                            let file_name = file_name.to_str().unwrap_or("");
+                            if !file_name.ends_with("_candles.report.bin") {
+                                continue;
+                            }
+                            if let Some(step) = file_name
+                                .strip_prefix("step")
+                                .and_then(|s| s.split('_').next())
+                                .and_then(|s| s.parse::<usize>().ok())
+                            {
+                                candle_snapshots.push((step, item.path()));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -395,10 +418,25 @@ impl App {
             self.latest_meta_charts.push(path);
         }
 
+        // Keep only the most recent global_step's candle-snapshot windows.
+        if let Some(latest_step) = candle_snapshots.iter().map(|(s, _)| *s).max() {
+            for (_, path) in candle_snapshots.into_iter().filter(|(s, _)| *s == latest_step) {
+                self.latest_meta_charts.push(path);
+            }
+        }
+
         // Sort by filename for consistent ordering
         self.latest_meta_charts.sort();
 
         Ok(())
+    }
+
+    fn pretrain_meta_reports(&self) -> Vec<(String, shared::report::Report)> {
+        let run_root = match &self.process_manager.active_run {
+            Some(run) => run.root.clone(),
+            None => PathBuf::from("../training/runs/latest"),
+        };
+        utils::pretrain::run_reports(&run_root)
     }
 
     pub fn is_training_running(&mut self) -> bool {
@@ -634,7 +672,9 @@ impl App {
 
     fn view_meta_charts(&mut self) -> Result<()> {
         if !self.latest_meta_charts.is_empty() {
-            self.chart_viewer.load_charts(&self.latest_meta_charts)?;
+            let extra = self.pretrain_meta_reports();
+            self.chart_viewer
+                .load_charts(&self.latest_meta_charts, extra)?;
             self.previous_mode = self.mode;
             self.mode = AppMode::ChartViewer;
         }
@@ -1295,8 +1335,9 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                             KeyCode::Char('r') => {
                                                 if app.chart_viewer.is_viewing_meta_charts() {
                                                     app.load_latest_meta_charts()?;
+                                                    let extra = app.pretrain_meta_reports();
                                                     app.chart_viewer
-                                                        .load_charts(&app.latest_meta_charts)?;
+                                                        .load_charts(&app.latest_meta_charts, extra)?;
                                                 }
                                             }
                                             KeyCode::Char('c') => {

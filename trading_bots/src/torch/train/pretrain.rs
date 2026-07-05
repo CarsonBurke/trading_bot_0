@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
+use rand::{rngs::StdRng, SeedableRng};
 use std::{
     fs::{self, File},
     io::{BufWriter, Write},
@@ -39,9 +40,10 @@ const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 const LEJEPA_HEAD_DIM: i64 = 64;
 const LEJEPA_ROPE_DIMS: i64 = 32;
 
-/// Per-probe-epoch batch budget for the detached OHLC probe. Caps probe training so
-/// mid-epoch validation stays cheap even though model epochs are full-data passes.
-const PROBE_BATCHES_PER_EPOCH: usize = 512;
+/// Number of fixed validation windows tracked by the candle-snapshot diagnostic.
+const CANDLE_SNAPSHOT_WINDOWS: usize = 4;
+/// Fixed seed so the candle-snapshot windows are the same for a whole run.
+const CANDLE_SNAPSHOT_SEED: u64 = 0xC0FFEE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -62,12 +64,12 @@ pub struct PretrainArgs {
     pub objective: PretrainObjective,
     pub lambda_lat: f64,
     pub lambda_sigreg: f64,
-    pub probe_epochs: usize,
     pub target_scale: f64,
     pub validation_batches: usize,
     pub validate_every: usize,
     pub checkpoint_every: usize,
-    pub log_step_losses: bool,
+    pub step_val_every: usize,
+    pub candle_snapshot_every: usize,
 }
 
 struct CausalLejepaLayer {
@@ -138,6 +140,9 @@ struct PretrainSampler {
     train_envs: Vec<Env>,
     train_pairs: Vec<(usize, usize)>,
     train_cursor: usize,
+    val_pairs: Vec<(usize, usize)>,
+    val_eval_cursor: usize,
+    test_pairs: Vec<(usize, usize)>,
     k_patches: usize,
     patch_size: usize,
     target_scale: f64,
@@ -148,6 +153,7 @@ struct PretrainSampler {
 enum SplitKind {
     Train,
     Validation,
+    Test,
 }
 
 impl PretrainHeads {
@@ -686,16 +692,46 @@ impl PretrainSampler {
             !train_pairs.is_empty(),
             "no training pairs available for pretraining"
         );
+        let mut val_pairs = Vec::new();
+        let mut test_pairs = Vec::new();
+        for (env_idx, env) in train_envs.iter().enumerate() {
+            let data_len = env.price_deltas[0].len();
+            for offset in build_split_offsets(data_len, k_patches, patch_size, SplitKind::Validation)
+            {
+                val_pairs.push((env_idx, offset));
+            }
+            for offset in build_split_offsets(data_len, k_patches, patch_size, SplitKind::Test) {
+                test_pairs.push((env_idx, offset));
+            }
+        }
+        val_pairs.shuffle(&mut rand::rng());
         Self {
             train_tickers: usable_train_tickers,
             train_envs,
             train_pairs,
             train_cursor: 0,
+            val_pairs,
+            val_eval_cursor: 0,
+            test_pairs,
             k_patches,
             patch_size,
             target_scale,
             device,
         }
+    }
+
+    /// Draw one round-robin validation mini-batch from the pre-shuffled validation
+    /// pair list, cycling with a persistent cursor. `None` when no validation pairs.
+    fn next_val_eval_batch(&mut self, batch_size: usize) -> Option<PretrainBatch> {
+        if self.val_pairs.is_empty() {
+            return None;
+        }
+        let mut picks = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            picks.push(self.val_pairs[self.val_eval_cursor]);
+            self.val_eval_cursor = (self.val_eval_cursor + 1) % self.val_pairs.len();
+        }
+        Some(self.batch_for_pairs(&picks))
     }
 
     /// Batches per full-data epoch, emergent from batch size (final partial chunk dropped).
@@ -968,12 +1004,19 @@ fn build_split_offsets(
     if max_exclusive <= min_offset {
         return Vec::new();
     }
-    let split_raw = min_offset + ((max_exclusive - min_offset) * 8 / 10).max(1);
-    let split = align_up_to_step(split_raw, min_offset, patch_size);
-    let train_max_exclusive = split.saturating_sub(max_target_advance);
+    // Chronological 80/10/10 split. Two patch-aligned split points carve the usable
+    // anchor range into train (first 80%), validation (next 10%), test (final 10%,
+    // most-future). A per-split margin of `max_target_advance` keeps each split's
+    // forecast/rollout targets from leaking into the next split's contexts.
+    let usable = max_exclusive - min_offset;
+    let split_train =
+        align_up_to_step(min_offset + (usable * 8 / 10).max(1), min_offset, patch_size);
+    let split_val =
+        align_up_to_step(min_offset + (usable * 9 / 10).max(1), min_offset, patch_size);
     let (start, end) = match split_kind {
-        SplitKind::Train => (min_offset, train_max_exclusive),
-        SplitKind::Validation => (split, max_exclusive),
+        SplitKind::Train => (min_offset, split_train.saturating_sub(max_target_advance)),
+        SplitKind::Validation => (split_train, split_val.saturating_sub(max_target_advance)),
+        SplitKind::Test => (split_val, max_exclusive),
     };
     if start >= end {
         return Vec::new();
@@ -1059,9 +1102,12 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     }
 
     let mut named_vars = named_trainable_variables(&model_vs);
+    // Probe params train online via their own optimizer every step, so they are
+    // excluded from the model optimizer to avoid double-updates.
     named_vars.extend(
         named_trainable_variables(&head_vs)
             .into_iter()
+            .filter(|(name, _)| !name.contains("probe_"))
             .map(|(name, tensor)| (format!("pretrain_heads.{name}"), tensor)),
     );
     let mut opt = Muon::new_named(
@@ -1084,7 +1130,6 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 "bar_proj".to_string(),
                 "bar_enrich_".to_string(),
                 "lejepa_".to_string(),
-                "probe_".to_string(),
             ],
             ..MuonConfig::default()
         },
@@ -1123,23 +1168,37 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     )?);
     let mut validation_log =
         BufWriter::new(File::create(run_dir.root.join("pretrain_validation.csv"))?);
+    let validation_header = "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,rollout_mean_mse,rollout_sampled_mse,rollout_mse_delta,rollout_mse_delta_se,rollout_mse_t,rollout_mse_n,samples,tickers,batches";
+    let mut test_log = BufWriter::new(File::create(run_dir.root.join("pretrain_test.csv"))?);
     writeln!(
         train_epoch_log,
         "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples,batches"
     )?;
+    writeln!(validation_log, "{validation_header}")?;
+    writeln!(test_log, "{validation_header}")?;
+    let mut step_log =
+        BufWriter::new(File::create(run_dir.root.join("pretrain_train_steps.csv"))?);
     writeln!(
-        validation_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,rollout_mean_mse,rollout_sampled_mse,rollout_mse_delta,rollout_mse_delta_se,rollout_mse_t,rollout_mse_n,samples,tickers,batches"
+        step_log,
+        "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples,val_total_loss,val_jepa_mse,val_sigreg,val_probe_mse,val_probe_mae"
     )?;
-    let mut step_log = if args.log_step_losses {
-        let mut log = BufWriter::new(File::create(run_dir.root.join("pretrain_train_steps.csv"))?);
-        writeln!(
-            log,
-            "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples"
-        )?;
-        Some(log)
-    } else {
-        None
+    let mut candle_snapshot_log = BufWriter::new(File::create(
+        run_dir.root.join("pretrain_candle_snapshots.csv"),
+    )?);
+    writeln!(
+        candle_snapshot_log,
+        "global_step,rollout_mean_mse,rollout_mean_dclose"
+    )?;
+
+    // Fixed validation windows for the candle-snapshot diagnostic, chosen once so
+    // the same rollouts are tracked across the whole run.
+    let candle_windows: Vec<(usize, usize)> = {
+        let mut snap_rng = StdRng::seed_from_u64(CANDLE_SNAPSHOT_SEED);
+        sampler
+            .val_pairs
+            .choose_multiple(&mut snap_rng, CANDLE_SNAPSHOT_WINDOWS.min(sampler.val_pairs.len()))
+            .copied()
+            .collect()
     };
 
     'epoch_loop: for epoch in 1..=args.epochs {
@@ -1178,98 +1237,72 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             opt.step();
             optimizer_step += 1;
 
-            let mut scalar_losses = None;
-            if let Some(log) = step_log.as_mut() {
-                let total_v = losses.total.double_value(&[]);
-                let jepa_mse_v = losses.jepa_mse.double_value(&[]);
-                let sigreg_v = losses.sigreg.double_value(&[]);
-                let repr_std_mean_v = losses.repr_std_mean.double_value(&[]);
-                let repr_std_min_v = losses.repr_std_min.double_value(&[]);
-                let pred_embed_std_v = losses.pred_embed_std.double_value(&[]);
-                let target_embed_std_v = losses.target_embed_std.double_value(&[]);
-                let probe_nll_v = losses.probe_nll.double_value(&[]);
-                let probe_mse_v = losses.probe_mse.double_value(&[]);
-                let probe_mae_v = losses.probe_mae.double_value(&[]);
-                let probe_bias_v = losses.probe_bias.double_value(&[]);
-                let pred_abs_v = losses.pred_abs.double_value(&[]);
-                let target_abs_v = losses.target_abs.double_value(&[]);
-                let pred_std_v = losses.pred_std.double_value(&[]);
-                let target_std_v = losses.target_std.double_value(&[]);
-                let probe_terminal_mse_v = losses.probe_terminal_mse.double_value(&[]);
-                let zero_mse_v = losses.zero_mse.double_value(&[]);
-                let probe_explained_variance_v = losses.probe_explained_variance.double_value(&[]);
-                let lat_v = losses.next_lat.double_value(&[]);
-                writeln!(
-                    log,
-                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples}"
-                )?;
-                scalar_losses = Some((
-                    total_v,
-                    jepa_mse_v,
-                    sigreg_v,
-                    repr_std_mean_v,
-                    repr_std_min_v,
-                    pred_embed_std_v,
-                    target_embed_std_v,
-                    probe_nll_v,
-                    probe_mse_v,
-                    probe_mae_v,
-                    probe_bias_v,
-                    pred_abs_v,
-                    target_abs_v,
-                    pred_std_v,
-                    target_std_v,
-                    probe_terminal_mse_v,
-                    zero_mse_v,
-                    probe_explained_variance_v,
-                    lat_v,
-                ));
+            // Online probe: one optimizer step on this batch's detached latents
+            // (probe_nll built from latest_token.detach()), kept separate from the
+            // model optimizer so probe grads never flow into the encoder.
+            if args.objective == PretrainObjective::Lejepa {
+                probe_step(&mut probe_opt, &probe_named_vars, &losses.probe_nll, device);
             }
 
+            let total_v = losses.total.double_value(&[]);
+            let jepa_mse_v = losses.jepa_mse.double_value(&[]);
+            let sigreg_v = losses.sigreg.double_value(&[]);
+            let repr_std_mean_v = losses.repr_std_mean.double_value(&[]);
+            let repr_std_min_v = losses.repr_std_min.double_value(&[]);
+            let pred_embed_std_v = losses.pred_embed_std.double_value(&[]);
+            let target_embed_std_v = losses.target_embed_std.double_value(&[]);
+            let probe_mse_v = losses.probe_mse.double_value(&[]);
+            let probe_mae_v = losses.probe_mae.double_value(&[]);
+            let probe_bias_v = losses.probe_bias.double_value(&[]);
+            let pred_abs_v = losses.pred_abs.double_value(&[]);
+            let target_abs_v = losses.target_abs.double_value(&[]);
+            let pred_std_v = losses.pred_std.double_value(&[]);
+            let target_std_v = losses.target_std.double_value(&[]);
+            let probe_terminal_mse_v = losses.probe_terminal_mse.double_value(&[]);
+            let zero_mse_v = losses.zero_mse.double_value(&[]);
+            let probe_explained_variance_v = losses.probe_explained_variance.double_value(&[]);
+            let lat_v = losses.next_lat.double_value(&[]);
+
+            // Per-N-step validation mini-batch: same loss battery on one round-robin
+            // validation batch, appended as val_* columns (empty on non-eval steps).
+            let step_val = (args.step_val_every > 0 && global_step % args.step_val_every == 0)
+                .then(|| {
+                    tch::no_grad(|| {
+                        sampler.next_val_eval_batch(args.batch_size).map(|val_batch| {
+                            let vl = pretrain_loss(
+                                &model,
+                                &heads,
+                                &val_batch,
+                                args.objective,
+                                args.lambda_lat,
+                                args.lambda_sigreg,
+                                args.target_scale,
+                                false,
+                            );
+                            (
+                                vl.total.double_value(&[]),
+                                vl.jepa_mse.double_value(&[]),
+                                vl.sigreg.double_value(&[]),
+                                vl.probe_mse.double_value(&[]),
+                                vl.probe_mae.double_value(&[]),
+                            )
+                        })
+                    })
+                })
+                .flatten();
+            match step_val {
+                Some((vt, vj, vs, vpm, vpa)) => writeln!(
+                    step_log,
+                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples},{vt:.9},{vj:.9},{vs:.9},{vpm:.9},{vpa:.9}"
+                )?,
+                None => writeln!(
+                    step_log,
+                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples},,,,,"
+                )?,
+            }
+            step_log.flush()?;
+
             if global_step == 1 || global_step % 20 == 0 {
-                let (
-                    total_v,
-                    jepa_mse_v,
-                    sigreg_v,
-                    repr_std_mean_v,
-                    repr_std_min_v,
-                    pred_embed_std_v,
-                    target_embed_std_v,
-                    _probe_nll_v,
-                    probe_mse_v,
-                    probe_mae_v,
-                    probe_bias_v,
-                    pred_abs_v,
-                    target_abs_v,
-                    pred_std_v,
-                    target_std_v,
-                    probe_terminal_mse_v,
-                    zero_mse_v,
-                    probe_explained_variance_v,
-                    lat_v,
-                ) = scalar_losses.unwrap_or_else(|| {
-                    (
-                        losses.total.double_value(&[]),
-                        losses.jepa_mse.double_value(&[]),
-                        losses.sigreg.double_value(&[]),
-                        losses.repr_std_mean.double_value(&[]),
-                        losses.repr_std_min.double_value(&[]),
-                        losses.pred_embed_std.double_value(&[]),
-                        losses.target_embed_std.double_value(&[]),
-                        losses.probe_nll.double_value(&[]),
-                        losses.probe_mse.double_value(&[]),
-                        losses.probe_mae.double_value(&[]),
-                        losses.probe_bias.double_value(&[]),
-                        losses.pred_abs.double_value(&[]),
-                        losses.target_abs.double_value(&[]),
-                        losses.pred_std.double_value(&[]),
-                        losses.target_std.double_value(&[]),
-                        losses.probe_terminal_mse.double_value(&[]),
-                        losses.zero_mse.double_value(&[]),
-                        losses.probe_explained_variance.double_value(&[]),
-                        losses.next_lat.double_value(&[]),
-                    )
-                });
                 println!(
                     "pretrain epoch {epoch} step {global_step} train total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6}",
                     total_v,
@@ -1294,20 +1327,11 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             }
 
             if args.validate_every > 0 && global_step % args.validate_every == 0 {
-                maybe_train_detached_probe(
-                    &model,
-                    &heads,
-                    &mut sampler,
-                    &args,
-                    &mut probe_opt,
-                    &probe_named_vars,
-                    device,
-                    &format!("step {global_step}"),
-                );
                 let val = validate_full(
                     &model,
                     &heads,
                     &mut sampler,
+                    SplitKind::Validation,
                     args.batch_size,
                     validation_batch_cap(args.validation_batches),
                     args.objective,
@@ -1345,36 +1369,11 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     val.tickers,
                     val.batches
                 );
-                writeln!(
-                    validation_log,
-                    "step:{global_step},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
-                    val.total,
-                    val.jepa_mse,
-                    val.sigreg,
-                    val.repr_std_mean,
-                    val.repr_std_min,
-                    val.pred_embed_std,
-                    val.target_embed_std,
-                    val.probe_mse,
-                    val.probe_mae,
-                    val.probe_bias,
-                    val.pred_abs,
-                    val.target_abs,
-                    val.pred_std,
-                    val.target_std,
-                    val.probe_terminal_mse,
-                    val.zero_mse,
-                    val.probe_explained_variance,
-                    val.next_lat,
-                    val.rollout_mean_mse,
-                    val.rollout_sampled_mse,
-                    val.rollout_mse_delta,
-                    val.rollout_mse_delta_se,
-                    val.rollout_mse_t,
-                    val.rollout_mse_n,
-                    val.samples,
-                    val.tickers,
-                    val.batches
+                write_validation_row(
+                    &mut validation_log,
+                    &format!("step:{global_step}"),
+                    global_step,
+                    &val,
                 )?;
                 if val.total < best_val {
                     best_val = val.total;
@@ -1382,6 +1381,21 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     head_vs.save(&best_heads_path)?;
                     println!("Saved best pretrained model: {}", best_path.display());
                 }
+            }
+
+            if args.candle_snapshot_every > 0
+                && global_step % args.candle_snapshot_every == 0
+                && !candle_windows.is_empty()
+            {
+                write_candle_snapshots(
+                    &heads,
+                    &mut sampler,
+                    &candle_windows,
+                    epoch,
+                    global_step,
+                    &run_dir.gens,
+                    &mut candle_snapshot_log,
+                )?;
             }
 
             if args.checkpoint_every > 0 && global_step % args.checkpoint_every == 0 {
@@ -1462,27 +1476,13 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             train.batches
         )?;
         train_epoch_log.flush()?;
-        if let Some(log) = step_log.as_mut() {
-            log.flush()?;
-        }
-
-        if !stop_requested {
-            maybe_train_detached_probe(
-                &model,
-                &heads,
-                &mut sampler,
-                &args,
-                &mut probe_opt,
-                &probe_named_vars,
-                device,
-                &format!("epoch {epoch}"),
-            );
-        }
+        step_log.flush()?;
 
         let val = validate_full(
             &model,
             &heads,
             &mut sampler,
+            SplitKind::Validation,
             args.batch_size,
             validation_batch_cap(args.validation_batches),
             args.objective,
@@ -1533,38 +1533,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.skill_belief_norm,
             val.skill_batches
         );
-        writeln!(
-            validation_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
-            val.total,
-            val.jepa_mse,
-            val.sigreg,
-            val.repr_std_mean,
-            val.repr_std_min,
-            val.pred_embed_std,
-            val.target_embed_std,
-            val.probe_mse,
-            val.probe_mae,
-            val.probe_bias,
-            val.pred_abs,
-            val.target_abs,
-            val.pred_std,
-            val.target_std,
-            val.probe_terminal_mse,
-            val.zero_mse,
-            val.probe_explained_variance,
-            val.next_lat,
-            val.rollout_mean_mse,
-            val.rollout_sampled_mse,
-            val.rollout_mse_delta,
-            val.rollout_mse_delta_se,
-            val.rollout_mse_t,
-            val.rollout_mse_n,
-            val.samples,
-            val.tickers,
-            val.batches
-        )?;
-        validation_log.flush()?;
+        write_validation_row(&mut validation_log, &epoch.to_string(), global_step, &val)?;
         scalar_history.push(&train, &val);
         write_pretrain_scalar_meta_reports(&run_dir.gens, epoch, global_step, &scalar_history)?;
         write_pretrain_diagnostics(
@@ -1579,6 +1548,55 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             &run_dir.gens,
             device,
         )?;
+
+        // Held-out TEST battery at each epoch end (and on --steps early stop, since
+        // the final epoch's end IS run end). Deep validation above stays untouched.
+        if !sampler.test_pairs.is_empty() {
+            let test = validate_full(
+                &model,
+                &heads,
+                &mut sampler,
+                SplitKind::Test,
+                args.batch_size,
+                validation_batch_cap(args.validation_batches),
+                args.objective,
+                args.lambda_lat,
+                args.lambda_sigreg,
+                device,
+            );
+            println!(
+                "pretrain step {global_step} test total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} samples={} tickers={} batches={}",
+                test.total,
+                test.jepa_mse,
+                test.sigreg,
+                test.repr_std_mean,
+                test.repr_std_min,
+                test.pred_embed_std,
+                test.target_embed_std,
+                test.probe_mse,
+                test.probe_mae,
+                test.probe_bias,
+                test.pred_abs,
+                test.target_abs,
+                test.pred_std,
+                test.target_std,
+                test.probe_terminal_mse,
+                test.zero_mse,
+                test.probe_explained_variance * 100.0,
+                test.next_lat,
+                test.rollout_mean_mse,
+                test.rollout_sampled_mse,
+                test.rollout_mse_delta,
+                test.rollout_mse_delta_se,
+                test.rollout_mse_t,
+                test.rollout_mse_n,
+                test.samples,
+                test.tickers,
+                test.batches
+            );
+            write_validation_row(&mut test_log, &epoch.to_string(), global_step, &test)?;
+        }
+
         if val.total < best_val {
             best_val = val.total;
             model_vs.save(&best_path)?;
@@ -1595,6 +1613,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             &model,
             &heads,
             &mut sampler,
+            SplitKind::Validation,
             args.batch_size,
             validation_batch_cap(args.validation_batches),
             args.objective,
@@ -1603,38 +1622,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             device,
         );
         best_val = val.total;
-        writeln!(
-            validation_log,
-            "final,{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
-            val.total,
-            val.jepa_mse,
-            val.sigreg,
-            val.repr_std_mean,
-            val.repr_std_min,
-            val.pred_embed_std,
-            val.target_embed_std,
-            val.probe_mse,
-            val.probe_mae,
-            val.probe_bias,
-            val.pred_abs,
-            val.target_abs,
-            val.pred_std,
-            val.target_std,
-            val.probe_terminal_mse,
-            val.zero_mse,
-            val.probe_explained_variance,
-            val.next_lat,
-            val.rollout_mean_mse,
-            val.rollout_sampled_mse,
-            val.rollout_mse_delta,
-            val.rollout_mse_delta_se,
-            val.rollout_mse_t,
-            val.rollout_mse_n,
-            val.samples,
-            val.tickers,
-            val.batches
-        )?;
-        validation_log.flush()?;
+        write_validation_row(&mut validation_log, "final", global_step, &val)?;
         model_vs.save(&best_path)?;
         head_vs.save(&best_heads_path)?;
         println!("Saved best pretrained model: {}", best_path.display());
@@ -1888,6 +1876,10 @@ fn lejepa_pretrain_loss(
         &latest_token.detach().unsqueeze(2),
         &probe_target,
     );
+    // Rollouts decode predicted latents, so the probe also trains on the detached
+    // teacher-forced pred_emb (target = the bar each position predicts).
+    let pred_probe_target = full.narrow(2, 1, length) * target_scale;
+    let probe_pred = ohlc_probe_metrics(heads, &pred_emb.detach(), &pred_probe_target);
     let zero_mse = probe_target.pow_tensor_scalar(2.0).mean(Kind::Float);
     let probe_explained_variance = explained_variance_tensor(&probe.probe_mse, &zero_mse);
     let next_lat = zero_like_scalar(&jepa_mse);
@@ -1899,7 +1891,7 @@ fn lejepa_pretrain_loss(
         repr_std_min,
         pred_embed_std,
         target_embed_std,
-        probe_nll: probe.probe_nll,
+        probe_nll: probe.probe_nll + probe_pred.probe_nll,
         probe_mae: probe.probe_mae,
         probe_mse: probe.probe_mse,
         pred_std: probe.pred_std,
@@ -2002,11 +1994,6 @@ struct ProbeLoss {
     pred_abs: Tensor,
     target_abs: Tensor,
     probe_terminal_mse: Tensor,
-    pred_sigma: Tensor,
-    pred_std_level: Tensor,
-    target_std_level: Tensor,
-    probe_ev_level: Tensor,
-    pred_sigma_level: Tensor,
 }
 
 fn ohlc_probe_metrics(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -> ProbeLoss {
@@ -2025,17 +2012,6 @@ fn ohlc_probe_metrics(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -
 
     let nll_elem = &logvar + err.pow_tensor_scalar(2.0) * logvar.neg().exp();
     let probe_nll = nll_elem.mean(Kind::Float) * 0.5;
-    let pred_sigma = (&logvar * 0.5).exp().mean(Kind::Float);
-
-    let mean_level = mean.select(3, 0);
-    let target_level = target.select(3, 0);
-    let logvar_level = logvar.select(3, 0);
-    let pred_std_level = mean_level.std(false);
-    let target_std_level = target_level.std(false);
-    let level_mse = mean_level.mse_loss(&target_level, Reduction::Mean);
-    let level_zero_mse = target_level.pow_tensor_scalar(2.0).mean(Kind::Float);
-    let probe_ev_level = explained_variance_tensor(&level_mse, &level_zero_mse);
-    let pred_sigma_level = (&logvar_level * 0.5).exp().mean(Kind::Float);
 
     ProbeLoss {
         probe_nll,
@@ -2047,11 +2023,6 @@ fn ohlc_probe_metrics(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -
         pred_abs,
         target_abs,
         probe_terminal_mse,
-        pred_sigma,
-        pred_std_level,
-        target_std_level,
-        probe_ev_level,
-        pred_sigma_level,
     }
 }
 
@@ -2264,23 +2235,6 @@ struct TrainEpochLoss {
     batches: usize,
 }
 
-struct ProbeTrainSummary {
-    probe_nll: f64,
-    probe_mae: f64,
-    probe_mse: f64,
-    pred_std: f64,
-    target_std: f64,
-    pred_sigma: f64,
-    pred_std_level: f64,
-    target_std_level: f64,
-    probe_ev_level: f64,
-    pred_sigma_level: f64,
-    grad_probe: f64,
-    pnorm_probe: f64,
-    samples: usize,
-    batches: usize,
-}
-
 #[derive(Default)]
 struct PretrainScalarHistory {
     train_mse: Vec<f32>,
@@ -2471,156 +2425,126 @@ fn write_pretrain_scalar_report(
     )
 }
 
-/// Train the detached OHLC probe (Lejepa only) so any subsequent validation reports
-/// probe metrics against an up-to-date probe. `label` distinguishes epoch-end vs
-/// mid-epoch (step) invocations in the log line.
-fn maybe_train_detached_probe(
-    model: &TradingModel,
-    heads: &PretrainHeads,
-    sampler: &mut PretrainSampler,
-    args: &PretrainArgs,
+// One online probe optimizer step on the current batch's detached-latent NLL.
+// Kept separate from the model optimizer so probe grads never reach the encoder.
+fn probe_step(
     probe_opt: &mut Muon,
     probe_named_vars: &[(String, Tensor)],
+    probe_nll: &Tensor,
     device: Device,
-    label: &str,
 ) {
-    if args.objective != PretrainObjective::Lejepa || args.probe_epochs == 0 {
-        return;
-    }
-    let probe = train_detached_probe(
-        model,
-        heads,
-        sampler,
-        args.batch_size,
-        args.probe_epochs,
-        args.target_scale,
-        probe_opt,
-        probe_named_vars,
-        device,
-    );
-    println!(
-        "pretrain {label} detached_probe_train probe_nll={:.6} ohlc_mse={:.6} ohlc_mae={:.6} pred_std={:.6} target_std={:.6} pred_sigma={:.6} pred_std_level={:.6} target_std_level={:.6} probe_ev_level={:.2}% pred_sigma_level={:.6} grad_probe={:.6} pnorm_probe={:.6} samples={} batches={} probe_epochs={}",
-        probe.probe_nll,
-        probe.probe_mse,
-        probe.probe_mae,
-        probe.pred_std,
-        probe.target_std,
-        probe.pred_sigma,
-        probe.pred_std_level,
-        probe.target_std_level,
-        probe.probe_ev_level * 100.0,
-        probe.pred_sigma_level,
-        probe.grad_probe,
-        probe.pnorm_probe,
-        probe.samples,
-        probe.batches,
-        args.probe_epochs
-    );
+    probe_opt.zero_grad();
+    probe_nll.backward();
+    clip_all_grads(probe_named_vars, MAX_GRAD_NORM, device);
+    probe_opt.step();
 }
 
-fn train_detached_probe(
-    model: &TradingModel,
+fn write_validation_row(
+    log: &mut impl Write,
+    label: &str,
+    global_step: usize,
+    val: &ValidationLoss,
+) -> Result<()> {
+    writeln!(
+        log,
+        "{label},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+        val.total,
+        val.jepa_mse,
+        val.sigreg,
+        val.repr_std_mean,
+        val.repr_std_min,
+        val.pred_embed_std,
+        val.target_embed_std,
+        val.probe_mse,
+        val.probe_mae,
+        val.probe_bias,
+        val.pred_abs,
+        val.target_abs,
+        val.pred_std,
+        val.target_std,
+        val.probe_terminal_mse,
+        val.zero_mse,
+        val.probe_explained_variance,
+        val.next_lat,
+        val.rollout_mean_mse,
+        val.rollout_sampled_mse,
+        val.rollout_mse_delta,
+        val.rollout_mse_delta_se,
+        val.rollout_mse_t,
+        val.rollout_mse_n,
+        val.samples,
+        val.tickers,
+        val.batches
+    )?;
+    log.flush()?;
+    Ok(())
+}
+
+// Deterministic (temperature 0) imagined rollouts on a fixed set of validation
+// windows. Writes a predicted-vs-actual CandleCompare report per window and
+// appends the step-indexed rollout MSE / decoded close-delta to a running CSV.
+fn write_candle_snapshots(
     heads: &PretrainHeads,
     sampler: &mut PretrainSampler,
-    batch_size: usize,
-    probe_epochs: usize,
-    target_scale: f64,
-    probe_opt: &mut Muon,
-    probe_named_vars: &[(String, Tensor)],
-    device: Device,
-) -> ProbeTrainSummary {
-    let _ = model;
-    let mut nll_sum = 0.0;
-    let mut mse_sum = 0.0;
-    let mut mae_sum = 0.0;
-    let mut pred_std_sum = 0.0;
-    let mut target_std_sum = 0.0;
-    let mut pred_sigma_sum = 0.0;
-    let mut pred_std_level_sum = 0.0;
-    let mut target_std_level_sum = 0.0;
-    let mut probe_ev_level_sum = 0.0;
-    let mut pred_sigma_level_sum = 0.0;
-    let mut grad_probe_sum = 0.0;
-    let mut pnorm_probe_sum = 0.0;
-    let mut samples = 0usize;
-    let mut batches = 0usize;
+    windows: &[(usize, usize)],
+    epoch: usize,
+    global_step: usize,
+    gens_dir: &Path,
+    snapshot_log: &mut impl Write,
+) -> Result<()> {
+    let target_scale = sampler.target_scale;
+    let batch = sampler.batch_for_pairs(windows);
+    tch::no_grad(|| -> Result<()> {
+        let roll = heads.lejepa_imagined_rollout(&batch.bar_history, false) / target_scale;
+        let actual = batch
+            .next_bars
+            .view([-1, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]);
+        let rollout_mean_mse = (&roll - &actual)
+            .pow_tensor_scalar(2.0)
+            .mean_dim([1i64, 2].as_slice(), false, Kind::Float)
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let rollout_mean_dclose = roll.narrow(2, 3, 1).mean(Kind::Float).double_value(&[]);
 
-    // Iterate an independent shuffled copy of the train pairs so probe training never
-    // disturbs the main epoch's in-progress full-data pass (cursor/order untouched).
-    let mut order = sampler.train_pairs.clone();
-    for probe_epoch in 0..probe_epochs {
-        order.shuffle(&mut rand::rng());
-        for chunk in order.chunks(batch_size).take(PROBE_BATCHES_PER_EPOCH) {
-            if chunk.len() < batch_size {
-                break;
-            }
-            let batch = sampler.batch_for_pairs(chunk);
-            let batch_samples = batch.len() as usize;
-            // The probe is trained on BOTH real encoded tokens AND teacher-forced
-            // predicted embeddings (each detached), so it decodes the same
-            // predicted-latent distribution the rollout feeds it. All encoder/AR
-            // inputs are detached so the probe never shapes them.
-            let (token, pred_emb, pred_target) = tch::no_grad(|| {
-                autocast(false, || {
-                    let real_token = heads.encode_bar_tokens(&batch.next_bars, false).narrow(2, 0, 1);
-                    let full =
-                        Tensor::cat(&[&batch.bar_history, &batch.next_bars.narrow(2, 0, 1)], 2);
-                    let all_tokens = heads.encode_bar_tokens(&full, false);
-                    let length = batch.bar_history.size()[2];
-                    let bar_tokens = all_tokens.narrow(2, 0, length);
-                    let belief = heads.predict_lejepa_bar_predictions(&bar_tokens, false).belief;
-                    let pred_emb = heads.pred_emb_from_belief(&belief, false);
-                    // Target for pred_emb at position t = raw features of bar t+1.
-                    let pred_target = full.narrow(2, 1, length) * target_scale;
-                    (real_token, pred_emb, pred_target)
-                })
-            });
-            let ohlc_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
-            let probe = ohlc_probe_metrics(heads, &token.detach(), &ohlc_target);
-            let probe_pred = ohlc_probe_metrics(heads, &pred_emb.detach(), &pred_target);
-            let probe_loss = &probe.probe_nll + &probe_pred.probe_nll;
-            assert_finite_loss(&probe_loss, probe_epoch + 1);
-            probe_opt.zero_grad();
-            probe_loss.backward();
-            let (grad_probe, pnorm_probe) = named_grad_param_l2(probe_named_vars, device);
-            grad_probe_sum += grad_probe;
-            pnorm_probe_sum += pnorm_probe;
-            clip_all_grads(probe_named_vars, MAX_GRAD_NORM, device);
-            probe_opt.step();
-
-            nll_sum += probe.probe_nll.double_value(&[]) * batch_samples as f64;
-            mse_sum += probe.probe_mse.double_value(&[]) * batch_samples as f64;
-            mae_sum += probe.probe_mae.double_value(&[]) * batch_samples as f64;
-            pred_std_sum += probe.pred_std.double_value(&[]) * batch_samples as f64;
-            target_std_sum += probe.target_std.double_value(&[]) * batch_samples as f64;
-            pred_sigma_sum += probe.pred_sigma.double_value(&[]) * batch_samples as f64;
-            pred_std_level_sum += probe.pred_std_level.double_value(&[]) * batch_samples as f64;
-            target_std_level_sum += probe.target_std_level.double_value(&[]) * batch_samples as f64;
-            probe_ev_level_sum += probe.probe_ev_level.double_value(&[]) * batch_samples as f64;
-            pred_sigma_level_sum += probe.pred_sigma_level.double_value(&[]) * batch_samples as f64;
-            samples += batch_samples;
-            batches += 1;
+        let pred_features = tensor_to_vec_f32(&roll)?;
+        let actual_features = tensor_to_vec_f32(&actual)?;
+        let stride = LEJEPA_ROLLOUT_BARS as usize * OHLC_BAR_FEATURES;
+        let snapshot_dir = gens_dir.join(epoch.to_string()).join("candle_snapshots");
+        fs::create_dir_all(&snapshot_dir)?;
+        for (i, &(env_idx, offset)) in windows.iter().enumerate() {
+            let env = &sampler.train_envs[env_idx];
+            let seed = seed_candle_from_feature_row(&env.ohlc_features[env.ticker_perm[0]][offset]);
+            let start = i * stride;
+            let end = start + stride;
+            let actual_candles =
+                chained_candles_from_ohlc_features(&actual_features[start..end], &seed);
+            let pred_candles =
+                chained_candles_from_ohlc_features(&pred_features[start..end], &seed);
+            write_report_file(
+                &snapshot_dir
+                    .join(format!("step{global_step}_window{:02}_candles.report.bin", i + 1)),
+                &Report {
+                    title: format!(
+                        "Pretrain Candle Snapshot - step {global_step} - window {:02}",
+                        i + 1
+                    ),
+                    x_label: Some("forecast bar".to_string()),
+                    y_label: Some("relative price".to_string()),
+                    scale: ScaleKind::Linear,
+                    kind: ReportKind::CandleCompare {
+                        actual: actual_candles,
+                        predicted: pred_candles,
+                    },
+                },
+            )?;
         }
-    }
-
-    assert!(samples > 0, "detached probe training set is empty");
-    let denom = samples as f64;
-    ProbeTrainSummary {
-        probe_nll: nll_sum / denom,
-        probe_mae: mae_sum / denom,
-        probe_mse: mse_sum / denom,
-        pred_std: pred_std_sum / denom,
-        target_std: target_std_sum / denom,
-        pred_sigma: pred_sigma_sum / denom,
-        pred_std_level: pred_std_level_sum / denom,
-        target_std_level: target_std_level_sum / denom,
-        probe_ev_level: probe_ev_level_sum / denom,
-        pred_sigma_level: pred_sigma_level_sum / denom,
-        grad_probe: grad_probe_sum / batches.max(1) as f64,
-        pnorm_probe: pnorm_probe_sum / batches.max(1) as f64,
-        samples,
-        batches,
-    }
+        writeln!(
+            snapshot_log,
+            "{global_step},{rollout_mean_mse:.9},{rollout_mean_dclose:.9}"
+        )?;
+        snapshot_log.flush()?;
+        Ok(())
+    })
 }
 
 fn validation_batch_cap(validation_batches: usize) -> Option<usize> {
@@ -2631,6 +2555,7 @@ fn validate_full(
     model: &TradingModel,
     heads: &PretrainHeads,
     sampler: &mut PretrainSampler,
+    split: SplitKind,
     batch_size: usize,
     max_batches: Option<usize>,
     objective: PretrainObjective,
@@ -2680,12 +2605,7 @@ fn validate_full(
                 break;
             }
 
-            let offsets = build_split_offsets(
-                env.price_deltas[0].len(),
-                k_patches,
-                patch_size,
-                SplitKind::Validation,
-            );
+            let offsets = build_split_offsets(env.price_deltas[0].len(), k_patches, patch_size, split);
             if offsets.is_empty() {
                 continue;
             }
@@ -3590,26 +3510,6 @@ fn pretrain_grad_norms(named_vars: &[(String, Tensor)], device: Device) -> Pretr
     })
 }
 
-// Global L2 grad norm and weight L2 norm over an arbitrary param slice (used for
-// the detached probe, whose params are all `probe_`).
-fn named_grad_param_l2(named_vars: &[(String, Tensor)], device: Device) -> (f64, f64) {
-    tch::no_grad(|| {
-        let mut grad_sq = Tensor::zeros([], (Kind::Float, device));
-        let mut param_sq = Tensor::zeros([], (Kind::Float, device));
-        for (_, param) in named_vars {
-            let grad = param.grad();
-            if grad.defined() {
-                grad_sq += grad.square().sum(Kind::Float);
-            }
-            param_sq += param.square().sum(Kind::Float);
-        }
-        (
-            grad_sq.sqrt().double_value(&[]),
-            param_sq.sqrt().double_value(&[]),
-        )
-    })
-}
-
 #[derive(Default)]
 struct GradNormAccum {
     grad_total: f64,
@@ -3896,11 +3796,10 @@ mod tests {
 
     #[test]
     fn split_offsets_allow_last_future_safe_patch_aligned_anchor() {
+        // The most-future TEST split now reaches the last forecast-safe anchor.
         let data_len = PRICE_DELTAS_PER_TICKER + 801;
-        let offsets = build_split_offsets(data_len, 16, 25, SplitKind::Validation);
-        let last = *offsets
-            .last()
-            .expect("validation offsets should be non-empty");
+        let offsets = build_split_offsets(data_len, 16, 25, SplitKind::Test);
+        let last = *offsets.last().expect("test offsets should be non-empty");
         assert_eq!(last + 1 + 16 * 25, data_len);
     }
 
@@ -3914,6 +3813,46 @@ mod tests {
             .first()
             .expect("validation offsets should be non-empty");
         assert!(last_train + 16 * 25 <= first_validation);
+    }
+
+    #[test]
+    fn three_way_split_is_ordered_disjoint_and_aligned() {
+        use std::collections::HashSet;
+        let data_len = PRICE_DELTAS_PER_TICKER + 10_000;
+        let (k, ps) = (16usize, 25usize);
+        let train = build_split_offsets(data_len, k, ps, SplitKind::Train);
+        let val = build_split_offsets(data_len, k, ps, SplitKind::Validation);
+        let test = build_split_offsets(data_len, k, ps, SplitKind::Test);
+        assert!(!train.is_empty() && !val.is_empty() && !test.is_empty());
+
+        // Each split is a contiguous patch-aligned stride from the shared origin.
+        for offsets in [&train, &val, &test] {
+            for pair in offsets.windows(2) {
+                assert_eq!(pair[1] - pair[0], ps, "offsets must step by patch_size");
+            }
+            for &o in offsets.iter() {
+                assert_eq!(
+                    (o - PRICE_DELTAS_PER_TICKER) % ps,
+                    0,
+                    "offset must be aligned to the patch stride"
+                );
+            }
+        }
+
+        // Chronological order train < val < test, with per-split target margins
+        // keeping each split's forecast targets out of the next split's contexts.
+        assert!(*train.last().unwrap() < *val.first().unwrap());
+        assert!(*val.last().unwrap() < *test.first().unwrap());
+        assert!(train.last().unwrap() + k * ps <= *val.first().unwrap());
+        assert!(val.last().unwrap() + k * ps <= *test.first().unwrap());
+
+        // Fully disjoint anchor sets.
+        let tset: HashSet<_> = train.iter().collect();
+        let vset: HashSet<_> = val.iter().collect();
+        let eset: HashSet<_> = test.iter().collect();
+        assert!(tset.is_disjoint(&vset));
+        assert!(vset.is_disjoint(&eset));
+        assert!(tset.is_disjoint(&eset));
     }
 
     #[test]
@@ -4023,6 +3962,9 @@ mod tests {
             train_envs: Vec::new(),
             train_pairs: (0..n).map(|i| (0usize, i)).collect(),
             train_cursor: 0,
+            val_pairs: Vec::new(),
+            val_eval_cursor: 0,
+            test_pairs: Vec::new(),
             k_patches: 1,
             patch_size: 1,
             target_scale: 1.0,

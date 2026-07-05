@@ -17,6 +17,21 @@ use crate::report_renderer::render_report_with_options;
 use crate::utils::clipboard;
 
 #[derive(Debug, Clone)]
+pub enum ChartSource {
+    Path(PathBuf),
+    Report(Box<Report>),
+}
+
+impl ChartSource {
+    fn report(&self) -> Result<Report> {
+        match self {
+            ChartSource::Path(path) => load_report(path),
+            ChartSource::Report(report) => Ok((**report).clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum ChartNode {
     Folder {
         name: String,
@@ -25,7 +40,7 @@ pub enum ChartNode {
     },
     Chart {
         name: String,
-        path: PathBuf,
+        source: ChartSource,
     },
 }
 
@@ -100,10 +115,10 @@ impl ChartViewer {
             return None;
         }
         let (node_idx, _) = self.flattened[i];
-        let ChartNode::Chart { path, .. } = &self.nodes[node_idx] else {
+        let ChartNode::Chart { source, .. } = &self.nodes[node_idx] else {
             return None;
         };
-        let report = load_report(path).ok()?;
+        let report = source.report().ok()?;
         match report.kind {
             ReportKind::Simple { ema_alpha, .. } => Some(if ema_alpha.is_some() { 2 } else { 1 }),
             ReportKind::MultiLine { series } => Some(series.len()),
@@ -220,7 +235,11 @@ impl ChartViewer {
         Ok(())
     }
 
-    pub fn load_charts(&mut self, chart_paths: &[PathBuf]) -> Result<()> {
+    pub fn load_charts(
+        &mut self,
+        chart_paths: &[PathBuf],
+        extra_reports: Vec<(String, Report)>,
+    ) -> Result<()> {
         use std::collections::HashMap;
         use std::time::SystemTime;
 
@@ -229,6 +248,17 @@ impl ChartViewer {
         self.expanded.clear();
         self.current_image = None;
         self.viewing_mode = ViewingMode::MetaCharts;
+
+        // In-memory CSV-derived charts (step losses, test metrics) surface first.
+        for (name, report) in extra_reports {
+            let chart_idx = self.nodes.len();
+            self.nodes.push(ChartNode::Chart {
+                name,
+                source: ChartSource::Report(Box::new(report)),
+            });
+            self.expanded.push(false);
+            self.root_indices.push(chart_idx);
+        }
 
         // Group charts by ticker (None for episode-level charts)
         // Store (path, chart_name, episode_num, modified_time)
@@ -240,6 +270,7 @@ impl ChartViewer {
             String,
             Vec<(PathBuf, String, Option<usize>, SystemTime)>,
         > = HashMap::new();
+        let mut candle_snapshot_charts: Vec<(PathBuf, String, SystemTime)> = Vec::new();
 
         for path in chart_paths {
             if path.exists() {
@@ -260,6 +291,13 @@ impl ChartViewer {
                     if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
                         if let Ok(ep) = parent_name.parse::<usize>() {
                             (Some(ep), None)
+                        } else if parent_name == "candle_snapshots" {
+                            candle_snapshot_charts.push((
+                                path.clone(),
+                                chart_name.clone(),
+                                modified,
+                            ));
+                            (None, Some("candle snapshots".to_string()))
                         } else if parent_name == "samples" {
                             let chart_parent = parent.parent();
                             if let Some(chart_parent) = chart_parent {
@@ -324,7 +362,7 @@ impl ChartViewer {
                 }
                 if ticker
                     .as_deref()
-                    .is_some_and(|name| name != "pretrain samples")
+                    .is_some_and(|name| name != "pretrain samples" && name != "candle snapshots")
                 {
                     ticker_groups.entry(ticker).or_insert_with(Vec::new).push((
                         path.clone(),
@@ -358,7 +396,7 @@ impl ChartViewer {
                 let chart_idx = self.nodes.len();
                 self.nodes.push(ChartNode::Chart {
                     name,
-                    path: path.clone(),
+                    source: ChartSource::Path(path.clone()),
                 });
                 self.expanded.push(false);
                 self.root_indices.push(chart_idx);
@@ -391,7 +429,7 @@ impl ChartViewer {
                         let chart_idx = self.nodes.len();
                         self.nodes.push(ChartNode::Chart {
                             name: format!("{sample_name} - {chart_name}"),
-                            path,
+                            source: ChartSource::Path(path),
                         });
                         self.expanded.push(false);
                         sample_chart_indices.push(chart_idx);
@@ -404,6 +442,28 @@ impl ChartViewer {
                 name: "pretrain samples".to_string(),
                 path: PathBuf::new(),
                 children: sample_chart_indices,
+            });
+            self.expanded.push(false);
+            self.root_indices.push(root_idx);
+        }
+
+        if !candle_snapshot_charts.is_empty() {
+            candle_snapshot_charts.sort_by(|a, b| a.1.cmp(&b.1));
+            let mut children = Vec::new();
+            for (path, chart_name, _) in candle_snapshot_charts {
+                let chart_idx = self.nodes.len();
+                self.nodes.push(ChartNode::Chart {
+                    name: chart_name,
+                    source: ChartSource::Path(path),
+                });
+                self.expanded.push(false);
+                children.push(chart_idx);
+            }
+            let root_idx = self.nodes.len();
+            self.nodes.push(ChartNode::Folder {
+                name: "candle snapshots".to_string(),
+                path: PathBuf::new(),
+                children,
             });
             self.expanded.push(false);
             self.root_indices.push(root_idx);
@@ -446,7 +506,7 @@ impl ChartViewer {
                     let chart_idx = self.nodes.len();
                     self.nodes.push(ChartNode::Chart {
                         name,
-                        path: path.clone(),
+                        source: ChartSource::Path(path.clone()),
                     });
                     self.expanded.push(false);
                     children.push(chart_idx);
@@ -510,7 +570,7 @@ impl ChartViewer {
                         let chart_idx = self.nodes.len();
                         self.nodes.push(ChartNode::Chart {
                             name: report_display_name(file_name),
-                            path: sub_entry.path().to_path_buf(),
+                            source: ChartSource::Path(sub_entry.path().to_path_buf()),
                         });
                         children.push(chart_idx);
                         self.expanded.push(false);
@@ -537,7 +597,7 @@ impl ChartViewer {
                 let chart_idx = self.nodes.len();
                 self.nodes.push(ChartNode::Chart {
                     name: report_display_name(&name),
-                    path: entry_path,
+                    source: ChartSource::Path(entry_path),
                 });
                 self.expanded.push(false);
                 charts.push(chart_idx);
@@ -610,7 +670,7 @@ impl ChartViewer {
                 let chart_idx = self.nodes.len();
                 self.nodes.push(ChartNode::Chart {
                     name: format!("{sample_name} - {chart_name}"),
-                    path,
+                    source: ChartSource::Path(path),
                 });
                 self.expanded.push(false);
                 chart_indices.push(chart_idx);
@@ -663,8 +723,8 @@ impl ChartViewer {
         if let Some(i) = self.list_state.selected() {
             if i < self.flattened.len() {
                 let (node_idx, _) = self.flattened[i];
-                if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
-                    if let Ok(report) = load_report(path) {
+                if let ChartNode::Chart { source, .. } = &self.nodes[node_idx] {
+                    if let Ok(report) = source.report() {
                         let skip = if self.viewing_mode == ViewingMode::MetaCharts {
                             self.row_skip
                         } else {
@@ -751,8 +811,8 @@ impl ChartViewer {
         if let Some(i) = self.list_state.selected() {
             if i < self.flattened.len() {
                 let (node_idx, _) = self.flattened[i];
-                if let ChartNode::Chart { path, .. } = &self.nodes[node_idx] {
-                    if let Ok(report) = load_report(path) {
+                if let ChartNode::Chart { source, .. } = &self.nodes[node_idx] {
+                    if let Ok(report) = source.report() {
                         let skip = if self.viewing_mode == ViewingMode::MetaCharts {
                             self.row_skip
                         } else {
@@ -760,7 +820,7 @@ impl ChartViewer {
                         };
                         let temp_path = render_report_to_temp(&report, skip, self.show_legend)?;
                         clipboard::copy_image_to_clipboard(&temp_path)?;
-                    } else {
+                    } else if let ChartSource::Path(path) = source {
                         clipboard::copy_image_to_clipboard(path)?;
                     }
                 }
