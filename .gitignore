@@ -11,3 +11,4 @@ CLAUDE.md
 bench_*.json
 .claude/
 *.pyc
+worktrees/
