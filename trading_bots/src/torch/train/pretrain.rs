@@ -48,12 +48,32 @@ const LEJEPA_FLOW_HIDDEN: i64 = 1024;
 const LEJEPA_FLOW_BLOCKS: usize = 3;
 const LEJEPA_ROLLOUT_STEPS: i64 = 4;
 const LEJEPA_ROLLOUT_STEP_SIZE: i64 = LEJEPA_K_MAX / LEJEPA_ROLLOUT_STEPS;
-// Mean/deterministic trajectory = Monte-Carlo average of K independent sampled rollouts.
-const LEJEPA_MEAN_ROLLOUT_SAMPLES: i64 = 4;
-const LEJEPA_ROLLOUT_EVAL_SAMPLES: usize = 4;
+// Sampled aggregate = mean per-window MSE over K independent temperature-1 rollouts;
+// the mean column is a single deterministic conditional-mean rollout, not an MC average.
+const LEJEPA_ROLLOUT_EVAL_SAMPLES: usize = 16;
 // Drift-mitigation context noise: ctx = (1-mix)*tokens + mix*randn, applied to the
 // AR predictor input at both train and rollout time.
 const LEJEPA_CTX_NOISE_MIX: f64 = 0.1;
+// Self-conditioning scheduled sampling: per-position probability of replacing the
+// real context token with the model's own detached one-shot prediction (exposure-bias
+// fix, cheap approximation of JEDI's random-switch scheduled sampling).
+const LEJEPA_SELF_COND_PROB: f64 = 0.25;
+// Fixed per-feature input standardization for the 16 OHLC relative-delta features.
+// All are rel_delta(a, b) = a/b - 1 at minute granularity with a characteristic scale
+// ~2e-3 (0.2%); the two full intra-bar range features (high/low idx 8, low/high idx 11)
+// sum two one-sided moves, so ~2x that. Dividing by these yields ~unit-scale inputs to
+// bar_proj. Deliberately static (no running stats / EMA).
+const OHLC_FEATURE_SCALE: [f32; LEJEPA_BAR_FEATURES as usize] = [
+    2e-3, 2e-3, 2e-3, 2e-3, // inter-bar open/high/low/close returns vs prev bar
+    2e-3, 2e-3, 2e-3, // open vs high / low / close (intra-bar, one-sided)
+    2e-3, // high vs open
+    4e-3, // high vs low (full intra-bar range)
+    2e-3, // high vs close
+    2e-3, // low vs open
+    4e-3, // low vs high (full intra-bar range)
+    2e-3, // low vs close
+    2e-3, 2e-3, 2e-3, // close vs open / high / low
+];
 // Batch-level Bernoulli: shortcut branch with prob 1 - 1/log2(K_MAX) = 1 - 1/6.
 const LEJEPA_PROB_SHORTCUT: f64 = 1.0 - 1.0 / 6.0;
 const LEJEPA_LATENT_BOUND: f64 = 3.0;
@@ -561,6 +581,9 @@ impl PretrainHeads {
             .view([batch * tickers * length, LEJEPA_BAR_FEATURES])
             .to_kind(Kind::Float)
             .nan_to_num(0.0, 0.0, 0.0);
+        // Fixed per-feature standardization to ~unit scale before the BN-free projector.
+        let scale = Tensor::from_slice(&OHLC_FEATURE_SCALE).to_device(features.device());
+        let features = features / scale;
         let h = self.bar_proj.forward(&features);
         let enriched = self.bar_enrich_fc2.forward(
             &normalize_last_dim(&self.bar_enrich_fc1.forward(&normalize_last_dim(&h))).gelu("none"),
@@ -715,31 +738,21 @@ impl PretrainHeads {
         (mean, logvar)
     }
 
-    // Stochastic imagined rollout. `temperature == 0` yields the MEAN path: the
-    // Monte-Carlo average (over decoded bar features) of K independent sampled
-    // trajectories, each drawn at temperature 1. Any other temperature yields a
-    // single sampled trajectory scaled by that temperature.
+    // Imagined rollout. `temperature == 0` yields the MEAN path: a single
+    // deterministic conditional-mean trajectory (each step appends the one-shot
+    // x-prediction from the zero prior). Any other temperature yields a single
+    // sampled trajectory scaled by that temperature.
     fn lejepa_imagined_rollout(&self, context_bars: &Tensor, temperature: f64, train: bool) -> Tensor {
-        if temperature == 0.0 {
-            let k = LEJEPA_MEAN_ROLLOUT_SAMPLES;
-            let mut acc: Option<Tensor> = None;
-            for _ in 0..k {
-                let (traj, _) = self.single_imagined_rollout(context_bars, 1.0, train, false);
-                acc = Some(match acc {
-                    Some(a) => a + traj,
-                    None => traj,
-                });
-            }
-            return acc.expect("K >= 1") / k as f64;
-        }
         self.single_imagined_rollout(context_bars, temperature, train, false).0
     }
 
-    // One stochastic autoregressive trajectory. Per generated frame: mix a fixed
-    // per-position context noise into the token sequence (drift mitigation), run
-    // the AR predictor to a belief, then sample the next latent with a 4-step
-    // shortcut Euler integration from a fresh N(0,I) prior (scaled by temperature).
-    // Each new latent is tanh-bounded, appended, and probe-decoded to an OHLC bar.
+    // One autoregressive trajectory. Per generated frame: mix a fixed per-position
+    // context noise into the token sequence (drift mitigation), run the AR predictor
+    // to a belief, then produce the next latent. At `temperature == 0` this is the
+    // deterministic conditional mean = the one-shot x-prediction (z = zeros, signal 0,
+    // step_log2 0); otherwise a 4-step shortcut Euler integration from a fresh N(0,I)
+    // prior scaled by temperature. Each new latent is tanh-bounded (by the flow head),
+    // appended, and probe-decoded to an OHLC bar.
     fn single_imagined_rollout(
         &self,
         context_bars: &Tensor,
@@ -767,22 +780,32 @@ impl PretrainHeads {
             let belief = self.predict_lejepa_bar_predictions(&noisy_tokens, train).belief;
             let last = tokens.size()[2] - 1;
             let ctx = belief.narrow(2, last, 1).reshape([rows, latent_dim]);
-            let mut z = Tensor::randn([rows, latent_dim], (Kind::Float, device)) * temperature;
-            for k in 0..LEJEPA_ROLLOUT_STEPS {
-                let sig_val = (k * LEJEPA_ROLLOUT_STEP_SIZE).min(LEJEPA_K_MAX - 1);
-                let signal = Tensor::full([rows], sig_val, (Kind::Int64, device));
-                let step_log2 = Tensor::full([rows], step_log2_val, (Kind::Int64, device));
-                let x_pred = self.lejepa_flow_predict(&z, &signal, &step_log2, &ctx);
-                let v = self.lejepa_flow_velocity(&x_pred, &z, &signal);
-                z = z + v * (LEJEPA_ROLLOUT_STEP_SIZE as f64 / LEJEPA_K_MAX as f64);
-            }
-            // Final Euler step lands exactly on the (already latent-bounded) x_pred.
-            let next_token = z.view([batch, tickers, 1, latent_dim]);
+            let next_z = if temperature == 0.0 {
+                // Deterministic conditional mean: one-shot x-prediction, no Euler loop,
+                // no prior noise. Already latent-bounded by the flow head.
+                let signal0 = Tensor::zeros([rows], (Kind::Int64, device));
+                let step0 = Tensor::zeros([rows], (Kind::Int64, device));
+                let z0 = Tensor::zeros([rows, latent_dim], (Kind::Float, device));
+                self.lejepa_flow_predict(&z0, &signal0, &step0, &ctx)
+            } else {
+                let mut z = Tensor::randn([rows, latent_dim], (Kind::Float, device)) * temperature;
+                for k in 0..LEJEPA_ROLLOUT_STEPS {
+                    let sig_val = (k * LEJEPA_ROLLOUT_STEP_SIZE).min(LEJEPA_K_MAX - 1);
+                    let signal = Tensor::full([rows], sig_val, (Kind::Int64, device));
+                    let step_log2 = Tensor::full([rows], step_log2_val, (Kind::Int64, device));
+                    let x_pred = self.lejepa_flow_predict(&z, &signal, &step_log2, &ctx);
+                    let v = self.lejepa_flow_velocity(&x_pred, &z, &signal);
+                    z = z + v * (LEJEPA_ROLLOUT_STEP_SIZE as f64 / LEJEPA_K_MAX as f64);
+                }
+                // Final Euler step lands exactly on the (already latent-bounded) x_pred.
+                z
+            };
+            let next_token = next_z.view([batch, tickers, 1, latent_dim]);
             let (mean, _logvar) = self.probe_ohlc_features(&next_token);
             let bar = mean.view([batch, LEJEPA_BAR_FEATURES]);
             imagined.push(bar.shallow_clone());
             if collect_entropy {
-                let nt_n = z
+                let nt_n = next_z
                     .reshape([rows, latent_dim])
                     .square()
                     .sum_dim_intlist([1i64].as_slice(), false, Kind::Float)
@@ -2034,15 +2057,53 @@ fn lejepa_pretrain_loss(
     // x-target and its noised input. SIGReg, not stop-grad, prevents collapse.
     let target_bar_tokens = all_tokens.narrow(2, 1, length);
     let latest_token = all_tokens.select(2, length);
-    // Drift-mitigation noisy context: mix fixed unit noise into the predictor
-    // INPUT only (same 10% as rollout). Clean targets / SIGReg keep the noiseless
-    // encoder tokens.
-    let noisy_bar_tokens =
-        &bar_tokens * (1.0 - LEJEPA_CTX_NOISE_MIX) + Tensor::randn_like(&bar_tokens) * LEJEPA_CTX_NOISE_MIX;
+    let latent_dim = heads.latent_dim;
+    let device = all_tokens.device();
+    let ctx_size = bar_tokens.size();
+    let (batch_n, tickers_n) = (ctx_size[0], ctx_size[1]);
+    let ctx_rows = batch_n * tickers_n * length;
+    // Self-conditioning scheduled sampling (exposure-bias fix): a first clean-context
+    // predictor pass yields a detached one-shot mean prediction x_pred (z = zeros,
+    // signal 0, step_log2 0) at every position; x_pred at position t is the model's
+    // prediction of the token at t+1. With per-position Bernoulli(p), the context
+    // token at t+1 is replaced by that prediction (position 0 has no predecessor and
+    // is never replaced). Everything about the replacement is detached, so gradient
+    // never flows through the model's own predictions; the flow target at each position
+    // stays the REAL clean next token.
+    let (shifted_pred, self_cond_mask) = tch::no_grad(|| {
+        let belief_clean = heads
+            .predict_lejepa_bar_predictions(&bar_tokens, train)
+            .belief;
+        let signal0 = Tensor::zeros([ctx_rows], (Kind::Int64, device));
+        let step0 = Tensor::zeros([ctx_rows], (Kind::Int64, device));
+        let z0 = Tensor::zeros([ctx_rows, latent_dim], (Kind::Float, device));
+        let x_pred = heads
+            .lejepa_flow_predict(&z0, &signal0, &step0, &belief_clean.reshape([ctx_rows, latent_dim]))
+            .reshape([batch_n, tickers_n, length, latent_dim]);
+        // Shift right by one along positions: prediction of token t+1 (from belief at t)
+        // sits at input position t+1; position 0 keeps the real token (masked out below).
+        let zeros_first = Tensor::zeros([batch_n, tickers_n, 1, latent_dim], (Kind::Float, device));
+        let shifted = Tensor::cat(&[&zeros_first, &x_pred.narrow(2, 0, length - 1)], 2);
+        let mask = Tensor::rand([batch_n, tickers_n, length, 1], (Kind::Float, device))
+            .lt(LEJEPA_SELF_COND_PROB)
+            .to_kind(Kind::Float);
+        let _ = mask.narrow(2, 0, 1).zero_();
+        (shifted, mask)
+    });
+    // Replace masked positions with the detached self-prediction; unmasked (real)
+    // positions keep their encoder gradient, so the flow's ctx path still trains the
+    // encoder there. Replaced positions inject detached constants -- no gradient leak.
+    let self_cond_tokens =
+        &shifted_pred * &self_cond_mask + &bar_tokens * (&self_cond_mask * -1.0 + 1.0);
+    // Drift-mitigation noisy context: mix fixed unit noise into the predictor INPUT
+    // only (same 10% as rollout), on top of self-conditioning. The second predictor
+    // pass produces the belief the flow loss uses; clean targets / SIGReg keep the
+    // noiseless real encoder tokens.
+    let noisy_bar_tokens = &self_cond_tokens * (1.0 - LEJEPA_CTX_NOISE_MIX)
+        + Tensor::randn_like(&self_cond_tokens) * LEJEPA_CTX_NOISE_MIX;
     let belief = heads
         .predict_lejepa_bar_predictions(&noisy_bar_tokens, train)
         .belief;
-    let latent_dim = heads.latent_dim;
     let rows = target_bar_tokens.numel() as i64 / latent_dim;
     // Attached belief conditioning and clean x-target both flow gradient to the
     // encoder (le-wm recipe): the flow is the sole dynamics loss.
@@ -2121,11 +2182,13 @@ fn lejepa_pretrain_loss(
 
 // dreamer4 shortcut-forcing objective. Per batch, a Bernoulli(p=1-1/6) picks the
 // SHORTCUT branch (self-consistency distillation of a size-d step into two size-d/2
-// steps, flow-space MSE weighted by (1-t)^2, plus the ramp-weighted x-space MSE to
-// clean data that dreamer4 keeps on every batch), else the PLAIN branch (per-position
-// diffusion-forcing x-prediction MSE, ramp-weighted 0.9t+0.1). `ctx` (belief) and
-// `clean` (next-token target) are attached [rows, latent_dim] so gradient reaches
-// the encoder through the flow.
+// steps, flow-space MSE weighted by (1-t)^2, plus an unweighted x-space MSE grounding
+// to clean data that dreamer4 keeps on every batch), else the PLAIN branch (per-position
+// diffusion-forcing x-prediction MSE). Both x-space MSE terms are unweighted across
+// signal levels so the conditional-mean (signal-0) regime is not starved; the (1-t)^2
+// weight remains only on the shortcut consistency term. `ctx` (belief) and `clean`
+// (next-token target) are attached [rows, latent_dim] so gradient reaches the encoder
+// through the flow.
 fn lejepa_flow_loss(heads: &PretrainHeads, ctx: &Tensor, clean: &Tensor) -> Tensor {
     let rows = clean.size()[0];
     let device = clean.device();
@@ -2142,8 +2205,9 @@ fn lejepa_flow_loss(heads: &PretrainHeads, ctx: &Tensor, clean: &Tensor) -> Tens
         let per_sample = (x_pred - clean)
             .square()
             .mean_dim([-1i64].as_slice(), false, Kind::Float);
-        let ramp = &t * 0.9 + 0.1;
-        return (per_sample * ramp).mean(Kind::Float);
+        // Unweighted x-space MSE to clean: equal weight across signal levels so the
+        // conditional-mean (signal-0) regime is not starved.
+        return per_sample.mean(Kind::Float);
     }
     // Shortcut branch: step size d = 2^log2 with log2 ~ Uniform{1..6}; signal ~
     // Uniform{0..K_MAX-1} discretized down to a multiple of d.
@@ -2178,11 +2242,12 @@ fn lejepa_flow_loss(heads: &PretrainHeads, ctx: &Tensor, clean: &Tensor) -> Tens
         .square()
         .mean_dim([-1i64].as_slice(), false, Kind::Float)
         * weight;
-    let ramp = &t1 * 0.9 + 0.1;
+    // Unweighted x-space grounding to clean (equal weight across signal levels, so the
+    // conditional-mean regime is not starved). The (1-t1)^2 weight stays only on the
+    // shortcut consistency term, where it is intrinsic to the shortcut math.
     let grounding = (x_pred - clean)
         .square()
-        .mean_dim([-1i64].as_slice(), false, Kind::Float)
-        * ramp;
+        .mean_dim([-1i64].as_slice(), false, Kind::Float);
     (consistency + grounding).mean(Kind::Float)
 }
 
@@ -4295,6 +4360,19 @@ mod tests {
         assert!(
             imagined.isfinite().all().int64_value(&[]) != 0,
             "imagined rollout must be finite"
+        );
+
+        // Deterministic mean path (temperature 0): appends the one-shot x-prediction
+        // with no flow-prior noise. Same shape and finite (context noise still varies
+        // per call, so outputs are not bit-identical across calls).
+        let mean = heads.lejepa_imagined_rollout(&context, 0.0, false);
+        assert_eq!(
+            mean.size(),
+            vec![batch, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]
+        );
+        assert!(
+            mean.isfinite().all().int64_value(&[]) != 0,
+            "deterministic mean rollout must be finite"
         );
     }
 
