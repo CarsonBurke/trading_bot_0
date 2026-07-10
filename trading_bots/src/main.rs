@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::{self, Colorize};
 use trading_bot_0::torch::model::ModelVariant;
 use trading_bot_0::torch::train::PretrainObjective;
@@ -118,6 +118,71 @@ enum Commands {
         #[arg(long, default_value_t = 500)]
         candle_snapshot_every: usize,
     },
+    TrainPlanner {
+        #[arg(long, default_value = "weights/pretrain_heads_best.ot")]
+        world_model_weights: String,
+
+        #[arg(long)]
+        world_model_metadata: Option<String>,
+
+        #[arg(long)]
+        planner_weights: Option<String>,
+
+        #[arg(long, default_value = "weights/planner.ot")]
+        output: String,
+
+        #[arg(long, default_value_t = 1_000)]
+        updates: usize,
+
+        #[arg(long, default_value_t = 100)]
+        horizon: usize,
+
+        #[arg(long, default_value_t = 100)]
+        rollout_length: usize,
+
+        #[arg(long, default_value_t = 16)]
+        environments: usize,
+
+        #[arg(long, default_value_t = 160)]
+        minibatch_size: usize,
+
+        #[arg(long)]
+        context_bars: Option<usize>,
+
+        #[arg(long, value_delimiter = ',')]
+        tickers: Option<Vec<String>>,
+
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+    },
+    InferPlanner {
+        #[arg(long, default_value = "weights/pretrain_heads_best.ot")]
+        world_model_weights: String,
+
+        #[arg(long)]
+        world_model_metadata: Option<String>,
+
+        #[arg(long, default_value = "weights/planner.ot")]
+        planner_weights: String,
+
+        #[arg(long, default_value_t = 10)]
+        episodes: usize,
+
+        #[arg(long)]
+        horizon: Option<usize>,
+
+        #[arg(long, default_value_t = 100)]
+        rollout_length: usize,
+
+        #[arg(long)]
+        context_bars: Option<usize>,
+
+        #[arg(long, value_delimiter = ',')]
+        tickers: Option<Vec<String>>,
+
+        #[arg(long, value_enum, default_value_t = PlannerSplitArg::Test)]
+        split: PlannerSplitArg,
+    },
     Infer {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
@@ -159,6 +224,23 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
         model_size: ModelVariant,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PlannerSplitArg {
+    Train,
+    Validation,
+    Test,
+}
+
+impl From<PlannerSplitArg> for torch::planner::PlannerDataSplit {
+    fn from(value: PlannerSplitArg) -> Self {
+        match value {
+            PlannerSplitArg::Train => Self::Train,
+            PlannerSplitArg::Validation => Self::Validation,
+            PlannerSplitArg::Test => Self::Test,
+        }
+    }
 }
 
 #[tokio::main]
@@ -245,6 +327,66 @@ async fn main() {
                 .await
                 .expect("pretraining task panicked")
                 .expect("pretraining failed");
+        }
+        Some(Commands::TrainPlanner {
+            world_model_weights,
+            world_model_metadata,
+            planner_weights,
+            output,
+            updates,
+            horizon,
+            rollout_length,
+            environments,
+            minibatch_size,
+            context_bars,
+            tickers,
+            seed,
+        }) => {
+            let args = torch::planner::TrainPlannerArgs {
+                world_model_weights: world_model_weights.clone(),
+                world_model_metadata: world_model_metadata.clone(),
+                planner_weights: planner_weights.clone(),
+                output: output.clone(),
+                updates: *updates,
+                horizon: *horizon,
+                rollout_length: *rollout_length,
+                environments: *environments,
+                minibatch_size: *minibatch_size,
+                context_bars: *context_bars,
+                tickers: tickers.clone(),
+                seed: *seed,
+            };
+            tokio::task::spawn_blocking(move || torch::planner::train_planner(args))
+                .await
+                .expect("planner training task panicked")
+                .expect("planner training failed");
+        }
+        Some(Commands::InferPlanner {
+            world_model_weights,
+            world_model_metadata,
+            planner_weights,
+            episodes,
+            horizon,
+            rollout_length,
+            context_bars,
+            tickers,
+            split,
+        }) => {
+            let args = torch::planner::InferPlannerArgs {
+                world_model_weights: world_model_weights.clone(),
+                world_model_metadata: world_model_metadata.clone(),
+                planner_weights: planner_weights.clone(),
+                episodes: *episodes,
+                horizon: *horizon,
+                rollout_length: *rollout_length,
+                context_bars: *context_bars,
+                tickers: tickers.clone(),
+                split: (*split).into(),
+            };
+            tokio::task::spawn_blocking(move || torch::planner::infer_planner(args))
+                .await
+                .expect("planner inference task panicked")
+                .expect("planner inference failed");
         }
         Some(Commands::Infer {
             weights,

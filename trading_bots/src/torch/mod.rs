@@ -6,5 +6,7 @@ pub mod infer;
 pub mod load;
 pub mod model;
 pub mod optim;
+pub mod planner;
 pub mod train;
 pub mod value;
+pub mod world_model;

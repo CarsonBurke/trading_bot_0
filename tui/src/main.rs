@@ -518,7 +518,7 @@ impl App {
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+            .filter(|e| e.path().is_dir() && e.file_name() != "latest")
             .collect();
         sort_run_dirs_newest_first(&mut dirs);
 
@@ -564,7 +564,8 @@ impl App {
                     num(b).cmp(&num(a))
                 });
                 let is_active = active_name.as_deref() == Some(&name);
-                if gen_count == 0 && weights.is_empty() && !is_active {
+                let has_step_data = entry.path().join("pretrain_train_steps.csv").exists();
+                if gen_count == 0 && weights.is_empty() && !has_step_data && !is_active {
                     return None;
                 }
                 Some(RunInfo {

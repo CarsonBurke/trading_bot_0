@@ -5,7 +5,7 @@ mod geometry;
 mod log;
 mod loop_;
 mod numeric_debug;
-mod optimizer_glue;
+pub(crate) mod optimizer_glue;
 pub mod pretrain;
 mod rollout;
 mod sample;
