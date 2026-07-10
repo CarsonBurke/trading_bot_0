@@ -352,7 +352,7 @@ Two arms, identical seed, identical config, identical data/episode schedule:
 - **Arm B (new):** bidirectional trunk + PMA readout (this spec).
 
 Setup:
-- Run each arm in its own git worktree under `../trading_bot_0_worktrees/` (per
+- Run each arm in its own git worktree under `worktrees/` (per
   CLAUDE.md) so binaries/checkpoints don't collide.
 - Pin RNG seed and `TradingModelConfig::default()` (`ModelVariant::Base`) for both.
 - Two distinct comparisons:
