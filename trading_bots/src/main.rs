@@ -1,6 +1,7 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use colored::{self, Colorize};
 use trading_bot_0::torch::model::ModelVariant;
+use trading_bot_0::torch::planner::PlannerDataSplit;
 use trading_bot_0::torch::train::PretrainObjective;
 use trading_bot_0::{genetic, torch};
 
@@ -76,6 +77,10 @@ enum Commands {
 
         #[arg(long)]
         steps: Option<usize>,
+
+        /// With --steps 0 and LeJEPA weights, run only the lightweight latent-skill gate.
+        #[arg(long, default_value_t = false)]
+        eval_skill_only: bool,
 
         #[arg(long, default_value_t = 256)]
         batch_size: usize,
@@ -180,8 +185,8 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         tickers: Option<Vec<String>>,
 
-        #[arg(long, value_enum, default_value_t = PlannerSplitArg::Test)]
-        split: PlannerSplitArg,
+        #[arg(long, value_enum, default_value_t = PlannerDataSplit::Test)]
+        split: PlannerDataSplit,
     },
     Infer {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
@@ -224,23 +229,6 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
         model_size: ModelVariant,
     },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum PlannerSplitArg {
-    Train,
-    Validation,
-    Test,
-}
-
-impl From<PlannerSplitArg> for torch::planner::PlannerDataSplit {
-    fn from(value: PlannerSplitArg) -> Self {
-        match value {
-            PlannerSplitArg::Train => Self::Train,
-            PlannerSplitArg::Validation => Self::Validation,
-            PlannerSplitArg::Test => Self::Test,
-        }
-    }
 }
 
 #[tokio::main]
@@ -293,6 +281,7 @@ async fn main() {
             run,
             epochs,
             steps,
+            eval_skill_only,
             batch_size,
             k_patches,
             objective,
@@ -311,6 +300,7 @@ async fn main() {
                 run: run.clone(),
                 epochs: *epochs,
                 steps: *steps,
+                eval_skill_only: *eval_skill_only,
                 batch_size: *batch_size,
                 k_patches: *k_patches,
                 objective: *objective,
@@ -381,7 +371,7 @@ async fn main() {
                 rollout_length: *rollout_length,
                 context_bars: *context_bars,
                 tickers: tickers.clone(),
-                split: (*split).into(),
+                split: *split,
             };
             tokio::task::spawn_blocking(move || torch::planner::infer_planner(args))
                 .await

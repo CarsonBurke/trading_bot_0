@@ -37,6 +37,16 @@ pub struct PlannerDataset {
     series: Vec<PlannerSeries>,
 }
 
+fn no_endpoints_err(
+    split: PlannerDataSplit,
+    context_bars: usize,
+    actual_future_bars: usize,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no {split:?} planner endpoints have context={context_bars} and future={actual_future_bars}"
+    )
+}
+
 impl PlannerDataset {
     pub fn load_cached(tickers: Option<&[String]>) -> Result<Self> {
         let tickers = tickers
@@ -80,9 +90,7 @@ impl PlannerDataset {
     ) -> Result<Vec<PlannerEndpoint>> {
         let eligible = self.eligible_ranges(split, context_bars, actual_future_bars);
         if eligible.is_empty() {
-            bail!(
-                "no {split:?} planner endpoints have context={context_bars} and future={actual_future_bars}"
-            );
+            return Err(no_endpoints_err(split, context_bars, actual_future_bars));
         }
         let total: usize = eligible.iter().map(|(_, start, end)| end - start).sum();
         let mut endpoints = Vec::with_capacity(count);
@@ -118,13 +126,40 @@ impl PlannerDataset {
             })
             .collect::<Vec<_>>();
         if all.is_empty() {
-            bail!(
-                "no {split:?} planner endpoints have context={context_bars} and future={actual_future_bars}"
-            );
+            return Err(no_endpoints_err(split, context_bars, actual_future_bars));
         }
         let count = count.min(all.len());
+        if count == 0 {
+            bail!("planner deterministic endpoint count must be positive");
+        }
         Ok((0..count)
             .map(|index| all[index * all.len() / count])
+            .collect())
+    }
+
+    pub fn deterministic_ticker_stratified_endpoints(
+        &self,
+        split: PlannerDataSplit,
+        count: usize,
+        context_bars: usize,
+        actual_future_bars: usize,
+    ) -> Result<Vec<PlannerEndpoint>> {
+        if count == 0 {
+            bail!("planner stratified endpoint count must be positive");
+        }
+        let eligible = self.eligible_ranges(split, context_bars, actual_future_bars);
+        if eligible.is_empty() {
+            return Err(no_endpoints_err(split, context_bars, actual_future_bars));
+        }
+        let count = count.min(eligible.len());
+        Ok((0..count)
+            .map(|index| {
+                let &(series, start, end) = &eligible[index * eligible.len() / count];
+                PlannerEndpoint {
+                    series,
+                    bar: start + (end - start) / 2,
+                }
+            })
             .collect())
     }
 
@@ -271,5 +306,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn ticker_stratified_endpoints_select_distinct_series_midpoints() {
+        let data = PlannerDataset {
+            series: (0..4)
+                .map(|index| PlannerSeries {
+                    ticker: format!("T{index}"),
+                    features: vec![[0.0; OHLC_BAR_FEATURES]; 1_000],
+                    closes: vec![1.0; 1_000],
+                })
+                .collect(),
+        };
+        let endpoints = data
+            .deterministic_ticker_stratified_endpoints(PlannerDataSplit::Validation, 3, 100, 20)
+            .unwrap();
+        assert_eq!(
+            endpoints.iter().map(|e| e.series).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(endpoints.iter().all(|endpoint| endpoint.bar == 840));
     }
 }

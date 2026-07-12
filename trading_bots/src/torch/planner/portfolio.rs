@@ -14,16 +14,10 @@ pub struct PlannerPortfolio {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PortfolioStep {
     pub reward: f64,
-    pub assets_before: f64,
-    pub assets_after_trade: f64,
-    pub assets_after: f64,
     pub commission: f64,
-    pub traded_notional: f64,
     pub turnover: f64,
-    pub requested_target_weight: f64,
-    pub stock_weight_after_trade: f64,
-    pub stock_weight_after: f64,
-    pub fill_ratio: f64,
+    pub assets_before: f64,
+    pub assets_after: f64,
 }
 
 impl PlannerPortfolio {
@@ -36,24 +30,6 @@ impl PlannerPortfolio {
             cash,
             shares: 0.0,
             previous_target_weight: 0.0,
-            total_commissions: 0.0,
-            previous_turnover: 0.0,
-        }
-    }
-
-    pub fn from_position(cash: f64, shares: f64, previous_target_weight: f64) -> Self {
-        assert!(
-            cash.is_finite() && cash >= 0.0,
-            "cash must be finite and non-negative"
-        );
-        assert!(
-            shares.is_finite() && shares >= 0.0,
-            "shares must be finite and non-negative"
-        );
-        Self {
-            cash,
-            shares,
-            previous_target_weight: sanitize_target(previous_target_weight),
             total_commissions: 0.0,
             previous_turnover: 0.0,
         }
@@ -103,7 +79,6 @@ impl PlannerPortfolio {
 
         let mut commission = 0.0;
         let mut traded_notional = 0.0;
-        let mut fill_ratio = 1.0;
 
         if delta_value.abs() >= min_trade_notional {
             if delta_value < 0.0 {
@@ -118,7 +93,7 @@ impl PlannerPortfolio {
             } else if delta_value > 0.0 {
                 let total_buy_demand =
                     delta_value + (delta_value / current_price) * COMMISSION_RATE;
-                fill_ratio = (self.cash / total_buy_demand).min(1.0);
+                let fill_ratio = (self.cash / total_buy_demand).min(1.0);
                 let scaled_amount = delta_value * fill_ratio;
                 let quantity = scaled_amount / current_price;
                 let buy_commission = quantity * COMMISSION_RATE;
@@ -133,27 +108,18 @@ impl PlannerPortfolio {
         }
 
         self.total_commissions += commission;
-        let assets_after_trade = self.total_assets(current_price);
         let assets_after = self.total_assets(next_price);
         let turnover = traded_notional / assets_before;
         let reward = (assets_after / assets_before).ln() * PLANNER_REWARD_SCALE;
-        let stock_weight_after_trade = self.stock_weight(current_price);
-        let stock_weight_after = self.stock_weight(next_price);
         self.previous_target_weight = target_weight;
         self.previous_turnover = turnover;
 
         PortfolioStep {
             reward,
-            assets_before,
-            assets_after_trade,
-            assets_after,
             commission,
-            traded_notional,
             turnover,
-            requested_target_weight: target_weight,
-            stock_weight_after_trade,
-            stock_weight_after,
-            fill_ratio,
+            assets_before,
+            assets_after,
         }
     }
 }
@@ -177,6 +143,26 @@ fn sanitize_target(target_weight: f64) -> f64 {
 mod tests {
     use super::*;
 
+    impl PlannerPortfolio {
+        fn from_position(cash: f64, shares: f64, previous_target_weight: f64) -> Self {
+            assert!(
+                cash.is_finite() && cash >= 0.0,
+                "cash must be finite and non-negative"
+            );
+            assert!(
+                shares.is_finite() && shares >= 0.0,
+                "shares must be finite and non-negative"
+            );
+            Self {
+                cash,
+                shares,
+                previous_target_weight: sanitize_target(previous_target_weight),
+                total_commissions: 0.0,
+                previous_turnover: 0.0,
+            }
+        }
+    }
+
     fn approx_eq(actual: f64, expected: f64, tolerance: f64) {
         assert!(
             (actual - expected).abs() <= tolerance,
@@ -196,7 +182,6 @@ mod tests {
         let commission = shares * COMMISSION_RATE;
         let next_assets = shares * 11.0;
 
-        approx_eq(result.fill_ratio, fill, 1e-12);
         approx_eq(portfolio.shares, shares, 1e-12);
         approx_eq(result.commission, commission, 1e-12);
         approx_eq(result.assets_after, next_assets, 1e-10);
@@ -212,7 +197,7 @@ mod tests {
         approx_eq(portfolio.shares, 5.0, 1e-12);
         approx_eq(portfolio.cash, 50.0 - expected_commission, 1e-12);
         approx_eq(
-            result.assets_after_trade,
+            portfolio.total_assets(10.0),
             100.0 - expected_commission,
             1e-12,
         );
@@ -233,8 +218,8 @@ mod tests {
         let target = 0.5004;
         let result = portfolio.step(target, 10.0, 10.0);
 
-        assert_eq!(result.traded_notional, 0.0);
         assert_eq!(result.commission, 0.0);
+        assert_eq!(result.turnover, 0.0);
         assert_eq!(portfolio.previous_target_weight, target);
         assert_eq!(
             portfolio.planner_state(10.0),
@@ -246,7 +231,21 @@ mod tests {
     fn non_finite_action_maps_to_cash() {
         let mut portfolio = PlannerPortfolio::from_position(0.0, 10.0, 0.8);
         let result = portfolio.step(f64::NAN, 10.0, 10.0);
-        assert_eq!(result.requested_target_weight, 0.0);
+        assert_eq!(result.turnover, 1.0);
+        assert_eq!(portfolio.previous_target_weight, 0.0);
         assert_eq!(portfolio.shares, 0.0);
+    }
+
+    #[test]
+    fn buy_matches_env_skip_when_rounding_places_total_cost_above_cash() {
+        let cash = 4.899001676003256e-6;
+        let price = 0.000583544021013014;
+        let target = 0.27196357812375815;
+        let mut portfolio = PlannerPortfolio::new(cash);
+        let result = portfolio.step(target, price, price);
+        assert_eq!(portfolio.cash, cash);
+        assert_eq!(portfolio.shares, 0.0);
+        assert_eq!(result.commission, 0.0);
+        assert_eq!(result.turnover, 0.0);
     }
 }

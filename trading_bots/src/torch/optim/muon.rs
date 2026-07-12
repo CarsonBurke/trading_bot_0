@@ -3,7 +3,10 @@
 //! norm preservation, and AdamW for non-matrix params.
 
 use std::collections::HashMap;
-use tch::{Kind, Tensor};
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use tch::{Device, Kind, Tensor};
 
 const NS_A: f64 = 3.4445;
 const NS_B: f64 = -4.7750;
@@ -31,6 +34,9 @@ pub struct MuonConfig {
     pub ns_steps: usize,
     /// Parameter name fragments that should use AdamW even if they are 2D.
     pub force_adamw_name_substrings: Vec<String>,
+    /// Optional allowlist for Muon-routed 2D parameters. Empty permits every
+    /// otherwise-eligible matrix; the AdamW blocklist always takes precedence.
+    pub muon_name_allowlist: Vec<String>,
     /// Benchmark/experiment mode: split attention projection matrices into
     /// per-head 2D blocks before Newton-Schulz orthogonalization.
     pub per_attention_head_ortho: bool,
@@ -60,6 +66,7 @@ impl Default for MuonConfig {
             adamw_wd: 0.0,
             ns_steps: DEFAULT_NS_STEPS,
             force_adamw_name_substrings: Vec::new(),
+            muon_name_allowlist: Vec::new(),
             per_attention_head_ortho: false,
             per_attention_output_head_ortho: true,
             attention_head_dim: 0,
@@ -105,6 +112,9 @@ pub struct Muon {
     adamw_state: HashMap<usize, AdamWParamState>,
     step_count: i64,
     params: Vec<Tensor>,
+    /// Variable name per param index; keys optimizer-state sidecar tensors so
+    /// restoration is robust to param ordering. Empty for the unnamed `new` path.
+    names: Vec<String>,
 }
 
 /// Single-matrix Newton-Schulz iteration.
@@ -389,6 +399,10 @@ impl Muon {
             .iter()
             .map(|(_, t)| t.shallow_clone())
             .collect();
+        let names: Vec<String> = trainable_vars
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
         let mut entries_2d = Vec::new();
         let mut adamw_indices = Vec::new();
 
@@ -397,7 +411,12 @@ impl Muon {
                 .force_adamw_name_substrings
                 .iter()
                 .any(|needle| name.contains(needle));
-            if cfg.use_muon_for_2d && p.dim() == 2 && !force_adamw {
+            let allowed = cfg.muon_name_allowlist.is_empty()
+                || cfg
+                    .muon_name_allowlist
+                    .iter()
+                    .any(|needle| name.contains(needle));
+            if cfg.use_muon_for_2d && p.dim() == 2 && !force_adamw && allowed {
                 let size = p.size();
                 let (m, n) = (size[0], size[1]);
                 let kind = p.kind();
@@ -449,6 +468,7 @@ impl Muon {
             adamw_state: HashMap::new(),
             step_count: 0,
             params,
+            names,
         }
     }
 
@@ -563,6 +583,95 @@ impl Muon {
 
     pub fn set_adamw_lr(&mut self, lr: f64) {
         self.cfg.adamw_lr = lr;
+    }
+
+    /// Serialize all optimizer state (per-param momentum/second-momentum for the
+    /// NorMuon 2D params, AdamW m/v for the rest, and the global step counter) to
+    /// a named-tensor sidecar. Keying by variable name makes restoration robust to
+    /// param ordering. Requires `new_named` (the unnamed path stores empty names
+    /// and its keys would collide).
+    pub fn save_state(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let mut named: Vec<(String, Tensor)> = Vec::new();
+        // Suffix separator is `.` because tch's save/load round-trips `.`<->`|`
+        // internally; any other separator would not survive the round trip.
+        for entry in &self.entries_2d {
+            let name = &self.names[entry.idx];
+            named.push((
+                format!("{name}.__momentum"),
+                entry.momentum.to_device(Device::Cpu),
+            ));
+            named.push((
+                format!("{name}.__second_momentum"),
+                entry.second_momentum.to_device(Device::Cpu),
+            ));
+        }
+        for (&idx, state) in &self.adamw_state {
+            let name = &self.names[idx];
+            named.push((format!("{name}.__adamw_m"), state.m.to_device(Device::Cpu)));
+            named.push((format!("{name}.__adamw_v"), state.v.to_device(Device::Cpu)));
+        }
+        named.push((
+            "__muon_step_count__".to_owned(),
+            Tensor::from(self.step_count),
+        ));
+        let refs: Vec<(&str, &Tensor)> = named.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        Tensor::save_multi(&refs, path)
+            .with_context(|| format!("failed saving optimizer state {}", path.display()))
+    }
+
+    /// Restore optimizer state saved by [`Muon::save_state`], copying buffers in
+    /// place so device/dtype match the live params. Absent 2D buffers are an
+    /// error (the checkpoint is incomplete); absent AdamW buffers leave that param
+    /// lazily re-initialized on its next step.
+    pub fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let device = self
+            .params
+            .first()
+            .map(|p| p.device())
+            .unwrap_or(Device::Cpu);
+        let loaded: HashMap<String, Tensor> = Tensor::load_multi_with_device(path, device)
+            .with_context(|| format!("failed loading optimizer state {}", path.display()))?
+            .into_iter()
+            .collect();
+        tch::no_grad(|| -> Result<()> {
+            for entry in &mut self.entries_2d {
+                let name = &self.names[entry.idx];
+                let momentum = loaded
+                    .get(&format!("{name}.__momentum"))
+                    .with_context(|| format!("optimizer state missing momentum for {name}"))?;
+                let second = loaded
+                    .get(&format!("{name}.__second_momentum"))
+                    .with_context(|| {
+                        format!("optimizer state missing second_momentum for {name}")
+                    })?;
+                entry.momentum.copy_(momentum);
+                entry.second_momentum.copy_(second);
+            }
+            self.adamw_state.clear();
+            for &idx in &self.adamw_indices {
+                let name = &self.names[idx];
+                if let (Some(m), Some(v)) = (
+                    loaded.get(&format!("{name}.__adamw_m")),
+                    loaded.get(&format!("{name}.__adamw_v")),
+                ) {
+                    self.adamw_state.insert(
+                        idx,
+                        AdamWParamState {
+                            m: m.shallow_clone(),
+                            v: v.shallow_clone(),
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })?;
+        self.step_count = loaded
+            .get("__muon_step_count__")
+            .map(|t| t.int64_value(&[]))
+            .unwrap_or(0);
+        Ok(())
     }
 
     /// Total bytes of optimizer state currently allocated.
@@ -963,6 +1072,31 @@ mod tests {
                 head_dim: 128
             }
         );
+    }
+
+    #[test]
+    fn muon_name_allowlist_routes_only_matching_matrices() {
+        let vars = vec![
+            (
+                "flow.fc1.weight".to_owned(),
+                Tensor::zeros([8, 8], (Kind::Float, Device::Cpu)).set_requires_grad(true),
+            ),
+            (
+                "flow.mod.weight".to_owned(),
+                Tensor::zeros([8, 8], (Kind::Float, Device::Cpu)).set_requires_grad(true),
+            ),
+        ];
+        let opt = Muon::new_named(
+            &vars,
+            MuonConfig {
+                muon_name_allowlist: vec!["flow.fc".to_owned()],
+                ..MuonConfig::default()
+            },
+        );
+        assert_eq!(opt.entries_2d.len(), 1);
+        assert_eq!(opt.adamw_indices.len(), 1);
+        assert_eq!(opt.entries_2d[0].idx, 0);
+        assert_eq!(opt.adamw_indices[0], 1);
     }
 
     #[test]

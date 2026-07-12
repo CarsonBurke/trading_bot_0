@@ -2,6 +2,7 @@ pub mod action_space;
 pub mod constants;
 pub mod cuda;
 pub mod env;
+pub(crate) mod hashing;
 pub mod infer;
 pub mod load;
 pub mod model;

@@ -33,7 +33,10 @@ pub(crate) fn build_no_reset_windowed_layouts(
         .view([chunk_count * ppo_chunk_len * TICKERS_COUNT, flat_layout_len])
 }
 
-/// Compute GAE advantages and returns from chunk-major rollout data.
+/// Compute GAE advantages and returns from chunk-major rollout data. Distinct
+/// from `planner::gae::compute_planner_gae` (time-major, terminated/truncated
+/// split, non-terminating env): this operates on the PPO chunk layout with a
+/// single `dones` flag and an explicit per-process bootstrap value.
 pub(crate) fn compute_gae_chunked(
     rewards_by_chunk: &Tensor,
     values_by_chunk: &Tensor,

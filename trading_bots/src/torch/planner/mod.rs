@@ -1,8 +1,8 @@
-use tch::nn::Init;
-use tch::{nn, Kind, Tensor};
+use tch::nn::{Init, Module};
+use tch::{nn, Tensor};
 
 use crate::torch::action_space::beta_concentration;
-use crate::torch::value::hl_gauss::NUM_BINS;
+use crate::torch::{value::hl_gauss::NUM_BINS, world_model::OHLC_FEATURE_SCALE};
 
 pub mod checkpoint;
 pub mod data;
@@ -26,9 +26,10 @@ pub const PLANNER_OHLC_DIM: i64 = 16;
 pub const PLANNER_PORTFOLIO_DIM: i64 = 4;
 
 const PLANNER_FF_DIM: i64 = PLANNER_MODEL_DIM * 4;
-const FORECAST_TOKEN_DIM: i64 = PLANNER_LATENT_DIM + 2 * PLANNER_OHLC_DIM + 1;
 const NORM_EPS: f64 = 1e-6;
 const RESIDUAL_GAIN: f64 = 0.2;
+const LOGVAR_LIMIT: f64 = 8.0;
+const READOUT_SEEDS: i64 = 3;
 
 /// One complete frozen-world-model forecast presented to the planner.
 pub struct PlannerForecast {
@@ -48,30 +49,49 @@ pub struct WorldModelPlannerInput {
 }
 
 pub struct WorldModelPlannerOutput {
-    pub value_logits: Tensor,
+    pub real_value_logits: Tensor,
+    pub fantasy_value_logits: Tensor,
     pub alpha: Tensor,
     pub beta: Tensor,
 }
 
 pub struct WorldModelPlanner {
-    token_projection: nn::Linear,
+    latent_projection: nn::Linear,
+    mean_projection: nn::Linear,
+    uncertainty_projection: nn::Linear,
+    horizon_projection: nn::Linear,
     trunk: Vec<BidirectionalBlock>,
     trunk_norm: RmsNorm,
     portfolio_projection: nn::Linear,
     pma: PortfolioConditionedPma,
     readout_norm: RmsNorm,
     policy_concentration: nn::Linear,
-    value_projection: nn::Linear,
+    real_value_projection: nn::Linear,
+    fantasy_value_projection: nn::Linear,
 }
 
 impl WorldModelPlanner {
     pub fn new(p: &nn::Path) -> Self {
-        let token_projection = linear_orthogonal(
-            &(p / "token_projection"),
-            FORECAST_TOKEN_DIM,
+        let latent_projection = linear_orthogonal(
+            &(p / "latent_projection"),
+            PLANNER_LATENT_DIM,
             PLANNER_MODEL_DIM,
             1.0,
         );
+        let mean_projection = linear_orthogonal(
+            &(p / "mean_projection"),
+            PLANNER_OHLC_DIM,
+            PLANNER_MODEL_DIM,
+            1.0,
+        );
+        let uncertainty_projection = linear_orthogonal(
+            &(p / "uncertainty_projection"),
+            PLANNER_OHLC_DIM,
+            PLANNER_MODEL_DIM,
+            1.0,
+        );
+        let horizon_projection =
+            linear_orthogonal(&(p / "horizon_projection"), 1, PLANNER_MODEL_DIM, 1.0);
         let trunk = (0..PLANNER_LAYERS)
             .map(|layer| BidirectionalBlock::new(&(p / format!("trunk_{layer}"))))
             .collect();
@@ -84,56 +104,83 @@ impl WorldModelPlanner {
         let pma = PortfolioConditionedPma::new(&(p / "pma"));
         let policy_concentration =
             linear_orthogonal(&(p / "policy_concentration"), PLANNER_MODEL_DIM, 2, 0.01);
-        let value_projection = linear_zero(&(p / "value_projection"), PLANNER_MODEL_DIM, NUM_BINS);
+        let real_value_projection =
+            linear_zero(&(p / "real_value_projection"), PLANNER_MODEL_DIM, NUM_BINS);
+        let fantasy_value_projection = linear_zero(
+            &(p / "fantasy_value_projection"),
+            PLANNER_MODEL_DIM,
+            NUM_BINS,
+        );
         Self {
-            token_projection,
+            latent_projection,
+            mean_projection,
+            uncertainty_projection,
+            horizon_projection,
             trunk,
             trunk_norm: RmsNorm::new(PLANNER_MODEL_DIM),
             portfolio_projection,
             pma,
             readout_norm: RmsNorm::new(PLANNER_MODEL_DIM),
             policy_concentration,
-            value_projection,
+            real_value_projection,
+            fantasy_value_projection,
         }
     }
 
     pub fn forward(&self, input: &WorldModelPlannerInput) -> WorldModelPlannerOutput {
-        validate_input(input);
-        let encoded = self.encode_forecast(&input.forecast);
-        let portfolio = align_to(&input.portfolio_state, &encoded);
-        let portfolio = linear_same_dtype(&portfolio, &self.portfolio_projection);
-        let pooled = self.pma.forward(&encoded, &portfolio);
-        let pooled = self.readout_norm.forward(&pooled);
-        let actor = pooled.select(1, 0);
-        let critic = pooled.select(1, 1);
-
-        let raw_concentration =
-            linear_same_dtype(&actor, &self.policy_concentration).to_kind(Kind::Float);
+        let (real_value_logits, fantasy_value_logits, raw_concentration) = self.forward_raw(input);
         let alpha = beta_concentration(&raw_concentration.narrow(-1, 0, 1));
         let beta = beta_concentration(&raw_concentration.narrow(-1, 1, 1));
-        let value_logits = linear_same_dtype(&critic, &self.value_projection).to_kind(Kind::Float);
-
         WorldModelPlannerOutput {
-            value_logits,
+            real_value_logits,
+            fantasy_value_logits,
             alpha,
             beta,
         }
     }
 
+    fn forward_raw(&self, input: &WorldModelPlannerInput) -> (Tensor, Tensor, Tensor) {
+        validate_input(input);
+        let encoded = self.encode_forecast(&input.forecast);
+        let portfolio = self.portfolio_projection.forward(&input.portfolio_state);
+        let pooled = self.pma.forward(&encoded, &portfolio);
+        let pooled = self.readout_norm.forward(&pooled);
+        let actor = pooled.select(1, 0);
+        let real_critic = pooled.select(1, 1);
+        let fantasy_critic = pooled.select(1, 2);
+
+        let raw_concentration = self.policy_concentration.forward(&actor);
+        let real_value_logits = self.real_value_projection.forward(&real_critic);
+        let fantasy_value_logits = self.fantasy_value_projection.forward(&fantasy_critic);
+        (real_value_logits, fantasy_value_logits, raw_concentration)
+    }
+
+    /// Runs the transformer under CUDA autocast so flash-only SDPA receives a
+    /// supported low-precision dtype, then promotes distribution/value outputs
+    /// to fp32 before numerically sensitive probability and loss operations.
+    pub fn forward_mixed_precision(
+        &self,
+        input: &WorldModelPlannerInput,
+    ) -> WorldModelPlannerOutput {
+        let use_cuda_autocast = input.forecast.latent.device().is_cuda();
+        let (real_value_logits, fantasy_value_logits, raw_concentration) =
+            tch::autocast(use_cuda_autocast, || self.forward_raw(input));
+        let raw_concentration = raw_concentration.to_kind(tch::Kind::Float);
+        WorldModelPlannerOutput {
+            real_value_logits: real_value_logits.to_kind(tch::Kind::Float),
+            fantasy_value_logits: fantasy_value_logits.to_kind(tch::Kind::Float),
+            alpha: beta_concentration(&raw_concentration.narrow(-1, 0, 1)),
+            beta: beta_concentration(&raw_concentration.narrow(-1, 1, 1)),
+        }
+    }
+
     /// Encodes every predicted step with full, non-causal attention.
     pub fn encode_forecast(&self, forecast: &PlannerForecast) -> Tensor {
-        validate_forecast(forecast);
-        let latent = &forecast.latent;
-        let features = Tensor::cat(
-            &[
-                latent.shallow_clone(),
-                align_to(&forecast.ohlc_mean, latent),
-                align_to(&forecast.ohlc_log_variance, latent),
-                align_to(&forecast.relative_horizon, latent),
-            ],
-            -1,
-        );
-        let mut x = linear_same_dtype(&features, &self.token_projection);
+        let (latent, mean, relative_logvar) = normalized_forecast_modalities(forecast);
+        let mut x = self.latent_projection.forward(&latent)
+            + self.mean_projection.forward(&mean)
+            + self.uncertainty_projection.forward(&relative_logvar)
+            + self.horizon_projection.forward(&forecast.relative_horizon);
         for block in &self.trunk {
             x = block.forward(&x);
         }
@@ -142,12 +189,27 @@ impl WorldModelPlanner {
 
     #[cfg(test)]
     fn pooled_readout(&self, encoded: &Tensor, portfolio_state: &Tensor) -> Tensor {
-        let portfolio = linear_same_dtype(
-            &align_to(portfolio_state, encoded),
-            &self.portfolio_projection,
-        );
+        let portfolio = self.portfolio_projection.forward(portfolio_state);
         self.pma.forward(encoded, &portfolio)
     }
+}
+
+fn normalized_forecast_modalities(forecast: &PlannerForecast) -> (Tensor, Tensor, Tensor) {
+    let feature_scale = Tensor::from_slice(&OHLC_FEATURE_SCALE)
+        .to_device(forecast.latent.device())
+        .view([1, 1, PLANNER_OHLC_DIM]);
+    let latent_rms =
+        (forecast
+            .latent
+            .square()
+            .mean_dim([-1i64].as_slice(), true, tch::Kind::Float)
+            + NORM_EPS)
+            .sqrt();
+    let latent = &forecast.latent / latent_rms;
+    let mean = &forecast.ohlc_mean / &feature_scale;
+    let relative_logvar = (&forecast.ohlc_log_variance - feature_scale.log() * 2.0)
+        .clamp(-LOGVAR_LIMIT, LOGVAR_LIMIT);
+    (latent, mean, relative_logvar)
 }
 
 struct BidirectionalBlock {
@@ -176,7 +238,7 @@ impl BidirectionalBlock {
 
     fn forward(&self, x: &Tensor) -> Tensor {
         let (batch, horizon, _) = x.size3().expect("planner trunk input must be rank 3");
-        let qkv = linear_same_dtype(&self.attention_norm.forward(x), &self.qkv);
+        let qkv = self.qkv.forward(&self.attention_norm.forward(x));
         let parts = qkv.chunk(3, -1);
         let head_dim = PLANNER_MODEL_DIM / PLANNER_HEADS;
         let reshape = |tensor: &Tensor| {
@@ -200,12 +262,8 @@ impl BidirectionalBlock {
         .permute([0, 2, 1, 3])
         .contiguous()
         .reshape([batch, horizon, PLANNER_MODEL_DIM]);
-        let residual = linear_same_dtype(&attended, &self.attention_output);
-        let residual = residual
-            * self
-                .attention_scale
-                .to_kind(x.kind())
-                .view([1, 1, PLANNER_MODEL_DIM]);
+        let residual = self.attention_output.forward(&attended);
+        let residual = residual * self.attention_scale.view([1, 1, PLANNER_MODEL_DIM]);
         self.feed_forward.forward(&(x + residual))
     }
 }
@@ -227,7 +285,7 @@ impl PortfolioConditionedPma {
         Self {
             seeds: p.var(
                 "seeds",
-                &[2, PLANNER_MODEL_DIM],
+                &[READOUT_SEEDS, PLANNER_MODEL_DIM],
                 Init::Randn {
                     mean: 0.0,
                     stdev: 0.02,
@@ -248,18 +306,18 @@ impl PortfolioConditionedPma {
         let (batch, horizon, _) = encoded.size3().expect("PMA encoded input must be rank 3");
         let conditioned_seeds = self
             .seeds
-            .to_device(encoded.device())
-            .to_kind(encoded.kind())
             .unsqueeze(0)
-            .expand([batch, 2, PLANNER_MODEL_DIM], false)
+            .expand([batch, READOUT_SEEDS, PLANNER_MODEL_DIM], false)
             + portfolio.unsqueeze(1);
         let source = self.source_norm.forward(encoded);
-        let queries = linear_same_dtype(&self.query_norm.forward(&conditioned_seeds), &self.query);
-        let keys = linear_same_dtype(&source, &self.key);
-        let values = linear_same_dtype(&source, &self.value);
+        let queries = self
+            .query
+            .forward(&self.query_norm.forward(&conditioned_seeds));
+        let keys = self.key.forward(&source);
+        let values = self.value.forward(&source);
         let head_dim = PLANNER_MODEL_DIM / PLANNER_HEADS;
         let query = queries
-            .reshape([batch, 2, PLANNER_HEADS, head_dim])
+            .reshape([batch, READOUT_SEEDS, PLANNER_HEADS, head_dim])
             .permute([0, 2, 1, 3]);
         let key = keys
             .reshape([batch, horizon, PLANNER_HEADS, head_dim])
@@ -279,13 +337,9 @@ impl PortfolioConditionedPma {
         )
         .permute([0, 2, 1, 3])
         .contiguous()
-        .reshape([batch, 2, PLANNER_MODEL_DIM]);
-        let residual = linear_same_dtype(&attended, &self.output);
-        let residual = residual
-            * self
-                .attention_scale
-                .to_kind(encoded.kind())
-                .view([1, 1, PLANNER_MODEL_DIM]);
+        .reshape([batch, READOUT_SEEDS, PLANNER_MODEL_DIM]);
+        let residual = self.output.forward(&attended);
+        let residual = residual * self.attention_scale.view([1, 1, PLANNER_MODEL_DIM]);
         self.feed_forward.forward(&(conditioned_seeds + residual))
     }
 }
@@ -313,11 +367,8 @@ impl FeedForward {
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let hidden = linear_same_dtype(&self.norm.forward(x), &self.input)
-            .relu()
-            .square();
-        let residual = linear_same_dtype(&hidden, &self.output)
-            * self.scale.to_kind(x.kind()).view([1, 1, PLANNER_MODEL_DIM]);
+        let hidden = self.input.forward(&self.norm.forward(x)).relu().square();
+        let residual = self.output.forward(&hidden) * self.scale.view([1, 1, PLANNER_MODEL_DIM]);
         x + residual
     }
 }
@@ -380,18 +431,6 @@ fn validate_forecast(forecast: &PlannerForecast) {
     );
 }
 
-fn align_to(input: &Tensor, reference: &Tensor) -> Tensor {
-    input
-        .to_device(reference.device())
-        .to_kind(reference.kind())
-}
-
-fn linear_same_dtype(input: &Tensor, linear: &nn::Linear) -> Tensor {
-    let weight = linear.ws.to_kind(input.kind());
-    let bias = linear.bs.as_ref().map(|bias| bias.to_kind(input.kind()));
-    input.linear(&weight, bias.as_ref())
-}
-
 fn linear_orthogonal(p: &nn::Path, input: i64, output: i64, gain: f64) -> nn::Linear {
     nn::linear(
         p,
@@ -421,7 +460,7 @@ fn linear_zero(p: &nn::Path, input: i64, output: i64) -> nn::Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tch::{Device, IndexOp};
+    use tch::{Device, IndexOp, Kind};
 
     fn forecast(batch: i64, horizon: i64) -> PlannerForecast {
         PlannerForecast {
@@ -437,7 +476,7 @@ mod tests {
                 [batch, horizon, PLANNER_OHLC_DIM],
                 (Kind::Float, Device::Cpu),
             ),
-            relative_horizon: Tensor::arange(horizon, (Kind::Float, Device::Cpu))
+            relative_horizon: (Tensor::arange(horizon, (Kind::Float, Device::Cpu)) + 1.0)
                 .view([1, horizon, 1])
                 .expand([batch, horizon, 1], false)
                 / horizon as f64,
@@ -465,14 +504,71 @@ mod tests {
     fn output_contract_has_expected_shapes_and_finite_values() {
         let (_vs, planner) = planner();
         let output = planner.forward(&input(2, 9));
-        assert_eq!(output.value_logits.size(), [2, NUM_BINS]);
+        assert_eq!(output.real_value_logits.size(), [2, NUM_BINS]);
+        assert_eq!(output.fantasy_value_logits.size(), [2, NUM_BINS]);
         assert_eq!(output.alpha.size(), [2, 1]);
         assert_eq!(output.beta.size(), [2, 1]);
-        assert!(output.value_logits.isfinite().all().int64_value(&[]) != 0);
+        assert!(output.real_value_logits.isfinite().all().int64_value(&[]) != 0);
+        assert!(
+            output
+                .fantasy_value_logits
+                .isfinite()
+                .all()
+                .int64_value(&[])
+                != 0
+        );
         assert!(output.alpha.isfinite().all().int64_value(&[]) != 0);
         assert!(output.beta.isfinite().all().int64_value(&[]) != 0);
         assert!(output.alpha.ge(1.0).all().int64_value(&[]) != 0);
         assert!(output.beta.ge(1.0).all().int64_value(&[]) != 0);
+    }
+
+    #[test]
+    fn mixed_precision_boundary_returns_fp32_outputs_and_gradients() {
+        let (vs, planner) = planner();
+        let output = planner.forward_mixed_precision(&input(2, 5));
+        for tensor in [
+            &output.real_value_logits,
+            &output.fantasy_value_logits,
+            &output.alpha,
+            &output.beta,
+        ] {
+            assert_eq!(tensor.kind(), Kind::Float);
+        }
+        (output.real_value_logits.sum(Kind::Float)
+            + output.fantasy_value_logits.sum(Kind::Float)
+            + output.alpha.sum(Kind::Float)
+            + output.beta.sum(Kind::Float))
+        .backward();
+        assert!(vs
+            .trainable_variables()
+            .iter()
+            .any(|parameter| parameter.grad().defined()));
+    }
+
+    #[test]
+    fn cuda_flash_only_forward_uses_supported_autocast_dtype() {
+        let device = Device::cuda_if_available();
+        if !device.is_cuda() {
+            return;
+        }
+        crate::torch::cuda::cfg::configure_cuda();
+        let vs = nn::VarStore::new(device);
+        let planner = WorldModelPlanner::new(&vs.root());
+        let cpu = input(2, 9);
+        let cuda_input = WorldModelPlannerInput {
+            forecast: PlannerForecast {
+                latent: cpu.forecast.latent.to_device(device),
+                ohlc_mean: cpu.forecast.ohlc_mean.to_device(device),
+                ohlc_log_variance: cpu.forecast.ohlc_log_variance.to_device(device),
+                relative_horizon: cpu.forecast.relative_horizon.to_device(device),
+            },
+            portfolio_state: cpu.portfolio_state.to_device(device),
+        };
+        let output = tch::no_grad(|| planner.forward_mixed_precision(&cuda_input));
+        assert_eq!(output.alpha.kind(), Kind::Float);
+        assert!(output.alpha.isfinite().all().int64_value(&[]) != 0);
+        assert!(output.real_value_logits.isfinite().all().int64_value(&[]) != 0);
     }
 
     #[test]
@@ -484,7 +580,8 @@ mod tests {
         let output = planner.forward(&input);
         let loss = output.alpha.sum(Kind::Float)
             + output.beta.sum(Kind::Float)
-            + output.value_logits.square().sum(Kind::Float);
+            + output.real_value_logits.square().sum(Kind::Float)
+            + output.fantasy_value_logits.square().sum(Kind::Float);
         loss.backward();
 
         let latent_grad = input.forecast.latent.grad();
@@ -524,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn both_pma_seeds_depend_on_portfolio_state() {
+    fn all_pma_seeds_depend_on_portfolio_state() {
         let (_vs, planner) = planner();
         let encoded = planner.encode_forecast(&forecast(1, 5));
         let portfolio_a = Tensor::zeros([1, PLANNER_PORTFOLIO_DIM], (Kind::Float, Device::Cpu));
@@ -537,5 +634,25 @@ mod tests {
                 .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
         assert!(per_seed.double_value(&[0, 0]) > 1e-6);
         assert!(per_seed.double_value(&[0, 1]) > 1e-6);
+        assert!(per_seed.double_value(&[0, 2]) > 1e-6);
+    }
+
+    #[test]
+    fn forecast_modalities_are_dimensionless_and_bounded() {
+        let scale = Tensor::from_slice(&OHLC_FEATURE_SCALE).view([1, 1, PLANNER_OHLC_DIM]);
+        let forecast = PlannerForecast {
+            latent: Tensor::randn([1, 2, PLANNER_LATENT_DIM], (Kind::Float, Device::Cpu)) * 7.0,
+            ohlc_mean: scale.expand([1, 2, PLANNER_OHLC_DIM], false),
+            ohlc_log_variance: (scale.log() * 2.0).expand([1, 2, PLANNER_OHLC_DIM], false),
+            relative_horizon: Tensor::ones([1, 2, 1], (Kind::Float, Device::Cpu)),
+        };
+        let (latent, mean, logvar) = normalized_forecast_modalities(&forecast);
+        assert!((mean - 1.0).abs().max().double_value(&[]) < 1e-6);
+        assert!(logvar.abs().max().double_value(&[]) < 1e-6);
+        let latent_rms = latent
+            .square()
+            .mean_dim([-1].as_slice(), false, Kind::Float)
+            .sqrt();
+        assert!((latent_rms - 1.0).abs().max().double_value(&[]) < 1e-5);
     }
 }

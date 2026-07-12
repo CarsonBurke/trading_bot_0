@@ -25,18 +25,6 @@ pub struct PlannerObservation {
     pub portfolio_state: Tensor,
 }
 
-impl PlannerObservation {
-    pub fn shallow_clone(&self) -> Self {
-        Self {
-            forecast_latent: self.forecast_latent.shallow_clone(),
-            forecast_mean: self.forecast_mean.shallow_clone(),
-            forecast_logvar: self.forecast_logvar.shallow_clone(),
-            relative_horizon: self.relative_horizon.shallow_clone(),
-            portfolio_state: self.portfolio_state.shallow_clone(),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct PlannerTransition {
     pub observation: PlannerObservation,
@@ -48,7 +36,10 @@ pub struct PlannerTransition {
     pub old_beta: Tensor,
     pub old_log_prob: Tensor,
     pub value: Tensor,
-    pub next_value: Tensor,
+    /// Bootstrap value of the successor decision. Left `None` while the
+    /// transition is still pending and filled the moment the next decision's
+    /// value is known; always `Some` before the transition enters a rollout.
+    pub next_value: Option<Tensor>,
     pub reward: f32,
     pub terminated: bool,
     pub truncated: bool,
@@ -56,32 +47,7 @@ pub struct PlannerTransition {
     pub turnover: f64,
     pub assets_before: f64,
     pub assets_after: f64,
-    pub world_model_hash: String,
-}
-
-impl PlannerTransition {
-    pub fn shallow_clone(&self) -> Self {
-        Self {
-            observation: self.observation.shallow_clone(),
-            source: self.source,
-            environment_id: self.environment_id,
-            decision_index: self.decision_index,
-            action: self.action.shallow_clone(),
-            old_alpha: self.old_alpha.shallow_clone(),
-            old_beta: self.old_beta.shallow_clone(),
-            old_log_prob: self.old_log_prob.shallow_clone(),
-            value: self.value.shallow_clone(),
-            next_value: self.next_value.shallow_clone(),
-            reward: self.reward,
-            terminated: self.terminated,
-            truncated: self.truncated,
-            commission: self.commission,
-            turnover: self.turnover,
-            assets_before: self.assets_before,
-            assets_after: self.assets_after,
-            world_model_hash: self.world_model_hash.clone(),
-        }
-    }
+    pub fantasy_clamped: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,7 +60,6 @@ pub enum MixedRolloutError {
         expected: usize,
     },
     InvalidMinibatchSize(usize),
-    InconsistentWorldModelHash,
     EmptyWorldModelHash,
     InconsistentForecastHorizon,
     InvalidTensorShape(&'static str),
@@ -114,9 +79,6 @@ impl Display for MixedRolloutError {
                 formatter,
                 "balanced minibatch size must be positive, even, and divide the rollout; got {size}"
             ),
-            Self::InconsistentWorldModelHash => {
-                write!(formatter, "all transitions must use the same world-model checkpoint")
-            }
             Self::EmptyWorldModelHash => write!(formatter, "world-model checkpoint hash is empty"),
             Self::InconsistentForecastHorizon => {
                 write!(formatter, "all transitions must use the same forecast horizon")
@@ -134,33 +96,35 @@ pub struct MixedRollout {
     transitions: Vec<PlannerTransition>,
     real_count: usize,
     fantasy_count: usize,
-    world_model_hash: Option<String>,
+    world_model_hash: String,
 }
 
 impl MixedRollout {
-    pub fn new(expected_per_source: usize) -> Result<Self, MixedRolloutError> {
+    pub fn new(
+        expected_per_source: usize,
+        world_model_hash: String,
+    ) -> Result<Self, MixedRolloutError> {
         if expected_per_source == 0 {
             return Err(MixedRolloutError::ZeroCapacity);
+        }
+        if world_model_hash.trim().is_empty() {
+            return Err(MixedRolloutError::EmptyWorldModelHash);
         }
         Ok(Self {
             expected_per_source,
             transitions: Vec::with_capacity(expected_per_source * 2),
             real_count: 0,
             fantasy_count: 0,
-            world_model_hash: None,
+            world_model_hash,
         })
+    }
+
+    pub fn world_model_hash(&self) -> &str {
+        &self.world_model_hash
     }
 
     pub fn push(&mut self, transition: PlannerTransition) -> Result<(), MixedRolloutError> {
         validate_transition(&transition)?;
-        if let Some(hash) = &self.world_model_hash {
-            if hash != &transition.world_model_hash {
-                return Err(MixedRolloutError::InconsistentWorldModelHash);
-            }
-        } else {
-            self.world_model_hash = Some(transition.world_model_hash.clone());
-        }
-
         let count = match transition.source {
             RolloutSource::Real => &mut self.real_count,
             RolloutSource::Fantasy => &mut self.fantasy_count,
@@ -241,7 +205,9 @@ impl MixedRollout {
 
     pub fn to_batch(&self, device: Device) -> Result<PlannerBatch, MixedRolloutError> {
         self.validate_complete()?;
-        PlannerBatch::from_transitions(&self.transitions, device)
+        // Every transition was validated at push time; only the cross-transition
+        // horizon invariant still needs checking before stacking.
+        PlannerBatch::from_validated_transitions(&self.transitions, device)
     }
 
     pub fn metrics(&self) -> RolloutMetrics {
@@ -281,19 +247,22 @@ impl PlannerBatch {
         for transition in transitions {
             validate_transition(transition)?;
         }
+        Self::from_validated_transitions(transitions, device)
+    }
+
+    fn from_validated_transitions(
+        transitions: &[PlannerTransition],
+        device: Device,
+    ) -> Result<Self, MixedRolloutError> {
+        if transitions.is_empty() {
+            return Err(MixedRolloutError::ZeroCapacity);
+        }
         let horizon = transitions[0].observation.forecast_latent.size()[0];
         if transitions
             .iter()
             .any(|transition| transition.observation.forecast_latent.size()[0] != horizon)
         {
             return Err(MixedRolloutError::InconsistentForecastHorizon);
-        }
-        let world_model_hash = &transitions[0].world_model_hash;
-        if transitions
-            .iter()
-            .any(|transition| &transition.world_model_hash != world_model_hash)
-        {
-            return Err(MixedRolloutError::InconsistentWorldModelHash);
         }
 
         let forecast_latent = stack_to_device(
@@ -321,7 +290,14 @@ impl PlannerBatch {
         let old_beta = stack_flat_to_device(transitions.iter().map(|t| &t.old_beta), device);
         let old_log_probs = cat_scalars(transitions.iter().map(|t| &t.old_log_prob), device);
         let values = cat_scalars(transitions.iter().map(|t| &t.value), device);
-        let next_values = cat_scalars(transitions.iter().map(|t| &t.next_value), device);
+        let next_values = cat_scalars(
+            transitions.iter().map(|t| {
+                t.next_value
+                    .as_ref()
+                    .expect("next_value filled before batching")
+            }),
+            device,
+        );
         let rewards = Tensor::from_slice(&transitions.iter().map(|t| t.reward).collect::<Vec<_>>())
             .to_device(device);
         let terminated = bool_tensor(transitions.iter().map(|t| t.terminated), device);
@@ -389,6 +365,7 @@ pub struct SourceMetrics {
     pub action_mean: f64,
     pub action_boundary_fraction: f64,
     pub mean_environment_wealth_ratio: f64,
+    pub fantasy_clamp_fraction: f64,
 }
 
 impl SourceMetrics {
@@ -402,6 +379,7 @@ impl SourceMetrics {
         let reward_sum = selected.iter().map(|t| t.reward as f64).sum::<f64>();
         let commissions = selected.iter().map(|t| t.commission).sum::<f64>();
         let turnover_sum = selected.iter().map(|t| t.turnover).sum::<f64>();
+        let fantasy_clamps = selected.iter().filter(|t| t.fantasy_clamped).count();
         let mut action_sum = 0.0;
         let mut boundary_count = 0usize;
         for transition in &selected {
@@ -435,7 +413,13 @@ impl SourceMetrics {
         }
         let wealth_ratio_sum = environments
             .values()
-            .map(|(_, initial, _, final_assets)| final_assets / initial)
+            .map(|(_, initial, _, final_assets)| {
+                if *initial > 0.0 {
+                    final_assets / initial
+                } else {
+                    1.0
+                }
+            })
             .sum::<f64>();
 
         Self {
@@ -447,6 +431,7 @@ impl SourceMetrics {
             action_mean: action_sum / samples as f64,
             action_boundary_fraction: boundary_count as f64 / samples as f64,
             mean_environment_wealth_ratio: wealth_ratio_sum / environments.len() as f64,
+            fantasy_clamp_fraction: fantasy_clamps as f64 / samples as f64,
         }
     }
 }
@@ -476,6 +461,10 @@ fn validate_transition(transition: &PlannerTransition) -> Result<(), MixedRollou
     if transition.observation.portfolio_state.size() != [PLANNER_PORTFOLIO_DIM] {
         return Err(MixedRolloutError::InvalidTensorShape("portfolio_state"));
     }
+    let next_value = transition
+        .next_value
+        .as_ref()
+        .ok_or(MixedRolloutError::InvalidTensorShape("next_value"))?;
     let action_count = transition.action.numel();
     if action_count != 1
         || transition.old_alpha.numel() != action_count
@@ -485,14 +474,11 @@ fn validate_transition(transition: &PlannerTransition) -> Result<(), MixedRollou
     }
     if transition.old_log_prob.numel() != 1
         || transition.value.numel() != 1
-        || transition.next_value.numel() != 1
+        || next_value.numel() != 1
     {
         return Err(MixedRolloutError::InvalidTensorShape(
             "scalar rollout fields",
         ));
-    }
-    if transition.world_model_hash.trim().is_empty() {
-        return Err(MixedRolloutError::EmptyWorldModelHash);
     }
     for (name, tensor) in [
         ("forecast_latent", &transition.observation.forecast_latent),
@@ -505,7 +491,7 @@ fn validate_transition(transition: &PlannerTransition) -> Result<(), MixedRollou
         ("old_beta", &transition.old_beta),
         ("old_log_prob", &transition.old_log_prob),
         ("value", &transition.value),
-        ("next_value", &transition.next_value),
+        ("next_value", next_value),
     ] {
         if tensor.isfinite().all().int64_value(&[]) == 0 {
             return Err(MixedRolloutError::NonFiniteValue(name));
@@ -526,24 +512,22 @@ fn validate_transition(transition: &PlannerTransition) -> Result<(), MixedRollou
 }
 
 fn stack_to_device<'a>(tensors: impl Iterator<Item = &'a Tensor>, device: Device) -> Tensor {
-    let tensors = tensors
-        .map(|tensor| tensor.to_device(device))
-        .collect::<Vec<_>>();
-    Tensor::stack(&tensors, 0)
+    let tensors = tensors.collect::<Vec<_>>();
+    Tensor::stack(&tensors, 0).to_device(device)
 }
 
 fn stack_flat_to_device<'a>(tensors: impl Iterator<Item = &'a Tensor>, device: Device) -> Tensor {
     let tensors = tensors
-        .map(|tensor| tensor.flatten(0, -1).to_device(device))
+        .map(|tensor| tensor.flatten(0, -1))
         .collect::<Vec<_>>();
-    Tensor::stack(&tensors, 0)
+    Tensor::stack(&tensors, 0).to_device(device)
 }
 
 fn cat_scalars<'a>(tensors: impl Iterator<Item = &'a Tensor>, device: Device) -> Tensor {
     let tensors = tensors
-        .map(|tensor| tensor.flatten(0, -1).to_device(device))
+        .map(|tensor| tensor.flatten(0, -1))
         .collect::<Vec<_>>();
-    Tensor::cat(&tensors, 0)
+    Tensor::cat(&tensors, 0).to_device(device)
 }
 
 fn bool_tensor(values: impl Iterator<Item = bool>, device: Device) -> Tensor {
@@ -585,7 +569,7 @@ mod tests {
             old_beta: Tensor::from_slice(&[2.0f32]),
             old_log_prob: Tensor::from_slice(&[0.1f32]),
             value: Tensor::from_slice(&[0.2f32]),
-            next_value: Tensor::from_slice(&[0.3f32]),
+            next_value: Some(Tensor::from_slice(&[0.3f32])),
             reward: 0.4,
             terminated: false,
             truncated: decision_index == 1,
@@ -593,13 +577,13 @@ mod tests {
             turnover: 0.1,
             assets_before: 100.0 + decision_index as f64,
             assets_after: 101.0 + decision_index as f64,
-            world_model_hash: "wm-test".to_string(),
+            fantasy_clamped: false,
         }
     }
 
     #[test]
     fn rollout_requires_exactly_equal_source_counts() {
-        let mut rollout = MixedRollout::new(2).unwrap();
+        let mut rollout = MixedRollout::new(2, "wm-test".to_string()).unwrap();
         rollout.push(transition(RolloutSource::Real, 0, 0)).unwrap();
         rollout
             .push(transition(RolloutSource::Fantasy, 1, 0))
@@ -621,7 +605,7 @@ mod tests {
 
     #[test]
     fn every_minibatch_is_source_balanced() {
-        let mut rollout = MixedRollout::new(4).unwrap();
+        let mut rollout = MixedRollout::new(4, "wm-test".to_string()).unwrap();
         for i in 0..4 {
             rollout.push(transition(RolloutSource::Real, 0, i)).unwrap();
             rollout
@@ -686,32 +670,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_finite_values_and_empty_hashes() {
+    fn rejects_non_finite_values() {
         let mut non_finite = transition(RolloutSource::Real, 0, 0);
         non_finite.reward = f32::NAN;
         assert!(matches!(
             PlannerBatch::from_transitions(&[non_finite], Device::Cpu),
             Err(MixedRolloutError::NonFiniteValue("reward"))
         ));
-
-        let mut empty_hash = transition(RolloutSource::Real, 0, 0);
-        empty_hash.world_model_hash.clear();
-        assert!(matches!(
-            PlannerBatch::from_transitions(&[empty_hash], Device::Cpu),
-            Err(MixedRolloutError::EmptyWorldModelHash)
-        ));
     }
 
     #[test]
-    fn rejects_mixed_world_model_checkpoints() {
-        let mut rollout = MixedRollout::new(1).unwrap();
-        rollout.push(transition(RolloutSource::Real, 0, 0)).unwrap();
-        let mut fantasy = transition(RolloutSource::Fantasy, 1, 0);
-        fantasy.world_model_hash = "different".to_string();
+    fn rollout_requires_non_empty_world_model_hash() {
         assert_eq!(
-            rollout.push(fantasy),
-            Err(MixedRolloutError::InconsistentWorldModelHash)
+            MixedRollout::new(1, String::new()).err(),
+            Some(MixedRolloutError::EmptyWorldModelHash)
         );
+        MixedRollout::new(1, "wm-test".to_string()).unwrap();
     }
 
     #[test]
@@ -725,7 +699,7 @@ mod tests {
             transitions: vec![real, fantasy],
             real_count: 1,
             fantasy_count: 1,
-            world_model_hash: Some("wm-test".to_string()),
+            world_model_hash: "wm-test".to_string(),
         }
         .metrics();
         assert_eq!(metrics.real.reward_sum, 1.0);

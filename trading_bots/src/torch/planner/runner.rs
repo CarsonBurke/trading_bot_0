@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rand::{rngs::StdRng, SeedableRng};
 use tch::{nn, Device, Kind, Tensor};
 
@@ -15,8 +15,8 @@ use crate::torch::{
     train::{
         config::{LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM_WARMUP_START, USE_MUON},
         optimizer_glue::{
-            backward_actor_critic_with_separate_clips, grad_clip_groups, muon_momentum_for_step,
-            named_trainable_variables,
+            apply_lr_scale, backward_actor_critic_with_separate_clips, grad_clip_groups,
+            muon_momentum_for_step, named_trainable_variables, KlLrController,
         },
     },
     value::hl_gauss::HlGaussBins,
@@ -24,23 +24,32 @@ use crate::torch::{
 };
 
 use super::{
-    checkpoint::{load_planner_checkpoint, save_planner_checkpoint, PlannerCheckpointMetadata},
+    checkpoint::{
+        load_planner_checkpoint, planner_metadata_path, planner_optimizer_state_path,
+        save_planner_checkpoint, verify_optimizer_state, PlannerCheckpointMetadata,
+        FANTASY_CLOSE_DELTA_MAX, FANTASY_CLOSE_DELTA_MIN, KL_CONTROLLER_HALF_LIFE, KL_MAX_LR_SCALE,
+        KL_MIN_LR_SCALE, OPTIMIZATION_EPOCHS, TARGET_KL,
+    },
     data::{planner_context_bars, PlannerDataSplit, PlannerDataset, PlannerEndpoint},
-    gae::compute_default_planner_gae,
-    losses::{planner_actor_critic_losses, split_optimization_metrics, PlannerLossConfig},
+    gae::compute_planner_gae,
+    losses::{planner_actor_critic_losses, route_value_logits, split_critic_diagnostics},
     portfolio::PlannerPortfolio,
     rollout::{
         MixedRollout, PlannerBatch, PlannerObservation, PlannerTransition, RolloutMetrics,
         RolloutSource,
     },
-    PlannerForecast, WorldModelPlanner, WorldModelPlannerInput,
+    PlannerForecast, WorldModelPlanner, WorldModelPlannerInput, PLANNER_PORTFOLIO_DIM,
 };
 
 pub const DEFAULT_PLANNER_HORIZON: usize = 100;
 pub const DEFAULT_PLANNER_ROLLOUT_LENGTH: usize = 100;
 pub const DEFAULT_PLANNER_ENVIRONMENTS: usize = 16;
-pub const DEFAULT_PLANNER_OPTIMIZATION_EPOCHS: usize = 3;
+pub const DEFAULT_PLANNER_OPTIMIZATION_EPOCHS: usize = OPTIMIZATION_EPOCHS;
 pub const DEFAULT_PLANNER_MINIBATCH_SIZE: usize = 160;
+const VALIDATION_EVERY_UPDATES: u64 = 50;
+const HELD_OUT_ENDPOINTS: usize = 16;
+const VALIDATION_MAX_MEAN_DRAWDOWN: f64 = 0.30;
+const VALIDATION_MAX_MEAN_TURNOVER: f64 = 0.50;
 
 #[derive(Clone, Debug)]
 pub struct TrainPlannerArgs {
@@ -116,6 +125,7 @@ pub struct PlannerInferenceEpisode {
     pub commissions: f64,
     pub turnover_mean: f64,
     pub action_mean: f64,
+    pub max_drawdown: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -130,6 +140,7 @@ struct OptimizationSummary {
     actor_loss: f64,
     critic_loss: f64,
     reverse_kl: f64,
+    max_reverse_kl: f64,
     entropy: f64,
     actor_grad_norm: f64,
     critic_grad_norm: f64,
@@ -137,24 +148,24 @@ struct OptimizationSummary {
     fantasy_beta_concentration: f64,
     real_critic_explained_variance: f64,
     fantasy_critic_explained_variance: f64,
+    kl_early_stopped: bool,
+    actor_steps: usize,
     steps: usize,
 }
 
-struct PendingTransition {
-    observation: PlannerObservation,
-    source: RolloutSource,
-    environment_id: usize,
-    decision_index: usize,
-    action: Tensor,
-    old_alpha: Tensor,
-    old_beta: Tensor,
-    old_log_prob: Tensor,
-    value: Tensor,
-    reward: f32,
-    commission: f64,
-    turnover: f64,
-    assets_before: f64,
-    assets_after: f64,
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeldOutMetrics {
+    median_wealth_ratio: f64,
+    mean_max_drawdown: f64,
+    mean_turnover: f64,
+}
+
+impl HeldOutMetrics {
+    fn eligible(self) -> bool {
+        self.median_wealth_ratio.is_finite()
+            && self.mean_max_drawdown <= VALIDATION_MAX_MEAN_DRAWDOWN
+            && self.mean_turnover <= VALIDATION_MAX_MEAN_TURNOVER
+    }
 }
 
 pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
@@ -167,17 +178,47 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| world_model_metadata_path(&args.world_model_weights));
     let world_model = LejepaWorldModel::load(&args.world_model_weights, metadata_path, device)?;
-    let world_hash = world_model.metadata().checkpoint_sha256.clone();
-    let context_bars = planner_context_bars(world_model.metadata(), args.context_bars)?;
+    let world_lineage = world_model.lineage_sha256().to_owned();
+    let world_weights_hash = world_model.metadata().checkpoint_sha256.clone();
     let dataset = PlannerDataset::load_cached(args.tickers.as_deref())?;
 
     let mut planner_vs = nn::VarStore::new(device);
     let planner = WorldModelPlanner::new(&planner_vs.root());
-    let mut optimizer_steps = 0u64;
-    if let Some(weights) = &args.planner_weights {
-        optimizer_steps =
-            load_planner_checkpoint(&mut planner_vs, weights, &world_hash, Some(args.horizon))?
-                .optimizer_steps;
+    let resumed = match &args.planner_weights {
+        Some(weights) => Some(load_planner_checkpoint(
+            &mut planner_vs,
+            weights,
+            &world_lineage,
+            Some(args.horizon),
+            Some(args.seed),
+        )?),
+        None => None,
+    };
+    // Context length must agree with the checkpoint on resume: derive from the
+    // checkpoint when the CLI is silent, and bail if the CLI contradicts it.
+    let context_bars = match &resumed {
+        Some(metadata) => {
+            let requested = args.context_bars.unwrap_or(metadata.context_bars);
+            if requested != metadata.context_bars {
+                bail!(
+                    "planner resume context_bars mismatch: checkpoint={}, requested={requested}",
+                    metadata.context_bars
+                );
+            }
+            planner_context_bars(world_model.metadata(), Some(metadata.context_bars))?
+        }
+        None => planner_context_bars(world_model.metadata(), args.context_bars)?,
+    };
+    let mut optimizer_steps = resumed.as_ref().map(|m| m.optimizer_steps).unwrap_or(0);
+    let base_updates = resumed.as_ref().map(|m| m.cumulative_updates).unwrap_or(0);
+    let mut kl_controller = KlLrController::new(
+        TARGET_KL,
+        KL_CONTROLLER_HALF_LIFE,
+        KL_MIN_LR_SCALE,
+        KL_MAX_LR_SCALE,
+    );
+    if let Some(metadata) = &resumed {
+        kl_controller.restore(metadata.kl_ema, metadata.kl_lr_scale);
     }
     let named_vars = named_trainable_variables(&planner_vs);
     let trainable_vars = named_vars
@@ -201,18 +242,62 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
             ..MuonConfig::default()
         },
     );
+    if let Some(metadata) = &resumed {
+        if let Some(weights) = &args.planner_weights {
+            let optimizer_state = planner_optimizer_state_path(weights);
+            if optimizer_state.exists() {
+                verify_optimizer_state(&optimizer_state, &metadata.optimizer_sha256)?;
+                optimizer.load_state(&optimizer_state)?;
+            } else if !metadata.optimizer_sha256.is_empty() {
+                bail!(
+                    "planner optimizer state {} is required by checkpoint metadata",
+                    optimizer_state.display()
+                );
+            } else {
+                // Moments and step_count are zero in a fresh optimizer; reset the
+                // warmup counter to match so the momentum schedule restarts from
+                // MUON_MOMENTUM_WARMUP_START instead of applying steady-state beta1
+                // to zeroed EMA buffers.
+                optimizer_steps = 0;
+                eprintln!(
+                    "warning: planner optimizer state {} absent; restarting optimizer moments and momentum warmup from zero",
+                    optimizer_state.display()
+                );
+            }
+        }
+    }
     let hl_gauss = HlGaussBins::default_for(device);
-    let mut rng = StdRng::seed_from_u64(args.seed);
-
+    let validation_endpoints = dataset.deterministic_ticker_stratified_endpoints(
+        PlannerDataSplit::Validation,
+        HELD_OUT_ENDPOINTS,
+        context_bars,
+        args.rollout_length,
+    )?;
+    let best_path = best_checkpoint_path(&args.output);
+    let compatible_existing_best = best_path.exists()
+        && PlannerCheckpointMetadata::load(planner_metadata_path(&best_path))
+            .and_then(|metadata| {
+                metadata.validate(&world_lineage, Some(args.horizon), Some(args.seed))
+            })
+            .is_ok();
+    let mut best_validation = compatible_existing_best
+        .then(|| load_best_validation_metrics(&args.output))
+        .flatten();
+    let mut best_selected_this_run = false;
     println!(
         "planner training: device={device:?} updates={} H={} T={} N={} context={} (stateful world-model KV cache enabled)",
         args.updates, args.horizon, args.rollout_length, args.environments, context_bars
     );
     for update in 0..args.updates {
+        let global_update = base_updates + update as u64 + 1;
+        let rollout_seed = update_seed(args.seed, global_update, 0x524f4c4c4f5554);
+        let mut rng = StdRng::seed_from_u64(rollout_seed);
+        tch::manual_seed(rollout_seed as i64);
         let rollout = collect_mixed_rollout(
             &planner,
             &world_model,
             &dataset,
+            &hl_gauss,
             args.horizon,
             args.rollout_length,
             args.environments,
@@ -221,34 +306,128 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
             device,
         )?;
         let rollout_metrics = rollout.metrics();
-        let (advantages, returns) =
-            rollout_advantages(&rollout, args.rollout_length, args.environments, device)?;
+        let batch = rollout.to_batch(device)?;
+        let (advantages, returns) = rollout_advantages(
+            &rollout,
+            &batch,
+            args.rollout_length,
+            args.environments,
+            device,
+        )?;
         let optimization = optimize_rollout(
             &planner,
             &rollout,
+            &batch,
             &advantages,
             &returns,
             args.minibatch_size,
-            args.seed ^ update as u64,
+            update_seed(args.seed, global_update, 0x4f5054494d495a45),
             &hl_gauss,
             &clip_groups,
             &trainable_vars,
             &mut optimizer,
             &mut optimizer_steps,
+            &mut kl_controller,
             device,
         )?;
-        print_training_metrics(update + 1, &rollout_metrics, optimization);
-        append_training_metrics(&args.output, update + 1, &rollout_metrics, optimization)?;
+        print_training_metrics(global_update, &rollout_metrics, optimization);
+        append_training_metrics(&args.output, global_update, &rollout_metrics, optimization)?;
         save_planner_checkpoint(
             &planner_vs,
             &args.output,
             &PlannerCheckpointMetadata::new(
-                &world_hash,
+                &world_lineage,
+                &world_weights_hash,
                 args.horizon,
                 context_bars,
                 optimizer_steps,
+                global_update,
+                args.seed,
+                kl_controller.ema(),
+                kl_controller.scale(),
             ),
+            &optimizer,
         )?;
+        if global_update % VALIDATION_EVERY_UPDATES == 0 || update + 1 == args.updates {
+            let (validation_summary, validation_metrics) = evaluate_real_endpoints(
+                &planner,
+                &world_model,
+                &dataset,
+                &validation_endpoints,
+                args.horizon,
+                args.rollout_length,
+                context_bars,
+                device,
+            )?;
+            let selected = validation_metrics.eligible()
+                && best_validation.is_none_or(|best| {
+                    validation_metrics.median_wealth_ratio > best.median_wealth_ratio
+                });
+            append_validation_metrics(&args.output, global_update, validation_metrics, selected)?;
+            println!(
+                "planner validation update={global_update} episodes={} median_wealth={:.6} mean_drawdown={:.6} mean_turnover={:.6} eligible={} selected={selected}",
+                validation_summary.episodes.len(),
+                validation_metrics.median_wealth_ratio,
+                validation_metrics.mean_max_drawdown,
+                validation_metrics.mean_turnover,
+                validation_metrics.eligible(),
+            );
+            if selected {
+                save_planner_checkpoint(
+                    &planner_vs,
+                    &best_path,
+                    &PlannerCheckpointMetadata::new(
+                        &world_lineage,
+                        &world_weights_hash,
+                        args.horizon,
+                        context_bars,
+                        optimizer_steps,
+                        global_update,
+                        args.seed,
+                        kl_controller.ema(),
+                        kl_controller.scale(),
+                    ),
+                    &optimizer,
+                )?;
+                best_validation = Some(validation_metrics);
+                best_selected_this_run = true;
+            }
+        }
+    }
+    if best_selected_this_run {
+        load_planner_checkpoint(
+            &mut planner_vs,
+            &best_path,
+            &world_lineage,
+            Some(args.horizon),
+            None,
+        )?;
+        let test_endpoints = dataset.deterministic_ticker_stratified_endpoints(
+            PlannerDataSplit::Test,
+            HELD_OUT_ENDPOINTS,
+            context_bars,
+            args.rollout_length,
+        )?;
+        let (test_summary, test_metrics) = evaluate_real_endpoints(
+            &planner,
+            &world_model,
+            &dataset,
+            &test_endpoints,
+            args.horizon,
+            args.rollout_length,
+            context_bars,
+            device,
+        )?;
+        write_inference_csv(&best_path, PlannerDataSplit::Test, &test_summary)?;
+        println!(
+            "planner selected test episodes={} median_wealth={:.6} mean_drawdown={:.6} mean_turnover={:.6}",
+            test_summary.episodes.len(),
+            test_metrics.median_wealth_ratio,
+            test_metrics.mean_max_drawdown,
+            test_metrics.mean_turnover,
+        );
+    } else if best_validation.is_none() {
+        eprintln!("planner produced no checkpoint passing real validation drawdown/turnover gates");
     }
     Ok(())
 }
@@ -265,14 +444,15 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
         .map(PathBuf::from)
         .unwrap_or_else(|| world_model_metadata_path(&args.world_model_weights));
     let world_model = LejepaWorldModel::load(&args.world_model_weights, metadata_path, device)?;
-    let world_hash = world_model.metadata().checkpoint_sha256.clone();
+    let world_lineage = world_model.lineage_sha256().to_owned();
     let mut planner_vs = nn::VarStore::new(device);
     let planner = WorldModelPlanner::new(&planner_vs.root());
     let checkpoint_metadata = load_planner_checkpoint(
         &mut planner_vs,
         &args.planner_weights,
-        &world_hash,
+        &world_lineage,
         args.horizon,
+        None,
     )?;
     planner_vs.freeze();
     let horizon = args.horizon.unwrap_or(checkpoint_metadata.horizon);
@@ -330,6 +510,7 @@ fn collect_mixed_rollout(
     planner: &WorldModelPlanner,
     world_model: &LejepaWorldModel,
     dataset: &PlannerDataset,
+    hl_gauss: &HlGaussBins,
     horizon: usize,
     rollout_length: usize,
     environments: usize,
@@ -354,24 +535,27 @@ fn collect_mixed_rollout(
         device,
     )?;
     let fantasy_session = world_model.start_session(&fantasy_context)?;
-    let fantasy_prediction =
+    let mut fantasy_prediction =
         fantasy_session.forecast(world_model, (horizon + rollout_length) as i64)?;
+    validate_prediction_finite(&fantasy_prediction)?;
     let real_context =
         dataset.contexts(&real_endpoints, &vec![0; per_source], context_bars, device)?;
     let mut real_session = world_model.start_session(&real_context)?;
+    let fantasy_clamp_mask = sanitize_fantasy_close_deltas(&mut fantasy_prediction)?;
     let fantasy_closes = fantasy_close_paths(dataset, &fantasy_endpoints, &fantasy_prediction)?;
     let mut portfolios = (0..environments)
         .map(|_| PlannerPortfolio::new(100.0))
         .collect::<Vec<_>>();
     let mut pending = (0..environments)
-        .map(|_| None::<PendingTransition>)
+        .map(|_| None::<PlannerTransition>)
         .collect::<Vec<_>>();
-    let mut rollout = MixedRollout::new(per_source * rollout_length)?;
+    let world_lineage = world_model.lineage_sha256().to_owned();
+    let mut rollout = MixedRollout::new(per_source * rollout_length, world_lineage)?;
     let relative_horizon = relative_horizon(environments, horizon, device);
-    let world_hash = &world_model.metadata().checkpoint_sha256;
 
     for decision in 0..=rollout_length {
         let real_prediction = real_session.forecast(world_model, horizon as i64)?;
+        validate_prediction_finite(&real_prediction)?;
         let latent = Tensor::cat(
             &[
                 real_prediction.latent.shallow_clone(),
@@ -413,10 +597,10 @@ fn collect_mixed_rollout(
                 .flat_map(|(portfolio, &price)| portfolio.planner_state(price))
                 .collect::<Vec<_>>(),
         )
-        .view([environments as i64, 4])
+        .view([environments as i64, PLANNER_PORTFOLIO_DIM])
         .to_device(device);
         let output = tch::no_grad(|| {
-            planner.forward(&WorldModelPlannerInput {
+            planner.forward_mixed_precision(&WorldModelPlannerInput {
                 forecast: PlannerForecast {
                     latent: latent.shallow_clone(),
                     ohlc_mean: mean.shallow_clone(),
@@ -426,7 +610,15 @@ fn collect_mixed_rollout(
                 portfolio_state: portfolio_state.shallow_clone(),
             })
         });
-        let values = HlGaussBins::default_for(device).decode(&output.value_logits);
+        let sources = Tensor::arange(environments as i64, (Kind::Int64, device))
+            .ge(per_source as i64)
+            .to_kind(Kind::Int64);
+        let routed_logits = route_value_logits(
+            &output.real_value_logits,
+            &output.fantasy_value_logits,
+            &sources,
+        );
+        let values_cpu = hl_gauss.decode(&routed_logits).to_device(Device::Cpu);
         let stored_latent = latent.to_device(Device::Cpu).detach();
         let stored_mean = mean.to_device(Device::Cpu).detach();
         let stored_logvar = logvar.to_device(Device::Cpu).detach();
@@ -434,27 +626,10 @@ fn collect_mixed_rollout(
         let stored_portfolio = portfolio_state.to_device(Device::Cpu).detach();
 
         for environment in 0..environments {
-            if let Some(previous) = pending[environment].take() {
-                rollout.push(PlannerTransition {
-                    observation: previous.observation,
-                    source: previous.source,
-                    environment_id: previous.environment_id,
-                    decision_index: previous.decision_index,
-                    action: previous.action,
-                    old_alpha: previous.old_alpha,
-                    old_beta: previous.old_beta,
-                    old_log_prob: previous.old_log_prob,
-                    value: previous.value,
-                    next_value: values.get(environment as i64).to_device(Device::Cpu),
-                    reward: previous.reward,
-                    terminated: false,
-                    truncated: decision == rollout_length,
-                    commission: previous.commission,
-                    turnover: previous.turnover,
-                    assets_before: previous.assets_before,
-                    assets_after: previous.assets_after,
-                    world_model_hash: world_hash.clone(),
-                })?;
+            if let Some(mut previous) = pending[environment].take() {
+                previous.next_value = Some(values_cpu.get(environment as i64));
+                previous.truncated = decision == rollout_length;
+                rollout.push(previous)?;
             }
         }
         if decision == rollout_length {
@@ -463,6 +638,10 @@ fn collect_mixed_rollout(
 
         let actions = sample_beta_action(&output.alpha, &output.beta);
         let log_probs = beta_log_prob(&actions, &output.alpha, &output.beta);
+        let actions_cpu = actions.to_device(Device::Cpu);
+        let alpha_cpu = output.alpha.to_device(Device::Cpu);
+        let beta_cpu = output.beta.to_device(Device::Cpu);
+        let log_probs_cpu = log_probs.to_device(Device::Cpu);
         for environment in 0..environments {
             let source = if environment < per_source {
                 RolloutSource::Real
@@ -475,10 +654,10 @@ fn collect_mixed_rollout(
             } else {
                 fantasy_closes[environment - per_source][decision + 1]
             };
-            let action = actions.double_value(&[environment as i64, 0]);
+            let action = actions_cpu.double_value(&[environment as i64, 0]);
             let step =
                 portfolios[environment].step(action, current_prices[environment], next_price);
-            pending[environment] = Some(PendingTransition {
+            pending[environment] = Some(PlannerTransition {
                 observation: observation_at(
                     &stored_latent,
                     &stored_mean,
@@ -490,16 +669,24 @@ fn collect_mixed_rollout(
                 source,
                 environment_id: environment,
                 decision_index: decision,
-                action: actions.get(environment as i64).to_device(Device::Cpu),
-                old_alpha: output.alpha.get(environment as i64).to_device(Device::Cpu),
-                old_beta: output.beta.get(environment as i64).to_device(Device::Cpu),
-                old_log_prob: log_probs.get(environment as i64).to_device(Device::Cpu),
-                value: values.get(environment as i64).to_device(Device::Cpu),
+                action: actions_cpu.get(environment as i64),
+                old_alpha: alpha_cpu.get(environment as i64),
+                old_beta: beta_cpu.get(environment as i64),
+                old_log_prob: log_probs_cpu.get(environment as i64),
+                value: values_cpu.get(environment as i64),
+                next_value: None,
                 reward: step.reward as f32,
+                // Long-only, no-leverage portfolio: total assets stay strictly
+                // positive every step, so an episode never terminates; it can
+                // only truncate at the rollout horizon.
+                terminated: false,
+                truncated: false,
                 commission: step.commission,
                 turnover: step.turnover,
                 assets_before: step.assets_before,
                 assets_after: step.assets_after,
+                fantasy_clamped: source == RolloutSource::Fantasy
+                    && fantasy_clamp_mask[environment - per_source][decision],
             });
         }
         let actual_next_bars =
@@ -514,6 +701,7 @@ fn collect_mixed_rollout(
 fn optimize_rollout(
     planner: &WorldModelPlanner,
     rollout: &MixedRollout,
+    batch: &PlannerBatch,
     advantages: &Tensor,
     returns: &Tensor,
     minibatch_size: usize,
@@ -523,25 +711,30 @@ fn optimize_rollout(
     trainable_vars: &[Tensor],
     optimizer: &mut Muon,
     optimizer_steps: &mut u64,
+    kl_controller: &mut KlLrController,
     device: Device,
 ) -> Result<OptimizationSummary> {
-    let batch = rollout.to_batch(device)?;
     let mut summary = OptimizationSummary::default();
-    let rollout_diagnostics = split_optimization_metrics(
+    let diagnostics = split_critic_diagnostics(
         &batch.sources,
-        &batch.actions,
-        &batch.old_alpha,
-        &batch.old_beta,
         &batch.old_alpha,
         &batch.old_beta,
         &batch.values,
         returns,
     );
-    summary.real_beta_concentration = rollout_diagnostics.real.beta_concentration_mean;
-    summary.fantasy_beta_concentration = rollout_diagnostics.fantasy.beta_concentration_mean;
-    summary.real_critic_explained_variance = rollout_diagnostics.real.critic_explained_variance;
-    summary.fantasy_critic_explained_variance =
-        rollout_diagnostics.fantasy.critic_explained_variance;
+    summary.real_beta_concentration = diagnostics.real.beta_concentration_mean;
+    summary.fantasy_beta_concentration = diagnostics.fantasy.beta_concentration_mean;
+    summary.real_critic_explained_variance = diagnostics.real.critic_explained_variance;
+    summary.fantasy_critic_explained_variance = diagnostics.fantasy.critic_explained_variance;
+
+    let mut actor_loss_sum = Tensor::zeros([], (Kind::Float, device));
+    let mut critic_loss_sum = Tensor::zeros([], (Kind::Float, device));
+    let mut reverse_kl_sum = Tensor::zeros([], (Kind::Float, device));
+    let mut entropy_sum = Tensor::zeros([], (Kind::Float, device));
+    let mut actor_grad_sum = Tensor::zeros([], (Kind::Float, device));
+    let mut critic_grad_sum = Tensor::zeros([], (Kind::Float, device));
+    apply_lr_scale(optimizer, kl_controller.scale());
+    let mut actor_stopped = false;
     for epoch in 0..DEFAULT_PLANNER_OPTIMIZATION_EPOCHS {
         for indices in
             rollout.balanced_minibatch_indices(minibatch_size, seed ^ ((epoch as u64 + 1) << 32))?
@@ -550,10 +743,12 @@ fn optimize_rollout(
             let index = Tensor::from_slice(&indices).to_device(device);
             let mini_advantages = advantages.index_select(0, &index);
             let mini_returns = returns.index_select(0, &index);
-            let output = planner.forward(&planner_input(&mini));
+            let output = planner.forward_mixed_precision(&planner_input(&mini));
             let losses = planner_actor_critic_losses(
                 hl_gauss,
-                &output.value_logits,
+                &output.real_value_logits,
+                &output.fantasy_value_logits,
+                &mini.sources,
                 &output.alpha,
                 &output.beta,
                 &mini.actions,
@@ -561,8 +756,15 @@ fn optimize_rollout(
                 &mini.old_beta,
                 &mini_advantages,
                 &mini_returns,
-                PlannerLossConfig::default(),
             );
+            let minibatch_kl = losses.reverse_kl.double_value(&[]);
+            if !actor_stopped {
+                summary.max_reverse_kl = summary.max_reverse_kl.max(minibatch_kl);
+            }
+            if !actor_stopped && summary.actor_steps > 0 && minibatch_kl > TARGET_KL {
+                actor_stopped = true;
+                summary.kl_early_stopped = true;
+            }
             optimizer.zero_grad();
             let (actor_norm, critic_norm) = backward_actor_critic_with_separate_clips(
                 clip_groups,
@@ -571,80 +773,78 @@ fn optimize_rollout(
                 &losses.critic_loss,
                 MAX_GRAD_NORM,
                 device,
-                false,
+                actor_stopped,
             );
             optimizer.set_momentum(muon_momentum_for_step(*optimizer_steps as i64));
             optimizer.step();
             *optimizer_steps += 1;
-            summary.actor_loss += losses.actor_loss.double_value(&[]);
-            summary.critic_loss += losses.critic_loss.double_value(&[]);
-            summary.reverse_kl += losses.reverse_kl.double_value(&[]);
-            summary.entropy += losses.entropy.double_value(&[]);
-            summary.actor_grad_norm += actor_norm.double_value(&[]);
-            summary.critic_grad_norm += critic_norm.double_value(&[]);
+            if !actor_stopped {
+                actor_loss_sum += losses.actor_loss.detach();
+                reverse_kl_sum += losses.reverse_kl.detach();
+                entropy_sum += losses.entropy.detach();
+                actor_grad_sum += actor_norm.detach();
+                summary.actor_steps += 1;
+            }
+            critic_loss_sum += losses.critic_loss.detach();
+            critic_grad_sum += critic_norm.detach();
             summary.steps += 1;
         }
     }
-    let denominator = summary.steps as f64;
-    summary.actor_loss /= denominator;
-    summary.critic_loss /= denominator;
-    summary.reverse_kl /= denominator;
-    summary.entropy /= denominator;
-    summary.actor_grad_norm /= denominator;
-    summary.critic_grad_norm /= denominator;
+    let critic_denominator = summary.steps as f64;
+    let actor_denominator = summary.actor_steps.max(1) as f64;
+    summary.actor_loss = actor_loss_sum.double_value(&[]) / actor_denominator;
+    summary.critic_loss = critic_loss_sum.double_value(&[]) / critic_denominator;
+    summary.reverse_kl = reverse_kl_sum.double_value(&[]) / actor_denominator;
+    summary.entropy = entropy_sum.double_value(&[]) / actor_denominator;
+    summary.actor_grad_norm = actor_grad_sum.double_value(&[]) / actor_denominator;
+    summary.critic_grad_norm = critic_grad_sum.double_value(&[]) / critic_denominator;
+    kl_controller.observe(summary.max_reverse_kl);
     Ok(summary)
 }
 
 fn rollout_advantages(
     rollout: &MixedRollout,
+    batch: &PlannerBatch,
     rollout_length: usize,
     environments: usize,
     device: Device,
 ) -> Result<(Tensor, Tensor)> {
     let len = rollout_length * environments;
-    let mut rewards = vec![0.0f32; len];
-    let mut values = vec![0.0f32; len];
-    let mut next_values = vec![0.0f32; len];
-    let mut terminated = vec![0.0f32; len];
-    let mut truncated = vec![0.0f32; len];
+    if rollout.len() != len {
+        bail!(
+            "planner rollout is not dense: expected {len} transitions, got {}",
+            rollout.len()
+        );
+    }
+    // Map each transition (in push order) to its [decision, environment] slot and
+    // assert the rollout is a dense rectangle: every slot filled exactly once.
+    let mut slots = Vec::with_capacity(len);
+    let mut seen = vec![false; len];
     for transition in rollout.transitions() {
         let slot = transition.decision_index * environments + transition.environment_id;
-        if slot >= len {
-            bail!("planner transition index exceeds GAE tensor");
+        if slot >= len || seen[slot] {
+            bail!("planner rollout is not a dense [rollout_length, environments] grid");
         }
-        rewards[slot] = transition.reward;
-        values[slot] = transition.value.double_value(&[]) as f32;
-        next_values[slot] = transition.next_value.double_value(&[]) as f32;
-        terminated[slot] = transition.terminated as u8 as f32;
-        truncated[slot] = transition.truncated as u8 as f32;
+        seen[slot] = true;
+        slots.push(slot as i64);
     }
+    let slot_index = Tensor::from_slice(&slots).to_device(device);
     let shape = [rollout_length as i64, environments as i64];
-    let (advantages, returns) = compute_default_planner_gae(
-        &Tensor::from_slice(&rewards).view(shape).to_device(device),
-        &Tensor::from_slice(&values).view(shape).to_device(device),
-        &Tensor::from_slice(&next_values)
-            .view(shape)
-            .to_device(device),
-        &Tensor::from_slice(&terminated)
-            .view(shape)
-            .to_device(device),
-        &Tensor::from_slice(&truncated).view(shape).to_device(device),
+    // Scatter push-ordered batch fields into grid order, run GAE on-device, then
+    // gather advantages/returns back into push order — no host readback.
+    let to_grid = |source: &Tensor| {
+        Tensor::zeros([len as i64], (Kind::Float, device)).index_copy(0, &slot_index, source)
+    };
+    let (advantages, returns) = compute_planner_gae(
+        &to_grid(&batch.rewards).view(shape),
+        &to_grid(&batch.values).view(shape),
+        &to_grid(&batch.next_values).view(shape),
+        &to_grid(&batch.terminated).view(shape),
+        &to_grid(&batch.truncated).view(shape),
     );
-    let mut rollout_advantages = Vec::with_capacity(rollout.len());
-    let mut rollout_returns = Vec::with_capacity(rollout.len());
-    for transition in rollout.transitions() {
-        rollout_advantages.push(advantages.double_value(&[
-            transition.decision_index as i64,
-            transition.environment_id as i64,
-        ]) as f32);
-        rollout_returns.push(returns.double_value(&[
-            transition.decision_index as i64,
-            transition.environment_id as i64,
-        ]) as f32);
-    }
     Ok((
-        Tensor::from_slice(&rollout_advantages).to_device(device),
-        Tensor::from_slice(&rollout_returns).to_device(device),
+        advantages.view([len as i64]).index_select(0, &slot_index),
+        returns.view([len as i64]).index_select(0, &slot_index),
     ))
 }
 
@@ -663,18 +863,26 @@ fn infer_real_episode(
     let mut reward_sum = 0.0;
     let mut turnover = 0.0;
     let mut action_sum = 0.0;
+    let mut peak_assets: f64 = 100.0;
+    let mut max_drawdown: f64 = 0.0;
     let relative_horizon = relative_horizon(1, horizon, device);
     let context = dataset.contexts(&[endpoint], &[0], context_bars, device)?;
     let mut session = world_model.start_session(&context)?;
     for decision in 0..rollout_length {
         let prediction = session.forecast(world_model, horizon as i64)?;
+        validate_prediction_finite(&prediction).with_context(|| {
+            format!(
+                "invalid world-model forecast for {} at decision {decision}",
+                dataset.series(endpoint.series).ticker
+            )
+        })?;
         let series = dataset.series(endpoint.series);
         let current_price = series.closes[endpoint.bar + decision];
         let portfolio_state = Tensor::from_slice(&portfolio.planner_state(current_price))
-            .view([1, 4])
+            .view([1, PLANNER_PORTFOLIO_DIM])
             .to_device(device);
         let output = tch::no_grad(|| {
-            planner.forward(&WorldModelPlannerInput {
+            planner.forward_mixed_precision(&WorldModelPlannerInput {
                 forecast: PlannerForecast {
                     latent: prediction.latent,
                     ohlc_mean: prediction.ohlc_mean,
@@ -693,6 +901,8 @@ fn infer_real_episode(
         reward_sum += step.reward;
         turnover += step.turnover;
         action_sum += action;
+        peak_assets = peak_assets.max(step.assets_after);
+        max_drawdown = max_drawdown.max(1.0 - step.assets_after / peak_assets);
         let actual_next_bar = dataset.contexts(&[endpoint], &[decision + 1], 1, device)?;
         session.append_actual_bar(world_model, &actual_next_bar)?;
     }
@@ -707,6 +917,7 @@ fn infer_real_episode(
         commissions: portfolio.total_commissions,
         turnover_mean: turnover / rollout_length as f64,
         action_mean: action_sum / rollout_length as f64,
+        max_drawdown,
     })
 }
 
@@ -727,6 +938,13 @@ fn relative_horizon(batch: usize, horizon: usize, device: Device) -> Tensor {
         .view([1, horizon as i64, 1])
         .expand([batch as i64, horizon as i64, 1], false)
         / horizon as f64
+}
+
+fn update_seed(base_seed: u64, cumulative_update: u64, stream: u64) -> u64 {
+    let mut value = base_seed ^ cumulative_update.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ stream;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn observation_at(
@@ -760,16 +978,48 @@ fn fantasy_close_paths(
         closes.push(dataset.series(endpoint.series).closes[endpoint.bar]);
         for step in 0..steps {
             let delta = means.double_value(&[batch as i64, step as i64, 3]);
-            let multiplier = if delta.is_finite() {
-                (1.0 + delta).clamp(1e-4, 100.0)
-            } else {
-                1.0
-            };
-            closes.push(closes.last().copied().unwrap() * multiplier);
+            let multiplier = 1.0 + delta;
+            let next = closes.last().copied().unwrap() * multiplier;
+            if !next.is_finite() || next <= 0.0 {
+                bail!("fantasy close path became invalid for batch {batch} at step {step}: {next}");
+            }
+            closes.push(next);
         }
         result.push(closes);
     }
     Ok(result)
+}
+
+fn sanitize_fantasy_close_deltas(prediction: &mut WorldModelPrediction) -> Result<Vec<Vec<bool>>> {
+    let close = prediction.ohlc_mean.narrow(2, 3, 1);
+    if close.isfinite().all().int64_value(&[]) == 0 {
+        bail!("fantasy close prediction contains NaN or infinity");
+    }
+    let clamped = close.clamp(FANTASY_CLOSE_DELTA_MIN, FANTASY_CLOSE_DELTA_MAX);
+    let changed = close.ne_tensor(&clamped).to_device(Device::Cpu);
+    tch::no_grad(|| prediction.ohlc_mean.narrow(2, 3, 1).copy_(&clamped));
+    let batch = changed.size()[0] as usize;
+    let steps = changed.size()[1] as usize;
+    Ok((0..batch)
+        .map(|b| {
+            (0..steps)
+                .map(|step| changed.int64_value(&[b as i64, step as i64, 0]) != 0)
+                .collect()
+        })
+        .collect())
+}
+
+fn validate_prediction_finite(prediction: &WorldModelPrediction) -> Result<()> {
+    for (name, tensor) in [
+        ("latent", &prediction.latent),
+        ("OHLC mean", &prediction.ohlc_mean),
+        ("OHLC log-variance", &prediction.ohlc_logvar),
+    ] {
+        if tensor.isfinite().all().int64_value(&[]) == 0 {
+            bail!("world-model {name} prediction contains NaN or infinity");
+        }
+    }
+    Ok(())
 }
 
 fn current_prices(
@@ -809,22 +1059,156 @@ fn validate_train_args(args: &TrainPlannerArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn evaluate_real_endpoints(
+    planner: &WorldModelPlanner,
+    world_model: &LejepaWorldModel,
+    dataset: &PlannerDataset,
+    endpoints: &[PlannerEndpoint],
+    horizon: usize,
+    rollout_length: usize,
+    context_bars: usize,
+    device: Device,
+) -> Result<(PlannerInferenceSummary, HeldOutMetrics)> {
+    let mut episodes = Vec::with_capacity(endpoints.len());
+    for &endpoint in endpoints {
+        episodes.push(infer_real_episode(
+            planner,
+            world_model,
+            dataset,
+            endpoint,
+            horizon,
+            rollout_length,
+            context_bars,
+            device,
+        )?);
+    }
+    let count = episodes.len() as f64;
+    let mean_reward = episodes
+        .iter()
+        .map(|episode| episode.reward_sum)
+        .sum::<f64>()
+        / count;
+    let mean_final_wealth_ratio = episodes
+        .iter()
+        .map(|episode| episode.final_wealth_ratio)
+        .sum::<f64>()
+        / count;
+    let mut wealth = episodes
+        .iter()
+        .map(|episode| episode.final_wealth_ratio)
+        .collect::<Vec<_>>();
+    wealth.sort_by(f64::total_cmp);
+    let median_wealth_ratio = if wealth.len() % 2 == 0 {
+        (wealth[wealth.len() / 2 - 1] + wealth[wealth.len() / 2]) * 0.5
+    } else {
+        wealth[wealth.len() / 2]
+    };
+    let metrics = HeldOutMetrics {
+        median_wealth_ratio,
+        mean_max_drawdown: episodes
+            .iter()
+            .map(|episode| episode.max_drawdown)
+            .sum::<f64>()
+            / count,
+        mean_turnover: episodes
+            .iter()
+            .map(|episode| episode.turnover_mean)
+            .sum::<f64>()
+            / count,
+    };
+    Ok((
+        PlannerInferenceSummary {
+            episodes,
+            mean_reward,
+            mean_final_wealth_ratio,
+        },
+        metrics,
+    ))
+}
+
+fn best_checkpoint_path(checkpoint: impl AsRef<Path>) -> PathBuf {
+    let checkpoint = checkpoint.as_ref();
+    let stem = checkpoint
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("planner");
+    checkpoint.with_file_name(format!("{stem}_best.ot"))
+}
+
+fn validation_metrics_path(checkpoint: impl AsRef<Path>) -> PathBuf {
+    checkpoint.as_ref().with_extension("validation.csv")
+}
+
+fn append_validation_metrics(
+    checkpoint: impl AsRef<Path>,
+    update: u64,
+    metrics: HeldOutMetrics,
+    selected: bool,
+) -> Result<()> {
+    let path = validation_metrics_path(checkpoint);
+    let write_header = fs::metadata(&path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(true);
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if write_header {
+        writeln!(
+            file,
+            "update,median_wealth_ratio,mean_max_drawdown,mean_turnover,eligible,selected"
+        )?;
+    }
+    writeln!(
+        file,
+        "{update},{},{},{},{},{}",
+        metrics.median_wealth_ratio,
+        metrics.mean_max_drawdown,
+        metrics.mean_turnover,
+        metrics.eligible(),
+        selected,
+    )?;
+    Ok(())
+}
+
+fn load_best_validation_metrics(checkpoint: impl AsRef<Path>) -> Option<HeldOutMetrics> {
+    let contents = fs::read_to_string(validation_metrics_path(checkpoint)).ok()?;
+    contents
+        .lines()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .find_map(|line| {
+            let fields = line.split(',').collect::<Vec<_>>();
+            if fields.len() != 6 || fields[5] != "true" {
+                return None;
+            }
+            Some(HeldOutMetrics {
+                median_wealth_ratio: fields[1].parse().ok()?,
+                mean_max_drawdown: fields[2].parse().ok()?,
+                mean_turnover: fields[3].parse().ok()?,
+            })
+        })
+}
+
 fn print_training_metrics(
-    update: usize,
+    update: u64,
     rollout: &RolloutMetrics,
     optimization: OptimizationSummary,
 ) {
     println!(
-        "planner update={update} real_reward={:.6} fantasy_reward={:.6} real_wealth={:.6} fantasy_wealth={:.6} real_turnover={:.6} fantasy_turnover={:.6} actor_loss={:.6} critic_loss={:.6} kl={:.6} entropy={:.6} real_critic_ev={:.4} fantasy_critic_ev={:.4} actor_grad={:.6} critic_grad={:.6}",
+        "planner update={update} real_reward={:.6} fantasy_reward={:.6} real_wealth={:.6} fantasy_wealth={:.6} real_turnover={:.6} fantasy_turnover={:.6} fantasy_clamp={:.6} actor_loss={:.6} critic_loss={:.6} kl={:.6} max_kl={:.6} kl_stop={} entropy={:.6} real_critic_ev={:.4} fantasy_critic_ev={:.4} actor_grad={:.6} critic_grad={:.6}",
         rollout.real.reward_mean,
         rollout.fantasy.reward_mean,
         rollout.real.mean_environment_wealth_ratio,
         rollout.fantasy.mean_environment_wealth_ratio,
         rollout.real.turnover_mean,
         rollout.fantasy.turnover_mean,
+        rollout.fantasy.fantasy_clamp_fraction,
         optimization.actor_loss,
         optimization.critic_loss,
         optimization.reverse_kl,
+        optimization.max_reverse_kl,
+        optimization.kl_early_stopped,
         optimization.entropy,
         optimization.real_critic_explained_variance,
         optimization.fantasy_critic_explained_variance,
@@ -835,7 +1219,7 @@ fn print_training_metrics(
 
 fn append_training_metrics(
     planner_checkpoint: impl AsRef<Path>,
-    update: usize,
+    update: u64,
     rollout: &RolloutMetrics,
     optimization: OptimizationSummary,
 ) -> Result<()> {
@@ -850,12 +1234,12 @@ fn append_training_metrics(
     if write_header {
         writeln!(
             file,
-            "update,real_reward_mean,fantasy_reward_mean,real_wealth_ratio,fantasy_wealth_ratio,real_turnover_mean,fantasy_turnover_mean,real_commissions,fantasy_commissions,real_action_mean,fantasy_action_mean,real_action_boundary_fraction,fantasy_action_boundary_fraction,real_beta_concentration,fantasy_beta_concentration,real_critic_explained_variance,fantasy_critic_explained_variance,actor_loss,critic_loss,reverse_kl,entropy,actor_grad_norm,critic_grad_norm"
+            "update,real_reward_mean,fantasy_reward_mean,real_wealth_ratio,fantasy_wealth_ratio,real_turnover_mean,fantasy_turnover_mean,real_commissions,fantasy_commissions,real_action_mean,fantasy_action_mean,real_action_boundary_fraction,fantasy_action_boundary_fraction,fantasy_clamp_fraction,real_beta_concentration,fantasy_beta_concentration,real_critic_explained_variance,fantasy_critic_explained_variance,actor_loss,critic_loss,reverse_kl,max_reverse_kl,kl_early_stopped,entropy,actor_grad_norm,critic_grad_norm"
         )?;
     }
     writeln!(
         file,
-        "{update},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{update},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         rollout.real.reward_mean,
         rollout.fantasy.reward_mean,
         rollout.real.mean_environment_wealth_ratio,
@@ -868,6 +1252,7 @@ fn append_training_metrics(
         rollout.fantasy.action_mean,
         rollout.real.action_boundary_fraction,
         rollout.fantasy.action_boundary_fraction,
+        rollout.fantasy.fantasy_clamp_fraction,
         optimization.real_beta_concentration,
         optimization.fantasy_beta_concentration,
         optimization.real_critic_explained_variance,
@@ -875,6 +1260,8 @@ fn append_training_metrics(
         optimization.actor_loss,
         optimization.critic_loss,
         optimization.reverse_kl,
+        optimization.max_reverse_kl,
+        optimization.kl_early_stopped,
         optimization.entropy,
         optimization.actor_grad_norm,
         optimization.critic_grad_norm,
@@ -891,12 +1278,12 @@ fn write_inference_csv(
     let mut file = File::create(&path)?;
     writeln!(
         file,
-        "split,episode,ticker,start_bar,steps,reward_sum,final_wealth_ratio,commissions,turnover_mean,action_mean"
+        "split,episode,ticker,start_bar,steps,reward_sum,final_wealth_ratio,commissions,turnover_mean,action_mean,max_drawdown"
     )?;
     for (index, episode) in summary.episodes.iter().enumerate() {
         writeln!(
             file,
-            "{split:?},{index},{},{},{},{},{},{},{},{}",
+            "{split:?},{index},{},{},{},{},{},{},{},{},{}",
             episode.ticker,
             episode.start_bar,
             episode.steps,
@@ -905,6 +1292,7 @@ fn write_inference_csv(
             episode.commissions,
             episode.turnover_mean,
             episode.action_mean,
+            episode.max_drawdown,
         )?;
     }
     Ok(())
@@ -939,6 +1327,89 @@ mod tests {
             prices.push(prices.last().copied().unwrap() * (1.0 + delta));
         }
         assert_eq!(prices, vec![100.0, 110.00000000000001, 55.00000000000001]);
+    }
+
+    #[test]
+    fn fantasy_sanitization_changes_both_presented_and_executed_close_delta() {
+        let mut prediction = WorldModelPrediction {
+            latent: Tensor::zeros([1, 2, 256], (Kind::Float, Device::Cpu)),
+            ohlc_mean: Tensor::zeros([1, 2, 16], (Kind::Float, Device::Cpu)),
+            ohlc_logvar: Tensor::zeros([1, 2, 16], (Kind::Float, Device::Cpu)),
+        };
+        let _ = prediction.ohlc_mean.get(0).get(0).get(3).fill_(-2.0);
+        let _ = prediction.ohlc_mean.get(0).get(1).get(3).fill_(120.0);
+        let mask = sanitize_fantasy_close_deltas(&mut prediction).unwrap();
+        assert_eq!(mask, vec![vec![true, true]]);
+        assert!((prediction.ohlc_mean.double_value(&[0, 0, 3]) + 0.25).abs() < 1e-6);
+        assert_eq!(prediction.ohlc_mean.double_value(&[0, 1, 3]), 0.25);
+    }
+
+    #[test]
+    fn fantasy_sanitization_rejects_non_finite_close_delta() {
+        let mut prediction = WorldModelPrediction {
+            latent: Tensor::zeros([1, 1, 256], (Kind::Float, Device::Cpu)),
+            ohlc_mean: Tensor::full([1, 1, 16], f64::NAN, (Kind::Float, Device::Cpu)),
+            ohlc_logvar: Tensor::zeros([1, 1, 16], (Kind::Float, Device::Cpu)),
+        };
+        assert!(sanitize_fantasy_close_deltas(&mut prediction).is_err());
+    }
+
+    #[test]
+    fn update_seeds_are_stable_and_do_not_repeat_after_resume() {
+        let first = update_seed(7, 1, 11);
+        assert_eq!(first, update_seed(7, 1, 11));
+        assert_ne!(first, update_seed(7, 2, 11));
+        assert_ne!(first, update_seed(7, 1, 12));
+    }
+
+    #[test]
+    fn validation_gates_drawdown_and_turnover_before_wealth_selection() {
+        let eligible = HeldOutMetrics {
+            median_wealth_ratio: 1.1,
+            mean_max_drawdown: 0.2,
+            mean_turnover: 0.1,
+        };
+        assert!(eligible.eligible());
+        assert!(!HeldOutMetrics {
+            mean_max_drawdown: 0.31,
+            ..eligible
+        }
+        .eligible());
+        assert!(!HeldOutMetrics {
+            mean_turnover: 0.51,
+            ..eligible
+        }
+        .eligible());
+    }
+
+    #[test]
+    fn validation_log_restores_only_the_last_selected_real_score() {
+        let checkpoint = std::env::temp_dir().join(format!(
+            "planner-validation-{}-{}.ot",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let first = HeldOutMetrics {
+            median_wealth_ratio: 1.05,
+            mean_max_drawdown: 0.1,
+            mean_turnover: 0.2,
+        };
+        let later_unselected = HeldOutMetrics {
+            median_wealth_ratio: 0.9,
+            mean_max_drawdown: 0.1,
+            mean_turnover: 0.2,
+        };
+        append_validation_metrics(&checkpoint, 50, first, true).unwrap();
+        append_validation_metrics(&checkpoint, 100, later_unselected, false).unwrap();
+        assert_eq!(load_best_validation_metrics(&checkpoint), Some(first));
+        assert_eq!(
+            best_checkpoint_path(&checkpoint),
+            checkpoint.with_file_name(format!(
+                "{}_best.ot",
+                checkpoint.file_stem().unwrap().to_str().unwrap()
+            ))
+        );
+        let _ = fs::remove_file(validation_metrics_path(&checkpoint));
     }
 
     #[test]

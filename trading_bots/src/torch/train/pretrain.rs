@@ -17,7 +17,13 @@ use crate::torch::env::{Env, OHLC_BAR_FEATURES};
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelVariant, RotaryEmbedding, TradingModel, TradingModelConfig};
 use crate::torch::optim::muon::{Muon, MuonConfig};
-use crate::torch::world_model::{world_model_metadata_path, WorldModelMetadata};
+use crate::torch::world_model::{
+    world_model_metadata_path, LejepaWorldModel, WorldModelMetadata, LEJEPA_AR_FF_DIM,
+    LEJEPA_AR_LAYERS, LEJEPA_CACHE_CONTRACT, LEJEPA_FLOW_BLOCKS, LEJEPA_FLOW_COND_DIM,
+    LEJEPA_FLOW_HIDDEN, LEJEPA_HEADS, LEJEPA_HEAD_DIM, LEJEPA_K_MAX, LEJEPA_LATENT_BOUND,
+    LEJEPA_MEAN_SIGNAL_LEVEL, LEJEPA_NORMALIZATION_EPS, LEJEPA_PROBE_LOGVAR_LIMIT,
+    LEJEPA_PROJECTOR_HIDDEN_DIM, LEJEPA_ROPE_DIMS, LEJEPA_SIGNAL_EMBED_DIM, OHLC_FEATURE_SCALE,
+};
 use shared::{
     paths::RUNS_PATH,
     report::{CandleBar, Report, ReportKind, ReportSeries, ScaleKind},
@@ -36,12 +42,11 @@ const LEJEPA_ROLLOUT_BARS: i64 = 100;
 const LEJEPA_ROLLOUT_EVAL_WINDOWS: usize = 64;
 const LEJEPA_PROBE_LR: f64 = 1e-3;
 const LEJEPA_WEIGHT_DECAY: f64 = 1e-3;
-const LEJEPA_AR_LAYERS: usize = 6;
-const LEJEPA_AR_FF_DIM: i64 = 1536;
-const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
-const LEJEPA_HEAD_DIM: i64 = 64;
-const LEJEPA_ROPE_DIMS: i64 = 32;
-
+const LEJEPA_ROLLOUT_STEPS: i64 = 8;
+const LEJEPA_ROLLOUT_STEP_SIZE: i64 = LEJEPA_K_MAX / LEJEPA_ROLLOUT_STEPS;
+const LEJEPA_ROLLOUT_EVAL_SAMPLES: usize = 16;
+const LEJEPA_CTX_NOISE_MIX: f64 = 0.1;
+const LEJEPA_SELF_COND_PROB: f64 = 0.25;
 /// Number of fixed validation windows tracked by the candle-snapshot diagnostic.
 const CANDLE_SNAPSHOT_WINDOWS: usize = 4;
 /// Fixed seed so the candle-snapshot windows are the same for a whole run.
@@ -61,6 +66,7 @@ pub struct PretrainArgs {
     pub run: Option<String>,
     pub epochs: usize,
     pub steps: Option<usize>,
+    pub eval_skill_only: bool,
     pub batch_size: usize,
     pub k_patches: usize,
     pub objective: PretrainObjective,
@@ -92,6 +98,59 @@ struct LejepaBarPredictions {
     belief: Tensor,
 }
 
+struct LejepaFlowBlock {
+    mod_fc: nn::Linear,
+    fc1: nn::Linear,
+    fc2: nn::Linear,
+}
+
+struct LejepaFlowHead {
+    signal_embed: nn::Embedding,
+    cond_fc1: nn::Linear,
+    cond_fc2: nn::Linear,
+    in_proj: nn::Linear,
+    blocks: Vec<LejepaFlowBlock>,
+    final_mod: nn::Linear,
+    out_proj: nn::Linear,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FlowRolloutMode {
+    Mean,
+    Sample { temperature: f64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidationMode {
+    Fast,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PretrainExecutionMode {
+    Train,
+    EvaluateOnly,
+}
+
+fn pretrain_execution_mode(args: &PretrainArgs) -> Result<PretrainExecutionMode> {
+    if args.eval_skill_only
+        && (args.steps != Some(0)
+            || args.weights.is_none()
+            || args.objective != PretrainObjective::Lejepa)
+    {
+        return Err(anyhow!(
+            "--eval-skill-only requires --steps 0, --weights <checkpoint>, and --objective lejepa"
+        ));
+    }
+    match args.steps {
+        Some(0) if args.weights.is_none() => Err(anyhow!(
+            "--steps 0 is evaluation-only and requires --weights <checkpoint>"
+        )),
+        Some(0) => Ok(PretrainExecutionMode::EvaluateOnly),
+        Some(_) | None => Ok(PretrainExecutionMode::Train),
+    }
+}
+
 struct PretrainHeads {
     forecast_queries: Tensor,
     horizon_pos_proj: nn::Linear,
@@ -105,7 +164,7 @@ struct PretrainHeads {
     bar_enrich_fc2: nn::Linear,
     lejepa_projector: ProjectionMlp,
     lejepa_layers: Vec<CausalLejepaLayer>,
-    lejepa_pred_proj: ProjectionMlp,
+    lejepa_flow: LejepaFlowHead,
     rope: RotaryEmbedding,
     probe_input_ln: nn::LayerNorm,
     probe_head: nn::Linear,
@@ -163,7 +222,7 @@ impl PretrainHeads {
         let ff_dim = latent_dim * 2;
         let horizon = k_patches * patch_size;
         let forecast_heads = 4;
-        let lejepa_heads = 4;
+        let lejepa_heads = LEJEPA_HEADS;
         assert_eq!(
             latent_dim % forecast_heads,
             0,
@@ -310,24 +369,77 @@ impl PretrainHeads {
             LEJEPA_ROPE_DIMS,
             p.device(),
         );
-        let lejepa_pred_proj = ProjectionMlp {
-            fc1: nn::linear(
-                p / "lejepa_pred_proj_fc1",
+        let zero_init = |mut linear: nn::Linear| {
+            tch::no_grad(|| {
+                let _ = linear.ws.zero_();
+                if let Some(bias) = linear.bs.as_mut() {
+                    let _ = bias.zero_();
+                }
+            });
+            linear
+        };
+        let mut flow_blocks = Vec::with_capacity(LEJEPA_FLOW_BLOCKS);
+        for block_idx in 0..LEJEPA_FLOW_BLOCKS {
+            let block_path = p / format!("lejepa_flow_block_{block_idx}");
+            flow_blocks.push(LejepaFlowBlock {
+                mod_fc: zero_init(nn::linear(
+                    &block_path / "mod",
+                    LEJEPA_FLOW_COND_DIM,
+                    latent_dim * 3,
+                    Default::default(),
+                )),
+                fc1: nn::linear(
+                    &block_path / "fc1",
+                    latent_dim,
+                    LEJEPA_FLOW_HIDDEN,
+                    Default::default(),
+                ),
+                fc2: nn::linear(
+                    &block_path / "fc2",
+                    LEJEPA_FLOW_HIDDEN,
+                    latent_dim,
+                    Default::default(),
+                ),
+            });
+        }
+        let lejepa_flow = LejepaFlowHead {
+            signal_embed: nn::embedding(
+                p / "lejepa_flow_signal_embed",
+                LEJEPA_K_MAX,
+                LEJEPA_SIGNAL_EMBED_DIM,
+                Default::default(),
+            ),
+            cond_fc1: nn::linear(
+                p / "lejepa_flow_cond_fc1",
+                latent_dim + LEJEPA_SIGNAL_EMBED_DIM,
+                LEJEPA_FLOW_COND_DIM,
+                Default::default(),
+            ),
+            cond_fc2: nn::linear(
+                p / "lejepa_flow_cond_fc2",
+                LEJEPA_FLOW_COND_DIM,
+                LEJEPA_FLOW_COND_DIM,
+                Default::default(),
+            ),
+            in_proj: nn::linear(
+                p / "lejepa_flow_in_proj",
                 latent_dim,
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
-                Default::default(),
-            ),
-            bn: nn::batch_norm1d(
-                p / "lejepa_pred_proj_bn",
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
-                Default::default(),
-            ),
-            fc2: nn::linear(
-                p / "lejepa_pred_proj_fc2",
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
                 latent_dim,
                 Default::default(),
             ),
+            blocks: flow_blocks,
+            final_mod: zero_init(nn::linear(
+                p / "lejepa_flow_final_mod",
+                LEJEPA_FLOW_COND_DIM,
+                latent_dim * 2,
+                Default::default(),
+            )),
+            out_proj: zero_init(nn::linear(
+                p / "lejepa_flow_out_proj",
+                latent_dim,
+                latent_dim,
+                Default::default(),
+            )),
         };
         let probe_input_ln =
             nn::layer_norm(p / "probe_input_ln", vec![latent_dim], Default::default());
@@ -364,7 +476,7 @@ impl PretrainHeads {
             bar_enrich_fc2,
             lejepa_projector,
             lejepa_layers,
-            lejepa_pred_proj,
+            lejepa_flow,
             rope,
             probe_input_ln,
             probe_head,
@@ -468,13 +580,15 @@ impl PretrainHeads {
             .view([batch * tickers * length, LEJEPA_BAR_FEATURES])
             .to_kind(Kind::Float)
             .nan_to_num(0.0, 0.0, 0.0);
+        let scale = Tensor::from_slice(&OHLC_FEATURE_SCALE).to_device(features.device());
+        let features = features / scale;
         let h = self.bar_proj.forward(&features);
         let enriched = self.bar_enrich_fc2.forward(
             &normalize_last_dim(&self.bar_enrich_fc1.forward(&normalize_last_dim(&h))).gelu("none"),
         );
         let h = h + enriched;
         let tokens = h.view([batch, tickers, length, self.latent_dim]);
-        self.project_lejepa_tokens(&tokens, train)
+        latent_bound(&self.project_lejepa_tokens(&tokens, train))
     }
 
     fn project_lejepa_tokens(&self, tokens: &Tensor, train: bool) -> Tensor {
@@ -482,7 +596,6 @@ impl PretrainHeads {
     }
 
     // AR transformer belief = final normalized representation, one per position.
-    // The next-embedding prediction `pred_proj(belief)` is applied by callers.
     fn predict_lejepa_bar_predictions(
         &self,
         bar_tokens: &Tensor,
@@ -504,10 +617,41 @@ impl PretrainHeads {
         }
     }
 
-    // le-wm pred_proj MLP: per-token Linear -> BatchNorm1d -> GELU -> Linear over
-    // the AR belief, yielding the predicted next-embedding.
-    fn pred_emb_from_belief(&self, belief: &Tensor, train: bool) -> Tensor {
-        self.projection_mlp(belief, &self.lejepa_pred_proj, train)
+    fn lejepa_flow_predict(&self, z: &Tensor, signal: &Tensor, ctx: &Tensor) -> Tensor {
+        debug_assert!(signal.kind() == Kind::Int64);
+        let flow = &self.lejepa_flow;
+        let signal_emb = flow.signal_embed.forward(signal);
+        let cond = flow
+            .cond_fc2
+            .forward(
+                &flow
+                    .cond_fc1
+                    .forward(&Tensor::cat(&[ctx, &signal_emb], -1))
+                    .silu(),
+            )
+            .silu();
+        let mut h = flow.in_proj.forward(z);
+        for block in &flow.blocks {
+            let mods = block.mod_fc.forward(&cond);
+            let shift = mods.narrow(-1, 0, self.latent_dim);
+            let scale = mods.narrow(-1, self.latent_dim, self.latent_dim);
+            let gate = mods.narrow(-1, self.latent_dim * 2, self.latent_dim);
+            let modulated = normalize_last_dim(&h) * (&scale + 1.0) + shift;
+            let update = block
+                .fc2
+                .forward(&block.fc1.forward(&modulated).gelu("none"));
+            h += gate * update;
+        }
+        let mods = flow.final_mod.forward(&cond);
+        let shift = mods.narrow(-1, 0, self.latent_dim);
+        let scale = mods.narrow(-1, self.latent_dim, self.latent_dim);
+        let modulated = normalize_last_dim(&h) * (&scale + 1.0) + shift;
+        latent_bound(&flow.out_proj.forward(&modulated))
+    }
+
+    fn lejepa_flow_velocity(&self, x_pred: &Tensor, z: &Tensor, signal: &Tensor) -> Tensor {
+        let remaining = signal.to_kind(Kind::Float) / (-(LEJEPA_K_MAX as f64)) + 1.0;
+        (x_pred - z) / remaining.unsqueeze(-1).clamp_min(1.0 / LEJEPA_K_MAX as f64)
     }
 
     fn causal_lejepa_layer(
@@ -579,39 +723,78 @@ impl PretrainHeads {
     fn probe_ohlc_features(&self, latent: &Tensor) -> (Tensor, Tensor) {
         let normed = self.probe_input_ln.forward(latent);
         let mean = self.probe_head.forward(&normed);
-        let logvar = self.probe_logvar_head.forward(&normed).clamp(-7.0, 7.0);
+        let logvar = self
+            .probe_logvar_head
+            .forward(&normed)
+            .clamp(-LEJEPA_PROBE_LOGVAR_LIMIT, LEJEPA_PROBE_LOGVAR_LIMIT);
         (mean, logvar)
     }
 
-    fn lejepa_imagined_rollout(&self, context_bars: &Tensor, train: bool) -> Tensor {
-        self.lejepa_imagined_rollout_inner(context_bars, train, false)
+    fn lejepa_imagined_rollout(&self, context_bars: &Tensor, mode: FlowRolloutMode) -> Tensor {
+        self.lejepa_imagined_rollout_inner(context_bars, mode, false)
             .0
     }
 
-    // Deterministic autoregressive rollout: each step runs one AR forward,
-    // projects the last belief to the next embedding via `pred_proj`, appends it
-    // (truncating to the causal window), and probe-decodes it to an OHLC bar.
-    // No noise, integration, temperature, or Monte-Carlo averaging.
+    // Mean mode uses the signal-0 endpoint from a zero prior without context
+    // corruption. Sample mode uses an eight-step Euler path from a Gaussian prior.
     fn lejepa_imagined_rollout_inner(
         &self,
         context_bars: &Tensor,
-        train: bool,
+        mode: FlowRolloutMode,
         collect_entropy: bool,
     ) -> (Tensor, Option<RolloutEntropy>) {
-        let mut tokens = self.encode_bar_tokens(context_bars, train).detach();
+        let mut tokens = self.encode_bar_tokens(context_bars, false).detach();
         let size = tokens.size();
         let batch = size[0];
         let tickers = size[1];
         let latent_dim = self.latent_dim;
+        let rows = batch * tickers;
+        let temperature = match mode {
+            FlowRolloutMode::Mean => 0.0,
+            FlowRolloutMode::Sample { temperature } => {
+                assert!(temperature.is_finite() && temperature >= 0.0);
+                temperature
+            }
+        };
+        let mut ctx_noise =
+            matches!(mode, FlowRolloutMode::Sample { .. }).then(|| Tensor::randn_like(&tokens));
         let mut imagined = Vec::with_capacity(LEJEPA_ROLLOUT_BARS as usize);
         let mut ent_means: Vec<Tensor> = Vec::new();
         let mut tok_norm_sum = 0.0f64;
         let mut tok_norm_max = 0.0f64;
         for _ in 0..LEJEPA_ROLLOUT_BARS {
-            let belief = self.predict_lejepa_bar_predictions(&tokens, train).belief;
+            let predictor_tokens = match &ctx_noise {
+                Some(noise) => {
+                    &tokens * (1.0 - LEJEPA_CTX_NOISE_MIX) + noise * LEJEPA_CTX_NOISE_MIX
+                }
+                None => tokens.shallow_clone(),
+            };
+            let belief = self
+                .predict_lejepa_bar_predictions(&predictor_tokens, false)
+                .belief;
             let last = tokens.size()[2] - 1;
-            let belief_last = belief.narrow(2, last, 1);
-            let next_token = self.pred_emb_from_belief(&belief_last, train);
+            let ctx = belief.narrow(2, last, 1).reshape([rows, latent_dim]);
+            let next_z = if matches!(mode, FlowRolloutMode::Mean) {
+                let signal = Tensor::full(
+                    [rows],
+                    LEJEPA_MEAN_SIGNAL_LEVEL,
+                    (Kind::Int64, tokens.device()),
+                );
+                let z = Tensor::zeros([rows, latent_dim], (Kind::Float, tokens.device()));
+                self.lejepa_flow_predict(&z, &signal, &ctx)
+            } else {
+                let mut z =
+                    Tensor::randn([rows, latent_dim], (Kind::Float, tokens.device())) * temperature;
+                for step in 0..LEJEPA_ROLLOUT_STEPS {
+                    let signal_value = step * LEJEPA_ROLLOUT_STEP_SIZE;
+                    let signal = Tensor::full([rows], signal_value, (Kind::Int64, tokens.device()));
+                    let x_pred = self.lejepa_flow_predict(&z, &signal, &ctx);
+                    let velocity = self.lejepa_flow_velocity(&x_pred, &z, &signal);
+                    z += velocity * (LEJEPA_ROLLOUT_STEP_SIZE as f64 / LEJEPA_K_MAX as f64);
+                }
+                z
+            };
+            let next_token = next_z.view([batch, tickers, 1, latent_dim]);
             let (mean, _logvar) = self.probe_ohlc_features(&next_token);
             let bar = mean.view([batch, LEJEPA_BAR_FEATURES]);
             imagined.push(bar.shallow_clone());
@@ -626,10 +809,16 @@ impl PretrainHeads {
                 ent_means.push(bar);
             }
             tokens = Tensor::cat(&[&tokens, &next_token], 2);
+            if let Some(noise) = &ctx_noise {
+                ctx_noise = Some(Tensor::cat(&[noise, &Tensor::randn_like(&next_token)], 2));
+            }
             let len = tokens.size()[2];
             let max_len = PRICE_DELTAS_PER_TICKER as i64;
             if len > max_len {
                 tokens = tokens.narrow(2, len - max_len, max_len);
+                if let Some(noise) = &ctx_noise {
+                    ctx_noise = Some(noise.narrow(2, len - max_len, max_len));
+                }
             }
         }
         let entropy = if collect_entropy {
@@ -1047,15 +1236,13 @@ fn align_up_to_step(value: usize, origin: usize, step: usize) -> usize {
 }
 
 pub fn pretrain(args: PretrainArgs) -> Result<()> {
+    let execution_mode = pretrain_execution_mode(&args)?;
     assert_eq!(
         args.model_size,
         ModelVariant::UniformStream,
         "world-model pretraining currently supports --model-size uniform-stream only"
     );
     assert!(args.epochs > 0, "--epochs must be positive");
-    if let Some(steps) = args.steps {
-        assert!(steps > 0, "--steps must be positive when provided");
-    }
     assert!(args.batch_size > 0, "--batch-size must be positive");
     assert!(args.k_patches > 0, "--k-patches must be positive");
     assert!(
@@ -1134,6 +1321,35 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             .filter(|(name, _)| !name.contains("probe_"))
             .map(|(name, tensor)| (format!("pretrain_heads.{name}"), tensor)),
     );
+    let mut flow_muon_allowlist = vec![
+        "bar_proj".to_string(),
+        "bar_enrich".to_string(),
+        "lejepa_projector_fc".to_string(),
+        "lejepa_layer_".to_string(),
+        "lejepa_flow_in_proj".to_string(),
+        "lejepa_flow_cond_fc".to_string(),
+    ];
+    for block_idx in 0..LEJEPA_FLOW_BLOCKS {
+        flow_muon_allowlist.push(format!("lejepa_flow_block_{block_idx}.fc"));
+    }
+    let (force_adamw_name_substrings, muon_name_allowlist) =
+        if args.objective == PretrainObjective::Lejepa {
+            (Vec::new(), flow_muon_allowlist)
+        } else {
+            (
+                vec![
+                    "policy_concentration".to_string(),
+                    "value_proj".to_string(),
+                    "forecast_".to_string(),
+                    "horizon_pos_proj".to_string(),
+                    "return_mean".to_string(),
+                    "bar_proj".to_string(),
+                    "bar_enrich_".to_string(),
+                    "lejepa_".to_string(),
+                ],
+                Vec::new(),
+            )
+        };
     let mut opt = Muon::new_named(
         &named_vars,
         MuonConfig {
@@ -1145,16 +1361,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             adamw_eps: 1e-8,
             weight_decay: 0.0,
             adamw_wd: LEJEPA_WEIGHT_DECAY,
-            force_adamw_name_substrings: vec![
-                "policy_concentration".to_string(),
-                "value_proj".to_string(),
-                "forecast_".to_string(),
-                "horizon_pos_proj".to_string(),
-                "return_mean".to_string(),
-                "bar_proj".to_string(),
-                "bar_enrich_".to_string(),
-                "lejepa_".to_string(),
-            ],
+            force_adamw_name_substrings,
+            muon_name_allowlist,
             ..MuonConfig::default()
         },
     );
@@ -1181,6 +1389,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     let mut optimizer_step = 0i64;
     let mut global_step = 0usize;
     let mut best_val = f64::INFINITY;
+    let mut best_rollout_mean_mse = f64::INFINITY;
     let mut scalar_history = PretrainScalarHistory::default();
     let mut stop_requested = false;
     let final_path = run_dir.weights.join("pretrain_model.ot");
@@ -1227,6 +1436,160 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             .collect()
     };
 
+    if execution_mode == PretrainExecutionMode::EvaluateOnly {
+        let input_model_path = start_weights
+            .as_deref()
+            .expect("evaluation-only weights validated before initialization");
+        if args.objective == PretrainObjective::Lejepa {
+            let input_heads_path =
+                matching_pretrain_heads_path(input_model_path).ok_or_else(|| {
+                    anyhow!("cannot derive pretrain heads path from input checkpoint")
+                })?;
+            let input_metadata_path = world_model_metadata_path(&input_heads_path);
+            let verified = LejepaWorldModel::load(&input_heads_path, &input_metadata_path, device)
+                .with_context(|| {
+                    format!(
+                        "evaluation-only input is not a complete compatible world model: {}",
+                        input_heads_path.display()
+                    )
+                })?;
+            drop(verified);
+        }
+        if args.eval_skill_only {
+            let validation = evaluate_skill_panel(
+                &heads,
+                &mut sampler,
+                SplitKind::Validation,
+                args.batch_size,
+                device,
+            );
+            println!(
+                "pretrain skill-only validation ev_correct={:.9} ev_shuffled={:.9} ev_zero={:.9} sse_correct={:.9} sse_shuffled={:.9} sse_zero={:.9} sst={:.9} windows={} tickers={} rows={}",
+                validation.ev_correct,
+                validation.ev_shuffled,
+                validation.ev_zero,
+                validation.sse_correct,
+                validation.sse_shuffled,
+                validation.sse_zero,
+                validation.sst,
+                validation.windows,
+                validation.tickers,
+                validation.rows,
+            );
+            let test = if sampler.test_pairs.is_empty() {
+                None
+            } else {
+                let metrics = evaluate_skill_panel(
+                    &heads,
+                    &mut sampler,
+                    SplitKind::Test,
+                    args.batch_size,
+                    device,
+                );
+                println!(
+                    "pretrain skill-only test ev_correct={:.9} ev_shuffled={:.9} ev_zero={:.9} sse_correct={:.9} sse_shuffled={:.9} sse_zero={:.9} sst={:.9} windows={} tickers={} rows={}",
+                    metrics.ev_correct,
+                    metrics.ev_shuffled,
+                    metrics.ev_zero,
+                    metrics.sse_correct,
+                    metrics.sse_shuffled,
+                    metrics.sse_zero,
+                    metrics.sst,
+                    metrics.windows,
+                    metrics.tickers,
+                    metrics.rows,
+                );
+                Some(metrics)
+            };
+            write_skill_panel_results(&run_dir, validation, test)?;
+            println!(
+                "Skill-only pretrain report written to {}",
+                run_dir.root.display()
+            );
+            return Ok(());
+        }
+        let validation = validate_full(
+            &model,
+            &heads,
+            &mut sampler,
+            SplitKind::Validation,
+            args.batch_size,
+            None,
+            args.objective,
+            args.lambda_lat,
+            args.lambda_sigreg,
+            device,
+            ValidationMode::Full,
+        );
+        print_step_eval_summary("validation-eval-only", 0, &validation);
+        write_validation_row(&mut validation_log, "eval-only", 0, &validation)?;
+        if args.objective == PretrainObjective::Lejepa {
+            let deployed = deployed_cached_rollout_mse(
+                &head_vs,
+                &heads,
+                &mut sampler,
+                args.batch_size,
+                &run_dir.weights,
+                args.target_scale,
+                device,
+                SplitKind::Validation,
+            )?;
+            println!(
+                "pretrain eval-only validation deployed_cached_rollout_mean_mse={deployed:.9} cache_contract={LEJEPA_CACHE_CONTRACT}"
+            );
+        }
+        write_pretrain_diagnostics(
+            &model,
+            &heads,
+            &mut sampler,
+            args.batch_size,
+            None,
+            args.objective,
+            0,
+            0,
+            &run_dir.gens,
+            device,
+            true,
+        )?;
+        if !sampler.test_pairs.is_empty() {
+            let test = validate_full(
+                &model,
+                &heads,
+                &mut sampler,
+                SplitKind::Test,
+                args.batch_size,
+                None,
+                args.objective,
+                args.lambda_lat,
+                args.lambda_sigreg,
+                device,
+                ValidationMode::Full,
+            );
+            print_step_eval_summary("test-eval-only", 0, &test);
+            write_validation_row(&mut test_log, "eval-only", 0, &test)?;
+            if args.objective == PretrainObjective::Lejepa {
+                let deployed = deployed_cached_rollout_mse(
+                    &head_vs,
+                    &heads,
+                    &mut sampler,
+                    args.batch_size,
+                    &run_dir.weights,
+                    args.target_scale,
+                    device,
+                    SplitKind::Test,
+                )?;
+                println!(
+                    "pretrain eval-only test deployed_cached_rollout_mean_mse={deployed:.9} cache_contract={LEJEPA_CACHE_CONTRACT}"
+                );
+            }
+        }
+        println!(
+            "Evaluation-only pretrain reports written to {}",
+            run_dir.root.display()
+        );
+        return Ok(());
+    }
+
     'epoch_loop: for epoch in 1..=args.epochs {
         sampler.start_epoch();
         let mut train_epoch_loss = RunningLoss::new(device);
@@ -1264,7 +1627,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             optimizer_step += 1;
 
             // Online probe: one optimizer step summed over this batch's detached
-            // probe groups (real latest-token + teacher-forced pred_emb), kept
+            // probe groups (real, deterministic endpoint, sampled endpoint), kept
             // separate from the model optimizer so probe grads never flow into the
             // encoder.
             if args.objective == PretrainObjective::Lejepa && !losses.probe_groups.is_empty() {
@@ -1325,16 +1688,16 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     })
                 })
                 .flatten();
-            match step_val {
-                Some((vt, vj, vs, vpm, vpa)) => writeln!(
-                    step_log,
-                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples},{vt:.9},{vj:.9},{vs:.9},{vpm:.9},{vpa:.9}"
-                )?,
-                None => writeln!(
-                    step_log,
-                    "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples},,,,,"
-                )?,
-            }
+            let val_cols = match step_val {
+                Some((vt, vj, vs, vpm, vpa)) => {
+                    format!(",{vt:.9},{vj:.9},{vs:.9},{vpm:.9},{vpa:.9}")
+                }
+                None => ",,,,,".to_owned(),
+            };
+            writeln!(
+                step_log,
+                "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples}{val_cols}"
+            )?;
             step_log.flush()?;
 
             if global_step == 1 || global_step % 20 == 0 {
@@ -1373,45 +1736,43 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     args.lambda_lat,
                     args.lambda_sigreg,
                     device,
+                    ValidationMode::Fast,
                 );
-                println!(
-                    "pretrain step {global_step} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} samples={} tickers={} batches={}",
-                    val.total,
-                    val.jepa_mse,
-                    val.sigreg,
-                    val.repr_std_mean,
-                    val.repr_std_min,
-                    val.pred_embed_std,
-                    val.target_embed_std,
-                    val.probe_mse,
-                    val.probe_mae,
-                    val.probe_bias,
-                    val.pred_abs,
-                    val.target_abs,
-                    val.pred_std,
-                    val.target_std,
-                    val.probe_terminal_mse,
-                    val.zero_mse,
-                    val.probe_explained_variance * 100.0,
-                    val.next_lat,
-                    val.rollout_mean_mse,
-                    val.rollout_sampled_mse,
-                    val.rollout_mse_delta,
-                    val.rollout_mse_delta_se,
-                    val.rollout_mse_t,
-                    val.rollout_mse_n,
-                    val.samples,
-                    val.tickers,
-                    val.batches
-                );
+                let deployed_rollout_mean_mse = if args.objective == PretrainObjective::Lejepa {
+                    deployed_cached_rollout_mse(
+                        &head_vs,
+                        &heads,
+                        &mut sampler,
+                        args.batch_size,
+                        &run_dir.weights,
+                        args.target_scale,
+                        device,
+                        SplitKind::Validation,
+                    )?
+                } else {
+                    f64::NAN
+                };
+                print_step_eval_summary("validation", global_step, &val);
+                if args.objective == PretrainObjective::Lejepa {
+                    println!(
+                        "pretrain step {global_step} deployed_cached_rollout_mean_mse={deployed_rollout_mean_mse:.9} cache_contract={LEJEPA_CACHE_CONTRACT}"
+                    );
+                }
                 write_validation_row(
                     &mut validation_log,
                     &format!("step:{global_step}"),
                     global_step,
                     &val,
                 )?;
-                if val.total < best_val {
+                if is_better_pretrain_checkpoint(
+                    args.objective,
+                    &val,
+                    deployed_rollout_mean_mse,
+                    best_val,
+                    best_rollout_mean_mse,
+                ) {
                     best_val = val.total;
+                    best_rollout_mean_mse = deployed_rollout_mean_mse;
                     model_vs.save(&best_path)?;
                     save_pretrain_heads_checkpoint(
                         &head_vs,
@@ -1525,6 +1886,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         train_epoch_log.flush()?;
         step_log.flush()?;
 
+        let final_epoch = stop_requested || epoch == args.epochs;
         let val = validate_full(
             &model,
             &heads,
@@ -1536,7 +1898,22 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             args.lambda_lat,
             args.lambda_sigreg,
             device,
+            ValidationMode::Fast,
         );
+        let deployed_rollout_mean_mse = if args.objective == PretrainObjective::Lejepa {
+            deployed_cached_rollout_mse(
+                &head_vs,
+                &heads,
+                &mut sampler,
+                args.batch_size,
+                &run_dir.weights,
+                args.target_scale,
+                device,
+                SplitKind::Validation,
+            )?
+        } else {
+            f64::NAN
+        };
         println!(
             "pretrain epoch {epoch} validation total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} rollout_mean_dclose={:.9} rollout_mean_dclose_std={:.9} rollout_sampled_dclose={:.9} rollout_sampled_dclose_std={:.9} samples={} tickers={} batches={}",
             val.total,
@@ -1580,25 +1957,53 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             val.skill_belief_norm,
             val.skill_batches
         );
+        if args.objective == PretrainObjective::Lejepa {
+            println!(
+                "pretrain epoch {epoch} deployed_cached_rollout_mean_mse={deployed_rollout_mean_mse:.9} cache_contract={LEJEPA_CACHE_CONTRACT}"
+            );
+        }
         write_validation_row(&mut validation_log, &epoch.to_string(), global_step, &val)?;
         scalar_history.push(&train, &val);
         write_pretrain_scalar_meta_reports(&run_dir.gens, epoch, global_step, &scalar_history)?;
-        write_pretrain_diagnostics(
-            &model,
-            &heads,
-            &mut sampler,
-            args.batch_size,
-            validation_batch_cap(args.validation_batches),
-            args.objective,
-            epoch,
-            global_step,
-            &run_dir.gens,
-            device,
-        )?;
+        if final_epoch {
+            let final_validation = validate_full(
+                &model,
+                &heads,
+                &mut sampler,
+                SplitKind::Validation,
+                args.batch_size,
+                validation_batch_cap(args.validation_batches),
+                args.objective,
+                args.lambda_lat,
+                args.lambda_sigreg,
+                device,
+                ValidationMode::Full,
+            );
+            print_step_eval_summary("final-validation", global_step, &final_validation);
+            write_validation_row(
+                &mut validation_log,
+                &format!("final:{epoch}"),
+                global_step,
+                &final_validation,
+            )?;
+            write_pretrain_diagnostics(
+                &model,
+                &heads,
+                &mut sampler,
+                args.batch_size,
+                validation_batch_cap(args.validation_batches),
+                args.objective,
+                epoch,
+                global_step,
+                &run_dir.gens,
+                device,
+                args.validation_batches == 0,
+            )?;
+        }
 
         // Held-out TEST battery at each epoch end (and on --steps early stop, since
         // the final epoch's end IS run end). Deep validation above stays untouched.
-        if !sampler.test_pairs.is_empty() {
+        if final_epoch && !sampler.test_pairs.is_empty() {
             let test = validate_full(
                 &model,
                 &heads,
@@ -1610,42 +2015,21 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 args.lambda_lat,
                 args.lambda_sigreg,
                 device,
+                ValidationMode::Full,
             );
-            println!(
-                "pretrain step {global_step} test total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} samples={} tickers={} batches={}",
-                test.total,
-                test.jepa_mse,
-                test.sigreg,
-                test.repr_std_mean,
-                test.repr_std_min,
-                test.pred_embed_std,
-                test.target_embed_std,
-                test.probe_mse,
-                test.probe_mae,
-                test.probe_bias,
-                test.pred_abs,
-                test.target_abs,
-                test.pred_std,
-                test.target_std,
-                test.probe_terminal_mse,
-                test.zero_mse,
-                test.probe_explained_variance * 100.0,
-                test.next_lat,
-                test.rollout_mean_mse,
-                test.rollout_sampled_mse,
-                test.rollout_mse_delta,
-                test.rollout_mse_delta_se,
-                test.rollout_mse_t,
-                test.rollout_mse_n,
-                test.samples,
-                test.tickers,
-                test.batches
-            );
+            print_step_eval_summary("test", global_step, &test);
             write_validation_row(&mut test_log, &epoch.to_string(), global_step, &test)?;
         }
 
-        if val.total < best_val {
+        if is_better_pretrain_checkpoint(
+            args.objective,
+            &val,
+            deployed_rollout_mean_mse,
+            best_val,
+            best_rollout_mean_mse,
+        ) {
             best_val = val.total;
+            best_rollout_mean_mse = deployed_rollout_mean_mse;
             model_vs.save(&best_path)?;
             save_pretrain_heads_checkpoint(
                 &head_vs,
@@ -1673,6 +2057,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             args.lambda_lat,
             args.lambda_sigreg,
             device,
+            ValidationMode::Full,
         );
         best_val = val.total;
         write_validation_row(&mut validation_log, "final", global_step, &val)?;
@@ -1771,6 +2156,62 @@ fn save_pretrain_heads_checkpoint(
         }
     }
     Ok(())
+}
+
+fn deployed_cached_rollout_mse(
+    head_vs: &nn::VarStore,
+    heads: &PretrainHeads,
+    sampler: &mut PretrainSampler,
+    batch_size: usize,
+    weights_dir: &Path,
+    target_scale: f64,
+    device: Device,
+    split: SplitKind,
+) -> Result<f64> {
+    let split_pairs = match split {
+        SplitKind::Train => &sampler.train_pairs,
+        SplitKind::Validation => &sampler.val_pairs,
+        SplitKind::Test => &sampler.test_pairs,
+    };
+    let samples = ticker_stratified_panel(split_pairs);
+    if samples.is_empty() {
+        return Err(anyhow!(
+            "deployed rollout evaluation has no validation windows"
+        ));
+    }
+    let checkpoint = weights_dir.join("pretrain_heads_promotion_candidate.ot");
+    save_pretrain_heads_checkpoint(
+        head_vs,
+        &checkpoint,
+        heads.latent_dim,
+        target_scale,
+        PretrainObjective::Lejepa,
+    )?;
+    let metadata_path = world_model_metadata_path(&checkpoint);
+    let world_model = LejepaWorldModel::load(&checkpoint, &metadata_path, device)?;
+    let mut squared_error_sum = 0.0;
+    let mut elements = 0usize;
+    for chunk in samples.chunks(batch_size) {
+        let batch = PretrainSampler::batch_from_env_offsets(
+            &mut sampler.train_envs,
+            chunk,
+            sampler.k_patches,
+            sampler.patch_size,
+            target_scale,
+            device,
+        );
+        let prediction = world_model.predict(&batch.bar_history, LEJEPA_ROLLOUT_BARS)?;
+        let actual = batch
+            .next_bars
+            .view([-1, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]);
+        let squared_error = (&prediction.ohlc_mean - actual).square();
+        squared_error_sum += squared_error.sum(Kind::Float).double_value(&[]);
+        elements += squared_error.numel();
+    }
+    drop(world_model);
+    fs::remove_file(&checkpoint)?;
+    fs::remove_file(metadata_path)?;
+    Ok(squared_error_sum / elements as f64)
 }
 
 fn pretrain_loss(
@@ -1912,75 +2353,126 @@ fn lejepa_pretrain_loss(
     target_scale: f64,
     train: bool,
 ) -> PretrainLoss {
-    let batch_size = batch.obs.size()[0];
-    let layout_len = model.pretrain_layout_len();
-    let layouts = model
-        .uniform_stream_layout_from_raw_input(&batch.obs)
-        .view([batch_size * TICKERS_COUNT, layout_len]);
-    let next_layouts = model
-        .uniform_stream_layout_from_raw_input(&batch.next_obs)
-        .view([batch_size * TICKERS_COUNT, layout_len]);
-    let (patch_tokens, target_patch_tokens) = autocast(false, || {
-        let source_tokens = model.pretrain_patch_tokens(&layouts, &batch.static_obs, batch_size);
-        let target_tokens =
-            model.pretrain_patch_tokens(&next_layouts, &batch.next_static_obs, batch_size);
-        let projected_source = heads.project_lejepa_tokens(&source_tokens, train);
-        let projected_target = heads.project_lejepa_tokens(&target_tokens, train);
-        (projected_source, sequence_frontier(&projected_target))
-    });
-    let patch_pair_tokens = Tensor::cat(&[&patch_tokens, &target_patch_tokens], 2);
-    let patch_belief = heads
-        .predict_lejepa_bar_predictions(&patch_tokens, train)
-        .belief;
-    let patch_frontier_belief = sequence_frontier(&patch_belief);
-    let patch_pred_train = train && batch_size * TICKERS_COUNT as i64 > 1;
-    let patch_pred_emb = heads.pred_emb_from_belief(&patch_frontier_belief, patch_pred_train);
-    debug_assert_eq!(patch_pred_emb.size(), target_patch_tokens.size());
-    let patch_pred_loss = patch_pred_emb.mse_loss(&target_patch_tokens, Reduction::Mean);
+    let _ = model;
 
     let full = Tensor::cat(&[&batch.bar_history, &batch.next_bars.narrow(2, 0, 1)], 2);
     let all_tokens = autocast(false, || heads.encode_bar_tokens(&full, train));
     let length = batch.bar_history.size()[2];
     let bar_tokens = all_tokens.narrow(2, 0, length);
-    // Un-detached shift-by-1 target (le-wm recipe): the next-embedding MSE target
-    // carries gradient into the shared online encoder. SIGReg, not stop-grad,
-    // prevents collapse.
     let target_bar_tokens = all_tokens.narrow(2, 1, length);
     let latest_token = all_tokens.select(2, length);
-    let belief = heads
-        .predict_lejepa_bar_predictions(&bar_tokens, train)
-        .belief;
-    // le-wm prediction loss: teacher-forced next-embedding MSE. Both pred_emb and
-    // tgt_emb come from the same online encoder with no stop-gradient.
-    let pred_emb = heads.pred_emb_from_belief(&belief, train);
-    let bar_pred_loss = pred_emb.mse_loss(&target_bar_tokens, Reduction::Mean);
-    let pred_loss = &patch_pred_loss + &bar_pred_loss;
+    let size = bar_tokens.size();
+    let (batch_size, tickers, latent_dim) = (size[0], size[1], heads.latent_dim);
+    let rows = batch_size * tickers * length;
 
-    let sigreg = (sampled_sigreg_loss(&all_tokens, heads.latent_dim, train)
-        + sampled_sigreg_loss(&patch_pair_tokens, heads.latent_dim, train))
-        * 0.5;
-    let (repr_std_mean, repr_std_min) = representation_std_metrics(&patch_tokens);
-    let target_embed_std = target_patch_tokens.std(false);
+    let predictor_tokens = if train {
+        let shifted_prediction = tch::no_grad(|| {
+            let clean_belief = heads
+                .predict_lejepa_bar_predictions(&bar_tokens, true)
+                .belief;
+            let signal = Tensor::full(
+                [rows],
+                LEJEPA_MEAN_SIGNAL_LEVEL,
+                (Kind::Int64, all_tokens.device()),
+            );
+            let z = Tensor::zeros([rows, latent_dim], (Kind::Float, all_tokens.device()));
+            let prediction = heads
+                .lejepa_flow_predict(&z, &signal, &clean_belief.reshape([rows, latent_dim]))
+                .reshape([batch_size, tickers, length, latent_dim]);
+            let first = Tensor::zeros(
+                [batch_size, tickers, 1, latent_dim],
+                (Kind::Float, all_tokens.device()),
+            );
+            Tensor::cat(&[&first, &prediction.narrow(2, 0, length - 1)], 2)
+        });
+        let mask = Tensor::rand(
+            [batch_size, tickers, length, 1],
+            (Kind::Float, all_tokens.device()),
+        )
+        .lt(LEJEPA_SELF_COND_PROB)
+        .to_kind(Kind::Float);
+        let _ = mask.narrow(2, 0, 1).zero_();
+        let scheduled = &shifted_prediction * &mask + &bar_tokens * (1.0 - &mask);
+        &scheduled * (1.0 - LEJEPA_CTX_NOISE_MIX)
+            + Tensor::randn_like(&scheduled) * LEJEPA_CTX_NOISE_MIX
+    } else {
+        bar_tokens.shallow_clone()
+    };
+    let belief = heads
+        .predict_lejepa_bar_predictions(&predictor_tokens, train)
+        .belief;
+    let ctx = belief.reshape([rows, latent_dim]);
+    let clean = target_bar_tokens.reshape([rows, latent_dim]);
+    let (pred_loss, _flow_x_pred, _flow_signal) = lejepa_flow_loss(heads, &ctx, &clean, train);
+
+    let sigreg = sampled_sigreg_loss(&all_tokens, heads.latent_dim, train);
+    let (repr_std_mean, repr_std_min) = representation_std_metrics(&latest_token);
+    let target_embed_std = target_bar_tokens.std(false);
 
     let total = &pred_loss + &sigreg * lambda_sigreg;
-
-    // jepa_mse column = patch-token + bar-token next-embedding prediction MSE.
-    let jepa_mse = pred_loss.detach();
-    let pred_embed_std = patch_pred_emb.std(false).detach();
+    let (clean_latest_token, clean_probe_ctx, clean_target) = tch::no_grad(|| {
+        let inference_tokens = autocast(false, || heads.encode_bar_tokens(&full, false));
+        let inference_bar_tokens = inference_tokens.narrow(2, 0, length);
+        let inference_target = inference_tokens
+            .narrow(2, 1, length)
+            .reshape([rows, latent_dim]);
+        let inference_belief = heads
+            .predict_lejepa_bar_predictions(&inference_bar_tokens, false)
+            .belief
+            .reshape([rows, latent_dim]);
+        (
+            inference_tokens.select(2, length).unsqueeze(2),
+            inference_belief,
+            inference_target,
+        )
+    });
+    let (jepa_mse, pred_embed_std, deterministic_endpoint) = tch::no_grad(|| {
+        let signal = Tensor::full(
+            [rows],
+            LEJEPA_MEAN_SIGNAL_LEVEL,
+            (Kind::Int64, all_tokens.device()),
+        );
+        let z = Tensor::zeros([rows, latent_dim], (Kind::Float, all_tokens.device()));
+        let endpoint = heads.lejepa_flow_predict(&z, &signal, &clean_probe_ctx);
+        (
+            endpoint.mse_loss(&clean_target, Reduction::Mean),
+            endpoint.std(false),
+            endpoint,
+        )
+    });
 
     let probe_target = scaled_next_ohlc_features(&batch.next_bars, target_scale);
-    let real_probe_input = latest_token.detach().unsqueeze(2);
+    let real_probe_input = clean_latest_token;
     let probe = ohlc_probe_metrics(heads, &real_probe_input, &probe_target);
-    // Online probe trains on TWO detached groups: (1) the real latest-token ->
-    // next bar, and (2) the teacher-forced pred_emb -> the bar each position
-    // predicts (target = full[t+1] * target_scale, the same off-by-one the deleted
-    // detached probe used). Group (2) matches the predicted-latent distribution the
-    // imagined rollout decodes, closing the train/inference gap.
     let pred_probe_target = full.narrow(2, 1, length) * target_scale;
-    let probe_groups = vec![
+    let mut probe_groups = vec![
         (real_probe_input, probe_target.shallow_clone()),
-        (pred_emb.detach(), pred_probe_target),
+        (
+            deterministic_endpoint.reshape([batch_size, tickers, length, latent_dim]),
+            pred_probe_target.shallow_clone(),
+        ),
     ];
+    if train {
+        let sampled_endpoint = tch::no_grad(|| {
+            let detached_ctx = ctx.detach();
+            let mut z = Tensor::randn_like(&detached_ctx);
+            for step in 0..LEJEPA_ROLLOUT_STEPS {
+                let signal = Tensor::full(
+                    [rows],
+                    step * LEJEPA_ROLLOUT_STEP_SIZE,
+                    (Kind::Int64, all_tokens.device()),
+                );
+                let x_pred = heads.lejepa_flow_predict(&z, &signal, &detached_ctx);
+                let velocity = heads.lejepa_flow_velocity(&x_pred, &z, &signal);
+                z += velocity * (LEJEPA_ROLLOUT_STEP_SIZE as f64 / LEJEPA_K_MAX as f64);
+            }
+            z
+        });
+        probe_groups.push((
+            sampled_endpoint.reshape([batch_size, tickers, length, latent_dim]),
+            pred_probe_target,
+        ));
+    }
     let zero_mse = probe_target.pow_tensor_scalar(2.0).mean(Kind::Float);
     let probe_explained_variance = explained_variance_tensor(&probe.probe_mse, &zero_mse);
     let next_lat = zero_like_scalar(&jepa_mse);
@@ -2008,13 +2500,42 @@ fn lejepa_pretrain_loss(
     }
 }
 
-fn sequence_frontier(tokens: &Tensor) -> Tensor {
-    let length = tokens.size()[2];
-    assert!(
-        length > 0,
-        "cannot select a frontier from an empty sequence"
-    );
-    tokens.narrow(2, length - 1, 1)
+fn lejepa_flow_loss(
+    heads: &PretrainHeads,
+    ctx: &Tensor,
+    clean: &Tensor,
+    train: bool,
+) -> (Tensor, Tensor, Tensor) {
+    let rows = clean.size()[0];
+    let device = clean.device();
+    let signal = if train {
+        Tensor::randint(LEJEPA_K_MAX, [rows], (Kind::Int64, device))
+    } else {
+        Tensor::arange(rows, (Kind::Int64, device)).remainder(LEJEPA_K_MAX)
+    };
+    let t = signal.to_kind(Kind::Float).unsqueeze(-1) / LEJEPA_K_MAX as f64;
+    let noise = if train {
+        Tensor::randn_like(clean)
+    } else {
+        deterministic_flow_noise(rows, clean.size()[1], device)
+    };
+    let noised = &noise * (1.0 - &t) + clean * &t;
+    let x_pred = heads.lejepa_flow_predict(&noised, &signal, ctx);
+    let loss = (&x_pred - clean)
+        .square()
+        .mean_dim([-1i64].as_slice(), false, Kind::Float)
+        .mean(Kind::Float);
+    (loss, x_pred.detach(), signal)
+}
+
+fn deterministic_flow_noise(rows: i64, dim: i64, device: Device) -> Tensor {
+    let row = Tensor::arange(rows, (Kind::Float, device)).unsqueeze(1) + 0.5;
+    let column = Tensor::arange(dim, (Kind::Float, device)).unsqueeze(0) + 0.5;
+    let first = (&row * 0.754_877_666 + &column * 0.569_840_291).sin();
+    let second = (&row * 1.324_717_957 + &column * 0.438_447_187).sin();
+    let third = (&row * 0.618_033_989 + &column * 1.220_744_085).sin();
+    let fourth = (&row * 1.414_213_562 + &column * 0.707_106_781).sin();
+    ((first + second + third + fourth) / 2.0_f64.sqrt()).to_kind(Kind::Float)
 }
 
 fn cumulative_future_returns(future_patches: &Tensor) -> Tensor {
@@ -2042,10 +2563,6 @@ fn explained_variance_value(mse: f64, zero_mse: f64) -> f64 {
     } else {
         1.0 - mse / zero_mse
     }
-}
-
-fn sigreg_loss(tokens: &Tensor) -> Tensor {
-    sigreg_loss_impl(tokens, false)
 }
 
 fn sampled_sigreg_loss(tokens: &Tensor, latent_dim: i64, train: bool) -> Tensor {
@@ -2208,6 +2725,7 @@ fn predict_future_returns(
     heads.predict_return_mean(&patch_tokens, false)
 }
 
+#[derive(Default)]
 struct ValidationLoss {
     total: f64,
     jepa_mse: f64,
@@ -2247,6 +2765,25 @@ struct ValidationLoss {
     samples: usize,
     tickers: usize,
     batches: usize,
+}
+
+fn is_better_pretrain_checkpoint(
+    objective: PretrainObjective,
+    validation: &ValidationLoss,
+    deployed_rollout_mean_mse: f64,
+    best_total: f64,
+    best_rollout_mean_mse: f64,
+) -> bool {
+    if !validation.total.is_finite() || validation.total >= best_total {
+        return false;
+    }
+    match objective {
+        PretrainObjective::MeanMse => true,
+        PretrainObjective::Lejepa => {
+            deployed_rollout_mean_mse.is_finite()
+                && deployed_rollout_mean_mse < best_rollout_mean_mse
+        }
+    }
 }
 
 struct PretrainLoss {
@@ -2604,10 +3141,8 @@ fn probe_nll(heads: &PretrainHeads, belief: &Tensor, target: &Tensor) -> Tensor 
     nll_elem.mean(Kind::Float) * 0.5
 }
 
-// One online probe optimizer step. Sums the Gaussian NLL over a LIST of detached
-// (probe_input, target) groups — today the real latest-token group and the
-// teacher-forced pred_emb group; the flow branch can add its masked x_pred group
-// later — and takes a single optimizer step. Every input is a graph leaf via
+// One online probe optimizer step. Sums Gaussian NLL over detached input/target
+// groups and takes a single optimizer step. Every input is a graph leaf via
 // `.detach()`, so probe grads never reach the encoder, and the model optimizer
 // never sees probe params (they are excluded from its named_vars).
 fn probe_step(
@@ -2626,6 +3161,39 @@ fn probe_step(
     loss.backward();
     clip_all_grads(probe_named_vars, MAX_GRAD_NORM, device);
     probe_opt.step();
+}
+
+fn print_step_eval_summary(kind: &str, global_step: usize, v: &ValidationLoss) {
+    println!(
+        "pretrain step {global_step} {kind} total_loss={:.6} jepa_mse={:.6} sigreg={:.6} repr_std_mean={:.6} repr_std_min={:.6} pred_embed_std={:.6} target_embed_std={:.6} probe_mse={:.6} probe_mae={:.6} probe_bias={:.6} pred_abs={:.6} target_abs={:.6} pred_std={:.6} target_std={:.6} probe_terminal_mse={:.6} zero_mse={:.6} probe_ev={:.2}% next_lat={:.6} rollout_mean_mse={:.6} rollout_sampled_mse={:.6} rollout_mse_delta={:.6} rollout_mse_delta_se={:.6} rollout_mse_t={:.6} rollout_mse_n={:.6} samples={} tickers={} batches={}",
+        v.total,
+        v.jepa_mse,
+        v.sigreg,
+        v.repr_std_mean,
+        v.repr_std_min,
+        v.pred_embed_std,
+        v.target_embed_std,
+        v.probe_mse,
+        v.probe_mae,
+        v.probe_bias,
+        v.pred_abs,
+        v.target_abs,
+        v.pred_std,
+        v.target_std,
+        v.probe_terminal_mse,
+        v.zero_mse,
+        v.probe_explained_variance * 100.0,
+        v.next_lat,
+        v.rollout_mean_mse,
+        v.rollout_sampled_mse,
+        v.rollout_mse_delta,
+        v.rollout_mse_delta_se,
+        v.rollout_mse_t,
+        v.rollout_mse_n,
+        v.samples,
+        v.tickers,
+        v.batches
+    );
 }
 
 fn write_validation_row(
@@ -2684,7 +3252,8 @@ fn write_candle_snapshots(
     let target_scale = sampler.target_scale;
     let batch = sampler.batch_for_pairs(windows);
     tch::no_grad(|| -> Result<()> {
-        let roll = heads.lejepa_imagined_rollout(&batch.bar_history, false) / target_scale;
+        let roll =
+            heads.lejepa_imagined_rollout(&batch.bar_history, FlowRolloutMode::Mean) / target_scale;
         let actual = batch
             .next_bars
             .view([-1, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]);
@@ -2742,6 +3311,192 @@ fn validation_batch_cap(validation_batches: usize) -> Option<usize> {
     (validation_batches > 0).then_some(validation_batches)
 }
 
+fn ticker_stratified_panel(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut by_ticker: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for &(ticker, offset) in pairs {
+        by_ticker.entry(ticker).or_default().push(offset);
+    }
+    by_ticker
+        .into_iter()
+        .map(|(ticker, mut offsets)| {
+            offsets.sort_unstable();
+            let median = offsets[offsets.len() / 2];
+            (ticker, median)
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SkillPanelMetrics {
+    ev_correct: f64,
+    ev_shuffled: f64,
+    ev_zero: f64,
+    sse_correct: f64,
+    sse_shuffled: f64,
+    sse_zero: f64,
+    sst: f64,
+    windows: usize,
+    tickers: usize,
+    rows: i64,
+}
+
+fn evaluate_skill_panel(
+    heads: &PretrainHeads,
+    sampler: &mut PretrainSampler,
+    split: SplitKind,
+    batch_size: usize,
+    device: Device,
+) -> SkillPanelMetrics {
+    let split_pairs = match split {
+        SplitKind::Train => &sampler.train_pairs,
+        SplitKind::Validation => &sampler.val_pairs,
+        SplitKind::Test => &sampler.test_pairs,
+    };
+    let panel = ticker_stratified_panel(split_pairs);
+    assert!(!panel.is_empty(), "skill panel is empty");
+    tch::no_grad(|| {
+        let latent_dim = heads.latent_dim;
+        let mut target_sum = Tensor::zeros([latent_dim], (Kind::Float, device));
+        let mut target_square_sum = 0.0;
+        let mut sse_correct = 0.0;
+        let mut sse_shuffled = 0.0;
+        let mut sse_zero = 0.0;
+        let mut total_rows = 0i64;
+        for chunk in panel.chunks(batch_size) {
+            let batch = PretrainSampler::batch_from_env_offsets(
+                &mut sampler.train_envs,
+                chunk,
+                sampler.k_patches,
+                sampler.patch_size,
+                sampler.target_scale,
+                device,
+            );
+            let full = Tensor::cat(&[&batch.bar_history, &batch.next_bars.narrow(2, 0, 1)], 2);
+            let tokens = autocast(false, || heads.encode_bar_tokens(&full, false));
+            let length = batch.bar_history.size()[2];
+            let source = tokens.narrow(2, 0, length);
+            let target = tokens.narrow(2, 1, length).reshape([-1, latent_dim]);
+            let belief_sequence = heads.predict_lejepa_bar_predictions(&source, false).belief;
+            let belief = belief_sequence.reshape([-1, latent_dim]);
+            let shuffled_belief = belief_sequence.flip([2]).reshape([-1, latent_dim]);
+            let rows = target.size()[0];
+            let signal = Tensor::full([rows], LEJEPA_MEAN_SIGNAL_LEVEL, (Kind::Int64, device));
+            let z = Tensor::zeros([rows, latent_dim], (Kind::Float, device));
+            let correct = heads.lejepa_flow_predict(&z, &signal, &belief);
+            let shuffled = heads.lejepa_flow_predict(&z, &signal, &shuffled_belief);
+            let zero = heads.lejepa_flow_predict(&z, &signal, &Tensor::zeros_like(&belief));
+            sse_correct += (&correct - &target)
+                .square()
+                .sum(Kind::Float)
+                .double_value(&[]);
+            sse_shuffled += (&shuffled - &target)
+                .square()
+                .sum(Kind::Float)
+                .double_value(&[]);
+            sse_zero += (&zero - &target)
+                .square()
+                .sum(Kind::Float)
+                .double_value(&[]);
+            target_sum += target.sum_dim_intlist([0i64].as_slice(), false, Kind::Float);
+            target_square_sum += target.square().sum(Kind::Float).double_value(&[]);
+            total_rows += rows;
+        }
+        let sst = target_square_sum
+            - target_sum.square().sum(Kind::Float).double_value(&[]) / total_rows as f64;
+        let ev = |sse: f64| if sst > 1e-12 { 1.0 - sse / sst } else { 0.0 };
+        SkillPanelMetrics {
+            ev_correct: ev(sse_correct),
+            ev_shuffled: ev(sse_shuffled),
+            ev_zero: ev(sse_zero),
+            sse_correct,
+            sse_shuffled,
+            sse_zero,
+            sst,
+            windows: panel.len(),
+            tickers: panel.len(),
+            rows: total_rows,
+        }
+    })
+}
+
+fn write_skill_panel_results(
+    run_dir: &RunDir,
+    validation: SkillPanelMetrics,
+    test: Option<SkillPanelMetrics>,
+) -> Result<()> {
+    let mut csv = BufWriter::new(File::create(run_dir.root.join("pretrain_skill_eval.csv"))?);
+    writeln!(
+        csv,
+        "split,ev_correct,ev_shuffled,ev_zero,sse_correct,sse_shuffled,sse_zero,sst,windows,tickers,rows"
+    )?;
+    let mut write_row = |split: &str, metrics: SkillPanelMetrics| -> Result<()> {
+        writeln!(
+            csv,
+            "{split},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
+            metrics.ev_correct,
+            metrics.ev_shuffled,
+            metrics.ev_zero,
+            metrics.sse_correct,
+            metrics.sse_shuffled,
+            metrics.sse_zero,
+            metrics.sst,
+            metrics.windows,
+            metrics.tickers,
+            metrics.rows,
+        )?;
+        Ok(())
+    };
+    write_row("validation", validation)?;
+    if let Some(test) = test {
+        write_row("test", test)?;
+    }
+    drop(write_row);
+    csv.flush()?;
+    let mut series = vec![
+        ReportSeries {
+            label: "validation correct".to_owned(),
+            values: vec![validation.ev_correct as f32],
+        },
+        ReportSeries {
+            label: "validation shuffled".to_owned(),
+            values: vec![validation.ev_shuffled as f32],
+        },
+        ReportSeries {
+            label: "validation zero".to_owned(),
+            values: vec![validation.ev_zero as f32],
+        },
+    ];
+    if let Some(test) = test {
+        series.extend([
+            ReportSeries {
+                label: "test correct".to_owned(),
+                values: vec![test.ev_correct as f32],
+            },
+            ReportSeries {
+                label: "test shuffled".to_owned(),
+                values: vec![test.ev_shuffled as f32],
+            },
+            ReportSeries {
+                label: "test zero".to_owned(),
+                values: vec![test.ev_zero as f32],
+            },
+        ]);
+    }
+    let report_dir = run_dir.gens.join("0");
+    fs::create_dir_all(&report_dir)?;
+    write_report_file(
+        &report_dir.join("pretrain_skill_eval.report.bin"),
+        &Report {
+            title: "Pretrain Latent Skill Evaluation".to_owned(),
+            x_label: Some("panel".to_owned()),
+            y_label: Some("global explained variance".to_owned()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::MultiLine { series },
+        },
+    )
+}
+
 fn validate_full(
     model: &TradingModel,
     heads: &PretrainHeads,
@@ -2753,6 +3508,7 @@ fn validate_full(
     lambda_lat: f64,
     lambda_sigreg: f64,
     device: Device,
+    mode: ValidationMode,
 ) -> ValidationLoss {
     tch::no_grad(|| {
         let mut total_sum = 0.0;
@@ -2773,7 +3529,7 @@ fn validate_full(
         let mut next_lat_sum = 0.0;
         let mut probe_terminal_mse_sum = 0.0;
         let mut zero_mse_sum = 0.0;
-        // Belief-ablation skill test (read-only): does `pred_proj` actually USE the
+        // Belief-ablation skill test (read-only): does the signal-0 endpoint use the
         // AR belief? Accumulated per Lejepa validation batch, meaned below.
         let mut skill_ev_correct_sum = 0.0;
         let mut skill_ev_shuffled_sum = 0.0;
@@ -2788,15 +3544,38 @@ fn validate_full(
         let mut rollout_windows = 0usize;
 
         let target_scale = sampler.target_scale;
-        let pairs = match split {
+        let split_pairs = match split {
             SplitKind::Train => sampler.train_pairs.clone(),
             SplitKind::Validation => sampler.val_pairs.clone(),
             SplitKind::Test => sampler.test_pairs.clone(),
         };
+        let full_window_count = split_pairs.len();
+        let pairs = match mode {
+            ValidationMode::Fast => ticker_stratified_panel(&split_pairs),
+            ValidationMode::Full if max_batches.is_none() => ticker_stratified_panel(&split_pairs),
+            ValidationMode::Full => split_pairs,
+        };
+        if mode == ValidationMode::Fast {
+            let full_batches = full_window_count.div_ceil(batch_size);
+            let fast_batches = pairs.len().div_ceil(batch_size);
+            println!(
+                "fast validation panel: tickers={} windows={} batches={} full_windows={} full_batches={} sampled_euler_rollouts=0",
+                pairs.len(),
+                pairs.len(),
+                fast_batches,
+                full_window_count,
+                full_batches,
+            );
+        }
+        let rollout_window_limit = if mode == ValidationMode::Full && max_batches.is_none() {
+            pairs.len()
+        } else {
+            LEJEPA_ROLLOUT_EVAL_WINDOWS.min(pairs.len())
+        };
         let mut evaluated_tickers = HashSet::new();
 
         for chunk in pairs.chunks(batch_size) {
-            if max_batches.is_some_and(|limit| batches >= limit) {
+            if mode == ValidationMode::Full && max_batches.is_some_and(|limit| batches >= limit) {
                 break;
             }
             record_evaluated_tickers(&mut evaluated_tickers, chunk);
@@ -2850,20 +3629,21 @@ fn validate_full(
             samples += batch_samples;
             batches += 1;
 
-            if matches!(objective, PretrainObjective::Lejepa)
-                && rollout_windows < LEJEPA_ROLLOUT_EVAL_WINDOWS
+            if mode == ValidationMode::Full
+                && matches!(objective, PretrainObjective::Lejepa)
+                && rollout_windows < rollout_window_limit
             {
-                let take = batch_samples.min(LEJEPA_ROLLOUT_EVAL_WINDOWS - rollout_windows);
+                let take = batch_samples.min(rollout_window_limit - rollout_windows);
                 rollout_ctx.push(batch.bar_history.narrow(0, 0, take as i64));
                 rollout_actual.push(batch.next_bars.narrow(0, 0, take as i64));
                 rollout_windows += take;
             }
 
             // Belief-ablation skill test: how much predictive info does the AR
-            // belief carry through `pred_proj`? ev = 1 - mse/var (centered
+            // belief carry through the flow endpoint? ev = 1 - mse/var (centered
             // marginal variance) of the next-embedding prediction. Comparing
             // belief vs row-shuffled vs zero context isolates the conditioning.
-            if matches!(objective, PretrainObjective::Lejepa) {
+            if mode == ValidationMode::Full && matches!(objective, PretrainObjective::Lejepa) {
                 let latent_dim = heads.latent_dim;
                 let full = Tensor::cat(&[&batch.bar_history, &batch.next_bars.narrow(2, 0, 1)], 2);
                 let all_tokens = autocast(false, || heads.encode_bar_tokens(&full, false));
@@ -2881,7 +3661,10 @@ fn validate_full(
                     .mean(Kind::Float)
                     .double_value(&[]);
                 let ev = |ctx: &Tensor| -> f64 {
-                    let est = heads.pred_emb_from_belief(ctx, false);
+                    let signal =
+                        Tensor::full([rows], LEJEPA_MEAN_SIGNAL_LEVEL, (Kind::Int64, device));
+                    let z = Tensor::zeros([rows, latent_dim], (Kind::Float, device));
+                    let est = heads.lejepa_flow_predict(&z, &signal, ctx);
                     let mse = est.mse_loss(&z1, Reduction::Mean).double_value(&[]);
                     1.0 - mse / var
                 };
@@ -2924,11 +3707,9 @@ fn validate_full(
             (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN)
         };
 
-        // Deterministic imagined-rollout MSE against the actual future in raw OHLC
-        // space (matching the candle diagnostics). Per-window MSE reduces over
-        // horizon x 16 features. The rollout has no stochasticity, so the "sampled"
-        // columns mirror the mean and the paired delta/se/t are zero. Chunked at
-        // `batch_size` to bound rollout VRAM.
+        // Compare the repeatable conditional-mean path with independent sampled
+        // flow trajectories. Sampled MSE is the mean of per-trajectory MSEs, not
+        // the MSE of an averaged trajectory.
         let (
             rollout_mean_mse,
             rollout_sampled_mse,
@@ -2963,7 +3744,8 @@ fn validate_full(
                     let len = chunk.min(n_total - start);
                     let ctx_c = ctx.narrow(0, start, len);
                     let actual_c = actual.narrow(0, start, len);
-                    let roll = heads.lejepa_imagined_rollout(&ctx_c, false) / target_scale;
+                    let roll =
+                        heads.lejepa_imagined_rollout(&ctx_c, FlowRolloutMode::Mean) / target_scale;
                     let dclose = roll.narrow(2, 3, 1);
                     dclose_sum += dclose.sum(Kind::Float).double_value(&[]);
                     dclose_sqsum += dclose.square().sum(Kind::Float).double_value(&[]);
@@ -2987,9 +3769,78 @@ fn validate_full(
                 let dclose_std = (dclose_sqsum / dclose_n as f64 - dclose_avg.powi(2))
                     .max(0.0)
                     .sqrt();
+                let mut sampled_mse = vec![0.0f64; n];
+                let mut sampled_dclose_sum = 0.0;
+                let mut sampled_dclose_sqsum = 0.0;
+                let mut sampled_dclose_n = 0i64;
+                for _ in 0..LEJEPA_ROLLOUT_EVAL_SAMPLES {
+                    let mut sample_start = 0;
+                    let mut window_start = 0usize;
+                    while sample_start < n_total {
+                        let len = chunk.min(n_total - sample_start);
+                        let ctx_c = ctx.narrow(0, sample_start, len);
+                        let actual_c = actual.narrow(0, sample_start, len);
+                        let roll = heads.lejepa_imagined_rollout(
+                            &ctx_c,
+                            FlowRolloutMode::Sample { temperature: 1.0 },
+                        ) / target_scale;
+                        let dclose = roll.narrow(2, 3, 1);
+                        sampled_dclose_sum += dclose.sum(Kind::Float).double_value(&[]);
+                        sampled_dclose_sqsum += dclose.square().sum(Kind::Float).double_value(&[]);
+                        sampled_dclose_n += dclose.numel() as i64;
+                        let pw = (&roll - actual_c).square().mean_dim(
+                            [1i64, 2].as_slice(),
+                            false,
+                            Kind::Float,
+                        );
+                        for (dst, value) in sampled_mse[window_start..window_start + len as usize]
+                            .iter_mut()
+                            .zip(tensor_to_vec_f32(&pw).expect("sampled rollout mse"))
+                        {
+                            *dst += value as f64 / LEJEPA_ROLLOUT_EVAL_SAMPLES as f64;
+                        }
+                        sample_start += len;
+                        window_start += len as usize;
+                    }
+                }
+                let sampled_avg = sampled_mse.iter().sum::<f64>() / n as f64;
+                let deltas = sampled_mse
+                    .iter()
+                    .zip(&mean_mse)
+                    .map(|(sampled, mean)| sampled - mean)
+                    .collect::<Vec<_>>();
+                let delta = deltas.iter().sum::<f64>() / n as f64;
+                let delta_var = if n > 1 {
+                    deltas
+                        .iter()
+                        .map(|value| (value - delta).powi(2))
+                        .sum::<f64>()
+                        / (n - 1) as f64
+                } else {
+                    0.0
+                };
+                let delta_se = (delta_var / n as f64).sqrt();
+                let delta_t = if delta_se > 0.0 {
+                    delta / delta_se
+                } else {
+                    0.0
+                };
+                let sampled_dclose_avg = sampled_dclose_sum / sampled_dclose_n as f64;
+                let sampled_dclose_std = (sampled_dclose_sqsum / sampled_dclose_n as f64
+                    - sampled_dclose_avg.powi(2))
+                .max(0.0)
+                .sqrt();
                 (
-                    mean_avg, mean_avg, 0.0, 0.0, 0.0, n as f64, dclose_avg, dclose_std,
-                    dclose_avg, dclose_std,
+                    mean_avg,
+                    sampled_avg,
+                    delta,
+                    delta_se,
+                    delta_t,
+                    n as f64,
+                    dclose_avg,
+                    dclose_std,
+                    sampled_dclose_avg,
+                    sampled_dclose_std,
                 )
             }
             // NaN/0 = not-applicable: MeanMse has no imagined rollout.
@@ -3084,6 +3935,7 @@ fn write_pretrain_diagnostics(
     global_step: usize,
     gens_dir: &Path,
     device: Device,
+    panel_only: bool,
 ) -> Result<()> {
     const TRACE_COUNT: usize = 8;
     const WORST_COUNT: usize = 8;
@@ -3130,6 +3982,11 @@ fn write_pretrain_diagnostics(
             if offsets.is_empty() {
                 continue;
             }
+            let offsets = if panel_only {
+                vec![offsets[offsets.len() / 2]]
+            } else {
+                offsets
+            };
 
             for chunk in offsets.chunks(batch_size) {
                 if max_batches.is_some_and(|limit| batches >= limit) {
@@ -3156,22 +4013,27 @@ fn write_pretrain_diagnostics(
                         )
                     }
                     PretrainObjective::Lejepa => {
-                        let (imagined, entropy) =
-                            heads.lejepa_imagined_rollout_inner(&batch.bar_history, false, true);
+                        let (imagined, entropy) = heads.lejepa_imagined_rollout_inner(
+                            &batch.bar_history,
+                            FlowRolloutMode::Mean,
+                            true,
+                        );
                         if let Some(e) = entropy {
                             ent_mstep += e.mean_step_std;
                             ent_tnmean += e.tok_norm_mean;
                             ent_tnmax = ent_tnmax.max(e.tok_norm_max);
                             ent_n += 1;
                         }
-                        // Deterministic rollout: the mean and sampled candle variants
-                        // are identical.
-                        let predicted_ohlc = imagined / target_scale;
-                        mean_ohlc = Some(tensor_to_vec_f32(&predicted_ohlc)?);
+                        let mean_prediction = imagined / target_scale;
+                        let sampled_prediction = heads.lejepa_imagined_rollout(
+                            &batch.bar_history,
+                            FlowRolloutMode::Sample { temperature: 1.0 },
+                        ) / target_scale;
+                        mean_ohlc = Some(tensor_to_vec_f32(&mean_prediction)?);
                         (
                             Vec::new(),
                             Vec::new(),
-                            Some(tensor_to_vec_f32(&predicted_ohlc)?),
+                            Some(tensor_to_vec_f32(&sampled_prediction)?),
                             Some(tensor_to_vec_f32(&batch.next_bars)?),
                         )
                     }
@@ -3589,7 +4451,11 @@ fn normalize_last_dim(x: &Tensor) -> Tensor {
     let var = centered
         .pow_tensor_scalar(2.0)
         .mean_dim([-1].as_slice(), true, Kind::Float);
-    centered / (var + 1e-5).sqrt()
+    centered / (var + LEJEPA_NORMALIZATION_EPS).sqrt()
+}
+
+fn latent_bound(value: &Tensor) -> Tensor {
+    (value / LEJEPA_LATENT_BOUND).tanh() * LEJEPA_LATENT_BOUND
 }
 
 fn clip_all_grads(named_vars: &[(String, Tensor)], max_grad_norm: f64, device: Device) {
@@ -3621,9 +4487,8 @@ enum LejepaGradGroup {
 }
 
 // Routes a trainable parameter to its learning-dynamics group by name. Order
-// matters: the per-bar encoder/projector (which also matches `lejepa_projector`)
-// is checked first, leaving the AR transformer + `lejepa_pred_proj` as the
-// remaining `lejepa_` params. Base-model params are grouped as Other.
+// matters: the per-bar encoder/projector is checked first, leaving the AR
+// transformer and flow head as the remaining `lejepa_` params.
 fn lejepa_grad_group(name: &str) -> LejepaGradGroup {
     if name.contains("bar_proj")
         || name.contains("bar_enrich_")
@@ -3757,9 +4622,10 @@ mod tests {
         chained_candles_from_ohlc_features, cumulative_future_returns,
         deterministic_sigreg_directions, future_patches_for_current_perm,
         next_bars_for_current_perm, record_evaluated_tickers, save_pretrain_heads_checkpoint,
-        seed_candle_from_feature_row, sequence_frontier, sigreg_loss, CandleBar, PretrainHeads,
-        PretrainObjective, PretrainSampler, SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_ROLLOUT_BARS,
-        LEJEPA_SIGREG_PROJECTIONS,
+        seed_candle_from_feature_row, sigreg_loss_impl, ticker_stratified_panel, CandleBar,
+        FlowRolloutMode, PretrainArgs, PretrainExecutionMode, PretrainHeads, PretrainObjective,
+        PretrainSampler, SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_K_MAX, LEJEPA_LATENT_BOUND,
+        LEJEPA_ROLLOUT_BARS, LEJEPA_SIGREG_PROJECTIONS,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -3811,6 +4677,51 @@ mod tests {
     }
 
     #[test]
+    fn zero_steps_reaches_eval_only_mode_only_with_weights() {
+        let mut args = PretrainArgs {
+            weights: Some("checkpoint.ot".to_owned()),
+            model_size: ModelVariant::UniformStream,
+            run: Some("eval-only-test".to_owned()),
+            epochs: 1,
+            steps: Some(0),
+            eval_skill_only: false,
+            batch_size: 8,
+            k_patches: 16,
+            objective: PretrainObjective::Lejepa,
+            lambda_lat: 0.0,
+            lambda_sigreg: 0.1,
+            target_scale: 100.0,
+            validation_batches: 0,
+            validate_every: 0,
+            checkpoint_every: 0,
+            step_val_every: 0,
+            candle_snapshot_every: 0,
+        };
+        assert_eq!(
+            super::pretrain_execution_mode(&args).unwrap(),
+            PretrainExecutionMode::EvaluateOnly
+        );
+        args.eval_skill_only = true;
+        assert_eq!(
+            super::pretrain_execution_mode(&args).unwrap(),
+            PretrainExecutionMode::EvaluateOnly
+        );
+        args.objective = PretrainObjective::MeanMse;
+        assert!(super::pretrain_execution_mode(&args).is_err());
+        args.objective = PretrainObjective::Lejepa;
+        args.weights = None;
+        assert!(super::pretrain_execution_mode(&args).is_err());
+        args.weights = Some("checkpoint.ot".to_owned());
+        args.steps = Some(1);
+        assert!(super::pretrain_execution_mode(&args).is_err());
+        args.eval_skill_only = false;
+        assert_eq!(
+            super::pretrain_execution_mode(&args).unwrap(),
+            PretrainExecutionMode::Train
+        );
+    }
+
+    #[test]
     fn cumulative_future_returns_flattens_patches_and_accumulates_horizon() {
         let future_patches =
             Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).view([1, 1, 2, 3]);
@@ -3818,39 +4729,6 @@ mod tests {
         let expected = Tensor::from_slice(&[1.0f32, 3.0, 6.0, 10.0, 15.0, 21.0]).view([1, 1, 6]);
         let max_diff = (cumulative - expected).abs().max().double_value(&[]);
         assert!(max_diff < 1e-6, "cumulative target mismatch: {max_diff}");
-    }
-
-    #[test]
-    fn patch_frontier_loss_ignores_overlapping_target_positions() {
-        let prediction = Tensor::from_slice(&[9.0f32, 10.0]).view([1, 1, 1, 2]);
-        let targets =
-            Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 9.0, 10.0]).view([1, 1, 4, 2]);
-        let changed_overlap =
-            Tensor::from_slice(&[-100.0f32, 200.0, 300.0, -400.0, 500.0, 600.0, 9.0, 10.0])
-                .view([1, 1, 4, 2]);
-
-        let frontier = sequence_frontier(&targets);
-        let changed_frontier = sequence_frontier(&changed_overlap);
-        assert_eq!(frontier.size(), vec![1, 1, 1, 2]);
-        assert_eq!(
-            prediction
-                .mse_loss(&frontier, tch::Reduction::Mean)
-                .double_value(&[]),
-            0.0
-        );
-        assert_eq!(
-            prediction
-                .mse_loss(&changed_frontier, tch::Reduction::Mean)
-                .double_value(&[]),
-            0.0
-        );
-        let wrong_frontier = Tensor::from_slice(&[9.0f32, 12.0]).view([1, 1, 1, 2]);
-        assert!(
-            prediction
-                .mse_loss(&wrong_frontier, tch::Reduction::Mean)
-                .double_value(&[])
-                > 0.0
-        );
     }
 
     #[test]
@@ -4118,8 +4996,8 @@ mod tests {
         let opts = (tch::Kind::Float, tch::Device::Cpu);
         let unit = Tensor::randn([positions, samples, dim], opts);
         let inflated = &unit * 3.0_f64.sqrt();
-        let unit_loss = sigreg_loss(&unit).double_value(&[]);
-        let inflated_loss = sigreg_loss(&inflated).double_value(&[]);
+        let unit_loss = sigreg_loss_impl(&unit, false).double_value(&[]);
+        let inflated_loss = sigreg_loss_impl(&inflated, false).double_value(&[]);
         assert!(
             inflated_loss > unit_loss * 4.0,
             "variance-3 sigreg {inflated_loss} should dwarf unit-variance {unit_loss}"
@@ -4168,6 +5046,15 @@ mod tests {
     }
 
     #[test]
+    fn fast_validation_panel_has_one_deterministic_window_per_ticker() {
+        let pairs = vec![(2, 30), (0, 40), (1, 50), (0, 20), (2, 10), (1, 60)];
+        assert_eq!(
+            ticker_stratified_panel(&pairs),
+            vec![(0, 40), (1, 60), (2, 30)]
+        );
+    }
+
+    #[test]
     fn probe_predicts_single_next_bar() {
         let vs = nn::VarStore::new(tch::Device::Cpu);
         let latent_dim = 256;
@@ -4210,12 +5097,17 @@ mod tests {
         for step in 0..3 {
             let preds = heads.predict_lejepa_bar_predictions(&tokens, false);
             let last = tokens.size()[2] - 1;
-            let next_latent = heads.pred_emb_from_belief(&preds.belief.narrow(2, last, 1), false);
+            let ctx = preds.belief.narrow(2, last, 1).reshape([batch, latent_dim]);
+            let signal = Tensor::zeros([batch], (tch::Kind::Int64, tch::Device::Cpu));
+            let z = Tensor::zeros([batch, latent_dim], (tch::Kind::Float, tch::Device::Cpu));
+            let next_latent = heads
+                .lejepa_flow_predict(&z, &signal, &ctx)
+                .view([batch, 1, 1, latent_dim]);
             tokens = Tensor::cat(&[&tokens, &next_latent], 2);
             assert_eq!(tokens.size()[2], start_len + step + 1);
         }
 
-        let imagined = heads.lejepa_imagined_rollout(&context, false);
+        let imagined = heads.lejepa_imagined_rollout(&context, FlowRolloutMode::Mean);
         assert_eq!(
             imagined.size(),
             vec![batch, LEJEPA_ROLLOUT_BARS, LEJEPA_BAR_FEATURES]
@@ -4227,7 +5119,7 @@ mod tests {
     }
 
     #[test]
-    fn pred_emb_handles_gapped_narrowed_targets() {
+    fn flow_loss_handles_gapped_narrowed_targets() {
         let vs = nn::VarStore::new(tch::Device::Cpu);
         let latent_dim = 256;
         let heads = PretrainHeads::new(&vs.root(), latent_dim, 16, 25);
@@ -4243,12 +5135,139 @@ mod tests {
         let bar_tokens = all_tokens.narrow(2, 0, length);
         let target_bar_tokens = all_tokens.narrow(2, 1, length);
         let predictions = heads.predict_lejepa_bar_predictions(&bar_tokens, true);
-        let pred_emb = heads.pred_emb_from_belief(&predictions.belief, true);
-        assert_eq!(pred_emb.size(), target_bar_tokens.size());
-        let loss = pred_emb.mse_loss(&target_bar_tokens, tch::Reduction::Mean);
+        let rows = target_bar_tokens.numel() as i64 / latent_dim;
+        let ctx = predictions.belief.reshape([rows, latent_dim]);
+        let clean = target_bar_tokens.reshape([rows, latent_dim]);
+        let (loss, pred_emb, signal) = super::lejepa_flow_loss(&heads, &ctx, &clean, true);
+        assert_eq!(pred_emb.size(), vec![rows, latent_dim]);
+        assert_eq!(signal.size(), vec![rows]);
+        assert!(signal.min().int64_value(&[]) >= 0);
+        assert!(signal.max().int64_value(&[]) < LEJEPA_K_MAX);
         let value = loss.double_value(&[]);
         assert!(value.is_finite(), "pred loss must be finite, got {value}");
         assert!(value >= 0.0, "pred loss must be non-negative, got {value}");
+    }
+
+    #[test]
+    fn flow_output_is_bounded_and_mean_rollout_is_repeatable() {
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let heads = PretrainHeads::new(&vs.root(), 256, 16, 25);
+        let z = Tensor::randn([4, 256], (tch::Kind::Float, tch::Device::Cpu));
+        let ctx = Tensor::randn([4, 256], (tch::Kind::Float, tch::Device::Cpu));
+        let signal = Tensor::zeros([4], (tch::Kind::Int64, tch::Device::Cpu));
+        let output = heads.lejepa_flow_predict(&z, &signal, &ctx);
+        assert!(output.abs().max().double_value(&[]) <= LEJEPA_LATENT_BOUND);
+
+        let context = Tensor::randn(
+            [1, 1, 8, LEJEPA_BAR_FEATURES],
+            (tch::Kind::Float, tch::Device::Cpu),
+        );
+        let first = heads.lejepa_imagined_rollout(&context, FlowRolloutMode::Mean);
+        let second = heads.lejepa_imagined_rollout(&context, FlowRolloutMode::Mean);
+        assert_eq!((first - second).abs().max().double_value(&[]), 0.0);
+    }
+
+    #[test]
+    fn evaluation_flow_loss_is_reproducible_and_stratifies_all_signals() {
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let heads = PretrainHeads::new(&vs.root(), 256, 16, 25);
+        let ctx = Tensor::randn([128, 256], (tch::Kind::Float, tch::Device::Cpu));
+        let clean = Tensor::randn([128, 256], (tch::Kind::Float, tch::Device::Cpu));
+        let (first_loss, first_prediction, first_signal) =
+            super::lejepa_flow_loss(&heads, &ctx, &clean, false);
+        let (second_loss, second_prediction, second_signal) =
+            super::lejepa_flow_loss(&heads, &ctx, &clean, false);
+        assert_eq!(first_loss.double_value(&[]), second_loss.double_value(&[]));
+        assert_eq!(
+            (first_prediction - second_prediction)
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0
+        );
+        assert_eq!(
+            (first_signal.shallow_clone() - second_signal)
+                .abs()
+                .max()
+                .int64_value(&[]),
+            0
+        );
+        for signal in 0..LEJEPA_K_MAX {
+            assert_eq!(
+                first_signal
+                    .eq(signal)
+                    .sum(tch::Kind::Int64)
+                    .int64_value(&[]),
+                2
+            );
+        }
+        let noise = super::deterministic_flow_noise(128, 256, tch::Device::Cpu);
+        assert!(noise.mean(tch::Kind::Float).double_value(&[]).abs() < 0.05);
+        let std = noise.std(false).double_value(&[]);
+        assert!((0.9..1.1).contains(&std), "fixed noise std={std}");
+    }
+
+    #[test]
+    fn lejepa_checkpoint_promotion_requires_both_metrics_to_improve() {
+        let validation = super::ValidationLoss {
+            total: 0.9,
+            ..Default::default()
+        };
+        assert!(super::is_better_pretrain_checkpoint(
+            PretrainObjective::Lejepa,
+            &validation,
+            0.8,
+            1.0,
+            0.9,
+        ));
+        assert!(!super::is_better_pretrain_checkpoint(
+            PretrainObjective::Lejepa,
+            &validation,
+            1.0,
+            1.0,
+            0.9,
+        ));
+        assert!(!super::is_better_pretrain_checkpoint(
+            PretrainObjective::Lejepa,
+            &validation,
+            0.8,
+            0.8,
+            0.9,
+        ));
+    }
+
+    #[test]
+    fn promotion_candidate_loads_through_deployed_world_model() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "trading-bot-promotion-candidate-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let checkpoint = temp_dir.join("candidate.ot");
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        let _heads = PretrainHeads::new(&vs.root(), 256, 16, 25);
+        vs.save(&checkpoint).unwrap();
+        let metadata_path = crate::torch::world_model::WorldModelMetadata::save_for_checkpoint(
+            &checkpoint,
+            256,
+            100.0,
+        )
+        .unwrap();
+        let world_model = crate::torch::world_model::LejepaWorldModel::load(
+            &checkpoint,
+            &metadata_path,
+            tch::Device::Cpu,
+        )
+        .unwrap();
+        let context = Tensor::randn(
+            [1, 1, 8, LEJEPA_BAR_FEATURES],
+            (tch::Kind::Float, tch::Device::Cpu),
+        );
+        let prediction = world_model.predict(&context, 2).unwrap();
+        assert_eq!(prediction.latent.size(), vec![1, 2, 256]);
+        assert_eq!(prediction.ohlc_mean.size(), vec![1, 2, LEJEPA_BAR_FEATURES]);
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     fn synthetic_sampler(n: usize) -> PretrainSampler {

@@ -4,7 +4,7 @@ pub(crate) mod gae;
 mod geometry;
 mod log;
 mod loop_;
-mod numeric_debug;
+pub(crate) mod numeric_debug;
 pub(crate) mod optimizer_glue;
 pub mod pretrain;
 mod rollout;

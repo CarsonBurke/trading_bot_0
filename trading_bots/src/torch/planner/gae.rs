@@ -3,15 +3,20 @@ use tch::{Kind, Tensor};
 pub const PLANNER_GAMMA: f64 = 0.995;
 pub const PLANNER_GAE_LAMBDA: f64 = 0.95;
 
+/// GAE over a dense `[time, environments]` planner rollout. Kept distinct from
+/// `train::gae::compute_gae_chunked`, which operates on chunk-major PPO layouts
+/// with a single `dones` flag and an explicit bootstrap value; this variant is
+/// time-major and separates terminated (no bootstrap) from truncated (bootstrap
+/// but stop the trace), matching the planner's non-terminating environment.
 pub fn compute_planner_gae(
     rewards: &Tensor,
     values: &Tensor,
     next_values: &Tensor,
     terminated: &Tensor,
     truncated: &Tensor,
-    gamma: f64,
-    gae_lambda: f64,
 ) -> (Tensor, Tensor) {
+    let gamma = PLANNER_GAMMA;
+    let gae_lambda = PLANNER_GAE_LAMBDA;
     assert_eq!(
         rewards.size(),
         values.size(),
@@ -64,24 +69,6 @@ pub fn compute_planner_gae(
     })
 }
 
-pub fn compute_default_planner_gae(
-    rewards: &Tensor,
-    values: &Tensor,
-    next_values: &Tensor,
-    terminated: &Tensor,
-    truncated: &Tensor,
-) -> (Tensor, Tensor) {
-    compute_planner_gae(
-        rewards,
-        values,
-        next_values,
-        terminated,
-        truncated,
-        PLANNER_GAMMA,
-        PLANNER_GAE_LAMBDA,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,19 +85,15 @@ mod tests {
         let terminated = Tensor::zeros([2, 1], (Kind::Float, tch::Device::Cpu));
         let truncated = Tensor::from_slice(&[1.0f32, 0.0]).view([2, 1]);
 
-        let (advantages, returns) = compute_planner_gae(
-            &rewards,
-            &values,
-            &next_values,
-            &terminated,
-            &truncated,
-            0.9,
-            0.8,
-        );
+        let (advantages, returns) =
+            compute_planner_gae(&rewards, &values, &next_values, &terminated, &truncated);
 
-        assert!((scalar(&advantages, 0, 0) - 2.8).abs() < 1e-5);
+        // Truncation bootstraps off next_values[0] but zeroes the trace, so the
+        // large adv[1] never leaks into adv[0].
+        let expected_first = 1.0 + PLANNER_GAMMA * 2.0;
+        assert!((scalar(&advantages, 0, 0) - expected_first).abs() < 1e-5);
         assert!((scalar(&advantages, 1, 0) - 100.0).abs() < 1e-5);
-        assert!((scalar(&returns, 0, 0) - 2.8).abs() < 1e-5);
+        assert!((scalar(&returns, 0, 0) - expected_first).abs() < 1e-5);
     }
 
     #[test]
@@ -121,7 +104,7 @@ mod tests {
         let terminated = Tensor::ones([1, 1], (Kind::Float, tch::Device::Cpu));
         let truncated = Tensor::zeros([1, 1], (Kind::Float, tch::Device::Cpu));
         let (advantages, returns) =
-            compute_default_planner_gae(&rewards, &values, &next_values, &terminated, &truncated);
+            compute_planner_gae(&rewards, &values, &next_values, &terminated, &truncated);
         assert!((scalar(&advantages, 0, 0) - 0.75).abs() < 1e-6);
         assert!((scalar(&returns, 0, 0) - 1.0).abs() < 1e-6);
     }
@@ -132,15 +115,9 @@ mod tests {
         let values = Tensor::zeros([2, 1], (Kind::Float, tch::Device::Cpu));
         let next_values = Tensor::zeros([2, 1], (Kind::Float, tch::Device::Cpu));
         let boundaries = Tensor::zeros([2, 1], (Kind::Float, tch::Device::Cpu));
-        let (advantages, _) = compute_planner_gae(
-            &rewards,
-            &values,
-            &next_values,
-            &boundaries,
-            &boundaries,
-            0.9,
-            0.8,
-        );
-        assert!((scalar(&advantages, 0, 0) - 2.44).abs() < 1e-5);
+        let (advantages, _) =
+            compute_planner_gae(&rewards, &values, &next_values, &boundaries, &boundaries);
+        let expected_first = 1.0 + PLANNER_GAMMA * PLANNER_GAE_LAMBDA * 2.0;
+        assert!((scalar(&advantages, 0, 0) - expected_first).abs() < 1e-5);
     }
 }
