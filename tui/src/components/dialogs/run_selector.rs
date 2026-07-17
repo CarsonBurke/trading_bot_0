@@ -57,7 +57,10 @@ pub fn render(f: &mut Frame, selected: usize, runs: &[RunInfo], purpose: &RunSel
             };
 
             let detail = match purpose {
-                RunSelectorPurpose::View => format!("  {} eps", run.gen_count),
+                RunSelectorPurpose::View => {
+                    let live = if run.is_active { ", live" } else { "" };
+                    format!("  {} eps{live}", run.gen_count)
+                }
                 RunSelectorPurpose::Train => {
                     let w = run.weights.len();
                     if w > 0 {

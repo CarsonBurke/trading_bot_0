@@ -240,17 +240,33 @@ impl ChartViewer {
         chart_paths: &[PathBuf],
         extra_reports: Vec<(String, Report)>,
     ) -> Result<()> {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         use std::time::SystemTime;
 
+        let selected_title = self.selected_report_title();
         self.nodes.clear();
         self.root_indices.clear();
         self.expanded.clear();
         self.current_image = None;
         self.viewing_mode = ViewingMode::MetaCharts;
 
-        // In-memory CSV-derived charts (step losses, test metrics) surface first.
+        let artifact_scores = chart_paths
+            .iter()
+            .filter_map(|path| {
+                let report = load_report(path).ok()?;
+                Some((report.title.clone(), report_score(&report)))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut suppressed_artifact_titles = HashSet::new();
+
         for (name, report) in extra_reports {
+            let use_fallback = artifact_scores
+                .get(&report.title)
+                .is_none_or(|artifact| report_score(&report) > *artifact);
+            if !use_fallback {
+                continue;
+            }
+            suppressed_artifact_titles.insert(report.title.clone());
             let chart_idx = self.nodes.len();
             self.nodes.push(ChartNode::Chart {
                 name,
@@ -274,6 +290,11 @@ impl ChartViewer {
 
         for path in chart_paths {
             if path.exists() {
+                if report_title_from_path(path)
+                    .is_some_and(|title| suppressed_artifact_titles.contains(&title))
+                {
+                    continue;
+                }
                 // Get modification time
                 let modified = path
                     .metadata()
@@ -527,11 +548,33 @@ impl ChartViewer {
         self.rebuild_flattened();
 
         if !self.flattened.is_empty() {
-            self.list_state.select(Some(0));
+            let selected = selected_title
+                .as_deref()
+                .and_then(|title| self.flattened_report_position(title))
+                .unwrap_or(0);
+            self.list_state.select(Some(selected));
             self.load_current_image();
         }
 
         Ok(())
+    }
+
+    fn selected_report_title(&self) -> Option<String> {
+        let selected = self.list_state.selected()?;
+        let (node, _) = *self.flattened.get(selected)?;
+        let ChartNode::Chart { source, .. } = self.nodes.get(node)? else {
+            return None;
+        };
+        source.report().ok().map(|report| report.title)
+    }
+
+    fn flattened_report_position(&self, title: &str) -> Option<usize> {
+        self.flattened.iter().position(|(node, _)| {
+            let Some(ChartNode::Chart { source, .. }) = self.nodes.get(*node) else {
+                return false;
+            };
+            source.report().is_ok_and(|report| report.title == title)
+        })
     }
 
     fn build_tree(&mut self, path: &PathBuf) -> Result<()> {
@@ -1153,6 +1196,59 @@ fn report_title_from_path(path: &PathBuf) -> Option<String> {
     Some(report.title)
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReportScore {
+    latest_finite_index: Option<usize>,
+    axis_semantics_current: bool,
+    series_count: usize,
+}
+
+fn report_score(report: &Report) -> ReportScore {
+    let series = match &report.kind {
+        ReportKind::Simple { values, .. } => vec![values.as_slice()],
+        ReportKind::MultiLine { series } => series
+            .iter()
+            .map(|series| series.values.as_slice())
+            .collect(),
+        ReportKind::Assets {
+            total,
+            cash,
+            positioned,
+            benchmark,
+        } => {
+            let mut series = vec![total.as_slice(), cash.as_slice()];
+            if let Some(positioned) = positioned {
+                series.push(positioned);
+            }
+            if let Some(benchmark) = benchmark {
+                series.push(benchmark);
+            }
+            series
+        }
+        _ => Vec::new(),
+    };
+    let latest_finite_index = series
+        .iter()
+        .filter_map(|values| values.iter().rposition(|value| value.is_finite()))
+        .max();
+    let series_count = series
+        .iter()
+        .filter(|values| values.iter().any(|value| value.is_finite()))
+        .count();
+    let axis_semantics_current = !(report.title.contains("Outperformance")
+        && !report.title.contains("Fraction")
+        && matches!(
+            &report.kind,
+            ReportKind::MultiLine { series }
+                if series.iter().any(|series| series.label.to_ascii_lowercase().contains("fraction"))
+        ));
+    ReportScore {
+        latest_finite_index,
+        axis_semantics_current,
+        series_count,
+    }
+}
+
 fn pretrain_sample_parts(path: &PathBuf, episode: Option<usize>) -> Option<(String, String)> {
     let file_name = path.file_name()?.to_str()?;
     let base = file_name.strip_suffix(".report.bin")?;
@@ -1192,4 +1288,152 @@ fn render_report_to_temp(report: &Report, skip: usize, show_legend: bool) -> Res
     path.push(format!("report_chart_{stamp}.png"));
     image.save(&path)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::report::{ReportSeries, ScaleKind};
+
+    fn multiline(title: &str, labels: &[&str]) -> Report {
+        Report {
+            title: title.to_owned(),
+            x_label: Some("update".to_owned()),
+            y_label: Some("value".to_owned()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::MultiLine {
+                series: labels
+                    .iter()
+                    .map(|label| ReportSeries {
+                        label: (*label).to_owned(),
+                        values: vec![1.0],
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn meta_refresh_preserves_selected_report_title() {
+        let mut viewer = ChartViewer::new();
+        viewer
+            .load_charts(
+                &[],
+                vec![
+                    ("A".to_owned(), multiline("A", &["a"])),
+                    ("B".to_owned(), multiline("B", &["b"])),
+                ],
+            )
+            .unwrap();
+        viewer.next();
+        assert_eq!(viewer.selected_report_title().as_deref(), Some("B"));
+
+        viewer
+            .load_charts(
+                &[],
+                vec![
+                    ("A".to_owned(), multiline("A", &["a"])),
+                    ("B".to_owned(), multiline("B", &["b", "new"])),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(viewer.selected_report_title().as_deref(), Some("B"));
+        assert_eq!(viewer.current_series_count(), Some(2));
+    }
+
+    #[test]
+    fn canonical_artifact_dedup_prefers_equally_current_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "chart-viewer-pretrain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let generation = root.join("gens/1");
+        fs::create_dir_all(&generation).unwrap();
+        let artifact_path = generation.join("outperformance.report.bin");
+        fs::write(
+            &artifact_path,
+            postcard::to_stdvec(&multiline("Pretrain Probe", &["train", "validation"])).unwrap(),
+        )
+        .unwrap();
+        let csv_fallback = multiline("Pretrain Probe", &["train", "validation"]);
+        let mut viewer = ChartViewer::new();
+
+        viewer
+            .load_charts(
+                &[artifact_path],
+                vec![("Pretrain Probe".to_owned(), csv_fallback)],
+            )
+            .unwrap();
+
+        assert_eq!(viewer.current_series_count(), Some(2));
+        let selected = viewer.list_state.selected().unwrap();
+        let (node, _) = viewer.flattened[selected];
+        let ChartNode::Chart { source, .. } = &viewer.nodes[node] else {
+            panic!("expected chart");
+        };
+        assert!(matches!(source, ChartSource::Path(_)));
+        assert_eq!(
+            viewer
+                .nodes
+                .iter()
+                .filter(|node| matches!(node, ChartNode::Chart { .. }))
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newer_pretrain_fallback_replaces_stale_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "chart-viewer-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let generation = root.join("gens/1");
+        fs::create_dir_all(&generation).unwrap();
+        let artifact_path = generation.join("reward.report.bin");
+        fs::write(
+            &artifact_path,
+            postcard::to_stdvec(&multiline("Pretrain Loss", &["train"])).unwrap(),
+        )
+        .unwrap();
+        let mut fallback = multiline("Pretrain Loss", &["train"]);
+        let ReportKind::MultiLine { series } = &mut fallback.kind else {
+            unreachable!();
+        };
+        series[0].values = vec![1.0, 2.0, 3.0];
+        let mut viewer = ChartViewer::new();
+
+        viewer
+            .load_charts(
+                &[artifact_path],
+                vec![("Pretrain Loss".to_owned(), fallback)],
+            )
+            .unwrap();
+
+        let selected = viewer.list_state.selected().unwrap();
+        let (node, _) = viewer.flattened[selected];
+        let ChartNode::Chart { source, .. } = &viewer.nodes[node] else {
+            panic!("expected chart");
+        };
+        assert!(matches!(source, ChartSource::Report(_)));
+        assert_eq!(source.report().unwrap().kind.to_lines().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn equally_fresh_richer_fallback_outranks_incomplete_artifact() {
+        let incomplete = multiline("Pretrain Loss", &["train"]);
+        let richer = multiline("Pretrain Loss", &["train", "validation"]);
+        assert!(report_score(&richer) > report_score(&incomplete));
+    }
 }

@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use image::{DynamicImage, RgbImage};
 use plotters::coord::Shift;
 use plotters::prelude::*;
+use plotters::style::text_anchor::{HPos, Pos, VPos};
 use shared::report::{CandleBar, Report, ReportKind, ReportSeries, ScaleKind, TradePoint};
 use shared::theme::plotters_colors as theme;
 
@@ -142,6 +143,18 @@ fn render_simple(
     solo_series: Option<usize>,
 ) -> Result<()> {
     if values.is_empty() {
+        return Ok(());
+    }
+    if !values.iter().any(|value| value.is_finite()) {
+        let message = format!("{} — no finite values", normalize_title(&report.title));
+        root.draw(&Text::new(
+            message,
+            (CHART_DIMS.0 as i32 / 2, CHART_DIMS.1 as i32 / 2),
+            ("sans-serif", 24)
+                .into_font()
+                .color(&theme::SUBTEXT0)
+                .pos(Pos::new(HPos::Center, VPos::Center)),
+        ))?;
         return Ok(());
     }
 
@@ -331,19 +344,27 @@ fn render_multi_line(
         let active = solo.is_none() || solo == Some(i);
         let color = colors[i % colors.len()];
         if active {
-            let mapped = s
+            let mapped: Vec<_> = s
                 .values
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| v.is_finite())
-                .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)));
+                .map(|(idx, v)| (x_offset + idx as u32, map_value(*v as f64, scale)))
+                .collect();
             chart
                 .draw_series(LineSeries::new(
-                    mapped,
+                    mapped.iter().copied(),
                     ShapeStyle::from(&color.mix(0.8)).stroke_width(1),
                 ))?
                 .label(s.label.as_str())
                 .legend(legend_rect(color));
+            if mapped.len() == 1 {
+                chart.draw_series(std::iter::once(Circle::new(
+                    mapped[0],
+                    3,
+                    color.mix(0.8).filled(),
+                )))?;
+            }
         } else {
             // Empty series to reserve legend entry, keep original color
             chart
@@ -935,4 +956,52 @@ fn legend_rect(
 fn darken(c: RGBColor, factor: f64) -> RGBColor {
     let scale = |v: u8| (v as f64 * factor).round().clamp(0.0, 255.0) as u8;
     RGBColor(scale(c.0), scale(c.1), scale(c.2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiline_single_point_is_visible() {
+        let report = Report {
+            title: "single point".to_string(),
+            x_label: None,
+            y_label: None,
+            scale: ScaleKind::Linear,
+            kind: ReportKind::MultiLine {
+                series: vec![ReportSeries {
+                    label: "sparse".to_string(),
+                    values: vec![f32::NAN, 0.5, f32::NAN],
+                }],
+            },
+        };
+
+        let image = render_report_with_options(&report, 0, false, None)
+            .unwrap()
+            .to_rgb8();
+        let blue_pixels = image
+            .pixels()
+            .filter(|pixel| {
+                pixel[2] as i16 > pixel[0] as i16 + 50 && pixel[2] as i16 > pixel[1] as i16 + 30
+            })
+            .count();
+
+        assert!(blue_pixels >= 10);
+    }
+
+    #[test]
+    fn all_nan_simple_report_renders_an_explicit_placeholder() {
+        let report = Report {
+            title: "Undefined EV".to_owned(),
+            x_label: Some("update".to_owned()),
+            y_label: Some("EV".to_owned()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::Simple {
+                values: vec![f32::NAN],
+                ema_alpha: None,
+            },
+        };
+        assert!(render_report(&report).is_ok());
+    }
 }

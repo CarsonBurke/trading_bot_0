@@ -1,5 +1,6 @@
 use anyhow::Result;
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
+use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -36,21 +37,61 @@ pub struct ProcessManagerState {
     pub inference_process: Option<Child>,
     pub training_process: Option<Child>,
     pub active_run: Option<RunDir>,
+    live_run: Option<RunDir>,
+    view_pinned: bool,
     cached_training_running: bool,
     last_training_check: Instant,
 }
 
 impl ProcessManagerState {
     pub fn new() -> Self {
-        let active_run = detect_active_training_run(None)
+        let live_run = detect_active_training_run(None);
+        let active_run = live_run
+            .as_ref()
+            .map(clone_run_dir)
+            .or_else(latest_observable_run)
             .or_else(|| RunDir::latest_with_data(RUNS_PATH))
             .or_else(|| RunDir::latest(RUNS_PATH).ok());
         Self {
             inference_process: None,
             training_process: None,
             active_run,
+            live_run,
+            view_pinned: false,
             cached_training_running: false,
             last_training_check: Instant::now(),
+        }
+    }
+
+    pub fn live_run(&self) -> Option<&RunDir> {
+        self.live_run.as_ref()
+    }
+
+    pub fn pin_view_run(&mut self, run: RunDir) {
+        self.active_run = Some(run);
+        self.view_pinned = true;
+    }
+
+    pub fn follow_live_run(&mut self) {
+        self.view_pinned = false;
+        self.active_run = self
+            .live_run
+            .as_ref()
+            .map(clone_run_dir)
+            .or_else(latest_observable_run)
+            .or_else(|| RunDir::latest_with_data(RUNS_PATH))
+            .or_else(|| RunDir::latest(RUNS_PATH).ok());
+    }
+
+    fn update_live_run(&mut self, live_run: Option<RunDir>) {
+        self.live_run = live_run;
+        if !self.view_pinned {
+            self.active_run = self.live_run.as_ref().map(clone_run_dir).or_else(|| {
+                self.active_run
+                    .as_ref()
+                    .map(clone_run_dir)
+                    .or_else(latest_observable_run)
+            });
         }
     }
 
@@ -82,9 +123,9 @@ impl ProcessManagerState {
                 }
                 Ok(None) => {
                     self.cached_training_running = true;
-                    self.active_run = detect_active_training_run(Some(child.id()))
-                        .or_else(|| self.active_run.take())
-                        .or_else(|| RunDir::latest(RUNS_PATH).ok());
+                    let live_run = detect_active_training_run(Some(child.id()))
+                        .or_else(|| self.live_run.as_ref().map(clone_run_dir));
+                    self.update_live_run(live_run);
                     return true;
                 }
                 Err(_) => {
@@ -96,7 +137,10 @@ impl ProcessManagerState {
         if let Some((pid, status)) = exit_status {
             self.training_process = None;
             append_training_exit_status(
-                self.active_run.as_ref().map(|run| run.log_file.as_path()),
+                self.live_run
+                    .as_ref()
+                    .or(self.active_run.as_ref())
+                    .map(|run| run.log_file.as_path()),
                 pid,
                 status,
             );
@@ -104,13 +148,13 @@ impl ProcessManagerState {
 
         if !list_training_pids().is_empty() {
             self.cached_training_running = true;
-            self.active_run =
-                detect_active_training_run(self.training_process.as_ref().map(|c| c.id()))
-                    .or_else(|| RunDir::latest_with_data(RUNS_PATH))
-                    .or_else(|| RunDir::latest(RUNS_PATH).ok());
+            self.update_live_run(detect_active_training_run(
+                self.training_process.as_ref().map(|c| c.id()),
+            ));
             return true;
         }
 
+        self.update_live_run(None);
         self.cached_training_running = false;
         false
     }
@@ -196,7 +240,9 @@ impl ProcessManagerState {
 
         let child = cmd.spawn()?;
         self.training_process = Some(child);
+        self.live_run = Some(clone_run_dir(&run_dir));
         self.active_run = Some(run_dir);
+        self.view_pinned = false;
         self.cached_training_running = true;
 
         Ok(())
@@ -266,6 +312,15 @@ fn list_training_pids() -> Vec<u32> {
         .collect()
 }
 
+fn clone_run_dir(run: &RunDir) -> RunDir {
+    RunDir {
+        root: run.root.clone(),
+        gens: run.gens.clone(),
+        weights: run.weights.clone(),
+        log_file: run.log_file.clone(),
+    }
+}
+
 fn list_training_processes() -> Vec<(u32, String)> {
     let Ok(output) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
         return Vec::new();
@@ -306,18 +361,32 @@ fn detect_active_training_run(preferred_pid: Option<u32>) -> Option<RunDir> {
 }
 
 fn parse_run_dir_from_cmdline(cmdline: &str) -> Option<RunDir> {
-    let run_name = cmdline
+    run_name_from_cmdline(cmdline).and_then(run_dir_from_name)
+}
+
+fn run_name_from_cmdline(cmdline: &str) -> Option<&str> {
+    option_value(cmdline, "--run").or_else(|| {
+        let output = option_value(cmdline, "--output")?;
+        let output = Path::new(output);
+        let weights = output.parent()?;
+        if weights.file_name()?.to_str()? != "weights" {
+            return None;
+        }
+        weights.parent()?.file_name()?.to_str()
+    })
+}
+
+fn option_value<'a>(cmdline: &'a str, option: &str) -> Option<&'a str> {
+    cmdline
         .split_whitespace()
         .collect::<Vec<_>>()
         .windows(2)
-        .find_map(|window| (window[0] == "--run").then_some(window[1]))
+        .find_map(|window| (window[0] == option).then_some(window[1]))
         .or_else(|| {
             cmdline
                 .split_whitespace()
-                .find_map(|part| part.strip_prefix("--run="))
-        })?;
-
-    run_dir_from_name(run_name)
+                .find_map(|part| part.strip_prefix(option)?.strip_prefix('='))
+        })
 }
 
 fn run_dir_from_name(name: &str) -> Option<RunDir> {
@@ -326,12 +395,58 @@ fn run_dir_from_name(name: &str) -> Option<RunDir> {
     let weights = root.join("weights");
     let log_file = root.join("training.log");
 
-    (root.is_dir() && gens.is_dir() && weights.is_dir()).then_some(RunDir {
+    (root.is_dir() && weights.is_dir()).then_some(RunDir {
         root,
         gens,
         weights,
         log_file,
     })
+}
+
+fn latest_observable_run() -> Option<RunDir> {
+    let mut runs = fs::read_dir(RUNS_PATH)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let root = entry.path();
+            let weights = root.join("weights");
+            if !weights.is_dir() || !has_observable_data(&root) {
+                return None;
+            }
+            let activity = [
+                root.clone(),
+                root.join("training.log"),
+                root.join("gens"),
+                weights.clone(),
+            ]
+            .into_iter()
+            .filter_map(|path| fs::metadata(path).ok()?.modified().ok())
+            .max()?;
+            Some((activity, entry.file_name(), root, weights))
+        })
+        .collect::<Vec<_>>();
+    runs.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+    let (_, _, root, weights) = runs.into_iter().next()?;
+    Some(RunDir {
+        gens: root.join("gens"),
+        log_file: root.join("training.log"),
+        root,
+        weights,
+    })
+}
+
+fn has_observable_data(root: &Path) -> bool {
+    if root.join("pretrain_train_steps.csv").is_file() {
+        return true;
+    }
+    if fs::read_dir(root.join("gens"))
+        .ok()
+        .is_some_and(|mut entries| entries.any(|entry| entry.is_ok()))
+    {
+        return true;
+    }
+    false
 }
 
 fn append_training_exit_status(log_file: Option<&Path>, pid: u32, status: ExitStatus) {
@@ -404,6 +519,8 @@ fn is_training_cmdline(cmdline: &str) -> bool {
         && !cmdline.contains("pgrep -f")
         && (cmdline.contains(" train ")
             || cmdline.ends_with(" train")
+            || cmdline.contains(" train-planner ")
+            || cmdline.ends_with(" train-planner")
             || cmdline.contains(" genetic ")
             || cmdline.ends_with(" genetic")
             || cmdline.contains(" pretrain ")
@@ -411,4 +528,78 @@ fn is_training_cmdline(cmdline: &str) -> bool {
             || cmdline.contains("trading_bot_0 train")
             || cmdline.contains("trading_bot_0 genetic")
             || cmdline.contains("trading_bot_0 pretrain"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_run(name: &str) -> RunDir {
+        let root = PathBuf::from("/tmp").join(name);
+        RunDir {
+            gens: root.join("gens"),
+            weights: root.join("weights"),
+            log_file: root.join("training.log"),
+            root,
+        }
+    }
+
+    #[test]
+    fn pinned_historical_run_survives_live_detection_and_can_follow_live_again() {
+        let live = test_run("live-run");
+        let historical = test_run("historical-run");
+        let mut state = ProcessManagerState {
+            inference_process: None,
+            training_process: None,
+            active_run: Some(clone_run_dir(&live)),
+            live_run: Some(clone_run_dir(&live)),
+            view_pinned: false,
+            cached_training_running: true,
+            last_training_check: Instant::now(),
+        };
+
+        state.pin_view_run(historical);
+        state.update_live_run(Some(clone_run_dir(&live)));
+        assert_eq!(
+            state.active_run.as_ref().map(|run| run.root.as_path()),
+            Some(Path::new("/tmp/historical-run"))
+        );
+
+        state.follow_live_run();
+        assert_eq!(
+            state.active_run.as_ref().map(|run| run.root.as_path()),
+            Some(Path::new("/tmp/live-run"))
+        );
+    }
+
+    #[test]
+    fn planner_output_identifies_its_run_without_run_flag() {
+        let cmdline = "target/release/trading_bot_0 train-planner --world-model-weights wm.ot --output training/runs/pope64_fa4_planner_rl_best_v1/weights/planner.ot --updates 1000";
+        assert_eq!(
+            run_name_from_cmdline(cmdline),
+            Some("pope64_fa4_planner_rl_best_v1")
+        );
+        assert!(is_training_cmdline(cmdline));
+    }
+
+    #[test]
+    fn planner_output_equals_form_is_supported() {
+        let cmdline =
+            "trading_bot_0 train-planner --output=/repo/training/runs/run-a/weights/custom.ot";
+        assert_eq!(run_name_from_cmdline(cmdline), Some("run-a"));
+    }
+
+    #[test]
+    fn output_outside_a_run_weights_directory_is_not_claimed() {
+        let cmdline = "trading_bot_0 train-planner --output weights/planner.ot";
+        assert_eq!(run_name_from_cmdline(cmdline), None);
+    }
+
+    #[test]
+    fn explicit_run_name_takes_precedence_over_output() {
+        let cmdline =
+            "trading_bot_0 pretrain --run named --output training/runs/other/weights/model.ot";
+        assert_eq!(run_name_from_cmdline(cmdline), Some("named"));
+    }
 }

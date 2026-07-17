@@ -41,6 +41,7 @@ impl GenerationBrowserState {
         if !training_path.exists() {
             return Ok(());
         }
+        let planner_committed_updates = crate::planner_committed_updates(training_path);
 
         for entry in WalkDir::new(&training_path)
             .min_depth(1)
@@ -51,6 +52,13 @@ impl GenerationBrowserState {
             if entry.file_type().is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
                     if let Ok(num) = name.parse::<usize>() {
+                        if !crate::planner_generation_visible(
+                            entry.path(),
+                            num as u64,
+                            &planner_committed_updates,
+                        ) {
+                            continue;
+                        }
                         self.generations.push(GenerationInfo {
                             number: num,
                             path: entry.path().to_path_buf(),
@@ -170,5 +178,61 @@ impl GenerationBrowserState {
         self.list_state
             .selected()
             .and_then(|i| self.filtered_generations.get(i))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn browser_hides_owned_generation_without_matching_lineage_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "generation-browser-planner-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let gens = root.join("gens");
+        let weights = root.join("weights");
+        fs::create_dir_all(&gens).unwrap();
+        fs::create_dir_all(&weights).unwrap();
+        for (generation, lineage) in [(1, "run-a"), (2, "run-b")] {
+            let path = gens.join(generation.to_string());
+            fs::create_dir(&path).unwrap();
+            fs::write(
+                path.join(".planner-report-generation"),
+                format!(r#"{{"run_lineage_id":"{lineage}","update":{generation}}}"#),
+            )
+            .unwrap();
+        }
+        for name in [
+            "planner_resume_u00000001.ot",
+            "planner_resume_u00000001.metadata.json",
+            "planner_resume_u00000001.optimizer.ot",
+        ] {
+            fs::write(weights.join(name), b"bundle").unwrap();
+        }
+        fs::write(
+            weights.join("planner.resume.json"),
+            br#"{"version":1,"run_lineage_id":"run-a","update":1,"checkpoint_file":"planner_resume_u00000001.ot"}"#,
+        )
+        .unwrap();
+
+        let mut browser = GenerationBrowserState::new();
+        browser.gens_path = gens;
+        browser.load_generations().unwrap();
+        assert_eq!(
+            browser
+                .generations
+                .iter()
+                .map(|generation| generation.number)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
