@@ -12,3 +12,4 @@ bench_*.json
 .claude/
 *.pyc
 worktrees/
+/.venv-fa4/
