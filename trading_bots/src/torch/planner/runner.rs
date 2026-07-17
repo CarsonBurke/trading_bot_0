@@ -1,22 +1,23 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs::{self, File},
     path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
 use rand::{rngs::StdRng, SeedableRng};
+use serde::{Deserialize, Serialize};
+use shared::run_dir::RunDir;
 use tch::{nn, Device, Kind, Tensor};
 
 use crate::torch::{
-    action_space::{beta_log_prob, beta_mean, sample_beta_action},
+    action_space::{beta_mean, sample_beta_action},
     cuda::cfg::configure_cuda,
     optim::muon::{Muon, MuonConfig},
     train::{
         config::{LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM_WARMUP_START, USE_MUON},
         optimizer_glue::{
-            apply_lr_scale, backward_actor_critic_with_separate_clips, grad_clip_groups,
-            muon_momentum_for_step, named_trainable_variables, KlLrController,
+            backward_actor_critic_with_separate_clips, grad_clip_groups, muon_momentum_for_step,
+            named_trainable_variables, KlLrController,
         },
     },
     value::hl_gauss::HlGaussBins,
@@ -25,18 +26,22 @@ use crate::torch::{
 
 use super::{
     checkpoint::{
-        load_planner_checkpoint, planner_metadata_path, planner_optimizer_state_path,
-        save_planner_checkpoint, verify_optimizer_state, PlannerCheckpointMetadata,
-        FANTASY_CLOSE_DELTA_MAX, FANTASY_CLOSE_DELTA_MIN, KL_CONTROLLER_HALF_LIFE, KL_MAX_LR_SCALE,
-        KL_MIN_LR_SCALE, OPTIMIZATION_EPOCHS, TARGET_KL,
+        load_committed_planner_metadata, load_planner_checkpoint, planner_metadata_path,
+        planner_optimizer_state_path, save_planner_checkpoint, verify_optimizer_state,
+        PlannerCheckpointMetadata, PlannerSelectedValidation, KL_CONTROLLER_HALF_LIFE,
+        KL_MAX_LR_SCALE, KL_MIN_LR_SCALE, OPTIMIZATION_EPOCHS, TARGET_KL,
     },
     data::{planner_context_bars, PlannerDataSplit, PlannerDataset, PlannerEndpoint},
     gae::compute_planner_gae,
-    losses::{planner_actor_critic_losses, route_value_logits, split_critic_diagnostics},
+    losses::{critic_diagnostics, planner_actor_critic_losses},
     portfolio::PlannerPortfolio,
+    reports::{
+        cleanup_uncommitted_report_generations, has_complete_inference_reports,
+        write_inference_reports, PlannerEpisodeTrace, PlannerReportHistory,
+        PlannerTrainingReportPoint, PlannerValidationReportPoint,
+    },
     rollout::{
-        MixedRollout, PlannerBatch, PlannerObservation, PlannerTransition, RolloutMetrics,
-        RolloutSource,
+        PlannerBatch, PlannerObservation, PlannerRollout, PlannerTransition, RolloutMetrics,
     },
     PlannerForecast, WorldModelPlanner, WorldModelPlannerInput, PLANNER_PORTFOLIO_DIM,
 };
@@ -47,9 +52,26 @@ pub const DEFAULT_PLANNER_ENVIRONMENTS: usize = 16;
 pub const DEFAULT_PLANNER_OPTIMIZATION_EPOCHS: usize = OPTIMIZATION_EPOCHS;
 pub const DEFAULT_PLANNER_MINIBATCH_SIZE: usize = 160;
 const VALIDATION_EVERY_UPDATES: u64 = 50;
-const HELD_OUT_ENDPOINTS: usize = 16;
+const VALIDATION_ENDPOINTS: usize = 64;
+const TEST_ENDPOINTS: usize = 16;
 const VALIDATION_MAX_MEAN_DRAWDOWN: f64 = 0.30;
 const VALIDATION_MAX_MEAN_TURNOVER: f64 = 0.50;
+const VALIDATION_MIN_MEDIAN_WEALTH_RATIO: f64 = 1.0;
+const VALIDATION_MIN_MEDIAN_OUTPERFORMANCE_RATIO: f64 = 0.0;
+const KL_NEGATIVE_ROUNDOFF_TOLERANCE: f64 = 8.0 * f32::EPSILON as f64;
+const RESUME_MANIFEST_VERSION: u32 = 1;
+const PLANNER_ACTOR_LR_PATTERNS: &[&str] = &["policy_concentration"];
+const PLANNER_ACTOR_PARAMETER_COUNT: usize = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PlannerResumeManifest {
+    version: u32,
+    run_lineage_id: String,
+    update: u64,
+    checkpoint_file: String,
+    weights_sha256: String,
+    optimizer_sha256: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct TrainPlannerArgs {
@@ -122,10 +144,14 @@ pub struct PlannerInferenceEpisode {
     pub steps: usize,
     pub reward_sum: f64,
     pub final_wealth_ratio: f64,
+    pub buy_and_hold_wealth_ratio: f64,
+    pub outperformance_ratio: f64,
     pub commissions: f64,
     pub turnover_mean: f64,
-    pub action_mean: f64,
+    pub requested_target_weight_mean: f64,
+    pub executed_stock_weight_mean: f64,
     pub max_drawdown: f64,
+    pub trace: PlannerEpisodeTrace,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -133,21 +159,50 @@ pub struct PlannerInferenceSummary {
     pub episodes: Vec<PlannerInferenceEpisode>,
     pub mean_reward: f64,
     pub mean_final_wealth_ratio: f64,
+    pub mean_buy_and_hold_wealth_ratio: f64,
+    pub mean_outperformance_ratio: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PairedBenchmarkMetrics {
+    mean_buy_and_hold_wealth_ratio: f64,
+    mean_outperformance_ratio: f64,
+    median_outperformance_ratio: f64,
+    outperformance_fraction: f64,
+}
+
+struct CollectedRollout {
+    rollout: PlannerRollout,
+    benchmark: PairedBenchmarkMetrics,
+    primary_trace: PlannerEpisodeTrace,
+    deterministic: DeterministicRolloutEvaluation,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct DeterministicRolloutEvaluation {
+    reward_mean: f64,
+    wealth_ratio: f64,
+    benchmark: PairedBenchmarkMetrics,
+    turnover_mean: f64,
+    commissions: f64,
+    requested_target_weight_mean: f64,
+    executed_stock_weight_mean: f64,
+    action_boundary_fraction: f64,
+    primary_trace: PlannerEpisodeTrace,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct OptimizationSummary {
     actor_loss: f64,
     critic_loss: f64,
+    aux_return_loss: f64,
     reverse_kl: f64,
     max_reverse_kl: f64,
     entropy: f64,
     actor_grad_norm: f64,
     critic_grad_norm: f64,
-    real_beta_concentration: f64,
-    fantasy_beta_concentration: f64,
-    real_critic_explained_variance: f64,
-    fantasy_critic_explained_variance: f64,
+    beta_concentration: f64,
+    critic_explained_variance: f64,
     kl_early_stopped: bool,
     actor_steps: usize,
     steps: usize,
@@ -156,15 +211,48 @@ struct OptimizationSummary {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HeldOutMetrics {
     median_wealth_ratio: f64,
+    median_buy_and_hold_wealth_ratio: f64,
+    mean_outperformance_ratio: f64,
+    median_outperformance_ratio: f64,
+    outperformance_fraction: f64,
     mean_max_drawdown: f64,
     mean_turnover: f64,
 }
 
 impl HeldOutMetrics {
     fn eligible(self) -> bool {
-        self.median_wealth_ratio.is_finite()
+        self.median_outperformance_ratio.is_finite()
+            && self.median_wealth_ratio >= VALIDATION_MIN_MEDIAN_WEALTH_RATIO
+            && self.median_outperformance_ratio >= VALIDATION_MIN_MEDIAN_OUTPERFORMANCE_RATIO
             && self.mean_max_drawdown <= VALIDATION_MAX_MEAN_DRAWDOWN
             && self.mean_turnover <= VALIDATION_MAX_MEAN_TURNOVER
+    }
+
+    fn selected_validation(self, update: u64) -> PlannerSelectedValidation {
+        PlannerSelectedValidation {
+            update,
+            median_wealth_ratio: self.median_wealth_ratio,
+            median_buy_and_hold_wealth_ratio: self.median_buy_and_hold_wealth_ratio,
+            mean_outperformance_ratio: self.mean_outperformance_ratio,
+            median_outperformance_ratio: self.median_outperformance_ratio,
+            outperformance_fraction: self.outperformance_fraction,
+            mean_max_drawdown: self.mean_max_drawdown,
+            mean_turnover: self.mean_turnover,
+        }
+    }
+}
+
+impl From<PlannerSelectedValidation> for HeldOutMetrics {
+    fn from(selected: PlannerSelectedValidation) -> Self {
+        Self {
+            median_wealth_ratio: selected.median_wealth_ratio,
+            median_buy_and_hold_wealth_ratio: selected.median_buy_and_hold_wealth_ratio,
+            mean_outperformance_ratio: selected.mean_outperformance_ratio,
+            median_outperformance_ratio: selected.median_outperformance_ratio,
+            outperformance_fraction: selected.outperformance_fraction,
+            mean_max_drawdown: selected.mean_max_drawdown,
+            mean_turnover: selected.mean_turnover,
+        }
     }
 }
 
@@ -184,8 +272,18 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
 
     let mut planner_vs = nn::VarStore::new(device);
     let planner = WorldModelPlanner::new(&planner_vs.root());
-    let resumed = match &args.planner_weights {
-        Some(weights) => Some(load_planner_checkpoint(
+    if args.planner_weights.is_none() {
+        ensure_fresh_resume_output(&args.output)?;
+    }
+    let resolved_resume = args
+        .planner_weights
+        .as_deref()
+        .map(|weights| {
+            resolve_resume_checkpoint(weights, &world_lineage, Some(args.horizon), Some(args.seed))
+        })
+        .transpose()?;
+    let resumed = match &resolved_resume {
+        Some((weights, _)) => Some(load_planner_checkpoint(
             &mut planner_vs,
             weights,
             &world_lineage,
@@ -194,6 +292,10 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
         )?),
         None => None,
     };
+    let run_lineage_id = resumed
+        .as_ref()
+        .map(|metadata| metadata.run_lineage_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Context length must agree with the checkpoint on resume: derive from the
     // checkpoint when the CLI is silent, and bail if the CLI contradicts it.
     let context_bars = match &resumed {
@@ -211,6 +313,33 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
     };
     let mut optimizer_steps = resumed.as_ref().map(|m| m.optimizer_steps).unwrap_or(0);
     let base_updates = resumed.as_ref().map(|m| m.cumulative_updates).unwrap_or(0);
+    validate_output_manifest_for_resume(&args.output, &run_lineage_id, base_updates)?;
+    cleanup_uncommitted_resume_bundles(&args.output, base_updates, &run_lineage_id)?;
+    cleanup_uncommitted_selected_bundles(&args.output, base_updates, &run_lineage_id)?;
+    let output_path = Path::new(&args.output);
+    let weights_dir = output_path
+        .parent()
+        .context("planner output has no parent")?;
+    let run_root = weights_dir
+        .parent()
+        .context("planner weights dir has no parent")?;
+    fs::create_dir_all(weights_dir).with_context(|| {
+        format!(
+            "failed creating planner weights dir {}",
+            weights_dir.display()
+        )
+    })?;
+    fs::create_dir_all(run_root.join("gens")).with_context(|| {
+        format!(
+            "failed creating planner reports dir {}",
+            run_root.join("gens").display()
+        )
+    })?;
+    let run_dir = RunDir::from_weights_path(output_path)?;
+    ensure_fresh_planner_gens(&run_dir.gens, base_updates)?;
+    cleanup_uncommitted_report_generations(&run_dir.gens, base_updates, &run_lineage_id)?;
+    let mut report_history =
+        PlannerReportHistory::load(&run_dir.gens, base_updates, &run_lineage_id)?;
     let mut kl_controller = KlLrController::new(
         TARGET_KL,
         KL_CONTROLLER_HALF_LIFE,
@@ -226,24 +355,10 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
         .map(|(_, tensor)| tensor.shallow_clone())
         .collect::<Vec<_>>();
     let clip_groups = grad_clip_groups(&named_vars);
-    let mut optimizer = Muon::new_named(
-        &named_vars,
-        MuonConfig {
-            lr: MUON_LR,
-            use_muon_for_2d: USE_MUON,
-            momentum: MUON_MOMENTUM_WARMUP_START,
-            adamw_lr: LEARNING_RATE,
-            adamw_betas: (0.9, 0.95),
-            adamw_eps: 1e-8,
-            force_adamw_name_substrings: vec![
-                "policy_concentration".to_owned(),
-                "value_projection".to_owned(),
-            ],
-            ..MuonConfig::default()
-        },
-    );
+    let mut optimizer = new_planner_optimizer(&named_vars);
+    apply_planner_actor_lr_scale(&mut optimizer, kl_controller.scale())?;
     if let Some(metadata) = &resumed {
-        if let Some(weights) = &args.planner_weights {
+        if let Some((weights, _)) = &resolved_resume {
             let optimizer_state = planner_optimizer_state_path(weights);
             if optimizer_state.exists() {
                 verify_optimizer_state(&optimizer_state, &metadata.optimizer_sha256)?;
@@ -267,23 +382,48 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
         }
     }
     let hl_gauss = HlGaussBins::default_for(device);
-    let validation_endpoints = dataset.deterministic_ticker_stratified_endpoints(
+    let validation_endpoints = dataset.deterministic_ticker_time_stratified_endpoints(
         PlannerDataSplit::Validation,
-        HELD_OUT_ENDPOINTS,
+        VALIDATION_ENDPOINTS,
         context_bars,
         args.rollout_length,
     )?;
-    let best_path = best_checkpoint_path(&args.output);
-    let compatible_existing_best = best_path.exists()
-        && PlannerCheckpointMetadata::load(planner_metadata_path(&best_path))
-            .and_then(|metadata| {
-                metadata.validate(&world_lineage, Some(args.horizon), Some(args.seed))
-            })
-            .is_ok();
-    let mut best_validation = compatible_existing_best
-        .then(|| load_best_validation_metrics(&args.output))
-        .flatten();
+    let existing_best = load_committed_best_validation(
+        &args.output,
+        &world_lineage,
+        &run_lineage_id,
+        args.horizon,
+        context_bars,
+        args.seed,
+        base_updates,
+    )?;
+    let mut best_path = existing_best.as_ref().map(|(path, _)| path.clone());
+    let mut best_validation = existing_best.map(|(_, metrics)| metrics);
     let mut best_selected_this_run = false;
+    if let Some(existing_best_path) = &best_path {
+        evaluate_selected_test(
+            &planner,
+            &mut planner_vs,
+            &world_model,
+            &dataset,
+            existing_best_path,
+            &world_lineage,
+            args.horizon,
+            args.rollout_length,
+            context_bars,
+            device,
+            &run_dir.gens,
+        )?;
+        if let Some((resume_path, _)) = &resolved_resume {
+            load_planner_checkpoint(
+                &mut planner_vs,
+                resume_path,
+                &world_lineage,
+                Some(args.horizon),
+                Some(args.seed),
+            )?;
+        }
+    }
     println!(
         "planner training: device={device:?} updates={} H={} T={} N={} context={} (stateful world-model KV cache enabled)",
         args.updates, args.horizon, args.rollout_length, args.environments, context_bars
@@ -293,7 +433,7 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
         let rollout_seed = update_seed(args.seed, global_update, 0x524f4c4c4f5554);
         let mut rng = StdRng::seed_from_u64(rollout_seed);
         tch::manual_seed(rollout_seed as i64);
-        let rollout = collect_mixed_rollout(
+        let collected = collect_real_rollout(
             &planner,
             &world_model,
             &dataset,
@@ -305,7 +445,11 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
             &mut rng,
             device,
         )?;
-        let rollout_metrics = rollout.metrics();
+        let rollout_metrics = collected.rollout.metrics();
+        let benchmark = collected.benchmark;
+        let primary_trace = collected.primary_trace;
+        let deterministic = collected.deterministic;
+        let rollout = collected.rollout;
         let batch = rollout.to_batch(device)?;
         let (advantages, returns) = rollout_advantages(
             &rollout,
@@ -330,11 +474,24 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
             &mut kl_controller,
             device,
         )?;
-        print_training_metrics(global_update, &rollout_metrics, optimization);
-        append_training_metrics(&args.output, global_update, &rollout_metrics, optimization)?;
-        save_planner_checkpoint(
+        print_training_metrics(
+            global_update,
+            &rollout_metrics,
+            benchmark,
+            &deterministic,
+            optimization,
+        );
+        let staged_reports = report_history.stage_training(
+            global_update,
+            training_report_point(&rollout_metrics, benchmark, &deterministic, optimization),
+            &primary_trace,
+            &deterministic.primary_trace,
+        )?;
+        let resume_path = resume_checkpoint_path(&args.output, global_update);
+        ensure_immutable_checkpoint_path(&resume_path)?;
+        let committed = save_planner_checkpoint(
             &planner_vs,
-            &args.output,
+            &resume_path,
             &PlannerCheckpointMetadata::new(
                 &world_lineage,
                 &world_weights_hash,
@@ -342,12 +499,14 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
                 context_bars,
                 optimizer_steps,
                 global_update,
+                &run_lineage_id,
                 args.seed,
                 kl_controller.ema(),
                 kl_controller.scale(),
             ),
             &optimizer,
         )?;
+        staged_reports.publish()?;
         if global_update % VALIDATION_EVERY_UPDATES == 0 || update + 1 == args.updates {
             let (validation_summary, validation_metrics) = evaluate_real_endpoints(
                 &planner,
@@ -361,21 +520,23 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
             )?;
             let selected = validation_metrics.eligible()
                 && best_validation.is_none_or(|best| {
-                    validation_metrics.median_wealth_ratio > best.median_wealth_ratio
+                    validation_metrics.median_outperformance_ratio
+                        > best.median_outperformance_ratio
                 });
-            append_validation_metrics(&args.output, global_update, validation_metrics, selected)?;
-            println!(
-                "planner validation update={global_update} episodes={} median_wealth={:.6} mean_drawdown={:.6} mean_turnover={:.6} eligible={} selected={selected}",
-                validation_summary.episodes.len(),
-                validation_metrics.median_wealth_ratio,
-                validation_metrics.mean_max_drawdown,
-                validation_metrics.mean_turnover,
-                validation_metrics.eligible(),
-            );
             if selected {
+                let selected_path = selected_checkpoint_path(&args.output, global_update);
+                if selected_path.exists()
+                    || planner_metadata_path(&selected_path).exists()
+                    || planner_optimizer_state_path(&selected_path).exists()
+                {
+                    bail!(
+                        "refusing to overwrite immutable selected planner checkpoint {}",
+                        selected_path.display()
+                    );
+                }
                 save_planner_checkpoint(
                     &planner_vs,
-                    &best_path,
+                    &selected_path,
                     &PlannerCheckpointMetadata::new(
                         &world_lineage,
                         &world_weights_hash,
@@ -383,52 +544,144 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
                         context_bars,
                         optimizer_steps,
                         global_update,
+                        &run_lineage_id,
                         args.seed,
                         kl_controller.ema(),
                         kl_controller.scale(),
+                    )
+                    .with_selected_validation(
+                        validation_metrics.selected_validation(global_update),
                     ),
                     &optimizer,
                 )?;
+                best_path = Some(selected_path);
                 best_validation = Some(validation_metrics);
                 best_selected_this_run = true;
             }
+            report_history.record_validation(
+                global_update,
+                validation_report_point(validation_metrics, selected),
+            )?;
+            println!(
+                "planner validation update={global_update} episodes={} median_wealth={:.6} median_buy_hold={:.6} mean_outperformance={:.6} median_outperformance={:.6} outperform_fraction={:.3} mean_drawdown={:.6} mean_turnover={:.6} eligible={} selected={selected}",
+                validation_summary.episodes.len(),
+                validation_metrics.median_wealth_ratio,
+                validation_metrics.median_buy_and_hold_wealth_ratio,
+                validation_metrics.mean_outperformance_ratio,
+                validation_metrics.median_outperformance_ratio,
+                validation_metrics.outperformance_fraction,
+                validation_metrics.mean_max_drawdown,
+                validation_metrics.mean_turnover,
+                validation_metrics.eligible(),
+            );
         }
+        commit_resume_manifest(&args.output, &resume_path, &committed)?;
     }
     if best_selected_this_run {
-        load_planner_checkpoint(
-            &mut planner_vs,
-            &best_path,
-            &world_lineage,
-            Some(args.horizon),
-            None,
-        )?;
-        let test_endpoints = dataset.deterministic_ticker_stratified_endpoints(
-            PlannerDataSplit::Test,
-            HELD_OUT_ENDPOINTS,
-            context_bars,
-            args.rollout_length,
-        )?;
-        let (test_summary, test_metrics) = evaluate_real_endpoints(
+        let best_path = best_path.context("selected planner checkpoint path is missing")?;
+        evaluate_selected_test(
             &planner,
+            &mut planner_vs,
             &world_model,
             &dataset,
-            &test_endpoints,
+            &best_path,
+            &world_lineage,
             args.horizon,
             args.rollout_length,
             context_bars,
             device,
+            &run_dir.gens,
         )?;
-        write_inference_csv(&best_path, PlannerDataSplit::Test, &test_summary)?;
-        println!(
-            "planner selected test episodes={} median_wealth={:.6} mean_drawdown={:.6} mean_turnover={:.6}",
-            test_summary.episodes.len(),
-            test_metrics.median_wealth_ratio,
-            test_metrics.mean_max_drawdown,
-            test_metrics.mean_turnover,
-        );
     } else if best_validation.is_none() {
         eprintln!("planner produced no checkpoint passing real validation drawdown/turnover gates");
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_selected_test(
+    planner: &WorldModelPlanner,
+    planner_vs: &mut nn::VarStore,
+    world_model: &LejepaWorldModel,
+    dataset: &PlannerDataset,
+    selected_path: &Path,
+    world_lineage: &str,
+    horizon: usize,
+    rollout_length: usize,
+    context_bars: usize,
+    device: Device,
+    gens: &Path,
+) -> Result<()> {
+    let selected_metadata =
+        load_committed_planner_metadata(selected_path, world_lineage, Some(horizon), None)?;
+    let test_endpoints = dataset.deterministic_ticker_stratified_endpoints(
+        PlannerDataSplit::Test,
+        TEST_ENDPOINTS,
+        context_bars,
+        rollout_length,
+    )?;
+    let evaluation_fingerprint = dataset.evaluation_fingerprint(
+        PlannerDataSplit::Test,
+        &test_endpoints,
+        horizon,
+        context_bars,
+        rollout_length,
+    )?;
+    if has_complete_inference_reports(
+        gens,
+        selected_metadata.cumulative_updates,
+        &selected_metadata.run_lineage_id,
+        "Test",
+        &evaluation_fingerprint,
+        TEST_ENDPOINTS,
+        rollout_length,
+    )? {
+        println!(
+            "planner selected test reports already complete for update={}; skipping evaluation",
+            selected_metadata.cumulative_updates
+        );
+        return Ok(());
+    }
+    let selected_metadata = load_planner_checkpoint(
+        planner_vs,
+        selected_path,
+        world_lineage,
+        Some(horizon),
+        None,
+    )?;
+    let (test_summary, test_metrics) = evaluate_real_endpoints(
+        planner,
+        world_model,
+        dataset,
+        &test_endpoints,
+        horizon,
+        rollout_length,
+        context_bars,
+        device,
+    )?;
+    write_inference_reports(
+        gens,
+        selected_metadata.cumulative_updates,
+        &selected_metadata.run_lineage_id,
+        "Test",
+        &test_summary
+            .episodes
+            .iter()
+            .map(|episode| episode.trace.clone())
+            .collect::<Vec<_>>(),
+        &evaluation_fingerprint,
+    )?;
+    println!(
+        "planner selected test episodes={} median_wealth={:.6} median_buy_hold={:.6} mean_outperformance={:.6} median_outperformance={:.6} outperform_fraction={:.3} mean_drawdown={:.6} mean_turnover={:.6}",
+        test_summary.episodes.len(),
+        test_metrics.median_wealth_ratio,
+        test_metrics.median_buy_and_hold_wealth_ratio,
+        test_metrics.mean_outperformance_ratio,
+        test_metrics.median_outperformance_ratio,
+        test_metrics.outperformance_fraction,
+        test_metrics.mean_max_drawdown,
+        test_metrics.mean_turnover,
+    );
     Ok(())
 }
 
@@ -447,9 +700,11 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
     let world_lineage = world_model.lineage_sha256().to_owned();
     let mut planner_vs = nn::VarStore::new(device);
     let planner = WorldModelPlanner::new(&planner_vs.root());
+    let (planner_weights, _) =
+        resolve_resume_checkpoint(&args.planner_weights, &world_lineage, args.horizon, None)?;
     let checkpoint_metadata = load_planner_checkpoint(
         &mut planner_vs,
-        &args.planner_weights,
+        &planner_weights,
         &world_lineage,
         args.horizon,
         None,
@@ -467,6 +722,13 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
         context_bars,
         args.rollout_length,
     )?;
+    let evaluation_fingerprint = dataset.evaluation_fingerprint(
+        args.split,
+        &endpoints,
+        horizon,
+        context_bars,
+        args.rollout_length,
+    )?;
     let mut episodes = Vec::with_capacity(endpoints.len());
 
     for endpoint in endpoints {
@@ -481,32 +743,34 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
             device,
         )?);
     }
-    let mean_reward = episodes
-        .iter()
-        .map(|episode| episode.reward_sum)
-        .sum::<f64>()
-        / episodes.len() as f64;
-    let mean_final_wealth_ratio = episodes
-        .iter()
-        .map(|episode| episode.final_wealth_ratio)
-        .sum::<f64>()
-        / episodes.len() as f64;
+    let summary = inference_summary(episodes);
     println!(
-        "planner held-out {:?}: episodes={} mean_reward={mean_reward:.6} mean_wealth={mean_final_wealth_ratio:.6}",
+        "planner held-out {:?}: episodes={} mean_reward={:.6} mean_wealth={:.6} mean_buy_hold={:.6} mean_outperformance={:.6}",
         args.split,
-        episodes.len()
+        summary.episodes.len(),
+        summary.mean_reward,
+        summary.mean_final_wealth_ratio,
+        summary.mean_buy_and_hold_wealth_ratio,
+        summary.mean_outperformance_ratio,
     );
-    let summary = PlannerInferenceSummary {
-        episodes,
-        mean_reward,
-        mean_final_wealth_ratio,
-    };
-    write_inference_csv(&args.planner_weights, args.split, &summary)?;
+    let run_dir = RunDir::from_weights_path(&planner_weights)?;
+    write_inference_reports(
+        &run_dir.gens,
+        checkpoint_metadata.cumulative_updates,
+        &checkpoint_metadata.run_lineage_id,
+        &format!("{:?}", args.split),
+        &summary
+            .episodes
+            .iter()
+            .map(|episode| episode.trace.clone())
+            .collect::<Vec<_>>(),
+        &evaluation_fingerprint,
+    )?;
     Ok(summary)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_mixed_rollout(
+fn collect_real_rollout(
     planner: &WorldModelPlanner,
     world_model: &LejepaWorldModel,
     dataset: &PlannerDataset,
@@ -517,79 +781,59 @@ fn collect_mixed_rollout(
     context_bars: usize,
     rng: &mut StdRng,
     device: Device,
-) -> Result<MixedRollout> {
-    let per_source = environments / 2;
-    let real_endpoints = dataset.sample_endpoints(
+) -> Result<CollectedRollout> {
+    let endpoints = dataset.sample_endpoints(
         PlannerDataSplit::Train,
-        per_source,
+        environments,
         context_bars,
         rollout_length,
         rng,
     )?;
-    let fantasy_endpoints =
-        dataset.sample_endpoints(PlannerDataSplit::Train, per_source, context_bars, 0, rng)?;
-    let fantasy_context = dataset.contexts(
-        &fantasy_endpoints,
-        &vec![0; per_source],
-        context_bars,
-        device,
-    )?;
-    let fantasy_session = world_model.start_session(&fantasy_context)?;
-    let mut fantasy_prediction =
-        fantasy_session.forecast(world_model, (horizon + rollout_length) as i64)?;
-    validate_prediction_finite(&fantasy_prediction)?;
-    let real_context =
-        dataset.contexts(&real_endpoints, &vec![0; per_source], context_bars, device)?;
-    let mut real_session = world_model.start_session(&real_context)?;
-    let fantasy_clamp_mask = sanitize_fantasy_close_deltas(&mut fantasy_prediction)?;
-    let fantasy_closes = fantasy_close_paths(dataset, &fantasy_endpoints, &fantasy_prediction)?;
+    let context = dataset.contexts(&endpoints, &vec![0; environments], context_bars, device)?;
+    let mut session = world_model.start_session(&context)?;
     let mut portfolios = (0..environments)
         .map(|_| PlannerPortfolio::new(100.0))
         .collect::<Vec<_>>();
+    let mut deterministic_portfolios = (0..environments)
+        .map(|_| PlannerPortfolio::new(100.0))
+        .collect::<Vec<_>>();
+    let mut deterministic_reward_sum = 0.0;
+    let mut deterministic_turnover_sum = 0.0;
+    let mut deterministic_requested_weight_sum = 0.0;
+    let mut deterministic_executed_weight_sum = 0.0;
+    let mut deterministic_boundary_count = 0usize;
     let mut pending = (0..environments)
         .map(|_| None::<PlannerTransition>)
         .collect::<Vec<_>>();
     let world_lineage = world_model.lineage_sha256().to_owned();
-    let mut rollout = MixedRollout::new(per_source * rollout_length, world_lineage)?;
+    let mut rollout = PlannerRollout::new(environments * rollout_length, world_lineage)?;
     let relative_horizon = relative_horizon(environments, horizon, device);
+    let primary_series = dataset.series(endpoints[0].series);
+    let primary_start_price = primary_series.closes[endpoints[0].bar];
+    let mut primary_trace = PlannerEpisodeTrace {
+        ticker: primary_series.ticker.clone(),
+        cash: vec![100.0],
+        positioned: vec![0.0],
+        total: vec![100.0],
+        benchmark: vec![100.0],
+        ..PlannerEpisodeTrace::default()
+    };
+    let mut deterministic_primary_trace = PlannerEpisodeTrace {
+        ticker: primary_series.ticker.clone(),
+        cash: vec![100.0],
+        positioned: vec![0.0],
+        total: vec![100.0],
+        benchmark: vec![100.0],
+        ..PlannerEpisodeTrace::default()
+    };
 
     for decision in 0..=rollout_length {
-        let real_prediction = real_session.forecast(world_model, horizon as i64)?;
-        validate_prediction_finite(&real_prediction)?;
-        let latent = Tensor::cat(
-            &[
-                real_prediction.latent.shallow_clone(),
-                fantasy_prediction
-                    .latent
-                    .narrow(1, decision as i64, horizon as i64),
-            ],
-            0,
-        );
-        let mean = Tensor::cat(
-            &[
-                real_prediction.ohlc_mean.shallow_clone(),
-                fantasy_prediction
-                    .ohlc_mean
-                    .narrow(1, decision as i64, horizon as i64),
-            ],
-            0,
-        );
-        let logvar = Tensor::cat(
-            &[
-                real_prediction.ohlc_logvar.shallow_clone(),
-                fantasy_prediction
-                    .ohlc_logvar
-                    .narrow(1, decision as i64, horizon as i64),
-            ],
-            0,
-        );
-        let current_prices = current_prices(
-            dataset,
-            &real_endpoints,
-            &fantasy_endpoints,
-            &fantasy_closes,
-            decision,
-        );
+        let prediction = session.forecast(world_model, horizon as i64)?;
+        validate_prediction_finite(&prediction)?;
+        let current_prices = endpoints
+            .iter()
+            .map(|endpoint| dataset.series(endpoint.series).closes[endpoint.bar + decision])
+            .collect::<Vec<_>>();
         let portfolio_state = Tensor::from_slice(
             &portfolios
                 .iter()
@@ -599,30 +843,22 @@ fn collect_mixed_rollout(
         )
         .view([environments as i64, PLANNER_PORTFOLIO_DIM])
         .to_device(device);
-        let output = tch::no_grad(|| {
-            planner.forward_mixed_precision(&WorldModelPlannerInput {
-                forecast: PlannerForecast {
-                    latent: latent.shallow_clone(),
-                    ohlc_mean: mean.shallow_clone(),
-                    ohlc_log_variance: logvar.shallow_clone(),
+        let belief = session.belief();
+        let (encoded_forecast, output) = tch::no_grad(|| {
+            let encoded = planner.encode_forecast_mixed_precision(
+                &PlannerForecast {
+                    latent: prediction.latent.shallow_clone(),
                     relative_horizon: relative_horizon.shallow_clone(),
                 },
-                portfolio_state: portfolio_state.shallow_clone(),
-            })
+                &belief,
+            );
+            let output = planner.readout_encoded_mixed_precision(&encoded, &portfolio_state);
+            (encoded, output)
         });
-        let sources = Tensor::arange(environments as i64, (Kind::Int64, device))
-            .ge(per_source as i64)
-            .to_kind(Kind::Int64);
-        let routed_logits = route_value_logits(
-            &output.real_value_logits,
-            &output.fantasy_value_logits,
-            &sources,
-        );
-        let values_cpu = hl_gauss.decode(&routed_logits).to_device(Device::Cpu);
-        let stored_latent = latent.to_device(Device::Cpu).detach();
-        let stored_mean = mean.to_device(Device::Cpu).detach();
-        let stored_logvar = logvar.to_device(Device::Cpu).detach();
+        let values_cpu = hl_gauss.decode(&output.value_logits).to_device(Device::Cpu);
+        let stored_latent = prediction.latent.to_device(Device::Cpu).detach();
         let stored_horizon = relative_horizon.to_device(Device::Cpu).detach();
+        let stored_belief = belief.to_device(Device::Cpu).detach();
         let stored_portfolio = portfolio_state.to_device(Device::Cpu).detach();
 
         for environment in 0..environments {
@@ -636,46 +872,107 @@ fn collect_mixed_rollout(
             break;
         }
 
+        let deterministic_portfolio_state = Tensor::from_slice(
+            &deterministic_portfolios
+                .iter()
+                .zip(&current_prices)
+                .flat_map(|(portfolio, &price)| portfolio.planner_state(price))
+                .collect::<Vec<_>>(),
+        )
+        .view([environments as i64, PLANNER_PORTFOLIO_DIM])
+        .to_device(device);
+        let deterministic_output = tch::no_grad(|| {
+            planner
+                .readout_encoded_mixed_precision(&encoded_forecast, &deterministic_portfolio_state)
+        });
         let actions = sample_beta_action(&output.alpha, &output.beta);
-        let log_probs = beta_log_prob(&actions, &output.alpha, &output.beta);
         let actions_cpu = actions.to_device(Device::Cpu);
+        let deterministic_actions_cpu =
+            beta_mean(&deterministic_output.alpha, &deterministic_output.beta)
+                .to_device(Device::Cpu);
         let alpha_cpu = output.alpha.to_device(Device::Cpu);
         let beta_cpu = output.beta.to_device(Device::Cpu);
-        let log_probs_cpu = log_probs.to_device(Device::Cpu);
         for environment in 0..environments {
-            let source = if environment < per_source {
-                RolloutSource::Real
-            } else {
-                RolloutSource::Fantasy
-            };
-            let next_price = if environment < per_source {
-                let endpoint = real_endpoints[environment];
-                dataset.series(endpoint.series).closes[endpoint.bar + decision + 1]
-            } else {
-                fantasy_closes[environment - per_source][decision + 1]
-            };
+            let endpoint = endpoints[environment];
+            let next_price = dataset.series(endpoint.series).closes[endpoint.bar + decision + 1];
             let action = actions_cpu.double_value(&[environment as i64, 0]);
             let step =
                 portfolios[environment].step(action, current_prices[environment], next_price);
+            let deterministic_action =
+                deterministic_actions_cpu.double_value(&[environment as i64, 0]);
+            let deterministic_step = deterministic_portfolios[environment].step(
+                deterministic_action,
+                current_prices[environment],
+                next_price,
+            );
+            deterministic_reward_sum += deterministic_step.reward;
+            deterministic_turnover_sum += deterministic_step.turnover;
+            deterministic_requested_weight_sum += deterministic_step.requested_target_weight;
+            deterministic_executed_weight_sum += deterministic_step.executed_stock_weight;
+            if !(0.01..=0.99).contains(&deterministic_step.requested_target_weight) {
+                deterministic_boundary_count += 1;
+            }
+            if environment == 0 {
+                primary_trace.cash.push(step.cash_after_trade);
+                primary_trace.positioned.push(step.positioned_value_after);
+                primary_trace.total.push(step.assets_after);
+                primary_trace
+                    .benchmark
+                    .push(100.0 * next_price / primary_start_price);
+                primary_trace.rewards.push(step.reward);
+                primary_trace.commissions.push(step.commission);
+                primary_trace.turnover.push(step.turnover);
+                primary_trace
+                    .requested_target_weight
+                    .push(step.requested_target_weight);
+                primary_trace
+                    .executed_stock_weight
+                    .push(step.executed_stock_weight);
+                deterministic_primary_trace
+                    .cash
+                    .push(deterministic_step.cash_after_trade);
+                deterministic_primary_trace
+                    .positioned
+                    .push(deterministic_step.positioned_value_after);
+                deterministic_primary_trace
+                    .total
+                    .push(deterministic_step.assets_after);
+                deterministic_primary_trace
+                    .benchmark
+                    .push(100.0 * next_price / primary_start_price);
+                deterministic_primary_trace
+                    .rewards
+                    .push(deterministic_step.reward);
+                deterministic_primary_trace
+                    .commissions
+                    .push(deterministic_step.commission);
+                deterministic_primary_trace
+                    .turnover
+                    .push(deterministic_step.turnover);
+                deterministic_primary_trace
+                    .requested_target_weight
+                    .push(deterministic_step.requested_target_weight);
+                deterministic_primary_trace
+                    .executed_stock_weight
+                    .push(deterministic_step.executed_stock_weight);
+            }
             pending[environment] = Some(PlannerTransition {
                 observation: observation_at(
                     &stored_latent,
-                    &stored_mean,
-                    &stored_logvar,
                     &stored_horizon,
+                    &stored_belief,
                     &stored_portfolio,
                     environment,
                 ),
-                source,
                 environment_id: environment,
                 decision_index: decision,
                 action: actions_cpu.get(environment as i64),
                 old_alpha: alpha_cpu.get(environment as i64),
                 old_beta: beta_cpu.get(environment as i64),
-                old_log_prob: log_probs_cpu.get(environment as i64),
                 value: values_cpu.get(environment as i64),
                 next_value: None,
                 reward: step.reward as f32,
+                next_log_return: (next_price / current_prices[environment]).ln() as f32,
                 // Long-only, no-leverage portfolio: total assets stay strictly
                 // positive every step, so an episode never terminates; it can
                 // only truncate at the rollout horizon.
@@ -683,24 +980,71 @@ fn collect_mixed_rollout(
                 truncated: false,
                 commission: step.commission,
                 turnover: step.turnover,
+                executed_stock_weight: step.executed_stock_weight,
                 assets_before: step.assets_before,
                 assets_after: step.assets_after,
-                fantasy_clamped: source == RolloutSource::Fantasy
-                    && fantasy_clamp_mask[environment - per_source][decision],
             });
         }
         let actual_next_bars =
-            dataset.contexts(&real_endpoints, &vec![decision + 1; per_source], 1, device)?;
-        real_session.append_actual_bar(world_model, &actual_next_bars)?;
+            dataset.contexts(&endpoints, &vec![decision + 1; environments], 1, device)?;
+        session.append_actual_bar(world_model, &actual_next_bars)?;
     }
     rollout.validate_complete()?;
-    Ok(rollout)
+    let policy_wealth = endpoints
+        .iter()
+        .enumerate()
+        .map(|(environment, endpoint)| {
+            let final_price = dataset.series(endpoint.series).closes[endpoint.bar + rollout_length];
+            portfolios[environment].total_assets(final_price) / 100.0
+        })
+        .collect::<Vec<_>>();
+    let buy_and_hold_wealth = endpoints
+        .iter()
+        .map(|endpoint| {
+            let series = dataset.series(endpoint.series);
+            buy_and_hold_wealth_ratio(
+                series.closes[endpoint.bar],
+                series.closes[endpoint.bar + rollout_length],
+            )
+        })
+        .collect::<Vec<_>>();
+    let deterministic_policy_wealth = endpoints
+        .iter()
+        .enumerate()
+        .map(|(environment, endpoint)| {
+            let final_price = dataset.series(endpoint.series).closes[endpoint.bar + rollout_length];
+            deterministic_portfolios[environment].total_assets(final_price) / 100.0
+        })
+        .collect::<Vec<_>>();
+    let samples = (environments * rollout_length) as f64;
+    Ok(CollectedRollout {
+        rollout,
+        benchmark: paired_benchmark_metrics(&policy_wealth, &buy_and_hold_wealth)?,
+        primary_trace,
+        deterministic: DeterministicRolloutEvaluation {
+            reward_mean: deterministic_reward_sum / samples,
+            wealth_ratio: deterministic_policy_wealth.iter().sum::<f64>() / environments as f64,
+            benchmark: paired_benchmark_metrics(
+                &deterministic_policy_wealth,
+                &buy_and_hold_wealth,
+            )?,
+            turnover_mean: deterministic_turnover_sum / samples,
+            commissions: deterministic_portfolios
+                .iter()
+                .map(|portfolio| portfolio.total_commissions)
+                .sum(),
+            requested_target_weight_mean: deterministic_requested_weight_sum / samples,
+            executed_stock_weight_mean: deterministic_executed_weight_sum / samples,
+            action_boundary_fraction: deterministic_boundary_count as f64 / samples,
+            primary_trace: deterministic_primary_trace,
+        },
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn optimize_rollout(
     planner: &WorldModelPlanner,
-    rollout: &MixedRollout,
+    rollout: &PlannerRollout,
     batch: &PlannerBatch,
     advantages: &Tensor,
     returns: &Tensor,
@@ -715,29 +1059,21 @@ fn optimize_rollout(
     device: Device,
 ) -> Result<OptimizationSummary> {
     let mut summary = OptimizationSummary::default();
-    let diagnostics = split_critic_diagnostics(
-        &batch.sources,
-        &batch.old_alpha,
-        &batch.old_beta,
-        &batch.values,
-        returns,
-    );
-    summary.real_beta_concentration = diagnostics.real.beta_concentration_mean;
-    summary.fantasy_beta_concentration = diagnostics.fantasy.beta_concentration_mean;
-    summary.real_critic_explained_variance = diagnostics.real.critic_explained_variance;
-    summary.fantasy_critic_explained_variance = diagnostics.fantasy.critic_explained_variance;
+    let diagnostics = critic_diagnostics(&batch.old_alpha, &batch.old_beta, &batch.values, returns);
+    summary.beta_concentration = diagnostics.beta_concentration_mean;
+    summary.critic_explained_variance = diagnostics.critic_explained_variance;
 
     let mut actor_loss_sum = Tensor::zeros([], (Kind::Float, device));
     let mut critic_loss_sum = Tensor::zeros([], (Kind::Float, device));
-    let mut reverse_kl_sum = Tensor::zeros([], (Kind::Float, device));
+    let mut aux_return_loss_sum = Tensor::zeros([], (Kind::Float, device));
+    let mut reverse_kl_sum = 0.0f64;
     let mut entropy_sum = Tensor::zeros([], (Kind::Float, device));
     let mut actor_grad_sum = Tensor::zeros([], (Kind::Float, device));
     let mut critic_grad_sum = Tensor::zeros([], (Kind::Float, device));
-    apply_lr_scale(optimizer, kl_controller.scale());
-    let mut actor_stopped = false;
+    apply_planner_actor_lr_scale(optimizer, kl_controller.scale())?;
     for epoch in 0..DEFAULT_PLANNER_OPTIMIZATION_EPOCHS {
         for indices in
-            rollout.balanced_minibatch_indices(minibatch_size, seed ^ ((epoch as u64 + 1) << 32))?
+            rollout.minibatch_indices(minibatch_size, seed ^ ((epoch as u64 + 1) << 32))?
         {
             let mini = batch.select(&indices);
             let index = Tensor::from_slice(&indices).to_device(device);
@@ -746,9 +1082,7 @@ fn optimize_rollout(
             let output = planner.forward_mixed_precision(&planner_input(&mini));
             let losses = planner_actor_critic_losses(
                 hl_gauss,
-                &output.real_value_logits,
-                &output.fantasy_value_logits,
-                &mini.sources,
+                &output.value_logits,
                 &output.alpha,
                 &output.beta,
                 &mini.actions,
@@ -756,15 +1090,13 @@ fn optimize_rollout(
                 &mini.old_beta,
                 &mini_advantages,
                 &mini_returns,
+                &output.next_return,
+                &mini.next_log_returns,
             );
-            let minibatch_kl = losses.reverse_kl.double_value(&[]);
-            if !actor_stopped {
-                summary.max_reverse_kl = summary.max_reverse_kl.max(minibatch_kl);
-            }
-            if !actor_stopped && summary.actor_steps > 0 && minibatch_kl > TARGET_KL {
-                actor_stopped = true;
-                summary.kl_early_stopped = true;
-            }
+            let raw_minibatch_kl = losses.reverse_kl.double_value(&[]);
+            let (stop, minibatch_kl) =
+                kl_stops_before_optimizer_step(&mut summary, raw_minibatch_kl)?;
+            let critic_only = stop || summary.kl_early_stopped;
             optimizer.zero_grad();
             let (actor_norm, critic_norm) = backward_actor_critic_with_separate_clips(
                 clip_groups,
@@ -773,19 +1105,22 @@ fn optimize_rollout(
                 &losses.critic_loss,
                 MAX_GRAD_NORM,
                 device,
-                actor_stopped,
+                critic_only,
             );
             optimizer.set_momentum(muon_momentum_for_step(*optimizer_steps as i64));
+            set_planner_actor_step_enabled(optimizer, !critic_only)?;
             optimizer.step();
+            set_planner_actor_step_enabled(optimizer, true)?;
             *optimizer_steps += 1;
-            if !actor_stopped {
+            if !critic_only {
                 actor_loss_sum += losses.actor_loss.detach();
-                reverse_kl_sum += losses.reverse_kl.detach();
+                reverse_kl_sum += minibatch_kl;
                 entropy_sum += losses.entropy.detach();
                 actor_grad_sum += actor_norm.detach();
                 summary.actor_steps += 1;
             }
             critic_loss_sum += losses.critic_loss.detach();
+            aux_return_loss_sum += losses.aux_return_loss.detach();
             critic_grad_sum += critic_norm.detach();
             summary.steps += 1;
         }
@@ -794,7 +1129,8 @@ fn optimize_rollout(
     let actor_denominator = summary.actor_steps.max(1) as f64;
     summary.actor_loss = actor_loss_sum.double_value(&[]) / actor_denominator;
     summary.critic_loss = critic_loss_sum.double_value(&[]) / critic_denominator;
-    summary.reverse_kl = reverse_kl_sum.double_value(&[]) / actor_denominator;
+    summary.aux_return_loss = aux_return_loss_sum.double_value(&[]) / critic_denominator;
+    summary.reverse_kl = reverse_kl_sum / actor_denominator;
     summary.entropy = entropy_sum.double_value(&[]) / actor_denominator;
     summary.actor_grad_norm = actor_grad_sum.double_value(&[]) / actor_denominator;
     summary.critic_grad_norm = critic_grad_sum.double_value(&[]) / critic_denominator;
@@ -802,8 +1138,66 @@ fn optimize_rollout(
     Ok(summary)
 }
 
+fn apply_planner_actor_lr_scale(optimizer: &mut Muon, lr_scale: f64) -> Result<()> {
+    let matched = optimizer.set_named_lr_scale(PLANNER_ACTOR_LR_PATTERNS, lr_scale);
+    if matched != PLANNER_ACTOR_PARAMETER_COUNT {
+        bail!(
+            "planner actor learning-rate routing matched {matched} parameters, expected {PLANNER_ACTOR_PARAMETER_COUNT}"
+        );
+    }
+    Ok(())
+}
+
+fn new_planner_optimizer(named_vars: &[(String, Tensor)]) -> Muon {
+    Muon::new_named(
+        named_vars,
+        MuonConfig {
+            lr: MUON_LR,
+            use_muon_for_2d: USE_MUON,
+            momentum: MUON_MOMENTUM_WARMUP_START,
+            adamw_lr: LEARNING_RATE,
+            adamw_betas: (0.9, 0.95),
+            adamw_eps: 1e-8,
+            force_adamw_name_substrings: vec![
+                "policy_concentration".to_owned(),
+                "value_projection".to_owned(),
+                "next_return_head".to_owned(),
+            ],
+            ..MuonConfig::default()
+        },
+    )
+}
+
+fn set_planner_actor_step_enabled(optimizer: &mut Muon, enabled: bool) -> Result<()> {
+    let matched = optimizer.set_named_step_enabled(PLANNER_ACTOR_LR_PATTERNS, enabled);
+    if matched != PLANNER_ACTOR_PARAMETER_COUNT {
+        bail!(
+            "planner actor step routing matched {matched} parameters, expected {PLANNER_ACTOR_PARAMETER_COUNT}"
+        );
+    }
+    Ok(())
+}
+
+fn kl_stops_before_optimizer_step(
+    summary: &mut OptimizationSummary,
+    raw_minibatch_kl: f64,
+) -> Result<(bool, f64)> {
+    let minibatch_kl = validated_reverse_kl(raw_minibatch_kl)?;
+    summary.max_reverse_kl = summary.max_reverse_kl.max(minibatch_kl);
+    let stop = summary.actor_steps > 0 && minibatch_kl > TARGET_KL;
+    summary.kl_early_stopped |= stop;
+    Ok((stop, minibatch_kl))
+}
+
+fn validated_reverse_kl(raw_kl: f64) -> Result<f64> {
+    if !raw_kl.is_finite() || raw_kl < -KL_NEGATIVE_ROUNDOFF_TOLERANCE {
+        bail!("planner reverse KL is invalid: {raw_kl}");
+    }
+    Ok(raw_kl.max(0.0))
+}
+
 fn rollout_advantages(
-    rollout: &MixedRollout,
+    rollout: &PlannerRollout,
     batch: &PlannerBatch,
     rollout_length: usize,
     environments: usize,
@@ -862,12 +1256,23 @@ fn infer_real_episode(
     let mut portfolio = PlannerPortfolio::new(100.0);
     let mut reward_sum = 0.0;
     let mut turnover = 0.0;
-    let mut action_sum = 0.0;
+    let mut requested_target_weight_sum = 0.0;
+    let mut executed_stock_weight_sum = 0.0;
     let mut peak_assets: f64 = 100.0;
     let mut max_drawdown: f64 = 0.0;
     let relative_horizon = relative_horizon(1, horizon, device);
     let context = dataset.contexts(&[endpoint], &[0], context_bars, device)?;
     let mut session = world_model.start_session(&context)?;
+    let series = dataset.series(endpoint.series);
+    let start_price = series.closes[endpoint.bar];
+    let mut trace = PlannerEpisodeTrace {
+        ticker: series.ticker.clone(),
+        cash: vec![100.0],
+        positioned: vec![0.0],
+        total: vec![100.0],
+        benchmark: vec![100.0],
+        ..PlannerEpisodeTrace::default()
+    };
     for decision in 0..rollout_length {
         let prediction = session.forecast(world_model, horizon as i64)?;
         validate_prediction_finite(&prediction).with_context(|| {
@@ -881,14 +1286,14 @@ fn infer_real_episode(
         let portfolio_state = Tensor::from_slice(&portfolio.planner_state(current_price))
             .view([1, PLANNER_PORTFOLIO_DIM])
             .to_device(device);
+        let belief = session.belief();
         let output = tch::no_grad(|| {
             planner.forward_mixed_precision(&WorldModelPlannerInput {
                 forecast: PlannerForecast {
                     latent: prediction.latent,
-                    ohlc_mean: prediction.ohlc_mean,
-                    ohlc_log_variance: prediction.ohlc_logvar,
                     relative_horizon: relative_horizon.shallow_clone(),
                 },
+                belief,
                 portfolio_state,
             })
         });
@@ -900,24 +1305,46 @@ fn infer_real_episode(
         );
         reward_sum += step.reward;
         turnover += step.turnover;
-        action_sum += action;
+        requested_target_weight_sum += step.requested_target_weight;
+        executed_stock_weight_sum += step.executed_stock_weight;
+        let next_price = series.closes[endpoint.bar + decision + 1];
+        trace.cash.push(step.cash_after_trade);
+        trace.positioned.push(step.positioned_value_after);
+        trace.total.push(step.assets_after);
+        trace.benchmark.push(100.0 * next_price / start_price);
+        trace.rewards.push(step.reward);
+        trace.commissions.push(step.commission);
+        trace.turnover.push(step.turnover);
+        trace
+            .requested_target_weight
+            .push(step.requested_target_weight);
+        trace.executed_stock_weight.push(step.executed_stock_weight);
         peak_assets = peak_assets.max(step.assets_after);
         max_drawdown = max_drawdown.max(1.0 - step.assets_after / peak_assets);
         let actual_next_bar = dataset.contexts(&[endpoint], &[decision + 1], 1, device)?;
         session.append_actual_bar(world_model, &actual_next_bar)?;
     }
     let series = dataset.series(endpoint.series);
+    let final_wealth_ratio =
+        portfolio.total_assets(series.closes[endpoint.bar + rollout_length]) / 100.0;
+    let buy_and_hold_wealth_ratio = buy_and_hold_wealth_ratio(
+        series.closes[endpoint.bar],
+        series.closes[endpoint.bar + rollout_length],
+    );
     Ok(PlannerInferenceEpisode {
         ticker: series.ticker.clone(),
         start_bar: endpoint.bar,
         steps: rollout_length,
         reward_sum,
-        final_wealth_ratio: portfolio.total_assets(series.closes[endpoint.bar + rollout_length])
-            / 100.0,
+        final_wealth_ratio,
+        buy_and_hold_wealth_ratio,
+        outperformance_ratio: final_wealth_ratio - buy_and_hold_wealth_ratio,
         commissions: portfolio.total_commissions,
         turnover_mean: turnover / rollout_length as f64,
-        action_mean: action_sum / rollout_length as f64,
+        requested_target_weight_mean: requested_target_weight_sum / rollout_length as f64,
+        executed_stock_weight_mean: executed_stock_weight_sum / rollout_length as f64,
         max_drawdown,
+        trace,
     })
 }
 
@@ -925,10 +1352,9 @@ fn planner_input(batch: &PlannerBatch) -> WorldModelPlannerInput {
     WorldModelPlannerInput {
         forecast: PlannerForecast {
             latent: batch.forecast_latent.shallow_clone(),
-            ohlc_mean: batch.forecast_mean.shallow_clone(),
-            ohlc_log_variance: batch.forecast_logvar.shallow_clone(),
             relative_horizon: batch.relative_horizon.shallow_clone(),
         },
+        belief: batch.belief.shallow_clone(),
         portfolio_state: batch.portfolio_state.shallow_clone(),
     }
 }
@@ -949,64 +1375,18 @@ fn update_seed(base_seed: u64, cumulative_update: u64, stream: u64) -> u64 {
 
 fn observation_at(
     latent: &Tensor,
-    mean: &Tensor,
-    logvar: &Tensor,
     relative_horizon: &Tensor,
+    belief: &Tensor,
     portfolio_state: &Tensor,
     index: usize,
 ) -> PlannerObservation {
     let index = index as i64;
     PlannerObservation {
         forecast_latent: latent.get(index).to_device(Device::Cpu).detach(),
-        forecast_mean: mean.get(index).to_device(Device::Cpu).detach(),
-        forecast_logvar: logvar.get(index).to_device(Device::Cpu).detach(),
         relative_horizon: relative_horizon.get(index).to_device(Device::Cpu).detach(),
+        belief: belief.get(index).to_device(Device::Cpu).detach(),
         portfolio_state: portfolio_state.get(index).to_device(Device::Cpu).detach(),
     }
-}
-
-fn fantasy_close_paths(
-    dataset: &PlannerDataset,
-    endpoints: &[PlannerEndpoint],
-    prediction: &WorldModelPrediction,
-) -> Result<Vec<Vec<f64>>> {
-    let means = prediction.ohlc_mean.to_device(Device::Cpu);
-    let steps = means.size()[1] as usize;
-    let mut result = Vec::with_capacity(endpoints.len());
-    for (batch, endpoint) in endpoints.iter().enumerate() {
-        let mut closes = Vec::with_capacity(steps + 1);
-        closes.push(dataset.series(endpoint.series).closes[endpoint.bar]);
-        for step in 0..steps {
-            let delta = means.double_value(&[batch as i64, step as i64, 3]);
-            let multiplier = 1.0 + delta;
-            let next = closes.last().copied().unwrap() * multiplier;
-            if !next.is_finite() || next <= 0.0 {
-                bail!("fantasy close path became invalid for batch {batch} at step {step}: {next}");
-            }
-            closes.push(next);
-        }
-        result.push(closes);
-    }
-    Ok(result)
-}
-
-fn sanitize_fantasy_close_deltas(prediction: &mut WorldModelPrediction) -> Result<Vec<Vec<bool>>> {
-    let close = prediction.ohlc_mean.narrow(2, 3, 1);
-    if close.isfinite().all().int64_value(&[]) == 0 {
-        bail!("fantasy close prediction contains NaN or infinity");
-    }
-    let clamped = close.clamp(FANTASY_CLOSE_DELTA_MIN, FANTASY_CLOSE_DELTA_MAX);
-    let changed = close.ne_tensor(&clamped).to_device(Device::Cpu);
-    tch::no_grad(|| prediction.ohlc_mean.narrow(2, 3, 1).copy_(&clamped));
-    let batch = changed.size()[0] as usize;
-    let steps = changed.size()[1] as usize;
-    Ok((0..batch)
-        .map(|b| {
-            (0..steps)
-                .map(|step| changed.int64_value(&[b as i64, step as i64, 0]) != 0)
-                .collect()
-        })
-        .collect())
 }
 
 fn validate_prediction_finite(prediction: &WorldModelPrediction) -> Result<()> {
@@ -1022,39 +1402,88 @@ fn validate_prediction_finite(prediction: &WorldModelPrediction) -> Result<()> {
     Ok(())
 }
 
-fn current_prices(
-    dataset: &PlannerDataset,
-    real: &[PlannerEndpoint],
-    fantasy: &[PlannerEndpoint],
-    fantasy_closes: &[Vec<f64>],
-    decision: usize,
-) -> Vec<f64> {
-    real.iter()
-        .map(|endpoint| dataset.series(endpoint.series).closes[endpoint.bar + decision])
-        .chain(
-            fantasy
-                .iter()
-                .enumerate()
-                .map(|(index, _)| fantasy_closes[index][decision]),
-        )
-        .collect()
+fn buy_and_hold_wealth_ratio(start_price: f64, end_price: f64) -> f64 {
+    end_price / start_price
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    if values.len() % 2 == 0 {
+        (values[values.len() / 2 - 1] + values[values.len() / 2]) * 0.5
+    } else {
+        values[values.len() / 2]
+    }
+}
+
+fn paired_benchmark_metrics(
+    policy_wealth: &[f64],
+    buy_and_hold_wealth: &[f64],
+) -> Result<PairedBenchmarkMetrics> {
+    if policy_wealth.is_empty() || policy_wealth.len() != buy_and_hold_wealth.len() {
+        bail!("paired benchmark requires equally sized, non-empty policy and buy-and-hold samples");
+    }
+    if policy_wealth
+        .iter()
+        .chain(buy_and_hold_wealth)
+        .any(|value| !value.is_finite())
+    {
+        bail!("paired benchmark wealth contains NaN or infinity");
+    }
+    let count = policy_wealth.len() as f64;
+    let mut outperformance = policy_wealth
+        .iter()
+        .zip(buy_and_hold_wealth)
+        .map(|(policy, benchmark)| policy - benchmark)
+        .collect::<Vec<_>>();
+    Ok(PairedBenchmarkMetrics {
+        mean_buy_and_hold_wealth_ratio: buy_and_hold_wealth.iter().sum::<f64>() / count,
+        mean_outperformance_ratio: outperformance.iter().sum::<f64>() / count,
+        median_outperformance_ratio: median(&mut outperformance),
+        outperformance_fraction: outperformance
+            .iter()
+            .filter(|outperformance| **outperformance > 0.0)
+            .count() as f64
+            / count,
+    })
+}
+
+fn inference_summary(episodes: Vec<PlannerInferenceEpisode>) -> PlannerInferenceSummary {
+    let count = episodes.len() as f64;
+    PlannerInferenceSummary {
+        mean_reward: episodes
+            .iter()
+            .map(|episode| episode.reward_sum)
+            .sum::<f64>()
+            / count,
+        mean_final_wealth_ratio: episodes
+            .iter()
+            .map(|episode| episode.final_wealth_ratio)
+            .sum::<f64>()
+            / count,
+        mean_buy_and_hold_wealth_ratio: episodes
+            .iter()
+            .map(|episode| episode.buy_and_hold_wealth_ratio)
+            .sum::<f64>()
+            / count,
+        mean_outperformance_ratio: episodes
+            .iter()
+            .map(|episode| episode.outperformance_ratio)
+            .sum::<f64>()
+            / count,
+        episodes,
+    }
 }
 
 fn validate_train_args(args: &TrainPlannerArgs) -> Result<()> {
     if args.updates == 0 || args.horizon == 0 || args.rollout_length == 0 {
         bail!("planner updates, horizon, and rollout length must be positive");
     }
-    if args.environments == 0 || args.environments % 2 != 0 {
-        bail!("planner environments must be positive and even for equal real/fantasy sources");
+    if args.environments == 0 {
+        bail!("planner environments must be positive");
     }
     let samples = args.environments * args.rollout_length;
-    let per_source = samples / 2;
-    if args.minibatch_size == 0
-        || args.minibatch_size % 2 != 0
-        || samples % args.minibatch_size != 0
-        || per_source % (args.minibatch_size / 2) != 0
-    {
-        bail!("planner minibatch size must be even and evenly partition both rollout sources");
+    if args.minibatch_size == 0 || samples % args.minibatch_size != 0 {
+        bail!("planner minibatch size must evenly divide the real rollout");
     }
     Ok(())
 }
@@ -1084,28 +1513,29 @@ fn evaluate_real_endpoints(
         )?);
     }
     let count = episodes.len() as f64;
-    let mean_reward = episodes
-        .iter()
-        .map(|episode| episode.reward_sum)
-        .sum::<f64>()
-        / count;
-    let mean_final_wealth_ratio = episodes
-        .iter()
-        .map(|episode| episode.final_wealth_ratio)
-        .sum::<f64>()
-        / count;
     let mut wealth = episodes
         .iter()
         .map(|episode| episode.final_wealth_ratio)
         .collect::<Vec<_>>();
-    wealth.sort_by(f64::total_cmp);
-    let median_wealth_ratio = if wealth.len() % 2 == 0 {
-        (wealth[wealth.len() / 2 - 1] + wealth[wealth.len() / 2]) * 0.5
-    } else {
-        wealth[wealth.len() / 2]
-    };
+    let median_wealth_ratio = median(&mut wealth);
+    let mut buy_and_hold_wealth = episodes
+        .iter()
+        .map(|episode| episode.buy_and_hold_wealth_ratio)
+        .collect::<Vec<_>>();
+    let mut outperformance = episodes
+        .iter()
+        .map(|episode| episode.outperformance_ratio)
+        .collect::<Vec<_>>();
     let metrics = HeldOutMetrics {
         median_wealth_ratio,
+        median_buy_and_hold_wealth_ratio: median(&mut buy_and_hold_wealth),
+        mean_outperformance_ratio: outperformance.iter().sum::<f64>() / count,
+        median_outperformance_ratio: median(&mut outperformance),
+        outperformance_fraction: outperformance
+            .iter()
+            .filter(|outperformance| **outperformance > 0.0)
+            .count() as f64
+            / count,
         mean_max_drawdown: episodes
             .iter()
             .map(|episode| episode.max_drawdown)
@@ -1117,185 +1547,477 @@ fn evaluate_real_endpoints(
             .sum::<f64>()
             / count,
     };
-    Ok((
-        PlannerInferenceSummary {
-            episodes,
-            mean_reward,
-            mean_final_wealth_ratio,
-        },
-        metrics,
-    ))
+    Ok((inference_summary(episodes), metrics))
 }
 
-fn best_checkpoint_path(checkpoint: impl AsRef<Path>) -> PathBuf {
+fn selected_checkpoint_path(checkpoint: impl AsRef<Path>, update: u64) -> PathBuf {
     let checkpoint = checkpoint.as_ref();
     let stem = checkpoint
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("planner");
-    checkpoint.with_file_name(format!("{stem}_best.ot"))
+    checkpoint.with_file_name(format!("{stem}_best_u{update:08}.ot"))
 }
 
-fn validation_metrics_path(checkpoint: impl AsRef<Path>) -> PathBuf {
-    checkpoint.as_ref().with_extension("validation.csv")
+fn resume_checkpoint_path(checkpoint: impl AsRef<Path>, update: u64) -> PathBuf {
+    let checkpoint = checkpoint.as_ref();
+    let stem = checkpoint
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("planner");
+    checkpoint.with_file_name(format!("{stem}_resume_u{update:08}.ot"))
 }
 
-fn append_validation_metrics(
-    checkpoint: impl AsRef<Path>,
-    update: u64,
-    metrics: HeldOutMetrics,
-    selected: bool,
-) -> Result<()> {
-    let path = validation_metrics_path(checkpoint);
-    let write_header = fs::metadata(&path)
-        .map(|metadata| metadata.len() == 0)
-        .unwrap_or(true);
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    if write_header {
-        writeln!(
-            file,
-            "update,median_wealth_ratio,mean_max_drawdown,mean_turnover,eligible,selected"
-        )?;
+fn resume_manifest_path(checkpoint: impl AsRef<Path>) -> PathBuf {
+    checkpoint.as_ref().with_extension("resume.json")
+}
+
+fn ensure_immutable_checkpoint_path(checkpoint: &Path) -> Result<()> {
+    if checkpoint.exists()
+        || planner_metadata_path(checkpoint).exists()
+        || planner_optimizer_state_path(checkpoint).exists()
+    {
+        bail!(
+            "refusing to overwrite immutable planner checkpoint {}",
+            checkpoint.display()
+        );
     }
-    writeln!(
-        file,
-        "{update},{},{},{},{},{}",
-        metrics.median_wealth_ratio,
-        metrics.mean_max_drawdown,
-        metrics.mean_turnover,
-        metrics.eligible(),
-        selected,
-    )?;
     Ok(())
 }
 
-fn load_best_validation_metrics(checkpoint: impl AsRef<Path>) -> Option<HeldOutMetrics> {
-    let contents = fs::read_to_string(validation_metrics_path(checkpoint)).ok()?;
-    contents
-        .lines()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .find_map(|line| {
-            let fields = line.split(',').collect::<Vec<_>>();
-            if fields.len() != 6 || fields[5] != "true" {
-                return None;
-            }
-            Some(HeldOutMetrics {
-                median_wealth_ratio: fields[1].parse().ok()?,
-                mean_max_drawdown: fields[2].parse().ok()?,
-                mean_turnover: fields[3].parse().ok()?,
+fn ensure_fresh_resume_output(checkpoint: impl AsRef<Path>) -> Result<()> {
+    let checkpoint = checkpoint.as_ref();
+    let stem = checkpoint
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("planner");
+    let has_sidecar = resume_manifest_path(checkpoint).exists();
+    let has_bundle = checkpoint
+        .parent()
+        .and_then(|parent| fs::read_dir(parent).ok())
+        .is_some_and(|entries| {
+            entries.filter_map(std::result::Result::ok).any(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(&format!("{stem}_resume_u"))
+                        || name.starts_with(&format!("{stem}_best_u"))
+                })
             })
+        });
+    if has_sidecar || has_bundle {
+        bail!(
+            "planner output {} already contains a run; resume it explicitly or use a fresh output",
+            checkpoint.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_fresh_planner_gens(gens: &Path, base_updates: u64) -> Result<()> {
+    if base_updates == 0 && fs::read_dir(gens).is_ok_and(|mut entries| entries.next().is_some()) {
+        bail!(
+            "fresh planner output requires an empty gens directory: {}",
+            gens.display()
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_uncommitted_resume_bundles(
+    checkpoint: impl AsRef<Path>,
+    committed_update: u64,
+    run_lineage_id: &str,
+) -> Result<()> {
+    let checkpoint = checkpoint.as_ref();
+    let Some(parent) = checkpoint.parent() else {
+        return Ok(());
+    };
+    let stem = checkpoint
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("planner");
+    let prefix = format!("{stem}_resume_u");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let updates = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let rest = name.to_str()?.strip_prefix(&prefix)?;
+            let digits = rest
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            digits.parse::<u64>().ok()
         })
+        .collect::<std::collections::BTreeSet<_>>();
+    for update in updates
+        .into_iter()
+        .filter(|update| *update > committed_update)
+    {
+        let resume = resume_checkpoint_path(checkpoint, update);
+        let metadata_path = planner_metadata_path(&resume);
+        if metadata_path.exists() {
+            let metadata = PlannerCheckpointMetadata::load(&metadata_path)?;
+            if metadata.run_lineage_id != run_lineage_id || metadata.cumulative_updates != update {
+                bail!(
+                    "uncommitted resume checkpoint {} belongs to a different run lineage or update",
+                    metadata_path.display()
+                );
+            }
+        }
+        for path in [
+            resume.clone(),
+            planner_optimizer_state_path(&resume),
+            planner_metadata_path(&resume),
+        ] {
+            if path.exists() {
+                fs::remove_file(&path).with_context(|| {
+                    format!(
+                        "failed removing uncommitted planner bundle {}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_uncommitted_selected_bundles(
+    checkpoint: impl AsRef<Path>,
+    committed_update: u64,
+    run_lineage_id: &str,
+) -> Result<()> {
+    let checkpoint = checkpoint.as_ref();
+    let Some(parent) = checkpoint.parent() else {
+        return Ok(());
+    };
+    let stem = checkpoint
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("planner");
+    let prefix = format!("{stem}_best_u");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let updates = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let rest = name.to_str()?.strip_prefix(&prefix)?;
+            let digits = rest
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            digits.parse::<u64>().ok()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for update in updates {
+        if update <= committed_update {
+            continue;
+        }
+        let selected = selected_checkpoint_path(checkpoint, update);
+        let metadata_path = planner_metadata_path(&selected);
+        if metadata_path.exists() {
+            let metadata = PlannerCheckpointMetadata::load(&metadata_path)?;
+            if metadata.run_lineage_id != run_lineage_id || metadata.cumulative_updates != update {
+                bail!(
+                    "uncommitted selected checkpoint {} belongs to a different run lineage or update",
+                    metadata_path.display()
+                );
+            }
+        }
+        for path in [
+            selected.clone(),
+            planner_optimizer_state_path(&selected),
+            planner_metadata_path(&selected),
+        ] {
+            if path.exists() {
+                fs::remove_file(&path).with_context(|| {
+                    format!(
+                        "failed removing uncommitted selected bundle {}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_output_manifest_for_resume(
+    checkpoint: impl AsRef<Path>,
+    run_lineage_id: &str,
+    resumed_update: u64,
+) -> Result<()> {
+    let checkpoint = checkpoint.as_ref();
+    let path = resume_manifest_path(checkpoint);
+    if !path.exists() {
+        return ensure_fresh_resume_output(checkpoint);
+    }
+    let manifest: PlannerResumeManifest = serde_json::from_slice(&fs::read(&path)?)?;
+    if manifest.version != RESUME_MANIFEST_VERSION
+        || manifest.run_lineage_id != run_lineage_id
+        || manifest.update != resumed_update
+    {
+        bail!(
+            "planner output manifest is newer than or unrelated to the requested resume checkpoint; resume the manifest target or use a fresh output"
+        );
+    }
+    Ok(())
+}
+
+fn commit_resume_manifest(
+    base_checkpoint: impl AsRef<Path>,
+    committed_checkpoint: &Path,
+    metadata: &PlannerCheckpointMetadata,
+) -> Result<()> {
+    let base_checkpoint = base_checkpoint.as_ref();
+    let checkpoint_file = committed_checkpoint
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("planner resume checkpoint filename is not UTF-8")?;
+    if committed_checkpoint.parent() != base_checkpoint.parent() {
+        bail!("planner resume checkpoint and manifest must share a directory");
+    }
+    let manifest = PlannerResumeManifest {
+        version: RESUME_MANIFEST_VERSION,
+        run_lineage_id: metadata.run_lineage_id.clone(),
+        update: metadata.cumulative_updates,
+        checkpoint_file: checkpoint_file.to_owned(),
+        weights_sha256: metadata.weights_sha256.clone(),
+        optimizer_sha256: metadata.optimizer_sha256.clone(),
+    };
+    let path = resume_manifest_path(base_checkpoint);
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("resume.json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(&manifest)?)?;
+    File::open(&temporary)?.sync_all()?;
+    fs::rename(&temporary, &path)?;
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn resolve_resume_checkpoint(
+    requested: impl AsRef<Path>,
+    world_model_lineage: &str,
+    horizon: Option<usize>,
+    seed: Option<u64>,
+) -> Result<(PathBuf, PlannerCheckpointMetadata)> {
+    let requested = requested.as_ref();
+    let manifest_path = resume_manifest_path(requested);
+    if manifest_path.exists() {
+        let manifest: PlannerResumeManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        if manifest.version != RESUME_MANIFEST_VERSION
+            || manifest.checkpoint_file.contains('/')
+            || manifest.checkpoint_file.contains('\\')
+        {
+            bail!("planner resume manifest is incompatible or unsafe");
+        }
+        let checkpoint = requested
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(&manifest.checkpoint_file);
+        let metadata =
+            load_committed_planner_metadata(&checkpoint, world_model_lineage, horizon, seed)?;
+        if metadata.cumulative_updates != manifest.update
+            || metadata.run_lineage_id != manifest.run_lineage_id
+            || metadata.weights_sha256 != manifest.weights_sha256
+            || metadata.optimizer_sha256 != manifest.optimizer_sha256
+        {
+            bail!("planner resume manifest does not match its committed checkpoint bundle");
+        }
+        return Ok((checkpoint, metadata));
+    }
+    let metadata = load_committed_planner_metadata(requested, world_model_lineage, horizon, seed)?;
+    Ok((requested.to_path_buf(), metadata))
+}
+
+fn load_committed_best_validation(
+    checkpoint: impl AsRef<Path>,
+    world_model_lineage: &str,
+    run_lineage_id: &str,
+    horizon: usize,
+    context_bars: usize,
+    seed: u64,
+    max_update: u64,
+) -> Result<Option<(PathBuf, HeldOutMetrics)>> {
+    let checkpoint = checkpoint.as_ref();
+    let Some(parent) = checkpoint.parent() else {
+        return Ok(None);
+    };
+    let stem = checkpoint
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("planner");
+    let prefix = format!("{stem}_best_u");
+    let mut best: Option<(u64, PathBuf, HeldOutMetrics)> = None;
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let metadata_path = entry.path();
+        let Some(name) = metadata_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(update_text) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".metadata.json"))
+        else {
+            continue;
+        };
+        let Ok(update) = update_text.parse::<u64>() else {
+            continue;
+        };
+        if update > max_update {
+            bail!(
+                "planner output contains selected checkpoint update {update} newer than committed resume update {max_update}; use the matching resume manifest or a fresh output"
+            );
+        }
+        let candidate = selected_checkpoint_path(checkpoint, update);
+        let metadata = load_committed_planner_metadata(
+            &candidate,
+            world_model_lineage,
+            Some(horizon),
+            Some(seed),
+        )?;
+        if metadata.cumulative_updates != update {
+            bail!(
+                "selected planner checkpoint filename update {update} does not match metadata update {}",
+                metadata.cumulative_updates
+            );
+        }
+        if metadata.run_lineage_id != run_lineage_id || metadata.context_bars != context_bars {
+            bail!(
+                "selected planner checkpoint {} belongs to a different run lineage",
+                candidate.display()
+            );
+        }
+        let selected = metadata.selected_validation.context(
+            "immutable planner best checkpoint is missing its selected validation record",
+        )?;
+        let metrics = HeldOutMetrics::from(selected);
+        if !metrics.eligible() {
+            bail!(
+                "immutable planner best checkpoint {} contains an ineligible selected score",
+                candidate.display()
+            );
+        }
+        if best.as_ref().is_none_or(|(current_update, _, current)| {
+            metrics.median_outperformance_ratio > current.median_outperformance_ratio
+                || (metrics.median_outperformance_ratio == current.median_outperformance_ratio
+                    && update > *current_update)
+        }) {
+            best = Some((update, candidate, metrics));
+        }
+    }
+    Ok(best.map(|(_, path, metrics)| (path, metrics)))
 }
 
 fn print_training_metrics(
     update: u64,
     rollout: &RolloutMetrics,
+    benchmark: PairedBenchmarkMetrics,
+    deterministic: &DeterministicRolloutEvaluation,
     optimization: OptimizationSummary,
 ) {
     println!(
-        "planner update={update} real_reward={:.6} fantasy_reward={:.6} real_wealth={:.6} fantasy_wealth={:.6} real_turnover={:.6} fantasy_turnover={:.6} fantasy_clamp={:.6} actor_loss={:.6} critic_loss={:.6} kl={:.6} max_kl={:.6} kl_stop={} entropy={:.6} real_critic_ev={:.4} fantasy_critic_ev={:.4} actor_grad={:.6} critic_grad={:.6}",
-        rollout.real.reward_mean,
-        rollout.fantasy.reward_mean,
-        rollout.real.mean_environment_wealth_ratio,
-        rollout.fantasy.mean_environment_wealth_ratio,
-        rollout.real.turnover_mean,
-        rollout.fantasy.turnover_mean,
-        rollout.fantasy.fantasy_clamp_fraction,
+        "planner update={update} sampled_reward={:.6} sampled_wealth={:.6} buy_hold={:.6} sampled_mean_outperformance={:.6} sampled_median_outperformance={:.6} sampled_outperform_fraction={:.3} sampled_turnover={:.6} deterministic_reward={:.6} deterministic_wealth={:.6} deterministic_mean_outperformance={:.6} deterministic_median_outperformance={:.6} deterministic_outperform_fraction={:.3} deterministic_turnover={:.6} actor_loss={:.6} critic_loss={:.6} aux_return_loss={:.6} kl={:.6} max_kl={:.6} kl_stop={} entropy={:.6} critic_ev={:.4} actor_grad={:.6} critic_grad={:.6}",
+        rollout.reward_mean,
+        rollout.mean_environment_wealth_ratio,
+        benchmark.mean_buy_and_hold_wealth_ratio,
+        benchmark.mean_outperformance_ratio,
+        benchmark.median_outperformance_ratio,
+        benchmark.outperformance_fraction,
+        rollout.turnover_mean,
+        deterministic.reward_mean,
+        deterministic.wealth_ratio,
+        deterministic.benchmark.mean_outperformance_ratio,
+        deterministic.benchmark.median_outperformance_ratio,
+        deterministic.benchmark.outperformance_fraction,
+        deterministic.turnover_mean,
         optimization.actor_loss,
         optimization.critic_loss,
+        optimization.aux_return_loss,
         optimization.reverse_kl,
         optimization.max_reverse_kl,
         optimization.kl_early_stopped,
         optimization.entropy,
-        optimization.real_critic_explained_variance,
-        optimization.fantasy_critic_explained_variance,
+        optimization.critic_explained_variance,
         optimization.actor_grad_norm,
         optimization.critic_grad_norm,
     );
 }
 
-fn append_training_metrics(
-    planner_checkpoint: impl AsRef<Path>,
-    update: u64,
+fn training_report_point(
     rollout: &RolloutMetrics,
+    benchmark: PairedBenchmarkMetrics,
+    deterministic: &DeterministicRolloutEvaluation,
     optimization: OptimizationSummary,
-) -> Result<()> {
-    let path = planner_checkpoint.as_ref().with_extension("training.csv");
-    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
+) -> PlannerTrainingReportPoint {
+    PlannerTrainingReportPoint {
+        reward_mean: rollout.reward_mean,
+        wealth_ratio: rollout.mean_environment_wealth_ratio,
+        buy_and_hold_wealth_ratio: benchmark.mean_buy_and_hold_wealth_ratio,
+        mean_outperformance_ratio: benchmark.mean_outperformance_ratio,
+        median_outperformance_ratio: benchmark.median_outperformance_ratio,
+        outperformance_fraction: benchmark.outperformance_fraction,
+        turnover_mean: rollout.turnover_mean,
+        commissions: rollout.commissions,
+        requested_target_weight_mean: rollout.requested_target_weight_mean,
+        executed_stock_weight_mean: rollout.executed_stock_weight_mean,
+        action_boundary_fraction: rollout.action_boundary_fraction,
+        deterministic_reward_mean: deterministic.reward_mean,
+        deterministic_wealth_ratio: deterministic.wealth_ratio,
+        deterministic_mean_outperformance_ratio: deterministic.benchmark.mean_outperformance_ratio,
+        deterministic_median_outperformance_ratio: deterministic
+            .benchmark
+            .median_outperformance_ratio,
+        deterministic_outperformance_fraction: deterministic.benchmark.outperformance_fraction,
+        deterministic_turnover_mean: deterministic.turnover_mean,
+        deterministic_commissions: deterministic.commissions,
+        deterministic_requested_target_weight_mean: deterministic.requested_target_weight_mean,
+        deterministic_executed_stock_weight_mean: deterministic.executed_stock_weight_mean,
+        deterministic_action_boundary_fraction: deterministic.action_boundary_fraction,
+        beta_concentration: optimization.beta_concentration,
+        critic_explained_variance: optimization.critic_explained_variance,
+        actor_loss: optimization.actor_loss,
+        critic_loss: optimization.critic_loss,
+        reverse_kl: optimization.reverse_kl,
+        max_reverse_kl: optimization.max_reverse_kl,
+        kl_early_stopped: optimization.kl_early_stopped,
+        entropy: optimization.entropy,
+        actor_grad_norm: optimization.actor_grad_norm,
+        critic_grad_norm: optimization.critic_grad_norm,
     }
-    let write_header = fs::metadata(&path)
-        .map(|metadata| metadata.len() == 0)
-        .unwrap_or(true);
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    if write_header {
-        writeln!(
-            file,
-            "update,real_reward_mean,fantasy_reward_mean,real_wealth_ratio,fantasy_wealth_ratio,real_turnover_mean,fantasy_turnover_mean,real_commissions,fantasy_commissions,real_action_mean,fantasy_action_mean,real_action_boundary_fraction,fantasy_action_boundary_fraction,fantasy_clamp_fraction,real_beta_concentration,fantasy_beta_concentration,real_critic_explained_variance,fantasy_critic_explained_variance,actor_loss,critic_loss,reverse_kl,max_reverse_kl,kl_early_stopped,entropy,actor_grad_norm,critic_grad_norm"
-        )?;
-    }
-    writeln!(
-        file,
-        "{update},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        rollout.real.reward_mean,
-        rollout.fantasy.reward_mean,
-        rollout.real.mean_environment_wealth_ratio,
-        rollout.fantasy.mean_environment_wealth_ratio,
-        rollout.real.turnover_mean,
-        rollout.fantasy.turnover_mean,
-        rollout.real.commissions,
-        rollout.fantasy.commissions,
-        rollout.real.action_mean,
-        rollout.fantasy.action_mean,
-        rollout.real.action_boundary_fraction,
-        rollout.fantasy.action_boundary_fraction,
-        rollout.fantasy.fantasy_clamp_fraction,
-        optimization.real_beta_concentration,
-        optimization.fantasy_beta_concentration,
-        optimization.real_critic_explained_variance,
-        optimization.fantasy_critic_explained_variance,
-        optimization.actor_loss,
-        optimization.critic_loss,
-        optimization.reverse_kl,
-        optimization.max_reverse_kl,
-        optimization.kl_early_stopped,
-        optimization.entropy,
-        optimization.actor_grad_norm,
-        optimization.critic_grad_norm,
-    )?;
-    Ok(())
 }
 
-fn write_inference_csv(
-    planner_checkpoint: impl AsRef<Path>,
-    split: PlannerDataSplit,
-    summary: &PlannerInferenceSummary,
-) -> Result<()> {
-    let path = planner_checkpoint.as_ref().with_extension("inference.csv");
-    let mut file = File::create(&path)?;
-    writeln!(
-        file,
-        "split,episode,ticker,start_bar,steps,reward_sum,final_wealth_ratio,commissions,turnover_mean,action_mean,max_drawdown"
-    )?;
-    for (index, episode) in summary.episodes.iter().enumerate() {
-        writeln!(
-            file,
-            "{split:?},{index},{},{},{},{},{},{},{},{},{}",
-            episode.ticker,
-            episode.start_bar,
-            episode.steps,
-            episode.reward_sum,
-            episode.final_wealth_ratio,
-            episode.commissions,
-            episode.turnover_mean,
-            episode.action_mean,
-            episode.max_drawdown,
-        )?;
+fn validation_report_point(
+    metrics: HeldOutMetrics,
+    selected: bool,
+) -> PlannerValidationReportPoint {
+    PlannerValidationReportPoint {
+        median_wealth_ratio: metrics.median_wealth_ratio,
+        median_buy_and_hold_wealth_ratio: metrics.median_buy_and_hold_wealth_ratio,
+        mean_outperformance_ratio: metrics.mean_outperformance_ratio,
+        median_outperformance_ratio: metrics.median_outperformance_ratio,
+        outperformance_fraction: metrics.outperformance_fraction,
+        mean_max_drawdown: metrics.mean_max_drawdown,
+        mean_turnover: metrics.mean_turnover,
+        eligible: metrics.eligible(),
+        selected,
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1303,7 +2025,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_mixed_rollout_plan() {
+    fn defaults_match_real_receding_horizon_plan() {
         let args = TrainPlannerArgs::default();
         assert_eq!(args.horizon, 100);
         assert_eq!(args.rollout_length, 100);
@@ -1312,46 +2034,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unbalanced_environment_count() {
+    fn accepts_odd_real_environment_count_and_rejects_zero() {
         let mut args = TrainPlannerArgs::default();
-        args.environments = 15;
+        args.environments = 5;
+        args.minibatch_size = 100;
+        validate_train_args(&args).unwrap();
+        args.environments = 0;
         assert!(validate_train_args(&args).is_err());
-    }
-
-    #[test]
-    fn fantasy_prices_use_next_close_delta_without_off_by_one() {
-        let previous = 100.0f64;
-        let deltas = [0.1f64, -0.5];
-        let mut prices = vec![previous];
-        for delta in deltas {
-            prices.push(prices.last().copied().unwrap() * (1.0 + delta));
-        }
-        assert_eq!(prices, vec![100.0, 110.00000000000001, 55.00000000000001]);
-    }
-
-    #[test]
-    fn fantasy_sanitization_changes_both_presented_and_executed_close_delta() {
-        let mut prediction = WorldModelPrediction {
-            latent: Tensor::zeros([1, 2, 256], (Kind::Float, Device::Cpu)),
-            ohlc_mean: Tensor::zeros([1, 2, 16], (Kind::Float, Device::Cpu)),
-            ohlc_logvar: Tensor::zeros([1, 2, 16], (Kind::Float, Device::Cpu)),
-        };
-        let _ = prediction.ohlc_mean.get(0).get(0).get(3).fill_(-2.0);
-        let _ = prediction.ohlc_mean.get(0).get(1).get(3).fill_(120.0);
-        let mask = sanitize_fantasy_close_deltas(&mut prediction).unwrap();
-        assert_eq!(mask, vec![vec![true, true]]);
-        assert!((prediction.ohlc_mean.double_value(&[0, 0, 3]) + 0.25).abs() < 1e-6);
-        assert_eq!(prediction.ohlc_mean.double_value(&[0, 1, 3]), 0.25);
-    }
-
-    #[test]
-    fn fantasy_sanitization_rejects_non_finite_close_delta() {
-        let mut prediction = WorldModelPrediction {
-            latent: Tensor::zeros([1, 1, 256], (Kind::Float, Device::Cpu)),
-            ohlc_mean: Tensor::full([1, 1, 16], f64::NAN, (Kind::Float, Device::Cpu)),
-            ohlc_logvar: Tensor::zeros([1, 1, 16], (Kind::Float, Device::Cpu)),
-        };
-        assert!(sanitize_fantasy_close_deltas(&mut prediction).is_err());
     }
 
     #[test]
@@ -1363,9 +2052,135 @@ mod tests {
     }
 
     #[test]
+    fn training_reports_keep_sampled_and_deterministic_metrics_distinct() {
+        let sampled = RolloutMetrics {
+            reward_mean: 0.1,
+            mean_environment_wealth_ratio: 1.01,
+            turnover_mean: 0.3,
+            ..RolloutMetrics::default()
+        };
+        let sampled_benchmark = PairedBenchmarkMetrics {
+            mean_buy_and_hold_wealth_ratio: 1.02,
+            mean_outperformance_ratio: -0.01,
+            median_outperformance_ratio: -0.02,
+            outperformance_fraction: 0.25,
+        };
+        let deterministic = DeterministicRolloutEvaluation {
+            reward_mean: 0.2,
+            wealth_ratio: 1.03,
+            benchmark: PairedBenchmarkMetrics {
+                mean_buy_and_hold_wealth_ratio: 1.02,
+                mean_outperformance_ratio: 0.01,
+                median_outperformance_ratio: 0.02,
+                outperformance_fraction: 0.75,
+            },
+            turnover_mean: 0.1,
+            commissions: 0.4,
+            requested_target_weight_mean: 0.6,
+            executed_stock_weight_mean: 0.59,
+            action_boundary_fraction: 0.05,
+            ..DeterministicRolloutEvaluation::default()
+        };
+
+        let point = training_report_point(
+            &sampled,
+            sampled_benchmark,
+            &deterministic,
+            OptimizationSummary::default(),
+        );
+        assert_eq!(point.reward_mean, 0.1);
+        assert_eq!(point.mean_outperformance_ratio, -0.01);
+        assert_eq!(point.deterministic_reward_mean, 0.2);
+        assert_eq!(point.deterministic_wealth_ratio, 1.03);
+        assert_eq!(point.deterministic_mean_outperformance_ratio, 0.01);
+        assert_eq!(point.deterministic_turnover_mean, 0.1);
+        assert_eq!(point.deterministic_commissions, 0.4);
+    }
+
+    #[test]
+    fn kl_trigger_disables_actor_without_stopping_critic_optimization() {
+        let mut summary = OptimizationSummary {
+            actor_steps: 1,
+            steps: 1,
+            ..OptimizationSummary::default()
+        };
+        let (critic_only, _) =
+            kl_stops_before_optimizer_step(&mut summary, TARGET_KL * 2.0).unwrap();
+
+        assert!(critic_only);
+        assert!(summary.kl_early_stopped);
+        assert_eq!(summary.max_reverse_kl, TARGET_KL * 2.0);
+        assert_eq!(summary.actor_steps, 1);
+        // The caller still performs and counts this minibatch's critic-only step.
+        summary.steps += 1;
+        assert_eq!(summary.steps, 2);
+    }
+
+    #[test]
+    fn planner_kl_lr_routing_matches_only_the_actor_head() {
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _planner = WorldModelPlanner::new(&vs.root());
+        let named_vars = named_trainable_variables(&vs);
+        let matched_names = named_vars
+            .iter()
+            .filter(|(name, _)| {
+                PLANNER_ACTOR_LR_PATTERNS
+                    .iter()
+                    .any(|pattern| name.contains(pattern))
+            })
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(matched_names.len(), PLANNER_ACTOR_PARAMETER_COUNT);
+        assert!(matched_names
+            .iter()
+            .all(|name| name.contains("policy_concentration")));
+        assert!(named_vars
+            .iter()
+            .any(|(name, _)| name.contains("value_projection")));
+        assert!(named_vars.iter().any(|(name, _)| name.contains("trunk_0")));
+
+        let mut optimizer = new_planner_optimizer(&named_vars);
+        apply_planner_actor_lr_scale(&mut optimizer, 0.25).unwrap();
+        set_planner_actor_step_enabled(&mut optimizer, false).unwrap();
+        set_planner_actor_step_enabled(&mut optimizer, true).unwrap();
+    }
+
+    #[test]
+    fn reverse_kl_clamps_only_float32_roundoff_negatives() {
+        let tiny_negative = -0.5 * KL_NEGATIVE_ROUNDOFF_TOLERANCE;
+        assert_eq!(validated_reverse_kl(tiny_negative).unwrap(), 0.0);
+        assert_eq!(validated_reverse_kl(0.0).unwrap(), 0.0);
+        assert_eq!(validated_reverse_kl(0.01).unwrap(), 0.01);
+
+        let mut summary = OptimizationSummary {
+            actor_steps: 1,
+            ..OptimizationSummary::default()
+        };
+        let (stopped, sanitized) =
+            kl_stops_before_optimizer_step(&mut summary, tiny_negative).unwrap();
+        assert!(!stopped);
+        assert_eq!(sanitized, 0.0);
+        assert_eq!(summary.max_reverse_kl, 0.0);
+        assert!(!summary.kl_early_stopped);
+    }
+
+    #[test]
+    fn reverse_kl_rejects_material_negatives_and_non_finite_values() {
+        assert!(validated_reverse_kl(-2.0 * KL_NEGATIVE_ROUNDOFF_TOLERANCE).is_err());
+        assert!(validated_reverse_kl(f64::NAN).is_err());
+        assert!(validated_reverse_kl(f64::INFINITY).is_err());
+        assert!(validated_reverse_kl(f64::NEG_INFINITY).is_err());
+    }
+
+    #[test]
     fn validation_gates_drawdown_and_turnover_before_wealth_selection() {
         let eligible = HeldOutMetrics {
             median_wealth_ratio: 1.1,
+            median_buy_and_hold_wealth_ratio: 1.0,
+            mean_outperformance_ratio: 0.1,
+            median_outperformance_ratio: 0.1,
+            outperformance_fraction: 0.75,
             mean_max_drawdown: 0.2,
             mean_turnover: 0.1,
         };
@@ -1383,51 +2198,345 @@ mod tests {
     }
 
     #[test]
-    fn validation_log_restores_only_the_last_selected_real_score() {
-        let checkpoint = std::env::temp_dir().join(format!(
-            "planner-validation-{}-{}.ot",
+    fn committed_best_metadata_is_the_only_selection_authority() {
+        let dir = std::env::temp_dir().join(format!(
+            "planner-selected-resume-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
+        let weights = dir.join("weights");
+        fs::create_dir_all(&weights).unwrap();
+        let checkpoint = weights.join("planner.ot");
         let first = HeldOutMetrics {
             median_wealth_ratio: 1.05,
+            median_buy_and_hold_wealth_ratio: 1.02,
+            mean_outperformance_ratio: 0.03,
+            median_outperformance_ratio: 0.04,
+            outperformance_fraction: 0.75,
             mean_max_drawdown: 0.1,
             mean_turnover: 0.2,
         };
-        let later_unselected = HeldOutMetrics {
-            median_wealth_ratio: 0.9,
+        let second = HeldOutMetrics {
+            median_wealth_ratio: 1.1,
+            median_buy_and_hold_wealth_ratio: 1.0,
+            mean_outperformance_ratio: 0.1,
+            median_outperformance_ratio: 0.08,
+            outperformance_fraction: 0.8,
             mean_max_drawdown: 0.1,
             mean_turnover: 0.2,
         };
-        append_validation_metrics(&checkpoint, 50, first, true).unwrap();
-        append_validation_metrics(&checkpoint, 100, later_unselected, false).unwrap();
-        assert_eq!(load_best_validation_metrics(&checkpoint), Some(first));
-        assert_eq!(
-            best_checkpoint_path(&checkpoint),
-            checkpoint.with_file_name(format!(
-                "{}_best.ot",
-                checkpoint.file_stem().unwrap().to_str().unwrap()
-            ))
+
+        let save_selected =
+            |path: &Path, update: u64, run_lineage: &str, metrics: HeldOutMetrics| {
+                let vs = nn::VarStore::new(Device::Cpu);
+                let _ = vs.root().zeros("weight", &[2, 2]);
+                let optimizer = Muon::new_named(
+                    &named_trainable_variables(&vs),
+                    MuonConfig {
+                        quiet: true,
+                        ..MuonConfig::default()
+                    },
+                );
+                save_planner_checkpoint(
+                    &vs,
+                    path,
+                    &PlannerCheckpointMetadata::new(
+                        "lineage-a",
+                        "world-weights-a",
+                        100,
+                        128,
+                        1,
+                        update,
+                        run_lineage,
+                        7,
+                        TARGET_KL,
+                        1.0,
+                    )
+                    .with_selected_validation(metrics.selected_validation(update)),
+                    &optimizer,
+                )
+                .unwrap();
+            };
+
+        let first_path = selected_checkpoint_path(&checkpoint, 50);
+        save_selected(&first_path, 50, "run-a", first);
+        let (resolved_path, resolved_metrics) =
+            load_committed_best_validation(&checkpoint, "lineage-a", "run-a", 100, 128, 7, 100)
+                .unwrap()
+                .unwrap();
+        assert_eq!(resolved_path, first_path);
+        assert_eq!(resolved_metrics, first);
+
+        let second_path = selected_checkpoint_path(&checkpoint, 100);
+        save_selected(&second_path, 100, "run-a", second);
+        let (resolved_path, resolved_metrics) =
+            load_committed_best_validation(&checkpoint, "lineage-a", "run-a", 100, 128, 7, 100)
+                .unwrap()
+                .unwrap();
+        assert_eq!(resolved_path, second_path);
+        assert_eq!(resolved_metrics, second);
+        assert!(
+            load_committed_best_validation(&checkpoint, "lineage-a", "run-a", 100, 128, 7, 50,)
+                .is_err()
         );
-        let _ = fs::remove_file(validation_metrics_path(&checkpoint));
+
+        // A pre-commit partial generation has no metadata commit marker and is
+        // ignored without damaging the previous valid best.
+        fs::write(selected_checkpoint_path(&checkpoint, 150), b"partial").unwrap();
+        assert_eq!(
+            load_committed_best_validation(&checkpoint, "lineage-a", "run-a", 100, 128, 7, 100,)
+                .unwrap()
+                .unwrap()
+                .0,
+            second_path
+        );
+
+        let unrelated_path = selected_checkpoint_path(&checkpoint, 120);
+        save_selected(&unrelated_path, 120, "run-b", second);
+        assert!(load_committed_best_validation(
+            &checkpoint,
+            "lineage-a",
+            "run-a",
+            100,
+            128,
+            7,
+            120,
+        )
+        .is_err());
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn training_diagnostics_append_one_header() {
-        let checkpoint = std::env::temp_dir().join(format!(
-            "planner-diagnostics-{}-{}.ot",
+    fn resume_manifest_switches_only_after_an_immutable_bundle_commits() {
+        let dir = std::env::temp_dir().join(format!(
+            "planner-resume-manifest-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let mut metrics = RolloutMetrics::default();
-        metrics.real.reward_mean = 1.0;
-        metrics.fantasy.reward_mean = -1.0;
-        append_training_metrics(&checkpoint, 1, &metrics, OptimizationSummary::default()).unwrap();
-        append_training_metrics(&checkpoint, 2, &metrics, OptimizationSummary::default()).unwrap();
-        let path = checkpoint.with_extension("training.csv");
-        let contents = fs::read_to_string(&path).unwrap();
-        assert_eq!(contents.lines().count(), 3);
-        assert_eq!(contents.matches("update,real_reward_mean").count(), 1);
-        let _ = fs::remove_file(path);
+        let weights = dir.join("weights");
+        fs::create_dir_all(&weights).unwrap();
+        let base = weights.join("planner.ot");
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _ = vs.root().zeros("weight", &[2, 2]);
+        let optimizer = Muon::new_named(
+            &named_trainable_variables(&vs),
+            MuonConfig {
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+        let save_resume = |update: u64| {
+            let path = resume_checkpoint_path(&base, update);
+            let committed = save_planner_checkpoint(
+                &vs,
+                &path,
+                &PlannerCheckpointMetadata::new(
+                    "lineage-a",
+                    "world-weights-a",
+                    100,
+                    128,
+                    update,
+                    update,
+                    "run-a",
+                    7,
+                    TARGET_KL,
+                    1.0,
+                ),
+                &optimizer,
+            )
+            .unwrap();
+            (path, committed)
+        };
+
+        let (first_path, first_metadata) = save_resume(1);
+        commit_resume_manifest(&base, &first_path, &first_metadata).unwrap();
+        assert_eq!(
+            resolve_resume_checkpoint(&base, "lineage-a", Some(100), Some(7))
+                .unwrap()
+                .0,
+            first_path
+        );
+
+        // A fully staged newer bundle is invisible until the atomic manifest
+        // rename commits it, so interruption here resumes the previous update.
+        let (second_path, _) = save_resume(2);
+        assert!(validate_output_manifest_for_resume(&base, "run-a", 2).is_err());
+        assert_eq!(
+            resolve_resume_checkpoint(&base, "lineage-a", Some(100), Some(7))
+                .unwrap()
+                .0,
+            first_path
+        );
+        cleanup_uncommitted_resume_bundles(&base, 1, "run-a").unwrap();
+        assert!(!second_path.exists());
+        assert!(!planner_metadata_path(&second_path).exists());
+        assert!(!planner_optimizer_state_path(&second_path).exists());
+        let (second_path, second_metadata) = save_resume(2);
+        commit_resume_manifest(&base, &second_path, &second_metadata).unwrap();
+        let (_, resolved) =
+            resolve_resume_checkpoint(&base, "lineage-a", Some(100), Some(7)).unwrap();
+        assert_eq!(resolved.cumulative_updates, 2);
+        assert_eq!(resolved.run_lineage_id, "run-a");
+        assert!(validate_output_manifest_for_resume(&base, "run-a", 1).is_err());
+        assert!(second_path.exists());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resume_removes_all_uncommitted_selected_bundle_shapes_for_same_output() {
+        let dir = std::env::temp_dir().join(format!(
+            "planner-selected-cleanup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let weights = dir.join("weights");
+        fs::create_dir_all(&weights).unwrap();
+        let base = weights.join("planner.ot");
+
+        let weights_only = selected_checkpoint_path(&base, 2);
+        fs::write(&weights_only, b"partial weights").unwrap();
+        let optimizer_only_checkpoint = selected_checkpoint_path(&base, 3);
+        let optimizer_only = planner_optimizer_state_path(&optimizer_only_checkpoint);
+        fs::write(&optimizer_only, b"partial optimizer").unwrap();
+
+        cleanup_uncommitted_selected_bundles(&base, 1, "run-a").unwrap();
+        assert!(!weights_only.exists());
+        assert!(!optimizer_only.exists());
+
+        let mismatched = selected_checkpoint_path(&base, 4);
+        fs::write(&mismatched, b"weights").unwrap();
+        let mismatched_metadata = PlannerCheckpointMetadata::new(
+            "lineage-a",
+            "world-weights-a",
+            100,
+            128,
+            4,
+            4,
+            "run-b",
+            7,
+            TARGET_KL,
+            1.0,
+        );
+        fs::write(
+            planner_metadata_path(&mismatched),
+            serde_json::to_vec(&mismatched_metadata).unwrap(),
+        )
+        .unwrap();
+        assert!(cleanup_uncommitted_selected_bundles(&base, 1, "run-a").is_err());
+        assert!(mismatched.exists());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resume_cleanup_refuses_mismatched_future_resume_bundle() {
+        let dir = std::env::temp_dir().join(format!(
+            "planner-resume-cleanup-owner-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let weights = dir.join("weights");
+        fs::create_dir_all(&weights).unwrap();
+        let base = weights.join("planner.ot");
+        let future = resume_checkpoint_path(&base, 2);
+        fs::write(&future, b"preserve").unwrap();
+        let metadata = PlannerCheckpointMetadata::new(
+            "lineage-a",
+            "world-weights-a",
+            100,
+            128,
+            2,
+            2,
+            "run-b",
+            7,
+            TARGET_KL,
+            1.0,
+        );
+        fs::write(
+            planner_metadata_path(&future),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        assert!(cleanup_uncommitted_resume_bundles(&base, 1, "run-a").is_err());
+        assert_eq!(fs::read(&future).unwrap(), b"preserve");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_training_rejects_reused_output_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "planner-fresh-output-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let checkpoint = dir.join("planner.ot");
+        ensure_fresh_resume_output(&checkpoint).unwrap();
+        fs::write(checkpoint.with_extension("resume.json"), "{}").unwrap();
+        assert!(ensure_fresh_resume_output(&checkpoint).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_training_rejects_any_preexisting_generation_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "planner-fresh-gens-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        ensure_fresh_planner_gens(&dir, 0).unwrap();
+        fs::create_dir(dir.join("1")).unwrap();
+        assert!(ensure_fresh_planner_gens(&dir, 0).is_err());
+        ensure_fresh_planner_gens(&dir, 1).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn buy_and_hold_is_the_raw_index_return_at_exact_endpoint_prices() {
+        let ratio = buy_and_hold_wealth_ratio(10.0, 12.0);
+        assert!((ratio - 1.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn benchmark_metrics_compare_each_policy_to_its_paired_market_path() {
+        let metrics = paired_benchmark_metrics(&[1.4, 0.9, 1.05], &[1.2, 1.0, 1.0]).unwrap();
+
+        assert!((metrics.mean_buy_and_hold_wealth_ratio - 1.0666666667).abs() < 1e-10);
+        assert!((metrics.mean_outperformance_ratio - 0.05).abs() < 1e-12);
+        assert!((metrics.median_outperformance_ratio - 0.05).abs() < 1e-12);
+        assert!((metrics.outperformance_fraction - 2.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn checkpoint_ranking_uses_outperformance_not_unpaired_wealth() {
+        let higher_wealth_but_worse_market_relative = HeldOutMetrics {
+            median_wealth_ratio: 1.2,
+            median_buy_and_hold_wealth_ratio: 1.3,
+            mean_outperformance_ratio: -0.1,
+            median_outperformance_ratio: -0.1,
+            outperformance_fraction: 0.25,
+            mean_max_drawdown: 0.1,
+            mean_turnover: 0.1,
+        };
+        let lower_wealth_but_better_market_relative = HeldOutMetrics {
+            median_wealth_ratio: 1.0,
+            median_buy_and_hold_wealth_ratio: 0.9,
+            mean_outperformance_ratio: 0.1,
+            median_outperformance_ratio: 0.1,
+            outperformance_fraction: 0.75,
+            mean_max_drawdown: 0.1,
+            mean_turnover: 0.1,
+        };
+
+        assert!(
+            lower_wealth_but_better_market_relative.median_outperformance_ratio
+                > higher_wealth_but_worse_market_relative.median_outperformance_ratio
+        );
+        assert!(!higher_wealth_but_worse_market_relative.eligible());
+        assert!(lower_wealth_but_better_market_relative.eligible());
     }
 }

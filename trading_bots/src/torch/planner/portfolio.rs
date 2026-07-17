@@ -16,6 +16,10 @@ pub struct PortfolioStep {
     pub reward: f64,
     pub commission: f64,
     pub turnover: f64,
+    pub requested_target_weight: f64,
+    pub executed_stock_weight: f64,
+    pub cash_after_trade: f64,
+    pub positioned_value_after: f64,
     pub assets_before: f64,
     pub assets_after: f64,
 }
@@ -108,7 +112,10 @@ impl PlannerPortfolio {
         }
 
         self.total_commissions += commission;
-        let assets_after = self.total_assets(next_price);
+        let executed_stock_weight = self.stock_weight(current_price);
+        let cash_after_trade = self.cash;
+        let positioned_value_after = self.shares * next_price;
+        let assets_after = cash_after_trade + positioned_value_after;
         let turnover = traded_notional / assets_before;
         let reward = (assets_after / assets_before).ln() * PLANNER_REWARD_SCALE;
         self.previous_target_weight = target_weight;
@@ -118,6 +125,10 @@ impl PlannerPortfolio {
             reward,
             commission,
             turnover,
+            requested_target_weight: target_weight,
+            executed_stock_weight,
+            cash_after_trade,
+            positioned_value_after,
             assets_before,
             assets_after,
         }
@@ -184,6 +195,14 @@ mod tests {
 
         approx_eq(portfolio.shares, shares, 1e-12);
         approx_eq(result.commission, commission, 1e-12);
+        approx_eq(result.executed_stock_weight, 1.0, 1e-12);
+        approx_eq(result.cash_after_trade, 0.0, 1e-12);
+        approx_eq(result.positioned_value_after, shares * 11.0, 1e-12);
+        approx_eq(
+            result.cash_after_trade + result.positioned_value_after,
+            result.assets_after,
+            1e-12,
+        );
         approx_eq(result.assets_after, next_assets, 1e-10);
         approx_eq(result.reward, 20.0 * (next_assets / 100.0).ln(), 1e-12);
     }
@@ -203,6 +222,19 @@ mod tests {
         );
         approx_eq(result.assets_after, 90.0 - expected_commission, 1e-12);
         approx_eq(result.turnover, 0.5, 1e-12);
+        approx_eq(result.requested_target_weight, 0.5, 1e-12);
+        approx_eq(
+            result.executed_stock_weight,
+            50.0 / (100.0 - expected_commission),
+            1e-12,
+        );
+        approx_eq(result.cash_after_trade, 50.0 - expected_commission, 1e-12);
+        approx_eq(result.positioned_value_after, 40.0, 1e-12);
+        approx_eq(
+            result.cash_after_trade + result.positioned_value_after,
+            result.assets_after,
+            1e-12,
+        );
     }
 
     #[test]
@@ -220,6 +252,8 @@ mod tests {
 
         assert_eq!(result.commission, 0.0);
         assert_eq!(result.turnover, 0.0);
+        assert_eq!(result.requested_target_weight, target);
+        assert_eq!(result.executed_stock_weight, 0.5);
         assert_eq!(portfolio.previous_target_weight, target);
         assert_eq!(
             portfolio.planner_state(10.0),
@@ -232,6 +266,10 @@ mod tests {
         let mut portfolio = PlannerPortfolio::from_position(0.0, 10.0, 0.8);
         let result = portfolio.step(f64::NAN, 10.0, 10.0);
         assert_eq!(result.turnover, 1.0);
+        assert_eq!(result.requested_target_weight, 0.0);
+        assert_eq!(result.executed_stock_weight, 0.0);
+        assert_eq!(result.positioned_value_after, 0.0);
+        assert_eq!(result.cash_after_trade, result.assets_after);
         assert_eq!(portfolio.previous_target_weight, 0.0);
         assert_eq!(portfolio.shares, 0.0);
     }

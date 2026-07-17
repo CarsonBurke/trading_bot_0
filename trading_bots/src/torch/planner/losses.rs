@@ -1,14 +1,14 @@
 use tch::{Kind, Tensor};
 
 use crate::torch::action_space::{beta_entropy, beta_log_prob, beta_reverse_kl};
+use crate::torch::planner::portfolio::PLANNER_REWARD_SCALE;
 use crate::torch::train::numeric_debug::compute_explained_variance;
 use crate::torch::value::hl_gauss::HlGaussBins;
-
-use super::rollout::RolloutSource;
 
 pub(crate) const POSITIVE_WEIGHT: f64 = 0.5;
 pub(crate) const REVERSE_KL_COEFFICIENT: f64 = 0.3;
 pub(crate) const VALUE_LOSS_COEFFICIENT: f64 = 1.0;
+pub(crate) const PLANNER_AUX_RETURN_COEF: f64 = 0.1;
 
 pub struct PlannerLosses {
     pub actor_loss: Tensor,
@@ -17,6 +17,7 @@ pub struct PlannerLosses {
     pub reverse_kl: Tensor,
     pub entropy: Tensor,
     pub value_loss: Tensor,
+    pub aux_return_loss: Tensor,
 }
 
 pub fn pmpo_policy_loss(
@@ -49,9 +50,7 @@ pub fn pmpo_policy_loss(
 #[allow(clippy::too_many_arguments)]
 pub fn planner_actor_critic_losses(
     hl_gauss: &HlGaussBins,
-    real_value_logits: &Tensor,
-    fantasy_value_logits: &Tensor,
-    sources: &Tensor,
+    value_logits: &Tensor,
     new_alpha: &Tensor,
     new_beta: &Tensor,
     actions: &Tensor,
@@ -59,10 +58,10 @@ pub fn planner_actor_critic_losses(
     old_beta: &Tensor,
     advantages: &Tensor,
     returns: &Tensor,
+    next_return: &Tensor,
+    next_return_target: &Tensor,
 ) -> PlannerLosses {
-    let batch_size = real_value_logits.size()[0];
-    assert_eq!(real_value_logits.size(), fantasy_value_logits.size());
-    assert_eq!(sources.numel() as i64, batch_size);
+    let batch_size = value_logits.size()[0];
     assert_eq!(new_alpha.size(), new_beta.size());
     assert_eq!(new_alpha.size(), actions.size());
     assert_eq!(new_alpha.size(), old_alpha.size());
@@ -81,15 +80,19 @@ pub fn planner_actor_critic_losses(
         new_beta,
     );
     let entropy = beta_entropy(new_alpha, new_beta).mean(Kind::Float);
-    let value_logits = route_value_logits(real_value_logits, fantasy_value_logits, sources);
     let value_targets = hl_gauss.encode(&returns.flatten(0, -1));
     let value_log_probs = value_logits.log_softmax(-1, Kind::Float);
     let value_loss = -(value_targets * value_log_probs)
         .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
         .mean(Kind::Float);
 
+    let aux_return_loss = (next_return.flatten(0, -1).to_kind(Kind::Float)
+        - next_return_target.flatten(0, -1).to_kind(Kind::Float) * PLANNER_REWARD_SCALE)
+    .square()
+    .mean(Kind::Float);
+
     let actor_loss = policy_loss.shallow_clone();
-    let critic_loss = VALUE_LOSS_COEFFICIENT * &value_loss;
+    let critic_loss = VALUE_LOSS_COEFFICIENT * &value_loss + PLANNER_AUX_RETURN_COEF * &aux_return_loss;
     PlannerLosses {
         actor_loss,
         critic_loss,
@@ -97,92 +100,35 @@ pub fn planner_actor_critic_losses(
         reverse_kl,
         entropy,
         value_loss,
+        aux_return_loss,
     }
 }
 
-pub fn route_value_logits(
-    real_value_logits: &Tensor,
-    fantasy_value_logits: &Tensor,
-    sources: &Tensor,
-) -> Tensor {
-    assert_eq!(real_value_logits.size(), fantasy_value_logits.size());
-    let fantasy = sources
-        .flatten(0, -1)
-        .eq(RolloutSource::Fantasy as i64)
-        .unsqueeze(-1);
-    fantasy_value_logits.where_self(&fantasy, real_value_logits)
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct SourceCriticDiagnostics {
+pub struct CriticDiagnostics {
     pub beta_concentration_mean: f64,
     pub critic_explained_variance: f64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct SplitCriticDiagnostics {
-    pub real: SourceCriticDiagnostics,
-    pub fantasy: SourceCriticDiagnostics,
-}
-
-/// Per-source Beta concentration and critic explained variance over the whole
-/// rollout. Explained variance uses the canonical `compute_explained_variance`
+/// Beta concentration and critic explained variance over the whole real rollout.
+/// Explained variance uses the canonical `compute_explained_variance`
 /// (NaN sentinel on zero target variance) so it agrees with pretrain metrics.
-pub fn split_critic_diagnostics(
-    sources: &Tensor,
+pub fn critic_diagnostics(
     alpha: &Tensor,
     beta: &Tensor,
     predicted_values: &Tensor,
     returns: &Tensor,
-) -> SplitCriticDiagnostics {
-    SplitCriticDiagnostics {
-        real: source_critic_diagnostics(
-            RolloutSource::Real,
-            sources,
-            alpha,
-            beta,
-            predicted_values,
-            returns,
-        ),
-        fantasy: source_critic_diagnostics(
-            RolloutSource::Fantasy,
-            sources,
-            alpha,
-            beta,
-            predicted_values,
-            returns,
-        ),
-    }
-}
-
-fn source_critic_diagnostics(
-    source: RolloutSource,
-    sources: &Tensor,
-    alpha: &Tensor,
-    beta: &Tensor,
-    predicted_values: &Tensor,
-    returns: &Tensor,
-) -> SourceCriticDiagnostics {
+) -> CriticDiagnostics {
     tch::no_grad(|| {
-        let indices = sources
-            .flatten(0, -1)
-            .eq(source as i64)
-            .nonzero()
-            .flatten(0, -1);
-        if indices.numel() == 0 {
-            return SourceCriticDiagnostics::default();
+        if predicted_values.numel() == 0 {
+            return CriticDiagnostics::default();
         }
-
-        let alpha = alpha.index_select(0, &indices);
-        let beta = beta.index_select(0, &indices);
-        let predicted_values = predicted_values.flatten(0, -1).index_select(0, &indices);
-        let returns = returns.flatten(0, -1).index_select(0, &indices);
-
-        let concentration = (&alpha + &beta).mean(Kind::Float).double_value(&[]);
+        let concentration = (alpha + beta).mean(Kind::Float).double_value(&[]);
         let explained_variance =
-            compute_explained_variance(&predicted_values, &returns).double_value(&[]);
+            compute_explained_variance(&predicted_values.flatten(0, -1), &returns.flatten(0, -1))
+                .double_value(&[]);
 
-        SourceCriticDiagnostics {
+        CriticDiagnostics {
             beta_concentration_mean: concentration,
             critic_explained_variance: explained_variance,
         }
@@ -210,11 +156,8 @@ mod tests {
     #[test]
     fn actor_and_hl_gauss_critic_losses_are_finite_and_differentiable() {
         let bins = HlGaussBins::default_for(Device::Cpu);
-        let real_value_logits =
+        let value_logits =
             Tensor::zeros([3, bins.num_bins()], (Kind::Float, Device::Cpu)).set_requires_grad(true);
-        let fantasy_value_logits =
-            Tensor::zeros([3, bins.num_bins()], (Kind::Float, Device::Cpu)).set_requires_grad(true);
-        let sources = Tensor::from_slice(&[0i64, 1, 0]);
         let new_alpha =
             Tensor::full([3, 1], 2.0, (Kind::Float, Device::Cpu)).set_requires_grad(true);
         let new_beta =
@@ -224,11 +167,12 @@ mod tests {
         let old_beta = Tensor::full([3, 1], 2.4, (Kind::Float, Device::Cpu));
         let advantages = Tensor::from_slice(&[1.0f32, -0.5, 0.25]);
         let returns = Tensor::from_slice(&[0.2f32, -0.1, 1.0]);
+        let next_return =
+            Tensor::from_slice(&[0.01f32, -0.02, 0.03]).view([3, 1]).set_requires_grad(true);
+        let next_return_target = Tensor::from_slice(&[0.02f32, -0.01, 0.0]).view([3, 1]);
         let losses = planner_actor_critic_losses(
             &bins,
-            &real_value_logits,
-            &fantasy_value_logits,
-            &sources,
+            &value_logits,
             &new_alpha,
             &new_beta,
             &actions,
@@ -236,40 +180,27 @@ mod tests {
             &old_beta,
             &advantages,
             &returns,
+            &next_return,
+            &next_return_target,
         );
         let total = &losses.actor_loss + &losses.critic_loss;
         assert!(total.double_value(&[]).is_finite());
+        assert!(losses.aux_return_loss.double_value(&[]).is_finite());
         total.backward();
-        assert!(real_value_logits.grad().defined());
-        assert!(fantasy_value_logits.grad().defined());
+        assert!(value_logits.grad().defined());
         assert!(new_alpha.grad().defined());
         assert!(new_beta.grad().defined());
+        assert!(next_return.grad().defined());
     }
 
     #[test]
-    fn routes_each_source_to_its_critic_without_changing_actor_inputs() {
-        let real = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).view([2, 2]);
-        let fantasy = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0]).view([2, 2]);
-        let sources =
-            Tensor::from_slice(&[RolloutSource::Real as i64, RolloutSource::Fantasy as i64]);
-        let routed = route_value_logits(&real, &fantasy, &sources);
-        assert_eq!(routed.double_value(&[0, 0]), 1.0);
-        assert_eq!(routed.double_value(&[0, 1]), 2.0);
-        assert_eq!(routed.double_value(&[1, 0]), 30.0);
-        assert_eq!(routed.double_value(&[1, 1]), 40.0);
-    }
-
-    #[test]
-    fn critic_diagnostics_are_split_by_source() {
-        let sources = Tensor::from_slice(&[0i64, 0, 1, 1]);
+    fn critic_diagnostics_cover_the_real_rollout() {
         let alpha = Tensor::full([4, 1], 2.0, (Kind::Float, Device::Cpu));
         let beta = Tensor::full([4, 1], 2.0, (Kind::Float, Device::Cpu));
         let values = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
         let returns = Tensor::from_slice(&[1.0f32, 2.0, 4.0, 3.0]);
-        let metrics = split_critic_diagnostics(&sources, &alpha, &beta, &values, &returns);
-        assert!((metrics.real.beta_concentration_mean - 4.0).abs() < 1e-9);
-        assert!((metrics.fantasy.beta_concentration_mean - 4.0).abs() < 1e-9);
-        assert_eq!(metrics.real.critic_explained_variance, 1.0);
-        assert_eq!(metrics.fantasy.critic_explained_variance, -3.0);
+        let metrics = critic_diagnostics(&alpha, &beta, &values, &returns);
+        assert!((metrics.beta_concentration_mean - 4.0).abs() < 1e-9);
+        assert!((metrics.critic_explained_variance - 0.6).abs() < 1e-8);
     }
 }

@@ -20,38 +20,40 @@ use crate::torch::{
 
 use super::{
     gae::{PLANNER_GAE_LAMBDA, PLANNER_GAMMA},
-    losses::{POSITIVE_WEIGHT, REVERSE_KL_COEFFICIENT, VALUE_LOSS_COEFFICIENT},
+    losses::{
+        PLANNER_AUX_RETURN_COEF, POSITIVE_WEIGHT, REVERSE_KL_COEFFICIENT, VALUE_LOSS_COEFFICIENT,
+    },
     portfolio::PLANNER_REWARD_SCALE,
-    PLANNER_HEADS, PLANNER_LATENT_DIM, PLANNER_LAYERS, PLANNER_MODEL_DIM, PLANNER_OHLC_DIM,
+    PLANNER_BELIEF_DIM, PLANNER_HEADS, PLANNER_LATENT_DIM, PLANNER_LAYERS, PLANNER_MODEL_DIM,
     PLANNER_PORTFOLIO_DIM,
 };
 
-const FORMAT_VERSION: u32 = 2;
-const ARCHITECTURE: &str = "world-model-planner-bidirectional-dual-critic-v2";
-const INPUT_NORMALIZATION: &str = "wm-feature-scale-relative-logvar-v1";
-const REAL_SOURCE_FRACTION: f64 = 0.5;
+const FORMAT_VERSION: u32 = 5;
+const ARCHITECTURE: &str = "world-model-planner-bidirectional-real-only-v5";
+const INPUT_NORMALIZATION: &str = "belief-token-latent-rms-normalized-with-log-scale-v1";
+const ROLLOUT_DATA: &str = "frozen-wm-observation-real-next-price-after-costs-v1";
 pub(crate) const OPTIMIZATION_EPOCHS: usize = 3;
 pub(crate) const TARGET_KL: f64 = 0.035;
 pub(crate) const KL_CONTROLLER_HALF_LIFE: f64 = 50.0;
 pub(crate) const KL_MIN_LR_SCALE: f64 = 0.01;
 pub(crate) const KL_MAX_LR_SCALE: f64 = 10.0;
-pub(crate) const FANTASY_CLOSE_DELTA_MIN: f64 = -0.25;
-pub(crate) const FANTASY_CLOSE_DELTA_MAX: f64 = 0.25;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannerTrainingContract {
     pub reward_scale: f64,
     pub gamma: f64,
     pub gae_lambda: f64,
-    pub real_source_fraction: f64,
+    pub rollout_data: String,
     pub pmpo_positive_weight: f64,
     pub pmpo_reverse_kl_coefficient: f64,
     pub value_loss_coefficient: f64,
+    pub aux_return_coefficient: f64,
     pub optimization_epochs: usize,
     pub target_kl: f64,
     pub kl_controller_half_life: f64,
     pub kl_min_lr_scale: f64,
     pub kl_max_lr_scale: f64,
+    pub kl_lr_routing: String,
     pub input_normalization: String,
     pub muon_lr: f64,
     pub adamw_lr: f64,
@@ -71,9 +73,6 @@ pub struct PlannerTrainingContract {
     pub optimizer_routing: String,
     pub action_threshold: f64,
     pub commission_rate: f64,
-    pub fantasy_close_delta_min: f64,
-    pub fantasy_close_delta_max: f64,
-    pub fantasy_sanitization: String,
     pub validation_policy: String,
     pub base_seed: u64,
 }
@@ -84,15 +83,18 @@ impl PlannerTrainingContract {
             reward_scale: PLANNER_REWARD_SCALE,
             gamma: PLANNER_GAMMA,
             gae_lambda: PLANNER_GAE_LAMBDA,
-            real_source_fraction: REAL_SOURCE_FRACTION,
+            rollout_data: ROLLOUT_DATA.to_owned(),
             pmpo_positive_weight: POSITIVE_WEIGHT,
             pmpo_reverse_kl_coefficient: REVERSE_KL_COEFFICIENT,
             value_loss_coefficient: VALUE_LOSS_COEFFICIENT,
+            aux_return_coefficient: PLANNER_AUX_RETURN_COEF,
             optimization_epochs: OPTIMIZATION_EPOCHS,
             target_kl: TARGET_KL,
             kl_controller_half_life: KL_CONTROLLER_HALF_LIFE,
             kl_min_lr_scale: KL_MIN_LR_SCALE,
             kl_max_lr_scale: KL_MAX_LR_SCALE,
+            kl_lr_routing:
+                "adaptive-policy-head-only-fixed-shared-trunk-and-value-head-v1".to_owned(),
             input_normalization: INPUT_NORMALIZATION.to_owned(),
             muon_lr: MUON_LR,
             adamw_lr: LEARNING_RATE,
@@ -109,17 +111,45 @@ impl PlannerTrainingContract {
             muon_newton_schulz_steps: 5,
             max_grad_norm: MAX_GRAD_NORM,
             adamw_weight_decay: 0.0,
-            optimizer_routing: "muon-matrices-adamw-policy-value-v1".to_owned(),
+            optimizer_routing:
+                "muon-matrices-adamw-policy-value-and-aux-return-per-parameter-lr-v4".to_owned(),
             action_threshold: ACTION_THRESHOLD,
             commission_rate: COMMISSION_RATE,
-            fantasy_close_delta_min: FANTASY_CLOSE_DELTA_MIN,
-            fantasy_close_delta_max: FANTASY_CLOSE_DELTA_MAX,
-            fantasy_sanitization: "finite-check-clamp-before-observe-and-execute-v2".to_owned(),
             validation_policy:
-                "fixed-ticker-stratified-16-every-50-median-wealth-dd0.30-turnover0.50-v1"
+                "fixed-ticker-time-stratified-64-every-50-paired-outperformance-profitable-dd0.30-turnover0.50-v3"
                     .to_owned(),
             base_seed,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannerSelectedValidation {
+    pub update: u64,
+    pub median_wealth_ratio: f64,
+    pub median_buy_and_hold_wealth_ratio: f64,
+    pub mean_outperformance_ratio: f64,
+    pub median_outperformance_ratio: f64,
+    pub outperformance_fraction: f64,
+    pub mean_max_drawdown: f64,
+    pub mean_turnover: f64,
+}
+
+impl PlannerSelectedValidation {
+    fn is_valid(self, cumulative_updates: u64) -> bool {
+        self.update == cumulative_updates
+            && self.median_wealth_ratio.is_finite()
+            && self.median_wealth_ratio > 0.0
+            && self.median_buy_and_hold_wealth_ratio.is_finite()
+            && self.median_buy_and_hold_wealth_ratio > 0.0
+            && self.mean_outperformance_ratio.is_finite()
+            && self.median_outperformance_ratio.is_finite()
+            && self.outperformance_fraction.is_finite()
+            && (0.0..=1.0).contains(&self.outperformance_fraction)
+            && self.mean_max_drawdown.is_finite()
+            && (0.0..=1.0).contains(&self.mean_max_drawdown)
+            && self.mean_turnover.is_finite()
+            && self.mean_turnover >= 0.0
     }
 }
 
@@ -135,14 +165,15 @@ pub struct PlannerCheckpointMetadata {
     pub layers: usize,
     pub heads: i64,
     pub latent_dim: i64,
-    pub ohlc_dim: i64,
+    pub belief_dim: i64,
     pub portfolio_dim: i64,
     pub optimizer_steps: u64,
+    pub run_lineage_id: String,
     pub training_contract: PlannerTrainingContract,
     pub kl_ema: f64,
     pub kl_lr_scale: f64,
-    /// Cumulative training updates across all resumes; seeds the CSV `update`
-    /// axis so it stays monotonic when appending after a restart.
+    /// Cumulative training updates across all resumes; keeps checkpoint and
+    /// native report generations monotonic after a restart.
     #[serde(default)]
     pub cumulative_updates: u64,
     /// SHA-256 of the planner weights file this metadata commits. Written last in
@@ -153,6 +184,10 @@ pub struct PlannerCheckpointMetadata {
     /// post-commit corruption or a mismatched sidecar before restoring moments.
     #[serde(default)]
     pub optimizer_sha256: String,
+    /// Present only on immutable model-selection checkpoints. Keeping the score
+    /// in the same metadata commit as the weight hashes makes selection atomic.
+    #[serde(default)]
+    pub selected_validation: Option<PlannerSelectedValidation>,
 }
 
 impl PlannerCheckpointMetadata {
@@ -163,6 +198,7 @@ impl PlannerCheckpointMetadata {
         context_bars: usize,
         optimizer_steps: u64,
         cumulative_updates: u64,
+        run_lineage_id: impl Into<String>,
         base_seed: u64,
         kl_ema: f64,
         kl_lr_scale: f64,
@@ -178,16 +214,23 @@ impl PlannerCheckpointMetadata {
             layers: PLANNER_LAYERS,
             heads: PLANNER_HEADS,
             latent_dim: PLANNER_LATENT_DIM,
-            ohlc_dim: PLANNER_OHLC_DIM,
+            belief_dim: PLANNER_BELIEF_DIM,
             portfolio_dim: PLANNER_PORTFOLIO_DIM,
             optimizer_steps,
+            run_lineage_id: run_lineage_id.into(),
             training_contract: PlannerTrainingContract::new(base_seed),
             kl_ema,
             kl_lr_scale,
             cumulative_updates,
             weights_sha256: String::new(),
             optimizer_sha256: String::new(),
+            selected_validation: None,
         }
+    }
+
+    pub fn with_selected_validation(mut self, selected: PlannerSelectedValidation) -> Self {
+        self.selected_validation = Some(selected);
+        self
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
@@ -254,7 +297,7 @@ impl PlannerCheckpointMetadata {
             || self.layers != PLANNER_LAYERS
             || self.heads != PLANNER_HEADS
             || self.latent_dim != PLANNER_LATENT_DIM
-            || self.ohlc_dim != PLANNER_OHLC_DIM
+            || self.belief_dim != PLANNER_BELIEF_DIM
             || self.portfolio_dim != PLANNER_PORTFOLIO_DIM
         {
             bail!("planner checkpoint architecture dimensions are incompatible");
@@ -265,6 +308,10 @@ impl PlannerCheckpointMetadata {
             || self.world_model_weights_sha256.is_empty()
             || self.weights_sha256.is_empty()
             || self.optimizer_sha256.is_empty()
+            || self.run_lineage_id.is_empty()
+            || self
+                .selected_validation
+                .is_some_and(|selected| !selected.is_valid(self.cumulative_updates))
             || self.training_contract
                 != PlannerTrainingContract::new(self.training_contract.base_seed)
             || !self.kl_ema.is_finite()
@@ -324,6 +371,27 @@ pub fn verify_optimizer_state(path: impl AsRef<Path>, expected: &str) -> Result<
     verify_file_sha256(path.as_ref(), expected, "optimizer state")
 }
 
+pub fn load_committed_planner_metadata(
+    checkpoint: impl AsRef<Path>,
+    world_model_lineage_sha256: &str,
+    expected_horizon: Option<usize>,
+    expected_base_seed: Option<u64>,
+) -> Result<PlannerCheckpointMetadata> {
+    let checkpoint = checkpoint.as_ref();
+    let metadata = PlannerCheckpointMetadata::load(planner_metadata_path(checkpoint))?;
+    metadata.validate(
+        world_model_lineage_sha256,
+        expected_horizon,
+        expected_base_seed,
+    )?;
+    verify_file_sha256(checkpoint, &metadata.weights_sha256, "checkpoint weights")?;
+    verify_optimizer_state(
+        planner_optimizer_state_path(checkpoint),
+        &metadata.optimizer_sha256,
+    )?;
+    Ok(metadata)
+}
+
 fn temp_sibling(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
@@ -340,7 +408,7 @@ pub fn save_planner_checkpoint(
     checkpoint: impl AsRef<Path>,
     metadata: &PlannerCheckpointMetadata,
     optimizer: &Muon,
-) -> Result<()> {
+) -> Result<PlannerCheckpointMetadata> {
     let checkpoint = checkpoint.as_ref();
     ensure_parent_dir(checkpoint)?;
 
@@ -360,6 +428,10 @@ pub fn save_planner_checkpoint(
     metadata.optimizer_sha256 = file_sha256(&optimizer_tmp)?;
     metadata.save(&metadata_tmp)?;
 
+    File::open(&weights_tmp)?.sync_all()?;
+    File::open(&optimizer_tmp)?.sync_all()?;
+    File::open(&metadata_tmp)?.sync_all()?;
+
     fs::rename(&weights_tmp, checkpoint)
         .with_context(|| format!("failed committing planner weights {}", checkpoint.display()))?;
     fs::rename(&optimizer_tmp, &optimizer_path).with_context(|| {
@@ -374,7 +446,13 @@ pub fn save_planner_checkpoint(
             metadata_path.display()
         )
     })?;
-    Ok(())
+    if let Some(parent) = checkpoint
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(metadata)
 }
 
 pub fn load_planner_checkpoint(
@@ -385,13 +463,12 @@ pub fn load_planner_checkpoint(
     expected_base_seed: Option<u64>,
 ) -> Result<PlannerCheckpointMetadata> {
     let checkpoint = checkpoint.as_ref();
-    let metadata = PlannerCheckpointMetadata::load(planner_metadata_path(checkpoint))?;
-    metadata.validate(
+    let metadata = load_committed_planner_metadata(
+        checkpoint,
         world_model_lineage_sha256,
         expected_horizon,
         expected_base_seed,
     )?;
-    verify_file_sha256(checkpoint, &metadata.weights_sha256, "checkpoint weights")?;
     var_store
         .load(checkpoint)
         .with_context(|| format!("failed loading planner weights {}", checkpoint.display()))?;
@@ -411,6 +488,7 @@ mod tests {
             6_000,
             10,
             10,
+            "run-a",
             7,
             0.035,
             1.0,
@@ -437,12 +515,87 @@ mod tests {
 
     #[test]
     fn metadata_rejects_training_contract_drift() {
-        let mut metadata =
-            PlannerCheckpointMetadata::new("lineage-a", "weights-a", 100, 128, 1, 1, 7, 0.035, 1.0);
+        let mut metadata = PlannerCheckpointMetadata::new(
+            "lineage-a",
+            "weights-a",
+            100,
+            128,
+            1,
+            1,
+            "run-a",
+            7,
+            0.035,
+            1.0,
+        );
         metadata.weights_sha256 = "planner-weights".to_owned();
         metadata.optimizer_sha256 = "planner-optimizer".to_owned();
         metadata.training_contract.gamma = 0.9;
         assert!(metadata.validate("lineage-a", Some(100), Some(7)).is_err());
+    }
+
+    #[test]
+    fn metadata_rejects_pre_actor_only_kl_lr_routing_format() {
+        let mut metadata = PlannerCheckpointMetadata::new(
+            "lineage-a",
+            "weights-a",
+            100,
+            128,
+            1,
+            1,
+            "run-a",
+            7,
+            0.035,
+            1.0,
+        );
+        metadata.weights_sha256 = "planner-weights".to_owned();
+        metadata.optimizer_sha256 = "planner-optimizer".to_owned();
+        metadata.format_version = 4;
+
+        assert!(metadata.validate("lineage-a", Some(100), Some(7)).is_err());
+    }
+
+    #[test]
+    fn training_contract_records_actor_only_kl_lr_routing() {
+        let contract = PlannerTrainingContract::new(7);
+        assert_eq!(
+            contract.kl_lr_routing,
+            "adaptive-policy-head-only-fixed-shared-trunk-and-value-head-v1"
+        );
+        assert_eq!(
+            contract.optimizer_routing,
+            "muon-matrices-adamw-policy-value-and-aux-return-per-parameter-lr-v4"
+        );
+    }
+
+    #[test]
+    fn selected_validation_must_match_the_committed_update() {
+        let mut metadata = PlannerCheckpointMetadata::new(
+            "lineage-a",
+            "weights-a",
+            100,
+            128,
+            1,
+            50,
+            "run-a",
+            7,
+            0.035,
+            1.0,
+        )
+        .with_selected_validation(PlannerSelectedValidation {
+            update: 49,
+            median_wealth_ratio: 1.1,
+            median_buy_and_hold_wealth_ratio: 1.0,
+            mean_outperformance_ratio: 0.1,
+            median_outperformance_ratio: 0.1,
+            outperformance_fraction: 0.75,
+            mean_max_drawdown: 0.1,
+            mean_turnover: 0.2,
+        });
+        metadata.weights_sha256 = "planner-weights".to_owned();
+        metadata.optimizer_sha256 = "planner-optimizer".to_owned();
+        assert!(metadata.validate("lineage-a", Some(100), Some(7)).is_err());
+        metadata.selected_validation.as_mut().unwrap().update = 50;
+        metadata.validate("lineage-a", Some(100), Some(7)).unwrap();
     }
 
     #[test]
@@ -486,8 +639,18 @@ mod tests {
         optimizer.step();
         optimizer.zero_grad();
 
-        let metadata =
-            PlannerCheckpointMetadata::new("lineage-a", "weights-a", 100, 128, 1, 1, 7, 0.035, 1.0);
+        let metadata = PlannerCheckpointMetadata::new(
+            "lineage-a",
+            "weights-a",
+            100,
+            128,
+            1,
+            1,
+            "run-a",
+            7,
+            0.035,
+            1.0,
+        );
         save_planner_checkpoint(&vs, &checkpoint, &metadata, &optimizer).unwrap();
 
         // Optimizer sidecar round-trips exactly.
