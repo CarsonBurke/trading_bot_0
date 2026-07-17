@@ -7,21 +7,27 @@ use std::{
 use anyhow::{bail, Context, Result};
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
-use tch::{nn, nn::Module, nn::ModuleT, Device, Kind, Tensor};
+use tch::{autocast, nn, nn::Module, nn::ModuleT, Device, Kind, Tensor};
 
 use crate::torch::{
-    constants::PRICE_DELTAS_PER_TICKER, env::OHLC_BAR_FEATURES, hashing::file_sha256,
+    constants::PRICE_DELTAS_PER_TICKER,
+    env::OHLC_BAR_FEATURES,
+    fa4::{pope_flash_attention_decode_q1, pope_flash_attention_prefill},
+    hashing::file_sha256,
     load::load_var_store_partial,
+    pope::{
+        init_pope_theta_bias, pope_attention_reference, pope_expand_qk_fp32, PolarQk,
+        PopeThetaInit, POPE_ATTENTION_SCALE, POPE_DIM, POPE_FREQUENCY_BASE, POPE_QK_DIM,
+    },
 };
 
-const METADATA_VERSION: u32 = 4;
-const ARCHITECTURE: &str = "lejepa-plainflow-causal-ar-v3";
+const METADATA_VERSION: u32 = 5;
+const ARCHITECTURE: &str = "lejepa-plainflow-causal-ar-pope64-fa4-v4";
 const FEATURE_LAYOUT: &str = "torch-env-ohlc-features-fixed-scale-v2";
 pub const LEJEPA_AR_LAYERS: usize = 6;
 pub const LEJEPA_AR_FF_DIM: i64 = 1536;
 pub const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 pub const LEJEPA_HEAD_DIM: i64 = 64;
-pub const LEJEPA_ROPE_DIMS: i64 = 32;
 pub const LEJEPA_HEADS: i64 = 4;
 pub const LEJEPA_K_MAX: i64 = 64;
 pub const LEJEPA_SIGNAL_EMBED_DIM: i64 = 32;
@@ -32,7 +38,7 @@ pub const LEJEPA_LATENT_BOUND: f64 = 3.0;
 pub const LEJEPA_NORMALIZATION_EPS: f64 = 1e-5;
 pub const LEJEPA_MEAN_SIGNAL_LEVEL: i64 = 0;
 pub const LEJEPA_PROBE_LOGVAR_LIMIT: f64 = 7.0;
-pub const LEJEPA_CACHE_CONTRACT: &str = "stateful-circular-retained-upper-v1";
+pub const LEJEPA_CACHE_CONTRACT: &str = "stateful-circular-pope-absolute-bshd-k128-v64-fa4-v2";
 pub const OHLC_FEATURE_SCALE: [f32; OHLC_BAR_FEATURES] = [
     2e-3, 2e-3, 2e-3, 2e-3, 2e-3, 2e-3, 2e-3, 2e-3, 4e-3, 2e-3, 2e-3, 4e-3, 2e-3, 2e-3, 2e-3, 2e-3,
 ];
@@ -172,7 +178,7 @@ impl WorldModelMetadata {
             .collect::<Vec<_>>()
             .join(",");
         let canonical = format!(
-            "format_version={};architecture={};feature_layout={};latent_dim={};bar_feature_dim={};max_context_bars={};target_scale_bits={:016x};weights_sha256={};ar_layers={};ar_ff_dim={};projector_hidden_dim={};head_dim={};rope_dims={};heads={};flow_signal_levels={};flow_signal_embed_dim={};flow_condition_dim={};flow_hidden_dim={};flow_blocks={};latent_bound_bits={:016x};normalization_eps_bits={:016x};mean_signal_level={};probe_logvar_limit_bits={:016x};cache_contract={};ohlc_feature_scale_bits={feature_scale}",
+            "format_version={};architecture={};feature_layout={};latent_dim={};bar_feature_dim={};max_context_bars={};target_scale_bits={:016x};weights_sha256={};ar_layers={};ar_ff_dim={};projector_hidden_dim={};head_dim={};heads={};pope_dim={};pope_qk_dim={};pope_frequency_base_bits={:016x};pope_attention_scale_bits={:016x};pope_theta_init=two-pi-block-aware;pope_layout=real-then-imag;fa4_contract=strict-bshd-qk128-v64;flow_signal_levels={};flow_signal_embed_dim={};flow_condition_dim={};flow_hidden_dim={};flow_blocks={};latent_bound_bits={:016x};normalization_eps_bits={:016x};mean_signal_level={};probe_logvar_limit_bits={:016x};cache_contract={};ohlc_feature_scale_bits={feature_scale}",
             self.format_version,
             self.architecture,
             self.feature_layout,
@@ -185,8 +191,11 @@ impl WorldModelMetadata {
             LEJEPA_AR_FF_DIM,
             LEJEPA_PROJECTOR_HIDDEN_DIM,
             LEJEPA_HEAD_DIM,
-            LEJEPA_ROPE_DIMS,
             LEJEPA_HEADS,
+            POPE_DIM,
+            POPE_QK_DIM,
+            POPE_FREQUENCY_BASE.to_bits(),
+            POPE_ATTENTION_SCALE.to_bits(),
             LEJEPA_K_MAX,
             LEJEPA_SIGNAL_EMBED_DIM,
             LEJEPA_FLOW_COND_DIM,
@@ -235,8 +244,8 @@ impl LayerKvCache {
         let key = Tensor::zeros(
             [
                 self.key.size()[0],
-                self.key.size()[1],
                 new_capacity,
+                self.key.size()[2],
                 self.key.size()[3],
             ],
             (self.key.kind(), self.key.device()),
@@ -244,19 +253,31 @@ impl LayerKvCache {
         let value = Tensor::zeros(
             [
                 self.value.size()[0],
-                self.value.size()[1],
                 new_capacity,
+                self.value.size()[2],
                 self.value.size()[3],
             ],
             (self.value.kind(), self.value.device()),
         );
-        key.narrow(2, 0, length)
-            .copy_(&self.key.narrow(2, 0, length));
+        key.narrow(1, 0, length)
+            .copy_(&self.key.narrow(1, 0, length));
         value
-            .narrow(2, 0, length)
-            .copy_(&self.value.narrow(2, 0, length));
+            .narrow(1, 0, length)
+            .copy_(&self.value.narrow(1, 0, length));
         self.key = key;
         self.value = value;
+    }
+
+    fn active_after_write(&self, previous_length: i64) -> (Tensor, Tensor) {
+        let capacity = self.key.size()[1];
+        if previous_length < capacity {
+            let length = previous_length + 1;
+            return (
+                self.key.narrow(1, 0, length),
+                self.value.narrow(1, 0, length),
+            );
+        }
+        (self.key.shallow_clone(), self.value.shallow_clone())
     }
 }
 
@@ -288,7 +309,7 @@ impl CausalKvCache {
         let capacity = self
             .layers
             .first()
-            .map(|layer| layer.key.size()[2])
+            .map(|layer| layer.key.size()[1])
             .unwrap_or(0);
         if self.length < capacity || capacity == self.max_tokens {
             return;
@@ -304,7 +325,7 @@ impl CausalKvCache {
         let capacity = self
             .layers
             .first()
-            .map(|layer| layer.key.size()[2])
+            .map(|layer| layer.key.size()[1])
             .unwrap_or(0);
         if self.length < self.max_tokens {
             self.length += 1;
@@ -341,6 +362,13 @@ impl LejepaWorldModelSession {
 
     pub fn lineage_sha256(&self) -> &str {
         &self.lineage_sha256
+    }
+
+    /// Current normalized autoregressive belief over the real context, shaped
+    /// `[batch, latent_dim]`. This is the decision-time state before forecasting;
+    /// each token is zero-mean, unit-variance from `normalize_last_dim`.
+    pub fn belief(&self) -> Tensor {
+        self.last_belief.squeeze_dim(2).squeeze_dim(1)
     }
 
     pub fn fork(&self) -> Self {
@@ -494,6 +522,7 @@ impl LejepaWorldModel {
 
 struct CausalLayer {
     qkv: nn::Linear,
+    pope_theta_bias: Tensor,
     out_proj: nn::Linear,
     ff_gate: nn::Linear,
     ff_value: nn::Linear,
@@ -593,6 +622,14 @@ impl LejepaInferenceCore {
                         latent_dim,
                         latent_dim * 3,
                         Default::default(),
+                    ),
+                    pope_theta_bias: init_pope_theta_bias(
+                        &layer_path,
+                        "pope_theta_bias",
+                        LEJEPA_HEADS,
+                        LEJEPA_HEAD_DIM,
+                        PRICE_DELTAS_PER_TICKER as i64,
+                        PopeThetaInit::TwoPi,
                     ),
                     out_proj: nn::linear(
                         &layer_path / "out_proj",
@@ -864,15 +901,15 @@ impl LejepaInferenceCore {
             let (next, key, value) = self.causal_layer_full(&x, layer, &positions);
             x = next;
             let key_storage = Tensor::zeros(
-                [key.size()[0], key.size()[1], capacity, key.size()[3]],
+                [key.size()[0], capacity, key.size()[2], key.size()[3]],
                 (key.kind(), key.device()),
             );
             let value_storage = Tensor::zeros(
-                [value.size()[0], value.size()[1], capacity, value.size()[3]],
+                [value.size()[0], capacity, value.size()[2], value.size()[3]],
                 (value.kind(), value.device()),
             );
-            key_storage.narrow(2, 0, length).copy_(&key);
-            value_storage.narrow(2, 0, length).copy_(&value);
+            key_storage.narrow(1, 0, length).copy_(&key);
+            value_storage.narrow(1, 0, length).copy_(&value);
             caches.push(LayerKvCache {
                 key: key_storage,
                 value: value_storage,
@@ -901,31 +938,29 @@ impl LejepaInferenceCore {
         let length = source.size()[1];
         let qkv = layer.qkv.forward(&normalize_last_dim(source));
         let parts = qkv.split(self.latent_dim, -1);
-        let reshape = |tensor: &Tensor| {
-            tensor
-                .view([rows, length, LEJEPA_HEADS, LEJEPA_HEAD_DIM])
-                .permute([0, 2, 1, 3])
-        };
-        let q = apply_rotary_positions(&reshape(&parts[0]), positions);
-        let k = apply_rotary_positions(&reshape(&parts[1]), positions);
+        let reshape = |tensor: &Tensor| tensor.view([rows, length, LEJEPA_HEADS, LEJEPA_HEAD_DIM]);
+        let q = reshape(&parts[0]);
+        let k = reshape(&parts[1]);
         let v = reshape(&parts[2]);
         let attention_kind = attention_kind(source);
-        let cached_key = k.to_kind(attention_kind);
-        let cached_value = v.to_kind(attention_kind);
-        let attention = Tensor::scaled_dot_product_attention(
-            &q.to_kind(attention_kind),
-            &cached_key,
-            &cached_value,
-            None::<&Tensor>,
-            0.0,
-            true,
-            None,
-            false,
-        )
-        .to_kind(source.kind())
-        .permute([0, 2, 1, 3])
-        .contiguous()
-        .view([rows, length, self.latent_dim]);
+        let polar = pope_expand_qk_fp32(
+            &q,
+            &k,
+            positions,
+            positions,
+            &layer.pope_theta_bias,
+            POPE_FREQUENCY_BASE,
+        );
+        let polar = PolarQk {
+            query: polar.query.to_kind(attention_kind).contiguous(),
+            key: polar.key.to_kind(attention_kind).contiguous(),
+        };
+        let cached_key = polar.key.shallow_clone();
+        let cached_value = v.to_kind(attention_kind).contiguous();
+        let attention = strict_pope_prefill(&polar, &cached_value)
+            .to_kind(source.kind())
+            .contiguous()
+            .view([rows, length, self.latent_dim]);
         let x = source + layer.out_proj.forward(&attention);
         (
             layer.feed_forward(&x),
@@ -947,41 +982,33 @@ impl LejepaInferenceCore {
             .to_kind(Kind::Int64)
             .to_device(token.device());
         let write_index = cache.write_index;
-        let attention_length = (cache.length + 1).min(cache.max_tokens);
+        let previous_length = cache.length;
         let mut x = token.reshape([batch * tickers, 1, self.latent_dim]);
         for (layer, layer_cache) in self.layers.iter().zip(cache.layers.iter_mut()) {
             let qkv = layer.qkv.forward(&normalize_last_dim(&x));
             let parts = qkv.split(self.latent_dim, -1);
-            let reshape = |tensor: &Tensor| {
-                tensor
-                    .view([batch * tickers, 1, LEJEPA_HEADS, LEJEPA_HEAD_DIM])
-                    .permute([0, 2, 1, 3])
-            };
+            let reshape =
+                |tensor: &Tensor| tensor.view([batch * tickers, 1, LEJEPA_HEADS, LEJEPA_HEAD_DIM]);
             let attention_kind = attention_kind(&x);
-            let query =
-                apply_rotary_positions(&reshape(&parts[0]), &position).to_kind(attention_kind);
-            let key =
-                apply_rotary_positions(&reshape(&parts[1]), &position).to_kind(attention_kind);
-            let value = reshape(&parts[2]).to_kind(attention_kind);
-            layer_cache.key.narrow(2, write_index, 1).copy_(&key);
-            layer_cache.value.narrow(2, write_index, 1).copy_(&value);
-            let active_key = layer_cache.key.narrow(2, 0, attention_length);
-            let active_value = layer_cache.value.narrow(2, 0, attention_length);
+            let polar = pope_expand_qk_fp32(
+                &reshape(&parts[0]),
+                &reshape(&parts[1]),
+                &position,
+                &position,
+                &layer.pope_theta_bias,
+                POPE_FREQUENCY_BASE,
+            );
+            let query = polar.query.to_kind(attention_kind).contiguous();
+            let key = polar.key.to_kind(attention_kind).contiguous();
+            let value = reshape(&parts[2]).to_kind(attention_kind).contiguous();
+            layer_cache.key.narrow(1, write_index, 1).copy_(&key);
+            layer_cache.value.narrow(1, write_index, 1).copy_(&value);
+            let (active_key, active_value) = layer_cache.active_after_write(previous_length);
 
-            let attention = Tensor::scaled_dot_product_attention(
-                &query,
-                &active_key,
-                &active_value,
-                None::<&Tensor>,
-                0.0,
-                false,
-                None,
-                false,
-            )
-            .to_kind(x.kind())
-            .permute([0, 2, 1, 3])
-            .contiguous()
-            .view([batch * tickers, 1, self.latent_dim]);
+            let attention = strict_pope_decode(&query, &active_key, &active_value)
+                .to_kind(x.kind())
+                .contiguous()
+                .view([batch * tickers, 1, self.latent_dim]);
             let residual = &x + layer.out_proj.forward(&attention);
             x = layer.feed_forward(&residual);
         }
@@ -1102,34 +1129,33 @@ fn attention_kind(value: &Tensor) -> Kind {
     }
 }
 
-fn apply_rotary_positions(value: &Tensor, positions: &Tensor) -> Tensor {
-    let head_dim = *value.size().last().unwrap();
-    let rope_dims = LEJEPA_ROPE_DIMS.min(head_dim);
-    let half = rope_dims / 2;
-    let exponents = Tensor::arange(half, (Kind::Float, value.device())) * (2.0 / rope_dims as f64);
-    let inv_frequency = (exponents * -(10000.0_f64.ln())).exp();
-    let angles = positions
-        .to_device(value.device())
-        .to_kind(Kind::Float)
-        .unsqueeze(1)
-        * inv_frequency.unsqueeze(0);
-    let cosine_half = angles.cos();
-    let sine_half = angles.sin();
-    let cosine = Tensor::cat(&[&cosine_half, &cosine_half], -1).to_kind(value.kind());
-    let sine = Tensor::cat(&[&sine_half, &sine_half], -1).to_kind(value.kind());
-    let rotary = value.narrow(-1, 0, rope_dims);
-    let first = rotary.narrow(-1, 0, half);
-    let second = rotary.narrow(-1, half, half);
-    let rotated_half = Tensor::cat(&[&(-&second), &first], -1);
-    let rotated = rotary * cosine + rotated_half * sine;
-    if rope_dims < head_dim {
-        Tensor::cat(
-            &[&rotated, &value.narrow(-1, rope_dims, head_dim - rope_dims)],
-            -1,
-        )
-    } else {
-        rotated
+fn strict_pope_prefill(qk: &PolarQk, value_bshd: &Tensor) -> Tensor {
+    if value_bshd.device().is_cuda() {
+        return autocast(true, || pope_flash_attention_prefill(qk, value_bshd))
+            .unwrap_or_else(|error| panic!("strict FA4 PoPE prefill failed: {error:#}"));
     }
+    #[cfg(test)]
+    return pope_attention_reference(qk, value_bshd, true);
+    #[cfg(not(test))]
+    panic!("world-model PoPE prefill requires CUDA with the strict FA4 bridge");
+}
+
+fn strict_pope_decode(query: &Tensor, key: &Tensor, value: &Tensor) -> Tensor {
+    if value.device().is_cuda() {
+        return autocast(true, || pope_flash_attention_decode_q1(query, key, value))
+            .unwrap_or_else(|error| panic!("strict FA4 PoPE decode failed: {error:#}"));
+    }
+    #[cfg(test)]
+    return pope_attention_reference(
+        &PolarQk {
+            query: query.shallow_clone(),
+            key: key.shallow_clone(),
+        },
+        value,
+        false,
+    );
+    #[cfg(not(test))]
+    panic!("world-model PoPE decode requires CUDA with the strict FA4 bridge");
 }
 
 fn raw_logvar(scaled_logvar: &Tensor, target_scale: f64) -> Tensor {
@@ -1268,6 +1294,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_pre_pope_v4_metadata() {
+        let mut metadata = test_metadata(100.0);
+        metadata.format_version = 4;
+        metadata.architecture = "lejepa-plainflow-causal-ar-v3".to_owned();
+        metadata.lineage_sha256 = metadata.compute_lineage_sha256();
+        assert!(metadata.validate_schema().is_err());
+    }
+
+    #[test]
     fn inference_metadata_mutation_invalidates_lineage() {
         let metadata = test_metadata(100.0);
         let original_lineage = metadata.lineage_sha256.clone();
@@ -1389,18 +1424,43 @@ mod tests {
             assert_eq!(cache.cached_tokens(), 3);
             assert_eq!(cache.next_position, expected_position);
             assert_eq!(cache.write_index, (append_index as i64 + 1) % 3);
-            assert!(cache
-                .layers
-                .iter()
-                .all(|layer| layer.key.size()[2] == 3 && layer.value.size()[2] == 3));
+            assert!(cache.layers.iter().all(|layer| {
+                layer.key.size()[1] == 3
+                    && layer.key.size()[3] == POPE_QK_DIM
+                    && layer.value.size()[1] == 3
+                    && layer.value.size()[3] == POPE_DIM
+            }));
             assert!(cache
                 .layers
                 .iter()
                 .zip(&storage_pointers)
                 .all(|(layer, &(key, value))| {
-                    layer.key.data_ptr() == key && layer.value.data_ptr() == value
+                    let (active_key, active_value) = layer.active_after_write(3);
+                    layer.key.data_ptr() == key
+                        && layer.value.data_ptr() == value
+                        && active_key.data_ptr() == key
+                        && active_value.data_ptr() == value
                 }));
         }
+    }
+
+    #[test]
+    fn pope_q1_decode_is_invariant_to_physical_ring_order() {
+        tch::manual_seed(31);
+        let query = Tensor::randn(
+            [1, 1, LEJEPA_HEADS, POPE_QK_DIM],
+            (Kind::Float, Device::Cpu),
+        );
+        let key = Tensor::randn(
+            [1, 5, LEJEPA_HEADS, POPE_QK_DIM],
+            (Kind::Float, Device::Cpu),
+        );
+        let value = Tensor::randn([1, 5, LEJEPA_HEADS, POPE_DIM], (Kind::Float, Device::Cpu));
+        let physical = strict_pope_decode(&query, &key, &value);
+        let chronological_key = Tensor::cat(&[&key.narrow(1, 2, 3), &key.narrow(1, 0, 2)], 1);
+        let chronological_value = Tensor::cat(&[&value.narrow(1, 2, 3), &value.narrow(1, 0, 2)], 1);
+        let chronological = strict_pope_decode(&query, &chronological_key, &chronological_value);
+        assert_close(&physical, &chronological, 1e-6);
     }
 
     #[test]
@@ -1465,6 +1525,14 @@ mod tests {
         for (name, shape) in expected_flow_shapes {
             assert_eq!(variables.get(name).unwrap().size(), shape, "{name}");
         }
+        for index in 0..LEJEPA_AR_LAYERS {
+            let name = format!("lejepa_layer_{index}.pope_theta_bias");
+            assert_eq!(
+                variables.get(&name).unwrap().size(),
+                vec![LEJEPA_HEADS, POPE_DIM],
+                "{name}"
+            );
+        }
         assert!(variables
             .keys()
             .all(|name| !name.starts_with("lejepa_pred_proj")));
@@ -1483,6 +1551,30 @@ mod tests {
             .variables()
             .into_iter()
             .filter(|(name, _)| !name.starts_with("lejepa_flow_"))
+            .collect::<Vec<_>>();
+        let tensors = legacy_names
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        Tensor::save_multi(&tensors, &checkpoint).unwrap();
+        WorldModelMetadata::save_for_checkpoint(&checkpoint, 256, 100.0).unwrap();
+
+        assert!(LejepaWorldModel::load(&checkpoint, &metadata_path, Device::Cpu).is_err());
+
+        let _ = fs::remove_file(checkpoint);
+        let _ = fs::remove_file(metadata_path);
+    }
+
+    #[test]
+    fn loading_rejects_checkpoint_missing_pope_phase_tensors() {
+        let checkpoint = temp_path("missing-pope.ot");
+        let metadata_path = world_model_metadata_path(&checkpoint);
+        let source = test_model(41);
+        let legacy_names = source
+            .var_store
+            .variables()
+            .into_iter()
+            .filter(|(name, _)| !name.ends_with(".pope_theta_bias"))
             .collect::<Vec<_>>();
         let tensors = legacy_names
             .iter()

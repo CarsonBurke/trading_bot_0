@@ -14,15 +14,21 @@ use crate::data::universe::cached_eligible_training_universe;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::env::{Env, OHLC_BAR_FEATURES};
+use crate::torch::fa4::pope_flash_attention_prefill;
 use crate::torch::load::load_var_store_partial;
-use crate::torch::model::{ModelVariant, RotaryEmbedding, TradingModel, TradingModelConfig};
+use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
 use crate::torch::optim::muon::{Muon, MuonConfig};
+#[cfg(test)]
+use crate::torch::pope::pope_attention_reference;
+use crate::torch::pope::{
+    init_pope_theta_bias, pope_expand_qk_fp32, PolarQk, PopeThetaInit, POPE_FREQUENCY_BASE,
+};
 use crate::torch::world_model::{
     world_model_metadata_path, LejepaWorldModel, WorldModelMetadata, LEJEPA_AR_FF_DIM,
     LEJEPA_AR_LAYERS, LEJEPA_CACHE_CONTRACT, LEJEPA_FLOW_BLOCKS, LEJEPA_FLOW_COND_DIM,
     LEJEPA_FLOW_HIDDEN, LEJEPA_HEADS, LEJEPA_HEAD_DIM, LEJEPA_K_MAX, LEJEPA_LATENT_BOUND,
     LEJEPA_MEAN_SIGNAL_LEVEL, LEJEPA_NORMALIZATION_EPS, LEJEPA_PROBE_LOGVAR_LIMIT,
-    LEJEPA_PROJECTOR_HIDDEN_DIM, LEJEPA_ROPE_DIMS, LEJEPA_SIGNAL_EMBED_DIM, OHLC_FEATURE_SCALE,
+    LEJEPA_PROJECTOR_HIDDEN_DIM, LEJEPA_SIGNAL_EMBED_DIM, OHLC_FEATURE_SCALE,
 };
 use shared::{
     paths::RUNS_PATH,
@@ -82,6 +88,7 @@ pub struct PretrainArgs {
 
 struct CausalLejepaLayer {
     qkv: nn::Linear,
+    pope_theta_bias: Tensor,
     out_proj: nn::Linear,
     ff_gate: nn::Linear,
     ff_value: nn::Linear,
@@ -151,6 +158,19 @@ fn pretrain_execution_mode(args: &PretrainArgs) -> Result<PretrainExecutionMode>
     }
 }
 
+fn strict_pope_prefill_attention(qk: &PolarQk, value_bshd: &Tensor) -> Tensor {
+    if value_bshd.device().is_cuda() {
+        return autocast(true, || pope_flash_attention_prefill(qk, value_bshd))
+            .unwrap_or_else(|error| panic!("strict FA4 PoPE prefill failed: {error:#}"));
+    }
+    #[cfg(test)]
+    {
+        return pope_attention_reference(qk, value_bshd, true);
+    }
+    #[cfg(not(test))]
+    panic!("PoPE pretraining requires CUDA with the strict FA4 bridge");
+}
+
 struct PretrainHeads {
     forecast_queries: Tensor,
     horizon_pos_proj: nn::Linear,
@@ -165,7 +185,6 @@ struct PretrainHeads {
     lejepa_projector: ProjectionMlp,
     lejepa_layers: Vec<CausalLejepaLayer>,
     lejepa_flow: LejepaFlowHead,
-    rope: RotaryEmbedding,
     probe_input_ln: nn::LayerNorm,
     probe_head: nn::Linear,
     probe_logvar_head: nn::Linear,
@@ -337,6 +356,14 @@ impl PretrainHeads {
                     latent_dim * 3,
                     Default::default(),
                 ),
+                pope_theta_bias: init_pope_theta_bias(
+                    &layer_path,
+                    "pope_theta_bias",
+                    LEJEPA_HEADS,
+                    LEJEPA_HEAD_DIM,
+                    PRICE_DELTAS_PER_TICKER as i64,
+                    PopeThetaInit::TwoPi,
+                ),
                 out_proj: nn::linear(
                     &layer_path / "out_proj",
                     latent_dim,
@@ -363,12 +390,6 @@ impl PretrainHeads {
                 ),
             });
         }
-        let rope = RotaryEmbedding::new(
-            PRICE_DELTAS_PER_TICKER as i64 + 1,
-            LEJEPA_HEAD_DIM,
-            LEJEPA_ROPE_DIMS,
-            p.device(),
-        );
         let zero_init = |mut linear: nn::Linear| {
             tch::no_grad(|| {
                 let _ = linear.ws.zero_();
@@ -477,7 +498,6 @@ impl PretrainHeads {
             lejepa_projector,
             lejepa_layers,
             lejepa_flow,
-            rope,
             probe_input_ln,
             probe_head,
             probe_logvar_head,
@@ -668,36 +688,31 @@ impl PretrainHeads {
         let normed = normalize_last_dim(source);
         let qkv = layer.qkv.forward(&normed);
         let parts = qkv.split(self.latent_dim, -1);
-        let q = parts[0]
-            .view([rows, length, self.lejepa_heads, head_dim])
-            .permute([0, 2, 1, 3]);
-        let k = parts[1]
-            .view([rows, length, self.lejepa_heads, head_dim])
-            .permute([0, 2, 1, 3]);
-        let v = parts[2]
-            .view([rows, length, self.lejepa_heads, head_dim])
-            .permute([0, 2, 1, 3]);
-        let q = self.rope.apply_positions(&q, positions);
-        let k = self.rope.apply_positions(&k, positions);
+        let q = parts[0].view([rows, length, self.lejepa_heads, head_dim]);
+        let k = parts[1].view([rows, length, self.lejepa_heads, head_dim]);
+        let v = parts[2].view([rows, length, self.lejepa_heads, head_dim]);
+        let polar = pope_expand_qk_fp32(
+            &q,
+            &k,
+            positions,
+            positions,
+            &layer.pope_theta_bias,
+            POPE_FREQUENCY_BASE,
+        );
         let attn_kind = if source.device().is_cuda() {
             Kind::BFloat16
         } else {
             source.kind()
         };
-        let attn = Tensor::scaled_dot_product_attention(
-            &q.to_kind(attn_kind),
-            &k.to_kind(attn_kind),
-            &v.to_kind(attn_kind),
-            None::<&Tensor>,
-            0.0,
-            true,
-            None,
-            false,
-        )
-        .to_kind(source.kind())
-        .permute([0, 2, 1, 3])
-        .contiguous()
-        .view([rows, length, self.latent_dim]);
+        let polar = PolarQk {
+            query: polar.query.to_kind(attn_kind).contiguous(),
+            key: polar.key.to_kind(attn_kind).contiguous(),
+        };
+        let value = v.to_kind(attn_kind).contiguous();
+        let attn = strict_pope_prefill_attention(&polar, &value)
+            .to_kind(source.kind())
+            .contiguous()
+            .view([rows, length, self.latent_dim]);
         let x = source + layer.out_proj.forward(&attn).dropout(self.dropout, train);
         let ff = self.causal_ff(layer, &x).dropout(self.dropout, train);
         x + ff
@@ -1309,7 +1324,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
         patch_size,
     );
     if let Some(path) = start_weights.as_deref() {
-        load_matching_pretrain_heads(&mut head_vs, path)?;
+        load_matching_pretrain_heads(&mut head_vs, path, args.objective)?;
     }
 
     let mut named_vars = named_trainable_variables(&model_vs);
@@ -1334,7 +1349,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     }
     let (force_adamw_name_substrings, muon_name_allowlist) =
         if args.objective == PretrainObjective::Lejepa {
-            (Vec::new(), flow_muon_allowlist)
+            (vec!["pope_theta_bias".to_string()], flow_muon_allowlist)
         } else {
             (
                 vec![
@@ -1361,6 +1376,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             adamw_eps: 1e-8,
             weight_decay: 0.0,
             adamw_wd: LEJEPA_WEIGHT_DECAY,
+            adamw_no_weight_decay_name_substrings: vec!["pope_theta_bias".to_string()],
             force_adamw_name_substrings,
             muon_name_allowlist,
             ..MuonConfig::default()
@@ -2094,7 +2110,11 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_matching_pretrain_heads(head_vs: &mut nn::VarStore, model_path: &Path) -> Result<()> {
+fn load_matching_pretrain_heads(
+    head_vs: &mut nn::VarStore,
+    model_path: &Path,
+    objective: PretrainObjective,
+) -> Result<()> {
     let Some(heads_path) = matching_pretrain_heads_path(model_path) else {
         return Ok(());
     };
@@ -2105,9 +2125,27 @@ fn load_matching_pretrain_heads(head_vs: &mut nn::VarStore, model_path: &Path) -
             model_path.display()
         ));
     }
+    if objective == PretrainObjective::Lejepa {
+        let metadata_path = world_model_metadata_path(&heads_path);
+        let metadata = WorldModelMetadata::load(&metadata_path).with_context(|| {
+            format!(
+                "LEJEPA warm-start requires compatible PoPE metadata {}",
+                metadata_path.display()
+            )
+        })?;
+        metadata.validate_checkpoint(&heads_path)?;
+    }
     let load_summary =
         load_var_store_partial(head_vs, &heads_path).map_err(|err| anyhow!("{err}"))?;
-    if let Err(err) = load_summary.require_complete() {
+    if objective == PretrainObjective::Lejepa {
+        load_summary.require_complete().map_err(|error| {
+            anyhow!(
+                "LEJEPA warm-start {} is not a complete PoPE checkpoint: {error}",
+                heads_path.display()
+            )
+        })?;
+        println!("Loaded PoPE pretrain heads from {}", heads_path.display());
+    } else if let Err(err) = load_summary.require_complete() {
         println!(
             "Warm-starting pretrain heads with partial load from {} ({err}); newly added head params are freshly initialized",
             heads_path.display()
@@ -4624,8 +4662,9 @@ mod tests {
         next_bars_for_current_perm, record_evaluated_tickers, save_pretrain_heads_checkpoint,
         seed_candle_from_feature_row, sigreg_loss_impl, ticker_stratified_panel, CandleBar,
         FlowRolloutMode, PretrainArgs, PretrainExecutionMode, PretrainHeads, PretrainObjective,
-        PretrainSampler, SplitKind, LEJEPA_BAR_FEATURES, LEJEPA_K_MAX, LEJEPA_LATENT_BOUND,
-        LEJEPA_ROLLOUT_BARS, LEJEPA_SIGREG_PROJECTIONS,
+        PretrainSampler, SplitKind, LEJEPA_AR_LAYERS, LEJEPA_BAR_FEATURES, LEJEPA_HEADS,
+        LEJEPA_HEAD_DIM, LEJEPA_K_MAX, LEJEPA_LATENT_BOUND, LEJEPA_ROLLOUT_BARS,
+        LEJEPA_SIGREG_PROJECTIONS,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -4633,7 +4672,7 @@ mod tests {
         model::{ModelVariant, TradingModel, TradingModelConfig},
     };
     use tch::nn;
-    use tch::Tensor;
+    use tch::{Kind, Tensor};
 
     #[test]
     fn only_lejepa_checkpoints_emit_world_model_metadata() {
@@ -5052,6 +5091,52 @@ mod tests {
             ticker_stratified_panel(&pairs),
             vec![(0, 40), (1, 60), (2, 30)]
         );
+    }
+
+    #[test]
+    fn lejepa_uses_full_two_pi_initialized_pope64_in_every_layer() {
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        tch::manual_seed(41);
+        let heads = PretrainHeads::new(&vs.root(), 256, 16, 25);
+        assert_eq!(heads.lejepa_layers.len(), LEJEPA_AR_LAYERS);
+        let variables = vs.variables();
+        for (index, layer) in heads.lejepa_layers.iter().enumerate() {
+            let bias = &layer.pope_theta_bias;
+            assert_eq!(bias.size(), vec![LEJEPA_HEADS, LEJEPA_HEAD_DIM]);
+            assert_eq!(
+                variables
+                    .get(&format!("lejepa_layer_{index}.pope_theta_bias"))
+                    .unwrap()
+                    .size(),
+                vec![LEJEPA_HEADS, LEJEPA_HEAD_DIM]
+            );
+            assert!(bias.max().double_value(&[]) <= 0.0);
+            assert!(bias.min().double_value(&[]) >= -2.0 * std::f64::consts::PI);
+            assert!(
+                bias.abs().max().double_value(&[]) > 0.0,
+                "two-pi initialization must not collapse to zero phase"
+            );
+        }
+    }
+
+    #[test]
+    fn lejepa_pope_phase_biases_receive_finite_gradients() {
+        let vs = nn::VarStore::new(tch::Device::Cpu);
+        tch::manual_seed(43);
+        let heads = PretrainHeads::new(&vs.root(), 256, 16, 25);
+        let tokens = Tensor::randn([2, 1, 8, 256], (Kind::Float, tch::Device::Cpu));
+        let belief = heads.predict_lejepa_bar_predictions(&tokens, true).belief;
+        let weights = Tensor::arange(256, (Kind::Float, tch::Device::Cpu)).view([1, 1, 1, 256]);
+        (&belief * weights).sum(Kind::Float).backward();
+        for layer in &heads.lejepa_layers {
+            let grad = layer.pope_theta_bias.grad();
+            assert!(grad.defined());
+            assert!(grad.isfinite().all().int64_value(&[]) != 0);
+            assert!(
+                grad.abs().max().double_value(&[]) > 0.0,
+                "PoPE phase bias must receive a learning signal"
+            );
+        }
     }
 
     #[test]
