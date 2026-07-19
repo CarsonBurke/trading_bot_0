@@ -145,10 +145,10 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         rollout_length: usize,
 
-        #[arg(long, default_value_t = 16)]
+        #[arg(long, default_value_t = 128)]
         environments: usize,
 
-        #[arg(long, default_value_t = 160)]
+        #[arg(long, default_value_t = 1280)]
         minibatch_size: usize,
 
         #[arg(long)]

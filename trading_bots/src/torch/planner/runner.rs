@@ -28,7 +28,7 @@ use super::{
     checkpoint::{
         load_committed_planner_metadata, load_planner_checkpoint, planner_metadata_path,
         planner_optimizer_state_path, save_planner_checkpoint, verify_optimizer_state,
-        PlannerCheckpointMetadata, PlannerSelectedValidation, KL_CONTROLLER_HALF_LIFE,
+        PlannerCheckpointMetadata, KL_CONTROLLER_HALF_LIFE,
         KL_MAX_LR_SCALE, KL_MIN_LR_SCALE, OPTIMIZATION_EPOCHS, TARGET_KL,
     },
     data::{planner_context_bars, PlannerDataSplit, PlannerDataset, PlannerEndpoint},
@@ -36,9 +36,8 @@ use super::{
     losses::{critic_diagnostics, planner_actor_critic_losses},
     portfolio::PlannerPortfolio,
     reports::{
-        cleanup_uncommitted_report_generations, has_complete_inference_reports,
-        write_inference_reports, PlannerEpisodeTrace, PlannerReportHistory,
-        PlannerTrainingReportPoint, PlannerValidationReportPoint,
+        cleanup_uncommitted_report_generations, write_inference_reports, PlannerEpisodeTrace,
+        PlannerReportHistory, PlannerTrainingReportPoint,
     },
     rollout::{
         PlannerBatch, PlannerObservation, PlannerRollout, PlannerTransition, RolloutMetrics,
@@ -48,16 +47,14 @@ use super::{
 
 pub const DEFAULT_PLANNER_HORIZON: usize = 100;
 pub const DEFAULT_PLANNER_ROLLOUT_LENGTH: usize = 100;
-pub const DEFAULT_PLANNER_ENVIRONMENTS: usize = 16;
+// Batch many environments through the world-model forecast per decision step.
+// The forecast is a small-batch autoregressive decode (the dominant GPU cost);
+// a wide environment batch amortizes its latency-bound kernels and is the primary
+// lever for GPU saturation. minibatch_size scales proportionally so the optimizer
+// still runs environments*rollout_length / minibatch_size = 10 minibatches/epoch.
+pub const DEFAULT_PLANNER_ENVIRONMENTS: usize = 128;
 pub const DEFAULT_PLANNER_OPTIMIZATION_EPOCHS: usize = OPTIMIZATION_EPOCHS;
-pub const DEFAULT_PLANNER_MINIBATCH_SIZE: usize = 160;
-const VALIDATION_EVERY_UPDATES: u64 = 50;
-const VALIDATION_ENDPOINTS: usize = 64;
-const TEST_ENDPOINTS: usize = 16;
-const VALIDATION_MAX_MEAN_DRAWDOWN: f64 = 0.30;
-const VALIDATION_MAX_MEAN_TURNOVER: f64 = 0.50;
-const VALIDATION_MIN_MEDIAN_WEALTH_RATIO: f64 = 1.0;
-const VALIDATION_MIN_MEDIAN_OUTPERFORMANCE_RATIO: f64 = 0.0;
+pub const DEFAULT_PLANNER_MINIBATCH_SIZE: usize = 1280;
 const KL_NEGATIVE_ROUNDOFF_TOLERANCE: f64 = 8.0 * f32::EPSILON as f64;
 const RESUME_MANIFEST_VERSION: u32 = 1;
 const PLANNER_ACTOR_LR_PATTERNS: &[&str] = &["policy_concentration"];
@@ -208,54 +205,6 @@ struct OptimizationSummary {
     steps: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct HeldOutMetrics {
-    median_wealth_ratio: f64,
-    median_buy_and_hold_wealth_ratio: f64,
-    mean_outperformance_ratio: f64,
-    median_outperformance_ratio: f64,
-    outperformance_fraction: f64,
-    mean_max_drawdown: f64,
-    mean_turnover: f64,
-}
-
-impl HeldOutMetrics {
-    fn eligible(self) -> bool {
-        self.median_outperformance_ratio.is_finite()
-            && self.median_wealth_ratio >= VALIDATION_MIN_MEDIAN_WEALTH_RATIO
-            && self.median_outperformance_ratio >= VALIDATION_MIN_MEDIAN_OUTPERFORMANCE_RATIO
-            && self.mean_max_drawdown <= VALIDATION_MAX_MEAN_DRAWDOWN
-            && self.mean_turnover <= VALIDATION_MAX_MEAN_TURNOVER
-    }
-
-    fn selected_validation(self, update: u64) -> PlannerSelectedValidation {
-        PlannerSelectedValidation {
-            update,
-            median_wealth_ratio: self.median_wealth_ratio,
-            median_buy_and_hold_wealth_ratio: self.median_buy_and_hold_wealth_ratio,
-            mean_outperformance_ratio: self.mean_outperformance_ratio,
-            median_outperformance_ratio: self.median_outperformance_ratio,
-            outperformance_fraction: self.outperformance_fraction,
-            mean_max_drawdown: self.mean_max_drawdown,
-            mean_turnover: self.mean_turnover,
-        }
-    }
-}
-
-impl From<PlannerSelectedValidation> for HeldOutMetrics {
-    fn from(selected: PlannerSelectedValidation) -> Self {
-        Self {
-            median_wealth_ratio: selected.median_wealth_ratio,
-            median_buy_and_hold_wealth_ratio: selected.median_buy_and_hold_wealth_ratio,
-            mean_outperformance_ratio: selected.mean_outperformance_ratio,
-            median_outperformance_ratio: selected.median_outperformance_ratio,
-            outperformance_fraction: selected.outperformance_fraction,
-            mean_max_drawdown: selected.mean_max_drawdown,
-            mean_turnover: selected.mean_turnover,
-        }
-    }
-}
-
 pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
     validate_train_args(&args)?;
     configure_cuda();
@@ -315,7 +264,6 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
     let base_updates = resumed.as_ref().map(|m| m.cumulative_updates).unwrap_or(0);
     validate_output_manifest_for_resume(&args.output, &run_lineage_id, base_updates)?;
     cleanup_uncommitted_resume_bundles(&args.output, base_updates, &run_lineage_id)?;
-    cleanup_uncommitted_selected_bundles(&args.output, base_updates, &run_lineage_id)?;
     let output_path = Path::new(&args.output);
     let weights_dir = output_path
         .parent()
@@ -382,48 +330,6 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
         }
     }
     let hl_gauss = HlGaussBins::default_for(device);
-    let validation_endpoints = dataset.deterministic_ticker_time_stratified_endpoints(
-        PlannerDataSplit::Validation,
-        VALIDATION_ENDPOINTS,
-        context_bars,
-        args.rollout_length,
-    )?;
-    let existing_best = load_committed_best_validation(
-        &args.output,
-        &world_lineage,
-        &run_lineage_id,
-        args.horizon,
-        context_bars,
-        args.seed,
-        base_updates,
-    )?;
-    let mut best_path = existing_best.as_ref().map(|(path, _)| path.clone());
-    let mut best_validation = existing_best.map(|(_, metrics)| metrics);
-    let mut best_selected_this_run = false;
-    if let Some(existing_best_path) = &best_path {
-        evaluate_selected_test(
-            &planner,
-            &mut planner_vs,
-            &world_model,
-            &dataset,
-            existing_best_path,
-            &world_lineage,
-            args.horizon,
-            args.rollout_length,
-            context_bars,
-            device,
-            &run_dir.gens,
-        )?;
-        if let Some((resume_path, _)) = &resolved_resume {
-            load_planner_checkpoint(
-                &mut planner_vs,
-                resume_path,
-                &world_lineage,
-                Some(args.horizon),
-                Some(args.seed),
-            )?;
-        }
-    }
     println!(
         "planner training: device={device:?} updates={} H={} T={} N={} context={} (stateful world-model KV cache enabled)",
         args.updates, args.horizon, args.rollout_length, args.environments, context_bars
@@ -507,181 +413,31 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
             &optimizer,
         )?;
         staged_reports.publish()?;
-        if global_update % VALIDATION_EVERY_UPDATES == 0 || update + 1 == args.updates {
-            let (validation_summary, validation_metrics) = evaluate_real_endpoints(
-                &planner,
-                &world_model,
-                &dataset,
-                &validation_endpoints,
-                args.horizon,
-                args.rollout_length,
-                context_bars,
-                device,
-            )?;
-            let selected = validation_metrics.eligible()
-                && best_validation.is_none_or(|best| {
-                    validation_metrics.median_outperformance_ratio
-                        > best.median_outperformance_ratio
-                });
-            if selected {
-                let selected_path = selected_checkpoint_path(&args.output, global_update);
-                if selected_path.exists()
-                    || planner_metadata_path(&selected_path).exists()
-                    || planner_optimizer_state_path(&selected_path).exists()
-                {
-                    bail!(
-                        "refusing to overwrite immutable selected planner checkpoint {}",
-                        selected_path.display()
-                    );
-                }
-                save_planner_checkpoint(
-                    &planner_vs,
-                    &selected_path,
-                    &PlannerCheckpointMetadata::new(
-                        &world_lineage,
-                        &world_weights_hash,
-                        args.horizon,
-                        context_bars,
-                        optimizer_steps,
-                        global_update,
-                        &run_lineage_id,
-                        args.seed,
-                        kl_controller.ema(),
-                        kl_controller.scale(),
-                    )
-                    .with_selected_validation(
-                        validation_metrics.selected_validation(global_update),
-                    ),
-                    &optimizer,
-                )?;
-                best_path = Some(selected_path);
-                best_validation = Some(validation_metrics);
-                best_selected_this_run = true;
-            }
-            report_history.record_validation(
-                global_update,
-                validation_report_point(validation_metrics, selected),
-            )?;
-            println!(
-                "planner validation update={global_update} episodes={} median_wealth={:.6} median_buy_hold={:.6} mean_outperformance={:.6} median_outperformance={:.6} outperform_fraction={:.3} mean_drawdown={:.6} mean_turnover={:.6} eligible={} selected={selected}",
-                validation_summary.episodes.len(),
-                validation_metrics.median_wealth_ratio,
-                validation_metrics.median_buy_and_hold_wealth_ratio,
-                validation_metrics.mean_outperformance_ratio,
-                validation_metrics.median_outperformance_ratio,
-                validation_metrics.outperformance_fraction,
-                validation_metrics.mean_max_drawdown,
-                validation_metrics.mean_turnover,
-                validation_metrics.eligible(),
-            );
-        }
         commit_resume_manifest(&args.output, &resume_path, &committed)?;
     }
-    if best_selected_this_run {
-        let best_path = best_path.context("selected planner checkpoint path is missing")?;
-        evaluate_selected_test(
-            &planner,
-            &mut planner_vs,
-            &world_model,
-            &dataset,
-            &best_path,
+    // Automatic validation is disabled: training is representative enough and
+    // validation is a major GPU/wall-clock sink. The canonical run output is the
+    // final checkpoint (identical weights to the last per-update resume bundle);
+    // write it explicitly from the final weights so `--output` is a self-contained,
+    // directly loadable planner.ot bundle (weights + metadata + optimizer sidecar)
+    // for infer-planner. Per-update resume bundles and their manifest are retained.
+    save_planner_checkpoint(
+        &planner_vs,
+        output_path,
+        &PlannerCheckpointMetadata::new(
             &world_lineage,
+            &world_weights_hash,
             args.horizon,
-            args.rollout_length,
             context_bars,
-            device,
-            &run_dir.gens,
-        )?;
-    } else if best_validation.is_none() {
-        eprintln!("planner produced no checkpoint passing real validation drawdown/turnover gates");
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn evaluate_selected_test(
-    planner: &WorldModelPlanner,
-    planner_vs: &mut nn::VarStore,
-    world_model: &LejepaWorldModel,
-    dataset: &PlannerDataset,
-    selected_path: &Path,
-    world_lineage: &str,
-    horizon: usize,
-    rollout_length: usize,
-    context_bars: usize,
-    device: Device,
-    gens: &Path,
-) -> Result<()> {
-    let selected_metadata =
-        load_committed_planner_metadata(selected_path, world_lineage, Some(horizon), None)?;
-    let test_endpoints = dataset.deterministic_ticker_stratified_endpoints(
-        PlannerDataSplit::Test,
-        TEST_ENDPOINTS,
-        context_bars,
-        rollout_length,
+            optimizer_steps,
+            base_updates + args.updates as u64,
+            &run_lineage_id,
+            args.seed,
+            kl_controller.ema(),
+            kl_controller.scale(),
+        ),
+        &optimizer,
     )?;
-    let evaluation_fingerprint = dataset.evaluation_fingerprint(
-        PlannerDataSplit::Test,
-        &test_endpoints,
-        horizon,
-        context_bars,
-        rollout_length,
-    )?;
-    if has_complete_inference_reports(
-        gens,
-        selected_metadata.cumulative_updates,
-        &selected_metadata.run_lineage_id,
-        "Test",
-        &evaluation_fingerprint,
-        TEST_ENDPOINTS,
-        rollout_length,
-    )? {
-        println!(
-            "planner selected test reports already complete for update={}; skipping evaluation",
-            selected_metadata.cumulative_updates
-        );
-        return Ok(());
-    }
-    let selected_metadata = load_planner_checkpoint(
-        planner_vs,
-        selected_path,
-        world_lineage,
-        Some(horizon),
-        None,
-    )?;
-    let (test_summary, test_metrics) = evaluate_real_endpoints(
-        planner,
-        world_model,
-        dataset,
-        &test_endpoints,
-        horizon,
-        rollout_length,
-        context_bars,
-        device,
-    )?;
-    write_inference_reports(
-        gens,
-        selected_metadata.cumulative_updates,
-        &selected_metadata.run_lineage_id,
-        "Test",
-        &test_summary
-            .episodes
-            .iter()
-            .map(|episode| episode.trace.clone())
-            .collect::<Vec<_>>(),
-        &evaluation_fingerprint,
-    )?;
-    println!(
-        "planner selected test episodes={} median_wealth={:.6} median_buy_hold={:.6} mean_outperformance={:.6} median_outperformance={:.6} outperform_fraction={:.3} mean_drawdown={:.6} mean_turnover={:.6}",
-        test_summary.episodes.len(),
-        test_metrics.median_wealth_ratio,
-        test_metrics.median_buy_and_hold_wealth_ratio,
-        test_metrics.mean_outperformance_ratio,
-        test_metrics.median_outperformance_ratio,
-        test_metrics.outperformance_fraction,
-        test_metrics.mean_max_drawdown,
-        test_metrics.mean_turnover,
-    );
     Ok(())
 }
 
@@ -808,6 +564,9 @@ fn collect_real_rollout(
     let world_lineage = world_model.lineage_sha256().to_owned();
     let mut rollout = PlannerRollout::new(environments * rollout_length, world_lineage)?;
     let relative_horizon = relative_horizon(environments, horizon, device);
+    // The relative-horizon tensor is identical across every decision step, so its
+    // host copy is hoisted out of the loop instead of being re-transferred ~100x.
+    let stored_horizon = relative_horizon.to_device(Device::Cpu).detach();
     let primary_series = dataset.series(endpoints[0].series);
     let primary_start_price = primary_series.closes[endpoints[0].bar];
     let mut primary_trace = PlannerEpisodeTrace {
@@ -856,10 +615,6 @@ fn collect_real_rollout(
             (encoded, output)
         });
         let values_cpu = hl_gauss.decode(&output.value_logits).to_device(Device::Cpu);
-        let stored_latent = prediction.latent.to_device(Device::Cpu).detach();
-        let stored_horizon = relative_horizon.to_device(Device::Cpu).detach();
-        let stored_belief = belief.to_device(Device::Cpu).detach();
-        let stored_portfolio = portfolio_state.to_device(Device::Cpu).detach();
 
         for environment in 0..environments {
             if let Some(mut previous) = pending[environment].take() {
@@ -871,6 +626,13 @@ fn collect_real_rollout(
         if decision == rollout_length {
             break;
         }
+
+        // The observation tensors feed only the transitions created below, so their
+        // host copies are deferred past the truncation break to skip the wasted
+        // final-iteration transfer (horizon is constant and copied once, hoisted).
+        let stored_latent = prediction.latent.to_device(Device::Cpu).detach();
+        let stored_belief = belief.to_device(Device::Cpu).detach();
+        let stored_portfolio = portfolio_state.to_device(Device::Cpu).detach();
 
         let deterministic_portfolio_state = Tensor::from_slice(
             &deterministic_portfolios
@@ -885,13 +647,26 @@ fn collect_real_rollout(
             planner
                 .readout_encoded_mixed_precision(&encoded_forecast, &deterministic_portfolio_state)
         });
-        let actions = sample_beta_action(&output.alpha, &output.beta);
-        let actions_cpu = actions.to_device(Device::Cpu);
-        let deterministic_actions_cpu =
-            beta_mean(&deterministic_output.alpha, &deterministic_output.beta)
-                .to_device(Device::Cpu);
-        let alpha_cpu = output.alpha.to_device(Device::Cpu);
-        let beta_cpu = output.beta.to_device(Device::Cpu);
+        // Coalesce the four per-step policy tensors (all [environments, 1]) into a
+        // single device->host copy: one sync per step instead of four. The split
+        // values are byte-identical to transferring each tensor separately.
+        let sampled_actions = sample_beta_action(&output.alpha, &output.beta);
+        let deterministic_actions =
+            beta_mean(&deterministic_output.alpha, &deterministic_output.beta);
+        let policy_bundle_cpu = Tensor::stack(
+            &[
+                &sampled_actions,
+                &deterministic_actions,
+                &output.alpha,
+                &output.beta,
+            ],
+            0,
+        )
+        .to_device(Device::Cpu);
+        let actions_cpu = policy_bundle_cpu.get(0);
+        let deterministic_actions_cpu = policy_bundle_cpu.get(1);
+        let alpha_cpu = policy_bundle_cpu.get(2);
+        let beta_cpu = policy_bundle_cpu.get(3);
         for environment in 0..environments {
             let endpoint = endpoints[environment];
             let next_price = dataset.series(endpoint.series).closes[endpoint.bar + decision + 1];
@@ -1488,77 +1263,6 @@ fn validate_train_args(args: &TrainPlannerArgs) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn evaluate_real_endpoints(
-    planner: &WorldModelPlanner,
-    world_model: &LejepaWorldModel,
-    dataset: &PlannerDataset,
-    endpoints: &[PlannerEndpoint],
-    horizon: usize,
-    rollout_length: usize,
-    context_bars: usize,
-    device: Device,
-) -> Result<(PlannerInferenceSummary, HeldOutMetrics)> {
-    let mut episodes = Vec::with_capacity(endpoints.len());
-    for &endpoint in endpoints {
-        episodes.push(infer_real_episode(
-            planner,
-            world_model,
-            dataset,
-            endpoint,
-            horizon,
-            rollout_length,
-            context_bars,
-            device,
-        )?);
-    }
-    let count = episodes.len() as f64;
-    let mut wealth = episodes
-        .iter()
-        .map(|episode| episode.final_wealth_ratio)
-        .collect::<Vec<_>>();
-    let median_wealth_ratio = median(&mut wealth);
-    let mut buy_and_hold_wealth = episodes
-        .iter()
-        .map(|episode| episode.buy_and_hold_wealth_ratio)
-        .collect::<Vec<_>>();
-    let mut outperformance = episodes
-        .iter()
-        .map(|episode| episode.outperformance_ratio)
-        .collect::<Vec<_>>();
-    let metrics = HeldOutMetrics {
-        median_wealth_ratio,
-        median_buy_and_hold_wealth_ratio: median(&mut buy_and_hold_wealth),
-        mean_outperformance_ratio: outperformance.iter().sum::<f64>() / count,
-        median_outperformance_ratio: median(&mut outperformance),
-        outperformance_fraction: outperformance
-            .iter()
-            .filter(|outperformance| **outperformance > 0.0)
-            .count() as f64
-            / count,
-        mean_max_drawdown: episodes
-            .iter()
-            .map(|episode| episode.max_drawdown)
-            .sum::<f64>()
-            / count,
-        mean_turnover: episodes
-            .iter()
-            .map(|episode| episode.turnover_mean)
-            .sum::<f64>()
-            / count,
-    };
-    Ok((inference_summary(episodes), metrics))
-}
-
-fn selected_checkpoint_path(checkpoint: impl AsRef<Path>, update: u64) -> PathBuf {
-    let checkpoint = checkpoint.as_ref();
-    let stem = checkpoint
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("planner");
-    checkpoint.with_file_name(format!("{stem}_best_u{update:08}.ot"))
-}
-
 fn resume_checkpoint_path(checkpoint: impl AsRef<Path>, update: u64) -> PathBuf {
     let checkpoint = checkpoint.as_ref();
     let stem = checkpoint
@@ -1686,70 +1390,6 @@ fn cleanup_uncommitted_resume_bundles(
     Ok(())
 }
 
-fn cleanup_uncommitted_selected_bundles(
-    checkpoint: impl AsRef<Path>,
-    committed_update: u64,
-    run_lineage_id: &str,
-) -> Result<()> {
-    let checkpoint = checkpoint.as_ref();
-    let Some(parent) = checkpoint.parent() else {
-        return Ok(());
-    };
-    let stem = checkpoint
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("planner");
-    let prefix = format!("{stem}_best_u");
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let updates = entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let rest = name.to_str()?.strip_prefix(&prefix)?;
-            let digits = rest
-                .chars()
-                .take_while(|character| character.is_ascii_digit())
-                .collect::<String>();
-            digits.parse::<u64>().ok()
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    for update in updates {
-        if update <= committed_update {
-            continue;
-        }
-        let selected = selected_checkpoint_path(checkpoint, update);
-        let metadata_path = planner_metadata_path(&selected);
-        if metadata_path.exists() {
-            let metadata = PlannerCheckpointMetadata::load(&metadata_path)?;
-            if metadata.run_lineage_id != run_lineage_id || metadata.cumulative_updates != update {
-                bail!(
-                    "uncommitted selected checkpoint {} belongs to a different run lineage or update",
-                    metadata_path.display()
-                );
-            }
-        }
-        for path in [
-            selected.clone(),
-            planner_optimizer_state_path(&selected),
-            planner_metadata_path(&selected),
-        ] {
-            if path.exists() {
-                fs::remove_file(&path).with_context(|| {
-                    format!(
-                        "failed removing uncommitted selected bundle {}",
-                        path.display()
-                    )
-                })?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_output_manifest_for_resume(
     checkpoint: impl AsRef<Path>,
     run_lineage_id: &str,
@@ -1842,89 +1482,6 @@ fn resolve_resume_checkpoint(
     Ok((requested.to_path_buf(), metadata))
 }
 
-fn load_committed_best_validation(
-    checkpoint: impl AsRef<Path>,
-    world_model_lineage: &str,
-    run_lineage_id: &str,
-    horizon: usize,
-    context_bars: usize,
-    seed: u64,
-    max_update: u64,
-) -> Result<Option<(PathBuf, HeldOutMetrics)>> {
-    let checkpoint = checkpoint.as_ref();
-    let Some(parent) = checkpoint.parent() else {
-        return Ok(None);
-    };
-    let stem = checkpoint
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("planner");
-    let prefix = format!("{stem}_best_u");
-    let mut best: Option<(u64, PathBuf, HeldOutMetrics)> = None;
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries.filter_map(std::result::Result::ok) {
-        let metadata_path = entry.path();
-        let Some(name) = metadata_path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(update_text) = name
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(".metadata.json"))
-        else {
-            continue;
-        };
-        let Ok(update) = update_text.parse::<u64>() else {
-            continue;
-        };
-        if update > max_update {
-            bail!(
-                "planner output contains selected checkpoint update {update} newer than committed resume update {max_update}; use the matching resume manifest or a fresh output"
-            );
-        }
-        let candidate = selected_checkpoint_path(checkpoint, update);
-        let metadata = load_committed_planner_metadata(
-            &candidate,
-            world_model_lineage,
-            Some(horizon),
-            Some(seed),
-        )?;
-        if metadata.cumulative_updates != update {
-            bail!(
-                "selected planner checkpoint filename update {update} does not match metadata update {}",
-                metadata.cumulative_updates
-            );
-        }
-        if metadata.run_lineage_id != run_lineage_id || metadata.context_bars != context_bars {
-            bail!(
-                "selected planner checkpoint {} belongs to a different run lineage",
-                candidate.display()
-            );
-        }
-        let selected = metadata.selected_validation.context(
-            "immutable planner best checkpoint is missing its selected validation record",
-        )?;
-        let metrics = HeldOutMetrics::from(selected);
-        if !metrics.eligible() {
-            bail!(
-                "immutable planner best checkpoint {} contains an ineligible selected score",
-                candidate.display()
-            );
-        }
-        if best.as_ref().is_none_or(|(current_update, _, current)| {
-            metrics.median_outperformance_ratio > current.median_outperformance_ratio
-                || (metrics.median_outperformance_ratio == current.median_outperformance_ratio
-                    && update > *current_update)
-        }) {
-            best = Some((update, candidate, metrics));
-        }
-    }
-    Ok(best.map(|(_, path, metrics)| (path, metrics)))
-}
-
 fn print_training_metrics(
     update: u64,
     rollout: &RolloutMetrics,
@@ -2003,23 +1560,6 @@ fn training_report_point(
     }
 }
 
-fn validation_report_point(
-    metrics: HeldOutMetrics,
-    selected: bool,
-) -> PlannerValidationReportPoint {
-    PlannerValidationReportPoint {
-        median_wealth_ratio: metrics.median_wealth_ratio,
-        median_buy_and_hold_wealth_ratio: metrics.median_buy_and_hold_wealth_ratio,
-        mean_outperformance_ratio: metrics.mean_outperformance_ratio,
-        median_outperformance_ratio: metrics.median_outperformance_ratio,
-        outperformance_fraction: metrics.outperformance_fraction,
-        mean_max_drawdown: metrics.mean_max_drawdown,
-        mean_turnover: metrics.mean_turnover,
-        eligible: metrics.eligible(),
-        selected,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2029,7 +1569,8 @@ mod tests {
         let args = TrainPlannerArgs::default();
         assert_eq!(args.horizon, 100);
         assert_eq!(args.rollout_length, 100);
-        assert_eq!(args.environments, 16);
+        assert_eq!(args.environments, 128);
+        assert_eq!(args.minibatch_size, 1280);
         validate_train_args(&args).unwrap();
     }
 
@@ -2174,140 +1715,6 @@ mod tests {
     }
 
     #[test]
-    fn validation_gates_drawdown_and_turnover_before_wealth_selection() {
-        let eligible = HeldOutMetrics {
-            median_wealth_ratio: 1.1,
-            median_buy_and_hold_wealth_ratio: 1.0,
-            mean_outperformance_ratio: 0.1,
-            median_outperformance_ratio: 0.1,
-            outperformance_fraction: 0.75,
-            mean_max_drawdown: 0.2,
-            mean_turnover: 0.1,
-        };
-        assert!(eligible.eligible());
-        assert!(!HeldOutMetrics {
-            mean_max_drawdown: 0.31,
-            ..eligible
-        }
-        .eligible());
-        assert!(!HeldOutMetrics {
-            mean_turnover: 0.51,
-            ..eligible
-        }
-        .eligible());
-    }
-
-    #[test]
-    fn committed_best_metadata_is_the_only_selection_authority() {
-        let dir = std::env::temp_dir().join(format!(
-            "planner-selected-resume-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let weights = dir.join("weights");
-        fs::create_dir_all(&weights).unwrap();
-        let checkpoint = weights.join("planner.ot");
-        let first = HeldOutMetrics {
-            median_wealth_ratio: 1.05,
-            median_buy_and_hold_wealth_ratio: 1.02,
-            mean_outperformance_ratio: 0.03,
-            median_outperformance_ratio: 0.04,
-            outperformance_fraction: 0.75,
-            mean_max_drawdown: 0.1,
-            mean_turnover: 0.2,
-        };
-        let second = HeldOutMetrics {
-            median_wealth_ratio: 1.1,
-            median_buy_and_hold_wealth_ratio: 1.0,
-            mean_outperformance_ratio: 0.1,
-            median_outperformance_ratio: 0.08,
-            outperformance_fraction: 0.8,
-            mean_max_drawdown: 0.1,
-            mean_turnover: 0.2,
-        };
-
-        let save_selected =
-            |path: &Path, update: u64, run_lineage: &str, metrics: HeldOutMetrics| {
-                let vs = nn::VarStore::new(Device::Cpu);
-                let _ = vs.root().zeros("weight", &[2, 2]);
-                let optimizer = Muon::new_named(
-                    &named_trainable_variables(&vs),
-                    MuonConfig {
-                        quiet: true,
-                        ..MuonConfig::default()
-                    },
-                );
-                save_planner_checkpoint(
-                    &vs,
-                    path,
-                    &PlannerCheckpointMetadata::new(
-                        "lineage-a",
-                        "world-weights-a",
-                        100,
-                        128,
-                        1,
-                        update,
-                        run_lineage,
-                        7,
-                        TARGET_KL,
-                        1.0,
-                    )
-                    .with_selected_validation(metrics.selected_validation(update)),
-                    &optimizer,
-                )
-                .unwrap();
-            };
-
-        let first_path = selected_checkpoint_path(&checkpoint, 50);
-        save_selected(&first_path, 50, "run-a", first);
-        let (resolved_path, resolved_metrics) =
-            load_committed_best_validation(&checkpoint, "lineage-a", "run-a", 100, 128, 7, 100)
-                .unwrap()
-                .unwrap();
-        assert_eq!(resolved_path, first_path);
-        assert_eq!(resolved_metrics, first);
-
-        let second_path = selected_checkpoint_path(&checkpoint, 100);
-        save_selected(&second_path, 100, "run-a", second);
-        let (resolved_path, resolved_metrics) =
-            load_committed_best_validation(&checkpoint, "lineage-a", "run-a", 100, 128, 7, 100)
-                .unwrap()
-                .unwrap();
-        assert_eq!(resolved_path, second_path);
-        assert_eq!(resolved_metrics, second);
-        assert!(
-            load_committed_best_validation(&checkpoint, "lineage-a", "run-a", 100, 128, 7, 50,)
-                .is_err()
-        );
-
-        // A pre-commit partial generation has no metadata commit marker and is
-        // ignored without damaging the previous valid best.
-        fs::write(selected_checkpoint_path(&checkpoint, 150), b"partial").unwrap();
-        assert_eq!(
-            load_committed_best_validation(&checkpoint, "lineage-a", "run-a", 100, 128, 7, 100,)
-                .unwrap()
-                .unwrap()
-                .0,
-            second_path
-        );
-
-        let unrelated_path = selected_checkpoint_path(&checkpoint, 120);
-        save_selected(&unrelated_path, 120, "run-b", second);
-        assert!(load_committed_best_validation(
-            &checkpoint,
-            "lineage-a",
-            "run-a",
-            100,
-            128,
-            7,
-            120,
-        )
-        .is_err());
-
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn resume_manifest_switches_only_after_an_immutable_bundle_commits() {
         let dir = std::env::temp_dir().join(format!(
             "planner-resume-manifest-{}-{}",
@@ -2380,52 +1787,6 @@ mod tests {
         assert_eq!(resolved.run_lineage_id, "run-a");
         assert!(validate_output_manifest_for_resume(&base, "run-a", 1).is_err());
         assert!(second_path.exists());
-
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn resume_removes_all_uncommitted_selected_bundle_shapes_for_same_output() {
-        let dir = std::env::temp_dir().join(format!(
-            "planner-selected-cleanup-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let weights = dir.join("weights");
-        fs::create_dir_all(&weights).unwrap();
-        let base = weights.join("planner.ot");
-
-        let weights_only = selected_checkpoint_path(&base, 2);
-        fs::write(&weights_only, b"partial weights").unwrap();
-        let optimizer_only_checkpoint = selected_checkpoint_path(&base, 3);
-        let optimizer_only = planner_optimizer_state_path(&optimizer_only_checkpoint);
-        fs::write(&optimizer_only, b"partial optimizer").unwrap();
-
-        cleanup_uncommitted_selected_bundles(&base, 1, "run-a").unwrap();
-        assert!(!weights_only.exists());
-        assert!(!optimizer_only.exists());
-
-        let mismatched = selected_checkpoint_path(&base, 4);
-        fs::write(&mismatched, b"weights").unwrap();
-        let mismatched_metadata = PlannerCheckpointMetadata::new(
-            "lineage-a",
-            "world-weights-a",
-            100,
-            128,
-            4,
-            4,
-            "run-b",
-            7,
-            TARGET_KL,
-            1.0,
-        );
-        fs::write(
-            planner_metadata_path(&mismatched),
-            serde_json::to_vec(&mismatched_metadata).unwrap(),
-        )
-        .unwrap();
-        assert!(cleanup_uncommitted_selected_bundles(&base, 1, "run-a").is_err());
-        assert!(mismatched.exists());
 
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2509,34 +1870,5 @@ mod tests {
         assert!((metrics.mean_outperformance_ratio - 0.05).abs() < 1e-12);
         assert!((metrics.median_outperformance_ratio - 0.05).abs() < 1e-12);
         assert!((metrics.outperformance_fraction - 2.0 / 3.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn checkpoint_ranking_uses_outperformance_not_unpaired_wealth() {
-        let higher_wealth_but_worse_market_relative = HeldOutMetrics {
-            median_wealth_ratio: 1.2,
-            median_buy_and_hold_wealth_ratio: 1.3,
-            mean_outperformance_ratio: -0.1,
-            median_outperformance_ratio: -0.1,
-            outperformance_fraction: 0.25,
-            mean_max_drawdown: 0.1,
-            mean_turnover: 0.1,
-        };
-        let lower_wealth_but_better_market_relative = HeldOutMetrics {
-            median_wealth_ratio: 1.0,
-            median_buy_and_hold_wealth_ratio: 0.9,
-            mean_outperformance_ratio: 0.1,
-            median_outperformance_ratio: 0.1,
-            outperformance_fraction: 0.75,
-            mean_max_drawdown: 0.1,
-            mean_turnover: 0.1,
-        };
-
-        assert!(
-            lower_wealth_but_better_market_relative.median_outperformance_ratio
-                > higher_wealth_but_worse_market_relative.median_outperformance_ratio
-        );
-        assert!(!higher_wealth_but_worse_market_relative.eligible());
-        assert!(lower_wealth_but_better_market_relative.eligible());
     }
 }
