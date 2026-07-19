@@ -22,21 +22,16 @@ use crate::torch::{
 };
 
 const METADATA_VERSION: u32 = 5;
-const ARCHITECTURE: &str = "lejepa-plainflow-causal-ar-pope64-fa4-v4";
+const ARCHITECTURE: &str = "lejepa-msejepa-causal-ar-pope64-fa4-v6";
 const FEATURE_LAYOUT: &str = "torch-env-ohlc-features-fixed-scale-v2";
 pub const LEJEPA_AR_LAYERS: usize = 6;
 pub const LEJEPA_AR_FF_DIM: i64 = 1536;
 pub const LEJEPA_PROJECTOR_HIDDEN_DIM: i64 = 2048;
 pub const LEJEPA_HEAD_DIM: i64 = 64;
 pub const LEJEPA_HEADS: i64 = 4;
-pub const LEJEPA_K_MAX: i64 = 64;
-pub const LEJEPA_SIGNAL_EMBED_DIM: i64 = 32;
-pub const LEJEPA_FLOW_COND_DIM: i64 = 512;
-pub const LEJEPA_FLOW_HIDDEN: i64 = 1024;
-pub const LEJEPA_FLOW_BLOCKS: usize = 3;
-pub const LEJEPA_LATENT_BOUND: f64 = 3.0;
+pub const LEJEPA_PREDICTOR_HIDDEN_MULT: i64 = 4;
+pub const LEJEPA_PREDICTOR_BLOCKS: usize = 2;
 pub const LEJEPA_NORMALIZATION_EPS: f64 = 1e-5;
-pub const LEJEPA_MEAN_SIGNAL_LEVEL: i64 = 0;
 pub const LEJEPA_PROBE_LOGVAR_LIMIT: f64 = 7.0;
 pub const LEJEPA_CACHE_CONTRACT: &str = "stateful-circular-pope-absolute-bshd-k128-v64-fa4-v2";
 pub const OHLC_FEATURE_SCALE: [f32; OHLC_BAR_FEATURES] = [
@@ -178,7 +173,7 @@ impl WorldModelMetadata {
             .collect::<Vec<_>>()
             .join(",");
         let canonical = format!(
-            "format_version={};architecture={};feature_layout={};latent_dim={};bar_feature_dim={};max_context_bars={};target_scale_bits={:016x};weights_sha256={};ar_layers={};ar_ff_dim={};projector_hidden_dim={};head_dim={};heads={};pope_dim={};pope_qk_dim={};pope_frequency_base_bits={:016x};pope_attention_scale_bits={:016x};pope_theta_init=two-pi-block-aware;pope_layout=real-then-imag;fa4_contract=strict-bshd-qk128-v64;flow_signal_levels={};flow_signal_embed_dim={};flow_condition_dim={};flow_hidden_dim={};flow_blocks={};latent_bound_bits={:016x};normalization_eps_bits={:016x};mean_signal_level={};probe_logvar_limit_bits={:016x};cache_contract={};ohlc_feature_scale_bits={feature_scale}",
+            "format_version={};architecture={};feature_layout={};latent_dim={};bar_feature_dim={};max_context_bars={};target_scale_bits={:016x};weights_sha256={};ar_layers={};ar_ff_dim={};projector_hidden_dim={};head_dim={};heads={};pope_dim={};pope_qk_dim={};pope_frequency_base_bits={:016x};pope_attention_scale_bits={:016x};pope_theta_init=two-pi-block-aware;pope_layout=real-then-imag;fa4_contract=strict-bshd-qk128-v64;predictor_hidden_mult={};predictor_blocks={};normalization_eps_bits={:016x};probe_logvar_limit_bits={:016x};cache_contract={};ohlc_feature_scale_bits={feature_scale}",
             self.format_version,
             self.architecture,
             self.feature_layout,
@@ -196,14 +191,9 @@ impl WorldModelMetadata {
             POPE_QK_DIM,
             POPE_FREQUENCY_BASE.to_bits(),
             POPE_ATTENTION_SCALE.to_bits(),
-            LEJEPA_K_MAX,
-            LEJEPA_SIGNAL_EMBED_DIM,
-            LEJEPA_FLOW_COND_DIM,
-            LEJEPA_FLOW_HIDDEN,
-            LEJEPA_FLOW_BLOCKS,
-            LEJEPA_LATENT_BOUND.to_bits(),
+            LEJEPA_PREDICTOR_HIDDEN_MULT,
+            LEJEPA_PREDICTOR_BLOCKS,
             LEJEPA_NORMALIZATION_EPS.to_bits(),
-            LEJEPA_MEAN_SIGNAL_LEVEL,
             LEJEPA_PROBE_LOGVAR_LIMIT.to_bits(),
             LEJEPA_CACHE_CONTRACT,
         );
@@ -541,24 +531,62 @@ impl CausalLayer {
 
 struct ProjectionMlp {
     fc1: nn::Linear,
-    bn: nn::BatchNorm,
+    gamma: Tensor,
     fc2: nn::Linear,
 }
 
-struct FlowBlock {
-    modulation: nn::Linear,
-    fc1: nn::Linear,
-    fc2: nn::Linear,
+struct PredictorBlock {
+    gate: nn::Linear,
+    value: nn::Linear,
+    out: nn::Linear,
 }
 
-struct PlainFlowHead {
-    signal_embedding: nn::Embedding,
-    condition_fc1: nn::Linear,
-    condition_fc2: nn::Linear,
-    input_projection: nn::Linear,
-    blocks: Vec<FlowBlock>,
-    final_modulation: nn::Linear,
-    output_projection: nn::Linear,
+struct LejepaPredictorHead {
+    in_proj: nn::Linear,
+    blocks: Vec<PredictorBlock>,
+    out_proj: nn::Linear,
+}
+
+impl LejepaPredictorHead {
+    fn new(p: &nn::Path, latent_dim: i64) -> Self {
+        let hidden = latent_dim * LEJEPA_PREDICTOR_HIDDEN_MULT;
+        let blocks = (0..LEJEPA_PREDICTOR_BLOCKS)
+            .map(|index| {
+                let block_path = p / format!("lejepa_predictor_block_{index}");
+                PredictorBlock {
+                    gate: nn::linear(&block_path / "gate", latent_dim, hidden, Default::default()),
+                    value: nn::linear(&block_path / "value", latent_dim, hidden, Default::default()),
+                    out: nn::linear(&block_path / "out", hidden, latent_dim, Default::default()),
+                }
+            })
+            .collect();
+        LejepaPredictorHead {
+            in_proj: nn::linear(
+                p / "lejepa_predictor_in_proj",
+                latent_dim,
+                latent_dim,
+                Default::default(),
+            ),
+            blocks,
+            out_proj: nn::linear(
+                p / "lejepa_predictor_out_proj",
+                latent_dim,
+                latent_dim,
+                Default::default(),
+            ),
+        }
+    }
+
+    // Deterministic conditional-mean next-latent prediction from the AR belief.
+    fn forward(&self, belief: &Tensor) -> Tensor {
+        let mut h = self.in_proj.forward(&normalize_last_dim(belief));
+        for block in &self.blocks {
+            let normed = normalize_last_dim(&h);
+            let gated = block.gate.forward(&normed).silu() * block.value.forward(&normed);
+            h += block.out.forward(&gated);
+        }
+        self.out_proj.forward(&normalize_last_dim(&h))
+    }
 }
 
 impl ProjectionMlp {
@@ -570,10 +598,10 @@ impl ProjectionMlp {
                 LEJEPA_PROJECTOR_HIDDEN_DIM,
                 Default::default(),
             ),
-            bn: nn::batch_norm1d(
-                p / format!("{prefix}_bn"),
-                LEJEPA_PROJECTOR_HIDDEN_DIM,
-                Default::default(),
+            gamma: p.var(
+                &format!("{prefix}_norm_gamma"),
+                &[LEJEPA_PROJECTOR_HIDDEN_DIM],
+                nn::Init::Const(1.0),
             ),
             fc2: nn::linear(
                 p / format!("{prefix}_fc2"),
@@ -591,7 +619,7 @@ struct LejepaInferenceCore {
     bar_enrich_fc2: nn::Linear,
     projector: ProjectionMlp,
     layers: Vec<CausalLayer>,
-    flow: PlainFlowHead,
+    predictor: LejepaPredictorHead,
     probe_input_ln: nn::LayerNorm,
     probe_head: nn::Linear,
     probe_logvar_head: nn::Linear,
@@ -658,79 +686,7 @@ impl LejepaInferenceCore {
                 }
             })
             .collect();
-        let zero_init = |mut linear: nn::Linear| {
-            tch::no_grad(|| {
-                let _ = linear.ws.zero_();
-                if let Some(bias) = linear.bs.as_mut() {
-                    let _ = bias.zero_();
-                }
-            });
-            linear
-        };
-        let blocks = (0..LEJEPA_FLOW_BLOCKS)
-            .map(|index| {
-                let block_path = p / format!("lejepa_flow_block_{index}");
-                FlowBlock {
-                    modulation: zero_init(nn::linear(
-                        &block_path / "mod",
-                        LEJEPA_FLOW_COND_DIM,
-                        latent_dim * 3,
-                        Default::default(),
-                    )),
-                    fc1: nn::linear(
-                        &block_path / "fc1",
-                        latent_dim,
-                        LEJEPA_FLOW_HIDDEN,
-                        Default::default(),
-                    ),
-                    fc2: nn::linear(
-                        &block_path / "fc2",
-                        LEJEPA_FLOW_HIDDEN,
-                        latent_dim,
-                        Default::default(),
-                    ),
-                }
-            })
-            .collect();
-        let flow = PlainFlowHead {
-            signal_embedding: nn::embedding(
-                p / "lejepa_flow_signal_embed",
-                LEJEPA_K_MAX,
-                LEJEPA_SIGNAL_EMBED_DIM,
-                Default::default(),
-            ),
-            condition_fc1: nn::linear(
-                p / "lejepa_flow_cond_fc1",
-                latent_dim + LEJEPA_SIGNAL_EMBED_DIM,
-                LEJEPA_FLOW_COND_DIM,
-                Default::default(),
-            ),
-            condition_fc2: nn::linear(
-                p / "lejepa_flow_cond_fc2",
-                LEJEPA_FLOW_COND_DIM,
-                LEJEPA_FLOW_COND_DIM,
-                Default::default(),
-            ),
-            input_projection: nn::linear(
-                p / "lejepa_flow_in_proj",
-                latent_dim,
-                latent_dim,
-                Default::default(),
-            ),
-            blocks,
-            final_modulation: zero_init(nn::linear(
-                p / "lejepa_flow_final_mod",
-                LEJEPA_FLOW_COND_DIM,
-                latent_dim * 2,
-                Default::default(),
-            )),
-            output_projection: zero_init(nn::linear(
-                p / "lejepa_flow_out_proj",
-                latent_dim,
-                latent_dim,
-                Default::default(),
-            )),
-        };
+        let predictor = LejepaPredictorHead::new(p, latent_dim);
         let probe_input_ln =
             nn::layer_norm(p / "probe_input_ln", vec![latent_dim], Default::default());
         let probe_head = nn::linear(
@@ -752,7 +708,7 @@ impl LejepaInferenceCore {
             bar_enrich_fc2,
             projector,
             layers,
-            flow,
+            predictor,
             probe_input_ln,
             probe_head,
             probe_logvar_head,
@@ -772,17 +728,8 @@ impl LejepaInferenceCore {
         let mut latents = Vec::with_capacity(horizon as usize);
         let mut means = Vec::with_capacity(horizon as usize);
         let mut logvars = Vec::with_capacity(horizon as usize);
-        let noised = Tensor::zeros(
-            [session.batch_size, self.latent_dim],
-            (Kind::Float, belief.device()),
-        );
-        let signal = Tensor::full(
-            [session.batch_size],
-            LEJEPA_MEAN_SIGNAL_LEVEL,
-            (Kind::Int64, belief.device()),
-        );
         for _ in 0..horizon {
-            let next_token = self.predict_mean_token(&belief, &noised, &signal);
+            let next_token = self.predict_next_token(&belief);
             let (scaled_mean, scaled_logvar) = self.probe(&next_token);
             latents.push(next_token.squeeze_dim(2).squeeze_dim(1));
             means.push((scaled_mean / target_scale).squeeze_dim(2).squeeze_dim(1));
@@ -811,17 +758,10 @@ impl LejepaInferenceCore {
         let mut latents = Vec::with_capacity(horizon as usize);
         let mut means = Vec::with_capacity(horizon as usize);
         let mut logvars = Vec::with_capacity(horizon as usize);
-        let rows = context.size()[0] * context.size()[1];
-        let noised = Tensor::zeros([rows, self.latent_dim], (Kind::Float, context.device()));
-        let signal = Tensor::full(
-            [rows],
-            LEJEPA_MEAN_SIGNAL_LEVEL,
-            (Kind::Int64, context.device()),
-        );
         for _ in 0..horizon {
             let belief = self.causal_belief(&tokens);
             let last = tokens.size()[2] - 1;
-            let next_token = self.predict_mean_token(&belief.narrow(2, last, 1), &noised, &signal);
+            let next_token = self.predict_next_token(&belief.narrow(2, last, 1));
             let (scaled_mean, scaled_logvar) = self.probe(&next_token);
             latents.push(next_token.squeeze_dim(2).squeeze_dim(1));
             means.push((scaled_mean / target_scale).squeeze_dim(2).squeeze_dim(1));
@@ -858,7 +798,7 @@ impl LejepaInferenceCore {
             &normalize_last_dim(&self.bar_enrich_fc1.forward(&normalize_last_dim(&h))).gelu("none"),
         );
         let tokens = (h + enriched).view([batch, tickers, length, self.latent_dim]);
-        latent_bound(&self.project(&tokens, &self.projector))
+        self.project(&tokens, &self.projector)
     }
 
     #[cfg(test)]
@@ -1020,50 +960,24 @@ impl LejepaInferenceCore {
         let shape = value.size();
         let flat = value.reshape([-1, self.latent_dim]);
         let hidden = projector.fc1.forward(&flat);
+        let normed = hidden
+            .internal_fused_rms_norm(
+                [LEJEPA_PROJECTOR_HIDDEN_DIM],
+                Some(&projector.gamma),
+                Some(1e-6),
+            )
+            .0;
         projector
             .fc2
-            .forward(&projector.bn.forward_t(&hidden, false).gelu("none"))
+            .forward(&normed.gelu("none"))
             .reshape(shape.as_slice())
     }
 
-    fn predict_mean_token(&self, belief: &Tensor, noised: &Tensor, signal: &Tensor) -> Tensor {
+    fn predict_next_token(&self, belief: &Tensor) -> Tensor {
         let shape = belief.size();
         let rows = belief.numel() as i64 / self.latent_dim;
         let context = belief.reshape([rows, self.latent_dim]);
-        self.flow_predict(noised, signal, &context)
-            .reshape(shape.as_slice())
-    }
-
-    fn flow_predict(&self, noised: &Tensor, signal: &Tensor, context: &Tensor) -> Tensor {
-        let signal_embedding = self.flow.signal_embedding.forward(signal);
-        let condition = self
-            .flow
-            .condition_fc2
-            .forward(
-                &self
-                    .flow
-                    .condition_fc1
-                    .forward(&Tensor::cat(&[context, &signal_embedding], -1))
-                    .silu(),
-            )
-            .silu();
-        let mut hidden = self.flow.input_projection.forward(noised);
-        for block in &self.flow.blocks {
-            let modulation = block.modulation.forward(&condition);
-            let shift = modulation.narrow(-1, 0, self.latent_dim);
-            let scale = modulation.narrow(-1, self.latent_dim, self.latent_dim);
-            let gate = modulation.narrow(-1, self.latent_dim * 2, self.latent_dim);
-            let modulated = normalize_last_dim(&hidden) * (scale + 1.0) + shift;
-            let enriched = block
-                .fc2
-                .forward(&block.fc1.forward(&modulated).gelu("none"));
-            hidden += gate * enriched;
-        }
-        let final_modulation = self.flow.final_modulation.forward(&condition);
-        let shift = final_modulation.narrow(-1, 0, self.latent_dim);
-        let scale = final_modulation.narrow(-1, self.latent_dim, self.latent_dim);
-        let modulated = normalize_last_dim(&hidden) * (scale + 1.0) + shift;
-        latent_bound(&self.flow.output_projection.forward(&modulated))
+        self.predictor.forward(&context).reshape(shape.as_slice())
     }
 
     fn probe(&self, latent: &Tensor) -> (Tensor, Tensor) {
@@ -1169,10 +1083,6 @@ fn validate_target_scale(target_scale: f64) -> Result<()> {
     Ok(())
 }
 
-fn latent_bound(value: &Tensor) -> Tensor {
-    (value / LEJEPA_LATENT_BOUND).tanh() * LEJEPA_LATENT_BOUND
-}
-
 fn normalize_last_dim(value: &Tensor) -> Tensor {
     let mean = value.mean_dim([-1i64].as_slice(), true, Kind::Float);
     let centered = value - mean;
@@ -1216,16 +1126,6 @@ mod tests {
         tch::manual_seed(seed);
         let mut var_store = nn::VarStore::new(Device::Cpu);
         let core = LejepaInferenceCore::new(&var_store.root(), 256);
-        tch::no_grad(|| {
-            for (name, mut tensor) in var_store.variables() {
-                if name.contains("lejepa_flow_block_") && name.contains(".mod.")
-                    || name.starts_with("lejepa_flow_final_mod.")
-                    || name.starts_with("lejepa_flow_out_proj.")
-                {
-                    let _ = tensor.normal_(0.0, 0.02);
-                }
-            }
-        });
         var_store.freeze();
         LejepaWorldModel {
             var_store,
@@ -1322,16 +1222,6 @@ mod tests {
         let expected_variance = 1.0 - 1e-5 / (14.0 / 9.0 + 1e-5);
         let actual_variance = normalized.square().mean(Kind::Float).double_value(&[]);
         assert!((actual_variance - expected_variance).abs() < 1e-6);
-    }
-
-    #[test]
-    fn encoded_and_predicted_latents_are_bounded() {
-        let model = test_model(7);
-        let context = deterministic_bars(2, 4) * 100.0;
-        let encoded = tch::no_grad(|| model.core.encode_bars(&context));
-        let prediction = model.predict(&context, 3).unwrap();
-        assert!(encoded.abs().max().double_value(&[]) <= LEJEPA_LATENT_BOUND);
-        assert!(prediction.latent.abs().max().double_value(&[]) <= LEJEPA_LATENT_BOUND);
     }
 
     #[test]
@@ -1511,20 +1401,20 @@ mod tests {
         assert_eq!(source_names, loaded_names);
 
         let variables = source.var_store.variables();
-        let expected_flow_shapes = [
-            ("lejepa_flow_signal_embed.weight", vec![64, 32]),
-            ("lejepa_flow_cond_fc1.weight", vec![512, 288]),
-            ("lejepa_flow_cond_fc2.weight", vec![512, 512]),
-            ("lejepa_flow_in_proj.weight", vec![256, 256]),
-            ("lejepa_flow_block_0.mod.weight", vec![768, 512]),
-            ("lejepa_flow_block_0.fc1.weight", vec![1024, 256]),
-            ("lejepa_flow_block_0.fc2.weight", vec![256, 1024]),
-            ("lejepa_flow_final_mod.weight", vec![512, 512]),
-            ("lejepa_flow_out_proj.weight", vec![256, 256]),
+        let expected_predictor_shapes = [
+            ("lejepa_predictor_in_proj.weight", vec![256, 256]),
+            ("lejepa_predictor_block_0.gate.weight", vec![1024, 256]),
+            ("lejepa_predictor_block_0.value.weight", vec![1024, 256]),
+            ("lejepa_predictor_block_0.out.weight", vec![256, 1024]),
+            ("lejepa_predictor_block_1.gate.weight", vec![1024, 256]),
+            ("lejepa_predictor_out_proj.weight", vec![256, 256]),
         ];
-        for (name, shape) in expected_flow_shapes {
+        for (name, shape) in expected_predictor_shapes {
             assert_eq!(variables.get(name).unwrap().size(), shape, "{name}");
         }
+        assert!(variables
+            .keys()
+            .all(|name| !name.starts_with("lejepa_flow")));
         for index in 0..LEJEPA_AR_LAYERS {
             let name = format!("lejepa_layer_{index}.pope_theta_bias");
             assert_eq!(
@@ -1542,15 +1432,15 @@ mod tests {
     }
 
     #[test]
-    fn loading_rejects_checkpoint_missing_plainflow_tensors() {
-        let checkpoint = temp_path("missing-flow.ot");
+    fn loading_rejects_checkpoint_missing_predictor_tensors() {
+        let checkpoint = temp_path("missing-predictor.ot");
         let metadata_path = world_model_metadata_path(&checkpoint);
         let source = test_model(37);
         let legacy_names = source
             .var_store
             .variables()
             .into_iter()
-            .filter(|(name, _)| !name.starts_with("lejepa_flow_"))
+            .filter(|(name, _)| !name.starts_with("lejepa_predictor_"))
             .collect::<Vec<_>>();
         let tensors = legacy_names
             .iter()
