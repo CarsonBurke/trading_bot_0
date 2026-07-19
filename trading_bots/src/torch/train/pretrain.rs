@@ -4,8 +4,7 @@ use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{rngs::StdRng, SeedableRng};
 use std::{
     collections::HashSet,
-    fs::{self, File},
-    io::{BufWriter, Write},
+    fs,
     path::{Path, PathBuf},
 };
 use tch::{autocast, nn, nn::Module, nn::ModuleT, Device, Kind, Reduction, Tensor};
@@ -1356,31 +1355,14 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     let best_path = run_dir.weights.join("pretrain_model_best.ot");
     let final_heads_path = run_dir.weights.join("pretrain_heads.ot");
     let best_heads_path = run_dir.weights.join("pretrain_heads_best.ot");
-    let mut train_epoch_log = BufWriter::new(File::create(
-        run_dir.root.join("pretrain_train_epochs.csv"),
-    )?);
-    let mut validation_log =
-        BufWriter::new(File::create(run_dir.root.join("pretrain_validation.csv"))?);
-    let validation_header = "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,rollout_mean_mse,pred_probe_ev_mean,pred_probe_ev_persist,pred_probe_diracc,pred_probe_diracc_n,return_ev_persist,return_diracc,return_diracc_n,return_rank_ic,latent_ev_marginal,latent_ev_persist,skill_ev_correct,skill_ev_shuffled,skill_ev_zero,skill_belief_spread,skill_belief_norm,skill_batches,samples,tickers,batches";
-    let mut test_log = BufWriter::new(File::create(run_dir.root.join("pretrain_test.csv"))?);
-    writeln!(
-        train_epoch_log,
-        "epoch,global_step,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples,batches"
-    )?;
-    writeln!(validation_log, "{validation_header}")?;
-    writeln!(test_log, "{validation_header}")?;
-    let mut step_log = BufWriter::new(File::create(run_dir.root.join("pretrain_train_steps.csv"))?);
-    writeln!(
-        step_log,
-        "global_step,epoch,total_loss,jepa_mse,sigreg,repr_std_mean,repr_std_min,pred_embed_std,target_embed_std,probe_mse,probe_mae,probe_bias,pred_abs,target_abs,pred_std,target_std,probe_terminal_mse,zero_mse,probe_explained_variance,next_lat,samples,val_total_loss,val_jepa_mse,val_sigreg,val_probe_mse,val_probe_mae"
-    )?;
-    let mut candle_snapshot_log = BufWriter::new(File::create(
-        run_dir.root.join("pretrain_candle_snapshots.csv"),
-    )?);
-    writeln!(
-        candle_snapshot_log,
-        "global_step,rollout_mean_mse,rollout_mean_dclose"
-    )?;
+    // Dense per-step train-vs-val total-loss curve (val is NaN on non-eval steps),
+    // emitted as the `pretrain_step_loss` report at each epoch end.
+    let mut step_loss_train: Vec<f32> = Vec::new();
+    let mut step_loss_val: Vec<f32> = Vec::new();
+    // Candle deterministic-rollout scalar diagnostics, accumulated across snapshots
+    // and emitted as reports from within `write_candle_snapshots`.
+    let mut candle_rollout_mse_hist: Vec<f32> = Vec::new();
+    let mut candle_rollout_dclose_hist: Vec<f32> = Vec::new();
 
     // Fixed validation windows for the candle-snapshot diagnostic, chosen once so
     // the same rollouts are tracked across the whole run.
@@ -1482,7 +1464,6 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             ValidationMode::Full,
         );
         print_step_eval_summary("validation-eval-only", 0, &validation);
-        write_validation_row(&mut validation_log, "eval-only", 0, &validation)?;
         if args.objective == PretrainObjective::Lejepa {
             let deployed = deployed_cached_rollout_mse(
                 &head_vs,
@@ -1526,7 +1507,6 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 ValidationMode::Full,
             );
             print_step_eval_summary("test-eval-only", 0, &test);
-            write_validation_row(&mut test_log, "eval-only", 0, &test)?;
             if args.objective == PretrainObjective::Lejepa {
                 let deployed = deployed_cached_rollout_mse(
                     &head_vs,
@@ -1646,17 +1626,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     })
                 })
                 .flatten();
-            let val_cols = match step_val {
-                Some((vt, vj, vs, vpm, vpa)) => {
-                    format!(",{vt:.9},{vj:.9},{vs:.9},{vpm:.9},{vpa:.9}")
-                }
-                None => ",,,,,".to_owned(),
-            };
-            writeln!(
-                step_log,
-                "{global_step},{epoch},{total_v:.9},{jepa_mse_v:.9},{sigreg_v:.9},{repr_std_mean_v:.9},{repr_std_min_v:.9},{pred_embed_std_v:.9},{target_embed_std_v:.9},{probe_mse_v:.9},{probe_mae_v:.9},{probe_bias_v:.9},{pred_abs_v:.9},{target_abs_v:.9},{pred_std_v:.9},{target_std_v:.9},{probe_terminal_mse_v:.9},{zero_mse_v:.9},{probe_explained_variance_v:.9},{lat_v:.9},{batch_samples}{val_cols}"
-            )?;
-            step_log.flush()?;
+            step_loss_train.push(total_v as f32);
+            step_loss_val.push(step_val.map(|(vt, ..)| vt as f32).unwrap_or(f32::NAN));
 
             if global_step == 1 || global_step % 20 == 0 {
                 println!(
@@ -1711,17 +1682,16 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     f64::NAN
                 };
                 print_step_eval_summary("validation", global_step, &val);
+                // Periodic full-validation loss takes priority over the inline
+                // step-val mini-batch in the step-loss overlay for the current step.
+                if let Some(last) = step_loss_val.last_mut() {
+                    *last = val.total as f32;
+                }
                 if args.objective == PretrainObjective::Lejepa {
                     println!(
                         "pretrain step {global_step} deployed_cached_rollout_mean_mse={deployed_rollout_mean_mse:.9} cache_contract={LEJEPA_CACHE_CONTRACT}"
                     );
                 }
-                write_validation_row(
-                    &mut validation_log,
-                    &format!("step:{global_step}"),
-                    global_step,
-                    &val,
-                )?;
                 if is_better_pretrain_checkpoint(
                     args.objective,
                     &val,
@@ -1754,7 +1724,8 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                     epoch,
                     global_step,
                     &run_dir.gens,
-                    &mut candle_snapshot_log,
+                    &mut candle_rollout_mse_hist,
+                    &mut candle_rollout_dclose_hist,
                 )?;
             }
 
@@ -1817,33 +1788,6 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             grad_norms.pnorm_encoder,
             grad_norm_acc.steps
         );
-        writeln!(
-            train_epoch_log,
-            "{epoch},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{}",
-            train.total,
-            train.jepa_mse,
-            train.sigreg,
-            train.repr_std_mean,
-            train.repr_std_min,
-            train.pred_embed_std,
-            train.target_embed_std,
-            train.probe_mse,
-            train.probe_mae,
-            train.probe_bias,
-            train.pred_abs,
-            train.target_abs,
-            train.pred_std,
-            train.target_std,
-            train.probe_terminal_mse,
-            train.zero_mse,
-            train.probe_explained_variance,
-            train.next_lat,
-            train.samples,
-            train.batches
-        )?;
-        train_epoch_log.flush()?;
-        step_log.flush()?;
-
         let final_epoch = stop_requested || epoch == args.epochs;
         let val = validate_full(
             &model,
@@ -1878,9 +1822,15 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 "pretrain epoch {epoch} deployed_cached_rollout_mean_mse={deployed_rollout_mean_mse:.9} cache_contract={LEJEPA_CACHE_CONTRACT}"
             );
         }
-        write_validation_row(&mut validation_log, &epoch.to_string(), global_step, &val)?;
         scalar_history.push(&train, &val);
         write_pretrain_scalar_meta_reports(&run_dir.gens, epoch, global_step, &scalar_history)?;
+        write_pretrain_step_loss_report(
+            &run_dir.gens,
+            epoch,
+            global_step,
+            &step_loss_train,
+            &step_loss_val,
+        )?;
         if final_epoch {
             let final_validation = validate_full(
                 &model,
@@ -1896,12 +1846,6 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 ValidationMode::Full,
             );
             print_step_eval_summary("final-validation", global_step, &final_validation);
-            write_validation_row(
-                &mut validation_log,
-                &format!("final:{epoch}"),
-                global_step,
-                &final_validation,
-            )?;
             write_pretrain_diagnostics(
                 &model,
                 &heads,
@@ -1934,7 +1878,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
                 ValidationMode::Full,
             );
             print_step_eval_summary("test", global_step, &test);
-            write_validation_row(&mut test_log, &epoch.to_string(), global_step, &test)?;
+            write_pretrain_test_report(&run_dir.gens, epoch, global_step, &test)?;
         }
 
         if is_better_pretrain_checkpoint(
@@ -1976,7 +1920,6 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
             ValidationMode::Full,
         );
         best_val = val.total;
-        write_validation_row(&mut validation_log, "final", global_step, &val)?;
         model_vs.save(&best_path)?;
         save_pretrain_heads_checkpoint(
             &head_vs,
@@ -2793,7 +2736,23 @@ struct PretrainScalarHistory {
     eval_target_std: Vec<f32>,
     train_probe_terminal_mse: Vec<f32>,
     eval_probe_terminal_mse: Vec<f32>,
+    train_total: Vec<f32>,
+    eval_total: Vec<f32>,
+    train_probe_bias: Vec<f32>,
+    eval_probe_bias: Vec<f32>,
+    train_pred_abs: Vec<f32>,
+    eval_pred_abs: Vec<f32>,
+    train_target_abs: Vec<f32>,
+    eval_target_abs: Vec<f32>,
+    train_zero_mse: Vec<f32>,
+    eval_zero_mse: Vec<f32>,
+    train_next_lat: Vec<f32>,
+    eval_next_lat: Vec<f32>,
+    eval_rollout_mean_mse: Vec<f32>,
     // Honest skill measurement (validation split, Lejepa only).
+    eval_pred_probe_ev_mean: Vec<f32>,
+    eval_latent_ev_marginal: Vec<f32>,
+    eval_skill_belief_norm: Vec<f32>,
     eval_pred_probe_ev_persist: Vec<f32>,
     eval_pred_probe_diracc: Vec<f32>,
     eval_return_ev_persist: Vec<f32>,
@@ -2839,7 +2798,26 @@ impl PretrainScalarHistory {
             .push(train.probe_terminal_mse as f32);
         self.eval_probe_terminal_mse
             .push(val.probe_terminal_mse as f32);
+        self.train_total.push(train.total as f32);
+        self.eval_total.push(val.total as f32);
+        self.train_probe_bias.push(train.probe_bias as f32);
+        self.eval_probe_bias.push(val.probe_bias as f32);
+        self.train_pred_abs.push(train.pred_abs as f32);
+        self.eval_pred_abs.push(val.pred_abs as f32);
+        self.train_target_abs.push(train.target_abs as f32);
+        self.eval_target_abs.push(val.target_abs as f32);
+        self.train_zero_mse.push(train.zero_mse as f32);
+        self.eval_zero_mse.push(val.zero_mse as f32);
+        self.train_next_lat.push(train.next_lat as f32);
+        self.eval_next_lat.push(val.next_lat as f32);
+        self.eval_rollout_mean_mse.push(val.rollout_mean_mse as f32);
         let m = &val.measurement;
+        self.eval_pred_probe_ev_mean
+            .push(m.pred_probe_ev_mean as f32);
+        self.eval_latent_ev_marginal
+            .push(m.latent_ev_marginal as f32);
+        self.eval_skill_belief_norm
+            .push(m.skill_belief_norm as f32);
         self.eval_pred_probe_ev_persist
             .push(m.pred_probe_ev_persist as f32);
         self.eval_pred_probe_diracc.push(m.pred_probe_diracc as f32);
@@ -2989,6 +2967,72 @@ fn write_pretrain_scalar_meta_reports(
         "AR belief cross-batch spread",
         &history.eval_skill_belief_spread,
     )?;
+    write_pretrain_scalar_report(
+        &epoch_dir.join("pretrain_total_loss.report.bin"),
+        format!("Pretrain Total Loss - epoch {epoch} step {global_step}"),
+        "total loss",
+        &history.train_total,
+        &history.eval_total,
+    )?;
+    write_pretrain_scalar_report(
+        &epoch_dir.join("pretrain_probe_bias.report.bin"),
+        format!("Pretrain Probe Bias - epoch {epoch} step {global_step}"),
+        "probe bias",
+        &history.train_probe_bias,
+        &history.eval_probe_bias,
+    )?;
+    write_pretrain_scalar_report(
+        &epoch_dir.join("pretrain_pred_abs.report.bin"),
+        format!("Pretrain Probe Pred Abs - epoch {epoch} step {global_step}"),
+        "probe pred abs mean",
+        &history.train_pred_abs,
+        &history.eval_pred_abs,
+    )?;
+    write_pretrain_scalar_report(
+        &epoch_dir.join("pretrain_target_abs.report.bin"),
+        format!("Pretrain Probe Target Abs - epoch {epoch} step {global_step}"),
+        "probe target abs mean",
+        &history.train_target_abs,
+        &history.eval_target_abs,
+    )?;
+    write_pretrain_scalar_report(
+        &epoch_dir.join("pretrain_zero_mse.report.bin"),
+        format!("Pretrain Zero-Baseline MSE - epoch {epoch} step {global_step}"),
+        "zero-baseline MSE",
+        &history.train_zero_mse,
+        &history.eval_zero_mse,
+    )?;
+    write_pretrain_scalar_report(
+        &epoch_dir.join("pretrain_next_lat.report.bin"),
+        format!("Pretrain Next-Latent Loss - epoch {epoch} step {global_step}"),
+        "next-latent loss",
+        &history.train_next_lat,
+        &history.eval_next_lat,
+    )?;
+    write_pretrain_val_scalar_report(
+        &epoch_dir.join("pretrain_rollout_mean_mse.report.bin"),
+        format!("Pretrain Imagined Rollout MSE - epoch {epoch} step {global_step}"),
+        "imagined rollout MSE",
+        &history.eval_rollout_mean_mse,
+    )?;
+    write_pretrain_val_scalar_report(
+        &epoch_dir.join("pretrain_pred_probe_ev_mean.report.bin"),
+        format!("Pretrain Pred-Probe EV vs Marginal - epoch {epoch} step {global_step}"),
+        "1 - probe SSE / marginal SSE",
+        &history.eval_pred_probe_ev_mean,
+    )?;
+    write_pretrain_val_scalar_report(
+        &epoch_dir.join("pretrain_latent_ev_marginal.report.bin"),
+        format!("Pretrain Latent EV vs Marginal - epoch {epoch} step {global_step}"),
+        "1 - latent SSE / marginal SSE",
+        &history.eval_latent_ev_marginal,
+    )?;
+    write_pretrain_val_scalar_report(
+        &epoch_dir.join("pretrain_belief_norm.report.bin"),
+        format!("Pretrain Belief Norm - epoch {epoch} step {global_step}"),
+        "AR belief L2 norm",
+        &history.eval_skill_belief_norm,
+    )?;
     write_report_file(
         &epoch_dir.join("pretrain_skill_ablation.report.bin"),
         &Report {
@@ -3065,6 +3109,103 @@ fn write_pretrain_scalar_report(
                     },
                 ],
             },
+        },
+    )
+}
+
+// Step-indexed train-vs-val total-loss curve. The val series is sparse (NaN on
+// non-eval steps); the report renderer filters non-finite values.
+fn write_pretrain_step_loss_report(
+    gens_dir: &Path,
+    epoch: usize,
+    global_step: usize,
+    train: &[f32],
+    val: &[f32],
+) -> Result<()> {
+    let epoch_dir = gens_dir.join(epoch.to_string());
+    fs::create_dir_all(&epoch_dir)?;
+    write_report_file(
+        &epoch_dir.join("pretrain_step_loss.report.bin"),
+        &Report {
+            title: format!("Pretrain Step Loss - epoch {epoch} step {global_step}"),
+            x_label: Some("step".to_string()),
+            y_label: Some("total loss".to_string()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::MultiLine {
+                series: vec![
+                    ReportSeries {
+                        label: "train".to_string(),
+                        values: train.to_vec(),
+                    },
+                    ReportSeries {
+                        label: "val".to_string(),
+                        values: val.to_vec(),
+                    },
+                ],
+            },
+        },
+    )
+}
+
+// Consolidated single-point held-out test battery (one series per non-bookkeeping
+// metric), mirroring the single-point/multi-series `pretrain_skill_eval` idiom.
+fn write_pretrain_test_report(
+    gens_dir: &Path,
+    epoch: usize,
+    global_step: usize,
+    test: &ValidationLoss,
+) -> Result<()> {
+    let epoch_dir = gens_dir.join(epoch.to_string());
+    fs::create_dir_all(&epoch_dir)?;
+    let m = &test.measurement;
+    let series = [
+        ("total", test.total),
+        ("jepa_mse", test.jepa_mse),
+        ("sigreg", test.sigreg),
+        ("repr_std_mean", test.repr_std_mean),
+        ("repr_std_min", test.repr_std_min),
+        ("pred_embed_std", test.pred_embed_std),
+        ("target_embed_std", test.target_embed_std),
+        ("probe_mse", test.probe_mse),
+        ("probe_mae", test.probe_mae),
+        ("probe_bias", test.probe_bias),
+        ("pred_abs", test.pred_abs),
+        ("target_abs", test.target_abs),
+        ("pred_std", test.pred_std),
+        ("target_std", test.target_std),
+        ("probe_terminal_mse", test.probe_terminal_mse),
+        ("zero_mse", test.zero_mse),
+        ("probe_explained_variance", test.probe_explained_variance),
+        ("next_lat", test.next_lat),
+        ("rollout_mean_mse", test.rollout_mean_mse),
+        ("pred_probe_ev_mean", m.pred_probe_ev_mean),
+        ("pred_probe_ev_persist", m.pred_probe_ev_persist),
+        ("pred_probe_diracc", m.pred_probe_diracc),
+        ("return_ev_persist", m.return_ev_persist),
+        ("return_diracc", m.return_diracc),
+        ("return_rank_ic", m.return_rank_ic),
+        ("latent_ev_marginal", m.latent_ev_marginal),
+        ("latent_ev_persist", m.latent_ev_persist),
+        ("skill_ev_correct", m.skill_ev_correct),
+        ("skill_ev_shuffled", m.skill_ev_shuffled),
+        ("skill_ev_zero", m.skill_ev_zero),
+        ("skill_belief_spread", m.skill_belief_spread),
+        ("skill_belief_norm", m.skill_belief_norm),
+    ]
+    .into_iter()
+    .map(|(label, value)| ReportSeries {
+        label: label.to_string(),
+        values: vec![value as f32],
+    })
+    .collect();
+    write_report_file(
+        &epoch_dir.join("pretrain_test.report.bin"),
+        &Report {
+            title: format!("Pretrain Held-out Test Battery - epoch {epoch} step {global_step}"),
+            x_label: Some("metric".to_string()),
+            y_label: Some("value".to_string()),
+            scale: ScaleKind::Linear,
+            kind: ReportKind::MultiLine { series },
         },
     )
 }
@@ -3157,62 +3298,10 @@ fn print_validation_summary(label: &str, v: &ValidationLoss) {
     );
 }
 
-fn write_validation_row(
-    log: &mut impl Write,
-    label: &str,
-    global_step: usize,
-    val: &ValidationLoss,
-) -> Result<()> {
-    let m = &val.measurement;
-    writeln!(
-        log,
-        "{label},{global_step},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.0},{:.9},{:.9},{:.0},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{},{}",
-        val.total,
-        val.jepa_mse,
-        val.sigreg,
-        val.repr_std_mean,
-        val.repr_std_min,
-        val.pred_embed_std,
-        val.target_embed_std,
-        val.probe_mse,
-        val.probe_mae,
-        val.probe_bias,
-        val.pred_abs,
-        val.target_abs,
-        val.pred_std,
-        val.target_std,
-        val.probe_terminal_mse,
-        val.zero_mse,
-        val.probe_explained_variance,
-        val.next_lat,
-        val.rollout_mean_mse,
-        m.pred_probe_ev_mean,
-        m.pred_probe_ev_persist,
-        m.pred_probe_diracc,
-        m.pred_probe_diracc_n,
-        m.return_ev_persist,
-        m.return_diracc,
-        m.return_diracc_n,
-        m.return_rank_ic,
-        m.latent_ev_marginal,
-        m.latent_ev_persist,
-        m.skill_ev_correct,
-        m.skill_ev_shuffled,
-        m.skill_ev_zero,
-        m.skill_belief_spread,
-        m.skill_belief_norm,
-        m.skill_batches,
-        val.samples,
-        val.tickers,
-        val.batches
-    )?;
-    log.flush()?;
-    Ok(())
-}
-
 // Deterministic (temperature 0) imagined rollouts on a fixed set of validation
 // windows. Writes a predicted-vs-actual CandleCompare report per window and
-// appends the step-indexed rollout MSE / decoded close-delta to a running CSV.
+// accumulates the snapshot-indexed rollout MSE / decoded close-delta into running
+// histories emitted as scalar reports.
 fn write_candle_snapshots(
     heads: &PretrainHeads,
     sampler: &mut PretrainSampler,
@@ -3220,7 +3309,8 @@ fn write_candle_snapshots(
     epoch: usize,
     global_step: usize,
     gens_dir: &Path,
-    snapshot_log: &mut impl Write,
+    mse_hist: &mut Vec<f32>,
+    dclose_hist: &mut Vec<f32>,
 ) -> Result<()> {
     let target_scale = sampler.target_scale;
     let batch = sampler.batch_for_pairs(windows);
@@ -3270,11 +3360,44 @@ fn write_candle_snapshots(
                 },
             )?;
         }
-        writeln!(
-            snapshot_log,
-            "{global_step},{rollout_mean_mse:.9},{rollout_mean_dclose:.9}"
+        mse_hist.push(rollout_mean_mse as f32);
+        dclose_hist.push(rollout_mean_dclose as f32);
+        let epoch_dir = gens_dir.join(epoch.to_string());
+        fs::create_dir_all(&epoch_dir)?;
+        write_report_file(
+            &epoch_dir.join("pretrain_candle_rollout_mse.report.bin"),
+            &Report {
+                title: format!(
+                    "Pretrain Candle Rollout MSE - epoch {epoch} step {global_step}"
+                ),
+                x_label: Some("snapshot".to_string()),
+                y_label: Some("deterministic rollout MSE".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::MultiLine {
+                    series: vec![ReportSeries {
+                        label: "mse".to_string(),
+                        values: mse_hist.clone(),
+                    }],
+                },
+            },
         )?;
-        snapshot_log.flush()?;
+        write_report_file(
+            &epoch_dir.join("pretrain_candle_rollout_dclose.report.bin"),
+            &Report {
+                title: format!(
+                    "Pretrain Candle Rollout Close Delta - epoch {epoch} step {global_step}"
+                ),
+                x_label: Some("snapshot".to_string()),
+                y_label: Some("mean decoded close delta".to_string()),
+                scale: ScaleKind::Linear,
+                kind: ReportKind::MultiLine {
+                    series: vec![ReportSeries {
+                        label: "dclose".to_string(),
+                        values: dclose_hist.clone(),
+                    }],
+                },
+            },
+        )?;
         Ok(())
     })
 }
@@ -3394,34 +3517,6 @@ fn write_skill_panel_results(
     validation: SkillPanelMetrics,
     test: Option<SkillPanelMetrics>,
 ) -> Result<()> {
-    let mut csv = BufWriter::new(File::create(run_dir.root.join("pretrain_skill_eval.csv"))?);
-    writeln!(
-        csv,
-        "split,ev_correct,ev_shuffled,ev_zero,sse_correct,sse_shuffled,sse_zero,sst,windows,tickers,rows"
-    )?;
-    let mut write_row = |split: &str, metrics: SkillPanelMetrics| -> Result<()> {
-        writeln!(
-            csv,
-            "{split},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{}",
-            metrics.ev_correct,
-            metrics.ev_shuffled,
-            metrics.ev_zero,
-            metrics.sse_correct,
-            metrics.sse_shuffled,
-            metrics.sse_zero,
-            metrics.sst,
-            metrics.windows,
-            metrics.tickers,
-            metrics.rows,
-        )?;
-        Ok(())
-    };
-    write_row("validation", validation)?;
-    if let Some(test) = test {
-        write_row("test", test)?;
-    }
-    drop(write_row);
-    csv.flush()?;
     let mut series = vec![
         ReportSeries {
             label: "validation correct".to_owned(),

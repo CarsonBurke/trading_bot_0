@@ -113,8 +113,8 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         checkpoint_every: usize,
 
-        /// Evaluate one validation mini-batch every N training steps, logged as
-        /// val_* columns in the always-on step CSV (0 disables).
+        /// Evaluate one validation mini-batch every N training steps, folded into
+        /// the pretrain_step_loss report's val overlay (0 disables).
         #[arg(long, default_value_t = 5)]
         step_val_every: usize,
 

@@ -435,6 +435,20 @@ impl App {
             "pretrain_belief_spread",
             "pretrain_skill_ablation",
             "pretrain_skill_eval",
+            "pretrain_total_loss",
+            "pretrain_probe_bias",
+            "pretrain_pred_abs",
+            "pretrain_target_abs",
+            "pretrain_zero_mse",
+            "pretrain_next_lat",
+            "pretrain_rollout_mean_mse",
+            "pretrain_pred_probe_ev_mean",
+            "pretrain_latent_ev_marginal",
+            "pretrain_belief_norm",
+            "pretrain_step_loss",
+            "pretrain_candle_rollout_mse",
+            "pretrain_candle_rollout_dclose",
+            "pretrain_test",
             "planner_wealth",
             "planner_reward",
             "planner_position",
@@ -679,14 +693,6 @@ impl App {
         Ok(())
     }
 
-    fn pretrain_meta_reports(&self) -> Vec<(String, shared::report::Report)> {
-        let run_root = match &self.process_manager.active_run {
-            Some(run) => run.root.clone(),
-            None => PathBuf::from("../training/runs/latest"),
-        };
-        utils::pretrain::run_reports(&run_root)
-    }
-
     fn current_meta_reports_revision(&self) -> u64 {
         let run_root = self
             .process_manager
@@ -780,9 +786,7 @@ impl App {
                 && self.mode == AppMode::ChartViewer
                 && self.chart_viewer.is_viewing_meta_charts()
             {
-                let extra = self.pretrain_meta_reports();
-                self.chart_viewer
-                    .load_charts(&self.latest_meta_charts, extra)?;
+                self.chart_viewer.load_charts(&self.latest_meta_charts)?;
             }
             self.meta_reports_revision = revision;
             let log_path = self
@@ -869,8 +873,7 @@ impl App {
                     num(b).cmp(&num(a))
                 });
                 let is_active = live_name.as_deref() == Some(&name);
-                let has_step_data = entry.path().join("pretrain_train_steps.csv").exists();
-                if gen_count == 0 && weights.is_empty() && !has_step_data && !is_active {
+                if gen_count == 0 && weights.is_empty() && !is_active {
                     return None;
                 }
                 Some(RunInfo {
@@ -989,11 +992,9 @@ impl App {
     }
 
     fn view_meta_charts(&mut self) -> Result<()> {
-        let extra = self.pretrain_meta_reports();
-        if !self.latest_meta_charts.is_empty() || !extra.is_empty() {
+        if !self.latest_meta_charts.is_empty() {
             self.meta_reports_revision = self.current_meta_reports_revision();
-            self.chart_viewer
-                .load_charts(&self.latest_meta_charts, extra)?;
+            self.chart_viewer.load_charts(&self.latest_meta_charts)?;
             self.previous_mode = self.mode;
             self.mode = AppMode::ChartViewer;
         }
@@ -1745,13 +1746,10 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                             KeyCode::Char('r') => {
                                                 if app.chart_viewer.is_viewing_meta_charts() {
                                                     app.load_latest_meta_charts()?;
-                                                    let extra = app.pretrain_meta_reports();
                                                     app.meta_reports_revision =
                                                         app.current_meta_reports_revision();
-                                                    app.chart_viewer.load_charts(
-                                                        &app.latest_meta_charts,
-                                                        extra,
-                                                    )?;
+                                                    app.chart_viewer
+                                                        .load_charts(&app.latest_meta_charts)?;
                                                 }
                                             }
                                             KeyCode::Char('c') => {

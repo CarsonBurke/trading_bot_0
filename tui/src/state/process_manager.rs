@@ -437,16 +437,9 @@ fn latest_observable_run() -> Option<RunDir> {
 }
 
 fn has_observable_data(root: &Path) -> bool {
-    if root.join("pretrain_train_steps.csv").is_file() {
-        return true;
-    }
-    if fs::read_dir(root.join("gens"))
+    fs::read_dir(root.join("gens"))
         .ok()
         .is_some_and(|mut entries| entries.any(|entry| entry.is_ok()))
-    {
-        return true;
-    }
-    false
 }
 
 fn append_training_exit_status(log_file: Option<&Path>, pid: u32, status: ExitStatus) {
