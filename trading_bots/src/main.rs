@@ -5,6 +5,14 @@ use trading_bot_0::torch::planner::PlannerDataSplit;
 use trading_bot_0::torch::train::PretrainObjective;
 use trading_bot_0::{genetic, torch};
 
+fn default_paper_symbols() -> Vec<String> {
+    trading_bot_0::constants::TICKERS
+        .iter()
+        .take(torch::constants::TICKERS_COUNT as usize)
+        .map(|symbol| (*symbol).to_string())
+        .collect()
+}
+
 #[derive(Parser)]
 #[command(name = "trading_bot")]
 #[command(about = "Trading bot with PPO training and inference", long_about = None)]
@@ -214,7 +222,11 @@ enum Commands {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
-        #[arg(short, long, value_delimiter = ',', default_value = "TSLA,AAPL")]
+        /// Dedicated IBKR paper account to trade. Existing positions are rejected.
+        #[arg(long)]
+        account: String,
+
+        #[arg(short, long, value_delimiter = ',', default_values_t = default_paper_symbols())]
         symbols: Vec<String>,
 
         #[arg(short, long, default_value_t = 60)]
@@ -400,6 +412,7 @@ async fn main() {
         }
         Some(Commands::Paper {
             weights,
+            account,
             symbols,
             interval,
             max_steps,
@@ -408,6 +421,7 @@ async fn main() {
         }) => {
             torch::infer::run_ibkr_paper_trading(
                 weights,
+                account.clone(),
                 symbols.clone(),
                 *interval,
                 *max_steps,
@@ -422,4 +436,23 @@ async fn main() {
     }
 
     println!("{}", "End".green())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn paper_defaults_match_model_ticker_count() {
+        let cli = Cli::try_parse_from(["trading_bot", "paper", "--account", "DU123"])
+            .expect("paper CLI should parse");
+        let Some(Commands::Paper { symbols, .. }) = cli.command else {
+            panic!("paper subcommand should parse as Paper");
+        };
+        assert_eq!(
+            symbols.len(),
+            trading_bot_0::torch::constants::TICKERS_COUNT as usize
+        );
+    }
 }

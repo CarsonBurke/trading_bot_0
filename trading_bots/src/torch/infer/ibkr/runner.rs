@@ -5,7 +5,6 @@ use std::time::Instant;
 use tch::{Device, Kind, Tensor};
 
 use ibapi::{
-    accounts::{types::AccountGroup, AccountSummaryResult, AccountSummaryTags},
     contracts::Contract,
     market_data::{
         realtime::{BarSize, WhatToShow},
@@ -20,21 +19,27 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use crate::torch::infer::offline::{load_model, sample_actions};
 use crate::torch::model::ModelVariant;
 
+use super::super::validate_ticker_count;
+
 use super::execute::execute_trades;
-use super::state::{LiveMarketState, MAX_ACCOUNT_VALUE};
+use super::state::LiveMarketState;
 use super::status::print_status;
-use super::sync::sync_account_from_ibkr;
+use super::sync::{initialize_dedicated_account, sync_account_from_ibkr};
 
 pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     weight_path: P,
+    account: String,
     symbols: Vec<String>,
     update_interval_secs: u64,
     max_steps: usize,
     _temperature: f64,
     model_variant: ModelVariant,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_ticker_count(&symbols, "IBKR paper trading")?;
+
     println!("=== IBKR Paper Trading ===");
     println!("Weight path: {:?}", weight_path.as_ref());
+    println!("Account: {}", account);
     println!("Symbols: {:?}", symbols);
     println!("Update interval: {}s", update_interval_secs);
     println!("Max steps: {}", max_steps);
@@ -42,48 +47,9 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     let client = Client::connect(api::CONNECTION_URL, 100)?;
     println!("Connected to IBKR");
 
-    let account_subscription =
-        client.account_summary(&AccountGroup::from("All"), AccountSummaryTags::ALL)?;
-
-    let mut starting_cash = 0.0;
-    for update in &account_subscription {
-        match update {
-            AccountSummaryResult::Summary(summary) => {
-                if summary.tag == "TotalCashValue" {
-                    starting_cash = summary.value.parse::<f64>().unwrap_or_else(|_| {
-                        println!(
-                            "Warning: Could not parse cash value '{}', using 0.0",
-                            summary.value
-                        );
-                        0.0
-                    });
-
-                    if let Some(max_value) = MAX_ACCOUNT_VALUE {
-                        starting_cash = starting_cash.min(max_value);
-                        println!(
-                            "Account cash: ${:.2} (limited to ${:.2})",
-                            starting_cash, max_value
-                        );
-                    } else {
-                        println!("Account cash: ${:.2}", starting_cash);
-                    }
-
-                    account_subscription.cancel();
-                    break;
-                }
-            }
-            AccountSummaryResult::End => {
-                account_subscription.cancel();
-                break;
-            }
-        }
-    }
-
-    if starting_cash == 0.0 {
-        return Err("Could not retrieve account cash from IBKR".into());
-    }
-
-    drop(account_subscription);
+    let (account_id, initial_account) = initialize_dedicated_account(&client, &account, &symbols)?;
+    let starting_cash = initial_account.cash;
+    println!("Dedicated account cash: ${starting_cash:.2}");
 
     let device = Device::cuda_if_available();
     let (_vs, model) = load_model(weight_path, device, model_variant)?;
@@ -93,6 +59,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
         symbols.clone(),
         starting_cash,
     )));
+    state.lock().unwrap().account = initial_account;
 
     // Seed the observation window from historical 5-minute bars (the resolution
     // the model trained on) so inference can start immediately with the correct
@@ -205,7 +172,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 
         let mut state_guard = state.lock().unwrap();
 
-        sync_account_from_ibkr(&client_arc, &symbols, &mut state_guard.account)?;
+        sync_account_from_ibkr(&client_arc, &account_id, &symbols, &mut state_guard.account)?;
         state_guard.update_account_total();
 
         if let Some((price_deltas_tensor, static_obs_tensor)) = state_guard.build_observation() {
@@ -251,10 +218,11 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 
             execute_trades(
                 &client_arc,
+                &account_id,
                 &symbols,
                 &actions_vec,
                 &current_prices,
-                &state_guard.account,
+                &mut state_guard.account,
             )?;
 
             step += 1;
