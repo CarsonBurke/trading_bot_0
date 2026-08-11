@@ -9,6 +9,20 @@
 
 ## Usage
 
+The supported ML toolchain is declared in `.pytorch-version`. Install and verify it,
+then run ML builds through the validating launcher:
+
+```bash
+./setup-fa4.sh
+./torch-env.sh check
+./torch-env.sh cargo check -p trading_bot_0
+./trading_bots/run-release-cuda.sh train
+./torch-env.sh ldd target/release/trading_bot_0
+```
+
+The launcher rejects mismatched PyTorch/CUDA builds before Cargo starts and places
+the matching wheel libraries first in the runtime linker path.
+
 It's recommended to use the `tui/` to start training or inference, or to view training or inference data. It's recommended to begin training/inference from inside the tui using the controls it provides so that it can show logs and track episodes correctly.
 
 ```rust

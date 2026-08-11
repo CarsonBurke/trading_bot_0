@@ -15,6 +15,8 @@ const PYTHON_PRINT_PYTORCH_DETAILS: &str = r"
 import torch
 from torch.utils import cpp_extension
 print('LIBTORCH_VERSION:', torch.__version__.split('+')[0])
+print('LIBTORCH_FULL_VERSION:', torch.__version__)
+print('LIBTORCH_CUDA_VERSION:', torch.version.cuda)
 print('LIBTORCH_CXX11:', torch._C._GLIBCXX_USE_CXX11_ABI)
 for include_path in cpp_extension.include_paths():
   print('LIBTORCH_INCLUDE:', include_path)
@@ -210,10 +212,37 @@ impl SystemInfo {
                 .arg(PYTHON_PRINT_PYTORCH_DETAILS)
                 .output()
                 .with_context(|| format!("error running {python_interpreter:?}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "failed querying the supported PyTorch environment with {python_interpreter:?}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let supported_torch = include_str!("../../.pytorch-version").trim();
             let mut cxx11_abi = None;
+            let mut full_version_validated = false;
+            let mut cuda_version_validated = false;
             for line in String::from_utf8_lossy(&output.stdout).lines() {
                 if let Some(version) = line.strip_prefix("LIBTORCH_VERSION: ") {
                     version_check(version)?
+                }
+                if let Some(version) = line.strip_prefix("LIBTORCH_FULL_VERSION: ") {
+                    if version.trim() != supported_torch {
+                        anyhow::bail!(
+                            "this repository requires PyTorch {supported_torch}, got {}; run ./setup-fa4.sh and use ./torch-env.sh cargo ...",
+                            version.trim()
+                        );
+                    }
+                    full_version_validated = true;
+                }
+                if let Some(version) = line.strip_prefix("LIBTORCH_CUDA_VERSION: ") {
+                    if version.trim() != "13.0" {
+                        anyhow::bail!(
+                            "this repository requires the CUDA 13.0 PyTorch build, got {}; run ./setup-fa4.sh",
+                            version.trim()
+                        );
+                    }
+                    cuda_version_validated = true;
                 }
                 match line.strip_prefix("LIBTORCH_CXX11: ") {
                     Some("True") => cxx11_abi = Some("1".to_owned()),
@@ -226,6 +255,9 @@ impl SystemInfo {
                 if let Some(path) = line.strip_prefix("LIBTORCH_LIB: ") {
                     libtorch_lib_dir = Some(PathBuf::from(path))
                 }
+            }
+            if !full_version_validated || !cuda_version_validated {
+                anyhow::bail!("PyTorch did not report its full version and CUDA build");
             }
             match cxx11_abi {
                 Some(cxx11_abi) => cxx11_abi,
@@ -496,6 +528,18 @@ fn add_cuda_include_dirs(include_dirs: &mut Vec<PathBuf>) -> bool {
 
 fn main() -> anyhow::Result<()> {
     if !cfg!(feature = "doc-only") {
+        println!("cargo:rerun-if-changed=../../.pytorch-version");
+        println!("cargo:rerun-if-env-changed=LIBTORCH_BYPASS_VERSION_CHECK");
+        if env::var_os("LIBTORCH_BYPASS_VERSION_CHECK").is_some() {
+            anyhow::bail!(
+                "LIBTORCH_BYPASS_VERSION_CHECK is unsupported; run Cargo through ./torch-env.sh"
+            );
+        }
+        if env::var_os("LIBTORCH_USE_PYTORCH").is_none() {
+            anyhow::bail!(
+                "the repository requires its pinned Python PyTorch toolchain; run ./setup-fa4.sh and ./torch-env.sh cargo ..."
+            );
+        }
         let system_info = SystemInfo::new()?;
         // use_cuda is a hacky way to detect whether cuda is available and
         // if it's the case link to it by explicitly depending on a symbol
