@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -411,27 +412,68 @@ fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
     if bars.is_empty() {
         bail!("no historical bars found for {}", split_label);
     }
-    let bars = align_bars_to_common_trailing_window(bars)
+    let bars = align_bars_to_common_dates(bars)
         .with_context(|| format!("failed to align historical bars for {}", split_label))?;
+    if bars[0].len() < min_bars {
+        bail!(
+            "only {} common historical bars found for {}, need at least {}",
+            bars[0].len(),
+            split_label,
+            min_bars
+        );
+    }
     Ok(MarketDataset::new(split_label.to_string(), tickers, bars))
 }
 
-fn align_bars_to_common_trailing_window(
+fn align_bars_to_common_dates(
     bars: Vec<Vec<ibapi::market_data::historical::Bar>>,
 ) -> Result<Vec<Vec<ibapi::market_data::historical::Bar>>> {
-    let common_len = bars
-        .iter()
-        .map(|ticker_bars| ticker_bars.len())
-        .min()
-        .unwrap_or(0);
-
-    if common_len == 0 {
+    if bars.is_empty() || bars.iter().any(Vec::is_empty) {
         bail!("encountered an empty ticker series");
+    }
+
+    for (ticker_idx, ticker_bars) in bars.iter().enumerate() {
+        for pair in ticker_bars.windows(2) {
+            if pair[1].date == pair[0].date {
+                bail!(
+                    "ticker series {} contains duplicate timestamp {}",
+                    ticker_idx,
+                    pair[1].date
+                );
+            }
+            if pair[1].date < pair[0].date {
+                bail!(
+                    "ticker series {} is not strictly chronological at {}",
+                    ticker_idx,
+                    pair[1].date
+                );
+            }
+        }
+    }
+
+    let mut common_dates = bars[0]
+        .iter()
+        .map(|bar| bar.date.unix_timestamp_nanos())
+        .collect::<HashSet<_>>();
+    for ticker_bars in bars.iter().skip(1) {
+        let ticker_dates = ticker_bars
+            .iter()
+            .map(|bar| bar.date.unix_timestamp_nanos())
+            .collect::<HashSet<_>>();
+        common_dates.retain(|date| ticker_dates.contains(date));
+    }
+    if common_dates.is_empty() {
+        bail!("ticker series have no timestamps in common");
     }
 
     Ok(bars
         .into_iter()
-        .map(|ticker_bars| ticker_bars[ticker_bars.len() - common_len..].to_vec())
+        .map(|ticker_bars| {
+            ticker_bars
+                .into_iter()
+                .filter(|bar| common_dates.contains(&bar.date.unix_timestamp_nanos()))
+                .collect()
+        })
         .collect())
 }
 
@@ -580,4 +622,68 @@ fn write_final_metadata<F: StrategyFamilySpec>(
         serde_json::to_vec_pretty(&summary)?,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ibapi::market_data::historical::Bar;
+    use time::{Duration, OffsetDateTime};
+
+    use super::align_bars_to_common_dates;
+
+    fn bar(minute: i64) -> Bar {
+        Bar {
+            date: OffsetDateTime::UNIX_EPOCH + Duration::minutes(minute),
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1_000.0,
+            wap: 100.0,
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn aligns_only_exact_common_dates() {
+        let aligned = align_bars_to_common_dates(vec![
+            vec![bar(0), bar(1), bar(2), bar(3)],
+            vec![bar(0), bar(2), bar(3), bar(4)],
+            vec![bar(2), bar(3), bar(5)],
+        ])
+        .expect("histories should align");
+
+        let expected = vec![bar(2).date, bar(3).date];
+        assert_eq!(aligned.len(), 3);
+        for ticker_bars in aligned {
+            assert_eq!(
+                ticker_bars.iter().map(|bar| bar.date).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_dates() {
+        let error = align_bars_to_common_dates(vec![vec![bar(0), bar(0)]])
+            .expect_err("duplicate dates must be rejected");
+
+        assert!(error.to_string().contains("duplicate timestamp"));
+    }
+
+    #[test]
+    fn rejects_non_monotonic_dates() {
+        let error = align_bars_to_common_dates(vec![vec![bar(1), bar(0)]])
+            .expect_err("non-monotonic dates must be rejected");
+
+        assert!(error.to_string().contains("not strictly chronological"));
+    }
+
+    #[test]
+    fn rejects_histories_without_common_dates() {
+        let error = align_bars_to_common_dates(vec![vec![bar(0)], vec![bar(1)]])
+            .expect_err("disjoint histories must be rejected");
+
+        assert!(error.to_string().contains("no timestamps in common"));
+    }
 }

@@ -6,26 +6,20 @@ use super::super::family::{DecisionContext, GeneticFamily, IndicatorConfig, Stra
 
 #[derive(Clone, Copy, Debug, Enum, Serialize, Deserialize)]
 enum Gene {
-    MinRsiSell,
     MaxRsiBuy,
-    ReboundSellThreshold,
     ReboundBuyThreshold,
     DeciderRsiAlpha,
     AmountRsiAlpha,
     BuyPercent,
-    SellPercent,
 }
 
 impl Gene {
-    const ALL: [Self; 8] = [
-        Self::MinRsiSell,
+    const ALL: [Self; 5] = [
         Self::MaxRsiBuy,
-        Self::ReboundSellThreshold,
         Self::ReboundBuyThreshold,
         Self::DeciderRsiAlpha,
         Self::AmountRsiAlpha,
         Self::BuyPercent,
-        Self::SellPercent,
     ];
 }
 
@@ -125,23 +119,11 @@ struct GeneSpec {
 
 fn spec(gene: Gene) -> GeneSpec {
     match gene {
-        Gene::MinRsiSell => GeneSpec {
-            min: 0.55,
-            max: 0.9,
-            init: 0.68,
-            mutation: 0.03,
-        },
         Gene::MaxRsiBuy => GeneSpec {
             min: 0.1,
             max: 0.45,
             init: 0.32,
             mutation: 0.03,
-        },
-        Gene::ReboundSellThreshold => GeneSpec {
-            min: 0.01,
-            max: 0.15,
-            init: 0.04,
-            mutation: 0.01,
         },
         Gene::ReboundBuyThreshold => GeneSpec {
             min: 0.01,
@@ -166,12 +148,6 @@ fn spec(gene: Gene) -> GeneSpec {
             max: 0.8,
             init: 0.18,
             mutation: 0.06,
-        },
-        Gene::SellPercent => GeneSpec {
-            min: 0.1,
-            max: 1.0,
-            init: 0.7,
-            mutation: 0.08,
         },
     }
 }
