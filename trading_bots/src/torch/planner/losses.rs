@@ -23,7 +23,11 @@ pub(crate) fn normalize_ppo_advantages(advantages: &Tensor) -> Result<Tensor> {
 
     let centered = advantages - advantages.mean(Kind::Float);
     let population_variance = centered.square().mean(Kind::Float);
-    let normalized = centered / population_variance.sqrt().clamp_min(1e-8);
+    let population_std = population_variance.sqrt();
+    let centered_normalized = &centered / population_std.clamp_min(1e-8);
+    let scale_normalized =
+        advantages / advantages.square().mean(Kind::Float).sqrt().clamp_min(1e-8);
+    let normalized = scale_normalized.where_self(&population_std.le(1e-8), &centered_normalized);
     if normalized.isfinite().all().int64_value(&[]) == 0 {
         bail!("normalized planner advantages contain NaN or infinity");
     }
@@ -230,14 +234,14 @@ mod tests {
     }
 
     #[test]
-    fn singleton_and_constant_advantages_have_finite_loss_and_gradients() {
+    fn singleton_and_constant_advantages_preserve_finite_policy_signal() {
         for raw_advantages in [
             Tensor::from_slice(&[3.0f32]),
             Tensor::from_slice(&[3.0f32, 3.0, 3.0, 3.0]),
         ] {
             let advantages = normalize_ppo_advantages(&raw_advantages).unwrap();
             assert_eq!(advantages.isfinite().all().int64_value(&[]), 1);
-            assert_eq!(advantages.abs().max().double_value(&[]), 0.0);
+            assert!((advantages.mean(Kind::Float).double_value(&[]) - 1.0).abs() < 1e-6);
 
             let log_ratio = Tensor::zeros_like(&advantages).set_requires_grad(true);
             let (loss, _) = asym_clip_policy_loss(&advantages, &log_ratio.exp());
@@ -245,7 +249,12 @@ mod tests {
             loss.backward();
             assert!(log_ratio.grad().defined());
             assert_eq!(log_ratio.grad().isfinite().all().int64_value(&[]), 1);
+            assert!(log_ratio.grad().abs().sum(Kind::Float).double_value(&[]) > 0.0);
         }
+
+        let zeros =
+            normalize_ppo_advantages(&Tensor::zeros([3], (Kind::Float, Device::Cpu))).unwrap();
+        assert_eq!(zeros.abs().sum(Kind::Float).double_value(&[]), 0.0);
     }
 
     #[test]
