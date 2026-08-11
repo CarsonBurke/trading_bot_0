@@ -6,6 +6,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use shared::paths::RUNS_PATH;
 use shared::run_dir::RunDir;
 use tch::{nn, Device, Kind, Tensor};
 
@@ -15,7 +16,7 @@ use crate::torch::{
     optim::muon::{Muon, MuonConfig},
     train::{
         config::{
-            LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM_WARMUP_START, PolicyObjective,
+            PolicyObjective, LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM_WARMUP_START,
             POLICY_OBJECTIVE, USE_MUON,
         },
         optimizer_glue::{
@@ -31,8 +32,8 @@ use super::{
     checkpoint::{
         load_committed_planner_metadata, load_planner_checkpoint, planner_metadata_path,
         planner_optimizer_state_path, save_planner_checkpoint, verify_optimizer_state,
-        PlannerCheckpointMetadata, KL_CONTROLLER_HALF_LIFE,
-        KL_MAX_LR_SCALE, KL_MIN_LR_SCALE, OPTIMIZATION_EPOCHS, TARGET_KL,
+        PlannerCheckpointMetadata, KL_CONTROLLER_HALF_LIFE, KL_MAX_LR_SCALE, KL_MIN_LR_SCALE,
+        OPTIMIZATION_EPOCHS, TARGET_KL,
     },
     data::{planner_context_bars, PlannerDataSplit, PlannerDataset, PlannerEndpoint},
     gae::compute_planner_gae,
@@ -79,6 +80,7 @@ pub struct TrainPlannerArgs {
     pub world_model_metadata: Option<String>,
     pub planner_weights: Option<String>,
     pub output: String,
+    pub run: Option<String>,
     pub updates: usize,
     pub horizon: usize,
     pub rollout_length: usize,
@@ -95,7 +97,8 @@ impl Default for TrainPlannerArgs {
             world_model_weights: "weights/pretrain_heads_best.ot".to_owned(),
             world_model_metadata: None,
             planner_weights: None,
-            output: "weights/planner.ot".to_owned(),
+            output: String::new(),
+            run: None,
             updates: 1_000,
             horizon: DEFAULT_PLANNER_HORIZON,
             rollout_length: DEFAULT_PLANNER_ROLLOUT_LENGTH,
@@ -119,6 +122,7 @@ pub struct InferPlannerArgs {
     pub context_bars: Option<usize>,
     pub tickers: Option<Vec<String>>,
     pub split: PlannerDataSplit,
+    pub report_root: Option<PathBuf>,
 }
 
 impl Default for InferPlannerArgs {
@@ -133,6 +137,7 @@ impl Default for InferPlannerArgs {
             context_bars: None,
             tickers: None,
             split: PlannerDataSplit::Test,
+            report_root: None,
         }
     }
 }
@@ -208,7 +213,8 @@ struct OptimizationSummary {
     steps: usize,
 }
 
-pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
+pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
+    args.output = resolve_planner_output(&args)?;
     validate_train_args(&args)?;
     configure_cuda();
     let device = Device::cuda_if_available();
@@ -520,7 +526,10 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
         summary.mean_buy_and_hold_wealth_ratio,
         summary.mean_outperformance_ratio,
     );
-    let run_dir = RunDir::from_weights_path(&planner_weights)?;
+    let run_dir = match args.report_root.as_deref() {
+        Some(root) => RunDir::open(root)?,
+        None => RunDir::create_fresh(RUNS_PATH, None)?,
+    };
     write_inference_reports(
         &run_dir.gens,
         checkpoint_metadata.cumulative_updates,
@@ -534,6 +543,38 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
         &evaluation_fingerprint,
     )?;
     Ok(summary)
+}
+
+fn resolve_planner_output(args: &TrainPlannerArgs) -> Result<String> {
+    if !args.output.is_empty() {
+        if args.run.is_some() {
+            bail!("--output and --run are mutually exclusive");
+        }
+        let destination = RunDir::from_weights_path_in(Path::new(&args.output), RUNS_PATH)
+            .with_context(|| {
+                format!(
+                    "planner output must belong to a prepared run: {}",
+                    args.output
+                )
+            })?;
+        destination.activate(RUNS_PATH)?;
+        return Ok(args.output.clone());
+    }
+    if let Some(weights) = args.planner_weights.as_deref() {
+        if args.run.is_some() {
+            bail!(
+                "--run cannot be combined with --planner-weights; omit --run to resume in place or use --output for an explicit destination"
+            );
+        }
+        let source =
+            RunDir::from_weights_path_in(Path::new(weights), RUNS_PATH).with_context(|| {
+                "planner resume weights must belong to a run when --output is omitted"
+            })?;
+        source.activate(RUNS_PATH)?;
+        return Ok(source.weights.join("planner.ot").display().to_string());
+    }
+    let destination = RunDir::create_fresh(RUNS_PATH, args.run.as_deref())?;
+    Ok(destination.weights.join("planner.ot").display().to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1604,6 +1645,17 @@ mod tests {
         validate_train_args(&args).unwrap();
         args.environments = 0;
         assert!(validate_train_args(&args).is_err());
+    }
+
+    #[test]
+    fn planner_resume_does_not_silently_ignore_an_explicit_run() {
+        let args = TrainPlannerArgs {
+            planner_weights: Some("source/weights/planner.ot".to_owned()),
+            run: Some("destination".to_owned()),
+            ..TrainPlannerArgs::default()
+        };
+        let error = resolve_planner_output(&args).unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"));
     }
 
     #[test]

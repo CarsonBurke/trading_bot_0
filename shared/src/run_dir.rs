@@ -5,6 +5,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunDir {
     pub root: PathBuf,
     pub gens: PathBuf,
@@ -15,7 +16,10 @@ pub struct RunDir {
 impl RunDir {
     pub fn create_fresh(runs_path: &str, name: Option<&str>) -> Result<Self> {
         let dir_name = match name {
-            Some(n) => n.to_string(),
+            Some(n) => {
+                validate_run_name(n)?;
+                n.to_string()
+            }
             None => Local::now().format("%Y-%m-%d_%H-%M-%S-%f").to_string(),
         };
 
@@ -35,6 +39,7 @@ impl RunDir {
                 log_file: log_file.clone(),
             };
             if is_prepared_empty_run(&run_dir)? {
+                run_dir.activate(runs_path)?;
                 return Ok(run_dir);
             }
             bail!("run dir already exists: {}", root.display());
@@ -51,25 +56,49 @@ impl RunDir {
         )
         .context("failed to write run metadata")?;
 
-        // Atomically update latest symlink (relative target)
-        let latest = runs.join("latest");
-        let _ = fs::remove_file(&latest);
-        symlink(&dir_name, &latest).context("failed to create latest symlink")?;
-
-        Ok(Self {
+        let run_dir = Self {
             root,
             gens,
             weights,
             log_file,
-        })
+        };
+        run_dir.activate(runs_path)?;
+        Ok(run_dir)
     }
 
     pub fn from_weights_path(path: &Path) -> Result<Self> {
         // path: runs/{name}/weights/{file}.ot
         let weights_dir = path.parent().context("weights path has no parent")?;
+        if weights_dir.file_name().is_none_or(|name| name != "weights") {
+            bail!(
+                "weights path is not inside a run weights directory: {}",
+                path.display()
+            );
+        }
         let root = weights_dir.parent().context("weights dir has no parent")?;
+        Self::open(root)
+    }
 
-        let root = root.to_path_buf();
+    pub fn from_weights_path_in(path: &Path, runs_path: impl AsRef<Path>) -> Result<Self> {
+        let run = Self::from_weights_path(path)?;
+        let expected_parent = canonical_or_original(runs_path.as_ref());
+        let actual_parent = run
+            .root
+            .parent()
+            .map(canonical_or_original)
+            .context("run root has no parent")?;
+        if actual_parent != expected_parent {
+            bail!(
+                "weights path {} is outside runs root {}",
+                path.display(),
+                runs_path.as_ref().display()
+            );
+        }
+        Ok(run)
+    }
+
+    pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
         let gens = root.join("gens");
         let weights = root.join("weights");
         let log_file = root.join("training.log");
@@ -90,6 +119,52 @@ impl RunDir {
             weights,
             log_file,
         })
+    }
+
+    pub fn named(runs_path: impl AsRef<Path>, name: &str) -> Result<Self> {
+        validate_run_name(name)?;
+        Self::open(runs_path.as_ref().join(name))
+    }
+
+    pub fn select(runs_path: impl AsRef<Path>, name: &str) -> Result<Self> {
+        if name == "latest" {
+            let runs_path = runs_path.as_ref();
+            return Self::latest(runs_path.to_string_lossy().as_ref());
+        }
+        Self::named(runs_path, name)
+    }
+
+    pub fn activate(&self, runs_path: impl AsRef<Path>) -> Result<()> {
+        let runs = runs_path.as_ref();
+        let run_parent = self
+            .root
+            .parent()
+            .context("run root has no parent directory")?;
+        if canonical_or_original(run_parent) != canonical_or_original(runs) {
+            bail!(
+                "run {} is not contained by runs root {}",
+                self.root.display(),
+                runs.display()
+            );
+        }
+        let target = self
+            .root
+            .file_name()
+            .context("run root has no directory name")?;
+        fs::create_dir_all(runs)?;
+        let latest = runs.join("latest");
+        let temporary = runs.join(format!(".latest.tmp-{}", std::process::id()));
+        if let Err(error) = fs::remove_file(&temporary) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).context("failed cleaning stale latest symlink temporary");
+            }
+        }
+        symlink(target, &temporary).context("failed creating latest symlink temporary")?;
+        if let Err(error) = fs::rename(&temporary, &latest) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).context("failed atomically activating run");
+        }
+        Ok(())
     }
 
     /// Scan runs newest-to-oldest, return the first that contains `filename` in its weights dir.
@@ -165,21 +240,25 @@ impl RunDir {
             target
         };
 
-        let gens = root.join("gens");
-        let weights = root.join("weights");
-        let log_file = root.join("training.log");
-
-        if !root.is_dir() {
-            bail!("latest run dir does not exist: {}", root.display());
-        }
-
-        Ok(Self {
-            root,
-            gens,
-            weights,
-            log_file,
-        })
+        Self::open(root).context("latest run is invalid")
     }
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn validate_run_name(name: &str) -> Result<()> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || name == "latest"
+        || name.starts_with('.')
+        || path.components().count() != 1
+        || path.file_name().is_none()
+    {
+        bail!("run name must be one safe, non-reserved path component");
+    }
+    Ok(())
 }
 
 fn sort_run_entries_newest_first(entries: &mut [fs::DirEntry]) {
@@ -256,4 +335,48 @@ fn current_git_commit() -> Option<String> {
         .ok()
         .map(|sha| sha.trim().to_string())
         .filter(|sha| !sha.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_runs() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("trading-bot-runs-{}-{unique}", std::process::id()))
+    }
+
+    #[test]
+    fn explicit_run_context_is_stable_and_latest_is_only_changed_by_activation() {
+        let runs = temp_runs();
+        let runs_str = runs.to_str().unwrap();
+        let first = RunDir::create_fresh(runs_str, Some("first")).unwrap();
+        let second = RunDir::create_fresh(runs_str, Some("second")).unwrap();
+        assert_eq!(RunDir::latest(runs_str).unwrap(), second);
+        assert_eq!(RunDir::select(&runs, "latest").unwrap(), second);
+        assert_eq!(RunDir::named(&runs, "first").unwrap(), first);
+        assert_eq!(RunDir::latest(runs_str).unwrap().root, second.root);
+
+        first.activate(&runs).unwrap();
+        assert_eq!(RunDir::latest(runs_str).unwrap().root, first.root);
+        fs::remove_dir_all(runs).unwrap();
+    }
+
+    #[test]
+    fn run_names_cannot_escape_or_replace_latest() {
+        let runs = temp_runs();
+        for name in ["../escape", ".", ".hidden", "latest", "a/b", ""] {
+            assert!(RunDir::create_fresh(runs.to_str().unwrap(), Some(name)).is_err());
+        }
+
+        let external_runs = temp_runs().with_extension("external");
+        let external =
+            RunDir::create_fresh(external_runs.to_str().unwrap(), Some("source")).unwrap();
+        assert!(RunDir::from_weights_path_in(&external.weights.join("ppo_ep1.ot"), &runs).is_err());
+        fs::remove_dir_all(external_runs).unwrap();
+    }
 }

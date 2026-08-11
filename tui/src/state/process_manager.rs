@@ -163,6 +163,7 @@ impl ProcessManagerState {
     }
 
     pub fn is_anything_running(&mut self) -> bool {
+        self.check_inference_process();
         self.is_training_running() || self.inference_process.is_some()
     }
 
@@ -180,13 +181,10 @@ impl ProcessManagerState {
             (TrainingKind::Pretrain, _) => RunDir::create_fresh(RUNS_PATH, None)?,
             (_, Some(w)) => {
                 let p = Path::new(w);
-                // If weights are inside runs/*/weights/, reuse that run dir
-                if p.parent()
-                    .and_then(|d| d.file_name())
-                    .map_or(false, |n| n == "weights")
-                    && p.ancestors().any(|a| a.ends_with("runs"))
-                {
-                    RunDir::from_weights_path(p)?
+                if kind == TrainingKind::Rl && is_ppo_resume_path(p) {
+                    let run = RunDir::from_weights_path_in(p, RUNS_PATH)?;
+                    run.activate(RUNS_PATH)?;
+                    run
                 } else {
                     RunDir::create_fresh(RUNS_PATH, None)?
                 }
@@ -196,11 +194,7 @@ impl ProcessManagerState {
 
         let log_file = open_training_log(&run_dir.log_file)?;
 
-        let mut cmd = Command::new("cargo");
-        cmd.current_dir(trading_bots_dir())
-            .arg("run")
-            .arg("--release")
-            .arg("--");
+        let mut cmd = trading_bot_command();
 
         match kind {
             TrainingKind::Rl => {
@@ -258,25 +252,35 @@ impl ProcessManagerState {
             return Ok(());
         }
 
-        let mut cmd = Command::new("cargo");
-        cmd.current_dir(trading_bots_dir())
-            .arg("run")
-            .arg("--release")
-            .arg("--")
-            .arg("infer")
+        let run_dir = RunDir::create_fresh(RUNS_PATH, None)?;
+        let log_file = open_training_log(&run_dir.log_file)?;
+        let run_name = run_dir
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("inference run has no UTF-8 name"))?;
+        let mut cmd = trading_bot_command();
+        cmd.arg("infer")
             .arg("--weights")
             .arg(weights)
             .arg("--model-size")
             .arg(model_size)
             .arg("--episodes")
-            .arg(episodes.to_string());
+            .arg(episodes.to_string())
+            .arg("--run")
+            .arg(run_name);
 
         if let Some(t) = ticker {
             cmd.arg("--tickers").arg(t);
         }
 
+        cmd.stdin(Stdio::null())
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file);
         let child = cmd.spawn()?;
         self.inference_process = Some(child);
+        self.active_run = Some(run_dir);
+        self.view_pinned = false;
 
         Ok(())
     }
@@ -325,6 +329,23 @@ fn open_training_log(path: &Path) -> Result<std::fs::File> {
         .create(true)
         .append(true)
         .open(path)?)
+}
+
+fn is_ppo_resume_path(path: &Path) -> bool {
+    path.with_extension("resume.json").is_file()
+        || path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.strip_prefix("ppo_ep"))
+            .is_some_and(|episode| episode.parse::<usize>().is_ok())
+}
+
+fn trading_bot_command() -> Command {
+    let mut command = Command::new(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../trading_bots/run-release-cuda.sh"),
+    );
+    command.current_dir(Path::new(WORKSPACE_ROOT));
+    command
 }
 
 fn list_training_processes() -> Vec<(u32, Vec<String>)> {
@@ -466,17 +487,7 @@ fn is_training_subcommand(arg: &str) -> bool {
 }
 
 fn run_dir_from_name(name: &str) -> Option<RunDir> {
-    let root = Path::new(RUNS_PATH).join(name);
-    let gens = root.join("gens");
-    let weights = root.join("weights");
-    let log_file = root.join("training.log");
-
-    (root.is_dir() && weights.is_dir()).then_some(RunDir {
-        root,
-        gens,
-        weights,
-        log_file,
-    })
+    RunDir::named(RUNS_PATH, name).ok()
 }
 
 fn latest_observable_run() -> Option<RunDir> {
@@ -678,6 +689,29 @@ mod tests {
     }
 
     #[test]
+    fn spawned_training_commands_use_the_hermetic_launcher() {
+        let command = trading_bot_command();
+        assert_eq!(
+            Path::new(command.get_program()),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../trading_bots/run-release-cuda.sh")
+        );
+        assert_eq!(command.get_current_dir(), Some(Path::new(WORKSPACE_ROOT)));
+    }
+
+    #[test]
+    fn only_complete_ppo_checkpoint_names_resume_in_place() {
+        assert!(is_ppo_resume_path(Path::new(
+            "training/runs/source/weights/ppo_ep42.ot"
+        )));
+        assert!(!is_ppo_resume_path(Path::new(
+            "training/runs/source/weights/pretrain_heads_best.ot"
+        )));
+        assert!(!is_ppo_resume_path(Path::new(
+            "training/runs/source/weights/planner.ot"
+        )));
+    }
+
+    #[test]
     fn only_repo_training_invocations_are_owned() {
         let workspace = Path::new("/repo");
         let bots = Path::new("/repo/trading_bots");
@@ -764,6 +798,28 @@ mod tests {
             "previous session\nnew session\n"
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn completed_inference_is_reaped_before_the_next_launch_check() {
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut state = ProcessManagerState {
+            inference_process: Some(child),
+            training_process: None,
+            active_run: None,
+            live_run: None,
+            view_pinned: false,
+            cached_training_running: false,
+            last_training_check: Instant::now(),
+        };
+        for _ in 0..100 {
+            if !state.is_anything_running() {
+                assert!(state.inference_process.is_none());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("inference child did not exit in time");
     }
 
     fn strings(args: &[&str]) -> Vec<String> {

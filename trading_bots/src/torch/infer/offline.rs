@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tch::{nn, Device, Kind, Tensor};
 
@@ -60,6 +60,7 @@ pub fn run_inference<P: AsRef<Path>>(
     tickers: Option<Vec<String>>,
     random_start: bool,
     model_variant: ModelVariant,
+    output_dir: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tickers) = tickers.as_ref() {
         validate_ticker_count(tickers, "offline inference")?;
@@ -141,7 +142,7 @@ pub fn run_inference<P: AsRef<Path>>(
 
         total_rewards += episode_reward;
         let total_commissions = env.episode_history.total_commissions;
-        env.record_inference(episode);
+        env.record_inference_to(&output_dir, episode)?;
 
         println!(
             "Episode {}: Reward: {:.4}, Commissions: ${:.2}, Time: {:.2}s",

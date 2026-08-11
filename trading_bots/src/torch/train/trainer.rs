@@ -319,17 +319,23 @@ impl Trainer {
             }
             let load_summary = load_var_store_partial(&mut vs, path).unwrap();
             load_summary.require_complete().unwrap();
-            let is_run_weights = is_resume
-                && path
-                    .parent()
-                    .and_then(|d| d.file_name())
-                    .map(|n| n == "weights")
-                    .unwrap_or(false)
-                && path
-                    .ancestors()
-                    .any(|a| a.file_name().map(|n| n == "runs").unwrap_or(false));
-            let rd = if is_run_weights {
-                RunDir::from_weights_path(path).expect("failed to open run dir from weights path")
+            let rd = if is_resume {
+                let run = RunDir::from_weights_path_in(path, RUNS_PATH)
+                    .expect("complete PPO resume weights must belong to a managed run");
+                if let Some(requested) = run_name.as_deref() {
+                    let source_name = run
+                        .root
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .expect("resume run name is not UTF-8");
+                    assert_eq!(
+                        requested, source_name,
+                        "--run cannot redirect a complete PPO resume bundle; omit it or select its source run"
+                    );
+                }
+                run.activate(RUNS_PATH)
+                    .expect("failed to activate resumed run");
+                run
             } else {
                 RunDir::create_fresh(RUNS_PATH, run_name.as_deref())
                     .expect("failed to create run dir")
@@ -410,7 +416,9 @@ impl Trainer {
             let meta_history = &mut env.primary_mut().meta_history;
             let completed_episode = completed_episode_for_resume(start_episode)
                 .expect("validated PPO resume metadata became invalid");
-            meta_history.load_from_episode(completed_episode, &gens_path);
+            meta_history
+                .load_from_episode(completed_episode, &gens_path)
+                .unwrap_or_else(|error| panic!("failed restoring PPO report history: {error:#}"));
         }
 
         let hl_gauss = HlGaussBins::default_for(device);
@@ -555,7 +563,7 @@ impl Trainer {
         })
     }
 
-    pub(super) async fn run(&mut self) {
+    pub(super) async fn run(&mut self) -> Result<()> {
         for episode in self.start_episode..1000000 {
             let rollout_data = self.collect_rollout(episode);
             let advantage_data = self.compute_advantages(episode, &rollout_data);
@@ -572,9 +580,10 @@ impl Trainer {
             update_metrics.kl_lr_signal = kl_lr_signal;
             update_metrics.kl_lr_ema = self.kl_lr_controller.ema();
             update_metrics.kl_lr_scale_next = self.kl_lr_controller.scale();
-            self.log_episode(episode, &advantage_data, &update_metrics);
+            self.log_episode(episode, &advantage_data, &update_metrics)?;
             self.maybe_checkpoint(episode);
         }
+        Ok(())
     }
 
     pub(super) fn maybe_checkpoint(&self, episode: usize) {

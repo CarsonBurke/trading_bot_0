@@ -10,6 +10,7 @@ pub struct InferenceInfo {
 }
 
 pub struct InferenceBrowserState {
+    pub infer_path: PathBuf,
     pub inferences: Vec<InferenceInfo>,
     pub filtered_inferences: Vec<InferenceInfo>,
     pub selected_inference: Option<usize>,
@@ -22,6 +23,7 @@ pub struct InferenceBrowserState {
 impl InferenceBrowserState {
     pub fn new() -> Self {
         Self {
+            infer_path: PathBuf::from("../infer"),
             inferences: Vec::new(),
             filtered_inferences: Vec::new(),
             selected_inference: None,
@@ -34,7 +36,7 @@ impl InferenceBrowserState {
 
     pub fn load_inferences(&mut self) -> Result<()> {
         self.inferences.clear();
-        let inference_path = PathBuf::from("../infer");
+        let inference_path = self.infer_path.clone();
 
         if !inference_path.exists() {
             return Ok(());

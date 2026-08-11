@@ -1,15 +1,15 @@
 use anyhow::{bail, Context, Result};
 use rand::seq::index;
-use rand::thread_rng;
-use shared::paths::TRAINING_PATH;
-use shared::report::Report;
+use shared::paths::RUNS_PATH;
+use shared::report::{CandleBar, Report, ReportKind};
+use shared::run_dir::RunDir;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        bail!("usage: report_cli <generation> <report_name> [ticker|inference_set/episode] [--sample N] [--min N] [--max N] [--var NAME]");
+        bail!("usage: report_cli <generation> <report_name> [ticker|inference_set/episode] [--run NAME|--run-root PATH] [--runs-root PATH] [--sample N] [--min N] [--max N] [--var NAME]");
     }
 
     let generation = args[1]
@@ -21,6 +21,9 @@ fn main() -> Result<()> {
     let mut min: Option<usize> = None;
     let mut max: Option<usize> = None;
     let mut var_filter: Option<String> = None;
+    let mut run_name: Option<String> = None;
+    let mut run_root: Option<PathBuf> = None;
+    let mut runs_root = PathBuf::from(RUNS_PATH);
     let mut i = 3;
     while i < args.len() {
         let arg = &args[i];
@@ -71,6 +74,26 @@ fn main() -> Result<()> {
             i += 2;
             continue;
         }
+        if arg == "--run" {
+            i += 1;
+            run_name = Some(args.get(i).context("missing --run value")?.clone());
+            i += 1;
+            continue;
+        }
+        if arg == "--run-root" {
+            i += 1;
+            run_root = Some(PathBuf::from(
+                args.get(i).context("missing --run-root value")?,
+            ));
+            i += 1;
+            continue;
+        }
+        if arg == "--runs-root" {
+            i += 1;
+            runs_root = PathBuf::from(args.get(i).context("missing --runs-root value")?);
+            i += 1;
+            continue;
+        }
         if let Some(value) = arg.strip_prefix("--var=") {
             var_filter = Some(value.to_string());
             i += 1;
@@ -86,16 +109,13 @@ fn main() -> Result<()> {
     if min.is_some() && max.is_some() {
         bail!("--min and --max are mutually exclusive");
     }
+    if run_name.is_some() && run_root.is_some() {
+        bail!("--run and --run-root are mutually exclusive");
+    }
 
-    let base_path = find_training_path().unwrap_or_else(|| {
-        let latest = PathBuf::from(TRAINING_PATH).join("runs/latest");
-        if latest.join("gens").exists() {
-            latest
-        } else {
-            PathBuf::from(TRAINING_PATH)
-        }
-    });
-    let report_path = build_report_path(&base_path, generation, &report_name, ticker)?;
+    let run = resolve_run(&runs_root, run_name.as_deref(), run_root.as_deref())?;
+    let report_path = build_report_path(&run.gens, generation, &report_name, ticker)?;
+
     let bytes = fs::read(&report_path)
         .with_context(|| format!("failed to read report {}", report_path.display()))?;
     let report: Report = postcard::from_bytes(&bytes).context("failed to decode report")?;
@@ -108,9 +128,9 @@ fn main() -> Result<()> {
         });
     }
     if let Some(count) = min {
-        lines = select_by_value(lines, count, false, var_filter.as_deref());
+        lines = select_by_report_value(&report.kind, lines, count, false, var_filter.as_deref());
     } else if let Some(count) = max {
-        lines = select_by_value(lines, count, true, var_filter.as_deref());
+        lines = select_by_report_value(&report.kind, lines, count, true, var_filter.as_deref());
     }
     if let Some(count) = sample {
         if count >= lines.len() {
@@ -118,7 +138,7 @@ fn main() -> Result<()> {
                 println!("{}", format_line(&line, var_filter.as_deref()));
             }
         } else {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             let indices = index::sample(&mut rng, lines.len(), count);
             for idx in indices.iter() {
                 println!("{}", format_line(&lines[idx], var_filter.as_deref()));
@@ -130,6 +150,19 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_run(
+    runs_root: &Path,
+    run_name: Option<&str>,
+    run_root: Option<&Path>,
+) -> Result<RunDir> {
+    Ok(match (run_name, run_root) {
+        (Some(name), None) => RunDir::select(runs_root, name)?,
+        (None, Some(root)) => RunDir::open(root)?,
+        (None, None) => RunDir::latest(runs_root.to_string_lossy().as_ref())?,
+        (Some(_), Some(_)) => unreachable!(),
+    })
 }
 
 fn select_by_value(
@@ -164,6 +197,56 @@ fn select_by_value(
         .take(take_count)
         .map(|(_, line)| line)
         .collect()
+}
+
+fn select_by_report_value(
+    kind: &ReportKind,
+    lines: Vec<String>,
+    count: usize,
+    pick_max: bool,
+    var_filter: Option<&str>,
+) -> Vec<String> {
+    let ReportKind::CandleCompare { actual, predicted } = kind else {
+        return select_by_value(lines, count, pick_max, var_filter);
+    };
+    let mut scored = lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let mut values = Vec::with_capacity(8);
+            if var_filter.is_none() || var_filter == Some("actual") {
+                if let Some(candle) = actual.get(index) {
+                    values.extend(candle_values(candle));
+                }
+            }
+            if var_filter.is_none() || var_filter == Some("predicted") {
+                if let Some(candle) = predicted.get(index) {
+                    values.extend(candle_values(candle));
+                }
+            }
+            values.retain(|value| value.is_finite());
+            let score = if pick_max {
+                values.into_iter().reduce(f32::max)
+            } else {
+                values.into_iter().reduce(f32::min)
+            }?;
+            Some((score, line))
+        })
+        .collect::<Vec<_>>();
+    if pick_max {
+        scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+    } else {
+        scored.sort_by(|left, right| left.0.total_cmp(&right.0));
+    }
+    scored
+        .into_iter()
+        .take(count)
+        .map(|(_, line)| line)
+        .collect()
+}
+
+fn candle_values(candle: &CandleBar) -> [f32; 4] {
+    [candle.open, candle.high, candle.low, candle.close]
 }
 
 fn extract_values(line: &str, var_filter: Option<&str>) -> Vec<f32> {
@@ -234,7 +317,6 @@ fn build_report_path(
     subpath: Option<&str>,
 ) -> Result<PathBuf> {
     let mut path = base_path.clone();
-    path.push("gens");
     path.push(generation.to_string());
     if let Some(subpath) = subpath {
         path.push(safe_report_subpath(subpath)?);
@@ -255,35 +337,6 @@ fn safe_report_subpath(raw: &str) -> Result<PathBuf> {
         bail!("report subpath must contain one or two safe relative components");
     }
     Ok(path.to_path_buf())
-}
-
-fn find_training_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd);
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(parent) = manifest_dir.parent() {
-        candidates.push(parent.to_path_buf());
-    }
-
-    for start in candidates {
-        let mut dir = Some(start.as_path());
-        while let Some(current) = dir {
-            let training = current.join("training");
-            // Check new layout first (runs/latest symlink)
-            let latest = training.join("runs/latest");
-            if latest.join("gens").exists() {
-                return Some(latest);
-            }
-            // Fall back to old layout
-            if training.join("gens").exists() {
-                return Some(training);
-            }
-            dir = current.parent();
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -317,7 +370,7 @@ mod tests {
         fs::write(&path, postcard::to_stdvec(&report).unwrap()).unwrap();
 
         let resolved = build_report_path(
-            &root,
+            &root.join("gens"),
             7,
             "planner_position",
             Some("planner_inference_test_set/planner_test_000_TEST"),
@@ -327,5 +380,72 @@ mod tests {
         assert_eq!(decoded.title, "Nested");
         assert!(build_report_path(&root, 7, "assets", Some("../escape")).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn candle_min_max_use_structured_ohlc_values() {
+        let kind = ReportKind::CandleCompare {
+            actual: vec![
+                CandleBar {
+                    open: 10.0,
+                    high: 12.0,
+                    low: 9.0,
+                    close: 11.0,
+                },
+                CandleBar {
+                    open: 3.0,
+                    high: 5.0,
+                    low: 2.0,
+                    close: 4.0,
+                },
+                CandleBar {
+                    open: 90.0,
+                    high: 100.0,
+                    low: 80.0,
+                    close: 95.0,
+                },
+            ],
+            predicted: vec![
+                CandleBar {
+                    open: 20.0,
+                    high: 30.0,
+                    low: 15.0,
+                    close: 25.0,
+                },
+                CandleBar {
+                    open: f32::NAN,
+                    high: 8.0,
+                    low: 7.0,
+                    close: 7.5,
+                },
+            ],
+        };
+        let lines = kind.to_lines();
+        assert!(select_by_report_value(&kind, lines.clone(), 1, true, None)[0].starts_with('2'));
+        assert!(select_by_report_value(&kind, lines.clone(), 1, false, None)[0].starts_with('1'));
+        assert!(
+            select_by_report_value(&kind, lines.clone(), 1, true, Some("actual"))[0]
+                .starts_with('2')
+        );
+        assert!(
+            select_by_report_value(&kind, lines, 1, true, Some("predicted"))[0].starts_with('0')
+        );
+    }
+
+    #[test]
+    fn explicit_historical_run_selection_does_not_change_latest() {
+        let runs = std::env::temp_dir().join(format!(
+            "report-cli-runs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = RunDir::create_fresh(runs.to_str().unwrap(), Some("first")).unwrap();
+        let second = RunDir::create_fresh(runs.to_str().unwrap(), Some("second")).unwrap();
+        assert_eq!(resolve_run(&runs, Some("first"), None).unwrap(), first);
+        assert_eq!(RunDir::latest(runs.to_str().unwrap()).unwrap(), second);
+        fs::remove_dir_all(runs).unwrap();
     }
 }

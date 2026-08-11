@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::{self, Colorize};
+use shared::{paths::RUNS_PATH, run_dir::RunDir};
 use trading_bot_0::torch::model::ModelVariant;
 use trading_bot_0::torch::planner::PlannerDataSplit;
 use trading_bot_0::torch::train::PretrainObjective;
@@ -160,8 +161,11 @@ enum Commands {
         #[arg(long)]
         planner_weights: Option<String>,
 
-        #[arg(long, default_value = "weights/planner.ot")]
-        output: String,
+        #[arg(long)]
+        output: Option<String>,
+
+        #[arg(long)]
+        run: Option<String>,
 
         #[arg(long, default_value_t = 1_000)]
         updates: usize,
@@ -214,6 +218,9 @@ enum Commands {
 
         #[arg(long, value_enum, default_value_t = PlannerDataSplit::Test)]
         split: PlannerDataSplit,
+
+        #[arg(long)]
+        run: Option<String>,
     },
     Infer {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
@@ -236,6 +243,9 @@ enum Commands {
 
         #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
         model_size: ModelVariant,
+
+        #[arg(long)]
+        run: Option<String>,
     },
     Paper {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
@@ -356,6 +366,7 @@ async fn main() {
             world_model_metadata,
             planner_weights,
             output,
+            run,
             updates,
             horizon,
             rollout_length,
@@ -369,7 +380,8 @@ async fn main() {
                 world_model_weights: world_model_weights.clone(),
                 world_model_metadata: world_model_metadata.clone(),
                 planner_weights: planner_weights.clone(),
-                output: output.clone(),
+                output: output.clone().unwrap_or_default(),
+                run: run.clone(),
                 updates: *updates,
                 horizon: *horizon,
                 rollout_length: *rollout_length,
@@ -394,7 +406,10 @@ async fn main() {
             context_bars,
             tickers,
             split,
+            run,
         }) => {
+            let destination = RunDir::create_fresh(RUNS_PATH, run.as_deref())
+                .expect("failed to create planner inference run dir");
             let args = torch::planner::InferPlannerArgs {
                 world_model_weights: world_model_weights.clone(),
                 world_model_metadata: world_model_metadata.clone(),
@@ -405,6 +420,7 @@ async fn main() {
                 context_bars: *context_bars,
                 tickers: tickers.clone(),
                 split: *split,
+                report_root: Some(destination.root),
             };
             tokio::task::spawn_blocking(move || torch::planner::infer_planner(args))
                 .await
@@ -419,7 +435,11 @@ async fn main() {
             tickers,
             random_start,
             model_size,
+            run,
         }) => {
+            let run_dir = RunDir::create_fresh(RUNS_PATH, run.as_deref())
+                .expect("failed to create inference run dir");
+            let output_dir = run_dir.root.join("inference");
             torch::infer::run_inference(
                 weights,
                 *episodes,
@@ -428,6 +448,7 @@ async fn main() {
                 tickers.clone(),
                 *random_start,
                 *model_size,
+                output_dir,
             )
             .expect("inference failed");
         }
