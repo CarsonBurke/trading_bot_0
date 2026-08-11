@@ -804,14 +804,18 @@ fn candle_body_high(candle: &CandleBar) -> f64 {
 }
 
 fn compute_ema(data: &[f32], alpha: f64) -> Vec<f32> {
-    if data.is_empty() {
-        return vec![];
-    }
     let mut result = Vec::with_capacity(data.len());
-    let mut ema = data[0] as f64;
+    let mut ema = None;
     for &v in data {
-        ema = alpha * v as f64 + (1.0 - alpha) * ema;
-        result.push(ema as f32);
+        if !v.is_finite() {
+            result.push(v);
+            continue;
+        }
+        let next = ema.map_or(v as f64, |previous| {
+            alpha * v as f64 + (1.0 - alpha) * previous
+        });
+        ema = Some(next);
+        result.push(next as f32);
     }
     result
 }
@@ -961,6 +965,19 @@ mod tests {
             },
         };
         assert!(render_report(&report).is_ok());
+    }
+
+    #[test]
+    fn ema_preserves_finite_gaps_and_resumes_from_last_state() {
+        let leading_gap = compute_ema(&[f32::NAN, 2.0, 4.0], 0.5);
+        assert!(leading_gap[0].is_nan());
+        assert_eq!(&leading_gap[1..], &[2.0, 3.0]);
+
+        let middle_gap = compute_ema(&[1.0, f32::NAN, f32::INFINITY, 3.0], 0.5);
+        assert_eq!(middle_gap[0], 1.0);
+        assert!(middle_gap[1].is_nan());
+        assert!(middle_gap[2].is_infinite());
+        assert_eq!(middle_gap[3], 2.0);
     }
 
     #[test]

@@ -12,7 +12,7 @@ impl Trainer {
         episode: usize,
         adv_data: &AdvantageData,
         metrics: &UpdateMetrics,
-    ) {
+    ) -> anyhow::Result<()> {
         let device = self.device;
         let max_param_norm = tch::no_grad(|| {
             let norms: Vec<Tensor> = self.trainable_vars.iter().map(|v| v.norm()).collect();
@@ -249,7 +249,7 @@ impl Trainer {
         );
         if episode % 5 == 0 {
             let gens_path = self.run_dir.gens.to_string_lossy();
-            primary.meta_history.write_reports(episode, &gens_path);
+            primary.meta_history.write_reports(episode, &gens_path)?;
         }
 
         println!(
@@ -289,5 +289,6 @@ impl Trainer {
             value_return_corr_symlog,
             value_explained_var_symlog
         );
+        Ok(())
     }
 }

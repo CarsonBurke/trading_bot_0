@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use shared::report::{Report, ReportKind, ReportSeries, ScaleKind};
+use shared::report::{write_report, Report, ReportKind, ReportSeries, ScaleKind};
 
 const PLANNER_GENERATION_MARKER: &str = ".planner-report-generation";
 const PLANNER_INFERENCE_MANIFEST: &str = ".planner-inference.json";
@@ -1033,7 +1033,7 @@ pub fn write_inference_reports(
         trace.validate()?;
     }
     let generation = gens.as_ref().join(update.to_string());
-    require_owner(&generation, run_lineage_id, update)?;
+    ensure_inference_generation_owner(gens.as_ref(), &generation, run_lineage_id, update)?;
     let display_split = display_split(split);
     let split_lower = sanitize_component(&split.to_ascii_lowercase());
     let rollout_length = traces[0].rewards.len();
@@ -1409,7 +1409,8 @@ fn write_simple_allow_nan(
                 ema_alpha: None,
             },
         },
-    )
+    )?;
+    Ok(())
 }
 
 fn write_simple_with_x(
@@ -1436,7 +1437,8 @@ fn write_simple_with_x(
                 ema_alpha: None,
             },
         },
-    )
+    )?;
+    Ok(())
 }
 
 fn write_multiline(
@@ -1473,16 +1475,8 @@ fn write_multiline_with_x(
             scale: ScaleKind::Linear,
             kind: ReportKind::MultiLine { series },
         },
-    )
-}
-
-fn write_report(path: &Path, report: &Report) -> Result<()> {
-    let bytes = postcard::to_stdvec(report).context("failed encoding planner report")?;
-    let temporary = path.with_extension("report.bin.tmp");
-    fs::write(&temporary, bytes)
-        .with_context(|| format!("failed writing {}", temporary.display()))?;
-    fs::File::open(&temporary)?.sync_all()?;
-    fs::rename(&temporary, path).with_context(|| format!("failed committing {}", path.display()))
+    )?;
+    Ok(())
 }
 
 fn read_report(path: &Path) -> Option<Report> {
@@ -1522,6 +1516,57 @@ fn require_owner(directory: &Path, run_lineage_id: &str, update: u64) -> Result<
         );
     }
     Ok(())
+}
+
+fn ensure_inference_generation_owner(
+    gens: &Path,
+    generation: &Path,
+    run_lineage_id: &str,
+    update: u64,
+) -> Result<()> {
+    fs::create_dir_all(gens)?;
+    if generation.exists() {
+        return require_owner(generation, run_lineage_id, update);
+    }
+
+    let staging = gens.join(format!(
+        ".{update}.planner-inference-owner-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&staging).with_context(|| {
+        format!(
+            "failed creating planner generation staging directory {}",
+            staging.display()
+        )
+    })?;
+    let result = (|| -> Result<()> {
+        write_owner(
+            &staging,
+            &PlannerGenerationOwner {
+                run_lineage_id: run_lineage_id.to_owned(),
+                update,
+            },
+        )?;
+        fs::File::open(&staging)?.sync_all()?;
+        match fs::rename(&staging, generation) {
+            Ok(()) => {
+                fs::File::open(gens)?.sync_all()?;
+                Ok(())
+            }
+            Err(_error) if generation.exists() => require_owner(generation, run_lineage_id, update),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed publishing planner generation {} from {}",
+                    generation.display(),
+                    staging.display()
+                )
+            }),
+        }
+    })();
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
 }
 
 fn read_simple(path: &Path) -> Option<Vec<f32>> {
@@ -2110,6 +2155,33 @@ mod tests {
             .unwrap();
         assert!(read_simple(&dir.join("1/explained_var.report.bin")).unwrap()[0].is_nan());
         PlannerReportHistory::load(&dir, 1, "run-a").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inference_initializes_a_fresh_destination_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "planner-native-inference-fresh-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let output =
+            write_inference_reports(&dir, 7, "source-lineage", "Test", &[trace()], "contract-a")
+                .unwrap();
+        assert!(output.is_dir());
+        require_owner(&dir.join("7"), "source-lineage", 7).unwrap();
+        assert!(has_complete_inference_reports(
+            &dir,
+            7,
+            "source-lineage",
+            "Test",
+            "contract-a",
+            1,
+            2,
+        )
+        .unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 

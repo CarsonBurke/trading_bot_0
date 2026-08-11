@@ -139,7 +139,10 @@ pub fn build_static_obs(
 }
 
 impl Env {
-    fn build_static_obs_array(&self, absolute_step: usize) -> [f32; STATIC_OBSERVATIONS_USIZE] {
+    pub(super) fn build_static_obs_array(
+        &self,
+        absolute_step: usize,
+    ) -> [f32; STATIC_OBSERVATIONS_USIZE] {
         let macro_ind = &self.macro_ind;
         let global = GlobalObsInputs {
             cash_percent: self.account.cash / self.account.total_assets,

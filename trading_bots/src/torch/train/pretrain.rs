@@ -30,7 +30,7 @@ use crate::torch::world_model::{
 };
 use shared::{
     paths::RUNS_PATH,
-    report::{CandleBar, Report, ReportKind, ReportSeries, ScaleKind},
+    report::{write_report, CandleBar, Report, ReportKind, ReportSeries, ScaleKind},
     run_dir::RunDir,
 };
 
@@ -4515,8 +4515,7 @@ fn tensor_to_vec_f32(tensor: &Tensor) -> Result<Vec<f32>> {
 }
 
 fn write_report_file(path: &Path, report: &Report) -> Result<()> {
-    let bytes = postcard::to_stdvec(report).context("failed to encode report")?;
-    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+    write_report(path, report).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn future_patches_for_current_perm(

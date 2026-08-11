@@ -3,7 +3,28 @@ use crate::history::episode_tickers_combined::EpisodeHistory;
 use crate::history::report::{
     read_report, write_report, Report, ReportKind, ReportSeries, ScaleKind,
 };
-use crate::utils::create_folder_if_not_exists;
+use anyhow::{bail, Context, Result};
+use std::io;
+use std::path::Path;
+
+macro_rules! assign_multiline {
+    ($history:expr, $values:expr, $($field:ident),+ $(,)?) => {{
+        let mut values = $values.into_iter();
+        $(
+            $history.$field = values
+                .next()
+                .expect("validated multiline report returned too few series");
+        )+
+        debug_assert!(values.next().is_none());
+    }};
+}
+
+#[derive(Clone, Copy)]
+enum MissingMetric {
+    Required,
+    AlignedNan,
+    Inactive,
+}
 
 #[derive(Default, Debug)]
 pub struct MetaHistory {
@@ -166,97 +187,153 @@ impl MetaHistory {
             .push(temporal_attn_last_weight);
     }
 
-    /// Load meta history from existing reports at the given episode
-    pub fn load_from_episode(&mut self, episode: usize, gens_path: &str) {
-        let base_dir = format!("{gens_path}/{}", episode);
-        let load_simple = |path: &str| -> Vec<f64> {
-            read_report(path)
-                .ok()
-                .map(|r| match r.kind {
-                    ReportKind::Simple { values, .. } => {
-                        values.into_iter().map(|v| v as f64).collect()
-                    }
-                    _ => vec![],
-                })
-                .unwrap_or_default()
+    /// Load a complete, schema-validated snapshot before mutating this history.
+    pub fn load_from_episode(&mut self, episode: usize, gens_path: &str) -> Result<()> {
+        let base_dir = Path::new(gens_path).join(episode.to_string());
+        let expected = episode
+            .checked_add(1)
+            .context("meta history episode length overflowed")?;
+        let mut loaded = Self::default();
+
+        loaded.final_assets = load_simple(&base_dir, "final_assets", expected, true)?;
+        loaded.cumulative_reward = load_simple(&base_dir, "cumulative_reward", expected, true)?;
+        loaded.outperformance = load_simple(&base_dir, "outperformance", expected, true)?;
+        loaded.total_commissions = load_simple(&base_dir, "total_commissions", expected, true)?;
+        loaded.policy_loss = load_simple(&base_dir, "policy_loss", expected, true)?;
+        loaded.value_loss = load_simple(&base_dir, "value_loss", expected, true)?;
+        loaded.explained_var = load_simple(&base_dir, "explained_var", expected, true)?;
+        loaded.actor_grad_norm = load_simple(&base_dir, "actor_grad_norm", expected, true)?;
+        loaded.critic_grad_norm = load_simple(&base_dir, "critic_grad_norm", expected, true)?;
+        // Validate historical inactive diagnostics if present, but do not carry them
+        // forward: no current recorder appends to these fields, so retaining a
+        // finite-length vector would create a stale, unresumable report later.
+        let _ = load_simple_if_present(&base_dir, "logit_scale", expected)?;
+        loaded.logit_scale = Vec::new();
+        loaded.clip_gap = load_simple(&base_dir, "clip_gap", expected, false)?;
+        loaded.approx_kl = load_simple(&base_dir, "approx_kl", expected, true)?;
+
+        loaded.clip_fraction = match load_simple_if_present(&base_dir, "clip_fraction", expected)? {
+            Some(values) => values,
+            None => load_simple_if_present(&base_dir, "spo_bound_fraction", expected)?
+                .unwrap_or_else(|| missing_history(expected)),
         };
-        let load_multiline = |path: &str, label: &str| -> Vec<f64> {
-            read_report(path)
-                .ok()
-                .map(|r| match r.kind {
-                    ReportKind::MultiLine { series } => series
-                        .into_iter()
-                        .find(|s| s.label == label)
-                        .map(|s| s.values.into_iter().map(|v| v as f64).collect())
-                        .unwrap_or_default(),
-                    _ => vec![],
-                })
-                .unwrap_or_default()
-        };
 
-        self.final_assets = load_simple(&format!("{base_dir}/final_assets.report.bin"));
-        self.cumulative_reward = load_simple(&format!("{base_dir}/cumulative_reward.report.bin"));
-        self.outperformance = load_simple(&format!("{base_dir}/outperformance.report.bin"));
-        self.policy_loss = load_simple(&format!("{base_dir}/policy_loss.report.bin"));
-        self.value_loss = load_simple(&format!("{base_dir}/value_loss.report.bin"));
-        self.explained_var = load_simple(&format!("{base_dir}/explained_var.report.bin"));
-        self.actor_grad_norm = load_simple(&format!("{base_dir}/actor_grad_norm.report.bin"));
-        self.critic_grad_norm = load_simple(&format!("{base_dir}/critic_grad_norm.report.bin"));
-        self.total_commissions = load_simple(&format!("{base_dir}/total_commissions.report.bin"));
-        self.logit_scale = load_simple(&format!("{base_dir}/logit_scale.report.bin"));
-        self.clip_fraction = load_simple(&format!("{base_dir}/clip_fraction.report.bin"));
-        if self.clip_fraction.is_empty() {
-            self.clip_fraction = load_simple(&format!("{base_dir}/spo_bound_fraction.report.bin"));
-        }
-        self.clip_gap = load_simple(&format!("{base_dir}/clip_gap.report.bin"));
-
-        // MultiLine reports
-        let beta_policy_path = format!("{base_dir}/beta_policy.report.bin");
-        self.beta_alpha_mean = load_multiline(&beta_policy_path, "alpha_mean");
-        self.beta_action_mean = load_multiline(&beta_policy_path, "action_mean");
-        self.beta_beta_mean = load_multiline(&beta_policy_path, "beta_mean");
-        self.beta_concentration_mean = load_multiline(&beta_policy_path, "concentration");
-
-        let adv_path = format!("{base_dir}/advantage_stats_log.report.bin");
-        self.mean_advantage = load_multiline(&adv_path, "mean");
-        self.min_advantage = load_multiline(&adv_path, "min");
-        self.max_advantage = load_multiline(&adv_path, "max");
-
-        let temporal_path = format!("{base_dir}/temporal_embed_debug.report.bin");
-        self.temporal_tau = load_multiline(&temporal_path, "temporal_tau");
-        self.temporal_attn_entropy = load_multiline(&temporal_path, "temporal_entropy");
-        self.temporal_attn_max = load_multiline(&temporal_path, "temporal_attn_max");
-        self.temporal_attn_eff_len = load_multiline(&temporal_path, "temporal_eff_len");
-        self.temporal_attn_center = load_multiline(&temporal_path, "temporal_attn_center");
-        self.temporal_attn_last_weight = load_multiline(&temporal_path, "temporal_attn_last");
-
-        let entropy_path = format!("{base_dir}/policy_entropy.report.bin");
-        self.policy_entropy_mean = load_multiline(&entropy_path, "mean");
-        self.policy_entropy_min = load_multiline(&entropy_path, "min");
-        self.policy_entropy_max = load_multiline(&entropy_path, "max");
-
-        self.approx_kl = load_simple(&format!("{base_dir}/approx_kl.report.bin"));
-        let kl_lr_path = format!("{base_dir}/kl_lr.report.bin");
-        self.kl_lr_scale = load_multiline(&kl_lr_path, "lr_scale");
-        self.kl_lr_scale_next = load_multiline(&kl_lr_path, "scale_next");
-        self.kl_lr_ema = load_multiline(&kl_lr_path, "ema");
-        self.kl_lr_signal = load_multiline(&kl_lr_path, "signal");
-        let gate_path = format!("{base_dir}/gate_stats.report.bin");
-        self.gate_mean = load_multiline(&gate_path, "mean");
-        self.gate_std = load_multiline(&gate_path, "std");
-        let hl_gauss_path = format!("{base_dir}/hl_gauss_return_range.report.bin");
-        self.return_min = load_multiline(&hl_gauss_path, "return_min");
-        self.return_max = load_multiline(&hl_gauss_path, "return_max");
-        self.support_min = load_multiline(&hl_gauss_path, "support_min");
-        self.support_max = load_multiline(&hl_gauss_path, "support_max");
-        self.return_below_support_frac = load_multiline(&hl_gauss_path, "below_frac");
-        self.return_above_support_frac = load_multiline(&hl_gauss_path, "above_frac");
-
-        println!(
-            "Loaded meta history from episode {} ({} data points)",
-            episode,
-            self.final_assets.len()
+        assign_multiline!(
+            loaded,
+            load_multiline(
+                &base_dir,
+                "beta_policy",
+                &["alpha_mean", "action_mean", "beta_mean", "concentration"],
+                expected,
+                MissingMetric::Required,
+            )?,
+            beta_alpha_mean,
+            beta_action_mean,
+            beta_beta_mean,
+            beta_concentration_mean
         );
+        assign_multiline!(
+            loaded,
+            load_multiline(
+                &base_dir,
+                "advantage_stats_log",
+                &["mean", "min", "max"],
+                expected,
+                MissingMetric::Required,
+            )?,
+            mean_advantage,
+            min_advantage,
+            max_advantage
+        );
+        assign_multiline!(
+            loaded,
+            load_multiline(
+                &base_dir,
+                "temporal_embed_debug",
+                &[
+                    "temporal_tau",
+                    "temporal_entropy",
+                    "temporal_attn_max",
+                    "temporal_eff_len",
+                    "temporal_attn_center",
+                    "temporal_attn_last",
+                ],
+                expected,
+                MissingMetric::Inactive,
+            )?,
+            temporal_tau,
+            temporal_attn_entropy,
+            temporal_attn_max,
+            temporal_attn_eff_len,
+            temporal_attn_center,
+            temporal_attn_last_weight
+        );
+        assign_multiline!(
+            loaded,
+            load_multiline(
+                &base_dir,
+                "policy_entropy",
+                &["mean", "min", "max"],
+                expected,
+                MissingMetric::Required,
+            )?,
+            policy_entropy_mean,
+            policy_entropy_min,
+            policy_entropy_max
+        );
+        assign_multiline!(
+            loaded,
+            load_multiline(
+                &base_dir,
+                "kl_lr",
+                &["lr_scale", "scale_next", "ema", "signal"],
+                expected,
+                MissingMetric::AlignedNan,
+            )?,
+            kl_lr_scale,
+            kl_lr_scale_next,
+            kl_lr_ema,
+            kl_lr_signal
+        );
+        assign_multiline!(
+            loaded,
+            load_multiline(
+                &base_dir,
+                "gate_stats",
+                &["mean", "std"],
+                expected,
+                MissingMetric::Inactive,
+            )?,
+            gate_mean,
+            gate_std
+        );
+        assign_multiline!(
+            loaded,
+            load_multiline(
+                &base_dir,
+                "hl_gauss_return_range",
+                &[
+                    "return_min",
+                    "return_max",
+                    "support_min",
+                    "support_max",
+                    "below_frac",
+                    "above_frac",
+                ],
+                expected,
+                MissingMetric::AlignedNan,
+            )?,
+            return_min,
+            return_max,
+            support_min,
+            support_max,
+            return_below_support_frac,
+            return_above_support_frac
+        );
+
+        *self = loaded;
+        println!("Loaded meta history from episode {episode} ({expected} data points)");
+        Ok(())
     }
 
     fn report(
@@ -275,13 +352,14 @@ impl MetaHistory {
         }
     }
 
-    pub fn write_reports_default(&self, episode: usize) {
-        self.write_reports(episode, &format!("{TRAINING_PATH}/gens"));
+    pub fn write_reports_default(&self, episode: usize) -> Result<()> {
+        self.write_reports(episode, &format!("{TRAINING_PATH}/gens"))
     }
 
-    pub fn write_reports(&self, episode: usize, gens_path: &str) {
+    pub fn write_reports(&self, episode: usize, gens_path: &str) -> Result<()> {
         let base_dir = format!("{gens_path}/{}", episode);
-        create_folder_if_not_exists(&base_dir);
+        std::fs::create_dir_all(&base_dir)
+            .with_context(|| format!("failed creating meta report directory {base_dir}"))?;
         let simple = |vals: &[f64]| ReportKind::Simple {
             values: f64_to_f32(vals),
             ema_alpha: Some(0.05),
@@ -294,7 +372,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.final_assets),
             );
-            let _ = write_report(&format!("{base_dir}/final_assets.report.bin"), &r);
+            write_report(format!("{base_dir}/final_assets.report.bin"), &r)?;
         }
         if !self.cumulative_reward.is_empty() {
             let r = Self::report(
@@ -304,7 +382,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.cumulative_reward),
             );
-            let _ = write_report(&format!("{base_dir}/cumulative_reward.report.bin"), &r);
+            write_report(format!("{base_dir}/cumulative_reward.report.bin"), &r)?;
         }
         if !self.outperformance.is_empty() {
             let r = Self::report(
@@ -314,7 +392,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.outperformance),
             );
-            let _ = write_report(&format!("{base_dir}/outperformance.report.bin"), &r);
+            write_report(format!("{base_dir}/outperformance.report.bin"), &r)?;
         }
         if !self.policy_loss.is_empty() {
             let r = Self::report(
@@ -324,7 +402,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.policy_loss),
             );
-            let _ = write_report(&format!("{base_dir}/policy_loss.report.bin"), &r);
+            write_report(format!("{base_dir}/policy_loss.report.bin"), &r)?;
         }
         if !self.value_loss.is_empty() {
             let r = Self::report(
@@ -334,7 +412,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.value_loss),
             );
-            let _ = write_report(&format!("{base_dir}/value_loss.report.bin"), &r);
+            write_report(format!("{base_dir}/value_loss.report.bin"), &r)?;
         }
         if !self.explained_var.is_empty() {
             let r = Self::report(
@@ -344,7 +422,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.explained_var),
             );
-            let _ = write_report(&format!("{base_dir}/explained_var.report.bin"), &r);
+            write_report(format!("{base_dir}/explained_var.report.bin"), &r)?;
         }
         if !self.actor_grad_norm.is_empty() {
             let r = Self::report(
@@ -354,7 +432,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.actor_grad_norm),
             );
-            let _ = write_report(&format!("{base_dir}/actor_grad_norm.report.bin"), &r);
+            write_report(format!("{base_dir}/actor_grad_norm.report.bin"), &r)?;
         }
         if !self.critic_grad_norm.is_empty() {
             let r = Self::report(
@@ -364,7 +442,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.critic_grad_norm),
             );
-            let _ = write_report(&format!("{base_dir}/critic_grad_norm.report.bin"), &r);
+            write_report(format!("{base_dir}/critic_grad_norm.report.bin"), &r)?;
         }
         if !self.total_commissions.is_empty() {
             let r = Self::report(
@@ -374,7 +452,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.total_commissions),
             );
-            let _ = write_report(&format!("{base_dir}/total_commissions.report.bin"), &r);
+            write_report(format!("{base_dir}/total_commissions.report.bin"), &r)?;
         }
         if !self.beta_alpha_mean.is_empty() {
             let r = Self::report(
@@ -403,7 +481,7 @@ impl MetaHistory {
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/beta_policy.report.bin"), &r);
+            write_report(format!("{base_dir}/beta_policy.report.bin"), &r)?;
         }
         if !self.mean_advantage.is_empty() {
             let r = Self::report(
@@ -428,7 +506,7 @@ impl MetaHistory {
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/advantage_stats_log.report.bin"), &r);
+            write_report(format!("{base_dir}/advantage_stats_log.report.bin"), &r)?;
         }
         if !self.logit_scale.is_empty() {
             let r = Self::report(
@@ -438,7 +516,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.logit_scale),
             );
-            let _ = write_report(&format!("{base_dir}/logit_scale.report.bin"), &r);
+            write_report(format!("{base_dir}/logit_scale.report.bin"), &r)?;
         }
         if !self.clip_fraction.is_empty() {
             let r = Self::report(
@@ -448,7 +526,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.clip_fraction),
             );
-            let _ = write_report(&format!("{base_dir}/clip_fraction.report.bin"), &r);
+            write_report(format!("{base_dir}/clip_fraction.report.bin"), &r)?;
         }
         if !self.clip_gap.is_empty() {
             let r = Self::report(
@@ -458,7 +536,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.clip_gap),
             );
-            let _ = write_report(&format!("{base_dir}/clip_gap.report.bin"), &r);
+            write_report(format!("{base_dir}/clip_gap.report.bin"), &r)?;
         }
         if !self.approx_kl.is_empty() {
             let r = Self::report(
@@ -468,7 +546,7 @@ impl MetaHistory {
                 ScaleKind::Linear,
                 simple(&self.approx_kl),
             );
-            let _ = write_report(&format!("{base_dir}/approx_kl.report.bin"), &r);
+            write_report(format!("{base_dir}/approx_kl.report.bin"), &r)?;
         }
         if !self.kl_lr_scale.is_empty() {
             let r = Self::report(
@@ -497,7 +575,7 @@ impl MetaHistory {
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/kl_lr.report.bin"), &r);
+            write_report(format!("{base_dir}/kl_lr.report.bin"), &r)?;
         }
         if !self.policy_entropy_mean.is_empty() {
             let r = Self::report(
@@ -522,7 +600,7 @@ impl MetaHistory {
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/policy_entropy.report.bin"), &r);
+            write_report(format!("{base_dir}/policy_entropy.report.bin"), &r)?;
         }
         if !self.temporal_tau.is_empty() {
             let r = Self::report(
@@ -559,7 +637,7 @@ impl MetaHistory {
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/temporal_embed_debug.report.bin"), &r);
+            write_report(format!("{base_dir}/temporal_embed_debug.report.bin"), &r)?;
         }
         if !self.gate_mean.is_empty() {
             let r = Self::report(
@@ -580,7 +658,7 @@ impl MetaHistory {
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/gate_stats.report.bin"), &r);
+            write_report(format!("{base_dir}/gate_stats.report.bin"), &r)?;
         }
         if !self.return_min.is_empty() {
             let r = Self::report(
@@ -617,11 +695,313 @@ impl MetaHistory {
                     ],
                 },
             );
-            let _ = write_report(&format!("{base_dir}/hl_gauss_return_range.report.bin"), &r);
+            write_report(format!("{base_dir}/hl_gauss_return_range.report.bin"), &r)?;
         }
+        Ok(())
     }
 }
 
 fn f64_to_f32(values: &[f64]) -> Vec<f32> {
     values.iter().map(|v| *v as f32).collect()
+}
+
+fn load_simple(base_dir: &Path, base: &str, expected: usize, required: bool) -> Result<Vec<f64>> {
+    match load_simple_if_present(base_dir, base, expected)? {
+        Some(values) => Ok(values),
+        None if required => bail!(
+            "required meta history report is missing: {}",
+            report_path(base_dir, base).display()
+        ),
+        None => Ok(missing_history(expected)),
+    }
+}
+
+fn load_simple_if_present(
+    base_dir: &Path,
+    base: &str,
+    expected: usize,
+) -> Result<Option<Vec<f64>>> {
+    let path = report_path(base_dir, base);
+    let report = match read_report(&path) {
+        Ok(report) => report,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed reading meta history {}", path.display()))
+        }
+    };
+    let ReportKind::Simple { values, .. } = report.kind else {
+        bail!("meta history {} is not a simple report", path.display());
+    };
+    validate_history_len(&path, expected, values.len())?;
+    Ok(Some(values.into_iter().map(f64::from).collect()))
+}
+
+fn load_multiline(
+    base_dir: &Path,
+    base: &str,
+    labels: &[&str],
+    expected: usize,
+    missing: MissingMetric,
+) -> Result<Vec<Vec<f64>>> {
+    let path = report_path(base_dir, base);
+    let report = match read_report(&path) {
+        Ok(report) => report,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match missing {
+            MissingMetric::Required => {
+                bail!(
+                    "required meta history report is missing: {}",
+                    path.display()
+                )
+            }
+            MissingMetric::AlignedNan => {
+                return Ok(labels.iter().map(|_| missing_history(expected)).collect())
+            }
+            MissingMetric::Inactive => return Ok(labels.iter().map(|_| Vec::new()).collect()),
+        },
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed reading meta history {}", path.display()))
+        }
+    };
+    let ReportKind::MultiLine { series } = report.kind else {
+        bail!("meta history {} is not a multiline report", path.display());
+    };
+    let mut seen = std::collections::HashSet::new();
+    for item in &series {
+        if !seen.insert(item.label.as_str()) {
+            bail!(
+                "meta history {} contains duplicate series {:?}",
+                path.display(),
+                item.label
+            );
+        }
+    }
+    let expected_labels = labels
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if series.len() != labels.len()
+        || series
+            .iter()
+            .any(|item| !expected_labels.contains(item.label.as_str()))
+    {
+        bail!(
+            "meta history {} has an unexpected multiline schema",
+            path.display()
+        );
+    }
+    let values = labels
+        .iter()
+        .map(|label| {
+            let item = series
+                .iter()
+                .find(|item| item.label == *label)
+                .with_context(|| {
+                    format!(
+                        "meta history {} is missing series {label:?}",
+                        path.display()
+                    )
+                })?;
+            validate_history_len(&path, expected, item.values.len())?;
+            Ok(item.values.iter().copied().map(f64::from).collect())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if matches!(missing, MissingMetric::Inactive) {
+        return Ok(labels.iter().map(|_| Vec::new()).collect());
+    }
+    Ok(values)
+}
+
+fn validate_history_len(path: &Path, expected: usize, actual: usize) -> Result<()> {
+    if actual != expected {
+        bail!(
+            "meta history {} has {actual} values; expected {expected}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn report_path(base_dir: &Path, base: &str) -> std::path::PathBuf {
+    base_dir.join(format!("{base}.report.bin"))
+}
+
+fn missing_history(expected: usize) -> Vec<f64> {
+    vec![f64::NAN; expected]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::report::RL_META_REPORT_BASES;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "trading-bot-meta-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn populated_history(len: usize) -> MetaHistory {
+        let mut history = MetaHistory::default();
+        macro_rules! fill {
+            ($($field:ident),+ $(,)?) => {
+                $(history.$field = vec![1.0; len];)+
+            };
+        }
+        fill!(
+            final_assets,
+            cumulative_reward,
+            outperformance,
+            policy_loss,
+            value_loss,
+            explained_var,
+            actor_grad_norm,
+            critic_grad_norm,
+            total_commissions,
+            beta_alpha_mean,
+            beta_action_mean,
+            beta_beta_mean,
+            beta_concentration_mean,
+            mean_advantage,
+            min_advantage,
+            max_advantage,
+            logit_scale,
+            clip_fraction,
+            clip_gap,
+            temporal_tau,
+            temporal_attn_entropy,
+            temporal_attn_max,
+            temporal_attn_eff_len,
+            temporal_attn_center,
+            temporal_attn_last_weight,
+            policy_entropy_mean,
+            policy_entropy_min,
+            policy_entropy_max,
+            approx_kl,
+            kl_lr_scale,
+            kl_lr_scale_next,
+            kl_lr_ema,
+            kl_lr_signal,
+            gate_mean,
+            gate_std,
+            return_min,
+            return_max,
+            support_min,
+            support_max,
+            return_below_support_frac,
+            return_above_support_frac,
+        );
+        history
+    }
+
+    #[test]
+    fn produced_meta_reports_match_the_tui_registry() {
+        let root = temp_dir("registry");
+        populated_history(1)
+            .write_reports(0, root.to_str().unwrap())
+            .unwrap();
+
+        let mut produced = fs::read_dir(root.join("0"))
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".report.bin")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        produced.sort();
+        let mut registered = RL_META_REPORT_BASES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        registered.sort();
+        assert_eq!(produced, registered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_rejects_corruption_without_partially_mutating_history() {
+        let root = temp_dir("corrupt");
+        populated_history(2)
+            .write_reports(1, root.to_str().unwrap())
+            .unwrap();
+        let corrupt = Report {
+            title: "Policy Loss".to_owned(),
+            x_label: None,
+            y_label: None,
+            scale: ScaleKind::Linear,
+            kind: ReportKind::Simple {
+                values: vec![1.0],
+                ema_alpha: None,
+            },
+        };
+        write_report(root.join("1/policy_loss.report.bin"), &corrupt).unwrap();
+
+        let mut destination = MetaHistory::default();
+        destination.final_assets = vec![99.0];
+        let error = destination
+            .load_from_episode(1, root.to_str().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("expected 2"));
+        assert_eq!(destination.final_assets, vec![99.0]);
+        assert!(destination.policy_loss.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_aligns_missing_optional_metrics_with_nan_placeholders() {
+        let root = temp_dir("optional");
+        populated_history(2)
+            .write_reports(1, root.to_str().unwrap())
+            .unwrap();
+        for optional in [
+            "logit_scale",
+            "clip_fraction",
+            "clip_gap",
+            "temporal_embed_debug",
+            "kl_lr",
+            "gate_stats",
+            "hl_gauss_return_range",
+        ] {
+            fs::remove_file(root.join(format!("1/{optional}.report.bin"))).unwrap();
+        }
+
+        let mut loaded = MetaHistory::default();
+        loaded.load_from_episode(1, root.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.final_assets, vec![1.0, 1.0]);
+        assert_eq!(loaded.clip_gap.len(), 2);
+        assert!(loaded.clip_gap.iter().all(|value| value.is_nan()));
+        assert!(loaded.logit_scale.is_empty());
+        assert!(loaded.temporal_tau.is_empty());
+        assert!(loaded.gate_mean.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_rejects_a_missing_established_metric() {
+        let root = temp_dir("missing-required");
+        populated_history(2)
+            .write_reports(1, root.to_str().unwrap())
+            .unwrap();
+        fs::remove_file(root.join("1/policy_loss.report.bin")).unwrap();
+
+        let error = MetaHistory::default()
+            .load_from_episode(1, root.to_str().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("policy_loss.report.bin"));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

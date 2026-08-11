@@ -222,7 +222,7 @@ impl ChartViewer {
         use std::collections::HashMap;
         use std::time::SystemTime;
 
-        let selected_title = self.selected_report_title();
+        let selected_path = self.selected_report_path();
         self.nodes.clear();
         self.root_indices.clear();
         self.expanded.clear();
@@ -249,98 +249,35 @@ impl ChartViewer {
                     .and_then(|m| m.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
 
-                // Extract episode number, ticker, and chart name from report path
-                // Expected: gens/123/chart.report.bin or gens/123/TICKER/chart.report.bin
-                let parent = path.parent();
                 let chart_name =
                     report_title_from_path(path).unwrap_or_else(|| chart_name_from_path(path));
                 let chart_name = normalize_title(&chart_name);
-
-                let (episode_num, ticker) = if let Some(parent) = parent {
-                    if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
-                        if let Ok(ep) = parent_name.parse::<usize>() {
-                            (Some(ep), None)
-                        } else if parent_name == "candle_snapshots" {
-                            candle_snapshot_charts.push((
-                                path.clone(),
-                                chart_name.clone(),
-                                modified,
-                            ));
-                            (None, Some("candle snapshots".to_string()))
-                        } else if parent_name == "samples" {
-                            let chart_parent = parent.parent();
-                            if let Some(chart_parent) = chart_parent {
-                                if let Some(ep_name) =
-                                    chart_parent.file_name().and_then(|n| n.to_str())
-                                {
-                                    if let Ok(ep) = ep_name.parse::<usize>() {
-                                        if let Some((sample_key, chart_name)) =
-                                            pretrain_sample_parts(path, Some(ep))
-                                        {
-                                            pretrain_sample_groups
-                                                .entry(sample_key)
-                                                .or_insert_with(Vec::new)
-                                                .push((
-                                                    path.clone(),
-                                                    chart_name,
-                                                    Some(ep),
-                                                    modified,
-                                                ));
-                                            (Some(ep), Some("pretrain samples".to_string()))
-                                        } else {
-                                            (Some(ep), Some("pretrain samples".to_string()))
-                                        }
-                                    } else {
-                                        (None, None)
-                                    }
-                                } else {
-                                    (None, None)
-                                }
-                            } else {
-                                (None, None)
-                            }
-                        } else if is_ticker_name(parent_name) {
-                            let chart_parent = parent.parent();
-                            if let Some(chart_parent) = chart_parent {
-                                if let Some(ep_name) =
-                                    chart_parent.file_name().and_then(|n| n.to_str())
-                                {
-                                    if let Ok(ep) = ep_name.parse::<usize>() {
-                                        (Some(ep), Some(parent_name.to_string()))
-                                    } else {
-                                        (None, None)
-                                    }
-                                } else {
-                                    (None, None)
-                                }
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            (None, None)
-                        }
-                    } else {
-                        (None, None)
+                let Some((episode, relative_parent)) = report_generation_location(path) else {
+                    continue;
+                };
+                let episode_num = Some(episode);
+                if relative_parent
+                    .first()
+                    .is_some_and(|part| part == "candle_snapshots")
+                {
+                    candle_snapshot_charts.push((path.clone(), chart_name, modified));
+                } else if relative_parent
+                    .first()
+                    .is_some_and(|part| part == "samples")
+                {
+                    if let Some((sample_key, sample_chart_name)) =
+                        pretrain_sample_parts(path, episode_num)
+                    {
+                        pretrain_sample_groups.entry(sample_key).or_default().push((
+                            path.clone(),
+                            sample_chart_name,
+                            episode_num,
+                            modified,
+                        ));
                     }
                 } else {
-                    (None, None)
-                };
-
-                if episode_num.is_none() && ticker.is_none() {
-                    continue;
-                }
-                if ticker
-                    .as_deref()
-                    .is_some_and(|name| name != "pretrain samples" && name != "candle snapshots")
-                {
-                    ticker_groups.entry(ticker).or_insert_with(Vec::new).push((
-                        path.clone(),
-                        chart_name,
-                        episode_num,
-                        modified,
-                    ));
-                } else if ticker.is_none() {
-                    ticker_groups.entry(ticker).or_insert_with(Vec::new).push((
+                    let group = (!relative_parent.is_empty()).then(|| relative_parent.join(" / "));
+                    ticker_groups.entry(group).or_default().push((
                         path.clone(),
                         chart_name,
                         episode_num,
@@ -493,12 +430,15 @@ impl ChartViewer {
             }
         }
 
+        if let Some(path) = selected_path.as_ref() {
+            self.expand_ancestors_of_path(path);
+        }
         self.rebuild_flattened();
 
         if !self.flattened.is_empty() {
-            let selected = selected_title
-                .as_deref()
-                .and_then(|title| self.flattened_report_position(title))
+            let selected = selected_path
+                .as_ref()
+                .and_then(|path| self.flattened_report_position(path))
                 .unwrap_or(0);
             self.list_state.select(Some(selected));
             self.load_current_image();
@@ -507,22 +447,36 @@ impl ChartViewer {
         Ok(())
     }
 
-    fn selected_report_title(&self) -> Option<String> {
+    fn selected_report_path(&self) -> Option<PathBuf> {
         let selected = self.list_state.selected()?;
         let (node, _) = *self.flattened.get(selected)?;
         let ChartNode::Chart { path, .. } = self.nodes.get(node)? else {
             return None;
         };
-        load_report(path).ok().map(|report| report.title)
+        Some(path.clone())
     }
 
-    fn flattened_report_position(&self, title: &str) -> Option<usize> {
+    fn flattened_report_position(&self, selected_path: &PathBuf) -> Option<usize> {
         self.flattened.iter().position(|(node, _)| {
             let Some(ChartNode::Chart { path, .. }) = self.nodes.get(*node) else {
                 return false;
             };
-            load_report(path).is_ok_and(|report| report.title == title)
+            path == selected_path
         })
+    }
+
+    fn expand_ancestors_of_path(&mut self, selected_path: &PathBuf) {
+        let Some(chart_index) = self.nodes.iter().position(
+            |node| matches!(node, ChartNode::Chart { path, .. } if path == selected_path),
+        ) else {
+            return;
+        };
+        for (index, node) in self.nodes.iter().enumerate() {
+            if matches!(node, ChartNode::Folder { children, .. } if children.contains(&chart_index))
+            {
+                self.expanded[index] = true;
+            }
+        }
     }
 
     fn build_tree(&mut self, path: &PathBuf) -> Result<()> {
@@ -1123,19 +1077,30 @@ fn normalize_title(name: &str) -> String {
     parts.join(" ")
 }
 
-fn is_ticker_name(name: &str) -> bool {
-    let mut has_alpha = false;
-    for c in name.chars() {
-        if c.is_ascii_alphabetic() {
-            has_alpha = true;
-            if !c.is_ascii_uppercase() {
-                return false;
+fn report_generation_location(path: &PathBuf) -> Option<(usize, Vec<String>)> {
+    let report_parent = path.parent()?;
+    for generation_dir in report_parent.ancestors() {
+        let episode = generation_dir
+            .file_name()
+            .and_then(|name| name.to_str())?
+            .parse::<usize>()
+            .ok();
+        if let Some(episode) = episode {
+            if generation_dir
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == "gens")
+            {
+                let relative = report_parent.strip_prefix(generation_dir).ok()?;
+                let parts = relative
+                    .components()
+                    .filter_map(|component| component.as_os_str().to_str().map(str::to_owned))
+                    .collect();
+                return Some((episode, parts));
             }
-        } else if !c.is_ascii_digit() {
-            return false;
         }
     }
-    has_alpha
+    None
 }
 
 fn report_title_from_path(path: &PathBuf) -> Option<String> {
@@ -1215,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_refresh_preserves_selected_report_title() {
+    fn meta_refresh_preserves_selected_report_path() {
         let root = std::env::temp_dir().join(format!(
             "chart-viewer-refresh-{}-{}",
             std::process::id(),
@@ -1234,7 +1199,7 @@ mod tests {
         let mut viewer = ChartViewer::new();
         viewer.load_charts(&paths).unwrap();
         viewer.next();
-        let selected = viewer.selected_report_title().unwrap();
+        let selected = viewer.selected_report_path().unwrap();
 
         write_report(
             &generation,
@@ -1248,11 +1213,103 @@ mod tests {
         );
         viewer.load_charts(&paths).unwrap();
 
-        assert_eq!(
-            viewer.selected_report_title().as_deref(),
-            Some(selected.as_str())
-        );
+        assert_eq!(viewer.selected_report_path().as_ref(), Some(&selected));
         assert_eq!(viewer.current_series_count(), Some(2));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn structural_discovery_keeps_dotted_tickers_and_nested_planner_reports() {
+        let root = std::env::temp_dir().join(format!(
+            "chart-viewer-structure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let generation = root.join("gens/7");
+        let ticker = generation.join("BRK.B");
+        let planner = generation.join("planner_inference_test_bundle/planner_test_000_BRK.B");
+        fs::create_dir_all(&ticker).unwrap();
+        fs::create_dir_all(&planner).unwrap();
+        let paths = vec![
+            write_report(
+                &ticker,
+                "assets.report.bin",
+                &multiline("Duplicate", &["a"]),
+            ),
+            write_report(
+                &planner,
+                "planner_position.report.bin",
+                &multiline("Duplicate", &["p"]),
+            ),
+        ];
+
+        let mut viewer = ChartViewer::new();
+        viewer.load_charts(&paths).unwrap();
+        let discovered = viewer
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                ChartNode::Chart { path, .. } => Some(path),
+                ChartNode::Folder { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(paths.iter().all(|path| discovered.contains(&path)));
+        assert!(viewer
+            .nodes
+            .iter()
+            .any(|node| matches!(node, ChartNode::Folder { name, .. } if name == "BRK.B")));
+        assert!(viewer.nodes.iter().any(|node| {
+            matches!(node, ChartNode::Folder { name, .. } if name.contains("planner_inference_test_bundle"))
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_restores_selected_child_by_path_and_expands_its_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "chart-viewer-child-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let generation = root.join("gens/4");
+        let left = generation.join("BRK.B");
+        let right = generation.join("RDS.A");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        let left_path = write_report(&left, "assets.report.bin", &multiline("Assets", &["a"]));
+        let right_path = write_report(&right, "assets.report.bin", &multiline("Assets", &["b"]));
+        let paths = vec![left_path, right_path.clone()];
+
+        let mut viewer = ChartViewer::new();
+        viewer.load_charts(&paths).unwrap();
+        let right_chart = viewer
+            .nodes
+            .iter()
+            .position(|node| matches!(node, ChartNode::Chart { path, .. } if path == &right_path))
+            .unwrap();
+        let right_folder = viewer
+            .nodes
+            .iter()
+            .position(|node| matches!(node, ChartNode::Folder { children, .. } if children.contains(&right_chart)))
+            .unwrap();
+        viewer.expanded[right_folder] = true;
+        viewer.rebuild_flattened();
+        let selected = viewer
+            .flattened
+            .iter()
+            .position(|(node, _)| *node == right_chart)
+            .unwrap();
+        viewer.list_state.select(Some(selected));
+
+        viewer.load_charts(&paths).unwrap();
+        assert_eq!(viewer.selected_report_path().as_ref(), Some(&right_path));
+        assert!(viewer.expanded.iter().copied().any(|expanded| expanded));
         fs::remove_dir_all(root).unwrap();
     }
 }

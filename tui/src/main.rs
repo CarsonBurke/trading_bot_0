@@ -7,6 +7,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use serde::Deserialize;
 use shared::paths::{RUNS_PATH, WEIGHTS_PATH};
+use shared::report::RL_META_REPORT_BASES;
 use shared::run_dir::RunDir;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -383,9 +384,10 @@ fn planner_generation_visible(
         .ok()
         .is_some_and(|owner| {
             owner.update == generation_number
-                && committed_updates
+                && (committed_updates
                     .get(&owner.run_lineage_id)
                     .is_some_and(|committed| generation_number <= *committed)
+                    || latest_complete_planner_inference_bundle(generation).is_some())
         })
 }
 
@@ -403,10 +405,12 @@ impl App {
     }
 
     fn new() -> Result<Self> {
-        let mut inference_browser = InferenceBrowserState::new();
-        inference_browser.load_inferences()?;
-
         let process_manager = ProcessManagerState::new();
+        let mut inference_browser = InferenceBrowserState::new();
+        if let Some(run) = &process_manager.active_run {
+            inference_browser.infer_path = run.root.join("inference");
+        }
+        inference_browser.load_inferences()?;
         let mut generation_browser = GenerationBrowserState::new();
         if let Some(run) = &process_manager.active_run {
             generation_browser.gens_path = run.gens.clone();
@@ -456,7 +460,7 @@ impl App {
         let planner_committed_updates = planner_committed_updates(&gens_path);
 
         // Meta chart base names (episode-level charts without ticker)
-        let meta_chart_bases = vec![
+        let mut meta_chart_bases = vec![
             "assets",
             "reward",
             "normalized_reward",
@@ -559,6 +563,9 @@ impl App {
             "planner_inference_action",
             "planner_inference_commissions",
         ];
+        meta_chart_bases.extend_from_slice(RL_META_REPORT_BASES);
+        meta_chart_bases.sort_unstable();
+        meta_chart_bases.dedup();
 
         // Ticker-specific chart base names
         let ticker_chart_bases = vec![
@@ -901,6 +908,7 @@ impl App {
     fn sync_gens_path(&mut self) {
         if let Some(run) = &self.process_manager.active_run {
             self.generation_browser.gens_path = run.gens.clone();
+            self.inference_browser.infer_path = run.root.join("inference");
         }
     }
 
@@ -966,16 +974,7 @@ impl App {
     }
 
     fn switch_to_run(&mut self, name: &str) -> Result<()> {
-        let root = std::path::Path::new(RUNS_PATH).join(name);
-        let gens = root.join("gens");
-        let weights = root.join("weights");
-        let log_file = root.join("training.log");
-        let run = RunDir {
-            root,
-            gens,
-            weights,
-            log_file,
-        };
+        let run = RunDir::named(RUNS_PATH, name)?;
         let is_live = self
             .process_manager
             .live_run()
@@ -1021,12 +1020,15 @@ impl App {
         } else {
             format!("{}/{}", WEIGHTS_PATH, weights)
         };
-        self.process_manager.start_inference(
+        let result = self.process_manager.start_inference(
             weights_path,
             ticker,
             episodes.unwrap_or(10),
             self.training_model_size.clone(),
-        )
+        );
+        self.sync_gens_path();
+        self.inference_browser.load_inferences()?;
+        result
     }
 
     fn stop_training(&mut self) -> Result<()> {
@@ -1195,6 +1197,33 @@ mod planner_inference_discovery_tests {
         assert!(!planner_generation_visible(&generation, 2, &unrelated));
         fs::remove_file(generation.join(".planner-report-generation")).unwrap();
         assert!(planner_generation_visible(&generation, 2, &committed_one));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_inference_only_generation_is_visible_without_training_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-planner-inference-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let generation = root.join("1");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(
+            generation.join(".planner-report-generation"),
+            br#"{"run_lineage_id":"run-a","update":1}"#,
+        )
+        .unwrap();
+        complete_bundle(&generation, "planner_inference_test_fresh");
+
+        assert!(planner_generation_visible(
+            &generation,
+            1,
+            &std::collections::HashMap::new()
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 }

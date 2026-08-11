@@ -95,6 +95,18 @@ impl Env {
     fn execute_step_core(&mut self, actions: &[f64]) -> StepCoreResult {
         let absolute_step = self.episode_start_offset + self.step;
         let next_absolute_step = absolute_step + 1;
+        if self.record_history_io && self.episode % 5 == 0 {
+            if self.episode_history.observation_tickers.is_empty() {
+                self.episode_history.observation_tickers = self
+                    .ticker_perm
+                    .iter()
+                    .map(|&real_index| self.tickers[real_index].clone())
+                    .collect();
+            }
+            self.episode_history
+                .static_observations
+                .push(self.build_static_obs_array(absolute_step).to_vec());
+        }
         self.account.update_total(&self.prices, absolute_step);
 
         for ema in &mut self.trade_activity_ema {

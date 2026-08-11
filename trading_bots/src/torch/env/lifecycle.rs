@@ -15,7 +15,6 @@ use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::constants::{ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, STEPS_PER_EPISODE},
     types::Account,
-    utils::create_folder_if_not_exists,
 };
 
 impl Env {
@@ -167,6 +166,49 @@ impl Env {
             format!("{:.2}%", outperformance).yellow()
         };
 
+        let recorded_history = if self.record_history_io {
+            self.meta_history
+                .record(&self.episode_history, outperformance);
+            let report_result = if let Some(ref gens_path) = self.gens_path {
+                self.episode_history.record_to_path(
+                    gens_path,
+                    self.episode,
+                    &self.tickers,
+                    &self.prices,
+                    history_start_offset,
+                )
+            } else {
+                self.episode_history.record(
+                    self.episode,
+                    &self.tickers,
+                    &self.prices,
+                    history_start_offset,
+                )
+            }
+            .and_then(|()| {
+                if self.episode % 5 != 0 {
+                    return Ok(());
+                }
+                if let Some(ref gens_path) = self.gens_path {
+                    self.meta_history.write_reports(self.episode, gens_path)
+                } else {
+                    self.meta_history.write_reports_default(self.episode)
+                }
+            });
+            match report_result {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!(
+                        "failed persisting reports for episode {} in env {}: {error:#}",
+                        self.episode, self.env_id
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
         println!(
             "{} {} [{}] - Total Assets: {} ({}) cumulative reward {:.2} | Index: {} | Outperformance: {} | Commissions: {} | tickers {:?} time {:.2}s {}",
             "Episode".bright_blue(),
@@ -180,40 +222,11 @@ impl Env {
             format!("${:.2}", self.episode_history.total_commissions).yellow(),
             self.tickers,
             Instant::now().duration_since(self.episode_start).as_secs_f32(),
-            match self.record_history_io {
+            match recorded_history {
                 true => "| recorded history",
                 false => "",
             }
         );
-
-        if self.record_history_io {
-            if let Some(ref gp) = self.gens_path {
-                self.episode_history.record_to_path(
-                    gp,
-                    self.episode,
-                    &self.tickers,
-                    &self.prices,
-                    history_start_offset,
-                );
-            } else {
-                self.episode_history.record(
-                    self.episode,
-                    &self.tickers,
-                    &self.prices,
-                    history_start_offset,
-                );
-            }
-            self.meta_history
-                .record(&self.episode_history, outperformance);
-
-            if self.episode % 5 == 0 {
-                if let Some(ref gp) = self.gens_path {
-                    self.meta_history.write_reports(self.episode, gp);
-                } else {
-                    self.meta_history.write_reports_default(self.episode);
-                }
-            }
-        }
 
         self.episode_start = Instant::now();
         self.episode += 1;
@@ -342,17 +355,18 @@ impl Env {
         self.ticker_perm.shuffle(&mut rng);
     }
 
-    pub fn record_inference(&self, episode: usize) {
-        let infer_dir = shared::paths::INFER_PATH;
-        create_folder_if_not_exists(&infer_dir.to_string());
-
+    pub fn record_inference_to(
+        &self,
+        infer_dir: &std::path::Path,
+        episode: usize,
+    ) -> anyhow::Result<()> {
         self.episode_history.record_to_path(
-            infer_dir,
+            infer_dir.to_string_lossy().as_ref(),
             episode,
             &self.tickers,
             &self.prices,
             self.episode_start_offset + 1,
-        );
+        )
     }
 }
 
