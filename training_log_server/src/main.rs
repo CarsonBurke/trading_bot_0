@@ -170,14 +170,12 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
     if path.starts_with("/tail") {
         let requested_lines =
             parse_query_usize(&path, "lines").unwrap_or(config.default_tail_lines);
-        if requested_lines > MAX_TAIL_LINES {
-            return write_response(
-                &mut stream,
-                400,
-                "Bad Request",
-                &format!("lines must be at most {MAX_TAIL_LINES}\n"),
-            );
-        }
+        let requested_lines = match validate_tail_lines(requested_lines) {
+            Ok(lines) => lines,
+            Err(message) => {
+                return write_response(&mut stream, 400, "Bad Request", &format!("{message}\n"));
+            }
+        };
         return match read_tail_lines(&config.log_path, requested_lines) {
             Ok(content) => write_response(&mut stream, 200, "OK", &content),
             Err(err) => write_response(
@@ -273,6 +271,14 @@ fn parse_query_usize(path: &str, key: &str) -> Option<usize> {
     None
 }
 
+fn validate_tail_lines(lines: usize) -> Result<usize, String> {
+    if lines <= MAX_TAIL_LINES {
+        Ok(lines)
+    } else {
+        Err(format!("lines must be at most {MAX_TAIL_LINES}"))
+    }
+}
+
 fn read_tail_lines(path: &PathBuf, lines: usize) -> io::Result<String> {
     if lines == 0 {
         return Ok(String::new());
@@ -347,10 +353,7 @@ mod tests {
 
     #[test]
     fn tail_line_limit_bounds_memory_use() {
-        assert!(MAX_TAIL_LINES < usize::MAX);
-        assert_eq!(
-            parse_query_usize("/tail?lines=100000", "lines"),
-            Some(MAX_TAIL_LINES)
-        );
+        assert_eq!(validate_tail_lines(MAX_TAIL_LINES), Ok(MAX_TAIL_LINES));
+        assert!(validate_tail_lines(MAX_TAIL_LINES + 1).is_err());
     }
 }
