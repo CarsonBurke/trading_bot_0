@@ -161,6 +161,27 @@ mod tests {
     }
 
     #[test]
+    fn consumed_frame_can_age_out_while_healthy_feed_waits_for_next_bar() {
+        let now = Instant::now();
+        let mut state = LiveMarketState::new(vec!["A".into()], 10_000.0);
+        state
+            .record_realtime_bar(0, bar_time(100, 5), 10.0, now)
+            .unwrap();
+        state
+            .record_realtime_bar(0, bar_time(101, 5), 11.0, now)
+            .unwrap();
+
+        assert!(state
+            .actionable_prices(now, bar_time(101, 31), Duration::from_secs(30), Some(1),)
+            .unwrap()
+            .is_none());
+        assert!(state
+            .actionable_prices(now, bar_time(101, 31), Duration::from_secs(30), None)
+            .unwrap_err()
+            .contains("model-observation frame is stale"));
+    }
+
+    #[test]
     fn post_fill_feedback_updates_the_next_observation_state() {
         let mut state = LiveMarketState::new(vec!["TEST".into()], 10_000.0);
         state.prices[0].extend([100.0, 101.0, 102.0]);
@@ -467,6 +488,9 @@ impl LiveMarketState {
         let Some(bucket) = self.committed_bucket else {
             return Ok(None);
         };
+        if last_acted_sequence.is_some_and(|sequence| self.committed_sequence <= sequence) {
+            return Ok(None);
+        }
         let completed_at = bucket
             .checked_add(1)
             .and_then(|next| next.checked_mul(300))
@@ -474,9 +498,6 @@ impl LiveMarketState {
         let completed_age = wall_now.unix_timestamp() - completed_at;
         if completed_age > max_feed_age.as_secs() as i64 {
             return Err("completed model-observation frame is stale".to_string());
-        }
-        if last_acted_sequence.is_some_and(|sequence| self.committed_sequence <= sequence) {
-            return Ok(None);
         }
         let prices = self
             .latest_execution_prices

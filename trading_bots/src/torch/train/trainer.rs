@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use tch::{autocast, nn, Device, Kind, Tensor};
 
+use crate::torch::action_space::BETA_SAMPLE_EPS;
 use crate::torch::constants::{
     ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT,
 };
@@ -15,20 +16,23 @@ use crate::torch::model::{
     ModelOutput, ModelVariant, StreamState, TradingModel, TradingModelConfig,
 };
 use crate::torch::optim::muon::{newton_schulz_polynomial_bits, Muon, MuonConfig};
-use crate::torch::value::hl_gauss::HlGaussBins;
+use crate::torch::value::hl_gauss::{
+    HlGaussBins, DIRECT_SIGMA_RATIO, NUM_BINS, SYMLOG_SUPPORT_MAX, SYMLOG_SUPPORT_MIN,
+};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 use super::config::{
     CLIP_EPS_HIGH, CLIP_EPS_LOW, CRITIC_PRETRAIN_EPISODES, ENTROPY_COEF, GAE_GAMMA, GAE_LAMBDA,
     KL_LR_EMA_HALF_LIFE, KL_LR_MAX_SCALE, KL_LR_MIN_SCALE, KL_LR_TARGET, KL_STOP_MULTIPLIER,
     LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM, MUON_MOMENTUM_WARMUP_START,
-    MUON_MOMENTUM_WARMUP_STEPS, OPTIM_EPOCHS, POLICY_OBJECTIVE, TARGET_KL, USE_MUON,
+    MUON_MOMENTUM_WARMUP_STEPS, OPTIM_EPOCHS, PMPO_KL_COEF, PMPO_POS_TO_NEG_WEIGHT,
+    POLICY_OBJECTIVE, RET_PERC_FLOOR, RET_PERC_HI, RET_PERC_LO, TARGET_KL, USE_MUON,
     VALUE_LOSS_COEF,
 };
 use super::geometry::{minibatch_samples_from_total, rollout_geometry, RolloutGeometry};
 use super::optimizer_glue::{
     apply_lr_scale, grad_clip_groups, named_trainable_variables, GradClipGroups, KlLrController,
-    KlLrControllerState,
+    KlLrControllerState, ACTOR_GRAD_CLIP_PATTERNS, CRITIC_GRAD_CLIP_PATTERNS, KL_LR_SCALE_EXPONENT,
 };
 use super::update::PpoUpdateCudaGraph;
 
@@ -120,7 +124,7 @@ pub(super) struct Trainer {
     contract: PpoTrainingContract,
 }
 
-const PPO_CHECKPOINT_FORMAT_VERSION: u32 = 2;
+const PPO_CHECKPOINT_FORMAT_VERSION: u32 = 3;
 const PPO_CHECKPOINT_PHASE: &str = "ready-for-rollout";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -136,12 +140,43 @@ struct PpoTrainingContract {
     static_observations: usize,
     objective: String,
     rng_algorithm: String,
+    libtorch_runtime: String,
     cuda_graphs_requested: bool,
     torch_num_threads: i32,
     torch_num_interop_threads: i32,
     environment_semantics: String,
     optimizer: PpoOptimizerContract,
-    objective_semantics: Vec<u64>,
+    objective_semantics: PpoObjectiveContract,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PpoObjectiveContract {
+    gae_gamma: u64,
+    gae_lambda: u64,
+    clip_eps_low: u64,
+    clip_eps_high: u64,
+    target_kl: u64,
+    kl_stop_multiplier: u64,
+    value_loss_coef: u64,
+    entropy_coef: u64,
+    max_grad_norm: u64,
+    kl_lr_target: u64,
+    kl_lr_ema_half_life: u64,
+    kl_lr_min_scale: u64,
+    kl_lr_max_scale: u64,
+    kl_lr_scale_exponent: u64,
+    critic_pretrain_episodes: usize,
+    policy_objective: String,
+    pmpo_pos_to_neg_weight: u64,
+    pmpo_kl_coef: u64,
+    return_percentile_low: u64,
+    return_percentile_high: u64,
+    return_percentile_floor: u64,
+    beta_sample_epsilon: u64,
+    value_bins: i64,
+    value_support_min: u64,
+    value_support_max: u64,
+    value_sigma_ratio: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -168,6 +203,8 @@ struct PpoOptimizerContract {
     per_attention_output_head_ortho: bool,
     attention_head_dim: i64,
     cross_attention_head_dim: i64,
+    actor_grad_clip_patterns: Vec<String>,
+    critic_grad_clip_patterns: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -297,6 +334,7 @@ fn training_contract(
     torch_num_interop_threads: i32,
     optimizer: &MuonConfig,
 ) -> PpoTrainingContract {
+    let libtorch_runtime = include_str!("../../../../.pytorch-version").trim();
     PpoTrainingContract {
         model_variant: model_variant.as_str().to_owned(),
         device: format!("{device:?}"),
@@ -308,7 +346,10 @@ fn training_contract(
         price_context: PRICE_DELTAS_PER_TICKER,
         static_observations: STATIC_OBSERVATIONS,
         objective: "ppo".to_owned(),
-        rng_algorithm: "rand_chacha::ChaCha12Rng/0.9".to_owned(),
+        rng_algorithm: format!(
+            "libtorch::standard_gamma/{libtorch_runtime};rand_chacha::ChaCha12Rng/0.9"
+        ),
+        libtorch_runtime: libtorch_runtime.to_owned(),
         cuda_graphs_requested: device.is_cuda()
             && env::var("PPO_CUDA_GRAPHS").ok().as_deref() != Some("0"),
         torch_num_threads,
@@ -337,24 +378,47 @@ fn training_contract(
             per_attention_output_head_ortho: optimizer.per_attention_output_head_ortho,
             attention_head_dim: optimizer.attention_head_dim,
             cross_attention_head_dim: optimizer.cross_attention_head_dim,
+            actor_grad_clip_patterns: ACTOR_GRAD_CLIP_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
+            critic_grad_clip_patterns: CRITIC_GRAD_CLIP_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
         },
-        objective_semantics: vec![
-            GAE_GAMMA.to_bits(),
-            GAE_LAMBDA.to_bits(),
-            CLIP_EPS_LOW.to_bits(),
-            CLIP_EPS_HIGH.to_bits(),
-            TARGET_KL.to_bits(),
-            KL_STOP_MULTIPLIER.to_bits(),
-            VALUE_LOSS_COEF.to_bits(),
-            ENTROPY_COEF.to_bits(),
-            MAX_GRAD_NORM.to_bits(),
-            KL_LR_TARGET.to_bits(),
-            KL_LR_EMA_HALF_LIFE.to_bits(),
-            KL_LR_MIN_SCALE.to_bits(),
-            KL_LR_MAX_SCALE.to_bits(),
-            CRITIC_PRETRAIN_EPISODES as u64,
-            matches!(POLICY_OBJECTIVE, super::config::PolicyObjective::Ppo) as u64,
-        ],
+        objective_semantics: PpoObjectiveContract {
+            gae_gamma: GAE_GAMMA.to_bits(),
+            gae_lambda: GAE_LAMBDA.to_bits(),
+            clip_eps_low: CLIP_EPS_LOW.to_bits(),
+            clip_eps_high: CLIP_EPS_HIGH.to_bits(),
+            target_kl: TARGET_KL.to_bits(),
+            kl_stop_multiplier: KL_STOP_MULTIPLIER.to_bits(),
+            value_loss_coef: VALUE_LOSS_COEF.to_bits(),
+            entropy_coef: ENTROPY_COEF.to_bits(),
+            max_grad_norm: MAX_GRAD_NORM.to_bits(),
+            kl_lr_target: KL_LR_TARGET.to_bits(),
+            kl_lr_ema_half_life: KL_LR_EMA_HALF_LIFE.to_bits(),
+            kl_lr_min_scale: KL_LR_MIN_SCALE.to_bits(),
+            kl_lr_max_scale: KL_LR_MAX_SCALE.to_bits(),
+            kl_lr_scale_exponent: KL_LR_SCALE_EXPONENT.to_bits(),
+            critic_pretrain_episodes: CRITIC_PRETRAIN_EPISODES,
+            policy_objective: match POLICY_OBJECTIVE {
+                super::config::PolicyObjective::Ppo => "ppo",
+                super::config::PolicyObjective::Pmpo => "pmpo",
+            }
+            .to_owned(),
+            pmpo_pos_to_neg_weight: PMPO_POS_TO_NEG_WEIGHT.to_bits(),
+            pmpo_kl_coef: PMPO_KL_COEF.to_bits(),
+            return_percentile_low: RET_PERC_LO.to_bits(),
+            return_percentile_high: RET_PERC_HI.to_bits(),
+            return_percentile_floor: RET_PERC_FLOOR.to_bits(),
+            beta_sample_epsilon: BETA_SAMPLE_EPS.to_bits(),
+            value_bins: NUM_BINS,
+            value_support_min: SYMLOG_SUPPORT_MIN.to_bits(),
+            value_support_max: SYMLOG_SUPPORT_MAX.to_bits(),
+            value_sigma_ratio: DIRECT_SIGMA_RATIO.to_bits(),
+        },
     }
 }
 
@@ -514,7 +578,7 @@ fn save_ppo_checkpoint_bundle(
     vs.save(&weights_tmp)
         .with_context(|| format!("failed saving PPO weights {}", weights_tmp.display()))?;
     opt.save_state(&optimizer_tmp)?;
-    fs::write(&trajectory_tmp, env.snapshot().to_bytes()?)?;
+    fs::write(&trajectory_tmp, env.snapshot()?.to_bytes()?)?;
     let metadata = PpoCheckpointMetadata {
         format_version: PPO_CHECKPOINT_FORMAT_VERSION,
         phase: PPO_CHECKPOINT_PHASE.to_owned(),
@@ -967,6 +1031,51 @@ mod tests {
     // libtorch's generator is process-global. Keep tests which reseed it from
     // perturbing one another when Rust's test harness runs them concurrently.
     static TORCH_RNG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resume_contract_covers_runtime_and_effective_objective_constants() {
+        let contract = training_contract(
+            ModelVariant::UniformStream,
+            Device::Cpu,
+            RolloutGeometry {
+                nprocs: 1,
+                seq_len: 2,
+                ppo_chunk_len: 1,
+                total_samples: 2,
+            },
+            1,
+            1,
+            &ppo_muon_config(),
+        );
+
+        assert_eq!(contract.libtorch_runtime, "2.12.1+cu130");
+        assert!(contract.rng_algorithm.contains("libtorch::standard_gamma"));
+        assert_eq!(
+            contract.objective_semantics.return_percentile_low,
+            RET_PERC_LO.to_bits()
+        );
+        assert_eq!(
+            contract.objective_semantics.beta_sample_epsilon,
+            BETA_SAMPLE_EPS.to_bits()
+        );
+        assert_eq!(contract.objective_semantics.value_bins, NUM_BINS);
+        assert_eq!(
+            contract.objective_semantics.kl_lr_scale_exponent,
+            KL_LR_SCALE_EXPONENT.to_bits()
+        );
+        assert_eq!(
+            contract.optimizer.actor_grad_clip_patterns,
+            vec!["policy_concentration"]
+        );
+        assert_eq!(
+            contract.optimizer.critic_grad_clip_patterns,
+            vec!["value_proj", "next_return_head"]
+        );
+        assert_eq!(
+            contract.objective_semantics.value_sigma_ratio,
+            DIRECT_SIGMA_RATIO.to_bits()
+        );
+    }
 
     #[derive(Debug, Default, PartialEq, Eq)]
     struct InterruptionTrace {

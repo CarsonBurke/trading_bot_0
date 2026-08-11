@@ -179,7 +179,15 @@ pub fn refresh_historical_bars(
     client: &Client,
     ticker: &str,
 ) -> Result<Vec<historical::Bar>, HistoricalLoadError> {
-    get_historical_data_from_ibkr(client, ticker)?
+    refresh_historical_bars_at(client, ticker, OffsetDateTime::now_utc())
+}
+
+pub fn refresh_historical_bars_at(
+    client: &Client,
+    ticker: &str,
+    completed_before: OffsetDateTime,
+) -> Result<Vec<historical::Bar>, HistoricalLoadError> {
+    get_historical_data_from_ibkr_at(client, ticker, completed_before)?
         .map(|bars| insert_cache_entry(ticker, bars))
         .ok_or_else(|| HistoricalLoadError::Request {
             ticker: ticker.to_string(),
@@ -310,6 +318,14 @@ fn get_historical_data_from_ibkr(
     client: &Client,
     ticker: &str,
 ) -> Result<Option<Vec<historical::Bar>>, HistoricalLoadError> {
+    get_historical_data_from_ibkr_at(client, ticker, OffsetDateTime::now_utc())
+}
+
+fn get_historical_data_from_ibkr_at(
+    client: &Client,
+    ticker: &str,
+    completed_before: OffsetDateTime,
+) -> Result<Option<Vec<historical::Bar>>, HistoricalLoadError> {
     create_folder_if_not_exists(&files::DATA_PATH.to_string());
 
     println!("Downloading data for {ticker}");
@@ -319,7 +335,7 @@ fn get_historical_data_from_ibkr(
     let historical_data = client
         .historical_data(
             &contract,
-            Some(OffsetDateTime::now_utc()),
+            Some(completed_before),
             match data_path_kind() {
                 "data" => 356.days(),
                 "long_data" => 5.years(),
@@ -347,8 +363,7 @@ fn get_historical_data_from_ibkr(
             && b.high > 0.0
             && b.low > 0.0
             && b.close > 0.0
-            && b.date.unix_timestamp().saturating_add(300)
-                <= OffsetDateTime::now_utc().unix_timestamp()
+            && b.date.unix_timestamp().saturating_add(300) <= completed_before.unix_timestamp()
     });
     if bars.len() != before {
         eprintln!(

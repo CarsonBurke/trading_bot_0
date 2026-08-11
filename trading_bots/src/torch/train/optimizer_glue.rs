@@ -6,9 +6,9 @@ use super::config::{
     LEARNING_RATE, MUON_LR, MUON_MOMENTUM, MUON_MOMENTUM_WARMUP_START, MUON_MOMENTUM_WARMUP_STEPS,
 };
 
-const ACTOR_GRAD_CLIP_PATTERNS: &[&str] = &["policy_concentration"];
-const CRITIC_GRAD_CLIP_PATTERNS: &[&str] = &["value_proj", "next_return_head"];
-const KL_LR_SCALE_EXPONENT: f64 = 0.5;
+pub(crate) const ACTOR_GRAD_CLIP_PATTERNS: &[&str] = &["policy_concentration"];
+pub(crate) const CRITIC_GRAD_CLIP_PATTERNS: &[&str] = &["value_proj", "next_return_head"];
+pub(crate) const KL_LR_SCALE_EXPONENT: f64 = 0.5;
 
 pub(crate) struct GradClipGroups {
     pub(crate) actor: Vec<Tensor>,

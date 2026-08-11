@@ -2,6 +2,10 @@ use anyhow::{ensure, Context, Result};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::single::{load_market_data, EnvMarketData};
@@ -12,6 +16,7 @@ use crate::history::{
 };
 use crate::torch::constants::{ACTION_COUNT, ACTION_HISTORY_LEN, STEPS_PER_EPISODE, TICKERS_COUNT};
 use crate::types::Account;
+use shared::paths::DATA_PATH;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct EnvSnapshot {
@@ -178,6 +183,25 @@ pub(crate) mod tests {
         snapshot.episode_history.raw_actions.clear();
         assert!(snapshot.validate().is_err());
     }
+
+    #[test]
+    fn universe_fingerprint_covers_inactive_ticker_inputs() {
+        let data_path = std::env::temp_dir().join(format!(
+            "trading-bot-snapshot-fingerprint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&data_path).unwrap();
+        let eligible = vec!["ACTIVE".to_owned(), "FUTURE".to_owned()];
+        fs::write(data_path.join("ACTIVE.bin"), b"active").unwrap();
+        fs::write(data_path.join("FUTURE.bin"), b"future-v1").unwrap();
+        let before = fingerprint_training_inputs(&data_path, &eligible).unwrap();
+
+        fs::write(data_path.join("FUTURE.bin"), b"future-v2").unwrap();
+        let after = fingerprint_training_inputs(&data_path, &eligible).unwrap();
+
+        fs::remove_dir_all(&data_path).unwrap();
+        assert_ne!(before, after);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,7 +216,8 @@ pub(crate) struct ValidatedVecEnvSnapshot {
     markets: Vec<EnvMarketData>,
 }
 
-const ENV_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const ENV_SNAPSHOT_FORMAT_VERSION: u32 = 2;
+static UNIVERSE_FINGERPRINT: OnceLock<String> = OnceLock::new();
 
 fn update_str(context: &mut DigestContext, value: &str) {
     context.update(&(value.len() as u64).to_le_bytes());
@@ -221,12 +246,73 @@ fn finish_hex(context: DigestContext) -> String {
         .collect()
 }
 
-fn universe_fingerprint() -> String {
-    let mut context = DigestContext::new(&SHA256);
-    for ticker in cached_eligible_training_universe() {
-        update_str(&mut context, ticker);
+fn update_input_file(context: &mut DigestContext, path: &Path) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("training input has an invalid filename: {}", path.display()))?;
+    update_str(context, name);
+    match fs::read(path) {
+        Ok(bytes) => {
+            context.update(&[1]);
+            context.update(&(bytes.len() as u64).to_le_bytes());
+            context.update(&bytes);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => context.update(&[0]),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed reading training input {}", path.display()))
+        }
     }
-    finish_hex(context)
+    Ok(())
+}
+
+fn fingerprint_training_inputs(data_path: &Path, eligible: &[String]) -> Result<String> {
+    let mut context = DigestContext::new(&SHA256);
+    for ticker in eligible {
+        update_str(&mut context, ticker);
+        update_input_file(&mut context, &data_path.join(format!("{ticker}.bin")))?;
+        for provider in ["alphavantage", "finnhub", "fmp"] {
+            update_input_file(
+                &mut context,
+                &data_path.join(format!("{ticker}_earnings_{provider}.bin")),
+            )?;
+        }
+    }
+
+    let entries = fs::read_dir(data_path)
+        .with_context(|| {
+            format!(
+                "failed reading training data directory {}",
+                data_path.display()
+            )
+        })?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut macro_files = entries
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("macro_") && name.ends_with(".bin"))
+        })
+        .collect::<Vec<PathBuf>>();
+    macro_files.sort();
+    context.update(&(macro_files.len() as u64).to_le_bytes());
+    for path in macro_files {
+        update_input_file(&mut context, &path)?;
+    }
+    Ok(finish_hex(context))
+}
+
+fn universe_fingerprint() -> Result<String> {
+    if let Some(fingerprint) = UNIVERSE_FINGERPRINT.get() {
+        return Ok(fingerprint.clone());
+    }
+    let computed =
+        fingerprint_training_inputs(Path::new(DATA_PATH), cached_eligible_training_universe())?;
+    let _ = UNIVERSE_FINGERPRINT.set(computed.clone());
+    Ok(UNIVERSE_FINGERPRINT.get().cloned().unwrap_or(computed))
 }
 
 fn market_fingerprint(tickers: &[String], market: &EnvMarketData) -> String {
@@ -651,7 +737,7 @@ impl VecEnvSnapshot {
             snapshot.format_version
         );
         ensure!(
-            snapshot.universe_sha256 == universe_fingerprint(),
+            snapshot.universe_sha256 == universe_fingerprint()?,
             "eligible training universe changed since checkpoint"
         );
         ensure!(!snapshot.envs.is_empty(), "environment snapshot is empty");
@@ -707,12 +793,12 @@ impl VecEnvSnapshot {
 }
 
 impl VecEnv {
-    pub(crate) fn snapshot(&self) -> VecEnvSnapshot {
-        VecEnvSnapshot {
+    pub(crate) fn snapshot(&self) -> Result<VecEnvSnapshot> {
+        Ok(VecEnvSnapshot {
             format_version: ENV_SNAPSHOT_FORMAT_VERSION,
-            universe_sha256: universe_fingerprint(),
+            universe_sha256: universe_fingerprint()?,
             envs: self.envs.iter().map(Env::snapshot).collect(),
-        }
+        })
     }
 
     /// Apply a plan whose complete causal and immutable state was preflighted.

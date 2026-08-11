@@ -9,7 +9,7 @@ pub const SYMLOG_SUPPORT_MIN: f64 = -3.0;
 pub const SYMLOG_SUPPORT_MAX: f64 = 3.0;
 
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
-const SIGMA_RATIO: f64 = 0.5;
+pub(crate) const DIRECT_SIGMA_RATIO: f64 = 0.5;
 
 /// Half-width, in standard deviations, of the standardized-space support for the
 /// running-stats scheme. The support spans `[-K, K]` in z-units. K=5 leaves
@@ -87,7 +87,7 @@ pub struct HlGaussBins {
 
 impl HlGaussBins {
     pub fn new(log_min: f64, log_max: f64, num_bins: i64, device: tch::Device) -> Self {
-        Self::new_with_sigma_ratio(log_min, log_max, num_bins, SIGMA_RATIO, device)
+        Self::new_with_sigma_ratio(log_min, log_max, num_bins, DIRECT_SIGMA_RATIO, device)
     }
 
     pub fn new_with_sigma_ratio(

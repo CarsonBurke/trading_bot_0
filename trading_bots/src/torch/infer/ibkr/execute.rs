@@ -526,6 +526,7 @@ pub(super) fn execute_trades(
     actions: &[f64],
     current_prices: &[f64],
     account: &mut Account,
+    ensure_fresh: &mut impl FnMut() -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<TradeBatchOutcome, Box<dyn std::error::Error>> {
     if symbols.len() != actions.len() {
         return Err(invalid_input(format!(
@@ -540,6 +541,7 @@ pub(super) fn execute_trades(
     let sells = plan_trade_phase(actions, current_prices, account, TradeSide::Sell)?;
     let mut fills = Vec::new();
     for trade in &sells {
+        ensure_fresh()?;
         fills.push(submit_and_wait(
             client,
             account_id,
@@ -549,10 +551,12 @@ pub(super) fn execute_trades(
     }
 
     if !sells.is_empty() {
+        ensure_fresh()?;
         sync_account_from_ibkr(client, account_id, symbols, account)?;
         revalue_account(account, current_prices)?;
     }
 
+    ensure_fresh()?;
     let (post_sale_plan, buy_fill_ratio) =
         plan_target_weight_trades_with_fill_ratio(actions, current_prices, account)?;
     let buys = post_sale_plan
@@ -571,6 +575,7 @@ pub(super) fn execute_trades(
     }
 
     for trade in &buys {
+        ensure_fresh()?;
         fills.push(submit_and_wait(
             client,
             account_id,

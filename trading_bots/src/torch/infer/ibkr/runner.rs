@@ -18,7 +18,7 @@ use ibapi::{
 use tch::{Device, Kind, Tensor};
 
 use crate::constants::api;
-use crate::data::historical::refresh_historical_bars;
+use crate::data::historical::refresh_historical_bars_at;
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::infer::offline::{load_model, sample_actions};
 use crate::torch::model::ModelVariant;
@@ -28,6 +28,13 @@ use super::execute::execute_trades;
 use super::state::LiveMarketState;
 use super::status::print_status;
 use super::sync::{initialize_dedicated_account, sync_account_from_ibkr};
+
+const MAX_FEED_AGE: Duration = Duration::from_secs(30);
+const MAX_FEED_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+fn feed_poll_interval(requested_secs: u64) -> Duration {
+    Duration::from_secs(requested_secs).min(MAX_FEED_POLL_INTERVAL)
+}
 
 pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     weight_path: P,
@@ -50,7 +57,9 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     println!("Weight path: {:?}", weight_path.as_ref());
     println!("Account: {account}");
     println!("Symbols: {symbols:?}");
-    println!("Update interval: {update_interval_secs}s");
+    let poll_interval = feed_poll_interval(update_interval_secs);
+    println!("Requested update interval: {update_interval_secs}s");
+    println!("Effective feed poll interval: {}s", poll_interval.as_secs());
     println!("Max steps: {max_steps}");
 
     let client = Client::connect(api::CONNECTION_URL, 100)?;
@@ -62,16 +71,12 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 
     let device = Device::cuda_if_available();
     let (_vs, model) = load_model(weight_path, device, model_variant)?;
-    let state = Arc::new(Mutex::new(LiveMarketState::new(
-        symbols.clone(),
-        starting_cash,
-    )));
-    state.lock().unwrap().account = initial_account;
 
     let history_len = PRICE_DELTAS_PER_TICKER + 1;
+    let historical_cutoff = time::OffsetDateTime::now_utc();
     let historical = symbols
         .iter()
-        .map(|symbol| refresh_historical_bars(&client, symbol))
+        .map(|symbol| refresh_historical_bars_at(&client, symbol, historical_cutoff))
         .collect::<Result<Vec<_>, _>>()?;
     let reference_times = historical
         .first()
@@ -89,6 +94,11 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
         .iter()
         .map(|bar| bar.date)
         .collect::<Vec<_>>();
+    let state = Arc::new(Mutex::new(LiveMarketState::new(
+        symbols.clone(),
+        starting_cash,
+    )));
+    state.lock().unwrap().account = initial_account;
     {
         let mut state_guard = state.lock().unwrap();
         for (ticker_idx, bars) in historical.iter().enumerate() {
@@ -169,7 +179,6 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     let started_at = Instant::now();
     // Realtime bars arrive every five seconds. Keep feed health independent of
     // the policy cadence so a slow action interval cannot bless old data.
-    let max_feed_age = Duration::from_secs(30);
     let mut last_acted_sequence = None;
     let mut static_obs_gpu = Tensor::zeros([1, STATIC_OBSERVATIONS as i64], (Kind::Float, device));
     let mut full_obs_raw_gpu = Tensor::zeros(
@@ -180,7 +189,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
 
     let trading_result = (|| -> Result<(), Box<dyn std::error::Error>> {
         while state.lock().unwrap().step_count < max_steps {
-            thread::sleep(Duration::from_secs(update_interval_secs));
+            thread::sleep(poll_interval);
 
             let action_gate = state
                 .lock()
@@ -188,7 +197,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 .actionable_prices(
                     Instant::now(),
                     time::OffsetDateTime::now_utc(),
-                    max_feed_age,
+                    MAX_FEED_AGE,
                     last_acted_sequence,
                 )
                 .map_err(io::Error::other)?;
@@ -245,7 +254,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 .actionable_prices(
                     Instant::now(),
                     time::OffsetDateTime::now_utc(),
-                    max_feed_age,
+                    MAX_FEED_AGE,
                     last_acted_sequence,
                 )
                 .map_err(io::Error::other)?;
@@ -257,6 +266,31 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 continue;
             }
 
+            let mut ensure_execution_frame = || -> Result<(), Box<dyn std::error::Error>> {
+                let gate = state
+                    .lock()
+                    .unwrap()
+                    .actionable_prices(
+                        Instant::now(),
+                        time::OffsetDateTime::now_utc(),
+                        MAX_FEED_AGE,
+                        last_acted_sequence,
+                    )
+                    .map_err(io::Error::other)?;
+                let Some((current_bucket, current_sequence, _)) = gate else {
+                    return Err(io::Error::other(
+                        "paper feed became stale or incomplete while executing order batch",
+                    )
+                    .into());
+                };
+                if current_bucket != bucket || current_sequence != sequence {
+                    return Err(io::Error::other(
+                        "paper feed advanced while executing order batch",
+                    )
+                    .into());
+                }
+                Ok(())
+            };
             let outcome = execute_trades(
                 &client,
                 &account_id,
@@ -264,6 +298,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 &actions,
                 &execution_prices,
                 &mut account_snapshot,
+                &mut ensure_execution_frame,
             )?;
             {
                 let mut state = state.lock().unwrap();
@@ -306,4 +341,16 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{feed_poll_interval, MAX_FEED_POLL_INTERVAL};
+    use std::time::Duration;
+
+    #[test]
+    fn slow_requested_cadence_cannot_exceed_realtime_feed_poll_bound() {
+        assert_eq!(feed_poll_interval(60), MAX_FEED_POLL_INTERVAL);
+        assert_eq!(feed_poll_interval(2), Duration::from_secs(2));
+    }
 }

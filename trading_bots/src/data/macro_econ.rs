@@ -425,6 +425,15 @@ fn observed_fixed_holiday(date: NaiveDate) -> NaiveDate {
     }
 }
 
+fn observed_new_year(date: NaiveDate) -> NaiveDate {
+    match date.weekday() {
+        // Unlike other fixed-date NYSE holidays, a Saturday New Year's Day
+        // does not close the preceding Friday session.
+        Weekday::Sun => date.succ_opt().expect("supported holiday date"),
+        _ => date,
+    }
+}
+
 fn nth_weekday(year: i32, month: u32, weekday: Weekday, nth: u32) -> NaiveDate {
     let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
     let offset = (7 + weekday.num_days_from_monday() as i64
@@ -469,8 +478,8 @@ fn easter_sunday(year: i32) -> NaiveDate {
 fn is_nyse_holiday(date: NaiveDate) -> bool {
     let year = date.year();
     let new_year =
-        observed_fixed_holiday(NaiveDate::from_ymd_opt(year, 1, 1).expect("valid New Year's Day"));
-    let next_new_year = observed_fixed_holiday(
+        observed_new_year(NaiveDate::from_ymd_opt(year, 1, 1).expect("valid New Year's Day"));
+    let next_new_year = observed_new_year(
         NaiveDate::from_ymd_opt(year + 1, 1, 1).expect("valid next New Year's Day"),
     );
     let christmas =
@@ -530,7 +539,10 @@ pub fn get_value_at_timestamp(
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_path, conservative_availability_timestamp, FredResponse, MacroSeries};
+    use super::{
+        cache_path, conservative_availability_timestamp, is_nyse_session, FredResponse, MacroSeries,
+    };
+    use chrono::NaiveDate;
     use chrono::NaiveDateTime;
 
     fn timestamp(value: &str) -> i64 {
@@ -590,6 +602,21 @@ mod tests {
             timestamp("2012-10-31 13:30:00"),
             "extraordinary full-day exchange closures must be skipped"
         );
+        assert_eq!(
+            conservative_availability_timestamp(MacroSeries::CpiAllItems, "2021-12-30").unwrap(),
+            timestamp("2021-12-31 14:30:00"),
+            "a Saturday New Year's Day must not close the preceding Friday"
+        );
+    }
+
+    #[test]
+    fn nyse_new_year_observance_matches_exchange_sessions() {
+        assert!(is_nyse_session(
+            NaiveDate::from_ymd_opt(2021, 12, 31).unwrap()
+        ));
+        assert!(!is_nyse_session(
+            NaiveDate::from_ymd_opt(2023, 1, 2).unwrap()
+        ));
     }
 
     #[test]

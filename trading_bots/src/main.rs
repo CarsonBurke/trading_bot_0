@@ -262,7 +262,7 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',', default_values_t = default_paper_symbols())]
         symbols: Vec<String>,
 
-        #[arg(short, long, default_value_t = 60)]
+        #[arg(short, long, default_value_t = 5)]
         interval: u64,
 
         #[arg(short, long, default_value_t = 500)]
@@ -548,13 +548,17 @@ mod tests {
     fn paper_defaults_match_model_ticker_count() {
         let cli = Cli::try_parse_from(["trading_bot", "paper", "--account", "DU123"])
             .expect("paper CLI should parse");
-        let Some(Commands::Paper { symbols, .. }) = cli.command else {
+        let Some(Commands::Paper {
+            symbols, interval, ..
+        }) = cli.command
+        else {
             panic!("paper subcommand should parse as Paper");
         };
         assert_eq!(
             symbols.len(),
             trading_bot_0::torch::constants::TICKERS_COUNT as usize
         );
+        assert_eq!(interval, 5);
     }
 
     #[test]
