@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use ibapi::{
     contracts::Contract,
     market_data::{
@@ -39,6 +39,17 @@ pub enum HistoricalLoadError {
     Connect(String),
     Request { ticker: String, message: String },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalAlignmentError(String);
+
+impl std::fmt::Display for HistoricalAlignmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HistoricalAlignmentError {}
 
 impl std::fmt::Display for HistoricalLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -191,7 +202,65 @@ pub fn get_historical_data(tickers: Option<&[&str]>) -> MappedHistorical {
         data.push(bars);
     }
 
-    data
+    align_bars_to_common_timestamps(data)
+        .unwrap_or_else(|err| panic!("failed aligning historical data: {err}"))
+}
+
+pub fn align_bars_to_common_timestamps(
+    bars_by_ticker: MappedHistorical,
+) -> Result<MappedHistorical, HistoricalAlignmentError> {
+    if bars_by_ticker.is_empty() || bars_by_ticker.iter().any(Vec::is_empty) {
+        return Err(HistoricalAlignmentError(
+            "encountered an empty ticker series".to_string(),
+        ));
+    }
+
+    for (ticker_idx, bars) in bars_by_ticker.iter().enumerate() {
+        for pair in bars.windows(2) {
+            if pair[1].date == pair[0].date {
+                return Err(HistoricalAlignmentError(format!(
+                    "ticker series {ticker_idx} contains duplicate timestamp {}",
+                    pair[1].date
+                )));
+            }
+            if pair[1].date < pair[0].date {
+                return Err(HistoricalAlignmentError(format!(
+                    "ticker series {ticker_idx} is not strictly chronological at {}",
+                    pair[1].date
+                )));
+            }
+        }
+    }
+
+    if bars_by_ticker.len() == 1 {
+        return Ok(bars_by_ticker);
+    }
+
+    let mut common_timestamps = bars_by_ticker[0]
+        .iter()
+        .map(|bar| bar.date.unix_timestamp_nanos())
+        .collect::<HashSet<_>>();
+    for bars in bars_by_ticker.iter().skip(1) {
+        let timestamps = bars
+            .iter()
+            .map(|bar| bar.date.unix_timestamp_nanos())
+            .collect::<HashSet<_>>();
+        common_timestamps.retain(|timestamp| timestamps.contains(timestamp));
+    }
+    if common_timestamps.is_empty() {
+        return Err(HistoricalAlignmentError(
+            "ticker series have no timestamps in common".to_string(),
+        ));
+    }
+
+    Ok(bars_by_ticker
+        .into_iter()
+        .map(|bars| {
+            bars.into_iter()
+                .filter(|bar| common_timestamps.contains(&bar.date.unix_timestamp_nanos()))
+                .collect()
+        })
+        .collect())
 }
 
 fn get_historical_data_from_files(ticker: &str) -> Option<Vec<historical::Bar>> {
@@ -295,4 +364,72 @@ fn data_path_kind() -> &'static str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use ibapi::market_data::historical::Bar;
+    use time::{Duration, OffsetDateTime};
+
+    use super::align_bars_to_common_timestamps;
+
+    fn bar(minute: i64) -> Bar {
+        Bar {
+            date: OffsetDateTime::UNIX_EPOCH + Duration::minutes(minute),
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1_000.0,
+            wap: 100.0,
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn aligns_different_starts_and_internal_gaps_to_strict_intersection() {
+        let aligned = align_bars_to_common_timestamps(vec![
+            vec![bar(0), bar(1), bar(2), bar(3)],
+            vec![bar(0), bar(2), bar(3), bar(4)],
+            vec![bar(2), bar(3), bar(5)],
+        ])
+        .expect("histories should align");
+
+        let expected = vec![bar(2).date, bar(3).date];
+        assert_eq!(aligned.len(), 3);
+        for bars in aligned {
+            assert_eq!(
+                bars.iter().map(|bar| bar.date).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn single_ticker_preserves_the_original_series() {
+        let original = vec![bar(0), bar(2), bar(5)];
+        let aligned = align_bars_to_common_timestamps(vec![original.clone()])
+            .expect("single ticker should remain valid");
+
+        assert_eq!(aligned, vec![original]);
+    }
+
+    #[test]
+    fn rejects_duplicate_or_non_monotonic_timestamps() {
+        let duplicate = align_bars_to_common_timestamps(vec![vec![bar(0), bar(0)]])
+            .expect_err("duplicate timestamps must be rejected");
+        assert!(duplicate.to_string().contains("duplicate timestamp"));
+
+        let reversed = align_bars_to_common_timestamps(vec![vec![bar(1), bar(0)]])
+            .expect_err("non-monotonic timestamps must be rejected");
+        assert!(reversed.to_string().contains("not strictly chronological"));
+    }
+
+    #[test]
+    fn rejects_histories_without_a_common_timestamp() {
+        let error = align_bars_to_common_timestamps(vec![vec![bar(0)], vec![bar(1)]])
+            .expect_err("disjoint histories must be rejected");
+
+        assert!(error.to_string().contains("no timestamps in common"));
+    }
 }

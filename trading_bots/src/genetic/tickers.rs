@@ -27,22 +27,6 @@ fn split_ranked_tickers(tickers: &[&str]) -> (Vec<String>, Vec<String>, Vec<Stri
     (train, validation, test)
 }
 
-fn split_ranked_ticker_strings(tickers: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut train = Vec::new();
-    let mut validation = Vec::new();
-    let mut test = Vec::new();
-
-    for (index, ticker) in tickers.iter().enumerate() {
-        match index % 6 {
-            0 | 1 | 2 | 3 => train.push(ticker.clone()),
-            4 => validation.push(ticker.clone()),
-            _ => test.push(ticker.clone()),
-        }
-    }
-
-    (train, validation, test)
-}
-
 impl TickerSet {
     pub fn label(self) -> &'static str {
         match self {
@@ -67,20 +51,47 @@ impl TickerSet {
     }
 
     pub fn cached_eligible_tickers(self, min_bars: usize) -> Vec<String> {
-        let eligible = TARGET_UNIVERSE_TICKERS
-            .iter()
-            .filter_map(|ticker| {
-                let bars = get_cached_historical_bars(ticker)?;
-                (bars.len() >= min_bars).then(|| (*ticker).to_string())
-            })
-            .collect::<Vec<_>>();
+        self.filter_available(|ticker| {
+            let bars = get_cached_historical_bars(ticker)?;
+            (bars.len() >= min_bars).then_some(())
+        })
+    }
 
-        let (train, validation, test) = split_ranked_ticker_strings(&eligible);
-        match self {
-            Self::Train => train,
-            Self::Validation => validation,
-            Self::Test => test,
-            Self::All => eligible,
+    fn filter_available(self, mut is_available: impl FnMut(&str) -> Option<()>) -> Vec<String> {
+        self.tickers()
+            .into_iter()
+            .filter(|ticker| is_available(ticker).is_some())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::TickerSet;
+
+    #[test]
+    fn missing_data_filters_within_canonical_partitions() {
+        let unavailable = HashSet::from(["NVDA".to_string()]);
+
+        for set in [TickerSet::Train, TickerSet::Validation, TickerSet::Test] {
+            let canonical = set.tickers();
+            let filtered =
+                set.filter_available(|ticker| (!unavailable.contains(ticker)).then_some(()));
+            let expected = canonical
+                .into_iter()
+                .filter(|ticker| !unavailable.contains(ticker))
+                .collect::<Vec<_>>();
+
+            assert_eq!(filtered, expected);
         }
+
+        assert!(TickerSet::Validation
+            .filter_available(|ticker| (!unavailable.contains(ticker)).then_some(()))
+            .contains(&"GOOGL".to_string()));
+        assert!(TickerSet::Test
+            .filter_available(|ticker| (!unavailable.contains(ticker)).then_some(()))
+            .contains(&"AVGO".to_string()));
     }
 }

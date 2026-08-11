@@ -262,13 +262,46 @@ pub fn generate_tickers_set(rng: &mut impl rand::Rng) -> Vec<Vec<usize>> {
     let mut tickers_set = Vec::new();
 
     for _ in 0..TICKER_SETS {
-        let indexes: Vec<usize> = match sample(rng, TICKERS.len() - 1, SAMPLE_INDEXES) {
-            rand::seq::index::IndexVec::U64(v) => v.into_iter().map(|i| i as usize).collect(),
-            rand::seq::index::IndexVec::U32(v) => v.into_iter().map(|i| i as usize).collect(),
-        };
-
-        tickers_set.push(indexes.clone());
+        tickers_set.push(sample_ticker_indexes(rng, TICKERS.len(), SAMPLE_INDEXES));
     }
 
     tickers_set
+}
+
+fn sample_ticker_indexes(
+    rng: &mut impl rand::Rng,
+    universe_len: usize,
+    sample_count: usize,
+) -> Vec<usize> {
+    match sample(rng, universe_len, sample_count) {
+        rand::seq::index::IndexVec::U64(values) => {
+            values.into_iter().map(|index| index as usize).collect()
+        }
+        rand::seq::index::IndexVec::U32(values) => {
+            values.into_iter().map(|index| index as usize).collect()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use rand::{rngs::StdRng, SeedableRng};
+
+    use super::sample_ticker_indexes;
+
+    #[test]
+    fn ticker_sampling_is_unique_in_bounds_and_includes_the_final_symbol() {
+        let mut rng = StdRng::seed_from_u64(0x51A7);
+        let all = sample_ticker_indexes(&mut rng, 10, 10);
+        assert_eq!(all.iter().copied().collect::<HashSet<_>>().len(), 10);
+        assert!(all.contains(&9));
+
+        for _ in 0..1_000 {
+            let indexes = sample_ticker_indexes(&mut rng, 31, 10);
+            assert_eq!(indexes.iter().copied().collect::<HashSet<_>>().len(), 10);
+            assert!(indexes.iter().all(|index| *index < 31));
+        }
+    }
 }

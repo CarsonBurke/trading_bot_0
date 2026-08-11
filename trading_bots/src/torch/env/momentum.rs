@@ -1,11 +1,24 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Global cache for momentum indicators (ticker -> indicators)
-static MOMENTUM_CACHE: OnceLock<Mutex<HashMap<String, Arc<MomentumIndicators>>>> = OnceLock::new();
+struct MomentumCacheEntry {
+    price_bits: Vec<u64>,
+    indicators: Arc<MomentumIndicators>,
+}
 
-fn get_cache() -> &'static Mutex<HashMap<String, Arc<MomentumIndicators>>> {
+/// Global cache for momentum indicators (ticker -> latest aligned grid)
+static MOMENTUM_CACHE: OnceLock<Mutex<HashMap<String, MomentumCacheEntry>>> = OnceLock::new();
+
+fn get_cache() -> &'static Mutex<HashMap<String, MomentumCacheEntry>> {
     MOMENTUM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn same_price_grid(price_bits: &[u64], prices: &[f64]) -> bool {
+    price_bits.len() == prices.len()
+        && price_bits
+            .iter()
+            .zip(prices)
+            .all(|(cached, price)| *cached == price.to_bits())
 }
 
 /// Precomputed momentum indicators
@@ -31,16 +44,19 @@ impl MomentumIndicators {
         {
             let locked = cache.lock().unwrap();
             if let Some(cached) = locked.get(ticker) {
-                if cached.rsi.len() == prices.len() {
-                    return cached.clone();
+                if same_price_grid(&cached.price_bits, prices) {
+                    return cached.indicators.clone();
                 }
             }
         }
         let computed = Arc::new(Self::compute(prices));
-        cache
-            .lock()
-            .unwrap()
-            .insert(ticker.to_string(), computed.clone());
+        cache.lock().unwrap().insert(
+            ticker.to_string(),
+            MomentumCacheEntry {
+                price_bits: prices.iter().map(|price| price.to_bits()).collect(),
+                indicators: computed.clone(),
+            },
+        );
         computed
     }
 
@@ -142,5 +158,24 @@ impl MomentumIndicators {
             stoch_k,
             trend_strength,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::MomentumIndicators;
+
+    #[test]
+    fn cache_recomputes_same_length_ticker_on_a_different_price_grid() {
+        let rising = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
+        let falling = [15.0, 14.0, 13.0, 12.0, 11.0, 10.0];
+        let first = MomentumIndicators::get_or_compute("MOMENTUM_GRID_TEST", &rising);
+        let second = MomentumIndicators::get_or_compute("MOMENTUM_GRID_TEST", &falling);
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(first.mom_5[5] > 0.0);
+        assert!(second.mom_5[5] < 0.0);
     }
 }

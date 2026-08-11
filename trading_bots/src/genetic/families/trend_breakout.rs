@@ -1,6 +1,6 @@
 use enum_map::{Enum, EnumMap};
 use rand::{rngs::StdRng, Rng};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use crate::utils::percent_diff;
 
@@ -37,9 +37,49 @@ impl Gene {
     ];
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct Genome {
     genes: EnumMap<Gene, f64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawGenome {
+    genes: EnumMap<Gene, f64>,
+}
+
+impl<'de> Deserialize<'de> for Genome {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawGenome::deserialize(deserializer)?;
+        if Gene::ALL.iter().any(|gene| !raw.genes[*gene].is_finite()) {
+            return Err(D::Error::custom("trend-breakout genes must be finite"));
+        }
+        Ok(Self { genes: raw.genes }.normalized())
+    }
+}
+
+impl Genome {
+    fn normalized(mut self) -> Self {
+        for gene in Gene::ALL {
+            let gene_spec = spec(gene);
+            let value = self.genes[gene];
+            self.genes[gene] = if value.is_finite() {
+                clamp(value, gene_spec)
+            } else {
+                gene_spec.init
+            };
+        }
+
+        if self.genes[Gene::FastEmaAlpha] <= self.genes[Gene::SlowEmaAlpha] {
+            self.genes[Gene::FastEmaAlpha] =
+                (self.genes[Gene::SlowEmaAlpha] + 0.01).min(spec(Gene::FastEmaAlpha).max);
+        }
+        if self.genes[Gene::PullbackMinPct] > self.genes[Gene::PullbackMaxPct] {
+            let minimum = self.genes[Gene::PullbackMaxPct];
+            self.genes[Gene::PullbackMaxPct] = self.genes[Gene::PullbackMinPct];
+            self.genes[Gene::PullbackMinPct] = minimum;
+        }
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -57,7 +97,7 @@ impl StrategyFamilySpec for Family {
         for gene in Gene::ALL {
             genes[gene] = jitter(spec(gene).init, spec(gene).mutation, spec(gene), rng);
         }
-        Genome { genes }
+        Genome { genes }.normalized()
     }
 
     fn mutate(&self, genome: &mut Self::Genome, rng: &mut StdRng, entropy: f64) {
@@ -69,10 +109,7 @@ impl StrategyFamilySpec for Family {
                 rng,
             );
         }
-        if genome.genes[Gene::FastEmaAlpha] <= genome.genes[Gene::SlowEmaAlpha] {
-            genome.genes[Gene::FastEmaAlpha] =
-                (genome.genes[Gene::SlowEmaAlpha] + 0.01).min(spec(Gene::FastEmaAlpha).max);
-        }
+        *genome = (*genome).normalized();
     }
 
     fn crossover(
@@ -89,11 +126,7 @@ impl StrategyFamilySpec for Family {
                 spec(gene),
             );
         }
-        if genes[Gene::FastEmaAlpha] <= genes[Gene::SlowEmaAlpha] {
-            genes[Gene::FastEmaAlpha] =
-                (genes[Gene::SlowEmaAlpha] + 0.01).min(spec(Gene::FastEmaAlpha).max);
-        }
-        Genome { genes }
+        Genome { genes }.normalized()
     }
 
     fn indicator_config(&self, genome: &Self::Genome) -> IndicatorConfig {
@@ -244,4 +277,70 @@ fn jitter(value: f64, amount: f64, spec: GeneSpec, rng: &mut StdRng) -> f64 {
 
 fn clamp(value: f64, spec: GeneSpec) -> f64 {
     value.clamp(spec.min, spec.max)
+}
+
+#[cfg(test)]
+mod tests {
+    use enum_map::EnumMap;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    use super::{spec, Family, Gene, Genome, RawGenome};
+    use crate::genetic::family::StrategyFamilySpec;
+
+    fn assert_invariants(genome: &Genome) {
+        for gene in Gene::ALL {
+            let value = genome.genes[gene];
+            let range = spec(gene);
+            assert!(value.is_finite());
+            assert!(value >= range.min && value <= range.max);
+        }
+        assert!(genome.genes[Gene::FastEmaAlpha] > genome.genes[Gene::SlowEmaAlpha]);
+        assert!(genome.genes[Gene::PullbackMinPct] <= genome.genes[Gene::PullbackMaxPct]);
+    }
+
+    #[test]
+    fn seed_mutation_and_crossover_preserve_relational_invariants() {
+        let family = Family;
+        let mut rng = StdRng::seed_from_u64(0xBAD5EED);
+        let mut left = family.seed_genome(&mut rng);
+        let mut right = family.seed_genome(&mut rng);
+
+        for _ in 0..1_000 {
+            family.mutate(&mut left, &mut rng, 4.0);
+            family.mutate(&mut right, &mut rng, 4.0);
+            let child = family.crossover(&left, &right, &mut rng);
+            assert_invariants(&left);
+            assert_invariants(&right);
+            assert_invariants(&child);
+            left = right;
+            right = child;
+        }
+    }
+
+    #[test]
+    fn deserialization_normalizes_inverted_pullback_bounds() {
+        let family = Family;
+        let mut genome = family.seed_genome(&mut StdRng::seed_from_u64(7));
+        genome.genes[Gene::PullbackMinPct] = 0.04;
+        genome.genes[Gene::PullbackMaxPct] = 0.01;
+
+        let encoded = serde_json::to_vec(&genome).expect("genome should serialize");
+        let decoded: Genome = serde_json::from_slice(&encoded).expect("genome should deserialize");
+
+        assert_eq!(decoded.genes[Gene::PullbackMinPct], 0.01);
+        assert_eq!(decoded.genes[Gene::PullbackMaxPct], 0.04);
+        assert_invariants(&decoded);
+    }
+
+    #[test]
+    fn deserialization_rejects_non_finite_genes() {
+        let family = Family;
+        let genome = family.seed_genome(&mut StdRng::seed_from_u64(11));
+        let mut genes: EnumMap<Gene, f64> = genome.genes;
+        genes[Gene::PullbackMinPct] = f64::NAN;
+        let encoded = postcard::to_allocvec(&RawGenome { genes })
+            .expect("raw genome should serialize for regression setup");
+
+        postcard::from_bytes::<Genome>(&encoded).expect_err("non-finite genes must be rejected");
+    }
 }

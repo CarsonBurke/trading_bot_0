@@ -24,8 +24,10 @@ pub struct MarketDataset {
     pub split_name: String,
     pub tickers: Vec<String>,
     pub bars: MappedHistorical,
+    pub open_prices: Vec<Vec<f64>>,
     pub close_prices: Vec<Vec<f64>>,
     pub benchmark_assets: Vec<f64>,
+    benchmark_open_assets: Vec<f64>,
 }
 
 impl MarketDataset {
@@ -34,14 +36,20 @@ impl MarketDataset {
         tickers: Vec<String>,
         bars: MappedHistorical,
     ) -> Self {
+        let open_prices = bars
+            .iter()
+            .map(|ticker_bars| ticker_bars.iter().map(|bar| bar.open).collect())
+            .collect::<Vec<_>>();
         let close_prices = bars.iter().map(convert_historical).collect::<Vec<_>>();
-        let benchmark_assets = benchmark_curve_from_prices(&close_prices);
+        let (benchmark_assets, benchmark_open_assets) = benchmark_curves(&bars);
         Self {
             split_name: split_name.into(),
             tickers,
             bars,
+            open_prices,
             close_prices,
             benchmark_assets,
+            benchmark_open_assets,
         }
     }
 }
@@ -104,30 +112,42 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
         .collect::<Vec<_>>();
     let mut trade_summary = TradeSummary::default();
 
-    for index in 0..indexes {
-        let prices_at_index = (0..ticker_count)
-            .map(|ticker_idx| market.close_prices[ticker_idx][index])
+    if let Some(total_assets) = total_assets.as_mut() {
+        total_assets.push(STARTING_CASH);
+    }
+    if let Some(cash_curve) = cash_curve.as_mut() {
+        cash_curve.push(STARTING_CASH);
+    }
+    if let Some(positioned_by_ticker) = positioned_by_ticker.as_mut() {
+        for ticker_positions in positioned_by_ticker {
+            ticker_positions.push(0.0);
+        }
+    }
+
+    for signal_index in 0..indexes.saturating_sub(1) {
+        let signal_prices = (0..ticker_count)
+            .map(|ticker_idx| market.close_prices[ticker_idx][signal_index])
             .collect::<Vec<_>>();
         let position_values = account
             .positions
             .iter()
             .enumerate()
-            .map(|(ticker_idx, position)| position.value_with_price(prices_at_index[ticker_idx]))
+            .map(|(ticker_idx, position)| position.value_with_price(signal_prices[ticker_idx]))
             .collect::<Vec<_>>();
         let assets = account.cash + position_values.iter().sum::<f64>();
 
         let mut contexts = Vec::with_capacity(ticker_count);
         for ticker_idx in 0..ticker_count {
-            let price = prices_at_index[ticker_idx];
+            let price = signal_prices[ticker_idx];
             let position = account.positions[ticker_idx];
             let state = &mut states[ticker_idx];
             state.observe(
                 price,
-                decider_rsi_by_ticker[ticker_idx][index],
+                decider_rsi_by_ticker[ticker_idx][signal_index],
                 position.quantity > 0.0,
             );
             let benchmark_return_since_entry_pct =
-                state.benchmark_return_since_entry_pct(market.benchmark_assets[index]);
+                state.benchmark_return_since_entry_pct(market.benchmark_assets[signal_index]);
             let excess_return_since_entry_pct = if position.quantity > 0.0 {
                 Some(((price / position.avg_price.max(1e-6)) - 1.0) * 100.0)
                     .zip(benchmark_return_since_entry_pct)
@@ -137,22 +157,22 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
             } else {
                 None
             };
-            state.observe_relative_performance(index, excess_return_since_entry_pct);
+            state.observe_relative_performance(signal_index, excess_return_since_entry_pct);
 
             contexts.push(DecisionContext {
-                index,
+                index: signal_index,
                 ticker_count: market.bars.len(),
                 ticker_idx,
                 price,
-                decider_rsi: decider_rsi_by_ticker[ticker_idx][index],
-                amount_rsi: amount_rsi_by_ticker[ticker_idx][index],
-                price_ema: price_ema_by_ticker[ticker_idx][index],
+                decider_rsi: decider_rsi_by_ticker[ticker_idx][signal_index],
+                amount_rsi: amount_rsi_by_ticker[ticker_idx][signal_index],
+                price_ema: price_ema_by_ticker[ticker_idx][signal_index],
                 fast_ema: fast_ema_by_ticker
                     .as_ref()
-                    .map(|series| series[ticker_idx][index]),
+                    .map(|series| series[ticker_idx][signal_index]),
                 slow_ema: slow_ema_by_ticker
                     .as_ref()
-                    .map(|series| series[ticker_idx][index]),
+                    .map(|series| series[ticker_idx][signal_index]),
                 local_minimum: state.local_minimum,
                 local_maximum: state.local_maximum,
                 last_buy_price: state.last_buy_price,
@@ -162,7 +182,7 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
                 position_value: position_values[ticker_idx],
                 position_avg_price: position.avg_price,
                 position_quantity: position.quantity,
-                bars_since_entry: state.bars_since_entry(index),
+                bars_since_entry: state.bars_since_entry(signal_index),
                 benchmark_return_since_entry_pct,
                 excess_return_since_entry_pct,
                 excess_return_peak_pct: state.peak_excess_return_since_entry_pct,
@@ -173,26 +193,42 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
             });
         }
 
-        rebalance_to_targets(
-            family,
-            genome,
-            index,
-            assets,
-            &prices_at_index,
-            market.benchmark_assets[index],
-            &contexts,
-            &mut account,
-            &mut states,
-            buys_by_ticker.as_mut(),
-            sells_by_ticker.as_mut(),
-            &mut trade_summary,
-        );
+        let fill_index = signal_index + 1;
+        if let Some(target_weights) = target_weights(family, genome, &contexts) {
+            let execution_prices = (0..ticker_count)
+                .map(|ticker_idx| market.open_prices[ticker_idx][fill_index])
+                .collect::<Vec<_>>();
+            let execution_assets = account.cash
+                + account
+                    .positions
+                    .iter()
+                    .enumerate()
+                    .map(|(ticker_idx, position)| {
+                        position.value_with_price(execution_prices[ticker_idx])
+                    })
+                    .sum::<f64>();
+            rebalance_to_target_weights(
+                fill_index,
+                execution_assets,
+                &execution_prices,
+                market.benchmark_open_assets[fill_index],
+                &target_weights,
+                &mut account,
+                &mut states,
+                buys_by_ticker.as_mut(),
+                sells_by_ticker.as_mut(),
+                &mut trade_summary,
+            );
+        }
 
+        let valuation_prices = (0..ticker_count)
+            .map(|ticker_idx| market.close_prices[ticker_idx][fill_index])
+            .collect::<Vec<_>>();
         let post_rebalance_values = account
             .positions
             .iter()
             .enumerate()
-            .map(|(ticker_idx, position)| position.value_with_price(prices_at_index[ticker_idx]))
+            .map(|(ticker_idx, position)| position.value_with_price(valuation_prices[ticker_idx]))
             .collect::<Vec<_>>();
         let post_assets = account.cash + post_rebalance_values.iter().sum::<f64>();
 
@@ -223,7 +259,7 @@ pub fn evaluate_family<F: StrategyFamilySpec>(
             total_assets: total_assets.unwrap_or_default(),
             cash: cash_curve.unwrap_or_default(),
             benchmark_assets: market.benchmark_assets.clone(),
-            prices_by_ticker: market.close_prices.clone(),
+            prices_by_ticker: market.open_prices.clone(),
             positioned_by_ticker: positioned_by_ticker.unwrap_or_default(),
             buys_by_ticker: buys_by_ticker.unwrap_or_default(),
             sells_by_ticker: sells_by_ticker.unwrap_or_default(),
@@ -386,35 +422,80 @@ fn compute_ema_map(data: &[Vec<f64>], alpha: f64) -> Vec<Vec<f64>> {
         .collect()
 }
 
-fn benchmark_curve_from_prices(prices_by_ticker: &[Vec<f64>]) -> Vec<f64> {
-    if prices_by_ticker.is_empty() {
-        return vec![STARTING_CASH];
+fn benchmark_curves(bars_by_ticker: &MappedHistorical) -> (Vec<f64>, Vec<f64>) {
+    let Some(first_bars) = bars_by_ticker.first() else {
+        return (vec![STARTING_CASH], vec![STARTING_CASH]);
+    };
+    if first_bars.len() < 2 {
+        return (
+            vec![STARTING_CASH; first_bars.len()],
+            vec![STARTING_CASH; first_bars.len()],
+        );
     }
-    let allocation = STARTING_CASH / prices_by_ticker.len() as f64;
-    let quantities: Vec<f64> = prices_by_ticker
-        .iter()
-        .map(|ticker_prices| allocation / ticker_prices[0])
-        .collect();
 
-    (0..prices_by_ticker[0].len())
-        .map(|index| {
+    let allocation = STARTING_CASH / bars_by_ticker.len() as f64;
+    let quantities = bars_by_ticker
+        .iter()
+        .map(|bars| allocation / bars[1].open)
+        .collect::<Vec<_>>();
+    let mut close_assets = Vec::with_capacity(first_bars.len());
+    let mut open_assets = Vec::with_capacity(first_bars.len());
+    close_assets.push(STARTING_CASH);
+    open_assets.push(STARTING_CASH);
+    for index in 1..first_bars.len() {
+        close_assets.push(
             quantities
                 .iter()
                 .enumerate()
-                .map(|(ticker_idx, quantity)| quantity * prices_by_ticker[ticker_idx][index])
-                .sum::<f64>()
-        })
-        .collect()
+                .map(|(ticker_idx, quantity)| quantity * bars_by_ticker[ticker_idx][index].close)
+                .sum(),
+        );
+        open_assets.push(
+            quantities
+                .iter()
+                .enumerate()
+                .map(|(ticker_idx, quantity)| quantity * bars_by_ticker[ticker_idx][index].open)
+                .sum(),
+        );
+    }
+    (close_assets, open_assets)
 }
 
-fn rebalance_to_targets<F: StrategyFamilySpec>(
+fn target_weights<F: StrategyFamilySpec>(
     family: &F,
     genome: &F::Genome,
+    contexts: &[DecisionContext],
+) -> Option<Vec<f64>> {
+    let asset_scores = contexts
+        .iter()
+        .map(|ctx| family.asset_desirability(genome, ctx).max(0.0))
+        .collect::<Vec<_>>();
+    let cash_score = family.cash_desirability(genome, contexts).max(0.0);
+    let total_score = cash_score + asset_scores.iter().sum::<f64>();
+    if total_score <= f64::EPSILON {
+        return None;
+    }
+
+    Some(
+        asset_scores
+            .iter()
+            .zip(contexts.iter())
+            .map(|(score, ctx)| {
+                let raw_weight = score / total_score;
+                let min_weight = family.min_target_weight(genome, ctx).clamp(0.0, 1.0);
+                let max_weight = family.max_target_weight(genome, ctx).clamp(0.0, 1.0);
+                raw_weight.min(max_weight).max(min_weight.min(max_weight))
+            })
+            .collect(),
+    )
+}
+
+fn rebalance_to_target_weights(
     index: usize,
     assets: f64,
     prices: &[f64],
     benchmark_assets: f64,
-    contexts: &[DecisionContext],
+    target_weights: &[f64],
     account: &mut Account,
     states: &mut [TickerRuntimeState],
     mut buy_markers: Option<&mut Vec<Vec<u32>>>,
@@ -425,26 +506,6 @@ fn rebalance_to_targets<F: StrategyFamilySpec>(
         return;
     }
 
-    let asset_scores = contexts
-        .iter()
-        .map(|ctx| family.asset_desirability(genome, ctx).max(0.0))
-        .collect::<Vec<_>>();
-    let cash_score = family.cash_desirability(genome, contexts).max(0.0);
-    let total_score = cash_score + asset_scores.iter().sum::<f64>();
-    if total_score <= f64::EPSILON {
-        return;
-    }
-
-    let target_weights = asset_scores
-        .iter()
-        .zip(contexts.iter())
-        .map(|(score, ctx)| {
-            let raw_weight = score / total_score;
-            let min_weight = family.min_target_weight(genome, ctx).clamp(0.0, 1.0);
-            let max_weight = family.max_target_weight(genome, ctx).clamp(0.0, 1.0);
-            raw_weight.min(max_weight).max(min_weight.min(max_weight))
-        })
-        .collect::<Vec<_>>();
     let target_values = target_weights
         .iter()
         .map(|weight| assets * weight)
@@ -568,9 +629,9 @@ fn try_buy(
     }
 
     let was_flat = account.positions[ticker_idx].quantity <= 0.0;
-    account.positions[ticker_idx].add(price, quantity);
+    account.positions[ticker_idx].add(price + COMMISSION_RATE, quantity);
     account.cash -= total_cost;
-    states[ticker_idx].record_buy(price, benchmark_assets, was_flat);
+    states[ticker_idx].record_buy(index, price, benchmark_assets, was_flat);
     if let Some(buy_markers) = buy_markers {
         buy_markers.push(index as u32);
     }
@@ -601,7 +662,7 @@ fn try_sell(
     }
     let commission = quantity * COMMISSION_RATE;
 
-    let profitable = price > position.avg_price;
+    let profitable = price - COMMISSION_RATE > position.avg_price;
     position.quantity -= quantity;
     if position.quantity <= 1e-9 {
         position.quantity = 0.0;
@@ -639,6 +700,8 @@ mod tests {
     struct ConcentratedGenome;
 
     struct ConcentratedFamily;
+
+    struct CheapCloseFamily;
 
     impl StrategyFamilySpec for ConcentratedFamily {
         type Genome = ConcentratedGenome;
@@ -685,6 +748,51 @@ mod tests {
         }
     }
 
+    impl StrategyFamilySpec for CheapCloseFamily {
+        type Genome = ConcentratedGenome;
+
+        fn kind(&self) -> GeneticFamily {
+            GeneticFamily::TrendBreakout
+        }
+
+        fn seed_genome(&self, _rng: &mut StdRng) -> Self::Genome {
+            ConcentratedGenome
+        }
+
+        fn mutate(&self, _genome: &mut Self::Genome, _rng: &mut StdRng, _entropy: f64) {}
+
+        fn crossover(
+            &self,
+            _left: &Self::Genome,
+            _right: &Self::Genome,
+            _rng: &mut StdRng,
+        ) -> Self::Genome {
+            ConcentratedGenome
+        }
+
+        fn indicator_config(&self, _genome: &Self::Genome) -> IndicatorConfig {
+            IndicatorConfig {
+                decider_rsi_alpha: 0.05,
+                amount_rsi_alpha: 0.05,
+                price_ema_alpha: 0.05,
+                fast_ema_alpha: None,
+                slow_ema_alpha: None,
+            }
+        }
+
+        fn asset_desirability(&self, _genome: &Self::Genome, ctx: &DecisionContext) -> f64 {
+            if ctx.price < 50.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+
+        fn cash_desirability(&self, _genome: &Self::Genome, _contexts: &[DecisionContext]) -> f64 {
+            0.0
+        }
+    }
+
     fn bars(base: f64) -> Vec<Bar> {
         (0..8)
             .map(|index| Bar {
@@ -695,6 +803,23 @@ mod tests {
                 close: base + index as f64,
                 volume: 1_000.0,
                 wap: base + index as f64,
+                count: 1,
+            })
+            .collect()
+    }
+
+    fn bars_with_open_close(prices: &[(f64, f64)]) -> Vec<Bar> {
+        prices
+            .iter()
+            .enumerate()
+            .map(|(index, &(open, close))| Bar {
+                date: OffsetDateTime::UNIX_EPOCH + Duration::minutes(index as i64 * 5),
+                open,
+                high: open.max(close),
+                low: open.min(close),
+                close,
+                volume: 1_000.0,
+                wap: close,
                 count: 1,
             })
             .collect()
@@ -716,6 +841,99 @@ mod tests {
             first_ticker_position > old_equal_weight_cap,
             "expected concentrated allocation above old equal-weight cap: {first_ticker_position} <= {old_equal_weight_cap}"
         );
+    }
+
+    #[test]
+    fn close_signal_fills_at_next_open_and_cannot_capture_an_overnight_gap() {
+        let market = MarketDataset::new(
+            "adversarial",
+            vec!["GAP".to_string()],
+            vec![bars_with_open_close(&[
+                (100.0, 100.0),
+                (100.0, 10.0),
+                (100.0, 20.0),
+            ])],
+        );
+
+        let outcome = evaluate_family(&CheapCloseFamily, &ConcentratedGenome, &market, true);
+        let trace = outcome.trace.expect("expected causal trace");
+        let hypothetical_same_close_final = STARTING_CASH / (10.0 + COMMISSION_RATE) * 20.0;
+
+        assert!(hypothetical_same_close_final > STARTING_CASH);
+        assert!(outcome.metrics.final_assets < STARTING_CASH);
+        assert_eq!(outcome.metrics.buy_count, 1);
+        assert_eq!(trace.buys_by_ticker[0], vec![2]);
+        assert_eq!(trace.prices_by_ticker[0][2], 100.0);
+        assert_eq!(trace.total_assets.len(), 3);
+        assert_eq!(trace.total_assets[0], STARTING_CASH);
+        assert_eq!(trace.benchmark_assets, vec![10_000.0, 1_000.0, 2_000.0]);
+    }
+
+    #[test]
+    fn final_close_signal_is_not_executed_without_a_later_bar() {
+        let market = MarketDataset::new(
+            "terminal",
+            vec!["LAST".to_string()],
+            vec![bars_with_open_close(&[(100.0, 100.0), (100.0, 10.0)])],
+        );
+
+        let outcome = evaluate_family(&CheapCloseFamily, &ConcentratedGenome, &market, true);
+        let trace = outcome.trace.expect("expected terminal trace");
+
+        assert_eq!(outcome.metrics.buy_count, 0);
+        assert!(trace.buys_by_ticker[0].is_empty());
+        assert_eq!(trace.total_assets, vec![STARTING_CASH, STARTING_CASH]);
+    }
+
+    #[test]
+    fn one_real_causal_return_does_not_gain_a_fabricated_sharpe_sample() {
+        let market = MarketDataset::new(
+            "one-return",
+            vec!["ONE".to_string()],
+            vec![bars_with_open_close(&[(10.0, 10.0), (10.0, 20.0)])],
+        );
+
+        let outcome = evaluate_family(&CheapCloseFamily, &ConcentratedGenome, &market, false);
+
+        assert!(outcome.metrics.final_assets > STARTING_CASH);
+        assert_eq!(outcome.metrics.sharpe, 0.0);
+    }
+
+    #[test]
+    fn realized_trade_profit_includes_entry_and_exit_commissions() {
+        let mut account = Account::new(STARTING_CASH, 1);
+        let mut states = vec![TickerRuntimeState::new(100.0)];
+        let mut trades = TradeSummary::default();
+        assert!(try_buy(
+            0,
+            1,
+            100.0,
+            1_000.0,
+            STARTING_CASH,
+            STARTING_CASH,
+            &mut account,
+            &mut states,
+            None,
+            &mut trades,
+        ));
+
+        let sell_price = 100.0 + 1.5 * COMMISSION_RATE;
+        let sell_budget = account.positions[0].value_with_price(sell_price);
+        assert!(try_sell(
+            0,
+            2,
+            sell_price,
+            sell_budget,
+            &mut account,
+            &mut states,
+            None,
+            &mut trades,
+        ));
+
+        assert_eq!(trades.sell_count, 1);
+        assert_eq!(trades.profitable_sells, 0);
+        let metrics = BacktestMetricAccumulator::default().finish(STARTING_CASH, trades);
+        assert_eq!(metrics.win_rate, 0.0);
     }
 }
 
@@ -771,7 +989,7 @@ impl TickerRuntimeState {
         }
     }
 
-    fn record_buy(&mut self, price: f64, benchmark_assets: f64, was_flat: bool) {
+    fn record_buy(&mut self, index: usize, price: f64, benchmark_assets: f64, was_flat: bool) {
         self.last_buy_price = Some(price);
         self.last_sell_price = None;
         self.lowest_rsi_since_flat = None;
@@ -779,7 +997,7 @@ impl TickerRuntimeState {
         self.local_maximum = price;
         if was_flat {
             self.position_open_benchmark_assets = Some(benchmark_assets);
-            self.position_entry_index = None;
+            self.position_entry_index = Some(index);
             self.last_excess_return_since_entry_pct = None;
             self.peak_excess_return_since_entry_pct = None;
             self.excess_return_delta_pct = None;

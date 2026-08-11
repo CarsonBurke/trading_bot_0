@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -11,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 use crate::data::{
-    historical::{get_historical_bars_result, set_ibkr_download_enabled},
+    historical::{
+        align_bars_to_common_timestamps, get_historical_bars_result, set_ibkr_download_enabled,
+    },
     universe::minimum_history_bars,
 };
 
@@ -34,6 +35,30 @@ pub struct TrainingConfig {
     pub heavy_report_every: usize,
     pub seed: u64,
     pub mutation_entropy: f64,
+}
+
+impl TrainingConfig {
+    fn validate(&self) -> Result<()> {
+        if self.generations == 0 {
+            bail!("generations must be at least 1");
+        }
+        if self.population < 3 {
+            bail!("population must be at least 3");
+        }
+        if !self.survivor_ratio.is_finite()
+            || self.survivor_ratio <= 0.0
+            || self.survivor_ratio >= 1.0
+        {
+            bail!("survivor_ratio must be finite and in 0..1, exclusive");
+        }
+        if self.heavy_report_every == 0 {
+            bail!("heavy_report_every must be at least 1");
+        }
+        if !self.mutation_entropy.is_finite() || self.mutation_entropy <= 0.0 {
+            bail!("mutation_entropy must be finite and > 0");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -75,14 +100,6 @@ struct Candidate<G> {
 }
 
 pub fn run(args: GeneticArgs) -> Result<()> {
-    set_ibkr_download_enabled(!args.skip_additional_downloads);
-    let run_dir = RunDir::create_fresh(RUNS_PATH, args.run.as_deref())?;
-    let datasets = load_datasets(
-        args.train_tickers,
-        args.validation_tickers,
-        args.test_tickers,
-        args.skip_additional_downloads,
-    )?;
     let config = TrainingConfig {
         family: args.family,
         generations: args.generations,
@@ -92,6 +109,15 @@ pub fn run(args: GeneticArgs) -> Result<()> {
         seed: args.seed,
         mutation_entropy: args.mutation_entropy,
     };
+    config.validate()?;
+    set_ibkr_download_enabled(!args.skip_additional_downloads);
+    let datasets = load_datasets(
+        args.train_tickers,
+        args.validation_tickers,
+        args.test_tickers,
+        args.skip_additional_downloads,
+    )?;
+    let run_dir = RunDir::create_fresh(RUNS_PATH, args.run.as_deref())?;
     let session_paths = SessionPaths {
         root: run_dir.root,
         gens: run_dir.gens,
@@ -159,15 +185,7 @@ pub fn run_family_with_markets<F: StrategyFamilySpec>(
     datasets: DatasetBundle,
     session_paths: SessionPaths,
 ) -> Result<TrainingSummary> {
-    if config.population < 2 {
-        bail!("population must be at least 2");
-    }
-    if !(0.0..1.0).contains(&config.survivor_ratio) {
-        bail!("survivor_ratio must be in 0..1");
-    }
-    if config.mutation_entropy <= 0.0 {
-        bail!("mutation_entropy must be > 0");
-    }
+    config.validate()?;
 
     fs::create_dir_all(&session_paths.gens)?;
     fs::create_dir_all(&session_paths.weights)?;
@@ -412,7 +430,7 @@ fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
     if bars.is_empty() {
         bail!("no historical bars found for {}", split_label);
     }
-    let bars = align_bars_to_common_dates(bars)
+    let bars = align_bars_to_common_timestamps(bars)
         .with_context(|| format!("failed to align historical bars for {}", split_label))?;
     if bars[0].len() < min_bars {
         bail!(
@@ -423,58 +441,6 @@ fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
         );
     }
     Ok(MarketDataset::new(split_label.to_string(), tickers, bars))
-}
-
-fn align_bars_to_common_dates(
-    bars: Vec<Vec<ibapi::market_data::historical::Bar>>,
-) -> Result<Vec<Vec<ibapi::market_data::historical::Bar>>> {
-    if bars.is_empty() || bars.iter().any(Vec::is_empty) {
-        bail!("encountered an empty ticker series");
-    }
-
-    for (ticker_idx, ticker_bars) in bars.iter().enumerate() {
-        for pair in ticker_bars.windows(2) {
-            if pair[1].date == pair[0].date {
-                bail!(
-                    "ticker series {} contains duplicate timestamp {}",
-                    ticker_idx,
-                    pair[1].date
-                );
-            }
-            if pair[1].date < pair[0].date {
-                bail!(
-                    "ticker series {} is not strictly chronological at {}",
-                    ticker_idx,
-                    pair[1].date
-                );
-            }
-        }
-    }
-
-    let mut common_dates = bars[0]
-        .iter()
-        .map(|bar| bar.date.unix_timestamp_nanos())
-        .collect::<HashSet<_>>();
-    for ticker_bars in bars.iter().skip(1) {
-        let ticker_dates = ticker_bars
-            .iter()
-            .map(|bar| bar.date.unix_timestamp_nanos())
-            .collect::<HashSet<_>>();
-        common_dates.retain(|date| ticker_dates.contains(date));
-    }
-    if common_dates.is_empty() {
-        bail!("ticker series have no timestamps in common");
-    }
-
-    Ok(bars
-        .into_iter()
-        .map(|ticker_bars| {
-            ticker_bars
-                .into_iter()
-                .filter(|bar| common_dates.contains(&bar.date.unix_timestamp_nanos()))
-                .collect()
-        })
-        .collect())
 }
 
 fn evaluate_population<F: StrategyFamilySpec>(
@@ -531,6 +497,8 @@ fn evolve_population<F: StrategyFamilySpec>(
 }
 
 fn survivor_count(population: usize, survivor_ratio: f64) -> usize {
+    debug_assert!(population >= 3);
+    debug_assert!(survivor_ratio.is_finite() && survivor_ratio > 0.0 && survivor_ratio < 1.0);
     ((population as f64 * survivor_ratio).ceil() as usize).clamp(2, population.saturating_sub(1))
 }
 
@@ -626,64 +594,68 @@ fn write_final_metadata<F: StrategyFamilySpec>(
 
 #[cfg(test)]
 mod tests {
-    use ibapi::market_data::historical::Bar;
-    use time::{Duration, OffsetDateTime};
+    use crate::genetic::family::GeneticFamily;
 
-    use super::align_bars_to_common_dates;
+    use super::{survivor_count, TrainingConfig};
 
-    fn bar(minute: i64) -> Bar {
-        Bar {
-            date: OffsetDateTime::UNIX_EPOCH + Duration::minutes(minute),
-            open: 100.0,
-            high: 101.0,
-            low: 99.0,
-            close: 100.0,
-            volume: 1_000.0,
-            wap: 100.0,
-            count: 1,
+    fn config() -> TrainingConfig {
+        TrainingConfig {
+            family: GeneticFamily::TrendBreakout,
+            generations: 1,
+            population: 3,
+            survivor_ratio: 0.25,
+            heavy_report_every: 1,
+            seed: 7,
+            mutation_entropy: 1.0,
         }
     }
 
     #[test]
-    fn aligns_only_exact_common_dates() {
-        let aligned = align_bars_to_common_dates(vec![
-            vec![bar(0), bar(1), bar(2), bar(3)],
-            vec![bar(0), bar(2), bar(3), bar(4)],
-            vec![bar(2), bar(3), bar(5)],
-        ])
-        .expect("histories should align");
+    fn rejects_non_executable_and_non_finite_training_configs() {
+        for population in 0..=2 {
+            let mut invalid = config();
+            invalid.population = population;
+            assert!(invalid.validate().is_err());
+        }
 
-        let expected = vec![bar(2).date, bar(3).date];
-        assert_eq!(aligned.len(), 3);
-        for ticker_bars in aligned {
-            assert_eq!(
-                ticker_bars.iter().map(|bar| bar.date).collect::<Vec<_>>(),
-                expected
-            );
+        let mut zero_generations = config();
+        zero_generations.generations = 0;
+        assert!(zero_generations.validate().is_err());
+
+        let mut zero_report_interval = config();
+        zero_report_interval.heavy_report_every = 0;
+        assert!(zero_report_interval.validate().is_err());
+
+        for ratio in [
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            -0.1,
+            0.0,
+            1.0,
+            1.1,
+        ] {
+            let mut invalid = config();
+            invalid.survivor_ratio = ratio;
+            assert!(invalid.validate().is_err(), "ratio {ratio:?} must fail");
+        }
+
+        for entropy in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -1.0, 0.0] {
+            let mut invalid = config();
+            invalid.mutation_entropy = entropy;
+            assert!(invalid.validate().is_err(), "entropy {entropy:?} must fail");
         }
     }
 
     #[test]
-    fn rejects_duplicate_dates() {
-        let error = align_bars_to_common_dates(vec![vec![bar(0), bar(0)]])
-            .expect_err("duplicate dates must be rejected");
-
-        assert!(error.to_string().contains("duplicate timestamp"));
-    }
-
-    #[test]
-    fn rejects_non_monotonic_dates() {
-        let error = align_bars_to_common_dates(vec![vec![bar(1), bar(0)]])
-            .expect_err("non-monotonic dates must be rejected");
-
-        assert!(error.to_string().contains("not strictly chronological"));
-    }
-
-    #[test]
-    fn rejects_histories_without_common_dates() {
-        let error = align_bars_to_common_dates(vec![vec![bar(0)], vec![bar(1)]])
-            .expect_err("disjoint histories must be rejected");
-
-        assert!(error.to_string().contains("no timestamps in common"));
+    fn survivor_count_is_executable_for_all_valid_small_configurations() {
+        for population in 3..=256 {
+            for numerator in 1..100 {
+                let ratio = numerator as f64 / 100.0;
+                let survivors = survivor_count(population, ratio);
+                assert!(survivors >= 2);
+                assert!(survivors < population);
+            }
+        }
     }
 }

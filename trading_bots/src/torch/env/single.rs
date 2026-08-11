@@ -11,7 +11,7 @@ use super::earnings::EarningsIndicators;
 use super::macro_ind::MacroIndicators;
 use super::momentum::MomentumIndicators;
 use crate::{
-    data::historical::{get_historical_data, get_historical_series},
+    data::historical::get_historical_data,
     data::universe::cached_eligible_training_universe,
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::constants::TICKERS_COUNT,
@@ -124,18 +124,13 @@ fn load_market_data_with_macro(
         .map(|ticker| ticker.as_str())
         .collect::<Vec<&str>>();
     let mapped_bars = get_historical_data(Some(&ticker_refs));
-    let mut prices = Vec::with_capacity(tickers.len());
+    let mut prices: Vec<Vec<f64>> = Vec::with_capacity(tickers.len());
     let mut price_deltas = Vec::with_capacity(tickers.len());
     let mut ohlc_features = Vec::with_capacity(tickers.len());
-    for (i, ticker) in tickers.iter().enumerate() {
-        ohlc_features.push(build_ohlc_features(&mapped_bars[i]));
-        if let Some((cached_prices, cached_deltas)) = get_historical_series(ticker) {
-            prices.push(cached_prices);
-            price_deltas.push(cached_deltas);
-        } else {
-            prices.push(mapped_bars[i].iter().map(|bar| bar.close).collect());
-            price_deltas.push(get_price_deltas(&mapped_bars[i]));
-        }
+    for bars in &mapped_bars {
+        ohlc_features.push(build_ohlc_features(bars));
+        prices.push(bars.iter().map(|bar| bar.close).collect::<Vec<_>>());
+        price_deltas.push(get_price_deltas(bars));
     }
 
     if log_progress {

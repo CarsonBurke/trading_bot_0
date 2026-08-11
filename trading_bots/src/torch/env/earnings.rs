@@ -5,11 +5,27 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const FUNDAMENTAL_AVAILABILITY_LAG_DAYS: i64 = 90;
 
-/// Global cache for earnings indicators (ticker -> indicators)
-static EARNINGS_CACHE: OnceLock<Mutex<HashMap<String, Arc<EarningsIndicators>>>> = OnceLock::new();
+struct EarningsCacheEntry {
+    bar_dates: Vec<String>,
+    price_bits: Vec<u64>,
+    indicators: Arc<EarningsIndicators>,
+}
 
-fn get_cache() -> &'static Mutex<HashMap<String, Arc<EarningsIndicators>>> {
+/// Global cache for earnings indicators (ticker -> latest aligned grid)
+static EARNINGS_CACHE: OnceLock<Mutex<HashMap<String, EarningsCacheEntry>>> = OnceLock::new();
+
+fn get_cache() -> &'static Mutex<HashMap<String, EarningsCacheEntry>> {
     EARNINGS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn same_market_grid(entry: &EarningsCacheEntry, bar_dates: &[String], prices: &[f64]) -> bool {
+    entry.bar_dates == bar_dates
+        && entry.price_bits.len() == prices.len()
+        && entry
+            .price_bits
+            .iter()
+            .zip(prices)
+            .all(|(cached, price)| *cached == price.to_bits())
 }
 
 /// Precomputed earnings indicators per step (from cached quarterly reports)
@@ -24,13 +40,17 @@ pub struct EarningsIndicators {
 }
 
 impl EarningsIndicators {
-    pub fn get_cached(ticker: &str, prices_len: usize) -> Option<Arc<EarningsIndicators>> {
+    fn get_cached(
+        ticker: &str,
+        bar_dates: &[String],
+        prices: &[f64],
+    ) -> Option<Arc<EarningsIndicators>> {
         let cache = get_cache();
         let locked = cache.lock().unwrap();
         locked
             .get(ticker)
-            .filter(|cached| cached.eps.len() == prices_len)
-            .cloned()
+            .filter(|cached| same_market_grid(cached, bar_dates, prices))
+            .map(|cached| cached.indicators.clone())
     }
 
     /// Get cached earnings indicators or compute if not present
@@ -40,7 +60,7 @@ impl EarningsIndicators {
         bar_dates: &[String],
         prices: &[f64],
     ) -> Arc<EarningsIndicators> {
-        if let Some(cached) = Self::get_cached(ticker, prices.len()) {
+        if let Some(cached) = Self::get_cached(ticker, bar_dates, prices) {
             return cached;
         }
         let cache = get_cache();
@@ -49,10 +69,14 @@ impl EarningsIndicators {
         } else {
             Arc::new(Self::compute(reports, bar_dates, prices))
         };
-        cache
-            .lock()
-            .unwrap()
-            .insert(ticker.to_string(), computed.clone());
+        cache.lock().unwrap().insert(
+            ticker.to_string(),
+            EarningsCacheEntry {
+                bar_dates: bar_dates.to_vec(),
+                price_bits: prices.iter().map(|price| price.to_bits()).collect(),
+                indicators: computed.clone(),
+            },
+        );
         computed
     }
 
@@ -157,6 +181,7 @@ mod tests {
     use super::{EarningsIndicators, FUNDAMENTAL_AVAILABILITY_LAG_DAYS};
     use crate::data::EarningsReport;
     use chrono::{Duration, NaiveDate};
+    use std::sync::Arc;
 
     fn report(date: &str, revenue_growth: f64) -> EarningsReport {
         EarningsReport {
@@ -251,5 +276,30 @@ mod tests {
         assert!((indicators.steps_since_available[2] - 0.1).abs() < 1e-12);
         // Long after (>= 90 days): clamped to the max scale.
         assert_eq!(indicators.steps_since_available[3], 1.0);
+    }
+
+    #[test]
+    fn cache_recomputes_same_length_ticker_on_a_different_date_grid() {
+        let reports = [report("2024-01-31", 0.5)];
+        let prices = [100.0, 100.0];
+        let after_release = ["2024-04-30".to_string(), "2024-05-01".to_string()];
+        let before_release = ["2024-04-28".to_string(), "2024-04-29".to_string()];
+
+        let first = EarningsIndicators::get_or_compute(
+            "EARNINGS_GRID_TEST",
+            &reports,
+            &after_release,
+            &prices,
+        );
+        let second = EarningsIndicators::get_or_compute(
+            "EARNINGS_GRID_TEST",
+            &reports,
+            &before_release,
+            &prices,
+        );
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.revenue_growth[0], 0.5);
+        assert_eq!(second.revenue_growth[0], 0.0);
     }
 }

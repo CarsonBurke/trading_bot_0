@@ -255,13 +255,14 @@ impl Trainer {
         weights_path: Option<&str>,
         model_variant: ModelVariant,
         run_name: Option<String>,
-    ) -> Self {
+    ) -> Result<Self> {
+        if model_variant != ModelVariant::UniformStream {
+            bail!(
+                "PPO rollout collection supports --model-size uniform-stream only, got {}",
+                model_variant.as_str()
+            );
+        }
         let rollout = rollout_geometry();
-        assert_eq!(
-            model_variant,
-            ModelVariant::UniformStream,
-            "PPO rollout collection is streaming-only; train with --model-size uniform-stream"
-        );
         if let Some(threads) = env::var("TORCH_NUM_THREADS")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
@@ -509,7 +510,7 @@ impl Trainer {
         let reset_env_indices_host: Vec<i64> = vec![0i64; rollout.nprocs as usize];
         let ticker_offsets = Tensor::arange(TICKERS_COUNT, (Kind::Int64, device));
 
-        Self {
+        Ok(Self {
             vs,
             trading_model,
             trainable_vars,
@@ -551,7 +552,7 @@ impl Trainer {
             reset_env_indices_host,
             ticker_offsets,
             ppo_update_graph: None,
-        }
+        })
     }
 
     pub(super) async fn run(&mut self) {
@@ -597,6 +598,16 @@ impl Trainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trainer_rejects_non_streaming_models_without_panicking() {
+        for variant in [ModelVariant::Base, ModelVariant::AblationSmall] {
+            let Err(error) = Trainer::new(None, variant, None) else {
+                panic!("unsupported PPO model variant must return an error");
+            };
+            assert!(error.to_string().contains("uniform-stream"));
+        }
+    }
 
     fn test_optimizer(named: &[(String, Tensor)]) -> Muon {
         Muon::new_named(

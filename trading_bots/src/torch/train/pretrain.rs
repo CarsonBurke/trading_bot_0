@@ -149,6 +149,35 @@ fn pretrain_execution_mode(args: &PretrainArgs) -> Result<PretrainExecutionMode>
     }
 }
 
+fn validate_pretrain_args(args: &PretrainArgs) -> Result<PretrainExecutionMode> {
+    let execution_mode = pretrain_execution_mode(args)?;
+    if args.model_size != ModelVariant::UniformStream {
+        return Err(anyhow!(
+            "world-model pretraining supports --model-size uniform-stream only, got {}",
+            args.model_size.as_str()
+        ));
+    }
+    if args.epochs == 0 {
+        return Err(anyhow!("--epochs must be positive"));
+    }
+    if args.batch_size == 0 {
+        return Err(anyhow!("--batch-size must be positive"));
+    }
+    if args.k_patches == 0 {
+        return Err(anyhow!("--k-patches must be positive"));
+    }
+    if !args.lambda_lat.is_finite() || args.lambda_lat < 0.0 {
+        return Err(anyhow!("--lambda-lat must be finite and non-negative"));
+    }
+    if !args.lambda_sigreg.is_finite() || args.lambda_sigreg < 0.0 {
+        return Err(anyhow!("--lambda-sigreg must be finite and non-negative"));
+    }
+    if !args.target_scale.is_finite() || args.target_scale <= 0.0 {
+        return Err(anyhow!("--target-scale must be finite and positive"));
+    }
+    Ok(execution_mode)
+}
+
 fn enforce_single_sampler_pass(
     execution_mode: PretrainExecutionMode,
     epochs: usize,
@@ -1186,27 +1215,7 @@ fn align_up_to_step(value: usize, origin: usize, step: usize) -> usize {
 }
 
 pub fn pretrain(args: PretrainArgs) -> Result<()> {
-    let execution_mode = pretrain_execution_mode(&args)?;
-    assert_eq!(
-        args.model_size,
-        ModelVariant::UniformStream,
-        "world-model pretraining currently supports --model-size uniform-stream only"
-    );
-    assert!(args.epochs > 0, "--epochs must be positive");
-    assert!(args.batch_size > 0, "--batch-size must be positive");
-    assert!(args.k_patches > 0, "--k-patches must be positive");
-    assert!(
-        args.lambda_lat.is_finite() && args.lambda_lat >= 0.0,
-        "--lambda-lat must be finite and non-negative"
-    );
-    assert!(
-        args.lambda_sigreg.is_finite() && args.lambda_sigreg >= 0.0,
-        "--lambda-sigreg must be finite and non-negative"
-    );
-    assert!(
-        args.target_scale.is_finite() && args.target_scale > 0.0,
-        "--target-scale must be finite and positive"
-    );
+    let execution_mode = validate_pretrain_args(&args)?;
     configure_threads();
     let device = tch::Device::cuda_if_available();
     println!("device is cuda: {}", device.is_cuda());
@@ -1235,22 +1244,19 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     }
 
     let patch_size = model.pretrain_patch_size();
-    assert_eq!(
-        args.k_patches as i64 * patch_size,
-        args.k_patches as i64 * model.pretrain_patch_size()
-    );
     let mut sampler = PretrainSampler::new(
         args.k_patches,
         patch_size as usize,
         args.target_scale,
         device,
     );
-    assert!(
-        sampler.batches_per_epoch(args.batch_size) > 0,
-        "--batch-size {} is larger than the available pretrain training pairs {}; reduce batch size or widen the training universe",
-        args.batch_size,
-        sampler.train_pairs.len()
-    );
+    if sampler.batches_per_epoch(args.batch_size) == 0 {
+        return Err(anyhow!(
+            "--batch-size {} is larger than the available pretrain training pairs {}; reduce batch size or widen the training universe",
+            args.batch_size,
+            sampler.train_pairs.len()
+        ));
+    }
     enforce_single_sampler_pass(
         execution_mode,
         args.epochs,
@@ -4744,11 +4750,11 @@ mod tests {
         chained_candles_from_ohlc_features, cumulative_future_returns, enforce_single_sampler_pass,
         future_patches_for_current_perm, next_bars_for_current_perm, record_evaluated_tickers,
         retain_spaced_train_pairs, save_pretrain_heads_checkpoint, seed_candle_from_feature_row,
-        sigreg_loss_with_directions, ticker_stratified_panel, validation_pairs, CandleBar,
-        PretrainArgs, PretrainExecutionMode, PretrainHeads, PretrainObjective, PretrainSampler,
-        SplitKind, ValidationMode, LEJEPA_AR_LAYERS, LEJEPA_BAR_FEATURES, LEJEPA_HEADS,
-        LEJEPA_HEAD_DIM, LEJEPA_ROLLOUT_BARS, LEJEPA_SIGREG_PROJECTIONS,
-        TRAIN_ANCHOR_STRIDE_MULTIPLIER,
+        sigreg_loss_with_directions, ticker_stratified_panel, validate_pretrain_args,
+        validation_pairs, CandleBar, PretrainArgs, PretrainExecutionMode, PretrainHeads,
+        PretrainObjective, PretrainSampler, SplitKind, ValidationMode, LEJEPA_AR_LAYERS,
+        LEJEPA_BAR_FEATURES, LEJEPA_HEADS, LEJEPA_HEAD_DIM, LEJEPA_ROLLOUT_BARS,
+        LEJEPA_SIGREG_PROJECTIONS, TRAIN_ANCHOR_STRIDE_MULTIPLIER,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -4757,6 +4763,28 @@ mod tests {
     };
     use tch::nn;
     use tch::{Kind, Tensor};
+
+    fn default_cli_pretrain_args(model_size: ModelVariant) -> PretrainArgs {
+        PretrainArgs {
+            weights: None,
+            model_size,
+            run: None,
+            epochs: 1,
+            steps: None,
+            eval_skill_only: false,
+            batch_size: 256,
+            k_patches: 16,
+            objective: PretrainObjective::MeanMse,
+            lambda_lat: 0.0,
+            lambda_sigreg: 0.09,
+            target_scale: 100.0,
+            validation_batches: 0,
+            validate_every: 0,
+            checkpoint_every: 0,
+            step_val_every: 5,
+            candle_snapshot_every: 500,
+        }
+    }
 
     #[test]
     fn only_lejepa_checkpoints_emit_world_model_metadata() {
@@ -4842,6 +4870,26 @@ mod tests {
             super::pretrain_execution_mode(&args).unwrap(),
             PretrainExecutionMode::Train
         );
+    }
+
+    #[test]
+    fn pretrain_validation_returns_contextual_errors_for_unsupported_models() {
+        for model_size in [ModelVariant::Base, ModelVariant::AblationSmall] {
+            let args = default_cli_pretrain_args(model_size);
+
+            let error = validate_pretrain_args(&args)
+                .expect_err("unsupported pretrain model must return an error");
+            assert!(error.to_string().contains("uniform-stream"));
+        }
+    }
+
+    #[test]
+    fn default_cli_pretrain_contract_passes_single_pass_validation() {
+        let args = default_cli_pretrain_args(ModelVariant::UniformStream);
+        let mode = validate_pretrain_args(&args).expect("default arguments should validate");
+
+        assert_eq!(mode, PretrainExecutionMode::Train);
+        assert!(enforce_single_sampler_pass(mode, args.epochs, args.steps, 10).is_ok());
     }
 
     #[test]

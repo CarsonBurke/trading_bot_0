@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::{self, Colorize};
 use trading_bot_0::torch::model::ModelVariant;
 use trading_bot_0::torch::planner::PlannerDataSplit;
@@ -11,6 +11,25 @@ fn default_paper_symbols() -> Vec<String> {
         .take(torch::constants::TICKERS_COUNT as usize)
         .map(|symbol| (*symbol).to_string())
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum StreamingModelVariant {
+    #[value(
+        name = "uniform-stream",
+        alias = "uniform-256-stream",
+        alias = "uniform256-stream"
+    )]
+    UniformStream,
+}
+
+impl From<StreamingModelVariant> for ModelVariant {
+    fn from(value: StreamingModelVariant) -> Self {
+        match value {
+            StreamingModelVariant::UniformStream => Self::UniformStream,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -64,8 +83,8 @@ enum Commands {
         #[arg(short, long)]
         weights: Option<String>,
 
-        #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
-        model_size: ModelVariant,
+        #[arg(long, value_enum, default_value_t = StreamingModelVariant::UniformStream)]
+        model_size: StreamingModelVariant,
 
         #[arg(long)]
         run: Option<String>,
@@ -74,13 +93,13 @@ enum Commands {
         #[arg(short, long)]
         weights: Option<String>,
 
-        #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
-        model_size: ModelVariant,
+        #[arg(long, value_enum, default_value_t = StreamingModelVariant::UniformStream)]
+        model_size: StreamingModelVariant,
 
         #[arg(long)]
         run: Option<String>,
 
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 1)]
         epochs: usize,
 
         #[arg(long)]
@@ -285,7 +304,9 @@ async fn main() {
             model_size,
             run,
         }) => {
-            torch::train::train(weights.as_deref(), *model_size, run.clone()).await;
+            torch::train::train(weights.as_deref(), (*model_size).into(), run.clone())
+                .await
+                .expect("PPO training failed");
         }
         Some(Commands::Pretrain {
             weights,
@@ -308,7 +329,7 @@ async fn main() {
         }) => {
             let args = torch::train::PretrainArgs {
                 weights: weights.clone(),
-                model_size: *model_size,
+                model_size: (*model_size).into(),
                 run: run.clone(),
                 epochs: *epochs,
                 steps: *steps,
@@ -431,7 +452,9 @@ async fn main() {
             .expect("paper trading failed");
         }
         None => {
-            torch::train::train(None, ModelVariant::UniformStream, None).await;
+            torch::train::train(None, ModelVariant::UniformStream, None)
+                .await
+                .expect("PPO training failed");
         }
     }
 
@@ -440,8 +463,65 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, StreamingModelVariant};
     use clap::Parser;
+    use trading_bot_0::torch::model::ModelVariant;
+
+    #[test]
+    fn train_and_pretrain_defaults_are_executable_contracts() {
+        let train = Cli::try_parse_from(["trading_bot", "train"]).expect("train should parse");
+        assert!(matches!(
+            train.command,
+            Some(Commands::Train {
+                model_size: StreamingModelVariant::UniformStream,
+                ..
+            })
+        ));
+
+        let pretrain =
+            Cli::try_parse_from(["trading_bot", "pretrain"]).expect("pretrain should parse");
+        assert!(matches!(
+            pretrain.command,
+            Some(Commands::Pretrain {
+                model_size: StreamingModelVariant::UniformStream,
+                epochs: 1,
+                steps: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn streaming_only_commands_reject_unimplemented_model_families() {
+        for command in ["train", "pretrain"] {
+            for model in ["base", "ablation-small"] {
+                let Err(error) =
+                    Cli::try_parse_from(["trading_bot", command, "--model-size", model])
+                else {
+                    panic!("unsupported streaming model must fail during parsing");
+                };
+                let message = error.to_string();
+                assert!(message.contains("invalid value"));
+                assert!(message.contains("uniform-stream"));
+            }
+        }
+    }
+
+    #[test]
+    fn offline_inference_exposes_every_implemented_model_family() {
+        for (name, expected) in [
+            ("base", ModelVariant::Base),
+            ("uniform-stream", ModelVariant::UniformStream),
+            ("ablation-small", ModelVariant::AblationSmall),
+        ] {
+            let cli = Cli::try_parse_from(["trading_bot", "infer", "--model-size", name])
+                .expect("implemented inference model should parse");
+            let Some(Commands::Infer { model_size, .. }) = cli.command else {
+                panic!("infer subcommand should parse as Infer");
+            };
+            assert_eq!(model_size, expected);
+        }
+    }
 
     #[test]
     fn paper_defaults_match_model_ticker_count() {
