@@ -245,6 +245,88 @@ struct PlannerInferenceManifestView {
     rollout_length: usize,
 }
 
+#[derive(Deserialize)]
+struct PpoResumeManifestView {
+    format_version: u32,
+    next_episode: usize,
+    optimizer_step: i64,
+    weights_sha256: String,
+    optimizer_sha256: String,
+    kl_lr_controller: KlLrControllerStateView,
+}
+
+#[derive(Deserialize)]
+struct KlLrControllerStateView {
+    version: u32,
+    ema: f64,
+    scale: f64,
+}
+
+fn selectable_weight_files(weights_dir: &Path) -> Vec<String> {
+    let mut weights = fs::read_dir(weights_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_owned();
+            is_selectable_primary_weight(&entry.path(), &name).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    weights.sort_by(|a, b| {
+        let checkpoint_number = |name: &str| -> usize {
+            name.chars()
+                .filter(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        };
+        checkpoint_number(b).cmp(&checkpoint_number(a))
+    });
+    weights
+}
+
+fn is_selectable_primary_weight(path: &Path, name: &str) -> bool {
+    if path.extension().is_none_or(|extension| extension != "ot")
+        || name.starts_with('.')
+        || name.starts_with("pretrain_heads")
+        || name.ends_with(".optimizer.ot")
+        || name.contains(".tmp-")
+        || name.contains(".tmp.")
+    {
+        return false;
+    }
+
+    let Some(episode) = name
+        .strip_prefix("ppo_ep")
+        .and_then(|suffix| suffix.strip_suffix(".ot"))
+    else {
+        return !name.starts_with("ppo_ep");
+    };
+    if episode.parse::<usize>().is_err() {
+        return false;
+    }
+
+    let optimizer = path.with_extension("optimizer.ot");
+    let resume = path.with_extension("resume.json");
+    let manifest = fs::read(&resume)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PpoResumeManifestView>(&bytes).ok());
+    optimizer.is_file()
+        && manifest.is_some_and(|manifest| {
+            manifest.format_version == 1
+                && manifest.next_episode > 0
+                && manifest.optimizer_step >= 0
+                && !manifest.weights_sha256.is_empty()
+                && !manifest.optimizer_sha256.is_empty()
+                && manifest.kl_lr_controller.version == 1
+                && manifest.kl_lr_controller.ema.is_finite()
+                && manifest.kl_lr_controller.ema > 0.0
+                && manifest.kl_lr_controller.scale.is_finite()
+                && manifest.kl_lr_controller.scale > 0.0
+        })
+}
+
 fn planner_committed_updates(gens: &Path) -> std::collections::HashMap<String, u64> {
     let Some(weights) = gens.parent().map(|root| root.join("weights")) else {
         return std::collections::HashMap::new();
@@ -454,8 +536,10 @@ impl App {
             "planner_position",
             "planner_position_mean",
             "planner_outperformance",
+            "planner_outperformance_fraction",
             "planner_turnover",
             "planner_commissions",
+            "planner_aux_return_loss",
             "planner_deterministic_wealth",
             "planner_deterministic_reward",
             "planner_deterministic_position_mean",
@@ -789,15 +873,19 @@ impl App {
                 self.chart_viewer.load_charts(&self.latest_meta_charts)?;
             }
             self.meta_reports_revision = revision;
-            let log_path = self
-                .process_manager
-                .active_run
-                .as_ref()
-                .map(|r| r.log_file.to_string_lossy().to_string());
-            self.logs_page.poll_training_output(log_path.as_deref());
+            let log_path = self.active_log_path();
+            self.logs_page.poll_training_output(&log_path);
             self.last_refresh = now;
         }
         Ok(())
+    }
+
+    fn active_log_path(&self) -> PathBuf {
+        self.process_manager
+            .active_run
+            .as_ref()
+            .map(|run| run.log_file.clone())
+            .unwrap_or_else(|| PathBuf::from("../training/runs/latest/training.log"))
     }
 
     fn start_training(&mut self, weights_path: Option<String>) -> Result<()> {
@@ -849,29 +937,7 @@ impl App {
                     .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
                     .count();
                 let weights_dir = entry.path().join("weights");
-                let mut weights: Vec<String> = fs::read_dir(&weights_dir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path().extension().map_or(false, |ext| ext == "ot")
-                            && !e
-                                .file_name()
-                                .to_string_lossy()
-                                .starts_with("pretrain_heads")
-                    })
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect();
-                weights.sort_by(|a, b| {
-                    let num = |s: &String| -> usize {
-                        s.chars()
-                            .filter(|c| c.is_ascii_digit())
-                            .collect::<String>()
-                            .parse()
-                            .unwrap_or(0)
-                    };
-                    num(b).cmp(&num(a))
-                });
+                let weights = selectable_weight_files(&weights_dir);
                 let is_active = live_name.as_deref() == Some(&name);
                 if gen_count == 0 && weights.is_empty() && !is_active {
                     return None;
@@ -1133,17 +1199,74 @@ mod planner_inference_discovery_tests {
     }
 }
 
+#[cfg(test)]
+mod checkpoint_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn ppo_bundle_exposes_only_primary_weights() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-ppo-selector-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ppo_ep50.ot"), b"weights").unwrap();
+        fs::write(root.join("ppo_ep50.optimizer.ot"), b"optimizer").unwrap();
+        fs::write(
+            root.join("ppo_ep50.resume.json"),
+            br#"{
+                "format_version": 1,
+                "next_episode": 51,
+                "optimizer_step": 100,
+                "weights_sha256": "weights-hash",
+                "optimizer_sha256": "optimizer-hash",
+                "kl_lr_controller": {"version": 1, "ema": 0.01, "scale": 1.0}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(selectable_weight_files(&root), vec!["ppo_ep50.ot"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_ppo_bundles_and_known_sidecars_are_hidden() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-weight-sidecars-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for name in [
+            "ppo_ep100.ot",
+            "planner.optimizer.ot",
+            "pretrain_heads_best.ot",
+            "checkpoint.tmp-deadbeef.ot",
+            ".hidden.ot",
+        ] {
+            fs::write(root.join(name), b"artifact").unwrap();
+        }
+        fs::write(root.join("custom_model.ot"), b"weights").unwrap();
+
+        assert_eq!(selectable_weight_files(&root), vec!["custom_model.ot"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
 
         app.maybe_refresh()?;
-        let log_path = app
-            .process_manager
-            .active_run
-            .as_ref()
-            .map(|r| r.log_file.to_string_lossy().to_string());
-        app.logs_page.poll_training_output(log_path.as_deref());
+        let log_path = app.active_log_path();
+        app.logs_page.poll_training_output(&log_path);
 
         // Wait for event, then drain all pending events before redrawing
         if event::poll(Duration::from_millis(16))? {
@@ -1771,7 +1894,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         app.mode = AppMode::Main;
                                     }
                                     KeyCode::Char('c') => {
-                                        app.logs_page.clear_logs();
+                                        let log_path = app.active_log_path();
+                                        app.logs_page.clear_logs(&log_path)?;
                                     }
                                     KeyCode::Down | KeyCode::Char('j') => {
                                         app.logs_page.next();

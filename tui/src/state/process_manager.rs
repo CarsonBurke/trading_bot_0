@@ -1,7 +1,10 @@
 use anyhow::Result;
-use shared::{paths::RUNS_PATH, run_dir::RunDir};
+use shared::{
+    paths::{RUNS_PATH, WORKSPACE_ROOT},
+    run_dir::RunDir,
+};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -191,11 +194,7 @@ impl ProcessManagerState {
             (_, None) => RunDir::create_fresh(RUNS_PATH, None)?,
         };
 
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&run_dir.log_file)?;
+        let log_file = open_training_log(&run_dir.log_file)?;
 
         let mut cmd = Command::new("cargo");
         cmd.current_dir(trading_bots_dir())
@@ -321,20 +320,29 @@ fn clone_run_dir(run: &RunDir) -> RunDir {
     }
 }
 
-fn list_training_processes() -> Vec<(u32, String)> {
-    let Ok(output) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
+fn open_training_log(path: &Path) -> Result<std::fs::File> {
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?)
+}
+
+fn list_training_processes() -> Vec<(u32, Vec<String>)> {
+    let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
     };
+    let workspace_root = canonical_or_original(Path::new(WORKSPACE_ROOT));
+    let bots_root = canonical_or_original(&trading_bots_dir());
 
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            let split_idx = trimmed.find(char::is_whitespace)?;
-            let (pid, cmdline) = trimmed.split_at(split_idx);
-            let pid = pid.parse::<u32>().ok()?;
-            let cmdline = cmdline.trim();
-            is_training_cmdline(cmdline).then_some((pid, cmdline.to_string()))
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let cwd = fs::read_link(entry.path().join("cwd")).ok()?;
+            let executable_path = fs::read_link(entry.path().join("exe")).ok()?;
+            let args = read_process_args(&entry.path().join("cmdline"))?;
+            is_training_invocation(&cwd, &executable_path, &args, &workspace_root, &bots_root)
+                .then_some((pid, args))
         })
         .collect()
 }
@@ -344,15 +352,15 @@ fn detect_active_training_run(preferred_pid: Option<u32>) -> Option<RunDir> {
     processes.sort_by_key(|(pid, _)| *pid);
 
     if let Some(pid) = preferred_pid {
-        if let Some((_, cmdline)) = processes.iter().find(|(candidate, _)| *candidate == pid) {
-            if let Some(run_dir) = parse_run_dir_from_cmdline(cmdline) {
+        if let Some((_, args)) = processes.iter().find(|(candidate, _)| *candidate == pid) {
+            if let Some(run_dir) = parse_run_dir_from_args(args) {
                 return Some(run_dir);
             }
         }
     }
 
-    for (_, cmdline) in processes.into_iter().rev() {
-        if let Some(run_dir) = parse_run_dir_from_cmdline(&cmdline) {
+    for (_, args) in processes.into_iter().rev() {
+        if let Some(run_dir) = parse_run_dir_from_args(&args) {
             return Some(run_dir);
         }
     }
@@ -360,13 +368,13 @@ fn detect_active_training_run(preferred_pid: Option<u32>) -> Option<RunDir> {
     None
 }
 
-fn parse_run_dir_from_cmdline(cmdline: &str) -> Option<RunDir> {
-    run_name_from_cmdline(cmdline).and_then(run_dir_from_name)
+fn parse_run_dir_from_args(args: &[String]) -> Option<RunDir> {
+    run_name_from_args(args).and_then(run_dir_from_name)
 }
 
-fn run_name_from_cmdline(cmdline: &str) -> Option<&str> {
-    option_value(cmdline, "--run").or_else(|| {
-        let output = option_value(cmdline, "--output")?;
+fn run_name_from_args(args: &[String]) -> Option<&str> {
+    option_value(args, "--run").or_else(|| {
+        let output = option_value(args, "--output")?;
         let output = Path::new(output);
         let weights = output.parent()?;
         if weights.file_name()?.to_str()? != "weights" {
@@ -376,17 +384,85 @@ fn run_name_from_cmdline(cmdline: &str) -> Option<&str> {
     })
 }
 
-fn option_value<'a>(cmdline: &'a str, option: &str) -> Option<&'a str> {
-    cmdline
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find_map(|window| (window[0] == option).then_some(window[1]))
+fn option_value<'a>(args: &'a [String], option: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find_map(|window| (window[0] == option).then_some(window[1].as_str()))
         .or_else(|| {
-            cmdline
-                .split_whitespace()
+            args.iter()
                 .find_map(|part| part.strip_prefix(option)?.strip_prefix('='))
         })
+}
+
+fn read_process_args(path: &Path) -> Option<Vec<String>> {
+    let bytes = fs::read(path).ok()?;
+    let args = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>();
+    (!args.is_empty()).then_some(args)
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_training_invocation(
+    cwd: &Path,
+    executable_path: &Path,
+    args: &[String],
+    workspace_root: &Path,
+    bots_root: &Path,
+) -> bool {
+    if cwd != workspace_root && cwd != bots_root {
+        return false;
+    }
+
+    let Some(argv_executable) = args
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let Some(actual_executable) = executable_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    match argv_executable {
+        "trading_bot_0" => {
+            actual_executable == "trading_bot_0"
+                && args.get(1).is_some_and(|arg| is_training_subcommand(arg))
+        }
+        "cargo" => {
+            if !matches!(actual_executable, "cargo" | "rustup") {
+                return false;
+            }
+            if args.get(1).is_none_or(|arg| arg != "run") {
+                return false;
+            }
+            if cwd == workspace_root && !cargo_selects_trading_bot(args) {
+                return false;
+            }
+            args.iter()
+                .position(|arg| arg == "--")
+                .and_then(|separator| args.get(separator + 1))
+                .is_some_and(|arg| is_training_subcommand(arg))
+        }
+        _ => false,
+    }
+}
+
+fn cargo_selects_trading_bot(args: &[String]) -> bool {
+    args.windows(2).any(|window| {
+        matches!(window[0].as_str(), "-p" | "--package" | "--bin") && window[1] == "trading_bot_0"
+    }) || args
+        .iter()
+        .any(|arg| ["--package=trading_bot_0", "--bin=trading_bot_0"].contains(&arg.as_str()))
+}
+
+fn is_training_subcommand(arg: &str) -> bool {
+    matches!(arg, "train" | "train-planner" | "genetic" | "pretrain")
 }
 
 fn run_dir_from_name(name: &str) -> Option<RunDir> {
@@ -506,23 +582,6 @@ fn trading_bots_dir() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../trading_bots")
 }
 
-fn is_training_cmdline(cmdline: &str) -> bool {
-    !cmdline.contains("trading-bot-tui")
-        && !cmdline.contains("ps -eo")
-        && !cmdline.contains("pgrep -f")
-        && (cmdline.contains(" train ")
-            || cmdline.ends_with(" train")
-            || cmdline.contains(" train-planner ")
-            || cmdline.ends_with(" train-planner")
-            || cmdline.contains(" genetic ")
-            || cmdline.ends_with(" genetic")
-            || cmdline.contains(" pretrain ")
-            || cmdline.ends_with(" pretrain")
-            || cmdline.contains("trading_bot_0 train")
-            || cmdline.contains("trading_bot_0 genetic")
-            || cmdline.contains("trading_bot_0 pretrain"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,31 +627,146 @@ mod tests {
 
     #[test]
     fn planner_output_identifies_its_run_without_run_flag() {
-        let cmdline = "target/release/trading_bot_0 train-planner --world-model-weights wm.ot --output training/runs/pope64_fa4_planner_rl_best_v1/weights/planner.ot --updates 1000";
+        let args = strings(&[
+            "target/release/trading_bot_0",
+            "train-planner",
+            "--world-model-weights",
+            "wm.ot",
+            "--output",
+            "training/runs/pope64_fa4_planner_rl_best_v1/weights/planner.ot",
+            "--updates",
+            "1000",
+        ]);
         assert_eq!(
-            run_name_from_cmdline(cmdline),
+            run_name_from_args(&args),
             Some("pope64_fa4_planner_rl_best_v1")
         );
-        assert!(is_training_cmdline(cmdline));
     }
 
     #[test]
     fn planner_output_equals_form_is_supported() {
-        let cmdline =
-            "trading_bot_0 train-planner --output=/repo/training/runs/run-a/weights/custom.ot";
-        assert_eq!(run_name_from_cmdline(cmdline), Some("run-a"));
+        let args = strings(&[
+            "trading_bot_0",
+            "train-planner",
+            "--output=/repo/training/runs/run-a/weights/custom.ot",
+        ]);
+        assert_eq!(run_name_from_args(&args), Some("run-a"));
     }
 
     #[test]
     fn output_outside_a_run_weights_directory_is_not_claimed() {
-        let cmdline = "trading_bot_0 train-planner --output weights/planner.ot";
-        assert_eq!(run_name_from_cmdline(cmdline), None);
+        let args = strings(&[
+            "trading_bot_0",
+            "train-planner",
+            "--output",
+            "weights/planner.ot",
+        ]);
+        assert_eq!(run_name_from_args(&args), None);
     }
 
     #[test]
     fn explicit_run_name_takes_precedence_over_output() {
-        let cmdline =
-            "trading_bot_0 pretrain --run named --output training/runs/other/weights/model.ot";
-        assert_eq!(run_name_from_cmdline(cmdline), Some("named"));
+        let args = strings(&[
+            "trading_bot_0",
+            "pretrain",
+            "--run",
+            "named",
+            "--output",
+            "training/runs/other/weights/model.ot",
+        ]);
+        assert_eq!(run_name_from_args(&args), Some("named"));
+    }
+
+    #[test]
+    fn only_repo_training_invocations_are_owned() {
+        let workspace = Path::new("/repo");
+        let bots = Path::new("/repo/trading_bots");
+
+        assert!(is_training_invocation(
+            bots,
+            Path::new("/home/user/.cargo/bin/rustup"),
+            &strings(&["cargo", "run", "--release", "--", "train", "--run", "run-a"]),
+            workspace,
+            bots,
+        ));
+        assert!(is_training_invocation(
+            workspace,
+            Path::new("/usr/bin/cargo"),
+            &strings(&["cargo", "run", "-p", "trading_bot_0", "--", "train-planner",]),
+            workspace,
+            bots,
+        ));
+        assert!(is_training_invocation(
+            bots,
+            Path::new("/repo/target/release/trading_bot_0"),
+            &strings(&["/repo/target/release/trading_bot_0", "pretrain"]),
+            workspace,
+            bots,
+        ));
+
+        assert!(!is_training_invocation(
+            Path::new("/other"),
+            Path::new("/usr/bin/cargo"),
+            &strings(&["cargo", "run", "--", "train"]),
+            workspace,
+            bots,
+        ));
+        assert!(!is_training_invocation(
+            workspace,
+            Path::new("/usr/bin/cargo"),
+            &strings(&["cargo", "run", "-p", "other", "--", "train"]),
+            workspace,
+            bots,
+        ));
+        assert!(!is_training_invocation(
+            bots,
+            Path::new("/usr/bin/python"),
+            &strings(&["python", "tool.py", "train"]),
+            workspace,
+            bots,
+        ));
+        assert!(!is_training_invocation(
+            bots,
+            Path::new("/usr/bin/bash"),
+            &strings(&["bash", "-lc", "trading_bot_0 train"]),
+            workspace,
+            bots,
+        ));
+        assert!(!is_training_invocation(
+            bots,
+            Path::new("/usr/bin/python"),
+            &strings(&["trading_bot_0", "train"]),
+            workspace,
+            bots,
+        ));
+    }
+
+    #[test]
+    fn opening_training_log_preserves_existing_run_history() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "tui-training-log-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "previous session\n").unwrap();
+
+        let mut log = open_training_log(&path).unwrap();
+        writeln!(log, "new session").unwrap();
+        drop(log);
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "previous session\nnew session\n"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
     }
 }

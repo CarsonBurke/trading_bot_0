@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use crate::components::episode_status;
-use crate::report_renderer::render_report_with_options;
+use crate::report_renderer::{asset_series_count, render_report_with_options};
 use crate::utils::clipboard;
 
 #[derive(Debug, Clone)]
@@ -111,12 +111,10 @@ impl ChartViewer {
                 positioned,
                 benchmark,
                 ..
-            } => Some(
-                2 + positioned
-                    .as_ref()
-                    .map_or(0, |p| if p.is_empty() { 0 } else { 1 })
-                    + benchmark.as_ref().map_or(0, |_| 1),
-            ),
+            } => Some(asset_series_count(
+                positioned.as_deref(),
+                benchmark.as_deref(),
+            )),
             ReportKind::CandleCompare { .. } => Some(2),
             ReportKind::BuySell { .. } | ReportKind::Observations { .. } => None,
         }

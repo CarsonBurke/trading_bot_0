@@ -1,5 +1,7 @@
 use ratatui::{layout::Rect, widgets::ListState};
 use std::fs;
+use std::io;
+use std::path::Path;
 
 const MAX_LOGS: usize = 1000;
 
@@ -20,9 +22,7 @@ impl LogsPageState {
         }
     }
 
-    pub fn poll_training_output(&mut self, log_path: Option<&str>) {
-        let default = "../training/runs/latest/training.log".to_string();
-        let log_path = log_path.unwrap_or(&default);
+    pub fn poll_training_output(&mut self, log_path: &Path) {
         if let Ok(content) = fs::read_to_string(log_path) {
             let new_lines: Vec<String> = content
                 .lines()
@@ -45,11 +45,11 @@ impl LogsPageState {
         }
     }
 
-    pub fn clear_logs(&mut self) {
-        let log_path = "../training/runs/latest/training.log";
-        let _ = fs::write(log_path, "");
+    pub fn clear_logs(&mut self, log_path: &Path) -> io::Result<()> {
+        fs::write(log_path, "")?;
         self.training_output.clear();
         self.logs_list_state.select(None);
+        Ok(())
     }
 
     pub fn set_logs_position(&mut self, selected: usize) {
@@ -135,5 +135,36 @@ impl LogsPageState {
         for _ in 0..page_size {
             self.next();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_logs_only_truncates_the_requested_log() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-clear-logs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let displayed = root.join("displayed.log");
+        let other = root.join("other.log");
+        fs::write(&displayed, "displayed history\n").unwrap();
+        fs::write(&other, "other history\n").unwrap();
+
+        let mut state = LogsPageState::new();
+        state.training_output.push("displayed history".to_owned());
+        state.clear_logs(&displayed).unwrap();
+
+        assert_eq!(fs::read_to_string(displayed).unwrap(), "");
+        assert_eq!(fs::read_to_string(other).unwrap(), "other history\n");
+        assert!(state.training_output.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 }
