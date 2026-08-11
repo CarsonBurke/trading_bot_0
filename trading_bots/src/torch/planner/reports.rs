@@ -206,6 +206,7 @@ pub struct PlannerTrainingReportPoint {
     pub critic_explained_variance: f64,
     pub actor_loss: f64,
     pub critic_loss: f64,
+    pub aux_return_loss: f64,
     pub reverse_kl: f64,
     pub max_reverse_kl: f64,
     pub kl_early_stopped: bool,
@@ -241,6 +242,7 @@ impl PlannerTrainingReportPoint {
             self.beta_concentration,
             self.actor_loss,
             self.critic_loss,
+            self.aux_return_loss,
             self.reverse_kl,
             self.max_reverse_kl,
             self.entropy,
@@ -299,6 +301,7 @@ pub struct PlannerReportHistory {
     critic_explained_variance: Vec<f32>,
     actor_loss: Vec<f32>,
     critic_loss: Vec<f32>,
+    aux_return_loss: Vec<f32>,
     reverse_kl: Vec<f32>,
     max_reverse_kl: Vec<f32>,
     kl_early_stopped: Vec<f32>,
@@ -408,6 +411,7 @@ impl PlannerReportHistory {
         set!(critic_explained_variance, point.critic_explained_variance);
         set!(actor_loss, point.actor_loss);
         set!(critic_loss, point.critic_loss);
+        set!(aux_return_loss, point.aux_return_loss);
         set!(reverse_kl, point.reverse_kl);
         set!(max_reverse_kl, point.max_reverse_kl);
         set!(kl_early_stopped, f64::from(point.kl_early_stopped));
@@ -631,6 +635,7 @@ impl PlannerReportHistory {
         simple_allow_nan!(critic_explained_variance, "explained_var.report.bin");
         simple!(actor_loss, "policy_loss.report.bin");
         simple!(critic_loss, "value_loss.report.bin");
+        optional_simple!(aux_return_loss, "planner_aux_return_loss.report.bin");
         line!(reverse_kl, "approx_kl.report.bin", "reverse KL");
         line!(max_reverse_kl, "approx_kl.report.bin", "max reverse KL");
         line!(kl_early_stopped, "approx_kl.report.bin", "early stopped");
@@ -712,6 +717,7 @@ impl PlannerReportHistory {
             critic_explained_variance,
             actor_loss,
             critic_loss,
+            aux_return_loss,
             reverse_kl,
             max_reverse_kl,
             kl_early_stopped,
@@ -910,6 +916,14 @@ impl PlannerReportHistory {
             "Planner Value Loss",
             "loss",
             &self.critic_loss,
+            ScaleKind::Linear,
+        )?;
+        write_simple(
+            output,
+            "planner_aux_return_loss",
+            "Planner Auxiliary Next-Return Loss",
+            "loss",
+            &self.aux_return_loss,
             ScaleKind::Linear,
         )?;
         write_multiline(
@@ -1742,6 +1756,7 @@ mod tests {
                     deterministic_requested_target_weight_mean: 0.275,
                     deterministic_executed_stock_weight_mean: 0.268,
                     deterministic_action_boundary_fraction: 0.0,
+                    aux_return_loss: 0.125,
                     ..PlannerTrainingReportPoint::default()
                 },
                 &trace(),
@@ -1775,6 +1790,10 @@ mod tests {
         }
         let sampled_wealth = read_report(&dir.join("1/planner_wealth.report.bin")).unwrap();
         assert!(sampled_wealth.title.contains("Sampled On-Policy"));
+        assert_eq!(
+            read_simple(&dir.join("1/planner_aux_return_loss.report.bin")).unwrap(),
+            vec![0.125]
+        );
         let deterministic_wealth =
             read_report(&dir.join("1/planner_deterministic_wealth.report.bin")).unwrap();
         assert!(deterministic_wealth
@@ -1889,6 +1908,41 @@ mod tests {
         let values = read_simple(&dir.join("2/planner_deterministic_reward.report.bin")).unwrap();
         assert!(values[0].is_nan());
         assert_eq!(values[1], 0.2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resume_from_generation_before_aux_return_report_preserves_alignment() {
+        let dir = std::env::temp_dir().join(format!(
+            "planner-aux-return-resume-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut history = PlannerReportHistory::load(&dir, 0, "run-a").unwrap();
+        history
+            .stage_training(1, PlannerTrainingReportPoint::default(), &trace(), &trace())
+            .unwrap()
+            .publish()
+            .unwrap();
+        fs::remove_file(dir.join("1/planner_aux_return_loss.report.bin")).unwrap();
+
+        let mut resumed = PlannerReportHistory::load(&dir, 1, "run-a").unwrap();
+        resumed
+            .stage_training(
+                2,
+                PlannerTrainingReportPoint {
+                    aux_return_loss: 0.25,
+                    ..PlannerTrainingReportPoint::default()
+                },
+                &trace(),
+                &trace(),
+            )
+            .unwrap()
+            .publish()
+            .unwrap();
+        let values = read_simple(&dir.join("2/planner_aux_return_loss.report.bin")).unwrap();
+        assert!(values[0].is_nan());
+        assert_eq!(values[1], 0.25);
         fs::remove_dir_all(dir).unwrap();
     }
 

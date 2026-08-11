@@ -14,7 +14,10 @@ use crate::torch::{
     cuda::cfg::configure_cuda,
     optim::muon::{Muon, MuonConfig},
     train::{
-        config::{LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM_WARMUP_START, USE_MUON},
+        config::{
+            LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM_WARMUP_START, PolicyObjective,
+            POLICY_OBJECTIVE, USE_MUON,
+        },
         optimizer_glue::{
             backward_actor_critic_with_separate_clips, grad_clip_groups, muon_momentum_for_step,
             named_trainable_variables, KlLrController,
@@ -221,6 +224,11 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
 
     let mut planner_vs = nn::VarStore::new(device);
     let planner = WorldModelPlanner::new(&planner_vs.root());
+    // The value critic's running-stats normalization buffers must be registered
+    // in the planner VarStore BEFORE any checkpoint load so they participate in
+    // save/load and are restored on resume. They are non-trainable, so they are
+    // excluded from the optimizer's trainable-variable set.
+    let hl_gauss = HlGaussBins::planner(&(planner_vs.root() / "value_running_stats"), device);
     if args.planner_weights.is_none() {
         ensure_fresh_resume_output(&args.output)?;
     }
@@ -329,7 +337,6 @@ pub fn train_planner(args: TrainPlannerArgs) -> Result<()> {
             }
         }
     }
-    let hl_gauss = HlGaussBins::default_for(device);
     println!(
         "planner training: device={device:?} updates={} H={} T={} N={} context={} (stateful world-model KV cache enabled)",
         args.updates, args.horizon, args.rollout_length, args.environments, context_bars
@@ -456,6 +463,10 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
     let world_lineage = world_model.lineage_sha256().to_owned();
     let mut planner_vs = nn::VarStore::new(device);
     let planner = WorldModelPlanner::new(&planner_vs.root());
+    // Register the critic value running-stats buffers before load so the persisted
+    // stats restore into this store (keeping the value function definition intact
+    // even though inference reads actions, not decoded values).
+    let _hl_gauss = HlGaussBins::planner(&(planner_vs.root() / "value_running_stats"), device);
     let (planner_weights, _) =
         resolve_resume_checkpoint(&args.planner_weights, &world_lineage, args.horizon, None)?;
     let checkpoint_metadata = load_planner_checkpoint(
@@ -837,6 +848,13 @@ fn optimize_rollout(
     let diagnostics = critic_diagnostics(&batch.old_alpha, &batch.old_beta, &batch.values, returns);
     summary.beta_concentration = diagnostics.beta_concentration_mean;
     summary.critic_explained_variance = diagnostics.critic_explained_variance;
+    // Refit the value critic's running normalization on this update's GAE returns
+    // (whole batch, once) BEFORE encoding any minibatch target, so every minibatch
+    // in this update standardizes against the same run-level stats and the encoded
+    // targets are consistent with the decode used for the next rollout/GAE/EV.
+    // critic_ev above is measured against the values the critic produced during the
+    // rollout (decoded with the prior stats), so it stays in raw return units.
+    hl_gauss.update_running_stats(returns);
 
     let mut actor_loss_sum = Tensor::zeros([], (Kind::Float, device));
     let mut critic_loss_sum = Tensor::zeros([], (Kind::Float, device));
@@ -846,7 +864,7 @@ fn optimize_rollout(
     let mut actor_grad_sum = Tensor::zeros([], (Kind::Float, device));
     let mut critic_grad_sum = Tensor::zeros([], (Kind::Float, device));
     apply_planner_actor_lr_scale(optimizer, kl_controller.scale())?;
-    for epoch in 0..DEFAULT_PLANNER_OPTIMIZATION_EPOCHS {
+    'optimization: for epoch in 0..DEFAULT_PLANNER_OPTIMIZATION_EPOCHS {
         for indices in
             rollout.minibatch_indices(minibatch_size, seed ^ ((epoch as u64 + 1) << 32))?
         {
@@ -871,7 +889,9 @@ fn optimize_rollout(
             let raw_minibatch_kl = losses.reverse_kl.double_value(&[]);
             let (stop, minibatch_kl) =
                 kl_stops_before_optimizer_step(&mut summary, raw_minibatch_kl)?;
-            let critic_only = stop || summary.kl_early_stopped;
+            if stop {
+                break 'optimization;
+            }
             optimizer.zero_grad();
             let (actor_norm, critic_norm) = backward_actor_critic_with_separate_clips(
                 clip_groups,
@@ -880,20 +900,16 @@ fn optimize_rollout(
                 &losses.critic_loss,
                 MAX_GRAD_NORM,
                 device,
-                critic_only,
+                false,
             );
             optimizer.set_momentum(muon_momentum_for_step(*optimizer_steps as i64));
-            set_planner_actor_step_enabled(optimizer, !critic_only)?;
             optimizer.step();
-            set_planner_actor_step_enabled(optimizer, true)?;
             *optimizer_steps += 1;
-            if !critic_only {
-                actor_loss_sum += losses.actor_loss.detach();
-                reverse_kl_sum += minibatch_kl;
-                entropy_sum += losses.entropy.detach();
-                actor_grad_sum += actor_norm.detach();
-                summary.actor_steps += 1;
-            }
+            actor_loss_sum += losses.actor_loss.detach();
+            reverse_kl_sum += minibatch_kl;
+            entropy_sum += losses.entropy.detach();
+            actor_grad_sum += actor_norm.detach();
+            summary.actor_steps += 1;
             critic_loss_sum += losses.critic_loss.detach();
             aux_return_loss_sum += losses.aux_return_loss.detach();
             critic_grad_sum += critic_norm.detach();
@@ -941,16 +957,6 @@ fn new_planner_optimizer(named_vars: &[(String, Tensor)]) -> Muon {
             ..MuonConfig::default()
         },
     )
-}
-
-fn set_planner_actor_step_enabled(optimizer: &mut Muon, enabled: bool) -> Result<()> {
-    let matched = optimizer.set_named_step_enabled(PLANNER_ACTOR_LR_PATTERNS, enabled);
-    if matched != PLANNER_ACTOR_PARAMETER_COUNT {
-        bail!(
-            "planner actor step routing matched {matched} parameters, expected {PLANNER_ACTOR_PARAMETER_COUNT}"
-        );
-    }
-    Ok(())
 }
 
 fn kl_stops_before_optimizer_step(
@@ -1011,10 +1017,22 @@ fn rollout_advantages(
         &to_grid(&batch.terminated).view(shape),
         &to_grid(&batch.truncated).view(shape),
     );
-    Ok((
-        advantages.view([len as i64]).index_select(0, &slot_index),
-        returns.view([len as i64]).index_select(0, &slot_index),
-    ))
+    let advantages = advantages.view([len as i64]).index_select(0, &slot_index);
+    let returns = returns.view([len as i64]).index_select(0, &slot_index);
+    // CleanRL-style advantage normalization over the ENTIRE batch (not per-minibatch):
+    // stabilizes per-minibatch step scale and keeps a cluster of boundary-driven
+    // advantage outliers from dominating a minibatch, which is what detaches max
+    // reverse-KL from the mean. Returns are left raw — the running-stats critic owns
+    // its own target normalization (no return norm). PPO only: PMPO consumes RAW GAE
+    // advantages (its tanh sign-weighting subsumes scale normalization, and mean-
+    // centering would flip the sign of near-mean samples and corrupt the objective).
+    let advantages = match POLICY_OBJECTIVE {
+        PolicyObjective::Ppo => {
+            (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8)
+        }
+        PolicyObjective::Pmpo => advantages,
+    };
+    Ok((advantages, returns))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1295,7 +1313,10 @@ fn ensure_fresh_resume_output(checkpoint: impl AsRef<Path>) -> Result<()> {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("planner");
-    let has_sidecar = resume_manifest_path(checkpoint).exists();
+    let has_output_bundle = checkpoint.exists()
+        || planner_metadata_path(checkpoint).exists()
+        || planner_optimizer_state_path(checkpoint).exists()
+        || resume_manifest_path(checkpoint).exists();
     let has_bundle = checkpoint
         .parent()
         .and_then(|parent| fs::read_dir(parent).ok())
@@ -1307,7 +1328,7 @@ fn ensure_fresh_resume_output(checkpoint: impl AsRef<Path>) -> Result<()> {
                 })
             })
         });
-    if has_sidecar || has_bundle {
+    if has_output_bundle || has_bundle {
         bail!(
             "planner output {} already contains a run; resume it explicitly or use a fresh output",
             checkpoint.display()
@@ -1551,6 +1572,7 @@ fn training_report_point(
         critic_explained_variance: optimization.critic_explained_variance,
         actor_loss: optimization.actor_loss,
         critic_loss: optimization.critic_loss,
+        aux_return_loss: optimization.aux_return_loss,
         reverse_kl: optimization.reverse_kl,
         max_reverse_kl: optimization.max_reverse_kl,
         kl_early_stopped: optimization.kl_early_stopped,
@@ -1627,7 +1649,10 @@ mod tests {
             &sampled,
             sampled_benchmark,
             &deterministic,
-            OptimizationSummary::default(),
+            OptimizationSummary {
+                aux_return_loss: 0.33,
+                ..OptimizationSummary::default()
+            },
         );
         assert_eq!(point.reward_mean, 0.1);
         assert_eq!(point.mean_outperformance_ratio, -0.01);
@@ -1636,25 +1661,39 @@ mod tests {
         assert_eq!(point.deterministic_mean_outperformance_ratio, 0.01);
         assert_eq!(point.deterministic_turnover_mean, 0.1);
         assert_eq!(point.deterministic_commissions, 0.4);
+        assert_eq!(point.aux_return_loss, 0.33);
     }
 
     #[test]
-    fn kl_trigger_disables_actor_without_stopping_critic_optimization() {
+    fn kl_trigger_stops_before_any_parameter_update() {
         let mut summary = OptimizationSummary {
             actor_steps: 1,
             steps: 1,
             ..OptimizationSummary::default()
         };
-        let (critic_only, _) =
-            kl_stops_before_optimizer_step(&mut summary, TARGET_KL * 2.0).unwrap();
+        let before_steps = summary.steps;
+        let vs = nn::VarStore::new(Device::Cpu);
+        let parameter = vs.root().ones("weight", &[1]);
+        let mut optimizer = Muon::new_named(
+            &named_trainable_variables(&vs),
+            MuonConfig {
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+        parameter.square().sum(Kind::Float).backward();
+        let before_parameter = parameter.copy();
+        let (stop, _) = kl_stops_before_optimizer_step(&mut summary, TARGET_KL * 2.0).unwrap();
+        if !stop {
+            optimizer.step();
+        }
 
-        assert!(critic_only);
+        assert!(stop);
         assert!(summary.kl_early_stopped);
         assert_eq!(summary.max_reverse_kl, TARGET_KL * 2.0);
         assert_eq!(summary.actor_steps, 1);
-        // The caller still performs and counts this minibatch's critic-only step.
-        summary.steps += 1;
-        assert_eq!(summary.steps, 2);
+        assert_eq!(summary.steps, before_steps);
+        assert!(parameter.equal(&before_parameter));
     }
 
     #[test]
@@ -1683,8 +1722,6 @@ mod tests {
 
         let mut optimizer = new_planner_optimizer(&named_vars);
         apply_planner_actor_lr_scale(&mut optimizer, 0.25).unwrap();
-        set_planner_actor_step_enabled(&mut optimizer, false).unwrap();
-        set_planner_actor_step_enabled(&mut optimizer, true).unwrap();
     }
 
     #[test]
@@ -1827,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_training_rejects_reused_output_sidecars() {
+    fn fresh_training_rejects_reused_output_bundle_and_sidecars() {
         let dir = std::env::temp_dir().join(format!(
             "planner-fresh-output-{}-{}",
             std::process::id(),
@@ -1836,8 +1873,18 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let checkpoint = dir.join("planner.ot");
         ensure_fresh_resume_output(&checkpoint).unwrap();
-        fs::write(checkpoint.with_extension("resume.json"), "{}").unwrap();
-        assert!(ensure_fresh_resume_output(&checkpoint).is_err());
+        for occupied in [
+            checkpoint.clone(),
+            planner_metadata_path(&checkpoint),
+            planner_optimizer_state_path(&checkpoint),
+            resume_manifest_path(&checkpoint),
+            resume_checkpoint_path(&checkpoint, 1),
+            checkpoint.with_file_name("planner_best_u00000001.ot"),
+        ] {
+            fs::write(&occupied, "occupied").unwrap();
+            assert!(ensure_fresh_resume_output(&checkpoint).is_err());
+            fs::remove_file(occupied).unwrap();
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

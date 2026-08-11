@@ -2,7 +2,9 @@ use tch::{Kind, Tensor};
 
 use crate::torch::action_space::{beta_entropy, beta_log_prob, beta_reverse_kl};
 use crate::torch::planner::portfolio::PLANNER_REWARD_SCALE;
+use crate::torch::train::config::{PolicyObjective, POLICY_OBJECTIVE};
 use crate::torch::train::numeric_debug::compute_explained_variance;
+use crate::torch::train::update::asym_clip_policy_loss;
 use crate::torch::value::hl_gauss::HlGaussBins;
 
 pub(crate) const POSITIVE_WEIGHT: f64 = 0.5;
@@ -71,14 +73,28 @@ pub fn planner_actor_critic_losses(
     assert_eq!(returns.numel() as i64, batch_size);
 
     let action_log_probs = beta_log_prob(actions, new_alpha, new_beta);
-    let (policy_loss, reverse_kl) = pmpo_policy_loss(
-        advantages,
-        &action_log_probs,
-        old_alpha,
-        old_beta,
-        new_alpha,
-        new_beta,
-    );
+    let (policy_loss, reverse_kl) = match POLICY_OBJECTIVE {
+        PolicyObjective::Pmpo => pmpo_policy_loss(
+            advantages,
+            &action_log_probs,
+            old_alpha,
+            old_beta,
+            new_alpha,
+            new_beta,
+        ),
+        // PPO: DAPO asymmetric clip on the (batch-normalized) advantages. The
+        // reverse-KL is computed for the KL controller/early-stop only and is
+        // NOT added to the loss — clipping is the trust region, matching the
+        // baseline PPO path in `train::update`.
+        PolicyObjective::Ppo => {
+            let old_log_probs = beta_log_prob(actions, old_alpha, old_beta).detach();
+            let ratio = (&action_log_probs - old_log_probs).exp();
+            let (clip_loss, _clip_gap) = asym_clip_policy_loss(advantages, &ratio);
+            let reverse_kl =
+                beta_reverse_kl(old_alpha, old_beta, new_alpha, new_beta).mean(Kind::Float);
+            (clip_loss, reverse_kl)
+        }
+    };
     let entropy = beta_entropy(new_alpha, new_beta).mean(Kind::Float);
     let value_targets = hl_gauss.encode(&returns.flatten(0, -1));
     let value_log_probs = value_logits.log_softmax(-1, Kind::Float);
