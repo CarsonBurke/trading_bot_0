@@ -1,5 +1,6 @@
+use anyhow::{bail, Context, Result};
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use tch::{autocast, nn, Device, Kind, Tensor};
 
@@ -8,6 +9,7 @@ use crate::torch::constants::{
 };
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::env::{CpuStepBatch, VecEnv};
+use crate::torch::hashing::file_sha256;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{
     ModelOutput, ModelVariant, StreamState, TradingModel, TradingModelConfig,
@@ -113,24 +115,139 @@ pub(super) struct Trainer {
     pub(super) ppo_update_graph: Option<PpoUpdateCudaGraph>,
 }
 
-fn kl_lr_state_path_for_weights_path(weights_path: &Path) -> PathBuf {
-    let stem = weights_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("checkpoint");
-    weights_path.with_file_name(format!("{stem}.kl_lr.json"))
+const PPO_CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PpoCheckpointMetadata {
+    format_version: u32,
+    next_episode: usize,
+    optimizer_step: i64,
+    weights_sha256: String,
+    optimizer_sha256: String,
+    kl_lr_controller: KlLrControllerState,
 }
 
-fn read_kl_lr_controller_state(path: &Path) -> Result<KlLrControllerState, String> {
-    let json = fs::read_to_string(path)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    serde_json::from_str(&json).map_err(|err| format!("failed to parse {}: {err}", path.display()))
+fn ppo_metadata_path(weights_path: &Path) -> PathBuf {
+    weights_path.with_extension("resume.json")
 }
 
-fn write_kl_lr_controller_state(path: &Path, state: KlLrControllerState) -> Result<(), String> {
-    let json = serde_json::to_vec_pretty(&state)
-        .map_err(|err| format!("failed to encode {}: {err}", path.display()))?;
-    fs::write(path, json).map_err(|err| format!("failed to write {}: {err}", path.display()))
+fn ppo_optimizer_path(weights_path: &Path) -> PathBuf {
+    weights_path.with_extension("optimizer.ot")
+}
+
+fn temp_sibling(path: &Path, transaction_id: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{transaction_id}"));
+    path.with_file_name(name)
+}
+
+fn is_ppo_checkpoint_path(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("ppo_ep"))
+        .is_some_and(|episode| episode.parse::<usize>().is_ok())
+}
+
+fn should_resume_from_path(path: &Path) -> bool {
+    is_ppo_checkpoint_path(path) || ppo_metadata_path(path).exists()
+}
+
+fn completed_episode_for_resume(next_episode: usize) -> Result<usize> {
+    next_episode
+        .checked_sub(1)
+        .context("PPO checkpoint does not follow a completed episode")
+}
+
+fn load_ppo_checkpoint_metadata(weights_path: &Path) -> Result<PpoCheckpointMetadata> {
+    let metadata_path = ppo_metadata_path(weights_path);
+    let metadata: PpoCheckpointMetadata =
+        serde_json::from_slice(&fs::read(&metadata_path).with_context(|| {
+            format!(
+                "failed reading PPO resume metadata {}",
+                metadata_path.display()
+            )
+        })?)
+        .with_context(|| {
+            format!(
+                "failed parsing PPO resume metadata {}",
+                metadata_path.display()
+            )
+        })?;
+    if metadata.format_version != PPO_CHECKPOINT_FORMAT_VERSION {
+        bail!(
+            "unsupported PPO checkpoint format {} in {}",
+            metadata.format_version,
+            metadata_path.display()
+        );
+    }
+    if metadata.optimizer_step < 0 {
+        bail!("PPO checkpoint has a negative optimizer step");
+    }
+    completed_episode_for_resume(metadata.next_episode)?;
+    let optimizer_path = ppo_optimizer_path(weights_path);
+    let weights_sha256 = file_sha256(weights_path)?;
+    if weights_sha256 != metadata.weights_sha256 {
+        bail!(
+            "PPO checkpoint weights hash mismatch for {}",
+            weights_path.display()
+        );
+    }
+    let optimizer_sha256 = file_sha256(&optimizer_path)?;
+    if optimizer_sha256 != metadata.optimizer_sha256 {
+        bail!(
+            "PPO checkpoint optimizer hash mismatch for {}",
+            optimizer_path.display()
+        );
+    }
+    Ok(metadata)
+}
+
+fn save_ppo_checkpoint_bundle(
+    vs: &nn::VarStore,
+    opt: &Muon,
+    weights_path: &Path,
+    completed_episode: usize,
+    optimizer_step: i64,
+    kl_lr_controller: &KlLrController,
+) -> Result<()> {
+    let parent = weights_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
+    let optimizer_path = ppo_optimizer_path(weights_path);
+    let metadata_path = ppo_metadata_path(weights_path);
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let weights_tmp = temp_sibling(weights_path, &transaction_id);
+    let optimizer_tmp = temp_sibling(&optimizer_path, &transaction_id);
+    let metadata_tmp = temp_sibling(&metadata_path, &transaction_id);
+
+    vs.save(&weights_tmp)
+        .with_context(|| format!("failed saving PPO weights {}", weights_tmp.display()))?;
+    opt.save_state(&optimizer_tmp)?;
+    let metadata = PpoCheckpointMetadata {
+        format_version: PPO_CHECKPOINT_FORMAT_VERSION,
+        next_episode: completed_episode
+            .checked_add(1)
+            .context("PPO checkpoint episode overflow")?,
+        optimizer_step,
+        weights_sha256: file_sha256(&weights_tmp)?,
+        optimizer_sha256: file_sha256(&optimizer_tmp)?,
+        kl_lr_controller: kl_lr_controller.state(),
+    };
+    fs::write(&metadata_tmp, serde_json::to_vec_pretty(&metadata)?)?;
+
+    File::open(&weights_tmp)?.sync_all()?;
+    File::open(&optimizer_tmp)?.sync_all()?;
+    File::open(&metadata_tmp)?.sync_all()?;
+    fs::rename(&weights_tmp, weights_path)?;
+    fs::rename(&optimizer_tmp, &optimizer_path)?;
+    fs::rename(&metadata_tmp, &metadata_path)?;
+    if let Some(parent) = parent {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 impl Trainer {
@@ -169,6 +286,20 @@ impl Trainer {
             "ppo rollout geometry: nprocs={} seq_len={} total_samples={} chunk_len={} objective=ppo",
             rollout.nprocs, rollout.seq_len, rollout.total_samples, rollout.ppo_chunk_len,
         );
+        let weights_path = weights_path.map(Path::new);
+        let resume_metadata = weights_path.and_then(|path| {
+            if should_resume_from_path(path) {
+                Some(load_ppo_checkpoint_metadata(path).unwrap_or_else(|error| {
+                    panic!(
+                        "PPO checkpoint {} is not a complete valid resume bundle: {error:#}",
+                        path.display()
+                    )
+                }))
+            } else {
+                None
+            }
+        });
+
         let mut vs = nn::VarStore::new(device);
         let trading_model = TradingModel::new_with_config(
             &vs.root(),
@@ -178,38 +309,38 @@ impl Trainer {
             },
         );
 
-        let checkpoint_kl_lr_state_path = weights_path
-            .map(Path::new)
-            .map(kl_lr_state_path_for_weights_path);
         let (start_episode, run_dir) = if let Some(path) = weights_path {
-            println!("Loading weights from {}", path);
+            let is_resume = resume_metadata.is_some();
+            if is_resume {
+                println!("Loading complete PPO resume bundle from {}", path.display());
+            } else {
+                println!("Warm-starting PPO weights from {}", path.display());
+            }
             let load_summary = load_var_store_partial(&mut vs, path).unwrap();
             load_summary.require_complete().unwrap();
-            let ep = Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.strip_prefix("ppo_ep"))
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
-            if ep > 0 {
-                println!("Resuming from episode {}", ep);
-            }
-            // If weights path is inside runs/*/weights/, resume that run dir
-            let p = Path::new(path);
-            let is_run_weights = p
-                .parent()
-                .and_then(|d| d.file_name())
-                .map(|n| n == "weights")
-                .unwrap_or(false)
-                && p.ancestors()
+            let is_run_weights = is_resume
+                && path
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .map(|n| n == "weights")
+                    .unwrap_or(false)
+                && path
+                    .ancestors()
                     .any(|a| a.file_name().map(|n| n == "runs").unwrap_or(false));
             let rd = if is_run_weights {
-                RunDir::from_weights_path(p).expect("failed to open run dir from weights path")
+                RunDir::from_weights_path(path).expect("failed to open run dir from weights path")
             } else {
                 RunDir::create_fresh(RUNS_PATH, run_name.as_deref())
                     .expect("failed to create run dir")
             };
-            (ep, rd)
+            let next_episode = resume_metadata
+                .as_ref()
+                .map(|metadata| metadata.next_episode)
+                .unwrap_or(0);
+            if is_resume {
+                println!("Resuming at episode {next_episode}");
+            }
+            (next_episode, rd)
         } else {
             println!("Starting training from scratch");
             let rd = RunDir::create_fresh(RUNS_PATH, run_name.as_deref())
@@ -225,7 +356,7 @@ impl Trainer {
             .iter()
             .map(|(_, tensor)| tensor.shallow_clone())
             .collect();
-        let opt = Muon::new_named(
+        let mut opt = Muon::new_named(
             &named_trainable_vars,
             MuonConfig {
                 lr: MUON_LR,
@@ -244,7 +375,7 @@ impl Trainer {
                 ..MuonConfig::default()
             },
         );
-        let optimizer_step = 0i64;
+        let mut optimizer_step = 0i64;
         let mut kl_lr_controller = KlLrController::new(
             KL_LR_TARGET,
             KL_LR_EMA_HALF_LIFE,
@@ -258,52 +389,27 @@ impl Trainer {
             gens_path.clone(),
             rollout.nprocs as usize,
         );
-        if start_episode > 0 {
+        if let Some(metadata) = resume_metadata {
+            let path = weights_path.expect("resume weights path missing");
+            opt.load_state(ppo_optimizer_path(path))
+                .unwrap_or_else(|error| panic!("failed restoring PPO optimizer state: {error:#}"));
+            optimizer_step = metadata.optimizer_step;
+            assert!(
+                kl_lr_controller.restore_state(metadata.kl_lr_controller),
+                "PPO checkpoint contains invalid KL-LR controller state"
+            );
+            println!(
+                "Restored PPO optimizer at step {} and KL-LR controller scale {:.3}, ema {:.4}",
+                optimizer_step,
+                kl_lr_controller.scale(),
+                kl_lr_controller.ema()
+            );
+
             env.set_episode(start_episode);
             let meta_history = &mut env.primary_mut().meta_history;
-            meta_history.load_from_episode(start_episode, &gens_path);
-            let restored_from_sidecar = checkpoint_kl_lr_state_path
-                .as_ref()
-                .and_then(|path| match read_kl_lr_controller_state(path) {
-                    Ok(state) if kl_lr_controller.restore_state(state) => {
-                        println!(
-                            "Restored KL-LR controller from {}: scale {:.3}, ema {:.4}",
-                            path.display(),
-                            kl_lr_controller.scale(),
-                            kl_lr_controller.ema()
-                        );
-                        Some(())
-                    }
-                    Ok(_) => {
-                        println!("Ignored invalid KL-LR controller state: {}", path.display());
-                        None
-                    }
-                    Err(err) => {
-                        println!("No usable KL-LR controller state sidecar: {err}");
-                        None
-                    }
-                })
-                .is_some();
-
-            if !restored_from_sidecar {
-                let restored_ema = meta_history.kl_lr_ema.last().copied();
-                let restored_scale = meta_history
-                    .kl_lr_scale_next
-                    .last()
-                    .or_else(|| meta_history.kl_lr_scale.last())
-                    .copied();
-                kl_lr_controller.restore(
-                    restored_ema.unwrap_or(f64::NAN),
-                    restored_scale.unwrap_or(f64::NAN),
-                );
-                if restored_ema.is_some() || restored_scale.is_some() {
-                    println!(
-                        "Restored KL-LR controller from reports: scale {:.3}, ema {:.4}",
-                        kl_lr_controller.scale(),
-                        kl_lr_controller.ema()
-                    );
-                }
-            }
+            let completed_episode = completed_episode_for_resume(start_episode)
+                .expect("validated PPO resume metadata became invalid");
+            meta_history.load_from_episode(completed_episode, &gens_path);
         }
 
         let hl_gauss = HlGaussBins::default_for(device);
@@ -473,17 +579,103 @@ impl Trainer {
     pub(super) fn maybe_checkpoint(&self, episode: usize) {
         if episode > 0 && episode % 50 == 0 {
             let path = self.run_dir.weights.join(format!("ppo_ep{episode}.ot"));
-            if let Err(err) = self.vs.save(&path) {
-                println!("Error while saving weights: {}", err);
-            } else {
-                let kl_lr_state_path = kl_lr_state_path_for_weights_path(&path);
-                if let Err(err) =
-                    write_kl_lr_controller_state(&kl_lr_state_path, self.kl_lr_controller.state())
-                {
-                    println!("Error while saving KL-LR controller state: {}", err);
-                }
-                println!("Saved model weights: {}", path.display());
+            match save_ppo_checkpoint_bundle(
+                &self.vs,
+                &self.opt,
+                &path,
+                episode,
+                self.optimizer_step,
+                &self.kl_lr_controller,
+            ) {
+                Ok(()) => println!("Saved complete PPO resume bundle: {}", path.display()),
+                Err(error) => println!("Error while saving PPO resume bundle: {error:#}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_optimizer(named: &[(String, Tensor)]) -> Muon {
+        Muon::new_named(
+            named,
+            MuonConfig {
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn ppo_checkpoint_bundle_roundtrips_resume_state_and_next_episode() {
+        let dir = std::env::temp_dir().join(format!(
+            "trading-bot-ppo-checkpoint-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let checkpoint = dir.join("ppo_ep41.ot");
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let weight = vs.root().var("weight", &[2, 2], nn::Init::Const(1.0));
+        let named = vec![("weight".to_owned(), weight.shallow_clone())];
+        let mut opt = test_optimizer(&named);
+        weight.sum(Kind::Float).backward();
+        opt.step();
+        let expected_weight_sum = weight.sum(Kind::Float).double_value(&[]);
+        let mut controller = KlLrController::new(0.02, 20.0, 0.1, 10.0);
+        controller.restore(0.04, 2.5);
+
+        save_ppo_checkpoint_bundle(&vs, &opt, &checkpoint, 41, 17, &controller).unwrap();
+        let metadata = load_ppo_checkpoint_metadata(&checkpoint).unwrap();
+        assert_eq!(metadata.next_episode, 42);
+        assert_eq!(metadata.optimizer_step, 17);
+        let mut restored_controller = KlLrController::new(0.02, 20.0, 0.1, 10.0);
+        assert!(restored_controller.restore_state(metadata.kl_lr_controller));
+        assert!((restored_controller.ema() - 0.04).abs() < 1e-12);
+        assert!((restored_controller.scale() - 2.5).abs() < 1e-12);
+
+        let mut restored_vs = nn::VarStore::new(Device::Cpu);
+        let restored_weight = restored_vs
+            .root()
+            .var("weight", &[2, 2], nn::Init::Const(0.0));
+        restored_vs.load(&checkpoint).unwrap();
+        assert_eq!(
+            restored_weight.sum(Kind::Float).double_value(&[]),
+            expected_weight_sum
+        );
+        let restored_named = vec![("weight".to_owned(), restored_weight)];
+        let mut restored_opt = test_optimizer(&restored_named);
+        restored_opt
+            .load_state(ppo_optimizer_path(&checkpoint))
+            .unwrap();
+
+        assert!(checkpoint.exists());
+        assert!(ppo_optimizer_path(&checkpoint).exists());
+        assert!(ppo_metadata_path(&checkpoint).exists());
+        fs::write(ppo_optimizer_path(&checkpoint), b"corrupt optimizer").unwrap();
+        assert!(load_ppo_checkpoint_metadata(&checkpoint).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ppo_checkpoint_paths_distinguish_resume_from_warm_start() {
+        let checkpoint = Path::new("weights/ppo_ep50.ot");
+        assert!(is_ppo_checkpoint_path(checkpoint));
+        assert_eq!(
+            ppo_optimizer_path(checkpoint),
+            PathBuf::from("weights/ppo_ep50.optimizer.ot")
+        );
+        assert_eq!(
+            ppo_metadata_path(checkpoint),
+            PathBuf::from("weights/ppo_ep50.resume.json")
+        );
+        assert!(!is_ppo_checkpoint_path(Path::new(
+            "weights/pretrain_model.ot"
+        )));
+        assert_eq!(completed_episode_for_resume(51).unwrap(), 50);
+        assert!(completed_episode_for_resume(0).is_err());
     }
 }

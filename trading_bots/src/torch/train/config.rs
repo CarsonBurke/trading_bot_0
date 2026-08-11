@@ -45,9 +45,10 @@ pub(crate) enum PolicyObjective {
     Ppo,
     Pmpo,
 }
-/// PMPO (sign-based weighted-MLE + closed-form reverse-KL trust region) is the
-/// default. PMPO uses RAW GAE advantages (no per-minibatch percentile norm).
-pub(crate) const POLICY_OBJECTIVE: PolicyObjective = PolicyObjective::Pmpo;
+/// PPO (DAPO asymmetric clip on batch-normalized advantages) is the default.
+/// PPO normalizes advantages (CleanRL-style, whole batch); PMPO uses RAW GAE
+/// advantages (its tanh weighting subsumes scale normalization).
+pub(crate) const POLICY_OBJECTIVE: PolicyObjective = PolicyObjective::Ppo;
 pub(crate) const PMPO_POS_TO_NEG_WEIGHT: f64 = 0.5;
 pub(crate) const PMPO_KL_COEF: f64 = 0.3;
 /// Per-minibatch percentile return-norm ("mbpercnorm"): scale advantages by

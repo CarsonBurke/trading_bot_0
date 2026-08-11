@@ -9,6 +9,8 @@ use crate::torch::env::Env;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
 
+use super::validate_ticker_count;
+
 pub fn load_model<P: AsRef<Path>>(
     weight_path: P,
     device: Device,
@@ -59,6 +61,10 @@ pub fn run_inference<P: AsRef<Path>>(
     random_start: bool,
     model_variant: ModelVariant,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(tickers) = tickers.as_ref() {
+        validate_ticker_count(tickers, "offline inference")?;
+    }
+
     println!("Starting inference run...");
     println!("Loading model from: {:?}", weight_path.as_ref());
 
@@ -76,8 +82,8 @@ pub fn run_inference<P: AsRef<Path>>(
     }
 
     let mut env = match tickers {
-        Some(t) => Env::new_with_tickers(t, random_start),
-        None => Env::new(random_start),
+        Some(t) => Env::new_with_tickers_and_recording(t, random_start, false, None),
+        None => Env::new_with_recording(random_start, false, None),
     };
     println!("Backtesting tickers: {:?}", env.tickers);
 
@@ -106,11 +112,7 @@ pub fn run_inference<P: AsRef<Path>>(
         static_obs_tensor.copy_(&Tensor::from_slice(&static_obs));
         let mut use_full = true;
 
-        env.episode = episode;
-
-        for step in 0..env.max_step {
-            env.step = step;
-
+        loop {
             // First call uses full history, then we switch to incremental per-ticker deltas.
             let (alpha, beta) = tch::no_grad(|| {
                 let price_input = if use_full {

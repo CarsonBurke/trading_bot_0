@@ -10,14 +10,14 @@ fn rotate_half(x: &Tensor) -> Tensor {
     Tensor::cat(&[&(-&x2), &x1], -1)
 }
 
-pub(in crate::torch::model) struct RotaryEmbedding {
+pub(crate) struct RotaryEmbedding {
     cos_cached: Tensor, // [max_seq_len, rope_dims]
     sin_cached: Tensor, // [max_seq_len, rope_dims]
     rope_dims: i64,
 }
 
 impl RotaryEmbedding {
-    pub(in crate::torch::model) fn new(
+    pub(crate) fn new(
         max_seq_len: i64,
         head_dim: i64,
         rope_dims: i64,
@@ -38,11 +38,7 @@ impl RotaryEmbedding {
         }
     }
 
-    pub(in crate::torch::model) fn apply_positions(
-        &self,
-        x: &Tensor,
-        positions: &Tensor,
-    ) -> Tensor {
+    pub(crate) fn apply_positions(&self, x: &Tensor, positions: &Tensor) -> Tensor {
         let head_dim = *x.size().last().unwrap();
         let positions = positions.to_kind(Kind::Int64).to_device(x.device());
         let cos = self

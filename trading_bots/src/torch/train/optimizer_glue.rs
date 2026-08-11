@@ -7,7 +7,7 @@ use super::config::{
 };
 
 const ACTOR_GRAD_CLIP_PATTERNS: &[&str] = &["policy_concentration"];
-const CRITIC_GRAD_CLIP_PATTERNS: &[&str] = &["value_proj"];
+const CRITIC_GRAD_CLIP_PATTERNS: &[&str] = &["value_proj", "next_return_head"];
 const KL_LR_SCALE_EXPONENT: f64 = 0.5;
 
 pub(crate) struct GradClipGroups {

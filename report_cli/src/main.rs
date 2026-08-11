@@ -4,12 +4,12 @@ use rand::thread_rng;
 use shared::paths::TRAINING_PATH;
 use shared::report::Report;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        bail!("usage: report_cli <generation> <report_name> [ticker] [--sample N] [--min N] [--max N] [--var NAME]");
+        bail!("usage: report_cli <generation> <report_name> [ticker|inference_set/episode] [--sample N] [--min N] [--max N] [--var NAME]");
     }
 
     let generation = args[1]
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
             PathBuf::from(TRAINING_PATH)
         }
     });
-    let report_path = build_report_path(&base_path, generation, &report_name, ticker);
+    let report_path = build_report_path(&base_path, generation, &report_name, ticker)?;
     let bytes = fs::read(&report_path)
         .with_context(|| format!("failed to read report {}", report_path.display()))?;
     let report: Report = postcard::from_bytes(&bytes).context("failed to decode report")?;
@@ -231,16 +231,30 @@ fn build_report_path(
     base_path: &PathBuf,
     generation: usize,
     report_name: &str,
-    ticker: Option<&str>,
-) -> PathBuf {
+    subpath: Option<&str>,
+) -> Result<PathBuf> {
     let mut path = base_path.clone();
     path.push("gens");
     path.push(generation.to_string());
-    if let Some(ticker) = ticker {
-        path.push(ticker);
+    if let Some(subpath) = subpath {
+        path.push(safe_report_subpath(subpath)?);
     }
     path.push(format!("{report_name}.report.bin"));
-    path
+    Ok(path)
+}
+
+fn safe_report_subpath(raw: &str) -> Result<PathBuf> {
+    let path = Path::new(raw);
+    let components = path.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components.len() > 2
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("report subpath must contain one or two safe relative components");
+    }
+    Ok(path.to_path_buf())
 }
 
 fn find_training_path() -> Option<PathBuf> {
@@ -270,4 +284,48 @@ fn find_training_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::report::{ReportKind, ScaleKind};
+
+    #[test]
+    fn nested_inference_episode_report_path_decodes() {
+        let root = std::env::temp_dir().join(format!(
+            "report-cli-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("gens/7/planner_inference_test_set/planner_test_000_TEST");
+        fs::create_dir_all(&nested).unwrap();
+        let report = Report {
+            title: "Nested".to_owned(),
+            x_label: Some("step".to_owned()),
+            y_label: None,
+            scale: ScaleKind::Linear,
+            kind: ReportKind::Simple {
+                values: vec![1.0],
+                ema_alpha: None,
+            },
+        };
+        let path = nested.join("planner_position.report.bin");
+        fs::write(&path, postcard::to_stdvec(&report).unwrap()).unwrap();
+
+        let resolved = build_report_path(
+            &root,
+            7,
+            "planner_position",
+            Some("planner_inference_test_set/planner_test_000_TEST"),
+        )
+        .unwrap();
+        let decoded: Report = postcard::from_bytes(&fs::read(resolved).unwrap()).unwrap();
+        assert_eq!(decoded.title, "Nested");
+        assert!(build_report_path(&root, 7, "assets", Some("../escape")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

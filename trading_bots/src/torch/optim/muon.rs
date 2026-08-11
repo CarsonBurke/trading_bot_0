@@ -3,7 +3,10 @@
 //! norm preservation, and AdamW for non-matrix params.
 
 use std::collections::HashMap;
-use tch::{Kind, Tensor};
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use tch::{Device, Kind, Tensor};
 
 const NS_A: f64 = 3.4445;
 const NS_B: f64 = -4.7750;
@@ -25,12 +28,26 @@ pub struct MuonConfig {
     pub adamw_betas: (f64, f64),
     pub adamw_eps: f64,
     pub adamw_wd: f64,
+    /// Parameter name fragments excluded from AdamW's decoupled weight decay.
+    pub adamw_no_weight_decay_name_substrings: Vec<String>,
     /// Newton-Schulz iteration count for orthogonalization. Reference default 5.
     /// Exposed only so offline sweeps can map the NS-steps landscape; real
     /// training must leave this at `DEFAULT_NS_STEPS`.
     pub ns_steps: usize,
     /// Parameter name fragments that should use AdamW even if they are 2D.
     pub force_adamw_name_substrings: Vec<String>,
+    /// Optional allowlist for Muon-routed 2D parameters. Empty permits every
+    /// otherwise-eligible matrix; the AdamW blocklist always takes precedence.
+    pub muon_name_allowlist: Vec<String>,
+    /// Benchmark/experiment mode: split attention projection matrices into
+    /// per-head 2D blocks before Newton-Schulz orthogonalization.
+    pub per_attention_head_ortho: bool,
+    /// Include attention output projections in `per_attention_head_ortho`.
+    pub per_attention_output_head_ortho: bool,
+    /// Self-attention head width used by `per_attention_head_ortho`.
+    pub attention_head_dim: i64,
+    /// Cross-attention head width used by `per_attention_head_ortho`.
+    pub cross_attention_head_dim: i64,
     /// Suppress the one-line routing-split print at construction. Benchmarks
     /// that build many optimizers set this; real training leaves it false.
     pub quiet: bool,
@@ -49,11 +66,24 @@ impl Default for MuonConfig {
             adamw_betas: (0.9, 0.95),
             adamw_eps: 1e-8,
             adamw_wd: 0.0,
+            adamw_no_weight_decay_name_substrings: Vec::new(),
             ns_steps: DEFAULT_NS_STEPS,
             force_adamw_name_substrings: Vec::new(),
+            muon_name_allowlist: Vec::new(),
+            per_attention_head_ortho: false,
+            per_attention_output_head_ortho: true,
+            attention_head_dim: 0,
+            cross_attention_head_dim: 0,
             quiet: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrthoLayout {
+    Matrix,
+    RowHeads { heads: i64, head_dim: i64 },
+    ColHeads { heads: i64, head_dim: i64 },
 }
 
 /// Per-2D-param state. Each 2D param holds its own momentum.
@@ -63,9 +93,11 @@ impl Default for MuonConfig {
 /// set at a single [m, n] matrix's worth of transients.
 struct Entry2D {
     idx: usize,
+    layout: OrthoLayout,
     /// First-moment EMA buffer, shape [m, n].
     momentum: Tensor,
-    /// NorMuon second-moment EMA buffer (mean-of-squares per row), shape [m, 1].
+    /// NorMuon second-moment EMA buffer (mean-of-squares per row). Matrix layout
+    /// stores [m, 1]; per-head layouts store [heads, block_rows, 1].
     /// Kept in fp32 regardless of param dtype: an EMA at gain (1-beta2)=0.05 in
     /// bf16 silently stalls because small increments round to zero.
     second_momentum: Tensor,
@@ -74,6 +106,7 @@ struct Entry2D {
 struct AdamWParamState {
     m: Tensor,
     v: Tensor,
+    step_count: i64,
 }
 
 pub struct Muon {
@@ -83,6 +116,17 @@ pub struct Muon {
     adamw_state: HashMap<usize, AdamWParamState>,
     step_count: i64,
     params: Vec<Tensor>,
+    /// Variable name per param index; keys optimizer-state sidecar tensors so
+    /// restoration is robust to param ordering. Empty for the unnamed `new` path.
+    names: Vec<String>,
+    /// Per-parameter multiplier over the routed optimizer's base learning rate.
+    /// These are runtime schedule values, not optimizer moments; callers restore
+    /// them from their training-controller state after loading a checkpoint.
+    lr_scales: Vec<f64>,
+    /// Runtime parameter-step mask. Disabled parameters retain both their value
+    /// and optimizer moments, even when an earlier backward left a defined zero
+    /// gradient in their slot.
+    step_enabled: Vec<bool>,
 }
 
 /// Single-matrix Newton-Schulz iteration.
@@ -133,6 +177,138 @@ fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     }
 }
 
+fn batched_newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
+    let orig_kind = g.kind();
+    let transposed = g.size()[1] > g.size()[2];
+    let x3d = if orig_kind == Kind::BFloat16 {
+        g.shallow_clone()
+    } else {
+        g.to_kind(Kind::BFloat16)
+    };
+    let nrm = x3d
+        .square()
+        .sum_dim_intlist([-2i64, -1].as_slice(), true, Kind::BFloat16)
+        .sqrt()
+        .clamp_min(1e-7);
+    let x3d = &x3d / &nrm;
+    let mut x = if transposed {
+        x3d.transpose(-2, -1).contiguous()
+    } else {
+        x3d
+    };
+
+    for _ in 0..ns_steps {
+        let a = x.matmul(&x.transpose(-2, -1));
+        let b = a.baddbmm(&a, &a, NS_B, NS_C);
+        x = x.baddbmm(&b, &x, NS_A, 1.0);
+    }
+
+    let x = if transposed {
+        x.transpose(-2, -1).contiguous()
+    } else {
+        x
+    };
+    if orig_kind == Kind::BFloat16 {
+        x
+    } else {
+        x.to_kind(orig_kind)
+    }
+}
+
+fn attention_ortho_layout(name: &str, size: &[i64], cfg: &MuonConfig) -> OrthoLayout {
+    if !cfg.per_attention_head_ortho || size.len() != 2 {
+        return OrthoLayout::Matrix;
+    }
+    let Some(head_dim) = attention_head_dim_for_name(name, cfg) else {
+        return OrthoLayout::Matrix;
+    };
+
+    let rows = size[0];
+    let cols = size[1];
+    let is_output = is_attention_output_projection_name(name);
+    if is_output && !cfg.per_attention_output_head_ortho {
+        OrthoLayout::Matrix
+    } else if is_output && cols % head_dim == 0 {
+        OrthoLayout::ColHeads {
+            heads: cols / head_dim,
+            head_dim,
+        }
+    } else if name.contains("attn_qkv") && rows == 3 * cols && rows % (3 * head_dim) == 0 {
+        OrthoLayout::RowHeads {
+            heads: rows / (3 * head_dim),
+            head_dim: 3 * head_dim,
+        }
+    } else if rows % head_dim == 0 {
+        OrthoLayout::RowHeads {
+            heads: rows / head_dim,
+            head_dim,
+        }
+    } else {
+        OrthoLayout::Matrix
+    }
+}
+
+fn attention_head_dim_for_name(name: &str, cfg: &MuonConfig) -> Option<i64> {
+    if is_cross_attention_projection_name(name) {
+        (cfg.cross_attention_head_dim > 0).then_some(cfg.cross_attention_head_dim)
+    } else if is_self_attention_projection_name(name) {
+        (cfg.attention_head_dim > 0).then_some(cfg.attention_head_dim)
+    } else {
+        None
+    }
+}
+
+fn is_self_attention_projection_name(name: &str) -> bool {
+    ["attn_q", "attn_k", "attn_v", "attn_qkv", "attn_o"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn is_cross_attention_projection_name(name: &str) -> bool {
+    ["ca_q", "ca_k", "ca_v", "ca_out"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn is_attention_output_projection_name(name: &str) -> bool {
+    ["attn_o", "ca_out"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+#[cfg(test)]
+fn orthogonalize_update(update: &Tensor, layout: OrthoLayout, ns_steps: usize) -> Tensor {
+    match layout {
+        OrthoLayout::Matrix => newtonschulz5(update, ns_steps),
+        OrthoLayout::RowHeads { heads, head_dim } => {
+            let cols = update.size()[1];
+            batched_newtonschulz5(&update.reshape([heads, head_dim, cols]), ns_steps)
+                .reshape(update.size().as_slice())
+        }
+        OrthoLayout::ColHeads { heads, head_dim } => {
+            let rows = update.size()[0];
+            batched_newtonschulz5(
+                &update
+                    .reshape([rows, heads, head_dim])
+                    .permute([1, 0, 2])
+                    .contiguous(),
+                ns_steps,
+            )
+            .permute([1, 0, 2])
+            .contiguous()
+            .reshape(update.size().as_slice())
+        }
+    }
+}
+
+fn second_momentum_shape(size: &[i64], layout: OrthoLayout) -> Vec<i64> {
+    match layout {
+        OrthoLayout::Matrix => vec![size[0], 1],
+        OrthoLayout::RowHeads { heads, head_dim } => vec![heads, head_dim, 1],
+        OrthoLayout::ColHeads { heads, .. } => vec![heads, size[0], 1],
+    }
+}
+
 /// NorMuon per-row second-moment rescale, all math in fp32. Scaling each row by
 /// `step_size_i * ratio` keeps the total Frobenius norm of the update
 /// (approximately) equal to its pre-divide value, because `ratio` is exactly the
@@ -163,6 +339,64 @@ fn normuon_rescale(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) ->
     update * &scale
 }
 
+fn normuon_rescale_batched(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) -> Tensor {
+    let uf = update.to_kind(Kind::Float);
+    let cols = update.size()[2] as f64;
+    let row_sq_sum = uf
+        .square()
+        .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float);
+    let v_mean = &row_sq_sum / cols;
+    let vnorm_sq = row_sq_sum.sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
+    let _ = second_momentum.lerp_(&v_mean, 1.0 - beta2);
+    let step_size = (second_momentum.sqrt() + 1e-10).reciprocal();
+    let vnorm_new_sq =
+        (step_size.square() * &row_sq_sum).sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
+    let ratio = vnorm_sq.sqrt() / (vnorm_new_sq.sqrt() + 1e-10);
+    let scale = (&step_size * &ratio).to_kind(update.kind());
+    update * &scale
+}
+
+fn normuon_transform(
+    update: &Tensor,
+    layout: OrthoLayout,
+    second_momentum: &mut Tensor,
+    beta2: f64,
+    ns_steps: usize,
+) -> (Tensor, f64) {
+    match layout {
+        OrthoLayout::Matrix => {
+            let update = newtonschulz5(update, ns_steps);
+            let update = normuon_rescale(&update, second_momentum, beta2);
+            let size = update.size();
+            let aspect_scale = (1.0_f64).max(size[0] as f64 / size[1] as f64).sqrt();
+            (update, aspect_scale)
+        }
+        OrthoLayout::RowHeads { heads, head_dim } => {
+            let cols = update.size()[1];
+            let blocks = update.reshape([heads, head_dim, cols]);
+            let blocks = batched_newtonschulz5(&blocks, ns_steps);
+            let blocks = normuon_rescale_batched(&blocks, second_momentum, beta2);
+            let aspect_scale = (1.0_f64).max(head_dim as f64 / cols as f64).sqrt();
+            (blocks.reshape(update.size().as_slice()), aspect_scale)
+        }
+        OrthoLayout::ColHeads { heads, head_dim } => {
+            let rows = update.size()[0];
+            let blocks = update
+                .reshape([rows, heads, head_dim])
+                .permute([1, 0, 2])
+                .contiguous();
+            let blocks = batched_newtonschulz5(&blocks, ns_steps);
+            let blocks = normuon_rescale_batched(&blocks, second_momentum, beta2);
+            let aspect_scale = (1.0_f64).max(rows as f64 / head_dim as f64).sqrt();
+            let update = blocks
+                .permute([1, 0, 2])
+                .contiguous()
+                .reshape(update.size().as_slice());
+            (update, aspect_scale)
+        }
+    }
+}
+
 impl Muon {
     pub fn new(trainable_vars: &[Tensor], cfg: MuonConfig) -> Self {
         let named: Vec<(String, Tensor)> = trainable_vars
@@ -177,6 +411,10 @@ impl Muon {
             .iter()
             .map(|(_, t)| t.shallow_clone())
             .collect();
+        let names: Vec<String> = trainable_vars
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
         let mut entries_2d = Vec::new();
         let mut adamw_indices = Vec::new();
 
@@ -185,15 +423,25 @@ impl Muon {
                 .force_adamw_name_substrings
                 .iter()
                 .any(|needle| name.contains(needle));
-            if cfg.use_muon_for_2d && p.dim() == 2 && !force_adamw {
+            let allowed = cfg.muon_name_allowlist.is_empty()
+                || cfg
+                    .muon_name_allowlist
+                    .iter()
+                    .any(|needle| name.contains(needle));
+            if cfg.use_muon_for_2d && p.dim() == 2 && !force_adamw && allowed {
                 let size = p.size();
                 let (m, n) = (size[0], size[1]);
                 let kind = p.kind();
                 let device = p.device();
+                let layout = attention_ortho_layout(name, &size, &cfg);
                 entries_2d.push(Entry2D {
                     idx: i,
+                    layout,
                     momentum: Tensor::zeros([m, n], (kind, device)),
-                    second_momentum: Tensor::zeros([m, 1], (Kind::Float, device)),
+                    second_momentum: Tensor::zeros(
+                        second_momentum_shape(&size, layout).as_slice(),
+                        (Kind::Float, device),
+                    ),
                 });
             } else {
                 adamw_indices.push(i);
@@ -207,6 +455,16 @@ impl Muon {
                     entries_2d.len(),
                     adamw_indices.len()
                 );
+                let head_ortho = entries_2d
+                    .iter()
+                    .filter(|entry| entry.layout != OrthoLayout::Matrix)
+                    .count();
+                if head_ortho > 0 {
+                    println!(
+                        "  attention-head ortho: {} params split into batched NS blocks (self_head_dim={}, cross_head_dim={})",
+                        head_ortho, cfg.attention_head_dim, cfg.cross_attention_head_dim
+                    );
+                }
             } else {
                 println!(
                     "AdamW optimizer: {} params (Muon disabled for root-cause logging)",
@@ -222,6 +480,9 @@ impl Muon {
             adamw_state: HashMap::new(),
             step_count: 0,
             params,
+            lr_scales: vec![1.0; names.len()],
+            step_enabled: vec![true; names.len()],
+            names,
         }
     }
 
@@ -237,15 +498,18 @@ impl Muon {
         let beta1 = self.cfg.momentum;
         let beta2 = self.cfg.beta2;
         let nesterov = self.cfg.nesterov;
-        let lr = self.cfg.lr;
         let wd = self.cfg.weight_decay;
-        let wd_factor = if wd > 0.0 { Some(1.0 - lr * wd) } else { None };
 
         for entry in &mut self.entries_2d {
+            if !self.step_enabled[entry.idx] {
+                continue;
+            }
             let grad = self.params[entry.idx].grad();
             if !grad.defined() {
                 continue;
             }
+            let lr = self.cfg.lr * self.lr_scales[entry.idx];
+            let wd_factor = if wd > 0.0 { Some(1.0 - lr * wd) } else { None };
 
             // First-moment EMA: buf = buf*beta1 + grad*(1-beta1).
             let _ = entry.momentum.lerp_(&grad, 1.0 - beta1);
@@ -257,16 +521,13 @@ impl Muon {
                 entry.momentum.shallow_clone()
             };
 
-            // Newton-Schulz orthogonalization; returns [rows, cols] orientation.
-            let update = newtonschulz5(&update, self.cfg.ns_steps);
-
-            // NorMuon: per-row second-moment rescale, all math in fp32.
-            let update = normuon_rescale(&update, &mut entry.second_momentum, beta2);
-
-            // Aspect-ratio scale max(1, rows/cols)^0.5 (after NorMuon rescale),
-            // folded into the LR so the update is scaled in a single pass.
-            let size = update.size();
-            let aspect_scale = (1.0_f64).max(size[0] as f64 / size[1] as f64).sqrt();
+            let (update, aspect_scale) = normuon_transform(
+                &update,
+                entry.layout,
+                &mut entry.second_momentum,
+                beta2,
+                self.cfg.ns_steps,
+            );
 
             // Apply to param: decoupled weight decay, then the update.
             let mut p = self.params[entry.idx].shallow_clone();
@@ -280,21 +541,19 @@ impl Muon {
 
     fn step_all_adamw(&mut self) {
         let (beta1, beta2) = self.cfg.adamw_betas;
-        let lr = self.cfg.adamw_lr;
         let eps = self.cfg.adamw_eps;
         let wd = self.cfg.adamw_wd;
 
-        let bc1 = 1.0 - beta1.powi(self.step_count as i32);
-        let bc2 = 1.0 - beta2.powi(self.step_count as i32);
-        let step_size = -lr / bc1;
-        let inv_bc2_sqrt = 1.0 / bc2.sqrt();
-
         for &idx in &self.adamw_indices {
+            if !self.step_enabled[idx] {
+                continue;
+            }
             let mut p = self.params[idx].shallow_clone();
             let grad = p.grad();
             if !grad.defined() {
                 continue;
             }
+            let lr = self.cfg.adamw_lr * self.lr_scales[idx];
 
             let state = self
                 .adamw_state
@@ -302,9 +561,21 @@ impl Muon {
                 .or_insert_with(|| AdamWParamState {
                     m: Tensor::zeros_like(&grad),
                     v: Tensor::zeros_like(&grad),
+                    step_count: 0,
                 });
+            state.step_count += 1;
+            let bc1 = 1.0 - beta1.powi(state.step_count as i32);
+            let bc2 = 1.0 - beta2.powi(state.step_count as i32);
+            let step_size = -lr / bc1;
+            let inv_bc2_sqrt = 1.0 / bc2.sqrt();
 
-            if wd > 0.0 {
+            let apply_weight_decay = wd > 0.0
+                && !self
+                    .cfg
+                    .adamw_no_weight_decay_name_substrings
+                    .iter()
+                    .any(|needle| self.names[idx].contains(needle));
+            if apply_weight_decay {
                 let _ = p.g_mul_scalar_(1.0 - lr * wd);
             }
 
@@ -341,6 +612,139 @@ impl Muon {
         self.cfg.adamw_lr = lr;
     }
 
+    /// Set a learning-rate multiplier for every named parameter matching at
+    /// least one substring. Returns the number of matched parameters so callers
+    /// can reject stale routing names instead of silently disabling a schedule.
+    pub fn set_named_lr_scale(&mut self, name_substrings: &[&str], lr_scale: f64) -> usize {
+        assert!(lr_scale.is_finite() && lr_scale > 0.0);
+        let mut matched = 0;
+        for (index, name) in self.names.iter().enumerate() {
+            if name_substrings
+                .iter()
+                .any(|substring| name.contains(substring))
+            {
+                self.lr_scales[index] = lr_scale;
+                matched += 1;
+            }
+        }
+        matched
+    }
+
+    /// Enable or disable optimizer steps for matching named parameters. This is
+    /// stronger than zeroing gradients: disabled parameters also skip momentum,
+    /// second-moment, and weight-decay updates.
+    pub fn set_named_step_enabled(&mut self, name_substrings: &[&str], enabled: bool) -> usize {
+        let mut matched = 0;
+        for (index, name) in self.names.iter().enumerate() {
+            if name_substrings
+                .iter()
+                .any(|substring| name.contains(substring))
+            {
+                self.step_enabled[index] = enabled;
+                matched += 1;
+            }
+        }
+        matched
+    }
+
+    /// Serialize all optimizer state (per-param momentum/second-momentum for the
+    /// NorMuon 2D params, AdamW m/v for the rest, and the global step counter) to
+    /// a named-tensor sidecar. Keying by variable name makes restoration robust to
+    /// param ordering. Requires `new_named` (the unnamed path stores empty names
+    /// and its keys would collide).
+    pub fn save_state(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let mut named: Vec<(String, Tensor)> = Vec::new();
+        // Suffix separator is `.` because tch's save/load round-trips `.`<->`|`
+        // internally; any other separator would not survive the round trip.
+        for entry in &self.entries_2d {
+            let name = &self.names[entry.idx];
+            named.push((
+                format!("{name}.__momentum"),
+                entry.momentum.to_device(Device::Cpu),
+            ));
+            named.push((
+                format!("{name}.__second_momentum"),
+                entry.second_momentum.to_device(Device::Cpu),
+            ));
+        }
+        for (&idx, state) in &self.adamw_state {
+            let name = &self.names[idx];
+            named.push((format!("{name}.__adamw_m"), state.m.to_device(Device::Cpu)));
+            named.push((format!("{name}.__adamw_v"), state.v.to_device(Device::Cpu)));
+            named.push((
+                format!("{name}.__adamw_step_count"),
+                Tensor::from(state.step_count),
+            ));
+        }
+        named.push((
+            "__muon_step_count__".to_owned(),
+            Tensor::from(self.step_count),
+        ));
+        let refs: Vec<(&str, &Tensor)> = named.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        Tensor::save_multi(&refs, path)
+            .with_context(|| format!("failed saving optimizer state {}", path.display()))
+    }
+
+    /// Restore optimizer state saved by [`Muon::save_state`], copying buffers in
+    /// place so device/dtype match the live params. Absent 2D buffers are an
+    /// error (the checkpoint is incomplete); absent AdamW buffers leave that param
+    /// lazily re-initialized on its next step.
+    pub fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let device = self
+            .params
+            .first()
+            .map(|p| p.device())
+            .unwrap_or(Device::Cpu);
+        let loaded: HashMap<String, Tensor> = Tensor::load_multi_with_device(path, device)
+            .with_context(|| format!("failed loading optimizer state {}", path.display()))?
+            .into_iter()
+            .collect();
+        let global_step_count = loaded
+            .get("__muon_step_count__")
+            .map(|t| t.int64_value(&[]))
+            .unwrap_or(0);
+        tch::no_grad(|| -> Result<()> {
+            for entry in &mut self.entries_2d {
+                let name = &self.names[entry.idx];
+                let momentum = loaded
+                    .get(&format!("{name}.__momentum"))
+                    .with_context(|| format!("optimizer state missing momentum for {name}"))?;
+                let second = loaded
+                    .get(&format!("{name}.__second_momentum"))
+                    .with_context(|| {
+                        format!("optimizer state missing second_momentum for {name}")
+                    })?;
+                entry.momentum.copy_(momentum);
+                entry.second_momentum.copy_(second);
+            }
+            self.adamw_state.clear();
+            for &idx in &self.adamw_indices {
+                let name = &self.names[idx];
+                if let (Some(m), Some(v)) = (
+                    loaded.get(&format!("{name}.__adamw_m")),
+                    loaded.get(&format!("{name}.__adamw_v")),
+                ) {
+                    self.adamw_state.insert(
+                        idx,
+                        AdamWParamState {
+                            m: m.shallow_clone(),
+                            v: v.shallow_clone(),
+                            step_count: loaded
+                                .get(&format!("{name}.__adamw_step_count"))
+                                .map(|step| step.int64_value(&[]))
+                                .unwrap_or(global_step_count),
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })?;
+        self.step_count = global_step_count;
+        Ok(())
+    }
+
     /// Total bytes of optimizer state currently allocated.
     /// 2D params: `momentum` + `second_momentum` per param.
     /// 1D params: AdamW `m` + `v` per param (lazy — zero until first step).
@@ -371,7 +775,10 @@ impl Muon {
 mod tests {
     use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
 
-    use super::{normuon_rescale, Muon, MuonConfig};
+    use super::{
+        attention_ortho_layout, batched_newtonschulz5, newtonschulz5, normuon_rescale,
+        orthogonalize_update, Muon, MuonConfig, OrthoLayout,
+    };
 
     const HIDDEN: i64 = 128;
     const TRAIN_STEPS: usize = 500;
@@ -660,6 +1067,257 @@ mod tests {
             "second_momentum not finite: [{}, {}]",
             v_min,
             v_max
+        );
+    }
+
+    #[test]
+    fn batched_newtonschulz_matches_independent_single_matrix_path() {
+        let _g = tch::no_grad_guard();
+        tch::manual_seed(17);
+        let device = Device::Cpu;
+        let heads = 4;
+        let update = Tensor::randn([heads, 32, 96], (Kind::Float, device));
+        let batched = batched_newtonschulz5(&update, 5);
+        let independent: Vec<Tensor> = (0..heads)
+            .map(|head| newtonschulz5(&update.get(head), 5))
+            .collect();
+        let independent = Tensor::stack(&independent, 0);
+        let max_diff = (&batched - independent).abs().max().double_value(&[]);
+        assert!(
+            max_diff < 3e-2,
+            "batched NS diverged from independent NS: max diff={max_diff:.3e}"
+        );
+    }
+
+    #[test]
+    fn attention_head_ortho_preserves_original_matrix_shape() {
+        let _g = tch::no_grad_guard();
+        tch::manual_seed(23);
+        let device = Device::Cpu;
+        let row_split = Tensor::randn([256, 256], (Kind::Float, device));
+        let col_split = Tensor::randn([256, 256], (Kind::Float, device));
+
+        let row_out = orthogonalize_update(
+            &row_split,
+            OrthoLayout::RowHeads {
+                heads: 4,
+                head_dim: 64,
+            },
+            5,
+        );
+        let col_out = orthogonalize_update(
+            &col_split,
+            OrthoLayout::ColHeads {
+                heads: 4,
+                head_dim: 64,
+            },
+            5,
+        );
+
+        assert_eq!(row_out.size(), row_split.size());
+        assert_eq!(col_out.size(), col_split.size());
+        assert!(row_out.isfinite().all().int64_value(&[]) != 0);
+        assert!(col_out.isfinite().all().int64_value(&[]) != 0);
+    }
+
+    #[test]
+    fn cross_attention_requires_explicit_cross_head_dim() {
+        let self_only = MuonConfig {
+            per_attention_head_ortho: true,
+            attention_head_dim: 64,
+            ..MuonConfig::default()
+        };
+        assert_eq!(
+            attention_ortho_layout("cross_attn.ca_q", &[256, 256], &self_only),
+            OrthoLayout::Matrix
+        );
+
+        let with_cross = MuonConfig {
+            cross_attention_head_dim: 128,
+            ..self_only
+        };
+        assert_eq!(
+            attention_ortho_layout("cross_attn.ca_q", &[256, 256], &with_cross),
+            OrthoLayout::RowHeads {
+                heads: 2,
+                head_dim: 128
+            }
+        );
+    }
+
+    #[test]
+    fn muon_name_allowlist_routes_only_matching_matrices() {
+        let vars = vec![
+            (
+                "flow.fc1.weight".to_owned(),
+                Tensor::zeros([8, 8], (Kind::Float, Device::Cpu)).set_requires_grad(true),
+            ),
+            (
+                "flow.mod.weight".to_owned(),
+                Tensor::zeros([8, 8], (Kind::Float, Device::Cpu)).set_requires_grad(true),
+            ),
+        ];
+        let opt = Muon::new_named(
+            &vars,
+            MuonConfig {
+                muon_name_allowlist: vec!["flow.fc".to_owned()],
+                ..MuonConfig::default()
+            },
+        );
+        assert_eq!(opt.entries_2d.len(), 1);
+        assert_eq!(opt.adamw_indices.len(), 1);
+        assert_eq!(opt.entries_2d[0].idx, 0);
+        assert_eq!(opt.adamw_indices[0], 1);
+    }
+
+    #[test]
+    fn named_lr_scale_changes_only_matching_parameter_updates() {
+        let actor = Tensor::zeros([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let critic = Tensor::zeros([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let shared = Tensor::zeros([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let vars = vec![
+            (
+                "policy_concentration.bias".to_owned(),
+                actor.shallow_clone(),
+            ),
+            ("value_projection.bias".to_owned(), critic.shallow_clone()),
+            ("trunk_norm.weight".to_owned(), shared.shallow_clone()),
+        ];
+        let mut opt = Muon::new_named(
+            &vars,
+            MuonConfig {
+                use_muon_for_2d: false,
+                adamw_lr: 0.1,
+                adamw_betas: (0.0, 0.0),
+                adamw_eps: 0.0,
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+
+        assert_eq!(opt.set_named_lr_scale(&["policy_concentration"], 0.25), 1);
+        (&actor + &critic + &shared).sum(Kind::Float).backward();
+        opt.step();
+
+        assert!((actor.double_value(&[]) + 0.025).abs() < 1e-7);
+        assert!((critic.double_value(&[]) + 0.1).abs() < 1e-7);
+        assert!((shared.double_value(&[]) + 0.1).abs() < 1e-7);
+    }
+
+    #[test]
+    fn disabled_named_parameters_skip_state_and_retain_their_adamw_clock() {
+        let actor = Tensor::zeros([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let critic = Tensor::zeros([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let vars = vec![
+            (
+                "policy_concentration.bias".to_owned(),
+                actor.shallow_clone(),
+            ),
+            ("value_projection.bias".to_owned(), critic.shallow_clone()),
+        ];
+        let mut opt = Muon::new_named(
+            &vars,
+            MuonConfig {
+                use_muon_for_2d: false,
+                adamw_lr: 0.1,
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+
+        (&actor + &critic).sum(Kind::Float).backward();
+        opt.step();
+        opt.zero_grad();
+        let actor_before_critic_only_step = actor.double_value(&[]);
+
+        assert_eq!(
+            opt.set_named_step_enabled(&["policy_concentration"], false),
+            1
+        );
+        critic.sum(Kind::Float).backward();
+        opt.step();
+
+        assert_eq!(actor.double_value(&[]), actor_before_critic_only_step);
+        assert!(critic.double_value(&[]) < actor_before_critic_only_step);
+        assert_eq!(opt.adamw_state[&0].step_count, 1);
+        assert_eq!(opt.adamw_state[&1].step_count, 2);
+
+        let state_path = std::env::temp_dir().join(format!(
+            "muon-per-param-clock-{}-{}.ot",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        opt.save_state(&state_path).unwrap();
+        let restored_actor = Tensor::zeros([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let restored_critic =
+            Tensor::zeros([1], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let mut restored = Muon::new_named(
+            &[
+                (
+                    "policy_concentration.bias".to_owned(),
+                    restored_actor.shallow_clone(),
+                ),
+                (
+                    "value_projection.bias".to_owned(),
+                    restored_critic.shallow_clone(),
+                ),
+            ],
+            MuonConfig {
+                use_muon_for_2d: false,
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+        restored.load_state(&state_path).unwrap();
+        assert_eq!(restored.adamw_state[&0].step_count, 1);
+        assert_eq!(restored.adamw_state[&1].step_count, 2);
+        std::fs::remove_file(state_path).unwrap();
+
+        opt.zero_grad();
+        opt.set_named_step_enabled(&["policy_concentration"], true);
+        actor.sum(Kind::Float).backward();
+        opt.step();
+        assert_eq!(opt.adamw_state[&0].step_count, 2);
+        assert!((actor.double_value(&[]) + 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adamw_named_no_weight_decay_excludes_only_matching_parameters() {
+        let phase = Tensor::ones([4], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let regular = Tensor::ones([4], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let vars = vec![
+            ("layer.pope_theta_bias".to_owned(), phase.shallow_clone()),
+            ("layer.bias".to_owned(), regular.shallow_clone()),
+        ];
+        let mut opt = Muon::new_named(
+            &vars,
+            MuonConfig {
+                use_muon_for_2d: false,
+                adamw_lr: 0.1,
+                adamw_wd: 0.5,
+                adamw_no_weight_decay_name_substrings: vec!["pope_theta_bias".to_owned()],
+                ..MuonConfig::default()
+            },
+        );
+        (&phase.sum(Kind::Float) * 0.0 + &regular.sum(Kind::Float) * 0.0).backward();
+        opt.step();
+        assert_eq!(phase.min().double_value(&[]), 1.0);
+        assert!((regular.max().double_value(&[]) - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fused_qkv_groups_qkv_rows_by_attention_head() {
+        let cfg = MuonConfig {
+            per_attention_head_ortho: true,
+            attention_head_dim: 64,
+            ..MuonConfig::default()
+        };
+        assert_eq!(
+            attention_ortho_layout("block0.attn_qkv", &[768, 256], &cfg),
+            OrthoLayout::RowHeads {
+                heads: 4,
+                head_dim: 192
+            }
         );
     }
 

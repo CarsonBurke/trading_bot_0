@@ -17,13 +17,12 @@ enum Gene {
     StopLossPct,
     TakeProfitPct,
     BuyPercent,
-    SellPercent,
     MinEntryRsi,
     MaxExitRsi,
 }
 
 impl Gene {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 11] = [
         Self::FastEmaAlpha,
         Self::SlowEmaAlpha,
         Self::PullbackMinPct,
@@ -33,7 +32,6 @@ impl Gene {
         Self::StopLossPct,
         Self::TakeProfitPct,
         Self::BuyPercent,
-        Self::SellPercent,
         Self::MinEntryRsi,
         Self::MaxExitRsi,
     ];
@@ -223,12 +221,6 @@ fn spec(gene: Gene) -> GeneSpec {
             min: 0.03,
             max: 0.9,
             init: 0.2,
-            mutation: 0.06,
-        },
-        Gene::SellPercent => GeneSpec {
-            min: 0.15,
-            max: 1.0,
-            init: 0.7,
             mutation: 0.06,
         },
         Gene::MinEntryRsi => GeneSpec {

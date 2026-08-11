@@ -57,7 +57,7 @@ pub(crate) struct BacktestMetricAccumulator {
 impl Default for BacktestMetricAccumulator {
     fn default() -> Self {
         Self {
-            previous_asset: None,
+            previous_asset: Some(STARTING_CASH),
             final_assets: STARTING_CASH,
             peak_assets: STARTING_CASH,
             max_drawdown_pct: 0.0,
@@ -200,4 +200,22 @@ fn std_dev_from_moments(sum: f64, sum_sq: f64, count: usize) -> f64 {
     let mean = sum / count as f64;
     let variance = (sum_sq / count as f64) - (mean * mean);
     variance.max(0.0).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BacktestMetricAccumulator, TradeSummary, STARTING_CASH};
+
+    #[test]
+    fn initial_equity_loss_contributes_to_risk_returns() {
+        let mut accumulator = BacktestMetricAccumulator::default();
+        let after_initial_commission = STARTING_CASH - 100.0;
+        accumulator.observe(after_initial_commission);
+        accumulator.observe(after_initial_commission);
+
+        assert_eq!(accumulator.return_count, 2);
+        assert!((accumulator.return_sum + 0.01).abs() < 1e-12);
+        let metrics = accumulator.finish(STARTING_CASH, TradeSummary::default());
+        assert!((metrics.sharpe + 1.0).abs() < 1e-12);
+    }
 }

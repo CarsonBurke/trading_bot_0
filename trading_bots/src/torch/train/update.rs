@@ -27,7 +27,7 @@ use super::value_loss::hl_gauss_value_loss;
 /// DAPO clip-higher asymmetric PPO objective.
 /// Returns the policy loss and the per-sample clip gap |ratio - clamp(ratio)|,
 /// a detached diagnostic of how much the clip is engaging.
-fn asym_clip_policy_loss(advantage: &Tensor, ratio: &Tensor) -> (Tensor, Tensor) {
+pub(crate) fn asym_clip_policy_loss(advantage: &Tensor, ratio: &Tensor) -> (Tensor, Tensor) {
     let pg_loss1 = -(advantage * ratio);
     let clipped = ratio.clamp(1.0 - CLIP_EPS_LOW, 1.0 + CLIP_EPS_HIGH);
     let pg_loss2 = -(advantage * &clipped);

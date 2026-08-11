@@ -1,7 +1,17 @@
 use clap::{Parser, Subcommand};
 use colored::{self, Colorize};
 use trading_bot_0::torch::model::ModelVariant;
+use trading_bot_0::torch::planner::PlannerDataSplit;
+use trading_bot_0::torch::train::PretrainObjective;
 use trading_bot_0::{genetic, torch};
+
+fn default_paper_symbols() -> Vec<String> {
+    trading_bot_0::constants::TICKERS
+        .iter()
+        .take(torch::constants::TICKERS_COUNT as usize)
+        .map(|symbol| (*symbol).to_string())
+        .collect()
+}
 
 #[derive(Parser)]
 #[command(name = "trading_bot")]
@@ -76,14 +86,24 @@ enum Commands {
         #[arg(long)]
         steps: Option<usize>,
 
+        /// With --steps 0 and LeJEPA weights, run only the lightweight latent-skill gate.
+        #[arg(long, default_value_t = false)]
+        eval_skill_only: bool,
+
         #[arg(long, default_value_t = 256)]
         batch_size: usize,
 
         #[arg(long, default_value_t = 16)]
         k_patches: usize,
 
+        #[arg(long, value_enum, default_value_t = PretrainObjective::MeanMse)]
+        objective: PretrainObjective,
+
         #[arg(long, default_value_t = 0.0)]
         lambda_lat: f64,
+
+        #[arg(long, default_value_t = 0.09)]
+        lambda_sigreg: f64,
 
         #[arg(long, default_value_t = 100.0)]
         target_scale: f64,
@@ -91,14 +111,90 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         validation_batches: usize,
 
+        /// Run validation every N global optimizer steps within an epoch (0 disables
+        /// mid-epoch validation). Validation always also runs at each epoch end.
         #[arg(long, default_value_t = 0)]
         validate_every: usize,
 
+        /// Write a checkpoint every N global optimizer steps within an epoch (0 disables
+        /// mid-epoch checkpoints).
         #[arg(long, default_value_t = 0)]
         checkpoint_every: usize,
 
-        #[arg(long, default_value_t = false)]
-        log_step_losses: bool,
+        /// Evaluate one validation mini-batch every N training steps, folded into
+        /// the pretrain_step_loss report's val overlay (0 disables).
+        #[arg(long, default_value_t = 5)]
+        step_val_every: usize,
+
+        /// Write deterministic candle-rollout snapshot reports on fixed validation
+        /// windows every N training steps (0 disables).
+        #[arg(long, default_value_t = 500)]
+        candle_snapshot_every: usize,
+    },
+    TrainPlanner {
+        #[arg(long, default_value = "weights/pretrain_heads_best.ot")]
+        world_model_weights: String,
+
+        #[arg(long)]
+        world_model_metadata: Option<String>,
+
+        #[arg(long)]
+        planner_weights: Option<String>,
+
+        #[arg(long, default_value = "weights/planner.ot")]
+        output: String,
+
+        #[arg(long, default_value_t = 1_000)]
+        updates: usize,
+
+        #[arg(long, default_value_t = 100)]
+        horizon: usize,
+
+        #[arg(long, default_value_t = 100)]
+        rollout_length: usize,
+
+        #[arg(long, default_value_t = 128)]
+        environments: usize,
+
+        #[arg(long, default_value_t = 1280)]
+        minibatch_size: usize,
+
+        #[arg(long)]
+        context_bars: Option<usize>,
+
+        #[arg(long, value_delimiter = ',')]
+        tickers: Option<Vec<String>>,
+
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+    },
+    InferPlanner {
+        #[arg(long, default_value = "weights/pretrain_heads_best.ot")]
+        world_model_weights: String,
+
+        #[arg(long)]
+        world_model_metadata: Option<String>,
+
+        #[arg(long, default_value = "weights/planner.ot")]
+        planner_weights: String,
+
+        #[arg(long, default_value_t = 10)]
+        episodes: usize,
+
+        #[arg(long)]
+        horizon: Option<usize>,
+
+        #[arg(long, default_value_t = 100)]
+        rollout_length: usize,
+
+        #[arg(long)]
+        context_bars: Option<usize>,
+
+        #[arg(long, value_delimiter = ',')]
+        tickers: Option<Vec<String>>,
+
+        #[arg(long, value_enum, default_value_t = PlannerDataSplit::Test)]
+        split: PlannerDataSplit,
     },
     Infer {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
@@ -126,7 +222,11 @@ enum Commands {
         #[arg(short, long, default_value = "weights/ppo_ep1000.ot")]
         weights: String,
 
-        #[arg(short, long, value_delimiter = ',', default_value = "TSLA,AAPL")]
+        /// Dedicated IBKR paper account to trade. Existing positions are rejected.
+        #[arg(long)]
+        account: String,
+
+        #[arg(short, long, value_delimiter = ',', default_values_t = default_paper_symbols())]
         symbols: Vec<String>,
 
         #[arg(short, long, default_value_t = 60)]
@@ -193,14 +293,18 @@ async fn main() {
             run,
             epochs,
             steps,
+            eval_skill_only,
             batch_size,
             k_patches,
+            objective,
             lambda_lat,
+            lambda_sigreg,
             target_scale,
             validation_batches,
             validate_every,
             checkpoint_every,
-            log_step_losses,
+            step_val_every,
+            candle_snapshot_every,
         }) => {
             let args = torch::train::PretrainArgs {
                 weights: weights.clone(),
@@ -208,19 +312,83 @@ async fn main() {
                 run: run.clone(),
                 epochs: *epochs,
                 steps: *steps,
+                eval_skill_only: *eval_skill_only,
                 batch_size: *batch_size,
                 k_patches: *k_patches,
+                objective: *objective,
                 lambda_lat: *lambda_lat,
+                lambda_sigreg: *lambda_sigreg,
                 target_scale: *target_scale,
                 validation_batches: *validation_batches,
                 validate_every: *validate_every,
                 checkpoint_every: *checkpoint_every,
-                log_step_losses: *log_step_losses,
+                step_val_every: *step_val_every,
+                candle_snapshot_every: *candle_snapshot_every,
             };
             tokio::task::spawn_blocking(move || torch::train::pretrain(args))
                 .await
                 .expect("pretraining task panicked")
                 .expect("pretraining failed");
+        }
+        Some(Commands::TrainPlanner {
+            world_model_weights,
+            world_model_metadata,
+            planner_weights,
+            output,
+            updates,
+            horizon,
+            rollout_length,
+            environments,
+            minibatch_size,
+            context_bars,
+            tickers,
+            seed,
+        }) => {
+            let args = torch::planner::TrainPlannerArgs {
+                world_model_weights: world_model_weights.clone(),
+                world_model_metadata: world_model_metadata.clone(),
+                planner_weights: planner_weights.clone(),
+                output: output.clone(),
+                updates: *updates,
+                horizon: *horizon,
+                rollout_length: *rollout_length,
+                environments: *environments,
+                minibatch_size: *minibatch_size,
+                context_bars: *context_bars,
+                tickers: tickers.clone(),
+                seed: *seed,
+            };
+            tokio::task::spawn_blocking(move || torch::planner::train_planner(args))
+                .await
+                .expect("planner training task panicked")
+                .expect("planner training failed");
+        }
+        Some(Commands::InferPlanner {
+            world_model_weights,
+            world_model_metadata,
+            planner_weights,
+            episodes,
+            horizon,
+            rollout_length,
+            context_bars,
+            tickers,
+            split,
+        }) => {
+            let args = torch::planner::InferPlannerArgs {
+                world_model_weights: world_model_weights.clone(),
+                world_model_metadata: world_model_metadata.clone(),
+                planner_weights: planner_weights.clone(),
+                episodes: *episodes,
+                horizon: *horizon,
+                rollout_length: *rollout_length,
+                context_bars: *context_bars,
+                tickers: tickers.clone(),
+                split: *split,
+            };
+            tokio::task::spawn_blocking(move || torch::planner::infer_planner(args))
+                .await
+                .expect("planner inference task panicked")
+                .expect("planner inference failed");
         }
         Some(Commands::Infer {
             weights,
@@ -244,6 +412,7 @@ async fn main() {
         }
         Some(Commands::Paper {
             weights,
+            account,
             symbols,
             interval,
             max_steps,
@@ -252,6 +421,7 @@ async fn main() {
         }) => {
             torch::infer::run_ibkr_paper_trading(
                 weights,
+                account.clone(),
                 symbols.clone(),
                 *interval,
                 *max_steps,
@@ -266,4 +436,23 @@ async fn main() {
     }
 
     println!("{}", "End".green())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn paper_defaults_match_model_ticker_count() {
+        let cli = Cli::try_parse_from(["trading_bot", "paper", "--account", "DU123"])
+            .expect("paper CLI should parse");
+        let Some(Commands::Paper { symbols, .. }) = cli.command else {
+            panic!("paper subcommand should parse as Paper");
+        };
+        assert_eq!(
+            symbols.len(),
+            trading_bot_0::torch::constants::TICKERS_COUNT as usize
+        );
+    }
 }

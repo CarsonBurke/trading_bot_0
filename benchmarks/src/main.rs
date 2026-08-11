@@ -1,6 +1,7 @@
 #![feature(f16)]
 
 mod optim_grid;
+mod optim_head_ortho;
 mod optim_loss;
 mod optim_transformer;
 mod results;
@@ -78,6 +79,14 @@ fn main() {
     if mode.as_deref() == Some("optim-grid") {
         optim_grid::run(device);
         println!("\n=== Optimizer Grid Search Complete ===");
+        return;
+    }
+
+    // `optim-head-ortho` compares the existing whole-matrix NorMuon
+    // orthogonalization with an experimental per-attention-head batched NS mode.
+    if mode.as_deref() == Some("optim-head-ortho") {
+        optim_head_ortho::run(device);
+        println!("\n=== Optimizer Attention-Head Ortho Benchmark Complete ===");
         return;
     }
 

@@ -10,4 +10,7 @@ members = [
 ]
 
 [patch.crates-io]
-torch-sys = { path = "vendor/torch-sys-0.23.0" }
+torch-sys = { path = "vendor/torch-sys-0.25.0" }
+
+[patch."https://github.com/LaurentMazare/tch-rs.git"]
+torch-sys = { path = "vendor/torch-sys-0.25.0" }

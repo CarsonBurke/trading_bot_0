@@ -5,10 +5,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
+use serde::Deserialize;
 use shared::paths::{RUNS_PATH, WEIGHTS_PATH};
 use shared::run_dir::RunDir;
 use std::{
-    fs, io,
+    collections::hash_map::DefaultHasher,
+    fs,
+    hash::{Hash, Hasher},
+    io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -25,7 +29,11 @@ use chart_viewer::ChartViewer;
 use state::{GenerationBrowserState, InferenceBrowserState, LogsPageState, ProcessManagerState};
 use state::{GeneticFamily as TuiGeneticFamily, TrainingKind};
 
-const TRAINING_KINDS: [TrainingKind; 2] = [TrainingKind::Rl, TrainingKind::Genetic];
+const TRAINING_KINDS: [TrainingKind; 3] = [
+    TrainingKind::Rl,
+    TrainingKind::Genetic,
+    TrainingKind::Pretrain,
+];
 const GENETIC_FAMILIES: [TuiGeneticFamily; 3] = [
     TuiGeneticFamily::TrendBreakout,
     TuiGeneticFamily::PriceRebound,
@@ -99,6 +107,7 @@ pub struct App {
     pub training_kind: TrainingKind,
     pub genetic_family: TuiGeneticFamily,
     pub latest_meta_charts: Vec<PathBuf>,
+    meta_reports_revision: u64,
     last_refresh: Instant,
     pub generation_browser: GenerationBrowserState,
     pub inference_browser: InferenceBrowserState,
@@ -155,6 +164,231 @@ fn sort_run_dirs_newest_first(dirs: &mut [std::fs::DirEntry]) {
     });
 }
 
+const PLANNER_INFERENCE_REPORTS: [&str; 6] = [
+    "planner_inference_wealth",
+    "planner_inference_outperformance",
+    "planner_inference_outperformance_fraction",
+    "planner_inference_risk",
+    "planner_inference_action",
+    "planner_inference_commissions",
+];
+
+fn latest_complete_planner_inference_bundle(generation: &Path) -> Option<PathBuf> {
+    let generation_owner = serde_json::from_slice::<PlannerOwnerView>(
+        &fs::read(generation.join(".planner-report-generation")).ok()?,
+    )
+    .ok()?;
+    let mut bundles = fs::read_dir(generation)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let manifest = serde_json::from_slice::<PlannerInferenceManifestView>(
+                &fs::read(entry.path().join(".planner-inference.json")).unwrap_or_default(),
+            )
+            .ok();
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && manifest.as_ref().is_some_and(|manifest| {
+                    manifest.version == 1
+                        && manifest.episodes > 0
+                        && manifest.rollout_length > 0
+                        && !manifest.evaluation_fingerprint.is_empty()
+                        && manifest.run_lineage_id == generation_owner.run_lineage_id
+                        && manifest.update == generation_owner.update
+                        && entry.file_name().to_str().is_some_and(|name| {
+                            name.starts_with(&format!("planner_inference_{}_", manifest.split))
+                        })
+                })
+                && PLANNER_INFERENCE_REPORTS
+                    .iter()
+                    .all(|base| entry.path().join(format!("{base}.report.bin")).is_file())
+                && serde_json::from_slice::<PlannerOwnerView>(
+                    &fs::read(entry.path().join(".planner-report-generation")).unwrap_or_default(),
+                )
+                .ok()
+                .as_ref()
+                    == Some(&generation_owner)
+        })
+        .collect::<Vec<_>>();
+    bundles.sort_by_key(|entry| {
+        (
+            fs::metadata(entry.path())
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+            entry.file_name(),
+        )
+    });
+    bundles.pop().map(|entry| entry.path())
+}
+
+#[derive(Deserialize)]
+struct PlannerManifestView {
+    version: u32,
+    run_lineage_id: String,
+    update: u64,
+    checkpoint_file: String,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+struct PlannerOwnerView {
+    run_lineage_id: String,
+    update: u64,
+}
+
+#[derive(Deserialize)]
+struct PlannerInferenceManifestView {
+    version: u32,
+    run_lineage_id: String,
+    update: u64,
+    split: String,
+    evaluation_fingerprint: String,
+    episodes: usize,
+    rollout_length: usize,
+}
+
+#[derive(Deserialize)]
+struct PpoResumeManifestView {
+    format_version: u32,
+    next_episode: usize,
+    optimizer_step: i64,
+    weights_sha256: String,
+    optimizer_sha256: String,
+    kl_lr_controller: KlLrControllerStateView,
+}
+
+#[derive(Deserialize)]
+struct KlLrControllerStateView {
+    version: u32,
+    ema: f64,
+    scale: f64,
+}
+
+fn selectable_weight_files(weights_dir: &Path) -> Vec<String> {
+    let mut weights = fs::read_dir(weights_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_owned();
+            is_selectable_primary_weight(&entry.path(), &name).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    weights.sort_by(|a, b| {
+        let checkpoint_number = |name: &str| -> usize {
+            name.chars()
+                .filter(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        };
+        checkpoint_number(b).cmp(&checkpoint_number(a))
+    });
+    weights
+}
+
+fn is_selectable_primary_weight(path: &Path, name: &str) -> bool {
+    if path.extension().is_none_or(|extension| extension != "ot")
+        || name.starts_with('.')
+        || name.starts_with("pretrain_heads")
+        || name.ends_with(".optimizer.ot")
+        || name.contains(".tmp-")
+        || name.contains(".tmp.")
+    {
+        return false;
+    }
+
+    let Some(episode) = name
+        .strip_prefix("ppo_ep")
+        .and_then(|suffix| suffix.strip_suffix(".ot"))
+    else {
+        return !name.starts_with("ppo_ep");
+    };
+    if episode.parse::<usize>().is_err() {
+        return false;
+    }
+
+    let optimizer = path.with_extension("optimizer.ot");
+    let resume = path.with_extension("resume.json");
+    let manifest = fs::read(&resume)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PpoResumeManifestView>(&bytes).ok());
+    optimizer.is_file()
+        && manifest.is_some_and(|manifest| {
+            manifest.format_version == 1
+                && manifest.next_episode > 0
+                && manifest.optimizer_step >= 0
+                && !manifest.weights_sha256.is_empty()
+                && !manifest.optimizer_sha256.is_empty()
+                && manifest.kl_lr_controller.version == 1
+                && manifest.kl_lr_controller.ema.is_finite()
+                && manifest.kl_lr_controller.ema > 0.0
+                && manifest.kl_lr_controller.scale.is_finite()
+                && manifest.kl_lr_controller.scale > 0.0
+        })
+}
+
+fn planner_committed_updates(gens: &Path) -> std::collections::HashMap<String, u64> {
+    let Some(weights) = gens.parent().map(|root| root.join("weights")) else {
+        return std::collections::HashMap::new();
+    };
+    fs::read_dir(&weights)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".resume.json"))
+        })
+        .filter_map(|entry| {
+            let manifest =
+                serde_json::from_slice::<PlannerManifestView>(&fs::read(entry.path()).ok()?)
+                    .ok()?;
+            let checkpoint = weights.join(&manifest.checkpoint_file);
+            if manifest.version != 1
+                || manifest.checkpoint_file.contains('/')
+                || manifest.checkpoint_file.contains('\\')
+                || !checkpoint.is_file()
+                || !checkpoint.with_extension("metadata.json").is_file()
+                || !checkpoint.with_extension("optimizer.ot").is_file()
+            {
+                return None;
+            }
+            Some((manifest.run_lineage_id, manifest.update))
+        })
+        .fold(
+            std::collections::HashMap::new(),
+            |mut updates, (lineage, update)| {
+                updates
+                    .entry(lineage)
+                    .and_modify(|current| *current = (*current).max(update))
+                    .or_insert(update);
+                updates
+            },
+        )
+}
+
+fn planner_generation_visible(
+    generation: &Path,
+    generation_number: u64,
+    committed_updates: &std::collections::HashMap<String, u64>,
+) -> bool {
+    let marker = generation.join(".planner-report-generation");
+    if !marker.is_file() {
+        return true;
+    }
+    serde_json::from_slice::<PlannerOwnerView>(&fs::read(marker).unwrap_or_default())
+        .ok()
+        .is_some_and(|owner| {
+            owner.update == generation_number
+                && committed_updates
+                    .get(&owner.run_lineage_id)
+                    .is_some_and(|committed| generation_number <= *committed)
+        })
+}
+
 impl App {
     fn coerce_weights_filename(input: &str) -> String {
         let trimmed = input.trim();
@@ -192,6 +426,7 @@ impl App {
             training_kind: TrainingKind::Rl,
             genetic_family: TuiGeneticFamily::TrendBreakout,
             latest_meta_charts: Vec::new(),
+            meta_reports_revision: 0,
             last_refresh: Instant::now(),
             generation_browser,
             inference_browser,
@@ -200,6 +435,7 @@ impl App {
         };
 
         app.load_latest_meta_charts()?;
+        app.meta_reports_revision = app.current_meta_reports_revision();
         Ok(app)
     }
 
@@ -217,6 +453,7 @@ impl App {
         if !gens_path.exists() {
             return Ok(());
         }
+        let planner_committed_updates = planner_committed_updates(&gens_path);
 
         // Meta chart base names (episode-level charts without ticker)
         let meta_chart_bases = vec![
@@ -226,6 +463,7 @@ impl App {
             "final_assets",
             "cumulative_reward",
             "outperformance",
+            "outperformance_fraction",
             "advantage_stats_log",
             "total_commissions",
             "beta_policy",
@@ -258,13 +496,84 @@ impl App {
             "pretrain_horizon_error",
             "pretrain_horizon_uncertainty",
             "pretrain_horizon_std_error",
+            "pretrain_probe_mse",
+            "pretrain_sigreg",
+            "pretrain_jepa_mse",
+            "pretrain_repr_std_mean",
+            "pretrain_repr_std_min",
+            "pretrain_pred_embed_std",
+            "pretrain_target_embed_std",
+            "pretrain_probe_mae",
+            "pretrain_probe_explained_variance",
+            "pretrain_pred_std",
+            "pretrain_target_std",
+            "pretrain_probe_terminal_mse",
+            "pretrain_pred_probe_ev_persist",
+            "pretrain_dir_acc_close",
+            "pretrain_return_ev_persist",
+            "pretrain_return_dir_acc",
+            "pretrain_return_rank_ic",
+            "pretrain_latent_ev_persist",
+            "pretrain_belief_spread",
+            "pretrain_skill_ablation",
+            "pretrain_skill_eval",
+            "pretrain_total_loss",
+            "pretrain_probe_bias",
+            "pretrain_pred_abs",
+            "pretrain_target_abs",
+            "pretrain_zero_mse",
+            "pretrain_next_lat",
+            "pretrain_rollout_mean_mse",
+            "pretrain_pred_probe_ev_mean",
+            "pretrain_latent_ev_marginal",
+            "pretrain_belief_norm",
+            "pretrain_step_loss",
+            "pretrain_candle_rollout_mse",
+            "pretrain_candle_rollout_dclose",
+            "pretrain_test",
+            "planner_wealth",
+            "planner_reward",
+            "planner_position",
+            "planner_position_mean",
+            "planner_outperformance",
+            "planner_outperformance_fraction",
+            "planner_turnover",
+            "planner_commissions",
+            "planner_aux_return_loss",
+            "planner_deterministic_wealth",
+            "planner_deterministic_reward",
+            "planner_deterministic_position_mean",
+            "planner_deterministic_outperformance",
+            "planner_deterministic_outperformance_fraction",
+            "planner_deterministic_turnover",
+            "planner_deterministic_commissions",
+            "planner_validation_wealth",
+            "planner_validation_outperformance",
+            "planner_validation_risk",
+            "planner_validation_selection",
+            "planner_validation_outperformance_fraction",
+            "planner_inference_wealth",
+            "planner_inference_outperformance",
+            "planner_inference_outperformance_fraction",
+            "planner_inference_risk",
+            "planner_inference_action",
+            "planner_inference_commissions",
         ];
 
         // Ticker-specific chart base names
-        let ticker_chart_bases = vec!["assets", "buy_sell", "raw_action"];
+        let ticker_chart_bases = vec![
+            "assets",
+            "buy_sell",
+            "raw_action",
+            "reward",
+            "planner_position",
+        ];
 
         // Track the latest file for each chart type: base_name -> (modified_time, path)
         let mut latest_per_type: HashMap<String, (SystemTime, PathBuf)> = HashMap::new();
+
+        // Candle-snapshot window reports, kept only for the most recent global_step.
+        let mut candle_snapshots: Vec<(usize, PathBuf)> = Vec::new();
 
         // Scan all generation directories
         if let Ok(entries) = fs::read_dir(&gens_path) {
@@ -278,13 +587,22 @@ impl App {
                     continue;
                 }
                 // Only process numeric directories (generation folders)
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.parse::<usize>().is_err() {
-                        continue;
-                    }
-                }
+                let Some(generation_number) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u64>().ok())
+                else {
+                    continue;
+                };
 
                 let gen_path = entry.path();
+                if !planner_generation_visible(
+                    &gen_path,
+                    generation_number,
+                    &planner_committed_updates,
+                ) {
+                    continue;
+                }
 
                 // Process episode-level meta charts
                 for base in &meta_chart_bases {
@@ -337,6 +655,50 @@ impl App {
                     }
                 }
 
+                if let Some(bundle_path) = latest_complete_planner_inference_bundle(&gen_path) {
+                    for base in PLANNER_INFERENCE_REPORTS {
+                        let report_path = bundle_path.join(format!("{base}.report.bin"));
+                        if let Some(modified) = fs::metadata(&report_path)
+                            .ok()
+                            .and_then(|metadata| metadata.modified().ok())
+                        {
+                            let key = format!("meta_{base}");
+                            if latest_per_type
+                                .get(&key)
+                                .is_none_or(|(current, _)| modified > *current)
+                            {
+                                latest_per_type.insert(key, (modified, report_path));
+                            }
+                        }
+                    }
+                    if let Ok(episodes) = fs::read_dir(&bundle_path) {
+                        for episode in episodes
+                            .filter_map(Result::ok)
+                            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                        {
+                            for base in &ticker_chart_bases {
+                                let report_path = episode.path().join(format!("{base}.report.bin"));
+                                if let Some(modified) = fs::metadata(&report_path)
+                                    .ok()
+                                    .and_then(|metadata| metadata.modified().ok())
+                                {
+                                    let key = format!(
+                                        "{}_{}",
+                                        episode.file_name().to_string_lossy(),
+                                        base
+                                    );
+                                    if latest_per_type
+                                        .get(&key)
+                                        .is_none_or(|(current, _)| modified > *current)
+                                    {
+                                        latest_per_type.insert(key, (modified, report_path));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let samples_path = gen_path.join("samples");
                 if samples_path.is_dir() {
                     if let Ok(items) = fs::read_dir(&samples_path) {
@@ -371,6 +733,26 @@ impl App {
                         }
                     }
                 }
+
+                let snapshot_path = gen_path.join("candle_snapshots");
+                if snapshot_path.is_dir() {
+                    if let Ok(items) = fs::read_dir(&snapshot_path) {
+                        for item in items.filter_map(|e| e.ok()) {
+                            let file_name = item.file_name();
+                            let file_name = file_name.to_str().unwrap_or("");
+                            if !file_name.ends_with("_candles.report.bin") {
+                                continue;
+                            }
+                            if let Some(step) = file_name
+                                .strip_prefix("step")
+                                .and_then(|s| s.split('_').next())
+                                .and_then(|s| s.parse::<usize>().ok())
+                            {
+                                candle_snapshots.push((step, item.path()));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -379,10 +761,59 @@ impl App {
             self.latest_meta_charts.push(path);
         }
 
+        // Keep only the most recent global_step's candle-snapshot windows.
+        if let Some(latest_step) = candle_snapshots.iter().map(|(s, _)| *s).max() {
+            for (_, path) in candle_snapshots
+                .into_iter()
+                .filter(|(s, _)| *s == latest_step)
+            {
+                self.latest_meta_charts.push(path);
+            }
+        }
+
         // Sort by filename for consistent ordering
         self.latest_meta_charts.sort();
 
         Ok(())
+    }
+
+    fn current_meta_reports_revision(&self) -> u64 {
+        let run_root = self
+            .process_manager
+            .active_run
+            .as_ref()
+            .map(|run| run.root.clone())
+            .unwrap_or_else(|| PathBuf::from("../training/runs/latest"));
+        let mut hasher = DefaultHasher::new();
+        run_root.hash(&mut hasher);
+        let mut inputs = self.latest_meta_charts.clone();
+        for directory in [&run_root, &run_root.join("weights")] {
+            if let Ok(entries) = fs::read_dir(directory) {
+                inputs.extend(
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            path.extension().is_some_and(|extension| extension == "csv")
+                        }),
+                );
+            }
+        }
+        inputs.sort();
+        inputs.dedup();
+        for path in inputs {
+            path.hash(&mut hasher);
+            if let Ok(metadata) = fs::metadata(&path) {
+                metadata.len().hash(&mut hasher);
+                metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .hash(&mut hasher);
+            }
+        }
+        hasher.finish()
     }
 
     pub fn is_training_running(&mut self) -> bool {
@@ -417,6 +848,10 @@ impl App {
         self.logs_page.training_output.iter().rev().any(|line| {
             line.contains("ppo update:")
                 || line.contains("Epoch ")
+                || line.contains("pretrain epoch ")
+                || line.contains("pretrain step ")
+                || line.contains("planner update=")
+                || line.contains("planner validation update=")
                 || line.contains("Policy:")
                 || (line.contains("Episode") && line.contains("Total Assets"))
         })
@@ -426,18 +861,31 @@ impl App {
         let now = Instant::now();
         if now.duration_since(self.last_refresh) >= Duration::from_secs(1) {
             self.process_manager.poll_training_process();
+            self.sync_gens_path();
             self.generation_browser.load_generations()?;
             self.inference_browser.load_inferences()?;
             self.load_latest_meta_charts()?;
-            let log_path = self
-                .process_manager
-                .active_run
-                .as_ref()
-                .map(|r| r.log_file.to_string_lossy().to_string());
-            self.logs_page.poll_training_output(log_path.as_deref());
+            let revision = self.current_meta_reports_revision();
+            if revision != self.meta_reports_revision
+                && self.mode == AppMode::ChartViewer
+                && self.chart_viewer.is_viewing_meta_charts()
+            {
+                self.chart_viewer.load_charts(&self.latest_meta_charts)?;
+            }
+            self.meta_reports_revision = revision;
+            let log_path = self.active_log_path();
+            self.logs_page.poll_training_output(&log_path);
             self.last_refresh = now;
         }
         Ok(())
+    }
+
+    fn active_log_path(&self) -> PathBuf {
+        self.process_manager
+            .active_run
+            .as_ref()
+            .map(|run| run.log_file.clone())
+            .unwrap_or_else(|| PathBuf::from("../training/runs/latest/training.log"))
     }
 
     fn start_training(&mut self, weights_path: Option<String>) -> Result<()> {
@@ -462,15 +910,20 @@ impl App {
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+            .filter(|e| e.path().is_dir() && e.file_name() != "latest")
             .collect();
         sort_run_dirs_newest_first(&mut dirs);
 
-        let active_name = self
+        let viewed_name = self
             .process_manager
             .active_run
             .as_ref()
             .and_then(|r| r.root.file_name().map(|n| n.to_string_lossy().to_string()));
+        let live_name = self
+            .process_manager
+            .live_run()
+            .and_then(|run| run.root.file_name())
+            .map(|name| name.to_string_lossy().to_string());
 
         let runs: Vec<RunInfo> = dirs
             .iter()
@@ -484,24 +937,8 @@ impl App {
                     .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
                     .count();
                 let weights_dir = entry.path().join("weights");
-                let mut weights: Vec<String> = fs::read_dir(&weights_dir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "ot"))
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect();
-                weights.sort_by(|a, b| {
-                    let num = |s: &String| -> usize {
-                        s.chars()
-                            .filter(|c| c.is_ascii_digit())
-                            .collect::<String>()
-                            .parse()
-                            .unwrap_or(0)
-                    };
-                    num(b).cmp(&num(a))
-                });
-                let is_active = active_name.as_deref() == Some(&name);
+                let weights = selectable_weight_files(&weights_dir);
+                let is_active = live_name.as_deref() == Some(&name);
                 if gen_count == 0 && weights.is_empty() && !is_active {
                     return None;
                 }
@@ -515,7 +952,10 @@ impl App {
             .collect();
 
         let selected = match purpose {
-            RunSelectorPurpose::View => 0,
+            RunSelectorPurpose::View => runs
+                .iter()
+                .position(|run| Some(run.name.as_str()) == viewed_name.as_deref())
+                .unwrap_or(0),
             RunSelectorPurpose::Train => runs.iter().position(|r| r.is_active).unwrap_or(0),
         };
         self.dialog_mode = DialogMode::RunSelector {
@@ -530,12 +970,21 @@ impl App {
         let gens = root.join("gens");
         let weights = root.join("weights");
         let log_file = root.join("training.log");
-        self.process_manager.active_run = Some(RunDir {
+        let run = RunDir {
             root,
             gens,
             weights,
             log_file,
-        });
+        };
+        let is_live = self
+            .process_manager
+            .live_run()
+            .is_some_and(|live| live.root == run.root);
+        if is_live {
+            self.process_manager.follow_live_run();
+        } else {
+            self.process_manager.pin_view_run(run);
+        }
         self.sync_gens_path();
         self.generation_browser.load_generations()?;
         self.load_latest_meta_charts()?;
@@ -610,6 +1059,7 @@ impl App {
 
     fn view_meta_charts(&mut self) -> Result<()> {
         if !self.latest_meta_charts.is_empty() {
+            self.meta_reports_revision = self.current_meta_reports_revision();
             self.chart_viewer.load_charts(&self.latest_meta_charts)?;
             self.previous_mode = self.mode;
             self.mode = AppMode::ChartViewer;
@@ -658,17 +1108,165 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod planner_inference_discovery_tests {
+    use super::*;
+
+    fn complete_bundle(generation: &Path, name: &str) -> PathBuf {
+        let bundle = generation.join(name);
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(
+            bundle.join(".planner-report-generation"),
+            br#"{"run_lineage_id":"run-a","update":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            bundle.join(".planner-inference.json"),
+            br#"{"version":1,"run_lineage_id":"run-a","update":1,"split":"test","evaluation_fingerprint":"contract-a","episodes":1,"rollout_length":100}"#,
+        )
+        .unwrap();
+        for base in PLANNER_INFERENCE_REPORTS {
+            fs::write(bundle.join(format!("{base}.report.bin")), b"report").unwrap();
+        }
+        bundle
+    }
+
+    #[test]
+    fn discovers_only_newest_complete_published_inference_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-planner-inference-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(".planner-report-generation"),
+            br#"{"run_lineage_id":"run-a","update":1}"#,
+        )
+        .unwrap();
+        let old = complete_bundle(&root, "planner_inference_test_a");
+        let new = complete_bundle(&root, "planner_inference_test_b");
+        complete_bundle(&root, ".planner-inference-test-temp.tmp");
+        let incomplete = root.join("planner_inference_test_z");
+        fs::create_dir(&incomplete).unwrap();
+        fs::write(
+            incomplete.join("planner_inference_wealth.report.bin"),
+            b"partial",
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest_complete_planner_inference_bundle(&root).unwrap(),
+            new
+        );
+        assert_ne!(
+            latest_complete_planner_inference_bundle(&root).unwrap(),
+            old
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hides_owned_generation_until_resume_manifest_commits_it() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-planner-visibility-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let generation = root.join("2");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(
+            generation.join(".planner-report-generation"),
+            br#"{"run_lineage_id":"run-a","update":2}"#,
+        )
+        .unwrap();
+
+        let committed_one = std::collections::HashMap::from([("run-a".to_owned(), 1)]);
+        let committed_two = std::collections::HashMap::from([("run-a".to_owned(), 2)]);
+        let unrelated = std::collections::HashMap::from([("run-b".to_owned(), 10)]);
+        assert!(!planner_generation_visible(&generation, 2, &committed_one));
+        assert!(planner_generation_visible(&generation, 2, &committed_two));
+        assert!(!planner_generation_visible(&generation, 2, &unrelated));
+        fs::remove_file(generation.join(".planner-report-generation")).unwrap();
+        assert!(planner_generation_visible(&generation, 2, &committed_one));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn ppo_bundle_exposes_only_primary_weights() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-ppo-selector-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ppo_ep50.ot"), b"weights").unwrap();
+        fs::write(root.join("ppo_ep50.optimizer.ot"), b"optimizer").unwrap();
+        fs::write(
+            root.join("ppo_ep50.resume.json"),
+            br#"{
+                "format_version": 1,
+                "next_episode": 51,
+                "optimizer_step": 100,
+                "weights_sha256": "weights-hash",
+                "optimizer_sha256": "optimizer-hash",
+                "kl_lr_controller": {"version": 1, "ema": 0.01, "scale": 1.0}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(selectable_weight_files(&root), vec!["ppo_ep50.ot"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_ppo_bundles_and_known_sidecars_are_hidden() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-weight-sidecars-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for name in [
+            "ppo_ep100.ot",
+            "planner.optimizer.ot",
+            "pretrain_heads_best.ot",
+            "checkpoint.tmp-deadbeef.ot",
+            ".hidden.ot",
+        ] {
+            fs::write(root.join(name), b"artifact").unwrap();
+        }
+        fs::write(root.join("custom_model.ot"), b"weights").unwrap();
+
+        assert_eq!(selectable_weight_files(&root), vec!["custom_model.ot"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
 
         app.maybe_refresh()?;
-        let log_path = app
-            .process_manager
-            .active_run
-            .as_ref()
-            .map(|r| r.log_file.to_string_lossy().to_string());
-        app.logs_page.poll_training_output(log_path.as_deref());
+        let log_path = app.active_log_path();
+        app.logs_page.poll_training_output(&log_path);
 
         // Wait for event, then drain all pending events before redrawing
         if event::poll(Duration::from_millis(16))? {
@@ -1042,7 +1640,10 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                     }
                                     KeyCode::Char('s') => {
                                         if !app.is_training_running() {
-                                            if app.training_kind == TrainingKind::Rl {
+                                            if matches!(
+                                                app.training_kind,
+                                                TrainingKind::Rl | TrainingKind::Pretrain
+                                            ) {
                                                 app.open_run_selector(RunSelectorPurpose::Train);
                                             } else {
                                                 app.start_training(None)?;
@@ -1268,6 +1869,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                             KeyCode::Char('r') => {
                                                 if app.chart_viewer.is_viewing_meta_charts() {
                                                     app.load_latest_meta_charts()?;
+                                                    app.meta_reports_revision =
+                                                        app.current_meta_reports_revision();
                                                     app.chart_viewer
                                                         .load_charts(&app.latest_meta_charts)?;
                                                 }
@@ -1291,7 +1894,8 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                                         app.mode = AppMode::Main;
                                     }
                                     KeyCode::Char('c') => {
-                                        app.logs_page.clear_logs();
+                                        let log_path = app.active_log_path();
+                                        app.logs_page.clear_logs(&log_path)?;
                                     }
                                     KeyCode::Down | KeyCode::Char('j') => {
                                         app.logs_page.next();
