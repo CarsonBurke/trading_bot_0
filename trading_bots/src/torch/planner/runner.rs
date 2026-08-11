@@ -37,7 +37,7 @@ use super::{
     },
     data::{planner_context_bars, PlannerDataSplit, PlannerDataset, PlannerEndpoint},
     gae::compute_planner_gae,
-    losses::{critic_diagnostics, planner_actor_critic_losses},
+    losses::{critic_diagnostics, normalize_ppo_advantages, planner_actor_critic_losses},
     portfolio::PlannerPortfolio,
     reports::{
         cleanup_uncommitted_report_generations, write_inference_reports, PlannerEpisodeTrace,
@@ -1068,10 +1068,13 @@ fn rollout_advantages(
     // advantages (its tanh sign-weighting subsumes scale normalization, and mean-
     // centering would flip the sign of near-mean samples and corrupt the objective).
     let advantages = match POLICY_OBJECTIVE {
-        PolicyObjective::Ppo => {
-            (&advantages - advantages.mean(Kind::Float)) / (advantages.std(true) + 1e-8)
+        PolicyObjective::Ppo => normalize_ppo_advantages(&advantages)?,
+        PolicyObjective::Pmpo => {
+            if advantages.isfinite().all().int64_value(&[]) == 0 {
+                bail!("planner advantage batch contains NaN or infinity");
+            }
+            advantages
         }
-        PolicyObjective::Pmpo => advantages,
     };
     Ok((advantages, returns))
 }

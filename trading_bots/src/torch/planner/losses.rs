@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use tch::{Kind, Tensor};
 
 use crate::torch::action_space::{beta_entropy, beta_log_prob, beta_reverse_kl};
@@ -11,6 +12,23 @@ pub(crate) const POSITIVE_WEIGHT: f64 = 0.5;
 pub(crate) const REVERSE_KL_COEFFICIENT: f64 = 0.3;
 pub(crate) const VALUE_LOSS_COEFFICIENT: f64 = 1.0;
 pub(crate) const PLANNER_AUX_RETURN_COEF: f64 = 0.1;
+
+pub(crate) fn normalize_ppo_advantages(advantages: &Tensor) -> Result<Tensor> {
+    if advantages.numel() == 0 {
+        bail!("planner advantage batch is empty");
+    }
+    if advantages.isfinite().all().int64_value(&[]) == 0 {
+        bail!("planner advantage batch contains NaN or infinity");
+    }
+
+    let centered = advantages - advantages.mean(Kind::Float);
+    let population_variance = centered.square().mean(Kind::Float);
+    let normalized = centered / population_variance.sqrt().clamp_min(1e-8);
+    if normalized.isfinite().all().int64_value(&[]) == 0 {
+        bail!("normalized planner advantages contain NaN or infinity");
+    }
+    Ok(normalized)
+}
 
 pub struct PlannerLosses {
     pub actor_loss: Tensor,
@@ -104,11 +122,12 @@ pub fn planner_actor_critic_losses(
 
     let aux_return_loss = (next_return.flatten(0, -1).to_kind(Kind::Float)
         - next_return_target.flatten(0, -1).to_kind(Kind::Float) * PLANNER_REWARD_SCALE)
-    .square()
-    .mean(Kind::Float);
+        .square()
+        .mean(Kind::Float);
 
     let actor_loss = policy_loss.shallow_clone();
-    let critic_loss = VALUE_LOSS_COEFFICIENT * &value_loss + PLANNER_AUX_RETURN_COEF * &aux_return_loss;
+    let critic_loss =
+        VALUE_LOSS_COEFFICIENT * &value_loss + PLANNER_AUX_RETURN_COEF * &aux_return_loss;
     PlannerLosses {
         actor_loss,
         critic_loss,
@@ -183,8 +202,9 @@ mod tests {
         let old_beta = Tensor::full([3, 1], 2.4, (Kind::Float, Device::Cpu));
         let advantages = Tensor::from_slice(&[1.0f32, -0.5, 0.25]);
         let returns = Tensor::from_slice(&[0.2f32, -0.1, 1.0]);
-        let next_return =
-            Tensor::from_slice(&[0.01f32, -0.02, 0.03]).view([3, 1]).set_requires_grad(true);
+        let next_return = Tensor::from_slice(&[0.01f32, -0.02, 0.03])
+            .view([3, 1])
+            .set_requires_grad(true);
         let next_return_target = Tensor::from_slice(&[0.02f32, -0.01, 0.0]).view([3, 1]);
         let losses = planner_actor_critic_losses(
             &bins,
@@ -207,6 +227,31 @@ mod tests {
         assert!(new_alpha.grad().defined());
         assert!(new_beta.grad().defined());
         assert!(next_return.grad().defined());
+    }
+
+    #[test]
+    fn singleton_and_constant_advantages_have_finite_loss_and_gradients() {
+        for raw_advantages in [
+            Tensor::from_slice(&[3.0f32]),
+            Tensor::from_slice(&[3.0f32, 3.0, 3.0, 3.0]),
+        ] {
+            let advantages = normalize_ppo_advantages(&raw_advantages).unwrap();
+            assert_eq!(advantages.isfinite().all().int64_value(&[]), 1);
+            assert_eq!(advantages.abs().max().double_value(&[]), 0.0);
+
+            let log_ratio = Tensor::zeros_like(&advantages).set_requires_grad(true);
+            let (loss, _) = asym_clip_policy_loss(&advantages, &log_ratio.exp());
+            assert!(loss.double_value(&[]).is_finite());
+            loss.backward();
+            assert!(log_ratio.grad().defined());
+            assert_eq!(log_ratio.grad().isfinite().all().int64_value(&[]), 1);
+        }
+    }
+
+    #[test]
+    fn non_finite_advantages_are_rejected() {
+        assert!(normalize_ppo_advantages(&Tensor::from_slice(&[0.0f32, f32::NAN])).is_err());
+        assert!(normalize_ppo_advantages(&Tensor::from_slice(&[0.0f32, f32::INFINITY])).is_err());
     }
 
     #[test]
