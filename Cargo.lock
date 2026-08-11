@@ -3559,6 +3559,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "plotters",
+ "postcard",
  "ratatui",
  "serde",
 ]
@@ -4162,6 +4163,9 @@ dependencies = [
 [[package]]
 name = "training_log_server"
 version = "0.1.0"
+dependencies = [
+ "shared",
+]
 
 [[package]]
 name = "try-lock"

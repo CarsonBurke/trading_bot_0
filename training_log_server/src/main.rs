@@ -1,3 +1,4 @@
+use shared::{paths::RUNS_PATH, run_dir::RunDir};
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
@@ -26,7 +27,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8787".to_string(),
-            log_path: PathBuf::from("training/training.log"),
+            log_path: PathBuf::new(),
             default_tail_lines: 200,
         }
     }
@@ -82,6 +83,10 @@ fn main() -> io::Result<()> {
 
 fn parse_args(args: Vec<String>) -> io::Result<Config> {
     let mut config = Config::default();
+    let mut explicit_log_path = None;
+    let mut run_name = None;
+    let mut run_root = None;
+    let mut runs_root = PathBuf::from(RUNS_PATH);
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -97,7 +102,29 @@ fn parse_args(args: Vec<String>) -> io::Result<Config> {
                 let value = args.get(i).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "--log-path needs a path")
                 })?;
-                config.log_path = PathBuf::from(value);
+                explicit_log_path = Some(PathBuf::from(value));
+            }
+            "--run" => {
+                i += 1;
+                run_name = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "--run needs a name")
+                        })?
+                        .clone(),
+                );
+            }
+            "--run-root" => {
+                i += 1;
+                run_root = Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--run-root needs a path")
+                })?));
+            }
+            "--runs-root" => {
+                i += 1;
+                runs_root = PathBuf::from(args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--runs-root needs a path")
+                })?);
             }
             "--tail-lines" => {
                 i += 1;
@@ -124,12 +151,36 @@ fn parse_args(args: Vec<String>) -> io::Result<Config> {
         }
         i += 1;
     }
+    let selector_count = usize::from(explicit_log_path.is_some())
+        + usize::from(run_name.is_some())
+        + usize::from(run_root.is_some());
+    if selector_count > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--log-path, --run, and --run-root are mutually exclusive",
+        ));
+    }
+    config.log_path = match (explicit_log_path, run_name, run_root) {
+        (Some(path), None, None) => path,
+        (None, Some(name), None) => {
+            RunDir::select(&runs_root, &name)
+                .map_err(io::Error::other)?
+                .log_file
+        }
+        (None, None, Some(root)) => RunDir::open(root).map_err(io::Error::other)?.log_file,
+        (None, None, None) => {
+            RunDir::latest(runs_root.to_string_lossy().as_ref())
+                .map_err(io::Error::other)?
+                .log_file
+        }
+        _ => unreachable!(),
+    };
     Ok(config)
 }
 
 fn print_usage() {
-    eprintln!("Usage: training_log_server [--bind ADDR] [--log-path PATH] [--tail-lines N]");
-    eprintln!("Defaults: --bind 127.0.0.1:8787 --log-path training/training.log --tail-lines 200");
+    eprintln!("Usage: training_log_server [--bind ADDR] [--run NAME|--run-root PATH|--log-path PATH] [--runs-root PATH] [--tail-lines N]");
+    eprintln!("Defaults: --bind 127.0.0.1:8787 --run latest --tail-lines 200");
     eprintln!("Public exposure requires an explicit --bind address and network access controls.");
     eprintln!("Routes:");
     eprintln!("  GET /health");
@@ -325,6 +376,34 @@ mod tests {
     #[test]
     fn default_bind_is_loopback_only() {
         assert_eq!(Config::default().bind, "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn explicit_run_selection_resolves_its_log_without_mutating_latest() {
+        let root = std::env::temp_dir().join(format!(
+            "log-server-runs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = RunDir::create_fresh(root.to_str().unwrap(), Some("first")).unwrap();
+        let second = RunDir::create_fresh(root.to_str().unwrap(), Some("second")).unwrap();
+        let config = parse_args(vec![
+            "training_log_server".to_owned(),
+            "--runs-root".to_owned(),
+            root.display().to_string(),
+            "--run".to_owned(),
+            "first".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(config.log_path, first.log_file);
+        assert_eq!(
+            RunDir::latest(root.to_str().unwrap()).unwrap().root,
+            second.root
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
