@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use ibapi::Client;
 use crate::torch::constants::{ACTION_THRESHOLD, COMMISSION_RATE};
 use crate::types::Account;
 
+use super::state::TradeBatchOutcome;
 use super::sync::sync_account_from_ibkr;
 
 const MIN_ORDER_NOTIONAL: f64 = 1.0;
@@ -29,6 +31,11 @@ enum OrderProgress {
     Active,
     Filled,
     TerminalFailure,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OrderFill {
+    commission: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +67,21 @@ fn classify_order_progress(status: &str, filled: f64, quantity: f64) -> OrderPro
         return OrderProgress::TerminalFailure;
     }
     OrderProgress::Active
+}
+
+fn execution_feedback_complete(
+    terminal_fill: bool,
+    requested_quantity: f64,
+    execution_filled_quantity: f64,
+    execution_ids: &HashSet<String>,
+    commissioned_execution_ids: &HashSet<String>,
+) -> bool {
+    terminal_fill
+        && execution_filled_quantity + MIN_ORDER_QUANTITY >= requested_quantity
+        && !execution_ids.is_empty()
+        && execution_ids
+            .iter()
+            .all(|id| commissioned_execution_ids.contains(id))
 }
 
 fn record_notice(notices: &mut Vec<String>, notice: String) {
@@ -112,6 +134,14 @@ fn plan_target_weight_trades(
     current_prices: &[f64],
     account: &Account,
 ) -> Result<Vec<PlannedTrade>, io::Error> {
+    Ok(plan_target_weight_trades_with_fill_ratio(target_weights, current_prices, account)?.0)
+}
+
+fn plan_target_weight_trades_with_fill_ratio(
+    target_weights: &[f64],
+    current_prices: &[f64],
+    account: &Account,
+) -> Result<(Vec<PlannedTrade>, f64), io::Error> {
     let ticker_count = target_weights.len();
     if current_prices.len() != ticker_count || account.positions.len() != ticker_count {
         return Err(invalid_input(format!(
@@ -228,7 +258,7 @@ fn plan_target_weight_trades(
     }
 
     sells.extend(buys);
-    Ok(sells)
+    Ok((sells, fill_ratio))
 }
 
 fn plan_trade_phase(
@@ -284,7 +314,7 @@ fn submit_and_wait(
     account_id: &AccountId,
     symbol: &str,
     trade: &PlannedTrade,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<OrderFill, Box<dyn std::error::Error>> {
     let action = match trade.side {
         TradeSide::Buy => Action::Buy,
         TradeSide::Sell => Action::Sell,
@@ -296,7 +326,7 @@ fn submit_and_wait(
     let subscription = match client.place_order(order_id, &contract, &order) {
         Ok(subscription) => subscription,
         Err(error) => {
-            return cancel_and_confirm_order(
+            cancel_and_confirm_order(
                 client,
                 account_id,
                 order_id,
@@ -304,10 +334,19 @@ fn submit_and_wait(
                 trade.quantity,
                 format!("place-order transport failed ambiguously: {error}"),
                 vec![error.to_string()],
-            );
+            )?;
+            return Err(io::Error::other(format!(
+                "IBKR order {order_id} for {symbol} filled during transport recovery without complete execution and commission feedback"
+            ))
+            .into());
         }
     };
     let mut notices = Vec::new();
+    let mut filled_quantity = 0.0f64;
+    let mut terminal_fill = false;
+    let mut execution_ids = HashSet::new();
+    let mut commissioned_execution_ids = HashSet::new();
+    let mut commission = 0.0f64;
 
     println!(
         "Submitted {action} order {order_id}: {:.6} shares of {symbol} (reference notional ${:.2})",
@@ -317,11 +356,17 @@ fn submit_and_wait(
 
     loop {
         let Some(event) = subscription.next_timeout(ORDER_EVENT_TIMEOUT) else {
+            if terminal_fill {
+                return Err(io::Error::other(format!(
+                    "IBKR order {order_id} for {symbol} filled but execution/commission feedback was incomplete"
+                ))
+                .into());
+            }
             let reason = subscription
                 .error()
                 .map(|error| format!("order event stream failed: {error}"))
                 .unwrap_or_else(|| "timed out waiting for a terminal order event".to_string());
-            return cancel_and_confirm_order(
+            cancel_and_confirm_order(
                 client,
                 account_id,
                 order_id,
@@ -329,13 +374,19 @@ fn submit_and_wait(
                 trade.quantity,
                 reason,
                 notices,
-            );
+            )?;
+            return Err(io::Error::other(format!(
+                "IBKR order {order_id} for {symbol} filled during timeout recovery without complete execution and commission feedback"
+            ))
+            .into());
         };
 
         match event {
             PlaceOrder::OrderStatus(status) => {
                 match classify_order_progress(&status.status, status.filled, trade.quantity) {
-                    OrderProgress::Filled => return Ok(()),
+                    OrderProgress::Filled => {
+                        terminal_fill = true;
+                    }
                     OrderProgress::TerminalFailure => {
                         return Err(io::Error::other(format!(
                         "IBKR order {order_id} for {symbol} ended with status {} after filling {:.4} of {:.4} shares{}",
@@ -346,17 +397,38 @@ fn submit_and_wait(
                     OrderProgress::Active => {}
                 }
             }
-            PlaceOrder::ExecutionData(execution)
-                if execution.execution.cumulative_quantity + 1e-8 >= trade.quantity =>
-            {
-                return Ok(());
+            PlaceOrder::ExecutionData(execution) => {
+                filled_quantity = filled_quantity.max(execution.execution.cumulative_quantity);
+                execution_ids.insert(execution.execution.execution_id);
+                terminal_fill |= filled_quantity + MIN_ORDER_QUANTITY >= trade.quantity;
+            }
+            PlaceOrder::CommissionReport(report) => {
+                if commissioned_execution_ids.insert(report.execution_id) {
+                    if !report.commission.is_finite() {
+                        return Err(io::Error::other(format!(
+                            "IBKR order {order_id} for {symbol} returned a non-finite commission"
+                        ))
+                        .into());
+                    }
+                    // Negative commission reports are legitimate exchange/broker
+                    // rebates and must remain part of the exact execution result.
+                    commission += report.commission;
+                }
             }
             PlaceOrder::Message(notice) => {
                 record_notice(&mut notices, notice.to_string());
             }
-            PlaceOrder::OpenOrder(_)
-            | PlaceOrder::ExecutionData(_)
-            | PlaceOrder::CommissionReport(_) => {}
+            PlaceOrder::OpenOrder(_) => {}
+        }
+
+        if execution_feedback_complete(
+            terminal_fill,
+            trade.quantity,
+            filled_quantity,
+            &execution_ids,
+            &commissioned_execution_ids,
+        ) {
+            return Ok(OrderFill { commission });
         }
     }
 }
@@ -454,7 +526,7 @@ pub(super) fn execute_trades(
     actions: &[f64],
     current_prices: &[f64],
     account: &mut Account,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<TradeBatchOutcome, Box<dyn std::error::Error>> {
     if symbols.len() != actions.len() {
         return Err(invalid_input(format!(
             "received {} actions for {} paper-trading symbols",
@@ -466,8 +538,14 @@ pub(super) fn execute_trades(
 
     revalue_account(account, current_prices)?;
     let sells = plan_trade_phase(actions, current_prices, account, TradeSide::Sell)?;
+    let mut fills = Vec::new();
     for trade in &sells {
-        submit_and_wait(client, account_id, &symbols[trade.ticker_idx], trade)?;
+        fills.push(submit_and_wait(
+            client,
+            account_id,
+            &symbols[trade.ticker_idx],
+            trade,
+        )?);
     }
 
     if !sells.is_empty() {
@@ -475,28 +553,52 @@ pub(super) fn execute_trades(
         revalue_account(account, current_prices)?;
     }
 
+    let (post_sale_plan, buy_fill_ratio) =
+        plan_target_weight_trades_with_fill_ratio(actions, current_prices, account)?;
+    let buys = post_sale_plan
+        .into_iter()
+        .filter(|trade| trade.side == TradeSide::Buy)
+        .collect::<Vec<_>>();
     if super::state::MAX_ACCOUNT_VALUE.is_some_and(|max_value| account.total_assets > max_value) {
         println!(
             "Account value ${:.2} exceeds the configured cap; skipping risk-increasing buys",
             account.total_assets
         );
-        return Ok(());
+        return Ok(TradeBatchOutcome {
+            commission: fills.iter().map(|fill| fill.commission).sum(),
+            fill_ratio: if buys.is_empty() { 1.0 } else { 0.0 },
+        });
     }
 
-    let buys = plan_trade_phase(actions, current_prices, account, TradeSide::Buy)?;
     for trade in &buys {
-        submit_and_wait(client, account_id, &symbols[trade.ticker_idx], trade)?;
+        fills.push(submit_and_wait(
+            client,
+            account_id,
+            &symbols[trade.ticker_idx],
+            trade,
+        )?);
     }
-    Ok(())
+    sync_account_from_ibkr(client, account_id, symbols, account)?;
+    revalue_account(account, current_prices)?;
+
+    Ok(TradeBatchOutcome {
+        commission: fills.iter().map(|fill| fill.commission).sum(),
+        // Training defines this feature as cash available divided by the
+        // pre-scaling buy demand. Broker fills are separately required to be
+        // complete before submit_and_wait returns.
+        fill_ratio: buy_fill_ratio,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_order_progress, plan_target_weight_trades, plan_trade_phase, revalue_account,
+        classify_order_progress, execution_feedback_complete, plan_target_weight_trades,
+        plan_target_weight_trades_with_fill_ratio, plan_trade_phase, revalue_account,
         OrderProgress, TradeSide, MIN_ORDER_NOTIONAL,
     };
     use crate::types::{Account, Position};
+    use std::collections::HashSet;
 
     fn account(cash: f64, total_assets: f64, quantities: &[f64]) -> Account {
         Account {
@@ -565,8 +667,9 @@ mod tests {
     #[test]
     fn planner_preserves_and_proportionally_scales_fractional_buys() {
         let account = account(75.0, 1_000.0, &[0.0, 0.0]);
-        let trades = plan_target_weight_trades(&[0.05, 0.05], &[200.0, 200.0], &account)
-            .expect("fractional buys should plan");
+        let (trades, fill_ratio) =
+            plan_target_weight_trades_with_fill_ratio(&[0.05, 0.05], &[200.0, 200.0], &account)
+                .expect("fractional buys should plan");
 
         assert_eq!(trades.len(), 2);
         assert!(trades.iter().all(|trade| trade.side == TradeSide::Buy));
@@ -580,6 +683,7 @@ mod tests {
             })
             .sum();
         assert!(total_cost <= account.cash + 1e-10);
+        assert!(fill_ratio > 0.74 && fill_ratio < 0.75);
     }
 
     #[test]
@@ -600,6 +704,36 @@ mod tests {
             classify_order_progress("Cancelled", 0.5, 1.0),
             OrderProgress::TerminalFailure
         );
+    }
+
+    #[test]
+    fn terminal_status_waits_for_all_execution_quantity_and_commissions() {
+        let execution_ids = HashSet::from(["partial".to_string()]);
+        let commissioned = execution_ids.clone();
+        assert!(!execution_feedback_complete(
+            true,
+            2.0,
+            1.0,
+            &execution_ids,
+            &commissioned,
+        ));
+
+        let execution_ids = HashSet::from(["partial".to_string(), "remainder".to_string()]);
+        assert!(!execution_feedback_complete(
+            true,
+            2.0,
+            2.0,
+            &execution_ids,
+            &commissioned,
+        ));
+        let commissioned = execution_ids.clone();
+        assert!(execution_feedback_complete(
+            true,
+            2.0,
+            2.0,
+            &execution_ids,
+            &commissioned,
+        ));
     }
 
     #[test]

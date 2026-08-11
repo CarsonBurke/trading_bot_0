@@ -175,6 +175,18 @@ pub fn get_historical_bars_result(
     fetch_or_load_ticker(ticker, &mut client)
 }
 
+pub fn refresh_historical_bars(
+    client: &Client,
+    ticker: &str,
+) -> Result<Vec<historical::Bar>, HistoricalLoadError> {
+    get_historical_data_from_ibkr(client, ticker)?
+        .map(|bars| insert_cache_entry(ticker, bars))
+        .ok_or_else(|| HistoricalLoadError::Request {
+            ticker: ticker.to_string(),
+            message: "IBKR returned no completed historical bars".to_string(),
+        })
+}
+
 pub fn get_historical_series(ticker: &str) -> Option<(Vec<f64>, Vec<f64>)> {
     if let Some(series) = get_cached_series(ticker) {
         return Some(series);
@@ -278,6 +290,8 @@ fn get_historical_data_from_files(ticker: &str) -> Option<Vec<historical::Bar>> 
             && b.high > 0.0
             && b.low > 0.0
             && b.close > 0.0
+            && b.date.unix_timestamp().saturating_add(300)
+                <= OffsetDateTime::now_utc().unix_timestamp()
     });
     if bars.len() != before {
         eprintln!(
@@ -333,6 +347,8 @@ fn get_historical_data_from_ibkr(
             && b.high > 0.0
             && b.low > 0.0
             && b.close > 0.0
+            && b.date.unix_timestamp().saturating_add(300)
+                <= OffsetDateTime::now_utc().unix_timestamp()
     });
     if bars.len() != before {
         eprintln!(
