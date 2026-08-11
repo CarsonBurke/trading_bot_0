@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 trading_bot_0 = { path = "../trading_bots" }
 tch = { git = "https://github.com/LaurentMazare/tch-rs.git", rev = "bbf49e6" }
+# Keep torch-sys direct so its selected libtorch directory is available to
+# build.rs as DEP_TCH_LIBTORCH_LIB for the benchmark binary RUNPATH.
+torch-sys = "0.25.0"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

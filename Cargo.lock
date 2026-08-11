@@ -236,6 +236,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tch",
+ "torch-sys",
  "trading_bot_0",
 ]
 

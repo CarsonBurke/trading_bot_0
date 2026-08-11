@@ -356,7 +356,7 @@ Setup:
   CLAUDE.md) so binaries/checkpoints don't collide.
 - Pin RNG seed and `TradingModelConfig::default()` (`ModelVariant::Base`) for both.
 - Two distinct comparisons:
-  1. **Perf/VRAM (mechanical, fast):** `cargo run -p benchmarks --release`
+  1. **Perf/VRAM (mechanical, fast):** `./torch-env.sh cargo run -p benchmarks --release`
      (`benchmarks/src/main.rs:59`) — compare `model_base_forward_infer_b*`,
      `model_base_fwd_bwd_train_b*`, and `model_base_stream_step_b*` timings + reported
      memory between arms. Expectation per §6: ~neutral (B no worse than ~A on

@@ -16,12 +16,15 @@ then run ML builds through the validating launcher:
 ./setup-fa4.sh
 ./torch-env.sh check
 ./torch-env.sh cargo check -p trading_bot_0
+./torch-env.sh cargo run -p benchmarks --release
 ./trading_bots/run-release-cuda.sh train
 ./torch-env.sh ldd target/release/trading_bot_0
 ```
 
-The launcher rejects mismatched PyTorch/CUDA builds before Cargo starts and places
-the matching wheel libraries first in the runtime linker path.
+The launcher rejects mismatched PyTorch/CUDA builds before Cargo starts. ML binaries
+embed the matching wheel's library directory so normal execution does not depend on
+`LD_LIBRARY_PATH`; the `ldd` check deliberately clears that variable while validating
+the binary's actual resolution.
 
 It's recommended to use the `tui/` to start training or inference, or to view training or inference data. It's recommended to begin training/inference from inside the tui using the controls it provides so that it can show logs and track episodes correctly.
 

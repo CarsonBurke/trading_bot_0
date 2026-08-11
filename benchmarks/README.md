@@ -5,6 +5,6 @@
 
 ## Model Ablation Comparison
 
-- `cargo run -p benchmarks --release` now benchmarks both model variants:
+- `./torch-env.sh cargo run -p benchmarks --release` now benchmarks both model variants:
 - `base`
 - `ablation-small`

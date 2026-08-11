@@ -70,12 +70,24 @@ case "${1:-check}" in
     ldd)
         [[ $# -eq 2 ]] || fail "usage: torch-env.sh ldd <binary>"
         [[ -x "$2" ]] || fail "binary is not executable: $2"
-        mixed="$({ ldd "$2" || true; } | awk -v root="$torch_lib/" '
+        # Inspect the binary's own RUNPATH. The launcher's build/run environment
+        # deliberately injects LD_LIBRARY_PATH, which would otherwise hide a
+        # missing or incorrect runtime path in the artifact being checked.
+        if ! linkage="$(env -u LD_LIBRARY_PATH ldd "$2" 2>&1)"; then
+            fail "could not inspect dynamic linkage for $2: $linkage"
+        fi
+        resolved_count="$(awk '
+            /lib(torch|c10|shm)/ && /=>/ { count += 1 }
+            END { print count + 0 }
+        ' <<<"$linkage")"
+        [[ "$resolved_count" -gt 0 ]] \
+            || fail "binary has no dynamically linked libtorch libraries: $2"
+        mixed="$(awk -v root="$torch_lib/" '
             /lib(torch|c10|shm)/ && /=>/ {
                 resolved=$3
                 if (index(resolved, root) != 1) print resolved
             }
-        ')"
+        ' <<<"$linkage")"
         [[ -z "$mixed" ]] || fail "mixed libtorch linkage detected outside $torch_lib: $mixed"
         echo "libtorch linkage is confined to $torch_lib"
         ;;
