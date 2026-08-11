@@ -6,9 +6,58 @@ use std::sync::{Arc, Mutex, OnceLock};
 const FUNDAMENTAL_AVAILABILITY_LAG_DAYS: i64 = 90;
 
 struct EarningsCacheEntry {
+    reports: Vec<EarningsReportCacheInput>,
     bar_dates: Vec<String>,
     price_bits: Vec<u64>,
     indicators: Arc<EarningsIndicators>,
+}
+
+struct EarningsReportCacheInput {
+    date: String,
+    symbol: String,
+    revenue_bits: Option<u64>,
+    revenue_growth_bits: Option<u64>,
+    operating_expenses_bits: Option<u64>,
+    opex_growth_bits: Option<u64>,
+    net_income_bits: Option<u64>,
+    net_income_growth_bits: Option<u64>,
+    eps_bits: Option<u64>,
+    eps_estimated_bits: Option<u64>,
+    eps_surprise_bits: Option<u64>,
+}
+
+impl From<&EarningsReport> for EarningsReportCacheInput {
+    fn from(report: &EarningsReport) -> Self {
+        Self {
+            date: report.date.clone(),
+            symbol: report.symbol.clone(),
+            revenue_bits: report.revenue.map(f64::to_bits),
+            revenue_growth_bits: report.revenue_growth.map(f64::to_bits),
+            operating_expenses_bits: report.operating_expenses.map(f64::to_bits),
+            opex_growth_bits: report.opex_growth.map(f64::to_bits),
+            net_income_bits: report.net_income.map(f64::to_bits),
+            net_income_growth_bits: report.net_income_growth.map(f64::to_bits),
+            eps_bits: report.eps.map(f64::to_bits),
+            eps_estimated_bits: report.eps_estimated.map(f64::to_bits),
+            eps_surprise_bits: report.eps_surprise.map(f64::to_bits),
+        }
+    }
+}
+
+impl EarningsReportCacheInput {
+    fn matches(&self, report: &EarningsReport) -> bool {
+        self.date == report.date
+            && self.symbol == report.symbol
+            && self.revenue_bits == report.revenue.map(f64::to_bits)
+            && self.revenue_growth_bits == report.revenue_growth.map(f64::to_bits)
+            && self.operating_expenses_bits == report.operating_expenses.map(f64::to_bits)
+            && self.opex_growth_bits == report.opex_growth.map(f64::to_bits)
+            && self.net_income_bits == report.net_income.map(f64::to_bits)
+            && self.net_income_growth_bits == report.net_income_growth.map(f64::to_bits)
+            && self.eps_bits == report.eps.map(f64::to_bits)
+            && self.eps_estimated_bits == report.eps_estimated.map(f64::to_bits)
+            && self.eps_surprise_bits == report.eps_surprise.map(f64::to_bits)
+    }
 }
 
 /// Global cache for earnings indicators (ticker -> latest aligned grid)
@@ -18,8 +67,19 @@ fn get_cache() -> &'static Mutex<HashMap<String, EarningsCacheEntry>> {
     EARNINGS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn same_market_grid(entry: &EarningsCacheEntry, bar_dates: &[String], prices: &[f64]) -> bool {
-    entry.bar_dates == bar_dates
+fn same_inputs(
+    entry: &EarningsCacheEntry,
+    reports: &[EarningsReport],
+    bar_dates: &[String],
+    prices: &[f64],
+) -> bool {
+    entry.reports.len() == reports.len()
+        && entry
+            .reports
+            .iter()
+            .zip(reports)
+            .all(|(cached, report)| cached.matches(report))
+        && entry.bar_dates == bar_dates
         && entry.price_bits.len() == prices.len()
         && entry
             .price_bits
@@ -42,6 +102,7 @@ pub struct EarningsIndicators {
 impl EarningsIndicators {
     fn get_cached(
         ticker: &str,
+        reports: &[EarningsReport],
         bar_dates: &[String],
         prices: &[f64],
     ) -> Option<Arc<EarningsIndicators>> {
@@ -49,7 +110,7 @@ impl EarningsIndicators {
         let locked = cache.lock().unwrap();
         locked
             .get(ticker)
-            .filter(|cached| same_market_grid(cached, bar_dates, prices))
+            .filter(|cached| same_inputs(cached, reports, bar_dates, prices))
             .map(|cached| cached.indicators.clone())
     }
 
@@ -60,7 +121,7 @@ impl EarningsIndicators {
         bar_dates: &[String],
         prices: &[f64],
     ) -> Arc<EarningsIndicators> {
-        if let Some(cached) = Self::get_cached(ticker, bar_dates, prices) {
+        if let Some(cached) = Self::get_cached(ticker, reports, bar_dates, prices) {
             return cached;
         }
         let cache = get_cache();
@@ -72,6 +133,7 @@ impl EarningsIndicators {
         cache.lock().unwrap().insert(
             ticker.to_string(),
             EarningsCacheEntry {
+                reports: reports.iter().map(EarningsReportCacheInput::from).collect(),
                 bar_dates: bar_dates.to_vec(),
                 price_bits: prices.iter().map(|price| price.to_bits()).collect(),
                 indicators: computed.clone(),
@@ -301,5 +363,30 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(first.revenue_growth[0], 0.5);
         assert_eq!(second.revenue_growth[0], 0.0);
+    }
+
+    #[test]
+    fn cache_recomputes_same_grid_ticker_when_reports_change() {
+        let bar_dates = ["2024-04-30".to_string(), "2024-05-01".to_string()];
+        let prices = [100.0, 100.0];
+        let first_reports = [report("2024-01-31", 0.5)];
+        let changed_reports = [report("2024-01-31", -0.5)];
+
+        let first = EarningsIndicators::get_or_compute(
+            "EARNINGS_REPORT_INPUT_TEST",
+            &first_reports,
+            &bar_dates,
+            &prices,
+        );
+        let second = EarningsIndicators::get_or_compute(
+            "EARNINGS_REPORT_INPUT_TEST",
+            &changed_reports,
+            &bar_dates,
+            &prices,
+        );
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.revenue_growth[0], 0.5);
+        assert_eq!(second.revenue_growth[0], -0.5);
     }
 }
