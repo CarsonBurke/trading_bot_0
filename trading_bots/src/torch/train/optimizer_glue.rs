@@ -217,7 +217,7 @@ impl KlLrController {
             self.ema = ema;
         }
         if scale.is_finite() && scale > 0.0 {
-            self.scale = scale;
+            self.scale = scale.clamp(self.min_scale, self.max_scale);
         }
     }
 

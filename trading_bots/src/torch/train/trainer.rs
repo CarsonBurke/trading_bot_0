@@ -1331,7 +1331,9 @@ mod tests {
         metrics.kl_lr_signal = signal;
         metrics.kl_lr_ema = trainer.kl_lr_controller.ema();
         metrics.kl_lr_scale_next = trainer.kl_lr_controller.scale();
-        trainer.log_episode(update, &advantage_data, &metrics);
+        trainer
+            .log_episode(update, &advantage_data, &metrics)
+            .unwrap();
         trainer.refresh_rollout_frontier();
         let env = &trainer.env.envs[0];
         trace.frontiers.push((
