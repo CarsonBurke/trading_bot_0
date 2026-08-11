@@ -26,7 +26,7 @@ enum MissingMetric {
     Inactive,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MetaHistory {
     pub final_assets: Vec<f64>,
     pub cumulative_reward: Vec<f64>,

@@ -7,7 +7,8 @@ pub async fn train(
     weights_path: Option<&str>,
     model_variant: ModelVariant,
     run_name: Option<String>,
+    seed: u64,
 ) -> Result<()> {
-    let mut trainer = Trainer::new(weights_path, model_variant, run_name)?;
+    let mut trainer = Trainer::new(weights_path, model_variant, run_name, seed)?;
     trainer.run().await
 }

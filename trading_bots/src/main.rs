@@ -89,6 +89,10 @@ enum Commands {
 
         #[arg(long)]
         run: Option<String>,
+
+        /// Reproducible environment, action-sampling, and minibatch seed.
+        #[arg(long, default_value_t = 20260811)]
+        seed: u64,
     },
     Pretrain {
         #[arg(short, long)]
@@ -264,9 +268,6 @@ enum Commands {
         #[arg(short, long, default_value_t = 500)]
         max_steps: usize,
 
-        #[arg(short, long, default_value_t = 0.8)]
-        temperature: f64,
-
         #[arg(long, value_enum, default_value_t = ModelVariant::UniformStream)]
         model_size: ModelVariant,
     },
@@ -313,8 +314,9 @@ async fn main() {
             weights,
             model_size,
             run,
+            seed,
         }) => {
-            torch::train::train(weights.as_deref(), (*model_size).into(), run.clone())
+            torch::train::train(weights.as_deref(), (*model_size).into(), run.clone(), *seed)
                 .await
                 .expect("PPO training failed");
         }
@@ -458,7 +460,6 @@ async fn main() {
             symbols,
             interval,
             max_steps,
-            temperature,
             model_size,
         }) => {
             torch::infer::run_ibkr_paper_trading(
@@ -467,13 +468,12 @@ async fn main() {
                 symbols.clone(),
                 *interval,
                 *max_steps,
-                *temperature,
                 *model_size,
             )
             .expect("paper trading failed");
         }
         None => {
-            torch::train::train(None, ModelVariant::UniformStream, None)
+            torch::train::train(None, ModelVariant::UniformStream, None, 20260811)
                 .await
                 .expect("PPO training failed");
         }
@@ -555,5 +555,18 @@ mod tests {
             symbols.len(),
             trading_bot_0::torch::constants::TICKERS_COUNT as usize
         );
+    }
+
+    #[test]
+    fn paper_rejects_unsupported_temperature_sampling() {
+        assert!(Cli::try_parse_from([
+            "trading_bot",
+            "paper",
+            "--account",
+            "DU123",
+            "--temperature",
+            "0.8",
+        ])
+        .is_err());
     }
 }

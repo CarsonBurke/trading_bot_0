@@ -52,6 +52,10 @@ pub struct Env {
     pub macro_ind: Arc<MacroIndicators>,
     pub(super) record_history_io: bool,
     pub(super) gens_path: Option<String>,
+    /// Counter-based RNG state. Each stochastic environment operation uses a
+    /// fresh, domain-separated stream so a checkpoint only needs two integers.
+    pub(super) rng_seed: u64,
+    pub(super) rng_counter: u64,
 }
 
 pub const TRADE_EMA_ALPHA: f64 = 0.05; // ~40-step equivalent window
@@ -144,6 +148,11 @@ fn load_market_data_with_macro(
 
     let total_data_length = prices[0].len();
 
+    let bar_times: Vec<Vec<time::OffsetDateTime>> = mapped_bars
+        .iter()
+        .map(|bars| bars.iter().map(|bar| bar.date).collect())
+        .collect();
+
     if log_progress {
         eprint!("dates..");
     }
@@ -186,7 +195,7 @@ fn load_market_data_with_macro(
         eprint!("macro..");
     }
     let macro_ind = match macro_mode {
-        MacroLoadMode::Required => MacroIndicators::get_or_compute(&bar_dates[0]),
+        MacroLoadMode::Required => MacroIndicators::get_or_compute(&bar_times[0]),
         #[cfg(test)]
         MacroLoadMode::Empty => Arc::new(MacroIndicators::empty(total_data_length)),
     };

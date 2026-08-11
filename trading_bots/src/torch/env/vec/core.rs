@@ -46,6 +46,29 @@ pub struct VecEnv {
 }
 
 impl VecEnv {
+    #[cfg(test)]
+    pub(crate) fn from_test_envs(mut envs: Vec<Env>) -> Self {
+        assert!(!envs.is_empty());
+        let nprocs = envs.len();
+        for (index, env) in envs.iter_mut().enumerate() {
+            env.env_id = index;
+        }
+        let price_deltas_dim = nprocs * TICKERS_COUNT as usize * PRICE_DELTAS_PER_TICKER;
+        Self {
+            nprocs,
+            envs,
+            done_mask: vec![false; nprocs],
+            last_static_obs: vec![0.0; nprocs * STATIC_OBSERVATIONS],
+            last_step_deltas: vec![0.0; nprocs * TICKERS_COUNT as usize],
+            step_deltas_buf: vec![0.0; nprocs * TICKERS_COUNT as usize],
+            reward_buf: vec![0.0; nprocs],
+            reward_per_ticker_buf: vec![0.0; nprocs * TICKERS_COUNT as usize],
+            is_done_buf: vec![0.0; nprocs],
+            price_deltas_buf: vec![0.0; price_deltas_dim],
+            static_obs_buf: vec![0.0; nprocs * STATIC_OBSERVATIONS],
+        }
+    }
+
     pub(super) fn nprocs_i64(&self) -> i64 {
         self.nprocs as i64
     }
@@ -72,6 +95,22 @@ impl VecEnv {
         gens_path: String,
         nprocs: usize,
     ) -> Self {
+        Self::new_seeded(
+            random_start,
+            _model_variant,
+            gens_path,
+            nprocs,
+            rand::random(),
+        )
+    }
+
+    pub(crate) fn new_seeded(
+        random_start: bool,
+        _model_variant: ModelVariant,
+        gens_path: String,
+        nprocs: usize,
+        seed: u64,
+    ) -> Self {
         let env_group_count = reset_group_count_for_nprocs(nprocs);
         assert_eq!(
             nprocs % env_group_count,
@@ -86,10 +125,20 @@ impl VecEnv {
             nprocs / env_group_count
         );
         let mut envs = Vec::with_capacity(nprocs);
-        envs.push(Env::new_with_recording(random_start, true, Some(gens_path)));
+        envs.push(Env::new_with_recording_seed(
+            random_start,
+            true,
+            Some(gens_path),
+            seed,
+        ));
         eprintln!("first env");
         for i in 1..nprocs {
-            envs.push(Env::new_with_recording(random_start, false, None));
+            envs.push(Env::new_with_recording_seed(
+                random_start,
+                false,
+                None,
+                seed.wrapping_add(i as u64),
+            ));
             eprintln!("env {}", i);
         }
         for (i, env) in envs.iter_mut().enumerate() {

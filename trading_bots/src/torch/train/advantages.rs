@@ -1,5 +1,6 @@
 use tch::{autocast, Kind, Tensor};
 
+use super::config::{GAE_GAMMA, GAE_LAMBDA};
 use super::gae::compute_gae_chunked;
 use super::geometry::{chunk_batch_from_minibatch, minibatch_samples_from_total};
 use super::trainer::{AdvantageData, RolloutData, Trainer};
@@ -29,8 +30,8 @@ impl Trainer {
             self.rollout_steps,
             self.rollout.nprocs,
             self.rollout.ppo_chunk_len,
-            0.995,
-            0.95,
+            GAE_GAMMA,
+            GAE_LAMBDA,
             self.device,
         );
         let reset_layout_bank_cpu = if rollout_data.reset_layout_batches_cpu.is_empty() {

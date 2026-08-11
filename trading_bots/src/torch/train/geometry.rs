@@ -5,7 +5,7 @@ use super::config::{
     DEFAULT_SEQ_LEN,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RolloutGeometry {
     pub(crate) nprocs: i64,
     pub(crate) seq_len: i64,

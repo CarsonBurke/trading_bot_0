@@ -1,4 +1,6 @@
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use rand_chacha::ChaCha12Rng;
 use std::{env, time::Instant};
 use tch::{autocast, Kind, Tensor};
 
@@ -648,7 +650,8 @@ impl Trainer {
         let mut last_minibatch_approx_kl = 0.0f64;
         let mut perm_host: Vec<i64> = (0..self.total_chunks).collect();
         let mut perm_gpu = Tensor::zeros([self.total_chunks], (Kind::Int64, device));
-        let mut rng = rand::rng();
+        let mut rng =
+            ChaCha12Rng::seed_from_u64(self.deterministic_seed(0x4d49_4e49_4241_5443, episode));
 
         'epoch_loop: for _epoch in 0..OPTIM_EPOCHS {
             perm_host.shuffle(&mut rng);

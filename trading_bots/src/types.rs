@@ -3,7 +3,7 @@ use ibapi::market_data::historical;
 /// A list of prices, where the last index is the most recent
 pub type Data = Vec<f64>;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Account {
     pub cash: f64,
     pub total_assets: f64,
@@ -59,7 +59,7 @@ pub type Positions = Vec<Position>;
 /// Key: Ticker, Value: Historical Bars
 pub type MappedHistorical = Vec<Vec<historical::Bar>>;
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Position {
     pub quantity: f64,
     /// The average price that these positions were purchased at

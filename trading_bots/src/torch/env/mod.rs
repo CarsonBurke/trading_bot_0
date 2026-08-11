@@ -6,11 +6,16 @@ pub mod obs;
 mod reward;
 mod reward_experiments;
 mod single;
+mod snapshot;
 mod step;
 mod trade;
 mod trade_experiments;
 mod vec;
 
 pub(crate) use single::build_ohlc_features;
+pub(crate) use single::TRADE_EMA_ALPHA;
 pub use single::{Env, OHLC_BAR_FEATURES};
+#[cfg(test)]
+pub(crate) use snapshot::tests::synthetic_env;
+pub(crate) use snapshot::{ValidatedVecEnvSnapshot, VecEnvSnapshot};
 pub use vec::{CpuStepBatch, VecEnv};

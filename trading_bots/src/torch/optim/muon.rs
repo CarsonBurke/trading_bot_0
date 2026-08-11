@@ -2,10 +2,10 @@
 //! orthogonalization, per-row second-moment (NorMuon) rescaling with Frobenius-
 //! norm preservation, and AdamW for non-matrix params.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use tch::{Device, Kind, Tensor};
 
 const NS_A: f64 = 3.4445;
@@ -14,6 +14,10 @@ const NS_C: f64 = 2.0315;
 /// Canonical Newton-Schulz iteration count; the reference default and the only
 /// value real training should ever use.
 pub const DEFAULT_NS_STEPS: usize = 5;
+
+pub(crate) fn newton_schulz_polynomial_bits() -> [u64; 3] {
+    [NS_A.to_bits(), NS_B.to_bits(), NS_C.to_bits()]
+}
 
 pub struct MuonConfig {
     pub lr: f64,
@@ -742,6 +746,143 @@ impl Muon {
             Ok(())
         })?;
         self.step_count = global_step_count;
+        Ok(())
+    }
+
+    /// Names of AdamW parameters whose lazy moments have been initialized.
+    /// Persisting this set distinguishes a legitimate never-stepped parameter
+    /// from a truncated resume sidecar.
+    pub fn initialized_adamw_names(&self) -> Vec<String> {
+        let mut names = self
+            .adamw_state
+            .keys()
+            .map(|&idx| self.names[idx].clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// Validate the complete optimizer tensor schema against a freshly
+    /// constructed optimizer without mutating any live parameter or state.
+    pub fn validate_state_strict(
+        &self,
+        path: impl AsRef<Path>,
+        expected_initialized_adamw: &[String],
+        expected_step: i64,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let loaded: HashMap<String, Tensor> = Tensor::load_multi_with_device(path, Device::Cpu)
+            .with_context(|| format!("failed loading optimizer state {}", path.display()))?
+            .into_iter()
+            .collect();
+        let mut expected_keys = HashSet::new();
+        expected_keys.insert("__muon_step_count__".to_owned());
+        let global_step = loaded
+            .get("__muon_step_count__")
+            .context("optimizer state missing global step")?;
+        ensure!(
+            global_step.numel() == 1 && global_step.int64_value(&[]) == expected_step,
+            "optimizer global step disagrees with checkpoint metadata"
+        );
+
+        for entry in &self.entries_2d {
+            let name = &self.names[entry.idx];
+            let momentum_name = format!("{name}.__momentum");
+            let second_name = format!("{name}.__second_momentum");
+            let momentum = loaded
+                .get(&momentum_name)
+                .with_context(|| format!("optimizer state missing momentum for {name}"))?;
+            let second = loaded
+                .get(&second_name)
+                .with_context(|| format!("optimizer state missing second momentum for {name}"))?;
+            ensure!(
+                momentum.size() == entry.momentum.size()
+                    && momentum.kind() == entry.momentum.kind(),
+                "optimizer momentum schema mismatch for {name}"
+            );
+            ensure!(
+                second.size() == entry.second_momentum.size()
+                    && second.kind() == entry.second_momentum.kind(),
+                "optimizer second-momentum schema mismatch for {name}"
+            );
+            expected_keys.insert(momentum_name);
+            expected_keys.insert(second_name);
+        }
+
+        let initialized = expected_initialized_adamw
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        ensure!(
+            initialized.len() == expected_initialized_adamw.len(),
+            "initialized AdamW names are not unique"
+        );
+        for name in &initialized {
+            let idx = self
+                .names
+                .iter()
+                .position(|candidate| candidate == name)
+                .with_context(|| format!("optimizer checkpoint names unknown parameter {name}"))?;
+            ensure!(
+                self.adamw_indices.contains(&idx),
+                "optimizer checkpoint routes non-AdamW parameter {name} through AdamW"
+            );
+            let m_name = format!("{name}.__adamw_m");
+            let v_name = format!("{name}.__adamw_v");
+            let step_name = format!("{name}.__adamw_step_count");
+            let m = loaded
+                .get(&m_name)
+                .with_context(|| format!("optimizer state missing AdamW m for {name}"))?;
+            let v = loaded
+                .get(&v_name)
+                .with_context(|| format!("optimizer state missing AdamW v for {name}"))?;
+            let step = loaded
+                .get(&step_name)
+                .with_context(|| format!("optimizer state missing AdamW step for {name}"))?;
+            ensure!(
+                m.size() == self.params[idx].size() && v.size() == self.params[idx].size(),
+                "optimizer AdamW moment shape mismatch for {name}"
+            );
+            ensure!(
+                m.kind() == self.params[idx].kind() && v.kind() == self.params[idx].kind(),
+                "optimizer AdamW moment dtype mismatch for {name}"
+            );
+            ensure!(
+                step.numel() == 1,
+                "optimizer AdamW step is not scalar for {name}"
+            );
+            expected_keys.extend([m_name, v_name, step_name]);
+        }
+
+        let actual_keys = loaded.keys().cloned().collect::<HashSet<_>>();
+        ensure!(
+            actual_keys == expected_keys,
+            "optimizer tensor schema differs from the current model: missing={:?}, unexpected={:?}",
+            expected_keys.difference(&actual_keys).collect::<Vec<_>>(),
+            actual_keys.difference(&expected_keys).collect::<Vec<_>>()
+        );
+        ensure!(
+            loaded.values().all(|tensor| {
+                !tensor.is_floating_point() || tensor.isfinite().all().int64_value(&[]) != 0
+            }),
+            "optimizer state contains non-finite tensors"
+        );
+        Ok(())
+    }
+
+    pub fn load_state_strict(
+        &mut self,
+        path: impl AsRef<Path>,
+        expected_initialized_adamw: &[String],
+    ) -> Result<()> {
+        self.load_state(path)?;
+        let actual = self.initialized_adamw_names();
+        anyhow::ensure!(
+            actual == expected_initialized_adamw,
+            "optimizer AdamW state is incomplete: expected {:?}, restored {:?}",
+            expected_initialized_adamw,
+            actual
+        );
         Ok(())
     }
 

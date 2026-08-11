@@ -1,5 +1,6 @@
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha12Rng;
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::time::Instant;
@@ -25,7 +26,14 @@ impl Env {
     }
 
     pub fn new_with_tickers(tickers: Vec<String>, random_start: bool) -> Self {
-        Self::new_with_tickers_recording_and_resampling(tickers, random_start, true, None, false)
+        Self::new_with_tickers_recording_and_resampling(
+            tickers,
+            random_start,
+            true,
+            None,
+            false,
+            rand::rng().random(),
+        )
     }
 
     pub fn new_with_recording(
@@ -34,6 +42,7 @@ impl Env {
         gens_path: Option<String>,
     ) -> Self {
         let rng = &mut rand::rng();
+        let seed = rng.random::<u64>();
         let tickers = sample_training_tickers(rng);
 
         Self::new_with_tickers_recording_and_resampling(
@@ -42,6 +51,25 @@ impl Env {
             record_history_io,
             gens_path,
             random_start,
+            seed,
+        )
+    }
+
+    pub(super) fn new_with_recording_seed(
+        random_start: bool,
+        record_history_io: bool,
+        gens_path: Option<String>,
+        seed: u64,
+    ) -> Self {
+        let mut rng = ChaCha12Rng::seed_from_u64(derive_rng_seed(seed, 0));
+        let tickers = sample_training_tickers(&mut rng);
+        Self::new_with_tickers_recording_and_resampling(
+            tickers,
+            random_start,
+            record_history_io,
+            gens_path,
+            random_start,
+            seed,
         )
     }
 
@@ -57,6 +85,7 @@ impl Env {
             record_history_io,
             gens_path,
             false,
+            rand::rng().random(),
         )
     }
 
@@ -66,6 +95,7 @@ impl Env {
         record_history_io: bool,
         gens_path: Option<String>,
         resample_tickers_on_reset: bool,
+        rng_seed: u64,
     ) -> Self {
         let market_data = load_market_data(&tickers, true);
         Self::new_from_market_data(
@@ -75,6 +105,7 @@ impl Env {
             gens_path,
             resample_tickers_on_reset,
             market_data,
+            rng_seed,
         )
     }
 
@@ -82,7 +113,15 @@ impl Env {
     pub(crate) fn new_without_macro_for_test(random_start: bool) -> Self {
         let tickers = sample_training_tickers(&mut rand::rng());
         let market_data = load_market_data_without_macro(&tickers, false);
-        Self::new_from_market_data(tickers, random_start, true, None, false, market_data)
+        Self::new_from_market_data(
+            tickers,
+            random_start,
+            true,
+            None,
+            false,
+            market_data,
+            rand::rng().random(),
+        )
     }
 
     fn new_from_market_data(
@@ -92,6 +131,7 @@ impl Env {
         gens_path: Option<String>,
         resample_tickers_on_reset: bool,
         market_data: EnvMarketData,
+        rng_seed: u64,
     ) -> Self {
         let num_tickers = tickers.len();
         let mut target_weights = vec![0.0; num_tickers + 1];
@@ -130,6 +170,8 @@ impl Env {
             macro_ind: market_data.macro_ind,
             record_history_io,
             gens_path,
+            rng_seed,
+            rng_counter: 1,
         }
     }
 
@@ -256,7 +298,7 @@ impl Env {
     }
 
     pub(super) fn resample_training_tickers(&mut self) {
-        let mut rng = rand::rng();
+        let mut rng = self.next_rng();
         let tickers = sample_training_tickers(&mut rng);
         self.set_training_tickers(tickers);
     }
@@ -293,10 +335,10 @@ impl Env {
         self.position_open_step.resize(num_tickers, None);
     }
 
-    pub(crate) fn sample_episode_start_offset(&self) -> usize {
+    pub(crate) fn sample_episode_start_offset(&mut self) -> usize {
         let valid_starts = full_episode_start_offsets(self.total_data_length);
         if self.random_start {
-            let mut rng = rand::rng();
+            let mut rng = self.next_rng();
             rng.random_range(valid_starts)
         } else {
             *valid_starts.start()
@@ -315,12 +357,13 @@ impl Env {
         }
     }
 
-    pub(super) fn reset_existing_episode_state(&mut self) {
+    pub(crate) fn reset_existing_episode_state(&mut self) {
         if self.resample_tickers_on_reset && self.episode > 0 {
             self.resample_training_tickers();
         }
 
-        self.reset_existing_episode_state_at(self.sample_episode_start_offset());
+        let start_offset = self.sample_episode_start_offset();
+        self.reset_existing_episode_state_at(start_offset);
     }
 
     pub(super) fn reset_existing_episode_state_at(&mut self, episode_start_offset: usize) {
@@ -351,7 +394,7 @@ impl Env {
         self.realized_weights[n] = 1.0;
 
         // Shuffle ticker permutation for this episode
-        let mut rng = rand::rng();
+        let mut rng = self.next_rng();
         self.ticker_perm.shuffle(&mut rng);
     }
 
@@ -367,6 +410,31 @@ impl Env {
             &self.prices,
             self.episode_start_offset + 1,
         )
+    }
+}
+
+fn derive_rng_seed(seed: u64, counter: u64) -> u64 {
+    let mut z = seed
+        .wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+impl Env {
+    #[cfg(test)]
+    pub(crate) fn test_rng_counter(&self) -> u64 {
+        self.rng_counter
+    }
+
+    fn next_rng(&mut self) -> ChaCha12Rng {
+        let stream = self.rng_counter;
+        self.rng_counter = self
+            .rng_counter
+            .checked_add(1)
+            .expect("environment RNG counter overflowed");
+        ChaCha12Rng::seed_from_u64(derive_rng_seed(self.rng_seed, stream))
     }
 }
 

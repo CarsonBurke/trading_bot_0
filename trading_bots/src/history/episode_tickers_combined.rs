@@ -8,7 +8,7 @@ use crate::history::report::{
 };
 use shared::constants::{GLOBAL_STATIC_OBS, PER_TICKER_STATIC_OBS};
 
-#[derive(Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EpisodeHistory {
     pub buys: Vec<HashMap<usize, (f64, f64)>>,
     pub sells: Vec<HashMap<usize, (f64, f64)>>,

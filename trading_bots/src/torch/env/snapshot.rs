@@ -1,0 +1,762 @@
+use anyhow::{ensure, Context, Result};
+use ring::digest::{Context as DigestContext, SHA256};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::time::Instant;
+
+use super::single::{load_market_data, EnvMarketData};
+use super::{Env, VecEnv};
+use crate::data::universe::cached_eligible_training_universe;
+use crate::history::{
+    episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory,
+};
+use crate::torch::constants::{ACTION_COUNT, ACTION_HISTORY_LEN, STEPS_PER_EPISODE, TICKERS_COUNT};
+use crate::types::Account;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct EnvSnapshot {
+    env_id: usize,
+    tickers: Vec<String>,
+    market_sha256: String,
+    total_data_length: usize,
+    step: usize,
+    max_step: usize,
+    account: Account,
+    episode_history: EpisodeHistory,
+    meta_history: MetaHistory,
+    episode: usize,
+    action_history: VecDeque<Vec<f64>>,
+    episode_start_offset: usize,
+    random_start: bool,
+    resample_tickers_on_reset: bool,
+    peak_assets: f64,
+    last_fill_ratio: f64,
+    trade_activity_ema: Vec<f64>,
+    steps_since_trade: Vec<usize>,
+    position_open_step: Vec<Option<usize>>,
+    ticker_perm: Vec<usize>,
+    target_weights: Vec<f64>,
+    realized_weights: Vec<f64>,
+    rng_seed: u64,
+    rng_counter: u64,
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::history::{
+        episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory,
+    };
+    use crate::torch::constants::{
+        ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STEPS_PER_EPISODE, TICKERS_COUNT,
+    };
+    use crate::torch::env::{
+        earnings::EarningsIndicators, macro_ind::MacroIndicators, momentum::MomentumIndicators,
+        OHLC_BAR_FEATURES,
+    };
+    use std::sync::Arc;
+
+    pub(crate) fn synthetic_env() -> Env {
+        let n = PRICE_DELTAS_PER_TICKER + STEPS_PER_EPISODE + 16;
+        let ticker_count = TICKERS_COUNT as usize;
+        let prices = (0..n)
+            .map(|index| 100.0 + index as f64 * 0.01)
+            .collect::<Vec<_>>();
+        let mut deltas = vec![0.0; n];
+        for index in 1..n {
+            deltas[index] = prices[index] / prices[index - 1] - 1.0;
+        }
+        Env {
+            env_id: 0,
+            step: 0,
+            max_step: STEPS_PER_EPISODE - 2,
+            tickers: (0..ticker_count)
+                .map(|index| format!("TEST{index}"))
+                .collect(),
+            prices: vec![prices.clone(); ticker_count],
+            price_deltas: vec![deltas; ticker_count],
+            ohlc_features: vec![vec![[0.0; OHLC_BAR_FEATURES]; n]; ticker_count],
+            account: Account::new(Env::STARTING_CASH, ticker_count),
+            episode_history: EpisodeHistory::new(ticker_count),
+            meta_history: MetaHistory::default(),
+            episode_start: Instant::now(),
+            episode: 7,
+            action_history: VecDeque::new(),
+            episode_start_offset: PRICE_DELTAS_PER_TICKER,
+            total_data_length: n,
+            random_start: true,
+            resample_tickers_on_reset: false,
+            peak_assets: Env::STARTING_CASH,
+            last_fill_ratio: 1.0,
+            trade_activity_ema: vec![0.0; ticker_count],
+            steps_since_trade: vec![0; ticker_count],
+            position_open_step: vec![None; ticker_count],
+            ticker_perm: (0..ticker_count).collect(),
+            target_weights: {
+                let mut weights = vec![0.0; ticker_count + 1];
+                weights[ticker_count] = 1.0;
+                weights
+            },
+            realized_weights: {
+                let mut weights = vec![0.0; ticker_count + 1];
+                weights[ticker_count] = 1.0;
+                weights
+            },
+            momentum: vec![Arc::new(MomentumIndicators::compute(&prices)); ticker_count],
+            earnings: vec![Arc::new(EarningsIndicators::empty(n)); ticker_count],
+            macro_ind: Arc::new(MacroIndicators::empty(n)),
+            record_history_io: false,
+            gens_path: None,
+            rng_seed: 91,
+            rng_counter: 3,
+        }
+    }
+
+    fn market_from(env: &Env) -> EnvMarketData {
+        EnvMarketData {
+            prices: env.prices.clone(),
+            price_deltas: env.price_deltas.clone(),
+            ohlc_features: env.ohlc_features.clone(),
+            momentum: env.momentum.clone(),
+            earnings: env.earnings.clone(),
+            macro_ind: env.macro_ind.clone(),
+            total_data_length: env.total_data_length,
+        }
+    }
+
+    #[test]
+    fn mid_episode_snapshot_resumes_through_a_terminal_reset_exactly() {
+        let mut uninterrupted = synthetic_env();
+        let hold = vec![0.0; ACTION_COUNT as usize];
+        for _ in 0..(STEPS_PER_EPISODE - 4) {
+            let transition = uninterrupted.step_step_single(&hold);
+            assert_eq!(transition.is_done, 0.0);
+        }
+        uninterrupted.snapshot().validate().unwrap();
+        let encoded = postcard::to_stdvec(&uninterrupted.snapshot()).unwrap();
+        let snapshot: EnvSnapshot = postcard::from_bytes(&encoded).unwrap();
+
+        let mut resumed = synthetic_env();
+        resumed.apply_snapshot(snapshot, market_from(&uninterrupted));
+
+        for update in 0..4 {
+            let action = vec![0.02 + update as f64 * 0.01; ACTION_COUNT as usize];
+            let left = uninterrupted.step_step_single(&action);
+            let right = resumed.step_step_single(&action);
+            assert_eq!(left.is_done, right.is_done);
+            assert_eq!(left.reward.to_bits(), right.reward.to_bits());
+            assert_eq!(left.step_deltas, right.step_deltas);
+            assert_eq!(left.static_obs, right.static_obs);
+            assert_eq!(
+                uninterrupted.account.total_assets.to_bits(),
+                resumed.account.total_assets.to_bits()
+            );
+            if left.is_done == 1.0 {
+                uninterrupted.reset_existing_episode_state();
+                resumed.reset_existing_episode_state();
+                assert_eq!(
+                    uninterrupted.episode_start_offset,
+                    resumed.episode_start_offset
+                );
+                assert_eq!(uninterrupted.ticker_perm, resumed.ticker_perm);
+                assert_eq!(uninterrupted.rng_counter, resumed.rng_counter);
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_validation_rejects_non_finite_and_invalid_permutation() {
+        let env = synthetic_env();
+        let mut snapshot = env.snapshot();
+        snapshot.account.cash = f64::NAN;
+        assert!(snapshot.validate().is_err());
+        snapshot.account.cash = 10_000.0;
+        snapshot.ticker_perm[0] = TICKERS_COUNT as usize;
+        assert!(snapshot.validate().is_err());
+
+        let mut snapshot = env.snapshot();
+        snapshot.episode_history.raw_actions.clear();
+        assert!(snapshot.validate().is_err());
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct VecEnvSnapshot {
+    format_version: u32,
+    universe_sha256: String,
+    envs: Vec<EnvSnapshot>,
+}
+
+pub(crate) struct ValidatedVecEnvSnapshot {
+    snapshot: VecEnvSnapshot,
+    markets: Vec<EnvMarketData>,
+}
+
+const ENV_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+fn update_str(context: &mut DigestContext, value: &str) {
+    context.update(&(value.len() as u64).to_le_bytes());
+    context.update(value.as_bytes());
+}
+
+fn update_f64s(context: &mut DigestContext, values: &[f64]) {
+    context.update(&(values.len() as u64).to_le_bytes());
+    for value in values {
+        context.update(&value.to_bits().to_le_bytes());
+    }
+}
+
+fn update_f32s(context: &mut DigestContext, values: impl IntoIterator<Item = f32>) {
+    for value in values {
+        context.update(&value.to_bits().to_le_bytes());
+    }
+}
+
+fn finish_hex(context: DigestContext) -> String {
+    context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn universe_fingerprint() -> String {
+    let mut context = DigestContext::new(&SHA256);
+    for ticker in cached_eligible_training_universe() {
+        update_str(&mut context, ticker);
+    }
+    finish_hex(context)
+}
+
+fn market_fingerprint(tickers: &[String], market: &EnvMarketData) -> String {
+    let mut context = DigestContext::new(&SHA256);
+    context.update(&(market.total_data_length as u64).to_le_bytes());
+    for ticker in tickers {
+        update_str(&mut context, ticker);
+    }
+    for values in &market.prices {
+        update_f64s(&mut context, values);
+    }
+    for values in &market.price_deltas {
+        update_f64s(&mut context, values);
+    }
+    for values in &market.ohlc_features {
+        context.update(&(values.len() as u64).to_le_bytes());
+        update_f32s(
+            &mut context,
+            values.iter().flat_map(|features| features.iter().copied()),
+        );
+    }
+    for indicators in &market.momentum {
+        for values in [
+            &indicators.rsi,
+            &indicators.mom_5,
+            &indicators.mom_60,
+            &indicators.mom_120,
+            &indicators.mom_accel,
+            &indicators.vol_adj_mom,
+            &indicators.range_pos,
+            &indicators.zscore,
+            &indicators.efficiency,
+            &indicators.macd,
+            &indicators.stoch_k,
+            &indicators.trend_strength,
+        ] {
+            update_f64s(&mut context, values);
+        }
+    }
+    for indicators in &market.earnings {
+        for values in [
+            &indicators.steps_since_available,
+            &indicators.revenue_growth,
+            &indicators.opex_growth,
+            &indicators.net_profit_growth,
+            &indicators.eps,
+            &indicators.eps_surprise,
+        ] {
+            update_f64s(&mut context, values);
+        }
+    }
+    let macro_ind = &market.macro_ind;
+    for values in [
+        &macro_ind.gdp_growth,
+        &macro_ind.unemployment,
+        &macro_ind.jobs_growth,
+        &macro_ind.cpi_yoy,
+        &macro_ind.core_cpi_yoy,
+        &macro_ind.fed_funds,
+        &macro_ind.treasury_10y,
+        &macro_ind.yield_spread,
+        &macro_ind.consumer_sentiment,
+        &macro_ind.initial_claims,
+        &macro_ind.steps_to_jobs,
+        &macro_ind.steps_to_cpi,
+        &macro_ind.steps_to_fomc,
+        &macro_ind.steps_to_gdp,
+    ] {
+        update_f64s(&mut context, values);
+    }
+    finish_hex(context)
+}
+
+fn finite(values: &[f64]) -> bool {
+    values.iter().all(|value| value.is_finite())
+}
+
+fn meta_history_is_finite(history: &MetaHistory) -> bool {
+    [
+        &history.final_assets,
+        &history.cumulative_reward,
+        &history.outperformance,
+        &history.policy_loss,
+        &history.value_loss,
+        &history.explained_var,
+        &history.actor_grad_norm,
+        &history.critic_grad_norm,
+        &history.total_commissions,
+        &history.beta_alpha_mean,
+        &history.beta_action_mean,
+        &history.beta_beta_mean,
+        &history.beta_concentration_mean,
+        &history.mean_advantage,
+        &history.min_advantage,
+        &history.max_advantage,
+        &history.logit_scale,
+        &history.clip_fraction,
+        &history.clip_gap,
+        &history.temporal_tau,
+        &history.temporal_attn_entropy,
+        &history.temporal_attn_max,
+        &history.temporal_attn_eff_len,
+        &history.temporal_attn_center,
+        &history.temporal_attn_last_weight,
+        &history.policy_entropy_mean,
+        &history.policy_entropy_min,
+        &history.policy_entropy_max,
+        &history.approx_kl,
+        &history.kl_lr_scale,
+        &history.kl_lr_scale_next,
+        &history.kl_lr_ema,
+        &history.kl_lr_signal,
+        &history.gate_mean,
+        &history.gate_std,
+        &history.return_min,
+        &history.return_max,
+        &history.support_min,
+        &history.support_max,
+        &history.return_below_support_frac,
+        &history.return_above_support_frac,
+    ]
+    .into_iter()
+    .all(|values| finite(values))
+}
+
+impl EnvSnapshot {
+    fn validate(&self) -> Result<()> {
+        let n = self.tickers.len();
+        ensure!(
+            n == TICKERS_COUNT as usize,
+            "snapshot ticker count mismatch"
+        );
+        ensure!(self.step <= self.max_step, "snapshot step exceeds max_step");
+        let remaining = self
+            .total_data_length
+            .checked_sub(self.episode_start_offset)
+            .context("snapshot episode offset exceeds market data")?;
+        ensure!(remaining >= 2, "snapshot episode has no usable frontier");
+        ensure!(
+            self.max_step == remaining.min(STEPS_PER_EPISODE) - 2,
+            "snapshot max_step is inconsistent with its market frontier"
+        );
+        ensure!(
+            self.episode_start_offset
+                .checked_add(self.step)
+                .is_some_and(|frontier| frontier < self.total_data_length),
+            "snapshot observation frontier exceeds market data"
+        );
+        ensure!(self.account.positions.len() == n, "position count mismatch");
+        ensure!(
+            self.trade_activity_ema.len() == n,
+            "activity count mismatch"
+        );
+        ensure!(
+            self.steps_since_trade.len() == n,
+            "trade-age count mismatch"
+        );
+        ensure!(
+            self.position_open_step.len() == n,
+            "position-age count mismatch"
+        );
+        ensure!(
+            self.ticker_perm.len() == n,
+            "ticker permutation length mismatch"
+        );
+        let mut sorted_perm = self.ticker_perm.clone();
+        sorted_perm.sort_unstable();
+        ensure!(
+            sorted_perm == (0..n).collect::<Vec<_>>(),
+            "invalid ticker permutation"
+        );
+        ensure!(
+            self.target_weights.len() == n + 1,
+            "target weight length mismatch"
+        );
+        ensure!(
+            self.realized_weights.len() == n + 1,
+            "realized weight length mismatch"
+        );
+        let absolute_frontier = self.episode_start_offset + self.step;
+        ensure!(
+            self.position_open_step
+                .iter()
+                .flatten()
+                .all(|open_step| *open_step <= absolute_frontier),
+            "position-open step lies beyond the observation frontier"
+        );
+        ensure!(
+            self.account.cash.is_finite()
+                && self.account.cash >= 0.0
+                && self.account.total_assets.is_finite()
+                && self.account.total_assets > 0.0
+                && self.account.positions.iter().all(|position| {
+                    position.quantity.is_finite()
+                        && position.quantity >= 0.0
+                        && position.avg_price.is_finite()
+                        && position.avg_price >= 0.0
+                })
+                && self.peak_assets.is_finite()
+                && self.peak_assets > 0.0
+                && self.last_fill_ratio.is_finite()
+                && (0.0..=1.0).contains(&self.last_fill_ratio)
+                && finite(&self.trade_activity_ema)
+                && self
+                    .trade_activity_ema
+                    .iter()
+                    .all(|value| (0.0..=1.0).contains(value))
+                && finite(&self.target_weights)
+                && self
+                    .target_weights
+                    .iter()
+                    .all(|value| (0.0..=1.0).contains(value))
+                && finite(&self.realized_weights)
+                && self
+                    .realized_weights
+                    .iter()
+                    .all(|value| (0.0..=1.0).contains(value))
+                && self
+                    .action_history
+                    .iter()
+                    .all(|values| values.len() == ACTION_COUNT as usize && finite(values))
+                && meta_history_is_finite(&self.meta_history),
+            "snapshot contains non-finite causal state"
+        );
+        ensure!(
+            self.action_history.len() == self.step.min(ACTION_HISTORY_LEN),
+            "action history frontier mismatch"
+        );
+        ensure!(
+            self.episode_history.buys.len() == n,
+            "buy history count mismatch"
+        );
+        ensure!(
+            self.episode_history.sells.len() == n,
+            "sell history count mismatch"
+        );
+        ensure!(
+            self.episode_history.positioned.len() == n,
+            "position history count mismatch"
+        );
+        ensure!(
+            self.episode_history.raw_actions.len() == n,
+            "raw-action history count mismatch"
+        );
+        ensure!(
+            self.episode_history.target_weights.len() == n,
+            "target-weight history count mismatch"
+        );
+        ensure!(
+            self.episode_history
+                .action_step0
+                .as_ref()
+                .is_none_or(|values| values.len() == ACTION_COUNT as usize)
+                && self
+                    .episode_history
+                    .action_final
+                    .as_ref()
+                    .is_none_or(|values| values.len() == ACTION_COUNT as usize),
+            "episode action snapshot length mismatch"
+        );
+        ensure!(
+            self.episode_history.cash.len() == self.step
+                && self.episode_history.rewards.len() == self.step
+                && self.episode_history.cash_weight.len() == self.step
+                && self
+                    .episode_history
+                    .positioned
+                    .iter()
+                    .all(|values| values.len() == self.step)
+                && self
+                    .episode_history
+                    .raw_actions
+                    .iter()
+                    .all(|values| values.len() == self.step)
+                && self
+                    .episode_history
+                    .target_weights
+                    .iter()
+                    .all(|values| values.len() == self.step),
+            "episode history frontier mismatch"
+        );
+        ensure!(
+            finite(&self.episode_history.cash)
+                && finite(&self.episode_history.rewards)
+                && finite(&self.episode_history.cash_weight)
+                && self.episode_history.total_commissions.is_finite()
+                && self
+                    .episode_history
+                    .positioned
+                    .iter()
+                    .all(|values| finite(values))
+                && self
+                    .episode_history
+                    .raw_actions
+                    .iter()
+                    .all(|values| finite(values))
+                && self
+                    .episode_history
+                    .target_weights
+                    .iter()
+                    .all(|values| finite(values))
+                && self
+                    .episode_history
+                    .static_observations
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite())
+                && self
+                    .episode_history
+                    .attention_weights
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite())
+                && self
+                    .episode_history
+                    .action_step0
+                    .as_deref()
+                    .is_none_or(finite)
+                && self
+                    .episode_history
+                    .action_final
+                    .as_deref()
+                    .is_none_or(finite)
+                && self
+                    .episode_history
+                    .buys
+                    .iter()
+                    .chain(&self.episode_history.sells)
+                    .all(|trades| trades
+                        .values()
+                        .all(|(price, quantity)| { price.is_finite() && quantity.is_finite() })),
+            "episode history contains non-finite state"
+        );
+        Ok(())
+    }
+}
+
+impl Env {
+    fn snapshot(&self) -> EnvSnapshot {
+        let market = EnvMarketData {
+            prices: self.prices.clone(),
+            price_deltas: self.price_deltas.clone(),
+            ohlc_features: self.ohlc_features.clone(),
+            momentum: self.momentum.clone(),
+            earnings: self.earnings.clone(),
+            macro_ind: self.macro_ind.clone(),
+            total_data_length: self.total_data_length,
+        };
+        EnvSnapshot {
+            env_id: self.env_id,
+            tickers: self.tickers.clone(),
+            market_sha256: market_fingerprint(&self.tickers, &market),
+            total_data_length: self.total_data_length,
+            step: self.step,
+            max_step: self.max_step,
+            account: self.account.clone(),
+            episode_history: self.episode_history.clone(),
+            meta_history: self.meta_history.clone(),
+            episode: self.episode,
+            action_history: self.action_history.clone(),
+            episode_start_offset: self.episode_start_offset,
+            random_start: self.random_start,
+            resample_tickers_on_reset: self.resample_tickers_on_reset,
+            peak_assets: self.peak_assets,
+            last_fill_ratio: self.last_fill_ratio,
+            trade_activity_ema: self.trade_activity_ema.clone(),
+            steps_since_trade: self.steps_since_trade.clone(),
+            position_open_step: self.position_open_step.clone(),
+            ticker_perm: self.ticker_perm.clone(),
+            target_weights: self.target_weights.clone(),
+            realized_weights: self.realized_weights.clone(),
+            rng_seed: self.rng_seed,
+            rng_counter: self.rng_counter,
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: EnvSnapshot, market: EnvMarketData) {
+        self.env_id = snapshot.env_id;
+        self.step = snapshot.step;
+        self.max_step = snapshot.max_step;
+        self.tickers = snapshot.tickers;
+        self.prices = market.prices;
+        self.price_deltas = market.price_deltas;
+        self.ohlc_features = market.ohlc_features;
+        self.momentum = market.momentum;
+        self.earnings = market.earnings;
+        self.macro_ind = market.macro_ind;
+        self.total_data_length = market.total_data_length;
+        self.account = snapshot.account;
+        self.episode_history = snapshot.episode_history;
+        self.meta_history = snapshot.meta_history;
+        self.episode = snapshot.episode;
+        self.action_history = snapshot.action_history;
+        self.episode_start_offset = snapshot.episode_start_offset;
+        self.random_start = snapshot.random_start;
+        self.resample_tickers_on_reset = snapshot.resample_tickers_on_reset;
+        self.peak_assets = snapshot.peak_assets;
+        self.last_fill_ratio = snapshot.last_fill_ratio;
+        self.trade_activity_ema = snapshot.trade_activity_ema;
+        self.steps_since_trade = snapshot.steps_since_trade;
+        self.position_open_step = snapshot.position_open_step;
+        self.ticker_perm = snapshot.ticker_perm;
+        self.target_weights = snapshot.target_weights;
+        self.realized_weights = snapshot.realized_weights;
+        self.rng_seed = snapshot.rng_seed;
+        self.rng_counter = snapshot.rng_counter;
+        self.episode_start = Instant::now();
+    }
+}
+
+impl VecEnvSnapshot {
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
+        postcard::to_stdvec(self).context("failed serializing PPO trajectory state")
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let snapshot: Self =
+            postcard::from_bytes(bytes).context("failed parsing PPO trajectory state")?;
+        ensure!(
+            snapshot.format_version == ENV_SNAPSHOT_FORMAT_VERSION,
+            "unsupported environment snapshot format {}",
+            snapshot.format_version
+        );
+        ensure!(
+            snapshot.universe_sha256 == universe_fingerprint(),
+            "eligible training universe changed since checkpoint"
+        );
+        ensure!(!snapshot.envs.is_empty(), "environment snapshot is empty");
+        for env in &snapshot.envs {
+            env.validate()?;
+        }
+        Ok(snapshot)
+    }
+
+    /// Validate trajectory identity and load every immutable input before
+    /// checkpoint weights or optimizer state are applied.
+    pub(crate) fn preflight(
+        self,
+        expected_nprocs: usize,
+        expected_seed: u64,
+    ) -> Result<ValidatedVecEnvSnapshot> {
+        ensure!(
+            self.envs.len() == expected_nprocs,
+            "PPO_NPROCS mismatch: saved={}, requested={expected_nprocs}",
+            self.envs.len()
+        );
+        for (index, env) in self.envs.iter().enumerate() {
+            ensure!(env.env_id == index, "environment IDs are not canonical");
+            ensure!(
+                env.random_start && env.resample_tickers_on_reset,
+                "saved environment flags are incompatible with PPO training"
+            );
+            ensure!(
+                env.rng_seed == expected_seed.wrapping_add(index as u64),
+                "environment RNG stream identity mismatch for env {index}"
+            );
+        }
+        let mut markets = Vec::with_capacity(self.envs.len());
+        for env in &self.envs {
+            let market = load_market_data(&env.tickers, false);
+            ensure!(
+                market.total_data_length == env.total_data_length,
+                "market length changed for {:?}",
+                env.tickers
+            );
+            ensure!(
+                market_fingerprint(&env.tickers, &market) == env.market_sha256,
+                "market data changed for {:?}",
+                env.tickers
+            );
+            markets.push(market);
+        }
+        Ok(ValidatedVecEnvSnapshot {
+            snapshot: self,
+            markets,
+        })
+    }
+}
+
+impl VecEnv {
+    pub(crate) fn snapshot(&self) -> VecEnvSnapshot {
+        VecEnvSnapshot {
+            format_version: ENV_SNAPSHOT_FORMAT_VERSION,
+            universe_sha256: universe_fingerprint(),
+            envs: self.envs.iter().map(Env::snapshot).collect(),
+        }
+    }
+
+    /// Apply a plan whose complete causal and immutable state was preflighted.
+    pub(crate) fn restore_snapshot(&mut self, plan: ValidatedVecEnvSnapshot) {
+        debug_assert_eq!(plan.snapshot.envs.len(), self.envs.len());
+        for ((env, saved), market) in self
+            .envs
+            .iter_mut()
+            .zip(plan.snapshot.envs)
+            .zip(plan.markets)
+        {
+            env.apply_snapshot(saved, market);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_snapshot_from_current_markets(
+        &mut self,
+        snapshot: VecEnvSnapshot,
+    ) -> Result<()> {
+        ensure!(
+            snapshot.envs.len() == self.envs.len(),
+            "test env count mismatch"
+        );
+        let mut markets = Vec::with_capacity(self.envs.len());
+        for (current, saved) in self.envs.iter().zip(&snapshot.envs) {
+            let market = EnvMarketData {
+                prices: current.prices.clone(),
+                price_deltas: current.price_deltas.clone(),
+                ohlc_features: current.ohlc_features.clone(),
+                momentum: current.momentum.clone(),
+                earnings: current.earnings.clone(),
+                macro_ind: current.macro_ind.clone(),
+                total_data_length: current.total_data_length,
+            };
+            ensure!(
+                market_fingerprint(&saved.tickers, &market) == saved.market_sha256,
+                "test market mismatch"
+            );
+            markets.push(market);
+        }
+        for ((env, saved), market) in self.envs.iter_mut().zip(snapshot.envs).zip(markets) {
+            env.apply_snapshot(saved, market);
+        }
+        Ok(())
+    }
+}

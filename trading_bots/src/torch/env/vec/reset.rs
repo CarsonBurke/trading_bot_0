@@ -3,6 +3,27 @@ use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICK
 use tch::Tensor;
 
 impl VecEnv {
+    /// Rebuild the full observation frontier without sampling or resetting an
+    /// environment. Used after restoring a checkpoint and after each policy
+    /// update so the next action is computed from current weights and state.
+    pub(crate) fn current_full_observation(&mut self) -> (Tensor, Tensor) {
+        for env_idx in 0..self.nprocs {
+            let (price_deltas, static_obs) = self.envs[env_idx].get_next_obs();
+            self.write_full_obs(env_idx, &price_deltas, &static_obs);
+        }
+        self.done_mask.fill(false);
+        self.last_static_obs.clone_from(&self.static_obs_buf);
+        self.last_step_deltas.clone_from(&self.step_deltas_buf);
+        (
+            Tensor::from_slice(&self.price_deltas_buf).view([
+                self.nprocs_i64(),
+                TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64,
+            ]),
+            Tensor::from_slice(&self.static_obs_buf)
+                .view([self.nprocs_i64(), STATIC_OBSERVATIONS as i64]),
+        )
+    }
+
     pub(super) fn reset_group_full_obs(
         &mut self,
         group_idx: usize,

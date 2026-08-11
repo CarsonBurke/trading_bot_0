@@ -217,7 +217,7 @@ impl KlLrController {
             self.ema = ema;
         }
         if scale.is_finite() && scale > 0.0 {
-            self.scale = scale.clamp(self.min_scale, self.max_scale);
+            self.scale = scale;
         }
     }
 
@@ -234,7 +234,7 @@ impl KlLrController {
             || !state.ema.is_finite()
             || state.ema <= 0.0
             || !state.scale.is_finite()
-            || state.scale <= 0.0
+            || !(self.min_scale..=self.max_scale).contains(&state.scale)
         {
             return false;
         }

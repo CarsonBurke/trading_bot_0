@@ -10,6 +10,10 @@ use super::trainer::{RolloutData, Trainer};
 
 impl Trainer {
     pub(super) fn collect_rollout(&mut self, episode: usize) -> RolloutData {
+        // Model construction, checkpoint loading, and CUDA graph setup may all
+        // consume framework RNG. Reseeding at the causal rollout boundary makes
+        // action samples a pure function of the saved seed and update index.
+        tch::manual_seed(self.deterministic_seed(0x524f_4c4c_4f55_5453, episode) as i64);
         println!(
             "rollout {}: collecting steps={} envs={} total_samples={}",
             episode,

@@ -23,8 +23,11 @@ impl Env {
     }
 
     pub(super) fn reset_single_resampled_training_episode(&mut self) -> (Vec<f32>, Vec<f32>) {
-        self.resample_training_tickers();
-        self.reset_existing_episode_state_at(self.sample_episode_start_offset());
+        if self.resample_tickers_on_reset {
+            self.resample_training_tickers();
+        }
+        let start_offset = self.sample_episode_start_offset();
+        self.reset_existing_episode_state_at(start_offset);
         self.get_next_obs()
     }
 
@@ -42,8 +45,11 @@ impl Env {
     }
 
     pub(crate) fn reset_step_single_resampled_training_episode(&mut self) -> (Vec<f32>, Vec<f32>) {
-        self.resample_training_tickers();
-        self.reset_existing_episode_state_at(self.sample_episode_start_offset());
+        if self.resample_tickers_on_reset {
+            self.resample_training_tickers();
+        }
+        let start_offset = self.sample_episode_start_offset();
+        self.reset_existing_episode_state_at(start_offset);
 
         let (step_deltas, static_obs) = self.get_next_step_obs();
         (step_deltas.to_vec(), static_obs.to_vec())
@@ -271,6 +277,8 @@ mod tests {
             macro_ind: Arc::new(MacroIndicators::empty(n)),
             record_history_io: false,
             gens_path: None,
+            rng_seed: 7,
+            rng_counter: 0,
         }
     }
 
