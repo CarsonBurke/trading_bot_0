@@ -1,5 +1,8 @@
 use crate::constants::files::DATA_PATH;
-use chrono::NaiveDate;
+use chrono::{
+    Datelike, Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Weekday,
+};
+use chrono_tz::America::New_York;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,12 +12,12 @@ use std::{
 };
 
 const FRED_BASE: &str = "https://api.stlouisfed.org/fred/series/observations";
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MacroObservation {
     pub date: String,
-    pub available_on: String,
+    pub available_at: i64,
     pub value: Option<f64>,
 }
 
@@ -216,12 +219,17 @@ fn fetch_series(series: MacroSeries, api_key: &str) -> Result<MacroData, MacroDa
     let observations = response
         .observations
         .into_iter()
-        .map(|observation| MacroObservation {
-            date: observation.date,
-            available_on: observation.realtime_start,
-            value: observation.value.parse().ok(),
+        .map(|observation| {
+            Ok(MacroObservation {
+                date: observation.date,
+                available_at: conservative_availability_timestamp(
+                    series,
+                    &observation.realtime_start,
+                )?,
+                value: observation.value.parse().ok(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, MacroDataError>>()?;
     let data = MacroData {
         series_id: series.series_id().to_string(),
         observations,
@@ -341,10 +349,10 @@ fn validate_data(series: MacroSeries, data: &MacroData) -> Result<(), MacroDataE
                 "an observation has an invalid period date",
             ));
         }
-        if NaiveDate::parse_from_str(&observation.available_on, "%Y-%m-%d").is_err() {
+        if chrono::DateTime::from_timestamp(observation.available_at, 0).is_none() {
             return Err(invalid_data(
                 series,
-                "an observation has an invalid availability date",
+                "an observation has an invalid availability timestamp",
             ));
         }
         if observation.value.is_some_and(|value| !value.is_finite()) {
@@ -375,39 +383,213 @@ pub fn get_latest_value(series: MacroSeries) -> Result<Option<f64>, MacroDataErr
     Ok(get_macro_data(series)?
         .observations
         .into_iter()
-        .max_by(|left, right| left.available_on.cmp(&right.available_on))
+        .max_by_key(|observation| observation.available_at)
         .and_then(|observation| observation.value))
 }
 
-pub fn get_value_at_date(series: MacroSeries, date: &str) -> Result<Option<f64>, MacroDataError> {
+fn conservative_availability_timestamp(
+    series: MacroSeries,
+    provider_date: &str,
+) -> Result<i64, MacroDataError> {
+    let mut session_date = NaiveDate::parse_from_str(provider_date, "%Y-%m-%d")
+        .map_err(|_| invalid_data(series, "an observation has an invalid availability date"))?
+        .succ_opt()
+        .ok_or_else(|| invalid_data(series, "availability date exceeds supported range"))?;
+    while !is_nyse_session(session_date) {
+        session_date = session_date
+            .succ_opt()
+            .ok_or_else(|| invalid_data(series, "availability date exceeds supported range"))?;
+    }
+    // FRED exposes only a date for realtime_start, not the instant when the
+    // vintage became observable. Make it visible at the following NYSE open.
+    let local_open = NaiveDateTime::new(
+        session_date,
+        NaiveTime::from_hms_opt(9, 30, 0).expect("NYSE open is valid"),
+    );
+    New_York
+        .from_local_datetime(&local_open)
+        .single()
+        .map(|open| open.timestamp())
+        .ok_or_else(|| invalid_data(series, "NYSE open has an ambiguous timezone offset"))
+}
+
+fn is_nyse_session(date: NaiveDate) -> bool {
+    !matches!(date.weekday(), Weekday::Sat | Weekday::Sun) && !is_nyse_holiday(date)
+}
+
+fn observed_fixed_holiday(date: NaiveDate) -> NaiveDate {
+    match date.weekday() {
+        Weekday::Sat => date.pred_opt().expect("supported holiday date"),
+        Weekday::Sun => date.succ_opt().expect("supported holiday date"),
+        _ => date,
+    }
+}
+
+fn nth_weekday(year: i32, month: u32, weekday: Weekday, nth: u32) -> NaiveDate {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
+    let offset = (7 + weekday.num_days_from_monday() as i64
+        - first.weekday().num_days_from_monday() as i64)
+        % 7;
+    first + ChronoDuration::days(offset + 7 * (nth - 1) as i64)
+}
+
+fn last_weekday(year: i32, month: u32, weekday: Weekday) -> NaiveDate {
+    let next_month = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .expect("valid next month");
+    let last = next_month.pred_opt().expect("valid previous date");
+    let offset = (7 + last.weekday().num_days_from_monday() as i64
+        - weekday.num_days_from_monday() as i64)
+        % 7;
+    last - ChronoDuration::days(offset)
+}
+
+// Gregorian computus, used because Good Friday is an NYSE holiday.
+fn easter_sunday(year: i32) -> NaiveDate {
+    let a = year % 19;
+    let b = year / 100;
+    let c = year % 100;
+    let d = b / 4;
+    let e = b % 4;
+    let f = (b + 8) / 25;
+    let g = (b - f + 1) / 3;
+    let h = (19 * a + b - d - g + 15) % 30;
+    let i = c / 4;
+    let k = c % 4;
+    let l = (32 + 2 * e + 2 * i - h - k) % 7;
+    let m = (a + 11 * h + 22 * l) / 451;
+    let month = (h + l - 7 * m + 114) / 31;
+    let day = (h + l - 7 * m + 114) % 31 + 1;
+    NaiveDate::from_ymd_opt(year, month as u32, day as u32).expect("valid Easter date")
+}
+
+fn is_nyse_holiday(date: NaiveDate) -> bool {
+    let year = date.year();
+    let new_year =
+        observed_fixed_holiday(NaiveDate::from_ymd_opt(year, 1, 1).expect("valid New Year's Day"));
+    let next_new_year = observed_fixed_holiday(
+        NaiveDate::from_ymd_opt(year + 1, 1, 1).expect("valid next New Year's Day"),
+    );
+    let christmas =
+        observed_fixed_holiday(NaiveDate::from_ymd_opt(year, 12, 25).expect("valid Christmas"));
+    let independence = observed_fixed_holiday(
+        NaiveDate::from_ymd_opt(year, 7, 4).expect("valid Independence Day"),
+    );
+    let juneteenth =
+        observed_fixed_holiday(NaiveDate::from_ymd_opt(year, 6, 19).expect("valid Juneteenth"));
+
+    const EXTRAORDINARY_FULL_DAY_CLOSURES: &[(i32, u32, u32)] = &[
+        // September 11 attacks.
+        (2001, 9, 11),
+        (2001, 9, 12),
+        (2001, 9, 13),
+        (2001, 9, 14),
+        // National days of mourning for Presidents Reagan, Ford, Bush, Carter.
+        (2004, 6, 11),
+        (2007, 1, 2),
+        (2018, 12, 5),
+        (2025, 1, 9),
+        // Hurricane Sandy.
+        (2012, 10, 29),
+        (2012, 10, 30),
+    ];
+
+    date == new_year
+        || date == next_new_year
+        || (year >= 1998 && date == nth_weekday(year, 1, Weekday::Mon, 3))
+        || date == nth_weekday(year, 2, Weekday::Mon, 3)
+        || date == easter_sunday(year) - ChronoDuration::days(2)
+        || date == last_weekday(year, 5, Weekday::Mon)
+        || (year >= 2022 && date == juneteenth)
+        || date == independence
+        || date == nth_weekday(year, 9, Weekday::Mon, 1)
+        || date == nth_weekday(year, 11, Weekday::Thu, 4)
+        || date == christmas
+        || EXTRAORDINARY_FULL_DAY_CLOSURES
+            .iter()
+            .any(|&(closure_year, month, day)| {
+                date == NaiveDate::from_ymd_opt(closure_year, month, day)
+                    .expect("valid extraordinary NYSE closure")
+            })
+}
+
+pub fn get_value_at_timestamp(
+    series: MacroSeries,
+    timestamp: i64,
+) -> Result<Option<f64>, MacroDataError> {
     Ok(get_macro_data(series)?
         .observations
         .into_iter()
-        .filter(|observation| observation.available_on.as_str() <= date)
-        .max_by(|left, right| left.available_on.cmp(&right.available_on))
+        .filter(|observation| observation.available_at <= timestamp)
+        .max_by_key(|observation| observation.available_at)
         .and_then(|observation| observation.value))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_path, FredResponse, MacroObservation, MacroSeries};
+    use super::{cache_path, conservative_availability_timestamp, FredResponse, MacroSeries};
+    use chrono::NaiveDateTime;
+
+    fn timestamp(value: &str) -> i64 {
+        NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+            .unwrap()
+            .and_utc()
+            .timestamp()
+    }
 
     #[test]
-    fn fred_initial_release_availability_is_preserved() {
+    fn fred_date_only_availability_moves_to_the_next_session() {
         let response: FredResponse = serde_json::from_str(
             r#"{"observations":[{"realtime_start":"2024-02-02","date":"2024-01-01","value":"353.0"}]}"#,
         )
         .unwrap();
         let observation = response.observations.into_iter().next().unwrap();
-        let stored = MacroObservation {
-            date: observation.date,
-            available_on: observation.realtime_start,
-            value: observation.value.parse().ok(),
-        };
 
-        assert_eq!(stored.date, "2024-01-01");
-        assert_eq!(stored.available_on, "2024-02-02");
-        assert_eq!(stored.value, Some(353.0));
+        assert_eq!(observation.date, "2024-01-01");
+        assert_eq!(observation.value.parse::<f64>().unwrap(), 353.0);
+        assert_eq!(
+            conservative_availability_timestamp(
+                MacroSeries::CpiAllItems,
+                &observation.realtime_start
+            )
+            .unwrap(),
+            timestamp("2024-02-05 14:30:00")
+        );
+    }
+
+    #[test]
+    fn date_only_availability_starts_at_the_next_weekday_session() {
+        assert_eq!(
+            conservative_availability_timestamp(MacroSeries::CpiAllItems, "2024-02-08").unwrap(),
+            timestamp("2024-02-09 14:30:00")
+        );
+        assert_eq!(
+            conservative_availability_timestamp(MacroSeries::CpiAllItems, "2024-02-09").unwrap(),
+            timestamp("2024-02-12 14:30:00")
+        );
+        assert_eq!(
+            conservative_availability_timestamp(MacroSeries::CpiAllItems, "2024-01-12").unwrap(),
+            timestamp("2024-01-16 14:30:00"),
+            "Martin Luther King Jr. Day is not a trading session"
+        );
+        assert_eq!(
+            conservative_availability_timestamp(MacroSeries::CpiAllItems, "2024-06-13").unwrap(),
+            timestamp("2024-06-14 13:30:00"),
+            "summer session open must use the daylight-saving offset"
+        );
+        assert_eq!(
+            conservative_availability_timestamp(MacroSeries::CpiAllItems, "2006-03-16").unwrap(),
+            timestamp("2006-03-17 14:30:00"),
+            "pre-2007 US daylight-saving rules must be respected"
+        );
+        assert_eq!(
+            conservative_availability_timestamp(MacroSeries::CpiAllItems, "2012-10-26").unwrap(),
+            timestamp("2012-10-31 13:30:00"),
+            "extraordinary full-day exchange closures must be skipped"
+        );
     }
 
     #[test]
@@ -416,7 +598,7 @@ mod tests {
         let growth = cache_path(MacroSeries::JobsGrowth);
 
         assert_ne!(levels, growth);
-        assert!(levels.to_string_lossy().ends_with("_v2.bin"));
-        assert!(growth.to_string_lossy().ends_with("_v2.bin"));
+        assert!(levels.to_string_lossy().ends_with("_v3.bin"));
+        assert!(growth.to_string_lossy().ends_with("_v3.bin"));
     }
 }

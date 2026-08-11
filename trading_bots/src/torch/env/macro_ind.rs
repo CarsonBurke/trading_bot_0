@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
+use time::OffsetDateTime;
 
-/// Cache for MacroIndicators keyed by the exact bar-date sequence.
+/// Cache for MacroIndicators keyed by the exact bar-timestamp sequence.
 static MACRO_CACHE: OnceLock<Mutex<HashMap<u64, Arc<MacroIndicators>>>> = OnceLock::new();
 static MACRO_SOURCE: OnceLock<Result<MacroSourceData, MacroDataError>> = OnceLock::new();
 
@@ -13,11 +14,11 @@ fn macro_cache() -> &'static Mutex<HashMap<u64, Arc<MacroIndicators>>> {
     MACRO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn date_sequence_key(bar_dates: &[String]) -> u64 {
+fn timestamp_sequence_key(bar_times: &[OffsetDateTime]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bar_dates.len().hash(&mut hasher);
-    for date in bar_dates {
-        date.hash(&mut hasher);
+    bar_times.len().hash(&mut hasher);
+    for timestamp in bar_times {
+        timestamp.unix_timestamp_nanos().hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -60,8 +61,8 @@ fn macro_source() -> Result<&'static MacroSourceData, &'static MacroDataError> {
         .as_ref()
 }
 
-/// Precomputed macroeconomic indicators aligned to bar dates
-/// Uses each observation's initial-release date to avoid lookahead bias.
+/// Precomputed macroeconomic indicators aligned to bar timestamps.
+/// Uses each observation's causal availability timestamp to avoid lookahead bias.
 #[derive(Serialize, Deserialize)]
 pub struct MacroIndicators {
     pub gdp_growth: Vec<f64>,
@@ -101,8 +102,8 @@ impl MacroIndicators {
     }
 
     /// Get cached or compute macro indicators
-    pub fn get_or_compute(bar_dates: &[String]) -> Arc<MacroIndicators> {
-        let key = date_sequence_key(bar_dates);
+    pub fn get_or_compute(bar_times: &[OffsetDateTime]) -> Arc<MacroIndicators> {
+        let key = timestamp_sequence_key(bar_times);
         {
             let locked = macro_cache().lock().unwrap();
             if let Some(cached) = locked.get(&key) {
@@ -112,9 +113,9 @@ impl MacroIndicators {
 
         eprintln!(
             "Computing macro indicators for {} dates (key {key:016x})",
-            bar_dates.len()
+            bar_times.len()
         );
-        let result = Self::compute_inner(bar_dates).unwrap_or_else(|err| {
+        let result = Self::compute_inner(bar_times).unwrap_or_else(|err| {
             panic!("failed to initialize required macroeconomic features: {err}")
         });
         let result = Arc::new(result);
@@ -122,30 +123,18 @@ impl MacroIndicators {
         result
     }
 
-    fn compute_inner(bar_dates: &[String]) -> Result<Self, MacroDataError> {
-        let n = bar_dates.len();
+    fn compute_inner(bar_times: &[OffsetDateTime]) -> Result<Self, MacroDataError> {
+        let n = bar_times.len();
         if n == 0 {
             return Ok(Self::empty(0));
         }
 
-        let bar_dates = bar_dates
-            .iter()
-            .map(|date| {
-                NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| {
-                    MacroDataError::InvalidData {
-                        series: "market bars",
-                        message: format!("invalid bar date {date:?}"),
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
         let source = macro_source().map_err(Clone::clone)?;
-        Ok(Self::compute_with_source(&bar_dates, source))
+        Ok(Self::compute_with_source(bar_times, source))
     }
 
-    fn compute_with_source(bar_dates: &[NaiveDate], source: &MacroSourceData) -> Self {
-        let n = bar_dates.len();
+    fn compute_with_source(bar_times: &[OffsetDateTime], source: &MacroSourceData) -> Self {
+        let n = bar_times.len();
 
         let mut result = Self::empty(n);
 
@@ -160,24 +149,32 @@ impl MacroIndicators {
         let mut t2y_idx = 0usize;
         let mut sentiment_idx = 0usize;
         let mut claims_idx = 0usize;
-        for (i, &bar_date) in bar_dates.iter().enumerate() {
-            result.gdp_growth[i] = advance_and_get(&source.gdp_obs, &mut gdp_idx, bar_date)
+        for (i, &bar_time) in bar_times.iter().enumerate() {
+            let bar_timestamp = bar_time.unix_timestamp();
+            let bar_date = NaiveDate::from_ymd_opt(
+                bar_time.year(),
+                bar_time.month() as u8 as u32,
+                bar_time.day() as u32,
+            )
+            .expect("OffsetDateTime always contains a valid date");
+            result.gdp_growth[i] = advance_and_get(&source.gdp_obs, &mut gdp_idx, bar_timestamp)
                 .map(|v| (v / 10.0).clamp(-1.0, 1.0))
                 .unwrap_or(0.0);
 
-            result.unemployment[i] = advance_and_get(&source.unemp_obs, &mut unemp_idx, bar_date)
-                .map(|v| ((v - 5.0) / 5.0).clamp(-1.0, 1.0))
-                .unwrap_or(0.0);
+            result.unemployment[i] =
+                advance_and_get(&source.unemp_obs, &mut unemp_idx, bar_timestamp)
+                    .map(|v| ((v - 5.0) / 5.0).clamp(-1.0, 1.0))
+                    .unwrap_or(0.0);
 
             result.jobs_growth[i] =
-                advance_and_get(&source.payrolls_obs, &mut payrolls_idx, bar_date)
+                advance_and_get(&source.payrolls_obs, &mut payrolls_idx, bar_timestamp)
                     .map(|v| (v / 2.0).clamp(-1.0, 1.0))
                     .unwrap_or(0.0);
 
-            let cpi_current = advance_to_latest(&source.cpi_obs, &mut cpi_idx, bar_date);
+            let cpi_current = advance_to_latest(&source.cpi_obs, &mut cpi_idx, bar_timestamp);
             let cpi_prev = cpi_current.and_then(|current| {
                 previous_year_period(current.period_date).and_then(|period| {
-                    released_period_value(&source.cpi_by_period, period, bar_date)
+                    released_period_value(&source.cpi_by_period, period, bar_timestamp)
                 })
             });
             result.cpi_yoy[i] = match (cpi_current, cpi_prev) {
@@ -187,10 +184,11 @@ impl MacroIndicators {
                 _ => 0.0,
             };
 
-            let core_current = advance_to_latest(&source.core_cpi_obs, &mut core_cpi_idx, bar_date);
+            let core_current =
+                advance_to_latest(&source.core_cpi_obs, &mut core_cpi_idx, bar_timestamp);
             let core_prev = core_current.and_then(|current| {
                 previous_year_period(current.period_date).and_then(|period| {
-                    released_period_value(&source.core_cpi_by_period, period, bar_date)
+                    released_period_value(&source.core_cpi_by_period, period, bar_timestamp)
                 })
             });
             result.core_cpi_yoy[i] = match (core_current, core_prev) {
@@ -200,12 +198,12 @@ impl MacroIndicators {
                 _ => 0.0,
             };
 
-            result.fed_funds[i] = advance_and_get(&source.fed_obs, &mut fed_idx, bar_date)
+            result.fed_funds[i] = advance_and_get(&source.fed_obs, &mut fed_idx, bar_timestamp)
                 .map(|v| ((v - 3.0) / 3.0).clamp(-1.0, 1.0))
                 .unwrap_or(0.0);
 
-            let t10y = advance_and_get(&source.t10y_obs, &mut t10y_idx, bar_date);
-            let t2y = advance_and_get(&source.t2y_obs, &mut t2y_idx, bar_date);
+            let t10y = advance_and_get(&source.t10y_obs, &mut t10y_idx, bar_timestamp);
+            let t2y = advance_and_get(&source.t2y_obs, &mut t2y_idx, bar_timestamp);
 
             result.treasury_10y[i] = t10y
                 .map(|v| ((v - 3.0) / 3.0).clamp(-1.0, 1.0))
@@ -217,12 +215,12 @@ impl MacroIndicators {
             };
 
             result.consumer_sentiment[i] =
-                advance_and_get(&source.sentiment_obs, &mut sentiment_idx, bar_date)
+                advance_and_get(&source.sentiment_obs, &mut sentiment_idx, bar_timestamp)
                     .map(|v| ((v - 90.0) / 30.0).clamp(-1.0, 1.0))
                     .unwrap_or(0.0);
 
             result.initial_claims[i] =
-                advance_and_get(&source.claims_obs, &mut claims_idx, bar_date)
+                advance_and_get(&source.claims_obs, &mut claims_idx, bar_timestamp)
                     .map(|v| ((v - 250.0) / 200.0).clamp(-1.0, 1.0))
                     .unwrap_or(0.0);
 
@@ -239,7 +237,7 @@ impl MacroIndicators {
 #[derive(Clone, Copy)]
 struct IntObs {
     period_date: NaiveDate,
-    available_on: NaiveDate,
+    available_at: i64,
     value: Option<f64>,
 }
 
@@ -252,29 +250,32 @@ fn obs_to_dates(
     series: MacroSeries,
     observations: &[MacroObservation],
 ) -> Result<Vec<IntObs>, MacroDataError> {
-    let mut dated = observations
-        .iter()
-        .map(|observation| {
-            let period_date =
-                NaiveDate::parse_from_str(&observation.date, "%Y-%m-%d").map_err(|_| {
-                    MacroDataError::InvalidData {
+    let mut dated =
+        observations
+            .iter()
+            .map(|observation| {
+                let period_date = NaiveDate::parse_from_str(&observation.date, "%Y-%m-%d")
+                    .map_err(|_| MacroDataError::InvalidData {
                         series: series.series_id(),
                         message: format!("invalid observation period {:?}", observation.date),
+                    })?;
+                OffsetDateTime::from_unix_timestamp(observation.available_at).map_err(|_| {
+                    MacroDataError::InvalidData {
+                        series: series.series_id(),
+                        message: format!(
+                            "invalid availability timestamp {:?}",
+                            observation.available_at
+                        ),
                     }
                 })?;
-            let available_on = NaiveDate::parse_from_str(&observation.available_on, "%Y-%m-%d")
-                .map_err(|_| MacroDataError::InvalidData {
-                    series: series.series_id(),
-                    message: format!("invalid availability date {:?}", observation.available_on),
-                })?;
-            Ok(IntObs {
-                period_date,
-                available_on,
-                value: observation.value,
+                Ok(IntObs {
+                    period_date,
+                    available_at: observation.available_at,
+                    value: observation.value,
+                })
             })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    dated.sort_by_key(|observation| observation.available_on);
+            .collect::<Result<Vec<_>, _>>()?;
+    dated.sort_by_key(|observation| observation.available_at);
     Ok(dated)
 }
 
@@ -284,7 +285,7 @@ fn index_by_period(observations: &[IntObs]) -> HashMap<NaiveDate, IntObs> {
         by_period
             .entry(observation.period_date)
             .and_modify(|existing: &mut IntObs| {
-                if observation.available_on < existing.available_on {
+                if observation.available_at < existing.available_at {
                     *existing = observation;
                 }
             })
@@ -300,11 +301,11 @@ fn previous_year_period(period: NaiveDate) -> Option<NaiveDate> {
 fn released_period_value(
     by_period: &HashMap<NaiveDate, IntObs>,
     period: NaiveDate,
-    bar_date: NaiveDate,
+    bar_timestamp: i64,
 ) -> Option<f64> {
     by_period
         .get(&period)
-        .filter(|observation| observation.available_on <= bar_date)
+        .filter(|observation| observation.available_at <= bar_timestamp)
         .and_then(|observation| observation.value)
 }
 
@@ -312,16 +313,17 @@ fn released_period_value(
 fn advance_to_latest<'a>(
     observations: &'a [IntObs],
     cursor: &mut usize,
-    target_date: NaiveDate,
+    target_timestamp: i64,
 ) -> Option<&'a IntObs> {
     if observations.is_empty() {
         return None;
     }
-    while *cursor + 1 < observations.len() && observations[*cursor + 1].available_on <= target_date
+    while *cursor + 1 < observations.len()
+        && observations[*cursor + 1].available_at <= target_timestamp
     {
         *cursor += 1;
     }
-    (observations[*cursor].available_on <= target_date).then(|| &observations[*cursor])
+    (observations[*cursor].available_at <= target_timestamp).then(|| &observations[*cursor])
 }
 
 /// Advance to the most recent observation released by the target date.
@@ -329,9 +331,10 @@ fn advance_to_latest<'a>(
 fn advance_and_get(
     observations: &[IntObs],
     cursor: &mut usize,
-    target_date: NaiveDate,
+    target_timestamp: i64,
 ) -> Option<f64> {
-    advance_to_latest(observations, cursor, target_date).and_then(|observation| observation.value)
+    advance_to_latest(observations, cursor, target_timestamp)
+        .and_then(|observation| observation.value)
 }
 
 #[inline]
@@ -409,16 +412,28 @@ fn days_to_gdp_release(date: NaiveDate) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{index_by_period, IntObs, MacroIndicators, MacroSourceData};
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, NaiveDateTime};
+    use time::OffsetDateTime;
 
     fn date(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap()
     }
 
-    fn observation(period_date: &str, available_on: &str, value: f64) -> IntObs {
+    fn timestamp(value: &str) -> i64 {
+        NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+            .unwrap()
+            .and_utc()
+            .timestamp()
+    }
+
+    fn bar(value: &str) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(timestamp(value)).unwrap()
+    }
+
+    fn observation(period_date: &str, available_at: &str, value: f64) -> IntObs {
         IntObs {
             period_date: date(period_date),
-            available_on: date(available_on),
+            available_at: timestamp(available_at),
             value: Some(value),
         }
     }
@@ -441,8 +456,8 @@ mod tests {
     }
 
     fn source_with_cpi(mut cpi_obs: Vec<IntObs>, mut core_cpi_obs: Vec<IntObs>) -> MacroSourceData {
-        cpi_obs.sort_by_key(|observation| observation.available_on);
-        core_cpi_obs.sort_by_key(|observation| observation.available_on);
+        cpi_obs.sort_by_key(|observation| observation.available_at);
+        core_cpi_obs.sort_by_key(|observation| observation.available_at);
         MacroSourceData {
             gdp_obs: vec![],
             unemp_obs: vec![],
@@ -460,25 +475,35 @@ mod tests {
     }
 
     #[test]
-    fn period_value_is_hidden_until_its_initial_release_date() {
-        let source = source_with_unemployment(vec![observation("2024-01-01", "2024-02-02", 6.0)]);
+    fn same_day_release_is_hidden_until_its_exact_availability_time() {
+        let source =
+            source_with_unemployment(vec![observation("2024-01-01", "2024-02-02 20:00:00", 6.0)]);
         let indicators = MacroIndicators::compute_with_source(
-            &[date("2024-02-01"), date("2024-02-02")],
+            &[
+                bar("2024-02-02 14:30:00"),
+                bar("2024-02-02 19:55:00"),
+                bar("2024-02-02 20:00:00"),
+            ],
             &source,
         );
 
         assert_eq!(indicators.unemployment[0], 0.0);
-        assert!((indicators.unemployment[1] - 0.2).abs() < 1e-12);
+        assert_eq!(indicators.unemployment[1], 0.0);
+        assert!((indicators.unemployment[2] - 0.2).abs() < 1e-12);
     }
 
     #[test]
     fn a_new_initial_release_replaces_the_previous_available_value() {
         let source = source_with_unemployment(vec![
-            observation("2024-01-01", "2024-02-02", 6.0),
-            observation("2024-02-01", "2024-03-08", 4.0),
+            observation("2024-01-01", "2024-02-02 00:00:00", 6.0),
+            observation("2024-02-01", "2024-03-08 00:00:00", 4.0),
         ]);
         let indicators = MacroIndicators::compute_with_source(
-            &[date("2024-02-02"), date("2024-03-07"), date("2024-03-08")],
+            &[
+                bar("2024-02-02 14:30:00"),
+                bar("2024-03-07 14:30:00"),
+                bar("2024-03-08 14:30:00"),
+            ],
             &source,
         );
 
@@ -490,13 +515,14 @@ mod tests {
     #[test]
     fn cpi_yoy_uses_matching_periods_when_release_schedules_shift() {
         let cpi = vec![
-            observation("2022-12-01", "2023-01-15", 80.0),
-            observation("2023-01-01", "2023-02-20", 100.0),
-            observation("2024-01-01", "2024-02-10", 103.0),
+            observation("2022-12-01", "2023-01-15 00:00:00", 80.0),
+            observation("2023-01-01", "2023-02-20 00:00:00", 100.0),
+            observation("2024-01-01", "2024-02-10 00:00:00", 103.0),
         ];
         let core_cpi = cpi.clone();
         let source = source_with_cpi(cpi, core_cpi);
-        let indicators = MacroIndicators::compute_with_source(&[date("2024-02-10")], &source);
+        let indicators =
+            MacroIndicators::compute_with_source(&[bar("2024-02-10 14:30:00")], &source);
 
         assert!((indicators.cpi_yoy[0] - 0.2).abs() < 1e-12);
         assert!((indicators.core_cpi_yoy[0] - 0.2).abs() < 1e-12);
@@ -505,11 +531,12 @@ mod tests {
     #[test]
     fn cpi_yoy_requires_a_released_matching_prior_period() {
         let cpi = vec![
-            observation("2022-12-01", "2023-01-15", 80.0),
-            observation("2024-01-01", "2024-02-10", 103.0),
+            observation("2022-12-01", "2023-01-15 00:00:00", 80.0),
+            observation("2024-01-01", "2024-02-10 00:00:00", 103.0),
         ];
         let source = source_with_cpi(cpi, vec![]);
-        let indicators = MacroIndicators::compute_with_source(&[date("2024-02-10")], &source);
+        let indicators =
+            MacroIndicators::compute_with_source(&[bar("2024-02-10 14:30:00")], &source);
 
         assert_eq!(indicators.cpi_yoy[0], 0.0);
     }
