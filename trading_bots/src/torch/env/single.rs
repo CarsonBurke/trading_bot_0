@@ -79,6 +79,12 @@ pub(super) struct EnvMarketData {
     pub(super) total_data_length: usize,
 }
 
+enum MacroLoadMode {
+    Required,
+    #[cfg(test)]
+    Empty,
+}
+
 pub(crate) fn sample_training_tickers(rng: &mut impl Rng) -> Vec<String> {
     let universe = cached_eligible_training_universe();
     assert!(
@@ -94,6 +100,22 @@ pub(crate) fn sample_training_tickers(rng: &mut impl Rng) -> Vec<String> {
 }
 
 pub(super) fn load_market_data(tickers: &[String], log_progress: bool) -> EnvMarketData {
+    load_market_data_with_macro(tickers, log_progress, MacroLoadMode::Required)
+}
+
+#[cfg(test)]
+pub(super) fn load_market_data_without_macro(
+    tickers: &[String],
+    log_progress: bool,
+) -> EnvMarketData {
+    load_market_data_with_macro(tickers, log_progress, MacroLoadMode::Empty)
+}
+
+fn load_market_data_with_macro(
+    tickers: &[String],
+    log_progress: bool,
+    macro_mode: MacroLoadMode,
+) -> EnvMarketData {
     if log_progress {
         eprint!("  hist..");
     }
@@ -168,7 +190,11 @@ pub(super) fn load_market_data(tickers: &[String], log_progress: bool) -> EnvMar
     if log_progress {
         eprint!("macro..");
     }
-    let macro_ind = MacroIndicators::get_or_compute(&bar_dates[0]);
+    let macro_ind = match macro_mode {
+        MacroLoadMode::Required => MacroIndicators::get_or_compute(&bar_dates[0]),
+        #[cfg(test)]
+        MacroLoadMode::Empty => Arc::new(MacroIndicators::empty(total_data_length)),
+    };
     if log_progress {
         eprintln!("done");
     }

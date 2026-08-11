@@ -1,11 +1,16 @@
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::VecDeque;
+use std::ops::RangeInclusive;
 use std::time::Instant;
 
 use colored::Colorize;
 
-use super::single::{load_market_data, sample_training_tickers, Env, EnvMarketSnapshot};
+#[cfg(test)]
+use super::single::load_market_data_without_macro;
+use super::single::{
+    load_market_data, sample_training_tickers, Env, EnvMarketData, EnvMarketSnapshot,
+};
 use crate::{
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::constants::{ACTION_HISTORY_LEN, PRICE_DELTAS_PER_TICKER, STEPS_PER_EPISODE},
@@ -64,7 +69,31 @@ impl Env {
         resample_tickers_on_reset: bool,
     ) -> Self {
         let market_data = load_market_data(&tickers, true);
+        Self::new_from_market_data(
+            tickers,
+            random_start,
+            record_history_io,
+            gens_path,
+            resample_tickers_on_reset,
+            market_data,
+        )
+    }
 
+    #[cfg(test)]
+    pub(crate) fn new_without_macro_for_test(random_start: bool) -> Self {
+        let tickers = sample_training_tickers(&mut rand::rng());
+        let market_data = load_market_data_without_macro(&tickers, false);
+        Self::new_from_market_data(tickers, random_start, true, None, false, market_data)
+    }
+
+    fn new_from_market_data(
+        tickers: Vec<String>,
+        random_start: bool,
+        record_history_io: bool,
+        gens_path: Option<String>,
+        resample_tickers_on_reset: bool,
+        market_data: EnvMarketData,
+    ) -> Self {
         let num_tickers = tickers.len();
         let mut target_weights = vec![0.0; num_tickers + 1];
         target_weights[num_tickers] = 1.0;
@@ -252,15 +281,12 @@ impl Env {
     }
 
     pub(crate) fn sample_episode_start_offset(&self) -> usize {
-        let max_start = self
-            .total_data_length
-            .saturating_sub(STEPS_PER_EPISODE + PRICE_DELTAS_PER_TICKER);
-
-        if self.random_start && max_start > PRICE_DELTAS_PER_TICKER {
+        let valid_starts = full_episode_start_offsets(self.total_data_length);
+        if self.random_start {
             let mut rng = rand::rng();
-            rng.random_range(PRICE_DELTAS_PER_TICKER..max_start)
+            rng.random_range(valid_starts)
         } else {
-            PRICE_DELTAS_PER_TICKER
+            *valid_starts.start()
         }
     }
 
@@ -317,7 +343,7 @@ impl Env {
     }
 
     pub fn record_inference(&self, episode: usize) {
-        let infer_dir = "../infer";
+        let infer_dir = shared::paths::INFER_PATH;
         create_folder_if_not_exists(&infer_dir.to_string());
 
         self.episode_history.record_to_path(
@@ -327,5 +353,52 @@ impl Env {
             &self.prices,
             self.episode_start_offset + 1,
         );
+    }
+}
+
+fn full_episode_start_offsets(total_data_length: usize) -> RangeInclusive<usize> {
+    let minimum_data_length = PRICE_DELTAS_PER_TICKER
+        .checked_add(STEPS_PER_EPISODE)
+        .expect("episode data-length requirement overflowed");
+    assert!(
+        total_data_length >= minimum_data_length,
+        "full episode requires at least {minimum_data_length} bars ({PRICE_DELTAS_PER_TICKER} context + {STEPS_PER_EPISODE} episode), found {total_data_length}"
+    );
+
+    PRICE_DELTAS_PER_TICKER..=total_data_length - STEPS_PER_EPISODE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_episode_start_offsets;
+    use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STEPS_PER_EPISODE};
+
+    #[test]
+    fn exact_minimum_history_has_one_full_episode_start() {
+        let data_len = PRICE_DELTAS_PER_TICKER + STEPS_PER_EPISODE;
+        let starts = full_episode_start_offsets(data_len);
+
+        assert_eq!(*starts.start(), PRICE_DELTAS_PER_TICKER);
+        assert_eq!(*starts.end(), PRICE_DELTAS_PER_TICKER);
+        assert_eq!(starts.count(), 1);
+    }
+
+    #[test]
+    fn all_full_episode_starts_include_newest_valid_offset() {
+        let extra_starts = 37;
+        let data_len = PRICE_DELTAS_PER_TICKER + STEPS_PER_EPISODE + extra_starts;
+        let starts = full_episode_start_offsets(data_len);
+        let newest_start = *starts.end();
+        let terminal_step = STEPS_PER_EPISODE - 2;
+
+        assert_eq!(starts.count(), extra_starts + 1);
+        assert_eq!(newest_start, data_len - STEPS_PER_EPISODE);
+        assert_eq!(newest_start + terminal_step + 1, data_len - 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "full episode requires at least")]
+    fn history_shorter_than_one_full_episode_is_rejected() {
+        full_episode_start_offsets(PRICE_DELTAS_PER_TICKER + STEPS_PER_EPISODE - 1);
     }
 }

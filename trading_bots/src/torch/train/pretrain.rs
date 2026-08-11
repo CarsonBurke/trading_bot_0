@@ -2816,8 +2816,7 @@ impl PretrainScalarHistory {
             .push(m.pred_probe_ev_mean as f32);
         self.eval_latent_ev_marginal
             .push(m.latent_ev_marginal as f32);
-        self.eval_skill_belief_norm
-            .push(m.skill_belief_norm as f32);
+        self.eval_skill_belief_norm.push(m.skill_belief_norm as f32);
         self.eval_pred_probe_ev_persist
             .push(m.pred_probe_ev_persist as f32);
         self.eval_pred_probe_diracc.push(m.pred_probe_diracc as f32);
@@ -3367,9 +3366,7 @@ fn write_candle_snapshots(
         write_report_file(
             &epoch_dir.join("pretrain_candle_rollout_mse.report.bin"),
             &Report {
-                title: format!(
-                    "Pretrain Candle Rollout MSE - epoch {epoch} step {global_step}"
-                ),
+                title: format!("Pretrain Candle Rollout MSE - epoch {epoch} step {global_step}"),
                 x_label: Some("snapshot".to_string()),
                 y_label: Some("deterministic rollout MSE".to_string()),
                 scale: ScaleKind::Linear,
@@ -3420,6 +3417,13 @@ fn ticker_stratified_panel(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
             (ticker, median)
         })
         .collect()
+}
+
+fn validation_pairs(split_pairs: &[(usize, usize)], mode: ValidationMode) -> Vec<(usize, usize)> {
+    match mode {
+        ValidationMode::Fast => ticker_stratified_panel(split_pairs),
+        ValidationMode::Full => split_pairs.to_vec(),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3893,11 +3897,7 @@ fn validate_full(
             SplitKind::Test => sampler.test_pairs.clone(),
         };
         let full_window_count = split_pairs.len();
-        let pairs = match mode {
-            ValidationMode::Fast => ticker_stratified_panel(&split_pairs),
-            ValidationMode::Full if max_batches.is_none() => ticker_stratified_panel(&split_pairs),
-            ValidationMode::Full => split_pairs,
-        };
+        let pairs = validation_pairs(&split_pairs, mode);
         if mode == ValidationMode::Fast {
             let full_batches = full_window_count.div_ceil(batch_size);
             let fast_batches = pairs.len().div_ceil(batch_size);
@@ -4744,10 +4744,11 @@ mod tests {
         chained_candles_from_ohlc_features, cumulative_future_returns, enforce_single_sampler_pass,
         future_patches_for_current_perm, next_bars_for_current_perm, record_evaluated_tickers,
         retain_spaced_train_pairs, save_pretrain_heads_checkpoint, seed_candle_from_feature_row,
-        sigreg_loss_with_directions, ticker_stratified_panel, CandleBar, PretrainArgs,
-        PretrainExecutionMode, PretrainHeads, PretrainObjective, PretrainSampler, SplitKind,
-        LEJEPA_AR_LAYERS, LEJEPA_BAR_FEATURES, LEJEPA_HEADS, LEJEPA_HEAD_DIM, LEJEPA_ROLLOUT_BARS,
-        LEJEPA_SIGREG_PROJECTIONS, TRAIN_ANCHOR_STRIDE_MULTIPLIER,
+        sigreg_loss_with_directions, ticker_stratified_panel, validation_pairs, CandleBar,
+        PretrainArgs, PretrainExecutionMode, PretrainHeads, PretrainObjective, PretrainSampler,
+        SplitKind, ValidationMode, LEJEPA_AR_LAYERS, LEJEPA_BAR_FEATURES, LEJEPA_HEADS,
+        LEJEPA_HEAD_DIM, LEJEPA_ROLLOUT_BARS, LEJEPA_SIGREG_PROJECTIONS,
+        TRAIN_ANCHOR_STRIDE_MULTIPLIER,
     };
     use crate::torch::{
         constants::PRICE_DELTAS_PER_TICKER,
@@ -4855,7 +4856,7 @@ mod tests {
 
     #[test]
     fn future_patches_follow_current_ticker_permutation() {
-        let mut env = Env::new(false);
+        let mut env = Env::new_without_macro_for_test(false);
         let offset = crate::torch::constants::PRICE_DELTAS_PER_TICKER;
         let _ = env.reset_single_at_offset_for_pretrain(offset);
         let patches = future_patches_for_current_perm(&env, offset, 2, 3, 1.0);
@@ -4870,7 +4871,7 @@ mod tests {
 
     #[test]
     fn bar_history_matches_observation_window_and_close_deltas() {
-        let mut env = Env::new(false);
+        let mut env = Env::new_without_macro_for_test(false);
         let offset = crate::torch::constants::PRICE_DELTAS_PER_TICKER;
         let _ = env.reset_single_at_offset_for_pretrain(offset);
         let bars = bar_history_for_current_perm(&env, offset);
@@ -5012,7 +5013,7 @@ mod tests {
 
     #[test]
     fn next_bars_start_after_current_offset() {
-        let mut env = Env::new(false);
+        let mut env = Env::new_without_macro_for_test(false);
         let offset = crate::torch::constants::PRICE_DELTAS_PER_TICKER;
         let _ = env.reset_single_at_offset_for_pretrain(offset);
         let bars = next_bars_for_current_perm(&env, offset);
@@ -5682,6 +5683,17 @@ mod tests {
         assert!(
             n - seen.len() < batch_size,
             "only a partial final chunk is dropped"
+        );
+    }
+
+    #[test]
+    fn full_validation_retains_every_split_pair() {
+        let pairs = vec![(0, 10), (0, 20), (0, 30), (1, 40), (1, 50)];
+
+        assert_eq!(validation_pairs(&pairs, ValidationMode::Full), pairs);
+        assert_eq!(
+            validation_pairs(&pairs, ValidationMode::Fast),
+            vec![(0, 20), (1, 50)]
         );
     }
 }
