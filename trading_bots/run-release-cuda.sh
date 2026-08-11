@@ -14,6 +14,9 @@ export VIRTUAL_ENV="$venv"
 export PATH="$venv/bin:$PATH"
 export PYTHONPATH="$site_packages${PYTHONPATH:+:$PYTHONPATH}"
 export LIBTORCH_USE_PYTORCH=1
+# Expandable CUDA segments eliminate the reserved-but-unallocated fragmentation
+# that otherwise strands GiBs of VRAM across the rollout/optimize allocation churn.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 cd "$repo_root"
 exec cargo run --release -p trading_bot_0 -- "$@"
