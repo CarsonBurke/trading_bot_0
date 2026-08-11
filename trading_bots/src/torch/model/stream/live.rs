@@ -304,10 +304,7 @@ impl TradingModel {
         if state.patch_pos >= self.finest_patch_size {
             state.patch_pos = 0;
             let _ = state.patch_buf.zero_();
-            // Full forward pass from ring buffer
-            let price_deltas = state
-                .delta_ring
-                .view([1, TICKERS_COUNT * PRICE_DELTAS_PER_TICKER as i64]);
+            let price_deltas = self.ordered_price_from_ring(state, 1);
             return self.forward_on_device(&price_deltas, &static_features, false);
         }
 
@@ -357,5 +354,85 @@ impl TradingModel {
             &static_features,
             false,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tch::{nn, Device, Kind, Tensor};
+
+    use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
+    use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
+
+    fn assert_close(lhs: &Tensor, rhs: &Tensor, name: &str) {
+        let max_diff = (lhs - rhs).abs().max().double_value(&[]);
+        assert!(
+            lhs.allclose(rhs, 1e-5, 1e-5, false),
+            "{name} max diff: {max_diff}"
+        );
+    }
+
+    fn assert_output_close(
+        streamed: &(Tensor, Tensor, Tensor),
+        full: &(Tensor, Tensor, Tensor),
+        step: usize,
+    ) {
+        assert_close(&streamed.0, &full.0, &format!("step {step} values"));
+        assert_close(&streamed.1, &full.1, &format!("step {step} alpha"));
+        assert_close(&streamed.2, &full.2, &format!("step {step} beta"));
+    }
+
+    fn non_uniform_stream_matches_shifted_full_history(variant: ModelVariant) {
+        tch::manual_seed(match variant {
+            ModelVariant::Base => 20260719,
+            ModelVariant::AblationSmall => 20260720,
+            ModelVariant::UniformStream => unreachable!(),
+        });
+
+        let vs = nn::VarStore::new(Device::Cpu);
+        let model = TradingModel::new_with_config(&vs.root(), TradingModelConfig { variant });
+        let history_len = PRICE_DELTAS_PER_TICKER as i64;
+        let mut chronological = Tensor::arange(history_len, (Kind::Float, Device::Cpu))
+            .view([1, history_len])
+            / history_len as f64;
+        let static_features = Tensor::linspace(
+            -0.5,
+            0.5,
+            STATIC_OBSERVATIONS as i64,
+            (Kind::Float, Device::Cpu),
+        )
+        .view([1, STATIC_OBSERVATIONS as i64]);
+        let mut state = model.init_stream_state();
+        let initial = model.step_on_device(&chronological, &static_features, &mut state);
+        let initial_full = model.forward_on_device(&chronological, &static_features, false);
+        assert_output_close(&initial, &initial_full, 0);
+
+        for (step, delta) in [0.75f32, -0.25, 1.5, -1.0].into_iter().enumerate() {
+            let next_delta = Tensor::from_slice(&[delta]).view([1, TICKERS_COUNT]);
+            chronological = Tensor::cat(
+                &[&chronological.narrow(1, 1, history_len - 1), &next_delta],
+                1,
+            );
+
+            let streamed = model.step_on_device(&next_delta, &static_features, &mut state);
+            let ordered = model.ordered_price_from_ring(&state, 1);
+            assert_close(
+                &ordered,
+                &chronological,
+                &format!("step {} chronological input", step + 1),
+            );
+            let full = model.forward_on_device(&chronological, &static_features, false);
+            assert_output_close(&streamed, &full, step + 1);
+        }
+    }
+
+    #[test]
+    fn base_stream_matches_shifted_full_history() {
+        non_uniform_stream_matches_shifted_full_history(ModelVariant::Base);
+    }
+
+    #[test]
+    fn ablation_small_stream_matches_shifted_full_history() {
+        non_uniform_stream_matches_shifted_full_history(ModelVariant::AblationSmall);
     }
 }
