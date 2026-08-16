@@ -1,18 +1,21 @@
 use crate::data::macro_econ::{get_macro_data, MacroDataError, MacroObservation, MacroSeries};
 use chrono::{Datelike, Duration, Months, NaiveDate, Weekday};
 use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use time::OffsetDateTime;
 
-/// Cache for MacroIndicators keyed by the exact bar-timestamp sequence.
-static MACRO_CACHE: OnceLock<Mutex<HashMap<u64, Arc<MacroIndicators>>>> = OnceLock::new();
-static MACRO_SOURCE: OnceLock<Result<MacroSourceData, MacroDataError>> = OnceLock::new();
+use super::cache::{BoundedCache, INDICATOR_CACHE_CAPACITY};
 
-fn macro_cache() -> &'static Mutex<HashMap<u64, Arc<MacroIndicators>>> {
-    MACRO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// Bounded cache of MacroIndicators keyed by the exact bar-timestamp sequence.
+///
+/// One entry per distinct bar grid, so effectively one per symbol: it needs the same bound
+/// as the other per-symbol indicator caches.
+static MACRO_CACHE: LazyLock<Mutex<BoundedCache<u64, Arc<MacroIndicators>>>> =
+    LazyLock::new(|| Mutex::new(BoundedCache::new(INDICATOR_CACHE_CAPACITY)));
+static MACRO_SOURCE: OnceLock<Result<MacroSourceData, MacroDataError>> = OnceLock::new();
 
 fn timestamp_sequence_key(bar_times: &[OffsetDateTime]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -105,7 +108,7 @@ impl MacroIndicators {
     pub fn get_or_compute(bar_times: &[OffsetDateTime]) -> Arc<MacroIndicators> {
         let key = timestamp_sequence_key(bar_times);
         {
-            let locked = macro_cache().lock().unwrap();
+            let locked = MACRO_CACHE.lock();
             if let Some(cached) = locked.get(&key) {
                 return cached.clone();
             }
@@ -119,7 +122,7 @@ impl MacroIndicators {
             panic!("failed to initialize required macroeconomic features: {err}")
         });
         let result = Arc::new(result);
-        macro_cache().lock().unwrap().insert(key, result.clone());
+        MACRO_CACHE.lock().insert(key, result.clone());
         result
     }
 

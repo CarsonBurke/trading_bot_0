@@ -13,5 +13,5 @@ pub fn price_rl(
 ) {
     let _time = std::time::Instant::now();
 
-    let _mapped_historical = get_historical_data(None);
+    let _mapped_historical = get_historical_data(crate::constants::tickers());
 }

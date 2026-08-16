@@ -18,7 +18,7 @@ use ibapi::{
 use tch::{Device, Kind, Tensor};
 
 use crate::constants::api;
-use crate::data::historical::refresh_historical_bars_at;
+use crate::data::historical::{exchange_time, refresh_historical_bars_at};
 use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
 use crate::torch::infer::offline::{load_model, sample_actions};
 use crate::torch::model::ModelVariant;
@@ -92,7 +92,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
             )
         })?
         .iter()
-        .map(|bar| bar.date)
+        .map(|bar| exchange_time(bar.ts()))
         .collect::<Vec<_>>();
     let state = Arc::new(Mutex::new(LiveMarketState::new(
         symbols.clone(),
@@ -114,7 +114,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 .into());
             }
             let window = &bars[bars.len() - history_len..];
-            let times = window.iter().map(|bar| bar.date).collect::<Vec<_>>();
+            let times = window.iter().map(|bar| exchange_time(bar.ts())).collect::<Vec<_>>();
             if times != reference_times {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -122,7 +122,7 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 )
                 .into());
             }
-            let closes = window.iter().map(|bar| bar.close).collect::<Vec<_>>();
+            let closes = window.iter().map(|bar| f64::from(bar.close)).collect::<Vec<_>>();
             state_guard.seed_history(ticker_idx, &closes, &times);
         }
     }

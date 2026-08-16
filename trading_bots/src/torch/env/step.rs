@@ -236,7 +236,7 @@ mod tests {
     use crate::torch::env::macro_ind::MacroIndicators;
     use crate::torch::env::momentum::MomentumIndicators;
     use crate::torch::env::reward::REWARD_SCALE;
-    use crate::torch::env::single::{Env, OHLC_BAR_FEATURES};
+    use crate::torch::env::single::Env;
     use crate::types::Account;
 
     fn test_env_with_prices(prices: Vec<f64>, start_offset: usize) -> Env {
@@ -253,7 +253,6 @@ mod tests {
             tickers: vec!["TEST".to_string()],
             prices: vec![prices.clone()],
             price_deltas: vec![price_deltas],
-            ohlc_features: vec![vec![[0.0; OHLC_BAR_FEATURES]; n]],
             account: Account::new(Env::STARTING_CASH, 1),
             episode_history: EpisodeHistory::new(1),
             meta_history: MetaHistory::default(),

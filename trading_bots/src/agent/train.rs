@@ -24,7 +24,7 @@ pub enum AgentStrategy {
 }
 
 pub async fn train_agents(strategy: AgentStrategy) {
-    let mapped_historical = Arc::new(get_historical_data(None));
+    let mapped_historical = Arc::new(get_historical_data(crate::constants::tickers()));
 
     let mut most_final_assets = 0.0;
     let mut best_of_gens = Vec::<Agent>::new();

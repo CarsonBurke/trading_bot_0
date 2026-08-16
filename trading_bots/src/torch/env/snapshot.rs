@@ -10,12 +10,13 @@ use std::time::Instant;
 
 use super::single::{load_market_data, EnvMarketData};
 use super::{Env, VecEnv};
-use crate::data::universe::cached_eligible_training_universe;
+use crate::data::universe::{cached_bar_universe, LIVE_RES_SECS};
 use crate::history::{
     episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory,
 };
 use crate::torch::constants::{ACTION_COUNT, ACTION_HISTORY_LEN, STEPS_PER_EPISODE, TICKERS_COUNT};
 use crate::types::Account;
+use shared::bars::bar_file_path;
 use shared::paths::DATA_PATH;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +30,7 @@ pub(crate) struct EnvSnapshot {
     account: Account,
     episode_history: EpisodeHistory,
     meta_history: MetaHistory,
+    explained_var: Vec<Option<f64>>,
     episode: usize,
     action_history: VecDeque<Vec<f64>>,
     episode_start_offset: usize,
@@ -57,7 +59,6 @@ pub(crate) mod tests {
     };
     use crate::torch::env::{
         earnings::EarningsIndicators, macro_ind::MacroIndicators, momentum::MomentumIndicators,
-        OHLC_BAR_FEATURES,
     };
     use std::sync::Arc;
 
@@ -80,7 +81,6 @@ pub(crate) mod tests {
                 .collect(),
             prices: vec![prices.clone(); ticker_count],
             price_deltas: vec![deltas; ticker_count],
-            ohlc_features: vec![vec![[0.0; OHLC_BAR_FEATURES]; n]; ticker_count],
             account: Account::new(Env::STARTING_CASH, ticker_count),
             episode_history: EpisodeHistory::new(ticker_count),
             meta_history: MetaHistory::default(),
@@ -121,7 +121,6 @@ pub(crate) mod tests {
         EnvMarketData {
             prices: env.prices.clone(),
             price_deltas: env.price_deltas.clone(),
-            ohlc_features: env.ohlc_features.clone(),
             momentum: env.momentum.clone(),
             earnings: env.earnings.clone(),
             macro_ind: env.macro_ind.clone(),
@@ -182,25 +181,113 @@ pub(crate) mod tests {
         let mut snapshot = env.snapshot();
         snapshot.episode_history.raw_actions.clear();
         assert!(snapshot.validate().is_err());
+
+        let mut env = synthetic_env();
+        env.meta_history.record_explained_var(f64::INFINITY);
+        assert!(env.snapshot().validate().is_err());
+
+        let mut env = synthetic_env();
+        env.meta_history.record_policy_loss(f64::NAN);
+        assert!(env.snapshot().validate().is_err());
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_undefined_explained_variance() {
+        let mut env = synthetic_env();
+        env.meta_history.record_explained_var(0.25);
+        env.meta_history.record_explained_var(f64::NAN);
+
+        let snapshot = env.snapshot();
+        assert!(snapshot.meta_history.explained_var.is_empty());
+        assert_eq!(snapshot.explained_var, vec![Some(0.25), None]);
+        snapshot.validate().unwrap();
+
+        let encoded = postcard::to_stdvec(&snapshot).unwrap();
+        let decoded: EnvSnapshot = postcard::from_bytes(&encoded).unwrap();
+        decoded.validate().unwrap();
+
+        let mut resumed = synthetic_env();
+        resumed.apply_snapshot(decoded, market_from(&env));
+        assert_eq!(resumed.meta_history.explained_var.len(), 2);
+        assert_eq!(
+            resumed.meta_history.explained_var[0].to_bits(),
+            0.25f64.to_bits()
+        );
+        assert!(resumed.meta_history.explained_var[1].is_nan());
     }
 
     #[test]
     fn universe_fingerprint_covers_inactive_ticker_inputs() {
-        let data_path = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "trading-bot-snapshot-fingerprint-{}",
             uuid::Uuid::new_v4()
         ));
+        let data_path = root.join("data");
+        let bars_path = root.join("bars");
         fs::create_dir_all(&data_path).unwrap();
+        fs::create_dir_all(&bars_path).unwrap();
         let eligible = vec!["ACTIVE".to_owned(), "FUTURE".to_owned()];
-        fs::write(data_path.join("ACTIVE.bin"), b"active").unwrap();
-        fs::write(data_path.join("FUTURE.bin"), b"future-v1").unwrap();
-        let before = fingerprint_training_inputs(&data_path, &eligible).unwrap();
+        let bar_file = |ticker: &str| bar_file_path(&bars_path, ticker, LIVE_RES_SECS);
+        fs::write(bar_file("ACTIVE"), b"active").unwrap();
+        fs::write(bar_file("FUTURE"), b"future-v1").unwrap();
+        let before = fingerprint_training_inputs(&data_path, &bars_path, &eligible).unwrap();
 
-        fs::write(data_path.join("FUTURE.bin"), b"future-v2").unwrap();
-        let after = fingerprint_training_inputs(&data_path, &eligible).unwrap();
+        fs::write(bar_file("FUTURE"), b"future-v2").unwrap();
+        let after = fingerprint_training_inputs(&data_path, &bars_path, &eligible).unwrap();
+        assert_ne!(before, after, "a changed bar corpus must change the fingerprint");
 
-        fs::remove_dir_all(&data_path).unwrap();
-        assert_ne!(before, after);
+        fs::write(data_path.join("FUTURE_earnings_fmp.bin"), b"reports").unwrap();
+        let with_earnings = fingerprint_training_inputs(&data_path, &bars_path, &eligible).unwrap();
+        assert_ne!(
+            after, with_earnings,
+            "a changed earnings cache must change the fingerprint"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The fingerprint must move when a single bar moves. This is why it hashes the corpus
+    /// records rather than any derived block: prices, price deltas and the indicator grids
+    /// are all lossy functions of the bars, so a change confined to (say) a bar's high or
+    /// volume could otherwise slip through unnoticed on resume.
+    #[test]
+    fn market_fingerprint_moves_when_one_bar_changes() {
+        let bars_path = std::env::temp_dir().join(format!(
+            "trading-bot-market-fingerprint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&bars_path).unwrap();
+        let tickers = vec!["SMOKE".to_owned()];
+        let path = bar_file_path(&bars_path, "SMOKE", LIVE_RES_SECS);
+
+        let mut bars: Vec<shared::bars::PackedBar> = (0..8)
+            .map(|index| shared::bars::PackedBar {
+                ts_ms: index * 300_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 1_000.0,
+                vwap: 100.0,
+                trades: 1,
+            })
+            .collect();
+        shared::bars::write_bar_file(&path, "SMOKE", LIVE_RES_SECS, &bars).unwrap();
+
+        let env = synthetic_env();
+        let market = market_from(&env);
+        let before = market_fingerprint(&tickers, &bars_path, &market);
+
+        // Touch only the high: no close, so no price, price-delta or indicator value moves.
+        bars[4].high = 102.0;
+        shared::bars::write_bar_file(&path, "SMOKE", LIVE_RES_SECS, &bars).unwrap();
+        let after = market_fingerprint(&tickers, &bars_path, &market);
+
+        fs::remove_dir_all(&bars_path).unwrap();
+        assert_ne!(
+            before, after,
+            "a single changed bar record must change the market fingerprint"
+        );
     }
 }
 
@@ -216,7 +303,7 @@ pub(crate) struct ValidatedVecEnvSnapshot {
     markets: Vec<EnvMarketData>,
 }
 
-const ENV_SNAPSHOT_FORMAT_VERSION: u32 = 2;
+const ENV_SNAPSHOT_FORMAT_VERSION: u32 = 3;
 static UNIVERSE_FINGERPRINT: OnceLock<String> = OnceLock::new();
 
 fn update_str(context: &mut DigestContext, value: &str) {
@@ -267,11 +354,15 @@ fn update_input_file(context: &mut DigestContext, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn fingerprint_training_inputs(data_path: &Path, eligible: &[String]) -> Result<String> {
+fn fingerprint_training_inputs(
+    data_path: &Path,
+    bars_path: &Path,
+    eligible: &[String],
+) -> Result<String> {
     let mut context = DigestContext::new(&SHA256);
     for ticker in eligible {
         update_str(&mut context, ticker);
-        update_input_file(&mut context, &data_path.join(format!("{ticker}.bin")))?;
+        update_input_file(&mut context, &bar_file_path(bars_path, ticker, LIVE_RES_SECS))?;
         for provider in ["alphavantage", "finnhub", "fmp"] {
             update_input_file(
                 &mut context,
@@ -309,30 +400,38 @@ fn universe_fingerprint() -> Result<String> {
     if let Some(fingerprint) = UNIVERSE_FINGERPRINT.get() {
         return Ok(fingerprint.clone());
     }
-    let computed =
-        fingerprint_training_inputs(Path::new(DATA_PATH), cached_eligible_training_universe())?;
+    let computed = fingerprint_training_inputs(
+        Path::new(DATA_PATH),
+        &crate::data::ingest::bars_dir(),
+        cached_bar_universe(),
+    )?;
     let _ = UNIVERSE_FINGERPRINT.set(computed.clone());
     Ok(UNIVERSE_FINGERPRINT.get().cloned().unwrap_or(computed))
 }
 
-fn market_fingerprint(tickers: &[String], market: &EnvMarketData) -> String {
+/// Identity of the market data an environment is running on.
+///
+/// Hashes the corpus bar file behind every ticker, not a derived block: the degrees of
+/// freedom, the close series and the indicator grids are all lossy functions of the bars, so
+/// the raw records are the strictly most sensitive thing available. `bars_path` is explicit
+/// so a test can point at a corpus it controls.
+fn market_fingerprint(tickers: &[String], bars_path: &Path, market: &EnvMarketData) -> String {
     let mut context = DigestContext::new(&SHA256);
     context.update(&(market.total_data_length as u64).to_le_bytes());
     for ticker in tickers {
         update_str(&mut context, ticker);
+        // Absent files hash as an absence marker rather than failing: a fingerprint that
+        // cannot be computed is worse than one that records "no file here".
+        let path = bar_file_path(bars_path, ticker, LIVE_RES_SECS);
+        if update_input_file(&mut context, &path).is_err() {
+            context.update(&[2]);
+        }
     }
     for values in &market.prices {
         update_f64s(&mut context, values);
     }
     for values in &market.price_deltas {
         update_f64s(&mut context, values);
-    }
-    for values in &market.ohlc_features {
-        context.update(&(values.len() as u64).to_le_bytes());
-        update_f32s(
-            &mut context,
-            values.iter().flat_map(|features| features.iter().copied()),
-        );
     }
     for indicators in &market.momentum {
         for values in [
@@ -397,7 +496,6 @@ fn meta_history_is_finite(history: &MetaHistory) -> bool {
         &history.outperformance,
         &history.policy_loss,
         &history.value_loss,
-        &history.explained_var,
         &history.actor_grad_norm,
         &history.critic_grad_norm,
         &history.total_commissions,
@@ -534,6 +632,12 @@ impl EnvSnapshot {
                     .action_history
                     .iter()
                     .all(|values| values.len() == ACTION_COUNT as usize && finite(values))
+                && self.meta_history.explained_var.is_empty()
+                && self
+                    .explained_var
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite())
                 && meta_history_is_finite(&self.meta_history),
             "snapshot contains non-finite causal state"
         );
@@ -655,22 +759,31 @@ impl Env {
         let market = EnvMarketData {
             prices: self.prices.clone(),
             price_deltas: self.price_deltas.clone(),
-            ohlc_features: self.ohlc_features.clone(),
             momentum: self.momentum.clone(),
             earnings: self.earnings.clone(),
             macro_ind: self.macro_ind.clone(),
             total_data_length: self.total_data_length,
         };
+        let mut meta_history = self.meta_history.clone();
+        let explained_var = std::mem::take(&mut meta_history.explained_var)
+            .into_iter()
+            .map(|value| if value.is_nan() { None } else { Some(value) })
+            .collect();
         EnvSnapshot {
             env_id: self.env_id,
             tickers: self.tickers.clone(),
-            market_sha256: market_fingerprint(&self.tickers, &market),
+            market_sha256: market_fingerprint(
+                &self.tickers,
+                &crate::data::ingest::bars_dir(),
+                &market,
+            ),
             total_data_length: self.total_data_length,
             step: self.step,
             max_step: self.max_step,
             account: self.account.clone(),
             episode_history: self.episode_history.clone(),
-            meta_history: self.meta_history.clone(),
+            meta_history,
+            explained_var,
             episode: self.episode,
             action_history: self.action_history.clone(),
             episode_start_offset: self.episode_start_offset,
@@ -696,7 +809,6 @@ impl Env {
         self.tickers = snapshot.tickers;
         self.prices = market.prices;
         self.price_deltas = market.price_deltas;
-        self.ohlc_features = market.ohlc_features;
         self.momentum = market.momentum;
         self.earnings = market.earnings;
         self.macro_ind = market.macro_ind;
@@ -704,6 +816,11 @@ impl Env {
         self.account = snapshot.account;
         self.episode_history = snapshot.episode_history;
         self.meta_history = snapshot.meta_history;
+        self.meta_history.explained_var = snapshot
+            .explained_var
+            .into_iter()
+            .map(|value| value.unwrap_or(f64::NAN))
+            .collect();
         self.episode = snapshot.episode;
         self.action_history = snapshot.action_history;
         self.episode_start_offset = snapshot.episode_start_offset;
@@ -779,7 +896,8 @@ impl VecEnvSnapshot {
                 env.tickers
             );
             ensure!(
-                market_fingerprint(&env.tickers, &market) == env.market_sha256,
+                market_fingerprint(&env.tickers, &crate::data::ingest::bars_dir(), &market)
+                    == env.market_sha256,
                 "market data changed for {:?}",
                 env.tickers
             );
@@ -828,14 +946,14 @@ impl VecEnv {
             let market = EnvMarketData {
                 prices: current.prices.clone(),
                 price_deltas: current.price_deltas.clone(),
-                ohlc_features: current.ohlc_features.clone(),
                 momentum: current.momentum.clone(),
                 earnings: current.earnings.clone(),
                 macro_ind: current.macro_ind.clone(),
                 total_data_length: current.total_data_length,
             };
             ensure!(
-                market_fingerprint(&saved.tickers, &market) == saved.market_sha256,
+                market_fingerprint(&saved.tickers, &crate::data::ingest::bars_dir(), &market)
+                    == saved.market_sha256,
                 "test market mismatch"
             );
             markets.push(market);

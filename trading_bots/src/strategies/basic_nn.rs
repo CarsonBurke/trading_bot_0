@@ -11,7 +11,7 @@ use crate::{
         agent::STARTING_CASH,
         files::TRAINING_PATH,
         neural_net::{INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS},
-        TICKERS,
+        tickers,
     },
     types::{Account, Data, MakeCharts, MappedHistorical, Position},
     utils::{convert_historical, create_folder_if_not_exists},
@@ -296,7 +296,7 @@ pub fn basic_nn(
 
                 for ticker_index_bor in tickers_slice {
                     let ticker_index = *ticker_index_bor;
-                    let ticker = TICKERS[ticker_index].to_string();
+                    let ticker = tickers()[ticker_index].clone();
 
                     let ticker_dir =
                         format!("{TRAINING_PATH}/gens/{}/{ticker}", charts_config.generation);

@@ -1,4 +1,11 @@
-pub const TICKERS: &[&str] = crate::data::universe::TARGET_UNIVERSE_TICKERS;
+/// The tradable universe, discovered from the packed-bar corpus rather than hand-curated.
+///
+/// See [`crate::data::universe::cached_bar_universe`]: one universe, derived from the same
+/// files the world model reads.
+pub fn tickers() -> &'static [String] {
+    crate::data::universe::cached_bar_universe()
+}
+
 pub const CHART_IMAGE_FORMAT: &str = "png";
 
 pub mod rsi {

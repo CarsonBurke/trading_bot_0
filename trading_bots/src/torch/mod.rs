@@ -1,6 +1,8 @@
 pub mod action_space;
+pub mod bar_dist;
 pub mod constants;
 pub mod cuda;
+pub mod dataset;
 pub mod env;
 pub mod fa4;
 pub(crate) mod hashing;

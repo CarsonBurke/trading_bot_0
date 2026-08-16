@@ -3587,7 +3587,9 @@ name = "shared"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "chrono",
+ "memmap2",
  "plotters",
  "postcard",
  "ratatui",
@@ -4172,6 +4174,7 @@ dependencies = [
  "ndarray",
  "nvml-wrapper",
  "ordered-float",
+ "parking_lot",
  "plotters",
  "postcard",
  "pyo3",

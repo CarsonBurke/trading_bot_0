@@ -3,7 +3,7 @@ use std::fs;
 use ibapi::market_data::historical::Bar;
 use time::{Duration, OffsetDateTime};
 use trading_bot_0::{
-    data::universe::TARGET_UNIVERSE_TICKERS,
+    constants::tickers,
     genetic::{
         run_family_with_markets, DatasetBundle, GeneticFamily, MarketDataset, PriceReboundFamily,
         RsiReboundFamily, SessionPaths, TickerSet, TrainingConfig, TrendBreakoutFamily,
@@ -252,14 +252,20 @@ fn price_and_rsi_families_run_through_same_engine() {
 }
 
 #[test]
-fn default_ticker_sets_are_disjoint_and_non_empty() {
+fn default_ticker_sets_partition_the_genetic_universe() {
+    let universe = TickerSet::All.tickers();
+    assert!(
+        !universe.is_empty(),
+        "the packed-bar corpus under long_data/bars is empty; nothing can be traded"
+    );
+    assert!(
+        universe.iter().all(|symbol| tickers().contains(symbol)),
+        "the genetic universe must be a subset of the corpus universe"
+    );
+
     let train = TickerSet::Train.tickers();
     let validation = TickerSet::Validation.tickers();
     let test = TickerSet::Test.tickers();
-
-    assert!(!train.is_empty());
-    assert!(!validation.is_empty());
-    assert!(!test.is_empty());
 
     for ticker in &train {
         assert!(!validation.contains(ticker));
@@ -269,11 +275,14 @@ fn default_ticker_sets_are_disjoint_and_non_empty() {
         assert!(!test.contains(ticker));
     }
 
-    assert_eq!(
-        train.len() + validation.len() + test.len(),
-        TARGET_UNIVERSE_TICKERS.len()
-    );
-    assert_eq!(train.len(), 68);
-    assert_eq!(validation.len(), 16);
-    assert_eq!(test.len(), 16);
+    // Depth-interleaved 4/1/1, so every split spans the whole history-depth range.
+    let share = |remainders: &[usize]| {
+        (0..universe.len())
+            .filter(|index| remainders.contains(&(index % 6)))
+            .count()
+    };
+    assert_eq!(train.len(), share(&[0, 1, 2, 3]));
+    assert_eq!(validation.len(), share(&[4]));
+    assert_eq!(test.len(), share(&[5]));
+    assert_eq!(train.len() + validation.len() + test.len(), universe.len());
 }

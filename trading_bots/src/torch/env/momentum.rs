@@ -1,17 +1,16 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, LazyLock};
+
+use super::cache::{BoundedCache, INDICATOR_CACHE_CAPACITY};
 
 struct MomentumCacheEntry {
     price_bits: Vec<u64>,
     indicators: Arc<MomentumIndicators>,
 }
 
-/// Global cache for momentum indicators (ticker -> latest aligned grid)
-static MOMENTUM_CACHE: OnceLock<Mutex<HashMap<String, MomentumCacheEntry>>> = OnceLock::new();
-
-fn get_cache() -> &'static Mutex<HashMap<String, MomentumCacheEntry>> {
-    MOMENTUM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// Bounded cache of momentum indicators (ticker -> latest aligned grid).
+static MOMENTUM_CACHE: LazyLock<Mutex<BoundedCache<String, MomentumCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(BoundedCache::new(INDICATOR_CACHE_CAPACITY)));
 
 fn same_price_grid(price_bits: &[u64], prices: &[f64]) -> bool {
     price_bits.len() == prices.len()
@@ -40,9 +39,8 @@ pub struct MomentumIndicators {
 impl MomentumIndicators {
     /// Get cached momentum indicators or compute if not present
     pub fn get_or_compute(ticker: &str, prices: &[f64]) -> Arc<MomentumIndicators> {
-        let cache = get_cache();
         {
-            let locked = cache.lock().unwrap();
+            let locked = MOMENTUM_CACHE.lock();
             if let Some(cached) = locked.get(ticker) {
                 if same_price_grid(&cached.price_bits, prices) {
                     return cached.indicators.clone();
@@ -50,7 +48,7 @@ impl MomentumIndicators {
             }
         }
         let computed = Arc::new(Self::compute(prices));
-        cache.lock().unwrap().insert(
+        MOMENTUM_CACHE.lock().insert(
             ticker.to_string(),
             MomentumCacheEntry {
                 price_bits: prices.iter().map(|price| price.to_bits()).collect(),

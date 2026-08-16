@@ -11,15 +11,13 @@ use super::earnings::EarningsIndicators;
 use super::macro_ind::MacroIndicators;
 use super::momentum::MomentumIndicators;
 use crate::{
-    data::historical::get_historical_data,
-    data::universe::cached_eligible_training_universe,
+    data::historical::{exchange_time, get_packed_historical_data},
+    data::universe::cached_bar_universe,
     history::{episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory},
     torch::constants::TICKERS_COUNT,
     types::Account,
-    utils::get_price_deltas,
+    utils::log_returns,
 };
-
-pub const OHLC_BAR_FEATURES: usize = 16;
 
 pub struct Env {
     pub env_id: usize,
@@ -28,7 +26,6 @@ pub struct Env {
     pub tickers: Vec<String>,
     pub prices: Vec<Vec<f64>>,
     pub price_deltas: Vec<Vec<f64>>,
-    pub ohlc_features: Vec<Vec<[f32; OHLC_BAR_FEATURES]>>,
     pub account: Account,
     pub episode_history: EpisodeHistory,
     pub meta_history: MetaHistory,
@@ -65,7 +62,6 @@ pub(super) struct EnvMarketSnapshot {
     pub tickers: Vec<String>,
     pub(super) prices: Vec<Vec<f64>>,
     pub(super) price_deltas: Vec<Vec<f64>>,
-    pub(super) ohlc_features: Vec<Vec<[f32; OHLC_BAR_FEATURES]>>,
     pub(super) momentum: Vec<Arc<MomentumIndicators>>,
     pub(super) earnings: Vec<Arc<EarningsIndicators>>,
     pub(super) macro_ind: Arc<MacroIndicators>,
@@ -76,7 +72,6 @@ pub(super) struct EnvMarketSnapshot {
 pub(super) struct EnvMarketData {
     pub(super) prices: Vec<Vec<f64>>,
     pub(super) price_deltas: Vec<Vec<f64>>,
-    pub(super) ohlc_features: Vec<Vec<[f32; OHLC_BAR_FEATURES]>>,
     pub(super) momentum: Vec<Arc<MomentumIndicators>>,
     pub(super) earnings: Vec<Arc<EarningsIndicators>>,
     pub(super) macro_ind: Arc<MacroIndicators>,
@@ -90,10 +85,10 @@ enum MacroLoadMode {
 }
 
 pub(crate) fn sample_training_tickers(rng: &mut impl Rng) -> Vec<String> {
-    let universe = cached_eligible_training_universe();
+    let universe = cached_bar_universe();
     assert!(
         universe.len() >= TICKERS_COUNT as usize,
-        "need at least {} cached eligible tickers, found {}",
+        "need at least {} eligible corpus tickers, found {}",
         TICKERS_COUNT,
         universe.len()
     );
@@ -123,18 +118,13 @@ fn load_market_data_with_macro(
     if log_progress {
         eprint!("  hist..");
     }
-    let ticker_refs = tickers
-        .iter()
-        .map(|ticker| ticker.as_str())
-        .collect::<Vec<&str>>();
-    let mapped_bars = get_historical_data(Some(&ticker_refs));
+    let mapped_bars = get_packed_historical_data(tickers);
     let mut prices: Vec<Vec<f64>> = Vec::with_capacity(tickers.len());
     let mut price_deltas = Vec::with_capacity(tickers.len());
-    let mut ohlc_features = Vec::with_capacity(tickers.len());
     for bars in &mapped_bars {
-        ohlc_features.push(build_ohlc_features(bars));
-        prices.push(bars.iter().map(|bar| bar.close).collect::<Vec<_>>());
-        price_deltas.push(get_price_deltas(bars));
+        let closes: Vec<f64> = bars.iter().map(|bar| f64::from(bar.close)).collect();
+        price_deltas.push(log_returns(closes.iter().copied()));
+        prices.push(closes);
     }
 
     if log_progress {
@@ -150,24 +140,18 @@ fn load_market_data_with_macro(
 
     let bar_times: Vec<Vec<time::OffsetDateTime>> = mapped_bars
         .iter()
-        .map(|bars| bars.iter().map(|bar| bar.date).collect())
+        .map(|bars| bars.iter().map(|bar| exchange_time(bar.ts())).collect())
         .collect();
 
     if log_progress {
         eprint!("dates..");
     }
-    let bar_dates: Vec<Vec<String>> = mapped_bars
+    let bar_dates: Vec<Vec<String>> = bar_times
         .iter()
-        .map(|bars| {
-            bars.iter()
-                .map(|b| {
-                    format!(
-                        "{:04}-{:02}-{:02}",
-                        b.date.year(),
-                        b.date.month() as u8,
-                        b.date.day()
-                    )
-                })
+        .map(|times| {
+            times
+                .iter()
+                .map(|t| format!("{:04}-{:02}-{:02}", t.year(), t.month() as u8, t.day()))
                 .collect()
         })
         .collect();
@@ -206,56 +190,10 @@ fn load_market_data_with_macro(
     EnvMarketData {
         prices,
         price_deltas,
-        ohlc_features,
         momentum,
         earnings,
         macro_ind,
         total_data_length,
-    }
-}
-
-pub(crate) fn build_ohlc_features(
-    bars: &[ibapi::market_data::historical::Bar],
-) -> Vec<[f32; OHLC_BAR_FEATURES]> {
-    bars.iter()
-        .enumerate()
-        .map(|(i, bar)| {
-            let open = bar.open;
-            let high = bar.high.max(open).max(bar.close);
-            let low = bar.low.min(open).min(bar.close);
-            let close = bar.close;
-            let prev = if i == 0 { bar } else { &bars[i - 1] };
-            let prev_open = prev.open;
-            let prev_close = prev.close;
-            let prev_high = prev.high.max(prev_open).max(prev_close);
-            let prev_low = prev.low.min(prev_open).min(prev_close);
-            [
-                rel_delta(open, prev_open),
-                rel_delta(high, prev_high),
-                rel_delta(low, prev_low),
-                rel_delta(close, prev_close),
-                rel_delta(open, high),
-                rel_delta(open, low),
-                rel_delta(open, close),
-                rel_delta(high, open),
-                rel_delta(high, low),
-                rel_delta(high, close),
-                rel_delta(low, open),
-                rel_delta(low, high),
-                rel_delta(low, close),
-                rel_delta(close, open),
-                rel_delta(close, high),
-                rel_delta(close, low),
-            ]
-        })
-        .collect()
-}
-
-fn rel_delta(a: f64, b: f64) -> f32 {
-    if a.is_finite() && b.is_finite() && b > 0.0 {
-        (a / b - 1.0) as f32
-    } else {
-        0.0
     }
 }
 
@@ -278,56 +216,43 @@ pub struct SingleStepStep {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ohlc_features, OHLC_BAR_FEATURES};
-    use ibapi::market_data::historical::Bar;
-    use time::{Duration, OffsetDateTime};
+    use super::Env;
+    use crate::torch::constants::{ACTION_COUNT, PRICE_DELTAS_PER_TICKER, STEPS_PER_EPISODE};
+    use shared::constants::TICKERS_COUNT as TICKERS_COUNT_USIZE;
 
-    fn bar(open: f64, high: f64, low: f64, close: f64) -> Bar {
-        Bar {
-            date: OffsetDateTime::UNIX_EPOCH + Duration::minutes(5),
-            open,
-            high,
-            low,
-            close,
-            volume: 1_000.0,
-            wap: close,
-            count: 1,
-        }
-    }
-
+    /// End-to-end proof that PPO runs off the packed corpus: a real symbol is loaded from
+    /// `long_data/bars/<SYM>.300.bars` and stepped. Macro indicators are stubbed because
+    /// they need FRED over the network; every other channel is the production path.
     #[test]
-    fn ohlc_features_have_sixteen_dimensions_and_expected_layout() {
-        assert_eq!(OHLC_BAR_FEATURES, 16);
-        let prev = bar(100.0, 105.0, 98.0, 102.0);
-        let cur = bar(102.0, 108.0, 101.0, 106.0);
-        let feats = build_ohlc_features(&[prev, cur]);
-        assert_eq!(feats.len(), 2);
-        let row = feats[1];
-        assert_eq!(row.len(), 16);
+    fn ppo_env_loads_the_packed_corpus_and_steps() {
+        let mut env = Env::new_without_macro_for_test(true, 0x5A11_0000_D0F0);
+        eprintln!(
+            "smoke: {:?} with {} bars from the packed corpus",
+            env.tickers, env.total_data_length
+        );
+        assert_eq!(env.prices.len(), env.tickers.len());
+        // The floor `full_episode_start_offsets` actually enforces. `MIN_TRADING_BARS` is a
+        // universe filter measured on the raw file, before `usable()` drops any bar, so it
+        // is not the invariant to assert here.
+        assert!(
+            env.total_data_length >= PRICE_DELTAS_PER_TICKER + STEPS_PER_EPISODE,
+            "a tradable symbol must serve a full observation window plus an episode"
+        );
 
-        let rd = |a: f64, b: f64| (a / b - 1.0) as f32;
-        let (o, h, l, c) = (102.0f64, 108.0f64, 101.0f64, 106.0f64);
-        let (po, ph, pl, pc) = (100.0f64, 105.0f64, 98.0f64, 102.0f64);
+        let (price_deltas, static_obs) = env.reset_single();
+        assert_eq!(
+            price_deltas.len(),
+            TICKERS_COUNT_USIZE * PRICE_DELTAS_PER_TICKER
+        );
+        assert!(price_deltas.iter().all(|value| value.is_finite()));
+        assert!(static_obs.iter().all(|value| value.is_finite()));
 
-        assert!((row[0] - rd(o, po)).abs() < 1e-6);
-        assert!((row[1] - rd(h, ph)).abs() < 1e-6);
-        assert!((row[2] - rd(l, pl)).abs() < 1e-6);
-        assert!((row[3] - rd(c, pc)).abs() < 1e-6);
-
-        assert!((row[4] - rd(o, h)).abs() < 1e-6);
-        assert!((row[6] - rd(o, c)).abs() < 1e-6);
-        assert!((row[8] - rd(h, l)).abs() < 1e-6);
-        assert!((row[12] - rd(l, c)).abs() < 1e-6);
-        assert!((row[13] - rd(c, o)).abs() < 1e-6);
-        assert!((row[15] - rd(c, l)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn first_bar_inter_features_are_zero() {
-        let feats = build_ohlc_features(&[bar(100.0, 110.0, 95.0, 104.0)]);
-        let row = feats[0];
-        for i in 0..4 {
-            assert_eq!(row[i], 0.0);
+        let hold = vec![0.0; ACTION_COUNT as usize];
+        for step in 0..8 {
+            let transition = env.step_step_single(&hold);
+            assert_eq!(transition.is_done, 0.0, "step {step} ended the episode early");
+            assert!(transition.reward.is_finite(), "step {step} reward");
+            assert!(transition.static_obs.iter().all(|value| value.is_finite()));
         }
     }
 }

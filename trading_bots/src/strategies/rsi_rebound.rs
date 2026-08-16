@@ -5,7 +5,7 @@ use hashbrown::HashMap;
 use crate::{
     agent::{self, Agent, Weight},
     charts::{assets_chart, buy_sell_chart, simple_chart},
-    constants::{files::TRAINING_PATH, rsi, TICKERS},
+    constants::{files::TRAINING_PATH, rsi, tickers},
     types::{Account, MakeCharts, MappedHistorical, Position},
     utils::{
         convert_historical, create_folder_if_not_exists, ema, get_rsi_values, is_min_transaction,
@@ -290,7 +290,7 @@ pub fn basic(
         let _ = assets_chart(&base_dir, &total_assets, &cash_graph, None, None);
 
         for (ticker, bars) in mapped_data.iter().enumerate() {
-            let ticker_name = TICKERS[ticker].to_string();
+            let ticker_name = tickers()[ticker].clone();
 
             let ticker_dir = format!(
                 "{TRAINING_PATH}/gens/{}/{ticker_name}",
@@ -591,7 +591,7 @@ pub fn get_buy_price_quantity(
 
     let percent = agent.weights.map[Weight::BuyPercent] * distance_weight;
     let available =
-        (cash).min(((assets / TICKERS.len() as f64) - position.value_with_price(price)) * percent);
+        (cash).min(((assets / tickers().len() as f64) - position.value_with_price(price)) * percent);
     // println!("available {available}");
     // panic!();
 

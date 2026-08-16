@@ -2,7 +2,7 @@ use hashbrown::HashMap;
 
 use crate::{
     charts::{assets_chart, buy_sell_chart, reward_chart},
-    constants::{files::TRAINING_PATH, TICKERS},
+    constants::{files::TRAINING_PATH, tickers},
     types::MappedHistorical,
     utils::create_folder_if_not_exists,
 };
@@ -41,7 +41,7 @@ impl EpisodeHistory {
         for (ticker_index, bars) in mapped_historical.iter().enumerate() {
             let prices = bars.iter().map(|bar| bar.close).collect::<Vec<f64>>();
 
-            let ticker = TICKERS[ticker_index].to_string();
+            let ticker = tickers()[ticker_index].clone();
             let ticker_dir = format!("{gp}/{}/{ticker}", generation);
             create_folder_if_not_exists(&ticker_dir);
 

@@ -11,9 +11,10 @@ use shared::{paths::RUNS_PATH, run_dir::RunDir};
 
 use crate::data::{
     historical::{
-        align_bars_to_common_timestamps, get_historical_bars_result, set_ibkr_download_enabled,
+        align_packed_to_common_timestamps, get_packed_historical_bars_result,
+        set_ibkr_download_enabled, to_ibkr_bars,
     },
-    universe::minimum_history_bars,
+    universe::MIN_TRADING_BARS,
 };
 
 use super::{
@@ -389,9 +390,9 @@ fn load_datasets(
 
 fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
     let split_label = set.label();
-    let min_bars = minimum_history_bars();
+    let min_bars = MIN_TRADING_BARS;
     let source_tickers = if cache_only {
-        set.cached_eligible_tickers(min_bars)
+        set.corpus_eligible_tickers(min_bars)
     } else {
         set.tickers()
     };
@@ -399,7 +400,7 @@ fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
     let mut bars = Vec::new();
 
     for ticker in source_tickers {
-        match get_historical_bars_result(&ticker).with_context(|| {
+        match get_packed_historical_bars_result(&ticker).with_context(|| {
             format!(
                 "failed loading {} historical data for {}",
                 split_label, ticker
@@ -430,7 +431,7 @@ fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
     if bars.is_empty() {
         bail!("no historical bars found for {}", split_label);
     }
-    let bars = align_bars_to_common_timestamps(bars)
+    let bars = align_packed_to_common_timestamps(bars)
         .with_context(|| format!("failed to align historical bars for {}", split_label))?;
     if bars[0].len() < min_bars {
         bail!(
@@ -440,6 +441,7 @@ fn load_market(set: TickerSet, cache_only: bool) -> Result<MarketDataset> {
             min_bars
         );
     }
+    let bars = bars.into_iter().map(|bars| to_ibkr_bars(&bars)).collect();
     Ok(MarketDataset::new(split_label.to_string(), tickers, bars))
 }
 

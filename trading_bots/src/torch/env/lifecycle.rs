@@ -109,9 +109,12 @@ impl Env {
         )
     }
 
+    /// Deterministic environment over the real packed corpus, with macro indicators stubbed
+    /// because they need FRED over the network.
     #[cfg(test)]
-    pub(crate) fn new_without_macro_for_test(random_start: bool) -> Self {
-        let tickers = sample_training_tickers(&mut rand::rng());
+    pub(crate) fn new_without_macro_for_test(random_start: bool, seed: u64) -> Self {
+        let mut rng = ChaCha12Rng::seed_from_u64(derive_rng_seed(seed, 0));
+        let tickers = sample_training_tickers(&mut rng);
         let market_data = load_market_data_without_macro(&tickers, false);
         Self::new_from_market_data(
             tickers,
@@ -120,7 +123,7 @@ impl Env {
             None,
             false,
             market_data,
-            rand::rng().random(),
+            seed,
         )
     }
 
@@ -145,7 +148,6 @@ impl Env {
             max_step: market_data.total_data_length - 2,
             prices: market_data.prices,
             price_deltas: market_data.price_deltas,
-            ohlc_features: market_data.ohlc_features,
             account: Account::default(),
             episode_history: EpisodeHistory::new(num_tickers),
             meta_history: MetaHistory::default(),
@@ -285,7 +287,6 @@ impl Env {
         self.tickers = tickers;
         self.prices = market_data.prices;
         self.price_deltas = market_data.price_deltas;
-        self.ohlc_features = market_data.ohlc_features;
         self.momentum = market_data.momentum;
         self.earnings = market_data.earnings;
         self.macro_ind = market_data.macro_ind;
@@ -308,7 +309,6 @@ impl Env {
             tickers: self.tickers.clone(),
             prices: self.prices.clone(),
             price_deltas: self.price_deltas.clone(),
-            ohlc_features: self.ohlc_features.clone(),
             momentum: self.momentum.clone(),
             earnings: self.earnings.clone(),
             macro_ind: self.macro_ind.clone(),
@@ -323,7 +323,6 @@ impl Env {
         self.tickers.clone_from(&snapshot.tickers);
         self.prices.clone_from(&snapshot.prices);
         self.price_deltas.clone_from(&snapshot.price_deltas);
-        self.ohlc_features.clone_from(&snapshot.ohlc_features);
         self.momentum.clone_from(&snapshot.momentum);
         self.earnings.clone_from(&snapshot.earnings);
         self.macro_ind = snapshot.macro_ind.clone();

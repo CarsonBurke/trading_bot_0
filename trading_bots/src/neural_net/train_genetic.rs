@@ -12,7 +12,7 @@ use crate::{
         agent::{KEEP_AGENTS_PER_GENERATION, TARGET_AGENT_COUNT, TARGET_GENERATIONS},
         files::TRAINING_PATH,
         neural_net::{INDEX_STEP, MAX_STEPS, SAMPLE_INDEXES, TICKER_SETS},
-        TICKERS,
+        tickers,
     },
     data::historical::get_historical_data,
     neural_net::{create::create_mapped_indicators, Replay},
@@ -26,7 +26,7 @@ use super::create::{create_networks, Indicator, Indicators};
 pub async fn train_networks_genetic() {
     let time = std::time::Instant::now();
 
-    let mapped_historical = Arc::new(get_historical_data(None));
+    let mapped_historical = Arc::new(get_historical_data(tickers()));
     let mapped_indicators = create_mapped_indicators(&mapped_historical);
 
     let mapped_diffs = Arc::new(get_mapped_price_deltas(&mapped_historical));
@@ -240,7 +240,7 @@ fn record_finances(neural_net_ids: &[(u32, f64)], gen: u32) {
 
 pub fn chart_indicators(mapped_indicators: &Vec<Indicators>) {
     for (ticker_index, indicators) in mapped_indicators.iter().enumerate() {
-        let ticker = TICKERS[ticker_index];
+        let ticker = &tickers()[ticker_index];
         let dir = format!("{TRAINING_PATH}/indicators/{ticker}");
         create_folder_if_not_exists(&dir);
 
@@ -262,7 +262,7 @@ pub fn generate_tickers_set(rng: &mut impl rand::Rng) -> Vec<Vec<usize>> {
     let mut tickers_set = Vec::new();
 
     for _ in 0..TICKER_SETS {
-        tickers_set.push(sample_ticker_indexes(rng, TICKERS.len(), SAMPLE_INDEXES));
+        tickers_set.push(sample_ticker_indexes(rng, tickers().len(), SAMPLE_INDEXES));
     }
 
     tickers_set

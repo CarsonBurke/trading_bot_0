@@ -1,7 +1,9 @@
 use crate::data::EarningsReport;
 use chrono::{Duration, NaiveDate};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, LazyLock};
+
+use super::cache::{BoundedCache, INDICATOR_CACHE_CAPACITY};
 
 const FUNDAMENTAL_AVAILABILITY_LAG_DAYS: i64 = 90;
 
@@ -60,12 +62,9 @@ impl EarningsReportCacheInput {
     }
 }
 
-/// Global cache for earnings indicators (ticker -> latest aligned grid)
-static EARNINGS_CACHE: OnceLock<Mutex<HashMap<String, EarningsCacheEntry>>> = OnceLock::new();
-
-fn get_cache() -> &'static Mutex<HashMap<String, EarningsCacheEntry>> {
-    EARNINGS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// Bounded cache of earnings indicators (ticker -> latest aligned grid).
+static EARNINGS_CACHE: LazyLock<Mutex<BoundedCache<String, EarningsCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(BoundedCache::new(INDICATOR_CACHE_CAPACITY)));
 
 fn same_inputs(
     entry: &EarningsCacheEntry,
@@ -106,9 +105,8 @@ impl EarningsIndicators {
         bar_dates: &[String],
         prices: &[f64],
     ) -> Option<Arc<EarningsIndicators>> {
-        let cache = get_cache();
-        let locked = cache.lock().unwrap();
-        locked
+        EARNINGS_CACHE
+            .lock()
             .get(ticker)
             .filter(|cached| same_inputs(cached, reports, bar_dates, prices))
             .map(|cached| cached.indicators.clone())
@@ -124,13 +122,12 @@ impl EarningsIndicators {
         if let Some(cached) = Self::get_cached(ticker, reports, bar_dates, prices) {
             return cached;
         }
-        let cache = get_cache();
         let computed = if reports.is_empty() {
             Arc::new(Self::empty(prices.len()))
         } else {
             Arc::new(Self::compute(reports, bar_dates, prices))
         };
-        cache.lock().unwrap().insert(
+        EARNINGS_CACHE.lock().insert(
             ticker.to_string(),
             EarningsCacheEntry {
                 reports: reports.iter().map(EarningsReportCacheInput::from).collect(),

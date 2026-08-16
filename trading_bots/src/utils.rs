@@ -189,22 +189,25 @@ pub fn get_mapped_price_deltas(data: &MappedHistorical) -> Vec<Vec<f64>> {
 }
 
 pub fn get_price_deltas(data: &[Bar]) -> Vec<f64> {
-    let mut diff = Vec::with_capacity(data.len());
+    log_returns(data.iter().map(|bar| bar.close))
+}
 
-    for (index, value) in data.iter().enumerate() {
-        let (previous_index, overflowed) = index.overflowing_sub(1);
-
-        if overflowed {
-            // First element: ln(1) = 0
-            diff.push(0.0);
-        } else {
-            let previous = data[previous_index].close;
-            // Log return: ln(price / previous)
-            diff.push((value.close / previous).ln());
-        }
+/// Log returns of a close series. The first element has no predecessor, so it is zero.
+///
+/// The single definition of the PPO price-delta channel, shared by the packed-bar loader
+/// and the IBKR-shaped backtests.
+pub fn log_returns(closes: impl IntoIterator<Item = f64>) -> Vec<f64> {
+    let closes = closes.into_iter();
+    let mut deltas = Vec::with_capacity(closes.size_hint().0);
+    let mut previous: Option<f64> = None;
+    for close in closes {
+        deltas.push(match previous {
+            Some(previous) => (close / previous).ln(),
+            None => 0.0,
+        });
+        previous = Some(close);
     }
-
-    diff
+    deltas
 }
 
 pub fn get_mapped_price_normals(data: &MappedHistorical) -> Vec<Vec<f64>> {
