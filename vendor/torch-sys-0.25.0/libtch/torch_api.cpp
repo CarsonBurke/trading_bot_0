@@ -249,6 +249,19 @@ bool at_autocast_set_enabled(bool b) {
   return -1;
 }
 
+// Autocast's reduced-precision dtype for CUDA. ATen defaults this to fp16, which is
+// unusable without a gradient scaler; every trainer here wants bf16.
+// Naming the dtype in C++ rather than passing a ScalarType code across the FFI keeps
+// the enum value out of Rust, where `Kind::c_int` is not public.
+void at_autocast_set_bfloat16() {
+  PROTECT(at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);)
+}
+
+bool at_autocast_is_bfloat16() {
+  PROTECT(return at::autocast::get_autocast_dtype(at::kCUDA) == at::kBFloat16;)
+  return false;
+}
+
 void at_sdp_set_use_flash(bool b) {
   PROTECT(at::globalContext().setSDPUseFlash(b);)
 }

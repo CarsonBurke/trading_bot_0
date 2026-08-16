@@ -56,6 +56,8 @@ int at_autocast_decrement_nesting();
 int at_autocast_increment_nesting();
 bool at_autocast_is_enabled();
 bool at_autocast_set_enabled(bool b);
+void at_autocast_set_bfloat16();
+bool at_autocast_is_bfloat16();
 void at_sdp_set_use_flash(bool b);
 bool at_sdp_use_flash();
 void at_sdp_set_use_mem_efficient(bool b);

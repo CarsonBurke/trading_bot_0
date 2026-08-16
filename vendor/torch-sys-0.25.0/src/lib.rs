@@ -82,6 +82,8 @@ extern "C" {
     pub fn at_autocast_increment_nesting() -> c_int;
     pub fn at_autocast_is_enabled() -> c_int;
     pub fn at_autocast_set_enabled(b: c_int) -> c_int;
+    pub fn at_autocast_set_bfloat16();
+    pub fn at_autocast_is_bfloat16() -> c_int;
     pub fn at_sdp_set_use_flash(b: c_int);
     pub fn at_sdp_use_flash() -> c_int;
     pub fn at_sdp_set_use_mem_efficient(b: c_int);
