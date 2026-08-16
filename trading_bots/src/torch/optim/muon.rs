@@ -19,6 +19,59 @@ pub(crate) fn newton_schulz_polynomial_bits() -> [u64; 3] {
     [NS_A.to_bits(), NS_B.to_bits(), NS_C.to_bits()]
 }
 
+/// Coefficient triple `(a, b, c)` of one quintic orthogonalization step
+/// `x <- a*x + (b*A + c*A*A)*x`, with `A = x*xᵀ` on the wide orientation.
+type QuinticCoeffs = (f64, f64, f64);
+
+/// Polar Express quintic schedule (`num_iters=5, safety_factor=2e-2, cushion=2`),
+/// from <https://arxiv.org/pdf/2505.16932> as shipped in modded-nanogpt
+/// `train_gpt.py:162-168`. Unlike Newton-Schulz this is deliberately *not* a
+/// convergent fixed-point iteration: every step has its own triple and the
+/// composition is tuned for exactly five steps. Never "correct" these
+/// coefficients, never terminate early, and never iterate past the schedule.
+const POLAR_EXPRESS_COEFFS: [QuinticCoeffs; 5] = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+];
+
+/// Polar Express spectral-norm safety factor and floor (`train_gpt.py:198`):
+/// `x <- x / (‖x‖_F * (1 + safety) + floor)`.
+const POLAR_EXPRESS_SAFETY: f64 = 2e-2;
+const POLAR_EXPRESS_FLOOR: f64 = 1e-6;
+
+/// Which quintic iteration approximates the orthogonal polar factor.
+///
+/// Both cost the same five bf16 quintic steps; Polar Express converges markedly
+/// closer to orthogonality on ill-conditioned gradients. Newton-Schulz remains
+/// the default so existing PPO and planner runs stay bit-identical.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Orthogonalizer {
+    #[default]
+    NewtonSchulz5,
+    PolarExpress5,
+}
+
+impl Orthogonalizer {
+    /// Newton-Schulz repeats one tuned triple `ns_steps` times; Polar Express runs
+    /// its own five-step schedule and ignores `ns_steps`.
+    fn steps(self, ns_steps: usize) -> usize {
+        match self {
+            Self::NewtonSchulz5 => ns_steps,
+            Self::PolarExpress5 => POLAR_EXPRESS_COEFFS.len(),
+        }
+    }
+
+    fn coeffs(self, step: usize) -> QuinticCoeffs {
+        match self {
+            Self::NewtonSchulz5 => (NS_A, NS_B, NS_C),
+            Self::PolarExpress5 => POLAR_EXPRESS_COEFFS[step],
+        }
+    }
+}
+
 pub struct MuonConfig {
     pub lr: f64,
     pub use_muon_for_2d: bool,
@@ -55,6 +108,30 @@ pub struct MuonConfig {
     /// Suppress the one-line routing-split print at construction. Benchmarks
     /// that build many optimizers set this; real training leaves it false.
     pub quiet: bool,
+    /// Quintic iteration used to orthogonalize the momentum buffer.
+    pub orthogonalizer: Orthogonalizer,
+    /// Scale the decoupled weight decay by `lr` a second time, so the decay is
+    /// quadratic in the learning rate. NorMuon then decays by
+    /// `p * (wd*lr) * (lr_mul*per_matrix_lr_mul*lr)` and AdamW by `p * lr*lr*wd`
+    /// (modded-nanogpt `train_gpt.py:845` and `:877-878` with `:928`). The NorMuon
+    /// form picks the per-parameter multipliers up in only one of the two factors,
+    /// so a matrix at 4x lr_mul decays 16x harder; that asymmetry is intentional.
+    pub quadratic_lr_weight_decay: bool,
+    /// Skip weight decay on coordinates where the step and the parameter disagree
+    /// in sign. NorMuon masks non-strictly on `(update * p) >= 0`
+    /// (`train_gpt.py:915-932`); AdamW masks strictly on `(update * p) > 0`
+    /// (`train_gpt.py:856-863`). The strictness difference is reproduced verbatim.
+    pub cautious_weight_decay: bool,
+    /// Per-parameter AdamW beta overrides as `(name fragment, (beta1, beta2))`.
+    /// First match wins; unmatched parameters use `adamw_betas`.
+    pub adamw_beta_overrides: Vec<(String, (f64, f64))>,
+    /// Per-parameter AdamW weight-decay multipliers as `(name fragment, wd_mul)`.
+    /// First match wins; unmatched parameters use `1.0`. The reference gives the
+    /// embedding tables and the output head `wd_mul = 150` (modded-nanogpt
+    /// `train_gpt.py:2033`,`:2038`), which is what makes a quadratic-in-lr decay
+    /// bite at all. `adamw_no_weight_decay_name_substrings` remains the `wd_mul = 0`
+    /// case and takes precedence.
+    pub adamw_weight_decay_multipliers: Vec<(String, f64)>,
 }
 
 impl Default for MuonConfig {
@@ -79,6 +156,11 @@ impl Default for MuonConfig {
             attention_head_dim: 0,
             cross_attention_head_dim: 0,
             quiet: false,
+            orthogonalizer: Orthogonalizer::NewtonSchulz5,
+            quadratic_lr_weight_decay: false,
+            cautious_weight_decay: false,
+            adamw_beta_overrides: Vec::new(),
+            adamw_weight_decay_multipliers: Vec::new(),
         }
     }
 }
@@ -133,21 +215,21 @@ pub struct Muon {
     step_enabled: Vec<bool>,
 }
 
-/// Single-matrix Newton-Schulz iteration.
-/// Runs NS_STEPS iterations in bf16 for speed; returns in the input's kind.
+/// Single-matrix quintic orthogonalization.
+/// Runs the orthogonalizer's schedule in bf16 for speed; returns in the input's kind.
 ///
-/// Each iteration is:  x ← NS_A·x + NS_B·(a·x) + NS_C·((a·a)·x), where a = x·xᵀ.
+/// Each iteration is:  x ← a·x + b·(A·x) + c·((A·A)·x), where A = x·xᵀ.
 /// Factoring the two correction terms over the shared right-multiply by `x`,
-///   NS_B·(a·x) + NS_C·((a·a)·x) = (NS_B·a + NS_C·(a·a))·x = b·x,
-/// collapses the iteration to **three** matmuls (x·xᵀ, a·a, b·x) instead of the
+///   b·(A·x) + c·((A·A)·x) = (b·A + c·(A·A))·x = B·x,
+/// collapses the iteration to **three** matmuls (x·xᵀ, A·A, B·x) instead of the
 /// four a naïve expansion needs, expressed as two `baddbmm` calls on [1,p,q]
 /// views. tch's 2D `addmm` doesn't accept scalar beta/alpha, so we lift to 3D.
 ///
-/// Peak live tensors during iter: `x` ([p,q]) + `a` ([p,p]) + `b` ([p,p]) =
+/// Peak live tensors during iter: `x` ([p,q]) + `A` ([p,p]) + `B` ([p,p]) =
 /// ~[p,q] + 2·[p,p]. For p == q this is ~3·[p,q]. This is the inherent
-/// working-set cost of NS5 and cannot be eliminated without changing the
-/// algorithm.
-fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
+/// working-set cost of a quintic iteration and cannot be eliminated without
+/// changing the algorithm.
+fn quintic_orthogonalize(g: &Tensor, orth: Orthogonalizer, ns_steps: usize) -> Tensor {
     let orig_kind = g.kind();
     let transposed = g.size()[0] > g.size()[1];
     let x2d = if orig_kind == Kind::BFloat16 {
@@ -155,17 +237,18 @@ fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     } else {
         g.to_kind(Kind::BFloat16)
     };
-    let nrm = x2d.norm().clamp_min(1e-7);
+    let nrm = prescale_divisor(&x2d.norm(), orth);
     let x2d = &x2d / &nrm;
     let x2d = if transposed { x2d.transpose(0, 1) } else { x2d };
     let mut x = x2d.unsqueeze(0); // [1, p, q] view — baddbmm needs 3D
 
-    for _ in 0..ns_steps {
+    for step in 0..orth.steps(ns_steps) {
+        let (ca, cb, cc) = orth.coeffs(step);
         let a = x.matmul(&x.transpose(-2, -1));
-        // b = NS_B·a + NS_C·(a·a)  — fold both corrections into one matrix.
-        let b = a.baddbmm(&a, &a, NS_B, NS_C);
-        // x = NS_A·x + b·x
-        x = x.baddbmm(&b, &x, NS_A, 1.0);
+        // B = b·A + c·(A·A)  — fold both corrections into one matrix.
+        let b = a.baddbmm(&a, &a, cb, cc);
+        // x = a·x + B·x
+        x = x.baddbmm(&b, &x, ca, 1.0);
     }
 
     let x = x.squeeze_dim(0);
@@ -181,7 +264,7 @@ fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     }
 }
 
-fn batched_newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
+fn batched_quintic_orthogonalize(g: &Tensor, orth: Orthogonalizer, ns_steps: usize) -> Tensor {
     let orig_kind = g.kind();
     let transposed = g.size()[1] > g.size()[2];
     let x3d = if orig_kind == Kind::BFloat16 {
@@ -189,11 +272,12 @@ fn batched_newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     } else {
         g.to_kind(Kind::BFloat16)
     };
-    let nrm = x3d
-        .square()
-        .sum_dim_intlist([-2i64, -1].as_slice(), true, Kind::BFloat16)
-        .sqrt()
-        .clamp_min(1e-7);
+    let nrm = prescale_divisor(
+        &x3d.square()
+            .sum_dim_intlist([-2i64, -1].as_slice(), true, Kind::BFloat16)
+            .sqrt(),
+        orth,
+    );
     let x3d = &x3d / &nrm;
     let mut x = if transposed {
         x3d.transpose(-2, -1).contiguous()
@@ -201,10 +285,11 @@ fn batched_newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
         x3d
     };
 
-    for _ in 0..ns_steps {
+    for step in 0..orth.steps(ns_steps) {
+        let (ca, cb, cc) = orth.coeffs(step);
         let a = x.matmul(&x.transpose(-2, -1));
-        let b = a.baddbmm(&a, &a, NS_B, NS_C);
-        x = x.baddbmm(&b, &x, NS_A, 1.0);
+        let b = a.baddbmm(&a, &a, cb, cc);
+        x = x.baddbmm(&b, &x, ca, 1.0);
     }
 
     let x = if transposed {
@@ -217,6 +302,29 @@ fn batched_newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
     } else {
         x.to_kind(orig_kind)
     }
+}
+
+/// Divisor that brings the spectral norm below one before the iteration starts.
+/// Newton-Schulz normalizes by the Frobenius norm with a hard floor; Polar Express
+/// leaves a `1 + 2e-2` safety cushion instead, because its first step has a very
+/// large leading coefficient and overshoots if any singular value exceeds one.
+fn prescale_divisor(frobenius: &Tensor, orth: Orthogonalizer) -> Tensor {
+    match orth {
+        Orthogonalizer::NewtonSchulz5 => frobenius.clamp_min(1e-7),
+        Orthogonalizer::PolarExpress5 => {
+            frobenius * (1.0 + POLAR_EXPRESS_SAFETY) + POLAR_EXPRESS_FLOOR
+        }
+    }
+}
+
+#[cfg(test)]
+fn newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
+    quintic_orthogonalize(g, Orthogonalizer::NewtonSchulz5, ns_steps)
+}
+
+#[cfg(test)]
+fn batched_newtonschulz5(g: &Tensor, ns_steps: usize) -> Tensor {
+    batched_quintic_orthogonalize(g, Orthogonalizer::NewtonSchulz5, ns_steps)
 }
 
 fn attention_ortho_layout(name: &str, size: &[i64], cfg: &MuonConfig) -> OrthoLayout {
@@ -281,21 +389,31 @@ fn is_attention_output_projection_name(name: &str) -> bool {
 }
 
 #[cfg(test)]
-fn orthogonalize_update(update: &Tensor, layout: OrthoLayout, ns_steps: usize) -> Tensor {
+fn orthogonalize_update(
+    update: &Tensor,
+    layout: OrthoLayout,
+    orth: Orthogonalizer,
+    ns_steps: usize,
+) -> Tensor {
     match layout {
-        OrthoLayout::Matrix => newtonschulz5(update, ns_steps),
+        OrthoLayout::Matrix => quintic_orthogonalize(update, orth, ns_steps),
         OrthoLayout::RowHeads { heads, head_dim } => {
             let cols = update.size()[1];
-            batched_newtonschulz5(&update.reshape([heads, head_dim, cols]), ns_steps)
-                .reshape(update.size().as_slice())
+            batched_quintic_orthogonalize(
+                &update.reshape([heads, head_dim, cols]),
+                orth,
+                ns_steps,
+            )
+            .reshape(update.size().as_slice())
         }
         OrthoLayout::ColHeads { heads, head_dim } => {
             let rows = update.size()[0];
-            batched_newtonschulz5(
+            batched_quintic_orthogonalize(
                 &update
                     .reshape([rows, heads, head_dim])
                     .permute([1, 0, 2])
                     .contiguous(),
+                orth,
                 ns_steps,
             )
             .permute([1, 0, 2])
@@ -365,11 +483,12 @@ fn normuon_transform(
     layout: OrthoLayout,
     second_momentum: &mut Tensor,
     beta2: f64,
+    orth: Orthogonalizer,
     ns_steps: usize,
 ) -> (Tensor, f64) {
     match layout {
         OrthoLayout::Matrix => {
-            let update = newtonschulz5(update, ns_steps);
+            let update = quintic_orthogonalize(update, orth, ns_steps);
             let update = normuon_rescale(&update, second_momentum, beta2);
             let size = update.size();
             let aspect_scale = (1.0_f64).max(size[0] as f64 / size[1] as f64).sqrt();
@@ -378,7 +497,7 @@ fn normuon_transform(
         OrthoLayout::RowHeads { heads, head_dim } => {
             let cols = update.size()[1];
             let blocks = update.reshape([heads, head_dim, cols]);
-            let blocks = batched_newtonschulz5(&blocks, ns_steps);
+            let blocks = batched_quintic_orthogonalize(&blocks, orth, ns_steps);
             let blocks = normuon_rescale_batched(&blocks, second_momentum, beta2);
             let aspect_scale = (1.0_f64).max(head_dim as f64 / cols as f64).sqrt();
             (blocks.reshape(update.size().as_slice()), aspect_scale)
@@ -389,7 +508,7 @@ fn normuon_transform(
                 .reshape([rows, heads, head_dim])
                 .permute([1, 0, 2])
                 .contiguous();
-            let blocks = batched_newtonschulz5(&blocks, ns_steps);
+            let blocks = batched_quintic_orthogonalize(&blocks, orth, ns_steps);
             let blocks = normuon_rescale_batched(&blocks, second_momentum, beta2);
             let aspect_scale = (1.0_f64).max(rows as f64 / head_dim as f64).sqrt();
             let update = blocks
@@ -421,6 +540,13 @@ impl Muon {
             .collect();
         let mut entries_2d = Vec::new();
         let mut adamw_indices = Vec::new();
+        assert!(
+            cfg.orthogonalizer != Orthogonalizer::PolarExpress5
+                || cfg.ns_steps == POLAR_EXPRESS_COEFFS.len(),
+            "Polar Express runs its own tuned {}-step schedule; ns_steps={} would be ignored",
+            POLAR_EXPRESS_COEFFS.len(),
+            cfg.ns_steps
+        );
 
         for (i, (name, p)) in trainable_vars.iter().enumerate() {
             let force_adamw = cfg
@@ -503,6 +629,10 @@ impl Muon {
         let beta2 = self.cfg.beta2;
         let nesterov = self.cfg.nesterov;
         let wd = self.cfg.weight_decay;
+        let base_lr = self.cfg.lr;
+        let orth = self.cfg.orthogonalizer;
+        let quadratic = self.cfg.quadratic_lr_weight_decay;
+        let cautious = self.cfg.cautious_weight_decay;
 
         for entry in &mut self.entries_2d {
             if !self.step_enabled[entry.idx] {
@@ -512,8 +642,7 @@ impl Muon {
             if !grad.defined() {
                 continue;
             }
-            let lr = self.cfg.lr * self.lr_scales[entry.idx];
-            let wd_factor = if wd > 0.0 { Some(1.0 - lr * wd) } else { None };
+            let lr = base_lr * self.lr_scales[entry.idx];
 
             // First-moment EMA: buf = buf*beta1 + grad*(1-beta1).
             let _ = entry.momentum.lerp_(&grad, 1.0 - beta1);
@@ -530,23 +659,40 @@ impl Muon {
                 entry.layout,
                 &mut entry.second_momentum,
                 beta2,
+                orth,
                 self.cfg.ns_steps,
             );
 
-            // Apply to param: decoupled weight decay, then the update.
+            // Apply to param: decoupled weight decay, then the update. Both read
+            // the pre-step parameter, so the composition is `p - decay*p - lr*u`.
             let mut p = self.params[entry.idx].shallow_clone();
-            if let Some(k) = wd_factor {
-                let _ = p.g_mul_scalar_(k);
+            let update = update.to_kind(p.kind());
+            // `aspect_scale` is this implementation's per-matrix lr multiplier, so
+            // the total step is `lr_mul * per_matrix_lr_mul * base_lr`.
+            let eff_lr = lr * aspect_scale;
+            let decay = if quadratic {
+                wd * base_lr * eff_lr
+            } else {
+                wd * lr
+            };
+            if decay > 0.0 {
+                if cautious {
+                    // Non-strict `>= 0`, unlike AdamW's strict `> 0`.
+                    let keep = (&update * &p).ge(0).to_kind(p.kind()) * decay;
+                    let _ = p.g_sub_(&(&p * keep));
+                } else {
+                    let _ = p.g_mul_scalar_(1.0 - decay);
+                }
             }
-            let update = update.to_kind(p.kind()) * (-lr * aspect_scale);
-            let _ = p.g_add_(&update);
+            let _ = p.g_add_(&(update * (-eff_lr)));
         }
     }
 
     fn step_all_adamw(&mut self) {
-        let (beta1, beta2) = self.cfg.adamw_betas;
         let eps = self.cfg.adamw_eps;
         let wd = self.cfg.adamw_wd;
+        let quadratic = self.cfg.quadratic_lr_weight_decay;
+        let cautious = self.cfg.cautious_weight_decay;
 
         for &idx in &self.adamw_indices {
             if !self.step_enabled[idx] {
@@ -558,6 +704,7 @@ impl Muon {
                 continue;
             }
             let lr = self.cfg.adamw_lr * self.lr_scales[idx];
+            let (beta1, beta2) = self.adamw_betas_for(idx);
 
             let state = self
                 .adamw_state
@@ -579,16 +726,53 @@ impl Muon {
                     .adamw_no_weight_decay_name_substrings
                     .iter()
                     .any(|needle| self.names[idx].contains(needle));
-            if apply_weight_decay {
-                let _ = p.g_mul_scalar_(1.0 - lr * wd);
-            }
 
             let _ = state.m.lerp_(&grad, 1.0 - beta1);
             let _ = state.v.lerp_(&grad.square(), 1.0 - beta2);
 
             let denom = state.v.sqrt() * inv_bc2_sqrt + eps;
-            let _ = p.g_add_(&(&state.m / &denom * step_size));
+            // `step` carries the negated descent direction, i.e. `p += step`.
+            let step = &state.m / &denom * step_size;
+            if apply_weight_decay {
+                let wd_mul = self.adamw_wd_mul_for(idx);
+                let decay = if quadratic {
+                    lr * lr * wd * wd_mul
+                } else {
+                    lr * wd * wd_mul
+                };
+                if cautious {
+                    // The reference masks strictly on `(descent_update * p) > 0`;
+                    // `step` is the negation of that update, hence `< 0`.
+                    let keep = (&step * &p).lt(0).to_kind(p.kind()) * decay;
+                    let _ = p.g_sub_(&(&p * keep));
+                } else {
+                    let _ = p.g_mul_scalar_(1.0 - decay);
+                }
+            }
+            let _ = p.g_add_(&step);
         }
+    }
+
+    /// AdamW weight-decay multiplier for one parameter: the first matching
+    /// `adamw_weight_decay_multipliers` fragment wins, otherwise `1.0`.
+    fn adamw_wd_mul_for(&self, idx: usize) -> f64 {
+        let name = &self.names[idx];
+        self.cfg
+            .adamw_weight_decay_multipliers
+            .iter()
+            .find(|(needle, _)| name.contains(needle.as_str()))
+            .map_or(1.0, |(_, mul)| *mul)
+    }
+
+    /// AdamW betas for one parameter: the first matching `adamw_beta_overrides`
+    /// fragment wins, otherwise the shared `adamw_betas`.
+    fn adamw_betas_for(&self, idx: usize) -> (f64, f64) {
+        let name = &self.names[idx];
+        self.cfg
+            .adamw_beta_overrides
+            .iter()
+            .find(|(needle, _)| name.contains(needle.as_str()))
+            .map_or(self.cfg.adamw_betas, |(_, betas)| *betas)
     }
 
     pub fn zero_grad(&self) {
@@ -632,6 +816,24 @@ impl Muon {
             }
         }
         matched
+    }
+
+    /// Names of every parameter routed to the NorMuon (2D) branch, in registration
+    /// order. Lets callers assert their intended routing instead of trusting
+    /// substring lists to have matched.
+    pub fn muon_param_names(&self) -> Vec<String> {
+        self.entries_2d
+            .iter()
+            .map(|entry| self.names[entry.idx].clone())
+            .collect()
+    }
+
+    /// Names of every parameter routed to the AdamW branch, in registration order.
+    pub fn adamw_param_names(&self) -> Vec<String> {
+        self.adamw_indices
+            .iter()
+            .map(|&idx| self.names[idx].clone())
+            .collect()
     }
 
     /// Enable or disable optimizer steps for matching named parameters. This is
@@ -918,7 +1120,8 @@ mod tests {
 
     use super::{
         attention_ortho_layout, batched_newtonschulz5, newtonschulz5, normuon_rescale,
-        orthogonalize_update, Muon, MuonConfig, OrthoLayout,
+        normuon_transform, orthogonalize_update, quintic_orthogonalize, Muon, MuonConfig,
+        OrthoLayout, Orthogonalizer,
     };
 
     const HIDDEN: i64 = 128;
@@ -1244,6 +1447,7 @@ mod tests {
                 heads: 4,
                 head_dim: 64,
             },
+            Orthogonalizer::NewtonSchulz5,
             5,
         );
         let col_out = orthogonalize_update(
@@ -1252,6 +1456,7 @@ mod tests {
                 heads: 4,
                 head_dim: 64,
             },
+            Orthogonalizer::NewtonSchulz5,
             5,
         );
 
@@ -1513,5 +1718,413 @@ mod tests {
         // second_momentum is per-row of the [out, in] weight => [out, 1].
         assert_eq!(after.size(), vec![HIDDEN, 1]);
         assert_eq!(after.kind(), Kind::Float);
+    }
+
+    /// Two parameters, deterministic grads, and a full read-back of the values the
+    /// legacy (pre-Polar-Express, pre-cautious) code path produced. Any accidental
+    /// flip of a new default, or any reordering of decay vs. update, breaks this.
+    #[test]
+    fn default_config_reproduces_legacy_decoupled_weight_decay() {
+        let device = Device::Cpu;
+        tch::manual_seed(4242);
+        let vs = nn::VarStore::new(device);
+        let w = vs.root().randn("w", &[8, 4], 0.0, 1.0);
+        let b = vs.root().randn("b", &[4], 0.0, 1.0);
+
+        let probe = Tensor::randn([4, 3], (Kind::Float, device));
+        let loss = w.matmul(&probe).square().sum(Kind::Float) + b.square().sum(Kind::Float) * 3.0;
+        loss.backward();
+
+        let w0 = w.detach().copy();
+        let b0 = b.detach().copy();
+        let gw = w.grad().detach().copy();
+        let gb = b.grad().detach().copy();
+
+        let (lr, wd, adamw_lr, adamw_wd) = (7e-3, 0.9, 4e-3, 0.05);
+        let cfg = MuonConfig {
+            lr,
+            weight_decay: wd,
+            adamw_lr,
+            adamw_wd,
+            momentum: 0.95,
+            beta2: 0.9,
+            adamw_eps: 1e-10,
+            quiet: true,
+            ..MuonConfig::default()
+        };
+        assert_eq!(cfg.orthogonalizer, Orthogonalizer::NewtonSchulz5);
+        assert!(!cfg.cautious_weight_decay);
+        assert!(!cfg.quadratic_lr_weight_decay);
+        assert!(cfg.adamw_beta_overrides.is_empty());
+
+        let named = vec![
+            ("w".to_owned(), w.shallow_clone()),
+            ("b".to_owned(), b.shallow_clone()),
+        ];
+        let mut opt = Muon::new_named(&named, cfg);
+        opt.step();
+
+        // Legacy NorMuon branch: EMA from zero, Nesterov lerp, NS5 + per-row second
+        // moment, then `p*(1 - lr*wd) - lr*aspect*update`.
+        let expected_w = tch::no_grad(|| {
+            let momentum = &gw * (1.0 - 0.95);
+            let update = gw.lerp(&momentum, 0.95);
+            let mut second = Tensor::zeros([8, 1], (Kind::Float, device));
+            let (update, aspect) = normuon_transform(
+                &update,
+                OrthoLayout::Matrix,
+                &mut second,
+                0.9,
+                Orthogonalizer::NewtonSchulz5,
+                5,
+            );
+            assert!((aspect - 2.0_f64.sqrt()).abs() < 1e-12);
+            &w0 * (1.0 - lr * wd) + update * (-lr * aspect)
+        });
+
+        // Legacy AdamW branch on the 1-D parameter.
+        let expected_b = tch::no_grad(|| {
+            let (ab1, ab2) = (0.9, 0.95);
+            let m = &gb * (1.0 - ab1);
+            let v = gb.square() * (1.0 - ab2);
+            let bc1 = 1.0 - ab1;
+            let bc2 = 1.0 - ab2;
+            let denom = v.sqrt() * (1.0 / bc2.sqrt()) + 1e-10;
+            &b0 * (1.0 - adamw_lr * adamw_wd) + m / denom * (-adamw_lr / bc1)
+        });
+
+        let dw = (w.detach() - expected_w).abs().max().double_value(&[]);
+        let db = (b.detach() - expected_b).abs().max().double_value(&[]);
+        assert!(dw < 1e-7, "NorMuon default path drifted from legacy: {dw:.3e}");
+        assert!(db < 1e-9, "AdamW default path drifted from legacy: {db:.3e}");
+    }
+
+    /// The cautious mask must leave sign-agreeing coordinates untouched and skip
+    /// decay entirely on the rest, on both branches, with the reference's strictness.
+    #[test]
+    fn cautious_weight_decay_skips_sign_disagreeing_coordinates() {
+        let device = Device::Cpu;
+        let build = || {
+            let vs = nn::VarStore::new(device);
+            let p = vs.root().var_copy(
+                "p",
+                &Tensor::from_slice(&[1.0f32, -1.0, 1.0, -1.0]).to_device(device),
+            );
+            let target = Tensor::from_slice(&[3.0f32, 3.0, -3.0, -3.0]).to_device(device);
+            // dL/dp = target, so the descent update has the sign of `target`.
+            let loss = (&p * &target).sum(Kind::Float);
+            loss.backward();
+            (vs, p)
+        };
+
+        let cfg = |cautious: bool| MuonConfig {
+            adamw_lr: 0.1,
+            adamw_wd: 0.5,
+            adamw_eps: 1e-10,
+            cautious_weight_decay: cautious,
+            quiet: true,
+            ..MuonConfig::default()
+        };
+
+        let (_vs_plain, p_plain) = build();
+        let (_vs_caut, p_caut) = build();
+        let p0 = p_plain.detach().copy();
+        Muon::new_named(&[("p".to_owned(), p_plain.shallow_clone())], cfg(false)).step();
+        Muon::new_named(&[("p".to_owned(), p_caut.shallow_clone())], cfg(true)).step();
+
+        // Reference mask: (descent_update * p) > 0, i.e. sign(target) == sign(p).
+        // Coordinates 0 and 3 agree; 1 and 2 disagree and must skip decay.
+        let decay = 0.1 * 0.5;
+        let diff = (p_caut.detach() - p_plain.detach()).to_kind(Kind::Double);
+        let diff: Vec<f64> = Vec::<f64>::try_from(diff).expect("diff");
+        let p0: Vec<f64> = Vec::<f64>::try_from(p0.to_kind(Kind::Double)).expect("p0");
+        for i in [0usize, 3] {
+            assert!(
+                diff[i].abs() < 1e-7,
+                "coordinate {i} agrees in sign and must still decay: diff={:.3e}",
+                diff[i]
+            );
+        }
+        for i in [1usize, 2] {
+            let expected = p0[i] * decay;
+            assert!(
+                (diff[i] - expected).abs() < 1e-7,
+                "coordinate {i} disagrees in sign and must skip decay: diff={:.3e}, expected={expected:.3e}",
+                diff[i]
+            );
+        }
+    }
+
+    /// The NorMuon cautious mask is non-strict `(update * p) >= 0` and governs decay on
+    /// every 2-D weight in a pretrain run, so it needs its own read-back: the 1-D test
+    /// above only exercises AdamW's strict `.lt(0)` branch, and flipping the NorMuon
+    /// comparison would otherwise leave this module green.
+    #[test]
+    fn cautious_weight_decay_masks_the_normuon_branch_too() {
+        let device = Device::Cpu;
+        tch::manual_seed(5150);
+        let w_init = Tensor::randn([8, 4], (Kind::Float, device));
+        let probe = Tensor::randn([4, 3], (Kind::Float, device));
+        let build = || {
+            let vs = nn::VarStore::new(device);
+            let w = vs.root().var_copy("w", &w_init);
+            let loss = w.matmul(&probe).square().sum(Kind::Float);
+            loss.backward();
+            (vs, w)
+        };
+        let (lr, wd) = (1e-3f64, 0.9f64);
+        let cfg = |cautious: bool| MuonConfig {
+            lr,
+            weight_decay: wd,
+            momentum: 0.95,
+            beta2: 0.9,
+            cautious_weight_decay: cautious,
+            quiet: true,
+            ..MuonConfig::default()
+        };
+
+        let (_a, wa) = build();
+        let (_b, wb) = build();
+        Muon::new_named(&[("w".to_owned(), wa.shallow_clone())], cfg(false)).step();
+        Muon::new_named(&[("w".to_owned(), wb.shallow_clone())], cfg(true)).step();
+
+        // Reproduce the update the optimizer computed, to recover its sign per coordinate.
+        let (update, _) = tch::no_grad(|| {
+            let grad = wa.grad().detach().copy();
+            let momentum = &grad * (1.0 - 0.95);
+            let combined = grad.lerp(&momentum, 0.95);
+            let mut second = Tensor::zeros([8, 1], (Kind::Float, device));
+            normuon_transform(
+                &combined,
+                OrthoLayout::Matrix,
+                &mut second,
+                0.9,
+                Orthogonalizer::NewtonSchulz5,
+                5,
+            )
+        });
+        // Coordinates where the update and the parameter AGREE in sign keep their decay;
+        // the rest skip it, so the cautious run sits further from zero by exactly p*lr*wd.
+        let keeps = (&update * &w_init).ge(0).to_kind(Kind::Float);
+        let skipped = keeps.neg() + 1.0;
+        let expected = &w_init * &skipped * (lr * wd);
+        let diff = wb.detach() - wa.detach();
+        let error = (&diff - &expected).abs().max().double_value(&[]);
+        assert!(
+            skipped.sum(Kind::Float).double_value(&[]) > 0.0
+                && keeps.sum(Kind::Float).double_value(&[]) > 0.0,
+            "the fixture must contain both agreeing and disagreeing coordinates"
+        );
+        assert!(
+            error < 1e-6,
+            "NorMuon cautious mask deviates from the non-strict (update*p) >= 0 rule: {error:.3e}"
+        );
+    }
+
+    /// Quadratic weight decay multiplies the decay by one more factor of the
+    /// learning rate — including the per-matrix multiplier on the NorMuon branch,
+    /// which is why a wide matrix decays harder than a square one.
+    #[test]
+    fn quadratic_weight_decay_adds_one_factor_of_the_learning_rate() {
+        let device = Device::Cpu;
+        let (lr, wd) = (0.05f64, 0.8f64);
+        // Same hazard as the beta-override test: draw once, `var_copy` in.
+        tch::manual_seed(7);
+        let w_init = Tensor::randn([8, 4], (Kind::Float, device));
+        let s_init = Tensor::randn([6], (Kind::Float, device));
+        let build = || {
+            let vs = nn::VarStore::new(device);
+            let w = vs.root().var_copy("w", &w_init);
+            let s = vs.root().var_copy("s", &s_init);
+            let probe = Tensor::ones([4, 2], (Kind::Float, device));
+            let loss = w.matmul(&probe).square().sum(Kind::Float) + s.square().sum(Kind::Float);
+            loss.backward();
+            (vs, w, s)
+        };
+        let cfg = |quadratic: bool| MuonConfig {
+            lr,
+            weight_decay: wd,
+            adamw_lr: lr,
+            adamw_wd: wd,
+            adamw_eps: 1e-10,
+            quadratic_lr_weight_decay: quadratic,
+            quiet: true,
+            ..MuonConfig::default()
+        };
+
+        let (_vs_a, wa, sa) = build();
+        let (_vs_b, wb, sb) = build();
+        let w0 = wa.detach().copy();
+        let s0 = sa.detach().copy();
+        let named = |w: &Tensor, s: &Tensor| {
+            vec![
+                ("w".to_owned(), w.shallow_clone()),
+                ("s".to_owned(), s.shallow_clone()),
+            ]
+        };
+        Muon::new_named(&named(&wa, &sa), cfg(false)).step();
+        Muon::new_named(&named(&wb, &sb), cfg(true)).step();
+
+        // The optimizer step itself is identical, so the whole difference is decay.
+        let aspect = 2.0_f64.sqrt();
+        let w_ratio = ((wb.detach() - wa.detach()) / (&w0 * (lr * wd)))
+            .mean(Kind::Double)
+            .double_value(&[]);
+        assert!(
+            (w_ratio - (1.0 - lr * aspect)).abs() < 1e-4,
+            "NorMuon quadratic decay ratio {w_ratio:.6} != 1 - lr*aspect = {:.6}",
+            1.0 - lr * aspect
+        );
+        let s_ratio = ((sb.detach() - sa.detach()) / (&s0 * (lr * wd)))
+            .mean(Kind::Double)
+            .double_value(&[]);
+        assert!(
+            (s_ratio - (1.0 - lr)).abs() < 1e-4,
+            "AdamW quadratic decay ratio {s_ratio:.6} != 1 - lr = {:.6}",
+            1.0 - lr
+        );
+    }
+
+    #[test]
+    fn adamw_beta_overrides_apply_only_to_matching_parameters() {
+        let device = Device::Cpu;
+        // Drawn ONCE, outside the closure: `manual_seed` seeds the process-global ATen
+        // generator, so two seeded draws inside a closure are not reproducible while
+        // sibling tests in this module concurrently reseed and draw from it.
+        tch::manual_seed(19);
+        let embed_init = Tensor::randn([5], (Kind::Float, device));
+        let gate_init = Tensor::randn([5], (Kind::Float, device));
+        let build = || {
+            let vs = nn::VarStore::new(device);
+            let embed = vs.root().var_copy("bar_bin_embed", &embed_init);
+            let gate = vs.root().var_copy("attn_resid_lambda", &gate_init);
+            let loss = embed.square().sum(Kind::Float) + gate.square().sum(Kind::Float);
+            loss.backward();
+            (vs, embed, gate)
+        };
+        let cfg = |overrides: Vec<(String, (f64, f64))>| MuonConfig {
+            adamw_lr: 0.01,
+            adamw_betas: (0.9, 0.99),
+            adamw_eps: 1e-10,
+            adamw_beta_overrides: overrides,
+            quiet: true,
+            ..MuonConfig::default()
+        };
+
+        // Adam's bias correction cancels the betas exactly on the first step, so
+        // the override only becomes observable once the EMAs have history. Two
+        // steps with a persistent optimizer each.
+        let mut runs = Vec::new();
+        for overrides in [
+            Vec::new(),
+            vec![("bar_bin_embed".to_owned(), (0.5, 0.95))],
+        ] {
+            let (vs, embed, gate) = build();
+            let named = vec![
+                ("bar_bin_embed".to_owned(), embed.shallow_clone()),
+                ("attn_resid_lambda".to_owned(), gate.shallow_clone()),
+            ];
+            let mut opt = Muon::new_named(&named, cfg(overrides));
+            opt.step();
+            opt.zero_grad();
+            let loss = embed.square().sum(Kind::Float) * 3.0 + gate.square().sum(Kind::Float) * 3.0;
+            loss.backward();
+            opt.step();
+            runs.push((vs, embed.detach().copy(), gate.detach().copy()));
+        }
+
+        let embed_delta = (&runs[1].1 - &runs[0].1).abs().max().double_value(&[]);
+        let gate_delta = (&runs[1].2 - &runs[0].2).abs().max().double_value(&[]);
+        assert!(
+            embed_delta > 1e-6,
+            "beta override did not change the matching parameter: {embed_delta:.3e}"
+        );
+        assert!(
+            gate_delta == 0.0,
+            "beta override leaked into a non-matching parameter: {gate_delta:.3e}"
+        );
+    }
+
+    /// Polar Express must land the singular values of an ill-conditioned gradient
+    /// closer to one than Newton-Schulz at identical cost. Condition number 1e3 is
+    /// representative of a real transformer weight gradient.
+    #[test]
+    fn polar_express_orthogonalizes_better_than_newton_schulz() {
+        let _g = tch::no_grad_guard();
+        let device = Device::Cpu;
+        tch::manual_seed(31337);
+        let (u, _, v) = Tensor::randn([64, 64], (Kind::Float, device)).svd(true, true);
+        let decades = Tensor::arange(64, (Kind::Float, device)) / 63.0 * -3.0;
+        let spectrum = (decades * std::f64::consts::LN_10).exp();
+        let g = (&u * spectrum.unsqueeze(0)).matmul(&v.transpose(0, 1));
+
+        let deviation = |t: &Tensor| {
+            let (_, s, _) = t.svd(true, false);
+            let err = (s - 1.0).abs();
+            (
+                err.max().double_value(&[]),
+                err.mean(Kind::Double).double_value(&[]),
+            )
+        };
+        let (ns_max, ns_mean) = deviation(&newtonschulz5(&g, 5));
+        let (pe_max, pe_mean) = deviation(&quintic_orthogonalize(
+            &g,
+            Orthogonalizer::PolarExpress5,
+            5,
+        ));
+        println!(
+            "singular-value deviation from 1: NS5 max={ns_max:.4} mean={ns_mean:.4}, \
+             PolarExpress5 max={pe_max:.4} mean={pe_mean:.4}"
+        );
+        assert!(
+            pe_mean < ns_mean,
+            "Polar Express mean deviation {pe_mean:.4} did not beat Newton-Schulz {ns_mean:.4}"
+        );
+        assert!(
+            pe_max < ns_max,
+            "Polar Express max deviation {pe_max:.4} did not beat Newton-Schulz {ns_max:.4}"
+        );
+        // Neither iteration may overshoot the unit ball by more than bf16 noise.
+        assert!(pe_max < 1.0 && ns_max < 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Polar Express runs its own tuned 5-step schedule")]
+    fn polar_express_rejects_non_default_step_counts() {
+        let device = Device::Cpu;
+        let vs = nn::VarStore::new(device);
+        let w = vs.root().randn("w", &[4, 4], 0.0, 1.0);
+        Muon::new_named(
+            &[("w".to_owned(), w)],
+            MuonConfig {
+                orthogonalizer: Orthogonalizer::PolarExpress5,
+                ns_steps: 3,
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+    }
+
+    #[test]
+    fn routing_names_report_the_realized_optimizer_split() {
+        let device = Device::Cpu;
+        let vs = nn::VarStore::new(device);
+        let matrix = vs.root().randn("ff_out_w", &[8, 4], 0.0, 1.0);
+        let gate = vs.root().randn("attn_resid_lambda", &[1], 0.0, 1.0);
+        let opt = Muon::new_named(
+            &[
+                ("ff_out_w".to_owned(), matrix),
+                ("attn_resid_lambda".to_owned(), gate),
+            ],
+            MuonConfig {
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+        assert_eq!(opt.muon_param_names(), vec!["ff_out_w".to_owned()]);
+        assert_eq!(
+            opt.adamw_param_names(),
+            vec!["attn_resid_lambda".to_owned()]
+        );
     }
 }
