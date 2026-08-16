@@ -7,6 +7,8 @@ mod loop_;
 pub(crate) mod numeric_debug;
 pub(crate) mod optimizer_glue;
 pub mod pretrain;
+pub mod pretrain_reports;
+pub mod pretrain_stats;
 mod rollout;
 mod sample;
 mod trainer;
@@ -14,4 +16,4 @@ pub(crate) mod update;
 pub(crate) mod value_loss;
 
 pub use loop_::train;
-pub use pretrain::{pretrain, PretrainArgs, PretrainObjective};
+pub use pretrain::{pretrain, PretrainArgs};

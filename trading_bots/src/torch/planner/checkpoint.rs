@@ -28,8 +28,8 @@ use super::{
     PLANNER_PORTFOLIO_DIM,
 };
 
-const FORMAT_VERSION: u32 = 5;
-const ARCHITECTURE: &str = "world-model-planner-bidirectional-real-only-v5";
+const FORMAT_VERSION: u32 = 6;
+const ARCHITECTURE: &str = "world-model-planner-disjoint-policy-critic-v6";
 const INPUT_NORMALIZATION: &str = "belief-token-latent-rms-normalized-with-log-scale-v1";
 const ROLLOUT_DATA: &str = "frozen-wm-observation-real-next-price-after-costs-v1";
 pub(crate) const OPTIMIZATION_EPOCHS: usize = 3;
@@ -93,8 +93,7 @@ impl PlannerTrainingContract {
             kl_controller_half_life: KL_CONTROLLER_HALF_LIFE,
             kl_min_lr_scale: KL_MIN_LR_SCALE,
             kl_max_lr_scale: KL_MAX_LR_SCALE,
-            kl_lr_routing:
-                "adaptive-policy-head-only-fixed-shared-trunk-and-value-head-v1".to_owned(),
+            kl_lr_routing: "adaptive-entire-policy-branch-disjoint-critic-v2".to_owned(),
             input_normalization: INPUT_NORMALIZATION.to_owned(),
             muon_lr: MUON_LR,
             adamw_lr: LEARNING_RATE,
@@ -111,8 +110,7 @@ impl PlannerTrainingContract {
             muon_newton_schulz_steps: 5,
             max_grad_norm: MAX_GRAD_NORM,
             adamw_weight_decay: 0.0,
-            optimizer_routing:
-                "muon-matrices-adamw-policy-value-and-aux-return-per-parameter-lr-v4".to_owned(),
+            optimizer_routing: "separate-policy-and-critic-normuon-optimizers-v5".to_owned(),
             action_threshold: ACTION_THRESHOLD,
             commission_rate: COMMISSION_RATE,
             validation_policy:
@@ -167,7 +165,8 @@ pub struct PlannerCheckpointMetadata {
     pub latent_dim: i64,
     pub belief_dim: i64,
     pub portfolio_dim: i64,
-    pub optimizer_steps: u64,
+    pub actor_optimizer_steps: u64,
+    pub critic_optimizer_steps: u64,
     pub run_lineage_id: String,
     pub training_contract: PlannerTrainingContract,
     pub kl_ema: f64,
@@ -180,10 +179,12 @@ pub struct PlannerCheckpointMetadata {
     /// the atomic save; a mismatch on load means a torn or corrupted checkpoint.
     #[serde(default)]
     pub weights_sha256: String,
-    /// SHA-256 of the optimizer-state sidecar this metadata commits. Detects
-    /// post-commit corruption or a mismatched sidecar before restoring moments.
-    #[serde(default)]
-    pub optimizer_sha256: String,
+    /// SHA-256 hashes of the optimizer-state sidecars this metadata commits.
+    /// Detect post-commit corruption or mismatched sidecars before restoring moments.
+    pub actor_optimizer_sha256: String,
+    pub critic_optimizer_sha256: String,
+    pub actor_initialized_adamw: Vec<String>,
+    pub critic_initialized_adamw: Vec<String>,
     /// Present only on immutable model-selection checkpoints. Keeping the score
     /// in the same metadata commit as the weight hashes makes selection atomic.
     #[serde(default)]
@@ -196,7 +197,8 @@ impl PlannerCheckpointMetadata {
         world_model_weights_sha256: impl Into<String>,
         horizon: usize,
         context_bars: usize,
-        optimizer_steps: u64,
+        actor_optimizer_steps: u64,
+        critic_optimizer_steps: u64,
         cumulative_updates: u64,
         run_lineage_id: impl Into<String>,
         base_seed: u64,
@@ -216,14 +218,18 @@ impl PlannerCheckpointMetadata {
             latent_dim: PLANNER_LATENT_DIM,
             belief_dim: PLANNER_BELIEF_DIM,
             portfolio_dim: PLANNER_PORTFOLIO_DIM,
-            optimizer_steps,
+            actor_optimizer_steps,
+            critic_optimizer_steps,
             run_lineage_id: run_lineage_id.into(),
             training_contract: PlannerTrainingContract::new(base_seed),
             kl_ema,
             kl_lr_scale,
             cumulative_updates,
             weights_sha256: String::new(),
-            optimizer_sha256: String::new(),
+            actor_optimizer_sha256: String::new(),
+            critic_optimizer_sha256: String::new(),
+            actor_initialized_adamw: Vec::new(),
+            critic_initialized_adamw: Vec::new(),
             selected_validation: None,
         }
     }
@@ -307,7 +313,8 @@ impl PlannerCheckpointMetadata {
             || self.world_model_lineage_sha256.is_empty()
             || self.world_model_weights_sha256.is_empty()
             || self.weights_sha256.is_empty()
-            || self.optimizer_sha256.is_empty()
+            || self.actor_optimizer_sha256.is_empty()
+            || self.critic_optimizer_sha256.is_empty()
             || self.run_lineage_id.is_empty()
             || self
                 .selected_validation
@@ -329,8 +336,12 @@ pub fn planner_metadata_path(checkpoint: impl AsRef<Path>) -> PathBuf {
     checkpoint.as_ref().with_extension("metadata.json")
 }
 
-pub fn planner_optimizer_state_path(checkpoint: impl AsRef<Path>) -> PathBuf {
-    checkpoint.as_ref().with_extension("optimizer.ot")
+pub fn planner_actor_optimizer_state_path(checkpoint: impl AsRef<Path>) -> PathBuf {
+    checkpoint.as_ref().with_extension("actor_optimizer.ot")
+}
+
+pub fn planner_critic_optimizer_state_path(checkpoint: impl AsRef<Path>) -> PathBuf {
+    checkpoint.as_ref().with_extension("critic_optimizer.ot")
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -386,8 +397,12 @@ pub fn load_committed_planner_metadata(
     )?;
     verify_file_sha256(checkpoint, &metadata.weights_sha256, "checkpoint weights")?;
     verify_optimizer_state(
-        planner_optimizer_state_path(checkpoint),
-        &metadata.optimizer_sha256,
+        planner_actor_optimizer_state_path(checkpoint),
+        &metadata.actor_optimizer_sha256,
+    )?;
+    verify_optimizer_state(
+        planner_critic_optimizer_state_path(checkpoint),
+        &metadata.critic_optimizer_sha256,
     )?;
     Ok(metadata)
 }
@@ -407,37 +422,65 @@ pub fn save_planner_checkpoint(
     var_store: &nn::VarStore,
     checkpoint: impl AsRef<Path>,
     metadata: &PlannerCheckpointMetadata,
-    optimizer: &Muon,
+    actor_optimizer: &Muon,
+    critic_optimizer: &Muon,
 ) -> Result<PlannerCheckpointMetadata> {
     let checkpoint = checkpoint.as_ref();
     ensure_parent_dir(checkpoint)?;
 
     let metadata_path = planner_metadata_path(checkpoint);
-    let optimizer_path = planner_optimizer_state_path(checkpoint);
+    let actor_optimizer_path = planner_actor_optimizer_state_path(checkpoint);
+    let critic_optimizer_path = planner_critic_optimizer_state_path(checkpoint);
     let weights_tmp = temp_sibling(checkpoint);
-    let optimizer_tmp = temp_sibling(&optimizer_path);
+    let actor_optimizer_tmp = temp_sibling(&actor_optimizer_path);
+    let critic_optimizer_tmp = temp_sibling(&critic_optimizer_path);
     let metadata_tmp = temp_sibling(&metadata_path);
 
     var_store
         .save(&weights_tmp)
         .with_context(|| format!("failed saving planner weights {}", weights_tmp.display()))?;
-    optimizer.save_state(&optimizer_tmp)?;
+    actor_optimizer.save_state(&actor_optimizer_tmp)?;
+    critic_optimizer.save_state(&critic_optimizer_tmp)?;
 
     let mut metadata = metadata.clone();
+    metadata.actor_initialized_adamw = actor_optimizer.initialized_adamw_names();
+    metadata.critic_initialized_adamw = critic_optimizer.initialized_adamw_names();
+    let actor_steps = i64::try_from(metadata.actor_optimizer_steps)
+        .context("planner actor optimizer step count exceeds i64")?;
+    let critic_steps = i64::try_from(metadata.critic_optimizer_steps)
+        .context("planner critic optimizer step count exceeds i64")?;
+    actor_optimizer.validate_state_strict(
+        &actor_optimizer_tmp,
+        &metadata.actor_initialized_adamw,
+        actor_steps,
+    )?;
+    critic_optimizer.validate_state_strict(
+        &critic_optimizer_tmp,
+        &metadata.critic_initialized_adamw,
+        critic_steps,
+    )?;
     metadata.weights_sha256 = file_sha256(&weights_tmp)?;
-    metadata.optimizer_sha256 = file_sha256(&optimizer_tmp)?;
+    metadata.actor_optimizer_sha256 = file_sha256(&actor_optimizer_tmp)?;
+    metadata.critic_optimizer_sha256 = file_sha256(&critic_optimizer_tmp)?;
     metadata.save(&metadata_tmp)?;
 
     File::open(&weights_tmp)?.sync_all()?;
-    File::open(&optimizer_tmp)?.sync_all()?;
+    File::open(&actor_optimizer_tmp)?.sync_all()?;
+    File::open(&critic_optimizer_tmp)?.sync_all()?;
     File::open(&metadata_tmp)?.sync_all()?;
 
     fs::rename(&weights_tmp, checkpoint)
         .with_context(|| format!("failed committing planner weights {}", checkpoint.display()))?;
-    fs::rename(&optimizer_tmp, &optimizer_path).with_context(|| {
+    fs::rename(&actor_optimizer_tmp, &actor_optimizer_path).with_context(|| {
         format!(
-            "failed committing planner optimizer state {}",
-            optimizer_path.display()
+            "failed committing planner actor optimizer state {}",
+            actor_optimizer_path.display()
+        )
+    })?;
+    fs::rename(&critic_optimizer_tmp, &critic_optimizer_path).with_context(|| {
+        format!(
+            "failed committing planner critic optimizer state {}",
+            critic_optimizer_path.display()
         )
     })?;
     fs::rename(&metadata_tmp, &metadata_path).with_context(|| {
@@ -488,13 +531,15 @@ mod tests {
             6_000,
             10,
             10,
+            10,
             "run-a",
             7,
             0.035,
             1.0,
         );
         metadata.weights_sha256 = "planner-weights".to_owned();
-        metadata.optimizer_sha256 = "planner-optimizer".to_owned();
+        metadata.actor_optimizer_sha256 = "planner-actor-optimizer".to_owned();
+        metadata.critic_optimizer_sha256 = "planner-critic-optimizer".to_owned();
         assert!(metadata.validate("lineage-b", Some(100), Some(7)).is_err());
         assert!(metadata.validate("lineage-a", Some(50), Some(7)).is_err());
         assert!(metadata.validate("lineage-a", Some(100), Some(8)).is_err());
@@ -508,8 +553,12 @@ mod tests {
             PathBuf::from("weights/planner.metadata.json")
         );
         assert_eq!(
-            planner_optimizer_state_path("weights/planner.ot"),
-            PathBuf::from("weights/planner.optimizer.ot")
+            planner_actor_optimizer_state_path("weights/planner.ot"),
+            PathBuf::from("weights/planner.actor_optimizer.ot")
+        );
+        assert_eq!(
+            planner_critic_optimizer_state_path("weights/planner.ot"),
+            PathBuf::from("weights/planner.critic_optimizer.ot")
         );
     }
 
@@ -522,13 +571,15 @@ mod tests {
             128,
             1,
             1,
+            1,
             "run-a",
             7,
             0.035,
             1.0,
         );
         metadata.weights_sha256 = "planner-weights".to_owned();
-        metadata.optimizer_sha256 = "planner-optimizer".to_owned();
+        metadata.actor_optimizer_sha256 = "planner-actor-optimizer".to_owned();
+        metadata.critic_optimizer_sha256 = "planner-critic-optimizer".to_owned();
         metadata.training_contract.gamma = 0.9;
         assert!(metadata.validate("lineage-a", Some(100), Some(7)).is_err());
     }
@@ -542,28 +593,30 @@ mod tests {
             128,
             1,
             1,
+            1,
             "run-a",
             7,
             0.035,
             1.0,
         );
         metadata.weights_sha256 = "planner-weights".to_owned();
-        metadata.optimizer_sha256 = "planner-optimizer".to_owned();
+        metadata.actor_optimizer_sha256 = "planner-actor-optimizer".to_owned();
+        metadata.critic_optimizer_sha256 = "planner-critic-optimizer".to_owned();
         metadata.format_version = 4;
 
         assert!(metadata.validate("lineage-a", Some(100), Some(7)).is_err());
     }
 
     #[test]
-    fn training_contract_records_actor_only_kl_lr_routing() {
+    fn training_contract_records_disjoint_optimizer_routing() {
         let contract = PlannerTrainingContract::new(7);
         assert_eq!(
             contract.kl_lr_routing,
-            "adaptive-policy-head-only-fixed-shared-trunk-and-value-head-v1"
+            "adaptive-entire-policy-branch-disjoint-critic-v2"
         );
         assert_eq!(
             contract.optimizer_routing,
-            "muon-matrices-adamw-policy-value-and-aux-return-per-parameter-lr-v4"
+            "separate-policy-and-critic-normuon-optimizers-v5"
         );
     }
 
@@ -575,6 +628,7 @@ mod tests {
             100,
             128,
             1,
+            50,
             50,
             "run-a",
             7,
@@ -592,7 +646,8 @@ mod tests {
             mean_turnover: 0.2,
         });
         metadata.weights_sha256 = "planner-weights".to_owned();
-        metadata.optimizer_sha256 = "planner-optimizer".to_owned();
+        metadata.actor_optimizer_sha256 = "planner-actor-optimizer".to_owned();
+        metadata.critic_optimizer_sha256 = "planner-critic-optimizer".to_owned();
         assert!(metadata.validate("lineage-a", Some(100), Some(7)).is_err());
         metadata.selected_validation.as_mut().unwrap().update = 50;
         metadata.validate("lineage-a", Some(100), Some(7)).unwrap();
@@ -602,7 +657,7 @@ mod tests {
     fn checkpoint_roundtrip_restores_weights_and_optimizer_state() {
         use crate::torch::optim::muon::{Muon, MuonConfig};
         use crate::torch::train::optimizer_glue::named_trainable_variables;
-        use tch::{Device, Kind, Tensor};
+        use tch::{Device, Kind};
 
         let dir = std::env::temp_dir().join(format!(
             "planner-ckpt-{}-{}",
@@ -613,31 +668,41 @@ mod tests {
         let checkpoint = dir.join("planner.ot");
 
         let vs = tch::nn::VarStore::new(Device::Cpu);
-        let proj = vs.root().sub("proj");
-        let _w = proj.randn("weight", &[8, 4], 0.0, 1.0);
-        let _b = proj.zeros("bias", &[8]);
-
+        let _actor = vs.root().sub("policy").randn("weight", &[8, 4], 0.0, 1.0);
+        let _critic = vs.root().sub("critic").randn("weight", &[8, 4], 0.0, 1.0);
         let named = named_trainable_variables(&vs);
-        let mut optimizer = Muon::new_named(
-            &named,
+        let actor_named = named
+            .iter()
+            .filter(|(name, _)| name.starts_with("policy."))
+            .map(|(name, tensor)| (name.clone(), tensor.shallow_clone()))
+            .collect::<Vec<_>>();
+        let critic_named = named
+            .iter()
+            .filter(|(name, _)| name.starts_with("critic."))
+            .map(|(name, tensor)| (name.clone(), tensor.shallow_clone()))
+            .collect::<Vec<_>>();
+        let mut actor_optimizer = Muon::new_named(
+            &actor_named,
             MuonConfig {
                 quiet: true,
                 ..MuonConfig::default()
             },
         );
-        // Drive a step so momentum/second-moment/AdamW buffers become non-zero.
-        let trainable: Vec<Tensor> = named.iter().map(|(_, t)| t.shallow_clone()).collect();
-        let loss = Tensor::stack(
-            &trainable
-                .iter()
-                .map(|t| t.square().sum(Kind::Float))
-                .collect::<Vec<_>>(),
-            0,
-        )
-        .sum(Kind::Float);
-        loss.backward();
-        optimizer.step();
-        optimizer.zero_grad();
+        let mut critic_optimizer = Muon::new_named(
+            &critic_named,
+            MuonConfig {
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+        actor_named[0].1.square().sum(Kind::Float).backward();
+        actor_optimizer.step();
+        actor_optimizer.zero_grad();
+        for _ in 0..2 {
+            critic_named[0].1.square().sum(Kind::Float).backward();
+            critic_optimizer.step();
+            critic_optimizer.zero_grad();
+        }
 
         let metadata = PlannerCheckpointMetadata::new(
             "lineage-a",
@@ -645,44 +710,103 @@ mod tests {
             100,
             128,
             1,
+            2,
             1,
             "run-a",
             7,
             0.035,
             1.0,
         );
-        save_planner_checkpoint(&vs, &checkpoint, &metadata, &optimizer).unwrap();
+        save_planner_checkpoint(
+            &vs,
+            &checkpoint,
+            &metadata,
+            &actor_optimizer,
+            &critic_optimizer,
+        )
+        .unwrap();
 
-        // Optimizer sidecar round-trips exactly.
-        let mut restored = Muon::new_named(
-            &named_trainable_variables(&vs),
+        let mut restored_actor = Muon::new_named(
+            &actor_named,
             MuonConfig {
                 quiet: true,
                 ..MuonConfig::default()
             },
         );
-        restored
-            .load_state(planner_optimizer_state_path(&checkpoint))
+        let mut restored_critic = Muon::new_named(
+            &critic_named,
+            MuonConfig {
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+        restored_actor
+            .load_state(planner_actor_optimizer_state_path(&checkpoint))
             .unwrap();
-        assert_eq!(restored.state_bytes(), optimizer.state_bytes());
+        restored_critic
+            .load_state(planner_critic_optimizer_state_path(&checkpoint))
+            .unwrap();
+        assert_eq!(restored_actor.state_bytes(), actor_optimizer.state_bytes());
+        assert_eq!(
+            restored_critic.state_bytes(),
+            critic_optimizer.state_bytes()
+        );
 
         // Weights + metadata load and the sha validates.
         let mut loaded_vs = tch::nn::VarStore::new(Device::Cpu);
         {
-            let lproj = loaded_vs.root().sub("proj");
-            let _ = lproj.randn("weight", &[8, 4], 0.0, 1.0);
-            let _ = lproj.zeros("bias", &[8]);
+            let _ = loaded_vs
+                .root()
+                .sub("policy")
+                .randn("weight", &[8, 4], 0.0, 1.0);
+            let _ = loaded_vs
+                .root()
+                .sub("critic")
+                .randn("weight", &[8, 4], 0.0, 1.0);
         }
         let loaded =
             load_planner_checkpoint(&mut loaded_vs, &checkpoint, "lineage-a", Some(100), Some(7))
                 .unwrap();
         assert_eq!(loaded.cumulative_updates, 1);
+        assert_eq!(loaded.actor_optimizer_steps, 1);
+        assert_eq!(loaded.critic_optimizer_steps, 2);
         assert!(!loaded.weights_sha256.is_empty());
-        assert!(!loaded.optimizer_sha256.is_empty());
+        assert!(!loaded.actor_optimizer_sha256.is_empty());
+        assert!(!loaded.critic_optimizer_sha256.is_empty());
+        assert_ne!(
+            loaded.actor_optimizer_sha256,
+            loaded.critic_optimizer_sha256
+        );
+        assert_eq!(
+            loaded.actor_initialized_adamw,
+            actor_optimizer.initialized_adamw_names()
+        );
+        assert_eq!(
+            loaded.critic_initialized_adamw,
+            critic_optimizer.initialized_adamw_names()
+        );
+
+        let mismatched_checkpoint = dir.join("planner-mismatched.ot");
+        let mut mismatched_metadata = metadata.clone();
+        mismatched_metadata.actor_optimizer_steps += 1;
+        assert!(save_planner_checkpoint(
+            &vs,
+            &mismatched_checkpoint,
+            &mismatched_metadata,
+            &actor_optimizer,
+            &critic_optimizer,
+        )
+        .is_err());
+        assert!(!mismatched_checkpoint.exists());
 
         // Optimizer sidecar sha validates intact and rejects corruption.
-        let optimizer_state = planner_optimizer_state_path(&checkpoint);
-        verify_optimizer_state(&optimizer_state, &loaded.optimizer_sha256).unwrap();
+        let optimizer_state = planner_actor_optimizer_state_path(&checkpoint);
+        verify_optimizer_state(&optimizer_state, &loaded.actor_optimizer_sha256).unwrap();
+        verify_optimizer_state(
+            planner_critic_optimizer_state_path(&checkpoint),
+            &loaded.critic_optimizer_sha256,
+        )
+        .unwrap();
         {
             use std::fs::OpenOptions;
             use std::io::Write;
@@ -692,7 +816,7 @@ mod tests {
                 .unwrap();
             f.write_all(b"corruption").unwrap();
         }
-        assert!(verify_optimizer_state(&optimizer_state, &loaded.optimizer_sha256).is_err());
+        assert!(verify_optimizer_state(&optimizer_state, &loaded.actor_optimizer_sha256).is_err());
 
         // A corrupted weights file is rejected against the metadata sha.
         {

@@ -68,7 +68,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
         crate::state::TrainingKind::Pretrain => {
             title_spans.push(Span::styled(
-                "objective: lejepa",
+                "objective: bar-nll + dyn + kl",
                 Style::default().fg(theme::BLUE),
             ));
         }

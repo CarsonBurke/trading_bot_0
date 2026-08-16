@@ -44,6 +44,12 @@ pub struct PlannerLosses {
     pub aux_return_loss: Tensor,
 }
 
+pub struct PlannerCriticLosses {
+    pub critic_loss: Tensor,
+    pub value_loss: Tensor,
+    pub aux_return_loss: Tensor,
+}
+
 pub fn pmpo_policy_loss(
     advantages: &Tensor,
     action_log_probs: &Tensor,
@@ -118,26 +124,49 @@ pub fn planner_actor_critic_losses(
         }
     };
     let entropy = beta_entropy(new_alpha, new_beta).mean(Kind::Float);
+    let critic = planner_critic_losses(
+        hl_gauss,
+        value_logits,
+        returns,
+        next_return,
+        next_return_target,
+    );
+    let actor_loss = policy_loss.shallow_clone();
+    PlannerLosses {
+        actor_loss,
+        critic_loss: critic.critic_loss,
+        policy_loss,
+        reverse_kl,
+        entropy,
+        value_loss: critic.value_loss,
+        aux_return_loss: critic.aux_return_loss,
+    }
+}
+
+pub fn planner_critic_losses(
+    hl_gauss: &HlGaussBins,
+    value_logits: &Tensor,
+    returns: &Tensor,
+    next_return: &Tensor,
+    next_return_target: &Tensor,
+) -> PlannerCriticLosses {
+    let batch_size = value_logits.size()[0];
+    assert_eq!(returns.numel() as i64, batch_size);
+    assert_eq!(next_return.numel() as i64, batch_size);
+    assert_eq!(next_return_target.numel() as i64, batch_size);
     let value_targets = hl_gauss.encode(&returns.flatten(0, -1));
     let value_log_probs = value_logits.log_softmax(-1, Kind::Float);
     let value_loss = -(value_targets * value_log_probs)
         .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
         .mean(Kind::Float);
-
     let aux_return_loss = (next_return.flatten(0, -1).to_kind(Kind::Float)
         - next_return_target.flatten(0, -1).to_kind(Kind::Float) * PLANNER_REWARD_SCALE)
         .square()
         .mean(Kind::Float);
-
-    let actor_loss = policy_loss.shallow_clone();
     let critic_loss =
         VALUE_LOSS_COEFFICIENT * &value_loss + PLANNER_AUX_RETURN_COEF * &aux_return_loss;
-    PlannerLosses {
-        actor_loss,
+    PlannerCriticLosses {
         critic_loss,
-        policy_loss,
-        reverse_kl,
-        entropy,
         value_loss,
         aux_return_loss,
     }

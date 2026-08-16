@@ -210,6 +210,11 @@ pub struct PlannerTrainingReportPoint {
     pub reverse_kl: f64,
     pub max_reverse_kl: f64,
     pub kl_early_stopped: bool,
+    pub actor_steps: f64,
+    pub actor_available_steps: f64,
+    pub critic_steps: f64,
+    pub critic_available_steps: f64,
+    pub actor_lr_scale: f64,
     pub entropy: f64,
     pub actor_grad_norm: f64,
     pub critic_grad_norm: f64,
@@ -245,6 +250,11 @@ impl PlannerTrainingReportPoint {
             self.aux_return_loss,
             self.reverse_kl,
             self.max_reverse_kl,
+            self.actor_steps,
+            self.actor_available_steps,
+            self.critic_steps,
+            self.critic_available_steps,
+            self.actor_lr_scale,
             self.entropy,
             self.actor_grad_norm,
             self.critic_grad_norm,
@@ -305,6 +315,11 @@ pub struct PlannerReportHistory {
     reverse_kl: Vec<f32>,
     max_reverse_kl: Vec<f32>,
     kl_early_stopped: Vec<f32>,
+    actor_steps: Vec<f32>,
+    actor_available_steps: Vec<f32>,
+    critic_steps: Vec<f32>,
+    critic_available_steps: Vec<f32>,
+    actor_lr_scale: Vec<f32>,
     entropy: Vec<f32>,
     actor_grad_norm: Vec<f32>,
     critic_grad_norm: Vec<f32>,
@@ -415,6 +430,11 @@ impl PlannerReportHistory {
         set!(reverse_kl, point.reverse_kl);
         set!(max_reverse_kl, point.max_reverse_kl);
         set!(kl_early_stopped, f64::from(point.kl_early_stopped));
+        set!(actor_steps, point.actor_steps);
+        set!(actor_available_steps, point.actor_available_steps);
+        set!(critic_steps, point.critic_steps);
+        set!(critic_available_steps, point.critic_available_steps);
+        set!(actor_lr_scale, point.actor_lr_scale);
         set!(entropy, point.entropy);
         set!(actor_grad_norm, point.actor_grad_norm);
         set!(critic_grad_norm, point.critic_grad_norm);
@@ -639,6 +659,27 @@ impl PlannerReportHistory {
         line!(reverse_kl, "approx_kl.report.bin", "reverse KL");
         line!(max_reverse_kl, "approx_kl.report.bin", "max reverse KL");
         line!(kl_early_stopped, "approx_kl.report.bin", "early stopped");
+        line!(actor_lr_scale, "approx_kl.report.bin", "actor LR scale");
+        line!(
+            actor_steps,
+            "planner_optimizer_steps.report.bin",
+            "actor steps"
+        );
+        line!(
+            actor_available_steps,
+            "planner_optimizer_steps.report.bin",
+            "actor available steps"
+        );
+        line!(
+            critic_steps,
+            "planner_optimizer_steps.report.bin",
+            "critic steps"
+        );
+        line!(
+            critic_available_steps,
+            "planner_optimizer_steps.report.bin",
+            "critic available steps"
+        );
         simple!(entropy, "policy_entropy.report.bin");
         simple!(actor_grad_norm, "actor_grad_norm.report.bin");
         simple!(critic_grad_norm, "critic_grad_norm.report.bin");
@@ -721,6 +762,11 @@ impl PlannerReportHistory {
             reverse_kl,
             max_reverse_kl,
             kl_early_stopped,
+            actor_steps,
+            actor_available_steps,
+            critic_steps,
+            critic_available_steps,
+            actor_lr_scale,
             entropy,
             actor_grad_norm,
             critic_grad_norm
@@ -935,6 +981,19 @@ impl PlannerReportHistory {
                 series("reverse KL", &self.reverse_kl),
                 series("max reverse KL", &self.max_reverse_kl),
                 series("early stopped", &self.kl_early_stopped),
+                series("actor LR scale", &self.actor_lr_scale),
+            ],
+        )?;
+        write_multiline(
+            output,
+            "planner_optimizer_steps",
+            "Planner Optimizer Steps",
+            "minibatches",
+            vec![
+                series("actor steps", &self.actor_steps),
+                series("actor available steps", &self.actor_available_steps),
+                series("critic steps", &self.critic_steps),
+                series("critic available steps", &self.critic_available_steps),
             ],
         )?;
         write_simple(

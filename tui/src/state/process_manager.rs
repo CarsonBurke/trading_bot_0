@@ -210,11 +210,10 @@ impl ProcessManagerState {
                     .arg(genetic_family.as_cli_str());
             }
             TrainingKind::Pretrain => {
-                cmd.arg("pretrain")
-                    .arg("--model-size")
-                    .arg("uniform-stream")
-                    .arg("--objective")
-                    .arg("lejepa");
+                // Every knob of the bar-distribution pretrainer has a default derived
+                // from the corpus, so the launcher passes nothing but the weights and
+                // the run name.
+                cmd.arg("pretrain");
 
                 if let Some(w) = weights {
                     cmd.arg("--weights").arg(w);
@@ -679,7 +678,7 @@ mod tests {
     fn explicit_run_name_takes_precedence_over_output() {
         let args = strings(&[
             "trading_bot_0",
-            "pretrain",
+            "train-planner",
             "--run",
             "named",
             "--output",
@@ -704,7 +703,7 @@ mod tests {
             "training/runs/source/weights/ppo_ep42.ot"
         )));
         assert!(!is_ppo_resume_path(Path::new(
-            "training/runs/source/weights/pretrain_heads_best.ot"
+            "training/runs/source/weights/pretrain_best.ot"
         )));
         assert!(!is_ppo_resume_path(Path::new(
             "training/runs/source/weights/planner.ot"

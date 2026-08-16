@@ -7,12 +7,18 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use tch::{Device, Tensor};
 
-use super::{PLANNER_BELIEF_DIM, PLANNER_LATENT_DIM, PLANNER_PORTFOLIO_DIM};
+use super::{
+    PLANNER_BELIEF_DIM, PLANNER_LATENT_DIM, PLANNER_PORTFOLIO_DIM, PLANNER_RETURN_QUANTILES,
+};
 
 #[derive(Debug)]
 pub struct PlannerObservation {
+    /// `[horizon, PLANNER_LATENT_DIM]`
     pub forecast_latent: Tensor,
+    /// `[horizon, 1]`
     pub relative_horizon: Tensor,
+    /// `[horizon, PLANNER_RETURN_QUANTILES]`
+    pub return_quantiles: Tensor,
     pub belief: Tensor,
     pub portfolio_state: Tensor,
 }
@@ -172,6 +178,7 @@ impl PlannerRollout {
 pub struct PlannerBatch {
     pub forecast_latent: Tensor,
     pub relative_horizon: Tensor,
+    pub return_quantiles: Tensor,
     pub belief: Tensor,
     pub portfolio_state: Tensor,
     pub actions: Tensor,
@@ -223,10 +230,11 @@ impl PlannerBatch {
                 transitions.iter().map(|t| &t.observation.relative_horizon),
                 device,
             ),
-            belief: stack_to_device(
-                transitions.iter().map(|t| &t.observation.belief),
+            return_quantiles: stack_to_device(
+                transitions.iter().map(|t| &t.observation.return_quantiles),
                 device,
             ),
+            belief: stack_to_device(transitions.iter().map(|t| &t.observation.belief), device),
             portfolio_state: stack_to_device(
                 transitions.iter().map(|t| &t.observation.portfolio_state),
                 device,
@@ -266,6 +274,7 @@ impl PlannerBatch {
         Self {
             forecast_latent: self.forecast_latent.index_select(0, &index),
             relative_horizon: self.relative_horizon.index_select(0, &index),
+            return_quantiles: self.return_quantiles.index_select(0, &index),
             belief: self.belief.index_select(0, &index),
             portfolio_state: self.portfolio_state.index_select(0, &index),
             actions: self.actions.index_select(0, &index),
@@ -363,6 +372,9 @@ fn validate_transition(transition: &PlannerTransition) -> Result<(), PlannerRoll
     if transition.observation.relative_horizon.size() != [latent[0], 1] {
         return Err(PlannerRolloutError::InvalidTensorShape("relative_horizon"));
     }
+    if transition.observation.return_quantiles.size() != [latent[0], PLANNER_RETURN_QUANTILES] {
+        return Err(PlannerRolloutError::InvalidTensorShape("return_quantiles"));
+    }
     if transition.observation.belief.size() != [PLANNER_BELIEF_DIM] {
         return Err(PlannerRolloutError::InvalidTensorShape("belief"));
     }
@@ -386,6 +398,7 @@ fn validate_transition(transition: &PlannerTransition) -> Result<(), PlannerRoll
     for (name, tensor) in [
         ("forecast_latent", &transition.observation.forecast_latent),
         ("relative_horizon", &transition.observation.relative_horizon),
+        ("return_quantiles", &transition.observation.return_quantiles),
         ("belief", &transition.observation.belief),
         ("portfolio_state", &transition.observation.portfolio_state),
         ("action", &transition.action),
@@ -469,6 +482,10 @@ mod tests {
             observation: PlannerObservation {
                 forecast_latent: Tensor::zeros([3, PLANNER_LATENT_DIM], (Kind::Float, Device::Cpu)),
                 relative_horizon: Tensor::arange(3, (Kind::Float, Device::Cpu)).view([3, 1]),
+                return_quantiles: Tensor::zeros(
+                    [3, PLANNER_RETURN_QUANTILES],
+                    (Kind::Float, Device::Cpu),
+                ),
                 belief: Tensor::zeros([PLANNER_BELIEF_DIM], (Kind::Float, Device::Cpu)),
                 portfolio_state: Tensor::from_slice(&[0.5f32, 0.5, 0.25, 0.0]),
             },

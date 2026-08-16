@@ -12,6 +12,7 @@ use tch::{nn, Device, Kind, Tensor};
 
 use crate::torch::{
     action_space::{beta_mean, sample_beta_action},
+    bar_dist::DOF_R,
     cuda::cfg::configure_cuda,
     optim::muon::{Muon, MuonConfig},
     train::{
@@ -19,25 +20,26 @@ use crate::torch::{
             PolicyObjective, LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM_WARMUP_START,
             POLICY_OBJECTIVE, USE_MUON,
         },
-        optimizer_glue::{
-            backward_actor_critic_with_separate_clips, grad_clip_groups, muon_momentum_for_step,
-            named_trainable_variables, KlLrController,
-        },
+        optimizer_glue::{muon_momentum_for_step, named_trainable_variables, KlLrController},
     },
     value::hl_gauss::HlGaussBins,
-    world_model::{world_model_metadata_path, LejepaWorldModel, WorldModelPrediction},
+    world_model::{world_model_metadata_path, BarWorldModel, BarWorldModelSession, RolloutMode},
 };
 
 use super::{
     checkpoint::{
-        load_committed_planner_metadata, load_planner_checkpoint, planner_metadata_path,
-        planner_optimizer_state_path, save_planner_checkpoint, verify_optimizer_state,
+        load_committed_planner_metadata, load_planner_checkpoint,
+        planner_actor_optimizer_state_path, planner_critic_optimizer_state_path,
+        planner_metadata_path, save_planner_checkpoint, verify_optimizer_state,
         PlannerCheckpointMetadata, KL_CONTROLLER_HALF_LIFE, KL_MAX_LR_SCALE, KL_MIN_LR_SCALE,
         OPTIMIZATION_EPOCHS, TARGET_KL,
     },
-    data::{planner_context_bars, PlannerDataSplit, PlannerDataset, PlannerEndpoint},
+    data::{planner_context_bars, PlannerCorpus, PlannerDataSplit, PlannerEndpoint},
     gae::compute_planner_gae,
-    losses::{critic_diagnostics, normalize_ppo_advantages, planner_actor_critic_losses},
+    losses::{
+        critic_diagnostics, normalize_ppo_advantages, planner_actor_critic_losses,
+        planner_critic_losses,
+    },
     portfolio::PlannerPortfolio,
     reports::{
         cleanup_uncommitted_report_generations, write_inference_reports, PlannerEpisodeTrace,
@@ -47,6 +49,7 @@ use super::{
         PlannerBatch, PlannerObservation, PlannerRollout, PlannerTransition, RolloutMetrics,
     },
     PlannerForecast, WorldModelPlanner, WorldModelPlannerInput, PLANNER_PORTFOLIO_DIM,
+    PLANNER_RETURN_QUANTILES,
 };
 
 pub const DEFAULT_PLANNER_HORIZON: usize = 100;
@@ -59,10 +62,27 @@ pub const DEFAULT_PLANNER_ROLLOUT_LENGTH: usize = 100;
 pub const DEFAULT_PLANNER_ENVIRONMENTS: usize = 128;
 pub const DEFAULT_PLANNER_OPTIMIZATION_EPOCHS: usize = OPTIMIZATION_EPOCHS;
 pub const DEFAULT_PLANNER_MINIBATCH_SIZE: usize = 1280;
+/// Ancestral samples drawn per imagined forecast. The planner never sees them
+/// individually: they are summarized into a per-step belief mean and standard
+/// deviation plus cumulative-return quantiles before the observation is stored,
+/// so this only controls how well those moments are estimated.
+pub const DEFAULT_PLANNER_FORECAST_SAMPLES: usize = 16;
+/// Samples per `imagine` call. Each call forks the session KV cache and replicates
+/// the cached history once per sample, so peak cache is `environments * chunk *
+/// context` rows; the chunk bounds that independently of the sample count.
+const PLANNER_FORECAST_SAMPLE_CHUNK: usize = 4;
+/// One is the model's own predictive distribution; anything else biases the risk
+/// estimate the planner trades against.
+const PLANNER_FORECAST_TEMPERATURE: f64 = 1.0;
+/// Symbols shorter than this cannot host a context plus a rollout plus a horizon.
+const PLANNER_MIN_CORPUS_BARS: usize = 4096;
+/// Cumulative-log-return quantile levels carried per horizon step. Tied to
+/// [`PLANNER_RETURN_QUANTILES`] so widening the planner's risk view without
+/// choosing the new levels here cannot compile.
+const PLANNER_RETURN_QUANTILE_LEVELS: [f32; PLANNER_RETURN_QUANTILES as usize] = [0.1, 0.5, 0.9];
 const KL_NEGATIVE_ROUNDOFF_TOLERANCE: f64 = 8.0 * f32::EPSILON as f64;
-const RESUME_MANIFEST_VERSION: u32 = 1;
-const PLANNER_ACTOR_LR_PATTERNS: &[&str] = &["policy_concentration"];
-const PLANNER_ACTOR_PARAMETER_COUNT: usize = 1;
+const RESUME_MANIFEST_VERSION: u32 = 2;
+const PLANNER_ACTOR_LR_PATTERNS: &[&str] = &["policy."];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlannerResumeManifest {
@@ -71,7 +91,8 @@ struct PlannerResumeManifest {
     update: u64,
     checkpoint_file: String,
     weights_sha256: String,
-    optimizer_sha256: String,
+    actor_optimizer_sha256: String,
+    critic_optimizer_sha256: String,
 }
 
 #[derive(Clone, Debug)]
@@ -94,7 +115,7 @@ pub struct TrainPlannerArgs {
 impl Default for TrainPlannerArgs {
     fn default() -> Self {
         Self {
-            world_model_weights: "weights/pretrain_heads_best.ot".to_owned(),
+            world_model_weights: "weights/pretrain_best.ot".to_owned(),
             world_model_metadata: None,
             planner_weights: None,
             output: String::new(),
@@ -128,7 +149,7 @@ pub struct InferPlannerArgs {
 impl Default for InferPlannerArgs {
     fn default() -> Self {
         Self {
-            world_model_weights: "weights/pretrain_heads_best.ot".to_owned(),
+            world_model_weights: "weights/pretrain_best.ot".to_owned(),
             world_model_metadata: None,
             planner_weights: "weights/planner.ot".to_owned(),
             episodes: 10,
@@ -210,7 +231,10 @@ struct OptimizationSummary {
     critic_explained_variance: f64,
     kl_early_stopped: bool,
     actor_steps: usize,
-    steps: usize,
+    actor_available_steps: usize,
+    critic_steps: usize,
+    critic_available_steps: usize,
+    actor_lr_scale: f64,
 }
 
 pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
@@ -223,10 +247,19 @@ pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| world_model_metadata_path(&args.world_model_weights));
-    let world_model = LejepaWorldModel::load(&args.world_model_weights, metadata_path, device)?;
+    let world_model =
+        BarWorldModel::load(Path::new(&args.world_model_weights), &metadata_path, device)?;
+    if !world_model.all_parameters_frozen() {
+        bail!("world model loaded for planning is still trainable; refusing to train a planner whose forecast can backpropagate into the world model");
+    }
     let world_lineage = world_model.lineage_sha256().to_owned();
     let world_weights_hash = world_model.metadata().checkpoint_sha256.clone();
-    let dataset = PlannerDataset::load_cached(args.tickers.as_deref())?;
+    let dataset = PlannerCorpus::load_filtered(
+        &crate::data::ingest::bars_dir(),
+        world_model.metadata().res_secs,
+        PLANNER_MIN_CORPUS_BARS,
+        args.tickers.as_deref(),
+    )?;
 
     let mut planner_vs = nn::VarStore::new(device);
     let planner = WorldModelPlanner::new(&planner_vs.root());
@@ -274,7 +307,14 @@ pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
         }
         None => planner_context_bars(world_model.metadata(), args.context_bars)?,
     };
-    let mut optimizer_steps = resumed.as_ref().map(|m| m.optimizer_steps).unwrap_or(0);
+    let mut actor_optimizer_steps = resumed
+        .as_ref()
+        .map(|m| m.actor_optimizer_steps)
+        .unwrap_or(0);
+    let mut critic_optimizer_steps = resumed
+        .as_ref()
+        .map(|m| m.critic_optimizer_steps)
+        .unwrap_or(0);
     let base_updates = resumed.as_ref().map(|m| m.cumulative_updates).unwrap_or(0);
     validate_output_manifest_for_resume(&args.output, &run_lineage_id, base_updates)?;
     cleanup_uncommitted_resume_bundles(&args.output, base_updates, &run_lineage_id)?;
@@ -312,35 +352,45 @@ pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
         kl_controller.restore(metadata.kl_ema, metadata.kl_lr_scale);
     }
     let named_vars = named_trainable_variables(&planner_vs);
-    let trainable_vars = named_vars
+    let (actor_named_vars, critic_named_vars) = split_planner_parameters(&named_vars)?;
+    let actor_vars = actor_named_vars
         .iter()
         .map(|(_, tensor)| tensor.shallow_clone())
         .collect::<Vec<_>>();
-    let clip_groups = grad_clip_groups(&named_vars);
-    let mut optimizer = new_planner_optimizer(&named_vars);
-    apply_planner_actor_lr_scale(&mut optimizer, kl_controller.scale())?;
+    let critic_vars = critic_named_vars
+        .iter()
+        .map(|(_, tensor)| tensor.shallow_clone())
+        .collect::<Vec<_>>();
+    let mut actor_optimizer = new_planner_optimizer(&actor_named_vars);
+    let mut critic_optimizer = new_planner_optimizer(&critic_named_vars);
+    apply_planner_actor_lr_scale(
+        &mut actor_optimizer,
+        kl_controller.scale(),
+        actor_vars.len(),
+    )?;
     if let Some(metadata) = &resumed {
         if let Some((weights, _)) = &resolved_resume {
-            let optimizer_state = planner_optimizer_state_path(weights);
-            if optimizer_state.exists() {
-                verify_optimizer_state(&optimizer_state, &metadata.optimizer_sha256)?;
-                optimizer.load_state(&optimizer_state)?;
-            } else if !metadata.optimizer_sha256.is_empty() {
-                bail!(
-                    "planner optimizer state {} is required by checkpoint metadata",
-                    optimizer_state.display()
-                );
-            } else {
-                // Moments and step_count are zero in a fresh optimizer; reset the
-                // warmup counter to match so the momentum schedule restarts from
-                // MUON_MOMENTUM_WARMUP_START instead of applying steady-state beta1
-                // to zeroed EMA buffers.
-                optimizer_steps = 0;
-                eprintln!(
-                    "warning: planner optimizer state {} absent; restarting optimizer moments and momentum warmup from zero",
-                    optimizer_state.display()
-                );
-            }
+            let actor_state = planner_actor_optimizer_state_path(weights);
+            let critic_state = planner_critic_optimizer_state_path(weights);
+            verify_optimizer_state(&actor_state, &metadata.actor_optimizer_sha256)?;
+            verify_optimizer_state(&critic_state, &metadata.critic_optimizer_sha256)?;
+            let actor_steps = i64::try_from(metadata.actor_optimizer_steps)
+                .context("planner actor optimizer step count exceeds i64")?;
+            let critic_steps = i64::try_from(metadata.critic_optimizer_steps)
+                .context("planner critic optimizer step count exceeds i64")?;
+            actor_optimizer.validate_state_strict(
+                &actor_state,
+                &metadata.actor_initialized_adamw,
+                actor_steps,
+            )?;
+            critic_optimizer.validate_state_strict(
+                &critic_state,
+                &metadata.critic_initialized_adamw,
+                critic_steps,
+            )?;
+            actor_optimizer.load_state_strict(&actor_state, &metadata.actor_initialized_adamw)?;
+            critic_optimizer
+                .load_state_strict(&critic_state, &metadata.critic_initialized_adamw)?;
         }
     }
     println!(
@@ -386,10 +436,12 @@ pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
             args.minibatch_size,
             update_seed(args.seed, global_update, 0x4f5054494d495a45),
             &hl_gauss,
-            &clip_groups,
-            &trainable_vars,
-            &mut optimizer,
-            &mut optimizer_steps,
+            &actor_vars,
+            &critic_vars,
+            &mut actor_optimizer,
+            &mut critic_optimizer,
+            &mut actor_optimizer_steps,
+            &mut critic_optimizer_steps,
             &mut kl_controller,
             device,
         )?;
@@ -416,14 +468,16 @@ pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
                 &world_weights_hash,
                 args.horizon,
                 context_bars,
-                optimizer_steps,
+                actor_optimizer_steps,
+                critic_optimizer_steps,
                 global_update,
                 &run_lineage_id,
                 args.seed,
                 kl_controller.ema(),
                 kl_controller.scale(),
             ),
-            &optimizer,
+            &actor_optimizer,
+            &critic_optimizer,
         )?;
         staged_reports.publish()?;
         commit_resume_manifest(&args.output, &resume_path, &committed)?;
@@ -442,14 +496,16 @@ pub fn train_planner(mut args: TrainPlannerArgs) -> Result<()> {
             &world_weights_hash,
             args.horizon,
             context_bars,
-            optimizer_steps,
+            actor_optimizer_steps,
+            critic_optimizer_steps,
             base_updates + args.updates as u64,
             &run_lineage_id,
             args.seed,
             kl_controller.ema(),
             kl_controller.scale(),
         ),
-        &optimizer,
+        &actor_optimizer,
+        &critic_optimizer,
     )?;
     Ok(())
 }
@@ -465,7 +521,11 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| world_model_metadata_path(&args.world_model_weights));
-    let world_model = LejepaWorldModel::load(&args.world_model_weights, metadata_path, device)?;
+    let world_model =
+        BarWorldModel::load(Path::new(&args.world_model_weights), &metadata_path, device)?;
+    if !world_model.all_parameters_frozen() {
+        bail!("world model loaded for planning is still trainable; refusing to plan against a world model whose forecast can accumulate gradient");
+    }
     let world_lineage = world_model.lineage_sha256().to_owned();
     let mut planner_vs = nn::VarStore::new(device);
     let planner = WorldModelPlanner::new(&planner_vs.root());
@@ -488,12 +548,20 @@ pub fn infer_planner(args: InferPlannerArgs) -> Result<PlannerInferenceSummary> 
         world_model.metadata(),
         args.context_bars.or(Some(checkpoint_metadata.context_bars)),
     )?;
-    let dataset = PlannerDataset::load_cached(args.tickers.as_deref())?;
+    let dataset = PlannerCorpus::load_filtered(
+        &crate::data::ingest::bars_dir(),
+        world_model.metadata().res_secs,
+        PLANNER_MIN_CORPUS_BARS,
+        args.tickers.as_deref(),
+    )?;
+    // The last decision of the episode still imagines a full horizon, whose future
+    // calendar is read off real bars, so an endpoint must leave room for the rollout
+    // AND the horizon behind it.
     let endpoints = dataset.deterministic_endpoints(
         args.split,
         args.episodes,
         context_bars,
-        args.rollout_length,
+        args.rollout_length + horizon,
     )?;
     let evaluation_fingerprint = dataset.evaluation_fingerprint(
         args.split,
@@ -577,11 +645,105 @@ fn resolve_planner_output(args: &TrainPlannerArgs) -> Result<String> {
     Ok(destination.weights.join("planner.ot").display().to_string())
 }
 
+/// Sample-axis summary of one imagined forecast, in exactly the shapes
+/// [`PlannerForecast`] accepts.
+struct PlannerForecastSummary {
+    /// `[B, horizon, PLANNER_LATENT_DIM]`: the per-step belief mean concatenated
+    /// with its across-sample standard deviation.
+    latent: Tensor,
+    /// `[B, horizon, PLANNER_RETURN_QUANTILES]`: quantiles of the cumulative log
+    /// return the same samples imply at that step.
+    quantiles: Tensor,
+}
+
+/// Imagine `samples` ancestral continuations from `session` and fold them into the
+/// two belief moments plus the cumulative-return quantiles.
+///
+/// Nothing per-sample survives, so the samples are drawn in chunks and reduced as
+/// they arrive instead of being materialized as one `[B, samples, horizon, D]` block:
+/// each `imagine` call replicates the session's cached context once per sample, and
+/// that replication — not the arithmetic — is what bounds the sample count.
+fn summarize_forecast(
+    world_model: &BarWorldModel,
+    session: &BarWorldModelSession,
+    future_time_ids: &Tensor,
+    samples: usize,
+) -> Result<PlannerForecastSummary> {
+    if samples == 0 {
+        bail!("planner forecast needs at least one imagined sample");
+    }
+    let device = world_model.device();
+    // Moments are accumulated about the decision-time belief rather than about zero.
+    // Every imagined step stays near it, so the centered `E[c^2] - E[c]^2` never has to
+    // cancel a large shared mean: measured uncentred, a step whose true across-sample
+    // spread is exactly zero reported 2.4e-4 of the belief scale purely from squaring in
+    // f32. `[B, 1, 1, D]` broadcasts against the `[B, samples, horizon, D]` beliefs.
+    let shift = session.belief().unsqueeze(1).unsqueeze(1);
+    tch::no_grad(|| {
+        let mut sum: Option<Tensor> = None;
+        let mut sum_sq: Option<Tensor> = None;
+        let mut cumulative_returns = Vec::new();
+        let mut drawn = 0usize;
+        while drawn < samples {
+            let chunk = PLANNER_FORECAST_SAMPLE_CHUNK.min(samples - drawn);
+            let rollout = world_model.imagine(
+                session,
+                future_time_ids,
+                chunk,
+                PLANNER_FORECAST_TEMPERATURE,
+                RolloutMode::Exact,
+            );
+            // The sums themselves accumulate in f64, so a long horizon cannot drift the
+            // moments even though each squared deviation is only f32-accurate.
+            let centered = &rollout.beliefs - &shift;
+            let chunk_sum = centered.sum_dim_intlist([1i64].as_slice(), false, Kind::Double);
+            let chunk_sum_sq =
+                centered
+                    .square()
+                    .sum_dim_intlist([1i64].as_slice(), false, Kind::Double);
+            sum = Some(match sum {
+                Some(total) => total + chunk_sum,
+                None => chunk_sum,
+            });
+            sum_sq = Some(match sum_sq {
+                Some(total) => total + chunk_sum_sq,
+                None => chunk_sum_sq,
+            });
+            // `[B, chunk, horizon]`: the log return compounds along the horizon, so the
+            // quantiles below are of the cumulative return to each step, not of one bar.
+            cumulative_returns.push(rollout.dof.select(-1, DOF_R as i64).cumsum(-1, Kind::Float));
+            drawn += chunk;
+        }
+        let (Some(sum), Some(sum_sq)) = (sum, sum_sq) else {
+            bail!("planner forecast summarized no imagined samples");
+        };
+        let count = samples as f64;
+        let offset = sum / count;
+        let variance = (sum_sq / count - offset.square()).clamp_min(0.0);
+        let mean = shift.squeeze_dim(1) + offset;
+        let latent = Tensor::cat(
+            &[
+                mean.to_kind(Kind::Float),
+                variance.sqrt().to_kind(Kind::Float),
+            ],
+            -1,
+        );
+        let levels = Tensor::from_slice(&PLANNER_RETURN_QUANTILE_LEVELS).to_device(device);
+        // `quantile` prepends the level axis, so `[B, samples, horizon]` reduces to
+        // `[levels, B, horizon]` and has to be rotated into the planner's layout.
+        let quantiles = Tensor::cat(&cumulative_returns, 1)
+            .quantile(&levels, Some(1), false, "linear")
+            .permute([1, 2, 0])
+            .contiguous();
+        Ok(PlannerForecastSummary { latent, quantiles })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_real_rollout(
     planner: &WorldModelPlanner,
-    world_model: &LejepaWorldModel,
-    dataset: &PlannerDataset,
+    world_model: &BarWorldModel,
+    dataset: &PlannerCorpus,
     hl_gauss: &HlGaussBins,
     horizon: usize,
     rollout_length: usize,
@@ -590,15 +752,18 @@ fn collect_real_rollout(
     rng: &mut StdRng,
     device: Device,
 ) -> Result<CollectedRollout> {
+    // The last decision still imagines a full horizon, and that horizon's calendar is
+    // read off real bars, so an endpoint has to leave room for the rollout AND the
+    // horizon behind it or `future_time_ids` runs past the end of the series.
     let endpoints = dataset.sample_endpoints(
         PlannerDataSplit::Train,
         environments,
         context_bars,
-        rollout_length,
+        rollout_length + horizon,
         rng,
     )?;
-    let context = dataset.contexts(&endpoints, &vec![0; environments], context_bars, device)?;
-    let mut session = world_model.start_session(&context)?;
+    let start = dataset.context_batch(&endpoints, &vec![0; environments], context_bars, device)?;
+    let mut session = world_model.start_session(&start.dof, &start.time_ids);
     let mut portfolios = (0..environments)
         .map(|_| PlannerPortfolio::new(100.0))
         .collect::<Vec<_>>();
@@ -619,10 +784,10 @@ fn collect_real_rollout(
     // The relative-horizon tensor is identical across every decision step, so its
     // host copy is hoisted out of the loop instead of being re-transferred ~100x.
     let stored_horizon = relative_horizon.to_device(Device::Cpu).detach();
-    let primary_series = dataset.series(endpoints[0].series);
-    let primary_start_price = primary_series.closes[endpoints[0].bar];
+    let primary_symbol = dataset.symbol(endpoints[0].series).to_owned();
+    let primary_start_price = dataset.close(endpoints[0].series, endpoints[0].bar);
     let mut primary_trace = PlannerEpisodeTrace {
-        ticker: primary_series.ticker.clone(),
+        ticker: primary_symbol.clone(),
         cash: vec![100.0],
         positioned: vec![0.0],
         total: vec![100.0],
@@ -630,7 +795,7 @@ fn collect_real_rollout(
         ..PlannerEpisodeTrace::default()
     };
     let mut deterministic_primary_trace = PlannerEpisodeTrace {
-        ticker: primary_series.ticker.clone(),
+        ticker: primary_symbol,
         cash: vec![100.0],
         positioned: vec![0.0],
         total: vec![100.0],
@@ -639,11 +804,20 @@ fn collect_real_rollout(
     };
 
     for decision in 0..=rollout_length {
-        let prediction = session.forecast(world_model, horizon as i64)?;
-        validate_prediction_finite(&prediction)?;
+        let future_time_ids =
+            dataset
+                .corpus()
+                .future_time_ids(&endpoints, decision, horizon as i64, device)?;
+        let summary = summarize_forecast(
+            world_model,
+            &session,
+            &future_time_ids,
+            DEFAULT_PLANNER_FORECAST_SAMPLES,
+        )?;
+        validate_forecast_finite(&summary)?;
         let current_prices = endpoints
             .iter()
-            .map(|endpoint| dataset.series(endpoint.series).closes[endpoint.bar + decision])
+            .map(|endpoint| dataset.close(endpoint.series, endpoint.bar + decision))
             .collect::<Vec<_>>();
         let portfolio_state = Tensor::from_slice(
             &portfolios
@@ -654,18 +828,18 @@ fn collect_real_rollout(
         )
         .view([environments as i64, PLANNER_PORTFOLIO_DIM])
         .to_device(device);
-        let belief = session.belief();
-        let (encoded_forecast, output) = tch::no_grad(|| {
-            let encoded = planner.encode_forecast_mixed_precision(
-                &PlannerForecast {
-                    latent: prediction.latent.shallow_clone(),
-                    relative_horizon: relative_horizon.shallow_clone(),
-                },
-                &belief,
-            );
-            let output = planner.readout_encoded_mixed_precision(&encoded, &portfolio_state);
-            (encoded, output)
-        });
+        let belief = session.belief().shallow_clone();
+        let planner_input = WorldModelPlannerInput {
+            forecast: PlannerForecast {
+                latent: summary.latent.shallow_clone(),
+                relative_horizon: relative_horizon.shallow_clone(),
+                return_quantiles: summary.quantiles.shallow_clone(),
+            },
+            belief: belief.shallow_clone(),
+            portfolio_state: portfolio_state.shallow_clone(),
+        };
+        let (encoded_policy, output) =
+            tch::no_grad(|| planner.forward_with_policy_encoding_mixed_precision(&planner_input));
         let values_cpu = hl_gauss.decode(&output.value_logits).to_device(Device::Cpu);
 
         for environment in 0..environments {
@@ -682,7 +856,8 @@ fn collect_real_rollout(
         // The observation tensors feed only the transitions created below, so their
         // host copies are deferred past the truncation break to skip the wasted
         // final-iteration transfer (horizon is constant and copied once, hoisted).
-        let stored_latent = prediction.latent.to_device(Device::Cpu).detach();
+        let stored_latent = summary.latent.to_device(Device::Cpu).detach();
+        let stored_quantiles = summary.quantiles.to_device(Device::Cpu).detach();
         let stored_belief = belief.to_device(Device::Cpu).detach();
         let stored_portfolio = portfolio_state.to_device(Device::Cpu).detach();
 
@@ -696,15 +871,16 @@ fn collect_real_rollout(
         .view([environments as i64, PLANNER_PORTFOLIO_DIM])
         .to_device(device);
         let deterministic_output = tch::no_grad(|| {
-            planner
-                .readout_encoded_mixed_precision(&encoded_forecast, &deterministic_portfolio_state)
+            planner.readout_policy_encoded_mixed_precision(
+                &encoded_policy,
+                &deterministic_portfolio_state,
+            )
         });
         // Coalesce the four per-step policy tensors (all [environments, 1]) into a
         // single device->host copy: one sync per step instead of four. The split
         // values are byte-identical to transferring each tensor separately.
         let sampled_actions = sample_beta_action(&output.alpha, &output.beta);
-        let deterministic_actions =
-            beta_mean(&deterministic_output.alpha, &deterministic_output.beta);
+        let deterministic_actions = beta_mean(&deterministic_output.0, &deterministic_output.1);
         let policy_bundle_cpu = Tensor::stack(
             &[
                 &sampled_actions,
@@ -721,7 +897,7 @@ fn collect_real_rollout(
         let beta_cpu = policy_bundle_cpu.get(3);
         for environment in 0..environments {
             let endpoint = endpoints[environment];
-            let next_price = dataset.series(endpoint.series).closes[endpoint.bar + decision + 1];
+            let next_price = dataset.close(endpoint.series, endpoint.bar + decision + 1);
             let action = actions_cpu.double_value(&[environment as i64, 0]);
             let step =
                 portfolios[environment].step(action, current_prices[environment], next_price);
@@ -787,6 +963,7 @@ fn collect_real_rollout(
                 observation: observation_at(
                     &stored_latent,
                     &stored_horizon,
+                    &stored_quantiles,
                     &stored_belief,
                     &stored_portfolio,
                     environment,
@@ -812,26 +989,25 @@ fn collect_real_rollout(
                 assets_after: step.assets_after,
             });
         }
-        let actual_next_bars =
-            dataset.contexts(&endpoints, &vec![decision + 1; environments], 1, device)?;
-        session.append_actual_bar(world_model, &actual_next_bars)?;
+        let next =
+            dataset.context_batch(&endpoints, &vec![decision + 1; environments], 1, device)?;
+        world_model.advance(&mut session, &next.dof, &next.time_ids)?;
     }
     rollout.validate_complete()?;
     let policy_wealth = endpoints
         .iter()
         .enumerate()
         .map(|(environment, endpoint)| {
-            let final_price = dataset.series(endpoint.series).closes[endpoint.bar + rollout_length];
+            let final_price = dataset.close(endpoint.series, endpoint.bar + rollout_length);
             portfolios[environment].total_assets(final_price) / 100.0
         })
         .collect::<Vec<_>>();
     let buy_and_hold_wealth = endpoints
         .iter()
         .map(|endpoint| {
-            let series = dataset.series(endpoint.series);
             buy_and_hold_wealth_ratio(
-                series.closes[endpoint.bar],
-                series.closes[endpoint.bar + rollout_length],
+                dataset.close(endpoint.series, endpoint.bar),
+                dataset.close(endpoint.series, endpoint.bar + rollout_length),
             )
         })
         .collect::<Vec<_>>();
@@ -839,7 +1015,7 @@ fn collect_real_rollout(
         .iter()
         .enumerate()
         .map(|(environment, endpoint)| {
-            let final_price = dataset.series(endpoint.series).closes[endpoint.bar + rollout_length];
+            let final_price = dataset.close(endpoint.series, endpoint.bar + rollout_length);
             deterministic_portfolios[environment].total_assets(final_price) / 100.0
         })
         .collect::<Vec<_>>();
@@ -878,10 +1054,12 @@ fn optimize_rollout(
     minibatch_size: usize,
     seed: u64,
     hl_gauss: &HlGaussBins,
-    clip_groups: &crate::torch::train::optimizer_glue::GradClipGroups,
-    trainable_vars: &[Tensor],
-    optimizer: &mut Muon,
-    optimizer_steps: &mut u64,
+    actor_vars: &[Tensor],
+    critic_vars: &[Tensor],
+    actor_optimizer: &mut Muon,
+    critic_optimizer: &mut Muon,
+    actor_optimizer_steps: &mut u64,
+    critic_optimizer_steps: &mut u64,
     kl_controller: &mut KlLrController,
     device: Device,
 ) -> Result<OptimizationSummary> {
@@ -889,6 +1067,7 @@ fn optimize_rollout(
     let diagnostics = critic_diagnostics(&batch.old_alpha, &batch.old_beta, &batch.values, returns);
     summary.beta_concentration = diagnostics.beta_concentration_mean;
     summary.critic_explained_variance = diagnostics.critic_explained_variance;
+    summary.actor_lr_scale = kl_controller.scale();
     // Refit the value critic's running normalization on this update's GAE returns
     // (whole batch, once) BEFORE encoding any minibatch target, so every minibatch
     // in this update standardizes against the same run-level stats and the encoded
@@ -904,8 +1083,12 @@ fn optimize_rollout(
     let mut entropy_sum = Tensor::zeros([], (Kind::Float, device));
     let mut actor_grad_sum = Tensor::zeros([], (Kind::Float, device));
     let mut critic_grad_sum = Tensor::zeros([], (Kind::Float, device));
-    apply_planner_actor_lr_scale(optimizer, kl_controller.scale())?;
-    'optimization: for epoch in 0..DEFAULT_PLANNER_OPTIMIZATION_EPOCHS {
+    apply_planner_actor_lr_scale(actor_optimizer, kl_controller.scale(), actor_vars.len())?;
+    summary.actor_available_steps =
+        batch.len() as usize / minibatch_size * DEFAULT_PLANNER_OPTIMIZATION_EPOCHS;
+    summary.critic_available_steps = summary.actor_available_steps;
+    let mut actor_stopped = false;
+    for epoch in 0..DEFAULT_PLANNER_OPTIMIZATION_EPOCHS {
         for indices in
             rollout.minibatch_indices(minibatch_size, seed ^ ((epoch as u64 + 1) << 32))?
         {
@@ -913,51 +1096,66 @@ fn optimize_rollout(
             let index = Tensor::from_slice(&indices).to_device(device);
             let mini_advantages = advantages.index_select(0, &index);
             let mini_returns = returns.index_select(0, &index);
-            let output = planner.forward_mixed_precision(&planner_input(&mini));
-            let losses = planner_actor_critic_losses(
-                hl_gauss,
-                &output.value_logits,
-                &output.alpha,
-                &output.beta,
-                &mini.actions,
-                &mini.old_alpha,
-                &mini.old_beta,
-                &mini_advantages,
-                &mini_returns,
-                &output.next_return,
-                &mini.next_log_returns,
-            );
-            let raw_minibatch_kl = losses.reverse_kl.double_value(&[]);
-            let (stop, minibatch_kl) =
-                kl_stops_before_optimizer_step(&mut summary, raw_minibatch_kl)?;
-            if stop {
-                break 'optimization;
-            }
-            optimizer.zero_grad();
-            let (actor_norm, critic_norm) = backward_actor_critic_with_separate_clips(
-                clip_groups,
-                trainable_vars,
-                &losses.actor_loss,
-                &losses.critic_loss,
-                MAX_GRAD_NORM,
-                device,
-                false,
-            );
-            optimizer.set_momentum(muon_momentum_for_step(*optimizer_steps as i64));
-            optimizer.step();
-            *optimizer_steps += 1;
-            actor_loss_sum += losses.actor_loss.detach();
-            reverse_kl_sum += minibatch_kl;
-            entropy_sum += losses.entropy.detach();
-            actor_grad_sum += actor_norm.detach();
-            summary.actor_steps += 1;
-            critic_loss_sum += losses.critic_loss.detach();
-            aux_return_loss_sum += losses.aux_return_loss.detach();
-            critic_grad_sum += critic_norm.detach();
-            summary.steps += 1;
+            let input = planner_input(&mini);
+            let (critic_loss, aux_return_loss) = if actor_stopped {
+                let output = planner.forward_critic_mixed_precision(&input);
+                let losses = planner_critic_losses(
+                    hl_gauss,
+                    &output.value_logits,
+                    &mini_returns,
+                    &output.next_return,
+                    &mini.next_log_returns,
+                );
+                (losses.critic_loss, losses.aux_return_loss)
+            } else {
+                let output = planner.forward_mixed_precision(&input);
+                let losses = planner_actor_critic_losses(
+                    hl_gauss,
+                    &output.value_logits,
+                    &output.alpha,
+                    &output.beta,
+                    &mini.actions,
+                    &mini.old_alpha,
+                    &mini.old_beta,
+                    &mini_advantages,
+                    &mini_returns,
+                    &output.next_return,
+                    &mini.next_log_returns,
+                );
+                let raw_minibatch_kl = losses.reverse_kl.double_value(&[]);
+                let (stop, minibatch_kl) =
+                    kl_stops_before_optimizer_step(&mut summary, raw_minibatch_kl)?;
+                actor_stopped = stop;
+                if !stop {
+                    actor_optimizer.zero_grad();
+                    losses.actor_loss.backward();
+                    let actor_norm = clip_gradients(actor_vars, MAX_GRAD_NORM, device);
+                    actor_optimizer
+                        .set_momentum(muon_momentum_for_step(*actor_optimizer_steps as i64));
+                    actor_optimizer.step();
+                    *actor_optimizer_steps += 1;
+                    actor_loss_sum += losses.actor_loss.detach();
+                    reverse_kl_sum += minibatch_kl;
+                    entropy_sum += losses.entropy.detach();
+                    actor_grad_sum += actor_norm;
+                    summary.actor_steps += 1;
+                }
+                (losses.critic_loss, losses.aux_return_loss)
+            };
+
+            critic_optimizer.zero_grad();
+            critic_loss.backward();
+            let critic_norm = clip_gradients(critic_vars, MAX_GRAD_NORM, device);
+            critic_optimizer.set_momentum(muon_momentum_for_step(*critic_optimizer_steps as i64));
+            critic_optimizer.step();
+            *critic_optimizer_steps += 1;
+            critic_loss_sum += critic_loss.detach();
+            aux_return_loss_sum += aux_return_loss.detach();
+            critic_grad_sum += critic_norm;
+            summary.critic_steps += 1;
         }
     }
-    let critic_denominator = summary.steps as f64;
+    let critic_denominator = summary.critic_steps as f64;
     let actor_denominator = summary.actor_steps.max(1) as f64;
     summary.actor_loss = actor_loss_sum.double_value(&[]) / actor_denominator;
     summary.critic_loss = critic_loss_sum.double_value(&[]) / critic_denominator;
@@ -970,11 +1168,15 @@ fn optimize_rollout(
     Ok(summary)
 }
 
-fn apply_planner_actor_lr_scale(optimizer: &mut Muon, lr_scale: f64) -> Result<()> {
+fn apply_planner_actor_lr_scale(
+    optimizer: &mut Muon,
+    lr_scale: f64,
+    expected: usize,
+) -> Result<()> {
     let matched = optimizer.set_named_lr_scale(PLANNER_ACTOR_LR_PATTERNS, lr_scale);
-    if matched != PLANNER_ACTOR_PARAMETER_COUNT {
+    if matched != expected {
         bail!(
-            "planner actor learning-rate routing matched {matched} parameters, expected {PLANNER_ACTOR_PARAMETER_COUNT}"
+            "planner actor learning-rate routing matched {matched} parameters, expected {expected}"
         );
     }
     Ok(())
@@ -991,13 +1193,60 @@ fn new_planner_optimizer(named_vars: &[(String, Tensor)]) -> Muon {
             adamw_betas: (0.9, 0.95),
             adamw_eps: 1e-8,
             force_adamw_name_substrings: vec![
-                "policy_concentration".to_owned(),
+                "concentration".to_owned(),
                 "value_projection".to_owned(),
                 "next_return_head".to_owned(),
             ],
             ..MuonConfig::default()
         },
     )
+}
+
+fn split_planner_parameters(
+    named_vars: &[(String, Tensor)],
+) -> Result<(Vec<(String, Tensor)>, Vec<(String, Tensor)>)> {
+    let mut actor = Vec::new();
+    let mut critic = Vec::new();
+    for (name, tensor) in named_vars {
+        let destination = if name.starts_with("policy.") {
+            &mut actor
+        } else if name.starts_with("critic.") {
+            &mut critic
+        } else {
+            bail!("planner trainable parameter is outside policy/critic ownership: {name}");
+        };
+        destination.push((name.clone(), tensor.shallow_clone()));
+    }
+    if actor.is_empty() || critic.is_empty() {
+        bail!("planner policy and critic parameter sets must both be non-empty");
+    }
+    Ok((actor, critic))
+}
+
+fn clip_gradients(parameters: &[Tensor], max_norm: f64, device: Device) -> Tensor {
+    tch::no_grad(|| {
+        let total_squared = parameters.iter().fold(
+            Tensor::zeros([], (Kind::Float, device)),
+            |sum, parameter| {
+                let grad = parameter.grad();
+                if grad.defined() {
+                    sum + grad.square().sum(Kind::Float)
+                } else {
+                    sum
+                }
+            },
+        );
+        let norm = total_squared.sqrt();
+        let coefficient =
+            (Tensor::from(max_norm as f32).to_device(device) / (&norm + 1e-6)).clamp_max(1.0);
+        for parameter in parameters {
+            let mut grad = parameter.grad();
+            if grad.defined() {
+                let _ = grad.g_mul_(&coefficient.to_kind(grad.kind()));
+            }
+        }
+        norm
+    })
 }
 
 fn kl_stops_before_optimizer_step(
@@ -1082,8 +1331,8 @@ fn rollout_advantages(
 #[allow(clippy::too_many_arguments)]
 fn infer_real_episode(
     planner: &WorldModelPlanner,
-    world_model: &LejepaWorldModel,
-    dataset: &PlannerDataset,
+    world_model: &BarWorldModel,
+    dataset: &PlannerCorpus,
     endpoint: PlannerEndpoint,
     horizon: usize,
     rollout_length: usize,
@@ -1098,12 +1347,12 @@ fn infer_real_episode(
     let mut peak_assets: f64 = 100.0;
     let mut max_drawdown: f64 = 0.0;
     let relative_horizon = relative_horizon(1, horizon, device);
-    let context = dataset.contexts(&[endpoint], &[0], context_bars, device)?;
-    let mut session = world_model.start_session(&context)?;
-    let series = dataset.series(endpoint.series);
-    let start_price = series.closes[endpoint.bar];
+    let start = dataset.context_batch(&[endpoint], &[0], context_bars, device)?;
+    let mut session = world_model.start_session(&start.dof, &start.time_ids);
+    let symbol = dataset.symbol(endpoint.series).to_owned();
+    let start_price = dataset.close(endpoint.series, endpoint.bar);
     let mut trace = PlannerEpisodeTrace {
-        ticker: series.ticker.clone(),
+        ticker: symbol.clone(),
         cash: vec![100.0],
         positioned: vec![0.0],
         total: vec![100.0],
@@ -1111,40 +1360,42 @@ fn infer_real_episode(
         ..PlannerEpisodeTrace::default()
     };
     for decision in 0..rollout_length {
-        let prediction = session.forecast(world_model, horizon as i64)?;
-        validate_prediction_finite(&prediction).with_context(|| {
-            format!(
-                "invalid world-model forecast for {} at decision {decision}",
-                dataset.series(endpoint.series).ticker
-            )
+        let future_time_ids =
+            dataset
+                .corpus()
+                .future_time_ids(&[endpoint], decision, horizon as i64, device)?;
+        let summary = summarize_forecast(
+            world_model,
+            &session,
+            &future_time_ids,
+            DEFAULT_PLANNER_FORECAST_SAMPLES,
+        )?;
+        validate_forecast_finite(&summary).with_context(|| {
+            format!("invalid world-model forecast for {symbol} at decision {decision}")
         })?;
-        let series = dataset.series(endpoint.series);
-        let current_price = series.closes[endpoint.bar + decision];
+        let current_price = dataset.close(endpoint.series, endpoint.bar + decision);
         let portfolio_state = Tensor::from_slice(&portfolio.planner_state(current_price))
             .view([1, PLANNER_PORTFOLIO_DIM])
             .to_device(device);
-        let belief = session.belief();
+        let belief = session.belief().shallow_clone();
         let output = tch::no_grad(|| {
             planner.forward_mixed_precision(&WorldModelPlannerInput {
                 forecast: PlannerForecast {
-                    latent: prediction.latent,
+                    latent: summary.latent.shallow_clone(),
                     relative_horizon: relative_horizon.shallow_clone(),
+                    return_quantiles: summary.quantiles.shallow_clone(),
                 },
                 belief,
                 portfolio_state,
             })
         });
         let action = beta_mean(&output.alpha, &output.beta).double_value(&[0, 0]);
-        let step = portfolio.step(
-            action,
-            current_price,
-            series.closes[endpoint.bar + decision + 1],
-        );
+        let next_price = dataset.close(endpoint.series, endpoint.bar + decision + 1);
+        let step = portfolio.step(action, current_price, next_price);
         reward_sum += step.reward;
         turnover += step.turnover;
         requested_target_weight_sum += step.requested_target_weight;
         executed_stock_weight_sum += step.executed_stock_weight;
-        let next_price = series.closes[endpoint.bar + decision + 1];
         trace.cash.push(step.cash_after_trade);
         trace.positioned.push(step.positioned_value_after);
         trace.total.push(step.assets_after);
@@ -1158,18 +1409,15 @@ fn infer_real_episode(
         trace.executed_stock_weight.push(step.executed_stock_weight);
         peak_assets = peak_assets.max(step.assets_after);
         max_drawdown = max_drawdown.max(1.0 - step.assets_after / peak_assets);
-        let actual_next_bar = dataset.contexts(&[endpoint], &[decision + 1], 1, device)?;
-        session.append_actual_bar(world_model, &actual_next_bar)?;
+        let next = dataset.context_batch(&[endpoint], &[decision + 1], 1, device)?;
+        world_model.advance(&mut session, &next.dof, &next.time_ids)?;
     }
-    let series = dataset.series(endpoint.series);
-    let final_wealth_ratio =
-        portfolio.total_assets(series.closes[endpoint.bar + rollout_length]) / 100.0;
-    let buy_and_hold_wealth_ratio = buy_and_hold_wealth_ratio(
-        series.closes[endpoint.bar],
-        series.closes[endpoint.bar + rollout_length],
-    );
+    let final_price = dataset.close(endpoint.series, endpoint.bar + rollout_length);
+    let final_wealth_ratio = portfolio.total_assets(final_price) / 100.0;
+    let buy_and_hold_wealth_ratio =
+        buy_and_hold_wealth_ratio(dataset.close(endpoint.series, endpoint.bar), final_price);
     Ok(PlannerInferenceEpisode {
-        ticker: series.ticker.clone(),
+        ticker: symbol,
         start_bar: endpoint.bar,
         steps: rollout_length,
         reward_sum,
@@ -1190,6 +1438,7 @@ fn planner_input(batch: &PlannerBatch) -> WorldModelPlannerInput {
         forecast: PlannerForecast {
             latent: batch.forecast_latent.shallow_clone(),
             relative_horizon: batch.relative_horizon.shallow_clone(),
+            return_quantiles: batch.return_quantiles.shallow_clone(),
         },
         belief: batch.belief.shallow_clone(),
         portfolio_state: batch.portfolio_state.shallow_clone(),
@@ -1213,6 +1462,7 @@ fn update_seed(base_seed: u64, cumulative_update: u64, stream: u64) -> u64 {
 fn observation_at(
     latent: &Tensor,
     relative_horizon: &Tensor,
+    return_quantiles: &Tensor,
     belief: &Tensor,
     portfolio_state: &Tensor,
     index: usize,
@@ -1221,19 +1471,20 @@ fn observation_at(
     PlannerObservation {
         forecast_latent: latent.get(index).to_device(Device::Cpu).detach(),
         relative_horizon: relative_horizon.get(index).to_device(Device::Cpu).detach(),
+        return_quantiles: return_quantiles.get(index).to_device(Device::Cpu).detach(),
         belief: belief.get(index).to_device(Device::Cpu).detach(),
         portfolio_state: portfolio_state.get(index).to_device(Device::Cpu).detach(),
     }
 }
 
-fn validate_prediction_finite(prediction: &WorldModelPrediction) -> Result<()> {
+fn validate_forecast_finite(summary: &PlannerForecastSummary) -> Result<()> {
     for (name, tensor) in [
-        ("latent", &prediction.latent),
-        ("OHLC mean", &prediction.ohlc_mean),
-        ("OHLC log-variance", &prediction.ohlc_logvar),
+        ("forecast latent", &summary.latent),
+        ("forecast return quantiles", &summary.quantiles),
     ] {
-        if tensor.isfinite().all().int64_value(&[]) == 0 {
-            bail!("world-model {name} prediction contains NaN or infinity");
+        let finite: i64 = tensor.isfinite().all().int64_value(&[]);
+        if finite == 0 {
+            bail!("world-model {name} contains NaN or infinity");
         }
     }
     Ok(())
@@ -1341,7 +1592,8 @@ fn resume_manifest_path(checkpoint: impl AsRef<Path>) -> PathBuf {
 fn ensure_immutable_checkpoint_path(checkpoint: &Path) -> Result<()> {
     if checkpoint.exists()
         || planner_metadata_path(checkpoint).exists()
-        || planner_optimizer_state_path(checkpoint).exists()
+        || planner_actor_optimizer_state_path(checkpoint).exists()
+        || planner_critic_optimizer_state_path(checkpoint).exists()
     {
         bail!(
             "refusing to overwrite immutable planner checkpoint {}",
@@ -1359,7 +1611,8 @@ fn ensure_fresh_resume_output(checkpoint: impl AsRef<Path>) -> Result<()> {
         .unwrap_or("planner");
     let has_output_bundle = checkpoint.exists()
         || planner_metadata_path(checkpoint).exists()
-        || planner_optimizer_state_path(checkpoint).exists()
+        || planner_actor_optimizer_state_path(checkpoint).exists()
+        || planner_critic_optimizer_state_path(checkpoint).exists()
         || resume_manifest_path(checkpoint).exists();
     let has_bundle = checkpoint
         .parent()
@@ -1439,7 +1692,8 @@ fn cleanup_uncommitted_resume_bundles(
         }
         for path in [
             resume.clone(),
-            planner_optimizer_state_path(&resume),
+            planner_actor_optimizer_state_path(&resume),
+            planner_critic_optimizer_state_path(&resume),
             planner_metadata_path(&resume),
         ] {
             if path.exists() {
@@ -1496,7 +1750,8 @@ fn commit_resume_manifest(
         update: metadata.cumulative_updates,
         checkpoint_file: checkpoint_file.to_owned(),
         weights_sha256: metadata.weights_sha256.clone(),
-        optimizer_sha256: metadata.optimizer_sha256.clone(),
+        actor_optimizer_sha256: metadata.actor_optimizer_sha256.clone(),
+        critic_optimizer_sha256: metadata.critic_optimizer_sha256.clone(),
     };
     let path = resume_manifest_path(base_checkpoint);
     if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
@@ -1537,7 +1792,8 @@ fn resolve_resume_checkpoint(
         if metadata.cumulative_updates != manifest.update
             || metadata.run_lineage_id != manifest.run_lineage_id
             || metadata.weights_sha256 != manifest.weights_sha256
-            || metadata.optimizer_sha256 != manifest.optimizer_sha256
+            || metadata.actor_optimizer_sha256 != manifest.actor_optimizer_sha256
+            || metadata.critic_optimizer_sha256 != manifest.critic_optimizer_sha256
         {
             bail!("planner resume manifest does not match its committed checkpoint bundle");
         }
@@ -1620,6 +1876,11 @@ fn training_report_point(
         reverse_kl: optimization.reverse_kl,
         max_reverse_kl: optimization.max_reverse_kl,
         kl_early_stopped: optimization.kl_early_stopped,
+        actor_steps: optimization.actor_steps as f64,
+        actor_available_steps: optimization.actor_available_steps as f64,
+        critic_steps: optimization.critic_steps as f64,
+        critic_available_steps: optimization.critic_available_steps as f64,
+        actor_lr_scale: optimization.actor_lr_scale,
         entropy: optimization.entropy,
         actor_grad_norm: optimization.actor_grad_norm,
         critic_grad_norm: optimization.critic_grad_norm,
@@ -1723,10 +1984,10 @@ mod tests {
     fn kl_trigger_stops_before_any_parameter_update() {
         let mut summary = OptimizationSummary {
             actor_steps: 1,
-            steps: 1,
+            critic_steps: 1,
             ..OptimizationSummary::default()
         };
-        let before_steps = summary.steps;
+        let before_steps = summary.critic_steps;
         let vs = nn::VarStore::new(Device::Cpu);
         let parameter = vs.root().ones("weight", &[1]);
         let mut optimizer = Muon::new_named(
@@ -1747,12 +2008,12 @@ mod tests {
         assert!(summary.kl_early_stopped);
         assert_eq!(summary.max_reverse_kl, TARGET_KL * 2.0);
         assert_eq!(summary.actor_steps, 1);
-        assert_eq!(summary.steps, before_steps);
+        assert_eq!(summary.critic_steps, before_steps);
         assert!(parameter.equal(&before_parameter));
     }
 
     #[test]
-    fn planner_kl_lr_routing_matches_only_the_actor_head() {
+    fn planner_kl_lr_routing_matches_the_entire_actor_branch() {
         let vs = nn::VarStore::new(Device::Cpu);
         let _planner = WorldModelPlanner::new(&vs.root());
         let named_vars = named_trainable_variables(&vs);
@@ -1766,17 +2027,169 @@ mod tests {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(matched_names.len(), PLANNER_ACTOR_PARAMETER_COUNT);
-        assert!(matched_names
-            .iter()
-            .all(|name| name.contains("policy_concentration")));
-        assert!(named_vars
-            .iter()
-            .any(|(name, _)| name.contains("value_projection")));
-        assert!(named_vars.iter().any(|(name, _)| name.contains("trunk_0")));
+        let (actor, critic) = split_planner_parameters(&named_vars).unwrap();
+        assert_eq!(matched_names.len(), actor.len());
+        assert!(matched_names.iter().all(|name| name.starts_with("policy.")));
+        assert!(critic.iter().all(|(name, _)| name.starts_with("critic.")));
+        assert!(actor.iter().any(|(name, _)| name.contains("trunk_0")));
+        assert!(critic.iter().any(|(name, _)| name.contains("trunk_0")));
 
-        let mut optimizer = new_planner_optimizer(&named_vars);
-        apply_planner_actor_lr_scale(&mut optimizer, 0.25).unwrap();
+        let mut optimizer = new_planner_optimizer(&actor);
+        apply_planner_actor_lr_scale(&mut optimizer, 0.25, actor.len()).unwrap();
+    }
+
+    #[test]
+    fn critic_only_step_cannot_change_policy_parameters_or_output() {
+        use crate::torch::planner::{PLANNER_BELIEF_DIM, PLANNER_LATENT_DIM};
+
+        tch::manual_seed(17);
+        let vs = nn::VarStore::new(Device::Cpu);
+        let planner = WorldModelPlanner::new(&vs.root());
+        let hl_gauss = HlGaussBins::planner(&(vs.root() / "value_running_stats"), Device::Cpu);
+        let named = named_trainable_variables(&vs);
+        let (actor_named, critic_named) = split_planner_parameters(&named).unwrap();
+        let actor_before = actor_named
+            .iter()
+            .map(|(_, parameter)| parameter.copy())
+            .collect::<Vec<_>>();
+        let critic_before = critic_named
+            .iter()
+            .map(|(_, parameter)| parameter.copy())
+            .collect::<Vec<_>>();
+        let critic_vars = critic_named
+            .iter()
+            .map(|(_, parameter)| parameter.shallow_clone())
+            .collect::<Vec<_>>();
+        let mut critic_optimizer = new_planner_optimizer(&critic_named);
+        let input = WorldModelPlannerInput {
+            forecast: PlannerForecast {
+                latent: Tensor::randn([2, 3, PLANNER_LATENT_DIM], (Kind::Float, Device::Cpu)),
+                relative_horizon: Tensor::from_slice(&[1.0f32 / 3.0, 2.0 / 3.0, 1.0])
+                    .view([1, 3, 1])
+                    .expand([2, 3, 1], false),
+                return_quantiles: Tensor::randn(
+                    [2, 3, PLANNER_RETURN_QUANTILES],
+                    (Kind::Float, Device::Cpu),
+                ),
+            },
+            belief: Tensor::randn([2, PLANNER_BELIEF_DIM], (Kind::Float, Device::Cpu)),
+            portfolio_state: Tensor::from_slice(&[0.5f32, 0.5, 0.5, 0.0])
+                .view([1, 4])
+                .expand([2, 4], false),
+        };
+        let policy_before = tch::no_grad(|| planner.forward_mixed_precision(&input));
+        let critic_output_before = policy_before.value_logits.copy();
+        let critic_output = planner.forward_critic_mixed_precision(&input);
+        let losses = planner_critic_losses(
+            &hl_gauss,
+            &critic_output.value_logits,
+            &Tensor::from_slice(&[0.4f32, -0.2]),
+            &critic_output.next_return,
+            &Tensor::from_slice(&[0.03f32, -0.01]),
+        );
+        critic_optimizer.zero_grad();
+        losses.critic_loss.backward();
+        let _ = clip_gradients(&critic_vars, MAX_GRAD_NORM, Device::Cpu);
+        critic_optimizer.step();
+
+        let after = tch::no_grad(|| planner.forward_mixed_precision(&input));
+        assert!(policy_before.alpha.equal(&after.alpha));
+        assert!(policy_before.beta.equal(&after.beta));
+        for ((_, parameter), before) in actor_named.iter().zip(&actor_before) {
+            assert!(parameter.equal(before));
+        }
+        assert!(critic_named
+            .iter()
+            .zip(&critic_before)
+            .any(|((_, parameter), before)| !parameter.equal(before)));
+        assert!(!critic_output_before.equal(&after.value_logits));
+    }
+
+    #[test]
+    fn actor_kl_stop_does_not_reduce_critic_minibatch_steps() {
+        use crate::torch::planner::{PLANNER_BELIEF_DIM, PLANNER_LATENT_DIM};
+
+        let transition = |decision_index: usize| PlannerTransition {
+            observation: PlannerObservation {
+                forecast_latent: Tensor::randn([2, PLANNER_LATENT_DIM], (Kind::Float, Device::Cpu)),
+                relative_horizon: Tensor::from_slice(&[0.5f32, 1.0]).view([2, 1]),
+                return_quantiles: Tensor::from_slice(&[-0.01f32, 0.0, 0.01, -0.02, 0.0, 0.02])
+                    .view([2, PLANNER_RETURN_QUANTILES]),
+                belief: Tensor::randn([PLANNER_BELIEF_DIM], (Kind::Float, Device::Cpu)),
+                portfolio_state: Tensor::from_slice(&[0.5f32, 0.5, 0.5, 0.0]),
+            },
+            environment_id: 0,
+            decision_index,
+            action: Tensor::from_slice(&[0.5f32]),
+            old_alpha: Tensor::from_slice(&[50.0f32]),
+            old_beta: Tensor::from_slice(&[1.1f32]),
+            value: Tensor::from_slice(&[0.0f32]),
+            next_value: Some(Tensor::from_slice(&[0.0f32])),
+            reward: if decision_index == 0 { 0.2 } else { -0.1 },
+            next_log_return: if decision_index == 0 { 0.01 } else { -0.02 },
+            terminated: false,
+            truncated: decision_index == 1,
+            commission: 0.0,
+            turnover: 0.1,
+            executed_stock_weight: 0.5,
+            assets_before: 100.0,
+            assets_after: 100.0,
+        };
+        let mut rollout = PlannerRollout::new(2, "wm-test".to_owned()).unwrap();
+        rollout.push(transition(0)).unwrap();
+        rollout.push(transition(1)).unwrap();
+        let batch = rollout.to_batch(Device::Cpu).unwrap();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let planner = WorldModelPlanner::new(&vs.root());
+        let hl_gauss = HlGaussBins::planner(&(vs.root() / "value_running_stats"), Device::Cpu);
+        let named = named_trainable_variables(&vs);
+        let (actor_named, critic_named) = split_planner_parameters(&named).unwrap();
+        let actor_vars = actor_named
+            .iter()
+            .map(|(_, parameter)| parameter.shallow_clone())
+            .collect::<Vec<_>>();
+        let critic_vars = critic_named
+            .iter()
+            .map(|(_, parameter)| parameter.shallow_clone())
+            .collect::<Vec<_>>();
+        let mut actor_optimizer = new_planner_optimizer(&actor_named);
+        let mut critic_optimizer = new_planner_optimizer(&critic_named);
+        let mut actor_optimizer_steps = 0;
+        let mut critic_optimizer_steps = 0;
+        let mut controller = KlLrController::new(
+            TARGET_KL,
+            KL_CONTROLLER_HALF_LIFE,
+            KL_MIN_LR_SCALE,
+            KL_MAX_LR_SCALE,
+        );
+        let summary = optimize_rollout(
+            &planner,
+            &rollout,
+            &batch,
+            &Tensor::from_slice(&[1.0f32, -1.0]),
+            &Tensor::from_slice(&[0.4f32, -0.2]),
+            1,
+            7,
+            &hl_gauss,
+            &actor_vars,
+            &critic_vars,
+            &mut actor_optimizer,
+            &mut critic_optimizer,
+            &mut actor_optimizer_steps,
+            &mut critic_optimizer_steps,
+            &mut controller,
+            Device::Cpu,
+        )
+        .unwrap();
+
+        assert!(summary.kl_early_stopped);
+        assert!(summary.actor_steps < summary.actor_available_steps);
+        assert_eq!(summary.critic_steps, summary.critic_available_steps);
+        assert_eq!(
+            critic_optimizer_steps as usize,
+            summary.critic_available_steps
+        );
+        assert_eq!(actor_optimizer_steps as usize, summary.actor_steps);
     }
 
     #[test]
@@ -1818,14 +2231,20 @@ mod tests {
         let base = weights.join("planner.ot");
         let vs = nn::VarStore::new(Device::Cpu);
         let _ = vs.root().zeros("weight", &[2, 2]);
-        let optimizer = Muon::new_named(
-            &named_trainable_variables(&vs),
-            MuonConfig {
-                quiet: true,
-                ..MuonConfig::default()
-            },
-        );
+        let named = named_trainable_variables(&vs);
         let save_resume = |update: u64| {
+            let mut optimizer = Muon::new_named(
+                &named,
+                MuonConfig {
+                    quiet: true,
+                    ..MuonConfig::default()
+                },
+            );
+            for _ in 0..update {
+                named[0].1.square().sum(Kind::Float).backward();
+                optimizer.step();
+                optimizer.zero_grad();
+            }
             let path = resume_checkpoint_path(&base, update);
             let committed = save_planner_checkpoint(
                 &vs,
@@ -1837,11 +2256,13 @@ mod tests {
                     128,
                     update,
                     update,
+                    update,
                     "run-a",
                     7,
                     TARGET_KL,
                     1.0,
                 ),
+                &optimizer,
                 &optimizer,
             )
             .unwrap();
@@ -1870,7 +2291,8 @@ mod tests {
         cleanup_uncommitted_resume_bundles(&base, 1, "run-a").unwrap();
         assert!(!second_path.exists());
         assert!(!planner_metadata_path(&second_path).exists());
-        assert!(!planner_optimizer_state_path(&second_path).exists());
+        assert!(!planner_actor_optimizer_state_path(&second_path).exists());
+        assert!(!planner_critic_optimizer_state_path(&second_path).exists());
         let (second_path, second_metadata) = save_resume(2);
         commit_resume_manifest(&base, &second_path, &second_metadata).unwrap();
         let (_, resolved) =
@@ -1902,6 +2324,7 @@ mod tests {
             128,
             2,
             2,
+            2,
             "run-b",
             7,
             TARGET_KL,
@@ -1931,7 +2354,8 @@ mod tests {
         for occupied in [
             checkpoint.clone(),
             planner_metadata_path(&checkpoint),
-            planner_optimizer_state_path(&checkpoint),
+            planner_actor_optimizer_state_path(&checkpoint),
+            planner_critic_optimizer_state_path(&checkpoint),
             resume_manifest_path(&checkpoint),
             resume_checkpoint_path(&checkpoint, 1),
             checkpoint.with_file_name("planner_best_u00000001.ot"),
@@ -1972,5 +2396,217 @@ mod tests {
         assert!((metrics.mean_outperformance_ratio - 0.05).abs() < 1e-12);
         assert!((metrics.median_outperformance_ratio - 0.05).abs() < 1e-12);
         assert!((metrics.outperformance_fraction - 2.0 / 3.0).abs() < 1e-12);
+    }
+
+    /// A hermetic corpus plus a structurally real, randomly-initialized frozen world
+    /// model. Both are needed because the collection loop's contract is exactly the
+    /// agreement between the two: the corpus decides how far an endpoint may look
+    /// ahead, and the world model decides what a forecast looks like.
+    struct RolloutFixture {
+        dir: PathBuf,
+        corpus: PlannerCorpus,
+        world_model: BarWorldModel,
+    }
+
+    impl Drop for RolloutFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl RolloutFixture {
+        const RES_SECS: u32 = 300;
+        const BARS: i64 = 1_600;
+
+        fn new(label: &str) -> Self {
+            use crate::torch::world_model::{world_model_supports_path, BarModules};
+            use rand::Rng;
+            use shared::bars::{write_bar_file, PackedBar, FILE_EXTENSION};
+
+            let dir = std::env::temp_dir().join(format!(
+                "planner-rollout-{label}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let step_ms = Self::RES_SECS as i64 * 1_000;
+            for (symbol, seed) in [("AAA", 11u64), ("BBB", 12)] {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let mut close = 100.0f32;
+                let bars = (0..Self::BARS)
+                    .map(|slot| {
+                        let open = close;
+                        close = (close * (1.0 + rng.random_range(-0.01f32..0.01))).max(1.0);
+                        let spread = rng.random_range(0.0f32..0.02) * open;
+                        PackedBar {
+                            ts_ms: 1_600_000_000_000i64 / step_ms * step_ms + slot * step_ms,
+                            open,
+                            high: open.max(close) + spread,
+                            low: (open.min(close) - spread).max(0.5),
+                            close,
+                            volume: rng.random_range(1_000.0f32..50_000.0),
+                            vwap: 0.5 * (open + close),
+                            trades: rng.random_range(1u32..500),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                write_bar_file(
+                    &dir.join(format!("{symbol}.{}.{FILE_EXTENSION}", Self::RES_SECS)),
+                    symbol,
+                    Self::RES_SECS,
+                    &bars,
+                )
+                .unwrap();
+            }
+            let corpus = PlannerCorpus::load(&dir, Self::RES_SECS, 512).unwrap();
+
+            // The loader accepts nothing but a hash-consistent weights/supports/metadata
+            // triple, so the fixture writes a real one rather than reaching past `load`.
+            let weights = dir.join("world_model.ot");
+            let supports_path = world_model_supports_path(&weights, Self::RES_SECS);
+            corpus
+                .corpus()
+                .fit_supports(4_096, 5)
+                .save(&supports_path)
+                .unwrap();
+            let mut world_vs = nn::VarStore::new(Device::Cpu);
+            let _modules = BarModules::new(&world_vs.root());
+            world_vs.freeze();
+            world_vs.save(&weights).unwrap();
+            let metadata_path =
+                crate::torch::world_model::BarWorldModelMetadata::save_for_checkpoint(
+                    &weights,
+                    &[Self::RES_SECS],
+                    Self::RES_SECS,
+                )
+                .unwrap();
+            let world_model = BarWorldModel::load(&weights, &metadata_path, Device::Cpu).unwrap();
+
+            Self {
+                dir,
+                corpus,
+                world_model,
+            }
+        }
+    }
+
+    #[test]
+    fn forecast_summary_carries_belief_moments_and_ordered_return_quantiles() {
+        use crate::torch::planner::{PLANNER_BELIEF_DIM, PLANNER_LATENT_DIM};
+
+        tch::manual_seed(23);
+        let fixture = RolloutFixture::new("summary");
+        let horizon = 4i64;
+        let endpoints = fixture
+            .corpus
+            .deterministic_endpoints(PlannerDataSplit::Train, 2, 64, 8)
+            .unwrap();
+        let start = fixture
+            .corpus
+            .context_batch(&endpoints, &[0, 0], 64, Device::Cpu)
+            .unwrap();
+        let session = fixture
+            .world_model
+            .start_session(&start.dof, &start.time_ids);
+        let future_time_ids = fixture
+            .corpus
+            .corpus()
+            .future_time_ids(&endpoints, 0, horizon, Device::Cpu)
+            .unwrap();
+        // Six samples with a chunk of four: the ragged final chunk is the case a
+        // fixed-stride accumulator would silently miscount.
+        let summary =
+            summarize_forecast(&fixture.world_model, &session, &future_time_ids, 6).unwrap();
+        validate_forecast_finite(&summary).unwrap();
+
+        assert_eq!(summary.latent.size(), [2, horizon, PLANNER_LATENT_DIM]);
+        assert_eq!(
+            summary.quantiles.size(),
+            [2, horizon, PLANNER_RETURN_QUANTILES]
+        );
+        // p10 <= p50 <= p90 at every step. This is what pins the quantile axis order:
+        // a wrong permute scatters the levels across the horizon and breaks it.
+        let quantiles = &summary.quantiles;
+        for level in 0..PLANNER_RETURN_QUANTILES - 1 {
+            let lower = quantiles.select(-1, level);
+            let upper = quantiles.select(-1, level + 1);
+            assert!(bool::try_from(lower.le_tensor(&upper).all()).unwrap());
+        }
+        // Every sample's first imagined step is drawn from the one decision-time belief,
+        // so the across-sample spread there is exactly zero and grows afterwards. This
+        // also pins the mean-then-standard-deviation halves of the latent.
+        let deviation = summary
+            .latent
+            .narrow(-1, PLANNER_BELIEF_DIM, PLANNER_BELIEF_DIM);
+        assert_eq!(
+            deviation.select(1, 0).abs().max().double_value(&[]),
+            0.0,
+            "the first imagined step has a single belief, so its spread must vanish"
+        );
+        assert!(
+            deviation
+                .select(1, horizon - 1)
+                .abs()
+                .max()
+                .double_value(&[])
+                > 0.0
+        );
+        let mean = summary.latent.narrow(-1, 0, PLANNER_BELIEF_DIM);
+        assert!(mean
+            .select(1, 0)
+            .allclose(session.belief(), 1e-5, 1e-6, false));
+    }
+
+    #[test]
+    fn real_rollout_collection_reserves_room_for_the_horizon_behind_the_episode() {
+        tch::manual_seed(29);
+        let fixture = RolloutFixture::new("collect");
+        let horizon = 3;
+        let rollout_length = 2;
+        let environments = 2;
+        let planner_vs = nn::VarStore::new(Device::Cpu);
+        let planner = WorldModelPlanner::new(&planner_vs.root());
+        let hl_gauss =
+            HlGaussBins::planner(&(planner_vs.root() / "value_running_stats"), Device::Cpu);
+        let mut rng = StdRng::seed_from_u64(31);
+
+        let collected = collect_real_rollout(
+            &planner,
+            &fixture.world_model,
+            &fixture.corpus,
+            &hl_gauss,
+            horizon,
+            rollout_length,
+            environments,
+            64,
+            &mut rng,
+            Device::Cpu,
+        )
+        .unwrap();
+
+        // A dense [rollout_length, environments] grid of transitions, each of which had
+        // to pass `validate_transition` — including the return-quantile shape — on push.
+        assert_eq!(collected.rollout.len(), environments * rollout_length);
+        assert_eq!(collected.primary_trace.total.len(), rollout_length + 1);
+        assert!(collected
+            .benchmark
+            .mean_buy_and_hold_wealth_ratio
+            .is_finite());
+        assert!(collected.deterministic.reward_mean.is_finite());
+        // The last bar a `rollout_length`-only reservation admits is
+        // `series_len - rollout_length - 1`; from there the final decision's horizon runs
+        // off the end of the series. Adding `horizon` to the reservation moves the
+        // boundary back by exactly enough, and not more.
+        let series_len = fixture.corpus.corpus().series_len(0);
+        let future_at = |bar: usize| {
+            fixture.corpus.corpus().future_time_ids(
+                &[PlannerEndpoint { series: 0, bar }],
+                rollout_length,
+                horizon as i64,
+                Device::Cpu,
+            )
+        };
+        assert!(future_at(series_len - rollout_length - 1).is_err());
+        assert!(future_at(series_len - rollout_length - horizon - 1).is_ok());
     }
 }
