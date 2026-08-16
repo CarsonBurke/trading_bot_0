@@ -34,10 +34,9 @@ pub(crate) const TARGET_KL: f64 = KL_LR_TARGET;
 pub(crate) const KL_STOP_MULTIPLIER: f64 = 1.0;
 pub(crate) const VALUE_LOSS_COEF: f64 = 1.0;
 /// Critic-only pretraining horizon. For the first `CRITIC_PRETRAIN_EPISODES`
-/// episodes only the value loss is backpropagated: the shared trunk learns a
-/// representation driven purely by value error and the policy head stays frozen
-/// (zero actor gradient, no entropy bonus). This warms up a usable critic before
-/// the actor begins, so early advantages are not estimated against noise. The
+/// episodes only critic-exclusive parameters receive gradients. Freezing both
+/// the policy head and its shared upstream features keeps the behavior policy
+/// exactly fixed while the value readout acquires a useful cold start. The
 /// CUDA update graph is suppressed during this phase and captured fresh once the
 /// actor turns on, so the persisted graph always reflects full actor+critic.
 pub(crate) const CRITIC_PRETRAIN_EPISODES: usize = 100;

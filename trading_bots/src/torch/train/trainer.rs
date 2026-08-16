@@ -68,7 +68,6 @@ pub(super) struct UpdateMetrics {
     pub(super) entropy_min: Tensor,
     pub(super) entropy_max: Tensor,
     pub(super) mean_epoch_approx_kl: f64,
-    pub(super) last_minibatch_approx_kl: f64,
     pub(super) lr_scale: f64,
     pub(super) kl_lr_scale_next: f64,
     pub(super) kl_lr_ema: f64,
@@ -83,6 +82,7 @@ pub(super) struct Trainer {
     pub(super) grad_clip_groups: GradClipGroups,
     pub(super) opt: Muon,
     pub(super) optimizer_step: i64,
+    pub(super) muon_momentum_step: i64,
     pub(super) kl_lr_controller: KlLrController,
     pub(super) env: VecEnv,
     pub(super) device: Device,
@@ -124,7 +124,7 @@ pub(super) struct Trainer {
     contract: PpoTrainingContract,
 }
 
-const PPO_CHECKPOINT_FORMAT_VERSION: u32 = 3;
+const PPO_CHECKPOINT_FORMAT_VERSION: u32 = 5;
 const PPO_CHECKPOINT_PHASE: &str = "ready-for-rollout";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -215,6 +215,7 @@ struct PpoCheckpointMetadata {
     seed: u64,
     contract: PpoTrainingContract,
     optimizer_step: i64,
+    muon_momentum_step: i64,
     weights_sha256: String,
     optimizer_sha256: String,
     trajectory_sha256: String,
@@ -486,6 +487,13 @@ fn load_ppo_checkpoint_files(
     if metadata.optimizer_step < 0 {
         bail!("PPO checkpoint has a negative optimizer step");
     }
+    if !(0..=metadata.optimizer_step).contains(&metadata.muon_momentum_step) {
+        bail!(
+            "PPO checkpoint Muon momentum step {} is outside 0..={}",
+            metadata.muon_momentum_step,
+            metadata.optimizer_step
+        );
+    }
     let mut controller_preflight = KlLrController::new(
         KL_LR_TARGET,
         KL_LR_EMA_HALF_LIFE,
@@ -558,6 +566,7 @@ fn save_ppo_checkpoint_bundle(
     contract: &PpoTrainingContract,
     env: &VecEnv,
     optimizer_step: i64,
+    muon_momentum_step: i64,
     kl_lr_controller: &KlLrController,
 ) -> Result<()> {
     let parent = weights_path
@@ -586,6 +595,7 @@ fn save_ppo_checkpoint_bundle(
         seed,
         contract: contract.clone(),
         optimizer_step,
+        muon_momentum_step,
         weights_sha256: file_sha256(&weights_tmp)?,
         optimizer_sha256: file_sha256(&optimizer_tmp)?,
         trajectory_sha256: file_sha256(&trajectory_tmp)?,
@@ -745,6 +755,7 @@ impl Trainer {
         println!("Run dir: {}", run_dir.root.display());
 
         let mut optimizer_step = 0i64;
+        let mut muon_momentum_step = 0i64;
         let mut kl_lr_controller = KlLrController::new(
             KL_LR_TARGET,
             KL_LR_EMA_HALF_LIFE,
@@ -769,13 +780,15 @@ impl Trainer {
             )
             .unwrap_or_else(|error| panic!("failed restoring PPO optimizer state: {error:#}"));
             optimizer_step = checkpoint.metadata.optimizer_step;
+            muon_momentum_step = checkpoint.metadata.muon_momentum_step;
             assert!(
                 kl_lr_controller.restore_state(checkpoint.metadata.kl_lr_controller),
                 "PPO checkpoint contains invalid KL-LR controller state"
             );
             println!(
-                "Restored PPO optimizer at step {} and KL-LR controller scale {:.3}, ema {:.4}",
+                "Restored PPO optimizer at step {} (Muon momentum step {}) and KL-LR controller scale {:.3}, ema {:.4}",
                 optimizer_step,
+                muon_momentum_step,
                 kl_lr_controller.scale(),
                 kl_lr_controller.ema()
             );
@@ -890,6 +903,7 @@ impl Trainer {
             grad_clip_groups,
             opt,
             optimizer_step,
+            muon_momentum_step,
             kl_lr_controller,
             env,
             device,
@@ -960,10 +974,10 @@ impl Trainer {
             let advantage_data = self.compute_advantages(update, &rollout_data);
             let lr_scale = self.kl_lr_controller.scale();
             apply_lr_scale(&mut self.opt, lr_scale);
-            let mut update_metrics = self.update_policy(update, &advantage_data);
-            let kl_lr_signal = update_metrics.last_minibatch_approx_kl;
-            // During critic-only pretraining the policy KL reflects trunk drift,
-            // not actor learning, so it must not steer the KL-adaptive LR.
+            let mut update_metrics = self.update_policy(update, &advantage_data)?;
+            let kl_lr_signal = update_metrics.kl_lr_signal;
+            // Critic-only pretraining leaves the policy path fixed; keep the
+            // controller at its initial state until actor optimization starts.
             if update >= CRITIC_PRETRAIN_EPISODES {
                 self.kl_lr_controller.observe(kl_lr_signal);
             }
@@ -992,6 +1006,7 @@ impl Trainer {
                 &self.contract,
                 &self.env,
                 self.optimizer_step,
+                self.muon_momentum_step,
                 &self.kl_lr_controller,
             ) {
                 Ok(()) => println!("Saved complete PPO resume bundle: {}", path.display()),
@@ -1093,6 +1108,7 @@ mod tests {
         env: VecEnv,
         controller: KlLrController,
         optimizer_step: i64,
+        muon_momentum_step: i64,
         seed: u64,
         contract: PpoTrainingContract,
     }
@@ -1141,6 +1157,7 @@ mod tests {
                 env: VecEnv::from_test_envs(vec![env]),
                 controller: KlLrController::new(0.035, 50.0, 0.01, 10.0),
                 optimizer_step: 0,
+                muon_momentum_step: 0,
                 seed,
                 contract,
             }
@@ -1183,8 +1200,12 @@ mod tests {
 
             self.opt.zero_grad();
             Tensor::stack(&losses, 0).mean(Kind::Float).backward();
-            self.opt.step();
-            self.optimizer_step += 1;
+            crate::torch::train::optimizer_glue::step_optimizer(
+                &mut self.opt,
+                &mut self.optimizer_step,
+                &mut self.muon_momentum_step,
+                true,
+            );
             self.controller.observe(0.01 + update as f64 * 0.001);
             let env = &self.env.envs[0];
             trace.env_frontiers.push((
@@ -1206,6 +1227,7 @@ mod tests {
                 &self.contract,
                 &self.env,
                 self.optimizer_step,
+                self.muon_momentum_step,
                 &self.controller,
             )
         }
@@ -1225,6 +1247,7 @@ mod tests {
                 &checkpoint.metadata.initialized_adamw,
             )?;
             resumed.optimizer_step = checkpoint.metadata.optimizer_step;
+            resumed.muon_momentum_step = checkpoint.metadata.muon_momentum_step;
             resumed
                 .env
                 .restore_snapshot_from_current_markets(checkpoint.trajectory)?;
@@ -1378,6 +1401,7 @@ mod tests {
                 grad_clip_groups,
                 opt,
                 optimizer_step: 0,
+                muon_momentum_step: 0,
                 kl_lr_controller: KlLrController::new(
                     KL_LR_TARGET,
                     KL_LR_EMA_HALF_LIFE,
@@ -1433,9 +1457,11 @@ mod tests {
         let advantage_data = trainer.compute_advantages(update, &rollout_data);
         let lr_scale = trainer.kl_lr_controller.scale();
         apply_lr_scale(&mut trainer.opt, lr_scale);
-        let mut metrics = trainer.update_policy(update, &advantage_data);
-        let signal = metrics.last_minibatch_approx_kl;
-        trainer.kl_lr_controller.observe(signal);
+        let mut metrics = trainer.update_policy(update, &advantage_data).unwrap();
+        let signal = metrics.kl_lr_signal;
+        if update >= CRITIC_PRETRAIN_EPISODES {
+            trainer.kl_lr_controller.observe(signal);
+        }
         metrics.lr_scale = lr_scale;
         metrics.kl_lr_signal = signal;
         metrics.kl_lr_ema = trainer.kl_lr_controller.ema();
@@ -1517,6 +1543,7 @@ mod tests {
 
         assert_eq!(uninterrupted_trace, resumed_trace);
         assert_eq!(uninterrupted.optimizer_step, resumed.optimizer_step);
+        assert_eq!(uninterrupted.muon_momentum_step, resumed.muon_momentum_step);
         assert_eq!(
             uninterrupted.controller.ema().to_bits(),
             resumed.controller.ema().to_bits()
@@ -1555,6 +1582,7 @@ mod tests {
             &interrupted.contract,
             &interrupted.env,
             interrupted.optimizer_step,
+            interrupted.muon_momentum_step,
             &interrupted.kl_lr_controller,
         )
         .unwrap();
@@ -1579,6 +1607,7 @@ mod tests {
             )
             .unwrap();
         resumed.optimizer_step = checkpoint.metadata.optimizer_step;
+        resumed.muon_momentum_step = checkpoint.metadata.muon_momentum_step;
         resumed
             .env
             .restore_snapshot_from_current_markets(checkpoint.trajectory)
@@ -1593,6 +1622,7 @@ mod tests {
 
         assert_eq!(uninterrupted_trace, resumed_trace);
         assert_eq!(uninterrupted.optimizer_step, resumed.optimizer_step);
+        assert_eq!(uninterrupted.muon_momentum_step, resumed.muon_momentum_step);
         assert_eq!(
             uninterrupted.kl_lr_controller.ema().to_bits(),
             resumed.kl_lr_controller.ema().to_bits()

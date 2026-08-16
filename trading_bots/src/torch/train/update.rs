@@ -70,6 +70,7 @@ fn pmpo_policy_loss(
 /// reach steady state; capturing a not-yet-warm body risks capturing a
 /// one-time allocation or autotune path. PyTorch's make_graphed_callables uses 3.
 const GRAPH_WARMUP_ITERS: usize = 3;
+const KL_NEGATIVE_ROUNDOFF_TOLERANCE: f64 = 8.0 * f32::EPSILON as f64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GraphCaptureState {
@@ -481,6 +482,9 @@ impl Trainer {
         adv_flat: &Tensor,
         ret_flat: &Tensor,
     ) {
+        if !DEBUG_NUMERICS {
+            return;
+        }
         if log_first_non_finite_tensor(
             logged,
             "replay_inputs",
@@ -525,6 +529,9 @@ impl Trainer {
         critic_loss: &Tensor,
         total_loss: &Tensor,
     ) {
+        if !DEBUG_NUMERICS {
+            return;
+        }
         if log_first_non_finite_tensor(
             logged,
             "loss",
@@ -560,6 +567,9 @@ impl Trainer {
         epoch: i64,
         chunk_i: usize,
     ) {
+        if !DEBUG_NUMERICS {
+            return;
+        }
         if log_first_non_finite_var(
             logged,
             "grads_after_backward",
@@ -589,6 +599,9 @@ impl Trainer {
         epoch: i64,
         chunk_i: usize,
     ) {
+        if !DEBUG_NUMERICS {
+            return;
+        }
         if log_first_non_finite_var(
             logged,
             "params_after_step",
@@ -616,13 +629,11 @@ impl Trainer {
         &mut self,
         episode: usize,
         adv_data: &AdvantageData,
-    ) -> UpdateMetrics {
+    ) -> anyhow::Result<UpdateMetrics> {
         let device = self.device;
-        // Critic-only pretraining: warm up the value function (and the shared
-        // trunk through it) before the actor turns on. While active, the actor
-        // backward is skipped, the CUDA graph is suppressed (so it captures
-        // fresh with the full actor+critic body once the actor begins), and the
-        // KL early-stop is disabled since trunk drift would spuriously trip it.
+        // Critic-only pretraining updates only critic-exclusive parameters, so
+        // the complete behavior-policy path remains fixed. The CUDA graph is
+        // suppressed until the full actor+critic update begins.
         let critic_only = episode < CRITIC_PRETRAIN_EPISODES;
         let mut total_policy_loss_weighted = Tensor::zeros([], (Kind::Float, device));
         let mut total_value_loss_weighted = Tensor::zeros([], (Kind::Float, device));
@@ -648,6 +659,7 @@ impl Trainer {
 
         let mut mean_epoch_approx_kl = 0.0f64;
         let mut last_minibatch_approx_kl = 0.0f64;
+        let mut max_minibatch_approx_kl = 0.0f64;
         let mut perm_host: Vec<i64> = (0..self.total_chunks).collect();
         let mut perm_gpu = Tensor::zeros([self.total_chunks], (Kind::Int64, device));
         let mut rng =
@@ -660,11 +672,8 @@ impl Trainer {
                 .to_device(device);
             perm_gpu.copy_(&perm_cpu);
 
-            let mut epoch_kl_gpu = Tensor::zeros([], (Kind::Float, device));
+            let mut epoch_kl_weighted = 0.0f64;
             let mut epoch_kl_count = 0i64;
-            // Track last minibatch's KL mean on-device; fetch once at end of epoch
-            // to avoid a host/device sync on every minibatch.
-            let mut last_minibatch_kl_mean_gpu: Option<Tensor> = None;
 
             for (chunk_i, mb_start) in (0..self.total_chunks)
                 .step_by(adv_data.chunk_batch_size as usize)
@@ -886,8 +895,27 @@ impl Trainer {
                             _epoch,
                             chunk_i,
                         );
-                        let _ = epoch_kl_gpu
-                            .g_add_(&(&metrics.approx_kl * minibatch_sample_count as f64));
+                        // This scalar synchronization is optimizer control, not
+                        // telemetry: reject the minibatch before an already-breached
+                        // trust region can take another parameter step.
+                        let minibatch_kl =
+                            validated_minibatch_kl(metrics.approx_kl.double_value(&[]))?;
+                        last_minibatch_approx_kl = minibatch_kl;
+                        max_minibatch_approx_kl = max_minibatch_approx_kl.max(minibatch_kl);
+                        epoch_kl_weighted += minibatch_kl * minibatch_sample_count as f64;
+                        epoch_kl_count += minibatch_sample_count;
+                        if kl_requires_stop_before_optimizer_step(critic_only, minibatch_kl) {
+                            self.opt.zero_grad();
+                            mean_epoch_approx_kl = epoch_kl_weighted / epoch_kl_count.max(1) as f64;
+                            println!(
+                                "Epoch {}/{}: RatioKL {:.4} (stop mb {:.4})",
+                                _epoch + 1,
+                                OPTIM_EPOCHS,
+                                mean_epoch_approx_kl,
+                                minibatch_kl
+                            );
+                            break 'epoch_loop;
+                        }
                         let _ = total_policy_loss_weighted
                             .g_add_(&(&metrics.action_loss * minibatch_sample_count as f64));
                         let _ = total_value_loss_weighted
@@ -898,21 +926,24 @@ impl Trainer {
                             .g_add_(&(&metrics.dist_entropy * minibatch_sample_count as f64));
                         entropy_min = entropy_min.min_other(&metrics.dist_entropy);
                         entropy_max = entropy_max.max_other(&metrics.dist_entropy);
-                        epoch_kl_count += minibatch_sample_count;
                         total_sample_count += minibatch_sample_count;
                         let _ = total_clip_violations.g_add_(&metrics.clip_violations);
                         total_ratio_samples += minibatch_sample_count;
                         actor_grad_norm_sum += metrics.actor_grad_norm;
                         critic_grad_norm_sum += metrics.critic_grad_norm;
                         grad_norm_count += 1;
-                        step_optimizer(&mut self.opt, &mut self.optimizer_step);
+                        step_optimizer(
+                            &mut self.opt,
+                            &mut self.optimizer_step,
+                            &mut self.muon_momentum_step,
+                            true,
+                        );
                         self.log_non_finite_params_after_step(
                             &mut nf_log.param,
                             episode,
                             _epoch,
                             chunk_i,
                         );
-                        last_minibatch_kl_mean_gpu = Some(metrics.approx_kl.detach().copy());
                         continue;
                     }
                     graph_time_us += graph_start.elapsed().as_micros() as u64;
@@ -951,24 +982,26 @@ impl Trainer {
                 let ratio = log_ratio.exp();
                 let ratio_diff = &ratio - 1.0;
 
-                if log_first_non_finite_tensor(
-                    &mut nf_log.forward,
-                    "forward",
-                    episode,
-                    _epoch,
-                    chunk_i,
-                    &[
-                        ("action_alpha", &action_alpha),
-                        ("action_beta", &action_beta),
-                        ("action_log_probs", &action_log_probs),
-                        ("old_log_probs", &old_log_probs_flat),
-                        ("log_ratio", &log_ratio),
-                        ("ratio", &ratio),
-                        ("new_value_logits", &new_value_logits),
-                        ("adv_flat", &adv_flat),
-                        ("ret_flat", &ret_flat),
-                    ],
-                ) {
+                if DEBUG_NUMERICS
+                    && log_first_non_finite_tensor(
+                        &mut nf_log.forward,
+                        "forward",
+                        episode,
+                        _epoch,
+                        chunk_i,
+                        &[
+                            ("action_alpha", &action_alpha),
+                            ("action_beta", &action_beta),
+                            ("action_log_probs", &action_log_probs),
+                            ("old_log_probs", &old_log_probs_flat),
+                            ("log_ratio", &log_ratio),
+                            ("ratio", &ratio),
+                            ("new_value_logits", &new_value_logits),
+                            ("adv_flat", &adv_flat),
+                            ("ret_flat", &ret_flat),
+                        ],
+                    )
+                {
                     log_named_var_extremes(
                         "params_at_forward_failure",
                         episode,
@@ -1040,6 +1073,47 @@ impl Trainer {
                     &total_loss,
                 );
 
+                // Analytical closed-form KL(old||new) drives both trust-region
+                // stopping and the adaptive LR controller. Critic-only warmup
+                // leaves the full policy path fixed, so its KL is exactly zero
+                // and needs no device-to-host decision synchronization.
+                let approx_kl_val = if critic_only {
+                    Tensor::zeros([], (Kind::Float, device))
+                } else {
+                    tch::no_grad(|| {
+                        beta_reverse_kl(
+                            &old_alphas_flat,
+                            &old_betas_flat,
+                            &action_alpha,
+                            &action_beta,
+                        )
+                        .mean(Kind::Float)
+                    })
+                };
+                if DEBUG_NUMERICS {
+                    let _ = debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
+                }
+                let minibatch_kl = if critic_only {
+                    0.0
+                } else {
+                    validated_minibatch_kl(approx_kl_val.double_value(&[]))?
+                };
+                last_minibatch_approx_kl = minibatch_kl;
+                max_minibatch_approx_kl = max_minibatch_approx_kl.max(minibatch_kl);
+                epoch_kl_weighted += minibatch_kl * minibatch_sample_count as f64;
+                epoch_kl_count += minibatch_sample_count;
+                if kl_requires_stop_before_optimizer_step(critic_only, minibatch_kl) {
+                    mean_epoch_approx_kl = epoch_kl_weighted / epoch_kl_count.max(1) as f64;
+                    println!(
+                        "Epoch {}/{}: RatioKL {:.4} (stop mb {:.4})",
+                        _epoch + 1,
+                        OPTIM_EPOCHS,
+                        mean_epoch_approx_kl,
+                        minibatch_kl
+                    );
+                    break 'epoch_loop;
+                }
+
                 fwd_time_us += fwd_start.elapsed().as_micros() as u64;
                 let bwd_start = Instant::now();
                 let (actor_grad_norm, critic_grad_norm) = backward_actor_critic_with_separate_clips(
@@ -1060,21 +1134,6 @@ impl Trainer {
                     chunk_i,
                 );
 
-                // Analytical closed-form KL(old||new) drives the early-stop and
-                // KL-LR controller for both objectives.
-                let approx_kl_val = tch::no_grad(|| {
-                    beta_reverse_kl(
-                        &old_alphas_flat,
-                        &old_betas_flat,
-                        &action_alpha,
-                        &action_beta,
-                    )
-                    .mean(Kind::Float)
-                });
-                if DEBUG_NUMERICS {
-                    let _ = debug_tensor_stats("approx_kl_val", &approx_kl_val, _epoch, chunk_i);
-                }
-                let _ = epoch_kl_gpu.g_add_(&(&approx_kl_val * minibatch_sample_count as f64));
                 let _ = total_policy_loss_weighted
                     .g_add_(&(&action_loss.detach() * minibatch_sample_count as f64));
                 let _ = total_value_loss_weighted
@@ -1085,7 +1144,6 @@ impl Trainer {
                     .g_add_(&(&dist_entropy_detached * minibatch_sample_count as f64));
                 entropy_min = entropy_min.min_other(&dist_entropy_detached);
                 entropy_max = entropy_max.max_other(&dist_entropy_detached);
-                epoch_kl_count += minibatch_sample_count;
                 total_sample_count += minibatch_sample_count;
 
                 let _ = total_clip_violations.g_add_(&tch::no_grad(|| {
@@ -1121,33 +1179,17 @@ impl Trainer {
                 critic_grad_norm_sum += critic_grad_norm.to_kind(Kind::Float);
                 grad_norm_count += 1;
 
-                step_optimizer(&mut self.opt, &mut self.optimizer_step);
+                step_optimizer(
+                    &mut self.opt,
+                    &mut self.optimizer_step,
+                    &mut self.muon_momentum_step,
+                    !critic_only,
+                );
                 self.log_non_finite_params_after_step(&mut nf_log.param, episode, _epoch, chunk_i);
                 self.opt.zero_grad();
-
-                // One forward/backward per minibatch now: the minibatch's KL is
-                // exactly approx_kl_val. Track the last one for end-of-epoch diagnostics.
-                last_minibatch_kl_mean_gpu = Some(approx_kl_val.shallow_clone());
             }
 
-            // Single end-of-epoch host sync covering both the epoch-mean KL used
-            // for early stopping and the last-minibatch KL diagnostic. Avoids
-            // per-minibatch D2H stalls that previously blocked the training pipeline.
-            let mean_epoch_kl = if let Some(last_mb) = last_minibatch_kl_mean_gpu {
-                let stacked = Tensor::stack(
-                    &[&(&epoch_kl_gpu / epoch_kl_count.max(1) as f64), &last_mb],
-                    0,
-                )
-                .to_kind(Kind::Double)
-                .to_device(tch::Device::Cpu);
-                let vec = Vec::<f64>::try_from(stacked).unwrap_or_else(|_| vec![0.0, 0.0]);
-                // Preserve prior-epoch value if this epoch somehow had zero minibatches.
-                last_minibatch_approx_kl = vec[1];
-                vec[0]
-            } else {
-                // Epoch had no minibatches; keep prior `last_minibatch_approx_kl`.
-                0.0
-            };
+            let mean_epoch_kl = epoch_kl_weighted / epoch_kl_count.max(1) as f64;
             mean_epoch_approx_kl = mean_epoch_kl;
             println!(
                 "Epoch {}/{}: RatioKL {:.4} (last mb {:.4})",
@@ -1156,9 +1198,6 @@ impl Trainer {
                 mean_epoch_kl,
                 last_minibatch_approx_kl
             );
-            if !critic_only && mean_epoch_kl > TARGET_KL * KL_STOP_MULTIPLIER {
-                break 'epoch_loop;
-            }
         }
 
         println!(
@@ -1168,7 +1207,7 @@ impl Trainer {
             graph_time_us as f64 / 1000.0
         );
 
-        UpdateMetrics {
+        Ok(UpdateMetrics {
             total_policy_loss_weighted,
             total_value_loss_weighted,
             total_clip_gap_weighted,
@@ -1182,18 +1221,33 @@ impl Trainer {
             entropy_min,
             entropy_max,
             mean_epoch_approx_kl,
-            last_minibatch_approx_kl,
             lr_scale: 1.0,
             kl_lr_scale_next: 1.0,
             kl_lr_ema: 0.0,
-            kl_lr_signal: last_minibatch_approx_kl,
-        }
+            kl_lr_signal: max_minibatch_approx_kl,
+        })
     }
+}
+
+fn kl_requires_stop_before_optimizer_step(critic_only: bool, minibatch_kl: f64) -> bool {
+    !critic_only && minibatch_kl > TARGET_KL * KL_STOP_MULTIPLIER
+}
+
+fn validated_minibatch_kl(kl: f64) -> anyhow::Result<f64> {
+    anyhow::ensure!(kl.is_finite(), "PPO analytical KL is non-finite: {kl}");
+    anyhow::ensure!(
+        kl >= -KL_NEGATIVE_ROUNDOFF_TOLERANCE,
+        "PPO analytical KL is materially negative: {kl}"
+    );
+    Ok(kl.max(0.0))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{asym_clip_policy_loss, CLIP_EPS_HIGH, CLIP_EPS_LOW};
+    use super::{
+        asym_clip_policy_loss, kl_requires_stop_before_optimizer_step, validated_minibatch_kl,
+        CLIP_EPS_HIGH, CLIP_EPS_LOW, KL_NEGATIVE_ROUNDOFF_TOLERANCE, TARGET_KL,
+    };
     use tch::Tensor;
 
     #[test]
@@ -1217,5 +1271,28 @@ mod tests {
             let expected_gap = (r - clamp(r)).abs();
             assert!((clip_gap.double_value(&[i as i64]) - expected_gap).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn kl_guard_stops_next_step_at_threshold_breach() {
+        assert!(!kl_requires_stop_before_optimizer_step(false, TARGET_KL));
+        assert!(kl_requires_stop_before_optimizer_step(
+            false,
+            TARGET_KL + f64::EPSILON
+        ));
+        assert!(!kl_requires_stop_before_optimizer_step(true, f64::INFINITY));
+    }
+
+    #[test]
+    fn kl_validation_clamps_only_roundoff_and_rejects_invalid_values() {
+        assert_eq!(validated_minibatch_kl(0.0).unwrap(), 0.0);
+        assert_eq!(
+            validated_minibatch_kl(-0.5 * KL_NEGATIVE_ROUNDOFF_TOLERANCE).unwrap(),
+            0.0
+        );
+        assert!(validated_minibatch_kl(-2.0 * KL_NEGATIVE_ROUNDOFF_TOLERANCE).is_err());
+        assert!(validated_minibatch_kl(f64::NAN).is_err());
+        assert!(validated_minibatch_kl(f64::INFINITY).is_err());
+        assert!(validated_minibatch_kl(f64::NEG_INFINITY).is_err());
     }
 }

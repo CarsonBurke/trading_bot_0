@@ -24,6 +24,23 @@ pub(crate) fn tensor_is_finite(t: &Tensor) -> bool {
     t.isfinite().all().int64_value(&[]) != 0
 }
 
+fn first_non_finite_index<'a>(tensors: impl IntoIterator<Item = &'a Tensor>) -> Option<usize> {
+    let finite_flags = tensors
+        .into_iter()
+        .map(|tensor| tensor.isfinite().all())
+        .collect::<Vec<_>>();
+    if finite_flags.is_empty() {
+        return None;
+    }
+
+    let finite_flags = Tensor::stack(&finite_flags, 0)
+        .to_kind(Kind::Int64)
+        .to_device(tch::Device::Cpu);
+    let finite_flags = Vec::<i64>::try_from(finite_flags)
+        .expect("failed to transfer numeric finite flags to the host");
+    finite_flags.into_iter().position(|finite| finite == 0)
+}
+
 pub(crate) fn tensor_summary(name: &str, t: &Tensor) -> String {
     let mean = t.mean(Kind::Float).double_value(&[]);
     let min = t.min().double_value(&[]);
@@ -64,24 +81,24 @@ pub(crate) fn log_first_non_finite_tensor(
     if *logged {
         return false;
     }
-    for (name, tensor) in tensors {
-        if !tensor_is_finite(tensor) {
-            println!(
-                "NUMERIC ROOT CAUSE: stage={} episode={} epoch={} chunk={} {}",
-                stage,
-                episode,
-                epoch + 1,
-                chunk_i,
-                tensor_summary(name, tensor)
-            );
-            for (other_name, other_tensor) in tensors {
-                println!("  {}", tensor_summary(other_name, other_tensor));
-            }
-            *logged = true;
-            return true;
-        }
+    let Some(non_finite_index) = first_non_finite_index(tensors.iter().map(|(_, tensor)| *tensor))
+    else {
+        return false;
+    };
+    let (name, tensor) = tensors[non_finite_index];
+    println!(
+        "NUMERIC ROOT CAUSE: stage={} episode={} epoch={} chunk={} {}",
+        stage,
+        episode,
+        epoch + 1,
+        chunk_i,
+        tensor_summary(name, tensor)
+    );
+    for (other_name, other_tensor) in tensors {
+        println!("  {}", tensor_summary(other_name, other_tensor));
     }
-    false
+    *logged = true;
+    true
 }
 
 pub(crate) fn log_first_non_finite_var(
@@ -96,34 +113,41 @@ pub(crate) fn log_first_non_finite_var(
     if *logged {
         return false;
     }
-    for (idx, (name, var)) in vars.iter().enumerate() {
-        let candidate = if use_grad {
-            var.grad()
-        } else {
-            var.shallow_clone()
-        };
-        if !candidate.defined() || tensor_is_finite(&candidate) {
-            continue;
-        }
-        println!(
-            "NUMERIC ROOT CAUSE: stage={} episode={} epoch={} chunk={} param_idx={} param_name={} param_shape={:?}",
-            stage,
-            episode,
-            epoch + 1,
-            chunk_i,
-            idx,
-            name,
-            var.size()
-        );
-        println!(
-            "  {}",
-            tensor_summary(if use_grad { "grad" } else { "param" }, &candidate)
-        );
-        println!("  {}", tensor_summary("param_snapshot", var));
-        *logged = true;
-        return true;
-    }
-    false
+    let candidates = vars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (name, var))| {
+            let candidate = if use_grad {
+                var.grad()
+            } else {
+                var.shallow_clone()
+            };
+            candidate.defined().then_some((index, name, var, candidate))
+        })
+        .collect::<Vec<_>>();
+    let Some(non_finite_index) =
+        first_non_finite_index(candidates.iter().map(|(_, _, _, candidate)| candidate))
+    else {
+        return false;
+    };
+    let (index, name, var, candidate) = &candidates[non_finite_index];
+    println!(
+        "NUMERIC ROOT CAUSE: stage={} episode={} epoch={} chunk={} param_idx={} param_name={} param_shape={:?}",
+        stage,
+        episode,
+        epoch + 1,
+        chunk_i,
+        index,
+        name,
+        var.size()
+    );
+    println!(
+        "  {}",
+        tensor_summary(if use_grad { "grad" } else { "param" }, candidate)
+    );
+    println!("  {}", tensor_summary("param_snapshot", var));
+    *logged = true;
+    true
 }
 
 pub(crate) fn log_named_var_extremes(
@@ -272,8 +296,86 @@ fn nan_if_zero_target_variance(explained_var: &Tensor, target_var: &Tensor) -> T
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_explained_variance, compute_value_diagnostics};
+    use super::{
+        compute_explained_variance, compute_value_diagnostics, first_non_finite_index,
+        log_first_non_finite_tensor, log_first_non_finite_var,
+    };
     use tch::Tensor;
+
+    #[test]
+    fn coalesced_finite_flags_preserve_first_failure_order() {
+        let finite_before = Tensor::from_slice(&[1.0f32, 2.0]);
+        let first_non_finite = Tensor::from_slice(&[3.0f32, f32::NAN]);
+        let later_non_finite = Tensor::from_slice(&[f32::INFINITY]);
+        let finite_after = Tensor::from_slice(&[4.0f32]);
+
+        let index = first_non_finite_index([
+            &finite_before,
+            &first_non_finite,
+            &later_non_finite,
+            &finite_after,
+        ]);
+
+        assert_eq!(index, Some(1));
+    }
+
+    #[test]
+    fn coalesced_finite_flags_accept_empty_and_all_finite_inputs() {
+        assert_eq!(first_non_finite_index(std::iter::empty()), None);
+
+        let first = Tensor::from_slice(&[1.0f32, 2.0]);
+        let second = Tensor::from_slice(&[-3.0f32, 4.0]);
+        assert_eq!(first_non_finite_index([&first, &second]), None);
+    }
+
+    #[test]
+    fn coalesced_tensor_guard_preserves_one_shot_latch() {
+        let finite = Tensor::from_slice(&[1.0f32]);
+        let non_finite = Tensor::from_slice(&[f32::NAN]);
+        let tensors = [("finite", &finite), ("non_finite", &non_finite)];
+        let mut logged = false;
+
+        assert!(log_first_non_finite_tensor(
+            &mut logged,
+            "test",
+            1,
+            2,
+            3,
+            &tensors,
+        ));
+        assert!(logged);
+        assert!(!log_first_non_finite_tensor(
+            &mut logged,
+            "test",
+            1,
+            2,
+            4,
+            &tensors,
+        ));
+    }
+
+    #[test]
+    fn coalesced_variable_guard_skips_undefined_gradients() {
+        let without_grad = Tensor::from_slice(&[1.0f32]).set_requires_grad(true);
+        let with_grad = Tensor::from_slice(&[2.0f32]).set_requires_grad(true);
+        (&with_grad * f64::NAN).sum(tch::Kind::Float).backward();
+        let vars = vec![
+            ("without_grad".to_string(), without_grad),
+            ("with_grad".to_string(), with_grad),
+        ];
+        let mut logged = false;
+
+        assert!(log_first_non_finite_var(
+            &mut logged,
+            "test",
+            1,
+            2,
+            3,
+            &vars,
+            true,
+        ));
+        assert!(logged);
+    }
 
     #[test]
     fn explained_variance_matches_cleanrl_residual_variance() {

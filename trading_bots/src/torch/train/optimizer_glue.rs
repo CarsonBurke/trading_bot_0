@@ -100,7 +100,14 @@ pub(crate) fn backward_actor_critic_with_separate_clips(
 ) -> (Tensor, Tensor) {
     if max_grad_norm <= 0.0 {
         if critic_only {
-            critic_loss.backward();
+            let critic_grads = Tensor::run_backward(&[critic_loss], &groups.critic, false, false);
+            clear_grads(trainable_vars);
+            accumulate_grad_surrogate(
+                Tensor::zeros([], (Kind::Float, device)),
+                &groups.critic,
+                &critic_grads,
+            )
+            .backward();
         } else {
             (actor_loss + critic_loss).backward();
         }
@@ -108,13 +115,18 @@ pub(crate) fn backward_actor_critic_with_separate_clips(
         return (zero.shallow_clone(), zero);
     }
 
-    // Critic params always receive the critic gradient. During critic-only
-    // pretraining the actor backward is skipped entirely, so the shared trunk
-    // is driven purely by value error and the policy head stays frozen.
+    // During critic-only pretraining, shared parameters must remain frozen too:
+    // they are upstream of the policy head, so moving them changes the behavior
+    // policy even when the actor-exclusive gradient is absent.
     let mut critic_params: Vec<Tensor> = groups
         .critic
         .iter()
-        .chain(groups.shared.iter())
+        .chain(
+            (!critic_only)
+                .then_some(groups.shared.iter())
+                .into_iter()
+                .flatten(),
+        )
         .map(Tensor::shallow_clone)
         .collect();
 
@@ -264,19 +276,28 @@ pub(crate) fn apply_lr_scale(opt: &mut Muon, lr_scale: f64) {
     opt.set_adamw_lr(LEARNING_RATE * lr_scale);
 }
 
-pub(crate) fn step_optimizer(opt: &mut Muon, optimizer_step: &mut i64) {
-    opt.set_momentum(muon_momentum_for_step(*optimizer_step));
+pub(crate) fn step_optimizer(
+    opt: &mut Muon,
+    optimizer_step: &mut i64,
+    muon_momentum_step: &mut i64,
+    advances_muon: bool,
+) {
+    opt.set_momentum(muon_momentum_for_step(*muon_momentum_step));
     opt.step();
     *optimizer_step += 1;
+    if advances_muon {
+        *muon_momentum_step += 1;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         backward_actor_critic_with_separate_clips, grad_clip_groups, kl_lr_ema_alpha,
-        GradClipGroups, KlLrController,
+        step_optimizer, GradClipGroups, KlLrController,
     };
     use crate::torch::model::{TradingModel, TradingModelConfig};
+    use crate::torch::optim::{Muon, MuonConfig};
     use crate::torch::train::optimizer_glue::named_trainable_variables;
     use std::collections::HashMap;
     use tch::nn;
@@ -402,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn critic_only_backward_freezes_actor_and_trains_trunk() {
+    fn critic_only_backward_freezes_entire_policy_path() {
         let device = Device::Cpu;
         let actor = Tensor::from_slice(&[1.0f32])
             .to_device(device)
@@ -423,6 +444,22 @@ mod tests {
             critic.shallow_clone(),
             shared.shallow_clone(),
         ];
+        let named = vec![
+            ("actor".to_owned(), actor.shallow_clone()),
+            ("critic".to_owned(), critic.shallow_clone()),
+            ("shared".to_owned(), shared.shallow_clone()),
+        ];
+        let mut optimizer = Muon::new_named(
+            &named,
+            MuonConfig {
+                lr: 0.1,
+                adamw_lr: 0.1,
+                ..MuonConfig::default()
+            },
+        );
+        let actor_before = actor.copy();
+        let critic_before = critic.copy();
+        let shared_before = shared.copy();
         let actor_loss = &actor * 3.0 + &shared * 4.0;
         let critic_loss = &critic * 30.0 + &shared * 40.0;
 
@@ -436,15 +473,27 @@ mod tests {
             true,
         );
 
-        // Actor backward is skipped entirely: zero reported norm and the actor
-        // head receives no gradient (slot stays undefined → head stays frozen).
+        // Actor backward is skipped entirely and every parameter on its path is
+        // frozen, including shared upstream features.
         assert!((actor_norm.double_value(&[])).abs() < 1e-12);
         assert!(!actor.grad().defined());
-        // Trunk learns purely from the clipped critic gradient; the shared param's
-        // raw critic grad is 40, clipped by 1/critic_norm with critic_norm=50.
-        assert!((critic_norm.double_value(&[]) - 50.0).abs() < 1e-6);
-        assert!((critic.grad().double_value(&[0]) - 0.6).abs() < 1e-6);
-        assert!((shared.grad().double_value(&[0]) - 0.8).abs() < 1e-6);
+        assert!((critic_norm.double_value(&[]) - 30.0).abs() < 1e-6);
+        assert!((critic.grad().double_value(&[0]) - 1.0).abs() < 1e-6);
+        assert!(!shared.grad().defined());
+
+        let mut optimizer_step = 0;
+        let mut muon_momentum_step = 0;
+        step_optimizer(
+            &mut optimizer,
+            &mut optimizer_step,
+            &mut muon_momentum_step,
+            false,
+        );
+        assert!(actor.equal(&actor_before));
+        assert!(!critic.equal(&critic_before));
+        assert!(shared.equal(&shared_before));
+        assert_eq!(optimizer_step, 1);
+        assert_eq!(muon_momentum_step, 0);
     }
 
     #[test]
