@@ -28,6 +28,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -41,7 +42,8 @@ use shared::report::{Report, ReportKind, ReportSeries, ScaleKind};
 use tch::{Device, Kind, Tensor};
 
 use crate::torch::bar_dist::{
-    encode_dof, BarDof, BarSupports, VolumeEma, BAR_DOF, DOF_R, DOF_S, DOF_W, NUM_BAR_BINS,
+    encode_dof, BarDof, BarSupports, BarSupportsProvenance, VolumeEma, BAR_DOF, DOF_R, DOF_S,
+    DOF_W, NUM_BAR_BINS,
 };
 
 /// Causal bars fed to the volume EMA before the first emitted DOF of a window. The span-20
@@ -196,8 +198,7 @@ pub const TIME_MARKET_W: usize = 8;
 
 /// The OBSERVED channels, in tensor order. Every future-facing id constructor must leave all
 /// of these at [`MARKET_MISSING`].
-pub const BAR_TIME_MARKET: [usize; MARKET_FEATURES] =
-    [TIME_MARKET_R, TIME_MARKET_S, TIME_MARKET_W];
+pub const BAR_TIME_MARKET: [usize; MARKET_FEATURES] = [TIME_MARKET_R, TIME_MARKET_S, TIME_MARKET_W];
 
 /// The same id row with every market channel pinned to [`MARKET_MISSING`].
 ///
@@ -542,7 +543,11 @@ fn market_support_sha256(supports: &BarSupports) -> String {
     digest.update(b"bar-market-supports-v1");
     digest.update(&NUM_BAR_BINS.to_le_bytes());
     for dof in MARKET_DOF {
-        for bound in supports.lower_bounds(dof).iter().chain(supports.upper_bounds(dof)) {
+        for bound in supports
+            .lower_bounds(dof)
+            .iter()
+            .chain(supports.upper_bounds(dof))
+        {
             digest.update(&bound.to_bits().to_le_bytes());
         }
     }
@@ -576,6 +581,172 @@ pub fn market_supports_path(dir: &Path, res_secs: u32) -> PathBuf {
     dir.join(format!("bar_market_supports.{res_secs}.json"))
 }
 
+/// Fingerprint of the proxy bars a fit of `sample_count` DOF consumed, and of nothing else.
+///
+/// NOT [`BarCorpus::identity_fingerprint`], for two independent reasons. It is unconstructible
+/// here — that fingerprint folds in [`MarketChannel::support_sha256`], the very geometry this
+/// validates, and it is a method on a corpus that does not exist yet at the only call site
+/// ([`BarCorpus::open_files`] builds the channel before it builds `Self`). And it would be
+/// wrong even if it existed: it moves with the symbol universe, which the market channel is
+/// deliberately built BEFORE the restriction in order to be independent of.
+///
+/// Keyed on the RECORDED sample count, never on the calling run's `train | val` instant. Only
+/// [`BarCorpus::load_with_bounds`] callers pin that instant; [`BarCorpus::load`] derives it from
+/// a live percentile that moves with every ingested bar and with each caller's `min_bars`, so a
+/// boundary-keyed fingerprint would let whichever entry point wrote the artifact first lock out
+/// the planner, the panels and the universe rebuild — all of which must simply CONSUME the
+/// geometry their checkpoint was trained on rather than re-derive it.
+///
+/// The fit region alone, never the whole file: `Ingest` appends to the proxy continuously and
+/// bars past the fit region cannot reach a bucket edge. CONTENT, not metadata, so an in-place
+/// backfill that revises history without shifting an endpoint is still caught.
+///
+/// Exactly the five fields [`for_each_window_dof`] consumes, plus the timestamp that says which
+/// bar this is. `vwap` and `trades` are deliberately excluded: nothing in the fit reads them, so
+/// hashing them would hard-error a corpus open over a vendor revision that provably cannot move
+/// an edge.
+fn market_proxy_fingerprint(file: &BarFile, res_secs: u32, sample_count: usize) -> Option<String> {
+    let bars = file.bars().get(..sample_count + 1)?;
+    let mut digest = DigestContext::new(&SHA256);
+    digest.update(b"bar-market-proxy-v2");
+    digest.update(MARKET_PROXY_SYMBOL.as_bytes());
+    digest.update(&res_secs.to_le_bytes());
+    digest.update(&(sample_count as u64).to_le_bytes());
+    // Chunked so the digest sees one call per few thousand bars rather than one per field.
+    let mut scratch: Vec<u8> = Vec::with_capacity(MARKET_FINGERPRINT_CHUNK * 24);
+    for chunk in bars.chunks(MARKET_FINGERPRINT_CHUNK) {
+        scratch.clear();
+        for bar in chunk {
+            let bar = *bar;
+            scratch.extend_from_slice(&bar.ts_ms.to_le_bytes());
+            for field in [bar.open, bar.high, bar.low, bar.close, bar.volume] {
+                scratch.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        digest.update(&scratch);
+    }
+    Some(hex_digest(digest))
+}
+
+const MARKET_FINGERPRINT_CHUNK: usize = 8_192;
+
+/// Process-level opt-out from the provenance guard below, set by the global
+/// `--freeze-market-supports`.
+///
+/// A process flag rather than a parameter because a corpus is opened from eight call sites —
+/// the planner, the horizon and portfolio panels, ingest's boundary derivation — none of which
+/// has any basis for deciding a campaign's freeze policy, and threading one through every
+/// `BarCorpus` constructor would put the decision in the wrong hands. It belongs to the
+/// invocation, and `main` sets it once before dispatch so every subcommand honours it.
+static FREEZE_MARKET_SUPPORTS: AtomicBool = AtomicBool::new(false);
+
+/// Reuse market buckets whose provenance does not match this proxy, loudly and on purpose.
+/// The right call mid-campaign: refitting moves every market conditioning row, so a frozen
+/// artifact is what keeps two runs' inputs comparable.
+pub fn set_freeze_market_supports(freeze: bool) {
+    FREEZE_MARKET_SUPPORTS.store(freeze, Ordering::Relaxed);
+}
+
+pub fn freeze_market_supports() -> bool {
+    FREEZE_MARKET_SUPPORTS.load(Ordering::Relaxed)
+}
+
+/// Decide whether cached market buckets may be used against this proxy. Returns whether they
+/// were accepted under the freeze despite a mismatch.
+///
+/// The same three cases [`crate::torch::train::pretrain`] applies to the model's own supports,
+/// against the same [`BarSupportsProvenance`] record, so there is one convention on disk and
+/// one decision rule: provenance matches -> reuse; mismatched or absent under the freeze ->
+/// reuse under a warning; otherwise -> hard error. `corpus_fingerprint` carries a
+/// [`market_proxy_fingerprint`] here, which shares no preimage with a corpus fingerprint
+/// because the two digests are domain-separated.
+///
+/// The question asked is "is this artifact still a faithful fit of the proxy history on disk",
+/// recomputed at the artifact's OWN `sample_count` — not "did this caller's boundary produce
+/// it". A differing `train | val` instant is reported, never refused: the planner, the panels
+/// and the universe rebuild all open the corpus on a derived boundary and must reuse the
+/// geometry their checkpoint was trained on, and refusing them would leave deleting the
+/// artifact as the only way forward, which re-means every conditioning row mid-campaign — the
+/// exact harm this guard exists to prevent.
+fn require_market_supports_provenance(
+    provenance: Option<&BarSupportsProvenance>,
+    path: &Path,
+    file: &BarFile,
+    res_secs: u32,
+    bounds: (i64, i64),
+    freeze: bool,
+) -> Result<bool> {
+    let short = |s: &str| s[..12.min(s.len())].to_owned();
+    let complaint = match provenance {
+        Some(recorded)
+            if market_proxy_fingerprint(file, res_secs, recorded.sample_count)
+                .is_some_and(|current| current == recorded.corpus_fingerprint) =>
+        {
+            println!(
+                "[dataset] market channel buckets reused from {} — fitted {} from {} \
+                 {MARKET_PROXY_SYMBOL} train bars, and that history is byte-identical today",
+                path.display(),
+                recorded.fitted_utc,
+                recorded.sample_count
+            );
+            if recorded.split_bounds.0 != bounds.0 {
+                // Not a refusal, but never silent: this is the discrepancy that hid an artifact
+                // fitted five weeks short of the campaign pin. Past the boundary is the direction
+                // that would mean the buckets saw held-out data, so it is called out by name.
+                let leaks = file
+                    .bars()
+                    .get(recorded.sample_count)
+                    .is_some_and(|bar| bar.ts() >= bounds.0);
+                println!(
+                    "[dataset] {}: buckets were fitted to a train|val instant of {}, this run \
+                     uses {}{}",
+                    if leaks { "WARNING" } else { "note" },
+                    iso_ms(recorded.split_bounds.0),
+                    iso_ms(bounds.0),
+                    if leaks {
+                        " — the fit region reaches AT OR PAST this run's boundary, so the bucket \
+                         edges saw bars this run holds out"
+                    } else {
+                        " — the fit region ends strictly inside this run's train region, so no \
+                         held-out bar reached an edge"
+                    }
+                );
+            }
+            return Ok(false);
+        }
+        Some(recorded) => format!(
+            "were fitted from {} {MARKET_PROXY_SYMBOL} bars fingerprinting {} (split {} | {}), \
+             but the first {} bars of {MARKET_PROXY_SYMBOL} on disk today do not reproduce it: \
+             the proxy's history was deepened, revised or truncated under the artifact",
+            recorded.sample_count,
+            short(&recorded.corpus_fingerprint),
+            iso_ms(recorded.split_bounds.0),
+            iso_ms(recorded.split_bounds.1),
+            recorded.sample_count,
+        ),
+        None => "carry no provenance at all, so nothing can confirm which proxy history or \
+                 which split instant produced them"
+            .to_owned(),
+    };
+    ensure!(
+        freeze,
+        "market channel buckets {} {complaint}. They bin {MARKET_PROXY_SYMBOL} into the \
+         conditioning ids every symbol's rows carry, so reusing them against a proxy history \
+         they were not fitted on silently re-means all {} market conditioning rows and makes \
+         this run's inputs incomparable to the fit it claims. Delete the file to refit from \
+         {MARKET_PROXY_SYMBOL}'s current train region, or pass --freeze-market-supports to \
+         reuse them deliberately.",
+        path.display(),
+        MARKET_FEATURES as i64 * NUM_BAR_BINS
+    );
+    println!(
+        "[dataset] WARNING: reusing FROZEN market channel buckets {} — they {complaint}. The \
+         market conditioning stays comparable to other runs on these buckets and to nothing else.",
+        path.display()
+    );
+    Ok(true)
+}
+
 /// Reuse the persisted market buckets if they exist, fit and persist them if they do not.
 ///
 /// Load-then-reuse rather than always-refit, and that is the whole point of the artifact: the
@@ -586,6 +757,10 @@ pub fn market_supports_path(dir: &Path, res_secs: u32) -> PathBuf {
 /// and when they do move [`MarketChannel::support_sha256`] moves the corpus fingerprint with
 /// them.
 ///
+/// Pinned is not the same as correct, which is what [`require_market_supports_provenance`]
+/// adds: mere file existence once let an artifact fitted under one proxy history and split
+/// instant be applied to another without a word, and a bin count cannot see that.
+///
 /// An unreadable or wrong-geometry artifact is a hard error, never a silent refit: refitting is
 /// exactly the failure this function exists to prevent, and falling back to an all-MISSING
 /// channel would delete a whole input group without failing anything.
@@ -593,9 +768,10 @@ fn load_or_fit_market_supports(
     dir: &Path,
     res_secs: u32,
     file: &BarFile,
-    train_bound: i64,
+    bounds: (i64, i64),
 ) -> Result<BarSupports> {
     let path = market_supports_path(dir, res_secs);
+    let freeze = freeze_market_supports();
     if path.exists() {
         let supports = BarSupports::load(&path).with_context(|| {
             format!(
@@ -610,11 +786,34 @@ fn load_or_fit_market_supports(
             path.display(),
             supports.num_bins()
         );
-        println!("[dataset] market channel buckets reused from {}", path.display());
+        require_market_supports_provenance(
+            supports.provenance(),
+            &path,
+            file,
+            res_secs,
+            bounds,
+            freeze,
+        )?;
         return Ok(supports);
     }
-    let train_end = file.index_at_or_after(train_bound);
-    let supports = fit_market_supports(file, train_end)?;
+    // The same refusal `fit_supports_at` makes for the model's own supports: a freeze that
+    // silently fits a brand-new geometry is the opposite of frozen.
+    ensure!(
+        !freeze,
+        "--freeze-market-supports was given but {} does not exist; put the frozen artifact \
+         there, or drop the flag to fit a new one from {MARKET_PROXY_SYMBOL}'s train region",
+        path.display()
+    );
+    let train_end = file.index_at_or_after(bounds.0);
+    let sample_count = train_end.saturating_sub(1);
+    let fingerprint = market_proxy_fingerprint(file, res_secs, sample_count)
+        .context("the proxy is shorter than the train region it was just cut against")?;
+    let supports = fit_market_supports(file, train_end)?.with_provenance(BarSupportsProvenance {
+        corpus_fingerprint: fingerprint,
+        split_bounds: bounds,
+        sample_count,
+        fitted_utc: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    });
     match supports.save(&path) {
         Ok(()) => println!(
             "[dataset] fitted market channel buckets from {} {MARKET_PROXY_SYMBOL} train bars \
@@ -875,11 +1074,16 @@ impl BarCorpus {
         // Proxy before restriction, for the same reason the bounds are: a symbol-universe
         // ablation must not change the market channel, or the two arms condition on different
         // exogenous state and their `nll_bar` stop being commensurable.
-        let market = match files.iter().find(|file| file.symbol() == MARKET_PROXY_SYMBOL) {
+        let market = match files
+            .iter()
+            .find(|file| file.symbol() == MARKET_PROXY_SYMBOL)
+        {
             Some(file) => {
-                let supports = load_or_fit_market_supports(dir, res_secs, file, bounds.0)?;
+                let supports = load_or_fit_market_supports(dir, res_secs, file, bounds)?;
                 let channel = MarketChannel::new(file, &supports);
-                println!("[dataset] market channel from {MARKET_PROXY_SYMBOL}.{res_secs}: {channel:?}");
+                println!(
+                    "[dataset] market channel from {MARKET_PROXY_SYMBOL}.{res_secs}: {channel:?}"
+                );
                 Some(channel)
             }
             None => {
@@ -984,7 +1188,11 @@ impl BarCorpus {
     ///
     /// Bounded by construction: the sink sees one bar at a time and nothing is buffered, so a
     /// pass over the whole corpus costs whatever the caller's accumulator costs and no more.
-    pub fn for_each_series_dof(&self, series: usize, mut sink: impl FnMut(usize, &PackedBar, BarDof)) {
+    pub fn for_each_series_dof(
+        &self,
+        series: usize,
+        mut sink: impl FnMut(usize, &PackedBar, BarDof),
+    ) {
         let bars = self.inner.files[series].bars();
         if bars.len() < 2 {
             return;
@@ -1120,12 +1328,15 @@ impl BarCorpus {
                 self.symbol(e.series)
             );
         }
-        (end + 1).checked_sub(len).filter(|&s| s >= 1).with_context(|| {
-            format!(
-                "dof_window of {len} bars ending at {end} needs a predecessor close in {}",
-                self.symbol(e.series)
-            )
-        })
+        (end + 1)
+            .checked_sub(len)
+            .filter(|&s| s >= 1)
+            .with_context(|| {
+                format!(
+                    "dof_window of {len} bars ending at {end} needs a predecessor close in {}",
+                    self.symbol(e.series)
+                )
+            })
     }
 
     /// Count, per symbol, the bars whose log return or log range exceeds
@@ -1322,7 +1533,10 @@ impl BarCorpus {
             picked.sort_unstable();
             picked
         };
-        chosen.shuffle(&mut ChaCha12Rng::seed_from_u64(mix64(seed, SUPPORT_ORDER_STREAM)));
+        chosen.shuffle(&mut ChaCha12Rng::seed_from_u64(mix64(
+            seed,
+            SUPPORT_ORDER_STREAM,
+        )));
         chosen.truncate(wanted as usize);
 
         chosen
@@ -2798,7 +3012,10 @@ impl CorpusAnomalies {
                 String::new()
             };
             for (name, pick) in [
-                ("splice", (|s: &SymbolAnomalies| s.splices) as fn(&SymbolAnomalies) -> usize),
+                (
+                    "splice",
+                    (|s: &SymbolAnomalies| s.splices) as fn(&SymbolAnomalies) -> usize,
+                ),
                 ("tick", |s: &SymbolAnomalies| s.ticks),
                 ("jump", |s: &SymbolAnomalies| s.jumps),
                 ("extreme_range", |s: &SymbolAnomalies| s.extreme_range),
@@ -3247,7 +3464,11 @@ mod tests {
                 corpus.series_len(series) - 1
             );
             for (offset, (index, ts, _)) in seen.iter().enumerate() {
-                assert_eq!(*index, offset + 1, "bar 0 carries no DOF and must be skipped");
+                assert_eq!(
+                    *index,
+                    offset + 1,
+                    "bar 0 carries no DOF and must be skipped"
+                );
                 assert_eq!(*ts, corpus.ts_ms(series, *index));
             }
         }
@@ -3295,7 +3516,10 @@ mod tests {
         // mid-day in ET terms and makes both assertions below vacuous-then-false.
         let midnight_et = 1_629_086_400_000i64;
         assert_eq!(et_local_day(midnight_et - 1) + 1, et_local_day(midnight_et));
-        assert_eq!(et_local_day(midnight_et), et_local_day(midnight_et + 86_399_999));
+        assert_eq!(
+            et_local_day(midnight_et),
+            et_local_day(midnight_et + 86_399_999)
+        );
     }
 
     #[test]
@@ -3352,8 +3576,7 @@ mod tests {
         let intraday_ids = bar_time_ids(intraday.ts_ms(0, 0), None, intraday.res_secs(), None);
         let daily_ids = bar_time_ids(daily.ts_ms(0, 0), None, daily.res_secs(), None);
         assert_ne!(
-            intraday_ids[TIME_RESOLUTION],
-            daily_ids[TIME_RESOLUTION],
+            intraday_ids[TIME_RESOLUTION], daily_ids[TIME_RESOLUTION],
             "the resolution channel must distinguish the timeframes"
         );
 
@@ -3425,7 +3648,10 @@ mod tests {
         // Every bar a training sampler can reach is strictly before the deployment's train|val
         // instant, target bars and DOF-carrying context alike.
         let sampler = BarSampler::new(&aux, Split::Train, 256, 11);
-        assert!(sampler.windows() > 0, "the auxiliary must yield train windows");
+        assert!(
+            sampler.windows() > 0,
+            "the auxiliary must yield train windows"
+        );
         for anchor in sampler.anchors() {
             let bars = aux.bars(anchor.symbol as usize);
             let last = anchor.bar_index as usize + 256;
@@ -3544,13 +3770,23 @@ mod tests {
             let (v_lo, v_hi) = corpus.split_range(s, Split::Val);
             let (e_lo, e_hi) = corpus.split_range(s, Split::Test);
             assert_eq!((t_lo, t_hi), (0, v_lo), "{symbol} train/val must abut");
-            assert_eq!((v_hi, e_hi), (e_lo, bars.len()), "{symbol} val/test must abut");
-            assert!(bars[..t_hi].iter().all(|b| b.ts() < b0), "{symbol} train leak");
+            assert_eq!(
+                (v_hi, e_hi),
+                (e_lo, bars.len()),
+                "{symbol} val/test must abut"
+            );
+            assert!(
+                bars[..t_hi].iter().all(|b| b.ts() < b0),
+                "{symbol} train leak"
+            );
             assert!(
                 bars[v_lo..v_hi].iter().all(|b| b.ts() >= b0 && b.ts() < b1),
                 "{symbol} val leak"
             );
-            assert!(bars[e_lo..].iter().all(|b| b.ts() >= b1), "{symbol} test leak");
+            assert!(
+                bars[e_lo..].iter().all(|b| b.ts() >= b1),
+                "{symbol} test leak"
+            );
             fractions.push(t_hi as f64 / bars.len() as f64);
         }
         // The whole point of a calendar split: symbols with different listing dates and
@@ -3558,7 +3794,10 @@ mod tests {
         // passing for the wrong reason.
         let spread = fractions.iter().cloned().fold(f64::MIN, f64::max)
             - fractions.iter().cloned().fold(f64::MAX, f64::min);
-        assert!(spread > 0.01, "fixture is degenerate, index split would agree");
+        assert!(
+            spread > 0.01,
+            "fixture is degenerate, index split would agree"
+        );
 
         // Global bar mass either side of the bounds tracks the requested percentiles.
         let train = corpus.split_bars(Split::Train) as f64 / corpus.unique_bars() as f64;
@@ -3583,7 +3822,10 @@ mod tests {
                 let bars = corpus.bars(r.symbol as usize);
                 let first = bars[r.bar_index as usize].ts();
                 let last = bars[r.bar_index as usize + 128].ts();
-                assert!(first >= lo_ts && last < hi_ts, "{split} window {r:?} crosses");
+                assert!(
+                    first >= lo_ts && last < hi_ts,
+                    "{split} window {r:?} crosses"
+                );
             }
         }
     }
@@ -3699,7 +3941,9 @@ mod tests {
                 );
                 for f in 0..BAR_TIME_FEATURES {
                     assert_eq!(
-                        batch.time_ids.int64_value(&[row as i64, step as i64, f as i64]),
+                        batch
+                            .time_ids
+                            .int64_value(&[row as i64, step as i64, f as i64]),
                         want_ids[f],
                         "row {row} step {step} {}",
                         BAR_TIME_NAMES[f]
@@ -3714,7 +3958,10 @@ mod tests {
         let (_fx, corpus) = fixture("pinned");
         let sampler = BarSampler::new(&corpus, Split::Train, 32, 99);
         let want = 64;
-        assert!(sampler.windows() > 2 * want, "fixture must oversupply windows");
+        assert!(
+            sampler.windows() > 2 * want,
+            "fixture must oversupply windows"
+        );
         let first = sampler.pinned_windows(want);
         assert_eq!(first.len(), want);
         assert_eq!(
@@ -3728,7 +3975,11 @@ mod tests {
         let unique: HashSet<WindowRef> = first.iter().copied().collect();
         assert_eq!(unique.len(), first.len(), "pinned windows must not repeat");
         let symbols: HashSet<u32> = first.iter().map(|r| r.symbol).collect();
-        assert_eq!(symbols.len(), corpus.symbols().len(), "every ticker represented");
+        assert_eq!(
+            symbols.len(),
+            corpus.symbols().len(),
+            "every ticker represented"
+        );
         // Time-stratified: the picks straddle the whole split, not just its head.
         for s in 0..corpus.symbols().len() as u32 {
             let picks: Vec<u32> = first
@@ -3739,7 +3990,10 @@ mod tests {
             let (lo, hi) = corpus.split_range(s as usize, Split::Train);
             let span = (hi - lo) as u32;
             let reach = picks.iter().max().unwrap() - picks.iter().min().unwrap();
-            assert!(reach > span / 2, "symbol {s} picks span only {reach} of {span}");
+            assert!(
+                reach > span / 2,
+                "symbol {s} picks span only {reach} of {span}"
+            );
         }
         // Independent of the epoch shuffle.
         let _ = sampler.batch(17, 0, 4, Device::Cpu);
@@ -3754,10 +4008,18 @@ mod tests {
         assert!(!samples.is_empty());
         assert!(samples.len() <= 4_000);
         for (ts, dof) in &samples {
-            assert!(*ts < b0, "sampled {} at or after the train|val bound {b0}", iso_ms(*ts));
+            assert!(
+                *ts < b0,
+                "sampled {} at or after the train|val bound {b0}",
+                iso_ms(*ts)
+            );
             assert!(dof.is_finite());
         }
-        assert_eq!(samples, corpus.sample_train_dof(4_000, 31), "sampling must be pinned");
+        assert_eq!(
+            samples,
+            corpus.sample_train_dof(4_000, 31),
+            "sampling must be pinned"
+        );
 
         let supports = corpus.fit_supports(4_000, 31);
         assert!(corpus.supports_path().is_file());
@@ -3794,7 +4056,10 @@ mod tests {
         // Daylight time in July: the same wall clock, an hour different in UTC. If the
         // producer used a fixed offset one of these two would be off by 60 minutes.
         let summer = bar_time_ids(et("2024-07-16T09:30:00"), None, RES, None);
-        assert_eq!(summer[TIME_MINUTE], 570, "09:30 ET is minute 570 in DST too");
+        assert_eq!(
+            summer[TIME_MINUTE], 570,
+            "09:30 ET is minute 570 in DST too"
+        );
         assert_ne!(
             et("2024-01-16T09:30:00").rem_euclid(86_400_000),
             et("2024-07-16T09:30:00").rem_euclid(86_400_000),
@@ -3925,14 +4190,20 @@ mod tests {
 
         let splice_stats = by_symbol["SPLICE"];
         assert_eq!(splice_stats.holes, 1);
-        assert_eq!(splice_stats.splices, 1, "level jump across a hole is a splice");
+        assert_eq!(
+            splice_stats.splices, 1,
+            "level jump across a hole is a splice"
+        );
         assert_eq!(splice_stats.ticks, 0);
 
         let tick_stats = by_symbol["TICK"];
         assert_eq!(tick_stats.ticks, 1, "a reverting single print is a tick");
         assert_eq!(tick_stats.splices, 0);
         assert_eq!(tick_stats.holes, 0);
-        assert!(tick_stats.extreme_range >= 1, "a 50x bar has an extreme range");
+        assert!(
+            tick_stats.extreme_range >= 1,
+            "a 50x bar has an extreme range"
+        );
 
         assert_eq!(audit.splices, 1);
         assert_eq!(audit.ticks, 1);
@@ -4008,7 +4279,9 @@ mod tests {
                 .zip(anchors.par_iter())
                 .map(|(bars, &anchor)| {
                     let mut n = 0usize;
-                    for_each_window_dof(bars, anchor, len, |_, dof| n += dof.r.is_finite() as usize);
+                    for_each_window_dof(bars, anchor, len, |_, dof| {
+                        n += dof.r.is_finite() as usize
+                    });
                     n
                 })
                 .sum();
@@ -4201,8 +4474,7 @@ mod tests {
     #[test]
     fn one_pass_targets_every_training_bar_exactly_once() {
         let (_fx, corpus) = fixture("pass_once");
-        let plan =
-            PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 7).unwrap();
+        let plan = PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 7).unwrap();
         let layout = plan.layout(0);
         let mut ledger = PassLedger::new(&layout);
         issue_full_pass(&layout, &mut ledger, 24);
@@ -4260,7 +4532,8 @@ mod tests {
         }
         let pass_mean = plan.pass_mean_conditioning_bars();
         assert!(
-            pass_mean > plan.mean_conditioning_bars(0) && pass_mean < plan.mean_conditioning_bars(2),
+            pass_mean > plan.mean_conditioning_bars(0)
+                && pass_mean < plan.mean_conditioning_bars(2),
             "the bar-weighted mean {pass_mean} must sit between the extreme stages"
         );
     }
@@ -4277,8 +4550,7 @@ mod tests {
     #[test]
     fn the_cross_pass_census_sees_reuse_the_per_pass_audit_cannot() {
         let (_fx, corpus) = fixture("cross_pass_census");
-        let plan =
-            PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 19).unwrap();
+        let plan = PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 19).unwrap();
         let contexts: Vec<i64> = PASS_CONTEXTS.to_vec();
         // An independent per-bar tally, built the same way `per_bar_coverage` builds one: the
         // reference the census is checked against is a direct count, not another formula.
@@ -4299,7 +4571,8 @@ mod tests {
             assert_eq!(audit.multiplicity_bars[3], 0, "epoch {epoch}");
 
             let run = plan.cumulative_coverage(&census, &layout, &ledger);
-            run.require_accounted().expect("the run must account for every bar");
+            run.require_accounted()
+                .expect("the run must account for every bar");
             for stage in 0..layout.stages() {
                 for window in layout.windows(stage) {
                     let anchor = window.bar_index as usize;
@@ -4335,7 +4608,8 @@ mod tests {
         let layout = plan.layout(PASSES);
         let ledger = PassLedger::new(&layout);
         let run = plan.cumulative_coverage(&census, &layout, &ledger);
-        run.require_accounted().expect("the run must account for every bar");
+        run.require_accounted()
+            .expect("the run must account for every bar");
         assert_eq!(run.completed_passes, PASSES);
         assert_eq!(
             run.bar_target_events,
@@ -4376,8 +4650,7 @@ mod tests {
     #[test]
     fn the_partition_is_disjoint_across_stages() {
         let (_fx, corpus) = fixture("pass_disjoint");
-        let plan =
-            PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 11).unwrap();
+        let plan = PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 11).unwrap();
         for epoch in [0usize, 1, 5] {
             let layout = plan.layout(epoch);
             let (counts, stages) = per_bar_coverage(&corpus, &layout, &PASS_CONTEXTS);
@@ -4421,8 +4694,7 @@ mod tests {
     #[test]
     fn the_coverage_assertion_fires_on_a_truncated_pass() {
         let (_fx, corpus) = fixture("pass_truncated");
-        let plan =
-            PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 13).unwrap();
+        let plan = PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 13).unwrap();
         let layout = plan.layout(0);
 
         // Truncated: stage 1 stops short, as a held batch or a short `--steps` would leave it.
@@ -4434,7 +4706,11 @@ mod tests {
         let mut ledger = PassLedger::new(&layout);
         for stage in 0..layout.stages() {
             let assigned = layout.windows(stage).len();
-            let issue = if stage == 1 { assigned - HELD } else { assigned };
+            let issue = if stage == 1 {
+                assigned - HELD
+            } else {
+                assigned
+            };
             ledger.mark(stage, 0, issue);
         }
         let audit = plan.audit(&layout, &ledger);
@@ -4485,8 +4761,7 @@ mod tests {
     #[test]
     fn partition_assignment_is_independent_of_symbol_and_calendar_position() {
         let (_fx, corpus) = fixture("pass_independence");
-        let plan =
-            PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 17).unwrap();
+        let plan = PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 17).unwrap();
         const STAGES: usize = PASS_CONTEXTS.len();
         const QUARTILES: usize = 4;
         // 50 epochs: each is an independent draw of the block order and the hole position, and
@@ -4573,16 +4848,18 @@ mod tests {
         let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
         // LONG sets the split instant; MID's train axis fits stage 0 and 1 windows but not one
         // stage-2 window; SHORT's fits no window of any stage.
-        for (symbol, seed, count) in [("LONG", 1u64, 4_000usize), ("MID", 2, 126), ("SHORT", 3, 40)]
-        {
+        for (symbol, seed, count) in [
+            ("LONG", 1u64, 4_000usize),
+            ("MID", 2, 126),
+            ("SHORT", 3, 40),
+        ] {
             let bars = synth_bars(seed, count, base);
             write_bar_file(&bar_path(&dir, symbol), symbol, RES, &bars).unwrap();
         }
         // `--min-bars` below the shortest ramp context on purpose: this is the case the
         // production 20,480 hides, and it has to be exercised somewhere.
         let corpus = BarCorpus::load(&dir, RES, 20).unwrap();
-        let plan =
-            PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 19).unwrap();
+        let plan = PassPlan::new(&corpus, Split::Train, &PASS_CONTEXTS, &FLAT_WEIGHTS, 19).unwrap();
         let index = |name: &str| corpus.symbols().iter().position(|s| s == name).unwrap();
         let (mid, short) = (index("MID"), index("SHORT"));
         let (mid_lo, mid_hi) = corpus.split_range(mid, Split::Train);
@@ -4675,8 +4952,13 @@ mod tests {
         let flat_ts = flat.ts();
         proxy[MARKET_FLAT_BAR] = flat;
         proxy.drain(MARKET_HOLE_START..MARKET_HOLE_END);
-        write_bar_file(&bar_path(&dir, MARKET_PROXY_SYMBOL), MARKET_PROXY_SYMBOL, RES, &proxy)
-            .unwrap();
+        write_bar_file(
+            &bar_path(&dir, MARKET_PROXY_SYMBOL),
+            MARKET_PROXY_SYMBOL,
+            RES,
+            &proxy,
+        )
+        .unwrap();
 
         let corpus = BarCorpus::load(&dir, RES, 100).unwrap();
         (Fixture { dir }, corpus, flat_ts)
@@ -4712,7 +4994,10 @@ mod tests {
         let start = 300usize;
         let batch = corpus
             .dof_window(
-                &[BarEndpoint { series: name, bar: start + len - 1 }],
+                &[BarEndpoint {
+                    series: name,
+                    bar: start + len - 1,
+                }],
                 &[0],
                 len as i64,
                 Device::Cpu,
@@ -4730,7 +5015,8 @@ mod tests {
                     .time_ids
                     .int64_value(&[0, slot as i64, channel_index as i64]);
                 assert_eq!(
-                    got, want[feature],
+                    got,
+                    want[feature],
                     "slot {slot} {} must read the proxy at its own instant {}",
                     BAR_TIME_NAMES[channel_index],
                     iso_ms(ts)
@@ -4772,7 +5058,10 @@ mod tests {
         let len = MARKET_HOLE_END - MARKET_HOLE_START;
         let batch = corpus
             .dof_window(
-                &[BarEndpoint { series: name, bar: MARKET_HOLE_END - 1 }],
+                &[BarEndpoint {
+                    series: name,
+                    bar: MARKET_HOLE_END - 1,
+                }],
                 &[0],
                 len as i64,
                 Device::Cpu,
@@ -4799,7 +5088,10 @@ mod tests {
         // not a constant.
         let covered = corpus
             .dof_window(
-                &[BarEndpoint { series: name, bar: MARKET_HOLE_START - 1 }],
+                &[BarEndpoint {
+                    series: name,
+                    bar: MARKET_HOLE_START - 1,
+                }],
                 &[0],
                 256,
                 Device::Cpu,
@@ -4819,7 +5111,15 @@ mod tests {
         let from = 1_000usize;
         let steps = 64i64;
         let ids = corpus
-            .future_time_ids(&[BarEndpoint { series: name, bar: from }], 0, steps, Device::Cpu)
+            .future_time_ids(
+                &[BarEndpoint {
+                    series: name,
+                    bar: from,
+                }],
+                0,
+                steps,
+                Device::Cpu,
+            )
             .expect("future ids");
 
         for step in 0..steps as usize {
@@ -4832,7 +5132,14 @@ mod tests {
                 );
             }
             let want = future_conditioning_ids(bars[bar].ts(), Some(bars[bar - 1].ts()), RES);
-            for feature in [TIME_MINUTE, TIME_WEEKDAY, TIME_SESSION, TIME_RESOLUTION, TIME_ELAPSED, TIME_DAY_EDGE] {
+            for feature in [
+                TIME_MINUTE,
+                TIME_WEEKDAY,
+                TIME_SESSION,
+                TIME_RESOLUTION,
+                TIME_ELAPSED,
+                TIME_DAY_EDGE,
+            ] {
                 assert_eq!(
                     ids.int64_value(&[0, step as i64, feature as i64]),
                     want[feature],
@@ -4864,7 +5171,15 @@ mod tests {
         assert_eq!(adjacent[TIME_DAY_EDGE], 1, "same ET day");
 
         // Powers of two land on consecutive buckets, which is the whole point of a log axis.
-        for (bars, bucket) in [(1i64, 1i64), (2, 2), (3, 2), (4, 3), (7, 3), (8, 4), (100, 7)] {
+        for (bars, bucket) in [
+            (1i64, 1i64),
+            (2, 2),
+            (3, 2),
+            (4, 3),
+            (7, 3),
+            (8, 4),
+            (100, 7),
+        ] {
             assert_eq!(
                 bar_time_ids(open + bars * RES_MS, Some(open), RES, None)[TIME_ELAPSED],
                 bucket,
@@ -4898,29 +5213,34 @@ mod tests {
         let (fx, corpus, _) = market_fixture("pinned");
         let path = market_supports_path(&fx.dir, RES);
         assert!(path.is_file(), "the fit must persist its buckets");
-        let first = corpus.market_channel().expect("proxy").support_sha256().to_owned();
+        let first = corpus
+            .market_channel()
+            .expect("proxy")
+            .support_sha256()
+            .to_owned();
         let fingerprint = corpus.identity_fingerprint();
 
         // A second load of the same directory reuses the artifact and reproduces the geometry.
         let again = BarCorpus::load(&fx.dir, RES, 100).unwrap();
-        assert_eq!(again.market_channel().expect("proxy").support_sha256(), first);
+        assert_eq!(
+            again.market_channel().expect("proxy").support_sha256(),
+            first
+        );
         assert_eq!(again.identity_fingerprint(), fingerprint);
 
         // Derived BEFORE the symbol restriction, so a universe ablation that drops the proxy
         // still conditions on the same market state. Without that, two arms of an ablation would
         // see different exogenous inputs and their `nll_bar` would not be comparable, which is
         // the exact failure the pre-restriction rule for the split bounds already prevents.
-        let restricted = BarCorpus::load_restricted(
-            &fx.dir,
-            RES,
-            100,
-            None,
-            &HashSet::from(["AAA".to_owned()]),
-        )
-        .unwrap();
+        let restricted =
+            BarCorpus::load_restricted(&fx.dir, RES, 100, None, &HashSet::from(["AAA".to_owned()]))
+                .unwrap();
         assert_eq!(restricted.symbols(), &["AAA"]);
         assert_eq!(
-            restricted.market_channel().expect("proxy survives restriction").support_sha256(),
+            restricted
+                .market_channel()
+                .expect("proxy survives restriction")
+                .support_sha256(),
             first
         );
 
@@ -4932,10 +5252,349 @@ mod tests {
         ));
         std::fs::create_dir_all(&empty).unwrap();
         let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
-        write_bar_file(&bar_path(&empty, "AAA"), "AAA", RES, &synth_bars(1, 3_000, base)).unwrap();
+        write_bar_file(
+            &bar_path(&empty, "AAA"),
+            "AAA",
+            RES,
+            &synth_bars(1, 3_000, base),
+        )
+        .unwrap();
         let proxyless = BarCorpus::load(&empty, RES, 100).unwrap();
         assert!(proxyless.market_channel().is_none());
-        assert_ne!(proxyless.identity_fingerprint(), restricted.identity_fingerprint());
+        assert_ne!(
+            proxyless.identity_fingerprint(),
+            restricted.identity_fingerprint()
+        );
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// Serialises the tests that touch [`FREEZE_MARKET_SUPPORTS`]. The flag is process-wide and
+    /// the harness runs tests on threads, so an unserialised setter would flip the guard under
+    /// a concurrent corpus load.
+    fn freeze_serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The hole this closes: `load_or_fit_market_supports` once reused the artifact on mere
+    /// file existence, checking only the bin count, so buckets fitted under one proxy history
+    /// and one split instant were applied to another without a word.
+    #[test]
+    fn market_buckets_refuse_a_proxy_history_they_were_not_fitted_on() {
+        let (fx, corpus, _) = market_fixture("provenance");
+        let path = market_supports_path(&fx.dir, RES);
+        let bounds = corpus.split_bounds();
+        let first = corpus
+            .market_channel()
+            .expect("proxy")
+            .support_sha256()
+            .to_owned();
+        drop(corpus);
+
+        // The fit stamps provenance rather than leaving an unverifiable artifact on disk.
+        let stamped = BarSupports::load(&path).unwrap();
+        let recorded = stamped
+            .provenance()
+            .expect("the fit must stamp provenance")
+            .clone();
+        assert_eq!(recorded.split_bounds, bounds);
+        assert!(recorded.sample_count > 0);
+
+        let proxy_path = bar_path(&fx.dir, MARKET_PROXY_SYMBOL);
+        let original: Vec<PackedBar> = BarFile::open(&proxy_path).unwrap().bars().to_vec();
+        let last_ts = original.last().unwrap().ts();
+
+        // Bars APPENDED after the boundary must not invalidate anything: they cannot reach a
+        // bucket edge, and a guard that expired on every ingest would be switched off within a
+        // week, which is how the silent hole got there in the first place.
+        let mut appended = original.clone();
+        appended.extend(synth_bars(21, 400, last_ts + RES_MS));
+        write_bar_file(&proxy_path, MARKET_PROXY_SYMBOL, RES, &appended).unwrap();
+        let grown = BarCorpus::load_with_bounds(&fx.dir, RES, 100, bounds)
+            .expect("appending past the train boundary must not invalidate the buckets");
+        assert_eq!(
+            grown.market_channel().expect("proxy").support_sha256(),
+            first
+        );
+        drop(grown);
+
+        // DEEPENING the proxy's history does invalidate them: the fit region itself changed,
+        // which is exactly the event a bin-count check cannot see.
+        let mut deepened = synth_bars(23, 500, original[0].ts() - 500 * RES_MS);
+        deepened.extend(appended.iter().copied());
+        write_bar_file(&proxy_path, MARKET_PROXY_SYMBOL, RES, &deepened).unwrap();
+        let refused = BarCorpus::load_with_bounds(&fx.dir, RES, 100, bounds)
+            .expect_err("a proxy history the buckets were not fitted on must be refused");
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains("market channel buckets") && message.contains("do not reproduce it"),
+            "the refusal must name the artifact and the mismatch: {message}"
+        );
+        assert!(
+            message.contains("--freeze-market-supports"),
+            "the refusal must name its opt-out: {message}"
+        );
+
+        // Same proxy history, a DERIVED train boundary. This must LOAD: the planner, the panels
+        // and the universe rebuild all open this corpus on their own percentile and have to
+        // consume the geometry the checkpoint was trained on. Refusing them would leave deleting
+        // the artifact as the only way forward, which re-means every conditioning row.
+        write_bar_file(&proxy_path, MARKET_PROXY_SYMBOL, RES, &original).unwrap();
+        let elsewhere = (bounds.0 - 600 * RES_MS, bounds.1);
+        let derived = BarCorpus::load_with_bounds(&fx.dir, RES, 100, elsewhere)
+            .expect("a derived boundary must reuse rather than refuse the pinned buckets");
+        assert_eq!(
+            derived.market_channel().expect("proxy").support_sha256(),
+            first
+        );
+        drop(derived);
+
+        // And the untouched original still loads, so the guard is discriminating rather than
+        // simply broken.
+        let restored = BarCorpus::load_with_bounds(&fx.dir, RES, 100, bounds)
+            .expect("the proxy the buckets were fitted on still loads");
+        assert_eq!(
+            restored.market_channel().expect("proxy").support_sha256(),
+            first
+        );
+        drop(restored);
+
+        // The freeze is the documented way past a refusal, and it is reachable: the global flag
+        // `main` sets is the only thing standing between the operator and the artifact.
+        let _serial = freeze_serial();
+        write_bar_file(&proxy_path, MARKET_PROXY_SYMBOL, RES, &deepened).unwrap();
+        assert!(BarCorpus::load_with_bounds(&fx.dir, RES, 100, bounds).is_err());
+        set_freeze_market_supports(true);
+        let frozen = BarCorpus::load_with_bounds(&fx.dir, RES, 100, bounds)
+            .expect("the freeze must let a mismatched artifact through");
+        assert_eq!(
+            frozen.market_channel().expect("proxy").support_sha256(),
+            first,
+            "a frozen reuse must keep the OLD geometry, not refit"
+        );
+        set_freeze_market_supports(false);
+        let _ = std::fs::remove_dir_all(&fx.dir);
+    }
+
+    /// The decision rule itself: reuse, frozen reuse, refusal — and the fact that the caller's
+    /// own train boundary never enters the verdict.
+    #[test]
+    fn market_supports_provenance_decides_reuse_freeze_and_refusal() {
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_market_rule_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
+        let bars = synth_bars(31, 2_000, base);
+        let proxy = bar_path(&dir, MARKET_PROXY_SYMBOL);
+        write_bar_file(&proxy, MARKET_PROXY_SYMBOL, RES, &bars).unwrap();
+        let file = BarFile::open(&proxy).unwrap();
+        let path = market_supports_path(&dir, RES);
+
+        let samples = 1_200usize;
+        let bounds = (bars[samples].ts(), bars[samples].ts() + 10 * RES_MS);
+        let recorded = BarSupportsProvenance {
+            corpus_fingerprint: market_proxy_fingerprint(&file, RES, samples).unwrap(),
+            split_bounds: bounds,
+            sample_count: samples,
+            fitted_utc: "2026-08-20T00:00:00Z".to_owned(),
+        };
+
+        assert!(
+            !require_market_supports_provenance(Some(&recorded), &path, &file, RES, bounds, false)
+                .expect("a faithful artifact is reused"),
+            "a match is not a freeze"
+        );
+
+        // The verdict must not depend on the caller's boundary: the planner, the panels and the
+        // universe rebuild all derive a different one against this same artifact.
+        for derived in [bounds.0 - 300 * RES_MS, bounds.0 + 300 * RES_MS] {
+            require_market_supports_provenance(
+                Some(&recorded),
+                &path,
+                &file,
+                RES,
+                (derived, derived + 10 * RES_MS),
+                false,
+            )
+            .expect("a derived boundary must not invalidate an otherwise faithful artifact");
+        }
+
+        // A proxy whose history no longer reproduces the recorded fit is refused.
+        let mut revised = bars.clone();
+        let mut touched = revised[400];
+        touched.close *= 1.05;
+        revised[400] = touched;
+        write_bar_file(&proxy, MARKET_PROXY_SYMBOL, RES, &revised).unwrap();
+        let moved = BarFile::open(&proxy).unwrap();
+        let refused =
+            require_market_supports_provenance(Some(&recorded), &path, &moved, RES, bounds, false)
+                .expect_err("a revised proxy history must be refused")
+                .to_string();
+        assert!(refused.contains("do not reproduce it"), "{refused}");
+        assert!(refused.contains("--freeze-market-supports"), "{refused}");
+        assert!(
+            require_market_supports_provenance(Some(&recorded), &path, &moved, RES, bounds, true)
+                .expect("the freeze accepts a mismatch"),
+            "a frozen mismatch must report itself as frozen"
+        );
+
+        // A proxy TRUNCATED below the recorded fit cannot even be checked, so it is refused
+        // rather than accepted for want of a comparison.
+        write_bar_file(&proxy, MARKET_PROXY_SYMBOL, RES, &bars[..500]).unwrap();
+        let short = BarFile::open(&proxy).unwrap();
+        require_market_supports_provenance(Some(&recorded), &path, &short, RES, bounds, false)
+            .expect_err("a proxy shorter than the recorded fit must be refused");
+
+        // Absent provenance is a refusal too, which is the exact state every artifact written
+        // before this guard is in — including the one this campaign was running on.
+        let bare = require_market_supports_provenance(None, &path, &file, RES, bounds, false)
+            .expect_err("an unverifiable artifact must be refused")
+            .to_string();
+        assert!(bare.contains("no provenance at all"), "{bare}");
+        assert!(
+            require_market_supports_provenance(None, &path, &file, RES, bounds, true)
+                .expect("the freeze accepts an unstamped artifact")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fingerprint must key on the fit region and nothing else: not the symbol universe,
+    /// not bars past the region, and not fields the fit never reads.
+    #[test]
+    fn market_proxy_fingerprint_tracks_the_fit_region_only() {
+        let dir =
+            std::env::temp_dir().join(format!("trading_bot_0_market_fp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = 1_600_000_000_000i64 / RES_MS * RES_MS;
+        let bars = synth_bars(5, 2_000, base);
+        let path = bar_path(&dir, MARKET_PROXY_SYMBOL);
+        write_bar_file(&path, MARKET_PROXY_SYMBOL, RES, &bars).unwrap();
+
+        let samples = 1_500usize;
+        let of = |p: &Path, n: usize| market_proxy_fingerprint(&BarFile::open(p).unwrap(), RES, n);
+        let baseline = of(&path, samples).expect("the fit region is inside the file");
+
+        // A fit region longer than the file cannot be checked at all, and says so.
+        assert!(of(&path, bars.len()).is_none());
+
+        // Appending past the fit region leaves it alone.
+        let mut appended = bars.clone();
+        appended.extend(synth_bars(6, 300, bars.last().unwrap().ts() + RES_MS));
+        write_bar_file(&path, MARKET_PROXY_SYMBOL, RES, &appended).unwrap();
+        assert_eq!(
+            of(&path, samples),
+            Some(baseline.clone()),
+            "bars past the fit region cannot reach a bucket edge"
+        );
+
+        // A different cut of the same history is a different fit sample.
+        assert_ne!(of(&path, samples + 1), Some(baseline.clone()));
+
+        // Fields the fit never reads must not invalidate it: `encode_dof` consumes OHLC and
+        // `VolumeEma` consumes volume, so a vendor revision of vwap or the trade count provably
+        // cannot move an edge and must not hard-error a corpus open.
+        let mut cosmetic = appended.clone();
+        let mut untouched = cosmetic[700];
+        untouched.vwap *= 1.5;
+        untouched.trades += 41;
+        cosmetic[700] = untouched;
+        write_bar_file(&path, MARKET_PROXY_SYMBOL, RES, &cosmetic).unwrap();
+        assert_eq!(
+            of(&path, samples),
+            Some(baseline.clone()),
+            "vwap and trades are read by nothing in the fit"
+        );
+
+        // An in-place revision INSIDE the fit region that preserves the bar count and both
+        // endpoints is caught, which a count-and-span fingerprint would have missed.
+        let mut revised = appended.clone();
+        let mut touched = revised[700];
+        touched.high *= 1.05;
+        revised[700] = touched;
+        write_bar_file(&path, MARKET_PROXY_SYMBOL, RES, &revised).unwrap();
+        assert_ne!(
+            of(&path, samples),
+            Some(baseline),
+            "content, not metadata: a backfill that rewrites history must move the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regenerate the persisted market buckets from the live proxy under the campaign pin.
+    ///
+    /// Fitted in a scratch directory and only then copied, so a run holding the canonical
+    /// artifact open can never race the writer. Ignored because it touches the live corpus and
+    /// writes an artifact; it is the recipe for that artifact, kept compiling beside the code
+    /// that reads it rather than living in somebody's shell history.
+    #[test]
+    #[ignore = "regenerates a persisted artifact from the live corpus"]
+    fn refit_market_buckets_from_the_live_proxy() {
+        let bars = Path::new(shared::paths::DATA_PATH).join("bars");
+        let bounds = crate::data::ingest::PINNED_SPLIT_BOUNDS;
+        let scratch = std::env::temp_dir().join(format!(
+            "trading_bot_0_market_refit_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let proxy = bars.join(format!("{MARKET_PROXY_SYMBOL}.{RES}.{FILE_EXTENSION}"));
+        let file = BarFile::open(&proxy).expect("the live proxy opens");
+        let train_end = file.index_at_or_after(bounds.0);
+        let supports = load_or_fit_market_supports(&scratch, RES, &file, bounds)
+            .expect("the proxy's train region fits");
+
+        let fitted = market_supports_path(&scratch, RES);
+        let recorded = supports.provenance().expect("the fit stamps provenance");
+        assert_eq!(recorded.split_bounds, bounds);
+        assert_eq!(recorded.sample_count, train_end - 1);
+        assert_eq!(
+            Some(&recorded.corpus_fingerprint),
+            market_proxy_fingerprint(&file, RES, train_end - 1).as_ref()
+        );
+
+        let destination = bars.join(format!("bar_market_supports.{RES}.v7.json"));
+        assert!(
+            destination != market_supports_path(&bars, RES),
+            "the refit must not overwrite the artifact a running job holds"
+        );
+        std::fs::copy(&fitted, &destination).expect("the refit lands beside the corpus");
+
+        // The artifact is only a deliverable if the guard ACCEPTS it: reload it through the
+        // same path a run takes, and confirm it is reused rather than refused or refitted.
+        let geometry = market_support_sha256(&supports);
+        let reused = load_or_fit_market_supports(&scratch, RES, &file, bounds)
+            .expect("the guard must accept the artifact this fit just stamped");
+        assert_eq!(market_support_sha256(&reused), geometry);
+        let landed = BarSupports::load(&destination).expect("the copy parses");
+        assert_eq!(
+            Some(
+                landed
+                    .provenance()
+                    .expect("provenance survives the copy")
+                    .corpus_fingerprint
+                    .clone()
+            ),
+            market_proxy_fingerprint(&file, RES, train_end - 1)
+        );
+        let bytes = std::fs::read(&destination).unwrap();
+        let mut digest = DigestContext::new(&SHA256);
+        digest.update(&bytes);
+        println!(
+            "[refit] {} bars={} train_end={} samples={} fitted={}\n[refit] proxy fingerprint {}\n\
+             [refit] geometry sha256 {}\n[refit] file sha256 {}",
+            destination.display(),
+            file.len(),
+            train_end,
+            recorded.sample_count,
+            recorded.fitted_utc,
+            recorded.corpus_fingerprint,
+            market_support_sha256(&supports),
+            hex_digest(digest),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }
