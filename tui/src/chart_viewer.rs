@@ -115,7 +115,10 @@ impl ChartViewer {
                 positioned.as_deref(),
                 benchmark.as_deref(),
             )),
-            ReportKind::CandleCompare { .. } => Some(2),
+            // Solo cycles the realized path, then each quantile locus, then each draw.
+            ReportKind::CandleFan {
+                bands, samples, ..
+            } => Some(1 + bands.len() + samples.len()),
             ReportKind::BuySell { .. } | ReportKind::Observations { .. } => None,
         }
     }

@@ -7,7 +7,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 use serde::Deserialize;
 use shared::paths::{RUNS_PATH, WEIGHTS_PATH};
-use shared::report::RL_META_REPORT_BASES;
+use shared::report::{PRETRAIN_REPORT_BASES, RL_META_REPORT_BASES};
 use shared::run_dir::RunDir;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -21,6 +21,7 @@ use std::{
 mod chart_viewer;
 mod components;
 mod pages;
+mod render_cli;
 mod report_renderer;
 mod state;
 mod theme;
@@ -328,6 +329,88 @@ fn is_selectable_primary_weight(path: &Path, name: &str) -> bool {
         })
 }
 
+/// Every episode-level chart base the TUI looks for, sorted and deduplicated.
+///
+/// The RL and pretraining families are EXTENDED from the writers' own registries rather
+/// than restated here, because a name that appears in only one of the two places fails
+/// silently in whichever direction it is missing: a base the writer produces but this
+/// list omits is a chart nobody can see, and a base this list carries with no writer is a
+/// permanently blank panel. Names still spelled out below belong to writers that have no
+/// exported registry yet; extend from one the moment they grow it.
+fn meta_chart_bases() -> Vec<&'static str> {
+    let mut bases = vec![
+        "assets",
+        "reward",
+        "normalized_reward",
+        "final_assets",
+        "cumulative_reward",
+        "outperformance",
+        "outperformance_fraction",
+        "advantage_stats_log",
+        "total_commissions",
+        "beta_policy",
+        "actor_grad_norm",
+        "critic_grad_norm",
+        "target_weights",
+        "clip_fraction",
+        "clip_gap",
+        "explained_var",
+        "value_loss",
+        "policy_loss",
+        "policy_entropy",
+        "approx_kl",
+        "kl_lr",
+        "gate_stats",
+        "ga_fitness",
+        "ga_return_pct",
+        "ga_outperformance",
+        "ga_max_drawdown",
+        "ga_sharpe",
+        "ga_turnover",
+        "ga_total_commissions",
+        "ga_trade_count",
+        "ga_generalization_gap",
+        "ga_distribution",
+        "ga_mutation_entropy",
+        "ga_train_assets",
+        "ga_validation_assets",
+        "ga_test_assets",
+        "planner_wealth",
+        "planner_reward",
+        "planner_position",
+        "planner_position_mean",
+        "planner_outperformance",
+        "planner_outperformance_fraction",
+        "planner_turnover",
+        "planner_commissions",
+        "planner_aux_return_loss",
+        "planner_optimizer_steps",
+        "planner_deterministic_wealth",
+        "planner_deterministic_reward",
+        "planner_deterministic_position_mean",
+        "planner_deterministic_outperformance",
+        "planner_deterministic_outperformance_fraction",
+        "planner_deterministic_turnover",
+        "planner_deterministic_commissions",
+        "planner_validation_wealth",
+        "planner_validation_outperformance",
+        "planner_validation_risk",
+        "planner_validation_selection",
+        "planner_validation_outperformance_fraction",
+        "planner_inference_wealth",
+        "planner_inference_outperformance",
+        "planner_inference_outperformance_fraction",
+        "planner_inference_risk",
+        "planner_inference_action",
+        "planner_inference_commissions",
+    ];
+    bases.extend_from_slice(RL_META_REPORT_BASES);
+    bases.extend_from_slice(PRETRAIN_REPORT_BASES);
+    bases.sort_unstable();
+    bases.dedup();
+    bases
+}
+
 fn planner_committed_updates(gens: &Path) -> std::collections::HashMap<String, u64> {
     let Some(weights) = gens.parent().map(|root| root.join("weights")) else {
         return std::collections::HashMap::new();
@@ -459,104 +542,7 @@ impl App {
         }
         let planner_committed_updates = planner_committed_updates(&gens_path);
 
-        // Meta chart base names (episode-level charts without ticker)
-        let mut meta_chart_bases = vec![
-            "assets",
-            "reward",
-            "normalized_reward",
-            "final_assets",
-            "cumulative_reward",
-            "outperformance",
-            "outperformance_fraction",
-            "advantage_stats_log",
-            "total_commissions",
-            "beta_policy",
-            "actor_grad_norm",
-            "critic_grad_norm",
-            "target_weights",
-            "clip_fraction",
-            "clip_gap",
-            "explained_var",
-            "value_loss",
-            "policy_loss",
-            "policy_entropy",
-            "approx_kl",
-            "kl_lr",
-            "gate_stats",
-            "ga_fitness",
-            "ga_return_pct",
-            "ga_outperformance",
-            "ga_max_drawdown",
-            "ga_sharpe",
-            "ga_turnover",
-            "ga_total_commissions",
-            "ga_trade_count",
-            "ga_generalization_gap",
-            "ga_distribution",
-            "ga_mutation_entropy",
-            "ga_train_assets",
-            "ga_validation_assets",
-            "ga_test_assets",
-            "pretrain_nll_bar",
-            "pretrain_nll_bar_diag896",
-            "pretrain_nll_dof",
-            "pretrain_nll_vs_baselines",
-            "pretrain_crps_dof",
-            "pretrain_pit_hist",
-            "pretrain_dyn_loss",
-            "pretrain_kl_loss",
-            "pretrain_total_loss",
-            "pretrain_loss_shares",
-            "pretrain_belief_autocorr",
-            "pretrain_dyn_vs_identity",
-            "pretrain_rollout_nll",
-            "pretrain_dir_acc",
-            "pretrain_lr",
-            "pretrain_muon_momentum",
-            "pretrain_grad_norm",
-            "pretrain_unique_bar_reuse",
-            "pretrain_stage_coverage",
-            "pretrain_effective_rank",
-            "pretrain_promotions",
-            "pretrain_schedule",
-            "pretrain_candle_rollout_mse",
-            "pretrain_candle_rollout_dclose",
-            "pretrain_candle_rollout_band",
-            "pretrain_candle_rollout_coverage",
-            "pretrain_test",
-            "pretrain_corpus_anomalies",
-            "planner_wealth",
-            "planner_reward",
-            "planner_position",
-            "planner_position_mean",
-            "planner_outperformance",
-            "planner_outperformance_fraction",
-            "planner_turnover",
-            "planner_commissions",
-            "planner_aux_return_loss",
-            "planner_optimizer_steps",
-            "planner_deterministic_wealth",
-            "planner_deterministic_reward",
-            "planner_deterministic_position_mean",
-            "planner_deterministic_outperformance",
-            "planner_deterministic_outperformance_fraction",
-            "planner_deterministic_turnover",
-            "planner_deterministic_commissions",
-            "planner_validation_wealth",
-            "planner_validation_outperformance",
-            "planner_validation_risk",
-            "planner_validation_selection",
-            "planner_validation_outperformance_fraction",
-            "planner_inference_wealth",
-            "planner_inference_outperformance",
-            "planner_inference_outperformance_fraction",
-            "planner_inference_risk",
-            "planner_inference_action",
-            "planner_inference_commissions",
-        ];
-        meta_chart_bases.extend_from_slice(RL_META_REPORT_BASES);
-        meta_chart_bases.sort_unstable();
-        meta_chart_bases.dedup();
+        let meta_chart_bases = meta_chart_bases();
 
         // Ticker-specific chart base names
         let ticker_chart_bases = vec![
@@ -738,7 +724,7 @@ impl App {
                         for item in items.filter_map(|e| e.ok()) {
                             let file_name = item.file_name();
                             let file_name = file_name.to_str().unwrap_or("");
-                            if !file_name.ends_with("_candles.report.bin") {
+                            if !file_name.ends_with("_fan.report.bin") {
                                 continue;
                             }
                             if let Some(step) = file_name
@@ -1081,6 +1067,11 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        return render_cli::run(&args);
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1160,6 +1151,28 @@ mod planner_inference_discovery_tests {
             old
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The registry side of the two-sided contract. The writer's suite proves a full
+    /// pretraining cycle produces every name in `PRETRAIN_REPORT_BASES`; this proves the
+    /// TUI actually looks for each of them, so neither half can drift into a chart that
+    /// is written and never displayed or displayed and never written.
+    #[test]
+    fn the_meta_chart_list_looks_for_every_registered_writer_base() {
+        let bases = meta_chart_bases();
+        for registered in PRETRAIN_REPORT_BASES.iter().chain(RL_META_REPORT_BASES) {
+            assert!(
+                bases.contains(registered),
+                "{registered} is written but the TUI never scans for it, so the chart is \
+                 invisible"
+            );
+        }
+        // Sorted and deduplicated, which is what lets the scan be a single pass and what
+        // stops a duplicated name costing one `read_dir` per copy.
+        let mut sorted = bases.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(bases, sorted, "the meta chart list must be sorted and unique");
     }
 
     #[test]

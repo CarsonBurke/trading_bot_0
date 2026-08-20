@@ -3594,6 +3594,7 @@ dependencies = [
  "postcard",
  "ratatui",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

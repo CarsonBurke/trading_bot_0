@@ -65,9 +65,16 @@ pub const BAR_MAX_CONTEXT: i64 = 2048;
 /// Lineage: `v2` -> `v3` replaces the rank-1 affine chain-prefix conditioning in
 /// [`BarEmissionHead`] with per-slot bin embeddings (`binprefix`) and RMS-normalizes
 /// the [`BarDynamics`] output onto the same unit shell as every belief the head was
-/// fitted on (`dynrms`). Both change the parameter set, so `v2` checkpoints cannot
-/// be loaded.
-pub const BAR_ARCHITECTURE: &str = "bardist-causal-ar-pope64-fa4-time4-binprefix-dynrms-v3";
+/// fitted on (`dynrms`). `v3` -> `v4` widens the conditioning bank from four calendar
+/// channels to nine: the four calendar ids, an elapsed-bars bucket, an ET day-edge flag and
+/// three equal-mass market-proxy channels. That grows both `bar_time_embed` banks, so no `v3`
+/// checkpoint can be loaded by this build — intended, because a `v3` checkpoint was trained
+/// against a strictly smaller observation interface and its weights are not a partial fit of
+/// this one. `v4` -> `v5` adds the per-layer embedding shortcut (`x0`), ten new scalars at
+/// zero, which changes the var-store shape and so cannot be cross-loaded either even though
+/// the function it computes at init is unchanged.
+pub const BAR_ARCHITECTURE: &str =
+    "bardist-causal-ar-pope64-fa4-time9market-binprefix-dynrms-x0shortcut-v5";
 
 /// KV-cache layout contract. Any change to the cache geometry, the position
 /// bookkeeping or the eviction rule must bump this, because it feeds the lineage
@@ -86,8 +93,11 @@ pub const BAR_DYNAMICS_HIDDEN: i64 = 1664;
 
 /// Metadata schema version. v5 and below are LeJEPA-era and unreadable here. v7 adds
 /// [`BarTrainingProvenance`], so a checkpoint states which corpus and which selection rule
-/// produced it instead of leaving both to a run log nobody kept.
-pub const BAR_METADATA_VERSION: u32 = 7;
+/// produced it instead of leaving both to a run log nobody kept. v8 adds the three CONTEXT
+/// lengths of that selection: a checkpoint promoted at the ramp's starting context because
+/// the run never reached the deployed one is a legitimate artifact but not the same artifact,
+/// and the difference has to be readable off the file rather than inferred from a log.
+pub const BAR_METADATA_VERSION: u32 = 8;
 
 /// ET minutes at which the session channel changes value, re-exported from the
 /// producer. Folded into the lineage because the cardinality alone does not pin
@@ -96,11 +106,16 @@ pub const BAR_METADATA_VERSION: u32 = 7;
 /// restating it means the lineage cannot drift from the definition it describes.
 pub use crate::torch::dataset::SESSION_BOUNDARY_MINUTES as BAR_SESSION_BOUNDARY_MINUTES;
 
-/// Rows of the fused calendar embedding bank, one block per time feature.
-const BAR_TIME_EMBED_ROWS: i64 = BAR_TIME_CARDINALITY[0]
-    + BAR_TIME_CARDINALITY[1]
-    + BAR_TIME_CARDINALITY[2]
-    + BAR_TIME_CARDINALITY[3];
+/// Rows of the fused conditioning embedding bank, one block per id channel.
+const BAR_TIME_EMBED_ROWS: i64 = {
+    let mut rows = 0;
+    let mut slot = 0;
+    while slot < BAR_TIME_FEATURES {
+        rows += BAR_TIME_CARDINALITY[slot];
+        slot += 1;
+    }
+    rows
+};
 
 const BAR_QKV_DIM: i64 = 3 * BAR_MODEL_DIM;
 
@@ -180,6 +195,13 @@ pub struct BarWorldModelMetadata {
     pub num_bins: i64,
     pub res_secs: u32,
     pub supports_sha256: BTreeMap<u32, String>,
+    /// SHA-256 of the weight FILE, which pins this sidecar to the exact bytes it was written
+    /// beside. It is not a fingerprint of the weights: a `.ot` is a torch zip whose internal
+    /// record names derive from the file stem, so re-saving identical tensors under a different
+    /// name yields different bytes and a different hash. Two checkpoints differing here may
+    /// hold bit-identical parameters, and equality here is the only direction that means
+    /// anything - it says the sidecar and the file belong together. To compare WEIGHTS, load
+    /// both and compare tensors, or compare the zip records' CRC-32s.
     pub checkpoint_sha256: String,
     pub lineage_sha256: String,
     /// Absent on a checkpoint written before v7, and on anything but a pretraining run.
@@ -257,6 +279,83 @@ pub struct BarTrainingProvenance {
     /// reason: a checkpoint cannot be relabelled with a mode it was not trained under, and
     /// `pretrain-compare` refuses to pair two runs that disagree.
     pub scoring: String,
+    /// Context length, in bars, of the held-out set the promotion decision was actually
+    /// taken on.
+    ///
+    /// Normally equal to `deployed_context`. It is SHORTER when the run ended without ever
+    /// training at the deployed context — a memory-held ramp, or a run cut short — in which
+    /// case selection fell back to the fixed diagnostic context so the run would still leave
+    /// an evaluable artifact behind. A planner loading such a checkpoint is running a model
+    /// outside the positional range it was selected at, and that is a fact about the file,
+    /// not about the log.
+    #[serde(default)]
+    pub selection_context: i64,
+    /// Context the model is meant to be deployed at, i.e. the final ramp stage's.
+    #[serde(default)]
+    pub deployed_context: i64,
+    /// Longest context the run actually took an optimizer step at. Below `deployed_context`
+    /// only when the ramp never got there.
+    #[serde(default)]
+    pub reached_context: i64,
+    /// Global optimizer step these exact weights are from. Present on every artifact a
+    /// pretraining run writes - promoted, epoch-boundary, step-tagged and `pretrain_last.ot`
+    /// alike - because the one question a reader of a checkpoint directory has is which step a
+    /// file holds, and before this was recorded the only answer was the run's log.
+    /// `selection_context` is what says whether a decision chose the file; this says when it
+    /// was taken. `None` only on a checkpoint written before this field existed.
+    #[serde(default)]
+    pub global_step: Option<usize>,
+    /// Context, in bars, the selection criteria were MEASURED at, as distinct from
+    /// `selection_context`, which is the range the artifact is certified deployable over.
+    ///
+    /// They differ by design: both criteria are read on one fixed diagnostic ruler that never
+    /// moves for the life of a run, so consecutive decisions compare models rather than
+    /// rulers, while eligibility to be promoted at all remains gated on the deployed context.
+    #[serde(default)]
+    pub selection_bench_context: Option<i64>,
+    /// The ECONOMIC criterion at the moment of promotion: mean per-window net Kelly edge over
+    /// the unconditional-marginal null at the selection cap, in basis points per bar, with the
+    /// block-bootstrap standard error of that level.
+    ///
+    /// Recorded beside `selection_nll_conditional` so BOTH numbers the decision weighed are on
+    /// the file. A promotion that bought edge while paying density, and one that improved
+    /// both, are then distinguishable from the artifact alone.
+    #[serde(default)]
+    pub selection_edge_bps: Option<f64>,
+    #[serde(default)]
+    pub selection_edge_se_bps: Option<f64>,
+    /// Conditional held-out NLL of the same pass, in nats per bar: the GUARDED quantity, not
+    /// the selected one.
+    #[serde(default)]
+    pub selection_nll_conditional: Option<f64>,
+    /// Batch size, in WINDOWS, the run actually used at each ramp stage.
+    ///
+    /// Absolute and not a multiplier of `--batch-size`, because `--batch-size` is itself
+    /// clamped at startup to what a measured device-capacity probe says the deployed context
+    /// can hold — so a multiplier alone does not identify the batch the run trained at, and
+    /// the batch is what the learning-rate plateau bump is derived from.
+    ///
+    /// The ramp is planned from that capacity probe, and the pretrainer additionally lowers a
+    /// stage in place when another tenant of a shared card takes memory after the probe. Two
+    /// runs whose only difference is such a hold are not the same experiment: with both
+    /// step-ups held a run delivers as little as 44% of the bar-token budget its step count
+    /// was sized for, and nothing else in the artifact says it happened.
+    #[serde(default)]
+    pub batch_ramp: Vec<usize>,
+    /// Fraction of the run held at the flat learning-rate plateau before the linear decay to
+    /// the terminal multiplier, i.e. the run's `--lr-plateau-fraction`.
+    ///
+    /// Two runs of the same length at different fractions are NOT the same experiment. Past the
+    /// plateau the learning-rate multiplier is affine in the step index, so a one-epoch run at
+    /// 0.40 finishes fully annealed while at 0.90 finishes at the peak rate, and their
+    /// re-decoded calibration slopes differ resolvably. Nothing else in the artifact says which
+    /// of the two a checkpoint came from.
+    ///
+    /// `0.0` means a checkpoint written before this was recorded, never a run that used it: the
+    /// flag refuses both degenerate boundaries. Folded into the lineage hash only when
+    /// recorded, so an unrecorded sidecar keeps validating against its own stored hash.
+    #[serde(default)]
+    pub lr_plateau_fraction: f64,
 }
 
 impl BarWorldModelMetadata {
@@ -465,7 +564,7 @@ impl BarWorldModelMetadata {
             "corpus={};bounds={}:{};pinned={};eval_seed={:016x};train_seed={:016x};\
              metric={};weights={};guard={}@{:016x};min_dollar_volume_bits={:016x};symbols={};\
              supports_frozen={};supports_corpus={};universe={};universe_train_end={};\
-             scoring={}",
+             scoring={};context={}@{}/{};batch_ramp={}{}",
             training.corpus_fingerprint,
             training.split_bounds.0,
             training.split_bounds.1,
@@ -494,6 +593,29 @@ impl BarWorldModelMetadata {
                 .map(|ms| ms.to_string())
                 .unwrap_or_else(|| "none".to_owned()),
             training.scoring,
+            training.selection_context,
+            training.reached_context,
+            training.deployed_context,
+            if training.batch_ramp.is_empty() {
+                "none".to_owned()
+            } else {
+                training
+                    .batch_ramp
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
+            // Absent — `0.0`, which the flag refuses — renders NOTHING, so every sidecar
+            // written before the fraction was recorded still validates against its own hash.
+            if training.lr_plateau_fraction == 0.0 {
+                String::new()
+            } else {
+                format!(
+                    ";lr_plateau_fraction={:016x}",
+                    training.lr_plateau_fraction.to_bits()
+                )
+            },
         )
     }
 
@@ -515,7 +637,8 @@ impl BarWorldModelMetadata {
              ff_dim={};max_context_bars={};num_bins={};res_secs={};dof={};dof_names={};chain={};supports_sha256={};\
              weights_sha256={};norm=rmsnorm-no-gain;norm_eps_bits={:016x};qk_norm=head-dim-rmsnorm;\
              mlp=relu-squared;resid_lambda_init_bits={:016x};post_lambda_init_bits={:016x};\
-             weight_scalars=qkv-and-out;zero_init=attn-out,ff-out,dyn-fc3;dynamics_hidden={};\
+             weight_scalars=qkv-and-out;zero_init=attn-out,ff-out,dyn-fc3,x0-lambda;\
+             shortcut=embedding-x0-per-layer-attn-residual;dynamics_hidden={};\
              dynamics_act=gelu-none;dynamics_layers=3;pope_dim={};pope_qk_dim={};\
              pope_frequency_base_bits={:016x};pope_attention_scale_bits={:016x};\
              pope_theta_init=two-pi-block-aware;pope_layout=real-then-imag;\
@@ -782,6 +905,10 @@ struct BarLayer {
     pope_theta_bias: Tensor,
     attn_resid_lambda: Tensor,
     attn_post_lambda: Tensor,
+    /// Gain on the embedding shortcut, zero at init. Fused into the attention residual rather
+    /// than added as a separate pre-layer term, which is where the reference recipe puts it
+    /// (`../modded-nanogpt/train_gpt.py:1638`).
+    x0_lambda: Tensor,
     /// `[F, D]`
     ff_in_w: Tensor,
     /// `[D, F]`, zero-init
@@ -819,6 +946,7 @@ impl BarLayer {
                 Init::Const(BAR_RESID_LAMBDA_INIT),
             ),
             attn_post_lambda: p.var("attn_post_lambda", &[1], Init::Const(BAR_POST_LAMBDA_INIT)),
+            x0_lambda: p.var("x0_lambda", &[1], Init::Const(0.0)),
             ff_in_w: p.var(
                 "ff_in_w",
                 &[BAR_FF_DIM, BAR_MODEL_DIM],
@@ -845,7 +973,12 @@ impl BarLayer {
         )
     }
 
-    fn attention_residual(&self, x: &Tensor, attention: &Tensor) -> Tensor {
+    /// `x0` is the trunk's embedding output for the same bars. At init its gain is exactly zero,
+    /// so this is a bit-identical no-op and a run cannot be destabilized by the shortcut existing;
+    /// what it buys is a path from the current bar's own bins to every depth, which for bars is
+    /// the single strongest predictor of the next bar and otherwise has to survive ten layers of
+    /// residual mixing to be read.
+    fn attention_residual(&self, x: &Tensor, attention: &Tensor, x0: &Tensor) -> Tensor {
         let rows = x.size()[0];
         let len = x.size()[1];
         let flat = attention
@@ -853,7 +986,7 @@ impl BarLayer {
             .contiguous()
             .view([rows, len, BAR_MODEL_DIM]);
         let out = flat.linear(&(&self.attn_out_lambda * &self.attn_out_w), None::<Tensor>);
-        &self.attn_resid_lambda * x + &self.attn_post_lambda * out
+        &self.attn_resid_lambda * x + &self.attn_post_lambda * out + &self.x0_lambda * x0
     }
 
     fn feed_forward(&self, x: &Tensor) -> Tensor {
@@ -869,7 +1002,7 @@ pub struct BarTrunk {
     bin_embed: Vec<Tensor>,
     /// `[D, BAR_DOF]`, the raw continuous DOF input map.
     dof_embed_w: Tensor,
-    /// `[BAR_TIME_EMBED_ROWS, D]`, the four calendar channels in one bank.
+    /// `[BAR_TIME_EMBED_ROWS, D]`, all [`BAR_TIME_FEATURES`] conditioning channels in one bank.
     time_embed: Tensor,
     /// `[1, 1, BAR_DOF]` constant, `dof * NUM_BAR_BINS`, for the fused lookup.
     bin_offsets: Tensor,
@@ -922,7 +1055,8 @@ impl BarTrunk {
         &BAR_TRUNK_MUON_SUBSTRINGS
     }
 
-    /// `dof [B,T,5]`, `bin_ids [B,T,5]` and `time_ids [B,T,4]` -> beliefs `[B,T,D]`.
+    /// `dof [B,T,BAR_DOF]`, `bin_ids [B,T,BAR_DOF]` and `time_ids [B,T,BAR_TIME_FEATURES]` ->
+    /// beliefs `[B,T,D]`.
     ///
     /// `window` is a sliding causal span in bars; `window <= 0`, or a window at
     /// least as long as the sequence, is full causal attention and takes the FA4
@@ -942,7 +1076,8 @@ impl BarTrunk {
     }
 
     fn run(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor, window: i64) -> Tensor {
-        let mut x = self.embed(dof, bin_ids, time_ids);
+        let x0 = self.embed(dof, bin_ids, time_ids);
+        let mut x = x0.shallow_clone();
         let len = x.size()[1];
         let positions = Tensor::arange(len, (Kind::Int64, x.device()));
         for layer in &self.layers {
@@ -966,7 +1101,7 @@ impl BarTrunk {
             } else {
                 strict_pope_prefill(&polar, &value)
             };
-            x = layer.attention_residual(&x, &attention);
+            x = layer.attention_residual(&x, &attention, &x0);
             x = layer.feed_forward(&x);
         }
         rms_norm(&x)
@@ -1064,7 +1199,7 @@ impl BarTrunk {
             };
             let value = value.to_kind(kind).contiguous();
             let attention = strict_pope_prefill(&polar, &value);
-            x = layer.attention_residual(&x, &attention);
+            x = layer.attention_residual(&x, &attention, tokens);
             x = layer.feed_forward(&x);
             layers.push(BarLayerKv::prefilled(&polar.key, &value, capacity));
         }
@@ -1104,7 +1239,7 @@ impl BarTrunk {
             layer_cache.value.narrow(1, write_index, 1).copy_(&value);
             let (active_key, active_value) = layer_cache.active_after_write(previous_length);
             let attention = strict_pope_decode(&query, &active_key, &active_value);
-            x = layer.attention_residual(&x, &attention);
+            x = layer.attention_residual(&x, &attention, token);
             x = layer.feed_forward(&x);
         }
         cache.finish_append();
@@ -1316,7 +1451,7 @@ impl BarKvCache {
 pub struct BarDynamics {
     /// `[dim, BAR_DOF]`
     dof_embed_w: Tensor,
-    /// `[BAR_TIME_EMBED_ROWS, dim]`, the four calendar channels in one bank.
+    /// `[BAR_TIME_EMBED_ROWS, dim]`, all [`BAR_TIME_FEATURES`] conditioning channels in one bank.
     time_embed: Tensor,
     /// `[1, BAR_TIME_FEATURES]` constant, the block base of each channel.
     time_offsets: Tensor,
@@ -1973,13 +2108,19 @@ const WINDOW_ATTENTION_BLOCK: i64 = 256;
 
 /// Exact sliding-window causal attention.
 ///
-/// FA4 exposes no window and a banded mask is not expressible through it, and the
-/// fused SDPA path is unavailable too: [`crate::torch::cuda::cfg::configure_cuda`]
-/// leaves only the flash backend enabled, which rejects an arbitrary `attn_mask`.
-/// So the band is evaluated directly, in fp32, over query blocks. Every query row
-/// admits at least its own key (`delta == 0 < window`), so no row is fully masked
-/// and the softmax cannot produce NaN. The full-causal path — the one training
-/// uses — still goes to FA4.
+/// NOT because FA4 cannot window. `flash_attn.cute.flash_attn_func` DOES accept a
+/// `window_size` argument — verified by introspection against `.venv-fa4`'s own interpreter,
+/// alongside `learnable_sink` and `softcap`, neither of which this model uses — and
+/// [`crate::torch::fa4`] already forwards keyword arguments through a `PyDict`, so routing a
+/// band to the kernel is one extra kwarg. An earlier version of this comment claimed the
+/// opposite and cost an audit a wrong cost estimate for a per-layer receptive-field schedule.
+///
+/// What is true is that this fp32 fallback is what the CURRENT code reaches for when
+/// `0 < window < len`, that the fused SDPA path is unavailable — [`crate::torch::cuda::cfg::configure_cuda`]
+/// leaves only the flash backend enabled, which rejects an arbitrary `attn_mask` — and that
+/// training never takes this path, because every trunk call passes `window <= 0` and lands on
+/// the full-causal FA4 prefill. Every query row admits at least its own key
+/// (`delta == 0 < window`), so no row is fully masked and the softmax cannot produce NaN.
 fn windowed_attention(query: &Tensor, key: &Tensor, value: &Tensor, window: i64) -> Tensor {
     let len = query.size()[1];
     let device = query.device();
@@ -2067,8 +2208,10 @@ mod tests {
     use std::{collections::HashSet, fs, path::PathBuf};
 
     use super::*;
-    use crate::torch::bar_dist::{
-        decode_dof, BarDof, BarScoring, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS,
+    use crate::torch::{
+        bar_dist::{decode_dof, BarDof, BarScoring, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS},
+        dataset::{BAR_TIME_MARKET, TIME_DAY_EDGE, TIME_ELAPSED, TIME_MINUTE, TIME_SESSION, TIME_WEEKDAY},
+        test_rng,
     };
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -2135,9 +2278,13 @@ mod tests {
         Tensor::from_slice(&values).view([batch, len, BAR_DOF as i64])
     }
 
-    /// Valid ids for every calendar channel, walking a plausible ET session so
+    /// Valid ids for every conditioning channel, walking a plausible ET session so
     /// consecutive bars differ. Built here rather than through `dataset` so the
     /// trunk tests never depend on the corpus or on tz data.
+    ///
+    /// The elapsed, day-edge and market channels cycle through their whole ranges rather than
+    /// sitting at one row, so a shape or offset error in the fused bank surfaces here instead of
+    /// only under a real corpus.
     fn synthetic_time_ids(batch: i64, len: i64, start_minute: i64) -> Tensor {
         let values: Vec<i64> = (0..batch)
             .flat_map(|b| {
@@ -2149,7 +2296,17 @@ mod tests {
                         m if m < 960 => 2,
                         _ => 3,
                     };
-                    [minute, (b + t / 78) % BAR_TIME_CARDINALITY[1], session, 0]
+                    let mut ids = [0i64; BAR_TIME_FEATURES];
+                    ids[TIME_MINUTE] = minute;
+                    ids[TIME_WEEKDAY] = (b + t / 78) % BAR_TIME_CARDINALITY[TIME_WEEKDAY];
+                    ids[TIME_SESSION] = session;
+                    ids[TIME_RESOLUTION] = 0;
+                    ids[TIME_ELAPSED] = (t + b) % BAR_TIME_CARDINALITY[TIME_ELAPSED];
+                    ids[TIME_DAY_EDGE] = (t / 78) % BAR_TIME_CARDINALITY[TIME_DAY_EDGE];
+                    for (channel, salt) in BAR_TIME_MARKET.into_iter().zip([11i64, 29, 47]) {
+                        ids[channel] = (salt * t + b) % BAR_TIME_CARDINALITY[channel];
+                    }
+                    ids
                 })
             })
             .collect();
@@ -2223,6 +2380,7 @@ mod tests {
 
     #[test]
     fn parameter_groups_partition_the_var_store() {
+        let _torch_rng_guard = test_rng::shared();
         let vs = nn::VarStore::new(Device::Cpu);
         let _ = BarModules::new(&vs.root());
         let muon = bar_muon_name_substrings();
@@ -2286,6 +2444,7 @@ mod tests {
 
     #[test]
     fn metadata_round_trips_and_pins_lineage() {
+        let _torch_rng_guard = test_rng::exclusive();
         let dir = temp_dir("metadata");
         let supports = synthetic_supports();
         let (weights, metadata_path, _vs) = write_fixture(&dir, &supports);
@@ -2352,6 +2511,16 @@ mod tests {
             universe_fingerprint: None,
             universe_train_end_ms: None,
             scoring: scoring.to_string(),
+            selection_context: BAR_MAX_CONTEXT,
+            deployed_context: BAR_MAX_CONTEXT,
+            reached_context: BAR_MAX_CONTEXT,
+            global_step: Some(30_000),
+            selection_bench_context: Some(896),
+            selection_edge_bps: Some(0.3382),
+            selection_edge_se_bps: Some(0.0204),
+            selection_nll_conditional: Some(-9.3817),
+            batch_ramp: vec![1, 2, 3],
+            lr_plateau_fraction: 0.40,
         }
     }
 
@@ -2361,6 +2530,7 @@ mod tests {
     /// sidecar relabelled with a rule its weights were not trained under must not validate.
     #[test]
     fn the_scoring_rule_is_part_of_the_lineage() {
+        let _torch_rng_guard = test_rng::exclusive();
         let dir = temp_dir("lineage_scoring");
         let supports = synthetic_supports();
         let (weights, _metadata_path, _vs) = write_fixture(&dir, &supports);
@@ -2395,6 +2565,48 @@ mod tests {
             .scoring = BarScoring::Smoothed.to_string();
         assert!(relabelled.validate_schema().is_err());
 
+        // The plateau fraction is the learning-rate schedule's one free parameter: at one full
+        // pass a checkpoint sits at the peak rate or at the annealed floor depending on it, so
+        // relabelling it must break the hash exactly as relabelling the scoring rule does.
+        let mut rescheduled = of(BarScoring::Density);
+        rescheduled
+            .training
+            .as_mut()
+            .expect("training provenance")
+            .lr_plateau_fraction = 0.90;
+        assert!(rescheduled.validate_schema().is_err());
+
+        // A sidecar written before the fraction was recorded renders NOTHING for it, which is
+        // what keeps the artifacts already on disk valid; it is still distinguishable from one
+        // that records a fraction.
+        let mut unrecorded = of(BarScoring::Density);
+        unrecorded
+            .training
+            .as_mut()
+            .expect("training provenance")
+            .lr_plateau_fraction = 0.0;
+        unrecorded.lineage_sha256 = unrecorded.compute_lineage_sha256();
+        unrecorded
+            .validate_schema()
+            .expect("an unrecorded fraction still validates");
+        assert!(!seen.contains(&unrecorded.lineage_sha256));
+        // The byte-level property the 716 sidecars already on disk depend on: an unrecorded
+        // fraction contributes NO text to the canonical rendering, so their stored hashes are
+        // still the hashes this build computes. A recorded one contributes exactly one field.
+        assert!(!unrecorded.training_canonical().contains("lr_plateau_fraction"));
+        assert!(
+            rescheduled
+                .training_canonical()
+                .ends_with(";lr_plateau_fraction=3feccccccccccccd"),
+            "{}",
+            rescheduled.training_canonical()
+        );
+
+        // Where a reader actually finds it: the sidecar's own `training.lr_plateau_fraction`,
+        // beside the batch ramp and the scoring rule the same comparison needs.
+        let sidecar = serde_json::to_value(of(BarScoring::Density)).expect("serialize");
+        assert_eq!(sidecar["training"]["lr_plateau_fraction"], 0.40);
+
         // An artifact that records no provenance at all is still distinguishable from every
         // recorded one, which is the point of hashing "none".
         let bare = BarWorldModelMetadata::for_checkpoint(&weights, &[300], 300).expect("bare");
@@ -2405,6 +2617,7 @@ mod tests {
 
     #[test]
     fn untrained_trunk_emits_finite_beliefs() {
+        let _torch_rng_guard = test_rng::exclusive();
         let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);
         let modules = BarModules::new(&vs.root());
@@ -2450,6 +2663,7 @@ mod tests {
 
     #[test]
     fn calendar_ids_change_the_belief() {
+        let _torch_rng_guard = test_rng::exclusive();
         let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);
         let modules = BarModules::new(&vs.root());
@@ -2468,6 +2682,7 @@ mod tests {
 
     #[test]
     fn cached_forward_matches_full_forward() {
+        let _torch_rng_guard = test_rng::exclusive();
         let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);
         let modules = BarModules::new(&vs.root());
@@ -2512,6 +2727,7 @@ mod tests {
     /// live session, where a wrong answer looks exactly like a bad forecast.
     #[test]
     fn saturated_cache_evicts_the_oldest_bar() {
+        let _torch_rng_guard = test_rng::exclusive();
         let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);
         let modules = BarModules::new(&vs.root());
@@ -2575,6 +2791,82 @@ mod tests {
         assert!(step_change > 1e-6, "beliefs froze after the ring wrapped");
     }
 
+    /// The embedding shortcut has to be two things at once: exactly shut at init, so adding it
+    /// cannot destabilize a run that was tuned without it, and — once opened — the SAME path in
+    /// all three trunk loops. `run`, `prefill` and `decode` inject `x0` independently, and a
+    /// shortcut wired into two of the three is a train/serve skew that no shape check and no
+    /// finiteness check can see, because at init all three agree trivially.
+    #[test]
+    fn the_embedding_shortcut_is_shut_at_init_and_identical_in_every_trunk_loop() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let supports = synthetic_supports();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        wake_projections(&vs, 31);
+
+        // Sorted, because `variables()` is a map: an unordered assignment below would make the
+        // per-layer gains differ between runs of this test.
+        let mut named: Vec<(String, Tensor)> = vs
+            .variables()
+            .into_iter()
+            .filter(|(name, _)| name.ends_with("x0_lambda"))
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut gains: Vec<Tensor> = named.into_iter().map(|(_, tensor)| tensor).collect();
+        assert_eq!(gains.len(), BAR_LAYERS, "one shortcut gain per trunk layer");
+        for gain in &gains {
+            assert_eq!(
+                f64::try_from(gain).expect("scalar gain"),
+                0.0,
+                "the shortcut must be EXACTLY zero at init, not merely small: a small gain \
+                 perturbs every belief of the first step"
+            );
+        }
+
+        let len = 16i64;
+        let (dof, ids, time_ids) = synthetic_inputs(&supports, 2, len, 0x0bad_f00d);
+        let shut = modules.trunk.forward(&dof, &ids, &time_ids, 0, false);
+
+        // Distinct per layer, so a loop that injected one layer's gain everywhere - or summed
+        // them - would not survive the comparisons below.
+        tch::no_grad(|| {
+            for (index, gain) in gains.iter_mut().enumerate() {
+                let _ = gain.fill_(0.1 + 0.05 * index as f64);
+            }
+        });
+        let open = modules.trunk.forward(&dof, &ids, &time_ids, 0, false);
+        let opened = f64::try_from((&open - &shut).abs().max()).expect("shortcut effect");
+        assert!(
+            opened > 1e-3,
+            "opening the shortcut changed nothing, so the path is not wired: {opened}"
+        );
+
+        // Whole-sequence prefill, then bar-at-a-time decode, both against the same weights.
+        let mut cache = BarKvCache::new(BAR_MAX_CONTEXT);
+        let split = 6i64;
+        let mut pieces = vec![modules.trunk.forward_cached(
+            &dof.narrow(1, 0, split),
+            &ids.narrow(1, 0, split),
+            &time_ids.narrow(1, 0, split),
+            &mut cache,
+        )];
+        for step in split..len {
+            pieces.push(modules.trunk.forward_cached(
+                &dof.narrow(1, step, 1),
+                &ids.narrow(1, step, 1),
+                &time_ids.narrow(1, step, 1),
+                &mut cache,
+            ));
+        }
+        let cached = Tensor::cat(&pieces, 1);
+        let skew = f64::try_from((&cached - &open).abs().max()).expect("path skew");
+        assert!(
+            skew < 1e-4,
+            "the cached trunk injects the embedding shortcut differently from the training \
+             pass: {skew}"
+        );
+    }
+
     /// A window-`w` layer sees `w` bars, but stacking `BAR_LAYERS` of them widens
     /// the receptive field of the last position to `BAR_LAYERS * (w - 1) + 1`
     /// bars: each layer reaches back `w - 1` further through the previous layer's
@@ -2583,6 +2875,7 @@ mod tests {
     /// "last position only sees the last `w` bars", which is false for depth > 1.
     #[test]
     fn sliding_window_bounds_the_receptive_field() {
+        let _torch_rng_guard = test_rng::exclusive();
         let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);
         let modules = BarModules::new(&vs.root());
@@ -2642,6 +2935,7 @@ mod tests {
 
     #[test]
     fn dynamics_starts_as_the_identity_and_stays_on_the_unit_shell() {
+        let _torch_rng_guard = test_rng::exclusive();
         let vs = nn::VarStore::new(Device::Cpu);
         let dynamics = BarDynamics::new(&vs.root(), BAR_MODEL_DIM);
         // `step` is only ever handed a belief, and every belief leaves the trunk
@@ -2687,6 +2981,7 @@ mod tests {
 
     #[test]
     fn rollout_shapes_and_decodes_to_valid_bars() {
+        let _torch_rng_guard = test_rng::exclusive();
         let dir = temp_dir("rollout");
         let supports = synthetic_supports();
         let (weights, metadata_path, _vs) = write_fixture(&dir, &supports);
@@ -2789,6 +3084,7 @@ mod tests {
 
     #[test]
     fn rollout_beliefs_share_their_first_step_across_modes() {
+        let _torch_rng_guard = test_rng::exclusive();
         let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);
         let modules = BarModules::new(&vs.root());
@@ -2848,6 +3144,7 @@ mod tests {
     /// before the NLL becomes visibly absurd.
     #[test]
     fn dynamics_rollout_stays_finite_and_sane_at_h64() {
+        let _torch_rng_guard = test_rng::exclusive();
         const HORIZON: i64 = 64;
         let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);

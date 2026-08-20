@@ -3,19 +3,15 @@ use image::{DynamicImage, RgbImage};
 use plotters::coord::Shift;
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
-use shared::report::{CandleBar, Report, ReportKind, ReportSeries, ScaleKind, TradePoint};
+use shared::report::{
+    CandleBar, QuantileBand, Report, ReportKind, ReportSeries, ScaleKind, TradePoint,
+};
 use shared::theme::plotters_colors as theme;
 
 const CHART_DIMS: (u32, u32) = (2560, 780);
 
-pub fn render_report(report: &Report) -> Result<DynamicImage> {
-    render_report_with_options(report, 0, true, None)
-}
-
-pub fn render_report_with_skip(report: &Report, skip: usize) -> Result<DynamicImage> {
-    render_report_with_options(report, skip, true, None)
-}
-
+/// The single rendering path: both the interactive chart viewer and the
+/// `render` CLI subcommand come through here.
 pub fn render_report_with_options(
     report: &Report,
     skip: usize,
@@ -99,14 +95,32 @@ pub fn render_report_with_options(
                     .collect();
                 render_buy_sell(&root, report, prices, &buys, &sells, x_offset)?;
             }
-            ReportKind::CandleCompare { actual, predicted } => {
+            ReportKind::CandleFan {
+                actual,
+                bands,
+                samples,
+            } => {
                 let actual = skip_slice(actual, skip);
-                let predicted = skip_slice(predicted, skip);
-                render_candle_compare(
+                let bands: Vec<QuantileBand> = bands
+                    .iter()
+                    .map(|band| QuantileBand {
+                        probability: band.probability,
+                        closes: skip_slice(&band.closes, skip).to_vec(),
+                    })
+                    .collect();
+                let samples: Vec<ReportSeries> = samples
+                    .iter()
+                    .map(|series| ReportSeries {
+                        label: series.label.clone(),
+                        values: skip_slice(&series.values, skip).to_vec(),
+                    })
+                    .collect();
+                render_candle_fan(
                     &root,
                     report,
                     actual,
-                    predicted,
+                    &bands,
+                    &samples,
                     x_offset,
                     show_legend,
                     solo_series,
@@ -636,42 +650,63 @@ fn render_buy_sell(
     Ok(())
 }
 
-fn render_candle_compare(
+/// A realized path against the quantile fan of the sampled continuations, with a
+/// few genuine draws overlaid.
+///
+/// The realized bars are candles because every field of them happened. The
+/// predictive law is a fan and a handful of draws, never a single line: the fan
+/// centre is a locus of per-horizon medians and no draw follows it, so drawing it
+/// as "the forecast" is what makes a reader score a pointwise error against a
+/// distribution over paths.
+///
+/// Series indices for solo: `0` is the realized path, `1..=bands.len()` the
+/// quantile loci in the order given, and the remainder the sampled draws.
+fn render_candle_fan(
     root: &DrawingArea<BitMapBackend, Shift>,
     report: &Report,
     actual: &[CandleBar],
-    predicted: &[CandleBar],
+    bands: &[QuantileBand],
+    samples: &[ReportSeries],
     x_offset: u32,
     show_legend: bool,
     solo_series: Option<usize>,
 ) -> Result<()> {
-    if actual.is_empty() && predicted.is_empty() {
+    if actual.is_empty() && bands.is_empty() && samples.is_empty() {
         return Ok(());
     }
+    let series_count = 1 + bands.len() + samples.len();
     let solo = match solo_series {
-        Some(idx) if idx < 2 => Some(idx),
+        Some(idx) if idx < series_count => Some(idx),
         _ => None,
     };
-    let actual_active = solo.is_none() || solo == Some(0);
-    let predicted_active = solo.is_none() || solo == Some(1);
+    let active = |index: usize| solo.is_none() || solo == Some(index);
+    let actual_active = active(0);
 
-    let mut values = Vec::with_capacity((actual.len() + predicted.len()) * 4);
+    let mut values = Vec::with_capacity(actual.len() * 4 + series_count * actual.len());
     if actual_active {
         for candle in actual {
             values.extend([candle.open, candle.high, candle.low, candle.close]);
         }
     }
-    if predicted_active {
-        for candle in predicted {
-            values.extend([candle.open, candle.high, candle.low, candle.close]);
+    for (index, band) in bands.iter().enumerate() {
+        if active(1 + index) {
+            values.extend(band.closes.iter().copied());
+        }
+    }
+    for (index, series) in samples.iter().enumerate() {
+        if active(1 + bands.len() + index) {
+            values.extend(series.values.iter().copied());
         }
     }
     let (y_min, y_max) = range_for(&values, false)?;
-    let x_len = actual.len().max(predicted.len()).max(1) as f64;
+    let x_len = actual
+        .len()
+        .max(bands.iter().map(|b| b.closes.len()).max().unwrap_or(0))
+        .max(samples.iter().map(|s| s.values.len()).max().unwrap_or(0))
+        .max(1) as f64;
     let x_start = x_offset as f64;
     let x_end = x_start + x_len;
 
-    let pred_green = darken(theme::GREEN, 0.55);
     let title = normalize_title(&report.title);
     let mut chart = plotters::chart::ChartBuilder::on(root)
         .caption(title.as_str(), ("sans-serif", 20, &theme::TEXT))
@@ -695,31 +730,94 @@ fn render_candle_compare(
     }
     mesh.draw()?;
 
-    // Both series share the up=green / down=red language; shade (lighter full-width
-    // actual fill vs. darker inset predicted fill) distinguishes them instead of hue.
+    // Sampled draws first, thin and dim, so they read as texture behind the fan rather
+    // than competing with it. Measured against a rendered 100-bar fan: at `mix(0.45)`
+    // and the fan's original 1px extremes, MAUVE on this background out-contrasts
+    // SAPPHIRE and TEAL and the eye lands on a random draw instead of the band, which
+    // is the same misreading in colour that the old median line was in geometry.
+    for (index, series) in samples.iter().enumerate() {
+        let slot = 1 + bands.len() + index;
+        let faded = theme::MAUVE.mix(0.28);
+        let style = ShapeStyle::from(&faded).stroke_width(1);
+        let points: Vec<(f64, f64)> = if active(slot) {
+            series
+                .values
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .map(|(i, value)| (x_start + i as f64 + 0.5, *value as f64))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let handle = chart.draw_series(LineSeries::new(points, style))?;
+        if index == 0 {
+            handle
+                .label(format!("{} ancestral draws", samples.len()))
+                .legend(legend_rect(&theme::MAUVE));
+        }
+    }
+
+    // Quantile loci. The extremes are dimmest and the centre brightest, which is
+    // the opposite of a forecast line's emphasis on purpose: the reader's eye
+    // should land on the WIDTH of the fan first.
+    for (index, band) in bands.iter().enumerate() {
+        let distance = (band.probability - 0.5).abs() * 2.0;
+        let color: &'static RGBColor = if band.probability > 0.5 {
+            &theme::SAPPHIRE
+        } else if band.probability < 0.5 {
+            &theme::TEAL
+        } else {
+            &theme::YELLOW
+        };
+        let width = if (band.probability - 0.5).abs() < 1.0e-9 {
+            3
+        } else {
+            2
+        };
+        let faded = color.mix(1.0 - 0.5 * distance);
+        let style = ShapeStyle::from(&faded).stroke_width(width);
+        let points: Vec<(f64, f64)> = if active(1 + index) {
+            band.closes
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .map(|(i, value)| (x_start + i as f64 + 0.5, *value as f64))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let label = if (band.probability - 0.5).abs() < 1.0e-9 {
+            "p50 (fan centre, NOT a draw)".to_owned()
+        } else {
+            format!("p{:02}", (band.probability * 100.0).round() as i64)
+        };
+        chart
+            .draw_series(LineSeries::new(points, style))?
+            .label(label)
+            .legend(legend_rect(color));
+    }
+
+    // Realized bars last, on top, in the up=green / down=red language.
     if actual_active {
         chart
             .draw_series(actual.iter().enumerate().map(|(idx, candle)| {
                 let x = x_start + idx as f64;
                 Rectangle::new(
                     [
-                        (x + 0.12, candle_body_low(candle)),
-                        (x + 0.88, candle_body_high(candle)),
+                        (x + 0.2, candle_body_low(candle)),
+                        (x + 0.8, candle_body_high(candle)),
                     ],
                     direction_color(candle).filled(),
                 )
             }))?
-            .label("actual (solid fill)")
+            .label("realized")
             .legend(legend_rect(&theme::GREEN));
-
-        // Actual wick: solid opaque, offset ~0.15 bar left of center to separate it
-        // from the right-offset predicted wick.
         chart.draw_series(actual.iter().enumerate().map(|(idx, candle)| {
-            let mid = x_start + idx as f64 + 0.35;
-            let color = direction_color(candle);
+            let mid = x_start + idx as f64 + 0.5;
             PathElement::new(
                 vec![(mid, candle.low as f64), (mid, candle.high as f64)],
-                ShapeStyle::from(&color).stroke_width(2),
+                ShapeStyle::from(&direction_color(candle)).stroke_width(2),
             )
         }))?;
     } else {
@@ -728,46 +826,8 @@ fn render_candle_compare(
                 std::iter::empty::<(f64, f64)>(),
                 ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
             ))?
-            .label("actual (solid fill)")
+            .label("realized")
             .legend(legend_rect(&theme::GREEN));
-    }
-
-    if predicted_active {
-        // Darker filled body, inset inside the actual body so the darker predicted
-        // block reads clearly inside the lighter full-width actual fill of the same
-        // hue.
-        chart
-            .draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
-                let x = x_start + idx as f64;
-                Rectangle::new(
-                    [
-                        (x + 0.28, candle_body_low(candle)),
-                        (x + 0.72, candle_body_high(candle)),
-                    ],
-                    darken(direction_color(candle), 0.55).filled(),
-                )
-            }))?
-            .label("predicted (darker fill)")
-            .legend(legend_rect(&pred_green));
-
-        // Predicted wick: solid line offset ~0.15 bar right of center, so it reads
-        // as separate from the solid actual wick.
-        chart.draw_series(predicted.iter().enumerate().map(|(idx, candle)| {
-            let mid = x_start + idx as f64 + 0.65;
-            let color = darken(direction_color(candle), 0.55);
-            PathElement::new(
-                vec![(mid, candle.low as f64), (mid, candle.high as f64)],
-                ShapeStyle::from(&color).stroke_width(2),
-            )
-        }))?;
-    } else {
-        chart
-            .draw_series(LineSeries::new(
-                std::iter::empty::<(f64, f64)>(),
-                ShapeStyle::from(&theme::SURFACE2).stroke_width(1),
-            ))?
-            .label("predicted (darker fill)")
-            .legend(legend_rect(&pred_green));
     }
 
     if show_legend {
@@ -915,11 +975,6 @@ fn legend_rect(
     }
 }
 
-fn darken(c: RGBColor, factor: f64) -> RGBColor {
-    let scale = |v: u8| (v as f64 * factor).round().clamp(0.0, 255.0) as u8;
-    RGBColor(scale(c.0), scale(c.1), scale(c.2))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,7 +1019,7 @@ mod tests {
                 ema_alpha: None,
             },
         };
-        assert!(render_report(&report).is_ok());
+        assert!(render_report_with_options(&report, 0, true, None).is_ok());
     }
 
     #[test]

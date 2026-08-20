@@ -40,6 +40,8 @@ use serde::{Deserialize, Serialize};
 use crate::torch::bar_dist::{BAR_DOF, BAR_DOF_NAMES};
 use crate::torch::dataset::iso_ms;
 
+use super::trade_bench::{self, TradeBench, COST_GRID_BPS, POLICY_NAMES};
+
 /// Resamples per bootstrap. 1000 draws over ~4k f64 is microseconds, and the 2.5/97.5
 /// percentiles of 1000 draws are stable to about a percent of the interval width.
 pub const BOOTSTRAP_DRAWS: usize = 1000;
@@ -245,6 +247,292 @@ impl WindowScore {
     }
 }
 
+/// A JSON-safe `f64`.
+///
+/// `serde_json` maps every non-finite float to `null` on the way out and then refuses to
+/// read it back as an `f64`, which would make an epoch sidecar unloadable the moment the
+/// bench reported one. Non-finite is not an error here: `break_even_bps` is `NaN` when
+/// there is no gross edge to lose and `+inf` when no cost ever removes it, and those are
+/// DIFFERENT findings that a shared `null` would merge. So the three non-finite values
+/// round-trip through their own names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JsonF64(pub f64);
+
+impl From<f64> for JsonF64 {
+    fn from(value: f64) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for JsonF64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Serialize for JsonF64 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.is_finite() {
+            serializer.serialize_f64(self.0)
+        } else if self.0.is_nan() {
+            serializer.serialize_str("nan")
+        } else if self.0 > 0.0 {
+            serializer.serialize_str("inf")
+        } else {
+            serializer.serialize_str("-inf")
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonF64 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Number(f64),
+            Name(String),
+            Absent,
+        }
+        Ok(Self(match Repr::deserialize(deserializer)? {
+            Repr::Number(value) => value,
+            // `null` is what an older writer, or `serde_json` itself, leaves behind for a
+            // non-finite value; it cannot say WHICH one, so it reads back as `NaN`.
+            Repr::Absent => f64::NAN,
+            Repr::Name(name) => match name.as_str() {
+                "nan" => f64::NAN,
+                "inf" => f64::INFINITY,
+                "-inf" => f64::NEG_INFINITY,
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "expected a number or one of `nan`, `inf`, `-inf`, got `{other}`"
+                    )))
+                }
+            },
+        }))
+    }
+}
+
+/// One policy's realized performance and its own paired verdict against the null, as an epoch
+/// artifact records it.
+///
+/// Mirrors `trade_bench::PolicyStats` field for field, plus this policy's row of the bench's
+/// per-policy edge, break-even and ceiling share. It is a separate type rather than a derive
+/// on the bench's own struct because every float here has to survive JSON, and because the
+/// persisted schema must not move whenever the bench grows an internal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradePolicySummary {
+    /// `trade_bench::POLICY_NAMES` entry, so the file is readable without the index table.
+    pub policy: String,
+    pub gross_growth: JsonF64,
+    pub net_growth: JsonF64,
+    pub sharpe: JsonF64,
+    pub hit_rate: JsonF64,
+    pub turnover: JsonF64,
+    pub time_in_market: JsonF64,
+    pub mean_abs_position: JsonF64,
+    pub clamped_fraction: JsonF64,
+    pub mean_drawdown: JsonF64,
+    pub max_drawdown: JsonF64,
+    pub ruin_bars: usize,
+    /// This policy's paired `policy - marginal null` net log growth per bar, with the same
+    /// block-bootstrap interval the headline uses. Present per policy so a fractional-Kelly
+    /// row can be quoted as the verdict without anyone re-deriving its interval by hand; the
+    /// null's own row is identically zero, by construction.
+    pub edge: JsonF64,
+    pub edge_se: JsonF64,
+    pub edge_ci_low: JsonF64,
+    pub edge_ci_high: JsonF64,
+    /// Cost at which this policy's edge reaches zero. `nan` = no gross edge, `inf` = never.
+    pub break_even_bps: JsonF64,
+    pub ceiling_capture: JsonF64,
+    /// This policy's edge at each [`TradeSummary::cost_grid_bps`] level.
+    pub cost_curve: Vec<JsonF64>,
+}
+
+/// The whole Kelly bench of one pinned pass, persisted beside the checkpoint it scored.
+///
+/// Growth figures are natural log growth PER BAR, exactly as the bench produces them — NOT
+/// the basis points the charts draw — so a reader never has to know which of the two a
+/// number is in.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradeSummary {
+    pub policies: Vec<TradePolicySummary>,
+    /// Paired `model - marginal null` net log growth per bar: THE number.
+    pub edge: JsonF64,
+    pub edge_se: JsonF64,
+    pub edge_ci_low: JsonF64,
+    pub edge_ci_high: JsonF64,
+    /// Resampling units behind the interval, which is what its width is governed by.
+    pub edge_blocks: usize,
+    /// Cost at which `edge` reaches zero. `nan` = no gross edge, `inf` = never.
+    pub break_even_bps: JsonF64,
+    pub ceiling_capture: JsonF64,
+    /// The cost axis `cost_curve` is evaluated on, so the pair is self-describing.
+    pub cost_grid_bps: Vec<JsonF64>,
+    pub cost_curve: Vec<JsonF64>,
+    pub cost_bps: JsonF64,
+    pub leverage_cap: JsonF64,
+    pub bars: usize,
+    pub windows: usize,
+    pub blocks: usize,
+    /// One entry per [`trade_bench::CAP_GRID`] point: the same verdict re-derived at each
+    /// leverage cap. Persisted because the headline is only interpretable beside it — an
+    /// edge that vanishes as the cap falls was bought with leverage, not with prediction.
+    pub cap_curve: Vec<TradeCapPointSummary>,
+    /// Distribution of the UNCAPPED optimum `|f*|` over traded bars, and the share of bars
+    /// the cap rather than the distribution sized.
+    pub free_kelly_bucket_floor: Vec<JsonF64>,
+    pub free_kelly_share: Vec<JsonF64>,
+    pub free_kelly_saturated: JsonF64,
+    pub free_kelly_median: JsonF64,
+    pub free_kelly_p95: JsonF64,
+    pub free_kelly_mean_signed: JsonF64,
+    /// Far-tail calibration of the traded law, lower tail then upper, one entry per
+    /// [`trade_bench::TAIL_LEVELS`] level.
+    pub tail_lower: Vec<TradeTailSummary>,
+    pub tail_upper: Vec<TradeTailSummary>,
+    pub tail_bars: JsonF64,
+    pub tail_windows: usize,
+}
+
+impl From<&TradeBench> for TradeSummary {
+    fn from(bench: &TradeBench) -> Self {
+        Self {
+            policies: POLICY_NAMES
+                .iter()
+                .enumerate()
+                .map(|(policy, name)| {
+                    let stats = &bench.policies[policy];
+                    let edge = bench.edge[policy];
+                    TradePolicySummary {
+                        policy: (*name).to_owned(),
+                        gross_growth: stats.gross_growth.into(),
+                        net_growth: stats.net_growth.into(),
+                        sharpe: stats.sharpe.into(),
+                        hit_rate: stats.hit_rate.into(),
+                        turnover: stats.turnover.into(),
+                        time_in_market: stats.time_in_market.into(),
+                        mean_abs_position: stats.mean_abs_position.into(),
+                        clamped_fraction: stats.clamped_fraction.into(),
+                        mean_drawdown: stats.mean_drawdown.into(),
+                        max_drawdown: stats.max_drawdown.into(),
+                        ruin_bars: stats.ruin_bars,
+                        edge: edge.mean.into(),
+                        edge_se: edge.se.into(),
+                        edge_ci_low: edge.ci_low.into(),
+                        edge_ci_high: edge.ci_high.into(),
+                        break_even_bps: bench.break_even_bps[policy].into(),
+                        ceiling_capture: bench.ceiling_capture[policy].into(),
+                        cost_curve: bench.cost_curve[policy]
+                            .iter()
+                            .map(|edge| JsonF64(*edge))
+                            .collect(),
+                    }
+                })
+                .collect(),
+            edge: bench.model_edge().mean.into(),
+            edge_se: bench.model_edge().se.into(),
+            edge_ci_low: bench.model_edge().ci_low.into(),
+            edge_ci_high: bench.model_edge().ci_high.into(),
+            edge_blocks: bench.model_edge().blocks,
+            break_even_bps: bench.model_break_even().into(),
+            ceiling_capture: bench.model_capture().into(),
+            cost_grid_bps: COST_GRID_BPS.iter().map(|bps| JsonF64(*bps)).collect(),
+            cost_curve: bench
+                .model_cost_curve()
+                .iter()
+                .map(|edge| JsonF64(*edge))
+                .collect(),
+            cost_bps: bench.cost_bps.into(),
+            leverage_cap: bench.leverage_cap.into(),
+            bars: bench.bars,
+            windows: bench.windows,
+            blocks: bench.blocks,
+            cap_curve: bench.cap_curve.iter().map(Into::into).collect(),
+            free_kelly_bucket_floor: trade_bench::FREE_KELLY_EDGES
+                [..trade_bench::FREE_KELLY_EDGES.len() - 1]
+                .iter()
+                .map(|edge| JsonF64(*edge))
+                .collect(),
+            free_kelly_share: bench
+                .free_kelly
+                .histogram
+                .iter()
+                .map(|share| JsonF64(*share))
+                .collect(),
+            free_kelly_saturated: bench.free_kelly.saturated.into(),
+            free_kelly_median: bench.free_kelly.median.into(),
+            free_kelly_p95: bench.free_kelly.p95.into(),
+            free_kelly_mean_signed: bench.free_kelly.mean_signed.into(),
+            tail_lower: bench.tail.lower.iter().map(Into::into).collect(),
+            tail_upper: bench.tail.upper.iter().map(Into::into).collect(),
+            tail_bars: bench.tail.bars.into(),
+            tail_windows: bench.tail.windows,
+        }
+    }
+}
+
+/// One leverage cap's re-derived verdict, as the artifact records it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradeCapPointSummary {
+    pub cap: JsonF64,
+    pub edge: JsonF64,
+    pub break_even_bps: JsonF64,
+    pub sharpe: JsonF64,
+    pub ceiling_capture: JsonF64,
+    pub mean_abs_position: JsonF64,
+    pub clamped_fraction: JsonF64,
+    pub max_drawdown: JsonF64,
+    pub ruin_bars: usize,
+}
+
+/// One tail level's promise against what happened.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradeTailSummary {
+    pub nominal: JsonF64,
+    pub realized: JsonF64,
+    /// `realized / nominal`: one is honest, four means a wipeout the model called impossible.
+    pub ratio: JsonF64,
+    pub exceedances: JsonF64,
+    /// Binomial interval treating bars as independent: a FLOOR on the uncertainty.
+    pub wilson_low: JsonF64,
+    pub wilson_high: JsonF64,
+    /// Window-blocked interval, the honest one, in the same units as `realized`.
+    pub blocked_low: JsonF64,
+    pub blocked_high: JsonF64,
+}
+
+impl From<&trade_bench::CapPoint> for TradeCapPointSummary {
+    fn from(point: &trade_bench::CapPoint) -> Self {
+        Self {
+            cap: point.cap.into(),
+            edge: point.edge.into(),
+            break_even_bps: point.break_even_bps.into(),
+            sharpe: point.sharpe.into(),
+            ceiling_capture: point.ceiling_capture.into(),
+            mean_abs_position: point.mean_abs_position.into(),
+            clamped_fraction: point.clamped_fraction.into(),
+            max_drawdown: point.max_drawdown.into(),
+            ruin_bars: point.ruin_bars,
+        }
+    }
+}
+
+impl From<&trade_bench::TailPoint> for TradeTailSummary {
+    fn from(point: &trade_bench::TailPoint) -> Self {
+        Self {
+            nominal: point.nominal.into(),
+            realized: point.realized.into(),
+            ratio: point.ratio.into(),
+            exceedances: point.exceedances.into(),
+            wilson_low: point.wilson.0.into(),
+            wilson_high: point.wilson.1.into(),
+            blocked_low: point.blocked.0.into(),
+            blocked_high: point.blocked.1.into(),
+        }
+    }
+}
+
 /// A run's per-window held-out vector, with everything needed to decide whether another
 /// run's vector is comparable to it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -271,6 +559,36 @@ pub struct WindowScores {
     #[serde(default)]
     pub scoring: Option<String>,
     pub windows: Vec<WindowScore>,
+    /// The Kelly trading bench measured on THIS pass, when the caller ran one.
+    ///
+    /// Present on the epoch-boundary artifacts, whose whole purpose is to be evaluable
+    /// without being re-scored: an epoch checkpoint that carries its per-window NLL vector
+    /// but not what those windows were WORTH still forces a reload to answer the only
+    /// question a reader has. Absent — not zero — on every sidecar written from a pass the
+    /// bench did not ride.
+    #[serde(default)]
+    pub trade: Option<TradeSummary>,
+    /// Base batch the run ACTUALLY executed, and the total step count priced from it.
+    ///
+    /// `None` on a vector written before these were recorded, which is NOT the same as
+    /// "matched": it means the pair cannot be checked, and [`paired_comparison`] refuses it
+    /// rather than assuming, exactly as it does for [`Self::scoring`].
+    ///
+    /// # Why an A/B needs these and why `--batch-size` is not enough
+    ///
+    /// The startup capacity probe clamps the base batch to what the card can hold, which
+    /// depends on what ELSE was resident at launch. Measured, on two arms of the
+    /// expected-log-growth ablation launched identically at `--batch-size 24` with the same
+    /// seed: 16.37 GiB free gave base 23 and 10818 steps, 14.94 GiB gave base 21 and 11847.
+    /// The bar budget is fixed by `--epochs`, so a smaller batch buys MORE steps — a different
+    /// gradient-noise level and a different-length lr and momentum schedule. Both runs
+    /// REQUESTED 24, so the requested figure cannot detect it and only the realized one can.
+    /// [`super::pretrain::PretrainArgs::exact_batch`] prevents it at launch; this refuses the
+    /// pair afterwards, for the runs that were launched before anyone knew to set it.
+    #[serde(default)]
+    pub realized_batch: Option<usize>,
+    #[serde(default)]
+    pub realized_steps: Option<usize>,
 }
 
 impl WindowScores {
@@ -522,6 +840,32 @@ pub fn paired_comparison(
             candidate.scoring
         ),
     };
+    match (
+        baseline.realized_batch.zip(baseline.realized_steps),
+        candidate.realized_batch.zip(candidate.realized_steps),
+    ) {
+        (Some(a), Some(b)) if a == b => {}
+        (Some((ab, asteps)), Some((bb, bsteps))) => bail!(
+            "REFUSING to pair: the two runs executed different schedules — baseline base \
+             batch {ab} over {asteps} steps, candidate {bb} over {bsteps}. The startup \
+             capacity probe clamps the base batch to whatever the card had free, and a \
+             fixed bar budget then buys a different number of steps, so the pair differs \
+             in gradient noise and in lr/momentum schedule length as well as in whatever \
+             was being tested. Relaunch both arms with --exact-batch so a card that cannot \
+             hold the requested batch refuses instead of quietly reducing it."
+        ),
+        (None, _) | (_, None) => bail!(
+            "REFUSING to pair: at least one per-window vector does not record the batch and \
+             step count its run actually executed (baseline {:?}/{:?}, candidate {:?}/{:?}). \
+             It was written before those were recorded, so whether the two arms ran the same \
+             schedule cannot be established from the artifact; re-score that arm rather than \
+             assuming it matched.",
+            baseline.realized_batch,
+            baseline.realized_steps,
+            candidate.realized_batch,
+            candidate.realized_steps
+        ),
+    }
     ensure!(
         baseline.split == candidate.split && baseline.context == candidate.context,
         "the two runs were scored on different sets: {} at context {} vs {} at context {}",
@@ -763,6 +1107,12 @@ mod tests {
             marginal_nll_bar: 21.6686,
             scoring: Some("density".to_owned()),
             windows,
+            trade: None,
+            // Set, because a real run always sets them: a fixture that left them absent
+            // would make every pairing test exercise the "unrecorded" refusal instead of
+            // the comparison.
+            realized_batch: Some(23),
+            realized_steps: Some(10818),
         }
     }
 
@@ -808,6 +1158,31 @@ mod tests {
         let mut unrecorded = scores("cand", "ff", -0.25);
         unrecorded.scoring = None;
         assert!(paired_comparison(&baseline, &unrecorded).is_err());
+
+        // The two arms of the growth ablation were launched identically at --batch-size 24
+        // and the startup capacity probe gave one 23 and the other 21, which bought 10818
+        // steps against 11847 — a different gradient-noise level and a different-length
+        // schedule, invisible in the requested figure. Refused on the realized one.
+        let mut clamped_lower = scores("cand", "ff", -0.25);
+        clamped_lower.realized_batch = Some(21);
+        clamped_lower.realized_steps = Some(11847);
+        let err = paired_comparison(&baseline, &clamped_lower)
+            .expect_err("two schedules must not be paired")
+            .to_string();
+        assert!(err.contains("different schedules"), "{err}");
+        assert!(err.contains("--exact-batch"), "{err}");
+
+        // Absent is not "matched": a vector too old to record what it ran is refused rather
+        // than assumed equal, exactly as an unrecorded scoring rule is.
+        for (batch, steps) in [(None, Some(10818)), (Some(23), None), (None, None)] {
+            let mut unrecorded = scores("cand", "ff", -0.25);
+            unrecorded.realized_batch = batch;
+            unrecorded.realized_steps = steps;
+            let err = paired_comparison(&baseline, &unrecorded)
+                .expect_err("an unrecorded schedule must not be paired")
+                .to_string();
+            assert!(err.contains("actually executed"), "{err}");
+        }
     }
 
     /// Month blocking must collapse the 64 windows onto the 8 calendar months they occupy,

@@ -206,22 +206,33 @@ fn select_by_report_value(
     pick_max: bool,
     var_filter: Option<&str>,
 ) -> Vec<String> {
-    let ReportKind::CandleCompare { actual, predicted } = kind else {
+    let ReportKind::CandleFan {
+        actual,
+        bands,
+        samples,
+    } = kind
+    else {
         return select_by_value(lines, count, pick_max, var_filter);
     };
     let mut scored = lines
         .into_iter()
         .enumerate()
         .filter_map(|(index, line)| {
-            let mut values = Vec::with_capacity(8);
+            let mut values = Vec::with_capacity(4 + bands.len() + samples.len());
             if var_filter.is_none() || var_filter == Some("actual") {
                 if let Some(candle) = actual.get(index) {
                     values.extend(candle_values(candle));
                 }
             }
-            if var_filter.is_none() || var_filter == Some("predicted") {
-                if let Some(candle) = predicted.get(index) {
-                    values.extend(candle_values(candle));
+            for band in bands {
+                let label = format!("p{:02}", (band.probability * 100.0).round() as i64);
+                if var_filter.is_none() || var_filter == Some(label.as_str()) {
+                    values.extend(band.closes.get(index).copied());
+                }
+            }
+            for series in samples {
+                if var_filter.is_none() || var_filter == Some(series.label.as_str()) {
+                    values.extend(series.values.get(index).copied());
                 }
             }
             values.retain(|value| value.is_finite());
@@ -342,7 +353,7 @@ fn safe_report_subpath(raw: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::report::{ReportKind, ScaleKind};
+    use shared::report::{QuantileBand, ReportKind, ReportSeries, ScaleKind};
 
     #[test]
     fn nested_inference_episode_report_path_decodes() {
@@ -383,8 +394,8 @@ mod tests {
     }
 
     #[test]
-    fn candle_min_max_use_structured_ohlc_values() {
-        let kind = ReportKind::CandleCompare {
+    fn candle_fan_min_max_use_structured_values() {
+        let kind = ReportKind::CandleFan {
             actual: vec![
                 CandleBar {
                     open: 10.0,
@@ -405,20 +416,20 @@ mod tests {
                     close: 95.0,
                 },
             ],
-            predicted: vec![
-                CandleBar {
-                    open: 20.0,
-                    high: 30.0,
-                    low: 15.0,
-                    close: 25.0,
+            bands: vec![
+                QuantileBand {
+                    probability: 0.10,
+                    closes: vec![20.0, f32::NAN, 7.0],
                 },
-                CandleBar {
-                    open: f32::NAN,
-                    high: 8.0,
-                    low: 7.0,
-                    close: 7.5,
+                QuantileBand {
+                    probability: 0.90,
+                    closes: vec![30.0, 8.0, 9.0],
                 },
             ],
+            samples: vec![ReportSeries {
+                label: "draw 1".to_owned(),
+                values: vec![21.0, 50.0, 40.0],
+            }],
         };
         let lines = kind.to_lines();
         assert!(select_by_report_value(&kind, lines.clone(), 1, true, None)[0].starts_with('2'));
@@ -427,9 +438,11 @@ mod tests {
             select_by_report_value(&kind, lines.clone(), 1, true, Some("actual"))[0]
                 .starts_with('2')
         );
-        assert!(
-            select_by_report_value(&kind, lines, 1, true, Some("predicted"))[0].starts_with('0')
-        );
+        // The p10 locus peaks on row 0, so filtering to it must not inherit the
+        // realized bars' row-2 maximum.
+        assert!(select_by_report_value(&kind, lines.clone(), 1, true, Some("p10"))[0]
+            .starts_with('0'));
+        assert!(select_by_report_value(&kind, lines, 1, true, Some("draw 1"))[0].starts_with('1'));
     }
 
     #[test]

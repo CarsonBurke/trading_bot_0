@@ -1,9 +1,61 @@
 use anyhow::{bail, Context, Result};
 use chrono::Local;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+/// `meta.json`: a run's identity, and what it was HANDED rather than what a reader must infer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunMeta {
+    pub commit: String,
+    /// Absent on runs created before the record existed, which is exactly the gap it closes:
+    /// their split instants are recoverable only by inferring the trainer's default at `commit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<RunProvenance>,
+}
+
+/// Every value a run ASSUMED rather than RECORDED, without which a checkpoint cannot be
+/// validated against the data it was trained on.
+///
+/// The distinction is not pedantic. `training/runs/bardist_v3_rfirst_1ep/meta.json` carried
+/// `{"commit": ...}` and nothing else, so "this checkpoint was trained with `b0` =
+/// 2025-10-07T12:10:00Z" was true, load-bearing for every economic number taken off that run,
+/// and recoverable only by checking out the commit and reading the trainer's DEFAULT. That is a
+/// fact about the code at a revision rather than a fact about the run, and it stops being
+/// recoverable the moment the default moves.
+///
+/// The two contexts sit beside the bounds because the bounds alone do NOT pin what the model
+/// conditioned on: a context reaches BACKWARD across `b0`, so a window at the start of the val
+/// region legitimately reads train-side bars. "No SCORED bar is in train" and "no bar the model
+/// SAW is in train" are different statements and only the first follows from the instants.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunProvenance {
+    /// `(train|val, val|test)` split instants in epoch millis, as handed to the corpus loader.
+    pub split_bounds_ms: [i64; 2],
+    /// `false` when the run re-derived the instants from the live corpus, which makes them
+    /// percentiles of whatever was on disk that day and comparable to nothing.
+    pub split_bounds_pinned: bool,
+    /// Deployment bar resolution. The split instants are resolution-specific.
+    pub resolution_secs: u32,
+    /// `BarCorpus::identity_fingerprint()`, taken after any symbol restriction.
+    pub corpus_fingerprint: String,
+    /// Corpus membership floor in bars.
+    pub min_bars: usize,
+    /// Liquidity floor for corpus membership; `0` loads every file on disk.
+    pub min_dollar_volume: f64,
+    /// Corpus the run read.
+    pub data_dir: String,
+    /// Context of the fixed across-run diagnostic evaluation.
+    pub diagnostic_context_bars: i64,
+    /// Context the run deploys and is promoted at.
+    pub deployed_context_bars: i64,
+    /// Pins the held-out window draw. A different value is a different bench.
+    pub eval_window_seed: u64,
+    /// Pins the training stream only, never the bench.
+    pub train_seed: u64,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunDir {
@@ -49,10 +101,10 @@ impl RunDir {
         fs::create_dir_all(&weights)?;
         fs::write(
             root.join("meta.json"),
-            format!(
-                "{{\n  \"commit\": \"{}\"\n}}\n",
-                current_git_commit().unwrap_or_default()
-            ),
+            meta_bytes(&RunMeta {
+                commit: current_git_commit().unwrap_or_default(),
+                provenance: None,
+            })?,
         )
         .context("failed to write run metadata")?;
 
@@ -64,6 +116,30 @@ impl RunDir {
         };
         run_dir.activate(runs_path)?;
         Ok(run_dir)
+    }
+
+    /// `meta.json` as written. A run created before [`RunProvenance`] existed reads back with
+    /// `provenance: None` rather than failing: the file is a historical record, not a schema.
+    pub fn meta(&self) -> Result<RunMeta> {
+        let path = self.root.join("meta.json");
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("{} is not run metadata", path.display()))
+    }
+
+    /// Record what the run was HANDED, beside the commit [`Self::create_fresh`] wrote.
+    ///
+    /// Called once, at run start, the moment the corpus is open and its identity is known —
+    /// before the first optimizer step and therefore before any artifact the record has to
+    /// explain can exist. Writing it later would make the record conditional on the run
+    /// surviving, which is the one case where a reader most needs it.
+    pub fn record_provenance(&self, provenance: RunProvenance) -> Result<()> {
+        let path = self.root.join("meta.json");
+        let mut meta = self.meta()?;
+        meta.provenance = Some(provenance);
+        fs::write(&path, meta_bytes(&meta)?)
+            .with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn from_weights_path(path: &Path) -> Result<Self> {
@@ -244,6 +320,14 @@ impl RunDir {
     }
 }
 
+/// Pretty JSON with a trailing newline, so `meta.json` stays the readable, diffable,
+/// `cat`-able file it has always been now that serde owns its shape.
+fn meta_bytes(meta: &RunMeta) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(meta).context("failed to encode run metadata")?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 fn canonical_or_original(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -378,5 +462,86 @@ mod tests {
             RunDir::create_fresh(external_runs.to_str().unwrap(), Some("source")).unwrap();
         assert!(RunDir::from_weights_path_in(&external.weights.join("ppo_ep1.ot"), &runs).is_err());
         fs::remove_dir_all(external_runs).unwrap();
+    }
+
+    fn provenance() -> RunProvenance {
+        RunProvenance {
+            split_bounds_ms: [1_759_839_000_000, 1_773_427_500_000],
+            split_bounds_pinned: true,
+            resolution_secs: 300,
+            corpus_fingerprint: "5297:368222980:deadbeef".to_owned(),
+            min_bars: 20_480,
+            min_dollar_volume: 0.0,
+            data_dir: "long_data/bars".to_owned(),
+            diagnostic_context_bars: 896,
+            deployed_context_bars: 2048,
+            eval_window_seed: 0xE7A1_5E7D_0001,
+            train_seed: 0x5EED,
+        }
+    }
+
+    /// A fresh run states its commit and states that it has recorded no provenance YET, and
+    /// what is then recorded reads back byte-for-byte equal to what the run was handed.
+    ///
+    /// The equality is the whole point. A record that merely EXISTS converts nothing: the claim
+    /// being made is "these are the instants this run was handed", and only a round-trip against
+    /// the handed value can support it.
+    #[test]
+    fn a_run_records_the_provenance_it_was_handed_and_reads_it_back_unchanged() {
+        let runs = temp_runs();
+        let run = RunDir::create_fresh(runs.to_str().unwrap(), Some("recorded")).unwrap();
+
+        let fresh = run.meta().unwrap();
+        assert!(
+            fresh.provenance.is_none(),
+            "a run that has recorded nothing must say so rather than imply a default"
+        );
+
+        let handed = provenance();
+        run.record_provenance(handed.clone()).unwrap();
+        let read_back = run.meta().unwrap();
+        assert_eq!(read_back.provenance.as_ref(), Some(&handed));
+        assert_eq!(
+            read_back.commit, fresh.commit,
+            "recording provenance must not disturb the run's identity"
+        );
+
+        // The instants specifically, spelled out: this is the field whose absence made
+        // `bardist_v3_rfirst_1ep` unverifiable, and a reader must find it without deserializing
+        // into this crate's types.
+        let raw = fs::read_to_string(run.root.join("meta.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["provenance"]["split_bounds_ms"][0], 1_759_839_000_000i64);
+        assert_eq!(parsed["provenance"]["split_bounds_ms"][1], 1_773_427_500_000i64);
+        assert_eq!(parsed["provenance"]["diagnostic_context_bars"], 896);
+        assert_eq!(parsed["provenance"]["split_bounds_pinned"], true);
+
+        fs::remove_dir_all(runs).unwrap();
+    }
+
+    /// Every run in `training/runs` predates the record, so `meta()` must read a bare
+    /// `{"commit": ...}` rather than refuse it. A provenance field that made 700-odd historical
+    /// runs unreadable would be a regression dressed as an improvement.
+    #[test]
+    fn a_run_written_before_the_record_existed_still_reads() {
+        let runs = temp_runs();
+        let run = RunDir::create_fresh(runs.to_str().unwrap(), Some("legacy")).unwrap();
+        fs::write(
+            run.root.join("meta.json"),
+            "{\n  \"commit\": \"a0ff3b29330493c315a8afc4514d17d7d6b5995c\"\n}\n",
+        )
+        .unwrap();
+
+        let meta = run.meta().unwrap();
+        assert_eq!(meta.commit, "a0ff3b29330493c315a8afc4514d17d7d6b5995c");
+        assert_eq!(meta.provenance, None);
+
+        // And it can be upgraded in place without losing the commit it already carried.
+        run.record_provenance(provenance()).unwrap();
+        let upgraded = run.meta().unwrap();
+        assert_eq!(upgraded.commit, meta.commit);
+        assert_eq!(upgraded.provenance, Some(provenance()));
+
+        fs::remove_dir_all(runs).unwrap();
     }
 }
