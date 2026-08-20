@@ -298,6 +298,7 @@ mod tests {
     };
     use crate::torch::model::{TradingModel, TradingModelConfig};
     use crate::torch::optim::{Muon, MuonConfig};
+    use crate::torch::test_rng;
     use crate::torch::train::optimizer_glue::named_trainable_variables;
     use std::collections::HashMap;
     use tch::nn;
@@ -545,6 +546,7 @@ mod tests {
 
     #[test]
     fn real_model_grad_clip_groups_match_actor_critic_topology() {
+        let _torch_rng_guard = test_rng::shared();
         let vs = nn::VarStore::new(Device::Cpu);
         let _model = TradingModel::new_with_config(&vs.root(), TradingModelConfig::default());
         let named = named_trainable_variables(&vs);

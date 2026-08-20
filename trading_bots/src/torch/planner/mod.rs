@@ -614,6 +614,7 @@ fn linear_zero(p: &nn::Path, input: i64, output: i64) -> nn::Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::torch::test_rng;
     use tch::{Device, IndexOp, Kind};
 
     fn forecast(batch: i64, horizon: i64) -> PlannerForecast {
@@ -659,6 +660,7 @@ mod tests {
 
     #[test]
     fn output_contract_has_expected_shapes_and_finite_values() {
+        let _torch_rng_guard = test_rng::exclusive();
         let (_vs, planner) = planner();
         let output = planner.forward(&input(2, 9));
         assert_eq!(output.value_logits.size(), [2, NUM_BINS]);
@@ -675,6 +677,7 @@ mod tests {
 
     #[test]
     fn mixed_precision_boundary_returns_fp32_outputs_and_gradients() {
+        let _torch_rng_guard = test_rng::exclusive();
         let (vs, planner) = planner();
         let output = planner.forward_mixed_precision(&input(2, 5));
         for tensor in [
@@ -698,6 +701,7 @@ mod tests {
 
     #[test]
     fn staged_policy_encoding_matches_the_policy_forward() {
+        let _torch_rng_guard = test_rng::exclusive();
         let (_vs, planner) = planner();
         let input = input(2, 7);
         let direct = planner.forward_mixed_precision(&input);
@@ -713,6 +717,7 @@ mod tests {
 
     #[test]
     fn staged_policy_encoding_and_readout_preserve_gradients() {
+        let _torch_rng_guard = test_rng::exclusive();
         let (vs, planner) = planner();
         let mut input = input(2, 5);
         input.forecast.latent = input.forecast.latent.set_requires_grad(true);
@@ -735,6 +740,7 @@ mod tests {
 
     #[test]
     fn cuda_flash_only_forward_uses_supported_autocast_dtype() {
+        let _torch_rng_guard = test_rng::shared();
         let device = Device::cuda_if_available();
         if !device.is_cuda() {
             return;
@@ -760,6 +766,7 @@ mod tests {
 
     #[test]
     fn gradients_reach_forecast_portfolio_and_parameters() {
+        let _torch_rng_guard = test_rng::exclusive();
         let (vs, planner) = planner();
         let mut input = input(2, 6);
         input.forecast.latent = input.forecast.latent.set_requires_grad(true);
@@ -786,6 +793,7 @@ mod tests {
 
     #[test]
     fn first_token_depends_on_a_future_token() {
+        let _torch_rng_guard = test_rng::exclusive();
         let (_vs, planner) = planner();
         let original = forecast(1, 7);
         let belief = belief(1);
@@ -808,6 +816,7 @@ mod tests {
 
     #[test]
     fn all_pma_seeds_depend_on_portfolio_state() {
+        let _torch_rng_guard = test_rng::exclusive();
         let (_vs, planner) = planner();
         let encoded = planner.encode_policy_forecast(&forecast(1, 5), &belief(1));
         let portfolio_a = Tensor::zeros([1, PLANNER_PORTFOLIO_DIM], (Kind::Float, Device::Cpu));
@@ -823,6 +832,7 @@ mod tests {
 
     #[test]
     fn policy_and_critic_have_disjoint_parameter_names() {
+        let _torch_rng_guard = test_rng::exclusive();
         let (vs, _planner) = planner();
         let variables = vs.variables();
         let policy = variables
@@ -840,6 +850,7 @@ mod tests {
 
     #[test]
     fn forecast_modalities_normalize_latents_and_expose_bounded_log_scale() {
+        let _torch_rng_guard = test_rng::shared();
         let scaled = Tensor::randn([1, 2, PLANNER_LATENT_DIM], (Kind::Float, Device::Cpu)) * 7.0;
         let forecast = PlannerForecast {
             latent: scaled.shallow_clone(),

@@ -521,6 +521,7 @@ pub fn load_planner_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::torch::test_rng;
 
     #[test]
     fn metadata_rejects_wrong_world_model() {
@@ -659,6 +660,7 @@ mod tests {
         use crate::torch::train::optimizer_glue::named_trainable_variables;
         use tch::{Device, Kind};
 
+        let _torch_rng_guard = test_rng::shared();
         let dir = std::env::temp_dir().join(format!(
             "planner-ckpt-{}-{}",
             std::process::id(),

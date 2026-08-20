@@ -1028,13 +1028,17 @@ mod tests {
     use super::*;
     use crate::torch::constants::{ACTION_COUNT, STEPS_PER_EPISODE};
     use crate::torch::env::synthetic_env;
+    use crate::torch::test_rng;
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
     use rand_chacha::ChaCha12Rng;
-    use std::sync::Mutex;
 
     #[test]
     fn trainer_rejects_non_streaming_models_without_panicking() {
+        // `Trainer::new` reseeds the global RNG. This variant is rejected
+        // before it gets that far, but the guard costs nothing and stops the
+        // test depending on where the early `bail!` happens to sit.
+        let _torch_rng_guard = test_rng::exclusive();
         for variant in [ModelVariant::Base, ModelVariant::AblationSmall] {
             let Err(error) = Trainer::new(None, variant, None, 20260811) else {
                 panic!("unsupported PPO model variant must return an error");
@@ -1042,10 +1046,6 @@ mod tests {
             assert!(error.to_string().contains("uniform-stream"));
         }
     }
-
-    // libtorch's generator is process-global. Keep tests which reseed it from
-    // perturbing one another when Rust's test harness runs them concurrently.
-    static TORCH_RNG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resume_contract_covers_runtime_and_effective_objective_constants() {
@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn interruption_resume_matches_three_uninterrupted_ppo_updates() {
-        let _torch_rng_guard = TORCH_RNG_TEST_LOCK.lock().unwrap();
+        let _torch_rng_guard = test_rng::exclusive();
         let seed = 0x5eed_u64;
         let mut uninterrupted = MiniPpo::new(seed);
         let mut uninterrupted_trace = InterruptionTrace::default();
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[test]
     fn production_ppo_frontier_is_exact_across_interruption() {
-        let _torch_rng_guard = TORCH_RNG_TEST_LOCK.lock().unwrap();
+        let _torch_rng_guard = test_rng::exclusive();
         let seed = 0xface_5eed_u64;
         let (mut uninterrupted, uninterrupted_root) = production_test_trainer(seed);
         let mut uninterrupted_trace = ProductionPpoTrace::default();

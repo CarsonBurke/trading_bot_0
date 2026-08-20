@@ -363,6 +363,7 @@ mod tests {
 
     use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
     use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
+    use crate::torch::test_rng;
 
     fn assert_close(lhs: &Tensor, rhs: &Tensor, name: &str) {
         let max_diff = (lhs - rhs).abs().max().double_value(&[]);
@@ -428,11 +429,13 @@ mod tests {
 
     #[test]
     fn base_stream_matches_shifted_full_history() {
+        let _torch_rng_guard = test_rng::exclusive();
         non_uniform_stream_matches_shifted_full_history(ModelVariant::Base);
     }
 
     #[test]
     fn ablation_small_stream_matches_shifted_full_history() {
+        let _torch_rng_guard = test_rng::exclusive();
         non_uniform_stream_matches_shifted_full_history(ModelVariant::AblationSmall);
     }
 }

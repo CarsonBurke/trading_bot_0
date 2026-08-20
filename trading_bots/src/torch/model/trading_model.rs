@@ -628,6 +628,7 @@ mod tests {
     use super::{ModelVariant, TradingModel, TradingModelConfig, UNIFORM_STREAM_PATCH_SIZE};
     use crate::torch::constants::TICKERS_COUNT;
     use crate::torch::load::load_var_store_partial;
+    use crate::torch::test_rng;
     use crate::torch::value::hl_gauss::HlGaussBins;
 
     fn temp_checkpoint_path(name: &str) -> PathBuf {
@@ -648,6 +649,7 @@ mod tests {
 
     #[test]
     fn stream_patch_embed_treats_nan_padding_as_zero() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let vs = nn::VarStore::new(Device::Cpu);
@@ -681,6 +683,7 @@ mod tests {
 
     #[test]
     fn value_head_initializes_bias_free_to_zero_return() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let vs = nn::VarStore::new(Device::Cpu);
@@ -711,6 +714,7 @@ mod tests {
 
     #[test]
     fn current_model_checkpoint_roundtrips_through_partial_loader() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let path = temp_checkpoint_path("model_roundtrip");
@@ -736,6 +740,7 @@ mod tests {
 
     #[test]
     fn biased_value_head_checkpoint_reports_dropped_bias() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let path = temp_checkpoint_path("biased_current_value_head");
@@ -787,6 +792,7 @@ mod tests {
 
     #[test]
     fn partial_current_value_head_checkpoint_remains_strict() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let path = temp_checkpoint_path("partial_current_value_head");
@@ -830,6 +836,7 @@ mod tests {
 
     #[test]
     fn legacy_scalar_value_head_checkpoint_keeps_new_unbiased_zero_head() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let path = temp_checkpoint_path("legacy_value_head");
@@ -883,6 +890,7 @@ mod tests {
 
     #[test]
     fn scalar_value_head_with_wrong_input_width_remains_strict() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let path = temp_checkpoint_path("wrong_width_scalar_value_head");
@@ -943,6 +951,7 @@ mod tests {
 
     #[test]
     fn renamed_legacy_value_head_checkpoint_keeps_new_unbiased_zero_head() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let path = temp_checkpoint_path("renamed_legacy_value_head");
@@ -983,6 +992,7 @@ mod tests {
 
     #[test]
     fn nonscalar_value_head_shape_drift_remains_strict() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260612);
 
         let path = temp_checkpoint_path("mismatched_value_head");

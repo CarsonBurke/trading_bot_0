@@ -433,6 +433,7 @@ mod tests {
     use tch::{nn, Device, Kind, Tensor};
 
     use super::{symexp_tensor, symlog, HlGaussBins, NUM_BINS};
+    use crate::torch::test_rng;
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() < tol
@@ -516,6 +517,7 @@ mod tests {
 
     #[test]
     fn weights_are_nonnegative() {
+        let _torch_rng_guard = test_rng::shared();
         let bins = HlGaussBins::default_for(tch::Device::Cpu);
         let values = Tensor::randn([64], (Kind::Float, tch::Device::Cpu)) * 50.0;
         let encoded = bins.encode(&values);
@@ -800,6 +802,7 @@ mod tests {
 
     #[test]
     fn standardized_running_stats_survive_save_load_roundtrip() {
+        let _torch_rng_guard = test_rng::shared();
         // The running stats are part of the value function's definition; they
         // must persist with the VarStore weights and restore exactly on load.
         let dir = std::env::temp_dir().join(format!(

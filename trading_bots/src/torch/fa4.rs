@@ -195,6 +195,8 @@ mod tests {
     use super::*;
     use tch::Device;
 
+    use crate::torch::test_rng;
+
     fn ready() -> bool {
         tch::Cuda::is_available() && is_available()
     }
@@ -228,6 +230,7 @@ mod tests {
 
     #[test]
     fn prefill_forward_and_backward_smoke() -> Result<()> {
+        let _torch_rng_guard = test_rng::shared();
         if !ready() {
             return Ok(());
         }
@@ -262,6 +265,7 @@ mod tests {
 
     #[test]
     fn q1_decode_matches_reference() -> Result<()> {
+        let _torch_rng_guard = test_rng::shared();
         if !ready() {
             return Ok(());
         }
@@ -278,6 +282,7 @@ mod tests {
 
     #[test]
     fn q1_decode_accepts_strided_active_cache_prefix() -> Result<()> {
+        let _torch_rng_guard = test_rng::shared();
         if !ready() {
             return Ok(());
         }

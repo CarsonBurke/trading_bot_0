@@ -150,6 +150,7 @@ mod tests {
 
     use crate::torch::constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT};
     use crate::torch::model::{ModelVariant, TradingModel, TradingModelConfig};
+    use crate::torch::test_rng;
 
     fn assert_close(lhs: &Tensor, rhs: &Tensor, name: &str) {
         let max_diff = (lhs - rhs).abs().max().double_value(&[]);
@@ -168,6 +169,7 @@ mod tests {
 
     #[test]
     fn fresh_uniform_stream_model_outputs_depend_on_price_history() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(20260425);
 
         let vs = nn::VarStore::new(Device::Cpu);
@@ -208,6 +210,7 @@ mod tests {
 
     #[test]
     fn uniform_stream_step_matches_full_forward_after_static_change() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(42);
 
         let vs = nn::VarStore::new(Device::Cpu);
@@ -259,6 +262,7 @@ mod tests {
     /// pre-built windowed layouts. Outputs must match to near-float32 precision.
     #[test]
     fn windowed_replay_matches_sequential_subchunk() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(4242);
 
         let batch = 2i64;
@@ -355,6 +359,7 @@ mod tests {
     /// advance→reset→forward ordering.
     #[test]
     fn windowed_replay_matches_sequential_subchunk_with_reset() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(777);
 
         let batch = 2i64;

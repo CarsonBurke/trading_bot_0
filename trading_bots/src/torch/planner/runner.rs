@@ -1890,6 +1890,7 @@ fn training_report_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::torch::test_rng;
 
     #[test]
     fn defaults_match_real_receding_horizon_plan() {
@@ -2014,6 +2015,7 @@ mod tests {
 
     #[test]
     fn planner_kl_lr_routing_matches_the_entire_actor_branch() {
+        let _torch_rng_guard = test_rng::shared();
         let vs = nn::VarStore::new(Device::Cpu);
         let _planner = WorldModelPlanner::new(&vs.root());
         let named_vars = named_trainable_variables(&vs);
@@ -2042,6 +2044,7 @@ mod tests {
     fn critic_only_step_cannot_change_policy_parameters_or_output() {
         use crate::torch::planner::{PLANNER_BELIEF_DIM, PLANNER_LATENT_DIM};
 
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(17);
         let vs = nn::VarStore::new(Device::Cpu);
         let planner = WorldModelPlanner::new(&vs.root());
@@ -2109,6 +2112,7 @@ mod tests {
     fn actor_kl_stop_does_not_reduce_critic_minibatch_steps() {
         use crate::torch::planner::{PLANNER_BELIEF_DIM, PLANNER_LATENT_DIM};
 
+        let _torch_rng_guard = test_rng::shared();
         let transition = |decision_index: usize| PlannerTransition {
             observation: PlannerObservation {
                 forecast_latent: Tensor::randn([2, PLANNER_LATENT_DIM], (Kind::Float, Device::Cpu)),
@@ -2494,6 +2498,7 @@ mod tests {
     fn forecast_summary_carries_belief_moments_and_ordered_return_quantiles() {
         use crate::torch::planner::{PLANNER_BELIEF_DIM, PLANNER_LATENT_DIM};
 
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(23);
         let fixture = RolloutFixture::new("summary");
         let horizon = 4i64;
@@ -2559,6 +2564,7 @@ mod tests {
 
     #[test]
     fn real_rollout_collection_reserves_room_for_the_horizon_behind_the_episode() {
+        let _torch_rng_guard = test_rng::exclusive();
         tch::manual_seed(29);
         let fixture = RolloutFixture::new("collect");
         let horizon = 3;
