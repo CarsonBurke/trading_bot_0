@@ -1,7 +1,7 @@
 use crate::data::macro_econ::{get_macro_data, MacroDataError, MacroObservation, MacroSeries};
 use chrono::{Datelike, Duration, Months, NaiveDate, Weekday};
-use serde::{Deserialize, Serialize};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock, OnceLock};

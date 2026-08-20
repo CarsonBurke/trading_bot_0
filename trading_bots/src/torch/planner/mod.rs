@@ -297,9 +297,7 @@ impl PlannerBranch {
         let forecast_tokens = self.latent_projection.forward(&latent)
             + self.latent_scale_projection.forward(&latent_log_rms)
             + self.horizon_projection.forward(&forecast.relative_horizon)
-            + self
-                .quantile_projection
-                .forward(&forecast.return_quantiles);
+            + self.quantile_projection.forward(&forecast.return_quantiles);
         let belief_token = self.belief_projection.forward(belief).unsqueeze(1);
         let mut x = Tensor::cat(&[belief_token, forecast_tokens], 1);
         for block in &self.trunk {

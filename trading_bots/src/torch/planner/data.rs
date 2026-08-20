@@ -388,7 +388,12 @@ impl PlannerCorpus {
             digest.update(&(symbol.len() as u64).to_le_bytes());
             digest.update(symbol.as_bytes());
             digest.update(&(endpoint.bar as u64).to_le_bytes());
-            digest.update(&self.corpus.ts_ms(endpoint.series, endpoint.bar).to_le_bytes());
+            digest.update(
+                &self
+                    .corpus
+                    .ts_ms(endpoint.series, endpoint.bar)
+                    .to_le_bytes(),
+            );
         }
         Ok(digest
             .finish()
@@ -525,8 +530,14 @@ mod tests {
     fn tight_test_future(corpus: &PlannerCorpus) -> usize {
         let (lo, _) = corpus.corpus().split_range(0, Split::Test);
         let width = corpus.corpus().series_len(0) - lo;
-        assert!(lo >= CONTEXT, "test split must start past the context floor");
-        assert!(width > 3, "test split of {width} bars is too narrow to trim");
+        assert!(
+            lo >= CONTEXT,
+            "test split must start past the context floor"
+        );
+        assert!(
+            width > 3,
+            "test split of {width} bars is too narrow to trim"
+        );
         width - 3
     }
 
@@ -674,7 +685,13 @@ mod tests {
             .unwrap();
         let fingerprint = |endpoints: &[PlannerEndpoint], horizon, rollout| {
             corpus
-                .evaluation_fingerprint(PlannerDataSplit::Test, endpoints, horizon, CONTEXT, rollout)
+                .evaluation_fingerprint(
+                    PlannerDataSplit::Test,
+                    endpoints,
+                    horizon,
+                    CONTEXT,
+                    rollout,
+                )
                 .unwrap()
         };
 

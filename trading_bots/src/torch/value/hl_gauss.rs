@@ -202,7 +202,10 @@ impl HlGaussBins {
         );
         tch::no_grad(|| {
             let device = self.running_mean.device();
-            let flat = targets.reshape([-1]).to_device(device).to_kind(Kind::Double);
+            let flat = targets
+                .reshape([-1])
+                .to_device(device)
+                .to_kind(Kind::Double);
             let batch_n = flat.numel() as f64;
             if batch_n == 0.0 {
                 return;
@@ -281,15 +284,10 @@ impl HlGaussBins {
             .to_kind(Kind::Float)
             .mean(Kind::Float);
         let (edge_lo, edge_hi) = match self.scheme {
-            ValueScheme::Symlog => {
-                (symexp_tensor(&p.min_support), symexp_tensor(&p.max_support))
-            }
+            ValueScheme::Symlog => (symexp_tensor(&p.min_support), symexp_tensor(&p.max_support)),
             ValueScheme::Standardized => {
                 let (mean, std) = self.running_mean_std(values.device());
-                (
-                    &p.min_support * &std + &mean,
-                    &p.max_support * &std + &mean,
-                )
+                (&p.min_support * &std + &mean, &p.max_support * &std + &mean)
             }
         };
         Tensor::stack(
@@ -750,7 +748,10 @@ mod tests {
         );
         let center = (NUM_BINS - 1) / 2;
         let spread = (&argmax - center).abs().max().int64_value(&[]);
-        assert!(spread > 3, "peak bins clustered at center (max offset {spread})");
+        assert!(
+            spread > 3,
+            "peak bins clustered at center (max offset {spread})"
+        );
         let _ = mean;
     }
 

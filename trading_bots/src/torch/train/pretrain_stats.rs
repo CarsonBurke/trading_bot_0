@@ -53,8 +53,10 @@ pub const BOOTSTRAP_SEED: u64 = 0xB10C_B007_5EED_0001;
 /// Two-sided interval the reported CI covers.
 pub const CI_MASS: f64 = 0.95;
 
-/// Schema of the persisted per-window vector.
-pub const WINDOW_SCORES_FORMAT_VERSION: u32 = 1;
+/// Schema of the persisted per-window vector. v2 replaces the mean-of-window conditional
+/// score with the numerator and denominator of every per-DOF conditional ratio, so a pooled
+/// point estimate and every bootstrap resample measure the same estimand.
+pub const WINDOW_SCORES_FORMAT_VERSION: u32 = 2;
 
 /// `z` for a two-sided 95% interval times `sqrt(2)`, i.e. the multiple of the paired
 /// standard error a difference must clear to be detectable at 80% power.
@@ -206,6 +208,91 @@ pub fn block_bootstrap(values: &[f64], blocks: &[u64], draws: usize, seed: u64) 
         samples,
     }
 }
+/// Paired block bootstrap of the pooled conditional-NLL difference.
+///
+/// Each draw resamples blocks once and applies that same multiplicity to both checkpoints,
+/// then recomputes each checkpoint's sum of per-DOF ratios from its resampled numerators and
+/// denominators. Differencing precomputed per-window ratios would target a mean-of-ratios
+/// instead and can move both the point estimate and the promotion decision when live-bar
+/// counts differ across windows.
+pub fn block_bootstrap_conditional_difference(
+    baseline: &[ConditionalNllStats],
+    candidate: &[ConditionalNllStats],
+    blocks: &[u64],
+    draws: usize,
+    seed: u64,
+) -> Dispersion {
+    assert_eq!(
+        baseline.len(),
+        candidate.len(),
+        "paired score counts differ"
+    );
+    assert_eq!(
+        candidate.len(),
+        blocks.len(),
+        "every conditional score needs a block assignment"
+    );
+    if candidate.is_empty() {
+        return Dispersion::nan();
+    }
+
+    let mut grouped: BTreeMap<u64, (ConditionalNllStats, ConditionalNllStats, usize)> =
+        BTreeMap::new();
+    for ((base, cand), block) in baseline.iter().zip(candidate).zip(blocks) {
+        let entry = grouped.entry(*block).or_insert((
+            ConditionalNllStats::default(),
+            ConditionalNllStats::default(),
+            0,
+        ));
+        entry.0.absorb(base);
+        entry.1.absorb(cand);
+        entry.2 += 1;
+    }
+    let totals: Vec<_> = grouped.into_values().collect();
+    let point = ConditionalNllStats::pooled(candidate).point_estimate()
+        - ConditionalNllStats::pooled(baseline).point_estimate();
+    if totals.len() < 2 || draws == 0 {
+        return Dispersion {
+            mean: point,
+            se: f64::NAN,
+            ci_low: f64::NAN,
+            ci_high: f64::NAN,
+            blocks: totals.len(),
+            samples: candidate.len(),
+        };
+    }
+
+    let mut rng = ChaCha12Rng::seed_from_u64(seed);
+    let mut differences = Vec::with_capacity(draws);
+    for _ in 0..draws {
+        let mut base = ConditionalNllStats::default();
+        let mut cand = ConditionalNllStats::default();
+        for _ in 0..totals.len() {
+            let (block_base, block_cand, _) = totals
+                .choose(&mut rng)
+                .expect("conditional bootstrap has at least one block");
+            base.absorb(block_base);
+            cand.absorb(block_cand);
+        }
+        differences.push(cand.point_estimate() - base.point_estimate());
+    }
+    differences.sort_by(f64::total_cmp);
+    let draw_mean = differences.iter().sum::<f64>() / differences.len() as f64;
+    let variance = differences
+        .iter()
+        .map(|value| (value - draw_mean).powi(2))
+        .sum::<f64>()
+        / (differences.len() - 1) as f64;
+    let tail = (1.0 - CI_MASS) / 2.0;
+    Dispersion {
+        mean: point,
+        se: variance.sqrt(),
+        ci_low: percentile(&differences, tail),
+        ci_high: percentile(&differences, 1.0 - tail),
+        blocks: totals.len(),
+        samples: candidate.len(),
+    }
+}
 
 /// Linear-interpolated percentile of an ascending slice.
 fn percentile(sorted: &[f64], q: f64) -> f64 {
@@ -226,6 +313,49 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 // Persisted per-window vectors
 // ---------------------------------------------------------------------------
 
+/// Per-window sufficient statistics for the encoding-adjusted conditional NLL.
+///
+/// The `r`, `s`, and `w` factors use every bar, while `u` and `v` use only live bars. Their
+/// pooled bar-level estimand is therefore a sum of five ratios, not a mean of per-window
+/// ratios. Keeping both sides of each ratio is what lets a block-bootstrap resample recompute
+/// that exact estimand after windows have been repeated or omitted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalNllStats {
+    pub numerator: [f64; BAR_DOF],
+    pub denominator: [f64; BAR_DOF],
+}
+
+impl ConditionalNllStats {
+    pub fn point_estimate_dof(&self) -> [f64; BAR_DOF] {
+        std::array::from_fn(|dof| {
+            if self.denominator[dof] > 0.0 {
+                self.numerator[dof] / self.denominator[dof]
+            } else {
+                0.0
+            }
+        })
+    }
+
+    pub fn point_estimate(&self) -> f64 {
+        self.point_estimate_dof().iter().sum()
+    }
+
+    pub fn absorb(&mut self, other: &Self) {
+        for dof in 0..BAR_DOF {
+            self.numerator[dof] += other.numerator[dof];
+            self.denominator[dof] += other.denominator[dof];
+        }
+    }
+
+    pub fn pooled(stats: &[Self]) -> Self {
+        let mut pooled = Self::default();
+        for row in stats {
+            pooled.absorb(row);
+        }
+        pooled
+    }
+}
+
 /// One pinned window's held-out score.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WindowScore {
@@ -236,9 +366,10 @@ pub struct WindowScore {
     pub ts_ms: i64,
     /// Mean nats per bar for each of the five chain factors, in `[r, s, u, v, w]` order.
     pub nll_dof: [f64; BAR_DOF],
-    /// `nll_bar` with the encoding tautology excluded: `u` and `v` are averaged only over
-    /// bars with `s != 0`, where they are not determined by the encoding.
-    pub nll_bar_conditional: f64,
+    /// Sufficient statistics for the displayed pooled conditional NLL. A window-local ratio
+    /// is deliberately not persisted: averaging those ratios would overweight windows with
+    /// few live bars and would make promotion guard a different quantity than it displays.
+    pub conditional_nll: ConditionalNllStats,
 }
 
 impl WindowScore {
@@ -625,8 +756,21 @@ impl WindowScores {
         self.windows.iter().map(WindowScore::nll_bar).collect()
     }
 
-    pub fn nll_bar_conditional(&self) -> Vec<f64> {
-        self.windows.iter().map(|w| w.nll_bar_conditional).collect()
+    /// The pooled encoding-adjusted conditional NLL displayed by evaluation and consumed by
+    /// selection. This is a ratio-of-sums within each DOF, then a sum across DOFs.
+    pub fn conditional_nll(&self) -> f64 {
+        let mut pooled = ConditionalNllStats::default();
+        for window in &self.windows {
+            pooled.absorb(&window.conditional_nll);
+        }
+        pooled.point_estimate()
+    }
+
+    pub fn conditional_nll_stats(&self) -> Vec<ConditionalNllStats> {
+        self.windows
+            .iter()
+            .map(|window| window.conditional_nll)
+            .collect()
     }
 
     pub fn nll_dof(&self, dof: usize) -> Vec<f64> {
@@ -755,7 +899,11 @@ impl fmt::Display for PairedComparison {
             "  candidate {:<28} {:.4} nats/bar",
             self.candidate_run, self.candidate_mean
         )?;
-        writeln!(f, "  paired delta (candidate - baseline) {}", self.difference)?;
+        writeln!(
+            f,
+            "  paired delta (candidate - baseline) {}",
+            self.difference
+        )?;
         writeln!(
             f,
             "  conditional delta (u,v scored only where s != 0) {}",
@@ -907,14 +1055,15 @@ pub fn paired_comparison(
         .collect();
     let difference = block_bootstrap(&deltas, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
 
-    let conditional: Vec<f64> = candidate
-        .nll_bar_conditional()
-        .iter()
-        .zip(baseline.nll_bar_conditional().iter())
-        .map(|(c, b)| c - b)
-        .collect();
-    let conditional_difference =
-        block_bootstrap(&conditional, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+    let base_conditional = baseline.conditional_nll_stats();
+    let cand_conditional = candidate.conditional_nll_stats();
+    let conditional_difference = block_bootstrap_conditional_difference(
+        &base_conditional,
+        &cand_conditional,
+        &blocks,
+        BOOTSTRAP_DRAWS,
+        BOOTSTRAP_SEED,
+    );
 
     let dof_difference = std::array::from_fn(|dof| {
         let per_dof: Vec<f64> = candidate
@@ -979,7 +1128,12 @@ mod tests {
 
     /// `values[i] = level + block_effect[block(i)] + noise`, so the true standard error of
     /// the mean is dominated by the block effect and is analytically known.
-    fn clustered(blocks: usize, per_block: usize, block_sd: f64, noise_sd: f64) -> (Vec<f64>, Vec<u64>) {
+    fn clustered(
+        blocks: usize,
+        per_block: usize,
+        block_sd: f64,
+        noise_sd: f64,
+    ) -> (Vec<f64>, Vec<u64>) {
         let mut rng = ChaCha12Rng::seed_from_u64(0xC1057E4);
         let mut values = Vec::with_capacity(blocks * per_block);
         let mut ids = Vec::with_capacity(blocks * per_block);
@@ -1027,8 +1181,8 @@ mod tests {
         );
 
         let iid_sd = {
-            let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-                / (values.len() - 1) as f64;
+            let var =
+                values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
             var.sqrt() / (values.len() as f64).sqrt()
         };
         assert!(
@@ -1065,7 +1219,12 @@ mod tests {
     /// reporting a zero-width interval.
     #[test]
     fn a_single_block_reports_no_interval() {
-        let d = block_bootstrap(&[1.0, 2.0, 3.0], &[7, 7, 7], BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        let d = block_bootstrap(
+            &[1.0, 2.0, 3.0],
+            &[7, 7, 7],
+            BOOTSTRAP_DRAWS,
+            BOOTSTRAP_SEED,
+        );
         assert_eq!(d.blocks, 1);
         assert!((d.mean - 2.0).abs() < 1e-12);
         assert!(d.se.is_nan() && d.ci_low.is_nan());
@@ -1080,6 +1239,47 @@ mod tests {
         let b = block_bootstrap(&values, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
         assert_eq!(a, b);
     }
+    /// Conditional NLL pools bar-level sufficient statistics. A mean of window ratios can say
+    /// "no change" on the same data, so both the reported point and every paired bootstrap
+    /// draw must recompute the ratio of sums.
+    #[test]
+    fn conditional_bootstrap_recomputes_ratio_of_sums_deterministically() {
+        let row = |numerator: f64, denominator: f64| {
+            let mut stats = ConditionalNllStats::default();
+            stats.numerator[0] = numerator;
+            stats.denominator[0] = denominator;
+            stats
+        };
+        let baseline = [row(1.0, 1.0), row(900.0, 100.0)];
+        let candidate = [row(2.0, 1.0), row(800.0, 100.0)];
+        let blocks = [0, 1];
+        let expected: f64 = 802.0 / 101.0 - 901.0 / 101.0;
+        let mean_of_window_ratio_deltas = ((2.0 - 1.0) + (8.0 - 9.0)) / 2.0;
+        assert_eq!(mean_of_window_ratio_deltas, 0.0);
+        assert!(expected.abs() > 0.9);
+
+        let a = block_bootstrap_conditional_difference(
+            &baseline,
+            &candidate,
+            &blocks,
+            BOOTSTRAP_DRAWS,
+            BOOTSTRAP_SEED,
+        );
+        let b = block_bootstrap_conditional_difference(
+            &baseline,
+            &candidate,
+            &blocks,
+            BOOTSTRAP_DRAWS,
+            BOOTSTRAP_SEED,
+        );
+        assert_eq!(a, b);
+        assert_eq!(a.mean, expected);
+        assert_eq!(
+            a.mean,
+            ConditionalNllStats::pooled(&candidate).point_estimate()
+                - ConditionalNllStats::pooled(&baseline).point_estimate()
+        );
+    }
 
     fn scores(run: &str, fingerprint: &str, offset: f64) -> WindowScores {
         let windows = (0..64)
@@ -1091,7 +1291,10 @@ mod tests {
                     // Eight windows per calendar month, so the blocking has something to do.
                     ts_ms: 1_700_000_000_000 + (i as i64 / 8) * 30 * 86_400_000,
                     nll_dof: [base * 0.2; BAR_DOF],
-                    nll_bar_conditional: base - 0.7,
+                    conditional_nll: ConditionalNllStats {
+                        numerator: [(base - 0.7) * 0.2; BAR_DOF],
+                        denominator: [1.0; BAR_DOF],
+                    },
                 }
             })
             .collect();
@@ -1129,6 +1332,7 @@ mod tests {
             "{}",
             paired.difference.mean
         );
+        assert!((paired.conditional_difference.mean + 0.25).abs() < 1e-9);
         // A pure shift leaves zero residual dispersion, so the interval collapses onto it.
         assert!(paired.difference.se < 1e-9);
         assert!(paired.significant() || paired.difference.se.is_nan());
@@ -1221,7 +1425,18 @@ mod tests {
             for dof in 0..BAR_DOF {
                 assert!((got.nll_dof[dof] - want.nll_dof[dof]).abs() < 1e-12);
             }
-            assert!((got.nll_bar_conditional - want.nll_bar_conditional).abs() < 1e-12);
+            for dof in 0..BAR_DOF {
+                assert!(
+                    (got.conditional_nll.numerator[dof] - want.conditional_nll.numerator[dof])
+                        .abs()
+                        < 1e-12
+                );
+                assert!(
+                    (got.conditional_nll.denominator[dof] - want.conditional_nll.denominator[dof])
+                        .abs()
+                        < 1e-12
+                );
+            }
         }
         assert_eq!(loaded.corpus_fingerprint, scored.corpus_fingerprint);
         assert_eq!(loaded.split_bounds, scored.split_bounds);

@@ -138,6 +138,25 @@ pub struct AuxiliaryConfig<'a> {
     pub device: Device,
 }
 
+/// Exact number of auxiliary steps assigned to one primary step by a periodic Bresenham cadence.
+///
+/// The widened products make the arithmetic exact for every `usize` input rather than overflowing
+/// before division. The quotient difference is at most `auxiliary_steps`, so it always fits back
+/// into `usize`.
+fn bresenham_fire_count(
+    auxiliary_steps: usize,
+    primary_step: usize,
+    primary_steps: usize,
+) -> usize {
+    if auxiliary_steps == 0 || primary_steps == 0 {
+        return 0;
+    }
+    let within = primary_step % primary_steps;
+    let scaled =
+        |position: usize| position as u128 * auxiliary_steps as u128 / primary_steps as u128;
+    (scaled(within + 1) - scaled(within)) as usize
+}
+
 impl AuxiliaryStream {
     /// Open every requested auxiliary resolution against the deployment corpus's split instants.
     ///
@@ -187,16 +206,10 @@ impl AuxiliaryStream {
             // partition geometry, and so the auxiliary pass can never collide with the primary's
             // stream for any `(seed, epoch)`.
             let seed = cfg.seed ^ ((res_secs as u64) << 32);
-            let pass = PassPlan::new(
-                &corpus,
-                Split::Train,
-                &AUXILIARY_CONTEXTS,
-                &weights,
-                seed,
-            )
-            .with_context(|| {
-                format!("failed partitioning the {res_secs}s auxiliary training split")
-            })?;
+            let pass = PassPlan::new(&corpus, Split::Train, &AUXILIARY_CONTEXTS, &weights, seed)
+                .with_context(|| {
+                    format!("failed partitioning the {res_secs}s auxiliary training split")
+                })?;
             let samplers: Vec<BarSampler> = AUXILIARY_CONTEXTS
                 .iter()
                 .map(|&context| BarSampler::new(&corpus, Split::Train, context, seed))
@@ -284,19 +297,14 @@ impl AuxiliaryStream {
         self.steps_per_epoch
     }
 
-    /// Whether an auxiliary step fires after primary step `primary_step` of a pass that runs
+    /// Number of auxiliary steps to fire after primary step `primary_step` of a pass that runs
     /// `primary_steps` steps.
     ///
-    /// Bresenham: fires exactly [`Self::steps_per_epoch`] times per primary pass and spreads them
-    /// evenly, so the auxiliary distribution is present throughout the epoch rather than in a
-    /// block at one end where it would read as a regime change to the optimizer.
-    pub fn fires_after(&self, primary_step: usize, primary_steps: usize) -> bool {
-        if self.steps_per_epoch == 0 || primary_steps == 0 {
-            return false;
-        }
-        let within = primary_step % primary_steps;
-        let scaled = |p: usize| p * self.steps_per_epoch / primary_steps;
-        scaled(within + 1) > scaled(within)
+    /// Bresenham: the counts sum to exactly [`Self::steps_per_epoch`] over one primary pass and
+    /// spread those steps evenly. A count can exceed one when an auxiliary pass has more steps
+    /// than the primary pass; reducing this to a boolean would silently truncate that pass.
+    pub fn fire_count_after(&self, primary_step: usize, primary_steps: usize) -> usize {
+        bresenham_fire_count(self.steps_per_epoch, primary_step, primary_steps)
     }
 
     /// The next auxiliary batch, or `None` once this pass is exhausted.
@@ -476,6 +484,29 @@ mod tests {
     use shared::report::read_report;
     use std::path::PathBuf;
 
+    #[test]
+    fn bresenham_fire_counts_cover_ratios_below_equal_and_above_one() {
+        let cases: &[(usize, usize, &[usize])] = &[
+            (3, 8, &[0, 0, 1, 0, 0, 1, 0, 1]),
+            (4, 4, &[1, 1, 1, 1]),
+            (10, 4, &[2, 3, 2, 3]),
+        ];
+        for &(auxiliary_steps, primary_steps, expected) in cases {
+            let actual: Vec<usize> = (0..primary_steps)
+                .map(|step| bresenham_fire_count(auxiliary_steps, step, primary_steps))
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.iter().sum::<usize>(), auxiliary_steps);
+            for step in 0..primary_steps {
+                assert_eq!(
+                    bresenham_fire_count(auxiliary_steps, step + primary_steps, primary_steps),
+                    actual[step],
+                    "the cadence must repeat exactly at the next pass boundary"
+                );
+            }
+        }
+    }
+
     /// `count` synthetic bars of `res_secs` ending just before `end_ms`, on a deterministic
     /// random walk so the fitted supports of two resolutions genuinely differ.
     fn synth(count: usize, res_secs: u32, end_ms: i64, seed: u64) -> Vec<PackedBar> {
@@ -538,8 +569,13 @@ mod tests {
                 deployment_start + 6_000 * RES as i64 * 1000,
                 index as u64 + 11,
             );
-            write_bar_file(&dir.join(format!("{symbol}.{RES}.bars")), symbol, RES, &bars)
-                .expect("deployment bars");
+            write_bar_file(
+                &dir.join(format!("{symbol}.{RES}.bars")),
+                symbol,
+                RES,
+                &bars,
+            )
+            .expect("deployment bars");
             for res in [3_600u32, 86_400] {
                 let aux = synth(3_000, res, deployment_start, index as u64 * 31 + res as u64);
                 write_bar_file(&dir.join(format!("{symbol}.{res}.bars")), symbol, res, &aux)
@@ -574,7 +610,10 @@ mod tests {
         .expect("auxiliary streams open");
         assert_eq!(streams.len(), 2, "both auxiliary resolutions must load");
         assert_eq!(
-            streams.iter().map(AuxiliaryStream::res_secs).collect::<Vec<_>>(),
+            streams
+                .iter()
+                .map(AuxiliaryStream::res_secs)
+                .collect::<Vec<_>>(),
             vec![3_600, 86_400],
             "streams must come back in the order requested"
         );
@@ -608,30 +647,37 @@ mod tests {
         // synthetic primary pass, then the epoch roll.
         let primary_steps = 64usize;
         let mut drawn_per_stream = vec![0usize; streams.len()];
+        let mut issued_steps = vec![0usize; streams.len()];
         for step in 0..primary_steps {
             for (index, stream) in streams.iter_mut().enumerate() {
-                if !stream.fires_after(step, primary_steps) {
-                    continue;
+                for _ in 0..stream.fire_count_after(step, primary_steps) {
+                    let Some((stage, sample, drawn)) = stream.draw(Device::Cpu) else {
+                        continue;
+                    };
+                    issued_steps[index] += 1;
+                    assert_eq!(
+                        sample.dof.size()[1],
+                        stream.context(stage) + 1,
+                        "a draw must carry context + 1 bars"
+                    );
+                    assert!(drawn > 0);
+                    // A real, resolution-dependent number rather than a constant: the marginal
+                    // NLL of this resolution's OWN fitted supports. Two resolutions cannot produce
+                    // the same value, so a writer that mixed up its rows cannot pass.
+                    let nll = stream.supports().marginal_nll_bar(BarScoring::Density);
+                    assert!(nll.is_finite());
+                    stream.record_step(nll);
+                    drawn_per_stream[index] += drawn;
                 }
-                let Some((stage, sample, drawn)) = stream.draw(Device::Cpu) else {
-                    continue;
-                };
-                assert_eq!(
-                    sample.dof.size()[1],
-                    stream.context(stage) + 1,
-                    "a draw must carry context + 1 bars"
-                );
-                assert!(drawn > 0);
-                // A real, resolution-dependent number rather than a constant: the marginal NLL
-                // of this resolution's OWN fitted supports. Two resolutions cannot produce the
-                // same value, so a writer that mixed up its rows cannot pass.
-                let nll = stream.supports().marginal_nll_bar(BarScoring::Density);
-                assert!(nll.is_finite());
-                stream.record_step(nll);
-                drawn_per_stream[index] += drawn;
             }
         }
         for (index, stream) in streams.iter_mut().enumerate() {
+            assert_eq!(
+                issued_steps[index],
+                stream.steps_per_epoch(),
+                "the {}s cadence did not issue its promised number of optimizer steps",
+                stream.res_secs()
+            );
             assert!(
                 drawn_per_stream[index] > 0,
                 "the {}s stream never fired across {primary_steps} primary steps",
@@ -643,9 +689,7 @@ mod tests {
         }
 
         report.write_report(&fx.dir).expect("report writes");
-        let path = fx
-            .dir
-            .join(format!("{AUXILIARY_REPORT_BASE}.report.bin"));
+        let path = fx.dir.join(format!("{AUXILIARY_REPORT_BASE}.report.bin"));
         assert!(path.exists(), "{AUXILIARY_REPORT_BASE} was never written");
         let read = read_report(&path).expect("report reads back");
         let series = match read.kind {

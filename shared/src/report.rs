@@ -40,7 +40,7 @@ pub const RL_META_REPORT_BASES: &[&str] = &[
 pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     "pretrain_nll_bar",
     "pretrain_nll_bar_diag896",
-    "pretrain_forecast_nll",
+    "pretrain_independent_marginal_nll",
     "pretrain_nll_dof",
     "pretrain_nll_vs_baselines",
     "pretrain_crps_dof",

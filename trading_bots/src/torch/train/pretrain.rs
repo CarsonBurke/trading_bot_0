@@ -38,9 +38,9 @@ use tch::{autocast, nn, Device, Kind, Reduction, Tensor};
 use crate::torch::bar_dist::{
     bar_categorical_kl, bar_crps_from_logits, bar_nll_decomposition, bar_nll_from_logits,
     bar_nll_terms, bar_pit_from_logits, bar_supports_format_version, BarScoring, BarSupports,
-    BarSupportsProvenance, BAR_CHAIN, BAR_DOF, BAR_DOF_NAMES, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS,
+    BarSupportsProvenance, BAR_DOF, BAR_DOF_NAMES, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS,
     BAR_LABEL_SIGMA_RATIO, BAR_SUPPORTS_FORMAT_VERSION, BAR_SUPPORTS_MOMENTS_VERSION, DOF_R, DOF_S,
-    DOF_U, DOF_V, DOF_W, NUM_BAR_BINS,
+    DOF_U, DOF_V, NUM_BAR_BINS,
 };
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::dataset::{
@@ -74,12 +74,11 @@ use super::pretrain_reports::{
     ROLLOUT_HORIZONS,
 };
 use super::pretrain_stats::{
-    block_bootstrap, calendar_month, window_scores_path, Dispersion, TradeSummary, WindowScore,
-    WindowScores, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, WINDOW_SCORES_FORMAT_VERSION,
+    block_bootstrap, block_bootstrap_conditional_difference, calendar_month, window_scores_path,
+    ConditionalNllStats, Dispersion, TradeSummary, WindowScore, WindowScores, BOOTSTRAP_DRAWS,
+    BOOTSTRAP_SEED, WINDOW_SCORES_FORMAT_VERSION,
 };
-use super::trade_bench::{
-    self, BenchConfig, ChunkPaths, MeanShrink, TradeBench, TradeSetup,
-};
+use super::trade_bench::{self, BenchConfig, ChunkPaths, MeanShrink, TradeBench, TradeSetup};
 
 /// Context length at the start of the ramp. Also the fixed context of the
 /// across-run diagnostic evaluation, which must never vary between runs.
@@ -204,22 +203,26 @@ const NORMUON_DOWN_PROJECTION_LR_MULT: f64 = 4.0;
 const ADAMW_LR: f64 = 0.008;
 const ADAMW_EPS: f64 = 1e-10;
 const ADAMW_WEIGHT_DECAY: f64 = 0.005;
-/// Betas for scalars and gates.
+/// Betas for attention weight scalars, the embedding shortcut, and the PoPE phase bias.
 const ADAMW_SCALAR_BETAS: (f64, f64) = (0.9, 0.99);
+/// Residual and post-branch lambdas use the reference scalar-momentum group.
+const ADAMW_RESID_POST_BETAS: (f64, f64) = (0.9, 0.95);
 /// Betas for embedding tables and the emission heads.
 const ADAMW_TABLE_BETAS: (f64, f64) = (0.5, 0.95);
-/// Extra learning-rate multiplier on the learned residual lambdas. The post lambdas
-/// stay at 1.0x, matching the reference's separate `resid_lambdas` / `post_lambdas`
-/// groups (modded-nanogpt `train_gpt.py:2035-2036`).
-const ADAMW_RESID_LAMBDA_LR_MULT: f64 = 5.0;
+/// Attention weight scalars are distinct from residual/post mixing lambdas.
+const ADAMW_ATTENTION_SCALAR_SUBSTRINGS: [&str; 2] = ["qkv_lambda", "attn_out_lambda"];
+const ADAMW_RESID_POST_SUBSTRINGS: [&str; 2] = ["resid_lambda", "post_lambda"];
+const ADAMW_OTHER_SCALAR_SUBSTRINGS: [&str; 2] = ["x0_lambda", "pope_theta_bias"];
+/// The reference raises the attention weight scalars and residual lambdas, but not post lambdas.
+const ADAMW_HIGH_LR_SCALAR_SUBSTRINGS: [&str; 3] =
+    ["qkv_lambda", "attn_out_lambda", "resid_lambda"];
+const ADAMW_HIGH_LR_SCALAR_MULT: f64 = 5.0;
 /// Weight-decay multiplier on the embedding tables and the emission heads. Without it
 /// a decay that is quadratic in the learning rate is inert: `lr*lr*wd` is 3.2e-7 per
 /// step, which moves a weight by 0.3% over ten thousand steps
 /// (`train_gpt.py:2033`, `:2038`).
 const ADAMW_TABLE_WEIGHT_DECAY_MULT: f64 = 150.0;
 
-/// Ancestral samples backing the directional-accuracy diagnostic.
-const DIRECTION_SAMPLES: i64 = 8;
 /// Realized continuation length handed to the rollout diagnostics and the candle
 /// snapshot writer. Must cover the longest reported rollout horizon, which the
 /// static assertion below enforces.
@@ -410,28 +413,24 @@ const SELECTION_NLL_TOLERANCE_SE_MULTIPLE: f64 = 2.0;
 /// makes it evidence. The planner never loads this file.
 const NLL_RULE_CHECKPOINT: &str = "pretrain_best_nll.ot";
 
-/// Monte-Carlo draws behind the marginalized forecast NLL, and the number of independent
-/// groups they are split into so the estimate carries a standard error.
+/// Monte-Carlo draws behind the independent per-DOF marginal NLLs, and the number of
+/// independent groups used to estimate their summed standard error.
 ///
-/// The estimator averages the head's predictive law over `FORECAST_MC_DRAWS` ancestral draws
-/// of the same-bar chain prefix, and `-log` of an average is convex, so it is biased UPWARD by
-/// order `1 / draws`. 64 draws puts that bias at a few hundredths of a nat against a
-/// teacher-forcing inflation measured in whole nats, and the reported group standard error
-/// says how much resolution the number actually has instead of implying it is exact. Biasing
-/// the honest number pessimistically is the safe direction.
+/// The estimator averages each factor's law over ancestral draws of its same-bar chain
+/// prefix. Because `-log` of an average is convex, each marginal score is biased upward by
+/// order `1 / draws`; the group standard error states the resolution rather than implying
+/// exact marginals.
 const FORECAST_MC_DRAWS: usize = 64;
 const FORECAST_MC_GROUPS: usize = 4;
 const _: () = assert!(
     FORECAST_MC_DRAWS % FORECAST_MC_GROUPS == 0,
     "the pooled mixture is the mean of the group mixtures, which requires equal groups"
 );
-/// Bar positions between successive rows of the forecast estimate.
+/// Bar positions between successive rows of the independent-marginal estimate.
 ///
-/// The estimator costs `FORECAST_MC_DRAWS * BAR_DOF` small projections per row, so it runs on
-/// a strided subset. The teacher-forced figure it is compared against is taken on EXACTLY the
-/// same rows, which makes the inflation a paired difference rather than two numbers measured
-/// on different data; and at 4096 windows the strided subset is still hundreds of thousands of
-/// bars, far more than the mean needs.
+/// The estimator costs `FORECAST_MC_DRAWS * BAR_DOF` small projections per row, so it runs
+/// on a strided subset. The chain-conditional terms use exactly the same rows, making the
+/// marginal-joint score gap paired rather than a comparison of two subsets.
 const FORECAST_POSITION_STRIDE: i64 = 8;
 
 /// Default optimizer steps between step-tagged crash-recovery checkpoints.
@@ -852,8 +851,7 @@ fn print_pass_plan(pass: &PassPlan, base_batch: usize, batch_ramp: &[usize; RAMP
                 pass.windows_per_stage()[stage] as u64 * stage_context(stage) as u64,
                 100.0 * shares[stage],
                 100.0 * weights[stage] / weight_sum,
-                pass.windows_per_stage()[stage]
-                    .div_ceil((base_batch * batch_ramp[stage]).max(1)),
+                pass.windows_per_stage()[stage].div_ceil((base_batch * batch_ramp[stage]).max(1)),
                 base_batch * batch_ramp[stage],
                 pass.mean_conditioning_bars(stage),
             )
@@ -1129,8 +1127,7 @@ impl Schedule {
             return f64::NAN;
         }
         let epochs = self.total_steps as f64 / self.steps_per_epoch as f64;
-        -epochs * (1.0 - self.lr_plateau_fraction)
-            / (self.lr_plateau_term(0) - LR_FLOOR_MULTIPLIER)
+        -epochs * (1.0 - self.lr_plateau_fraction) / (self.lr_plateau_term(0) - LR_FLOOR_MULTIPLIER)
     }
 
     /// `MOMENTUM_START -> MOMENTUM_PEAK` over the warmup, hold, then back down over
@@ -1253,8 +1250,7 @@ impl CapacityModel {
         } else {
             stage_context_for(last - 1, deployed)
         };
-        let room =
-            self.free_bytes as f64 - RAMP_MEMORY_RESERVE_BYTES as f64 - self.fixed_bytes;
+        let room = self.free_bytes as f64 - RAMP_MEMORY_RESERVE_BYTES as f64 - self.fixed_bytes;
         if room <= 0.0 || self.per_token_bytes <= 0.0 {
             return 0;
         }
@@ -2185,7 +2181,9 @@ pub fn pretrain_trade(args: TradeArgs) -> Result<()> {
         .as_ref()
         .map(|trained| trained.scoring.parse())
         .transpose()
-        .map_err(|reason| anyhow!("the checkpoint records a scoring rule this build cannot parse: {reason}"))?
+        .map_err(|reason| {
+            anyhow!("the checkpoint records a scoring rule this build cannot parse: {reason}")
+        })?
         .unwrap_or_default();
     let set = PinnedSet::pinned(&corpus, args.split, args.context, args.windows)?;
     let stats = evaluate(
@@ -2208,10 +2206,7 @@ pub fn pretrain_trade(args: TradeArgs) -> Result<()> {
         BenchConfig::new(
             trade_bench::DEFAULT_COST_BPS,
             trade_bench::LEVERAGE_CAP,
-            trade_bench::marginal_position(
-                world.deployment_supports(),
-                trade_bench::FREE_LEVERAGE,
-            ),
+            trade_bench::marginal_position(world.deployment_supports(), trade_bench::FREE_LEVERAGE),
         ),
     );
 
@@ -2322,8 +2317,7 @@ fn expected_net_ci_half_width_bps(blocks: usize) -> f64 {
     if blocks == 0 {
         return f64::INFINITY;
     }
-    REFERENCE_NET_CI_HALF_WIDTH_BPS
-        * (REFERENCE_NET_CI_BLOCKS as f64 / blocks as f64).sqrt()
+    REFERENCE_NET_CI_HALF_WIDTH_BPS * (REFERENCE_NET_CI_BLOCKS as f64 / blocks as f64).sqrt()
 }
 
 /// What one split holds, at one context, before any model sees it.
@@ -2370,11 +2364,10 @@ impl HeldOutPower {
     /// Rungs of the ladder, as traded-window counts. Powers of two up to the whole draw, so the
     /// pinned prefix a published number was taken on always appears as a rung.
     fn rungs(windows_drawn: usize) -> Vec<usize> {
-        let mut rungs: Vec<usize> = std::iter::successors(Some(trade_bench::TRADE_WINDOWS), |n| {
-            Some(n * 2)
-        })
-        .take_while(|n| *n < windows_drawn)
-        .collect();
+        let mut rungs: Vec<usize> =
+            std::iter::successors(Some(trade_bench::TRADE_WINDOWS), |n| Some(n * 2))
+                .take_while(|n| *n < windows_drawn)
+                .collect();
         rungs.push(windows_drawn);
         rungs.retain(|n| *n > 0);
         rungs.dedup();
@@ -2633,7 +2626,8 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
     let mut traded_indices: Vec<usize> = (0..traded_count).collect();
     if !args.restrict_symbols.is_empty() {
         let wanted: BTreeSet<&str> = args.restrict_symbols.iter().map(String::as_str).collect();
-        traded_indices.retain(|index| wanted.contains(set.sampler.symbol(all_windows[*index].symbol)));
+        traded_indices
+            .retain(|index| wanted.contains(set.sampler.symbol(all_windows[*index].symbol)));
         ensure!(
             traded_indices.len() >= 2,
             "--restrict-symbols matched only {} of the {} traded windows; a blocked interval \
@@ -2658,11 +2652,18 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
             if missing.is_empty() {
                 String::new()
             } else {
-                format!(", {} of which the traded prefix does not carry: {}", missing.len(), missing.join(","))
+                format!(
+                    ", {} of which the traded prefix does not carry: {}",
+                    missing.len(),
+                    missing.join(",")
+                )
             }
         );
     }
-    let eval_blocks: Vec<u64> = traded_indices.iter().map(|index| blocks_all[*index]).collect();
+    let eval_blocks: Vec<u64> = traded_indices
+        .iter()
+        .map(|index| blocks_all[*index])
+        .collect();
     let fit_blocks: Vec<u64> = fit_indices.iter().map(|index| blocks_all[*index]).collect();
     ensure!(
         trade_bench::blocks_disjoint(&fit_blocks, &eval_blocks),
@@ -2673,8 +2674,10 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
         .iter()
         .map(|index| all_windows[*index])
         .collect();
-    let traded_windows: Vec<WindowRef> =
-        traded_indices.iter().map(|index| all_windows[*index]).collect();
+    let traded_windows: Vec<WindowRef> = traded_indices
+        .iter()
+        .map(|index| all_windows[*index])
+        .collect();
     println!(
         "mean calibration on the pinned {:?} split at context {}: fitting on {} windows over \
          {} blocks, evaluating on the {} traded windows over {} blocks, block-DISJOINT",
@@ -2732,7 +2735,10 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
         .with_context(|| format!("failed to create {}", args.output))?;
     std::fs::write(&provenance_path, serde_json::to_vec_pretty(&provenance)?)
         .with_context(|| format!("failed to write {}", provenance_path.display()))?;
-    println!("traded and fit window slices written to {}", provenance_path.display());
+    println!(
+        "traded and fit window slices written to {}",
+        provenance_path.display()
+    );
 
     // The census is part of the pass's provenance as much as the window list is: "this interval
     // is 1.09 bps wide" is only checkable against the block count it was taken over.
@@ -2836,15 +2842,11 @@ pub fn pretrain_calibration(args: CalibrationArgs) -> Result<()> {
             &stats.trade_paths.tail,
             config,
         );
-        let shrunk = trade_bench::shrunk_bench(
-            &stats.trade_paths.windows,
-            &eval_blocks,
-            config,
-            shrink,
-        )
-        .ok_or_else(|| {
-            anyhow!("the evaluation pass produced no recalibrated fraction to score")
-        })?;
+        let shrunk =
+            trade_bench::shrunk_bench(&stats.trade_paths.windows, &eval_blocks, config, shrink)
+                .ok_or_else(|| {
+                    anyhow!("the evaluation pass produced no recalibrated fraction to score")
+                })?;
         println!(
             "\n=== {} (step {step}, lineage {}) nll {:.4} nats/bar ===",
             weights.display(),
@@ -3356,7 +3358,10 @@ fn validate_args(args: &PretrainArgs) -> Result<()> {
          error bar of exactly zero, and the fan writer refuses it at the first epoch boundary \
          rather than 40 hours in"
     );
-    ensure!(args.support_samples > 0, "--support-samples must be positive");
+    ensure!(
+        args.support_samples > 0,
+        "--support-samples must be positive"
+    );
     ensure!(
         args.min_dollar_volume >= 0.0,
         "--min-dollar-volume must be non-negative"
@@ -3416,13 +3421,7 @@ pub(super) fn load_corpus(args: &CorpusFlags) -> Result<BarCorpus> {
             keep.len(),
             args.min_dollar_volume
         );
-        BarCorpus::load_restricted(
-            dir,
-            args.resolution_secs,
-            args.min_bars,
-            bounds,
-            &keep,
-        )
+        BarCorpus::load_restricted(dir, args.resolution_secs, args.min_bars, bounds, &keep)
     } else {
         match bounds {
             Some(bounds) => {
@@ -3592,14 +3591,15 @@ pub(super) fn fit_supports_at(
         fit.samples,
         fit.seed
     );
-    let supports = corpus
-        .fit_supports(fit.samples, fit.seed)
-        .with_provenance(BarSupportsProvenance {
-            corpus_fingerprint: corpus_fingerprint.to_owned(),
-            split_bounds: corpus.split_bounds(),
-            sample_count: fit.samples,
-            fitted_utc: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        });
+    let supports =
+        corpus
+            .fit_supports(fit.samples, fit.seed)
+            .with_provenance(BarSupportsProvenance {
+                corpus_fingerprint: corpus_fingerprint.to_owned(),
+                split_bounds: corpus.split_bounds(),
+                sample_count: fit.samples,
+                fitted_utc: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            });
     // `BarCorpus::fit_supports` already persisted the provenance-free object, so rewrite it
     // with the stamp attached rather than leaving an unverifiable artifact on disk.
     supports
@@ -3806,6 +3806,11 @@ fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
     let beta_overrides: Vec<(String, (f64, f64))> = adamw_tables
         .iter()
         .map(|needle| (needle.clone(), ADAMW_TABLE_BETAS))
+        .chain(
+            ADAMW_RESID_POST_SUBSTRINGS
+                .iter()
+                .map(|needle| ((*needle).to_owned(), ADAMW_RESID_POST_BETAS)),
+        )
         .collect();
     let wd_multipliers: Vec<(String, f64)> = adamw_tables
         .iter()
@@ -3854,14 +3859,96 @@ fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
         "no MLP down-projection matched {down:?}; the {NORMUON_DOWN_PROJECTION_LR_MULT}x \
          learning-rate bump would be a no-op"
     );
-    // Only the residual lambdas take the 5x bump; post lambdas and the PoPE phase
-    // bias stay at 1.0x.
-    let matched = optimizer.set_named_lr_scale(&["resid_lambda"], ADAMW_RESID_LAMBDA_LR_MULT);
+    // Attention weight scalars and residual lambdas take the 5x bump. Post lambdas, the
+    // embedding shortcut, and the PoPE phase bias stay at 1.0x.
+    let expected = named
+        .iter()
+        .filter(|(name, _)| {
+            ADAMW_HIGH_LR_SCALAR_SUBSTRINGS
+                .iter()
+                .any(|needle| name.contains(needle))
+        })
+        .count();
+    let matched =
+        optimizer.set_named_lr_scale(&ADAMW_HIGH_LR_SCALAR_SUBSTRINGS, ADAMW_HIGH_LR_SCALAR_MULT);
     ensure!(
-        matched > 0,
-        "no parameter matched `resid_lambda`; the 5x learning-rate bump would be a no-op"
+        matched == expected,
+        "the {ADAMW_HIGH_LR_SCALAR_MULT}x scalar learning-rate group matched {matched} \
+         parameters, expected {expected}"
     );
+    for (name, _) in named
+        .iter()
+        .filter(|(name, _)| adamw_scalars.iter().any(|needle| name.contains(needle)))
+    {
+        let Some((lr_scale, betas, wd_multiplier)) = optimizer.adamw_group_settings(name) else {
+            bail!("{name} was classified as a scalar but was not routed to AdamW");
+        };
+        let expected_lr_scale = if ADAMW_HIGH_LR_SCALAR_SUBSTRINGS
+            .iter()
+            .any(|needle| name.contains(needle))
+        {
+            ADAMW_HIGH_LR_SCALAR_MULT
+        } else {
+            1.0
+        };
+        let expected_betas = if ADAMW_RESID_POST_SUBSTRINGS
+            .iter()
+            .any(|needle| name.contains(needle))
+        {
+            ADAMW_RESID_POST_BETAS
+        } else {
+            ADAMW_SCALAR_BETAS
+        };
+        ensure!(
+            (lr_scale, betas, wd_multiplier) == (expected_lr_scale, expected_betas, 0.0),
+            "{name} resolved to AdamW group (lr_scale={lr_scale}, betas={betas:?}, \
+             wd_multiplier={wd_multiplier}), expected (lr_scale={expected_lr_scale}, \
+             betas={expected_betas:?}, wd_multiplier=0)"
+        );
+    }
     Ok(optimizer)
+}
+
+fn assert_exact_substring_partition(names: &[String], groups: &[(&str, &[String])]) -> Result<()> {
+    let mut unclaimed = Vec::new();
+    let mut ambiguous = Vec::new();
+    for name in names {
+        let mut claims = Vec::new();
+        for (group, needles) in groups {
+            for needle in *needles {
+                if name.contains(needle.as_str()) {
+                    claims.push(format!("{group}:{needle}"));
+                }
+            }
+        }
+        match claims.len() {
+            0 => unclaimed.push(name.clone()),
+            1 => {}
+            _ => ambiguous.push((name.clone(), claims)),
+        }
+    }
+
+    let mut stale = Vec::new();
+    for (group, needles) in groups {
+        for needle in *needles {
+            if !names.iter().any(|name| name.contains(needle.as_str())) {
+                stale.push(format!("{group}:{needle}"));
+            }
+        }
+    }
+    ensure!(
+        unclaimed.is_empty(),
+        "these parameters match no optimizer substring: {unclaimed:?}"
+    );
+    ensure!(
+        ambiguous.is_empty(),
+        "these parameters match overlapping optimizer substrings: {ambiguous:?}"
+    );
+    ensure!(
+        stale.is_empty(),
+        "these optimizer substrings match no parameter: {stale:?}"
+    );
+    Ok(())
 }
 
 fn assert_routing_partitions(
@@ -3871,29 +3958,43 @@ fn assert_routing_partitions(
     adamw_tables: &[String],
     adamw_scalars: &[String],
 ) -> Result<()> {
-    let matches = |name: &str, needles: &[String]| needles.iter().any(|n| name.contains(n.as_str()));
-    let mut unclaimed = Vec::new();
-    let mut ambiguous = Vec::new();
-    for (name, _) in named {
-        let claims = [muon, adamw_tables, adamw_scalars]
-            .iter()
-            .filter(|needles| matches(name, needles))
-            .count();
-        match claims {
-            0 => unclaimed.push(name.clone()),
-            1 => {}
-            _ => ambiguous.push(name.clone()),
-        }
-    }
-    ensure!(
-        unclaimed.is_empty(),
-        "these trainable parameters match no optimizer routing list and would never be \
-         updated: {unclaimed:?}"
-    );
-    ensure!(
-        ambiguous.is_empty(),
-        "these trainable parameters match more than one optimizer routing list: {ambiguous:?}"
-    );
+    let matches =
+        |name: &str, needles: &[String]| needles.iter().any(|n| name.contains(n.as_str()));
+    let names: Vec<String> = named.iter().map(|(name, _)| name.clone()).collect();
+    assert_exact_substring_partition(
+        &names,
+        &[
+            ("NorMuon", muon),
+            ("AdamW table/head", adamw_tables),
+            ("AdamW scalar", adamw_scalars),
+        ],
+    )?;
+
+    let scalar_names: Vec<String> = names
+        .iter()
+        .filter(|name| matches(name, adamw_scalars))
+        .cloned()
+        .collect();
+    let attention: Vec<String> = ADAMW_ATTENTION_SCALAR_SUBSTRINGS
+        .iter()
+        .map(|needle| (*needle).to_owned())
+        .collect();
+    let resid_post: Vec<String> = ADAMW_RESID_POST_SUBSTRINGS
+        .iter()
+        .map(|needle| (*needle).to_owned())
+        .collect();
+    let other: Vec<String> = ADAMW_OTHER_SCALAR_SUBSTRINGS
+        .iter()
+        .map(|needle| (*needle).to_owned())
+        .collect();
+    assert_exact_substring_partition(
+        &scalar_names,
+        &[
+            ("attention scalar", &attention),
+            ("residual/post scalar", &resid_post),
+            ("other scalar", &other),
+        ],
+    )?;
 
     let routed = optimizer.muon_param_names().len() + optimizer.adamw_param_names().len();
     ensure!(
@@ -4377,7 +4478,8 @@ impl Trainer {
                     self.schedule.context(step),
                     // The schedule's own bump, at the stage's reference exponent — `sqrt` here
                     // printed 1.414x where the schedule applied 1.516x at the 2x step-up.
-                    self.schedule.lr_multiplier_for(0, self.schedule.batch_ramp[stage]),
+                    self.schedule
+                        .lr_multiplier_for(0, self.schedule.batch_ramp[stage]),
                 );
             }
 
@@ -4478,9 +4580,8 @@ impl Trainer {
                 .map_or(f64::NAN, |free| CapacityModel::gib(free as f64));
             metrics.bar_tokens = bar_tokens as f64;
             if let Some(capacity) = self.capacity.as_ref() {
-                metrics.projected_footprint_gib = CapacityModel::gib(
-                    capacity.step_bytes(batch, self.schedule.context(step)),
-                );
+                metrics.projected_footprint_gib =
+                    CapacityModel::gib(capacity.step_bytes(batch, self.schedule.context(step)));
                 metrics.capacity_ceiling_gib = CapacityModel::gib(
                     capacity.free_bytes as f64 - RAMP_MEMORY_RESERVE_BYTES as f64,
                 );
@@ -4537,9 +4638,8 @@ impl Trainer {
             // throughput ratio being read as a coverage one and which crossed one whole
             // `train_bars` while 28.7% of the corpus had never been a prediction target.
             let epoch_boundary = self.schedule.completes_epoch(step);
-            let periodic = self.args.validate_every > 0
-                && step > 0
-                && step % self.args.validate_every == 0;
+            let periodic =
+                self.args.validate_every > 0 && step > 0 && step % self.args.validate_every == 0;
             let final_step = step + 1 == self.schedule.total_steps;
 
             // Crash insurance, independent of promotion and of the ramp. Promotion is gated on
@@ -4548,9 +4648,7 @@ impl Trainer {
             // boundaries and nine validations, before its first one. A step-tagged checkpoint
             // every `checkpoint_every` steps bounds what an OOM or a power cut can destroy;
             // the window is pruned so disk does not grow with the run.
-            if self.args.checkpoint_every > 0
-                && step > 0
-                && step % self.args.checkpoint_every == 0
+            if self.args.checkpoint_every > 0 && step > 0 && step % self.args.checkpoint_every == 0
             {
                 self.write_step_artifacts(step)?;
             }
@@ -4664,10 +4762,9 @@ impl Trainer {
         // a count of completed passes and it is FATAL. A run that trained on part of its corpus
         // while its reports are indexed by epoch is not comparable to its siblings, and the
         // exit code is the only thing a campaign script reads.
-        let audit = self
-            .audit
-            .as_ref()
-            .map_or_else(String::new, |audit| format!(" Last pass: {}", audit.summary()));
+        let audit = self.audit.as_ref().map_or_else(String::new, |audit| {
+            format!(" Last pass: {}", audit.summary())
+        });
         println!(
             "pretrain finished: {} of the {} requested passes over the training split completed \
              and audited, {} bars per pass targeted exactly once out of {} in the split.{audit}",
@@ -4743,12 +4840,13 @@ impl Trainer {
     fn test_battery(&self) -> Result<(TestBattery, f64)> {
         let checkpoint = self.run.weights.join("pretrain_best.ot");
         let metadata = world_model_metadata_path(&checkpoint);
-        let world = BarWorldModel::load(&checkpoint, &metadata, self.device).with_context(|| {
-            format!(
-                "the promoted checkpoint {} could not be reloaded for the test battery",
-                checkpoint.display()
-            )
-        })?;
+        let world =
+            BarWorldModel::load(&checkpoint, &metadata, self.device).with_context(|| {
+                format!(
+                    "the promoted checkpoint {} could not be reloaded for the test battery",
+                    checkpoint.display()
+                )
+            })?;
         let lineage = world.lineage_sha256().to_owned();
         ensure!(
             !lineage.is_empty(),
@@ -4787,8 +4885,11 @@ impl Trainer {
             RolloutMode::Dynamics,
             self.args.scoring,
         );
-        let dyn_identity =
-            self.measure_dynamics_versus_identity(world.modules(), world.deployment_supports(), set)?;
+        let dyn_identity = self.measure_dynamics_versus_identity(
+            world.modules(),
+            world.deployment_supports(),
+            set,
+        )?;
 
         println!(
             "test split ({} windows at context {}, {} scoring): nll {} nats/bar, {:+.4} vs the \
@@ -4814,16 +4915,16 @@ impl Trainer {
             self.baselines.marginal_nll_bar_conditional(),
             self.baselines.encoding_identity_nats,
         );
-        let teacher: f64 = stats.forecast_teacher_nll_dof.iter().sum();
-        let forecast: f64 = stats.forecast_nll_dof.iter().sum();
+        let independent: f64 = stats.independent_marginal_nll_dof.iter().sum();
+        let chain: f64 = stats.chain_conditional_nll_dof.iter().sum();
         println!(
-            "test split FORECAST-ONLY nll {forecast:.4} +/- {:.4} nats/bar vs TEACHER-FORCED \
-             {teacher:.4} on identical rows: teacher-forcing is {:.4} nats/bar OPTIMISTIC. The \
-             forecast figure is the headline forecasting number — every factor conditions on \
-             strictly past bars; the teacher-forced figure is the joint bar likelihood, kept for \
-             comparability with every earlier run.",
-            stats.forecast_nll_se,
-            forecast - teacher,
+            "test split independent per-DOF marginal NLL sum {independent:.4} +/- {:.4} \
+             nats/bar vs chain-conditional joint NLL {chain:.4} on identical rows: \
+             marginal-joint score gap {:.4}. Each marginal conditions only on strictly past \
+             bars, but their sum is not a joint forecast likelihood; the chain score is. The \
+             gap is descriptive and does not isolate model dependence under misspecification.",
+            stats.independent_marginal_nll_se,
+            independent - chain,
         );
         println!(
             "test split selection context {} bars (deployed {}, longest trained {})",
@@ -4845,9 +4946,9 @@ impl Trainer {
         battery.nll_dof_conditional = stats.nll_dof_conditional;
         battery.nll_bar_se = dispersion.se;
         battery.nll_bar_ci = (dispersion.ci_low, dispersion.ci_high);
-        battery.forecast_nll_dof = stats.forecast_nll_dof;
-        battery.forecast_teacher_nll_dof = stats.forecast_teacher_nll_dof;
-        battery.forecast_nll_se = stats.forecast_nll_se;
+        battery.independent_marginal_nll_dof = stats.independent_marginal_nll_dof;
+        battery.chain_conditional_nll_dof = stats.chain_conditional_nll_dof;
+        battery.independent_marginal_nll_se = stats.independent_marginal_nll_se;
         battery.selection_context = self.selection_context;
         battery.deployed_context = self.eval.promotion.context;
         battery.reached_context = self.reached_context;
@@ -4890,12 +4991,13 @@ impl Trainer {
             return Ok(None);
         }
         let metadata = world_model_metadata_path(&checkpoint);
-        let world = BarWorldModel::load(&checkpoint, &metadata, self.device).with_context(|| {
-            format!(
-                "the NLL-selected rival {} could not be reloaded for the test comparison",
-                checkpoint.display()
-            )
-        })?;
+        let world =
+            BarWorldModel::load(&checkpoint, &metadata, self.device).with_context(|| {
+                format!(
+                    "the NLL-selected rival {} could not be reloaded for the test comparison",
+                    checkpoint.display()
+                )
+            })?;
         let stats = evaluate(
             world.modules(),
             world.deployment_supports(),
@@ -5044,7 +5146,7 @@ impl Trainer {
                 horizon,
                 self.args.scoring,
                 self.device,
-            )?)
+            ))
         } else {
             None
         };
@@ -5066,57 +5168,31 @@ impl Trainer {
                 self.device,
             )
         });
-        let TrainingGraph {
-            loss,
-            nll,
-            nll_dof,
-            dyn_loss,
-            kl_loss,
-            growth: growth_loss,
-            growth_stats,
-            identity,
-            autocorr,
-        } = graph;
-
-        let total = loss.double_value(&[]);
-        ensure!(
-            total.is_finite(),
-            "loss is not finite at step {step}: {total}"
-        );
-        loss.backward();
-
-        // Reported, never applied: orthogonalization replaces gradient clipping.
-        let grad_norm = global_grad_norm(&self.vs, self.device);
-        ensure!(
-            grad_norm.is_finite(),
-            "gradient norm is not finite at step {step}: {grad_norm}"
-        );
-        // `stream` is also the only thing that distinguishes a primary update from an
-        // auxiliary resolution's share of one, and AdamW's `adamw_every` cadence is defined
-        // over PRIMARY steps: keying it off a count of `step()` calls would silently halve
-        // AdamW's effective interval the moment `--auxiliary-resolutions` is non-empty.
-        self.optimizer.step(match stream {
-            None => StepKind::Primary,
-            Some(_) => StepKind::Auxiliary,
-        });
-        let dyn_value = dyn_loss.double_value(&[]);
-        let kl_value = kl_loss.double_value(&[]);
-        let nll_value = nll.double_value(&[]);
-        let growth_value = growth_loss.double_value(&[]);
-        let growth_stats = growth::GrowthStats::read(&growth_stats);
-        let identity = identity.double_value(&[]);
+        // Backward first so the gradient norm can join every loss and diagnostic in one
+        // device tensor. Reading that tensor is the step's sole host synchronization.
+        graph.loss.backward();
+        let grad_norm_tensor = global_grad_norm_tensor(&self.vs, self.device);
+        let packed = pack_step_metrics(&graph, &grad_norm_tensor, growth_probe.as_ref());
+        let metrics = read_packed_step_metrics(&packed);
+        ensure_finite_step_metrics(&metrics, step)?;
+        let total = metrics[STEP_METRIC_TOTAL];
+        let grad_norm = metrics[STEP_METRIC_GRAD_NORM];
+        let nll_value = metrics[STEP_METRIC_NLL];
+        let mut nll_dof = [f64::NAN; BAR_DOF];
+        nll_dof.copy_from_slice(&metrics[STEP_METRIC_NLL_DOF]);
+        let dyn_value = metrics[STEP_METRIC_DYN];
+        let kl_value = metrics[STEP_METRIC_KL];
+        let growth_value = metrics[STEP_METRIC_GROWTH];
+        let growth_stats = growth::GrowthStats {
+            mean_abs_f: metrics[STEP_METRIC_GROWTH_STATS.start],
+            clamp_bind: metrics[STEP_METRIC_GROWTH_STATS.start + 1],
+            min_log_argument: metrics[STEP_METRIC_GROWTH_STATS.start + 2],
+        };
+        let identity = metrics[STEP_METRIC_IDENTITY];
+        let autocorr = metrics[STEP_METRIC_AUTOCORR];
         // The structural bound is 0.6876 at this cap and support, so this can only fire if
-        // the support, the cap or the clip stopped agreeing with each other. It is an error
-        // and not a clamp because a silently absorbed bad argument is a NaN objective a few
-        // steps later, attributed to nothing.
-        //
-        // The comparison's polarity is deliberate and is the reason this is written as a
-        // guard on the GOOD state rather than a test for the bad one. `min_log_argument` is
-        // NaN if any bar's argument is NaN, and `NaN > FLOOR` is false, so a NaN argument
-        // FAILS this `ensure!` and stops the run. Written the other way round — `ensure!(!(x
-        // <= FLOOR))` — a NaN would pass and train silently, which is the three-state bug
-        // this repository has now hit four times in one session: a bool over floats cannot
-        // say "not measured", so the absent value must land on the failing branch.
+        // the support, the cap or the clip stopped agreeing with each other. This guard and
+        // both finite guards above run before any optimizer parameter mutation.
         ensure!(
             growth_stats.min_log_argument > growth::LOG_ARGUMENT_FLOOR,
             "the growth term's log argument fell to {:.6} at step {step}, at or below the \
@@ -5126,12 +5202,32 @@ impl Trainer {
             growth::LOG_ARGUMENT_FLOOR,
             growth_support.cap()
         );
+        let growth_probe = growth_probe.map(|_| GrowthGradientShare {
+            nll_norm: metrics[STEP_METRIC_PROBE_NLL_NORM],
+            unit_growth_norm: metrics[STEP_METRIC_PROBE_GROWTH_NORM],
+        });
+        if let Some(probe) = &growth_probe {
+            ensure!(
+                probe.unit_growth_norm > 0.0,
+                "the growth term reached no trainable parameter: its gradient norm is zero, so \
+                 it is decoration rather than an objective. The likely cause is a detach on \
+                 the path from the emission head's r factor back to the trunk."
+            );
+        }
+        // `stream` is also the only thing that distinguishes a primary update from an
+        // auxiliary resolution's share of one, and AdamW's `adamw_every` cadence is defined
+        // over PRIMARY steps: keying it off a count of `step()` calls would silently halve
+        // AdamW's effective interval the moment `--auxiliary-resolutions` is non-empty.
+        self.optimizer.step(match stream {
+            None => StepKind::Primary,
+            Some(_) => StepKind::Auxiliary,
+        });
         if let Some(probe) = growth_probe {
             probe.report(step, lambda_growth);
         }
         Ok(StepLoss {
             nll_bar: nll_value,
-            nll_dof: dof_array(&nll_dof),
+            nll_dof,
             dyn_loss: dyn_value,
             kl_loss: kl_value,
             growth_loss: growth_value,
@@ -5149,7 +5245,7 @@ impl Trainer {
                 lambda_kl * kl_value,
                 lambda_growth * growth_value,
             ),
-            belief_autocorr: autocorr.double_value(&[]),
+            belief_autocorr: autocorr,
             // A zero-init dynamics MLP is exactly the identity, so the ratio starts at 1.0
             // by construction and any departure is the MLP doing something. A degenerate
             // baseline — beliefs already frozen — would divide by zero, so it reports NaN
@@ -5170,7 +5266,8 @@ impl Trainer {
     /// interval from step 0, at a context every ramp stage has trained at, and everything
     /// that does not require the deployed context is populated from it: the per-DOF
     /// breakdown, the conditional variant, the calibration panels, the gain-vs-baselines
-    /// curve and the marginalized forecast number. The promotion DECISION alone waits for
+    /// curve and the independent per-DOF marginal diagnostic. The promotion DECISION alone
+    /// waits for
     /// the deployed context, because a checkpoint has to be selected at the context it will
     /// be deployed at. When it waits it says so, and the metrics that genuinely were not
     /// measured are DECLARED unmeasured, so they leave a gap in their series instead of a
@@ -5260,12 +5357,14 @@ impl Trainer {
                 self.reached_context,
                 self.eval.diagnostic.context,
             );
-            unmeasured.extend(DEPLOYED_CONTEXT_METRICS.iter().map(|metric| {
-                UnmeasuredMetric {
-                    metric: (*metric).to_owned(),
-                    reason: reason.clone(),
-                }
-            }));
+            unmeasured.extend(
+                DEPLOYED_CONTEXT_METRICS
+                    .iter()
+                    .map(|metric| UnmeasuredMetric {
+                        metric: (*metric).to_owned(),
+                        reason: reason.clone(),
+                    }),
+            );
             None
         };
 
@@ -5356,7 +5455,7 @@ impl Trainer {
             // terminal battery are measured at. It is not the comparison.
             // ---------------------------------------------------------------------------
             let scores = self.window_scores(set, &stats, step);
-            let selection_nll = diagnostic.nll_bar_conditional;
+            let selection_nll = diagnostic_scores.conditional_nll();
             let candidate_edge = self.selection_edge_windows(&diagnostic.trade_paths);
             let edge_level = self.bootstrap_traded(&self.eval.diagnostic, &candidate_edge);
             let edge_gain = self.selection_edge_gain(&self.eval.diagnostic, &candidate_edge);
@@ -5469,8 +5568,7 @@ impl Trainer {
                          the within-cell read-to-read sd is ~0.02 bps, so an argmax over a \
                          run's reads promotes noise; a candidate inside the band is not \
                          better, it is unresolved.",
-                        gain.mean,
-                        gain.se,
+                        gain.mean, gain.se,
                     );
                 }
                 SelectionOutcome::RefusedNllGuard => {
@@ -5544,8 +5642,7 @@ impl Trainer {
                     edge_se_bps: ledger.edge_se_bps,
                     nll_conditional: selection_nll,
                 };
-                promoted_checkpoint =
-                    Some(self.promote(nll, target, eval_batch, &scores, record)?);
+                promoted_checkpoint = Some(self.promote(nll, target, eval_batch, &scores, record)?);
                 self.best_val_nll_bar = nll;
                 self.best_selection_edge_bps = ledger.edge_bps;
                 self.best_selection_edge_windows = Some(candidate_edge);
@@ -5563,7 +5660,7 @@ impl Trainer {
             // is what the previous rule would have shipped, and it is kept so the inversion
             // is evidence on the test split rather than an assertion. See
             // [`Self::promote_nll_rule`].
-            self.promote_nll_rule(step, &stats, &scores, target, ledger.edge_bps)?;
+            self.promote_nll_rule(step, &scores, target, ledger.edge_bps)?;
             promotion_stats = Some(stats);
         }
 
@@ -5612,10 +5709,10 @@ impl Trainer {
             .map_or(f64::NAN, |stats| stats.nll_bar_conditional);
         metrics.val_nll_dof_class = diagnostic.nll_dof_class;
         metrics.val_nll_dof_shape = diagnostic.nll_dof_shape;
-        // The honest forecasting number beside the teacher-forced one, on identical rows.
-        metrics.val_forecast_nll_dof = diagnostic.forecast_nll_dof;
-        metrics.val_forecast_teacher_nll_dof = diagnostic.forecast_teacher_nll_dof;
-        metrics.val_forecast_nll_se = diagnostic.forecast_nll_se;
+        // Independent per-DOF marginals and chain-conditional terms on identical rows.
+        metrics.val_independent_marginal_nll_dof = diagnostic.independent_marginal_nll_dof;
+        metrics.val_chain_conditional_nll_dof = diagnostic.chain_conditional_nll_dof;
+        metrics.val_independent_marginal_nll_se = diagnostic.independent_marginal_nll_se;
         // The bench rides the DIAGNOSTIC pass: fixed context, pinned windows, measured from
         // step 0, so the growth curve is comparable across the whole run and across runs.
         metrics.trade = trade;
@@ -5700,9 +5797,7 @@ impl Trainer {
                  panel can show that: `pretrain_pass_multiplicity` and `pretrain_stage_coverage` \
                  are per-pass censuses and read identically on pass three and pass one. The \
                  run-scoped series are `cover_effective_epochs` and `cover_run_bar_exposure`.",
-                metrics.projected_effective_epochs,
-                self.schedule.total_steps,
-                self.args.epochs,
+                metrics.projected_effective_epochs, self.schedule.total_steps, self.args.epochs,
             );
         }
 
@@ -5755,8 +5850,8 @@ impl Trainer {
         snapshot_secs: f64,
         checkpoint_secs: f64,
     ) -> EpochBoundary {
-        let forecast: f64 = diagnostic.forecast_nll_dof.iter().sum();
-        let teacher: f64 = diagnostic.forecast_teacher_nll_dof.iter().sum();
+        let independent: f64 = diagnostic.independent_marginal_nll_dof.iter().sum();
+        let chain: f64 = diagnostic.chain_conditional_nll_dof.iter().sum();
         let full_pass = self.full_pass_bar_tokens();
         EpochBoundary {
             epoch: self.epoch,
@@ -5771,8 +5866,8 @@ impl Trainer {
             bench_secs,
             snapshot_secs,
             val_nll_bar: diagnostic.nll_bar,
-            forecast_nll_bar: forecast,
-            teacher_forcing_inflation: forecast - teacher,
+            independent_marginal_nll_bar: independent,
+            marginal_joint_score_gap: independent - chain,
             dyn_vs_identity: if self.epoch_dyn_identity_steps > 0 {
                 self.epoch_dyn_identity_sum / self.epoch_dyn_identity_steps as f64
             } else {
@@ -5859,11 +5954,11 @@ impl Trainer {
     /// promotion branch, which made it invisible for the two thirds of a run that cannot
     /// promote.
     ///
-    /// The second line is the one that matters for trust: `nll_bar` teacher-forces each chain
-    /// factor on the realized value of the SAME bar's earlier factors, so only the first chain
-    /// factor is a forecast and the rest is within-bar accounting. The forecast figure scores
-    /// every factor against the head's own marginalized law instead, and the difference is how
-    /// much of the headline was accounting.
+    /// The second line distinguishes two different objects measured on identical rows. Each
+    /// independently marginalized per-DOF score conditions only on strictly past bars, but
+    /// their sum is not a joint likelihood. The chain-conditional terms sum to the proper
+    /// joint bar likelihood; their difference is a descriptive held-out score gap, not an
+    /// estimate of dependence under a potentially misspecified model.
     fn print_diagnostic(&self, step: usize, stats: &EvalStats) {
         println!(
             "step {step}: DIAG at the fixed {}-bar context — nll {:.4} nats/bar ({:+.4} vs the \
@@ -5880,33 +5975,31 @@ impl Trainer {
             stats.effective_rank,
         );
         println!("step {step}: DIAG {}", self.per_dof_line(stats));
-        let teacher: f64 = stats.forecast_teacher_nll_dof.iter().sum();
-        let forecast: f64 = stats.forecast_nll_dof.iter().sum();
+        let chain: f64 = stats.chain_conditional_nll_dof.iter().sum();
+        let independent: f64 = stats.independent_marginal_nll_dof.iter().sum();
         let parts: Vec<String> = BAR_DOF_NAMES
             .iter()
             .enumerate()
             .map(|(dof, name)| {
                 format!(
                     "{name} {:.4} vs {:.4} ({:+.4})",
-                    stats.forecast_nll_dof[dof],
-                    stats.forecast_teacher_nll_dof[dof],
-                    stats.forecast_nll_dof[dof] - stats.forecast_teacher_nll_dof[dof],
+                    stats.independent_marginal_nll_dof[dof],
+                    stats.chain_conditional_nll_dof[dof],
+                    stats.independent_marginal_nll_dof[dof] - stats.chain_conditional_nll_dof[dof],
                 )
             })
             .collect();
         println!(
-            "step {step}: FORECAST-ONLY nll {forecast:.4} +/- {:.4} (MC, {} draws in {} groups) \
-             vs TEACHER-FORCED {teacher:.4} on the identical rows: teacher-forcing is {:.4} \
-             nats/bar OPTIMISTIC. The forecast number conditions every one of the five factors \
-             on strictly PAST bars only and is the honest forecasting figure; the teacher-forced \
-             number is the joint likelihood of the bar, and every per-factor term after `{}` in \
-             the chain is within-bar accounting given realized same-bar values. Per DOF \
-             (forecast vs teacher-forced): {}",
-            stats.forecast_nll_se,
+            "step {step}: independent per-DOF marginal NLL sum {independent:.4} +/- {:.4} \
+             (MC, {} draws in {} groups) vs chain-conditional joint NLL {chain:.4} on the \
+             identical rows: marginal-joint score gap {:.4}. Each per-DOF marginal \
+             conditions only on strictly past bars; summing them is not a joint forecast \
+             likelihood, and the gap does not isolate model dependence. Per DOF \
+             (independent marginal vs chain-conditional): {}",
+            stats.independent_marginal_nll_se,
             FORECAST_MC_DRAWS,
             FORECAST_MC_GROUPS,
-            forecast - teacher,
-            BAR_DOF_NAMES[BAR_CHAIN[0]],
+            independent - chain,
             parts.join(" | "),
         );
     }
@@ -6023,10 +6116,10 @@ impl Trainer {
         trade: &TradeBench,
     ) -> Result<PathBuf> {
         let context = self.reached_context;
-        let path = self.run.weights.join(format!(
-            "pretrain_epoch_{}_ctx{context}.ot",
-            self.epoch
-        ));
+        let path = self
+            .run
+            .weights
+            .join(format!("pretrain_epoch_{}_ctx{context}.ot", self.epoch));
         self.write_checkpoint(&path, step, 0, None)?;
         let sidecar = window_scores_path(&path);
         let mut scores = scores.clone();
@@ -6052,11 +6145,10 @@ impl Trainer {
             } else {
                 ""
             },
-            sidecar
-                .file_name()
-                .map_or_else(|| sidecar.display().to_string(), |n| n
-                    .to_string_lossy()
-                    .into_owned()),
+            sidecar.file_name().map_or_else(
+                || sidecar.display().to_string(),
+                |n| n.to_string_lossy().into_owned()
+            ),
         );
         Ok(path)
     }
@@ -6131,10 +6223,7 @@ impl Trainer {
     /// easier prediction problem, so one number spanning both would let a ramp step-up look
     /// like learning. Every entry is reported in the final banner.
     fn record_context_best(&mut self, context: i64, selection: f64) {
-        let slot = self
-            .best_by_context
-            .entry(context)
-            .or_insert(f64::INFINITY);
+        let slot = self.best_by_context.entry(context).or_insert(f64::INFINITY);
         if selection < *slot {
             *slot = selection;
         }
@@ -6158,20 +6247,19 @@ impl Trainer {
     fn promote_nll_rule(
         &mut self,
         step: usize,
-        stats: &EvalStats,
         scores: &WindowScores,
         target: PromotionTarget,
         edge_bps: f64,
     ) -> Result<()> {
-        let selection = stats.nll_bar_conditional;
+        let selection = scores.conditional_nll();
         if !selection.is_finite() {
             return Ok(());
         }
         let set = self.promotion_set(target);
         let context = set.context;
         let guard = self.nll_rule_regression(set, scores);
-        let regressed = guard
-            .is_some_and(|delta| delta.mean > SELECTION_GUARD_SE_MULTIPLE * delta.se.max(0.0));
+        let regressed =
+            guard.is_some_and(|delta| delta.mean > SELECTION_GUARD_SE_MULTIPLE * delta.se.max(0.0));
         let improved = selection < self.best_val_nll_bar_conditional;
         if !improved || regressed {
             return Ok(());
@@ -6233,9 +6321,8 @@ impl Trainer {
     /// [`PLATEAU_ANCHOR_CHECKPOINTS`].
     fn prune_step_checkpoints(&self) -> Result<()> {
         let mut tagged: Vec<(usize, PathBuf)> = Vec::new();
-        let entries = std::fs::read_dir(&self.run.weights).with_context(|| {
-            format!("failed listing {}", self.run.weights.display())
-        })?;
+        let entries = std::fs::read_dir(&self.run.weights)
+            .with_context(|| format!("failed listing {}", self.run.weights.display()))?;
         for entry in entries {
             let path = entry
                 .with_context(|| format!("failed reading {}", self.run.weights.display()))?
@@ -6316,9 +6403,7 @@ impl Trainer {
             selection_weights: SELECTION_WEIGHTS,
             selection_guard_dof: BAR_DOF_NAMES[SELECTION_GUARD_DOF].to_owned(),
             selection_guard_se_multiple: SELECTION_GUARD_SE_MULTIPLE,
-            universe_fingerprint: crate::data::ingest::universe_fingerprint()
-                .ok()
-                .flatten(),
+            universe_fingerprint: crate::data::ingest::universe_fingerprint().ok().flatten(),
             universe_train_end_ms: crate::data::ingest::universe_train_end()
                 .ok()
                 .flatten()
@@ -6435,25 +6520,50 @@ impl Trainer {
 
     /// Paired regression of the conditional aggregate against the same incumbent. Positive
     /// means the candidate's density is worse.
+    ///
+    /// Unlike the scalar criteria above, this estimand is a sum of per-DOF ratios. Every
+    /// resample therefore repeats raw numerators and denominators and recomputes both pooled
+    /// checkpoint levels before differencing them.
     fn conditional_regression(
         &self,
         set: &PinnedSet,
         candidate: &WindowScores,
     ) -> Option<Dispersion> {
-        self.paired_difference(set, self.best_scores.as_ref(), candidate, |window| {
-            window.nll_bar_conditional
-        })
+        let incumbent = self.best_scores.as_ref()?;
+        if incumbent.context != candidate.context
+            || incumbent.split != candidate.split
+            || incumbent.windows.len() != candidate.windows.len()
+        {
+            return None;
+        }
+        assert_eq!(
+            incumbent.conditional_nll(),
+            self.best_selection_nll,
+            "the promotion incumbent level must be the same pooled conditional NLL its \
+             sufficient statistics reproduce"
+        );
+        let baseline_stats = incumbent.conditional_nll_stats();
+        let candidate_stats = candidate.conditional_nll_stats();
+        let difference = block_bootstrap_conditional_difference(
+            &baseline_stats,
+            &candidate_stats,
+            &self.blocks(set),
+            BOOTSTRAP_DRAWS,
+            BOOTSTRAP_SEED,
+        );
+        assert_eq!(
+            difference.mean,
+            candidate.conditional_nll() - incumbent.conditional_nll(),
+            "conditional-NLL bootstrap point must equal the displayed pooled-level delta"
+        );
+        Some(difference)
     }
 
     /// The rival NLL rule's own guard, pairing against the rival's own incumbent rather than
     /// against the economically promoted artifact. Without this the two rules would not be
     /// running the disciplines they claim, and the terminal comparison would be between the
     /// new rule and a strawman.
-    fn nll_rule_regression(
-        &self,
-        set: &PinnedSet,
-        candidate: &WindowScores,
-    ) -> Option<Dispersion> {
+    fn nll_rule_regression(&self, set: &PinnedSet, candidate: &WindowScores) -> Option<Dispersion> {
         self.paired_difference(set, self.nll_rule_scores.as_ref(), candidate, |window| {
             window.nll_dof[SELECTION_GUARD_DOF]
         })
@@ -6476,8 +6586,12 @@ impl Trainer {
             trade_bench::marginal_position(&self.supports_dev, trade_bench::FREE_LEVERAGE);
         let recapped = trade_bench::recap(&paths.windows, SELECTION_CAP, free_marginal);
         let cost = trade_bench::DEFAULT_COST_BPS;
-        let model =
-            trade_bench::window_growth_at(&recapped, trade_bench::POLICY_MODEL, SELECTION_CAP, cost);
+        let model = trade_bench::window_growth_at(
+            &recapped,
+            trade_bench::POLICY_MODEL,
+            SELECTION_CAP,
+            cost,
+        );
         let null = trade_bench::window_growth_at(
             &recapped,
             trade_bench::POLICY_MARGINAL,
@@ -6724,10 +6838,11 @@ impl Trainer {
 
     /// Run each auxiliary resolution's share of step `step`.
     ///
-    /// Fires on the Bresenham cadence so a full auxiliary pass completes in exactly the same
-    /// number of primary steps one primary pass takes, spread evenly. Every draw returning
-    /// `None` while the cadence says fire is a real error, not a quiet skip: it means the
-    /// auxiliary partition and the firing rule disagree and the pass would come up short.
+    /// Uses a Bresenham cadence so a full auxiliary pass completes in exactly the same number
+    /// of primary steps one primary pass takes, spread evenly. More than one auxiliary step may
+    /// follow a primary step when the auxiliary pass is longer. Every draw returning `None` while
+    /// the cadence says fire is a real error, not a quiet skip: it means the auxiliary partition
+    /// and the firing rule disagree and the pass would come up short.
     fn auxiliary_steps(&mut self, step: usize) -> Result<()> {
         if self.aux.is_empty() {
             return Ok(());
@@ -6735,18 +6850,18 @@ impl Trainer {
         let primary_steps = self.schedule.steps_per_epoch;
         let device = self.device;
         for index in 0..self.aux.len() {
-            if !self.aux[index].fires_after(step, primary_steps) {
-                continue;
+            let fire_count = self.aux[index].fire_count_after(step, primary_steps);
+            for _ in 0..fire_count {
+                let Some((stage, sample, drawn)) = self.aux[index].draw(device) else {
+                    // Only reachable under `--steps`, which can end a pass mid-partition.
+                    continue;
+                };
+                let loss = self.optimizer_step(&sample, step, Some(index))?;
+                let context = self.aux[index].context(stage);
+                self.aux[index].record_step(loss.nll_bar);
+                self.aux_steps += 1;
+                self.aux_bars_seen += drawn as u64 * context as u64;
             }
-            let Some((stage, sample, drawn)) = self.aux[index].draw(device) else {
-                // Only reachable under `--steps`, which can end a pass mid-partition.
-                continue;
-            };
-            let loss = self.optimizer_step(&sample, step, Some(index))?;
-            let context = self.aux[index].context(stage);
-            self.aux[index].record_step(loss.nll_bar);
-            self.aux_steps += 1;
-            self.aux_bars_seen += drawn as u64 * context as u64;
         }
         Ok(())
     }
@@ -6775,10 +6890,10 @@ impl Trainer {
                 bar_index: window.bar_index,
                 ts_ms: set.sampler.anchor_ts_ms(window),
                 nll_dof: stats.window_nll_dof[index],
-                nll_bar_conditional: stats.window_nll_conditional[index],
+                conditional_nll: stats.window_conditional_nll_stats[index],
             })
             .collect();
-        WindowScores {
+        let scores = WindowScores {
             format_version: WINDOW_SCORES_FORMAT_VERSION,
             run: self
                 .run
@@ -6804,7 +6919,14 @@ impl Trainer {
             // disagree on it — see `WindowScores::realized_batch`.
             realized_batch: Some(self.args.batch_size),
             realized_steps: Some(self.schedule.total_steps),
-        }
+        };
+        assert_eq!(
+            scores.conditional_nll(),
+            stats.nll_bar_conditional,
+            "persisted conditional-NLL sufficient statistics must reproduce the displayed \
+             pooled point estimate exactly"
+        );
+        scores
     }
 
     /// Save a candidate, load it back through the real world-model loader, confirm
@@ -6947,7 +7069,8 @@ impl Trainer {
     /// biases the ramp toward holding — the safe direction, and the only one that does not
     /// hand the next OOM to whichever process allocates after us.
     fn probe_activation_footprint(&mut self, step: usize) {
-        let (Some(baseline), Some(used)) = (self.vram_baseline_bytes, device_used_bytes(self.device))
+        let (Some(baseline), Some(used)) =
+            (self.vram_baseline_bytes, device_used_bytes(self.device))
         else {
             return;
         };
@@ -7006,9 +7129,8 @@ impl Trainer {
         let base = self.schedule.base_batch as f64;
         let current_tokens = base * held as f64 * stage_context(previous) as f64;
         let tokens_of = |multiplier: usize| base * multiplier as f64 * stage_context(stage) as f64;
-        let increment = |multiplier: usize| {
-            per_token * (tokens_of(multiplier) - current_tokens).max(0.0)
-        };
+        let increment =
+            |multiplier: usize| per_token * (tokens_of(multiplier) - current_tokens).max(0.0);
         let required = |multiplier: usize| {
             increment(multiplier) * (1.0 + RAMP_MEMORY_MARGIN) + RAMP_MEMORY_RESERVE_BYTES as f64
         };
@@ -7149,23 +7271,23 @@ pub(super) struct EvalStats {
     /// what makes an ablation detectable at 0.04-0.09 nats instead of 0.41.
     pub(super) window_nll: Vec<f64>,
     pub(super) window_nll_conditional: Vec<f64>,
+    /// Per-window numerators and denominators of the displayed pooled conditional NLL.
+    /// Promotion resamples these and recomputes the ratios; it never averages the scalar
+    /// window diagnostics above.
+    window_conditional_nll_stats: Vec<ConditionalNllStats>,
     window_nll_dof: Vec<[f64; BAR_DOF]>,
     crps_dof: [f64; BAR_DOF],
     pit: PitHistogram,
     dir_acc: f64,
     effective_rank: f64,
-    /// Per-DOF MARGINALIZED forecast NLL: every factor scored conditioning ONLY on strictly
-    /// past bars, with the same-bar chain prefix marginalized over the head's own predictive
-    /// law instead of teacher-forced on its realized value. See [`chunk_forecast`]. NaN
-    /// unless `full`.
-    forecast_nll_dof: [f64; BAR_DOF],
-    /// Teacher-forced per-DOF NLL over EXACTLY the rows [`Self::forecast_nll_dof`] used, so
-    /// the teacher-forcing inflation is a paired difference on identical data rather than
-    /// two numbers measured on different row sets. NaN unless `full`.
-    forecast_teacher_nll_dof: [f64; BAR_DOF],
-    /// Monte-Carlo standard error of `forecast_nll_dof.iter().sum()`, from
-    /// [`FORECAST_MC_GROUPS`] independent draw groups. NaN unless `full`.
-    forecast_nll_se: f64,
+    /// NLL of each independently marginalized per-DOF law. These are valid marginal
+    /// forecasts from strictly past bars, but their sum is not a joint forecast likelihood.
+    independent_marginal_nll_dof: [f64; BAR_DOF],
+    /// Chain-conditional terms on exactly the same rows. Their sum is the proper joint bar
+    /// likelihood; the independent-marginal sum minus it is a descriptive held-out score gap.
+    chain_conditional_nll_dof: [f64; BAR_DOF],
+    /// Monte-Carlo standard error of `independent_marginal_nll_dof.iter().sum()`.
+    independent_marginal_nll_se: f64,
     /// Per-window Kelly positions for the trading bench, over the first
     /// [`trade_bench::TRADE_WINDOWS`] windows of the set. Empty unless `full`.
     pub(super) trade_paths: ChunkPaths,
@@ -7180,7 +7302,10 @@ pub(super) fn pinned_blocks(set: &PinnedSet) -> Vec<u64> {
     set.windows
         .iter()
         .map(|window| {
-            let key = (window.symbol, calendar_month(set.sampler.anchor_ts_ms(window)));
+            let key = (
+                window.symbol,
+                calendar_month(set.sampler.anchor_ts_ms(window)),
+            );
             *ids.entry(key).or_insert_with(|| {
                 next += 1;
                 next - 1
@@ -7199,7 +7324,10 @@ pub(super) fn pinned_blocks(set: &PinnedSet) -> Vec<u64> {
 fn pinned_fingerprint(set: &PinnedSet) -> u64 {
     let mut acc = mix64(set.context as u64, set.windows.len() as u64);
     for window in &set.windows {
-        acc = mix64(acc, (u64::from(window.symbol) << 32) | u64::from(window.bar_index));
+        acc = mix64(
+            acc,
+            (u64::from(window.symbol) << 32) | u64::from(window.bar_index),
+        );
     }
     acc
 }
@@ -7285,60 +7413,59 @@ struct ChunkExtras {
     rank: Option<f64>,
     class: [f64; BAR_DOF],
     shape: [f64; BAR_DOF],
-    forecast: ChunkForecast,
+    independent_marginals: IndependentMarginalDiagnostic,
     /// Traded windows contributed by this chunk, up to the pass's budget.
     trade: ChunkPaths,
 }
 
-/// The marginalized-forecast estimate of one chunk, on its strided row subset.
-struct ChunkForecast {
+/// Independent per-DOF marginal diagnostic for one chunk, on its strided row subset.
+struct IndependentMarginalDiagnostic {
     /// Rows the estimate covers, i.e. the weight of these means in the pooled figure.
     rows: f64,
-    /// Per-DOF forecast NLL, marginalized over the same-bar prefix.
-    forecast_dof: [f64; BAR_DOF],
-    /// Per-DOF teacher-forced NLL on exactly those rows.
-    teacher_dof: [f64; BAR_DOF],
-    /// Per-group forecast totals, for the Monte-Carlo standard error.
+    /// Each per-DOF law with the same-bar prefix integrated out independently.
+    marginal_dof: [f64; BAR_DOF],
+    /// Chain-conditional per-DOF terms on exactly those rows.
+    chain_dof: [f64; BAR_DOF],
+    /// Per-group independent-marginal totals, for the Monte-Carlo standard error.
     group_totals: [f64; FORECAST_MC_GROUPS],
 }
 
-/// The HONEST forecasting number beside the teacher-forced one, on the same rows.
+/// Independently marginalized per-DOF scores beside the chain-conditional joint score.
 ///
-/// `nll_bar` factorizes the bar as `p(r|h) p(s|h,r) p(u|h,r,s) p(v|..) p(w|..)` and evaluates
-/// every factor at the realized prefix. That sum is the proper JOINT one-step-ahead
-/// log-likelihood of the bar and stays the comparability anchor — but only its first chain
-/// factor, `r`, is a forecast. `s` is scored already knowing the realized return, and `u`,
-/// `v`, `w` are scored knowing everything ahead of them: those four terms are within-bar
-/// accounting, not prediction.
+/// `nll_bar` factorizes the bar as `p(r|h) p(s|h,r) p(u|h,r,s) p(v|..) p(w|..)`. Evaluating
+/// those terms at the realized prefixes and summing them is the proper joint one-step-ahead
+/// log-likelihood. The individual later-factor terms are conditional scores, not marginal
+/// forecasts, but their sum is a forecast score for the complete bar.
 ///
-/// Here each factor is scored against the marginalized predictive law
-/// [`BarEmissionHead::forecast_log_probs`] — the head's own distribution over the same-bar
-/// prefix, integrated out — so every one of the five terms conditions only on strictly past
-/// bars. The sum is the code length of a forecaster that must emit the bar without being
-/// told any part of it, and by subadditivity it is >= the joint, with equality exactly when
-/// the chain factors are conditionally independent given `h`. The gap IS the teacher-forcing
-/// inflation.
+/// Here each factor is instead scored against its own marginalized law from
+/// [`BarEmissionHead::forecast_log_probs`]. Every per-DOF value is a valid marginal forecast
+/// score from strictly past bars. Their sum is not a joint code length. Its excess over the
+/// chain-conditional joint NLL is a held-out score gap that mixes model dependence and
+/// marginal/joint calibration error under misspecification.
 ///
-/// Both numbers are taken on every [`FORECAST_POSITION_STRIDE`]-th bar position. The stride
-/// is what makes the estimator affordable at [`FORECAST_MC_DRAWS`] draws, and taking the
-/// teacher-forced figure on the identical rows makes the difference a paired measurement
-/// rather than a comparison of two subsets.
-fn chunk_forecast(
+/// Both arrays are taken on every [`FORECAST_POSITION_STRIDE`]-th bar position. The stride
+/// makes the Monte-Carlo estimate affordable, and the chain-conditional terms use identical
+/// rows so the gap is paired.
+fn chunk_independent_marginals(
     modules: &BarModules,
     supports: &BarSupports,
     beliefs: &Tensor,
+    conditioning: &Tensor,
     target: &Tensor,
     scoring: BarScoring,
     seed: u64,
-) -> ChunkForecast {
+) -> IndependentMarginalDiagnostic {
     let positions = beliefs.size()[1];
     let stride = FORECAST_POSITION_STRIDE.min(positions.max(1));
     let beliefs = beliefs.slice(1, 0, positions, stride).contiguous();
     let target = target.slice(1, 0, positions, stride).contiguous();
+    let conditioning = conditioning.slice(1, 0, positions, stride).contiguous();
     let rows = (beliefs.size()[0] * beliefs.size()[1]) as f64;
     let targets = supports.targets(&target, scoring);
-    let teacher_dof = dof_mean(&bar_nll_terms(
-        &modules.head.logits(&beliefs, &supports.bin_ids(&target)),
+    let chain_dof = dof_mean(&bar_nll_terms(
+        &modules
+            .head
+            .logits(&beliefs, &conditioning, &supports.bin_ids(&target)),
         &targets,
     ));
 
@@ -7348,11 +7475,15 @@ fn chunk_forecast(
     for (group, total) in group_totals.iter_mut().enumerate() {
         // Disjoint streams per group, so the spread across groups is an honest Monte-Carlo
         // standard error rather than the same draws counted several times.
-        let log_mixture =
-            modules
-                .head
-                .forecast_log_probs(&beliefs, per_group, mix64(seed, group as u64));
-        *total = dof_mean(&bar_nll_terms(&log_mixture, &targets)).iter().sum();
+        let log_mixture = modules.head.forecast_log_probs(
+            &beliefs,
+            &conditioning,
+            per_group,
+            mix64(seed, group as u64),
+        );
+        *total = dof_mean(&bar_nll_terms(&log_mixture, &targets))
+            .iter()
+            .sum();
         let probs = log_mixture.exp();
         pooled = Some(match pooled {
             Some(acc) => acc + probs,
@@ -7363,14 +7494,14 @@ fn chunk_forecast(
     // FORECAST_MC_DRAWS draws — the pooled figure is not the mean of the group figures,
     // which would carry the bias of a `per_group`-draw estimate.
     let pooled = pooled.expect("at least one forecast group") / FORECAST_MC_GROUPS as f64;
-    let forecast_dof = dof_mean(&bar_nll_terms(
+    let marginal_dof = dof_mean(&bar_nll_terms(
         &pooled.clamp_min(f32::MIN_POSITIVE as f64).log(),
         &targets,
     ));
-    ChunkForecast {
+    IndependentMarginalDiagnostic {
         rows,
-        forecast_dof,
-        teacher_dof,
+        marginal_dof,
+        chain_dof,
         group_totals,
     }
 }
@@ -7438,11 +7569,9 @@ pub(super) fn evaluate(
     let mut crps_dof_sum = [0.0f64; BAR_DOF];
     let mut class_dof_sum = [0.0f64; BAR_DOF];
     let mut shape_dof_sum = [0.0f64; BAR_DOF];
-    // Live-bar sums for the conditional metric, pooled over the WHOLE set: a per-window
-    // ratio averaged over windows would weight a mostly-flat window's few live bars as
-    // heavily as a fully live one's.
-    let mut live_dof_sum = [0.0f64; BAR_DOF];
-    let mut live_bars = 0.0f64;
+    // The conditional metric is a pooled ratio of sums. Its per-window numerators and
+    // denominators are retained below so every promotion bootstrap can recompute that same
+    // estimand after resampling blocks.
     let mut rows_total = 0.0f64;
     let mut direction_correct = 0.0f64;
     let mut direction_total = 0.0f64;
@@ -7450,13 +7579,15 @@ pub(super) fn evaluate(
     let mut effective_rank = f64::NAN;
     let mut window_nll: Vec<f64> = Vec::with_capacity(set.windows.len());
     let mut window_nll_conditional: Vec<f64> = Vec::with_capacity(set.windows.len());
+    let mut window_conditional_nll_stats: Vec<ConditionalNllStats> =
+        Vec::with_capacity(set.windows.len());
     let mut window_nll_dof: Vec<[f64; BAR_DOF]> = Vec::with_capacity(set.windows.len());
-    // Forecast accumulators. Weighted by the STRIDED row count, which is the population the
-    // marginalized estimate covers, not the chunk's window count.
-    let mut forecast_rows = 0.0f64;
-    let mut forecast_dof_sum = [0.0f64; BAR_DOF];
-    let mut forecast_teacher_sum = [0.0f64; BAR_DOF];
-    let mut forecast_group_sums = [0.0f64; FORECAST_MC_GROUPS];
+    // Independent-marginal accumulators. Weighted by the strided row count, which is the
+    // population the Monte-Carlo estimate covers, not the chunk's window count.
+    let mut marginal_rows = 0.0f64;
+    let mut marginal_dof_sum = [0.0f64; BAR_DOF];
+    let mut chain_dof_sum = [0.0f64; BAR_DOF];
+    let mut marginal_group_sums = [0.0f64; FORECAST_MC_GROUPS];
     // The trading bench. Built once: the null's position is a property of the supports, so
     // re-deriving it per chunk would be 170 identical derivations and would leave open the
     // question of whether the null moved.
@@ -7483,9 +7614,14 @@ pub(super) fn evaluate(
                 0,
                 false,
             );
-            let target_bins = supports.bin_ids(&target);
-            let logits = modules.head.logits(&beliefs, &target_bins);
             let soft_targets = supports.targets(&target, scoring);
+            let target_bins = supports.bin_ids(&target);
+            let current_time = sample.time_ids.narrow(1, 0, context);
+            let target_time = sample.time_ids.narrow(1, 1, context);
+            let conditioning = modules
+                .trunk
+                .forecast_conditioning(&target_time, &current_time);
+            let logits = modules.head.logits(&beliefs, &conditioning, &target_bins);
             // `[B, T, BAR_DOF]`, unreduced: everything below is a reduction of this.
             let terms = bar_nll_terms(&logits, &soft_targets);
             // A bar is LIVE when `s != 0`. On a flat bar the encoding fixes `u = v = 0.5`,
@@ -7515,9 +7651,10 @@ pub(super) fn evaluate(
                     supports,
                     mix64(EVAL_WINDOW_SEED, chunk_index as u64),
                 );
-                let direction = direction_hits(modules, supports, &beliefs, &target, context);
-                let rank = (chunk_index == 0)
-                    .then(|| belief_effective_rank(&flatten_beliefs(&beliefs)));
+                let direction =
+                    direction_hits(modules, supports, &beliefs, &conditioning, &target, context);
+                let rank =
+                    (chunk_index == 0).then(|| belief_effective_rank(&flatten_beliefs(&beliefs)));
                 let parts = bar_nll_decomposition(&logits, &soft_targets, supports);
                 ChunkExtras {
                     crps,
@@ -7526,10 +7663,11 @@ pub(super) fn evaluate(
                     rank,
                     class: dof_array(&parts.class),
                     shape: dof_array(&parts.shape),
-                    forecast: chunk_forecast(
+                    independent_marginals: chunk_independent_marginals(
                         modules,
                         supports,
                         &beliefs,
+                        &conditioning,
                         &target,
                         scoring,
                         mix64(EVAL_WINDOW_SEED, chunk_index as u64),
@@ -7545,6 +7683,7 @@ pub(super) fn evaluate(
                                 .paths(
                                     &modules.head,
                                     &beliefs,
+                                    &conditioning,
                                     &target,
                                     trade_budget.saturating_sub(trade_paths.len()),
                                 )
@@ -7580,16 +7719,15 @@ pub(super) fn evaluate(
         }
         let (live_dof, live_counts) = live;
         for (index, row) in live_dof.iter().enumerate() {
-            window_nll_conditional.push(conditional_window_nll(
+            let stats = conditional_window_stats(
                 &per_window[index],
                 row,
                 live_counts[index],
-            ));
-            for (acc, value) in live_dof_sum.iter_mut().zip(row) {
-                *acc += value;
-            }
+                context as f64,
+            );
+            window_nll_conditional.push(stats.point_estimate());
+            window_conditional_nll_stats.push(stats);
         }
-        live_bars += live_counts.iter().sum::<f64>();
 
         if let Some(extras) = extras {
             for (acc, value) in crps_dof_sum.iter_mut().zip(extras.crps) {
@@ -7607,16 +7745,16 @@ pub(super) fn evaluate(
             if let Some(rank) = extras.rank {
                 effective_rank = rank;
             }
-            let forecast = extras.forecast;
-            forecast_rows += forecast.rows;
-            for (acc, value) in forecast_dof_sum.iter_mut().zip(forecast.forecast_dof) {
-                *acc += value * forecast.rows;
+            let marginal = extras.independent_marginals;
+            marginal_rows += marginal.rows;
+            for (acc, value) in marginal_dof_sum.iter_mut().zip(marginal.marginal_dof) {
+                *acc += value * marginal.rows;
             }
-            for (acc, value) in forecast_teacher_sum.iter_mut().zip(forecast.teacher_dof) {
-                *acc += value * forecast.rows;
+            for (acc, value) in chain_dof_sum.iter_mut().zip(marginal.chain_dof) {
+                *acc += value * marginal.rows;
             }
-            for (acc, value) in forecast_group_sums.iter_mut().zip(forecast.group_totals) {
-                *acc += value * forecast.rows;
+            for (acc, value) in marginal_group_sums.iter_mut().zip(marginal.group_totals) {
+                *acc += value * marginal.rows;
             }
             trade_paths.absorb(extras.trade);
         }
@@ -7626,10 +7764,11 @@ pub(super) fn evaluate(
     ensure!(rows_total > 0.0, "evaluation set produced no windows");
     let scale = 1.0 / rows_total;
     let nll_dof = nll_dof_sum.map(|v| v * scale);
-    let nll_dof_conditional = conditional_nll_dof(&nll_dof, &live_dof_sum, live_bars);
-    let forecast_measured = full && forecast_rows > 0.0;
-    let forecast_scale = if forecast_measured {
-        1.0 / forecast_rows
+    let pooled_conditional = ConditionalNllStats::pooled(&window_conditional_nll_stats);
+    let nll_dof_conditional = pooled_conditional.point_estimate_dof();
+    let marginal_measured = full && marginal_rows > 0.0;
+    let marginal_scale = if marginal_measured {
+        1.0 / marginal_rows
     } else {
         f64::NAN
     };
@@ -7651,6 +7790,7 @@ pub(super) fn evaluate(
         },
         window_nll,
         window_nll_conditional,
+        window_conditional_nll_stats,
         window_nll_dof,
         crps_dof: if full {
             crps_dof_sum.map(|v| v * scale)
@@ -7664,10 +7804,10 @@ pub(super) fn evaluate(
             f64::NAN
         },
         effective_rank,
-        forecast_nll_dof: forecast_dof_sum.map(|v| v * forecast_scale),
-        forecast_teacher_nll_dof: forecast_teacher_sum.map(|v| v * forecast_scale),
-        forecast_nll_se: if forecast_measured {
-            group_standard_error(&forecast_group_sums.map(|v| v * forecast_scale))
+        independent_marginal_nll_dof: marginal_dof_sum.map(|v| v * marginal_scale),
+        chain_conditional_nll_dof: chain_dof_sum.map(|v| v * marginal_scale),
+        independent_marginal_nll_se: if marginal_measured {
+            group_standard_error(&marginal_group_sums.map(|v| v * marginal_scale))
         } else {
             f64::NAN
         },
@@ -7684,43 +7824,30 @@ fn host_rows(t: &Tensor, rows: usize) -> Vec<[f64; BAR_DOF]> {
         .collect()
 }
 
-/// Per-DOF NLL with the ENCODING TAUTOLOGY excluded.
+/// Per-window sufficient statistics for the NLL with the encoding tautology excluded.
 ///
-/// `encode_dof` sets `u = v = 0.5` on every flat bar, and the chain predicts `s` first, so
-/// on a flat bar those two factors are determined and cost a well-fitted head nothing. Left
-/// in, they are ~0.69 nats/bar of "gain over the calibrated marginal" that is arithmetic
-/// rather than prediction. Here `u` and `v` are the mean over LIVE bars only —
-/// `live_dof_sum` is the summed per-bar NLL over bars with `s != 0` and `live_bars` their
-/// count, pooled over the whole set so a mostly-flat window cannot outweigh a live one.
-/// `r`, `s` and `w` are untouched: nothing in the encoding determines them.
-fn conditional_nll_dof(
-    nll_dof: &[f64; BAR_DOF],
-    live_dof_sum: &[f64; BAR_DOF],
-    live_bars: f64,
-) -> [f64; BAR_DOF] {
-    let scale = if live_bars > 0.0 { 1.0 / live_bars } else { 0.0 };
-    std::array::from_fn(|dof| match dof {
-        DOF_U | DOF_V => live_dof_sum[dof] * scale,
-        _ => nll_dof[dof],
-    })
-}
-
-/// The same exclusion for a single window, summed over the five factors.
-///
-/// A window with no live bar at all contributes zero for `u` and `v`, which is the only
-/// honest value: it carries no evidence about intra-bar shape, and charging it the flat-bar
-/// factors would put the tautology straight back in.
-fn conditional_window_nll(
+/// `r`, `s`, and `w` use every bar. `u` and `v` use only live bars because `encode_dof`
+/// fixes both on a flat bar. Returning the raw numerators and denominators rather than only
+/// this window's ratio is load-bearing: pooling and bootstrap resampling must recompute the
+/// ratio of sums, not average windows with different live-bar counts.
+fn conditional_window_stats(
     mean_row: &[f64; BAR_DOF],
     live_row: &[f64; BAR_DOF],
     live_bars: f64,
-) -> f64 {
-    let scale = if live_bars > 0.0 { 1.0 / live_bars } else { 0.0 };
-    mean_row[DOF_R]
-        + mean_row[DOF_S]
-        + mean_row[DOF_W]
-        + live_row[DOF_U] * scale
-        + live_row[DOF_V] * scale
+    bars: f64,
+) -> ConditionalNllStats {
+    let numerator = std::array::from_fn(|dof| match dof {
+        DOF_U | DOF_V => live_row[dof],
+        _ => mean_row[dof] * bars,
+    });
+    let denominator = std::array::from_fn(|dof| match dof {
+        DOF_U | DOF_V => live_bars,
+        _ => bars,
+    });
+    ConditionalNllStats {
+        numerator,
+        denominator,
+    }
 }
 
 /// Score the TRAIN-fitted reference row as a FIXED prediction against a pinned held-out
@@ -7754,12 +7881,24 @@ fn marginal_nll_dof_on(
         let context = sample.dof.size()[1] - 1;
         let chunk_total = tch::no_grad(|| {
             let target = sample.dof.narrow(1, 1, context);
-            supports
-                .targets(&target, scoring)
-                .targets()
-                .reshape([-1, BAR_DOF as i64, bins])
-                .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
-                .to_device(Device::Cpu)
+            let targets = supports.targets(&target, scoring);
+            let histogram = if scoring.is_smoothed() {
+                targets
+                    .smoothed_probabilities()
+                    .reshape([-1, BAR_DOF as i64, bins])
+                    .sum_dim_intlist([0i64].as_slice(), false, Kind::Double)
+            } else {
+                // One dense histogram, not one dense one-hot row per observation. Offset
+                // each DOF's class IDs into its own segment, then scatter counts once.
+                let offsets =
+                    Tensor::arange(BAR_DOF as i64, (Kind::Int64, device)).view([1, 1, -1]) * bins;
+                let flat_index = (targets.class_ids() + offsets).reshape([-1]);
+                let counts = Tensor::ones(flat_index.size().as_slice(), (Kind::Double, device));
+                Tensor::zeros([BAR_DOF as i64 * bins], (Kind::Double, device))
+                    .scatter_add(0, &flat_index, &counts)
+                    .view([BAR_DOF as i64, bins])
+            };
+            histogram.to_device(Device::Cpu)
         });
         totals += chunk_total;
         rows_total += (chunk.len() as i64 * context) as f64;
@@ -7824,37 +7963,60 @@ fn marginal_nll_dof_on(
     Ok(out)
 }
 
-/// Directional accuracy of the model's return sign at the final position of each window —
-/// the one position that is a genuine next-bar forecast rather than a mid-sequence
-/// conditional. `r` heads the chain, so `BarEmissionHead::sample` draws it from `p(r|h)`
-/// before any same-bar factor exists, and the majority sign over `DIRECTION_SAMPLES` draws
-/// is a statistic of that law alone.
+/// Directional accuracy of the deterministic expected return at the final position of each
+/// window. This is the one position that is a genuine next-bar forecast rather than a
+/// mid-sequence conditional.
+///
+/// `forecast_r_probs` reads the head's prefix-free `r` row, and the support centers are the
+/// expectations of the within-bin sampling law the former stochastic diagnostic drew from.
+/// Reducing that complete law once removes sampling noise. Every non-flat realized return is
+/// scored; an exactly zero predicted expectation is a miss, never a hidden abstention.
 fn direction_hits(
     modules: &BarModules,
     supports: &BarSupports,
     beliefs: &Tensor,
+    conditioning: &Tensor,
     target: &Tensor,
     context: i64,
 ) -> (f64, f64) {
-    let last = beliefs.narrow(1, context - 1, 1);
-    let repeated = last.repeat([1, DIRECTION_SAMPLES, 1]);
-    let samples = modules.head.sample(&repeated, supports, 1.0);
-    let predicted = samples
-        .select(-1, DOF_R as i64)
-        .sign()
-        .mean_dim([1i64].as_slice(), false, Kind::Float)
-        .sign();
+    let last = beliefs.narrow(1, context - 1, 1).squeeze_dim(1);
+    let last_conditioning = conditioning.narrow(1, context - 1, 1).squeeze_dim(1);
+    let probabilities = trade_bench::forecast_r_probs(&modules.head, &last, &last_conditioning)
+        .to_kind(Kind::Double);
+    let support = Tensor::from_slice(supports.centers(DOF_R))
+        .to_device(probabilities.device())
+        .to_kind(Kind::Double);
     let realized = target
         .narrow(1, context - 1, 1)
         .squeeze_dim(1)
         .select(-1, DOF_R as i64)
-        .sign();
-    // Flat bars carry no direction to predict, and an exact tie among the samples is
-    // an abstention rather than a wrong call. With eight samples a coin-flip model
-    // ties 70/256 of the time, so counting ties as misses would cap `dir_acc` near
-    // 0.36 and make an uninformative model read as anti-predictive.
-    let scored = realized.ne(0.0).logical_and(&predicted.ne(0.0));
-    let hits = (&predicted * &realized).gt(0.0).logical_and(&scored);
+        .to_kind(Kind::Double);
+    direction_counts_from_law(&probabilities, &support, &realized)
+}
+
+fn direction_counts_from_law(
+    probabilities: &Tensor,
+    support: &Tensor,
+    realized: &Tensor,
+) -> (f64, f64) {
+    assert_eq!(
+        probabilities.size().last(),
+        support.size().last(),
+        "one support value per return bin"
+    );
+    let expected =
+        (probabilities * support).sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+    direction_counts(&expected, realized)
+}
+
+fn direction_counts(expected: &Tensor, realized: &Tensor) -> (f64, f64) {
+    assert_eq!(
+        expected.size(),
+        realized.size(),
+        "one realized return per expectation"
+    );
+    let scored = realized.ne(0.0);
+    let hits = (expected * realized).gt(0.0).logical_and(&scored);
     (
         hits.sum(Kind::Float).double_value(&[]),
         scored.sum(Kind::Float).double_value(&[]),
@@ -7892,8 +8054,7 @@ fn flatten_beliefs(beliefs: &Tensor) -> Tensor {
 /// which is exactly the property a swept hyperparameter must not have. Commensurability is
 /// `lambda_dyn`'s job, not the reduction's.
 fn next_lat_loss(predicted: &Tensor, target: &Tensor) -> Tensor {
-    predicted
-        .smooth_l1_loss(target, Reduction::Mean, 1.0)
+    predicted.smooth_l1_loss(target, Reduction::Mean, 1.0)
 }
 
 /// One optimizer step's graph, still attached.
@@ -7940,9 +8101,8 @@ fn forward_losses(
     let target = dof.narrow(1, 1, context);
     // `prepare`/`locate` are elementwise, so binning commutes with narrowing: one pass over
     // `[B, T + 1, BAR_DOF]` serves the trunk's input, the head's teacher-forced target and
-    // every dynamics horizon. Each pass materializes an `[N, BAR_DOF, NUM_BAR_BINS]`
-    // comparison tensor, so this is worth hoisting even though it is small beside the
-    // transformer.
+    // every dynamics horizon. Hard and density scoring narrow these integer IDs directly;
+    // only smoothed scoring returns to the observations to construct probability rows.
     let bins = supports.bin_ids(dof);
     // One transformer pass. Every dynamics horizon reuses this belief sequence, shifted, so
     // recursion costs only MLP evaluations.
@@ -7954,24 +8114,37 @@ fn forward_losses(
         true,
     );
 
-    let logits = modules.head.logits(&beliefs, &bins.narrow(1, 1, context));
-    // The objective and every reported baseline read the same `--scoring`.
-    let (nll, nll_dof) = bar_nll_from_logits(&logits, &supports.targets(&target, scoring));
+    let current_time = time_ids.narrow(1, 0, context);
+    let target_time = time_ids.narrow(1, 1, context);
+    let conditioning = modules
+        .trunk
+        .forecast_conditioning(&target_time, &current_time);
+    let logits = modules
+        .head
+        .logits(&beliefs, &conditioning, &bins.narrow(1, 1, context));
+    // The objective and every reported baseline read the same `--scoring`. Reuse the target
+    // IDs already computed for the full window instead of locating the same bins twice.
+    let target_bins = bins.narrow(1, 1, context);
+    let targets = if scoring.is_smoothed() {
+        supports.targets(&target, scoring)
+    } else {
+        supports.targets_from_class_ids(&target_bins, scoring)
+    };
+    let (nll, nll_dof) = bar_nll_from_logits(&logits, &targets);
 
     let (dyn_loss, kl_loss, identity) = dynamics_losses(
         modules, dof, &bins, time_ids, &beliefs, context, horizon, device,
     );
-    // The SAME beliefs the likelihood is scored from, and the realized log return of the bar
-    // each of them predicts. Deliberately NOT `logits`: this hands the head only the causal
-    // belief, so no part of the realized bar can reach the position. `r` heads the chain, so
-    // its row is a forecast to begin with, and `growth::verify_traded_law` proves that on
-    // this head before the first step.
+    // The SAME beliefs and forecast-safe conditioning the likelihood is scored from, paired
+    // with the realized log return each predicts. The conditioner contains target exogenous
+    // clock and current observed market, never an observed field from the target bar.
     let growth::Growth {
         loss: growth,
         stats: growth_stats,
     } = growth::growth_loss(
         &modules.head,
         &beliefs,
+        &conditioning,
         &target.select(-1, DOF_R as i64),
         growth_support,
     );
@@ -7994,10 +8167,9 @@ fn forward_losses(
 /// bar `t`; `z` after `k` steps predicts `beliefs[:, t+k]`.
 ///
 /// Both targets are stop-gradient and the emission head is detached in both
-/// branches, so these terms train the trunk and the dynamics MLP only. The
-/// calendar of the advancing bar is fed alongside its DOF: `h_{t+k}` is a
-/// function of `time_ids_{t+k}`, so withholding it would leave the dynamics model
-/// predicting a target it has no information about.
+/// branches, so these terms train the trunk and dynamics only. Each advance consumes
+/// [`BarTrunk::token_embedding`](crate::torch::world_model::BarTrunk::token_embedding),
+/// the exact forecast-safe token the transformer consumes.
 ///
 /// `bins` is `bin_ids(dof)` over the same `[B, T + 1, BAR_DOF]` window, passed in
 /// so the whole step bins once.
@@ -8028,13 +8200,15 @@ fn dynamics_losses(
     let mut identity_total: Option<Tensor> = None;
 
     for k in 1..=horizon {
-        // Teacher-forced bar t+k, with its calendar, advances the latent one step. The market
-        // channels are dropped: `BarDynamics::step` is only ever CALLED on an imagined bar, whose
-        // market row is unknowable, so training it on the realized one would fit a channel that
-        // is `MARKET_MISSING` at every deployment call site.
+        // The shared trunk token structurally drops same-instant market ids, matching every
+        // imagined dynamics call while reusing exactly the embedding the exact trunk consumes.
         let advance = dof.narrow(1, k, anchors);
-        let advance_time = time_ids_without_market(&time_ids.narrow(1, k, anchors));
-        z = modules.dynamics.step(&z, &advance, &advance_time);
+        let advance_bins = bins.narrow(1, k, anchors);
+        let advance_time = time_ids.narrow(1, k, anchors);
+        let advance_token = modules
+            .trunk
+            .token_embedding(&advance, &advance_bins, &advance_time);
+        z = modules.dynamics.step(&z, &advance_token);
 
         let target = beliefs.narrow(1, k, anchors).detach();
         let dyn_term = next_lat_loss(&z, &target);
@@ -8049,10 +8223,19 @@ fn dynamics_losses(
             None => identity_term,
         });
 
-        // Both categoricals predict bar t+k+1 from their respective latents.
+        // Both categoricals predict bar t+k+1 from their respective latents. This is an
+        // imagined comparison, so the readout receives the target clock with missing market.
         let emitted = bins.narrow(1, k + 1, anchors);
-        let target_logits = modules.head.logits_frozen(&target, &emitted).detach();
-        let predicted_logits = modules.head.logits_frozen(&z, &emitted);
+        let emitted_time = time_ids.narrow(1, k + 1, anchors);
+        let missing_market = time_ids_without_market(&emitted_time);
+        let conditioning = modules
+            .trunk
+            .forecast_conditioning(&emitted_time, &missing_market);
+        let target_logits = modules
+            .head
+            .logits_frozen(&target, &conditioning, &emitted)
+            .detach();
+        let predicted_logits = modules.head.logits_frozen(&z, &conditioning, &emitted);
         let (kl, _) = bar_categorical_kl(&target_logits, &predicted_logits);
         kl_total = Some(match kl_total {
             Some(acc) => acc + kl,
@@ -8185,8 +8368,14 @@ fn belief_autocorrelation(beliefs: &Tensor) -> Tensor {
         // Cast the INPUTS, not the result. Under bf16 autocast a similarity rounded before
         // the mean has 0.0039 resolution at `cos ~ 1`, which is exactly the resolution this
         // diagnostic exists to provide.
-        let current = beliefs.narrow(1, 0, steps - 1).detach().to_kind(Kind::Float);
-        let next = beliefs.narrow(1, 1, steps - 1).detach().to_kind(Kind::Float);
+        let current = beliefs
+            .narrow(1, 0, steps - 1)
+            .detach()
+            .to_kind(Kind::Float);
+        let next = beliefs
+            .narrow(1, 1, steps - 1)
+            .detach()
+            .to_kind(Kind::Float);
         Tensor::cosine_similarity(&current, &next, -1, 1e-8)
             .to_kind(Kind::Float)
             .mean(Kind::Float)
@@ -8199,12 +8388,13 @@ fn belief_autocorrelation(beliefs: &Tensor) -> Tensor {
 /// log density and is routinely NEGATIVE, so a signed denominator would pass through zero
 /// and make every share meaningless exactly when the objective is most worth watching.
 ///
-/// `nll` here is the SCORING-INVARIANT likelihood scale, i.e. the density rule's measure
-/// constant already removed by the caller. That constant is a property of the binning that
-/// no prediction can move and no gradient touches, so leaving it in the denominator would
-/// make [`AUX_SHARE_WARN`] mean something different under each rule — and worst under the
-/// default one, where a zero-init head starts near `-0.54` nats and any auxiliary term
-/// would read as 80%+ of an objective it is not remotely dominating.
+/// `nll` here is the categorical likelihood scale shared by the scoring modes, i.e. the
+/// density diagnostic's finite-bin measure constant already removed by the caller. That
+/// constant is a property of this fitted binning that no prediction can move and no gradient
+/// touches, so leaving it in the denominator would make [`AUX_SHARE_WARN`] mean something
+/// different under each rule — especially under density, where a zero-init head starts near
+/// `-0.54` nats and any auxiliary term would read as 80%+ of an objective it is not remotely
+/// dominating.
 ///
 /// Four terms now, and `growth` is one of them for exactly the same reason `dyn` is: it
 /// carries a weight that had to be sized against `nll`, so a chart of absolute curves
@@ -8216,8 +8406,7 @@ fn loss_shares(
     weighted_kl: f64,
     weighted_growth: f64,
 ) -> (f64, f64, f64, f64) {
-    let total =
-        nll.abs() + weighted_dyn.abs() + weighted_kl.abs() + weighted_growth.abs();
+    let total = nll.abs() + weighted_dyn.abs() + weighted_kl.abs() + weighted_growth.abs();
     if !(total > 0.0) || !total.is_finite() {
         return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
     }
@@ -8288,9 +8477,20 @@ fn rollout_nll(
             }
             let belief = beliefs.narrow(1, index, 1);
             let target = window.future_dof.narrow(1, index, 1);
-            let logits = modules.head.logits(&belief, &deployment.bin_ids(&target));
-            let (nll, _) =
-                bar_nll_from_logits(&logits, &deployment.targets(&target, scoring));
+            let target_time = window.future_time_ids.narrow(1, index, 1);
+            let current_time = if index == 0 {
+                let history_len = window.history_time_ids.size()[1];
+                window.history_time_ids.narrow(1, history_len - 1, 1)
+            } else {
+                window.future_time_ids.narrow(1, index - 1, 1)
+            };
+            let conditioning = modules
+                .trunk
+                .forecast_conditioning(&target_time, &current_time);
+            let logits = modules
+                .head
+                .logits(&belief, &conditioning, &deployment.bin_ids(&target));
+            let (nll, _) = bar_nll_from_logits(&logits, &deployment.targets(&target, scoring));
             *slot = nll.double_value(&[]);
         }
     });
@@ -8312,14 +8512,97 @@ fn dof_array(per_dof: &Tensor) -> [f64; BAR_DOF] {
     out
 }
 
-/// Global L2 gradient norm, observed only. The recipe deliberately does not clip:
-/// Newton-Schulz/Polar Express orthogonalization already bounds the update.
+const STEP_METRIC_TOTAL: usize = 0;
+const STEP_METRIC_NLL: usize = 1;
+const STEP_METRIC_NLL_DOF: std::ops::Range<usize> = 2..2 + BAR_DOF;
+const STEP_METRIC_DYN: usize = 2 + BAR_DOF;
+const STEP_METRIC_KL: usize = 3 + BAR_DOF;
+const STEP_METRIC_GROWTH: usize = 4 + BAR_DOF;
+const STEP_METRIC_GROWTH_STATS: std::ops::Range<usize> =
+    5 + BAR_DOF..5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
+const STEP_METRIC_IDENTITY: usize = 5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
+const STEP_METRIC_AUTOCORR: usize = STEP_METRIC_IDENTITY + 1;
+const STEP_METRIC_GRAD_NORM: usize = STEP_METRIC_AUTOCORR + 1;
+const STEP_METRIC_PROBE_NLL_NORM: usize = STEP_METRIC_GRAD_NORM + 2;
+const STEP_METRIC_PROBE_GROWTH_NORM: usize = STEP_METRIC_GRAD_NORM + 4;
+const STEP_METRIC_COUNT: usize = STEP_METRIC_GRAD_NORM + 5;
+
+/// Pack every device-resident scalar read by one optimizer step. The caller performs this
+fn pack_step_metrics(
+    graph: &TrainingGraph,
+    grad_norm: &Tensor,
+    growth_probe: Option<&GrowthGradientProbe>,
+) -> Tensor {
+    let flat_f32 = |tensor: &Tensor| tensor.detach().to_kind(Kind::Float).reshape([-1]);
+    let probe = match growth_probe {
+        Some(probe) => Tensor::stack(
+            &[
+                flat_f32(&probe.nll_value),
+                flat_f32(&probe.nll_norm),
+                flat_f32(&probe.growth_value),
+                flat_f32(&probe.growth_norm),
+            ],
+            0,
+        )
+        .reshape([-1]),
+        None => Tensor::zeros([4], (Kind::Float, graph.loss.device())),
+    };
+    Tensor::cat(
+        &[
+            flat_f32(&graph.loss),
+            flat_f32(&graph.nll),
+            flat_f32(&graph.nll_dof),
+            flat_f32(&graph.dyn_loss),
+            flat_f32(&graph.kl_loss),
+            flat_f32(&graph.growth),
+            flat_f32(&graph.growth_stats),
+            flat_f32(&graph.identity),
+            flat_f32(&graph.autocorr),
+            flat_f32(grad_norm),
+            probe,
+        ],
+        0,
+    )
+}
+
+/// The optimizer step's single device-to-host metric transfer.
+fn read_packed_step_metrics(packed: &Tensor) -> [f64; STEP_METRIC_COUNT] {
+    let values = Vec::<f64>::try_from(packed.to_kind(Kind::Double).reshape([-1]))
+        .expect("packed step metrics are convertible");
+    values.try_into().unwrap_or_else(|values: Vec<f64>| {
+        panic!(
+            "packed step metrics carry {} entries, expected {STEP_METRIC_COUNT}",
+            values.len()
+        )
+    })
+}
+
+/// Fail before optimizer mutation if the packed loss, gradient or any attached diagnostic is
+/// non-finite. Kept separate so the safety boundary is directly testable.
+fn ensure_finite_step_metrics(metrics: &[f64; STEP_METRIC_COUNT], step: usize) -> Result<()> {
+    let total = metrics[STEP_METRIC_TOTAL];
+    ensure!(
+        total.is_finite(),
+        "loss is not finite at step {step}: {total}"
+    );
+    let grad_norm = metrics[STEP_METRIC_GRAD_NORM];
+    ensure!(
+        grad_norm.is_finite(),
+        "gradient norm is not finite at step {step}: {grad_norm}"
+    );
+    ensure!(
+        metrics.iter().all(|value| value.is_finite()),
+        "packed loss/gradient diagnostics are not finite at step {step}: {metrics:?}"
+    );
+    Ok(())
+}
+
+/// Global L2 gradient norm as a device scalar, observed only. The recipe deliberately does
+/// not clip: Newton-Schulz/Polar Express orthogonalization already bounds the update.
 ///
 /// Reduces in sorted parameter-name order. `vs.variables()` hands back a `HashMap`
-/// whose iteration order is seeded per process, and an fp32 sum is order-dependent,
-/// so an unsorted reduction would make this number differ in its last digits between
-/// two otherwise bit-identical replays of the same seed.
-fn global_grad_norm(vs: &nn::VarStore, device: Device) -> f64 {
+/// whose iteration order is seeded per process, and an fp32 sum is order-dependent.
+fn global_grad_norm_tensor(vs: &nn::VarStore, device: Device) -> Tensor {
     tch::no_grad(|| {
         let squares: Vec<Tensor> = named_trainable_variables(vs)
             .into_iter()
@@ -8330,13 +8613,13 @@ fn global_grad_norm(vs: &nn::VarStore, device: Device) -> f64 {
             })
             .collect();
         if squares.is_empty() {
-            return 0.0;
+            Tensor::zeros([], (Kind::Float, device))
+        } else {
+            Tensor::stack(&squares, 0)
+                .to_device(device)
+                .sum(Kind::Float)
+                .sqrt()
         }
-        Tensor::stack(&squares, 0)
-            .to_device(device)
-            .sum(Kind::Float)
-            .sqrt()
-            .double_value(&[])
     })
 }
 
@@ -8360,6 +8643,15 @@ const GROWTH_PROBE_STEPS: [usize; 2] = [0, 200];
 /// minibatch variation; above 20% it starts buying economics with density, and NLL STAYS
 /// PRIMARY — the density is what makes the model useful for anything beyond the sign.
 const GROWTH_GRADIENT_TARGET_SHARE: f64 = 0.15;
+
+/// Device-resident result of the occasional gradient-share probe. It joins the main graph's
+/// packed metric transfer rather than synchronizing independently before backward.
+struct GrowthGradientProbe {
+    nll_value: Tensor,
+    nll_norm: Tensor,
+    growth_value: Tensor,
+    growth_norm: Tensor,
+}
 
 /// A measured gradient-norm split between the likelihood and the growth term.
 struct GrowthGradientShare {
@@ -8441,15 +8733,15 @@ fn probe_growth_gradient_share(
     horizon: i64,
     scoring: BarScoring,
     device: Device,
-) -> Result<GrowthGradientShare> {
+) -> GrowthGradientProbe {
     let zero_grads = || {
         for mut variable in vs.trainable_variables() {
             variable.zero_grad();
         }
     };
-    // `lambda_* = 0`: the probe reads the UNWEIGHTED terms off the graph, so the numbers it
-    // prints are properties of the objective's pieces and not of the weights in force.
-    let measure = |name: &str, want_growth: bool| -> Result<f64> {
+    // `lambda_* = 0`: the probe reads the unweighted terms off the graph. Values and norms
+    // remain on device and join the real step's packed transfer after its backward.
+    let measure = |want_growth: bool| -> (Tensor, Tensor) {
         zero_grads();
         let graph = autocast(device.is_cuda(), || {
             forward_losses(
@@ -8467,36 +8759,28 @@ fn probe_growth_gradient_share(
                 device,
             )
         });
-        let term = if want_growth { &graph.growth } else { &graph.nll };
-        let value = term.double_value(&[]);
-        ensure!(
-            value.is_finite(),
-            "the growth gradient probe measured a non-finite {name} term: {value}"
-        );
+        let term = if want_growth {
+            &graph.growth
+        } else {
+            &graph.nll
+        };
+        let value = term.detach();
         term.backward();
-        let norm = global_grad_norm(vs, device);
-        ensure!(
-            norm.is_finite(),
-            "the growth gradient probe measured a non-finite {name} gradient norm: {norm}"
-        );
-        Ok(norm)
+        let norm = global_grad_norm_tensor(vs, device);
+        (value, norm)
     };
-    let nll_norm = measure("nll", false)?;
-    let unit_growth_norm = measure("growth", true)?;
+    let (nll_value, nll_norm) = measure(false);
+    let (growth_value, growth_norm) = measure(true);
     zero_grads();
     if device.is_cuda() {
         crate::torch::cuda::empty_cache();
     }
-    ensure!(
-        unit_growth_norm > 0.0,
-        "the growth term reached no trainable parameter: its gradient norm is zero, so it \
-         is decoration rather than an objective. The likely cause is a detach on the path \
-         from the emission head's r factor back to the trunk."
-    );
-    Ok(GrowthGradientShare {
+    GrowthGradientProbe {
+        nll_value,
         nll_norm,
-        unit_growth_norm,
-    })
+        growth_value,
+        growth_norm,
+    }
 }
 
 /// The measured ceiling, the ramp it produced, and the batch/context frontier.
@@ -8554,7 +8838,12 @@ fn print_capacity_banner(
     println!("ramp           {}", stages.join(" | "));
     let frontier: Vec<String> = CONTEXT_FRONTIER
         .iter()
-        .map(|&context| format!("{context} bars -> {} windows", capacity.frontier_batch(context)))
+        .map(|&context| {
+            format!(
+                "{context} bars -> {} windows",
+                capacity.frontier_batch(context)
+            )
+        })
         .collect();
     println!(
         "frontier       achievable FLAT batch if the deployed context were [{}]. The card caps \
@@ -8693,9 +8982,9 @@ fn print_banner(
                 "one-hot cross entropy on the containing bin; proper for the discretized \
                  law, no floor, but its scale moves with the bin count",
             BarScoring::Density =>
-                "the mixed-measure log-likelihood: log P(atom) on an atom and log P_b - log \
-                 width_b inside a continuous bin; no floor and, up to discretization error, \
-                 no dependence on the bin count",
+                "a finite-bin measure diagnostic: log P(atom) on an atom and log P_b - log \
+                 width_b inside a continuous bin. Clipped outer bins do not define normalized \
+                 continuous tails; this is not an open-tail density model or bin-count invariant",
         },
     );
     println!(
@@ -8740,8 +9029,7 @@ fn print_banner(
          heads start), calibrated marginal {marginal_nll_bar:.4}, both under {}. Only \
          progress past the MARGINAL is evidence of conditional structure: beating uniform \
          only proves the unconditional bin masses were learned.",
-        baselines.uniform_nll_bar,
-        args.scoring,
+        baselines.uniform_nll_bar, args.scoring,
     );
     // Three corrections to the headline comparison, all of which move it the same way: the
     // reported gain over the calibrated marginal is smaller than it looks.
@@ -8783,8 +9071,8 @@ fn print_banner(
             "floor          label smoothing at sigma {BAR_LABEL_SIGMA_RATIO:.2}x bin width \
              makes nll_bar a proper rule for the SMOOTHED law, so {floor_bar:.4} nats/bar is \
              UNREACHABLE even by an oracle (per DOF {}). The marginal reference pays none of \
-             it, so the reachable range is {:.4}, not {marginal_nll_bar:.4}. This floor is \
-             exactly why --scoring density is the default.",
+             it, so the reachable range is {:.4}, not {marginal_nll_bar:.4}. The default \
+             --scoring hard avoids this smoothing floor.",
             floor_dof
                 .iter()
                 .map(|f| format!("{f:.3}"))
@@ -8819,7 +9107,7 @@ fn print_banner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::torch::bar_dist::BarDof;
+    use crate::torch::bar_dist::{BarDof, DOF_W};
     use crate::torch::dataset::BAR_TIME_FEATURES;
     use crate::torch::test_rng;
     use rand::{Rng, SeedableRng};
@@ -8827,6 +9115,93 @@ mod tests {
     use shared::bars::{write_bar_file, PackedBar, FILE_EXTENSION};
 
     const TEST_RES: u32 = 300;
+    #[test]
+    fn scalar_optimizer_groups_have_exact_reference_semantics() {
+        let cases = [
+            ("layers.0.qkv_lambda", 5.0, (0.9, 0.99)),
+            ("layers.0.attn_out_lambda", 5.0, (0.9, 0.99)),
+            ("layers.0.attn_resid_lambda", 5.0, (0.9, 0.95)),
+            ("layers.0.attn_post_lambda", 1.0, (0.9, 0.95)),
+            ("layers.0.ff_resid_lambda", 5.0, (0.9, 0.95)),
+            ("layers.0.ff_post_lambda", 1.0, (0.9, 0.95)),
+            ("layers.0.x0_lambda", 1.0, (0.9, 0.99)),
+            ("layers.0.pope_theta_bias", 1.0, (0.9, 0.99)),
+        ];
+        let names: Vec<String> = cases
+            .iter()
+            .map(|(name, _, _)| (*name).to_owned())
+            .collect();
+        let attention: Vec<String> = ADAMW_ATTENTION_SCALAR_SUBSTRINGS
+            .iter()
+            .map(|needle| (*needle).to_owned())
+            .collect();
+        let resid_post: Vec<String> = ADAMW_RESID_POST_SUBSTRINGS
+            .iter()
+            .map(|needle| (*needle).to_owned())
+            .collect();
+        let other: Vec<String> = ADAMW_OTHER_SCALAR_SUBSTRINGS
+            .iter()
+            .map(|needle| (*needle).to_owned())
+            .collect();
+        assert_exact_substring_partition(
+            &names,
+            &[
+                ("attention scalar", &attention),
+                ("residual/post scalar", &resid_post),
+                ("other scalar", &other),
+            ],
+        )
+        .expect("scalar policies must exactly partition every scalar");
+
+        for (name, expected_lr_scale, expected_betas) in cases {
+            let lr_scale = if ADAMW_HIGH_LR_SCALAR_SUBSTRINGS
+                .iter()
+                .any(|needle| name.contains(needle))
+            {
+                ADAMW_HIGH_LR_SCALAR_MULT
+            } else {
+                1.0
+            };
+            let betas = if ADAMW_RESID_POST_SUBSTRINGS
+                .iter()
+                .any(|needle| name.contains(needle))
+            {
+                ADAMW_RESID_POST_BETAS
+            } else {
+                ADAMW_SCALAR_BETAS
+            };
+            assert_eq!(lr_scale, expected_lr_scale, "{name}");
+            assert_eq!(betas, expected_betas, "{name}");
+            assert!(
+                bar_adamw_scalar_substrings()
+                    .iter()
+                    .any(|needle| name.contains(needle)),
+                "{name} must be in the no-weight-decay scalar route"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_substring_partition_rejects_overlap_miss_and_stale_needles() {
+        let qkv = vec!["layers.0.qkv_lambda".to_owned()];
+        let overlap = vec!["qkv_lambda".to_owned(), "_lambda".to_owned()];
+        assert!(
+            assert_exact_substring_partition(&qkv, &[("scalar", &overlap)]).is_err(),
+            "overlapping substrings must not be resolved by first-match precedence"
+        );
+
+        let missed = vec!["attn_out_lambda".to_owned()];
+        assert!(
+            assert_exact_substring_partition(&qkv, &[("scalar", &missed)]).is_err(),
+            "an unclaimed parameter must fail the partition"
+        );
+
+        let stale = vec!["qkv_lambda".to_owned(), "deleted_scalar".to_owned()];
+        assert!(
+            assert_exact_substring_partition(&qkv, &[("scalar", &stale)]).is_err(),
+            "a routing substring that matches no parameter must fail the partition"
+        );
+    }
 
     struct Fixture {
         dir: PathBuf,
@@ -9029,7 +9404,11 @@ mod tests {
             "both resolutions must be routable, or one is scored against the other's bins"
         );
         assert_ne!(
-            trainer.support_set_dev.get(TEST_RES).unwrap().marginal_nll_bar(trainer.args.scoring),
+            trainer
+                .support_set_dev
+                .get(TEST_RES)
+                .unwrap()
+                .marginal_nll_bar(trainer.args.scoring),
             trainer
                 .support_set_dev
                 .get(AUX_TEST_RES)
@@ -9045,8 +9424,7 @@ mod tests {
         // The auxiliary held-out set is on the auxiliary axis at the auxiliary context.
         assert_eq!(trainer.aux_heldout.len(), 1);
         assert_eq!(
-            trainer.aux_heldout[0].context,
-            AUXILIARY_HELDOUT_CONTEXT,
+            trainer.aux_heldout[0].context, AUXILIARY_HELDOUT_CONTEXT,
             "the auxiliary held-out read is pinned to its own context, not the deployed one"
         );
 
@@ -9070,19 +9448,19 @@ mod tests {
             series.iter().map(|s| &s.label).collect::<Vec<_>>()
         );
 
-        // 2. It takes real optimizer steps, on the Bresenham cadence, over one primary pass.
+        // 2. It takes exactly the promised number of real optimizer steps on the Bresenham
+        // cadence over one primary pass.
         let primary_steps = trainer.schedule.steps_per_epoch;
-        let mut fired = 0usize;
+        let promised_auxiliary_steps = trainer.aux[0].steps_per_epoch();
         for step in 0..primary_steps {
-            trainer.auxiliary_steps(step).expect("an auxiliary step runs");
-            if trainer.aux_steps > fired {
-                fired = trainer.aux_steps;
-            }
+            trainer
+                .auxiliary_steps(step)
+                .expect("an auxiliary step runs");
         }
-        assert!(
-            trainer.aux_steps > 0,
-            "the auxiliary stream never fired across {primary_steps} primary steps, which is \
-             exactly what a corpus that trains nothing looks like"
+        assert_eq!(
+            trainer.aux_steps, promised_auxiliary_steps,
+            "the auxiliary cadence must issue its complete pass even when its ratio to the \
+             primary pass is greater than one"
         );
         assert!(trainer.aux_bars_seen > 0);
 
@@ -9090,10 +9468,7 @@ mod tests {
         trainer
             .finish_auxiliary_passes(primary_steps)
             .expect("the auxiliary pass boundary reconciles");
-        let path = trainer
-            .run
-            .gens
-            .join("pretrain_auxiliary_nll.report.bin");
+        let path = trainer.run.gens.join("pretrain_auxiliary_nll.report.bin");
         assert!(path.exists(), "the auxiliary report must be written");
         let report = shared::report::read_report(&path).expect("the auxiliary report reads back");
         let shared::report::ReportKind::MultiLine { series } = report.kind else {
@@ -9169,8 +9544,10 @@ mod tests {
         object.remove("bin_second_moments");
         std::fs::write(&path, serde_json::to_vec(&raw).expect("serialize")).expect("write");
 
-        let runs = std::env::temp_dir()
-            .join(format!("trading_bot_0_pretrain_unpersistable_{}", uuid::Uuid::new_v4()));
+        let runs = std::env::temp_dir().join(format!(
+            "trading_bot_0_pretrain_unpersistable_{}",
+            uuid::Uuid::new_v4()
+        ));
         let err = build_trainer(args, &runs.display().to_string(), Device::Cpu)
             .err()
             .expect("a run that can never write a checkpoint must not start");
@@ -9210,7 +9587,8 @@ mod tests {
             4.8 * bars,
         ];
 
-        let conditional = conditional_nll_dof(&nll_dof, &live_dof_sum, live_bars);
+        let stats = conditional_window_stats(&nll_dof, &live_dof_sum, live_bars, bars);
+        let conditional = stats.point_estimate_dof();
         // r, s and w are untouched, bit for bit.
         for dof in [DOF_R, DOF_S, DOF_W] {
             assert_eq!(conditional[dof], nll_dof[dof], "DOF {}", BAR_DOF_NAMES[dof]);
@@ -9230,22 +9608,44 @@ mod tests {
         // moves.
         let excluded: f64 = conditional.iter().sum::<f64>() - nll_dof.iter().sum::<f64>();
         let expected = 2.0 * per_live * (1.0 - live_bars / bars);
-        assert!((excluded - expected).abs() < 1e-12, "{excluded} != {expected}");
+        assert!(
+            (excluded - expected).abs() < 1e-12,
+            "{excluded} != {expected}"
+        );
 
-        // Per-window: a fully live window is unchanged by the exclusion.
+        // A fully live window is unchanged by the exclusion.
         let all_live = [1.0, 2.0, 3.0, 4.0, 5.0];
         let live_row = all_live.map(|v| v * 8.0);
-        assert!(
-            (conditional_window_nll(&all_live, &live_row, 8.0) - all_live.iter().sum::<f64>())
-                .abs()
-                < 1e-12
+        assert_eq!(
+            conditional_window_stats(&all_live, &live_row, 8.0, 8.0).point_estimate(),
+            all_live.iter().sum::<f64>()
         );
         // A window with no live bar contributes nothing for u and v rather than the free
         // flat-bar factors, which would smuggle the tautology back in.
-        assert!(
-            (conditional_window_nll(&all_live, &[0.0; BAR_DOF], 0.0) - (1.0 + 2.0 + 5.0)).abs()
-                < 1e-12
+        assert_eq!(
+            conditional_window_stats(&all_live, &[0.0; BAR_DOF], 0.0, 8.0).point_estimate(),
+            1.0 + 2.0 + 5.0
         );
+    }
+
+    /// Direction is an arithmetic function of the predictive law, with no sampling and no
+    /// abstention hidden in the denominator. An exactly flat prediction on a non-flat return
+    /// is scored as a miss; only a flat realized return is excluded.
+    #[test]
+    fn directional_accuracy_is_deterministic_and_scores_every_non_flat_return() {
+        let probabilities = Tensor::from_slice(&[
+            1.0f64, 0.0, 0.0, // negative expectation
+            0.5, 0.0, 0.5, // exactly zero expectation: scored as a miss
+            0.0, 0.0, 1.0, // positive expectation
+            1.0, 0.0, 0.0, // flat realization: the only excluded row
+        ])
+        .view([4, 3]);
+        let support = Tensor::from_slice(&[-1.0f64, 0.0, 1.0]);
+        let realized = Tensor::from_slice(&[-0.1f64, 0.2, 0.4, 0.0]);
+        let first = direction_counts_from_law(&probabilities, &support, &realized);
+        let second = direction_counts_from_law(&probabilities, &support, &realized);
+        assert_eq!(first, second);
+        assert_eq!(first, (2.0, 3.0));
     }
 
     fn test_args(seed: u64, dir: &Path) -> PretrainArgs {
@@ -9323,8 +9723,8 @@ mod tests {
         args.snapshot_windows = 1;
         // CPU, explicitly: this asserts validation and promotion bookkeeping, none of which
         // is device-dependent, and it must never allocate on a card another tenant owns.
-        let mut trainer = build_trainer(args, &runs.display().to_string(), Device::Cpu)
-            .expect("trainer builds");
+        let mut trainer =
+            build_trainer(args, &runs.display().to_string(), Device::Cpu).expect("trainer builds");
         let diag = trainer.eval.diagnostic.context;
         let deployed = trainer.eval.promotion.context;
         assert!(
@@ -9410,8 +9810,12 @@ mod tests {
             "the baseline-comparison curve must come from the diagnostic pass"
         );
         assert!(
-            finite("pretrain_forecast_nll", "forecast (marginalized)").0,
-            "the marginalized forecast number must be measured at every validation"
+            finite(
+                "pretrain_independent_marginal_nll",
+                "independent per-DOF marginals (sum)"
+            )
+            .0,
+            "the independent-marginal diagnostic must be measured at every validation"
         );
         let (measured, label) = finite("pretrain_nll_bar", "val deployed");
         assert!(
@@ -9425,7 +9829,9 @@ mod tests {
 
         // Second half: the final step of a run that never got to the deployed context.
         let last = trainer.schedule.total_steps - 1;
-        trainer.validate(last, false, true).expect("final validation");
+        trainer
+            .validate(last, false, true)
+            .expect("final validation");
         assert_eq!(
             trainer.promotions, 1,
             "the final step must promote at the reached context rather than leave nothing"
@@ -9454,9 +9860,12 @@ mod tests {
         assert_eq!(battery.reached_context, diag);
         assert_eq!(battery.deployed_context, deployed);
         assert!(
-            battery.forecast_nll_dof.iter().all(|v| v.is_finite()),
+            battery
+                .independent_marginal_nll_dof
+                .iter()
+                .all(|v| v.is_finite()),
             "the forecast breakdown must be measured on the test split too: {:?}",
-            battery.forecast_nll_dof
+            battery.independent_marginal_nll_dof
         );
         // The artifact must state the context it was selected at, on disk, not just in a log.
         let metadata = BarWorldModelMetadata::load(&world_model_metadata_path(
@@ -9497,8 +9906,8 @@ mod tests {
         let mut args = test_args(0x5EED, &dir);
         args.validation_windows = 1;
         args.snapshot_windows = 1;
-        let trainer = build_trainer(args, &runs.display().to_string(), Device::Cpu)
-            .expect("trainer builds");
+        let trainer =
+            build_trainer(args, &runs.display().to_string(), Device::Cpu).expect("trainer builds");
 
         let meta = trainer.run.meta().expect("meta.json reads back");
         let recorded = meta
@@ -9532,7 +9941,10 @@ mod tests {
         assert_eq!(recorded.min_dollar_volume, 0.0);
         assert_eq!(recorded.data_dir, dir.display().to_string());
         assert_eq!(recorded.diagnostic_context_bars, BAR_CONTEXT_RAMP_START);
-        assert_eq!(recorded.deployed_context_bars, trainer.eval.promotion.context);
+        assert_eq!(
+            recorded.deployed_context_bars,
+            trainer.eval.promotion.context
+        );
         assert_eq!(recorded.eval_window_seed, EVAL_WINDOW_SEED);
         assert_eq!(recorded.train_seed, 0x5EED);
         assert_eq!(recorded.corpus_fingerprint, trainer.corpus_fingerprint);
@@ -9630,7 +10042,10 @@ mod tests {
                 half_hi <= half_lo,
                 "more blocks must not widen the interval: {half_lo} then {half_hi}"
             );
-            assert!(blocks_hi <= windows_hi, "blocks must coarsen windows, never split them");
+            assert!(
+                blocks_hi <= windows_hi,
+                "blocks must coarsen windows, never split them"
+            );
         }
 
         // 3. The scaling law, exactly, against the reference it extrapolates from.
@@ -9666,7 +10081,11 @@ mod tests {
             let shared::report::ReportKind::MultiLine { series } = report.kind else {
                 panic!("{base} must be a MultiLine chart");
             };
-            assert!(series.len() >= 3, "{base} carries only {} series", series.len());
+            assert!(
+                series.len() >= 3,
+                "{base} carries only {} series",
+                series.len()
+            );
             for row in &series {
                 assert!(
                     row.values.iter().any(|value| value.is_finite()),
@@ -9711,14 +10130,17 @@ mod tests {
         let mut args = test_args(0x5EED, &dir);
         args.validation_windows = 1;
         args.snapshot_windows = 1;
-        let trainer = build_trainer(args, &runs.display().to_string(), Device::Cpu)
-            .expect("trainer builds");
+        let trainer =
+            build_trainer(args, &runs.display().to_string(), Device::Cpu).expect("trainer builds");
 
         // The device is pinned above, so this is a GUARANTEE and not a property of the host:
         // a CPU build cannot measure capacity, so it must keep the DECLARED ramp rather than
         // invent a ceiling out of a missing reading. Before the device became a parameter this
         // assertion silently inverted on any machine with a visible card.
-        assert!(trainer.capacity.is_none(), "there is no NVML behind a CPU device");
+        assert!(
+            trainer.capacity.is_none(),
+            "there is no NVML behind a CPU device"
+        );
         assert_eq!(trainer.derived_batch_ramp, BATCH_RAMP);
         assert_eq!(trainer.schedule.batch_ramp, BATCH_RAMP);
 
@@ -9760,13 +10182,11 @@ mod tests {
                 .iter()
                 .find(|(other, _)| other == name)
                 .expect("the probe must not add or rename parameters");
-            let drift = tch::no_grad(|| {
-                (current.detach() - saved)
-                    .abs()
-                    .max()
-                    .double_value(&[])
-            });
-            assert_eq!(drift, 0.0, "{name} moved by {drift} during the capacity probe");
+            let drift = tch::no_grad(|| (current.detach() - saved).abs().max().double_value(&[]));
+            assert_eq!(
+                drift, 0.0,
+                "{name} moved by {drift} during the capacity probe"
+            );
         }
         assert_eq!(
             trainer.optimizer.state_bytes(),
@@ -9801,8 +10221,8 @@ mod tests {
         args.snapshot_windows = 1;
         // Pruning is a decision about file names; the device is irrelevant and a visible card
         // would only mean allocating on someone else's GPU to rename files.
-        let trainer = build_trainer(args, &runs.display().to_string(), Device::Cpu)
-            .expect("trainer builds");
+        let trainer =
+            build_trainer(args, &runs.display().to_string(), Device::Cpu).expect("trainer builds");
         let weights = trainer.run.weights.clone();
         // Stand-in artifacts: pruning is a decision about file NAMES, and a real
         // `write_checkpoint` here would move a gigabyte of weights to say nothing more.
@@ -9972,8 +10392,8 @@ mod tests {
         args.snapshot_windows = 1;
         // CPU, explicitly: this is bookkeeping about which weights land in which file, none of
         // it device-dependent, and it must never allocate on a card another tenant owns.
-        let mut trainer = build_trainer(args, &runs.display().to_string(), Device::Cpu)
-            .expect("trainer builds");
+        let mut trainer =
+            build_trainer(args, &runs.display().to_string(), Device::Cpu).expect("trainer builds");
         let weights = trainer.run.weights.clone();
         // The fixture's ramp never reaches the deployed context, so the promotion this needs is
         // the forced one `validate` takes on its final step. That is also the promotion that
@@ -10157,7 +10577,11 @@ mod tests {
             ("diagnostic", &eval_a.diagnostic, &eval_b.diagnostic),
             ("snapshot", &eval_a.snapshot, &eval_b.snapshot),
             ("test", &eval_a.test, &eval_b.test),
-            ("test_snapshot", &eval_a.test_snapshot, &eval_b.test_snapshot),
+            (
+                "test_snapshot",
+                &eval_a.test_snapshot,
+                &eval_b.test_snapshot,
+            ),
         ] {
             assert_eq!(
                 a.sampler.seed(),
@@ -10359,7 +10783,13 @@ mod tests {
         let per = total / RAMP_STAGES;
         let mut stage_steps = [per; RAMP_STAGES];
         stage_steps[RAMP_STAGES - 1] = total - per * (RAMP_STAGES - 1);
-        Schedule::new(stage_steps, total, base_batch, batch_ramp, lr_plateau_fraction)
+        Schedule::new(
+            stage_steps,
+            total,
+            base_batch,
+            batch_ramp,
+            lr_plateau_fraction,
+        )
     }
 
     fn schedule(total: usize) -> Schedule {
@@ -10505,6 +10935,57 @@ mod tests {
         assert_eq!(dof_array(&t), [1.0, 2.0, 3.0, 4.0, 5.0]);
     }
 
+    #[test]
+    fn step_metrics_use_one_stable_packed_transfer_layout() {
+        let scalar = |value: f32| Tensor::from(value);
+        let graph = TrainingGraph {
+            loss: scalar(1.0),
+            nll: scalar(2.0),
+            nll_dof: Tensor::from_slice(&[3.0f32, 4.0, 5.0, 6.0, 7.0]),
+            dyn_loss: scalar(8.0),
+            kl_loss: scalar(9.0),
+            growth: scalar(10.0),
+            growth_stats: Tensor::from_slice(&[11.0f32, 12.0, 13.0]),
+            identity: scalar(14.0),
+            autocorr: scalar(15.0),
+        };
+        let probe = GrowthGradientProbe {
+            nll_value: scalar(17.0),
+            nll_norm: scalar(18.0),
+            growth_value: scalar(19.0),
+            growth_norm: scalar(20.0),
+        };
+        let packed = pack_step_metrics(&graph, &scalar(16.0), Some(&probe));
+        assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
+        assert_eq!(
+            read_packed_step_metrics(&packed),
+            [
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+                16.0, 17.0, 18.0, 19.0, 20.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn packed_metric_guard_rejects_nonfinite_loss_and_gradient() {
+        let finite = [0.0; STEP_METRIC_COUNT];
+        ensure_finite_step_metrics(&finite, 7).expect("finite packet");
+
+        let mut bad_loss = finite;
+        bad_loss[STEP_METRIC_TOTAL] = f64::NAN;
+        assert!(ensure_finite_step_metrics(&bad_loss, 7)
+            .expect_err("NaN loss must stop the step")
+            .to_string()
+            .contains("loss is not finite"));
+
+        let mut bad_grad = finite;
+        bad_grad[STEP_METRIC_GRAD_NORM] = f64::INFINITY;
+        assert!(ensure_finite_step_metrics(&bad_grad, 7)
+            .expect_err("infinite gradient must stop the step")
+            .to_string()
+            .contains("gradient norm is not finite"));
+    }
+
     /// The snapshot window must be long enough for every horizon the report plots,
     /// otherwise the longest series would silently be all-NaN and vanish.
     #[test]
@@ -10528,10 +11009,8 @@ mod tests {
     fn drifting_beliefs(batch: i64, context: i64, drift: f64, seed: i64) -> Tensor {
         tch::manual_seed(seed);
         let anchor = Tensor::randn([batch, 1, BAR_MODEL_DIM], (Kind::Float, Device::Cpu));
-        let noise = Tensor::randn(
-            [batch, context, BAR_MODEL_DIM],
-            (Kind::Float, Device::Cpu),
-        ) * drift;
+        let noise =
+            Tensor::randn([batch, context, BAR_MODEL_DIM], (Kind::Float, Device::Cpu)) * drift;
         let raw = anchor + noise;
         let scale = raw
             .pow_tensor_scalar(2.0)
@@ -10617,9 +11096,8 @@ mod tests {
         );
     }
 
-    /// The shares are of the objective's MAGNITUDE, so they stay meaningful when the
-    /// likelihood term is a negative log density — which under the default `density`
-    /// scoring it routinely is.
+    /// The shares are of the objective's MAGNITUDE, so they stay meaningful when density
+    /// scoring is selected and the likelihood term is routinely negative.
     ///
     /// # What this test guards, and what it deliberately does NOT
     ///
@@ -11119,8 +11597,7 @@ mod tests {
             BarScoring::Density,
             Device::Cpu,
         );
-        let three_terms =
-            &again.nll + lambda_dyn * &again.dyn_loss + lambda_kl * &again.kl_loss;
+        let three_terms = &again.nll + lambda_dyn * &again.dyn_loss + lambda_kl * &again.kl_loss;
         let without_the_term = three_terms.double_value(&[]);
         three_terms.backward();
         let grads_without_the_term = grads(&vs);
@@ -11307,23 +11784,12 @@ mod tests {
         };
         let (growth_live, nll_live) = (live(&trunk), live(&nll_trunk));
 
-        // One: growth cannot reach anything the likelihood cannot. A parameter that only the
-        // growth term touches would mean the two terms read different representations.
-        let extra: Vec<&String> = growth_live.difference(&nll_live).collect();
-        assert!(
-            extra.is_empty(),
-            "the growth term reached trunk parameters the likelihood cannot reach on the same \
-             batch: {extra:?}"
-        );
-
-        // Two: it traverses the FULL DEPTH. This is the assertion that "only the last
+        // It traverses the FULL DEPTH. This is the assertion that "only the last
         // projection is learning" would fail, and it is stated per layer rather than as a
         // count so it cannot be satisfied by a wide gradient in one block. Set equality is
-        // deliberately NOT asserted: the growth gradient is ~4 orders smaller than the
-        // likelihood's, so a handful of the tiniest scalars (measured: 2 of 47, both
-        // `attn_resid_lambda` in the last layers) underflow f32 to exactly zero. That is
-        // arithmetic, not detachment, and pinning it would make this test a float-noise
-        // detector.
+        // deliberately NOT asserted: different scalar objectives may cancel at different
+        // individual parameters even though both read the same representation, and the
+        // growth gradient is roughly four orders smaller than the likelihood's.
         let layers: BTreeSet<String> = nll_live
             .iter()
             .filter(|name| name.starts_with("bar_layer_"))
@@ -11607,8 +12073,7 @@ mod tests {
     #[test]
     fn a_batch_that_cannot_fit_is_clamped_at_startup_with_the_arithmetic() {
         let capacity = measured_5090();
-        let plan =
-            resolve_ramp(Some(&capacity), 72, false).expect("72 clamps rather than failing");
+        let plan = resolve_ramp(Some(&capacity), 72, false).expect("72 clamps rather than failing");
         assert_eq!(plan.base_batch, 24);
         let notice = plan.notice.expect("a clamp must announce itself");
         for fragment in [
@@ -11764,7 +12229,10 @@ mod tests {
         // margin is charged on a smaller context step too.
         assert!(batches[0] > 2 * batches[2]);
         for pair in batches.windows(2) {
-            assert!(pair[0] > pair[1], "the frontier must fall with context: {batches:?}");
+            assert!(
+                pair[0] > pair[1],
+                "the frontier must fall with context: {batches:?}"
+            );
         }
     }
 
@@ -11799,9 +12267,7 @@ mod tests {
             "a CPU run has no VRAM to gate on"
         );
         let Some(nvml) = NVML.as_ref() else {
-            eprintln!(
-                "NVML unavailable on this host; the ramp guard degrades to never holding"
-            );
+            eprintln!("NVML unavailable on this host; the ramp guard degrades to never holding");
             return;
         };
         let count = nvml.device_count().expect("NVML device count");
@@ -11872,7 +12338,9 @@ mod tests {
             trail.push((read.step, outcome));
         }
         (
-            incumbent.expect("the first eligible read always promotes").step,
+            incumbent
+                .expect("the first eligible read always promotes")
+                .step,
             trail,
         )
     }

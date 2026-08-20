@@ -560,7 +560,10 @@ impl Panel {
             "a tradeable bar needs a predecessor close, so min_history must be at least 1"
         );
         ensure!(config.max_symbols > 0, "a panel needs at least one symbol");
-        ensure!(config.max_instants > 0, "a panel needs at least one instant");
+        ensure!(
+            config.max_instants > 0,
+            "a panel needs at least one instant"
+        );
 
         let ranked = rank_by_prior_liquidity(corpus, config);
         ensure!(
@@ -1134,21 +1137,32 @@ pub fn model_forecasts(
         let mut cursor = first;
         while cursor <= last {
             let emit = BELIEF_EMIT.min((last - cursor + 1) as i64);
-            // Inputs are the bars that PRECEDE the emitted predictions, plus the causal
-            // history each belief must stand on.
-            let end = cursor + emit as usize - 2;
+            // One extra row supplies each predicted bar's exogenous target clock;
+            // only the preceding `len` bars enter the causal trunk.
+            let end = cursor + emit as usize - 1;
             let len = emit + BELIEF_PRE_CONTEXT;
             let batch = corpus
-                .dof_window(&[BarEndpoint { series, bar: end }], &[0], len, device)
+                .dof_window(&[BarEndpoint { series, bar: end }], &[0], len + 1, device)
                 .with_context(|| {
                     format!(
-                        "belief block of {len} bars ending at {end} for {}",
+                        "belief block of {} bars ending at {end} for {}",
+                        len + 1,
                         panel.symbols()[id]
                     )
                 })?;
-            let beliefs = model.beliefs(&batch.dof, &batch.time_ids);
+            let input_dof = batch.dof.narrow(1, 0, len);
+            let current_time = batch.time_ids.narrow(1, 0, len);
+            let target_time = batch.time_ids.narrow(1, 1, len);
+            let beliefs = model.beliefs(&input_dof, &current_time);
+            let conditioning = model
+                .trunk()
+                .forecast_conditioning(&target_time, &current_time);
             let latent = *beliefs.size().last().expect("beliefs carry a feature dim");
             let block = beliefs
+                .narrow(1, len - emit, emit)
+                .reshape([emit, latent])
+                .contiguous();
+            let conditioning_block = conditioning
                 .narrow(1, len - emit, emit)
                 .reshape([emit, latent])
                 .contiguous();
@@ -1156,7 +1170,11 @@ pub fn model_forecasts(
             let mut start = 0i64;
             while start < emit {
                 let rows = ROW_CHUNK.min(emit - start);
-                let probs = forecast_r_probs(model.head(), &block.narrow(0, start, rows));
+                let probs = forecast_r_probs(
+                    model.head(),
+                    &block.narrow(0, start, rows),
+                    &conditioning_block.narrow(0, start, rows),
+                );
                 let kelly = host_f32(&kelly_fractions(&probs, &returns, FREE_LEVERAGE));
                 let probs = probs.to_kind(Kind::Double);
                 let mean = probs.matmul(&returns.reshape([NUM_BAR_BINS, 1])).squeeze();
@@ -1265,8 +1283,7 @@ impl Policy {
                 // Breadth-weighted mean, which for an equal-count cross-section is the plain
                 // mean of the present names: the book carries no net exposure by
                 // construction rather than by an optimizer's constraint.
-                let mean =
-                    model.kelly_f.iter().map(|f| f64::from(*f)).sum::<f64>() / n as f64;
+                let mean = model.kelly_f.iter().map(|f| f64::from(*f)).sum::<f64>() / n as f64;
                 out.extend(model.kelly_f.iter().map(|f| f64::from(*f) - mean));
             }
             Policy::Marginal => out.extend(marginal.kelly_f.iter().map(|f| f64::from(*f))),
@@ -2122,7 +2139,11 @@ impl PortfolioMetrics {
         // Excess over a zero risk-free rate, stated rather than assumed: over a five-month
         // held-out span at a 5-minute horizon the cash rate moves the ratio by less than the
         // width of its own interval.
-        let sharpe = if sd > 0.0 { mean / sd * per_year.sqrt() } else { f64::NAN };
+        let sharpe = if sd > 0.0 {
+            mean / sd * per_year.sqrt()
+        } else {
+            f64::NAN
+        };
 
         // Drawdown from the log curve: `1 - exp(log w - log peak)` is exact and stays inside
         // `[0, 1]` even where the linear curve has overflowed.
@@ -2910,7 +2931,9 @@ fn bootstrap_edge(
         let mut rng = ChaCha12Rng::seed_from_u64(BOOTSTRAP_SEED);
         let mut totals = vec![EdgeInstant::default(); buckets];
         for _ in 0..BOOTSTRAP_DRAWS {
-            totals.iter_mut().for_each(|cell| *cell = EdgeInstant::default());
+            totals
+                .iter_mut()
+                .for_each(|cell| *cell = EdgeInstant::default());
             let mut pooled_total = EdgeInstant::default();
             for _ in 0..block_count {
                 let block = *indices.choose(&mut rng).expect("a block index exists");
@@ -2957,11 +2980,9 @@ fn bootstrap_edge(
             draws: draws.len(),
         }
     };
-    let deepest_point = full_rows
-        .last()
-        .map_or(f64::NAN, |deepest| {
-            deepest.moving_edge_bps() / full_pooled.moving_edge_bps()
-        });
+    let deepest_point = full_rows.last().map_or(f64::NAN, |deepest| {
+        deepest.moving_edge_bps() / full_pooled.moving_edge_bps()
+    });
     EdgeCiSet {
         blocking,
         blocks: block_count,
@@ -3118,8 +3139,18 @@ impl EdgeVsCostTable {
         // An unmeasurable ADV sorts to the THINNEST decile, where an untradeable name belongs:
         // IEEE total order would rank a NaN above `+inf` and put it in the deepest.
         let mut ranked: Vec<usize> = (0..names).collect();
-        let key = |adv: f64| if adv.is_finite() { adv } else { f64::NEG_INFINITY };
-        ranked.sort_by(|a, b| key(mean_adv[*a]).total_cmp(&key(mean_adv[*b])).then(a.cmp(b)));
+        let key = |adv: f64| {
+            if adv.is_finite() {
+                adv
+            } else {
+                f64::NEG_INFINITY
+            }
+        };
+        ranked.sort_by(|a, b| {
+            key(mean_adv[*a])
+                .total_cmp(&key(mean_adv[*b]))
+                .then(a.cmp(b))
+        });
 
         let buckets = DECILES.min(names.max(1));
         let mut decile_of = vec![0usize; names];
@@ -3141,7 +3172,9 @@ impl EdgeVsCostTable {
         let mut day_of: Vec<u64> = Vec::with_capacity(instants);
         let mut cells = vec![EdgeInstant::default(); buckets];
         for (t, slice) in panel.slices().iter().enumerate() {
-            cells.iter_mut().for_each(|cell| *cell = EdgeInstant::default());
+            cells
+                .iter_mut()
+                .for_each(|cell| *cell = EdgeInstant::default());
             let mut pooled_cell = EdgeInstant::default();
             let forecast = &inputs.model[t];
             for (k, &id) in slice.symbols.iter().enumerate() {
@@ -3197,7 +3230,10 @@ impl EdgeVsCostTable {
             }
             price_decile(&mut pooled, panel, model, &ranked);
         }
-        let all_in: Vec<f64> = deciles.iter().map(EdgeVsCost::headline_all_in_bps).collect();
+        let all_in: Vec<f64> = deciles
+            .iter()
+            .map(EdgeVsCost::headline_all_in_bps)
+            .collect();
         let impact_free: Vec<f64> = deciles.iter().map(EdgeVsCost::impact_free_bps).collect();
         let pooled_all_in = pooled.headline_all_in_bps();
         let pooled_impact_free = pooled.impact_free_bps();
@@ -3277,7 +3313,13 @@ impl EdgeVsCostTable {
         // held fixed, so their widths scale with it exactly - which makes this the one line
         // where a reader can see whether the choice of blocking is doing any work at all. What
         // gets printed is the two widths, not a claimed direction between them.
-        let width = |ci: &EdgeCi| if ci.is_measured() { ci.hi - ci.lo } else { f64::NAN };
+        let width = |ci: &EdgeCi| {
+            if ci.is_measured() {
+                ci.hi - ci.lo
+            } else {
+                f64::NAN
+            }
+        };
         out.push_str(&format!(
             "  pooled signed edge per positioned bar: {} bps by {} (width {:.4}); {} bps by {} \
              (width {:.4})\n",
@@ -3312,9 +3354,17 @@ impl EdgeVsCostTable {
             // lower bound at or below zero the shortfall is unbounded above, and printing
             // `1 / lo` there would render an infinite shortfall as a finite one.
             let shortfall = if ci.is_measured() && ci.lo > 0.0 {
-                format!("shortfall {:.1}x ({:.1}x..{:.1}x)", 1.0 / ci.point, 1.0 / ci.hi, 1.0 / ci.lo)
+                format!(
+                    "shortfall {:.1}x ({:.1}x..{:.1}x)",
+                    1.0 / ci.point,
+                    1.0 / ci.hi,
+                    1.0 / ci.lo
+                )
             } else if ci.point > 0.0 {
-                format!("shortfall {:.1}x, unbounded above (the edge interval reaches zero)", 1.0 / ci.point)
+                format!(
+                    "shortfall {:.1}x, unbounded above (the edge interval reaches zero)",
+                    1.0 / ci.point
+                )
             } else {
                 "no shortfall is definable: the edge itself is not positive".to_owned()
             };
@@ -3893,9 +3943,7 @@ impl PortfolioBench {
         out.push_str(&format!(
             "  impact is an ASSUMPTION at k = {IMPACT_K:.2}; the same column at k = {:?} is \
              {:?} bps pooled, and the all-in becomes {:?} bps\n",
-            IMPACT_K_GRID,
-            self.edge.pooled.impact_bps,
-            self.edge.pooled.all_in_bps,
+            IMPACT_K_GRID, self.edge.pooled.impact_bps, self.edge.pooled.all_in_bps,
         ));
         out.push_str(&format!(
             "  {} of {} panel symbols priced at the cross-sectional median spread, {} at the \
@@ -4387,7 +4435,9 @@ pub fn write_portfolio_bench(dir: &Path, label: &str, bench: &PortfolioBench) ->
     push("half-spread (bps, one way)".to_owned(), &|d| {
         d.half_spread_bps
     });
-    push("commission (bps, one way)".to_owned(), &|d| d.commission_bps);
+    push("commission (bps, one way)".to_owned(), &|d| {
+        d.commission_bps
+    });
     push("regulatory fee (bps, one way)".to_owned(), &|d| {
         d.regulatory_bps
     });
@@ -4549,12 +4599,13 @@ pub fn run_portfolio_backtest(args: &PortfolioArgs) -> Result<PortfolioBench> {
     let panel = Panel::build(&corpus, &config)?;
 
     let metadata = world_model_metadata_path(&args.checkpoint);
-    let model = BarWorldModel::load(&args.checkpoint, &metadata, args.device).with_context(|| {
-        format!(
-            "loading the traded checkpoint {}",
-            args.checkpoint.display()
-        )
-    })?;
+    let model =
+        BarWorldModel::load(&args.checkpoint, &metadata, args.device).with_context(|| {
+            format!(
+                "loading the traded checkpoint {}",
+                args.checkpoint.display()
+            )
+        })?;
     let supports = model
         .supports_for(args.res_secs)
         .with_context(|| format!("the checkpoint carries no supports at {}s", args.res_secs))?;
@@ -4576,7 +4627,9 @@ pub fn run_portfolio_backtest(args: &PortfolioArgs) -> Result<PortfolioBench> {
     } else {
         None
     };
-    let measured = calibration.as_ref().map(|c| BarCostModel::new(Arc::clone(c)));
+    let measured = calibration
+        .as_ref()
+        .map(|c| BarCostModel::new(Arc::clone(c)));
     if let Some(measured) = measured.as_ref() {
         let calibration = measured.calibration();
         ensure!(
@@ -4615,10 +4668,8 @@ mod tests {
 
     fn scratch_dir(name: &str) -> PathBuf {
         let unique = SCRATCH.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "portfolio_{name}_{}_{unique}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("portfolio_{name}_{}_{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -4650,11 +4701,7 @@ mod tests {
             .slices()
             .iter()
             .map(|slice| PanelForecast {
-                kelly_f: slice
-                    .symbols
-                    .iter()
-                    .map(|id| kelly[*id as usize])
-                    .collect(),
+                kelly_f: slice.symbols.iter().map(|id| kelly[*id as usize]).collect(),
                 mean_r: vec![0.0; slice.symbols.len()],
                 var_r: vec![1.0e-4; slice.symbols.len()],
             })
@@ -4706,7 +4753,10 @@ mod tests {
                 run.equity[t + 1]
             );
             assert!((run.returns[t] - payoff).abs() < 1e-12);
-            assert!((run.gross[t] - 1.0).abs() < 1e-12, "the cap must bind exactly");
+            assert!(
+                (run.gross[t] - 1.0).abs() < 1e-12,
+                "the cap must bind exactly"
+            );
             assert!(run.bound[t], "raw gross 4.0 against a budget of 1.0 binds");
         }
         assert!(run.ruined_at.is_none());
@@ -4718,10 +4768,7 @@ mod tests {
     /// weight that actually moved.
     #[test]
     fn cost_is_charged_on_the_weight_that_moved() {
-        let rows = vec![
-            (0, vec![(0u32, 0.0f32)]),
-            (FIVE_MIN, vec![(0u32, 0.0f32)]),
-        ];
+        let rows = vec![(0, vec![(0u32, 0.0f32)]), (FIVE_MIN, vec![(0u32, 0.0f32)])];
         let panel = fixture_panel(&rows, 1);
         let model = constant_forecast(&panel, &[1.0]);
         let run = backtest(
@@ -4785,7 +4832,10 @@ mod tests {
         assert_eq!(run.returns[3], 0.0);
         assert_eq!(run.gross[3], 0.0);
         assert_eq!(run.metrics.final_wealth, 0.0);
-        assert_eq!(run.metrics.cagr, -1.0, "total loss is -100% a year, not NaN");
+        assert_eq!(
+            run.metrics.cagr, -1.0,
+            "total loss is -100% a year, not NaN"
+        );
         assert!((run.metrics.max_drawdown - 1.0).abs() < 1e-12);
         assert_eq!(run.metrics.ruined_at_instant, 1.0);
     }
@@ -4989,7 +5039,12 @@ mod tests {
                     t as i64 * FIVE_MIN,
                     (0..6u32)
                         .filter(|id| uniform(3, u64::from(*id) * 5 + t) > 0.2)
-                        .map(|id| (id, (0.03 * (uniform(5, u64::from(id) * 11 + t) - 0.5)) as f32))
+                        .map(|id| {
+                            (
+                                id,
+                                (0.03 * (uniform(5, u64::from(id) * 11 + t) - 0.5)) as f32,
+                            )
+                        })
                         .collect::<Vec<_>>(),
                 )
             })
@@ -5016,11 +5071,25 @@ mod tests {
             marginal: &marginal,
         };
         let free = FlatCost::new(0.0);
-        let oracle = backtest(&panel, &inputs, Policy::Oracle, 2.0, &free, &BacktestConfig::default())
-            .expect("oracle");
+        let oracle = backtest(
+            &panel,
+            &inputs,
+            Policy::Oracle,
+            2.0,
+            &free,
+            &BacktestConfig::default(),
+        )
+        .expect("oracle");
         for policy in POLICIES {
-            let run = backtest(&panel, &inputs, policy, 2.0, &free, &BacktestConfig::default())
-                .expect("policy");
+            let run = backtest(
+                &panel,
+                &inputs,
+                policy,
+                2.0,
+                &free,
+                &BacktestConfig::default(),
+            )
+            .expect("policy");
             for t in 0..panel.instants() {
                 assert!(
                     oracle.returns[t] >= run.returns[t] - 1e-12,
@@ -5256,9 +5325,11 @@ mod tests {
         ];
         let panel = fixture_panel(&rows, 2);
         let forecasts = marginal_forecasts(&panel, &supports);
-        let expected =
-            kelly_fraction(supports.bin_masses(DOF_R), &bin_returns(&supports), FREE_LEVERAGE)
-                as f32;
+        let expected = kelly_fraction(
+            supports.bin_masses(DOF_R),
+            &bin_returns(&supports),
+            FREE_LEVERAGE,
+        ) as f32;
         assert_eq!(forecasts.len(), 2);
         assert_eq!(forecasts[0].kelly_f, vec![expected; 2]);
         assert_eq!(forecasts[1].kelly_f, vec![expected; 1]);
@@ -5304,7 +5375,12 @@ mod tests {
                 (
                     t as i64 * FIVE_MIN,
                     (0..4u32)
-                        .map(|id| (id, (0.004 * (uniform(2, u64::from(id) * 3 + t) - 0.5)) as f32))
+                        .map(|id| {
+                            (
+                                id,
+                                (0.004 * (uniform(2, u64::from(id) * 3 + t) - 0.5)) as f32,
+                            )
+                        })
                         .collect(),
                 )
             })
@@ -5358,14 +5434,16 @@ mod tests {
                 panic!("{base} is not a MultiLine chart");
             };
             assert!(
-                series.iter().any(|s| s.values.iter().any(|v| v.is_finite())),
+                series
+                    .iter()
+                    .any(|s| s.values.iter().any(|v| v.is_finite())),
                 "{base} holds no finite value"
             );
         }
         // The equity chart carries one series per (policy, cap) and one point per instant
         // plus the starting wealth.
-        let report = read_report(&dir.join(format!("{PORTFOLIO_EQUITY_BASE}.report.bin")))
-            .expect("equity");
+        let report =
+            read_report(&dir.join(format!("{PORTFOLIO_EQUITY_BASE}.report.bin"))).expect("equity");
         let ReportKind::MultiLine { series } = report.kind else {
             panic!("equity is not a MultiLine chart");
         };
@@ -5850,7 +5928,11 @@ mod tests {
                 let i = i as u64;
                 log_mid += 0.001 * (uniform(seed, 2 * i) - 0.5);
                 let mid = log_mid.exp();
-                let side = if uniform(seed, 2 * i + 1) < 0.5 { 1.0 } else { -1.0 };
+                let side = if uniform(seed, 2 * i + 1) < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                };
                 let close = mid * (1.0 + side * 0.5 * spread);
                 PackedBar {
                     ts_ms: first_ts + i as i64 * FIVE_MIN,
@@ -6161,7 +6243,12 @@ mod tests {
         .expect("bench");
 
         assert_eq!(bench.arms.len(), 1 + 1 + 2 * IMPACT_K_GRID.len());
-        assert!(bench.flat_arm().arm == CostArm::Flat { bps: DEFAULT_COST_BPS });
+        assert!(
+            bench.flat_arm().arm
+                == CostArm::Flat {
+                    bps: DEFAULT_COST_BPS
+                }
+        );
         assert!(bench.headline_measured_arm().is_some());
         let free = bench
             .assumption_free_arm()
@@ -6287,7 +6374,10 @@ mod tests {
             &BacktestConfig::default(),
         )
         .expect("run");
-        assert_eq!(run.trades.trades, 1, "one position, opened once, closed once");
+        assert_eq!(
+            run.trades.trades, 1,
+            "one position, opened once, closed once"
+        );
         assert_eq!(run.trades.bars_held, 4);
         assert_eq!(run.trades.positioned_legs, 4);
         assert_eq!(run.trades.sign_agreements, 3);
@@ -6393,7 +6483,10 @@ mod tests {
             None,
         );
         assert!(!table.measured, "no cost model was supplied");
-        assert!(table.pooled.half_spread_bps.is_nan(), "and none is invented");
+        assert!(
+            table.pooled.half_spread_bps.is_nan(),
+            "and none is invented"
+        );
         assert_eq!(table.deciles.len(), DECILES);
         assert!((table.pooled.forecast_sign_agreement - 1.0).abs() < 1e-12);
         assert!(
@@ -6554,7 +6647,11 @@ mod tests {
         );
         // Twenty instant blocks over the same bars DO resolve, so the refusal above is a
         // property of the blocking rather than of the panel.
-        assert!(table.intervals.by_instant.pooled_signed_edge_bps.is_measured());
+        assert!(table
+            .intervals
+            .by_instant
+            .pooled_signed_edge_bps
+            .is_measured());
         assert_eq!(table.intervals.by_instant.blocks, panel.instants());
     }
 
@@ -6582,7 +6679,10 @@ mod tests {
             "the edge needs no cost model and its interval must survive",
         );
         let trip = day.pooled_edge_over_round_trip;
-        assert!(trip.point.is_nan(), "an unpriced round trip is not a number");
+        assert!(
+            trip.point.is_nan(),
+            "an unpriced round trip is not a number"
+        );
         assert!(!trip.is_measured());
         assert_eq!(trip.verdict(1.0), "n/a", "and it carries no verdict");
         assert_eq!(trip.excludes(1.0), None);
@@ -6753,8 +6853,8 @@ mod tests {
             "PORTFOLIO_CHECKPOINT",
             "training/runs/bardist_v2/weights/pretrain_best.ot",
         );
-        let run = std::env::var("PORTFOLIO_RUN")
-            .unwrap_or_else(|_| "bardist_v2_portfolio".to_owned());
+        let run =
+            std::env::var("PORTFOLIO_RUN").unwrap_or_else(|_| "bardist_v2_portfolio".to_owned());
         let gens = root.join("training/runs").join(&run).join("gens/0");
 
         let args = PortfolioArgs {

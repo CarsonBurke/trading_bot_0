@@ -279,7 +279,8 @@ impl SupportDecode {
     /// conclude that the fitted numbers describe what the pipeline computes. With the
     /// qualification attached to every line, they cannot.
     pub fn summary_rows(&self) -> Vec<(String, Vec<f64>)> {
-        let per_dof = |pick: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..BAR_DOF).map(pick).collect() };
+        let per_dof =
+            |pick: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..BAR_DOF).map(pick).collect() };
         let bps = 1e4;
         let mut rows: Vec<(String, Vec<f64>)> = vec![
             ("dof index".to_owned(), per_dof(&|dof| dof as f64)),
@@ -292,7 +293,10 @@ impl SupportDecode {
         ];
         for (tag, census) in [
             ("edge decode = PRODUCTION", &self.edge_census),
-            ("fitted decode = NOT the production decode", &self.fitted_census),
+            (
+                "fitted decode = NOT the production decode",
+                &self.fitted_census,
+            ),
         ] {
             rows.extend([
                 (
@@ -429,7 +433,11 @@ impl SupportDecode {
             ),
             (
                 "fitted minus edge, bps".to_owned(),
-                fitted.iter().zip(edge).map(|(f, e)| (f - e) * bps).collect(),
+                fitted
+                    .iter()
+                    .zip(edge)
+                    .map(|(f, e)| (f - e) * bps)
+                    .collect(),
             ),
             (
                 "within-bin sd, bps [MEASURED, r's tail exponent ~1.8 so the outer entries are \
@@ -454,8 +462,7 @@ impl SupportDecode {
                 share(fitted, mean_fitted, false),
             ),
             (
-                "share of the decoded mean's estimation variance, % [edge = PRODUCTION]"
-                    .to_owned(),
+                "share of the decoded mean's estimation variance, % [edge = PRODUCTION]".to_owned(),
                 share(edge, mean_edge, true),
             ),
             (
@@ -914,7 +921,9 @@ mod tests {
                 panic!("{base} must be a MultiLine chart");
             };
             assert!(
-                series.iter().any(|s| s.values.iter().any(|v| v.is_finite())),
+                series
+                    .iter()
+                    .any(|s| s.values.iter().any(|v| v.is_finite())),
                 "{base} carries no finite value, so it is a blank panel"
             );
         }

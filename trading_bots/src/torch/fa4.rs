@@ -229,8 +229,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "libtorch CUDA autograd must run in a fresh test process"]
     fn prefill_forward_and_backward_smoke() -> Result<()> {
-        let _torch_rng_guard = test_rng::shared();
+        let _torch_rng_guard = test_rng::exclusive();
         if !ready() {
             return Ok(());
         }

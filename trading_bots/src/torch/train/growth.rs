@@ -437,24 +437,21 @@ impl GrowthStats {
 
 /// `[rows, NUM_BAR_BINS]` `p(r | strictly past bars)`, attached.
 ///
-/// The emission head is `Linear([h, masked prefix embeddings]) -> NUM_BAR_BINS` per DOF,
-/// and the constant `prefix_mask` keeps only the slots strictly below a DOF's chain
-/// position. `r` sits at chain position 0, so it sees NO slot and its logit row is a
-/// function of the latent alone. That is what makes the traded law a plain read rather
-/// than a mixture, and it is why `r` was put first.
-///
-/// The zero prefix is not a stand-in for the realized bar: the mask discards it, so
-/// passing the realized bins there would return the identical row. No realized same-bar
-/// value reaches this function — the signature carries the head and the causal beliefs and
-/// nothing else, the same discipline [`super::trade_bench::forecast_r_probs`] is built on.
-/// That one is the same law with the graph dropped; this one stays attached because it is
-/// an objective term.
-pub fn r_probs(head: &BarEmissionHead, beliefs: &Tensor) -> Tensor {
+/// The emission readout is `Linear([h, forecast_conditioning, masked prefix
+/// embeddings]) -> NUM_BAR_BINS` per DOF. `r` sits at chain position 0, so it
+/// sees no same-bar prefix; its explicit conditioning contains only the target
+/// exogenous clock and the current observed market.
+pub fn r_probs(head: &BarEmissionHead, beliefs: &Tensor, conditioning: &Tensor) -> Tensor {
     let size = beliefs.size();
     assert_eq!(size.len(), 2, "beliefs must be [rows, latent_dim]");
+    assert_eq!(
+        conditioning.size(),
+        size,
+        "one forecast-conditioning row per belief"
+    );
     let rows = size[0];
     let zero_prefix = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, beliefs.device()));
-    head.logits(beliefs, &zero_prefix)
+    head.logits(beliefs, conditioning, &zero_prefix)
         .select(1, DOF_R as i64)
         .to_kind(Kind::Float)
         .softmax(-1, Kind::Float)
@@ -538,13 +535,15 @@ fn per_bar_growth(
 pub fn growth_loss(
     head: &BarEmissionHead,
     beliefs: &Tensor,
+    conditioning: &Tensor,
     realized_log_r: &Tensor,
     support: &GrowthSupport,
 ) -> Growth {
     tch::autocast(false, || {
         let latent = head.latent_dim();
         let flat = beliefs.reshape([-1, latent]).to_kind(Kind::Float);
-        let (mu_hat, second_moment) = r_moments(&r_probs(head, &flat), support);
+        let flat_conditioning = conditioning.reshape([-1, latent]).to_kind(Kind::Float);
+        let (mu_hat, second_moment) = r_moments(&r_probs(head, &flat, &flat_conditioning), support);
         // DATA: clipped to the same support the bins are clamped onto, then converted to a
         // simple return with the same `exp_m1` convention as the bin returns. Detached
         // because a gradient into the realized bar would be a gradient into the future.
@@ -593,15 +592,16 @@ pub fn verify_traded_law(
     let rows = 16i64;
     let probe =
         Tensor::linspace(-1.0, 1.0, rows * latent, (Kind::Float, device)).view([rows, latent]);
+    let conditioning = Tensor::zeros_like(&probe);
     let (probs, drift) = tch::no_grad(|| {
-        let probs = r_probs(head, &probe);
+        let probs = r_probs(head, &probe, &conditioning);
         // Every prefix slot filled with the same non-zero bin. If any of them could reach
         // the `r` row, this moves it.
         let mut drift = 0.0f64;
         for bin in [1i64, NUM_BAR_BINS / 2, NUM_BAR_BINS - 1] {
             let prefix = Tensor::full([rows, BAR_DOF as i64], bin, (Kind::Int64, device));
             let row = head
-                .logits(&probe, &prefix)
+                .logits(&probe, &conditioning, &prefix)
                 .select(1, DOF_R as i64)
                 .to_kind(Kind::Float)
                 .softmax(-1, Kind::Float);
@@ -743,21 +743,24 @@ mod tests {
         let (batch, steps) = (3i64, 7i64);
         let rows = batch * steps;
         let beliefs = probe_beliefs(rows, latent, 0x6705_0003).view([batch, steps, latent]);
+        let conditioning = probe_beliefs(rows, latent, 0x6705_0004).view([batch, steps, latent]);
         tch::manual_seed(0x6705_0004);
         let realized_r = Tensor::randn([batch, steps], (Kind::Float, Device::Cpu)) * 0.004;
 
-        let baseline = growth_loss(&head, &beliefs, &realized_r, &support);
+        let baseline = growth_loss(&head, &beliefs, &conditioning, &realized_r, &support);
         let base_loss = baseline.loss.double_value(&[]);
         let base_stats = GrowthStats::read(&baseline.stats);
         let flat = beliefs.reshape([-1, latent]);
-        let (base_mu, base_second) = r_moments(&r_probs(&head, &flat), &support);
+        let flat_conditioning = conditioning.reshape([-1, latent]);
+        let (base_mu, base_second) =
+            r_moments(&r_probs(&head, &flat, &flat_conditioning), &support);
 
         // The reference for the non-vacuity half: a factor whose prefix CONTAINS the realized
         // `s`, read at the zero prefix. `u` sits directly behind `s` in the chain, so its row
         // is conditioned on the range — exactly the kind of row a wrong read would pick up.
         let zero_prefix = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, Device::Cpu));
         let conditioned = head
-            .logits(&flat, &zero_prefix)
+            .logits(&flat, &flat_conditioning, &zero_prefix)
             .select(1, DOF_U as i64)
             .softmax(-1, Kind::Float);
         let (conditioned_mu, _) = r_moments(&conditioned, &support);
@@ -774,24 +777,24 @@ mod tests {
             }
             let prefix = Tensor::from_slice(&values).view([rows, BAR_DOF as i64]);
             let swept = head
-                .logits(&flat, &prefix)
+                .logits(&flat, &flat_conditioning, &prefix)
                 .select(1, DOF_U as i64)
                 .softmax(-1, Kind::Float);
             prefix_response =
                 prefix_response.max((&swept - &conditioned).abs().max().double_value(&[]));
             let (leaked_mu, _) = r_moments(&swept, &support);
-            leaked_mu_drift = leaked_mu_drift
-                .max((&leaked_mu - &conditioned_mu).abs().max().double_value(&[]));
+            leaked_mu_drift =
+                leaked_mu_drift.max((&leaked_mu - &conditioned_mu).abs().max().double_value(&[]));
 
             // BIT-identical, not close: a tolerance here would pass an implementation that
             // mixed a little lookahead in.
-            let again = growth_loss(&head, &beliefs, &realized_r, &support);
+            let again = growth_loss(&head, &beliefs, &conditioning, &realized_r, &support);
             assert_eq!(
                 again.loss.double_value(&[]),
                 base_loss,
                 "the growth loss moved while the realized same-bar s was swept to bin {bin}"
             );
-            let (mu, second) = r_moments(&r_probs(&head, &flat), &support);
+            let (mu, second) = r_moments(&r_probs(&head, &flat, &flat_conditioning), &support);
             assert_eq!((&mu - &base_mu).abs().max().double_value(&[]), 0.0);
             assert_eq!((&second - &base_second).abs().max().double_value(&[]), 0.0);
             let stats = GrowthStats::read(&again.stats);
@@ -919,7 +922,13 @@ mod tests {
         let seconds = [0.0f32, 1e-18, 1e30, 6.4e-3];
         // Realized LOG returns, including two well outside the support so the clip has
         // work to do.
-        let realized = [0.0f32, support.log_lo as f32, support.log_hi as f32, -30.0, 30.0];
+        let realized = [
+            0.0f32,
+            support.log_lo as f32,
+            support.log_hi as f32,
+            -30.0,
+            30.0,
+        ];
         let clipped = Tensor::from_slice(&realized)
             .clamp(support.log_lo, support.log_hi)
             .expm1();
@@ -1118,8 +1127,10 @@ mod tests {
     /// for the two catch-alls with nothing anywhere saying so.
     #[test]
     fn a_support_without_fitted_moments_refuses_to_build_the_term() {
-        let dir = std::env::temp_dir()
-            .join(format!("trading_bot_0_growth_decode_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_growth_decode_{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("bar_supports.300.json");
         synthetic_supports(40_000, 0x670A_0001)

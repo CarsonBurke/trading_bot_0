@@ -116,15 +116,7 @@ impl Env {
         let mut rng = ChaCha12Rng::seed_from_u64(derive_rng_seed(seed, 0));
         let tickers = sample_training_tickers(&mut rng);
         let market_data = load_market_data_without_macro(&tickers, false);
-        Self::new_from_market_data(
-            tickers,
-            random_start,
-            true,
-            None,
-            false,
-            market_data,
-            seed,
-        )
+        Self::new_from_market_data(tickers, random_start, true, None, false, market_data, seed)
     }
 
     fn new_from_market_data(

@@ -235,7 +235,10 @@ pub(crate) mod tests {
 
         fs::write(bar_file("FUTURE"), b"future-v2").unwrap();
         let after = fingerprint_training_inputs(&data_path, &bars_path, &eligible).unwrap();
-        assert_ne!(before, after, "a changed bar corpus must change the fingerprint");
+        assert_ne!(
+            before, after,
+            "a changed bar corpus must change the fingerprint"
+        );
 
         fs::write(data_path.join("FUTURE_earnings_fmp.bin"), b"reports").unwrap();
         let with_earnings = fingerprint_training_inputs(&data_path, &bars_path, &eligible).unwrap();
@@ -375,7 +378,10 @@ fn fingerprint_training_inputs(
     let mut context = DigestContext::new(&SHA256);
     for ticker in eligible {
         update_str(&mut context, ticker);
-        update_input_file(&mut context, &bar_file_path(bars_path, ticker, LIVE_RES_SECS))?;
+        update_input_file(
+            &mut context,
+            &bar_file_path(bars_path, ticker, LIVE_RES_SECS),
+        )?;
         for provider in ["alphavantage", "finnhub", "fmp"] {
             update_input_file(
                 &mut context,

@@ -1167,12 +1167,23 @@ mod planner_inference_discovery_tests {
                  invisible"
             );
         }
+        assert!(
+            bases.contains(&"pretrain_independent_marginal_nll"),
+            "the independent-marginal diagnostic must be registered under its honest base"
+        );
+        assert!(
+            !bases.contains(&"pretrain_forecast_nll"),
+            "the old base mislabeled a sum of per-DOF marginals as a joint forecast NLL"
+        );
         // Sorted and deduplicated, which is what lets the scan be a single pass and what
         // stops a duplicated name costing one `read_dir` per copy.
         let mut sorted = bases.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(bases, sorted, "the meta chart list must be sorted and unique");
+        assert_eq!(
+            bases, sorted,
+            "the meta chart list must be sorted and unique"
+        );
     }
 
     #[test]

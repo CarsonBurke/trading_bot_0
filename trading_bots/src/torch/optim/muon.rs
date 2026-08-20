@@ -972,6 +972,36 @@ impl Muon {
             .map(|&idx| self.names[idx].clone())
             .collect()
     }
+    /// Resolved AdamW group settings for one exactly named parameter:
+    /// `(learning-rate scale, betas, weight-decay multiplier)`.
+    ///
+    /// The multiplier is zero when the no-decay routing wins. This exposes the resolved
+    /// first-match policy so a model-specific optimizer builder can assert named groups rather
+    /// than merely asserting that a collection of substring overrides was populated.
+    pub(crate) fn adamw_group_settings(
+        &self,
+        parameter_name: &str,
+    ) -> Option<(f64, (f64, f64), f64)> {
+        let idx = self.names.iter().position(|name| name == parameter_name)?;
+        if !self.adamw_indices.contains(&idx) {
+            return None;
+        }
+        let no_weight_decay = self
+            .cfg
+            .adamw_no_weight_decay_name_substrings
+            .iter()
+            .any(|needle| parameter_name.contains(needle));
+        let wd_multiplier = if no_weight_decay {
+            0.0
+        } else {
+            self.adamw_wd_mul_for(idx)
+        };
+        Some((
+            self.lr_scales[idx],
+            self.adamw_betas_for(idx),
+            wd_multiplier,
+        ))
+    }
 
     /// Enable or disable optimizer steps for matching named parameters. This is
     /// stronger than zeroing gradients: disabled parameters also skip momentum,

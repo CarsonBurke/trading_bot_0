@@ -63,6 +63,17 @@ impl From<StreamingModelVariant> for ModelVariant {
 #[command(name = "trading_bot")]
 #[command(about = "Trading bot with PPO training and inference", long_about = None)]
 struct Cli {
+    /// Reuse `bar_market_supports.<res>.json` even when the proxy's history no longer
+    /// reproduces the fit recorded in it.
+    ///
+    /// Global rather than per-subcommand because every corpus-opening entry point — the
+    /// planner, the horizon and portfolio panels, the universe rebuild — consults the same
+    /// artifact, and after a legitimate proxy backfill they all need the same escape hatch.
+    /// Without one, the only way forward is deleting the artifact, which refits the buckets
+    /// and re-means every market conditioning row mid-campaign.
+    #[arg(long, global = true, default_value_t = false)]
+    freeze_market_supports: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -241,12 +252,13 @@ enum Commands {
         /// checkpoint metadata, folded into the lineage hash, and `pretrain-compare`
         /// refuses to pair two runs that disagree.
         ///
-        /// * `density` (default) — the proper log-likelihood of the MIXED law we observe:
-        ///   a probability MASS on an atom, a DENSITY inside a continuous bin. No
-        ///   unreachable floor, and up to discretization error no dependence on the bin
-        ///   count, which is what makes `NUM_BAR_BINS` ablatable.
-        /// * `hard` — one-hot cross entropy on the containing bin. Proper for the
-        ///   discretized law and floor-free, but its scale moves with the bin count.
+        /// * `hard` (default) — sparse categorical cross entropy on the containing-bin class,
+        ///   indexed rather than one-hot. Proper for the discretized law and floor-free, but
+        ///   its scale moves with the bin count.
+        /// * `density` — the hard score plus the finite selected bin's log width. Useful as
+        ///   a within-support measure diagnostic, but the clipped catch-all tails are not a
+        ///   normalized continuous-tail model, so absolute tail-density and bin-count
+        ///   invariance claims are invalid.
         /// * `smoothed` — the old Gaussian label smoothing at 0.75x the local bin width.
         ///   Proper for the SMOOTHED law rather than the observed one, and it imposes an
         ///   unreachable 4.6482 nats/bar floor. Kept only so the campaign's earlier runs
@@ -772,9 +784,13 @@ enum Commands {
     /// (b) A fitted Hill tail index on `r`, with its standard error, against the measured
     /// 1.66-1.84 figure, which is a SPREAD OF SIX PAIRWISE SLOPES and not an estimate — the two
     /// are never compared as though both were. (c) The marginal NLL of each family against the
-    /// discrete marginal under `scoring: density`, which is already a log DENSITY on the same
-    /// mixed measure because the density rule adds `E[ln width]`, so no offset is applied to
-    /// either column. (d) The truncation bound `R_max` a declared max leverage licenses, from
+    /// discrete marginal under `scoring: density`, which adds `E[ln width]` on the FINITE bins
+    /// only. That makes the columns commensurable across the interior, holding 98.55% of mass,
+    /// and NOT on the two clipped outer bins, which the discrete rule charges as atoms while a
+    /// continuous family charges an unbounded tail density. Neither column is offset because no
+    /// offset is well defined, NOT because the measures agree — a verdict inside the residual
+    /// that mismatch can carry is not licensed. (d) The truncation bound `R_max` a declared max
+    /// leverage licenses, from
     /// `1 + F(exp(r) - 1) > 0`, tabulated through both live constants.
     ///
     /// CPU ONLY and bounded: one drawn `Vec<BarDof>` buffer, streaming rayon folds with `O(K)`
@@ -1305,6 +1321,10 @@ async fn run() {
 
     let cli = Cli::parse();
 
+    // Once, before dispatch: every subcommand that opens a corpus consults the same market
+    // buckets, so the freeze is a property of the invocation rather than of one arm.
+    torch::dataset::set_freeze_market_supports(cli.freeze_market_supports);
+
     match &cli.command {
         Some(Commands::Genetic {
             family,
@@ -1547,7 +1567,8 @@ async fn run() {
                 } else {
                     tch::Device::cuda_if_available()
                 },
-                split_bounds: split_bounds.unwrap_or(trading_bot_0::data::ingest::PINNED_SPLIT_BOUNDS),
+                split_bounds: split_bounds
+                    .unwrap_or(trading_bot_0::data::ingest::PINNED_SPLIT_BOUNDS),
                 max_symbols: *max_symbols,
                 max_instants: *max_instants,
                 cost_bps: *cost_bps,
@@ -1711,12 +1732,10 @@ async fn run() {
                     min_dollar_volume: *min_dollar_volume,
                 },
             };
-            tokio::task::spawn_blocking(move || {
-                torch::train::split_seams::audit_split_seams(args)
-            })
-            .await
-            .expect("split seam audit task panicked")
-            .expect("split seam audit failed");
+            tokio::task::spawn_blocking(move || torch::train::split_seams::audit_split_seams(args))
+                .await
+                .expect("split seam audit task panicked")
+                .expect("split seam audit failed");
         }
         Some(Commands::PretrainMemProbe {
             checkpoints,

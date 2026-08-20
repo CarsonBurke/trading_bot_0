@@ -615,7 +615,10 @@ mod tests {
             if !text.contains("#[test]") && !text.contains("::test]") {
                 continue;
             }
-            let is_torch = path.to_string_lossy().replace('\\', "/").contains("/torch/");
+            let is_torch = path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("/torch/");
             let lines: Vec<&str> = text.lines().collect();
             for (name, header, end) in test_bodies(&lines) {
                 let body = &lines[header..=end];

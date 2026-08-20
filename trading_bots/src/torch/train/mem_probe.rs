@@ -1083,15 +1083,19 @@ fn recency_profile(more: &Arm, partition: &Partition) -> Vec<RecencyBucket> {
 
 fn recency_lines(buckets: &[RecencyBucket]) -> Vec<String> {
     if buckets.is_empty() {
-        return vec!["recency profile: NOT MEASURED - too few issued windows carried a \
+        return vec![
+            "recency profile: NOT MEASURED - too few issued windows carried a \
                      recoverable visit step to bucket."
-            .to_owned()];
+                .to_owned(),
+        ];
     }
-    let mut lines = vec!["recency profile within the extra-exposure arm. A flat nll across \
+    let mut lines = vec![
+        "recency profile within the extra-exposure arm. A flat nll across \
                          buckets is DURABLE memorization; a nll concentrated at the newest \
                          bucket is TRANSIENT retention of recently-visited rows, and the two \
                          have different remedies."
-        .to_owned()];
+            .to_owned(),
+    ];
     for bucket in buckets {
         lines.push(format!(
             "  {:>7.0} steps ago: {} windows / {} blocks, nll {:.4} [{:.4}, {:.4}], \
@@ -1471,8 +1475,12 @@ pub fn write_row_dump(
             record[0..4].copy_from_slice(&(index as u32).to_le_bytes());
             record[4..8].copy_from_slice(&reference.symbol.to_le_bytes());
             // The TARGET bar, not the anchor: a window anchored at `a` predicts `a+1 ..= a+C`.
-            record[8..12]
-                .copy_from_slice(&reference.bar_index.saturating_add(1 + bar as u32).to_le_bytes());
+            record[8..12].copy_from_slice(
+                &reference
+                    .bar_index
+                    .saturating_add(1 + bar as u32)
+                    .to_le_bytes(),
+            );
             record[12..20].copy_from_slice(&block.to_le_bytes());
             record[20] = population.flags();
             record[21] = u8::from(values.iter().all(|value| value.is_finite()));
@@ -1524,18 +1532,16 @@ mod tests {
     use super::super::pretrain_reports::write_mem_probe;
     use super::*;
     use shared::report::{read_report, ReportKind};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static SCRATCH: AtomicU64 = AtomicU64::new(0);
 
     fn scratch_dir(name: &str) -> PathBuf {
         let unique = SCRATCH.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "mem_probe_{name}_{}_{unique}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mem_probe_{name}_{}_{unique}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -1693,17 +1699,15 @@ mod tests {
             panic!("the spine must be a MultiLine chart");
         };
         assert!(
-            series
-                .iter()
-                .any(|line| line.label.contains("CONTAMINATED")
-                    && line.label.contains("NOT a discriminator")),
+            series.iter().any(|line| line.label.contains("CONTAMINATED")
+                && line.label.contains("NOT a discriminator")),
             "the pooled gap's own label must say it is contaminated and not a discriminator: {:?}",
             series.iter().map(|line| &line.label).collect::<Vec<_>>()
         );
         assert!(
-            series
-                .iter()
-                .any(|line| line.label.contains("STRICTLY LESS CONTAMINATED, NEVER CLEAN")),
+            series.iter().any(|line| line
+                .label
+                .contains("STRICTLY LESS CONTAMINATED, NEVER CLEAN")),
             "the symbol-paired gap must say it is less contaminated and never clean"
         );
         let _ = fs::remove_dir_all(&dir);

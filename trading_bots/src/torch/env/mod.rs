@@ -13,8 +13,8 @@ mod trade;
 mod trade_experiments;
 mod vec;
 
-pub(crate) use single::TRADE_EMA_ALPHA;
 pub use single::Env;
+pub(crate) use single::TRADE_EMA_ALPHA;
 #[cfg(test)]
 pub(crate) use snapshot::tests::synthetic_env;
 pub(crate) use snapshot::{ValidatedVecEnvSnapshot, VecEnvSnapshot};

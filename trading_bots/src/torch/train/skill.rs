@@ -1040,9 +1040,7 @@ fn confusion_report(panel: &SkillPanel) -> ConfusionReport {
         always_up_accuracy: blocked(&cells, Cell::base_rate_up),
         always_down_accuracy: blocked(&cells, |cell| 1.0 - cell.base_rate_up()),
         majority_accuracy: blocked(&cells, Cell::majority_accuracy),
-        accuracy_over_majority: blocked(&cells, |cell| {
-            cell.accuracy() - cell.majority_accuracy()
-        }),
+        accuracy_over_majority: blocked(&cells, |cell| cell.accuracy() - cell.majority_accuracy()),
         balanced_over_chance: blocked(&cells, |cell| cell.balanced_accuracy() - 0.5),
         kelly_sign_hit_rate: blocked(&kelly, KellySign::hit_rate),
         kelly_sign_disagreement: blocked(&kelly, KellySign::disagreement),
@@ -1762,9 +1760,7 @@ fn confidence_curve(
         .map(|decile| DecileRow {
             bars: pooled.cells[decile].all as usize,
             accuracy: blocked(&blocks, |sums| sums.cells[decile].accuracy()),
-            balanced_accuracy: blocked(&blocks, |sums| {
-                sums.cells[decile].balanced_accuracy()
-            }),
+            balanced_accuracy: blocked(&blocks, |sums| sums.cells[decile].balanced_accuracy()),
             edge_bps: blocked(&blocks, |sums| sums.cells[decile].edge_bps()),
             edge_bps_moving: blocked(&blocks, |sums| sums.cells[decile].edge_bps_moving()),
             ic: blocked(&blocks, |sums| sums.cells[decile].ic()),
@@ -1796,9 +1792,7 @@ fn confidence_curve(
         top_minus_bottom_edge_bps: blocked(&blocks, |sums| {
             sums.cells[top].edge_bps() - sums.cells[0].edge_bps()
         }),
-        top_minus_bottom_ic: blocked(&blocks, |sums| {
-            sums.cells[top].ic() - sums.cells[0].ic()
-        }),
+        top_minus_bottom_ic: blocked(&blocks, |sums| sums.cells[top].ic() - sums.cells[0].ic()),
         top_edge_multiple: blocked(&blocks, |sums| {
             // The all-bar denominator is rebuilt from the SAME draw's ten cells, so a draw that
             // happened to sample a high-edge month raises numerator and denominator together and
@@ -1991,8 +1985,9 @@ impl SelectiveTable {
     /// names plausibly cost on the bars this rule actually selects, under a linear
     /// spread-in-volatility proxy.
     pub fn volatility_scaled_reference_bps(&self) -> f64 {
-        self.best()
-            .map_or(f64::NAN, |row| self.reference_cost_bps * row.sigma_ratio.mean)
+        self.best().map_or(f64::NAN, |row| {
+            self.reference_cost_bps * row.sigma_ratio.mean
+        })
     }
 
     /// The honest form of the screening question: does the best break-even clear the reference
@@ -2167,20 +2162,24 @@ impl SkillProfile {
     /// — high-confidence bars being reliably WORSE, a real and reportable finding — must not be
     /// allowed to return `true` here.
     pub fn concentrated(&self) -> bool {
-        [&self.abs_mu_curve, &self.sharpe_curve].iter().any(|curve| {
-            resolved(&curve.top_minus_bottom_balanced)
-                && curve.top_minus_bottom_balanced.mean > 0.0
-        })
+        [&self.abs_mu_curve, &self.sharpe_curve]
+            .iter()
+            .any(|curve| {
+                resolved(&curve.top_minus_bottom_balanced)
+                    && curve.top_minus_bottom_balanced.mean > 0.0
+            })
     }
 
     /// The mirror of [`Self::concentrated`]: is the top decile resolvably WORSE than the bottom
     /// on the imbalance-proof axis? Reported so an inverted curve is stated as the finding it is
     /// rather than as an absence of power.
     pub fn anti_concentrated(&self) -> bool {
-        [&self.abs_mu_curve, &self.sharpe_curve].iter().any(|curve| {
-            resolved(&curve.top_minus_bottom_balanced)
-                && curve.top_minus_bottom_balanced.mean < 0.0
-        })
+        [&self.abs_mu_curve, &self.sharpe_curve]
+            .iter()
+            .any(|curve| {
+                resolved(&curve.top_minus_bottom_balanced)
+                    && curve.top_minus_bottom_balanced.mean < 0.0
+            })
     }
 
     /// Does the paired top-minus-bottom IC resolve POSITIVE for either selector? The second
@@ -2192,7 +2191,9 @@ impl SkillProfile {
     pub fn concentrated_by_ic(&self) -> bool {
         [&self.abs_mu_curve, &self.sharpe_curve]
             .iter()
-            .any(|curve| resolved(&curve.top_minus_bottom_ic) && curve.top_minus_bottom_ic.mean > 0.0)
+            .any(|curve| {
+                resolved(&curve.top_minus_bottom_ic) && curve.top_minus_bottom_ic.mean > 0.0
+            })
     }
 
     /// Does the model beat the best CONSTANT predictor on the imbalance-proof score?
@@ -2210,11 +2211,7 @@ impl SkillProfile {
         candidates
             .into_iter()
             .filter_map(|(name, row)| row.map(|row| (name, row)))
-            .max_by(|a, b| {
-                a.1.break_even_bps
-                    .mean
-                    .total_cmp(&b.1.break_even_bps.mean)
-            })
+            .max_by(|a, b| a.1.break_even_bps.mean.total_cmp(&b.1.break_even_bps.mean))
     }
 
     /// The plain-language verdict, so the numbers cannot be quoted without it.
@@ -2748,7 +2745,10 @@ pub fn write_skill_profile(dir: &Path, profile: &SkillProfile) -> Result<()> {
     for curve in [&profile.abs_mu_curve, &profile.sharpe_curve] {
         let tag = curve.selector;
         for (label, pick) in [
-            ("accuracy", (|row: &DecileRow| row.accuracy.mean) as PickDecile),
+            (
+                "accuracy",
+                (|row: &DecileRow| row.accuracy.mean) as PickDecile,
+            ),
             ("accuracy CI low", |row: &DecileRow| row.accuracy.ci_low),
             ("accuracy CI high", |row: &DecileRow| row.accuracy.ci_high),
             ("balanced accuracy", |row: &DecileRow| {
@@ -2793,9 +2793,12 @@ pub fn write_skill_profile(dir: &Path, profile: &SkillProfile) -> Result<()> {
             // The reference cost put on the KIND of bar the threshold selects. Charted beside
             // the break-even because the flat unconditional line invites exactly the comparison
             // that the volatility selection invalidates.
-            ("vol-scaled cost bps (LINEAR proxy)", |row: &SelectiveRow| {
-                clamp_break_even(MEASURED_COST_BPS_MATCHED * row.sigma_ratio.mean)
-            }),
+            (
+                "vol-scaled cost bps (LINEAR proxy)",
+                |row: &SelectiveRow| {
+                    clamp_break_even(MEASURED_COST_BPS_MATCHED * row.sigma_ratio.mean)
+                },
+            ),
         ] {
             series.push(ReportSeries {
                 label: format!("{tag} threshold {label}"),
@@ -3202,10 +3205,7 @@ mod tests {
                 push_dispersion(&mut out, &row.over_reference_sigma);
                 out.push(row.flat_bars as u64);
             }
-            for value in [
-                curve.accuracy_rank_correlation,
-                curve.edge_rank_correlation,
-            ] {
+            for value in [curve.accuracy_rank_correlation, curve.edge_rank_correlation] {
                 out.push(value.to_bits());
             }
         }
@@ -3318,9 +3318,7 @@ mod tests {
         assert!(clamp_break_even(f64::NEG_INFINITY).is_nan());
         // Finite values are clipped, not altered.
         assert!((clamp_break_even(7.5) - 7.5).abs() < 1e-12);
-        assert!(
-            (clamp_break_even(MAX_BREAK_EVEN_BPS * 10.0) - MAX_BREAK_EVEN_BPS).abs() < 1e-12
-        );
+        assert!((clamp_break_even(MAX_BREAK_EVEN_BPS * 10.0) - MAX_BREAK_EVEN_BPS).abs() < 1e-12);
         // A finite NEGATIVE break-even is a real measurement — the rule loses money gross — and
         // must pass through untouched rather than being floored.
         assert!((clamp_break_even(-3.25) + 3.25).abs() < 1e-12);
@@ -3428,7 +3426,11 @@ mod tests {
             }
         }
         let panel = panel_from(&rows);
-        let profile = SkillProfile::measure(&panel, "base-rate confound", &SkillCutpoints::from_panel(&panel));
+        let profile = SkillProfile::measure(
+            &panel,
+            "base-rate confound",
+            &SkillCutpoints::from_panel(&panel),
+        );
         let curve = &profile.abs_mu_curve;
         // Balanced accuracy is EXACTLY 0.5 in every bucket, so the criterion axis is flat with a
         // degenerate interval and cannot resolve.
@@ -3448,8 +3450,7 @@ mod tests {
                 && curve.rows[0].accuracy.mean < 0.70
                 && resolved(&curve.top_minus_bottom_accuracy)
                 && curve.top_minus_bottom_accuracy.mean > 0.1
-                && curve.top_minus_bottom_accuracy.mean
-                    > 5.0 * curve.top_minus_bottom_accuracy.se,
+                && curve.top_minus_bottom_accuracy.mean > 5.0 * curve.top_minus_bottom_accuracy.se,
             "the fixture must produce a large RESOLVED raw-accuracy gradient, got {} at the top, \
              {} at the bottom, paired {}",
             curve.rows[DECILES - 1].accuracy.mean,
@@ -3505,7 +3506,11 @@ mod tests {
             }
         }
         let panel = panel_from(&rows);
-        let profile = SkillProfile::measure(&panel, "volatility confound", &SkillCutpoints::from_panel(&panel));
+        let profile = SkillProfile::measure(
+            &panel,
+            "volatility confound",
+            &SkillCutpoints::from_panel(&panel),
+        );
         let curve = &profile.abs_mu_curve;
         for (index, row) in curve.rows.iter().enumerate() {
             assert!(
@@ -3647,7 +3652,12 @@ mod tests {
             })
             .collect();
         let panel = panel_from(&rows);
-        let table = selective_table(&panel, SELECTOR_ABS_MU, selector_abs_mu, &SkillCutpoints::from_panel(&panel));
+        let table = selective_table(
+            &panel,
+            SELECTOR_ABS_MU,
+            selector_abs_mu,
+            &SkillCutpoints::from_panel(&panel),
+        );
         assert_eq!(table.rows.len(), DECILES);
         for row in &table.rows {
             let implied = row.edge_bps.mean / row.turnover_per_traded_bar.mean;
@@ -3719,7 +3729,12 @@ mod tests {
             })
             .collect();
         let panel = panel_from(&rows);
-        let table = selective_table(&panel, SELECTOR_ABS_MU, selector_abs_mu, &SkillCutpoints::from_panel(&panel));
+        let table = selective_table(
+            &panel,
+            SELECTOR_ABS_MU,
+            selector_abs_mu,
+            &SkillCutpoints::from_panel(&panel),
+        );
         // Mean sigma over all ten bars is (1 + .. + 10)/10 * 1e-4 = 5.5e-4.
         let all_mean = 5.5e-4;
         for (threshold, traded_mean) in [
@@ -3795,7 +3810,12 @@ mod tests {
             }
         }
         let panel = panel_from(&rows);
-        let curve = confidence_curve(&panel, SELECTOR_ABS_MU, selector_abs_mu, &SkillCutpoints::from_panel(&panel));
+        let curve = confidence_curve(
+            &panel,
+            SELECTOR_ABS_MU,
+            selector_abs_mu,
+            &SkillCutpoints::from_panel(&panel),
+        );
         let top = &curve.rows[DECILES - 1].accuracy;
         let bottom = &curve.rows[0].accuracy;
         let paired = &curve.top_minus_bottom_accuracy;
@@ -3841,7 +3861,8 @@ mod tests {
             }
         }
         let panel = panel_from(&rows);
-        let profile = SkillProfile::measure(&panel, "null fixture", &SkillCutpoints::from_panel(&panel));
+        let profile =
+            SkillProfile::measure(&panel, "null fixture", &SkillCutpoints::from_panel(&panel));
         assert!(
             !profile.concentrated(),
             "a selector independent of correctness was reported as concentrated: {} +/- {}",
@@ -3883,28 +3904,24 @@ mod tests {
         let (windows, bars) = (6i64, 24i64);
         tch::manual_seed(0x5111_0003);
         let beliefs = Tensor::randn([windows, bars, latent], (Kind::Float, Device::Cpu));
+        let conditioning = Tensor::randn([windows, bars, latent], (Kind::Float, Device::Cpu));
         tch::manual_seed(0x5111_0004);
         let realized_r = Tensor::randn([windows, bars], (Kind::Float, Device::Cpu)) * 0.004;
         // `s` is a RANGE and is non-negative by construction; a signed fixture would be a
         // different and wrong one.
-        let realized_s =
-            Tensor::randn([windows, bars], (Kind::Float, Device::Cpu)).abs() * 0.004;
+        let realized_s = Tensor::randn([windows, bars], (Kind::Float, Device::Cpu)).abs() * 0.004;
         let symbols: Vec<u32> = (0..windows as u32).map(|window| window % 3).collect();
         let blocks: Vec<u64> = (0..windows as u64).map(|window| window % 3).collect();
         let build = |s: &Tensor| -> SkillProfile {
-            let dof = Tensor::zeros(
-                [windows, bars, BAR_DOF as i64],
-                (Kind::Float, Device::Cpu),
-            );
+            let dof = Tensor::zeros([windows, bars, BAR_DOF as i64], (Kind::Float, Device::Cpu));
             let mut r_column = dof.select(-1, DOF_R as i64);
             let _ = r_column.copy_(&realized_r);
             let mut s_column = dof.select(-1, DOF_S as i64);
             let _ = s_column.copy_(s);
             let paths = setup
-                .paths(&head, &beliefs, &dof, windows as usize)
+                .paths(&head, &beliefs, &conditioning, &dof, windows as usize)
                 .expect("paths");
-            let panel =
-                SkillPanel::from_paths(&paths.windows, &symbols, &blocks).expect("panel");
+            let panel = SkillPanel::from_paths(&paths.windows, &symbols, &blocks).expect("panel");
             SkillProfile::measure(&panel, "fixture", &SkillCutpoints::from_panel(&panel))
         };
         let baseline = build(&realized_s);
@@ -3921,9 +3938,12 @@ mod tests {
         // the factors that carry it in their prefix. Without that, the bit-identity above
         // would be a property of a fixture nothing can move.
         let flat_beliefs = beliefs.reshape([-1, latent]);
+        let flat_conditioning = conditioning.reshape([-1, latent]);
         let rows = flat_beliefs.size()[0];
         let zero_prefix = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, Device::Cpu));
-        let causal = head.logits(&flat_beliefs, &zero_prefix).select(1, DOF_U as i64);
+        let causal = head
+            .logits(&flat_beliefs, &flat_conditioning, &zero_prefix)
+            .select(1, DOF_U as i64);
         let mut prefix_response = 0.0f64;
         for bin in [0usize, 1, 37, 64, 91, NUM_BAR_BINS as usize - 1] {
             // Every bar told the same lie about its own range, once per probe bin: a sweep over
@@ -3944,7 +3964,9 @@ mod tests {
             let _ = column.fill_(bin as i64);
             // `u` sits behind `s` in the chain, so ITS row is conditioned on the realized
             // range. The traded `r` row is not, and that asymmetry is the whole property.
-            let conditioned = head.logits(&flat_beliefs, &prefix).select(1, DOF_U as i64);
+            let conditioned = head
+                .logits(&flat_beliefs, &flat_conditioning, &prefix)
+                .select(1, DOF_U as i64);
             prefix_response =
                 prefix_response.max((&conditioned - &causal).abs().max().double_value(&[]));
         }
@@ -3961,12 +3983,14 @@ mod tests {
             &head,
             &supports,
             &beliefs,
+            &conditioning,
             &realized_r,
             &realized_s,
             &symbols,
             &blocks,
         );
-        let leaked_profile = SkillProfile::measure(&leaked, "leaked", &SkillCutpoints::from_panel(&leaked));
+        let leaked_profile =
+            SkillProfile::measure(&leaked, "leaked", &SkillCutpoints::from_panel(&leaked));
         assert_ne!(
             leaked_profile.confusion.counts, baseline.confusion.counts,
             "conditioning on the realized same-bar s did not change a single cell of the 2x2, \
@@ -3990,6 +4014,7 @@ mod tests {
             &head,
             &supports,
             &beliefs,
+            &conditioning,
             &realized_r,
             &lied_s,
             &symbols,
@@ -4013,6 +4038,7 @@ mod tests {
         head: &BarEmissionHead,
         supports: &BarSupports,
         beliefs: &Tensor,
+        conditioning: &Tensor,
         realized_r: &Tensor,
         realized_s: &Tensor,
         symbols: &[u32],
@@ -4021,17 +4047,15 @@ mod tests {
         let shape = beliefs.size();
         let (windows, bars, latent) = (shape[0], shape[1], shape[2]);
         let flat = beliefs.reshape([-1, latent]);
-        let dof = Tensor::zeros(
-            [windows, bars, BAR_DOF as i64],
-            (Kind::Float, Device::Cpu),
-        );
+        let flat_conditioning = conditioning.reshape([-1, latent]);
+        let dof = Tensor::zeros([windows, bars, BAR_DOF as i64], (Kind::Float, Device::Cpu));
         let mut r_column = dof.select(-1, DOF_R as i64);
         let _ = r_column.copy_(realized_r);
         let mut s_column = dof.select(-1, DOF_S as i64);
         let _ = s_column.copy_(realized_s);
         let prefix = supports.bin_ids(&dof).reshape([-1, BAR_DOF as i64]);
         let probs = head
-            .logits(&flat, &prefix)
+            .logits(&flat, &flat_conditioning, &prefix)
             .select(1, DOF_U as i64)
             .softmax(-1, Kind::Double);
         let centers = Tensor::from_slice(supports.centers(DOF_R))
@@ -4039,8 +4063,11 @@ mod tests {
             .view([1, NUM_BAR_BINS as i64]);
         let mu = (&probs * &centers).sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
         let deviation = &centers - mu.unsqueeze(-1);
-        let var = (&probs * &deviation * &deviation)
-            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let var = (&probs * &deviation * &deviation).sum_dim_intlist(
+            [-1i64].as_slice(),
+            false,
+            Kind::Double,
+        );
         let mu = Vec::<f64>::try_from(mu).expect("mu");
         let var = Vec::<f64>::try_from(var).expect("var");
         let r = Vec::<f64>::try_from(realized_r.reshape([-1]).to_kind(Kind::Double)).expect("r");
@@ -4088,11 +4115,10 @@ mod tests {
             }
         }
         let panel = panel_from(&rows);
-        let profile = SkillProfile::measure(&panel, "round trip", &SkillCutpoints::from_panel(&panel));
-        let dir = std::env::temp_dir().join(format!(
-            "skill_profile_round_trip_{}",
-            std::process::id()
-        ));
+        let profile =
+            SkillProfile::measure(&panel, "round trip", &SkillCutpoints::from_panel(&panel));
+        let dir =
+            std::env::temp_dir().join(format!("skill_profile_round_trip_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         write_skill_profile(&dir, &profile).expect("write");
         let path = dir.join(format!("{SKILL_PROFILE_BASE}.report.bin"));

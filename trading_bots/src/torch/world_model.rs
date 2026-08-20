@@ -1,16 +1,16 @@
 //! Discrete distributional bar world model.
 //!
-//! [`BarTrunk`] is a causal transformer over bars. Its input is the discrete
-//! mirror of its output: a bar enters as the sum of five bin embeddings (one per
-//! degree of freedom, looked up on the same equal-mass supports the emission head
-//! predicts over) plus a linear map of the raw continuous DOF, and leaves as a
-//! belief that [`BarEmissionHead`] turns back into five categoricals.
+//! [`BarTrunk`] is a causal transformer over bars. A forecast-safe token sums
+//! five bin embeddings, a raw-DOF projection and exogenous clock embeddings;
+//! same-instant observed market ids are masked before every token path. The
+//! resulting belief and a separate shared target-clock/current-market embedding
+//! condition [`BarEmissionHead`]'s five categoricals.
 //!
 //! [`BarDynamics`] is the NextLat one-step latent predictor: given the belief
-//! after bar `t` and the DOF of bar `t+1`, it predicts the belief after bar
-//! `t+1` without running the trunk. It is trained to approximate exactly the
-//! state the cached trunk computes, which makes it a strictly cheaper but
-//! drifting substitute at rollout time — see [`RolloutMode`].
+//! after bar `t` and the exact shared trunk token of bar `t+1`, it predicts the
+//! next belief without running the transformer. It is trained to approximate
+//! exactly the state the cached trunk computes, which makes it a strictly cheaper
+//! but drifting substitute at rollout time — see [`RolloutMode`].
 //!
 //! [`BarWorldModel`] is the frozen inference bundle: trunk + emission head +
 //! dynamics + supports + [`BarWorldModelMetadata`], loaded with
@@ -35,8 +35,8 @@ use crate::torch::{
         BAR_PREFIX_EMBED_DIM, BAR_VOLUME_EMA_SPAN, NUM_BAR_BINS,
     },
     dataset::{
-        resolution_class, BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING, BAR_TIME_FEATURES,
-        TIME_RESOLUTION,
+        resolution_class, time_ids_without_market, BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING,
+        BAR_TIME_FEATURES, BAR_TIME_MARKET, TIME_RESOLUTION,
     },
     fa4::{pope_flash_attention_decode_q1, pope_flash_attention_prefill},
     hashing::file_sha256,
@@ -64,17 +64,16 @@ pub const BAR_FF_DIM: i64 = 2048;
 pub const BAR_MAX_CONTEXT: i64 = 2048;
 /// Lineage: `v2` -> `v3` replaces the rank-1 affine chain-prefix conditioning in
 /// [`BarEmissionHead`] with per-slot bin embeddings (`binprefix`) and RMS-normalizes
-/// the [`BarDynamics`] output onto the same unit shell as every belief the head was
-/// fitted on (`dynrms`). `v3` -> `v4` widens the conditioning bank from four calendar
-/// channels to nine: the four calendar ids, an elapsed-bars bucket, an ET day-edge flag and
-/// three equal-mass market-proxy channels. That grows both `bar_time_embed` banks, so no `v3`
-/// checkpoint can be loaded by this build — intended, because a `v3` checkpoint was trained
-/// against a strictly smaller observation interface and its weights are not a partial fit of
-/// this one. `v4` -> `v5` adds the per-layer embedding shortcut (`x0`), ten new scalars at
-/// zero, which changes the var-store shape and so cannot be cross-loaded either even though
-/// the function it computes at init is unchanged.
+/// the [`BarDynamics`] output onto the trunk belief shell (`dynrms`). `v3` -> `v4`
+/// widens the conditioning bank from four calendar channels to nine. `v4` -> `v5`
+/// adds the per-layer embedding shortcut (`x0`). `v5` -> `v6` makes every trunk
+/// token forecast-safe by masking its same-instant market ids, gives the emission
+/// readout an explicit target-clock/current-market conditioning vector, and makes
+/// dynamics consume the trunk's exact shared token embedding rather than private
+/// DOF and clock encoders. Each transition changes VarStore shapes or semantics,
+/// so checkpoints cannot be cross-loaded.
 pub const BAR_ARCHITECTURE: &str =
-    "bardist-causal-ar-pope64-fa4-time9market-binprefix-dynrms-x0shortcut-v5";
+    "bardist-causal-ar-pope64-fa4-time9market-binprefix-dynrms-x0shortcut-forecastcond-sharedtoken-v6";
 
 /// KV-cache layout contract. Any change to the cache geometry, the position
 /// bookkeeping or the eviction rule must bump this, because it feeds the lineage
@@ -127,16 +126,11 @@ const _: () = assert!(BAR_FF_DIM == 4 * BAR_MODEL_DIM);
 /// per-layer variable names, so a substring match cannot collect anything else.
 const BAR_TRUNK_MUON_SUBSTRINGS: [&str; 4] = ["qkv_w", "attn_out_w", "ff_in_w", "ff_out_w"];
 const BAR_DYNAMICS_MUON_SUBSTRINGS: [&str; 3] = ["bar_dyn_fc1_w", "bar_dyn_fc2_w", "bar_dyn_fc3_w"];
-/// Down-projections, which take the extra `2.0x` NorMuon learning-rate multiplier.
+/// Down-projections, which take the extra `4.0x` NorMuon learning-rate multiplier.
 const BAR_MUON_DOWN_PROJECTION_SUBSTRINGS: [&str; 2] = ["ff_out_w", "bar_dyn_fc3_w"];
-/// Lookup tables and raw-DOF input maps, routed to AdamW with the embedding betas.
-/// `time_embed` matches both the trunk and the dynamics calendar banks.
-const BAR_ADAMW_EMBEDDING_SUBSTRINGS: [&str; 4] = [
-    "bar_bin_embed",
-    "bar_dof_embed",
-    "bar_dyn_dof_embed",
-    "time_embed",
-];
+/// Lookup tables and the raw-DOF input map, routed to AdamW with the embedding betas.
+const BAR_ADAMW_EMBEDDING_SUBSTRINGS: [&str; 3] =
+    ["bar_bin_embed", "bar_dof_embed", "bar_time_embed"];
 /// Learned scalars and the PoPE phase bias, routed to AdamW with `wd_mul = 0`.
 const BAR_ADAMW_SCALAR_SUBSTRINGS: [&str; 2] = ["_lambda", "pope_theta_bias"];
 
@@ -385,9 +379,7 @@ impl BarWorldModelMetadata {
             bail!("world-model bar resolution must be positive");
         }
         if !resolutions.contains(&res_secs) {
-            bail!(
-                "deployment resolution {res_secs}s has no fitted support; got {resolutions:?}"
-            );
+            bail!("deployment resolution {res_secs}s has no fitted support; got {resolutions:?}");
         }
         let mut supports_sha256 = BTreeMap::new();
         for &resolution in resolutions {
@@ -697,7 +689,10 @@ impl BarWorldModelMetadata {
 /// suffix appended rather than substituted, so two checkpoints that differ only
 /// in a dotted stem (`model.v2` and `model.v3`) cannot share a sidecar.
 fn sidecar_path(checkpoint: &Path, suffix: &str) -> PathBuf {
-    if checkpoint.extension().is_some_and(|extension| extension == "ot") {
+    if checkpoint
+        .extension()
+        .is_some_and(|extension| extension == "ot")
+    {
         return checkpoint.with_extension(suffix);
     }
     let mut name = checkpoint.file_name().unwrap_or_default().to_os_string();
@@ -807,8 +802,8 @@ impl BarSupportSet {
     /// failure per-resolution supports exist to prevent, and it is distinct from
     /// the duplicate-class collision `new` rejects.
     fn assert_rows_routed(&self, matched: &Tensor, rows: i64) {
-        let covered = i64::try_from(matched.to_kind(Kind::Int64).sum(Kind::Int64))
-            .expect("routed row count");
+        let covered =
+            i64::try_from(matched.to_kind(Kind::Int64).sum(Kind::Int64)).expect("routed row count");
         assert_eq!(
             covered,
             rows,
@@ -836,7 +831,8 @@ impl BarSupportSet {
         out
     }
 
-    /// Row-routed ancestral sample, `[..., BAR_DOF]` from latents `[..., dim]`.
+    /// Row-routed ancestral sample, `[..., BAR_DOF]` from beliefs and their
+    /// explicit forecast conditioning `[..., dim]`.
     ///
     /// Rows are PARTITIONED by resolution and each partition is sampled in its
     /// own [`BarEmissionHead::sample`] call. The chain is sequential — each
@@ -848,16 +844,23 @@ impl BarSupportSet {
         &self,
         head: &BarEmissionHead,
         h: &Tensor,
+        conditioning: &Tensor,
         time_ids: &Tensor,
         temperature: f64,
     ) -> Tensor {
         if self.entries.len() == 1 {
-            return head.sample(h, &self.entries[0].2, temperature);
+            return head.sample(h, conditioning, &self.entries[0].2, temperature);
         }
         let shape = h.size();
+        assert_eq!(
+            conditioning.size(),
+            shape,
+            "beliefs and forecast conditioning must have identical shapes"
+        );
         let dim = *shape.last().expect("latent must be ranked");
         let rows = h.numel() as i64 / dim;
         let flat = h.reshape([rows, dim]);
+        let flat_conditioning = conditioning.reshape([rows, dim]);
         let class = time_ids
             .reshape([rows, BAR_TIME_FEATURES as i64])
             .select(1, TIME_RESOLUTION as i64);
@@ -870,7 +873,12 @@ impl BarSupportSet {
             if index.numel() == 0 {
                 continue;
             }
-            let drawn = head.sample(&flat.index_select(0, &index), supports, temperature);
+            let drawn = head.sample(
+                &flat.index_select(0, &index),
+                &flat_conditioning.index_select(0, &index),
+                supports,
+                temperature,
+            );
             out = out.index_copy(0, &index, &drawn);
         }
         self.assert_rows_routed(&matched, rows);
@@ -1055,8 +1063,8 @@ impl BarTrunk {
         &BAR_TRUNK_MUON_SUBSTRINGS
     }
 
-    /// `dof [B,T,BAR_DOF]`, `bin_ids [B,T,BAR_DOF]` and `time_ids [B,T,BAR_TIME_FEATURES]` ->
-    /// beliefs `[B,T,D]`.
+    /// `dof [B,T,BAR_DOF]`, `bin_ids [B,T,BAR_DOF]` and observed
+    /// `time_ids [B,T,BAR_TIME_FEATURES]` -> forecast-safe beliefs `[B,T,D]`.
     ///
     /// `window` is a sliding causal span in bars; `window <= 0`, or a window at
     /// least as long as the sequence, is full causal attention and takes the FA4
@@ -1076,7 +1084,7 @@ impl BarTrunk {
     }
 
     fn run(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor, window: i64) -> Tensor {
-        let x0 = self.embed(dof, bin_ids, time_ids);
+        let x0 = self.token_embedding(dof, bin_ids, time_ids);
         let mut x = x0.shallow_clone();
         let len = x.size()[1];
         let positions = Tensor::arange(len, (Kind::Int64, x.device()));
@@ -1117,7 +1125,7 @@ impl BarTrunk {
         cache: &mut BarKvCache,
     ) -> Tensor {
         tch::no_grad(|| {
-            let x = self.embed(dof, bin_ids, time_ids);
+            let x = self.token_embedding(dof, bin_ids, time_ids);
             if cache.length == 0 {
                 self.prefill(&x, cache)
             } else {
@@ -1131,10 +1139,11 @@ impl BarTrunk {
         })
     }
 
-    /// Discrete bins, the exogenous calendar, and the raw continuous DOF, summed
-    /// and normalized. Both id gathers run against one fused bank each, so the
-    /// nine lookup tables cost two `embedding` calls rather than nine.
-    fn embed(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor) -> Tensor {
+    /// Exact shared token embedding used by the trunk and dynamics: discrete bins,
+    /// raw continuous DOF and exogenous clock, summed and normalized. The observed
+    /// same-instant market channels are always replaced by `dataset::MARKET_MISSING` before
+    /// lookup, so neither training nor cached serving can leak a bar's own market row.
+    pub fn token_embedding(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor) -> Tensor {
         let shape = dof.size();
         assert_eq!(shape.len(), 3, "bar DOF must be [batch, len, BAR_DOF]");
         assert_eq!(shape[2], BAR_DOF as i64, "bar DOF must have BAR_DOF slots");
@@ -1155,20 +1164,66 @@ impl BarTrunk {
         )
         .view([batch, len, BAR_DOF as i64, BAR_MODEL_DIM])
         .sum_dim_intlist([2i64].as_slice(), false, Kind::Float);
-        let calendar = Tensor::embedding(
-            &self.time_embed,
-            &(time_ids.to_device(device) + self.time_offsets.to_device(device)).reshape([-1]),
-            -1,
-            false,
-            false,
-        )
-        .view([batch, len, BAR_TIME_FEATURES as i64, BAR_MODEL_DIM])
-        .sum_dim_intlist([2i64].as_slice(), false, Kind::Float);
+        let clock = self.time_embedding(&time_ids_without_market(time_ids));
         let raw = dof
             .to_device(device)
             .to_kind(Kind::Float)
             .linear(&self.dof_embed_w, None::<Tensor>);
-        rms_norm(&(bins + calendar + raw))
+        rms_norm(&(bins + clock + raw))
+    }
+
+    /// Shared fused embedding of all nine conditioning ids. Callers choose which
+    /// market row is legal before entering this primitive.
+    fn time_embedding(&self, time_ids: &Tensor) -> Tensor {
+        let shape = time_ids.size();
+        assert_eq!(
+            shape.last().copied(),
+            Some(BAR_TIME_FEATURES as i64),
+            "time ids must end in BAR_TIME_FEATURES"
+        );
+        let device = self.time_embed.device();
+        let rows = time_ids.numel() as i64 / BAR_TIME_FEATURES as i64;
+        let embedded = Tensor::embedding(
+            &self.time_embed,
+            &(time_ids
+                .to_device(device)
+                .reshape([rows, BAR_TIME_FEATURES as i64])
+                + self
+                    .time_offsets
+                    .to_device(device)
+                    .view([1, BAR_TIME_FEATURES as i64]))
+            .reshape([-1]),
+            -1,
+            false,
+            false,
+        )
+        .view([rows, BAR_TIME_FEATURES as i64, BAR_MODEL_DIM])
+        .sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
+        let mut output_shape = shape[..shape.len() - 1].to_vec();
+        output_shape.push(BAR_MODEL_DIM);
+        rms_norm(&embedded).reshape(output_shape.as_slice())
+    }
+
+    /// Conditioning for predicting a target bar. Exogenous slots through the
+    /// day-edge flag come from the target's knowable clock; the three [`BAR_TIME_MARKET`] slots
+    /// come from the current bar. No target market id is ever read.
+    pub fn forecast_conditioning(
+        &self,
+        target_time_ids: &Tensor,
+        current_time_ids: &Tensor,
+    ) -> Tensor {
+        assert_eq!(
+            target_time_ids.size(),
+            current_time_ids.size(),
+            "target and current conditioning ids must have identical shapes"
+        );
+        let device = self.time_embed.device();
+        let target = time_ids_without_market(&target_time_ids.to_device(device));
+        let current = current_time_ids.to_device(device);
+        let channels: [i64; 3] = BAR_TIME_MARKET.map(|slot| slot as i64);
+        let index = Tensor::from_slice(&channels).to_device(device);
+        let composed = target.index_copy(-1, &index, &current.index_select(-1, &index));
+        self.time_embedding(&composed)
     }
 
     fn prefill(&self, tokens: &Tensor, cache: &mut BarKvCache) -> Tensor {
@@ -1429,32 +1484,19 @@ impl BarKvCache {
 // ---------------------------------------------------------------------------
 
 /// NextLat one-step latent predictor:
-/// `RMSNorm(h + MLP(RMSNorm([h ; embed(next_dof, next_time_ids)])))`.
+/// `RMSNorm(h + MLP(RMSNorm([h ; next_token])))`.
+///
+/// `next_token` is the exact output of [`BarTrunk::token_embedding`]: bins, raw
+/// DOF and exogenous time with same-instant market masked. Dynamics deliberately
+/// owns no parallel input encoder, so exact and cheap rollouts cannot drift into
+/// two incompatible definitions of a bar token.
 ///
 /// The closing RMSNorm is not cosmetic. Every belief this predictor is trained
 /// against, and every belief [`BarEmissionHead`] has ever been fitted on, is the
 /// output of the gain-free `rms_norm` that closes `BarTrunk::run`, so the unit
-/// shell IS the head's input domain. Without it the residual is free to leave that
-/// shell, and because [`BarWorldModel::rollout_beliefs`] and
-/// [`BarWorldModel::imagine`] feed the prediction back into itself the drift
-/// compounds geometrically — a 64-step
-/// dynamics rollout measured 79,321 nats against 20.93 for the exact trunk. It also
-/// makes the `smooth_l1` NextLat target well posed, since prediction and target now
-/// live in the same space. `fc3_w` is zero-init and `h` already has unit RMS, so an
-/// untrained predictor is still exactly the identity.
-///
-/// The calendar enters here as well as in the trunk. Once the trunk conditions on
-/// the clock, `h_{t+1}` is a function of `time_ids_{t+1}`, so a dynamics head
-/// blind to it would be asked to predict a target it has no information about,
-/// and its KL against the true next belief would be floored by the time-of-day
-/// regime spread rather than by anything the objective can reduce.
+/// shell is the head's input domain. `fc3_w` is zero-init and `h` already has unit
+/// RMS, so an untrained predictor is exactly the identity.
 pub struct BarDynamics {
-    /// `[dim, BAR_DOF]`
-    dof_embed_w: Tensor,
-    /// `[BAR_TIME_EMBED_ROWS, dim]`, all [`BAR_TIME_FEATURES`] conditioning channels in one bank.
-    time_embed: Tensor,
-    /// `[1, BAR_TIME_FEATURES]` constant, the block base of each channel.
-    time_offsets: Tensor,
     /// `[hidden, 2 * dim]`
     fc1_w: Tensor,
     /// `[hidden, hidden]`
@@ -1469,17 +1511,6 @@ impl BarDynamics {
         assert!(dim > 0, "bar dynamics needs a positive latent dim");
         let joined = 2 * dim;
         Self {
-            dof_embed_w: vs.var(
-                "bar_dyn_dof_embed_w",
-                &[dim, BAR_DOF as i64],
-                uniform_init(dim),
-            ),
-            time_embed: vs.var(
-                "bar_dyn_time_embed",
-                &[BAR_TIME_EMBED_ROWS, dim],
-                uniform_init(dim),
-            ),
-            time_offsets: time_block_offsets(vs.device()).view([1, BAR_TIME_FEATURES as i64]),
             fc1_w: vs.var(
                 "bar_dyn_fc1_w",
                 &[BAR_DYNAMICS_HIDDEN, joined],
@@ -1490,7 +1521,11 @@ impl BarDynamics {
                 &[BAR_DYNAMICS_HIDDEN, BAR_DYNAMICS_HIDDEN],
                 uniform_init(BAR_DYNAMICS_HIDDEN),
             ),
-            fc3_w: vs.var("bar_dyn_fc3_w", &[dim, BAR_DYNAMICS_HIDDEN], Init::Const(0.0)),
+            fc3_w: vs.var(
+                "bar_dyn_fc3_w",
+                &[dim, BAR_DYNAMICS_HIDDEN],
+                Init::Const(0.0),
+            ),
             dim,
         }
     }
@@ -1503,42 +1538,31 @@ impl BarDynamics {
         self.dim
     }
 
-    /// `h [..., dim]`, `next_dof [..., BAR_DOF]` and `next_time_ids [..., 4]` ->
+    /// `h [..., dim]` and the matching shared trunk `next_token [..., dim]` ->
     /// predicted `h' [..., dim]` on the unit-RMS shell, shaped exactly like `h`.
-    pub fn step(&self, h: &Tensor, next_dof: &Tensor, next_time_ids: &Tensor) -> Tensor {
+    pub fn step(&self, h: &Tensor, next_token: &Tensor) -> Tensor {
         let shape = h.size();
         assert_eq!(
             shape.last().copied(),
             Some(self.dim),
             "dynamics latent width mismatch"
         );
+        assert_eq!(
+            next_token.size(),
+            shape,
+            "dynamics shared token must match the latent shape"
+        );
         let rows = h.numel() as i64 / self.dim;
-        assert_eq!(
-            next_dof.numel() as i64,
-            rows * BAR_DOF as i64,
-            "dynamics next_dof must cover every latent row"
-        );
-        assert_eq!(
-            next_time_ids.numel() as i64,
-            rows * BAR_TIME_FEATURES as i64,
-            "dynamics next_time_ids must cover every latent row"
-        );
-        let device = self.dof_embed_w.device();
-        let embedded = next_dof
+        let device = self.fc1_w.device();
+        let flat = h
             .to_device(device)
             .to_kind(Kind::Float)
-            .reshape([rows, BAR_DOF as i64])
-            .linear(&self.dof_embed_w, None::<Tensor>);
-        let ids = (next_time_ids
+            .reshape([rows, self.dim]);
+        let token = next_token
             .to_device(device)
-            .reshape([rows, BAR_TIME_FEATURES as i64])
-            + self.time_offsets.to_device(device))
-        .reshape([-1]);
-        let calendar = Tensor::embedding(&self.time_embed, &ids, -1, false, false)
-            .view([rows, BAR_TIME_FEATURES as i64, self.dim])
-            .sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
-        let flat = h.to_device(device).to_kind(Kind::Float).reshape([rows, self.dim]);
-        let joined = rms_norm(&Tensor::cat(&[&flat, &(embedded + calendar)], -1));
+            .to_kind(Kind::Float)
+            .reshape([rows, self.dim]);
+        let joined = rms_norm(&Tensor::cat(&[&flat, &token], -1));
         let residual = joined
             .linear(&self.fc1_w, None::<Tensor>)
             .gelu("none")
@@ -1632,8 +1656,16 @@ impl BarModules {
         future_time_ids: &Tensor,
         mode: RolloutMode,
     ) -> Tensor {
-        assert_eq!(history_dof.dim(), 3, "history must be [batch, len, BAR_DOF]");
-        assert_eq!(future_dof.dim(), 3, "future must be [batch, steps, BAR_DOF]");
+        assert_eq!(
+            history_dof.dim(),
+            3,
+            "history must be [batch, len, BAR_DOF]"
+        );
+        assert_eq!(
+            future_dof.dim(),
+            3,
+            "future must be [batch, steps, BAR_DOF]"
+        );
         let history_len = history_dof.size()[1];
         let steps = future_dof.size()[1];
         assert!(history_len > 0, "belief rollout needs a history");
@@ -1664,7 +1696,11 @@ impl BarModules {
                         &time_ids,
                         &mut cache,
                     ),
-                    RolloutMode::Dynamics => self.dynamics.step(&h, &dof, &time_ids),
+                    RolloutMode::Dynamics => {
+                        let bins = supports.bin_ids(&dof, &time_ids);
+                        let token = self.trunk.token_embedding(&dof, &bins, &time_ids);
+                        self.dynamics.step(&h, &token)
+                    }
                 };
             }
             Tensor::cat(&out, 1)
@@ -1875,10 +1911,12 @@ impl BarWorldModel {
             &history_time_ids,
             &mut cache,
         );
+        let current_time_ids = history_time_ids.narrow(1, history_len - 1, 1);
         BarWorldModelSession {
             belief: prefill.narrow(1, history_len - 1, 1).squeeze_dim(1),
             batch: history.size()[0],
             cache,
+            current_time_ids,
             lineage_sha256: self.metadata.lineage_sha256.clone(),
         }
     }
@@ -1893,8 +1931,14 @@ impl BarWorldModel {
         if session.lineage_sha256 != self.metadata.lineage_sha256 {
             bail!("world-model session has an incompatible inference lineage");
         }
-        let next = as_single_bar(next_dof, self.device(), session.batch, BAR_DOF as i64, "bar")?
-            .to_kind(Kind::Float);
+        let next = as_single_bar(
+            next_dof,
+            self.device(),
+            session.batch,
+            BAR_DOF as i64,
+            "bar",
+        )?
+        .to_kind(Kind::Float);
         let time_ids = as_single_bar(
             next_time_ids,
             self.device(),
@@ -1912,6 +1956,7 @@ impl BarWorldModel {
                 &mut session.cache,
             )
             .squeeze_dim(1);
+        session.current_time_ids = time_ids;
         Ok(())
     }
 
@@ -1956,6 +2001,7 @@ impl BarWorldModel {
             let future_time_ids = future_time_ids.to_device(self.device());
             let mut h = session.belief.unsqueeze(1);
             let mut clock = future_time_ids.shallow_clone();
+            let mut current_time_ids = session.current_time_ids.shallow_clone();
             // `Dynamics` never touches the cache, and `repeat_batch` already
             // materializes fresh storage, so neither the fork nor the replication
             // is paid unless the mode actually reads a cache.
@@ -1967,6 +2013,7 @@ impl BarWorldModel {
             if samples > 1 {
                 h = h.repeat_interleave_self_int(samples, 0, None);
                 clock = clock.repeat_interleave_self_int(samples, 0, None);
+                current_time_ids = current_time_ids.repeat_interleave_self_int(samples, 0, None);
             }
 
             let mut sampled = Vec::with_capacity(steps as usize);
@@ -1976,18 +2023,36 @@ impl BarWorldModel {
                 // drawn from, so `beliefs[.., i]` conditions `dof[.., i]`.
                 beliefs.push(h.squeeze_dim(1));
                 let time_ids = clock.narrow(1, step, 1);
-                let dof =
-                    self.supports
-                        .sample(&self.modules.head, &h, &time_ids, temperature);
+                // The first imagined bar follows a real observation, so its market channels
+                // come from the session's final row. Once the rollout enters imagined history,
+                // no contemporaneous market proxy is observable.
+                let current = if step == 0 {
+                    current_time_ids.shallow_clone()
+                } else {
+                    time_ids_without_market(&time_ids)
+                };
+                let conditioning = self
+                    .modules
+                    .trunk
+                    .forecast_conditioning(&time_ids, &current);
+                let dof = self.supports.sample(
+                    &self.modules.head,
+                    &h,
+                    &conditioning,
+                    &time_ids,
+                    temperature,
+                );
                 sampled.push(dof.squeeze_dim(1));
+                let bins = self.supports.bin_ids(&dof, &time_ids);
                 h = match mode {
-                    RolloutMode::Exact => self.modules.trunk.forward_cached(
-                        &dof,
-                        &self.supports.bin_ids(&dof, &time_ids),
-                        &time_ids,
-                        &mut cache,
-                    ),
-                    RolloutMode::Dynamics => self.modules.dynamics.step(&h, &dof, &time_ids),
+                    RolloutMode::Exact => self
+                        .modules
+                        .trunk
+                        .forward_cached(&dof, &bins, &time_ids, &mut cache),
+                    RolloutMode::Dynamics => {
+                        let token = self.modules.trunk.token_embedding(&dof, &bins, &time_ids);
+                        self.modules.dynamics.step(&h, &token)
+                    }
                 };
             }
             BarRollout {
@@ -2002,6 +2067,8 @@ impl BarWorldModel {
 pub struct BarWorldModelSession {
     cache: BarKvCache,
     belief: Tensor,
+    /// Final observed clock/market row, `[B, 1, BAR_TIME_FEATURES]`.
+    current_time_ids: Tensor,
     batch: i64,
     lineage_sha256: String,
 }
@@ -2028,6 +2095,7 @@ impl BarWorldModelSession {
         Self {
             cache: self.cache.fork(),
             belief: self.belief.shallow_clone(),
+            current_time_ids: self.current_time_ids.shallow_clone(),
             batch: self.batch,
             lineage_sha256: self.lineage_sha256.clone(),
         }
@@ -2132,8 +2200,14 @@ fn windowed_attention(query: &Tensor, key: &Tensor, value: &Tensor, window: i64)
         // Widest key span any query in this block can reach.
         let first_key = (start - window + 1).max(0);
         let keys = start + rows - first_key;
-        let q = query.narrow(1, start, rows).transpose(1, 2).to_kind(Kind::Float);
-        let k = key.narrow(1, first_key, keys).transpose(1, 2).to_kind(Kind::Float);
+        let q = query
+            .narrow(1, start, rows)
+            .transpose(1, 2)
+            .to_kind(Kind::Float);
+        let k = key
+            .narrow(1, first_key, keys)
+            .transpose(1, 2)
+            .to_kind(Kind::Float);
         let v = value
             .narrow(1, first_key, keys)
             .transpose(1, 2)
@@ -2148,12 +2222,7 @@ fn windowed_attention(query: &Tensor, key: &Tensor, value: &Tensor, window: i64)
             .view([1, 1, rows, keys]);
         let scores = (q.matmul(&k.transpose(-2, -1)) * POPE_ATTENTION_SCALE)
             .masked_fill(&blocked, f64::NEG_INFINITY);
-        blocks.push(
-            scores
-                .softmax(-1, Kind::Float)
-                .matmul(&v)
-                .transpose(1, 2),
-        );
+        blocks.push(scores.softmax(-1, Kind::Float).matmul(&v).transpose(1, 2));
         start += rows;
     }
     Tensor::cat(&blocks, 1).to_kind(value.kind())
@@ -2210,7 +2279,9 @@ mod tests {
     use super::*;
     use crate::torch::{
         bar_dist::{decode_dof, BarDof, BarScoring, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS},
-        dataset::{BAR_TIME_MARKET, TIME_DAY_EDGE, TIME_ELAPSED, TIME_MINUTE, TIME_SESSION, TIME_WEEKDAY},
+        dataset::{
+            BAR_TIME_MARKET, TIME_DAY_EDGE, TIME_ELAPSED, TIME_MINUTE, TIME_SESSION, TIME_WEEKDAY,
+        },
         test_rng,
     };
 
@@ -2374,7 +2445,10 @@ mod tests {
     fn architecture_constants_are_self_consistent() {
         assert!((BAR_RESID_LAMBDA_INIT - 1.1f64.sqrt()).abs() < 1e-15);
         assert_eq!(BAR_POST_LAMBDA_INIT, 1.0);
-        assert_eq!(BAR_DYNAMICS_HIDDEN, (1.6 * 1024.0f64 / 128.0).round() as i64 * 128);
+        assert_eq!(
+            BAR_DYNAMICS_HIDDEN,
+            (1.6 * 1024.0f64 / 128.0).round() as i64 * 128
+        );
         assert_eq!(BAR_HEADS * BAR_HEAD_DIM, BAR_MODEL_DIM);
     }
 
@@ -2400,7 +2474,7 @@ mod tests {
         for down in bar_muon_down_projection_substrings() {
             assert!(
                 muon.contains(down),
-                "down-projection substring {down} is not NorMuon-routed, so its 2.0x \
+                "down-projection substring {down} is not NorMuon-routed, so its 4.0x \
                  learning-rate multiplier would land on an AdamW parameter"
             );
         }
@@ -2461,15 +2535,13 @@ mod tests {
         metadata.validate_supports(&weights).expect("supports");
 
         // Recomputing from the same files reproduces an identical sidecar.
-        let again = BarWorldModelMetadata::for_checkpoint(&weights, &[300], 300)
-            .expect("recompute");
+        let again =
+            BarWorldModelMetadata::for_checkpoint(&weights, &[300], 300).expect("recompute");
         assert_eq!(again, metadata);
 
         // The lineage is a function of the supports, not just the weights.
         let mut swapped = metadata.clone();
-        swapped
-            .supports_sha256
-            .insert(300, "0".repeat(64));
+        swapped.supports_sha256.insert(300, "0".repeat(64));
         assert!(swapped.validate_schema().is_err());
 
         // A deployment resolution with no fitted support is rejected outright.
@@ -2547,7 +2619,9 @@ mod tests {
         let mut seen = HashSet::new();
         for scoring in BarScoring::ALL {
             let metadata = of(scoring);
-            metadata.validate_schema().expect("its own lineage validates");
+            metadata
+                .validate_schema()
+                .expect("its own lineage validates");
             assert!(
                 seen.insert(metadata.lineage_sha256.clone()),
                 "{scoring} collided with another mode's lineage"
@@ -2593,7 +2667,9 @@ mod tests {
         // The byte-level property the 716 sidecars already on disk depend on: an unrecorded
         // fraction contributes NO text to the canonical rendering, so their stored hashes are
         // still the hashes this build computes. A recorded one contributes exactly one field.
-        assert!(!unrecorded.training_canonical().contains("lr_plateau_fraction"));
+        assert!(!unrecorded
+            .training_canonical()
+            .contains("lr_plateau_fraction"));
         assert!(
             rescheduled
                 .training_canonical()
@@ -2642,7 +2718,10 @@ mod tests {
         let deviation = f64::try_from((rms - 1.0).abs().max()).expect("rms");
         assert!(deviation < 1e-3, "belief RMS deviated by {deviation}");
 
-        let (nll, _) = modules.head.nll(&beliefs, &dof, &supports, BarScoring::Hard);
+        let conditioning = modules.trunk.forecast_conditioning(&time_ids, &time_ids);
+        let (nll, _) = modules
+            .head
+            .nll(&beliefs, &conditioning, &dof, &supports, BarScoring::Hard);
         let nll = f64::try_from(nll).expect("nll");
         let uniform = BAR_DOF as f64 * (NUM_BAR_BINS as f64).ln();
         assert!(
@@ -2677,6 +2756,93 @@ mod tests {
         assert!(
             difference > 1e-4,
             "the trunk ignored the calendar channel ({difference})"
+        );
+    }
+
+    #[test]
+    fn forecast_conditioning_uses_target_clock_and_current_market_only() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        wake_projections(&vs, 43);
+
+        let h = Tensor::zeros([2, 1, BAR_MODEL_DIM], (Kind::Float, Device::Cpu));
+        let bins = Tensor::zeros([2, 1, BAR_DOF as i64], (Kind::Int64, Device::Cpu));
+        let target = synthetic_time_ids(2, 1, 570);
+        let current = synthetic_time_ids(2, 1, 565);
+        let market_channels = Tensor::from_slice(&BAR_TIME_MARKET.map(|slot| slot as i64));
+
+        let target_market_changed = target.index_fill(-1, &market_channels, 127);
+        let base_conditioning = modules.trunk.forecast_conditioning(&target, &current);
+        let no_target_market = modules
+            .trunk
+            .forecast_conditioning(&target_market_changed, &current);
+        assert_eq!(
+            f64::try_from((&base_conditioning - &no_target_market).abs().max()).expect("gap"),
+            0.0,
+            "the target bar's observed market ids leaked into forecast conditioning"
+        );
+
+        let minute = Tensor::from_slice(&[crate::torch::dataset::TIME_MINUTE as i64]);
+        let shifted_clock = target.index_fill(-1, &minute, 17);
+        let clock_conditioning = modules
+            .trunk
+            .forecast_conditioning(&shifted_clock, &current);
+        let base_logits = modules.head.logits(&h, &base_conditioning, &bins);
+        let no_target_logits = modules.head.logits(&h, &no_target_market, &bins);
+        assert_eq!(
+            f64::try_from((&base_logits - no_target_logits).abs().max()).expect("logit gap"),
+            0.0,
+            "the target bar's observed market ids leaked into emission logits"
+        );
+        let clock_logits = modules.head.logits(&h, &clock_conditioning, &bins);
+        assert!(
+            f64::try_from((clock_logits - &base_logits).abs().max()).expect("clock gap") > 1e-5,
+            "the target exogenous clock did not reach the emission logits"
+        );
+
+        let changed_current = current.index_fill(-1, &market_channels, 127);
+        let market_conditioning = modules
+            .trunk
+            .forecast_conditioning(&target, &changed_current);
+        let market_logits = modules.head.logits(&h, &market_conditioning, &bins);
+        assert!(
+            f64::try_from((market_logits - base_logits).abs().max()).expect("market gap") > 1e-5,
+            "the current observed market did not reach the emission logits after wake-up"
+        );
+    }
+
+    #[test]
+    fn train_and_cached_trunk_paths_mask_same_instant_market_ids() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let supports = synthetic_supports();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        wake_projections(&vs, 47);
+        let (dof, bins, time_ids) = synthetic_inputs(&supports, 2, 8, 0xCA5E);
+        let market_channels = Tensor::from_slice(&BAR_TIME_MARKET.map(|slot| slot as i64));
+        let changed = time_ids.index_fill(-1, &market_channels, 127);
+
+        let train_a = modules.trunk.forward(&dof, &bins, &time_ids, 0, true);
+        let train_b = modules.trunk.forward(&dof, &bins, &changed, 0, true);
+        assert_eq!(
+            f64::try_from((train_a - train_b).abs().max()).expect("train gap"),
+            0.0,
+            "the training trunk path ingested same-instant market ids"
+        );
+
+        let mut cache_a = BarKvCache::new(BAR_MAX_CONTEXT);
+        let mut cache_b = BarKvCache::new(BAR_MAX_CONTEXT);
+        let cached_a = modules
+            .trunk
+            .forward_cached(&dof, &bins, &time_ids, &mut cache_a);
+        let cached_b = modules
+            .trunk
+            .forward_cached(&dof, &bins, &changed, &mut cache_b);
+        assert_eq!(
+            f64::try_from((cached_a - cached_b).abs().max()).expect("cached gap"),
+            0.0,
+            "the cached trunk path ingested same-instant market ids"
         );
     }
 
@@ -2754,8 +2920,16 @@ mod tests {
             ));
         }
         let cached = Tensor::cat(&cached, 1);
-        assert_eq!(cache.cached_bars(), window, "cache must saturate at its window");
-        assert_eq!(cache.next_position(), len, "positions stay absolute past a wrap");
+        assert_eq!(
+            cache.cached_bars(),
+            window,
+            "cache must saturate at its window"
+        );
+        assert_eq!(
+            cache.next_position(),
+            len,
+            "positions stay absolute past a wrap"
+        );
 
         // A one-layer-deep comparison: recompute the final belief from exactly the
         // trailing `window` bars with a matching sliding window. The trunk is ten
@@ -2769,13 +2943,12 @@ mod tests {
             0,
             false,
         );
-        let error = f64::try_from(
-            (cached.narrow(1, 0, window) - unsaturated)
-                .abs()
-                .max(),
-        )
-        .expect("max error");
-        assert!(error < 1e-4, "pre-eviction beliefs diverged from a full forward: {error}");
+        let error = f64::try_from((cached.narrow(1, 0, window) - unsaturated).abs().max())
+            .expect("max error");
+        assert!(
+            error < 1e-4,
+            "pre-eviction beliefs diverged from a full forward: {error}"
+        );
 
         // Past saturation the beliefs must still be finite and must keep moving:
         // a wrap that silently read stale or zeroed slots would show up as a
@@ -2930,14 +3103,25 @@ mod tests {
         let full = modules.trunk.forward(&dof, &ids, &time_ids, 0, false);
         let wide = modules.trunk.forward(&dof, &ids, &time_ids, len, false);
         let error = f64::try_from((full - wide).abs().max()).expect("max error");
-        assert!(error < 1e-5, "wide window diverged from full causal {error}");
+        assert!(
+            error < 1e-5,
+            "wide window diverged from full causal {error}"
+        );
     }
 
     #[test]
     fn dynamics_starts_as_the_identity_and_stays_on_the_unit_shell() {
         let _torch_rng_guard = test_rng::exclusive();
+        let supports = synthetic_supports();
         let vs = nn::VarStore::new(Device::Cpu);
-        let dynamics = BarDynamics::new(&vs.root(), BAR_MODEL_DIM);
+        let modules = BarModules::new(&vs.root());
+        assert!(
+            vs.variables()
+                .keys()
+                .all(|name| !name.contains("bar_dyn_dof_embed")
+                    && !name.contains("bar_dyn_time_embed")),
+            "dynamics must not own a private token encoder"
+        );
         // `step` is only ever handed a belief, and every belief leaves the trunk
         // through the gain-free `rms_norm`, so the identity claim is about the unit
         // shell — feeding an unnormalized latent tests a domain that cannot occur.
@@ -2947,7 +3131,9 @@ mod tests {
         ));
         let dof = synthetic_dof(3, 4, 0x2020);
         let time_ids = synthetic_time_ids(3, 4, 570);
-        let predicted = dynamics.step(&h, &dof, &time_ids);
+        let bins = bar_bin_ids(&supports, &dof);
+        let token = modules.trunk.token_embedding(&dof, &bins, &time_ids);
+        let predicted = modules.dynamics.step(&h, &token);
         assert_eq!(predicted.size(), h.size());
         let error = f64::try_from((&predicted - &h).abs().max()).expect("max error");
         assert!(
@@ -2956,7 +3142,8 @@ mod tests {
         );
 
         wake_projections(&vs, 17);
-        let predicted = dynamics.step(&h, &dof, &time_ids);
+        let token = modules.trunk.token_embedding(&dof, &bins, &time_ids);
+        let predicted = modules.dynamics.step(&h, &token);
         assert!(bool::try_from(predicted.isfinite().all()).expect("finite check"));
         assert!(f64::try_from((&predicted - &h).abs().max()).expect("max") > 0.0);
         // The output has to live where the emission head was fitted, whatever the
@@ -2971,8 +3158,12 @@ mod tests {
             "a woken dynamics step left the unit-RMS shell by {drift}"
         );
 
-        // The clock reaches the prediction: same latent and bar, different hour.
-        let overnight = dynamics.step(&h, &dof, &synthetic_time_ids(3, 4, 1260));
+        // The shared token's clock reaches the prediction: same latent and bar, different hour.
+        let overnight_token =
+            modules
+                .trunk
+                .token_embedding(&dof, &bins, &synthetic_time_ids(3, 4, 1260));
+        let overnight = modules.dynamics.step(&h, &overnight_token);
         assert!(
             f64::try_from((predicted - overnight).abs().max()).expect("max") > 0.0,
             "dynamics ignored the calendar channel"
@@ -3026,8 +3217,7 @@ mod tests {
             "two different histories produced identical greedy rollouts"
         );
 
-        let flat =
-            Vec::<f32>::try_from(rollout.reshape([-1]).contiguous()).expect("host copy");
+        let flat = Vec::<f32>::try_from(rollout.reshape([-1]).contiguous()).expect("host copy");
         assert_eq!(flat.len(), 2 * samples * steps * BAR_DOF);
         for chunk in flat.chunks_exact(BAR_DOF) {
             let dof = BarDof::from_array([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]]);
@@ -3077,7 +3267,10 @@ mod tests {
                 .max(),
         )
         .expect("gap");
-        assert!(gap < 1e-4, "session advance diverged from a full prefill: {gap}");
+        assert!(
+            gap < 1e-4,
+            "session advance diverged from a full prefill: {gap}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -3118,13 +3311,11 @@ mod tests {
         // What actually distinguishes the two modes is the tail: if a match arm
         // fell through to the wrong branch, `Dynamics` would silently run the
         // trunk (or vice versa) and every trajectory would coincide.
-        let head_gap =
-            f64::try_from((exact.narrow(1, 0, 1) - approx.narrow(1, 0, 1)).abs().max())
-                .expect("gap");
+        let head_gap = f64::try_from((exact.narrow(1, 0, 1) - approx.narrow(1, 0, 1)).abs().max())
+            .expect("gap");
         assert_eq!(head_gap, 0.0);
-        let tail_gap =
-            f64::try_from((exact.narrow(1, 4, 1) - approx.narrow(1, 4, 1)).abs().max())
-                .expect("tail gap");
+        let tail_gap = f64::try_from((exact.narrow(1, 4, 1) - approx.narrow(1, 4, 1)).abs().max())
+            .expect("tail gap");
         assert!(
             tail_gap > 0.0,
             "the cached trunk and the dynamics head produced identical trajectories"
@@ -3171,8 +3362,14 @@ mod tests {
                 mode.as_str()
             );
             let last = HORIZON - 1;
+            let target_time = future_time_ids.narrow(1, last, 1);
+            let current_time = future_time_ids.narrow(1, last - 1, 1);
+            let conditioning = modules
+                .trunk
+                .forecast_conditioning(&target_time, &current_time);
             let (nll, _) = modules.head.nll(
                 &beliefs.narrow(1, last, 1),
+                &conditioning,
                 &future.narrow(1, last, 1),
                 set.only(),
                 BarScoring::Hard,

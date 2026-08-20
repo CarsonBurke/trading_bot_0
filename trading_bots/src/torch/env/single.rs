@@ -250,7 +250,10 @@ mod tests {
         let hold = vec![0.0; ACTION_COUNT as usize];
         for step in 0..8 {
             let transition = env.step_step_single(&hold);
-            assert_eq!(transition.is_done, 0.0, "step {step} ended the episode early");
+            assert_eq!(
+                transition.is_done, 0.0,
+                "step {step} ended the episode early"
+            );
             assert!(transition.reward.is_finite(), "step {step} reward");
             assert!(transition.static_obs.iter().all(|value| value.is_finite()));
         }

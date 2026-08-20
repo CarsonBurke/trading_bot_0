@@ -114,8 +114,9 @@ pub const TAIL_LEVELS_P: [f64; 4] = [1.0e-2, 3.0e-3, 1.0e-3, 3.0e-4];
 /// not reproduced anywhere in the `k >= 500` range, and a heavier index can only live FURTHER out;
 /// `k = 50` on 3.6e6 continuous rows is a `1.4e-5` exceedance, which is as far as the draw reaches
 /// before the estimator is counting single bars.
-const HILL_K: [usize; 10] =
-    [50, 100, 200, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
+const HILL_K: [usize; 10] = [
+    50, 100, 200, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000,
+];
 
 /// Points on the log-log tail chart, geometric in threshold so a power law reads as a line.
 const TAIL_GRID: usize = 40;
@@ -241,8 +242,7 @@ fn ln_gamma(x: f64) -> f64 {
     let series = inv
         * (1.0 / 12.0
             + inv2
-                * (-1.0 / 360.0
-                    + inv2 * (1.0 / 1260.0 + inv2 * (-1.0 / 1680.0 + inv2 / 1188.0))));
+                * (-1.0 / 360.0 + inv2 * (1.0 / 1260.0 + inv2 * (-1.0 / 1680.0 + inv2 / 1188.0))));
     (z - 0.5) * z.ln() - z + 0.5 * (2.0 * PI).ln() + series - shift
 }
 
@@ -277,8 +277,7 @@ fn trigamma(x: f64) -> f64 {
     let series = inv
         * (1.0
             + 0.5 * inv
-            + inv2
-                * (1.0 / 6.0 + inv2 * (-1.0 / 30.0 + inv2 * (1.0 / 42.0 - inv2 / 30.0))));
+            + inv2 * (1.0 / 6.0 + inv2 * (-1.0 / 30.0 + inv2 * (1.0 / 42.0 - inv2 / 30.0))));
     series + shift
 }
 
@@ -459,10 +458,7 @@ impl GaussianMixture {
         for k in 0..self.components() {
             let sd = self.sds[k];
             let z = (x - self.means[k]) / sd;
-            acc = log_add(
-                acc,
-                self.weights[k].ln() - sd.ln() - log_root - 0.5 * z * z,
-            );
+            acc = log_add(acc, self.weights[k].ln() - sd.ln() - log_root - 0.5 * z * z);
         }
         acc - log_normalizer
     }
@@ -1102,7 +1098,11 @@ impl Continuous {
             Self::Gaussian(m) => (1.0 - (m.cumulative(hi) - m.cumulative(lo))).clamp(0.0, 1.0),
             Self::LogNormal(m) => {
                 let below = if lo > 0.0 { m.cumulative(lo.ln()) } else { 0.0 };
-                let above = if hi > 0.0 { 1.0 - m.cumulative(hi.ln()) } else { 1.0 };
+                let above = if hi > 0.0 {
+                    1.0 - m.cumulative(hi.ln())
+                } else {
+                    1.0
+                };
                 (below + above).clamp(0.0, 1.0)
             }
             // A Beta lives on `[0, 1]` and the `u` / `v` grid spans exactly that, so there is
@@ -1438,7 +1438,8 @@ pub struct RuinLicence {
 
 impl RuinLicence {
     pub fn draw_max_leverage(&self) -> f64 {
-        self.draw_long_max_leverage.min(self.draw_short_max_leverage)
+        self.draw_long_max_leverage
+            .min(self.draw_short_max_leverage)
     }
 
     /// The leverage the SUPPORT's bounded range licenses, short side binding.
@@ -2275,10 +2276,7 @@ fn class_probabilities(
     if total == 0 {
         return vec![f64::NAN; classes];
     }
-    counts
-        .iter()
-        .map(|c| *c as f64 / total as f64)
-        .collect()
+    counts.iter().map(|c| *c as f64 / total as f64).collect()
 }
 
 /// Nats per bar of the mixed likelihood over `score_rows`, on the mixed-measure density footing:
@@ -2292,7 +2290,10 @@ fn mixed_nll(
     class: &[f64],
 ) -> f64 {
     let classes = atom_values.len() + 1;
-    let log_class: Vec<f64> = class.iter().map(|p| p.max(f64::MIN_POSITIVE).ln()).collect();
+    let log_class: Vec<f64> = class
+        .iter()
+        .map(|p| p.max(f64::MIN_POSITIVE).ln())
+        .collect();
     let parts: Vec<(f64, u64)> = samples
         .par_chunks(EM_CHUNK)
         .enumerate()
@@ -2417,8 +2418,8 @@ fn fit_one_dof(
     let truncation = (dof == DOF_R).then_some(r_truncation);
     let concentration_cap = (0.25 / (floor * floor) - 1.0).max(1.0);
 
-    let continuous_share = count_continuous(samples, Rows::All, &value_of) as f64
-        / samples.len().max(1) as f64;
+    let continuous_share =
+        count_continuous(samples, Rows::All, &value_of) as f64 / samples.len().max(1) as f64;
     let fit_class = class_probabilities(samples, Rows::Fit, dof, &atom_values);
     let all_class = class_probabilities(samples, Rows::All, dof, &atom_values);
     let fit_rows = count_continuous(samples, Rows::Fit, &value_of).max(1) as f64;
@@ -2669,7 +2670,10 @@ pub fn upper_order_statistics(samples: &[BarDof]) -> (Vec<f64>, u64, u64) {
             push(&mut merged, magnitude);
         }
     }
-    let mut ordered: Vec<f64> = merged.into_iter().map(|Reverse(m)| m.into_inner()).collect();
+    let mut ordered: Vec<f64> = merged
+        .into_iter()
+        .map(|Reverse(m)| m.into_inner())
+        .collect();
     ordered.sort_unstable_by(f64::total_cmp);
     (ordered, rows, continuous)
 }
@@ -2802,11 +2806,7 @@ fn measure_tail(
                 .iter()
                 .map(|x| x.ln() - log_threshold)
                 .sum();
-            let alpha = if sum > 0.0 {
-                *k as f64 / sum
-            } else {
-                f64::NAN
-            };
+            let alpha = if sum > 0.0 { *k as f64 / sum } else { f64::NAN };
             HillPoint {
                 k: *k,
                 threshold,
@@ -2907,10 +2907,8 @@ mod tests {
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
         let unique = SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "bar_family_{name}_{}_{unique}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bar_family_{name}_{}_{unique}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -3093,7 +3091,11 @@ mod tests {
                 z[i]
             );
         }
-        assert_eq!(erfc(40.0), 0.0, "erfc must underflow to exactly zero, not NaN");
+        assert_eq!(
+            erfc(40.0),
+            0.0,
+            "erfc must underflow to exactly zero, not NaN"
+        );
     }
 
     /// A truncated mixture is a DENSITY: it integrates to one over its truncation, its survival
@@ -3156,7 +3158,8 @@ mod tests {
             })
             .collect();
         let value_of = |row: &BarDof| Some(row.w as f64);
-        let (fitted, sweeps) = fit_gaussian_mixture(&samples, Rows::All, &value_of, 2, 1.0e-7, None);
+        let (fitted, sweeps) =
+            fit_gaussian_mixture(&samples, Rows::All, &value_of, 2, 1.0e-7, None);
         assert!(sweeps > 1, "EM took {sweeps} sweeps");
 
         // Components come out in whatever order the quantile init put them; identify by mean.
@@ -3366,8 +3369,7 @@ mod tests {
         let class = class_probabilities(&samples, Rows::All, DOF_R, &atoms);
         let measured = mixed_nll(&samples, Rows::All, DOF_R, &atoms, &continuous, &class);
         let atom_share = class[0];
-        let expected = -atom_share * atom_share.ln()
-            - (1.0 - atom_share) * (1.0 - atom_share).ln()
+        let expected = -atom_share * atom_share.ln() - (1.0 - atom_share) * (1.0 - atom_share).ln()
             + (1.0 - atom_share) * SPAN.ln();
         assert!(
             (measured - expected).abs() < 1.0e-6,
@@ -3589,7 +3591,10 @@ mod tests {
             !fit.dofs[DOF_R].atoms.is_empty(),
             "the fixture must plant an r atom"
         );
-        assert!(fit.tail.pairs.len() == 6, "six pairwise slopes are required");
+        assert!(
+            fit.tail.pairs.len() == 6,
+            "six pairwise slopes are required"
+        );
         assert!(fit.ruin.rows.len() == RUIN_LEVERAGES.len());
         assert!(!fit.report_lines().is_empty());
 
@@ -3608,7 +3613,9 @@ mod tests {
                 panic!("{base} must be a MultiLine chart");
             };
             assert!(
-                series.iter().any(|s| s.values.iter().any(|v| v.is_finite())),
+                series
+                    .iter()
+                    .any(|s| s.values.iter().any(|v| v.is_finite())),
                 "{base} carries no finite value, so it is a blank panel"
             );
         }

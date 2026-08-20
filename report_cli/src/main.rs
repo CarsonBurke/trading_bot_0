@@ -440,8 +440,9 @@ mod tests {
         );
         // The p10 locus peaks on row 0, so filtering to it must not inherit the
         // realized bars' row-2 maximum.
-        assert!(select_by_report_value(&kind, lines.clone(), 1, true, Some("p10"))[0]
-            .starts_with('0'));
+        assert!(
+            select_by_report_value(&kind, lines.clone(), 1, true, Some("p10"))[0].starts_with('0')
+        );
         assert!(select_by_report_value(&kind, lines, 1, true, Some("draw 1"))[0].starts_with('1'));
     }
 

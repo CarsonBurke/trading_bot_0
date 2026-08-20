@@ -56,7 +56,7 @@
 //! module is arithmetic on those slopes and on the schedule, and its own uncertainty input is a
 //! DETERMINISTIC one — see [`JitterFloor`].
 
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 
 use super::pretrain::Schedule;
 
@@ -476,12 +476,10 @@ pub(super) fn disentangle(
     let grid = sweep(&attribution);
 
     let plateau_checkpoints = axes.iter().filter(|axis| axis.in_lr_plateau).count();
-    let pairing_precondition_holds = axes
-        .windows(2)
-        .all(|pair| {
-            pair[0].beta_fit_blocks == pair[1].beta_fit_blocks
-                && pair[0].beta_fit_samples == pair[1].beta_fit_samples
-        });
+    let pairing_precondition_holds = axes.windows(2).all(|pair| {
+        pair[0].beta_fit_blocks == pair[1].beta_fit_blocks
+            && pair[0].beta_fit_samples == pair[1].beta_fit_samples
+    });
     let kink = repetition_kink(&axes, schedule, population, jitter.cadence_spacing);
 
     Ok(Disentangle {
@@ -526,10 +524,14 @@ fn equally_spaced_cadence(axes: &[CheckpointAxes], schedule: &Schedule) -> Resul
             let spacing = axes[candidates[next]].step - axes[candidates[start]].step;
             let mut run = vec![candidates[start], candidates[next]];
             let mut cursor = next;
-            while let Some(found) = candidates[(cursor + 1)..].iter().find(|index| {
-                axes[**index].step == axes[candidates[cursor]].step + spacing
-            }) {
-                cursor = candidates.iter().position(|index| index == found).expect("member");
+            while let Some(found) = candidates[(cursor + 1)..]
+                .iter()
+                .find(|index| axes[**index].step == axes[candidates[cursor]].step + spacing)
+            {
+                cursor = candidates
+                    .iter()
+                    .position(|index| index == found)
+                    .expect("member");
                 run.push(candidates[cursor]);
             }
             if run.len() > best.len() {
@@ -605,7 +607,10 @@ fn jitter_floor(
     let consecutive: Vec<f64> = betas.windows(2).map(|pair| pair[1] - pair[0]).collect();
     let disagreement = if consecutive.len() >= 2 {
         let lo = consecutive.iter().copied().fold(f64::INFINITY, f64::min);
-        let hi = consecutive.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let hi = consecutive
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
         hi - lo
     } else {
         0.0
@@ -774,7 +779,10 @@ mod tests {
         assert!((schedule.passes_at(12438) - 1.2).abs() < 1e-12);
         assert!(schedule.in_lr_plateau(10364) && !schedule.in_lr_plateau(12439));
         let flat = schedule.lr_multiplier(0) - schedule.lr_multiplier(12438);
-        assert_eq!(flat, 0.0, "the plateau must be exactly flat, not nearly flat");
+        assert_eq!(
+            flat, 0.0,
+            "the plateau must be exactly flat, not nearly flat"
+        );
     }
 
     /// The identified window is the plateau OVERHANG of the spine's lower checkpoint, and the
@@ -803,9 +811,7 @@ mod tests {
         // 12438 - 10364 = 2074 steps of plateau overhang, in passes.
         assert!((attribution.identified_passes - 2074.0 / 10365.0).abs() < 1e-9);
         assert!((attribution.attenuation - 19636.0 / 2074.0).abs() < 1e-6);
-        assert!(
-            (attribution.amplification - (19636.0 / 2074.0) * (17562.0 / 1024.0)).abs() < 1e-5
-        );
+        assert!((attribution.amplification - (19636.0 / 2074.0) * (17562.0 / 1024.0)).abs() < 1e-5);
         // The components are a decomposition: they sum to the movement exactly.
         assert!(
             (attribution.passes_component + attribution.lr_component - out.spine.d_beta).abs()
@@ -902,11 +908,10 @@ mod tests {
             axis("s30208", 30208, &schedule, 0.8790),
             axis("s30720", 30720, &schedule, 0.8780),
         ];
-        let bare = disentangle(axes.clone(), &schedule, SlopePopulation::FitSlice)
-            .expect("decomposes");
+        let bare =
+            disentangle(axes.clone(), &schedule, SlopePopulation::FitSlice).expect("decomposes");
         assert!(
-            bare.jitter.null_control.is_nan()
-                && bare.jitter.null_control_labels.is_none(),
+            bare.jitter.null_control.is_nan() && bare.jitter.null_control_labels.is_none(),
             "no such pair must read as NaN, never as a measured zero"
         );
         let floor_without = bare.jitter.worst();
@@ -915,7 +920,10 @@ mod tests {
         let with = disentangle(axes, &schedule, SlopePopulation::FitSlice).expect("decomposes");
         assert!((with.jitter.null_control.abs() - 0.0177).abs() < 1e-9);
         assert_eq!(
-            with.jitter.null_control_labels.as_ref().map(|pair| pair.1.as_str()),
+            with.jitter
+                .null_control_labels
+                .as_ref()
+                .map(|pair| pair.1.as_str()),
             Some("best_diag896")
         );
         assert_eq!(
@@ -959,15 +967,12 @@ mod tests {
         let middle = out.grid[GRID_POINTS / 2];
         assert_eq!(middle.assumed_d_beta_local, 0.0);
         assert!(
-            (middle.passes_component - out.spine.d_beta * out.attribution.attenuation).abs()
-                < 1e-9,
+            (middle.passes_component - out.spine.d_beta * out.attribution.attenuation).abs() < 1e-9,
             "at zero assumed local movement the whole spine movement is attributed to passes, \
              scaled by the attenuation"
         );
         for point in &out.grid {
-            assert!(
-                (point.passes_component + point.lr_component - out.spine.d_beta).abs() < 1e-9
-            );
+            assert!((point.passes_component + point.lr_component - out.spine.d_beta).abs() < 1e-9);
         }
         let rise = out.grid[GRID_POINTS - 1].passes_component - out.grid[0].passes_component;
         let run = out.grid[GRID_POINTS - 1].assumed_d_beta_local - out.grid[0].assumed_d_beta_local;

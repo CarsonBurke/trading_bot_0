@@ -511,8 +511,14 @@ mod tests {
         // into this crate's types.
         let raw = fs::read_to_string(run.root.join("meta.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["provenance"]["split_bounds_ms"][0], 1_759_839_000_000i64);
-        assert_eq!(parsed["provenance"]["split_bounds_ms"][1], 1_773_427_500_000i64);
+        assert_eq!(
+            parsed["provenance"]["split_bounds_ms"][0],
+            1_759_839_000_000i64
+        );
+        assert_eq!(
+            parsed["provenance"]["split_bounds_ms"][1],
+            1_773_427_500_000i64
+        );
         assert_eq!(parsed["provenance"]["diagnostic_context_bars"], 896);
         assert_eq!(parsed["provenance"]["split_bounds_pinned"], true);
 

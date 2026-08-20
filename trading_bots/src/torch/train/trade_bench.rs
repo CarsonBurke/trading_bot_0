@@ -35,21 +35,20 @@
 //! traded factor FIRST, so the `r` head conditions on no same-bar factor at all and
 //!
 //! ```text
-//! p(r | h) = softmax(head.logits(h)_r)
+//! p(r | h, c) = softmax(head.logits(h, c)_r)
 //! ```
 //!
-//! is the traded law exactly, with nothing to integrate out. The `r` row of
-//! [`BarEmissionHead::forecast_log_probs`] is the same object up to a `log`/`exp` round
-//! trip, which the tests check it against.
+//! is the traded law exactly, with nothing to integrate out. `c` is explicit
+//! forecast-safe conditioning: target exogenous clock plus current observed
+//! market, built by the shared trunk without target market. The `r` row of
+//! [`BarEmissionHead::forecast_log_probs`] is the same object up to a `log`/`exp`
+//! round trip, which the tests check it against.
 //!
-//! The no-lookahead property is STRUCTURAL, not asserted at runtime:
-//! [`forecast_r_probs`] takes the head and the causal beliefs, and there is no parameter
-//! through which a caller could hand it the realized bar. Even the head's own
-//! [`BarEmissionHead::logits`] cannot leak one into that row: the prefix mask of chain
-//! position 0 is identically zero, so the row is the same whatever prefix is passed. The
-//! realized bar enters this module in exactly two places, both of them
-//! outcomes rather than decisions: the realized return that the position is paid on,
-//! and the perfect-foresight oracle, whose entire purpose is to see it.
+//! The no-lookahead property is structural: [`forecast_r_probs`] accepts only the
+//! causal belief and its forecast conditioner, never the realized target bar. Even
+//! the head's own [`BarEmissionHead::logits`] cannot leak a same-bar chain factor
+//! into `r`: chain position 0's prefix mask is identically zero. The realized bar
+//! enters this module only as an outcome and in the perfect-foresight oracle.
 //!
 //! # The baselines are the point
 //!
@@ -140,12 +139,13 @@ use crate::torch::bar_dist::{
 };
 use crate::torch::dataset::mix64;
 
-use super::pretrain_stats::{block_bootstrap, Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, CI_MASS};
+use super::pretrain_stats::{
+    block_bootstrap, Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, CI_MASS,
+};
 
-/// `p(r | h)` is READ DIRECTLY off the head's `r` row, because `r` heads the chain and
-/// therefore has no prefix to integrate out. A reorder that puts any factor before `r`
-/// gives it a prefix again, at which point the direct read silently becomes a
-/// teacher-forced row and the mixture that was deleted here would have to come back.
+/// `p(r | h, c)` is read directly off the head's `r` row, because `r` heads the chain
+/// and therefore has no same-bar prefix to integrate out. A reorder that puts any
+/// factor before `r` would require the mixture to return.
 const _: () = assert!(
     BAR_CHAIN[0] == DOF_R,
     "trade_bench reads p(r|h) directly off the head's r row, which is p(r|past) only while \
@@ -365,24 +365,21 @@ pub fn bin_returns(supports: &BarSupports) -> Vec<f64> {
 
 /// `[rows, NUM_BAR_BINS]` probabilities of `p(r | strictly past bars)`.
 ///
-/// **This is the only distribution the traded decision is ever allowed to see.** There
-/// is deliberately no parameter through which the realized bar could reach it: the
-/// signature carries the head and the causal beliefs and nothing else. `beliefs[i]` must
-/// be the belief formed from bars up to and including the bar BEFORE the one being
-/// predicted, which is exactly the alignment the pretrainer's teacher-forced pass
-/// produces.
-///
-/// `r` is [`BAR_CHAIN`]`[0]`, so the head's `r` row IS this law. The prefix
-/// [`BarEmissionHead::logits`] requires is a placeholder that chain position 0's all-zero
-/// prefix mask discards; handing it the realized bar instead of zeros would return the
-/// identical row.
-pub fn forecast_r_probs(head: &BarEmissionHead, beliefs: &Tensor) -> Tensor {
+/// The explicit forecast conditioning must align with `beliefs` and is the only
+/// non-belief input: target exogenous clock plus current observed market. The
+/// realized target bar still has no route into this decision law.
+pub fn forecast_r_probs(head: &BarEmissionHead, beliefs: &Tensor, conditioning: &Tensor) -> Tensor {
     let size = beliefs.size();
     assert_eq!(size.len(), 2, "beliefs must be [rows, latent_dim]");
+    assert_eq!(
+        conditioning.size(),
+        size,
+        "one forecast-conditioning row per belief"
+    );
     let rows = size[0];
     tch::no_grad(|| {
         let zero_prefix = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, beliefs.device()));
-        head.logits(beliefs, &zero_prefix)
+        head.logits(beliefs, conditioning, &zero_prefix)
             .select(1, DOF_R as i64)
             .softmax(-1, Kind::Float)
     })
@@ -503,8 +500,11 @@ pub fn kelly_fractions(probs: &Tensor, returns: &Tensor, cap: f64) -> Tensor {
             hi = hi.where_self(&rising, &mid);
         }
         let fraction = (lo + hi) * 0.5;
-        let growth = (&probs * (fraction.unsqueeze(-1) * &returns + 1.0).clamp_min(WEALTH_FLOOR).log())
-            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let growth = (&probs
+            * (fraction.unsqueeze(-1) * &returns + 1.0)
+                .clamp_min(WEALTH_FLOOR)
+                .log())
+        .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
         // The derived confidence gate: no position unless the optimum strictly grows
         // wealth. `g(0) = 0`, so this fires exactly on a zero-edge law.
         fraction.where_self(&growth.gt(0.0), &growth.zeros_like())
@@ -781,6 +781,7 @@ impl TradeSetup {
         &self,
         head: &BarEmissionHead,
         beliefs: &Tensor,
+        conditioning: &Tensor,
         realized_dof: &Tensor,
         windows: usize,
     ) -> Result<ChunkPaths> {
@@ -792,6 +793,7 @@ impl TradeSetup {
         window_paths(
             head,
             &beliefs.narrow(0, 0, take),
+            &conditioning.narrow(0, 0, take),
             &realized_dof.narrow(0, 0, take).select(-1, DOF_R as i64),
             &TradedLaw {
                 returns: &self.returns,
@@ -896,11 +898,10 @@ impl ChunkPaths {
 
 /// Positions, conditional moments and tail exceedances for one chunk of pinned windows.
 ///
-/// `beliefs` is `[windows, bars, latent_dim]` and `realized_r` is `[windows, bars]`, the
-/// realized `r` of the bar each belief predicts. The traded decision is computed from
-/// `beliefs` alone: `realized_r` reaches only the payoff, the perfect-foresight oracle
-/// (the one policy allowed to see it) and the tail-calibration COUNT, which is an outcome
-/// rather than a decision.
+/// `beliefs` and `conditioning` are `[windows, bars, latent_dim]`; `realized_r`
+/// is `[windows, bars]`, the realized return each pair predicts. The decision is
+/// computed only from the causal belief and forecast-safe conditioner. `realized_r`
+/// reaches the payoff, perfect-foresight oracle and tail-calibration count only.
 ///
 /// The Kelly solve runs ONCE per bar, uncapped. Every policy is then a clamp of that one
 /// number, which is exact by concavity and is what makes the cap curve free. When
@@ -915,6 +916,7 @@ impl ChunkPaths {
 pub fn window_paths(
     head: &BarEmissionHead,
     beliefs: &Tensor,
+    conditioning: &Tensor,
     realized_r: &Tensor,
     law: &TradedLaw<'_>,
     free_marginal: f64,
@@ -932,6 +934,11 @@ pub fn window_paths(
         head.latent_dim()
     );
     ensure!(
+        conditioning.size() == shape,
+        "forecast conditioning must align with beliefs: {:?} vs {shape:?}",
+        conditioning.size()
+    );
+    ensure!(
         realized_r.size() == [windows, bars],
         "realized returns must align with the beliefs that predict them: {:?} vs \
          [{windows}, {bars}]",
@@ -940,6 +947,7 @@ pub fn window_paths(
 
     let rows = windows * bars;
     let flat_beliefs = beliefs.reshape([rows, latent]);
+    let flat_conditioning = conditioning.reshape([rows, latent]);
     let flat_r = realized_r.reshape([rows]).to_kind(Kind::Double);
     let realized = flat_r.expm1();
     let centers = law.centers.to_kind(Kind::Double);
@@ -990,8 +998,13 @@ pub fn window_paths(
     while start < rows {
         let len = ROW_CHUNK.min(rows - start);
         let chunk = flat_beliefs.narrow(0, start, len);
-        let probs = forecast_r_probs(head, &chunk);
-        free.extend(host_vec(&kelly_fractions(&probs, law.returns, FREE_LEVERAGE)));
+        let chunk_conditioning = flat_conditioning.narrow(0, start, len);
+        let probs = forecast_r_probs(head, &chunk, &chunk_conditioning);
+        free.extend(host_vec(&kelly_fractions(
+            &probs,
+            law.returns,
+            FREE_LEVERAGE,
+        )));
         // The moments of `r` itself, not of the simple return: the calibration fit regresses
         // the realized LOG return, and `E[exp(r) - 1] != exp(E[r]) - 1`.
         let mass = probs
@@ -1001,8 +1014,11 @@ pub fn window_paths(
         let normalized = probs.to_kind(Kind::Double).divide(&mass);
         let mu = (&normalized * &centers).sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
         let deviation = &centers - &mu;
-        let var = (&normalized * &deviation * &deviation)
-            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let var = (&normalized * &deviation * &deviation).sum_dim_intlist(
+            [-1i64].as_slice(),
+            false,
+            Kind::Double,
+        );
         predicted_mean.extend(host_vec(&mu.reshape([-1])));
         predicted_var.extend(host_vec(&var));
         let lower_outer = normalized.select(-1, 0);
@@ -1014,8 +1030,8 @@ pub fn window_paths(
             .sum_dim_intlist([-1i64].as_slice(), true, Kind::Double)
             .clamp_min(f64::MIN_POSITIVE);
         let interior_probs = interior_probs.divide(&interior_mass);
-        let interior_mu = (&interior_probs * &centers)
-            .sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
+        let interior_mu =
+            (&interior_probs * &centers).sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
         let interior_deviation = &centers - &interior_mu;
         let interior_variance = (&interior_probs * &interior_deviation * &interior_deviation)
             .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
@@ -1104,7 +1120,10 @@ pub fn window_paths(
             }
         })
         .collect();
-    Ok(ChunkPaths { windows: paths, tail })
+    Ok(ChunkPaths {
+        windows: paths,
+        tail,
+    })
 }
 
 /// Per-row `q`-quantile of `r` under each row's own predictive law, in log-return space.
@@ -1117,7 +1136,10 @@ pub fn window_paths(
 /// convenient approximation of it. An atom has `lo == hi` and the interpolation collapses
 /// onto the atom's own value with no special case.
 pub fn predicted_quantile(probs: &Tensor, lo: &Tensor, hi: &Tensor, q: f64) -> Tensor {
-    assert!(q > 0.0 && q < 1.0, "a quantile probability must be interior");
+    assert!(
+        q > 0.0 && q < 1.0,
+        "a quantile probability must be interior"
+    );
     tch::no_grad(|| {
         let probs = probs.to_kind(Kind::Double);
         let mass = probs
@@ -1881,7 +1903,8 @@ pub fn bench(
     // against itself: exactly zero, zero-width interval, no break-even. That is correct
     // rather than degenerate, and it is asserted.
     let null_growth = ledgers[POLICY_MARGINAL].window_growth(cost);
-    let ceiling = result.policies[POLICY_ORACLE].net_growth - result.policies[POLICY_MARGINAL].net_growth;
+    let ceiling =
+        result.policies[POLICY_ORACLE].net_growth - result.policies[POLICY_MARGINAL].net_growth;
     for policy in 0..POLICY_COUNT {
         let deltas: Vec<f64> = ledgers[policy]
             .window_growth(cost)
@@ -2107,8 +2130,7 @@ fn wilson_interval(successes: f64, trials: f64) -> (f64, f64) {
     let z2 = Z * Z;
     let denominator = 1.0 + z2 / trials;
     let center = (p + z2 / (2.0 * trials)) / denominator;
-    let spread =
-        Z * ((p * (1.0 - p) / trials) + z2 / (4.0 * trials * trials)).sqrt() / denominator;
+    let spread = Z * ((p * (1.0 - p) / trials) + z2 / (4.0 * trials * trials)).sqrt() / denominator;
     ((center - spread).max(0.0), (center + spread).min(1.0))
 }
 
@@ -2286,7 +2308,9 @@ impl MzFit {
 
     /// True when the blocked interval on the slope excludes perfect calibration.
     pub fn slope_resolvable(&self) -> bool {
-        self.beta_ci.0.is_finite() && self.beta_ci.1.is_finite() && !(self.beta_ci.0..=self.beta_ci.1).contains(&1.0)
+        self.beta_ci.0.is_finite()
+            && self.beta_ci.1.is_finite()
+            && !(self.beta_ci.0..=self.beta_ci.1).contains(&1.0)
     }
 
     /// True when the block-dispersion pair carries a real measurement.
@@ -2458,13 +2482,7 @@ impl RegressionSums {
 /// pooling every symbol inside a calendar month is a different clustering of the same rows through
 /// the same code. [`compare_clustering`] runs exactly that and reports what it costs in width, so
 /// the question is answered by measurement at whatever call site has the keys.
-pub fn mincer_zarnowitz(
-    x: &[f64],
-    y: &[f64],
-    blocks: &[u64],
-    draws: usize,
-    seed: u64,
-) -> MzFit {
+pub fn mincer_zarnowitz(x: &[f64], y: &[f64], blocks: &[u64], draws: usize, seed: u64) -> MzFit {
     mincer_zarnowitz_paired(x, y, blocks, draws, seed).fit
 }
 
@@ -2524,7 +2542,10 @@ impl PairedFit {
             .filter(|value| value.is_finite())
             .collect();
         if column.len() < 2 {
-            return Some(BlockedScalar { point, ..BlockedScalar::nan() });
+            return Some(BlockedScalar {
+                point,
+                ..BlockedScalar::nan()
+            });
         }
         column.sort_by(f64::total_cmp);
         let tail = (1.0 - CI_MASS) / 2.0;
@@ -2626,7 +2647,10 @@ pub fn mincer_zarnowitz_paired(
     if totals.len() < 2 || draws == 0 {
         // One block is one observation: there is no dispersion to estimate, and a zero-width
         // interval reported as precision is the failure this refuses to commit.
-        return PairedFit { fit, draws: Vec::new() };
+        return PairedFit {
+            fit,
+            draws: Vec::new(),
+        };
     }
 
     let mut rng = ChaCha12Rng::seed_from_u64(seed);
@@ -2798,8 +2822,8 @@ fn standard_deviation(values: &[f64]) -> f64 {
         return f64::NAN;
     }
     let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let variance = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>()
-        / (values.len() - 1) as f64;
+    let variance =
+        values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (values.len() - 1) as f64;
     variance.sqrt()
 }
 
@@ -3013,7 +3037,11 @@ pub fn volatility_gradient(
 ) -> VolatilityGradient {
     assert_eq!(mu.len(), realized.len(), "one outcome per forecast");
     assert_eq!(mu.len(), variance.len(), "one variance per forecast");
-    assert_eq!(mu.len(), residual_squares.len(), "one residual per forecast");
+    assert_eq!(
+        mu.len(),
+        residual_squares.len(),
+        "one residual per forecast"
+    );
     assert_eq!(mu.len(), blocks.len(), "every observation needs a block");
     if let Some(outer) = outer {
         assert_eq!(mu.len(), outer.len(), "one catch-all mass per forecast");
@@ -3573,7 +3601,11 @@ pub struct BlockedScalar {
 
 impl BlockedScalar {
     pub fn nan() -> Self {
-        Self { point: f64::NAN, se: f64::NAN, ci: (f64::NAN, f64::NAN) }
+        Self {
+            point: f64::NAN,
+            se: f64::NAN,
+            ci: (f64::NAN, f64::NAN),
+        }
     }
 
     pub fn measured(&self) -> bool {
@@ -3597,10 +3629,7 @@ impl BlockedScalar {
     /// declares agreement too easily and disagreement never. Prefer a paired difference - see
     /// [`PhiCensus::mechanism_gap`] - wherever one exists.
     pub fn overlaps(&self, other: &Self) -> bool {
-        self.measured()
-            && other.measured()
-            && self.ci.0 <= other.ci.1
-            && other.ci.0 <= self.ci.1
+        self.measured() && other.measured() && self.ci.0 <= other.ci.1 && other.ci.0 <= self.ci.1
     }
 }
 
@@ -3739,7 +3768,11 @@ impl DecodeSums {
         // hypothesis is about.
         out[PHI_GAP_MECHANISM] = measured - exact;
         out[PHI_GAP_MAP] = exact - model;
-        out[PHI_FITTED_SHARE] = if v_fitted > 0.0 { vt / v_fitted } else { f64::NAN };
+        out[PHI_FITTED_SHARE] = if v_fitted > 0.0 {
+            vt / v_fitted
+        } else {
+            f64::NAN
+        };
         out[PHI_CHANNEL_RATIO] = if vt > 0.0 && gain.is_finite() && gain != 0.0 {
             vd / (gain * gain * vt)
         } else {
@@ -4094,8 +4127,7 @@ impl PhiCensus {
             map.ci.0,
             map.ci.1,
             self.cross_share().point,
-            0.5 * self.cross_share().point.abs()
-                * (1.0 - 1.0 / self.directional_gain).abs(),
+            0.5 * self.cross_share().point.abs() * (1.0 - 1.0 / self.directional_gain).abs(),
             self.channel_ratio().point,
             if !map.measured() {
                 "UNRESOLVED"
@@ -4114,7 +4146,11 @@ impl PhiCensus {
             arm.point,
             arm.ci.0,
             arm.ci.1,
-            if arm.excludes(1.0) { "EXCLUDES" } else { "contains" },
+            if arm.excludes(1.0) {
+                "EXCLUDES"
+            } else {
+                "contains"
+            },
         ));
         lines.push(format!(
             "  INVERSION: this census's phi is {:+.5}; the map would need phi = {:+.5} to produce \
@@ -4150,8 +4186,16 @@ fn measure_phi(
     realized: &[f64],
     blocks: &[u64],
 ) -> PhiCensus {
-    assert_eq!(bars.len(), edge_mean.len(), "one forecast mean per decomposed bar");
-    assert_eq!(bars.len(), realized.len(), "one realized return per decomposed bar");
+    assert_eq!(
+        bars.len(),
+        edge_mean.len(),
+        "one forecast mean per decomposed bar"
+    );
+    assert_eq!(
+        bars.len(),
+        realized.len(),
+        "one realized return per decomposed bar"
+    );
     assert_eq!(bars.len(), blocks.len(), "every bar needs a block");
 
     let mut grouped: BTreeMap<u64, DecodeSums> = BTreeMap::new();
@@ -4176,8 +4220,7 @@ fn measure_phi(
     // MEASURED geometry, held fixed across the draws because it is a property of the support and
     // not of the sample: resampling blocks must move the variance shares, never the bin values
     // the decode reads.
-    let directional_gain =
-        recovered_half_span / (0.5 * (OUTER_REDECODE.1 - OUTER_REDECODE.0));
+    let directional_gain = recovered_half_span / (0.5 * (OUTER_REDECODE.1 - OUTER_REDECODE.0));
 
     let totals: Vec<DecodeSums> = grouped.into_values().collect();
     let mut pooled = DecodeSums::default();
@@ -4284,15 +4327,12 @@ pub struct OuterDecomposition {
 }
 
 impl OuterDecomposition {
-    fn measure(
-        bars: &[OuterBar],
-        realized: &[f64],
-        blocks: &[u64],
-        edge_mean: &[f64],
-    ) -> Self {
+    fn measure(bars: &[OuterBar], realized: &[f64], blocks: &[u64], edge_mean: &[f64]) -> Self {
         let count = bars.len().max(1) as f64;
-        let redecoded: Vec<(f64, f64)> =
-            bars.iter().map(|bar| bar.redecoded(OUTER_REDECODE)).collect();
+        let redecoded: Vec<(f64, f64)> = bars
+            .iter()
+            .map(|bar| bar.redecoded(OUTER_REDECODE))
+            .collect();
         let zeroed: Vec<(f64, f64)> = bars
             .iter()
             .map(|bar| (bar.interior_mean, bar.interior_var))
@@ -4332,7 +4372,10 @@ impl OuterDecomposition {
             100.0 * (1.0 - self.mass * NUM_BAR_BINS as f64 / 2.0),
             100.0 * self.signed,
         )];
-        for (label, arm) in [("ZEROED    ", &self.zeroed), ("RE-DECODED", &self.redecoded)] {
+        for (label, arm) in [
+            ("ZEROED    ", &self.zeroed),
+            ("RE-DECODED", &self.redecoded),
+        ] {
             lines.push(format!(
                 "  {label} catch-alls: mean slope {:+.4} (se {:.4}), var slope {:+.4} (se \
                  {:.4}), predicted sd {:7.2} bps/bar",
@@ -4565,7 +4608,11 @@ impl ShrunkBench {
                 point.paired.ci_low * 1e4,
                 point.paired.ci_high * 1e4,
                 point.paired.se * 1e4,
-                if point.resolvable() { "" } else { " NOT RESOLVABLE" },
+                if point.resolvable() {
+                    ""
+                } else {
+                    " NOT RESOLVABLE"
+                },
                 point.unshrunk.sharpe,
                 point.shrunk.sharpe,
                 point.sharpe_gain(),
@@ -4633,7 +4680,6 @@ fn promote_shrunk(windows: &[WindowPaths]) -> Option<Vec<WindowPaths>> {
             .collect(),
     )
 }
-
 
 /// Score the recalibrated policy on windows that already carry a recalibrated fraction.
 ///
@@ -4779,9 +4825,8 @@ pub const FROZEN_SLOT: usize = SIZING_KNOBS - 1;
 /// Stated in multiples of the cap rather than in absolute leverage so the same knob means
 /// the same thing at every point of [`CAP_GRID`]: positions live in `[-cap, cap]`, so a
 /// fraction of `2.0` cannot be breached by any move and freezes the book.
-pub const BAND_FRACTIONS: [f64; SIZING_KNOBS] = [
-    0.0, 0.025, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.00, 2.00,
-];
+pub const BAND_FRACTIONS: [f64; SIZING_KNOBS] =
+    [0.0, 0.025, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.00, 2.00];
 const _: () = assert!(
     BAND_FRACTIONS[INCUMBENT_SLOT] == 0.0,
     "a band of zero is the every-bar re-solve every gain is paired against"
@@ -5130,8 +5175,11 @@ pub fn myopic_fractions(
         // holding nothing is only preferable if going flat is itself affordable, so the
         // comparison is against the value of unwinding to zero rather than against `0`.
         let value_at = |f: &Tensor| -> Tensor {
-            let growth = (&probs * (f.unsqueeze(-1) * &returns + 1.0).clamp_min(WEALTH_FLOOR).log())
-                .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+            let growth = (&probs
+                * (f.unsqueeze(-1) * &returns + 1.0)
+                    .clamp_min(WEALTH_FLOOR)
+                    .log())
+            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
             growth + factor(f).clamp_min(WEALTH_FLOOR).log()
         };
         let flat = solved.zeros_like();
@@ -5168,7 +5216,6 @@ impl BandSource {
         }
     }
 }
-
 
 /// A window set whose `free` is `replacement`, so `recap`, `Ledger` and `cap_point` produce
 /// an alternative sizing's whole verdict through the identical code path.
@@ -5370,10 +5417,10 @@ impl BandSweep {
              {} (gain {:+.4} bps/bar, {})",
             self.shape.name(),
             name(self.best_break_even()),
-            self.best_break_even()
-                .map_or_else(|| "n/a".to_owned(), |slot| TradeBench::break_even_text(
-                    self.points[slot].break_even_bps
-                )),
+            self.best_break_even().map_or_else(
+                || "n/a".to_owned(),
+                |slot| TradeBench::break_even_text(self.points[slot].break_even_bps)
+            ),
             name(self.best_gain()),
             self.best_gain()
                 .map_or(f64::NAN, |slot| self.points[slot].gain.mean * 1e4),
@@ -5424,13 +5471,17 @@ pub fn band_sweep(
     // The frictionless target is the CLAMPED path, because the band is a statement about the
     // position actually held and the cap is what decides that. Re-clamping through `recap`
     // rather than clamping here keeps the one definition of what a policy path is.
-    let targets: Vec<Vec<f64>> = recap(&rebased(windows, source_paths(windows, source)), cap, free_marginal)
-        .into_iter()
-        .map(|window| {
-            let mut positions = window.positions;
-            std::mem::take(&mut positions[POLICY_MODEL])
-        })
-        .collect();
+    let targets: Vec<Vec<f64>> = recap(
+        &rebased(windows, source_paths(windows, source)),
+        cap,
+        free_marginal,
+    )
+    .into_iter()
+    .map(|window| {
+        let mut positions = window.positions;
+        std::mem::take(&mut positions[POLICY_MODEL])
+    })
+    .collect();
 
     // One null for the whole sweep: its position is a constant, so no band can move it, and
     // building it once is what makes every row's edge a difference against the SAME null.
@@ -5660,13 +5711,17 @@ fn band_growth_paths(
         cap,
         free_marginal,
     } = config;
-    let targets: Vec<Vec<f64>> = recap(&rebased(windows, source_paths(windows, source)), cap, free_marginal)
-        .into_iter()
-        .map(|window| {
-            let mut positions = window.positions;
-            std::mem::take(&mut positions[POLICY_MODEL])
-        })
-        .collect();
+    let targets: Vec<Vec<f64>> = recap(
+        &rebased(windows, source_paths(windows, source)),
+        cap,
+        free_marginal,
+    )
+    .into_iter()
+    .map(|window| {
+        let mut positions = window.positions;
+        std::mem::take(&mut positions[POLICY_MODEL])
+    })
+    .collect();
     Some(
         shape
             .knobs()
@@ -6120,7 +6175,10 @@ pub fn traded_panel(windows: &[WindowPaths], blocks: &[u64]) -> TradedPanel {
     if windows.is_empty() || blocks.len() < windows.len() {
         return TradedPanel::nan();
     }
-    if windows.iter().any(|window| window.free.len() != window.bars()) {
+    if windows
+        .iter()
+        .any(|window| window.free.len() != window.bars())
+    {
         return TradedPanel::nan();
     }
     let mut magnitudes: Vec<f64> = windows
@@ -6469,7 +6527,10 @@ impl EdgeAttribution {
             "INTERACTION (actual - sign - size + short)",
             &self.interaction,
         ));
-        lines.push(effect("DRIFT corner (always-short - null)", &self.drift_edge()));
+        lines.push(effect(
+            "DRIFT corner (always-short - null)",
+            &self.drift_edge(),
+        ));
         lines.extend(
             self.panel
                 .report_lines()
@@ -6853,7 +6914,8 @@ pub fn edge_attribution(
     result.size_effect = paired(ATTRIBUTION_MAGNITUDE_SHORT, ATTRIBUTION_SHORT_CONSTANT);
     let interaction: Vec<f64> = (0..growth[ATTRIBUTION_ACTUAL].len())
         .map(|window| {
-            growth[ATTRIBUTION_ACTUAL][window] - growth[ATTRIBUTION_SIGN_ONLY][window]
+            growth[ATTRIBUTION_ACTUAL][window]
+                - growth[ATTRIBUTION_SIGN_ONLY][window]
                 - growth[ATTRIBUTION_MAGNITUDE_SHORT][window]
                 + growth[ATTRIBUTION_SHORT_CONSTANT][window]
         })
@@ -6869,7 +6931,19 @@ pub fn edge_attribution(
 }
 
 pub const HYSTERESIS_MARGINS: [f64; 13] = [
-    0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, f64::INFINITY,
+    0.0,
+    0.5,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    16.0,
+    32.0,
+    64.0,
+    128.0,
+    256.0,
+    512.0,
+    f64::INFINITY,
 ];
 
 /// Standardized-conviction thresholds, in units of the head's own predicted SD.
@@ -6877,7 +6951,19 @@ pub const HYSTERESIS_MARGINS: [f64; 13] = [
 /// The same doubling structure and the same length as [`HYSTERESIS_MARGINS`], so the two axes
 /// share a grid INDEX and can be charted and tested against each other row for row.
 pub const HYSTERESIS_SD_MARGINS: [f64; 13] = [
-    0.0, 0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, f64::INFINITY,
+    0.0,
+    0.005,
+    0.01,
+    0.02,
+    0.04,
+    0.08,
+    0.16,
+    0.32,
+    0.64,
+    1.28,
+    2.56,
+    5.12,
+    f64::INFINITY,
 ];
 
 /// What a flip margin is compared AGAINST.
@@ -7269,10 +7355,11 @@ impl HysteresisSweep {
         // Where each column turns over. Break-even rises monotonically across this whole grid,
         // so it cannot name an interior optimum and only these columns can.
         for (slot, (name, bps)) in HYSTERESIS_NET_COSTS.iter().enumerate() {
-            lines.push(self.peak_line(
-                &format!("{name} @{bps:.3}"),
-                &|point: &HysteresisPoint| point.net_at_cost[slot].mean * 1e4,
-            ));
+            lines.push(
+                self.peak_line(&format!("{name} @{bps:.3}"), &|point: &HysteresisPoint| {
+                    point.net_at_cost[slot].mean * 1e4
+                }),
+            );
         }
         lines.push(self.peak_line("all-in [INFERENCE]", &|point| point.net_all_in_bps));
         lines.push(self.verdict_line());
@@ -7537,8 +7624,7 @@ pub fn hysteresis_sweep(
             let edge = block_bootstrap(&deltas, blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
             // Impact is the ONLY component that scales with participation; the fixed component
             // does not, so only the difference is scaled.
-            let impact =
-                super::horizon::MATCHED_ALL_IN_BPS - super::horizon::MATCHED_MEASURED_BPS;
+            let impact = super::horizon::MATCHED_ALL_IN_BPS - super::horizon::MATCHED_MEASURED_BPS;
             let all_in_cost_bps = super::horizon::MATCHED_MEASURED_BPS
                 + impact * (policy.turnover / incumbent_turnover).sqrt();
             HysteresisPoint {
@@ -8206,9 +8292,7 @@ mod tests {
             for (index, mut tensor) in vs.trainable_variables().into_iter().enumerate() {
                 let numel = tensor.numel() as u64;
                 let values: Vec<f32> = (0..numel)
-                    .map(|slot| {
-                        (2.0 * uniform(mix64(seed, index as u64), slot) - 1.0) as f32 * 0.4
-                    })
+                    .map(|slot| (2.0 * uniform(mix64(seed, index as u64), slot) - 1.0) as f32 * 0.4)
                     .collect();
                 let replacement = Tensor::from_slice(&values).reshape(tensor.size());
                 tensor.copy_(&replacement);
@@ -8335,7 +8419,8 @@ mod tests {
         let latent = 24;
         let (_vs, head) = perturbed_head(latent, 0x7EA5_0001);
         let h = beliefs(7, latent, 0x7EA5_0002);
-        let probs = forecast_r_probs(&head, &h);
+        let conditioning = beliefs(7, latent, 0x7EA5_0004);
+        let probs = forecast_r_probs(&head, &h, &conditioning);
         let rows = h.size()[0];
 
         let mass = host_vec(&probs.sum_dim_intlist([-1i64].as_slice(), false, Kind::Double));
@@ -8351,7 +8436,7 @@ mod tests {
         for bin in [0i64, 1, 37, 64, NUM_BAR_BINS - 1] {
             let prefix = Tensor::full([rows, BAR_DOF as i64], bin, (Kind::Int64, Device::Cpu));
             let row = head
-                .logits(&h, &prefix)
+                .logits(&h, &conditioning, &prefix)
                 .select(1, DOF_R as i64)
                 .softmax(-1, Kind::Float);
             assert_eq!(
@@ -8365,7 +8450,7 @@ mod tests {
         // And it is the head's own forecast row, which is a separate implementation: an
         // ancestral-draw mixture over the chain, whose first factor is drawn from no prefix.
         let forecast = head
-            .forecast_log_probs(&h, 4, 0x7EA5_0003)
+            .forecast_log_probs(&h, &conditioning, 4, 0x7EA5_0003)
             .select(1, DOF_R as i64)
             .exp();
         let error = (&probs - &forecast).abs().max().double_value(&[]);
@@ -8380,11 +8465,15 @@ mod tests {
         // does have a prefix must move when that prefix does.
         let zero = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, Device::Cpu));
         let filled = Tensor::full([rows, BAR_DOF as i64], 64i64, (Kind::Int64, Device::Cpu));
-        let response = (head.logits(&h, &zero).select(1, DOF_S as i64)
-            - head.logits(&h, &filled).select(1, DOF_S as i64))
-            .abs()
-            .max()
-            .double_value(&[]);
+        let response = (head
+            .logits(&h, &conditioning, &zero)
+            .select(1, DOF_S as i64)
+            - head
+                .logits(&h, &conditioning, &filled)
+                .select(1, DOF_S as i64))
+        .abs()
+        .max()
+        .double_value(&[]);
         assert!(
             response > 1e-3,
             "the fixture head has no prefix response at all ({response:.3e} logits), so the \
@@ -8407,6 +8496,7 @@ mod tests {
         let free_null = marginal_position(&supports, FREE_LEVERAGE);
         let (windows, bars) = (3i64, 16i64);
         let h = beliefs(windows * bars, latent, 0xA003).view([windows, bars, latent]);
+        let conditioning = beliefs(windows * bars, latent, 0xA005).view([windows, bars, latent]);
 
         // A monotone realized path, so reversing it provably reverses the sign pattern
         // the oracle keys on rather than relying on a random draw to differ.
@@ -8422,6 +8512,7 @@ mod tests {
             window_paths(
                 &head,
                 &h,
+                &conditioning,
                 realized,
                 &TradedLaw::new(&returns, &centers),
                 free_null,
@@ -8461,8 +8552,9 @@ mod tests {
         // whose own signature admits no realized bar, and every non-oracle policy is a
         // clamp of that one solve rather than a second decision.
         let flat = h.reshape([windows * bars, latent]);
+        let flat_conditioning = conditioning.reshape([windows * bars, latent]);
         let independent = host_vec(&kelly_fractions(
-            &forecast_r_probs(&head, &flat),
+            &forecast_r_probs(&head, &flat, &flat_conditioning),
             &returns,
             FREE_LEVERAGE,
         ));
@@ -8519,11 +8611,13 @@ mod tests {
         let returns = Tensor::from_slice(&bin_returns(&supports)).view([1, NUM_BAR_BINS]);
         let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
         let h = beliefs(8, latent, 0xB004).view([2, 4, latent]);
+        let conditioning = beliefs(8, latent, 0xB005).view([2, 4, latent]);
         let realized = Tensor::zeros([2, 4], (Kind::Float, Device::Cpu));
         let paths_of = |head: &BarEmissionHead| {
             window_paths(
                 head,
                 &h,
+                &conditioning,
                 &realized,
                 &TradedLaw::new(&returns, &centers),
                 marginal_position(&supports, FREE_LEVERAGE),
@@ -8546,8 +8640,10 @@ mod tests {
         // Two different heads must produce different predictive laws, or this test proves
         // nothing. Compared on the law rather than the position, because a saturated cap
         // would hide a genuine disagreement behind two identical clamps.
-        let law_a = forecast_r_probs(&head_a, &h.reshape([8, latent]));
-        let law_b = forecast_r_probs(&head_b, &h.reshape([8, latent]));
+        let flat = h.reshape([8, latent]);
+        let flat_conditioning = conditioning.reshape([8, latent]);
+        let law_a = forecast_r_probs(&head_a, &flat, &flat_conditioning);
+        let law_b = forecast_r_probs(&head_b, &flat, &flat_conditioning);
         assert!(
             (&law_a - &law_b).abs().max().double_value(&[]) > 1e-4,
             "two independently perturbed heads must disagree about p(r|past)"
@@ -8564,9 +8660,7 @@ mod tests {
         (0..count)
             .map(|window| {
                 let realized: Vec<f64> = (0..bars)
-                    .map(|bar| {
-                        0.006 * (2.0 * uniform(seed, (window * bars + bar) as u64) - 1.0)
-                    })
+                    .map(|bar| 0.006 * (2.0 * uniform(seed, (window * bars + bar) as u64) - 1.0))
                     .collect();
                 let free: Vec<f64> = (0..bars)
                     .map(|bar| {
@@ -8742,9 +8836,7 @@ mod tests {
             measured.edge_at_default()
         );
         assert!((point.sharpe - measured.policies[POLICY_MODEL].sharpe).abs() < 1e-12);
-        assert!(
-            (point.max_drawdown - measured.policies[POLICY_MODEL].max_drawdown).abs() < 1e-12
-        );
+        assert!((point.max_drawdown - measured.policies[POLICY_MODEL].max_drawdown).abs() < 1e-12);
         assert!(
             (point.clamped_fraction - measured.policies[POLICY_MODEL].clamped_fraction).abs()
                 < 1e-12
@@ -8836,7 +8928,10 @@ mod tests {
         let (worst, is_lower) = understated.worst();
         assert!((worst - 4.0).abs() < 1e-12, "worst ratio {worst} is not 4x");
         assert!(is_lower, "the understated side is the lower one");
-        assert!(worst > TAIL_RATIO_WARN, "4x must trip the warning threshold");
+        assert!(
+            worst > TAIL_RATIO_WARN,
+            "4x must trip the warning threshold"
+        );
     }
 
     #[test]
@@ -8879,6 +8974,7 @@ mod tests {
         let hi = Tensor::from_slice(supports.upper_bounds(DOF_R)).view([1, NUM_BAR_BINS]);
         let (windows, bars) = (3i64, 64i64);
         let h = beliefs(windows * bars, latent, 0x1A03).view([windows, bars, latent]);
+        let conditioning = beliefs(windows * bars, latent, 0x1A05).view([windows, bars, latent]);
         // A realized path with genuine outliers, so both tails are actually reached.
         let realized = Tensor::from_slice(
             &(0..windows * bars)
@@ -8892,6 +8988,7 @@ mod tests {
         let chunk = window_paths(
             &head,
             &h,
+            &conditioning,
             &realized,
             &TradedLaw::new(&returns, &centers).with_bounds(&lo, &hi),
             marginal_position(&supports, FREE_LEVERAGE),
@@ -8938,7 +9035,10 @@ mod tests {
             (crossing - 0.5).abs() < 1e-9,
             "an edge of 1 bp/bar at 2.0 turnover breaks even at 0.5 bps, got {crossing}"
         );
-        assert!(break_even_bps(&|_| -1e-6).is_nan(), "no edge, no break-even");
+        assert!(
+            break_even_bps(&|_| -1e-6).is_nan(),
+            "no edge, no break-even"
+        );
         assert!(
             break_even_bps(&|_| 1e-6).is_infinite(),
             "an edge cost cannot touch never breaks even"
@@ -9071,8 +9171,7 @@ mod tests {
         );
         // A perfectly calibrated panel must come back at one, or the estimator is biased
         // rather than the model miscalibrated.
-        let (honest_x, honest_y, honest_blocks) =
-            calibrated_panel(64, 32, 1.0, 0.004, 0xCA11_0002);
+        let (honest_x, honest_y, honest_blocks) = calibrated_panel(64, 32, 1.0, 0.004, 0xCA11_0002);
         let honest = mincer_zarnowitz(
             &honest_x,
             &honest_y,
@@ -9103,7 +9202,8 @@ mod tests {
         // which swamps any dispersion this fixture could build, and the estimator correctly
         // reports "common" for a panel it cannot resolve. A test that ran there would be
         // asserting the noise floor rather than the statistic.
-        let (forecast_h, realized_h, blocks_h) = calibrated_panel(64, 512, 0.7, 0.0005, 0xCA11_0301);
+        let (forecast_h, realized_h, blocks_h) =
+            calibrated_panel(64, 512, 0.7, 0.0005, 0xCA11_0301);
         let homogeneous = mincer_zarnowitz(
             &forecast_h,
             &realized_h,
@@ -9136,7 +9236,13 @@ mod tests {
             realized.extend(r);
             blocks.extend(std::iter::repeat_n(block, 512));
         }
-        let varying = mincer_zarnowitz(&forecast, &realized, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        let varying = mincer_zarnowitz(
+            &forecast,
+            &realized,
+            &blocks,
+            BOOTSTRAP_DRAWS,
+            BOOTSTRAP_SEED,
+        );
         assert!(
             varying.slope_heterogeneous(),
             "blocks built at 0.35 and 1.05 came back COMMON at {:.2}x (sd {:.4} against {:.4})",
@@ -9229,8 +9335,7 @@ mod tests {
             .enumerate()
             .map(|(slot, f)| {
                 let block = slot / 32;
-                let mean: f64 =
-                    forecast[block * 32..(block + 1) * 32].iter().sum::<f64>() / 32.0;
+                let mean: f64 = forecast[block * 32..(block + 1) * 32].iter().sum::<f64>() / 32.0;
                 f - mean
             })
             .collect();
@@ -9347,10 +9452,7 @@ mod tests {
 
         // The recalibration the fitted slope prescribes, applied exactly as `window_paths`
         // applies it: shift every bin's LOG value so the mean becomes `beta * mu`.
-        let shrink = MeanShrink {
-            alpha: 0.0,
-            beta,
-        };
+        let shrink = MeanShrink { alpha: 0.0, beta };
         let shift = shrink.shift(mean_model);
         let shrunk_returns: Vec<f64> = model_returns
             .iter()
@@ -9421,8 +9523,10 @@ mod tests {
         // The interior law, renormalized - exactly what `window_paths` forms with the mask.
         let interior_mean: f64 =
             (1..bins - 1).map(|b| probs[b] * centers[b]).sum::<f64>() / interior;
-        let interior_second: f64 =
-            (1..bins - 1).map(|b| probs[b] * centers[b] * centers[b]).sum::<f64>() / interior;
+        let interior_second: f64 = (1..bins - 1)
+            .map(|b| probs[b] * centers[b] * centers[b])
+            .sum::<f64>()
+            / interior;
         let bar = OuterBar {
             mass: probs[0] + probs[bins - 1],
             signed: probs[bins - 1] - probs[0],
@@ -9590,8 +9694,14 @@ mod tests {
         }
         let blocks: Vec<u64> = (0..windows.len() as u64).collect();
         let calibration = mean_calibration(&windows, &blocks);
-        assert!(calibration.mean.beta.is_finite(), "the mean fit still stands on its own");
-        assert!(calibration.outer.is_none(), "an unformed decomposition must not read as zero");
+        assert!(
+            calibration.mean.beta.is_finite(),
+            "the mean fit still stands on its own"
+        );
+        assert!(
+            calibration.outer.is_none(),
+            "an unformed decomposition must not read as zero"
+        );
         assert!(
             calibration
                 .report_lines()
@@ -9619,11 +9729,7 @@ mod tests {
         // Centered shape: every bar's law is this shifted onto its own mean.
         let base_mean: f64 = masses.iter().zip(&base).map(|(p, c)| p * c).sum();
         let shape: Vec<f64> = base.iter().map(|c| c - base_mean).collect();
-        let variance: f64 = masses
-            .iter()
-            .zip(&shape)
-            .map(|(p, c)| p * c * c)
-            .sum();
+        let variance: f64 = masses.iter().zip(&shape).map(|(p, c)| p * c * c).sum();
         let mut cumulative = Vec::with_capacity(bins);
         let mut running = 0.0;
         for mass in &masses {
@@ -9653,19 +9759,14 @@ mod tests {
                         shrunk_rows.push((centered + mu_model + shift).exp() - 1.0);
                     }
                     let q = (slot * PHI).fract();
-                    let bin = cumulative
-                        .iter()
-                        .position(|c| *c >= q)
-                        .unwrap_or(bins - 1);
+                    let bin = cumulative.iter().position(|c| *c >= q).unwrap_or(bins - 1);
                     realized.push((shape[bin] + mu_true).exp() - 1.0);
                 }
-                let row = |values: &[f64]| {
-                    Tensor::from_slice(values).view([bars as i64, bins as i64])
-                };
+                let row =
+                    |values: &[f64]| Tensor::from_slice(values).view([bars as i64, bins as i64]);
                 let probs = mass_row.expand([bars as i64, bins as i64], false);
                 let free = host_vec(&kelly_fractions(&probs, &row(&model_rows), FREE_LEVERAGE));
-                let shrunk =
-                    host_vec(&kelly_fractions(&probs, &row(&shrunk_rows), FREE_LEVERAGE));
+                let shrunk = host_vec(&kelly_fractions(&probs, &row(&shrunk_rows), FREE_LEVERAGE));
                 let mut paths = WindowPaths::unmeasured(
                     realized.clone(),
                     free.clone(),
@@ -9680,10 +9781,7 @@ mod tests {
                         } else if policy == POLICY_BUY_HOLD {
                             vec![1.0; bars]
                         } else {
-                            realized
-                                .iter()
-                                .map(|r| LEVERAGE_CAP * r.signum())
-                                .collect()
+                            realized.iter().map(|r| LEVERAGE_CAP * r.signum()).collect()
                         }
                     }),
                 );
@@ -9754,8 +9852,7 @@ mod tests {
                 CAP_GRID[slot]
             );
             assert_eq!(
-                point.paired.samples,
-                shrunk.windows,
+                point.paired.samples, shrunk.windows,
                 "the paired unit is the WINDOW, so there is one observation per window"
             );
         }
@@ -9810,8 +9907,14 @@ mod tests {
             },
             ..ShrunkPoint::nan()
         };
-        assert!(point(2.0, 0.5, 3.5).resolvable(), "a positive band excluding zero resolves");
-        assert!(point(-2.0, -3.5, -0.5).resolvable(), "so does a negative one");
+        assert!(
+            point(2.0, 0.5, 3.5).resolvable(),
+            "a positive band excluding zero resolves"
+        );
+        assert!(
+            point(-2.0, -3.5, -0.5).resolvable(),
+            "so does a negative one"
+        );
         assert!(
             !point(2.0, -0.5, 4.5).resolvable(),
             "a band straddling zero does NOT resolve, however large its point estimate"
@@ -9909,6 +10012,8 @@ mod tests {
         let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
         let (windows, bars) = (2i64, 24i64);
         let h = beliefs(windows * bars, latent, 0xCA11_0103).view([windows, bars, latent]);
+        let conditioning =
+            beliefs(windows * bars, latent, 0xCA11_0105).view([windows, bars, latent]);
         let realized = Tensor::from_slice(
             &(0..windows * bars)
                 .map(|slot| (0.002 * (2.0 * uniform(0xCA11_0104, slot as u64) - 1.0)) as f32)
@@ -9920,6 +10025,7 @@ mod tests {
         let chunk = window_paths(
             &head,
             &h,
+            &conditioning,
             &realized,
             &law,
             marginal_position(&supports, FREE_LEVERAGE),
@@ -10128,7 +10234,8 @@ mod tests {
                     let wanted = want - previous;
                     if wanted.abs() <= band {
                         assert_eq!(
-                            *position, previous,
+                            *position,
+                            previous,
                             "[{}] band {fraction} traded a move of {wanted} from inside the \
                              dead zone at bar {bar}",
                             shape.name()
@@ -10189,7 +10296,8 @@ mod tests {
                 );
                 if lambda > 0.0 && (want - previous).abs() > 0.0 {
                     assert_ne!(
-                        *position, previous,
+                        *position,
+                        previous,
                         "partial adjustment must have no dead zone, but lambda {lambda} froze \
                          a wanted move of {} at bar {bar}",
                         want - previous
@@ -10293,7 +10401,9 @@ mod tests {
     fn the_myopic_gap_to_the_cost_blind_solve_is_first_order_in_the_cost() {
         let (probs, returns) = myopic_law();
         let blind = kelly_fraction(&probs, &returns, LEVERAGE_CAP);
-        let gap_at = |bps: f64| (myopic_scalar(&probs, &returns, LEVERAGE_CAP, bps * 1e-4, 0.0) - blind).abs();
+        let gap_at = |bps: f64| {
+            (myopic_scalar(&probs, &returns, LEVERAGE_CAP, bps * 1e-4, 0.0) - blind).abs()
+        };
         let mut previous = (f64::INFINITY, f64::INFINITY);
         for bps in [1.0, 0.5, 0.25, 0.125, 0.0625] {
             let gap = gap_at(bps);
@@ -10660,8 +10770,7 @@ mod tests {
             crossing.is_finite() && crossing > 0.0,
             "the incumbent must have a finite break-even for this test to have a subject"
         );
-        let edge_at =
-            |bps: f64| sweep_at(bps).points[INCUMBENT_SLOT].edge.mean;
+        let edge_at = |bps: f64| sweep_at(bps).points[INCUMBENT_SLOT].edge.mean;
         let below = edge_at(0.5 * crossing);
         let at = edge_at(crossing);
         let above = edge_at(2.0 * crossing);
@@ -10710,12 +10819,13 @@ mod tests {
                 )
                 .expect("fixture")
                 .points[FROZEN_SLOT]
-                .policy
+                    .policy
             };
             let cheap = sweep(0.0);
             let dear = sweep(MAX_BREAK_EVEN_BPS);
             assert_eq!(
-                cheap.turnover, 0.0,
+                cheap.turnover,
+                0.0,
                 "[{}] the frozen knob traded {}",
                 shape.name(),
                 cheap.turnover
@@ -10741,10 +10851,22 @@ mod tests {
             .expect("the fixture carries a recalibrated fraction for every bar");
         assert_eq!(overlap.len(), BAND_FRACTIONS.len());
 
-        let plain = band_sweep(&windows, &blocks, config, BandSource::Frictionless, SizingShape::BandToTarget)
-            .expect("fixture");
-        let shrunk = band_sweep(&windows, &blocks, config, BandSource::Recalibrated, SizingShape::BandToTarget)
-            .expect("fixture");
+        let plain = band_sweep(
+            &windows,
+            &blocks,
+            config,
+            BandSource::Frictionless,
+            SizingShape::BandToTarget,
+        )
+        .expect("fixture");
+        let shrunk = band_sweep(
+            &windows,
+            &blocks,
+            config,
+            BandSource::Recalibrated,
+            SizingShape::BandToTarget,
+        )
+        .expect("fixture");
         for (slot, point) in overlap.iter().enumerate() {
             assert_eq!(point.knob, BAND_FRACTIONS[slot]);
             assert_eq!(
@@ -10786,17 +10908,35 @@ mod tests {
         let blocks = blocks_for(&windows);
         let config = BenchConfig::new(DEFAULT_COST_BPS, LEVERAGE_CAP, 1.7);
         assert!(
-            band_sweep(&windows, &blocks, config, BandSource::Frictionless, SizingShape::BandToTarget)
-                .is_some(),
+            band_sweep(
+                &windows,
+                &blocks,
+                config,
+                BandSource::Frictionless,
+                SizingShape::BandToTarget
+            )
+            .is_some(),
             "every window carries its own solved fraction"
         );
+        assert!(band_sweep(
+            &windows,
+            &blocks,
+            config,
+            BandSource::Recalibrated,
+            SizingShape::BandToTarget
+        )
+        .is_none());
         assert!(
-            band_sweep(&windows, &blocks, config, BandSource::Recalibrated, SizingShape::BandToTarget)
-                .is_none()
+            band_shrink_overlap(&windows, &blocks, config, SizingShape::BandToTarget).is_none()
         );
-        assert!(band_shrink_overlap(&windows, &blocks, config, SizingShape::BandToTarget).is_none());
-        assert!(band_sweep(&[], &blocks, config, BandSource::Frictionless, SizingShape::BandToTarget)
-            .is_none());
+        assert!(band_sweep(
+            &[],
+            &blocks,
+            config,
+            BandSource::Frictionless,
+            SizingShape::BandToTarget
+        )
+        .is_none());
     }
 
     /// Six of these blocks land in one log - three shapes on two sources - so every row has to
@@ -10858,9 +10998,18 @@ mod tests {
         let split = edge_attribution(&windows, &blocks, config);
 
         let actual = &split.arms[ATTRIBUTION_ACTUAL];
-        assert_eq!(actual.policy.net_growth, bench.policies[POLICY_MODEL].net_growth);
-        assert_eq!(actual.policy.hit_rate, bench.policies[POLICY_MODEL].hit_rate);
-        assert_eq!(actual.policy.turnover, bench.policies[POLICY_MODEL].turnover);
+        assert_eq!(
+            actual.policy.net_growth,
+            bench.policies[POLICY_MODEL].net_growth
+        );
+        assert_eq!(
+            actual.policy.hit_rate,
+            bench.policies[POLICY_MODEL].hit_rate
+        );
+        assert_eq!(
+            actual.policy.turnover,
+            bench.policies[POLICY_MODEL].turnover
+        );
         assert_eq!(actual.edge, bench.model_edge());
         // The fixture's fractions are noise, so both break-evens are `NAN` — "there was never
         // an edge for a cost to remove" — and `NAN != NAN`. What has to match is the bit
@@ -10918,7 +11067,10 @@ mod tests {
                     row.interior <= row.total + 1e-12,
                     "interior turnover cannot exceed the total it is carved out of"
                 );
-                assert!(row.interior >= 0.0, "turnover is a notional and never negative");
+                assert!(
+                    row.interior >= 0.0,
+                    "turnover is a notional and never negative"
+                );
             }
         }
 
@@ -10959,8 +11111,7 @@ mod tests {
                 }
                 let mut positions: [Vec<f64>; POLICY_COUNT] = std::array::from_fn(|_| Vec::new());
                 positions[POLICY_MODEL] = path;
-                let mut window =
-                    WindowPaths::unmeasured(vec![0.0; BARS], Vec::new(), positions);
+                let mut window = WindowPaths::unmeasured(vec![0.0; BARS], Vec::new(), positions);
                 window.predicted_mean = mu;
                 window
             })
@@ -11031,7 +11182,10 @@ mod tests {
                 bars += 1;
                 // SIGN-ONLY keeps the sign and only the sign.
                 let staked = sign_only[window].positions[POLICY_MODEL][bar];
-                assert_eq!(staked.signum() * f64::from(staked != 0.0), f.signum() * f64::from(f != 0.0));
+                assert_eq!(
+                    staked.signum() * f64::from(staked != 0.0),
+                    f.signum() * f64::from(f != 0.0)
+                );
                 assert!(
                     (staked.abs() - leverage).abs() < 1e-12 || staked == 0.0,
                     "sign-only stakes the matched leverage, got {staked}"
@@ -11110,7 +11264,12 @@ mod tests {
         let config = BenchConfig::new(0.0, LEVERAGE_CAP, 0.0);
         let split = edge_attribution(&windows, &blocks, config);
 
-        assert_eq!(split.verdict(), EdgeSource::Direction, "{}", split.verdict_line());
+        assert_eq!(
+            split.verdict(),
+            EdgeSource::Direction,
+            "{}",
+            split.verdict_line()
+        );
         // The size half is exactly dead by construction: `|f*|` is constant, so the
         // magnitude-short corner IS the always-short corner and the size effect is identically
         // zero. That is what makes the SIGN effect the whole result rather than the larger of
@@ -11241,7 +11400,12 @@ mod tests {
         let pearson = |x: &[f64], y: &[f64]| {
             let n = x.len() as f64;
             let (mx, my) = (x.iter().sum::<f64>() / n, y.iter().sum::<f64>() / n);
-            let cov: f64 = x.iter().zip(y).map(|(a, b)| (a - mx) * (b - my)).sum::<f64>() / n;
+            let cov: f64 = x
+                .iter()
+                .zip(y)
+                .map(|(a, b)| (a - mx) * (b - my))
+                .sum::<f64>()
+                / n;
             let vx: f64 = x.iter().map(|a| (a - mx) * (a - mx)).sum::<f64>() / n;
             let vy: f64 = y.iter().map(|b| (b - my) * (b - my)).sum::<f64>() / n;
             cov / (vx * vy).sqrt()
@@ -11277,8 +11441,7 @@ mod tests {
         for arm in 0..ATTRIBUTION_ARMS {
             assert_eq!(first.arms[arm].edge, second.arms[arm].edge, "arm {arm}");
             assert_eq!(
-                first.arms[arm].paired_vs_actual,
-                second.arms[arm].paired_vs_actual,
+                first.arms[arm].paired_vs_actual, second.arms[arm].paired_vs_actual,
                 "arm {arm}"
             );
             assert_eq!(
@@ -11308,7 +11471,10 @@ mod tests {
         let panel = traded_panel(&windows, &[0]);
         assert!(!panel.measured());
         assert_eq!(panel.samples, 0);
-        assert_eq!(panel.report_lines(), vec!["traded panel: not measured".to_owned()]);
+        assert_eq!(
+            panel.report_lines(),
+            vec!["traded panel: not measured".to_owned()]
+        );
     }
 
     /// A conviction-carrying fixture: the sign reverses on a fixed cadence and the predicted
@@ -11466,11 +11632,13 @@ mod tests {
         );
 
         assert!(
-            sweep.points.iter().any(|point| (point.net_at_cost_pooled
-                [HYSTERESIS_SELECTION_COST]
-                - point.net_reconstructed_bps)
-                .abs()
-                > 1e-6),
+            sweep
+                .points
+                .iter()
+                .any(|point| (point.net_at_cost_pooled[HYSTERESIS_SELECTION_COST]
+                    - point.net_reconstructed_bps)
+                    .abs()
+                    > 1e-6),
             "no row's reported linear gap is nonzero, so the gap column is not measuring anything"
         );
     }
@@ -11514,8 +11682,9 @@ mod tests {
         let config = attribution_config();
         let raw = hysteresis_sweep(&windows, &blocks, config, ConvictionAxis::Raw)
             .expect("the raw axis sweeps");
-        let standardized = hysteresis_sweep(&windows, &blocks, config, ConvictionAxis::Standardized)
-            .expect("this fixture carries a per-bar SD");
+        let standardized =
+            hysteresis_sweep(&windows, &blocks, config, ConvictionAxis::Standardized)
+                .expect("this fixture carries a per-bar SD");
 
         assert_eq!(raw.points[0].margin_bps, 0.0);
         assert_eq!(standardized.points[0].margin_bps, 0.0);
@@ -11644,7 +11813,11 @@ mod tests {
 
     /// A recalibrated fixture whose shrunk book sizes SMALLER, which is what a fitted slope
     /// below one produces and what unbinds the leverage cap.
-    fn shrinkable_conviction_windows(count: usize, bars: usize, cadence: usize) -> Vec<WindowPaths> {
+    fn shrinkable_conviction_windows(
+        count: usize,
+        bars: usize,
+        cadence: usize,
+    ) -> Vec<WindowPaths> {
         conviction_windows(count, bars, cadence)
             .into_iter()
             .map(|mut window| {
@@ -11661,9 +11834,14 @@ mod tests {
     fn the_shrink_hysteresis_second_difference_closes_against_its_own_cells() {
         let windows = shrinkable_conviction_windows(6, 60, 5);
         let blocks = blocks_for(&windows);
-        let composition =
-            hysteresis_composition(&windows, &blocks, attribution_config(), 1.0, ConvictionAxis::Raw)
-                .expect("every window carries a recalibrated fraction");
+        let composition = hysteresis_composition(
+            &windows,
+            &blocks,
+            attribution_config(),
+            1.0,
+            ConvictionAxis::Raw,
+        )
+        .expect("every window carries a recalibrated fraction");
 
         let cell = |slot: usize| composition.cells[slot].net.mean;
         let both = cell(COMPOSITION_BOTH) - cell(COMPOSITION_INCUMBENT);
@@ -11677,14 +11855,14 @@ mod tests {
         assert!(
             (composition.hysteresis_effect.mean
                 - (cell(COMPOSITION_HYSTERESIS) - cell(COMPOSITION_INCUMBENT)))
-                .abs()
+            .abs()
                 < 1e-15,
             "the hysteresis effect is not its own two cells' difference"
         );
         assert!(
             (composition.both_vs_hysteresis.mean
                 - (cell(COMPOSITION_BOTH) - cell(COMPOSITION_HYSTERESIS)))
-                .abs()
+            .abs()
                 < 1e-15,
             "the decision-relevant gain is not its own two cells' difference"
         );

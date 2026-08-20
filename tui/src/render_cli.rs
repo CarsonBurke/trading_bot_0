@@ -70,7 +70,9 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 out = Some(PathBuf::from(value));
             }
             "--skip" => {
-                let value = iter.next().ok_or_else(|| anyhow!("`--skip` needs a count"))?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("`--skip` needs a count"))?;
                 skip = value
                     .parse()
                     .with_context(|| format!("`--skip` expects a count, got `{value}`"))?;
@@ -167,8 +169,8 @@ pub fn render_one(source: &Path, destination: &Path, skip: usize, show_legend: b
 pub fn collect_targets(inputs: &[PathBuf]) -> Result<Vec<RenderTarget>> {
     let mut targets = Vec::new();
     for input in inputs {
-        let metadata = std::fs::metadata(input)
-            .with_context(|| format!("stat input {}", input.display()))?;
+        let metadata =
+            std::fs::metadata(input).with_context(|| format!("stat input {}", input.display()))?;
         if metadata.is_dir() {
             for entry in walkdir::WalkDir::new(input).sort_by_file_name() {
                 let entry = entry.with_context(|| format!("walk {}", input.display()))?;
@@ -315,7 +317,10 @@ mod tests {
         let output = Scratch::new("candle-out");
         let (actual, bands, samples) = synthetic_fan();
         let up_bars = actual.iter().filter(|c| c.close >= c.open).count();
-        assert!(up_bars > 0 && up_bars < actual.len(), "need both directions");
+        assert!(
+            up_bars > 0 && up_bars < actual.len(),
+            "need both directions"
+        );
 
         let report = Report {
             title: "pretrain candle rollout".to_owned(),
@@ -407,7 +412,14 @@ mod tests {
         assert!(parse(&args(&["renderr", "a", "-o", "x"])).is_err());
         assert_eq!(parse(&args(&["--help"])).unwrap(), Command::Help);
         assert_eq!(
-            parse(&args(&["render", "a.report.bin", "-o", "out", "--no-legend"])).unwrap(),
+            parse(&args(&[
+                "render",
+                "a.report.bin",
+                "-o",
+                "out",
+                "--no-legend"
+            ]))
+            .unwrap(),
             Command::Render(RenderArgs {
                 inputs: vec![PathBuf::from("a.report.bin")],
                 out: PathBuf::from("out"),

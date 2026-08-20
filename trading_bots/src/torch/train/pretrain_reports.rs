@@ -2,8 +2,7 @@
 //!
 //! Every metric the pretrainer produces leaves the process through this module
 //! and through `shared::report::write_report` only; there is no second channel.
-//! The base names written here are mirrored in `meta_chart_bases` in
-//! `tui/src/main.rs`, which is what makes them visible.
+//! Bases live in `shared::report::PRETRAIN_REPORT_BASES`, which the TUI consumes directly.
 //!
 //! All scalar curves share one x-axis, the *record tick*. [`PretrainReporter::record_step`]
 //! mean-aggregates [`STEP_DECIMATION`] optimizer steps into one tick, and
@@ -33,32 +32,31 @@ use shared::report::{
 };
 use tch::{Device, Kind, Tensor};
 
+use super::bar_family::{BarFamilyFit, DENSITY_BASES};
+use super::mem_probe::{Arm, GapPoint, PairedContrast, RecencyBucket, StabilityPoint};
 use super::pretrain::{
     HeldOutPower, SelectionLedger, SelectionOutcome, EVAL_WINDOW_SEED, SELECTION_CAP,
     SELECTION_CAP_SLOT,
 };
 use super::pretrain_stats::Dispersion;
-use super::trade_bench::{
-    BandShrinkOverlap, BandSweep, EdgeAttribution, HysteresisComposition, HysteresisSweep,
-    MeanCalibration,
-    HysteresisOos, OuterDecomposition, PolicyStats, ShrunkBench, SignalDecay, TradeBench, ATTRIBUTION_ARMS,
-    ATTRIBUTION_DECILES, COMPOSITION_NAMES, DECAY_HORIZONS, HYSTERESIS_MARGINS,
-    HYSTERESIS_NET_COSTS, HYSTERESIS_SELECTION_COST,
-    ATTRIBUTION_NAMES, SIZING_KNOBS, SIZING_SHAPES, BARS_PER_YEAR, CAP_GRID, CELL_LABELS,
-    COST_GRID_BPS, DEFAULT_COST_SLOT, FREE_KELLY_EDGES, LEVERAGE_CAP, MAX_BREAK_EVEN_BPS,
-    MAX_LEVERAGE, PANEL_LABELS, POLICY_COUNT, POLICY_KELLY_MULTIPLE, POLICY_MARGINAL,
-    POLICY_MODEL, POLICY_NAMES, POLICY_ORACLE, TAIL_LEVELS, TAIL_RATIO_WARN,
-};
-use crate::torch::bar_dist::{
-    decode_dof, BarDof, BarScoring, BarSupports, BAR_CHAIN, BAR_DOF, BAR_DOF_NAMES, DOF_R, DOF_U,
-    DOF_V, NUM_BAR_BINS,
-};
-use super::support_moments::SupportDecode;
-use super::mem_probe::{Arm, GapPoint, PairedContrast, RecencyBucket, StabilityPoint};
-use super::bar_family::{BarFamilyFit, DENSITY_BASES};
 use super::split_seams::{
     deviation_edges, range_ratio_edges, ranked_ratios, volume_edges, SeamAudit, CENSUS_LOG_LEVELS,
     TIER_EXACT, TIER_NEAR,
+};
+use super::support_moments::SupportDecode;
+use super::trade_bench::{
+    BandShrinkOverlap, BandSweep, EdgeAttribution, HysteresisComposition, HysteresisOos,
+    HysteresisSweep, MeanCalibration, OuterDecomposition, PolicyStats, ShrunkBench, SignalDecay,
+    TradeBench, ATTRIBUTION_ARMS, ATTRIBUTION_DECILES, ATTRIBUTION_NAMES, BARS_PER_YEAR, CAP_GRID,
+    CELL_LABELS, COMPOSITION_NAMES, COST_GRID_BPS, DECAY_HORIZONS, DEFAULT_COST_SLOT,
+    FREE_KELLY_EDGES, HYSTERESIS_MARGINS, HYSTERESIS_NET_COSTS, HYSTERESIS_SELECTION_COST,
+    LEVERAGE_CAP, MAX_BREAK_EVEN_BPS, MAX_LEVERAGE, PANEL_LABELS, POLICY_COUNT,
+    POLICY_KELLY_MULTIPLE, POLICY_MARGINAL, POLICY_MODEL, POLICY_NAMES, POLICY_ORACLE,
+    SIZING_KNOBS, SIZING_SHAPES, TAIL_LEVELS, TAIL_RATIO_WARN,
+};
+use crate::torch::bar_dist::{
+    decode_dof, BarDof, BarScoring, BarSupports, BAR_DOF, BAR_DOF_NAMES, DOF_R, DOF_U, DOF_V,
+    NUM_BAR_BINS,
 };
 use crate::torch::dataset::{mix64, Split, MULTIPLICITY_BUCKETS};
 
@@ -299,7 +297,8 @@ pub struct EpochMetrics {
     pub val_nll_dof: [f64; BAR_DOF],
     pub val_crps_dof: [f64; BAR_DOF],
     pub val_pit: PitHistogram,
-    /// Sign accuracy of `E[r]` against the realized return, validation only.
+    /// Deterministic sign accuracy of `E[r | past]` from the prefix-free `r` law, scoring
+    /// every non-flat realized return.
     pub val_dir_acc: f64,
     /// Teacher-forced rollout NLL at [`ROLLOUT_HORIZONS`] with beliefs advanced
     /// by the trunk. NaN for horizons the evaluation window cannot reach.
@@ -332,15 +331,15 @@ pub struct EpochMetrics {
     /// The selection metric itself, at the deployed context. Unmeasured before the ramp
     /// reaches it.
     pub val_nll_bar_conditional_deployed: f64,
-    /// Per-DOF MARGINALIZED forecast NLL: every factor conditioned on strictly PAST bars
-    /// only, with the same-bar chain prefix integrated over the head's own predictive law.
-    /// This is the honest forecasting number.
-    pub val_forecast_nll_dof: [f64; BAR_DOF],
-    /// Teacher-forced per-DOF NLL on EXACTLY the rows the forecast figure used, so the
-    /// teacher-forcing inflation is a paired difference.
-    pub val_forecast_teacher_nll_dof: [f64; BAR_DOF],
-    /// Monte-Carlo standard error of the summed forecast figure.
-    pub val_forecast_nll_se: f64,
+    /// NLL of each independently marginalized per-DOF law. Every factor conditions only on
+    /// strictly past bars, but their sum is not a joint forecast score.
+    pub val_independent_marginal_nll_dof: [f64; BAR_DOF],
+    /// Chain-conditional per-DOF NLL on exactly the same rows. Its sum is the proper joint
+    /// bar likelihood. The marginal sum minus this joint score is a held-out score gap, not a
+    /// direct estimate of dependence under a potentially misspecified model.
+    pub val_chain_conditional_nll_dof: [f64; BAR_DOF],
+    /// Monte-Carlo standard error of the summed independent-marginal figure.
+    pub val_independent_marginal_nll_se: f64,
     /// Context, in bars, the promotion decision was taken at this tick. Unmeasured when it
     /// was skipped.
     pub val_promotion_context: f64,
@@ -437,9 +436,9 @@ impl EpochMetrics {
             val_nll_bar_se_level: f64::NAN,
             val_nll_bar_conditional: f64::NAN,
             val_nll_bar_conditional_deployed: f64::NAN,
-            val_forecast_nll_dof: [f64::NAN; BAR_DOF],
-            val_forecast_teacher_nll_dof: [f64::NAN; BAR_DOF],
-            val_forecast_nll_se: f64::NAN,
+            val_independent_marginal_nll_dof: [f64::NAN; BAR_DOF],
+            val_chain_conditional_nll_dof: [f64::NAN; BAR_DOF],
+            val_independent_marginal_nll_se: f64::NAN,
             val_promotion_context: f64::NAN,
             reached_context: f64::NAN,
             selection: SelectionLedger::unmeasured(),
@@ -502,9 +501,10 @@ pub struct EpochBoundary {
     pub snapshot_secs: f64,
     /// Held-out NLL at the fixed diagnostic context.
     pub val_nll_bar: f64,
-    /// The forecast-only figure on the same rows, and how much teacher-forcing flatters it.
-    pub forecast_nll_bar: f64,
-    pub teacher_forcing_inflation: f64,
+    /// Sum of independent per-DOF marginal NLLs on the diagnostic rows.
+    pub independent_marginal_nll_bar: f64,
+    /// Independent-marginal sum minus the chain-conditional joint score on held-out data.
+    pub marginal_joint_score_gap: f64,
     /// Mean `dyn / identity` over the epoch's optimizer steps.
     pub dyn_vs_identity: f64,
     /// The Kelly bench of this boundary's diagnostic pass.
@@ -526,8 +526,8 @@ impl EpochBoundary {
             bench_secs: f64::NAN,
             snapshot_secs: f64::NAN,
             val_nll_bar: f64::NAN,
-            forecast_nll_bar: f64::NAN,
-            teacher_forcing_inflation: f64::NAN,
+            independent_marginal_nll_bar: f64::NAN,
+            marginal_joint_score_gap: f64::NAN,
             dyn_vs_identity: f64::NAN,
             trade: TradeBench::nan(),
         }
@@ -573,8 +573,8 @@ impl EpochBoundary {
             "EPOCH {} at step {} | {:.1}M bar-tokens = {:.3} of a full pass ({:.1}M unique \
              bars) | run {:.1}M / {:.1}M requested = {:.3}, projecting {:.1}M = {:.2} \
              effective epochs | {:.1} min ({:.1} min boundary = {:.1}%, bench {:.1} min, \
-             snapshots {:.1} min) | held-out nll {:.4}, forecast-only {:.4} \
-             (teacher-forcing {:+.4} optimistic), dyn/identity {:.3} | trade edge {:+.4} \
+             snapshots {:.1} min) | held-out nll {:.4}, independent-marginal sum {:.4} \
+             (marginal-joint score gap {:+.4}), dyn/identity {:.3} | trade edge {:+.4} \
              bps/bar (95% CI {:+.4}..{:+.4}), break-even {}, |f| {:.2} with {:.0}% of bars \
              at the {:.1}x cap, {} ruined bars",
             self.epoch,
@@ -593,8 +593,8 @@ impl EpochBoundary {
             self.bench_secs / 60.0,
             self.snapshot_secs / 60.0,
             self.val_nll_bar,
-            self.forecast_nll_bar,
-            self.teacher_forcing_inflation,
+            self.independent_marginal_nll_bar,
+            self.marginal_joint_score_gap,
             self.dyn_vs_identity,
             self.trade.model_edge().mean * 1e4,
             self.trade.model_edge().ci_low * 1e4,
@@ -663,7 +663,8 @@ pub struct TestBattery {
     pub rollout_nll_exact: [f64; ROLLOUT_HORIZONS.len()],
     pub rollout_nll_dynamics: [f64; ROLLOUT_HORIZONS.len()],
     pub pit: PitHistogram,
-    /// Sign accuracy of `E[r]` against the realized return.
+    /// Deterministic sign accuracy of `E[r | past]` from the prefix-free `r` law, scoring
+    /// every non-flat realized return.
     pub dir_acc: f64,
     /// `BarCorpus::identity_fingerprint()` of the corpus this battery scored. The corpus is
     /// live and the split instants are percentiles of it, so without this two batteries a
@@ -677,17 +678,16 @@ pub struct TestBattery {
     /// Block-bootstrap standard error and 95% interval of `nll_bar`.
     pub nll_bar_se: f64,
     pub nll_bar_ci: (f64, f64),
-    /// Per-DOF MARGINALIZED forecast NLL, and the teacher-forced figure on identical rows.
+    /// NLL of each independently marginalized per-DOF law and the chain-conditional terms
+    /// on identical rows.
     ///
-    /// `nll_bar` above is the joint bar likelihood with every chain factor teacher-forced on
-    /// the realized same-bar prefix, which makes its per-factor terms within-bar accounting
-    /// rather than forecasts. These two are the honest forecasting number and its paired
-    /// comparator, so the terminal report states the inflation instead of leaving it to be
-    /// rediscovered by the next reviewer.
-    pub forecast_nll_dof: [f64; BAR_DOF],
-    pub forecast_teacher_nll_dof: [f64; BAR_DOF],
-    /// Monte-Carlo standard error of `forecast_nll_dof.iter().sum()`.
-    pub forecast_nll_se: f64,
+    /// The first array contains valid marginal scores, but summing them is not a joint forecast
+    /// likelihood. The second array sums to the proper joint bar likelihood. Their difference
+    /// is a held-out score gap; it does not isolate model dependence under misspecification.
+    pub independent_marginal_nll_dof: [f64; BAR_DOF],
+    pub chain_conditional_nll_dof: [f64; BAR_DOF],
+    /// Monte-Carlo standard error of `independent_marginal_nll_dof.iter().sum()`.
+    pub independent_marginal_nll_se: f64,
     /// Context the scored checkpoint was SELECTED at, the context it is meant to be deployed
     /// at, and the longest context the run trained at. Equal on a full run; the first is
     /// shorter on a run that never reached the deployed context, and then every number here
@@ -759,9 +759,9 @@ impl TestBattery {
             nll_dof_conditional: [f64::NAN; BAR_DOF],
             nll_bar_se: f64::NAN,
             nll_bar_ci: (f64::NAN, f64::NAN),
-            forecast_nll_dof: [f64::NAN; BAR_DOF],
-            forecast_teacher_nll_dof: [f64::NAN; BAR_DOF],
-            forecast_nll_se: f64::NAN,
+            independent_marginal_nll_dof: [f64::NAN; BAR_DOF],
+            chain_conditional_nll_dof: [f64::NAN; BAR_DOF],
+            independent_marginal_nll_se: f64::NAN,
             selection_context: 0,
             deployed_context: 0,
             reached_context: 0,
@@ -965,7 +965,10 @@ pub fn belief_effective_rank(beliefs: &Tensor) -> f64 {
         let centered = &flat - flat.mean_dim([0i64].as_slice(), true, Kind::Float);
         let cov = centered.transpose(0, 1).matmul(&centered) / (rows - 1) as f64;
         let trace = cov.diagonal(0, 0, 1).sum(Kind::Float).double_value(&[]);
-        let frobenius = cov.pow_tensor_scalar(2.0).sum(Kind::Float).double_value(&[]);
+        let frobenius = cov
+            .pow_tensor_scalar(2.0)
+            .sum(Kind::Float)
+            .double_value(&[]);
         if !trace.is_finite() || !frobenius.is_finite() || frobenius <= 0.0 {
             f64::NAN
         } else {
@@ -1113,7 +1116,8 @@ impl StepAccumulator {
         self.bars_seen = self.bars_seen.max(step.bars_seen);
         self.free_vram_gib.push(step.free_vram_gib);
         self.bar_tokens.push(step.bar_tokens);
-        self.projected_footprint_gib.push(step.projected_footprint_gib);
+        self.projected_footprint_gib
+            .push(step.projected_footprint_gib);
         self.capacity_ceiling_gib.push(step.capacity_ceiling_gib);
         self.market_missing_bars += step.market_missing_bars;
         self.market_total_bars += step.market_total_bars;
@@ -1272,15 +1276,15 @@ pub struct PretrainReporter {
     /// Mean conditioning length per ramp stage, grown on demand like `stage_coverage`.
     stage_conditioning: Vec<Series>,
     nll_bar_conditional_deployed: Series,
-    /// The marginalized forecast curves and their teacher-forced comparators, both from the
-    /// diagnostic pass on identical rows.
-    forecast_nll_bar: Series,
-    vs_uniform_forecast: Series,
-    forecast_nll_bar_se: Series,
-    forecast_teacher_nll_bar: Series,
-    forecast_inflation: Series,
-    forecast_nll_dof: [Series; BAR_DOF],
-    forecast_teacher_nll_dof: [Series; BAR_DOF],
+    /// Independent per-DOF marginal curves and their chain-conditional comparators, both
+    /// measured on identical diagnostic rows.
+    independent_marginal_nll_bar: Series,
+    vs_uniform_independent_marginal: Series,
+    independent_marginal_nll_bar_se: Series,
+    chain_conditional_nll_bar: Series,
+    marginal_joint_score_gap: Series,
+    independent_marginal_nll_dof: [Series; BAR_DOF],
+    chain_conditional_nll_dof: [Series; BAR_DOF],
     /// Context of the promotion decision and the longest context trained, charted so a run
     /// held below the deployed context is visible rather than inferred.
     promotion_context: Series,
@@ -1432,13 +1436,13 @@ impl PretrainReporter {
             pass_remainder: array::from_fn(|_| Series::default()),
             stage_conditioning: Vec::new(),
             nll_bar_conditional_deployed: Series::default(),
-            forecast_nll_bar: Series::default(),
-            vs_uniform_forecast: Series::default(),
-            forecast_nll_bar_se: Series::default(),
-            forecast_teacher_nll_bar: Series::default(),
-            forecast_inflation: Series::default(),
-            forecast_nll_dof: array::from_fn(|_| Series::default()),
-            forecast_teacher_nll_dof: array::from_fn(|_| Series::default()),
+            independent_marginal_nll_bar: Series::default(),
+            vs_uniform_independent_marginal: Series::default(),
+            independent_marginal_nll_bar_se: Series::default(),
+            chain_conditional_nll_bar: Series::default(),
+            marginal_joint_score_gap: Series::default(),
+            independent_marginal_nll_dof: array::from_fn(|_| Series::default()),
+            chain_conditional_nll_dof: array::from_fn(|_| Series::default()),
             promotion_context: Series::default(),
             reached_context: Series::default(),
             trade_growth: array::from_fn(|_| Series::default()),
@@ -1522,21 +1526,25 @@ impl PretrainReporter {
         }
         self.nll_bar_conditional_deployed
             .set(tick, metrics.val_nll_bar_conditional_deployed);
-        // The forecast panel. `Series::set` drops a non-finite value, so a tick that did not
-        // measure these leaves a GAP rather than a NaN that reads as a measured catastrophe.
-        let forecast: f64 = metrics.val_forecast_nll_dof.iter().sum();
-        let teacher: f64 = metrics.val_forecast_teacher_nll_dof.iter().sum();
-        self.forecast_nll_bar.set(tick, forecast);
-        self.forecast_nll_bar_se.set(tick, metrics.val_forecast_nll_se);
-        self.forecast_teacher_nll_bar.set(tick, teacher);
-        self.forecast_inflation.set(tick, forecast - teacher);
-        self.vs_uniform_forecast.set(tick, uniform - forecast);
+        // Independent per-DOF marginals versus the chain-conditional joint terms. A tick
+        // that did not measure these leaves a GAP rather than a NaN point.
+        let independent: f64 = metrics.val_independent_marginal_nll_dof.iter().sum();
+        let chain: f64 = metrics.val_chain_conditional_nll_dof.iter().sum();
+        self.independent_marginal_nll_bar.set(tick, independent);
+        self.independent_marginal_nll_bar_se
+            .set(tick, metrics.val_independent_marginal_nll_se);
+        self.chain_conditional_nll_bar.set(tick, chain);
+        self.marginal_joint_score_gap.set(tick, independent - chain);
+        self.vs_uniform_independent_marginal
+            .set(tick, uniform - independent);
         for dof in 0..BAR_DOF {
-            self.forecast_nll_dof[dof].set(tick, metrics.val_forecast_nll_dof[dof]);
-            self.forecast_teacher_nll_dof[dof]
-                .set(tick, metrics.val_forecast_teacher_nll_dof[dof]);
+            self.independent_marginal_nll_dof[dof]
+                .set(tick, metrics.val_independent_marginal_nll_dof[dof]);
+            self.chain_conditional_nll_dof[dof]
+                .set(tick, metrics.val_chain_conditional_nll_dof[dof]);
         }
-        self.promotion_context.set(tick, metrics.val_promotion_context);
+        self.promotion_context
+            .set(tick, metrics.val_promotion_context);
         self.reached_context.set(tick, metrics.reached_context);
         // Each ramp stage owns a DISJOINT share of the pass, so coverage is per stage and the
         // stage count is the schedule's business, not the reporter's.
@@ -1565,8 +1573,10 @@ impl PretrainReporter {
         let pass_bars = metrics.pass_multiplicity_bars.iter().sum::<u64>();
         if pass_bars > 0 {
             for bucket in 0..MULTIPLICITY_BUCKETS {
-                self.pass_multiplicity[bucket]
-                    .set(tick, metrics.pass_multiplicity_bars[bucket] as f64 / pass_bars as f64);
+                self.pass_multiplicity[bucket].set(
+                    tick,
+                    metrics.pass_multiplicity_bars[bucket] as f64 / pass_bars as f64,
+                );
             }
         }
         // The cross-pass counterpart, on the SAME denominator so the two panels' shares are
@@ -1576,8 +1586,10 @@ impl PretrainReporter {
         let run_bars = metrics.run_exposure_bars.iter().sum::<u64>();
         if run_bars > 0 {
             for bucket in 0..MULTIPLICITY_BUCKETS {
-                self.run_exposure[bucket]
-                    .set(tick, metrics.run_exposure_bars[bucket] as f64 / run_bars as f64);
+                self.run_exposure[bucket].set(
+                    tick,
+                    metrics.run_exposure_bars[bucket] as f64 / run_bars as f64,
+                );
             }
             self.run_reused.set(
                 tick,
@@ -1643,7 +1655,8 @@ impl PretrainReporter {
                 SelectionOutcome::Unmeasurable => self.unmeasurable += 1,
                 SelectionOutcome::Promoted | SelectionOutcome::NotEligible => {}
             }
-            self.refused_noise_trace.set(tick, self.refused_noise as f64);
+            self.refused_noise_trace
+                .set(tick, self.refused_noise as f64);
             self.refused_nll_trace.set(tick, self.refused_nll as f64);
             self.refused_dof_trace.set(tick, self.refused_dof as f64);
             self.unmeasurable_trace.set(tick, self.unmeasurable as f64);
@@ -1704,12 +1717,13 @@ impl PretrainReporter {
         self.trade_drawdown_mean.set(tick, model.mean_drawdown);
         self.trade_drawdown_max.set(tick, model.max_drawdown);
         self.trade_edge.set(tick, trade.model_edge().mean * 1e4);
-        self.trade_edge_low.set(tick, trade.model_edge().ci_low * 1e4);
-        self.trade_edge_high.set(tick, trade.model_edge().ci_high * 1e4);
+        self.trade_edge_low
+            .set(tick, trade.model_edge().ci_low * 1e4);
+        self.trade_edge_high
+            .set(tick, trade.model_edge().ci_high * 1e4);
         self.trade_oracle_edge.set(
             tick,
-            (trade.policies[POLICY_ORACLE].net_growth
-                - trade.policies[POLICY_MARGINAL].net_growth)
+            (trade.policies[POLICY_ORACLE].net_growth - trade.policies[POLICY_MARGINAL].net_growth)
                 * 1e4,
         );
         // An infinite break-even is a real outcome (cost never removes the edge) but it is
@@ -1762,7 +1776,10 @@ impl PretrainReporter {
             ),
             ("val_dir_acc".to_owned(), metrics.val_dir_acc),
             ("effective_rank".to_owned(), metrics.effective_rank),
-            ("val_forecast_nll_se".to_owned(), metrics.val_forecast_nll_se),
+            (
+                "val_independent_marginal_nll_se".to_owned(),
+                metrics.val_independent_marginal_nll_se,
+            ),
             (
                 "val_promotion_context".to_owned(),
                 metrics.val_promotion_context,
@@ -1781,10 +1798,13 @@ impl PretrainReporter {
                 ("val_nll_dof_conditional", &metrics.val_nll_dof_conditional),
                 ("val_nll_dof_class", &metrics.val_nll_dof_class),
                 ("val_nll_dof_shape", &metrics.val_nll_dof_shape),
-                ("val_forecast_nll_dof", &metrics.val_forecast_nll_dof),
                 (
-                    "val_forecast_teacher_nll_dof",
-                    &metrics.val_forecast_teacher_nll_dof,
+                    "val_independent_marginal_nll_dof",
+                    &metrics.val_independent_marginal_nll_dof,
+                ),
+                (
+                    "val_chain_conditional_nll_dof",
+                    &metrics.val_chain_conditional_nll_dof,
                 ),
             ] {
                 checked.push((format!("{label}[{name}]"), values[dof]));
@@ -1990,31 +2010,35 @@ impl PretrainReporter {
                 self.marginal_nll_dof[dof] - battery.nll_dof[dof],
             ));
         }
-        // The honest forecasting number beside the teacher-forced one, on identical rows.
-        // `nll_bar` above is a JOINT likelihood in which four of the five factors are handed
-        // the realized values of the same bar's earlier factors; only `r` forecasts. These
-        // lines say how much of the headline came from that.
-        let forecast: f64 = battery.forecast_nll_dof.iter().sum();
-        let teacher: f64 = battery.forecast_teacher_nll_dof.iter().sum();
-        series.push(point_series("FORECAST nll_bar (marginalized)", forecast));
-        series.push(point_series("forecast nll_bar se (MC)", battery.forecast_nll_se));
+        // Each factor below is a valid marginal prediction from strictly past bars. Their sum
+        // is not a joint forecast likelihood. The gap to the chain-conditional joint score is
+        // reported descriptively and is not interpreted as model dependence.
+        let independent: f64 = battery.independent_marginal_nll_dof.iter().sum();
+        let chain: f64 = battery.chain_conditional_nll_dof.iter().sum();
         series.push(point_series(
-            "teacher-forced nll_bar (same rows)",
-            teacher,
+            "sum of independent per-DOF marginal NLLs",
+            independent,
         ));
         series.push(point_series(
-            "teacher-forcing inflation (forecast - teacher)",
-            forecast - teacher,
+            "independent-marginal sum se (MC)",
+            battery.independent_marginal_nll_se,
+        ));
+        series.push(point_series(
+            "chain-conditional joint NLL (same rows)",
+            chain,
+        ));
+        series.push(point_series(
+            "marginal-joint score gap (marginal sum - joint)",
+            independent - chain,
         ));
         for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            let role = if dof == BAR_CHAIN[0] {
-                "pure forecasting"
-            } else {
-                "marginalized over earlier same-bar factors"
-            };
             series.push(point_series(
-                &format!("forecast nll {name} ({role})"),
-                battery.forecast_nll_dof[dof],
+                &format!("independent marginal NLL {name}"),
+                battery.independent_marginal_nll_dof[dof],
+            ));
+            series.push(point_series(
+                &format!("chain-conditional NLL {name}"),
+                battery.chain_conditional_nll_dof[dof],
             ));
         }
         series.push(point_series(
@@ -2131,7 +2155,8 @@ impl PretrainReporter {
         self.growth_loss.set(tick, acc.growth_loss.value());
         self.growth_share.set(tick, acc.growth_share.value());
         self.growth_abs_f.set(tick, acc.growth_abs_f.value());
-        self.growth_clamp_bind.set(tick, acc.growth_clamp_bind.value());
+        self.growth_clamp_bind
+            .set(tick, acc.growth_clamp_bind.value());
         self.belief_autocorr.set(tick, acc.belief_autocorr.value());
         self.dyn_vs_identity.set(tick, acc.dyn_vs_identity.value());
         self.lr.set(tick, acc.lr_mult.value());
@@ -2153,9 +2178,7 @@ impl PretrainReporter {
         if acc.market_total_bars > 0 {
             self.market_missing_bars += acc.market_missing_bars;
             self.market_total_bars += acc.market_total_bars;
-            let observed = |missing: u64, total: u64| {
-                100.0 * (1.0 - missing as f64 / total as f64)
-            };
+            let observed = |missing: u64, total: u64| 100.0 * (1.0 - missing as f64 / total as f64);
             self.market_observed_pct.set(
                 tick,
                 observed(acc.market_missing_bars, acc.market_total_bars),
@@ -2231,50 +2254,48 @@ impl PretrainReporter {
                 self.nll_bar_diag.labeled("val diag", len),
                 self.nll_bar_conditional
                     .labeled("val diag conditional", len),
-                self.forecast_nll_bar
-                    .labeled("val diag FORECAST (marginalized)", len),
+                self.independent_marginal_nll_bar
+                    .labeled("val diag independent-marginal sum", len),
             ],
         )?;
 
-        // The forecast panel. `nll_bar` teacher-forces every chain factor on the realized
-        // values of the SAME bar's earlier factors, so four of its five terms are within-bar
-        // accounting and only the first is prediction. This chart is the number a forecaster
-        // may quote, its Monte-Carlo standard error, the teacher-forced figure on identical
-        // rows, and the difference between them.
-        let mut forecast = vec![
-            self.forecast_nll_bar.labeled("forecast (marginalized)", len),
-            self.forecast_teacher_nll_bar
-                .labeled("teacher-forced (same rows)", len),
-            self.forecast_inflation
-                .labeled("teacher-forcing inflation", len),
-            self.forecast_nll_bar_se.labeled("forecast MC se", len),
+        // Each per-DOF marginal conditions only on strictly past bars. Summing them is not a
+        // joint forecast score, so this panel shows the chain-conditional joint and their
+        // descriptive held-out score gap beside it.
+        let mut independent = vec![
+            self.independent_marginal_nll_bar
+                .labeled("independent per-DOF marginals (sum)", len),
+            self.chain_conditional_nll_bar
+                .labeled("chain-conditional joint (same rows)", len),
+            self.marginal_joint_score_gap
+                .labeled("marginal-joint score gap", len),
+            self.independent_marginal_nll_bar_se
+                .labeled("independent-marginal MC se", len),
         ];
         for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
-            let role = if dof == BAR_CHAIN[0] {
-                "forecast"
-            } else {
-                "forecast marginalized"
-            };
-            forecast.push(self.forecast_nll_dof[dof].labeled(&format!("{name} {role}"), len));
-            forecast.push(
-                self.forecast_teacher_nll_dof[dof].labeled(&format!("{name} teacher-forced"), len),
+            independent.push(
+                self.independent_marginal_nll_dof[dof]
+                    .labeled(&format!("{name} independent marginal"), len),
+            );
+            independent.push(
+                self.chain_conditional_nll_dof[dof]
+                    .labeled(&format!("{name} chain-conditional"), len),
             );
         }
         write_chart(
             &dir,
-            "pretrain_forecast_nll",
-            format!("Pretrain FORECAST vs teacher-forced Bar NLL - {suffix}"),
+            "pretrain_independent_marginal_nll",
+            format!("Pretrain Independent Marginals vs Chain-Conditional Joint NLL - {suffix}"),
             "record",
             &format!(
-                "nats/bar at the fixed {diag} context. FORECAST conditions every factor on \
-                 strictly PAST bars only, marginalizing the intra-bar chain over the head's own \
-                 predictive law; TEACHER-FORCED hands each factor the realized value of the \
-                 same bar's earlier factors, so only `{}` forecasts and the other four are \
-                 within-bar accounting",
-                BAR_DOF_NAMES[BAR_CHAIN[0]]
+                "nats/bar at the fixed {diag} context. Each per-DOF marginal conditions only \
+                 on strictly past bars, but their sum is not a joint forecast likelihood. The \
+                 chain-conditional score is the proper joint likelihood on identical rows. \
+                 Marginal sum minus joint is a held-out score gap, not an estimate of model \
+                 dependence under misspecification."
             ),
             ScaleKind::Linear,
-            forecast,
+            independent,
         )?;
 
         let mut nll_dof = Vec::with_capacity(3 * BAR_DOF);
@@ -2296,9 +2317,7 @@ impl PretrainReporter {
         // learned intra-bar shape.
         for dof in [DOF_U, DOF_V] {
             let name = BAR_DOF_NAMES[dof];
-            nll_dof.push(
-                self.nll_dof_conditional[dof].labeled(&format!("{name} val | s!=0"), len),
-            );
+            nll_dof.push(self.nll_dof_conditional[dof].labeled(&format!("{name} val | s!=0"), len));
             nll_dof.push(constant_series(
                 &format!("{name} marginal | s!=0"),
                 self.baselines.marginal_nll_dof_conditional[dof],
@@ -2343,10 +2362,10 @@ impl PretrainReporter {
             self.vs_uniform_train.labeled("train", len),
             self.vs_uniform_val.labeled("val deployed", len),
             self.vs_uniform_diag.labeled("val diag", len),
-            // The gain a forecaster actually has. The two curves above are joint likelihoods
-            // in which four of five factors are conditioned on the same bar's realized values.
-            self.vs_uniform_forecast
-                .labeled("val diag FORECAST (marginalized)", len),
+            // Gain of the sum of independent per-DOF marginals. This is not a joint
+            // likelihood; the dedicated panel shows its gap to the proper joint score.
+            self.vs_uniform_independent_marginal
+                .labeled("val diag independent-marginal sum", len),
             constant_series("uniform", 0.0, len),
             constant_series("marginal", uniform - self.marginal_nll_bar, len),
             constant_series(
@@ -2816,8 +2835,7 @@ impl PretrainReporter {
                 self.refused_dof_trace.labeled("refused: r guard", len),
                 self.unmeasurable_trace
                     .labeled("no comparable bench vector", len),
-                self.selection_edge
-                    .labeled("edge @0.25x cap, bps/bar", len),
+                self.selection_edge.labeled("edge @0.25x cap, bps/bar", len),
                 self.selection_edge_incumbent
                     .labeled("incumbent edge, bps/bar", len),
                 self.selection_edge_gain
@@ -2875,8 +2893,10 @@ impl PretrainReporter {
             "% of bars with an observed market proxy bar",
             ScaleKind::Linear,
             vec![
-                self.market_observed_pct.labeled("observed this tick (%)", len),
-                self.market_observed_run_pct.labeled("observed, run to date (%)", len),
+                self.market_observed_pct
+                    .labeled("observed this tick (%)", len),
+                self.market_observed_run_pct
+                    .labeled("observed, run to date (%)", len),
             ],
         )?;
 
@@ -3055,9 +3075,10 @@ impl PretrainReporter {
     /// answer it from the second and third alone; the cap and tail charts are what say
     /// whether the answer is a property of the model or of the leverage it was handed.
     fn write_trade_charts(&self, dir: &Path, suffix: &str, len: usize) -> Result<()> {
-        let windows = self
-            .trade_val
-            .map_or_else(|| "unmeasured".to_owned(), |t| format!("{} windows", t.windows));
+        let windows = self.trade_val.map_or_else(
+            || "unmeasured".to_owned(),
+            |t| format!("{} windows", t.windows),
+        );
         let cap = self.trade_val.map_or(f64::NAN, |t| t.leverage_cap);
         let cost = self.trade_val.map_or(f64::NAN, |t| t.cost_bps);
 
@@ -3129,11 +3150,10 @@ impl PretrainReporter {
                 format!(
                     "Pretrain Kelly Edge vs Transaction Cost (val break-even {}{}) - {suffix}",
                     break_even_label(&val),
-                    self.trade_test
-                        .map_or_else(String::new, |t| format!(
-                            ", TEST break-even {}",
-                            break_even_label(&t)
-                        )),
+                    self.trade_test.map_or_else(String::new, |t| format!(
+                        ", TEST break-even {}",
+                        break_even_label(&t)
+                    )),
                 ),
                 "cost grid index (see the `cost (bps)` series)",
                 "net growth minus the marginal null, bps/bar",
@@ -3172,8 +3192,7 @@ impl PretrainReporter {
                 self.trade_time_in_market.labeled("time in market", len),
                 self.trade_abs_position.labeled("mean |f|", len),
                 self.trade_turnover[POLICY_MODEL].labeled("turnover/bar", len),
-                self.trade_turnover[POLICY_MARGINAL]
-                    .labeled("turnover/bar, marginal", len),
+                self.trade_turnover[POLICY_MARGINAL].labeled("turnover/bar, marginal", len),
                 self.trade_drawdown_mean.labeled("mean drawdown", len),
                 self.trade_drawdown_max.labeled("max drawdown", len),
                 constant_series("coin flip", 0.5, len),
@@ -3243,7 +3262,9 @@ impl PretrainReporter {
                     row.trade.model_edge().mean * 1e4
                 }),
                 series("edge ci95 low", &|row| row.trade.model_edge().ci_low * 1e4),
-                series("edge ci95 high", &|row| row.trade.model_edge().ci_high * 1e4),
+                series("edge ci95 high", &|row| {
+                    row.trade.model_edge().ci_high * 1e4
+                }),
                 series("BREAK-EVEN cost (bps)", &|row| row.trade.model_break_even()),
                 series("share of oracle ceiling captured", &|row| {
                     row.trade.model_capture()
@@ -3288,10 +3309,7 @@ impl PretrainReporter {
             &model(|stats| stats.clamped_fraction),
         ));
         growth.push(series("mean |f|", &model(|stats| stats.mean_abs_position)));
-        growth.push(series(
-            "turnover/bar",
-            &model(|stats| stats.turnover),
-        ));
+        growth.push(series("turnover/bar", &model(|stats| stats.turnover)));
         growth.push(series(
             "max drawdown (wealth fraction)",
             &model(|stats| stats.max_drawdown),
@@ -3367,16 +3385,24 @@ impl PretrainReporter {
                     "PROJECTED delivered / requested",
                     &EpochBoundary::projected_fraction,
                 ),
-                series("projected effective epochs", &EpochBoundary::projected_epochs),
+                series(
+                    "projected effective epochs",
+                    &EpochBoundary::projected_epochs,
+                ),
                 // The clock.
                 series("epoch wall clock (min)", &|row| row.epoch_secs / 60.0),
                 series("boundary overhead (min)", &|row| row.boundary_secs / 60.0),
-                series("boundary overhead (fraction of epoch)", &EpochBoundary::boundary_share),
+                series(
+                    "boundary overhead (fraction of epoch)",
+                    &EpochBoundary::boundary_share,
+                ),
                 // What the epoch bought.
                 series("held-out nll (nats/bar)", &|row| row.val_nll_bar),
-                series("forecast-only nll (nats/bar)", &|row| row.forecast_nll_bar),
-                series("teacher-forcing inflation (nats/bar)", &|row| {
-                    row.teacher_forcing_inflation
+                series("independent-marginal sum (nats/bar)", &|row| {
+                    row.independent_marginal_nll_bar
+                }),
+                series("marginal-joint score gap (nats/bar)", &|row| {
+                    row.marginal_joint_score_gap
                 }),
                 series("dyn/identity", &|row| row.dyn_vs_identity),
                 series("trade edge vs null (bps/bar)", &|row| {
@@ -3401,179 +3427,179 @@ fn write_cap_and_tail_charts(
     val: &TradeBench,
     test: Option<&TradeBench>,
 ) -> Result<()> {
-        // 1. The cap curve. The x axis is the cap grid index and the `cap (x)` series is
-        //    the axis itself, exactly as the cost curve carries its own cost axis.
-        let mut cap_series = vec![
-            ReportSeries {
-                label: "cap (x)".to_owned(),
-                values: CAP_GRID.iter().map(|cap| *cap as f32).collect(),
-            },
-            ReportSeries {
-                label: "val edge, bps/bar".to_owned(),
-                values: val
-                    .cap_curve
-                    .iter()
-                    .map(|point| (point.edge * 1e4) as f32)
-                    .collect(),
-            },
-            ReportSeries {
-                // Clipped, not dropped: `break_even_bps` is `inf` when cost never removes
-                // the edge, the renderer filters non-finite points, and a missing point on a
-                // curve reads as "never measured" rather than "never breaks even".
-                //
-                // Through [`charted_break_even`] rather than `min`, because `NaN.min(k) == k`:
-                // a bare `min` maps an UNMEASURED break-even onto the ceiling, i.e. onto the
-                // most profitable row on a chart that carries real cost reference lines. The
-                // helper maps only `inf` to the ceiling and lets `NaN` stay non-finite so the
-                // renderer drops it.
-                label: format!("break-even cost, bps ({MAX_BREAK_EVEN_BPS:.0} = never)"),
-                values: val
-                    .cap_curve
-                    .iter()
-                    .map(|point| charted_break_even(point.break_even_bps) as f32)
-                    .collect(),
-            },
-            ReportSeries {
-                label: "share of bars at the cap".to_owned(),
-                values: val
-                    .cap_curve
-                    .iter()
-                    .map(|point| point.clamped_fraction as f32)
-                    .collect(),
-            },
-            ReportSeries {
-                label: "max drawdown".to_owned(),
-                values: val
-                    .cap_curve
-                    .iter()
-                    .map(|point| point.max_drawdown as f32)
-                    .collect(),
-            },
-            constant_series("no edge", 0.0, CAP_GRID.len()),
-        ];
-        if let Some(test) = test {
-            cap_series.push(ReportSeries {
-                label: "TEST edge, bps/bar".to_owned(),
-                values: test
-                    .cap_curve
-                    .iter()
-                    .map(|point| (point.edge * 1e4) as f32)
-                    .collect(),
-            });
-        }
-        write_chart(
-            dir,
-            "pretrain_trade_cap_curve",
-            format!(
-                "Pretrain Kelly Edge vs the Leverage Cap (headline {:.1}x, {:.0}% of bars \
+    // 1. The cap curve. The x axis is the cap grid index and the `cap (x)` series is
+    //    the axis itself, exactly as the cost curve carries its own cost axis.
+    let mut cap_series = vec![
+        ReportSeries {
+            label: "cap (x)".to_owned(),
+            values: CAP_GRID.iter().map(|cap| *cap as f32).collect(),
+        },
+        ReportSeries {
+            label: "val edge, bps/bar".to_owned(),
+            values: val
+                .cap_curve
+                .iter()
+                .map(|point| (point.edge * 1e4) as f32)
+                .collect(),
+        },
+        ReportSeries {
+            // Clipped, not dropped: `break_even_bps` is `inf` when cost never removes
+            // the edge, the renderer filters non-finite points, and a missing point on a
+            // curve reads as "never measured" rather than "never breaks even".
+            //
+            // Through [`charted_break_even`] rather than `min`, because `NaN.min(k) == k`:
+            // a bare `min` maps an UNMEASURED break-even onto the ceiling, i.e. onto the
+            // most profitable row on a chart that carries real cost reference lines. The
+            // helper maps only `inf` to the ceiling and lets `NaN` stay non-finite so the
+            // renderer drops it.
+            label: format!("break-even cost, bps ({MAX_BREAK_EVEN_BPS:.0} = never)"),
+            values: val
+                .cap_curve
+                .iter()
+                .map(|point| charted_break_even(point.break_even_bps) as f32)
+                .collect(),
+        },
+        ReportSeries {
+            label: "share of bars at the cap".to_owned(),
+            values: val
+                .cap_curve
+                .iter()
+                .map(|point| point.clamped_fraction as f32)
+                .collect(),
+        },
+        ReportSeries {
+            label: "max drawdown".to_owned(),
+            values: val
+                .cap_curve
+                .iter()
+                .map(|point| point.max_drawdown as f32)
+                .collect(),
+        },
+        constant_series("no edge", 0.0, CAP_GRID.len()),
+    ];
+    if let Some(test) = test {
+        cap_series.push(ReportSeries {
+            label: "TEST edge, bps/bar".to_owned(),
+            values: test
+                .cap_curve
+                .iter()
+                .map(|point| (point.edge * 1e4) as f32)
+                .collect(),
+        });
+    }
+    write_chart(
+        dir,
+        "pretrain_trade_cap_curve",
+        format!(
+            "Pretrain Kelly Edge vs the Leverage Cap (headline {:.1}x, {:.0}% of bars \
                  clipped there) - {suffix}",
-                val.leverage_cap,
-                100.0 * val.policies[POLICY_MODEL].clamped_fraction,
-            ),
-            "cap grid index (see the `cap (x)` series)",
-            "bps/bar, bps, or fraction — see the series labels",
-            ScaleKind::Symlog,
-            cap_series,
-        )?;
+            val.leverage_cap,
+            100.0 * val.policies[POLICY_MODEL].clamped_fraction,
+        ),
+        "cap grid index (see the `cap (x)` series)",
+        "bps/bar, bps, or fraction — see the series labels",
+        ScaleKind::Symlog,
+        cap_series,
+    )?;
 
-        // 2. The distribution of the uncapped optimum. Reading the mass at and beyond the
-        //    cap is how one sees whether the reported policy is Kelly or is a constant.
-        write_chart(
-            dir,
-            "pretrain_trade_free_kelly",
-            format!(
-                "Pretrain Uncapped Kelly |f*| Distribution (median {:.2}x, p95 {:.2}x, \
+    // 2. The distribution of the uncapped optimum. Reading the mass at and beyond the
+    //    cap is how one sees whether the reported policy is Kelly or is a constant.
+    write_chart(
+        dir,
+        "pretrain_trade_free_kelly",
+        format!(
+            "Pretrain Uncapped Kelly |f*| Distribution (median {:.2}x, p95 {:.2}x, \
                  {:.0}% at the {:.1}x cap) - {suffix}",
-                val.free_kelly.median,
-                val.free_kelly.p95,
-                100.0 * val.free_kelly.saturated,
-                val.leverage_cap,
-            ),
-            "|f*| bucket index (see the `bucket floor (x)` series)",
-            "share of traded bars",
-            ScaleKind::Linear,
-            vec![
-                ReportSeries {
-                    label: "bucket floor (x)".to_owned(),
-                    values: FREE_KELLY_EDGES[..FREE_KELLY_EDGES.len() - 1]
-                        .iter()
-                        .map(|edge| *edge as f32)
-                        .collect(),
-                },
-                ReportSeries {
-                    label: "share of bars".to_owned(),
-                    values: val
-                        .free_kelly
-                        .histogram
-                        .iter()
-                        .map(|share| *share as f32)
-                        .collect(),
-                },
-            ],
-        )?;
+            val.free_kelly.median,
+            val.free_kelly.p95,
+            100.0 * val.free_kelly.saturated,
+            val.leverage_cap,
+        ),
+        "|f*| bucket index (see the `bucket floor (x)` series)",
+        "share of traded bars",
+        ScaleKind::Linear,
+        vec![
+            ReportSeries {
+                label: "bucket floor (x)".to_owned(),
+                values: FREE_KELLY_EDGES[..FREE_KELLY_EDGES.len() - 1]
+                    .iter()
+                    .map(|edge| *edge as f32)
+                    .collect(),
+            },
+            ReportSeries {
+                label: "share of bars".to_owned(),
+                values: val
+                    .free_kelly
+                    .histogram
+                    .iter()
+                    .map(|share| *share as f32)
+                    .collect(),
+            },
+        ],
+    )?;
 
-        // 3. Far-tail calibration, the one diagnostic the NLL provably cannot produce.
-        //    Plotted as realized/promised so the honest line is a flat 1.0 and any bar above
-        //    it is the traded law understating its own tail.
-        let ratios = |pick: fn(&TradeBench, usize) -> f64| -> Vec<f32> {
-            (0..TAIL_LEVELS.len())
-                .map(|level| pick(&val, level) as f32)
-                .collect()
-        };
-        write_chart(
-            dir,
-            "pretrain_trade_tail",
-            format!(
-                "Pretrain Traded-Law Far-Tail Calibration (worst {:.2}x promised on the {} \
+    // 3. Far-tail calibration, the one diagnostic the NLL provably cannot produce.
+    //    Plotted as realized/promised so the honest line is a flat 1.0 and any bar above
+    //    it is the traded law understating its own tail.
+    let ratios = |pick: fn(&TradeBench, usize) -> f64| -> Vec<f32> {
+        (0..TAIL_LEVELS.len())
+            .map(|level| pick(&val, level) as f32)
+            .collect()
+    };
+    write_chart(
+        dir,
+        "pretrain_trade_tail",
+        format!(
+            "Pretrain Traded-Law Far-Tail Calibration (worst {:.2}x promised on the {} \
                  side, {:.0}k bars) - {suffix}",
-                val.tail.worst().0,
-                if val.tail.worst().1 { "LOWER" } else { "upper" },
-                val.tail.bars / 1000.0,
-            ),
-            "tail level index (see the `nominal (%)` series)",
-            "realized exceedances / promised",
-            ScaleKind::Symlog,
-            vec![
-                ReportSeries {
-                    label: "nominal (%)".to_owned(),
-                    values: TAIL_LEVELS.iter().map(|q| (100.0 * q) as f32).collect(),
-                },
-                ReportSeries {
-                    label: "lower tail".to_owned(),
-                    values: ratios(|t, level| t.tail.lower[level].ratio),
-                },
-                ReportSeries {
-                    label: "lower ci95 low".to_owned(),
-                    values: ratios(|t, level| {
-                        t.tail.lower[level].blocked.0 / t.tail.lower[level].nominal
-                    }),
-                },
-                ReportSeries {
-                    label: "lower ci95 high".to_owned(),
-                    values: ratios(|t, level| {
-                        t.tail.lower[level].blocked.1 / t.tail.lower[level].nominal
-                    }),
-                },
-                ReportSeries {
-                    label: "upper tail".to_owned(),
-                    values: ratios(|t, level| t.tail.upper[level].ratio),
-                },
-                ReportSeries {
-                    label: "upper ci95 low".to_owned(),
-                    values: ratios(|t, level| {
-                        t.tail.upper[level].blocked.0 / t.tail.upper[level].nominal
-                    }),
-                },
-                ReportSeries {
-                    label: "upper ci95 high".to_owned(),
-                    values: ratios(|t, level| {
-                        t.tail.upper[level].blocked.1 / t.tail.upper[level].nominal
-                    }),
-                },
-                constant_series("honest", 1.0, TAIL_LEVELS.len()),
-                constant_series("warn", TAIL_RATIO_WARN, TAIL_LEVELS.len()),
-            ],
-        )?;
+            val.tail.worst().0,
+            if val.tail.worst().1 { "LOWER" } else { "upper" },
+            val.tail.bars / 1000.0,
+        ),
+        "tail level index (see the `nominal (%)` series)",
+        "realized exceedances / promised",
+        ScaleKind::Symlog,
+        vec![
+            ReportSeries {
+                label: "nominal (%)".to_owned(),
+                values: TAIL_LEVELS.iter().map(|q| (100.0 * q) as f32).collect(),
+            },
+            ReportSeries {
+                label: "lower tail".to_owned(),
+                values: ratios(|t, level| t.tail.lower[level].ratio),
+            },
+            ReportSeries {
+                label: "lower ci95 low".to_owned(),
+                values: ratios(|t, level| {
+                    t.tail.lower[level].blocked.0 / t.tail.lower[level].nominal
+                }),
+            },
+            ReportSeries {
+                label: "lower ci95 high".to_owned(),
+                values: ratios(|t, level| {
+                    t.tail.lower[level].blocked.1 / t.tail.lower[level].nominal
+                }),
+            },
+            ReportSeries {
+                label: "upper tail".to_owned(),
+                values: ratios(|t, level| t.tail.upper[level].ratio),
+            },
+            ReportSeries {
+                label: "upper ci95 low".to_owned(),
+                values: ratios(|t, level| {
+                    t.tail.upper[level].blocked.0 / t.tail.upper[level].nominal
+                }),
+            },
+            ReportSeries {
+                label: "upper ci95 high".to_owned(),
+                values: ratios(|t, level| {
+                    t.tail.upper[level].blocked.1 / t.tail.upper[level].nominal
+                }),
+            },
+            constant_series("honest", 1.0, TAIL_LEVELS.len()),
+            constant_series("warn", TAIL_RATIO_WARN, TAIL_LEVELS.len()),
+        ],
+    )?;
     Ok(())
 }
 
@@ -3780,11 +3806,7 @@ pub struct CalibrationPoint {
 /// from the other: the trend is indexed by CHECKPOINT and the policy comparison by LEVERAGE
 /// CAP. Both carry their own axis as an explicit series, the convention the cost curve already
 /// uses, so an index maps onto a step or a cap without reading this source.
-pub fn write_mean_calibration(
-    dir: &Path,
-    label: &str,
-    points: &[CalibrationPoint],
-) -> Result<()> {
+pub fn write_mean_calibration(dir: &Path, label: &str, points: &[CalibrationPoint]) -> Result<()> {
     ensure!(
         !points.is_empty(),
         "the calibration experiment measured no checkpoint, so there is nothing to write"
@@ -3801,9 +3823,8 @@ pub fn write_mean_calibration(
         label: name.to_owned(),
         values: values.iter().map(|v| *v as f32).collect(),
     };
-    let over = |pick: &dyn Fn(&CalibrationPoint) -> f64| -> Vec<f64> {
-        points.iter().map(pick).collect()
-    };
+    let over =
+        |pick: &dyn Fn(&CalibrationPoint) -> f64| -> Vec<f64> { points.iter().map(pick).collect() };
     // NaN when the pass did not form the decomposition, which is the absent state and not a
     // measured zero: a mass of zero would be a finding, and this is the lack of one.
     let arm = |point: &CalibrationPoint, pick: &dyn Fn(&OuterDecomposition) -> f64| -> f64 {
@@ -3819,7 +3840,10 @@ pub fn write_mean_calibration(
         series_of("step", over(&|p| p.step as f64)),
         series_of("perfect calibration", vec![1.0; points.len()]),
         series_of("beta, mean (traded)", over(&|p| p.eval.mean.beta)),
-        series_of("beta ci low, mean (traded)", over(&|p| p.eval.mean.beta_ci.0)),
+        series_of(
+            "beta ci low, mean (traded)",
+            over(&|p| p.eval.mean.beta_ci.0),
+        ),
         series_of(
             "beta ci high, mean (traded)",
             over(&|p| p.eval.mean.beta_ci.1),
@@ -3904,7 +3928,9 @@ pub fn write_mean_calibration(
         let tag = &point.label;
         let pick = |name: &str, extract: &dyn Fn(usize) -> f64| ReportSeries {
             label: format!("{tag} {name}"),
-            values: (0..CAP_GRID.len()).map(|slot| extract(slot) as f32).collect(),
+            values: (0..CAP_GRID.len())
+                .map(|slot| extract(slot) as f32)
+                .collect(),
         };
         policy.push(pick("edge unshrunk (bps/bar)", &|slot| {
             curve[slot].unshrunk.edge * 1e4
@@ -4023,9 +4049,7 @@ fn write_no_trade_band(dir: &Path, suffix: &str, points: &[CalibrationPoint]) ->
             );
             let pick = |name: &str, extract: &dyn Fn(usize) -> f64| ReportSeries {
                 label: format!("{tag} {name}"),
-                values: (0..SIZING_KNOBS)
-                    .map(|slot| extract(slot) as f32)
-                    .collect(),
+                values: (0..SIZING_KNOBS).map(|slot| extract(slot) as f32).collect(),
             };
             series.push(pick("edge (bps/bar)", &|slot| {
                 sweep.points[slot].edge.mean * 1e4
@@ -4049,7 +4073,9 @@ fn write_no_trade_band(dir: &Path, suffix: &str, points: &[CalibrationPoint]) ->
                 sweep.points[slot].gross.net_growth * 1e4
             }));
             series.push(pick("sharpe net", &|slot| sweep.points[slot].policy.sharpe));
-            series.push(pick("sharpe GROSS", &|slot| sweep.points[slot].gross.sharpe));
+            series.push(pick("sharpe GROSS", &|slot| {
+                sweep.points[slot].gross.sharpe
+            }));
             series.push(pick("hit rate", &|slot| sweep.points[slot].policy.hit_rate));
             series.push(pick("turnover/bar", &|slot| {
                 sweep.points[slot].policy.turnover
@@ -4156,7 +4182,9 @@ fn write_edge_attribution(dir: &Path, suffix: &str, points: &[CalibrationPoint])
             charted_break_even(attribution.arms[arm].break_even_bps)
         }));
         series.push(pick("sharpe", &|arm| attribution.arms[arm].policy.sharpe));
-        series.push(pick("hit rate", &|arm| attribution.arms[arm].policy.hit_rate));
+        series.push(pick("hit rate", &|arm| {
+            attribution.arms[arm].policy.hit_rate
+        }));
         series.push(pick("turnover/bar", &|arm| {
             attribution.arms[arm].policy.turnover
         }));
@@ -4191,7 +4219,10 @@ fn write_edge_attribution(dir: &Path, suffix: &str, points: &[CalibrationPoint])
 /// arm anywhere in them, and they are what makes a sub-coin-flip hit rate beside a positive
 /// edge arithmetically possible rather than merely asserted.
 fn write_edge_panel(dir: &Path, suffix: &str, points: &[CalibrationPoint]) -> Result<()> {
-    if points.iter().all(|point| !point.attribution.panel.measured()) {
+    if points
+        .iter()
+        .all(|point| !point.attribution.panel.measured())
+    {
         return Ok(());
     }
     let mut series = vec![ReportSeries {
@@ -4242,9 +4273,15 @@ fn write_edge_panel(dir: &Path, suffix: &str, points: &[CalibrationPoint]) -> Re
             },
         ]
     };
-    series.extend(effect("SIGN effect (bps/bar)", &|a: &EdgeAttribution| a.sign_effect));
-    series.extend(effect("SIZE effect (bps/bar)", &|a: &EdgeAttribution| a.size_effect));
-    series.extend(effect("INTERACTION (bps/bar)", &|a: &EdgeAttribution| a.interaction));
+    series.extend(effect("SIGN effect (bps/bar)", &|a: &EdgeAttribution| {
+        a.sign_effect
+    }));
+    series.extend(effect("SIZE effect (bps/bar)", &|a: &EdgeAttribution| {
+        a.size_effect
+    }));
+    series.extend(effect("INTERACTION (bps/bar)", &|a: &EdgeAttribution| {
+        a.interaction
+    }));
     series.extend(effect("DRIFT corner (bps/bar)", &|a: &EdgeAttribution| {
         a.drift_edge()
     }));
@@ -4274,7 +4311,10 @@ fn write_edge_panel(dir: &Path, suffix: &str, points: &[CalibrationPoint]) -> Re
 /// `|f*|` says the model knows where its own sign is good, which is a direction predictor with
 /// heterogeneous confidence and a different object entirely.
 fn write_edge_confidence(dir: &Path, suffix: &str, points: &[CalibrationPoint]) -> Result<()> {
-    if points.iter().all(|point| !point.attribution.panel.measured()) {
+    if points
+        .iter()
+        .all(|point| !point.attribution.panel.measured())
+    {
         return Ok(());
     }
     let mut series = vec![ReportSeries {
@@ -4314,11 +4354,7 @@ fn write_edge_confidence(dir: &Path, suffix: &str, points: &[CalibrationPoint]) 
                 .map(|decile| {
                     // The last decile is open-ended above, so its upper cut is not a number the
                     // split produced and is reported absent rather than as the largest `|f*|`.
-                    panel
-                        .cuts()
-                        .get(decile)
-                        .copied()
-                        .unwrap_or(f64::NAN) as f32
+                    panel.cuts().get(decile).copied().unwrap_or(f64::NAN) as f32
                 })
                 .collect(),
         });
@@ -4564,7 +4600,12 @@ fn write_signal_decay(dir: &Path, suffix: &str, points: &[CalibrationPoint]) -> 
         }
         let tag = &point.label;
         let row = |extract: &dyn Fn(&super::trade_bench::DecayPoint) -> f64| -> Vec<f32> {
-            point.decay.points.iter().map(|p| extract(p) as f32).collect()
+            point
+                .decay
+                .points
+                .iter()
+                .map(|p| extract(p) as f32)
+                .collect()
         };
         series.push(ReportSeries {
             label: format!("{tag} hit rate"),
@@ -5300,7 +5341,10 @@ fn push_trade_series(series: &mut Vec<ReportSeries>, trade: &TradeBench) {
             stats.gross_growth * 1e4,
         ));
         series.push(point_series(&format!("trade {name} sharpe"), stats.sharpe));
-        series.push(point_series(&format!("trade {name} hit rate"), stats.hit_rate));
+        series.push(point_series(
+            &format!("trade {name} hit rate"),
+            stats.hit_rate,
+        ));
         series.push(point_series(
             &format!("trade {name} turnover/bar"),
             stats.turnover,
@@ -5309,7 +5353,10 @@ fn push_trade_series(series: &mut Vec<ReportSeries>, trade: &TradeBench) {
             &format!("trade {name} time in market"),
             stats.time_in_market,
         ));
-        series.push(point_series(&format!("trade {name} mean |f|"), stats.mean_abs_position));
+        series.push(point_series(
+            &format!("trade {name} mean |f|"),
+            stats.mean_abs_position,
+        ));
         series.push(point_series(
             &format!("trade {name} capped fraction"),
             stats.clamped_fraction,
@@ -5331,14 +5378,26 @@ fn push_trade_series(series: &mut Vec<ReportSeries>, trade: &TradeBench) {
         "trade EDGE vs marginal bps/bar",
         trade.model_edge().mean * 1e4,
     ));
-    series.push(point_series("trade edge se bps/bar", trade.model_edge().se * 1e4));
-    series.push(point_series("trade edge ci95 low bps/bar", trade.model_edge().ci_low * 1e4));
+    series.push(point_series(
+        "trade edge se bps/bar",
+        trade.model_edge().se * 1e4,
+    ));
+    series.push(point_series(
+        "trade edge ci95 low bps/bar",
+        trade.model_edge().ci_low * 1e4,
+    ));
     series.push(point_series(
         "trade edge ci95 high bps/bar",
         trade.model_edge().ci_high * 1e4,
     ));
-    series.push(point_series("trade edge blocks", trade.model_edge().blocks as f64));
-    series.push(point_series("trade break-even cost bps", trade.model_break_even()));
+    series.push(point_series(
+        "trade edge blocks",
+        trade.model_edge().blocks as f64,
+    ));
+    series.push(point_series(
+        "trade break-even cost bps",
+        trade.model_break_even(),
+    ));
     series.push(point_series(
         "trade share of the perfect-foresight ceiling",
         trade.model_capture(),
@@ -5537,7 +5596,10 @@ pub fn write_bar_family(dir: &Path, fit: &BarFamilyFit) -> Result<()> {
             "density per unit / bin edge",
             ScaleKind::Symlog,
             vec![
-                of("bin midpoint (the x axis of this panel)".to_owned(), midpoints),
+                of(
+                    "bin midpoint (the x axis of this panel)".to_owned(),
+                    midpoints,
+                ),
                 of("bin width".to_owned(), widths),
                 of(
                     format!(
@@ -5600,7 +5662,10 @@ pub fn write_bar_family(dir: &Path, fit: &BarFamilyFit) -> Result<()> {
         "exceedance probability / threshold bps / rows",
         ScaleKind::Symlog,
         vec![
-            of("threshold bps (the x axis of this panel)".to_owned(), thresholds),
+            of(
+                "threshold bps (the x axis of this panel)".to_owned(),
+                thresholds,
+            ),
             of(
                 "empirical P(|r| > x) on THIS draw".to_owned(),
                 tail.grid.iter().map(|p| p.empirical_exceedance).collect(),
@@ -5630,7 +5695,10 @@ pub fn write_bar_family(dir: &Path, fit: &BarFamilyFit) -> Result<()> {
                 band(tail.measured_band.0),
             ),
             of(
-                format!("BAND EDGE, slope {:.2}: same band, other end", tail.measured_band.1),
+                format!(
+                    "BAND EDGE, slope {:.2}: same band, other end",
+                    tail.measured_band.1
+                ),
                 band(tail.measured_band.1),
             ),
         ],
@@ -5655,7 +5723,10 @@ pub fn write_bar_family(dir: &Path, fit: &BarFamilyFit) -> Result<()> {
             dof.sweep.iter().map(|p| p.holdout_nll).collect(),
         ));
         sweep_series.push(of(
-            format!("{} fit nats/bar (in sample, NOT the criterion)", BAR_DOF_NAMES[dof.dof]),
+            format!(
+                "{} fit nats/bar (in sample, NOT the criterion)",
+                BAR_DOF_NAMES[dof.dof]
+            ),
             dof.sweep.iter().map(|p| p.fit_nll).collect(),
         ));
         sweep_series.push(of(
@@ -5699,7 +5770,10 @@ pub fn write_bar_family(dir: &Path, fit: &BarFamilyFit) -> Result<()> {
         "nats/bar / free parameters",
         ScaleKind::Symlog,
         vec![
-            of("dof index (the x axis of this panel)".to_owned(), dof_axis.clone()),
+            of(
+                "dof index (the x axis of this panel)".to_owned(),
+                dof_axis.clone(),
+            ),
             of(
                 "continuous family nats/bar, mixed-measure density footing (counting on the \
                  atoms, Lebesgue elsewhere)"
@@ -5737,7 +5811,10 @@ pub fn write_bar_family(dir: &Path, fit: &BarFamilyFit) -> Result<()> {
             ),
             of(
                 "continuous family free parameters".to_owned(),
-                fit.dofs.iter().map(|d| d.free_parameters() as f64).collect(),
+                fit.dofs
+                    .iter()
+                    .map(|d| d.free_parameters() as f64)
+                    .collect(),
             ),
             of(
                 "discrete free parameters (127 masses per DOF)".to_owned(),
@@ -5894,9 +5971,7 @@ pub fn write_bar_family(dir: &Path, fit: &BarFamilyFit) -> Result<()> {
                     .collect(),
             ),
             of(
-                format!(
-                    "the live LEVERAGE_CAP, {LEVERAGE_CAP}x, for reference against the F axis"
-                ),
+                format!("the live LEVERAGE_CAP, {LEVERAGE_CAP}x, for reference against the F axis"),
                 vec![LEVERAGE_CAP; fit.ruin.rows.len()],
             ),
             of(
@@ -5951,7 +6026,11 @@ pub fn write_bar_seams(dir: &Path, audit: &SeamAudit) -> Result<()> {
     // question "how many of them are splits" are only meaningful together.
     let mut level_axis: Vec<f64> = CENSUS_LOG_LEVELS.to_vec();
     let mut level_counts: Vec<f64> = census.level_counts.iter().map(|c| *c as f64).collect();
-    let mut level_share: Vec<f64> = census.level_counts.iter().map(|c| *c as f64 / bars).collect();
+    let mut level_share: Vec<f64> = census
+        .level_counts
+        .iter()
+        .map(|c| *c as f64 / bars)
+        .collect();
     let mut level_kind: Vec<f64> = vec![0.0; CENSUS_LOG_LEVELS.len()];
     for count in census.criterion_counts() {
         level_axis.push(f64::NAN);
@@ -6024,7 +6103,10 @@ pub fn write_bar_seams(dir: &Path, audit: &SeamAudit) -> Result<()> {
             ),
             of(
                 "extreme bars whose exp(r) is nearest this ratio".to_owned(),
-                ranked[..listed].iter().map(|(_, total, _)| *total as f64).collect(),
+                ranked[..listed]
+                    .iter()
+                    .map(|(_, total, _)| *total as f64)
+                    .collect(),
             ),
             of(
                 "of those, bars satisfying ALL FOUR criteria with exp(r) EXACTLY on the ratio - \
@@ -6048,11 +6130,17 @@ pub fn write_bar_seams(dir: &Path, audit: &SeamAudit) -> Result<()> {
                 "numerator of the ratio, so a reader can name it: 5 with denominator 1 is a 5:1 \
                  split, 1 with denominator 5 a 1:5 reverse split"
                     .to_owned(),
-                ranked[..listed].iter().map(|(r, _, _)| f64::from(r.num)).collect(),
+                ranked[..listed]
+                    .iter()
+                    .map(|(r, _, _)| f64::from(r.num))
+                    .collect(),
             ),
             of(
                 "denominator of the ratio".to_owned(),
-                ranked[..listed].iter().map(|(r, _, _)| f64::from(r.den)).collect(),
+                ranked[..listed]
+                    .iter()
+                    .map(|(r, _, _)| f64::from(r.den))
+                    .collect(),
             ),
         ],
     )?;
@@ -6129,14 +6217,19 @@ pub fn write_bar_seams(dir: &Path, audit: &SeamAudit) -> Result<()> {
         format!(
             "Six Pairwise Tail Slopes On |r|, Control Against Seam-Removed - {} to {} of {} draw \
              rows removed",
-            audit.draw_rows_removed[TIER_EXACT], audit.draw_rows_removed[TIER_NEAR], audit.draw_rows
+            audit.draw_rows_removed[TIER_EXACT],
+            audit.draw_rows_removed[TIER_NEAR],
+            audit.draw_rows
         ),
         "pair index over the four exceedance levels 1e-2/3e-3/1e-3/3e-4 (see the `p high` and `p \
          low` series)",
         "slope / exceedance level / threshold bps",
         ScaleKind::Symlog,
         vec![
-            of("pair index (the x axis of this panel)".to_owned(), slope_axis),
+            of(
+                "pair index (the x axis of this panel)".to_owned(),
+                slope_axis,
+            ),
             of(
                 "p high, the nearer level of the pair".to_owned(),
                 audit.control.slopes.iter().map(|s| s.p_high).collect(),
@@ -6326,7 +6419,10 @@ pub fn write_bar_seams(dir: &Path, audit: &SeamAudit) -> Result<()> {
         "log bound / bps / leverage",
         ScaleKind::Symlog,
         vec![
-            of("row index (the x axis of this panel)".to_owned(), licence_axis),
+            of(
+                "row index (the x axis of this panel)".to_owned(),
+                licence_axis,
+            ),
             of("lower edge lo[r][0] in bps".to_owned(), edges_lo),
             of("upper edge hi[r][127] in bps".to_owned(), edges_hi),
             of(
@@ -6394,9 +6490,8 @@ pub fn write_mem_probe(
         values: values.iter().map(|value| *value as f32).collect(),
     };
 
-    let spine = |pick: &dyn Fn(&GapPoint) -> f64| -> Vec<f64> {
-        gap_points.iter().map(pick).collect()
-    };
+    let spine =
+        |pick: &dyn Fn(&GapPoint) -> f64| -> Vec<f64> { gap_points.iter().map(pick).collect() };
     write_chart(
         dir,
         "memprobe_epoch_spine",
@@ -6524,7 +6619,10 @@ pub fn write_mem_probe(
     ];
     for arm in [seen_more, seen_fewer] {
         repetition.push(point_series(
-            &format!("{} - nll LEVEL, nats/bar (a level, not a contrast)", arm.label),
+            &format!(
+                "{} - nll LEVEL, nats/bar (a level, not a contrast)",
+                arm.label
+            ),
             arm.nll.mean,
         ));
         repetition.push(point_series(
@@ -6536,7 +6634,10 @@ pub fn write_mem_probe(
             arm.mean_slope_month.beta,
         ));
         repetition.push(point_series(
-            &format!("{} - blocks (the interval's denominator, not windows)", arm.label),
+            &format!(
+                "{} - blocks (the interval's denominator, not windows)",
+                arm.label
+            ),
             arm.blocks as f64,
         ));
         repetition.push(point_series(
@@ -6562,9 +6663,8 @@ pub fn write_mem_probe(
         repetition,
     )?;
 
-    let bucket = |pick: &dyn Fn(&RecencyBucket) -> f64| -> Vec<f64> {
-        recency.iter().map(pick).collect()
-    };
+    let bucket =
+        |pick: &dyn Fn(&RecencyBucket) -> f64| -> Vec<f64> { recency.iter().map(pick).collect() };
     write_chart(
         dir,
         "memprobe_recency",
@@ -6841,11 +6941,11 @@ fn write_report_at(path: &Path, report: &Report) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::trade_bench::{
-        BenchConfig, TailCounts, WindowPaths, DEFAULT_COST_BPS, POLICY_HALF,
-        POLICY_KELLY_MULTIPLE, POLICY_QUARTER,
+        BenchConfig, TailCounts, WindowPaths, DEFAULT_COST_BPS, POLICY_HALF, POLICY_KELLY_MULTIPLE,
+        POLICY_QUARTER,
     };
+    use super::*;
     use crate::torch::test_rng;
     use shared::report::read_report;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7147,13 +7247,7 @@ mod tests {
     /// the exponential of a Gaussian random walk. `E[exp(r)] = 1`, so the process is a
     /// martingale and the analytic median of its close at horizon `t` is
     /// `exp(-(t + 1) sigma^2 / 2)` — nothing else.
-    fn martingale_rollout(
-        windows: i64,
-        samples: i64,
-        steps: i64,
-        sigma: f64,
-        seed: u64,
-    ) -> Tensor {
+    fn martingale_rollout(windows: i64, samples: i64, steps: i64, sigma: f64, seed: u64) -> Tensor {
         cap_torch_threads();
         let mut rng = Gaussian(seed);
         let mut values = Vec::with_capacity((windows * samples * steps) as usize * BAR_DOF);
@@ -7245,8 +7339,14 @@ mod tests {
             // The one measurable window still reports, and it reports ITS OWN spread:
             // a single finite draw has no across-window variance, so the se is NaN
             // rather than a zero that would claim certainty.
-            assert!(summary.dclose.is_finite(), "{poison}: the clean window vanished");
-            assert!(summary.dclose_se.is_nan(), "{poison}: one window claimed a spread");
+            assert!(
+                summary.dclose.is_finite(),
+                "{poison}: the clean window vanished"
+            );
+            assert!(
+                summary.dclose_se.is_nan(),
+                "{poison}: one window claimed a spread"
+            );
             assert!(
                 summary.band.is_finite(),
                 "{poison}: the clean window's band width vanished"
@@ -7311,7 +7411,10 @@ mod tests {
                 overlay_indices(window, samples),
                 "the overlay must be a pure function of the pinned seed and the window"
             );
-            assert!(chosen.windows(2).all(|pair| pair[0] < pair[1]), "{chosen:?}");
+            assert!(
+                chosen.windows(2).all(|pair| pair[0] < pair[1]),
+                "{chosen:?}"
+            );
             assert!(chosen.iter().all(|index| *index < samples));
         }
         // Distinct windows must not all show the same five draws, which a seed mixed on
@@ -7330,8 +7433,7 @@ mod tests {
         let read_back = |name: &str| -> Vec<Vec<f32>> {
             let dir = scratch_dir(name);
             write_candle_windows(&dir, 3, Some(2), &rollout, &future).expect("snapshot writes");
-            let report =
-                read_report(&dir.join("step3_epoch002_window01_fan.report.bin")).unwrap();
+            let report = read_report(&dir.join("step3_epoch002_window01_fan.report.bin")).unwrap();
             fs::remove_dir_all(&dir).ok();
             let ReportKind::CandleFan { samples, .. } = report.kind else {
                 panic!("expected CandleFan");
@@ -7437,7 +7539,9 @@ mod tests {
     /// bins, which is the adversarial case for the chaining.
     #[test]
     fn a_hundred_bar_ancestral_rollout_stays_finite_and_decodes_to_valid_bars() {
-        use crate::torch::dataset::{BAR_TIME_CARDINALITY, BAR_TIME_FEATURES};
+        use crate::torch::dataset::{
+            time_ids_without_market, BAR_TIME_CARDINALITY, BAR_TIME_FEATURES, MARKET_MISSING,
+        };
         use crate::torch::world_model::{BarKvCache, BarModules, BarSupportSet, BAR_MAX_CONTEXT};
         use tch::nn::VarStore;
         let _torch_rng_guard = test_rng::shared();
@@ -7500,7 +7604,7 @@ mod tests {
             Tensor::from_slice(&values).view([1, len, BAR_TIME_FEATURES as i64])
         };
         let history_time_ids = time_ids(history, 570, 64);
-        let future_time_ids = time_ids(steps, 600, 0);
+        let future_time_ids = time_ids(steps, 600, MARKET_MISSING);
 
         let vs = VarStore::new(Device::Cpu);
         let modules = BarModules::new(&vs.root());
@@ -7524,12 +7628,14 @@ mod tests {
         let mut drawn = Vec::with_capacity(steps as usize);
         let decode_started = std::time::Instant::now();
         for step in 0..steps {
-            let dof = modules.head.sample(&h, set.only(), 1.0);
+            let ids = future_ids.narrow(1, step, 1);
+            let missing_market = time_ids_without_market(&ids);
+            let conditioning = modules.trunk.forecast_conditioning(&ids, &missing_market);
+            let dof = modules.head.sample(&h, &conditioning, set.only(), 1.0);
             assert!(
                 bool::try_from(dof.isfinite().all()).expect("finite"),
                 "the ancestral draw at step {step} went non-finite"
             );
-            let ids = future_ids.narrow(1, step, 1);
             h = modules
                 .trunk
                 .forward_cached(&dof, &set.bin_ids(&dof, &ids), &ids, &mut cache);
@@ -7562,7 +7668,8 @@ mod tests {
         const PRODUCTION_PREFILL: i64 = DIAGNOSTIC_CONTEXT - DEEPEST;
         const _: () = assert!(PRODUCTION_PREFILL > 512 && PRODUCTION_PREFILL <= 1024);
         const _: () = assert!(PRODUCTION_PREFILL + DEEPEST <= 1024);
-        const _: () = assert!(DIAGNOSTIC_CONTEXT - 64 > 512 && DIAGNOSTIC_CONTEXT - 64 + 64 <= 1024);
+        const _: () =
+            assert!(DIAGNOSTIC_CONTEXT - 64 > 512 && DIAGNOSTIC_CONTEXT - 64 + 64 <= 1024);
 
         // Through the writer, which is where the chaining and the fan live. `drawn[step]`
         // is `[paths, 1, BAR_DOF]`, so concatenating on the step axis gives
@@ -7577,7 +7684,9 @@ mod tests {
         for (index, horizon) in ROLLOUT_HORIZONS.iter().enumerate() {
             let t = horizon - 1;
             assert!(
-                fan.quantiles.iter().all(|row| row[t].is_finite() && row[t] > 0.0),
+                fan.quantiles
+                    .iter()
+                    .all(|row| row[t].is_finite() && row[t] > 0.0),
                 "horizon {horizon} (slot {index}) is not a finite positive price"
             );
             assert!(fan.rank[t].is_finite());
@@ -7642,10 +7751,10 @@ mod tests {
         metrics.val_nll_bar_se = 0.05;
         metrics.val_nll_bar_ci = (20.9, 21.1);
         metrics.val_nll_bar_se_level = 0.10;
-        // Marginalizing the chain can only cost nats, so the forecast row sits above the
-        // teacher-forced one on identical rows.
-        metrics.val_forecast_nll_dof = [4.6; BAR_DOF];
-        metrics.val_forecast_teacher_nll_dof = [4.2; BAR_DOF];
+        // The independent-marginal sum sits above the chain-conditional joint score on the
+        // same rows by the descriptive marginal-joint score gap.
+        metrics.val_independent_marginal_nll_dof = [4.6; BAR_DOF];
+        metrics.val_chain_conditional_nll_dof = [4.2; BAR_DOF];
         // Three ramp stages, the last one still in progress: the shape a run reports at a
         // periodic validation mid-pass, and the shape the shortfall chart is for.
         metrics.stage_coverage = vec![1.0, 1.0, 0.31];
@@ -7665,14 +7774,14 @@ mod tests {
         metrics.run_effective_epochs = 2.8532;
         metrics.projected_effective_epochs = 3.0000625;
         metrics.planned_effective_epochs = 3.0;
-        metrics.val_forecast_nll_se = 0.03;
+        metrics.val_independent_marginal_nll_se = 0.03;
         metrics.val_promotion_context = 2048.0;
         metrics.reached_context = 2048.0;
-        metrics
-            .val_pit
-            .accumulate(&(Tensor::arange(512, (Kind::Float, Device::Cpu)) / 512.0)
+        metrics.val_pit.accumulate(
+            &(Tensor::arange(512, (Kind::Float, Device::Cpu)) / 512.0)
                 .unsqueeze(-1)
-                .repeat([1, BAR_DOF as i64]));
+                .repeat([1, BAR_DOF as i64]),
+        );
         metrics.trade = populated_trade();
         metrics
     }
@@ -7686,7 +7795,13 @@ mod tests {
             .map(|window| {
                 let bars = 48usize;
                 let realized: Vec<f64> = (0..bars)
-                    .map(|bar| if (bar + window) % 3 == 0 { 0.004 } else { -0.001 })
+                    .map(|bar| {
+                        if (bar + window) % 3 == 0 {
+                            0.004
+                        } else {
+                            -0.001
+                        }
+                    })
                     .collect();
                 // The UNCAPPED log-optimal fraction is the primitive, exactly as
                 // `WindowPaths::free` documents: the model leans the right way more often
@@ -7698,7 +7813,11 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(bar, r)| {
-                        let direction = if bar % 5 == 0 { -r.signum() } else { r.signum() };
+                        let direction = if bar % 5 == 0 {
+                            -r.signum()
+                        } else {
+                            r.signum()
+                        };
                         let size = if bar % 7 == 0 { 1.5 * cap } else { 0.9 * cap };
                         direction * size
                     })
@@ -7715,7 +7834,14 @@ mod tests {
                 WindowPaths::unmeasured(
                     realized,
                     free,
-                    [model, half, quarter, vec![0.5; bars], vec![1.0; bars], oracle],
+                    [
+                        model,
+                        half,
+                        quarter,
+                        vec![0.5; bars],
+                        vec![1.0; bars],
+                        oracle,
+                    ],
                 )
             })
             .collect();
@@ -7756,14 +7882,23 @@ mod tests {
                     .map(|window| {
                         let bars = 48usize;
                         let realized: Vec<f64> = (0..bars)
-                            .map(|bar| if (bar + window) % 3 == 0 { 0.004 } else { -0.001 })
+                            .map(|bar| {
+                                if (bar + window) % 3 == 0 {
+                                    0.004
+                                } else {
+                                    -0.001
+                                }
+                            })
                             .collect();
                         let free: Vec<f64> = realized
                             .iter()
                             .enumerate()
                             .map(|(bar, r)| {
-                                let direction =
-                                    if bar % 5 == 0 { -r.signum() } else { r.signum() };
+                                let direction = if bar % 5 == 0 {
+                                    -r.signum()
+                                } else {
+                                    r.signum()
+                                };
                                 direction * if bar % 7 == 0 { 1.5 * cap } else { 0.9 * cap }
                             })
                             .collect();
@@ -7772,8 +7907,7 @@ mod tests {
                                 .map(|position| (multiple * position).clamp(-cap, cap))
                                 .collect()
                         };
-                        let oracle: Vec<f64> =
-                            realized.iter().map(|r| cap * r.signum()).collect();
+                        let oracle: Vec<f64> = realized.iter().map(|r| cap * r.signum()).collect();
                         let mut paths = WindowPaths::unmeasured(
                             realized.clone(),
                             free.clone(),
@@ -7796,8 +7930,7 @@ mod tests {
                         paths
                     })
                     .collect();
-                let blocks: Vec<u64> =
-                    (0..windows.len() as u64).map(|window| window / 2).collect();
+                let blocks: Vec<u64> = (0..windows.len() as u64).map(|window| window / 2).collect();
                 let config = BenchConfig::new(DEFAULT_COST_BPS, cap, 0.5);
                 let trade = super::super::trade_bench::bench(
                     &windows,
@@ -7819,11 +7952,7 @@ mod tests {
                 ] {
                     for shape in super::super::trade_bench::SIZING_SHAPES {
                         if let Some(sweep) = super::super::trade_bench::band_sweep(
-                            &windows,
-                            &blocks,
-                            config,
-                            source,
-                            shape,
+                            &windows, &blocks, config, source, shape,
                         ) {
                             bands.push(sweep);
                         }
@@ -7833,10 +7962,7 @@ mod tests {
                     .into_iter()
                     .filter_map(|shape| {
                         super::super::trade_bench::band_shrink_overlap(
-                            &windows,
-                            &blocks,
-                            config,
-                            shape,
+                            &windows, &blocks, config, shape,
                         )
                     })
                     .flatten()
@@ -7925,7 +8051,9 @@ mod tests {
                 panic!("{base} must be a multi-line chart");
             };
             assert!(
-                series.iter().any(|s| s.values.iter().any(|v| v.is_finite())),
+                series
+                    .iter()
+                    .any(|s| s.values.iter().any(|v| v.is_finite())),
                 "{base} holds no finite value"
             );
             // Every series shares the base's x-axis, or the reader is aligning two different
@@ -7954,8 +8082,8 @@ mod tests {
 
         // The trend chart has to carry the STEP axis and the perfect-calibration reference,
         // because a slope of 0.62 means nothing to a reader who cannot see where 1.0 is.
-        let trend = read_report(&root.join("pretrain_mean_calibration.report.bin"))
-            .expect("reads back");
+        let trend =
+            read_report(&root.join("pretrain_mean_calibration.report.bin")).expect("reads back");
         let ReportKind::MultiLine { series } = trend.kind else {
             panic!("multi-line");
         };
@@ -8073,8 +8201,8 @@ mod tests {
             bench_secs: 14.0,
             snapshot_secs: 6.0,
             val_nll_bar: 21.5 - epoch as f64 * 0.1,
-            forecast_nll_bar: 22.4 - epoch as f64 * 0.1,
-            teacher_forcing_inflation: 0.9,
+            independent_marginal_nll_bar: 22.4 - epoch as f64 * 0.1,
+            marginal_joint_score_gap: 0.9,
             dyn_vs_identity: 0.87,
             trade: populated_trade(),
         }
@@ -8114,7 +8242,8 @@ mod tests {
             metrics.capacity_ceiling_gib = 26.9;
             // A real corpus never covers every bar, so the fixture does not either: an
             // all-observed fixture would pass the registry walk on a constant 100.
-            metrics.market_total_bars = (metrics.batch_size * (metrics.context as usize + 1)) as u64;
+            metrics.market_total_bars =
+                (metrics.batch_size * (metrics.context as usize + 1)) as u64;
             metrics.market_missing_bars = metrics.market_total_bars / 20;
             reporter.record_step(&metrics).unwrap();
         }
@@ -8191,6 +8320,27 @@ mod tests {
                  the TUI never scans for it and the chart is invisible; add it there"
             );
         }
+        let marginal_report =
+            read_report(&dir.join("pretrain_independent_marginal_nll.report.bin"))
+                .expect("independent-marginal report reads");
+        let ReportKind::MultiLine { series } = marginal_report.kind else {
+            panic!("independent-marginal report must be a multiline chart");
+        };
+        let labels: Vec<&str> = series.iter().map(|series| series.label.as_str()).collect();
+        for required in [
+            "independent per-DOF marginals (sum)",
+            "chain-conditional joint (same rows)",
+            "marginal-joint score gap",
+        ] {
+            assert!(
+                labels.contains(&required),
+                "honest diagnostic label {required:?} is missing from {labels:?}"
+            );
+        }
+        assert!(
+            !dir.join("pretrain_forecast_nll.report.bin").exists(),
+            "the misleading old report base must not be written"
+        );
 
         let snapshots = dir.join("candle_snapshots");
         for window in 1..=windows {
@@ -8200,12 +8350,10 @@ mod tests {
             ));
             assert!(path.exists(), "missing snapshot {}", path.display());
         }
-        let compare = read_report(
-            &snapshots.join(format!(
-                "step{}_epoch000_window01_fan.report.bin",
-                STEP_DECIMATION
-            )),
-        )
+        let compare = read_report(&snapshots.join(format!(
+            "step{}_epoch000_window01_fan.report.bin",
+            STEP_DECIMATION
+        )))
         .unwrap();
         // Nothing here may be called `predicted`, and the chart must carry the two
         // numbers that separate miscalibration from ordinary dispersion and from the
@@ -8353,17 +8501,18 @@ mod tests {
                 fans.len()
             );
             for window in 1..=windows {
-                let path =
-                    dir.join(format!("step{step}_epoch{epoch:03}_window{window:02}_fan.report.bin"));
+                let path = dir.join(format!(
+                    "step{step}_epoch{epoch:03}_window{window:02}_fan.report.bin"
+                ));
                 assert!(
                     path.exists(),
                     "a fan must name both its epoch and its step: {}",
                     path.display()
                 );
             }
-            let report = read_report(
-                &dir.join(format!("step{step}_epoch{epoch:03}_window01_fan.report.bin")),
-            )
+            let report = read_report(&dir.join(format!(
+                "step{step}_epoch{epoch:03}_window01_fan.report.bin"
+            )))
             .expect("fan reads back");
             let ReportKind::CandleFan { actual, .. } = report.kind else {
                 panic!("expected CandleFan at epoch {epoch}");
@@ -8482,9 +8631,7 @@ mod tests {
         // And the on-plan fixture must NOT trip it, or the warning is noise.
         let healthy = populated_boundary(0, 100);
         assert!((healthy.projected_epochs() - REQUESTED_EPOCHS as f64).abs() < 1e-9);
-        assert!(
-            healthy.projected_fraction() >= super::super::pretrain::BAR_TOKEN_SHORTFALL_WARN
-        );
+        assert!(healthy.projected_fraction() >= super::super::pretrain::BAR_TOKEN_SHORTFALL_WARN);
     }
 
     /// The STANDALONE bench path, which has no [`PretrainReporter`] and therefore no
@@ -8518,7 +8665,10 @@ mod tests {
         );
         for base in bases {
             let path = root.join(format!("{base}.report.bin"));
-            assert!(path.exists(), "{base} was never written by the standalone bench");
+            assert!(
+                path.exists(),
+                "{base} was never written by the standalone bench"
+            );
             let report = read_report(&path).expect("report reads back");
             match report.kind {
                 // A histogram lands as one of these two; anything else is not a chart of
@@ -8661,8 +8811,8 @@ mod tests {
         );
         // The diagnostic panel, on the same tick, IS measured — that is the whole point of
         // decoupling it from the promotion gate.
-        let diag = read_report(&root.join("0").join("pretrain_nll_bar_diag896.report.bin"))
-            .unwrap();
+        let diag =
+            read_report(&root.join("0").join("pretrain_nll_bar_diag896.report.bin")).unwrap();
         let ReportKind::MultiLine { series } = diag.kind else {
             panic!("expected MultiLine");
         };
@@ -8683,22 +8833,21 @@ mod tests {
         battery.rollout_nll_exact = [21.4, 22.1, 22.9, 23.8, 24.4];
         battery.rollout_nll_dynamics = [21.5, 22.4, 23.6, 25.1, 26.2];
         battery.dir_acc = 0.514;
-        battery
-            .pit
-            .accumulate(&(Tensor::arange(1024, (Kind::Float, Device::Cpu)) / 1024.0)
+        battery.pit.accumulate(
+            &(Tensor::arange(1024, (Kind::Float, Device::Cpu)) / 1024.0)
                 .unsqueeze(-1)
-                .repeat([1, BAR_DOF as i64]));
+                .repeat([1, BAR_DOF as i64]),
+        );
         battery.corpus_fingerprint = "c".repeat(64);
         battery.split_bounds = (1_600_000_000_000, 1_650_000_000_000);
         battery.nll_bar_conditional = 22.1;
         battery.nll_dof_conditional = [4.2, 4.3, 4.55, 4.65, 4.4];
         battery.nll_bar_se = 0.031;
         battery.nll_bar_ci = (21.34, 21.46);
-        // Marginalizing the intra-bar chain can only cost nats, so the forecast row is above
-        // the teacher-forced one on identical rows.
-        battery.forecast_nll_dof = [4.35, 4.62, 4.71, 4.78, 4.58];
-        battery.forecast_teacher_nll_dof = [4.2, 4.3, 4.2, 4.3, 4.4];
-        battery.forecast_nll_se = 0.019;
+        // Independent marginals sum above the chain-conditional joint score on identical rows.
+        battery.independent_marginal_nll_dof = [4.35, 4.62, 4.71, 4.78, 4.58];
+        battery.chain_conditional_nll_dof = [4.2, 4.3, 4.2, 4.3, 4.4];
+        battery.independent_marginal_nll_se = 0.019;
         battery.selection_context = 896;
         battery.deployed_context = 2048;
         battery.reached_context = 1024;
@@ -8770,12 +8919,13 @@ mod tests {
             assert!(labels.contains(&expected), "battery is missing {expected}");
         }
         for entry in &series {
-            assert_eq!(entry.values.len(), 1, "{} is not a single point", entry.label);
-            assert!(
-                entry.values[0].is_finite(),
-                "{} is not finite",
+            assert_eq!(
+                entry.values.len(),
+                1,
+                "{} is not a single point",
                 entry.label
             );
+            assert!(entry.values[0].is_finite(), "{} is not finite", entry.label);
         }
         let marginal_total: f64 = MARGINAL_DOF.iter().sum();
         let gain = series
@@ -8844,7 +8994,9 @@ mod tests {
             .finish(&battery)
             .expect_err("an empty lineage means no reload happened");
         assert!(
-            error.to_string().contains("reloaded through BarWorldModel::load"),
+            error
+                .to_string()
+                .contains("reloaded through BarWorldModel::load"),
             "unexpected error: {error}"
         );
 
@@ -8859,7 +9011,9 @@ mod tests {
             .record_epoch(&populated_epoch(0, 10, Some(root.join("absent.ot"))))
             .expect_err("promoting a file that is not on disk must fail at once");
         assert!(
-            error.to_string().contains("save it before reporting the promotion"),
+            error
+                .to_string()
+                .contains("save it before reporting the promotion"),
             "unexpected error: {error}"
         );
 
@@ -8872,7 +9026,9 @@ mod tests {
         let mut reporter = PretrainReporter::new(&root, MARGINAL_DOF);
         let baselines = smoothed_baselines();
         reporter.set_held_out_baselines(baselines);
-        reporter.record_epoch(&populated_epoch(0, 10, None)).unwrap();
+        reporter
+            .record_epoch(&populated_epoch(0, 10, None))
+            .unwrap();
 
         let report =
             read_report(&root.join("0").join("pretrain_nll_vs_baselines.report.bin")).unwrap();
@@ -8894,9 +9050,7 @@ mod tests {
             .iter()
             .find(|s| s.label == "smoothing floor (unreachable)")
             .expect("the smoothed rule must draw its floor");
-        assert!(
-            (floor.values[0] as f64 - (uniform - baselines.scoring_floor_bar)).abs() < 1.0e-4
-        );
+        assert!((floor.values[0] as f64 - (uniform - baselines.scoring_floor_bar)).abs() < 1.0e-4);
 
         let dof_report = read_report(&root.join("0").join("pretrain_nll_dof.report.bin")).unwrap();
         let ReportKind::MultiLine { series } = dof_report.kind else {
@@ -8912,8 +9066,12 @@ mod tests {
         let bare_root = scratch_dir("baselines_bare");
         let mut bare = PretrainReporter::new(&bare_root, [f64::NAN; BAR_DOF]);
         bare.record_epoch(&populated_epoch(0, 10, None)).unwrap();
-        let report =
-            read_report(&bare_root.join("0").join("pretrain_nll_vs_baselines.report.bin")).unwrap();
+        let report = read_report(
+            &bare_root
+                .join("0")
+                .join("pretrain_nll_vs_baselines.report.bin"),
+        )
+        .unwrap();
         let ReportKind::MultiLine { series } = report.kind else {
             panic!("expected MultiLine");
         };
@@ -8993,13 +9151,19 @@ mod tests {
             series.iter().map(|s| &s.label).collect::<Vec<_>>()
         );
         // The per-pass census reads exactly zero at two and three-or-more, as it must.
-        for label in ["targeted 2 times IN THIS PASS", "targeted 3+ times IN THIS PASS"] {
+        for label in [
+            "targeted 2 times IN THIS PASS",
+            "targeted 3+ times IN THIS PASS",
+        ] {
             let line = series
                 .iter()
                 .find(|s| s.label == label)
                 .unwrap_or_else(|| panic!("{label} is charted"));
             assert!(
-                line.values.iter().filter(|v| v.is_finite()).all(|v| *v == 0.0),
+                line.values
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .all(|v| *v == 0.0),
                 "{label} must be zero: a full pass targets each bar exactly once"
             );
         }
@@ -9041,10 +9205,7 @@ mod tests {
             .find(|s| s.label.contains("PROJECTED"))
             .expect("the projection is charted");
         assert!(
-            projected
-                .values
-                .iter()
-                .any(|v| v.is_finite() && *v > 1.0),
+            projected.values.iter().any(|v| v.is_finite() && *v > 1.0),
             "a three-epoch fixture must project above one pass"
         );
 
@@ -9058,15 +9219,12 @@ mod tests {
             "targeted 2 times SO FAR IN THIS RUN (cross-pass)",
             "targeted 3+ times SO FAR IN THIS RUN (cross-pass, NOT a per-pass census)",
         ] {
-            let line = series
-                .iter()
-                .find(|s| s.label == label)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{label} is charted, got {:?}",
-                        series.iter().map(|s| &s.label).collect::<Vec<_>>()
-                    )
-                });
+            let line = series.iter().find(|s| s.label == label).unwrap_or_else(|| {
+                panic!(
+                    "{label} is charted, got {:?}",
+                    series.iter().map(|s| &s.label).collect::<Vec<_>>()
+                )
+            });
             assert!(
                 line.values.iter().any(|v| v.is_finite() && *v > 0.0),
                 "{label} must be positive on a multi-pass fixture: this is the series whose \

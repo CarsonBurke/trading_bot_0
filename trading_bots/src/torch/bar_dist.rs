@@ -6,7 +6,8 @@
 //! module maps `PackedBar` onto those five numbers ([`encode_dof`] /
 //! [`decode_dof`]), discretizes each of them onto an equal-mass quantile support
 //! fitted on training data ([`BarSupports`]), and predicts the bar as a chain of
-//! five categoricals conditioned on a latent ([`BarEmissionHead`]).
+//! five categoricals conditioned on a belief plus forecast-safe clock/market context
+//! ([`BarEmissionHead`]).
 //!
 //! The chain order is [`BAR_CHAIN`] = `r -> s -> u -> v -> w`. `BAR_CHAIN[0]` is the
 //! only factor with no prefix, hence the only one predicted from strictly past
@@ -78,19 +79,20 @@ pub const BAR_VOLUME_EMA_SPAN: f64 = 20.0;
 ///   `BAR_LABEL_SIGMA_RATIO` local bin widths, discretized over the bins. That regularizes
 ///   against a NOISY target, which is what a bootstrapped value estimate is — and what a
 ///   bar observation is not. Kept because the campaign's earlier runs were scored under it.
-/// * [`Self::Hard`] is the one-hot cross entropy on the containing bin: proper for the
-///   discretized law, with no artificial floor, but its scale still moves with
-///   [`NUM_BAR_BINS`] because finer bins mean a smaller per-bin probability.
-/// * [`Self::Density`] is the proper log-likelihood of the MIXED measure we actually
-///   observe: a probability MASS `P(atom)` on an atom, and a DENSITY `P_b / width_b` inside
-///   a continuous bin. It has no floor and, up to discretization error, no dependence on
-///   the bin count at all, which is what makes [`NUM_BAR_BINS`] ablatable.
+/// * [`Self::Hard`] is indexed cross entropy on the containing-bin class: proper for the
+///   discretized law, with no artificial floor or dense one-hot target, but its scale still
+///   moves with [`NUM_BAR_BINS`] because finer bins mean a smaller per-bin probability.
+/// * [`Self::Density`] is a finite-bin measure diagnostic: it scores atom bins as
+///   probability masses and continuous bins as the piecewise-constant quantity
+///   `P_b / width_b`. The fitted support clips observations into finite outer bins, so those
+///   bins do not define normalized continuous tails. This score is neither a proper open-tail
+///   density model nor guaranteed invariant to changing [`NUM_BAR_BINS`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BarScoring {
     Smoothed,
-    Hard,
     #[default]
+    Hard,
     Density,
 }
 
@@ -256,7 +258,9 @@ fn positive_finite(x: f32) -> Option<f64> {
 }
 
 fn safe_price(x: f32, fallback: f64) -> f64 {
-    positive_finite(x).unwrap_or(fallback).clamp(PRICE_FLOOR, PRICE_CEIL)
+    positive_finite(x)
+        .unwrap_or(fallback)
+        .clamp(PRICE_FLOOR, PRICE_CEIL)
 }
 
 fn finite_or(x: f32, fallback: f64) -> f64 {
@@ -309,8 +313,12 @@ pub fn encode_dof(prev_close: f32, bar: &PackedBar, ema_volume: f32) -> BarDof {
         (0.5, 0.5)
     };
 
-    let volume = positive_finite(bar.volume).unwrap_or(VOLUME_FLOOR).max(VOLUME_FLOOR);
-    let reference = positive_finite(ema_volume).unwrap_or(volume).max(VOLUME_FLOOR);
+    let volume = positive_finite(bar.volume)
+        .unwrap_or(VOLUME_FLOOR)
+        .max(VOLUME_FLOOR);
+    let reference = positive_finite(ema_volume)
+        .unwrap_or(volume)
+        .max(VOLUME_FLOOR);
     let w = (volume / reference).ln().clamp(-LOG_LIMIT, LOG_LIMIT);
 
     BarDof {
@@ -344,7 +352,9 @@ pub fn decode_dof(prev_close: f32, dof: &BarDof, ema_volume: f32) -> PackedBar {
     let ln_open = ln_low + v * s;
     let price = |ln_p: f64| ln_p.exp().clamp(PRICE_FLOOR, PRICE_CEIL) as f32;
 
-    let reference = positive_finite(ema_volume).unwrap_or(VOLUME_FLOOR).max(VOLUME_FLOOR);
+    let reference = positive_finite(ema_volume)
+        .unwrap_or(VOLUME_FLOOR)
+        .max(VOLUME_FLOOR);
     let volume = (reference * w.exp()).clamp(0.0, PRICE_CEIL) as f32;
 
     PackedBar {
@@ -986,9 +996,10 @@ impl BarSupports {
             let continuous = is_atom.neg() + 1.0;
             total += (self.smooth(&clamped, &index, BAR_LABEL_SIGMA_RATIO) * &continuous)
                 .sum_dim_intlist([0i64].as_slice(), false, Kind::Float);
-            counted += continuous
-                .squeeze_dim(-1)
-                .sum_dim_intlist([0i64].as_slice(), false, Kind::Float);
+            counted +=
+                continuous
+                    .squeeze_dim(-1)
+                    .sum_dim_intlist([0i64].as_slice(), false, Kind::Float);
         }
         for dof in 0..BAR_DOF {
             let seen = counted.double_value(&[dof as i64]);
@@ -1104,9 +1115,15 @@ impl BarSupports {
             if !high.iter().zip(low.iter()).any(|(h, l)| h > l) {
                 bail!("DOF {name} support has no continuous bin");
             }
-            for (what, row) in [("bin masses", &masses[dof]), ("smoothed marginal", &smoothed_marginal[dof])] {
+            for (what, row) in [
+                ("bin masses", &masses[dof]),
+                ("smoothed marginal", &smoothed_marginal[dof]),
+            ] {
                 if row.len() != bins {
-                    bail!("DOF {name} {what} has {} entries, expected {bins}", row.len());
+                    bail!(
+                        "DOF {name} {what} has {} entries, expected {bins}",
+                        row.len()
+                    );
                 }
                 if let Some(bad) = row.iter().position(|p| !p.is_finite() || *p < 0.0) {
                     bail!("DOF {name} {what} entry {bad} is {}", row[bad]);
@@ -1420,12 +1437,16 @@ impl BarSupports {
     pub fn mean_decode_tensor(&self, convention: MeanDecode) -> Result<&Tensor> {
         match convention {
             MeanDecode::Edge => Ok(&self.centers_t),
-            MeanDecode::Fitted => self.bin_moment_tensors().map(|(mean, _)| mean).ok_or_else(|| {
-                anyhow!(
+            MeanDecode::Fitted => {
+                self.bin_moment_tensors()
+                    .map(|(mean, _)| mean)
+                    .ok_or_else(|| {
+                        anyhow!(
                     "the FITTED mean decode was requested but this support carries no measured \
                      per-bin moments (pre-v{BAR_SUPPORTS_MOMENTS_VERSION} artifact)"
                 )
-            }),
+                    })
+            }
         }
     }
 
@@ -1746,8 +1767,8 @@ impl BarSupports {
     /// CONDITIONED on a non-flat bar: the `0.5` atom is dropped and the rest renormalized.
     /// `r`, `s` and `w` are unchanged, because nothing in the encoding determines them.
     ///
-    /// The measure term is conditioned the same way, so the density rule's conditional
-    /// reference stays the log-likelihood of the same conditioned law.
+    /// The measure term is conditioned the same way, so density scoring remains the same
+    /// finite-bin diagnostic on the conditioned rows.
     ///
     /// This is the honest yardstick for [`crate::torch::train::pretrain`]'s
     /// `nll_bar_conditional`, which scores `u` and `v` only on bars with `s != 0`.
@@ -1908,8 +1929,8 @@ impl BarSupports {
     ///
     /// Zero for [`BarScoring::Hard`] and [`BarScoring::Density`]: both score the bin the
     /// observation actually landed in, and an oracle that knew it exactly would pay nothing.
-    /// That is the whole reason `density` is the default — the number below is what
-    /// smoothing costs.
+    /// Hard is the default because it is the sparse categorical objective without the
+    /// density diagnostic's finite-bin measure offset.
     ///
     /// For [`BarScoring::Smoothed`] this is `E_x[H(t(x))]`. Gaussian label smoothing makes
     /// the soft-target cross entropy a proper scoring rule for the SMOOTHED law `T(P)`, not
@@ -2102,7 +2123,10 @@ impl BarSupports {
                         path.display()
                     );
                 }
-                if let Some(dof) = rows.iter().position(|row| row.iter().any(|x| !x.is_finite())) {
+                if let Some(dof) = rows
+                    .iter()
+                    .position(|row| row.iter().any(|x| !x.is_finite()))
+                {
                     bail!(
                         "bar supports {} has a non-finite {what} entry on DOF {}",
                         path.display(),
@@ -2146,9 +2170,7 @@ impl BarSupports {
         let continuous = continuous.clamp(0, NUM_BAR_BINS - 1);
         // NaN padding never compares equal, so unused atom slots cannot match.
         let hit = clamped.eq_tensor(&self.atom_value_t.to_device(device));
-        let is_atom = hit
-            .any_dim(-1, true)
-            .to_kind(Kind::Int64);
+        let is_atom = hit.any_dim(-1, true).to_kind(Kind::Int64);
         let atom_index = (hit.to_kind(Kind::Int64) * self.atom_bin_t.to_device(device))
             .sum_dim_intlist([-1].as_slice(), true, Kind::Int64);
         let index = &is_atom * atom_index + (1 - &is_atom) * continuous;
@@ -2202,7 +2224,8 @@ impl BarSupports {
     /// location into the continuous bins beyond it. Values outside the support clamp
     /// onto the edge bins.
     pub fn encode_targets(&self, dof: &Tensor) -> Tensor {
-        self.targets(dof, BarScoring::Smoothed).into_targets()
+        self.targets(dof, BarScoring::Smoothed)
+            .into_smoothed_probabilities()
     }
 
     /// The scoring rule in force, materialized against `[..., BAR_DOF]` observations.
@@ -2211,7 +2234,47 @@ impl BarSupports {
     /// reported number cannot disagree about which rule is in force: they take the same
     /// [`BarTargets`].
     pub fn targets(&self, dof: &Tensor, scoring: BarScoring) -> BarTargets {
-        self.targets_with_sigma(dof, scoring, BAR_LABEL_SIGMA_RATIO)
+        if scoring.is_smoothed() {
+            self.targets_with_sigma(dof, scoring, BAR_LABEL_SIGMA_RATIO)
+        } else {
+            self.targets_from_class_ids(&self.bin_ids(dof), scoring)
+        }
+    }
+
+    /// Build a hard or density target from already-located `[..., BAR_DOF]` bin IDs.
+    ///
+    /// Training bins its full input/target window once for the recurrent trunk. Narrowing
+    /// that tensor here avoids locating the same target bars a second time and keeps both
+    /// sparse rules free of dense one-hot rows.
+    pub fn targets_from_class_ids(&self, class_ids: &Tensor, scoring: BarScoring) -> BarTargets {
+        assert!(
+            !scoring.is_smoothed(),
+            "smoothed targets require observations, not only containing-bin IDs"
+        );
+        let lead = leading_dims(class_ids, BAR_DOF as i64, "target class IDs");
+        assert_eq!(
+            class_ids.kind(),
+            Kind::Int64,
+            "target class IDs must be int64"
+        );
+        let class_ids = class_ids
+            .detach()
+            .reshape(with_tail(&lead, &[BAR_DOF as i64]));
+        let log_measure = scoring.is_density().then(|| {
+            let index = class_ids.reshape([-1, BAR_DOF as i64, 1]);
+            let width = self.gather_bin(&self.widths_flat, &index);
+            let is_atom = width.eq(0.0).to_kind(Kind::Float);
+            (width + is_atom)
+                .log()
+                .squeeze_dim(-1)
+                .reshape(with_tail(&lead, &[BAR_DOF as i64]))
+        });
+        BarTargets {
+            class_ids,
+            probabilities: None,
+            log_measure,
+            scoring,
+        }
     }
 
     /// [`Self::targets`] with an explicit smoothing width, in multiples of the local bin
@@ -2226,40 +2289,26 @@ impl BarSupports {
         scoring: BarScoring,
         sigma_ratio: f64,
     ) -> BarTargets {
+        assert!(
+            scoring.is_smoothed(),
+            "an explicit smoothing width is only valid for smoothed scoring"
+        );
         let lead = leading_dims(dof, BAR_DOF as i64, "target dof");
         let clamped = self.prepare(dof);
         let (index, _, is_atom) = self.locate(&clamped);
+        let class_ids = index
+            .squeeze_dim(-1)
+            .reshape(with_tail(&lead, &[BAR_DOF as i64]));
         let target_shape = with_tail(&lead, &[BAR_DOF as i64, NUM_BAR_BINS]);
-        let targets = if scoring.is_smoothed() {
-            let smoothed = self.smooth(&clamped, &index, sigma_ratio);
-            let one_hot = Tensor::zeros_like(&smoothed).scatter_value(-1, &index, 1.0);
-            let continuous = is_atom.neg() + 1.0;
-            (&is_atom * one_hot + continuous * smoothed).reshape(target_shape)
-        } else {
-            Tensor::zeros(
-                [
-                    index.size()[0],
-                    BAR_DOF as i64,
-                    NUM_BAR_BINS,
-                ],
-                (Kind::Float, clamped.device()),
-            )
-            .scatter_value(-1, &index, 1.0)
-            .reshape(target_shape)
-        };
-        let log_measure = scoring.is_density().then(|| {
-            // An atom bin has zero width and carries a probability MASS, so it takes no
-            // correction at all. Adding the mask to the width — rather than clamping it —
-            // leaves every continuous width exact (no distortion even for a one-ulp bin)
-            // and turns an atom's `ln(0)` into `ln(1) == 0` without a branch.
-            (self.gather_bin(&self.widths_flat, &index) + &is_atom)
-                .log()
-                .squeeze_dim(-1)
-                .reshape(with_tail(&lead, &[BAR_DOF as i64]))
-        });
+        let smoothed = self.smooth(&clamped, &index, sigma_ratio);
+        let one_hot = Tensor::zeros_like(&smoothed).scatter_value(-1, &index, 1.0);
+        let continuous = is_atom.neg() + 1.0;
+        let probabilities =
+            Some((&is_atom * one_hot + continuous * smoothed).reshape(target_shape));
         BarTargets {
-            targets,
-            log_measure,
+            class_ids,
+            probabilities,
+            log_measure: None,
             scoring,
         }
     }
@@ -2420,7 +2469,13 @@ fn fit_dof_support(sorted: &[f32], mandated: &[f32]) -> (Vec<f64>, Vec<f64>) {
             let (lo, hi) = (pair[0], pair[1]);
             let start = continuous.partition_point(|x| f32::total_cmp(x, &lo).is_le());
             let end = continuous.partition_point(|x| f32::total_cmp(x, &hi).is_lt());
-            Segment::new(lo, hi, &continuous[start..end], is_atom(&atom_values, lo), is_atom(&atom_values, hi))
+            Segment::new(
+                lo,
+                hi,
+                &continuous[start..end],
+                is_atom(&atom_values, lo),
+                is_atom(&atom_values, hi),
+            )
         })
         .collect();
 
@@ -2722,13 +2777,14 @@ fn with_tail(lead: &[i64], tail: &[i64]) -> Vec<i64> {
 // ---------------------------------------------------------------------------
 
 /// Intra-bar autoregressive emission head, factorized in [`BAR_CHAIN`] order:
-/// `p(bar|h) = p(r|h) p(s|h,r) p(u|h,r,s) p(v|h,r,s,u) p(w|h,r,s,u,v)`.
+/// `p(bar|h,c) = p(r|h,c) p(s|h,c,r) p(u|h,c,r,s) p(v|..) p(w|..)`, where `c`
+/// is the forecast-safe conditioning embedding supplied by the shared bar trunk.
 ///
-/// One `Linear(latent_dim + BAR_PREFIX_SLOTS * BAR_PREFIX_EMBED_DIM -> NUM_BAR_BINS)`
-/// per DOF, plus one `[NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM]` embedding table per
-/// prefix slot. A constant `[BAR_DOF, BAR_PREFIX_SLOTS, 1]` mask zeroes the
-/// embeddings of the slots a head may not see, which lets all five factors be
-/// evaluated in a single batched pass instead of a loop over the chain.
+/// One `Linear(2 * latent_dim + BAR_PREFIX_SLOTS * BAR_PREFIX_EMBED_DIM ->
+/// NUM_BAR_BINS)` per DOF, plus one `[NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM]`
+/// embedding table per prefix slot. A constant `[BAR_DOF, BAR_PREFIX_SLOTS, 1]`
+/// mask zeroes the embeddings of the slots a head may not see, which lets all
+/// five factors be evaluated in a single batched pass instead of a loop.
 ///
 /// The chain conditions on the prefix DOF's BIN, never on its raw value. An affine
 /// map of the value (`x * w + b`) is exactly rank one in `x`, so the whole head
@@ -2796,8 +2852,11 @@ fn prefix_stream_seed(seed: u64, draw: usize, position: usize) -> u64 {
 
 impl BarEmissionHead {
     pub fn new(vs: &nn::Path, latent_dim: i64) -> Self {
-        assert!(latent_dim > 0, "bar emission head needs a positive latent dim");
-        let in_features = latent_dim + BAR_PREFIX_WIDTH;
+        assert!(
+            latent_dim > 0,
+            "bar emission head needs a positive latent dim"
+        );
+        let in_features = 2 * latent_dim + BAR_PREFIX_WIDTH;
         let heads = (0..BAR_DOF)
             .map(|dof| {
                 nn::linear(
@@ -2812,9 +2871,9 @@ impl BarEmissionHead {
                 )
             })
             .collect();
-        // Unit per-component scale, matching the RMS of the latent half of the head
-        // input, so neither half of the concatenation dominates the learning rate.
-        // The heads are zero-init, so the table sees no gradient until they move.
+        // Unit per-component scale, matching the RMS scale of both the belief and
+        // conditioning blocks. The heads are zero-init, so the table sees no
+        // gradient until they move.
         let prefix_embed = vs.var(
             "bar_prefix_embed",
             &[BAR_PREFIX_SLOTS as i64 * NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM],
@@ -2858,11 +2917,11 @@ impl BarEmissionHead {
         self.latent_dim
     }
 
-    fn latent_weights(&self, detach: bool) -> Tensor {
+    fn readout_weights(&self, detach: bool) -> Tensor {
         stack_maybe_detached(
             self.heads
                 .iter()
-                .map(|h| h.ws.narrow(1, 0, self.latent_dim)),
+                .map(|h| h.ws.narrow(1, 0, 2 * self.latent_dim)),
             detach,
         )
     }
@@ -2871,7 +2930,7 @@ impl BarEmissionHead {
         stack_maybe_detached(
             self.heads
                 .iter()
-                .map(|h| h.ws.narrow(1, self.latent_dim, BAR_PREFIX_WIDTH)),
+                .map(|h| h.ws.narrow(1, 2 * self.latent_dim, BAR_PREFIX_WIDTH)),
             detach,
         )
     }
@@ -2903,26 +2962,40 @@ impl BarEmissionHead {
         ])
     }
 
-    /// Teacher-forced logits `[..., BAR_DOF, NUM_BAR_BINS]` for latents
-    /// `[..., latent_dim]` and the ground-truth bar's `[..., BAR_DOF]` bin ids.
+    /// Teacher-forced logits `[..., BAR_DOF, NUM_BAR_BINS]` for beliefs and
+    /// forecast conditioning `[..., latent_dim]`, plus the ground-truth bar's
+    /// `[..., BAR_DOF]` bin ids.
     ///
     /// The bins MUST come from [`BarSupports::bin_ids`] (or
     /// [`crate::torch::world_model::BarSupportSet::bin_ids`] when resolutions are
     /// mixed): that is what pins the prefix onto the fitted support and what makes
     /// an exact atom land on its own zero-width bin rather than a neighbour.
-    pub fn logits(&self, h: &Tensor, target_bins: &Tensor) -> Tensor {
-        self.forward_logits(h, target_bins, false)
+    pub fn logits(&self, h: &Tensor, conditioning: &Tensor, target_bins: &Tensor) -> Tensor {
+        self.forward_logits(h, conditioning, target_bins, false)
     }
 
     /// Same factorization with every head parameter detached, so gradients reach
-    /// only `h`. This is the predicted-latent branch of the dynamics KL term.
-    pub fn logits_frozen(&self, h: &Tensor, target_bins: &Tensor) -> Tensor {
-        self.forward_logits(h, target_bins, true)
+    /// only `h` and `conditioning`. This is the predicted-latent branch of the
+    /// dynamics KL term.
+    pub fn logits_frozen(&self, h: &Tensor, conditioning: &Tensor, target_bins: &Tensor) -> Tensor {
+        self.forward_logits(h, conditioning, target_bins, true)
     }
 
-    fn forward_logits(&self, h: &Tensor, target_bins: &Tensor, detach: bool) -> Tensor {
+    fn forward_logits(
+        &self,
+        h: &Tensor,
+        conditioning: &Tensor,
+        target_bins: &Tensor,
+        detach: bool,
+    ) -> Tensor {
         let lead = leading_dims(h, self.latent_dim, "latent");
+        let conditioning_lead =
+            leading_dims(conditioning, self.latent_dim, "forecast conditioning");
         let bin_lead = leading_dims(target_bins, BAR_DOF as i64, "target bins");
+        assert_eq!(
+            lead, conditioning_lead,
+            "latent and forecast conditioning must share leading dimensions"
+        );
         assert_eq!(
             lead, bin_lead,
             "latent and target bins must share leading dimensions"
@@ -2934,7 +3007,16 @@ impl BarEmissionHead {
         );
         let device = h.device();
         let rows = lead.iter().product::<i64>();
-        let h_flat = h.to_kind(Kind::Float).reshape([-1, self.latent_dim]);
+        let readout = Tensor::cat(
+            &[
+                h.to_kind(Kind::Float).reshape([-1, self.latent_dim]),
+                conditioning
+                    .to_device(device)
+                    .to_kind(Kind::Float)
+                    .reshape([-1, self.latent_dim]),
+            ],
+            -1,
+        );
         let prefix_bins = target_bins
             .reshape([-1, BAR_DOF as i64])
             .index_select(1, &self.prefix_slot_dof.to_device(device));
@@ -2948,7 +3030,7 @@ impl BarEmissionHead {
 
         let latent_part = Tensor::einsum(
             "nl,kol->nko",
-            &[&h_flat, &self.latent_weights(detach)],
+            &[&readout, &self.readout_weights(detach)],
             None::<&[i64]>,
         );
         let prefix_part = Tensor::einsum(
@@ -2960,25 +3042,46 @@ impl BarEmissionHead {
             .reshape(with_tail(&lead, &[BAR_DOF as i64, NUM_BAR_BINS]))
     }
 
-    /// Ancestral sample of a bar's DOF from latents `[..., latent_dim]`, returning
-    /// `[..., BAR_DOF]`. Sequential over the five chain factors (inherent to the
-    /// factorization) and fully vectorized over every leading dimension.
+    /// Ancestral sample of a bar's DOF from beliefs and forecast conditioning
+    /// `[..., latent_dim]`, returning `[..., BAR_DOF]`. Sequential over the five
+    /// chain factors (inherent to the factorization) and fully vectorized over
+    /// every leading dimension.
     ///
     /// Each step conditions the rest of the chain on the BIN it drew, not on the
     /// value it decoded to, so the rollout prefix is exactly the quantity the
     /// teacher-forced path was fitted on. Re-binning the drawn value would round-trip
     /// through `lo + (hi - lo) * u`, which can land on a bin boundary and shift the
     /// conditioning by one bin.
-    pub fn sample(&self, h: &Tensor, supports: &BarSupports, temperature: f64) -> Tensor {
+    pub fn sample(
+        &self,
+        h: &Tensor,
+        conditioning: &Tensor,
+        supports: &BarSupports,
+        temperature: f64,
+    ) -> Tensor {
         tch::no_grad(|| {
             let lead = leading_dims(h, self.latent_dim, "latent");
+            assert_eq!(
+                lead,
+                leading_dims(conditioning, self.latent_dim, "forecast conditioning"),
+                "latent and forecast conditioning must share leading dimensions"
+            );
             let device = h.device();
             let rows = lead.iter().product::<i64>();
-            let h_flat = h.to_kind(Kind::Float).reshape([-1, self.latent_dim]);
+            let readout = Tensor::cat(
+                &[
+                    h.to_kind(Kind::Float).reshape([-1, self.latent_dim]),
+                    conditioning
+                        .to_device(device)
+                        .to_kind(Kind::Float)
+                        .reshape([-1, self.latent_dim]),
+                ],
+                -1,
+            );
 
             let base = Tensor::einsum(
                 "nl,kol->nko",
-                &[&h_flat, &self.latent_weights(false)],
+                &[&readout, &self.readout_weights(false)],
                 None::<&[i64]>,
             ) + self.biases(false).unsqueeze(0);
             let prefix_w_all = self.prefix_weights(false);
@@ -3036,23 +3139,38 @@ impl BarEmissionHead {
     /// rather than pretending it is exact. Factor `BAR_CHAIN[0]` has no prefix, so its row is
     /// bit-identical to its teacher-forced row and its marginal is exact by construction.
     ///
-    /// The latent GEMM is hoisted out of the draw loop: only the prefix embedding lookup and
-    /// its `[BAR_PREFIX_WIDTH, NUM_BAR_BINS]` projection are repeated per draw.
+    /// The belief/conditioning GEMM is hoisted out of the draw loop: only the prefix
+    /// embedding lookup and its `[BAR_PREFIX_WIDTH, NUM_BAR_BINS]` projection repeat.
     pub fn forecast_log_probs(
         &self,
         h: &Tensor,
+        conditioning: &Tensor,
         draws: usize,
         seed: u64,
     ) -> Tensor {
         assert!(draws > 0, "the forecast mixture needs at least one draw");
         tch::no_grad(|| {
             let lead = leading_dims(h, self.latent_dim, "latent");
+            assert_eq!(
+                lead,
+                leading_dims(conditioning, self.latent_dim, "forecast conditioning"),
+                "latent and forecast conditioning must share leading dimensions"
+            );
             let device = h.device();
             let rows = lead.iter().product::<i64>();
-            let h_flat = h.to_kind(Kind::Float).reshape([-1, self.latent_dim]);
+            let readout = Tensor::cat(
+                &[
+                    h.to_kind(Kind::Float).reshape([-1, self.latent_dim]),
+                    conditioning
+                        .to_device(device)
+                        .to_kind(Kind::Float)
+                        .reshape([-1, self.latent_dim]),
+                ],
+                -1,
+            );
             let base = Tensor::einsum(
                 "nl,kol->nko",
-                &[&h_flat, &self.latent_weights(false)],
+                &[&readout, &self.readout_weights(false)],
                 None::<&[i64]>,
             ) + self.biases(false).unsqueeze(0);
             let prefix_w_all = self.prefix_weights(false);
@@ -3117,18 +3235,25 @@ impl BarEmissionHead {
     pub fn nll(
         &self,
         h: &Tensor,
+        conditioning: &Tensor,
         target_dof: &Tensor,
         supports: &BarSupports,
         scoring: BarScoring,
     ) -> (Tensor, Tensor) {
-        let logits = self.logits(h, &supports.bin_ids(target_dof));
+        let logits = self.logits(h, conditioning, &supports.bin_ids(target_dof));
         bar_nll_from_logits(&logits, &supports.targets(target_dof, scoring))
     }
 
     /// Per-DOF `[BAR_DOF]` CRPS of the predictive categoricals, for calibration
     /// reporting.
-    pub fn crps(&self, h: &Tensor, target_dof: &Tensor, supports: &BarSupports) -> Tensor {
-        let logits = self.logits(h, &supports.bin_ids(target_dof));
+    pub fn crps(
+        &self,
+        h: &Tensor,
+        conditioning: &Tensor,
+        target_dof: &Tensor,
+        supports: &BarSupports,
+    ) -> Tensor {
+        let logits = self.logits(h, conditioning, &supports.bin_ids(target_dof));
         bar_crps_from_logits(&logits, target_dof, supports)
     }
 
@@ -3137,11 +3262,12 @@ impl BarEmissionHead {
     pub fn pit(
         &self,
         h: &Tensor,
+        conditioning: &Tensor,
         target_dof: &Tensor,
         supports: &BarSupports,
         seed: u64,
     ) -> Tensor {
-        let logits = self.logits(h, &supports.bin_ids(target_dof));
+        let logits = self.logits(h, conditioning, &supports.bin_ids(target_dof));
         bar_pit_from_logits(&logits, target_dof, supports, seed)
     }
 }
@@ -3155,30 +3281,43 @@ fn stack_maybe_detached(parts: impl Iterator<Item = Tensor>, detach: bool) -> Te
     Tensor::stack(&collected, 0)
 }
 
-/// The scoring rule of [`BarScoring`], materialized against one batch of observations:
-/// the target distribution over bins plus the additive measure correction.
+/// The scoring rule of [`BarScoring`], materialized against one batch of observations.
 ///
-/// Carrying both together is what makes the objective and the reported metric agree by
-/// construction. A caller that took only the target rows would silently score
-/// [`BarScoring::Density`] as [`BarScoring::Hard`].
+/// Hard and density scoring carry only integer class IDs, avoiding a
+/// `[..., BAR_DOF, NUM_BAR_BINS]` one-hot allocation. Smoothed scoring additionally carries
+/// dense probability rows. The optional measure correction stays coupled to the target so
+/// [`BarScoring::Density`] cannot silently be scored as [`BarScoring::Hard`].
 #[derive(Debug)]
 pub struct BarTargets {
-    /// `[..., BAR_DOF, NUM_BAR_BINS]` rows summing to one.
-    targets: Tensor,
+    /// `[..., BAR_DOF]` containing-bin IDs, shared by every scoring rule.
+    class_ids: Tensor,
+    /// `[..., BAR_DOF, NUM_BAR_BINS]` probability rows, present only for smoothed scoring.
+    probabilities: Option<Tensor>,
     /// `[..., BAR_DOF]` additive nats: `+ln(width_b)` for a continuous observation under
-    /// [`BarScoring::Density`], and zero on an atom, whose factor is a probability MASS.
-    /// `None` for the discrete rules, where it would be an all-zero tensor.
+    /// [`BarScoring::Density`], and zero on an atom, whose factor is a probability mass.
     log_measure: Option<Tensor>,
     scoring: BarScoring,
 }
 
 impl BarTargets {
-    /// The `[..., BAR_DOF, NUM_BAR_BINS]` target rows.
-    pub fn targets(&self) -> &Tensor {
-        &self.targets
+    /// The `[..., BAR_DOF]` containing-bin IDs.
+    pub fn class_ids(&self) -> &Tensor {
+        &self.class_ids
     }
 
-    /// The additive measure term, `None` under the two discrete rules.
+    /// Dense `[..., BAR_DOF, NUM_BAR_BINS]` probability rows, only under smoothed scoring.
+    pub fn probabilities(&self) -> Option<&Tensor> {
+        self.probabilities.as_ref()
+    }
+
+    /// Dense probability rows for a deliberately smoothed-only caller.
+    pub fn smoothed_probabilities(&self) -> &Tensor {
+        self.probabilities
+            .as_ref()
+            .expect("dense target rows exist only under smoothed scoring")
+    }
+
+    /// The additive measure term, present only under density scoring.
     pub fn log_measure(&self) -> Option<&Tensor> {
         self.log_measure.as_ref()
     }
@@ -3187,14 +3326,10 @@ impl BarTargets {
         self.scoring
     }
 
-    /// Consume into the target rows alone. Only correct where the measure term is known to
-    /// be absent, i.e. for a deliberately mode-specific caller.
-    pub fn into_targets(self) -> Tensor {
-        debug_assert!(
-            self.log_measure.is_none(),
-            "discarding the measure term of a density-scored target"
-        );
-        self.targets
+    /// Consume into dense target rows. Only valid for smoothed scoring.
+    pub fn into_smoothed_probabilities(self) -> Tensor {
+        self.probabilities
+            .expect("dense target rows exist only under smoothed scoring")
     }
 
     /// `[..., BAR_DOF]` measure term, or a broadcastable zero.
@@ -3207,24 +3342,32 @@ impl BarTargets {
 }
 
 /// Per-factor nats of `[..., BAR_DOF, NUM_BAR_BINS]` logits under the scoring rule
-/// `targets` was built with, reduced over the bin axis ONLY: the result is
+/// `targets` was built with, reduced over the bin axis only: the result is
 /// `[..., BAR_DOF]`.
 ///
-/// [`bar_nll_from_logits`] averages this over every leading axis and throws the individual
-/// values away, which is exactly what makes a held-out mean have no measurable dispersion.
-/// Selection needs the per-window vector — to block-bootstrap a confidence interval, and to
-/// pair two runs window by window — and the conditional metric needs the per-BAR values so
-/// the `u`/`v` terms can be masked to non-flat bars. Both come off this tensor.
+/// [`bar_nll_from_logits`] averages this over every leading axis. Hard and density targets
+/// use an indexed gather; only smoothed targets perform dense soft-target cross entropy.
 pub fn bar_nll_terms(logits: &Tensor, targets: &BarTargets) -> Tensor {
-    let _ = factor_dims(logits, "logits");
+    let lead = factor_dims(logits, "logits");
     assert_eq!(
-        logits.size(),
-        targets.targets.size(),
-        "logits and targets must have identical shapes"
+        targets.class_ids.size(),
+        with_tail(&lead, &[BAR_DOF as i64]),
+        "class IDs must match the logits' leading and DOF dimensions"
     );
     let log_probs = logits.log_softmax(-1, Kind::Float);
-    let cross_entropy =
-        -(&targets.targets * log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+    let cross_entropy = match &targets.probabilities {
+        Some(probabilities) => {
+            assert_eq!(
+                logits.size(),
+                probabilities.size(),
+                "logits and smoothed targets must have identical shapes"
+            );
+            -(probabilities * log_probs).sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+        }
+        None => -log_probs
+            .gather(-1, &targets.class_ids.unsqueeze(-1), false)
+            .squeeze_dim(-1),
+    };
     cross_entropy + targets.measure_or_zero(logits)
 }
 
@@ -3305,12 +3448,11 @@ pub fn bar_nll_decomposition(
     targets: &BarTargets,
     supports: &BarSupports,
 ) -> BarNllParts {
-    let _ = factor_dims(logits, "logits");
-    let soft_targets = &targets.targets;
+    let lead = factor_dims(logits, "logits");
     assert_eq!(
-        logits.size(),
-        soft_targets.size(),
-        "logits and targets must have identical shapes"
+        targets.class_ids.size(),
+        with_tail(&lead, &[BAR_DOF as i64]),
+        "class IDs must match the logits' leading and DOF dimensions"
     );
     let device = logits.device();
     // Atom bins ARE the zero-width bins, and the width table is already resident on
@@ -3321,22 +3463,53 @@ pub fn bar_nll_decomposition(
         .to_device(device)
         .view([BAR_DOF as i64, NUM_BAR_BINS])
         .eq(0.0);
-    let atom = is_atom.to_kind(Kind::Float);
     let continuous = is_atom.logical_not().to_kind(Kind::Float);
 
     let log_probs = logits.log_softmax(-1, Kind::Float);
     let log_p_cont = log_probs
         .masked_fill(&is_atom, f64::NEG_INFINITY)
-        .logsumexp([-1].as_slice(), true);
-    let sum_last = |t: Tensor| t.sum_dim_intlist([-1].as_slice(), true, Kind::Float);
-    let target_cont = sum_last(soft_targets * &continuous);
-    let atom_term = sum_last(soft_targets * &log_probs * &atom);
-    let cont_term = sum_last(soft_targets * &log_probs * &continuous);
-
+        .logsumexp([-1].as_slice(), false);
     let measure = targets.measure_or_zero(logits);
-    let class = -(atom_term + &target_cont * &log_p_cont).squeeze_dim(-1);
-    let shape = -(cont_term - target_cont * log_p_cont).squeeze_dim(-1) + &measure;
-    let total = -sum_last(soft_targets * &log_probs).squeeze_dim(-1) + measure;
+    let (class, shape, total) = match &targets.probabilities {
+        Some(soft_targets) => {
+            assert_eq!(
+                logits.size(),
+                soft_targets.size(),
+                "logits and smoothed targets must have identical shapes"
+            );
+            let atom = is_atom.to_kind(Kind::Float);
+            let sum_last = |t: Tensor| t.sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+            let target_cont = sum_last(soft_targets * &continuous);
+            let atom_term = sum_last(soft_targets * &log_probs * &atom);
+            let cont_term = sum_last(soft_targets * &log_probs * &continuous);
+            let class = -(atom_term + &target_cont * &log_p_cont);
+            let shape = -(cont_term - target_cont * &log_p_cont) + &measure;
+            let total = -sum_last(soft_targets * &log_probs) + &measure;
+            (class, shape, total)
+        }
+        None => {
+            let selected = log_probs
+                .gather(-1, &targets.class_ids.unsqueeze(-1), false)
+                .squeeze_dim(-1);
+            let rows = targets.class_ids.numel() as i64 / BAR_DOF as i64;
+            let selected_is_atom = is_atom
+                .unsqueeze(0)
+                .expand([rows, BAR_DOF as i64, NUM_BAR_BINS], true)
+                .gather(
+                    -1,
+                    &targets.class_ids.reshape([rows, BAR_DOF as i64, 1]),
+                    false,
+                )
+                .squeeze_dim(-1)
+                .reshape(targets.class_ids.size().as_slice());
+            let class = selected
+                .neg()
+                .where_self(&selected_is_atom, &log_p_cont.neg());
+            let total = selected.neg() + &measure;
+            let shape = &total - &class;
+            (class, shape, total)
+        }
+    };
 
     let mean_per_dof = |t: Tensor| {
         t.reshape([-1, BAR_DOF as i64])
@@ -3362,11 +3535,8 @@ pub fn bar_categorical_kl(target_logits: &Tensor, pred_logits: &Tensor) -> (Tens
     let target_log = target_logits.detach().log_softmax(-1, Kind::Float);
     let target = target_log.exp();
     let pred_log = pred_logits.log_softmax(-1, Kind::Float);
-    let kl = (&target * (target_log - pred_log)).sum_dim_intlist(
-        [-1].as_slice(),
-        false,
-        Kind::Float,
-    );
+    let kl =
+        (&target * (target_log - pred_log)).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
     let per_dof = kl
         .reshape([-1, BAR_DOF as i64])
         .mean_dim([0i64].as_slice(), false, Kind::Float);
@@ -3392,16 +3562,14 @@ pub fn bar_crps_from_logits(
         .reshape([-1, BAR_DOF as i64, 1]);
     let probs = probs.reshape([-1, BAR_DOF as i64, NUM_BAR_BINS]);
 
-    let absolute = (&probs * (&centers - &target).abs()).sum_dim_intlist(
-        [-1].as_slice(),
-        false,
-        Kind::Float,
-    );
-    let cdf = probs.cumsum(-1, Kind::Float).narrow(-1, 0, NUM_BAR_BINS - 1);
+    let absolute =
+        (&probs * (&centers - &target).abs()).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+    let cdf = probs
+        .cumsum(-1, Kind::Float)
+        .narrow(-1, 0, NUM_BAR_BINS - 1);
     let gaps = centers.narrow(1, 1, NUM_BAR_BINS - 1) - centers.narrow(1, 0, NUM_BAR_BINS - 1);
     let complement = cdf.neg() + 1.0;
-    let spread =
-        (complement * cdf * gaps).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+    let spread = (complement * cdf * gaps).sum_dim_intlist([-1].as_slice(), false, Kind::Float);
     (absolute - spread)
         .clamp_min(0.0)
         .mean_dim([0i64].as_slice(), false, Kind::Float)
@@ -3427,10 +3595,11 @@ pub fn bar_pit_from_logits(
 ) -> Tensor {
     let lead = leading_dims(target_dof, BAR_DOF as i64, "target dof");
     let _ = factor_dims(logits, "logits");
-    let probs = logits
-        .detach()
-        .softmax(-1, Kind::Float)
-        .reshape([-1, BAR_DOF as i64, NUM_BAR_BINS]);
+    let probs =
+        logits
+            .detach()
+            .softmax(-1, Kind::Float)
+            .reshape([-1, BAR_DOF as i64, NUM_BAR_BINS]);
     let clamped = supports.prepare(target_dof);
     let (index, position, is_atom) = supports.locate(&clamped);
     let draws = counter_uniforms(seed, (index.numel()) as usize);
@@ -3586,7 +3755,9 @@ mod tests {
             );
             let masses = supports.bin_masses(dof);
             let means = supports.bin_means(dof).expect("fitted means");
-            let seconds = supports.bin_second_moments(dof).expect("fitted second moments");
+            let seconds = supports
+                .bin_second_moments(dof)
+                .expect("fitted second moments");
             let mixed_mean: f64 = masses.iter().zip(means).map(|(p, m)| p * m).sum();
             let mixed_second: f64 = masses.iter().zip(seconds).map(|(p, s)| p * s).sum();
 
@@ -3728,10 +3899,11 @@ mod tests {
                 > 0.25 * (outer - interior),
             "a mean in the middle of the catch-all gap must force a large sd"
         );
-        let extreme = means
-            .iter()
-            .copied()
-            .fold(0.0f64, |worst, m| if m.abs() > worst.abs() { m } else { worst });
+        let extreme =
+            means.iter().copied().fold(
+                0.0f64,
+                |worst, m| if m.abs() > worst.abs() { m } else { worst },
+            );
         assert_eq!(
             supports
                 .min_variance_for_mean(DOF_R, extreme, MeanDecode::Fitted)
@@ -3783,11 +3955,7 @@ mod tests {
                 if total <= 0.0 {
                     continue;
                 }
-                let mean: f64 = weights
-                    .iter()
-                    .zip(means)
-                    .map(|(w, m)| w / total * m)
-                    .sum();
+                let mean: f64 = weights.iter().zip(means).map(|(w, m)| w / total * m).sum();
                 let bound = if interior_only { interior } else { all };
                 assert!(
                     mean.abs() <= bound * (1.0 + 1e-9) + 1e-18,
@@ -3822,21 +3990,30 @@ mod tests {
     #[test]
     fn legacy_supports_report_no_fitted_moments_and_a_lying_v5_is_refused() {
         let _torch_rng_guard = test_rng::shared();
-        let dir = std::env::temp_dir()
-            .join(format!("trading_bot_0_supports_moments_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_supports_moments_{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("bar_supports.300.json");
 
         let fitted = synthetic_supports(20_000, 0x5EED);
         fitted.save(&path).expect("save");
         let reloaded = BarSupports::load(&path).expect("load");
-        assert!(reloaded.bin_means_measured(), "a v5 round trip keeps its moments");
+        assert!(
+            reloaded.bin_means_measured(),
+            "a v5 round trip keeps its moments"
+        );
         for dof in 0..BAR_DOF {
             let (before, after) = (
                 fitted.bin_means(dof).expect("fitted"),
                 reloaded.bin_means(dof).expect("reloaded"),
             );
-            assert_eq!(before, after, "DOF {} means changed on reload", BAR_DOF_NAMES[dof]);
+            assert_eq!(
+                before, after,
+                "DOF {} means changed on reload",
+                BAR_DOF_NAMES[dof]
+            );
         }
         // Moving them to a device must not lose them either — the training path only ever
         // sees a `to_device` copy.
@@ -3912,7 +4089,10 @@ mod tests {
         // moments and let `bin_means_measured()` be true for an incomplete support.
         raw["bin_means"] = serde_json::json!(vec![vec![0.0f64; NUM_BAR_BINS as usize]; BAR_DOF]);
         std::fs::write(&path, serde_json::to_vec(&raw).expect("serialize")).expect("write");
-        assert!(BarSupports::load(&path).is_err(), "a half-present moment pair must be refused");
+        assert!(
+            BarSupports::load(&path).is_err(),
+            "a half-present moment pair must be refused"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3925,26 +4105,34 @@ mod tests {
     #[test]
     fn a_support_carrying_no_fitted_moments_cannot_be_written_at_all() {
         let _torch_rng_guard = test_rng::shared();
-        let dir = std::env::temp_dir()
-            .join(format!("trading_bot_0_supports_unwritable_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "trading_bot_0_supports_unwritable_{}",
+            uuid::Uuid::new_v4()
+        ));
         let corpus_artifact = dir.join("bar_supports.300.json");
-        synthetic_supports(20_000, 0x5EED).save(&corpus_artifact).expect("v5 save");
+        synthetic_supports(20_000, 0x5EED)
+            .save(&corpus_artifact)
+            .expect("v5 save");
 
         // Exactly the shape of the live artifact: v4 geometry, no moments.
         let mut raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&corpus_artifact).expect("read"))
-                .expect("parse");
+            serde_json::from_slice(&std::fs::read(&corpus_artifact).expect("read")).expect("parse");
         let object = raw.as_object_mut().expect("object");
         object.insert("format_version".to_owned(), serde_json::json!(4));
         object.remove("bin_means");
         object.remove("bin_second_moments");
-        std::fs::write(&corpus_artifact, serde_json::to_vec(&raw).expect("serialize"))
-            .expect("write");
+        std::fs::write(
+            &corpus_artifact,
+            serde_json::to_vec(&raw).expect("serialize"),
+        )
+        .expect("write");
         let loaded = BarSupports::load(&corpus_artifact).expect("a v4 artifact still loads");
         assert!(!loaded.bin_means_measured());
 
         // The sidecar the first promotion would have written beside the weights.
-        let sidecar = dir.join("weights").join("pretrain_best_diag896.supports.300.json");
+        let sidecar = dir
+            .join("weights")
+            .join("pretrain_best_diag896.supports.300.json");
         let err = loaded.save(&sidecar).expect_err(
             "a support with no fitted moments must be unwritable: the only schema this build \
              writes promises them, so every file it could produce here is one the loader refuses",
@@ -3993,11 +4181,16 @@ mod tests {
                     BAR_DOF_NAMES[dof]
                 );
             } else {
-                assert_eq!(lo[j], hi[j], "DOF {} bin {j} has negative width", BAR_DOF_NAMES[dof]);
+                assert_eq!(
+                    lo[j], hi[j],
+                    "DOF {} bin {j} has negative width",
+                    BAR_DOF_NAMES[dof]
+                );
             }
             if j + 1 < bins {
                 assert_eq!(
-                    hi[j], lo[j + 1],
+                    hi[j],
+                    lo[j + 1],
                     "DOF {} leaves a gap between bins {j} and {}",
                     BAR_DOF_NAMES[dof],
                     j + 1
@@ -4148,8 +4341,7 @@ mod tests {
             sample_count: 4_000_000,
             fitted_utc: "2026-08-15T00:00:00Z".to_owned(),
         };
-        let fitted =
-            synthetic_supports(20_000, 0x9A9A).with_provenance(provenance.clone());
+        let fitted = synthetic_supports(20_000, 0x9A9A).with_provenance(provenance.clone());
         fitted.save(&path).expect("save");
         let reloaded = BarSupports::load(&path).expect("load");
         assert_eq!(reloaded.provenance(), Some(&provenance));
@@ -4174,10 +4366,22 @@ mod tests {
     #[test]
     fn dof_round_trip_is_exact() {
         let cases = [
-            (191.32_f32, bar(191.40, 192.05, 190.88, 191.77, 812_344.0), 640_000.0_f32),
+            (
+                191.32_f32,
+                bar(191.40, 192.05, 190.88, 191.77, 812_344.0),
+                640_000.0_f32,
+            ),
             (4.21, bar(4.19, 4.44, 4.05, 4.40, 1_912.0), 3_000.0),
-            (1_284.5, bar(1_284.5, 1_284.5, 1_270.0, 1_275.25, 88.0), 91.5),
-            (0.0421, bar(0.0430, 0.0455, 0.0412, 0.0418, 55_000.0), 61_233.0),
+            (
+                1_284.5,
+                bar(1_284.5, 1_284.5, 1_270.0, 1_275.25, 88.0),
+                91.5,
+            ),
+            (
+                0.0421,
+                bar(0.0430, 0.0455, 0.0412, 0.0418, 55_000.0),
+                61_233.0,
+            ),
         ];
         for (prev_close, original, ema) in cases {
             let dof = encode_dof(prev_close, &original, ema);
@@ -4242,9 +4446,8 @@ mod tests {
                 (1.0 + 1e6 * rng.uniform()) as f32
             };
             let out = decode_dof(prev_close, &dof, ema);
-            let (o, h, l, c, vol, wap) = (
-                out.open, out.high, out.low, out.close, out.volume, out.vwap,
-            );
+            let (o, h, l, c, vol, wap) =
+                (out.open, out.high, out.low, out.close, out.volume, out.vwap);
             for (field, value) in [
                 ("open", o),
                 ("high", h),
@@ -4332,7 +4535,11 @@ mod tests {
                     }
                     let total: usize = run.iter().map(|&bin| counts[bin]).sum();
                     let share = total as f64 / run.len() as f64;
-                    assert!(share > 0.0, "{label} DOF {} run is empty", BAR_DOF_NAMES[dof]);
+                    assert!(
+                        share > 0.0,
+                        "{label} DOF {} run is empty",
+                        BAR_DOF_NAMES[dof]
+                    );
                     let tolerance = 5.0 * share.sqrt().max(1.0);
                     for &bin in &run {
                         let deviation = counts[bin] as f64 - share;
@@ -4379,7 +4586,11 @@ mod tests {
             assert_tiling(&supports, dof);
         }
         // The mandated atoms are present on exactly the DOF that can carry them.
-        for (dof, mandated) in [(DOF_S, &[0.0f32][..]), (DOF_U, &[0.0, 0.5, 1.0]), (DOF_V, &[0.0, 0.5, 1.0])] {
+        for (dof, mandated) in [
+            (DOF_S, &[0.0f32][..]),
+            (DOF_U, &[0.0, 0.5, 1.0]),
+            (DOF_V, &[0.0, 0.5, 1.0]),
+        ] {
             for &value in mandated {
                 assert!(
                     supports.atoms(dof).iter().any(|a| a.value == value as f64),
@@ -4391,16 +4602,33 @@ mod tests {
         // 20% of the sample is a flat bar, so s == 0 and u == v == 0.5 each hold
         // about a fifth of the mass, and u == 0 / u == 1 another fifth each.
         let atom_mass = |dof: usize, value: f64| {
-            supports.atoms(dof)
+            supports
+                .atoms(dof)
                 .iter()
                 .find(|a| a.value == value)
                 .map(|a| a.mass)
                 .unwrap_or(0.0)
         };
-        assert!((atom_mass(DOF_S, 0.0) - 0.2).abs() < 0.01, "{}", atom_mass(DOF_S, 0.0));
-        assert!((atom_mass(DOF_U, 0.5) - 0.2).abs() < 0.01, "{}", atom_mass(DOF_U, 0.5));
-        assert!((atom_mass(DOF_U, 0.0) - 0.2).abs() < 0.01, "{}", atom_mass(DOF_U, 0.0));
-        assert!((atom_mass(DOF_U, 1.0) - 0.2).abs() < 0.01, "{}", atom_mass(DOF_U, 1.0));
+        assert!(
+            (atom_mass(DOF_S, 0.0) - 0.2).abs() < 0.01,
+            "{}",
+            atom_mass(DOF_S, 0.0)
+        );
+        assert!(
+            (atom_mass(DOF_U, 0.5) - 0.2).abs() < 0.01,
+            "{}",
+            atom_mass(DOF_U, 0.5)
+        );
+        assert!(
+            (atom_mass(DOF_U, 0.0) - 0.2).abs() < 0.01,
+            "{}",
+            atom_mass(DOF_U, 0.0)
+        );
+        assert!(
+            (atom_mass(DOF_U, 1.0) - 0.2).abs() < 0.01,
+            "{}",
+            atom_mass(DOF_U, 1.0)
+        );
 
         // `bin_of` (host), `bin_ids`/`locate` (tensor) and `encode_targets` must all
         // name the same bin for every observed value, atoms included.
@@ -4433,8 +4661,13 @@ mod tests {
         let containing = encoded.gather(-1, &index, false).squeeze_dim(-1);
         let atom_rows = is_atom.squeeze_dim(-1);
         let atom_count = atom_rows.sum(Kind::Double).double_value(&[]);
-        assert!(atom_count > 0.0, "the atom-heavy sample produced no atom rows");
-        let atom_mass_on_target = (&containing * &atom_rows).sum(Kind::Double).double_value(&[]);
+        assert!(
+            atom_count > 0.0,
+            "the atom-heavy sample produced no atom rows"
+        );
+        let atom_mass_on_target = (&containing * &atom_rows)
+            .sum(Kind::Double)
+            .double_value(&[]);
         assert!(
             (atom_mass_on_target - atom_count).abs() < 1e-4,
             "atom labels are not exact one-hots: {atom_mass_on_target} over {atom_count} rows"
@@ -4514,7 +4747,10 @@ mod tests {
         let per_dof = supports.marginal_nll_dof(scoring);
         assert!((uniform - BAR_DOF as f64 * (NUM_BAR_BINS as f64).ln()).abs() < 1e-12);
         assert!((marginal - per_dof.iter().sum::<f64>()).abs() < 1e-12);
-        assert!(marginal < uniform - 0.5, "marginal {marginal} must beat uniform {uniform}");
+        assert!(
+            marginal < uniform - 0.5,
+            "marginal {marginal} must beat uniform {uniform}"
+        );
 
         // No ordering is claimed against the hard-histogram entropy: that is the
         // optimum of a different objective and the two land within ~0.002 nats.
@@ -4561,7 +4797,12 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(bin, p)| {
-                    (p + if bin < NUM_BAR_BINS as usize / 2 { 1e-3 } else { -1e-3 }).max(0.0)
+                    (p + if bin < NUM_BAR_BINS as usize / 2 {
+                        1e-3
+                    } else {
+                        -1e-3
+                    })
+                    .max(0.0)
                 })
                 .collect();
             let total: f64 = bumped.iter().sum();
@@ -4632,7 +4873,10 @@ mod tests {
             "r support [{r_lo}, {r_hi}] still contains the bad ticks"
         );
         let s_hi = *supports.upper_bounds(DOF_S).last().expect("bounds");
-        assert!(s_hi < 1.0, "s support upper bound {s_hi} still at the bad tick");
+        assert!(
+            s_hi < 1.0,
+            "s support upper bound {s_hi} still at the bad tick"
+        );
 
         // Outer bin centers decode to the clipped bound, not to an invented extreme.
         for dof in 0..BAR_DOF {
@@ -4642,7 +4886,11 @@ mod tests {
                 centers[NUM_BAR_BINS as usize - 1],
                 supports.upper_bounds(dof)[NUM_BAR_BINS as usize - 1]
             );
-            assert!(centers.windows(2).all(|p| p[1] > p[0]), "DOF {} centers", BAR_DOF_NAMES[dof]);
+            assert!(
+                centers.windows(2).all(|p| p[1] > p[0]),
+                "DOF {} centers",
+                BAR_DOF_NAMES[dof]
+            );
         }
 
         // The outliers still bin (into the catch-all bins) and still score finitely.
@@ -4654,10 +4902,13 @@ mod tests {
                 r_bin == 0 || r_bin == NUM_BAR_BINS - 1,
                 "an out-of-range r landed in interior bin {r_bin}"
             );
-            assert_eq!(r_bin, supports.bin_of(DOF_R, samples[bulk + row as usize].r as f64) as i64);
+            assert_eq!(
+                r_bin,
+                supports.bin_of(DOF_R, samples[bulk + row as usize].r as f64) as i64
+            );
         }
         let targets = supports.targets(&extremes, BarScoring::Smoothed);
-        let encoded = targets.targets().shallow_clone();
+        let encoded = targets.smoothed_probabilities().shallow_clone();
         let sums = encoded.sum_dim_intlist([-1].as_slice(), false, Kind::Double);
         assert!((sums - 1.0).abs().max().double_value(&[]) < 1e-5);
         let uniform = Tensor::zeros(encoded.size().as_slice(), (Kind::Float, Device::Cpu));
@@ -4671,7 +4922,15 @@ mod tests {
         let sharp = encoded.clamp_min(1e-30).log() * 4.0;
         let drawn = supports.sample(&sharp, 1.0);
         assert!(drawn.select(1, DOF_R as i64).abs().max().double_value(&[]) < 1.0);
-        assert!(supports.expectation(&sharp).select(1, DOF_R as i64).abs().max().double_value(&[]) < 1.0);
+        assert!(
+            supports
+                .expectation(&sharp)
+                .select(1, DOF_R as i64)
+                .abs()
+                .max()
+                .double_value(&[])
+                < 1.0
+        );
     }
 
     /// A head that predicts the empirical distribution exactly attains its entropy,
@@ -4729,10 +4988,8 @@ mod tests {
         let rows = 4_096usize;
         let target = dof_tensor(&samples[..rows]);
         let logits = empirical_logits(&supports, &samples, rows);
-        let (_, per_dof) = bar_nll_from_logits(
-            &logits,
-            &supports.targets(&target, BarScoring::Smoothed),
-        );
+        let (_, per_dof) =
+            bar_nll_from_logits(&logits, &supports.targets(&target, BarScoring::Smoothed));
         let achieved = per_dof.double_value(&[DOF_U as i64]);
         // The soft targets for continuous observations spread mass over neighbouring
         // bins, which can only raise the cross entropy above the hard-label entropy.
@@ -4774,10 +5031,7 @@ mod tests {
         // observations would land on a single PIT value; with it they must spread
         // across the atom's whole probability interval.
         let u_pit = b.select(1, DOF_U as i64);
-        let is_half = target
-            .select(1, DOF_U as i64)
-            .eq(0.5)
-            .to_kind(Kind::Float);
+        let is_half = target.select(1, DOF_U as i64).eq(0.5).to_kind(Kind::Float);
         let hits = is_half.sum(Kind::Double).double_value(&[]);
         assert!(hits > 1_000.0, "expected many u = 0.5 rows, got {hits}");
         let selected = u_pit.masked_select(&is_half.to_kind(Kind::Bool));
@@ -4809,7 +5063,10 @@ mod tests {
         );
         let sums = encoded.sum_dim_intlist([-1].as_slice(), false, Kind::Double);
         let deviation = (sums - 1.0).abs().max().double_value(&[]);
-        assert!(deviation < 1e-5, "target rows must sum to 1, off by {deviation}");
+        assert!(
+            deviation < 1e-5,
+            "target rows must sum to 1, off by {deviation}"
+        );
         assert!(encoded.min().double_value(&[]) >= 0.0);
 
         // The mode must sit on the bin containing the value, and the mass must be
@@ -4864,8 +5121,7 @@ mod tests {
             for bin in 0..bins {
                 for (slot, position) in POSITIONS.iter().enumerate() {
                     let row = bin * POSITIONS.len() + slot;
-                    probes[row * BAR_DOF + dof] =
-                        (lo[bin] + (hi[bin] - lo[bin]) * position) as f32;
+                    probes[row * BAR_DOF + dof] = (lo[bin] + (hi[bin] - lo[bin]) * position) as f32;
                 }
             }
         }
@@ -4880,11 +5136,7 @@ mod tests {
         // assertions below run on all five, and the pre-fix COMPARISON runs only where
         // there is a bug to compare against.
         let pathological: [bool; BAR_DOF] = std::array::from_fn(|dof| {
-            let widest = supports
-                .widths(dof)
-                .iter()
-                .copied()
-                .fold(0.0f64, f64::max);
+            let widest = supports.widths(dof).iter().copied().fold(0.0f64, f64::max);
             widest / (supports.smooth_sigma_cap(dof) / BAR_LABEL_SIGMA_RATIO) > 8.0
         });
         assert!(
@@ -4900,8 +5152,11 @@ mod tests {
         // pre-fix kernel. Without this the test could not distinguish the fix from a
         // fixture whose bins happen to be uniform.
         let mut uncapped = supports.to_device(Device::Cpu);
-        uncapped.cap_width_t =
-            Tensor::full([BAR_DOF as i64, 1], f64::INFINITY, (Kind::Float, Device::Cpu));
+        uncapped.cap_width_t = Tensor::full(
+            [BAR_DOF as i64, 1],
+            f64::INFINITY,
+            (Kind::Float, Device::Cpu),
+        );
         let before = uncapped.encode_targets(&probe_t);
 
         for dof in 0..BAR_DOF {
@@ -4925,8 +5180,7 @@ mod tests {
                 let mut reachable_width = 0.0f64;
                 for bin in 0..bins {
                     let mass = encoded.double_value(&[row as i64, dof as i64, bin as i64]);
-                    let mass_before =
-                        before.double_value(&[row as i64, dof as i64, bin as i64]);
+                    let mass_before = before.double_value(&[row as i64, dof as i64, bin as i64]);
                     mean += mass * centers[bin];
                     second += mass * centers[bin] * centers[bin];
                     mean_before += mass_before * centers[bin];
@@ -5026,8 +5280,10 @@ mod tests {
         let expected = BAR_DOF as f64 * (NUM_BAR_BINS as f64).ln();
         for scoring in [BarScoring::Smoothed, BarScoring::Hard] {
             let targets = supports.targets(&values, scoring);
-            let uniform =
-                Tensor::zeros(targets.targets().size().as_slice(), (Kind::Float, Device::Cpu));
+            let uniform = Tensor::zeros(
+                [samples.len() as i64, BAR_DOF as i64, NUM_BAR_BINS],
+                (Kind::Float, Device::Cpu),
+            );
             let (mean, per_dof) = bar_nll_from_logits(&uniform, &targets);
             assert!(
                 (mean.double_value(&[]) - expected).abs() < 1e-3,
@@ -5046,8 +5302,10 @@ mod tests {
         // The density rule differs from the hard rule by exactly the mean log bin width of
         // THESE observations, which no prediction can move.
         let density = supports.targets(&values, BarScoring::Density);
-        let uniform =
-            Tensor::zeros(density.targets().size().as_slice(), (Kind::Float, Device::Cpu));
+        let uniform = Tensor::zeros(
+            [samples.len() as i64, BAR_DOF as i64, NUM_BAR_BINS],
+            (Kind::Float, Device::Cpu),
+        );
         let (mean, _) = bar_nll_from_logits(&uniform, &density);
         let measure = density
             .log_measure()
@@ -5066,10 +5324,11 @@ mod tests {
         let vs = nn::VarStore::new(Device::Cpu);
         let head = BarEmissionHead::new(&vs.root(), 48);
         let h = Tensor::randn([4, 128, 48], (Kind::Float, Device::Cpu));
+        let conditioning = Tensor::zeros_like(&h);
         let mut rng = Rng::new(12);
         let batch: Vec<BarDof> = (0..4 * 128).map(|_| synthetic_dof(&mut rng)).collect();
         let batch_dof = dof_tensor(&batch).view([4, 128, BAR_DOF as i64]);
-        let (mean, _) = head.nll(&h, &batch_dof, &supports, BarScoring::Hard);
+        let (mean, _) = head.nll(&h, &conditioning, &batch_dof, &supports, BarScoring::Hard);
         assert!(
             (mean.double_value(&[]) - expected).abs() < 1e-3,
             "fresh head NLL {} vs {expected}",
@@ -5083,7 +5342,7 @@ mod tests {
         let mut rng = Rng::new(13);
         let samples: Vec<BarDof> = (0..512).map(|_| synthetic_dof(&mut rng)).collect();
         let targets = supports.targets(&dof_tensor(&samples), BarScoring::Smoothed);
-        let rows = targets.targets().shallow_clone();
+        let rows = targets.smoothed_probabilities().shallow_clone();
         let uniform = Tensor::zeros(rows.size().as_slice(), (Kind::Float, Device::Cpu));
         let (uniform_nll, _) = bar_nll_from_logits(&uniform, &targets);
         let (matched_nll, matched_per_dof) =
@@ -5101,13 +5360,17 @@ mod tests {
             false,
             Kind::Double,
         );
-        let entropy_per_dof = entropy
-            .reshape([-1, BAR_DOF as i64])
-            .mean_dim([0i64].as_slice(), false, Kind::Double);
+        let entropy_per_dof =
+            entropy
+                .reshape([-1, BAR_DOF as i64])
+                .mean_dim([0i64].as_slice(), false, Kind::Double);
         for dof in 0..BAR_DOF {
             let got = matched_per_dof.double_value(&[dof as i64]);
             let want = entropy_per_dof.double_value(&[dof as i64]);
-            assert!((got - want).abs() < 1e-4, "DOF {dof}: {got} vs entropy {want}");
+            assert!(
+                (got - want).abs() < 1e-4,
+                "DOF {dof}: {got} vs entropy {want}"
+            );
         }
     }
 
@@ -5303,9 +5566,10 @@ mod tests {
         let mut rng = Rng::new(23);
         let samples: Vec<BarDof> = (0..64).map(|_| synthetic_dof(&mut rng)).collect();
         let h = Tensor::randn([64, 32], (Kind::Float, Device::Cpu));
+        let conditioning = Tensor::randn([64, 32], (Kind::Float, Device::Cpu));
         let base_dof = dof_tensor(&samples);
         let base_bins = supports.bin_ids(&base_dof);
-        let base = head.logits(&h, &base_bins);
+        let base = head.logits(&h, &conditioning, &base_bins);
         assert_eq!(base.size(), vec![64, BAR_DOF as i64, NUM_BAR_BINS]);
 
         // Perturbing one DOF may only move the factors that come after it.
@@ -5316,7 +5580,11 @@ mod tests {
                 array[dof] += 0.37;
                 *sample = BarDof::from_array(array);
             }
-            let moved = head.logits(&h, &supports.bin_ids(&dof_tensor(&perturbed)));
+            let moved = head.logits(
+                &h,
+                &conditioning,
+                &supports.bin_ids(&dof_tensor(&perturbed)),
+            );
             let delta = (&moved - &base).abs().amax([0i64, 2].as_slice(), false);
             for (other_position, &other) in BAR_CHAIN.iter().enumerate() {
                 let change = delta.double_value(&[other as i64]);
@@ -5339,20 +5607,24 @@ mod tests {
         }
 
         // Frozen weights keep the same values but stop parameter gradients.
-        let frozen = head.logits_frozen(&h, &base_bins);
+        let frozen = head.logits_frozen(&h, &conditioning, &base_bins);
         assert!((frozen - &base).abs().max().double_value(&[]) < 1e-6);
 
-        let drawn = head.sample(&h, &supports, 1.0);
+        let drawn = head.sample(&h, &conditioning, &supports, 1.0);
         assert_eq!(drawn.size(), vec![64, BAR_DOF as i64]);
         assert!(drawn.isfinite().all().int64_value(&[]) == 1);
-        let (mean, per_dof) = head.nll(&h, &base_dof, &supports, BarScoring::Density);
+        let (mean, per_dof) =
+            head.nll(&h, &conditioning, &base_dof, &supports, BarScoring::Density);
         assert!(mean.double_value(&[]).is_finite());
         assert_eq!(per_dof.size(), vec![BAR_DOF as i64]);
         assert_eq!(
-            head.pit(&h, &base_dof, &supports, 7).size(),
+            head.pit(&h, &conditioning, &base_dof, &supports, 7).size(),
             vec![64, BAR_DOF as i64]
         );
-        assert_eq!(head.crps(&h, &base_dof, &supports).size(), vec![BAR_DOF as i64]);
+        assert_eq!(
+            head.crps(&h, &conditioning, &base_dof, &supports).size(),
+            vec![BAR_DOF as i64]
+        );
 
         // The training loop bins the whole `[B, T + 1, BAR_DOF]` window once and hands
         // the head a NARROWED, non-contiguous view of it. That view must produce the
@@ -5360,13 +5632,18 @@ mod tests {
         // reinterpreted stride.
         let window = supports.bin_ids(&base_dof.view([4, 16, BAR_DOF as i64]));
         let view = window.narrow(1, 1, 12);
-        assert!(!view.is_contiguous(), "the probe view is contiguous after all");
+        assert!(
+            !view.is_contiguous(),
+            "the probe view is contiguous after all"
+        );
         let h_window = Tensor::randn([4, 12, 32], (Kind::Float, Device::Cpu));
+        let conditioning_window = Tensor::randn([4, 12, 32], (Kind::Float, Device::Cpu));
         assert_eq!(
             f64::try_from(
-                (head.logits(&h_window, &view) - head.logits(&h_window, &view.contiguous()))
-                    .abs()
-                    .max()
+                (head.logits(&h_window, &conditioning_window, &view)
+                    - head.logits(&h_window, &conditioning_window, &view.contiguous()))
+                .abs()
+                .max()
             )
             .expect("view gap"),
             0.0,
@@ -5378,7 +5655,7 @@ mod tests {
     /// the batched one masks `[rows, 1, SLOTS, DIM]` against `[BAR_DOF, SLOTS, 1]` and
     /// contracts with `einsum`, the sequential one masks `[rows, SLOTS, DIM]` against
     /// one DOF's mask row and contracts with `linear`. Both then flatten (slot, dim)
-    /// into the `BAR_PREFIX_WIDTH` block that `ws.narrow(1, latent_dim, ..)` reads. A
+    /// into the `BAR_PREFIX_WIDTH` block after the two readout-width blocks. A
     /// transposition or a slot swap in either one would leave the teacher-forced
     /// training loss exactly correct while every ancestral draw — direction accuracy,
     /// `BarWorldModel::imagine`, the planner's whole forecast — came from the wrong
@@ -5404,9 +5681,12 @@ mod tests {
         });
 
         let h = Tensor::randn([48, 20], (Kind::Float, Device::Cpu));
-        let drawn = head.sample(&h, &supports, 0.0);
+        let conditioning = Tensor::randn([48, 20], (Kind::Float, Device::Cpu));
+        let drawn = head.sample(&h, &conditioning, &supports, 0.0);
         let drawn_bins = supports.bin_ids(&drawn);
-        let replayed = head.logits(&h, &drawn_bins).argmax(-1, false);
+        let replayed = head
+            .logits(&h, &conditioning, &drawn_bins)
+            .argmax(-1, false);
         assert_eq!(
             Vec::<i64>::try_from(drawn_bins.reshape([-1]).contiguous()).expect("drawn bins"),
             Vec::<i64>::try_from(replayed.reshape([-1]).contiguous()).expect("replayed bins"),
@@ -5419,7 +5699,10 @@ mod tests {
                 .expect("drawn bins")
                 .into_iter()
                 .collect();
-        assert!(distinct.len() > 4, "the argmax chain collapsed onto {distinct:?}");
+        assert!(
+            distinct.len() > 4,
+            "the argmax chain collapsed onto {distinct:?}"
+        );
     }
 
     #[test]
@@ -5432,6 +5715,8 @@ mod tests {
         let samples: Vec<BarDof> = (0..32).map(|_| synthetic_dof(&mut rng)).collect();
         let target = dof_tensor(&samples);
         let h = Tensor::randn([32, 24], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let conditioning =
+            Tensor::randn([32, 24], (Kind::Float, Device::Cpu)).set_requires_grad(true);
 
         let grad_sum = |t: &Tensor| {
             let grad = t.grad();
@@ -5442,7 +5727,7 @@ mod tests {
             }
         };
 
-        let (loss, _) = head.nll(&h, &target, &supports, BarScoring::Density);
+        let (loss, _) = head.nll(&h, &conditioning, &target, &supports, BarScoring::Density);
         loss.backward();
         let head_weight = &head.heads[DOF_S].ws;
         assert!(
@@ -5458,7 +5743,7 @@ mod tests {
                 let _ = ws.normal_(0.0, 0.2);
             }
         });
-        let (loss, _) = head.nll(&h, &target, &supports, BarScoring::Density);
+        let (loss, _) = head.nll(&h, &conditioning, &target, &supports, BarScoring::Density);
         loss.backward();
         assert!(
             grad_sum(&head.prefix_embed) > 0.0,
@@ -5470,8 +5755,11 @@ mod tests {
         // there would train the head on its own predicted latent.
         let before = (grad_sum(head_weight), grad_sum(&head.prefix_embed));
         let target_bins = supports.bin_ids(&target);
-        let frozen_logits = head.logits_frozen(&h, &target_bins);
-        let (kl, _) = bar_categorical_kl(&head.logits(&h, &target_bins).detach(), &frozen_logits);
+        let frozen_logits = head.logits_frozen(&h, &conditioning, &target_bins);
+        let (kl, _) = bar_categorical_kl(
+            &head.logits(&h, &conditioning, &target_bins).detach(),
+            &frozen_logits,
+        );
         kl.backward();
         let after = (grad_sum(head_weight), grad_sum(&head.prefix_embed));
         assert!(
@@ -5491,12 +5779,20 @@ mod tests {
         // JSON decimal parsing is round-trip faithful to within an ulp, which is
         // far below the f32 precision the supports are actually evaluated in.
         for dof in 0..BAR_DOF {
-            assert_eq!(supports.lower_bounds(dof).len(), loaded.lower_bounds(dof).len());
+            assert_eq!(
+                supports.lower_bounds(dof).len(),
+                loaded.lower_bounds(dof).len()
+            );
             for (a, b) in supports
                 .lower_bounds(dof)
                 .iter()
                 .chain(supports.upper_bounds(dof))
-                .zip(loaded.lower_bounds(dof).iter().chain(loaded.upper_bounds(dof)))
+                .zip(
+                    loaded
+                        .lower_bounds(dof)
+                        .iter()
+                        .chain(loaded.upper_bounds(dof)),
+                )
             {
                 assert!(
                     (a - b).abs() <= 1e-12 * a.abs().max(1e-12),
@@ -5511,7 +5807,10 @@ mod tests {
             .abs()
             .max()
             .double_value(&[]);
-        assert!(delta < 1e-6, "reloaded supports encode differently by {delta}");
+        assert!(
+            delta < 1e-6,
+            "reloaded supports encode differently by {delta}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5520,7 +5819,13 @@ mod tests {
         let bars: Vec<PackedBar> = (0..64)
             .map(|i| {
                 let base = 100.0 + i as f32 * 0.1;
-                bar(base, base + 0.4, base - 0.3, base + 0.2, 1_000.0 + i as f32 * 25.0)
+                bar(
+                    base,
+                    base + 0.4,
+                    base - 0.3,
+                    base + 0.2,
+                    1_000.0 + i as f32 * 25.0,
+                )
             })
             .collect();
         let dof = encode_series(&bars);
@@ -5548,7 +5853,13 @@ mod tests {
                 let r = (0.004 * rng.normal()) as f32;
                 let w = (0.4 * rng.normal()) as f32;
                 if rng.uniform() < 0.35 {
-                    BarDof { r, s: 0.0, u: 0.5, v: 0.5, w }
+                    BarDof {
+                        r,
+                        s: 0.0,
+                        u: 0.5,
+                        v: 0.5,
+                        w,
+                    }
                 } else {
                     BarDof {
                         r,
@@ -5595,17 +5906,16 @@ mod tests {
         // A constant latent: the head can only learn this from the chain prefix.
         let vs = nn::VarStore::new(Device::Cpu);
         let head = BarEmissionHead::new(&vs.root(), 4);
-        let mut optimizer = nn::Adam::default()
-            .build(&vs, 0.05)
-            .expect("adam");
+        let mut optimizer = nn::Adam::default().build(&vs, 0.05).expect("adam");
 
         let batch = &corpus[..1024];
         let target = dof_tensor(batch);
         let bins = supports.bin_ids(&target);
         let soft = supports.targets(&target, BarScoring::Smoothed);
         let h = Tensor::zeros([batch.len() as i64, 4], (Kind::Float, Device::Cpu));
+        let conditioning = Tensor::zeros_like(&h);
         for _ in 0..400 {
-            let (loss, _) = bar_nll_from_logits(&head.logits(&h, &bins), &soft);
+            let (loss, _) = bar_nll_from_logits(&head.logits(&h, &conditioning, &bins), &soft);
             optimizer.backward_step(&loss);
         }
 
@@ -5613,7 +5923,13 @@ mod tests {
         // every one of them, because it is a function of s alone.
         let probes: Vec<BarDof> = [-0.02f32, -0.004, 0.0, 0.004, 0.02]
             .into_iter()
-            .map(|r| BarDof { r, s: 0.0, u: 0.5, v: 0.5, w: 0.0 })
+            .map(|r| BarDof {
+                r,
+                s: 0.0,
+                u: 0.5,
+                v: 0.5,
+                w: 0.0,
+            })
             .collect();
         let probe_bins = supports.bin_ids(&dof_tensor(&probes));
         assert!(
@@ -5622,11 +5938,9 @@ mod tests {
             "the probe rows did not land on the s == 0 atom bin"
         );
         let probs = tch::no_grad(|| {
-            head.logits(
-                &Tensor::zeros([probes.len() as i64, 4], (Kind::Float, Device::Cpu)),
-                &probe_bins,
-            )
-            .softmax(-1, Kind::Double)
+            let latent = Tensor::zeros([probes.len() as i64, 4], (Kind::Float, Device::Cpu));
+            head.logits(&latent, &Tensor::zeros_like(&latent), &probe_bins)
+                .softmax(-1, Kind::Double)
         });
         for (slot, &dof) in [DOF_U, DOF_V].iter().enumerate() {
             let mut worst = 1.0f64;
@@ -5644,10 +5958,18 @@ mod tests {
 
         // And it did not collapse to always predicting the atom: a live bar must
         // still spread its shape mass.
-        let live = [BarDof { r: 0.001, s: 0.004, u: 0.31, v: 0.77, w: 0.0 }];
+        let live = [BarDof {
+            r: 0.001,
+            s: 0.004,
+            u: 0.31,
+            v: 0.77,
+            w: 0.0,
+        }];
         let live_probs = tch::no_grad(|| {
+            let latent = Tensor::zeros([1, 4], (Kind::Float, Device::Cpu));
             head.logits(
-                &Tensor::zeros([1, 4], (Kind::Float, Device::Cpu)),
+                &latent,
+                &Tensor::zeros_like(&latent),
                 &supports.bin_ids(&dof_tensor(&live)),
             )
             .softmax(-1, Kind::Double)
@@ -5690,8 +6012,20 @@ mod tests {
             }
         };
         let wild = vec![
-            BarDof { r: -LOG_LIMIT as f32, s: 14.4 * edge(DOF_S, true), u: 1.0, v: 0.0, w: 9.0 },
-            BarDof { r: 20.4 * edge(DOF_R, true), s: 1.369, u: 0.0, v: 1.0, w: -9.0 },
+            BarDof {
+                r: -LOG_LIMIT as f32,
+                s: 14.4 * edge(DOF_S, true),
+                u: 1.0,
+                v: 0.0,
+                w: 9.0,
+            },
+            BarDof {
+                r: 20.4 * edge(DOF_R, true),
+                s: 1.369,
+                u: 0.0,
+                v: 1.0,
+                w: -9.0,
+            },
         ];
         let clamped: Vec<BarDof> = wild
             .iter()
@@ -5722,8 +6056,9 @@ mod tests {
         }
 
         let h = Tensor::randn([2, 16], (Kind::Float, Device::Cpu));
-        let wild_logits = head.logits(&h, &wild_bins);
-        let clamped_logits = head.logits(&h, &clamped_bins);
+        let conditioning = Tensor::randn([2, 16], (Kind::Float, Device::Cpu));
+        let wild_logits = head.logits(&h, &conditioning, &wild_bins);
+        let clamped_logits = head.logits(&h, &conditioning, &clamped_bins);
         let gap = f64::try_from((&wild_logits - &clamped_logits).abs().max()).expect("gap");
         assert_eq!(
             gap, 0.0,
@@ -5750,8 +6085,10 @@ mod tests {
             wild_bins.int64_value(&[0, DOF_S as i64]),
             "the probe did not actually change the s bin"
         );
-        let moved = head.logits(&h, &inside_bins);
-        let delta = (&moved - &wild_logits).abs().amax([0i64, 2].as_slice(), false);
+        let moved = head.logits(&h, &conditioning, &inside_bins);
+        let delta = (&moved - &wild_logits)
+            .abs()
+            .amax([0i64, 2].as_slice(), false);
         for (position, &dof) in BAR_CHAIN.iter().enumerate() {
             let change = delta.double_value(&[dof as i64]);
             if position > CHAIN_POS[DOF_S] {
@@ -5813,7 +6150,7 @@ mod tests {
         let draws = Tensor::from_slice(&flat).view([DRAWS as i64, BAR_DOF as i64]);
         let targets = supports
             .targets(&draws, BarScoring::Smoothed)
-            .into_targets();
+            .into_smoothed_probabilities();
         let entropy = -(&targets * targets.clamp_min(1e-30).log()).sum_dim_intlist(
             [-1].as_slice(),
             false,
@@ -5852,7 +6189,8 @@ mod tests {
         let samples: Vec<BarDof> = (0..256).map(|_| synthetic_dof(&mut rng)).collect();
         let target = dof_tensor(&samples);
         let h = Tensor::randn([256, 12], (Kind::Float, Device::Cpu));
-        let logits = head.logits(&h, &supports.bin_ids(&target));
+        let conditioning = Tensor::randn([256, 12], (Kind::Float, Device::Cpu));
+        let logits = head.logits(&h, &conditioning, &supports.bin_ids(&target));
 
         for scoring in BarScoring::ALL {
             let marginal = supports.marginal_nll_parts(scoring);
@@ -5911,83 +6249,93 @@ mod tests {
         }
     }
 
-    /// `H(p) + sum_b p_b ln w_b` — the density rule's marginal reference — written out for
-    /// an ARBITRARY bin count over the analytic law's clipped quantile range, so "double
-    /// the bins" is expressible even though [`NUM_BAR_BINS`] is a compile-time constant.
-    ///
-    /// Mirrors `fit_dof_support` exactly: the outer edges sit at the
-    /// [`BAR_SUPPORT_CLIP_QUANTILE`] quantiles and the interior edges are equal-mass
-    /// positions of the law conditioned onto that range.
-    fn density_marginal_reference(bins: usize, quantile: impl Fn(f64) -> f64) -> f64 {
-        let clip = BAR_SUPPORT_CLIP_QUANTILE;
-        let edge = |j: usize| quantile(clip + (1.0 - 2.0 * clip) * j as f64 / bins as f64);
-        let p = 1.0 / bins as f64;
-        -p.ln() + (0..bins).map(|j| p * (edge(j + 1) - edge(j)).ln()).sum::<f64>()
+    #[test]
+    fn hard_is_default_and_sparse_rules_do_not_allocate_probability_rows() {
+        assert_eq!(BarScoring::default(), BarScoring::Hard);
+        let supports = synthetic_supports(10_000, 0x5A25E);
+        let mut rng = Rng::new(0x1D5);
+        let samples: Vec<BarDof> = (0..17).map(|_| synthetic_dof(&mut rng)).collect();
+        let values = dof_tensor(&samples).view([1, 17, BAR_DOF as i64]);
+        let expected_ids = supports.bin_ids(&values);
+
+        for scoring in [BarScoring::Hard, BarScoring::Density] {
+            let targets = supports.targets(&values, scoring);
+            assert_eq!(targets.class_ids().size(), [1, 17, BAR_DOF as i64]);
+            assert!(
+                targets.probabilities().is_none(),
+                "{scoring} must not allocate dense probability rows"
+            );
+            assert_eq!(
+                targets
+                    .class_ids()
+                    .eq_tensor(&expected_ids)
+                    .all()
+                    .int64_value(&[]),
+                1
+            );
+            match scoring {
+                BarScoring::Hard => assert!(targets.log_measure().is_none()),
+                BarScoring::Density => assert_eq!(
+                    targets
+                        .log_measure()
+                        .expect("density carries one measure scalar per class ID")
+                        .size(),
+                    [1, 17, BAR_DOF as i64]
+                ),
+                BarScoring::Smoothed => unreachable!(),
+            }
+        }
+
+        let smoothed = supports.targets(&values, BarScoring::Smoothed);
+        assert_eq!(
+            smoothed
+                .probabilities()
+                .expect("smoothed scoring keeps dense rows")
+                .size(),
+            [1, 17, BAR_DOF as i64, NUM_BAR_BINS]
+        );
+        assert!(smoothed.log_measure().is_none());
     }
 
-    /// The property that makes `density` proper for a continuous law and `hard` not: its
-    /// value does not move when the discretization is refined, because the measure term
-    /// cancels the `ln(bins)` that the categorical picks up.
-    ///
-    /// [`NUM_BAR_BINS`] is fixed at compile time, so the doubling happens in
-    /// [`density_marginal_reference`], which is the same formula the production code
-    /// evaluates. The link back to production is the first assertion: the fitted
-    /// 128-bin support reproduces that formula on a sample from the same law.
     #[test]
-    fn the_density_rule_is_invariant_to_the_bin_count() {
-        // Exponential(1) on `r`: quantile `-ln(1 - u)`, differential entropy exactly 1 nat.
-        let quantile = |u: f64| -(1.0 - u).ln();
-        const ROWS: usize = 200_000;
-        let mut rng = Rng::new(0xB1_0000);
-        let samples: Vec<BarDof> = (0..ROWS)
-            .map(|_| {
-                let mut dof = synthetic_dof(&mut rng);
-                dof.r = quantile(rng.uniform()) as f32;
-                dof
-            })
-            .collect();
-        let supports = BarSupports::fit(&samples);
-        assert!(
-            supports.atoms(DOF_R).is_empty(),
-            "a continuous law must not manufacture atoms on r"
+    fn sparse_indexed_nll_matches_dense_reference_in_value_and_gradient() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let supports = synthetic_supports(10_000, 0xD3A5E);
+        let mut rng = Rng::new(0xE901);
+        let samples: Vec<BarDof> = (0..23).map(|_| synthetic_dof(&mut rng)).collect();
+        let values = dof_tensor(&samples);
+        let base = Tensor::randn(
+            [samples.len() as i64, BAR_DOF as i64, NUM_BAR_BINS],
+            (Kind::Float, Device::Cpu),
         );
 
-        let fitted = supports.marginal_nll_dof(BarScoring::Density)[DOF_R];
-        let coarse = density_marginal_reference(NUM_BAR_BINS as usize, quantile);
-        let fine = density_marginal_reference(2 * NUM_BAR_BINS as usize, quantile);
-        assert!(
-            (fitted - coarse).abs() < 0.03,
-            "the fitted 128-bin density reference {fitted} does not match the analytic \
-             {coarse}"
-        );
-        // The claim: doubling the bins moves the density figure by discretization error
-        // only. The hard rule moves by ln 2 = 0.693 by construction, which is what makes
-        // it unusable for a bin-count ablation.
-        let drift = (fine - coarse).abs();
-        assert!(
-            drift < 0.02,
-            "doubling the bins moved the density reference by {drift} nats \
-             ({coarse} -> {fine})"
-        );
-        assert!(
-            drift < 0.05 * std::f64::consts::LN_2,
-            "the density drift {drift} is not small beside the hard rule's ln 2 shift"
-        );
-        // Both bin counts sit at the analytic differential entropy of Exponential(1).
-        for (label, value) in [("128", coarse), ("256", fine)] {
+        for scoring in [BarScoring::Hard, BarScoring::Density] {
+            let targets = supports.targets(&values, scoring);
+            let sparse_logits = base.detach().set_requires_grad(true);
+            let dense_logits = base.detach().set_requires_grad(true);
+            let sparse_terms = bar_nll_terms(&sparse_logits, &targets);
+            let one_hot = Tensor::zeros_like(&dense_logits).scatter_value(
+                -1,
+                &targets.class_ids().unsqueeze(-1),
+                1.0,
+            );
+            let dense_terms = -(one_hot * dense_logits.log_softmax(-1, Kind::Float))
+                .sum_dim_intlist([-1].as_slice(), false, Kind::Float)
+                + targets.measure_or_zero(&dense_logits);
             assert!(
-                (value - 1.0).abs() < 0.05,
-                "{label}-bin density reference {value} is not the 1-nat differential entropy"
+                sparse_terms.allclose(&dense_terms, 1e-6, 1e-6, false),
+                "{scoring} indexed NLL differs from dense one-hot cross entropy"
+            );
+
+            sparse_terms.sum(Kind::Float).backward();
+            dense_terms.sum(Kind::Float).backward();
+            assert!(
+                sparse_logits
+                    .grad()
+                    .allclose(&dense_logits.grad(), 1e-6, 1e-6, false),
+                "{scoring} indexed NLL gradient differs from dense one-hot cross entropy"
             );
         }
-        // The contrast, measured rather than asserted from theory: the hard rule's
-        // reference IS ln(bins) up to the histogram's own entropy deficit.
-        let hard = supports.marginal_nll_dof(BarScoring::Hard)[DOF_R];
-        assert!(
-            (hard - (NUM_BAR_BINS as f64).ln()).abs() < 0.05,
-            "the hard reference {hard} is not ln(bins) = {}",
-            (NUM_BAR_BINS as f64).ln()
-        );
     }
 
     /// The hard rule is the `sigma -> 0` limit of the smoothed one. Probed at every bin's
@@ -6015,10 +6363,11 @@ mod tests {
         let mut previous = f64::INFINITY;
         for sigma_ratio in [BAR_LABEL_SIGMA_RATIO, 0.1, 1e-3] {
             let smoothed = supports.targets_with_sigma(&probes, BarScoring::Smoothed, sigma_ratio);
-            let gap = (smoothed.targets() - hard.targets())
-                .abs()
-                .max()
-                .double_value(&[]);
+            let selected = smoothed
+                .smoothed_probabilities()
+                .gather(-1, &hard.class_ids().unsqueeze(-1), false)
+                .squeeze_dim(-1);
+            let gap = (selected - 1.0).abs().max().double_value(&[]);
             assert!(
                 gap < previous,
                 "shrinking sigma to {sigma_ratio} did not tighten the gap to the one-hot: \
@@ -6046,9 +6395,9 @@ mod tests {
         );
     }
 
-    /// On an analytic MIXED law the density rule must score an atom as a probability MASS
-    /// and a continuous observation as a DENSITY. Those are different units, and the whole
-    /// reason the rule needs the support's widths.
+    /// On a bounded analytic mixed fixture, the finite-bin density diagnostic must score an
+    /// atom as a probability mass and an interior continuous observation as `P_b / width_b`.
+    /// This checks those units; it does not turn the clipped outer bins into a tail model.
     #[test]
     fn the_atom_path_is_a_mass_and_the_continuous_path_a_density() {
         // r ~ 0.25 * delta(0) + 0.75 * Uniform(-0.05, 0.05).
@@ -6069,9 +6418,17 @@ mod tests {
             .collect();
         let supports = BarSupports::fit(&samples);
         let atoms = supports.atoms(DOF_R);
-        assert_eq!(atoms.len(), 1, "the 25% point mass must be promoted to an atom");
+        assert_eq!(
+            atoms.len(),
+            1,
+            "the 25% point mass must be promoted to an atom"
+        );
         assert_eq!(atoms[0].value, 0.0);
-        assert!((atoms[0].mass - ATOM_MASS).abs() < 5e-3, "{}", atoms[0].mass);
+        assert!(
+            (atoms[0].mass - ATOM_MASS).abs() < 5e-3,
+            "{}",
+            atoms[0].mass
+        );
 
         // The oracle head: a fixed prediction equal to the fitted marginal row.
         let rows = 40_000usize;
@@ -6092,7 +6449,10 @@ mod tests {
         let terms = bar_nll_terms(&logits, &supports.targets(&target, BarScoring::Density))
             .select(-1, DOF_R as i64);
         let on_atom = target.select(-1, DOF_R as i64).eq(0.0);
-        let atom_nats = terms.masked_select(&on_atom).mean(Kind::Double).double_value(&[]);
+        let atom_nats = terms
+            .masked_select(&on_atom)
+            .mean(Kind::Double)
+            .double_value(&[]);
         let continuous_nats = terms
             .masked_select(&on_atom.logical_not())
             .mean(Kind::Double)
@@ -6115,7 +6475,8 @@ mod tests {
             "continuous rows scored {continuous_nats}, expected the log density \
              {expected_continuous}"
         );
-        // And the reference line is the analytic mixed-measure entropy of the same law.
+        // The reference approximates the bounded fixture's mixed-measure entropy; the
+        // tolerance includes the explicitly clipped fraction in the two outer bins.
         let expected_total = ATOM_MASS * expected_atom + (1.0 - ATOM_MASS) * expected_continuous;
         let reported = supports.marginal_nll_dof(BarScoring::Density)[DOF_R];
         assert!(
@@ -6175,15 +6536,17 @@ mod tests {
             }
         });
         let h = Tensor::randn([rows, latent], (Kind::Float, Device::Cpu));
+        let conditioning = Tensor::randn([rows, latent], (Kind::Float, Device::Cpu));
         // Targets drawn from the head's OWN law, so the comparison is not dominated by a
         // mismatch between the head and the data.
-        let target = head.sample(&h, &supports, 1.0);
+        let target = head.sample(&h, &conditioning, &supports, 1.0);
         let bins = supports.bin_ids(&target);
         let targets = supports.targets(&target, BarScoring::Density);
         let per_dof = |terms: &Tensor| -> [f64; BAR_DOF] {
-            let mean = terms
-                .reshape([-1, BAR_DOF as i64])
-                .mean_dim([0i64].as_slice(), false, Kind::Float);
+            let mean =
+                terms
+                    .reshape([-1, BAR_DOF as i64])
+                    .mean_dim([0i64].as_slice(), false, Kind::Float);
             let mut out = [0.0f64; BAR_DOF];
             for dof in 0..BAR_DOF {
                 out[dof] = mean.double_value(&[dof as i64]);
@@ -6191,11 +6554,14 @@ mod tests {
             out
         };
 
-        let teacher = per_dof(&bar_nll_terms(&head.logits(&h, &bins), &targets));
+        let teacher = per_dof(&bar_nll_terms(
+            &head.logits(&h, &conditioning, &bins),
+            &targets,
+        ));
         // `forecast_log_probs` returns normalized log-probabilities, and `log_softmax` of a
         // normalized log-probability row is that row, so the same scorer applies unchanged.
         let forecast = per_dof(&bar_nll_terms(
-            &head.forecast_log_probs(&h, 128, 0xE7A1_5E7D),
+            &head.forecast_log_probs(&h, &conditioning, 128, 0xE7A1_5E7D),
             &targets,
         ));
         let first = BAR_CHAIN[0];
@@ -6206,8 +6572,7 @@ mod tests {
             forecast[first],
             teacher[first]
         );
-        let dependent_inflation: f64 =
-            forecast.iter().sum::<f64>() - teacher.iter().sum::<f64>();
+        let dependent_inflation: f64 = forecast.iter().sum::<f64>() - teacher.iter().sum::<f64>();
         assert!(
             dependent_inflation > 1e-2,
             "with a dependent chain the marginalized law must be strictly worse than the \
@@ -6221,9 +6586,12 @@ mod tests {
             let mut table = head.prefix_embed.shallow_clone();
             let _ = table.zero_();
         });
-        let teacher_indep = per_dof(&bar_nll_terms(&head.logits(&h, &bins), &targets));
+        let teacher_indep = per_dof(&bar_nll_terms(
+            &head.logits(&h, &conditioning, &bins),
+            &targets,
+        ));
         let forecast_indep = per_dof(&bar_nll_terms(
-            &head.forecast_log_probs(&h, 128, 0xE7A1_5E7D),
+            &head.forecast_log_probs(&h, &conditioning, 128, 0xE7A1_5E7D),
             &targets,
         ));
         for dof in 0..BAR_DOF {

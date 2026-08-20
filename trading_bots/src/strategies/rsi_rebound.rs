@@ -590,8 +590,8 @@ pub fn get_buy_price_quantity(
     let distance_weight = distance / agent.weights.map[Weight::BuyDistanceWeightAmount];
 
     let percent = agent.weights.map[Weight::BuyPercent] * distance_weight;
-    let available =
-        (cash).min(((assets / tickers().len() as f64) - position.value_with_price(price)) * percent);
+    let available = (cash)
+        .min(((assets / tickers().len() as f64) - position.value_with_price(price)) * percent);
     // println!("available {available}");
     // panic!();
 

@@ -804,7 +804,11 @@ impl SymbolCost {
                 let before = insert.checked_sub(1).map(|i| &self.buckets[i]);
                 let after = self.buckets.get(insert);
                 match (before, after) {
-                    (Some(b), Some(a)) => Some(if month - b.month <= a.month - month { b } else { a }),
+                    (Some(b), Some(a)) => Some(if month - b.month <= a.month - month {
+                        b
+                    } else {
+                        a
+                    }),
                     (Some(b), None) => Some(b),
                     (None, Some(a)) => Some(a),
                     (None, None) => None,
@@ -1027,7 +1031,10 @@ impl BarCostModel {
     /// symbol's five years is still that symbol's own liquidity.
     pub fn resolve(&self, symbol: u32, ts_ms: i64) -> ResolvedCost {
         let entry = self.calibration.symbols.get(symbol as usize);
-        self.resolve_from(entry.and_then(|s| s.bucket_at(ts_ms)), entry.map(|s| &s.pooled))
+        self.resolve_from(
+            entry.and_then(|s| s.bucket_at(ts_ms)),
+            entry.map(|s| &s.pooled),
+        )
     }
 
     /// The same resolution against the symbol's SPAN-POOLED liquidity, which is what the
@@ -1113,7 +1120,13 @@ impl BarCostModel {
         let mut ranked: Vec<(f64, u32)> = (0..self.calibration.len() as u32)
             .map(|symbol| (self.calibration.pooled_adv_usd(symbol), symbol))
             .collect();
-        let rank_key = |adv: f64| if adv.is_finite() { adv } else { f64::NEG_INFINITY };
+        let rank_key = |adv: f64| {
+            if adv.is_finite() {
+                adv
+            } else {
+                f64::NEG_INFINITY
+            }
+        };
         ranked.sort_by(|a, b| rank_key(a.0).total_cmp(&rank_key(b.0)).then(a.1.cmp(&b.1)));
         ranked
     }
@@ -2434,7 +2447,8 @@ impl MatrixPanel {
             let live: Vec<usize> = (0..self.width)
                 .filter(|&column| flat[column * self.width + column] > 0.0)
                 .collect();
-            let mut off_diagonal = Vec::with_capacity(live.len().saturating_sub(1) * live.len() / 2);
+            let mut off_diagonal =
+                Vec::with_capacity(live.len().saturating_sub(1) * live.len() / 2);
             for (offset, &row) in live.iter().enumerate() {
                 for &column in &live[offset + 1..] {
                     off_diagonal.push(flat[row * self.width + column]);
@@ -2670,9 +2684,7 @@ fn decile_series(deciles: &[CostDecile]) -> Vec<ReportSeries> {
     let mut series = vec![
         column("median ADV ($M)", &|d| d.median_adv_usd / 1.0e6),
         column("median price ($)", &|d| d.median_harmonic_price),
-        column("Roll spread, PRIMARY (bps)", &|d| {
-            d.median_roll_spread_bps
-        }),
+        column("Roll spread, PRIMARY (bps)", &|d| d.median_roll_spread_bps),
         column("CS spread (bps)", &|d| d.median_cs_spread_bps),
         column("CS spread, clamped (bps)", &|d| {
             d.median_cs_spread_bps_clamped
@@ -2979,7 +2991,10 @@ pub fn corpus_panel(
     max_slices: usize,
 ) -> Result<(Vec<PanelSlice>, Vec<u32>)> {
     ensure!(to_ms > from_ms, "an empty span carries no panel");
-    ensure!(max_symbols >= MIN_PANEL_SYMBOLS, "the panel cap is too small");
+    ensure!(
+        max_symbols >= MIN_PANEL_SYMBOLS,
+        "the panel cap is too small"
+    );
     let stride = corpus.res_secs() as i64 * 1000;
 
     let mut coverage: HashMap<i64, usize> = HashMap::new();
@@ -3005,7 +3020,10 @@ pub fn corpus_panel(
     if grid.len() > max_slices {
         grid.drain(..grid.len() - max_slices);
     }
-    ensure!(grid.len() >= 2, "the retained grid holds fewer than 2 instants");
+    ensure!(
+        grid.len() >= 2,
+        "the retained grid holds fewer than 2 instants"
+    );
     let slot_of: HashMap<i64, usize> = grid
         .iter()
         .enumerate()
@@ -3021,7 +3039,8 @@ pub fn corpus_panel(
         let mut filled = 0usize;
         let mut dollars = 0.0f64;
         for pair in bars.windows(2) {
-            let Some((ts, log_return)) = contiguous_return(pair[0], pair[1], stride, from_ms, to_ms)
+            let Some((ts, log_return)) =
+                contiguous_return(pair[0], pair[1], stride, from_ms, to_ms)
             else {
                 continue;
             };
@@ -3384,7 +3403,10 @@ mod tests {
         );
         // 20,000 bars is 256 whole sessions plus a remainder: one window is lost at each
         // session boundary and one at the end of the series.
-        assert_eq!(measured.pooled.pairs, 20_000 - 1 - 20_000 / SESSION_BARS as u64);
+        assert_eq!(
+            measured.pooled.pairs,
+            20_000 - 1 - 20_000 / SESSION_BARS as u64
+        );
         // A wide spread against a quiet tape is the easy regime, so few windows should come out
         // negative here. This is the control for the next test.
         assert!(
@@ -3646,11 +3668,7 @@ mod tests {
             "at positive size an unmeasurable coefficient must propagate, not read as zero"
         );
         // And the decile table must COUNT it, because `median` silently drops the NaN.
-        let counted: usize = model
-            .deciles()
-            .iter()
-            .map(|d| d.impact_unpriceable)
-            .sum();
+        let counted: usize = model.deciles().iter().map(|d| d.impact_unpriceable).sum();
         assert_eq!(
             counted, 1,
             "the one unpriceable symbol must be counted in exactly one decile"
@@ -3824,11 +3842,7 @@ mod tests {
             "the fixed floor must carry the absence, not absorb it"
         );
         // And the table must COUNT it, in the column that is otherwise measured on every member.
-        let counted: usize = model
-            .deciles()
-            .iter()
-            .map(|d| d.fixed_unmeasurable)
-            .sum();
+        let counted: usize = model.deciles().iter().map(|d| d.fixed_unmeasurable).sum();
         assert_eq!(
             counted, 1,
             "the one unmeasurable fixed floor must be counted in exactly one decile"
@@ -4167,7 +4181,11 @@ mod tests {
         };
         let mut weights = Vec::new();
 
-        book_weights(&kelly, BookSpec::new(BookStyle::LongOnly, 1.0), &mut weights);
+        book_weights(
+            &kelly,
+            BookSpec::new(BookStyle::LongOnly, 1.0),
+            &mut weights,
+        );
         let long_only = measured
             .book(BookStyle::LongOnly)
             .expect("the long-only book is measured");
@@ -4606,9 +4624,8 @@ mod tests {
         // 0.5 of top-up on the survivor as it goes from half to the whole book. Total 2.0.
         // Both names carry their own measured spread, so the expected charge is the sum of the
         // two fixed costs: one full leg of each over two bars.
-        let expected = (model.resolve(0, EPOCH_MS).fixed_bps()
-            + model.resolve(1, EPOCH_MS).fixed_bps())
-            / 2.0;
+        let expected =
+            (model.resolve(0, EPOCH_MS).fixed_bps() + model.resolve(1, EPOCH_MS).fixed_bps()) / 2.0;
         assert!(
             (curve.points[0].fixed_cost_bps - expected).abs() < 1.0e-6,
             "expected {expected} bps/bar of fixed cost, got {}",
@@ -4672,7 +4689,12 @@ mod tests {
                 BookSpec::new(style, 2.0),
                 &mut weights,
             );
-            assert_eq!(weights[0], 0.0, "{} gave a NaN forecast a position", style.label());
+            assert_eq!(
+                weights[0],
+                0.0,
+                "{} gave a NaN forecast a position",
+                style.label()
+            );
             assert!(
                 (weights.iter().map(|w| w.abs()).sum::<f64>() - 2.0).abs() < 1.0e-9,
                 "{} lost its gross exposure to a NaN",
@@ -4745,7 +4767,11 @@ mod tests {
         // about where the split landed.
         let mut bars = synthetic_bars(SESSION_BARS * 40, 0.0020, 0.0010, 50.0, 64, 0x3F0);
         for (index, bar) in bars.iter_mut().enumerate() {
-            bar.volume = if index / SESSION_BARS < 30 { 1.0e6 } else { 1.0e4 };
+            bar.volume = if index / SESSION_BARS < 30 {
+                1.0e6
+            } else {
+                1.0e4
+            };
         }
         let measured = SymbolCost::measure("FADE", &bars, RES_SECS);
         assert_eq!(
@@ -4818,27 +4844,32 @@ mod tests {
                     session != 4
                 });
             }
-            write_bar_file(&dir.join(format!("{name}.{RES_SECS}.bars")), &name, RES_SECS, &bars)
-                .expect("the bar file writes");
+            write_bar_file(
+                &dir.join(format!("{name}.{RES_SECS}.bars")),
+                &name,
+                RES_SECS,
+                &bars,
+            )
+            .expect("the bar file writes");
             written.push((name, bars));
         }
 
-        let corpus =
-            crate::torch::dataset::BarCorpus::load_with_bounds(&dir, RES_SECS, 200, (from_ms, to_ms))
-                .expect("the synthetic corpus loads");
+        let corpus = crate::torch::dataset::BarCorpus::load_with_bounds(
+            &dir,
+            RES_SECS,
+            200,
+            (from_ms, to_ms),
+        )
+        .expect("the synthetic corpus loads");
         assert_eq!(corpus.series_count(), symbols);
 
         // The parallel corpus pass and the single-threaded series pass are the same measurement.
         let parallel = CostCalibration::from_corpus(&corpus, 3).expect("the corpus calibrates");
         let ordered: Vec<(String, &[PackedBar])> = (0..corpus.series_count())
-            .map(|series| {
-                (
-                    corpus.symbol(series).to_owned(),
-                    corpus.bars(series),
-                )
-            })
+            .map(|series| (corpus.symbol(series).to_owned(), corpus.bars(series)))
             .collect();
-        let serial = CostCalibration::from_series(&ordered, RES_SECS).expect("the series calibrate");
+        let serial =
+            CostCalibration::from_series(&ordered, RES_SECS).expect("the series calibrate");
         assert_eq!(parallel.len(), serial.len());
         assert_eq!(parallel.unmeasured, serial.unmeasured);
         for (index, (a, b)) in parallel.symbols.iter().zip(&serial.symbols).enumerate() {
@@ -4863,7 +4894,10 @@ mod tests {
             "the symbol with a hole inside the span must be excluded, got {panel:?}"
         );
         // Ranked by traded dollars, so the cap keeps the top `cap` volumes: symbols 4..11.
-        assert_eq!(panel, (symbols as u32 - cap as u32..symbols as u32).collect::<Vec<u32>>());
+        assert_eq!(
+            panel,
+            (symbols as u32 - cap as u32..symbols as u32).collect::<Vec<u32>>()
+        );
         for slice in &slices {
             assert_eq!(slice.symbols, panel);
             assert_eq!(slice.realized_r.len(), panel.len());
@@ -4871,7 +4905,10 @@ mod tests {
             assert!(slice.ts_ms >= from_ms && slice.ts_ms < to_ms);
         }
         for pair in slices.windows(2) {
-            assert!(pair[1].ts_ms > pair[0].ts_ms, "the grid must be time ordered");
+            assert!(
+                pair[1].ts_ms > pair[0].ts_ms,
+                "the grid must be time ordered"
+            );
         }
 
         // And the whole diagnostic runs on it, which is what the ignored real-corpus test does at
@@ -4939,8 +4976,14 @@ mod tests {
         let capacity = IMPACT_K_GRID
             .iter()
             .map(|&k| {
-                capacity_curve(&slices, &forecasts, &model.with_impact_k(k), spec, &AUM_GRID)
-                    .expect("the capacity curve computes")
+                capacity_curve(
+                    &slices,
+                    &forecasts,
+                    &model.with_impact_k(k),
+                    spec,
+                    &AUM_GRID,
+                )
+                .expect("the capacity curve computes")
             })
             .collect::<Vec<_>>();
         let correlation = cross_correlation(
@@ -4962,7 +5005,11 @@ mod tests {
 
         let dir = scratch_dir("battery");
         write_cost_capacity_reports(&dir, &report, "fixture").expect("the battery writes");
-        for base in [COST_DECILE_BASE, CAPACITY_CURVE_BASE, CROSS_CORRELATION_BASE] {
+        for base in [
+            COST_DECILE_BASE,
+            CAPACITY_CURVE_BASE,
+            CROSS_CORRELATION_BASE,
+        ] {
             assert!(
                 shared::report::PRETRAIN_REPORT_BASES.contains(&base),
                 "{base} must be registered in shared::report::PRETRAIN_REPORT_BASES or the TUI \
@@ -4981,7 +5028,9 @@ mod tests {
                 panic!("{base} must be a MultiLine chart");
             };
             assert!(
-                series.iter().any(|s| s.values.iter().any(|v| v.is_finite())),
+                series
+                    .iter()
+                    .any(|s| s.values.iter().any(|v| v.is_finite())),
                 "{base} carries no finite value, so it is a blank panel"
             );
         }
@@ -5275,7 +5324,10 @@ mod tests {
         // every ratio it reported, which is the specific way a resolution fix can manufacture the
         // effect it was introduced to measure honestly.
         let wide = liquidity_volatility_overlap(&monotone, 10, 0.25);
-        assert_eq!(wide.tail_n, 25, "a quartile of a hundred names is twenty-five");
+        assert_eq!(
+            wide.tail_n, 25,
+            "a quartile of a hundred names is twenty-five"
+        );
         assert_eq!(
             wide.loud_intersection, 10,
             "all ten deep names stay inside a widened loud tail"
@@ -5451,18 +5503,18 @@ mod tests {
         let priced: HashSet<String> = wanted
             .iter()
             .cloned()
-            .chain(fit.into_iter().flatten().filter_map(|row| {
-                row["symbol"].as_str().map(str::to_owned)
-            }))
+            .chain(
+                fit.into_iter()
+                    .flatten()
+                    .filter_map(|row| row["symbol"].as_str().map(str::to_owned)),
+            )
             .collect();
         // Anchor month per name, traded taking precedence where a name is in both slices: the
         // traded windows are the ones the published constants were measured on.
         let anchor_of: HashMap<String, i64> = fit
             .into_iter()
             .flatten()
-            .filter_map(|row| {
-                Some((row["symbol"].as_str()?.to_owned(), row["ts_ms"].as_i64()?))
-            })
+            .filter_map(|row| Some((row["symbol"].as_str()?.to_owned(), row["ts_ms"].as_i64()?)))
             .chain(anchor_of)
             .collect();
         println!(
@@ -5472,9 +5524,13 @@ mod tests {
             parsed["context"]
         );
 
-        let corpus =
-            BarCorpus::load_with_bounds(&bars_dir(), RES_SECS, DEFAULT_MIN_BARS, PINNED_SPLIT_BOUNDS)
-                .expect("the 300s corpus loads");
+        let corpus = BarCorpus::load_with_bounds(
+            &bars_dir(),
+            RES_SECS,
+            DEFAULT_MIN_BARS,
+            PINNED_SPLIT_BOUNDS,
+        )
+        .expect("the 300s corpus loads");
         let calibration =
             Arc::new(CostCalibration::from_corpus(&corpus, 4).expect("the corpus calibrates"));
         let model = BarCostModel::new(Arc::clone(&calibration));
@@ -5580,9 +5636,9 @@ mod tests {
             }
             let pooled = model.resolve_pooled(symbol);
             let price = calibration.symbols[symbol as usize].pooled.harmonic_price;
-            let anchor_fixed = anchor_of
-                .get(name)
-                .map_or(f64::NAN, |&anchor| model.resolve(symbol, anchor).fixed_bps());
+            let anchor_fixed = anchor_of.get(name).map_or(f64::NAN, |&anchor| {
+                model.resolve(symbol, anchor).fixed_bps()
+            });
             cost_rows.push(serde_json::json!({
                 "symbol": name,
                 "half_spread_bps": pooled.half_spread_bps,
@@ -5658,9 +5714,8 @@ mod tests {
             // instead of arguable.
             if let Some(&anchor) = anchor_of.get(name) {
                 let at_anchor = model.resolve(symbol, anchor);
-                month_sized.push(
-                    at_anchor.total_bps(PARTICIPATION_GRID[PARTICIPATION_HEADLINE_SLOT]),
-                );
+                month_sized
+                    .push(at_anchor.total_bps(PARTICIPATION_GRID[PARTICIPATION_HEADLINE_SLOT]));
                 month_fixed.push(at_anchor.fixed_bps());
                 month_commission.push(at_anchor.commission_bps);
                 month_half.push(at_anchor.half_spread_bps);
@@ -5790,9 +5845,14 @@ mod tests {
         // each expectation, so no count on this line can be read as resolved without its own noise
         // level sitting next to it.
         for tail_fraction in [0.1f64, 1.0 / 6.0, 0.25] {
-            let overlap =
-                liquidity_volatility_overlap(&ranked, decile_names[DECILES - 1].len(), tail_fraction);
-            let z = |count: usize| (count as f64 - overlap.expected) / overlap.sd.max(f64::MIN_POSITIVE);
+            let overlap = liquidity_volatility_overlap(
+                &ranked,
+                decile_names[DECILES - 1].len(),
+                tail_fraction,
+            );
+            let z = |count: usize| {
+                (count as f64 - overlap.expected) / overlap.sd.max(f64::MIN_POSITIVE)
+            };
             println!(
                 "LIQUIDITY vs VOLATILITY over {} traded names: Spearman rho(dollar ADV, realized \
                  sigma) = {:+.4} | deepest-liquidity decile ({} names) vs volatility tails of {} \
@@ -6012,7 +6072,9 @@ mod tests {
         let capped = prices
             .iter()
             .filter(|p| {
-                p.is_finite() && **p > 0.0 && COMMISSION_PER_SHARE_USD / **p > COMMISSION_CAP_FRACTION
+                p.is_finite()
+                    && **p > 0.0
+                    && COMMISSION_PER_SHARE_USD / **p > COMMISSION_CAP_FRACTION
             })
             .count();
         println!(
@@ -6202,8 +6264,11 @@ mod tests {
             }
         };
         let matched_current: Vec<f64> = prices.iter().copied().map(regulatory_current).collect();
-        let universe_current: Vec<f64> =
-            universe_price.iter().copied().map(regulatory_current).collect();
+        let universe_current: Vec<f64> = universe_price
+            .iter()
+            .copied()
+            .map(regulatory_current)
+            .collect();
         let (matched_current_mean, _) = mean_of(&matched_current);
         let (universe_current_mean, _) = mean_of(&universe_current);
         println!(
@@ -6280,8 +6345,11 @@ mod tests {
             "matched_adv_notional_weighted_fixed_bps": fixed_adv_weighted,
             "rows": cost_rows,
         });
-        fs::write(&cost_artifact, serde_json::to_vec_pretty(&payload).expect("the payload encodes"))
-            .unwrap_or_else(|error| panic!("writing {}: {error}", cost_artifact.display()));
+        fs::write(
+            &cost_artifact,
+            serde_json::to_vec_pretty(&payload).expect("the payload encodes"),
+        )
+        .unwrap_or_else(|error| panic!("writing {}: {error}", cost_artifact.display()));
         println!(
             "wrote {} rows of per-symbol cost to {}",
             cost_rows.len(),
@@ -6779,9 +6847,13 @@ mod tests {
         use crate::data::ingest::{bars_dir, PINNED_SPLIT_BOUNDS};
         use crate::torch::dataset::{BarCorpus, DEFAULT_MIN_BARS};
 
-        let corpus =
-            BarCorpus::load_with_bounds(&bars_dir(), RES_SECS, DEFAULT_MIN_BARS, PINNED_SPLIT_BOUNDS)
-                .expect("the 300s corpus loads");
+        let corpus = BarCorpus::load_with_bounds(
+            &bars_dir(),
+            RES_SECS,
+            DEFAULT_MIN_BARS,
+            PINNED_SPLIT_BOUNDS,
+        )
+        .expect("the 300s corpus loads");
         let calibration =
             Arc::new(CostCalibration::from_corpus(&corpus, 4).expect("the corpus calibrates"));
         let universe = calibration.len();
@@ -6865,8 +6937,14 @@ mod tests {
         let capacity: Vec<CapacityCurve> = IMPACT_K_GRID
             .iter()
             .map(|&k| {
-                capacity_curve(&slices, &forecasts, &model.with_impact_k(k), spec, &AUM_GRID)
-                    .expect("the capacity curve computes")
+                capacity_curve(
+                    &slices,
+                    &forecasts,
+                    &model.with_impact_k(k),
+                    spec,
+                    &AUM_GRID,
+                )
+                .expect("the capacity curve computes")
             })
             .collect();
         for curve in &capacity {

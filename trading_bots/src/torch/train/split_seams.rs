@@ -911,7 +911,11 @@ fn read_tail(rows: &[BarDof]) -> TailReading {
 /// UNFILTERED draw, reproduces the live artifact's `lo[DOF_R][0]` and `hi[DOF_R][127]` exactly —
 /// which is the only evidence that makes the CLEANED figure beside it mean anything.
 fn clipped_r_range(rows: &[BarDof]) -> (f64, f64) {
-    let mut column: Vec<f32> = rows.iter().map(|row| row.r).filter(|r| r.is_finite()).collect();
+    let mut column: Vec<f32> = rows
+        .iter()
+        .map(|row| row.r)
+        .filter(|r| r.is_finite())
+        .collect();
     if column.is_empty() {
         return (f64::NAN, f64::NAN);
     }
@@ -1062,7 +1066,10 @@ impl SeamAudit {
                 )
             })
             .collect();
-        lines.push(format!("exceedance     |r| above {}", level_parts.join(" | ")));
+        lines.push(format!(
+            "exceedance     |r| above {}",
+            level_parts.join(" | ")
+        ));
         lines.push(format!(
             "census         {} bars above ln 1.5; exp(r) on a simple rational EXACTLY {} \
              ({:.2}%), within {:.0}% of one {} ({:.2}%); at a session open {} ({:.2}%); \
@@ -1191,7 +1198,11 @@ impl SeamAudit {
                  exp(r) = {:.8}, nearest simple rational {} = {:.8} at rel dev {:.3e}; classified \
                  a seam: exact {} loose {}; classified a REVERTING bad print: {}",
                 if side == 0 { "min" } else { "max" },
-                if side == 0 { "most negative" } else { "most positive" },
+                if side == 0 {
+                    "most negative"
+                } else {
+                    "most positive"
+                },
                 extreme.symbol,
                 extreme.bar,
                 iso_ms(extreme.ts_ms),
@@ -1321,7 +1332,11 @@ impl SeamAudit {
                 "edges {:<9} with the {} seams removed the edges become {:+.8} ({:.2} bps) / \
                  {:+.8} ({:.2} bps), i.e. {:.4}x long and {:.4}x short, binding {:.4}x — a change \
                  of {:+.4}x on the binding side against the control",
-                if tier == TIER_EXACT { "cleaned" } else { "cleaned-x" },
+                if tier == TIER_EXACT {
+                    "cleaned"
+                } else {
+                    "cleaned-x"
+                },
                 TIER_NAMES[tier],
                 cleaned.clip_lo,
                 cleaned.clip_lo * 10_000.0,
@@ -1416,8 +1431,12 @@ pub fn audit_split_seams(args: SplitSeamArgs) -> Result<()> {
     ensure!(args.samples > 0, "--samples must be positive");
 
     let source = Path::new(&args.supports);
-    let supports = BarSupports::load(source)
-        .with_context(|| format!("reading the support geometry to bin against, {}", source.display()))?;
+    let supports = BarSupports::load(source).with_context(|| {
+        format!(
+            "reading the support geometry to bin against, {}",
+            source.display()
+        )
+    })?;
     ensure!(
         supports.num_bins() == NUM_BAR_BINS,
         "{} has {} bins, this build uses {NUM_BAR_BINS}",
@@ -1437,10 +1456,7 @@ pub fn audit_split_seams(args: SplitSeamArgs) -> Result<()> {
                 .with_context(|| format!("reading the cross-check support {}", other.display()))?;
             let agrees = twin.lower_bounds(DOF_R) == supports.lower_bounds(DOF_R)
                 && twin.upper_bounds(DOF_R) == supports.upper_bounds(DOF_R);
-            (
-                Some(other.display().to_string()),
-                Some(agrees),
-            )
+            (Some(other.display().to_string()), Some(agrees))
         } else {
             (None, None)
         }
@@ -1676,10 +1692,8 @@ mod tests {
     }
 
     fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "split_seams_{label}_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("split_seams_{label}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
     }
@@ -1868,7 +1882,10 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         for seam in &exact {
-            assert!(seam.on_rational(), "a ladder-aligned split sits ON its ratio");
+            assert!(
+                seam.on_rational(),
+                "a ladder-aligned split sits ON its ratio"
+            );
             assert!(seam.near_rational(), "the exact test implies the loose one");
             assert!(seam.session_open, "a planted split is at the open");
             assert!(seam.quiet, "a planted split does not trade its move");
@@ -1922,9 +1939,7 @@ mod tests {
             assert!(!tick.isolated, "a reverting print has an extreme neighbour");
         }
         assert!(
-            census.reverts > 0
-                && census.seams[TIER_EXACT] == 2
-                && census.seams[TIER_NEAR] == 3,
+            census.reverts > 0 && census.seams[TIER_EXACT] == 2 && census.seams[TIER_NEAR] == 3,
             "reverts {} seams {:?}",
             census.reverts,
             census.seams
@@ -2131,7 +2146,9 @@ mod tests {
                 panic!("{base} must be a MultiLine chart");
             };
             assert!(
-                series.iter().any(|s| s.values.iter().any(|v| v.is_finite())),
+                series
+                    .iter()
+                    .any(|s| s.values.iter().any(|v| v.is_finite())),
                 "{base} carries no finite value, so it is a blank panel"
             );
         }

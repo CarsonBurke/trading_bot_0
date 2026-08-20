@@ -114,7 +114,10 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 .into());
             }
             let window = &bars[bars.len() - history_len..];
-            let times = window.iter().map(|bar| exchange_time(bar.ts())).collect::<Vec<_>>();
+            let times = window
+                .iter()
+                .map(|bar| exchange_time(bar.ts()))
+                .collect::<Vec<_>>();
             if times != reference_times {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -122,7 +125,10 @@ pub fn run_ibkr_paper_trading<P: AsRef<Path>>(
                 )
                 .into());
             }
-            let closes = window.iter().map(|bar| f64::from(bar.close)).collect::<Vec<_>>();
+            let closes = window
+                .iter()
+                .map(|bar| f64::from(bar.close))
+                .collect::<Vec<_>>();
             state_guard.seed_history(ticker_idx, &closes, &times);
         }
     }
