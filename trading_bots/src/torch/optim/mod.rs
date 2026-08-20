@@ -1,3 +1,3 @@
 pub mod muon;
 #[allow(unused_imports)]
-pub use muon::{Muon, MuonConfig};
+pub use muon::{Muon, MuonConfig, StepKind};

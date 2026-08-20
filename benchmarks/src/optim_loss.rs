@@ -12,7 +12,7 @@
 //! weights -> NorMuon.
 
 use tch::{nn, nn::OptimizerConfig, Device, Kind, Tensor};
-use trading_bot_0::torch::optim::{Muon, MuonConfig};
+use trading_bot_0::torch::optim::{Muon, MuonConfig, StepKind};
 
 use crate::optim_transformer::{
     self as tf, force_adamw_substrings, named_trainable, GptModel, COMPUTE_KIND,
@@ -117,7 +117,7 @@ fn run_normuon(device: Device, lr: f64, beta2: f64, print_split: bool) -> RunSta
     );
     let curve = train(device, &model, |loss| {
         loss.backward();
-        opt.step();
+        opt.step(StepKind::Primary);
         opt.zero_grad();
     });
     RunStats::from_curve(&curve)

@@ -11,7 +11,7 @@ use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
 use trading_bot_0::torch::{
     constants::{PRICE_DELTAS_PER_TICKER, STATIC_OBSERVATIONS, TICKERS_COUNT},
     model::{ModelVariant, TradingModel, TradingModelConfig},
-    optim::{Muon, MuonConfig},
+    optim::{Muon, MuonConfig, StepKind},
 };
 
 use results::{BenchmarkResult, BenchmarkRun, BenchmarkSuite};
@@ -327,7 +327,7 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         for _ in 0..warmup {
             let loss = net.forward(&x).sum(Kind::Float);
             loss.backward();
-            muon.step();
+            muon.step(StepKind::Primary);
             muon.zero_grad();
         }
         sync_device(device);
@@ -338,7 +338,7 @@ fn run_optimizer_benchmarks(suite: &mut BenchmarkSuite, device: Device) {
         for _ in 0..iters {
             let loss = net.forward(&x).sum(Kind::Float);
             loss.backward();
-            muon.step();
+            muon.step(StepKind::Primary);
             muon.zero_grad();
         }
         sync_device(device);

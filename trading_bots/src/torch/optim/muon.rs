@@ -110,6 +110,19 @@ pub struct MuonConfig {
     pub quiet: bool,
     /// Quintic iteration used to orthogonalize the momentum buffer.
     pub orthogonalizer: Orthogonalizer,
+    /// Apply the AdamW update once every N steps, accumulating the intervening gradients
+    /// rather than discarding them. `1` updates every step and is the default, so every
+    /// existing caller keeps its behaviour.
+    ///
+    /// modded-nanogpt sets the equivalent of `2` (`train_gpt.py:2104-2106`,
+    /// `_is_adam_step(step) = step % 2 == 1`) and skips `param.grad = None` for Adam params
+    /// on the intervening step (`:821-823`), so the update sees a summed, effective 2x
+    /// batch. Adam is invariant to the gradient's overall scale, so the step size is
+    /// unchanged and the gain is variance reduction plus half the optimizer work on the
+    /// embedding tables and output heads. It is a property of THAT recipe, which is why it
+    /// lives here rather than in `step`: the PPO and planner trainers share this optimizer
+    /// and have no reason to inherit it.
+    pub adamw_every: usize,
     /// Scale the decoupled weight decay by `lr` a second time, so the decay is
     /// quadratic in the learning rate. NorMuon then decays by
     /// `p * (wd*lr) * (lr_mul*per_matrix_lr_mul*lr)` and AdamW by `p * lr*lr*wd`
@@ -157,12 +170,34 @@ impl Default for MuonConfig {
             cross_attention_head_dim: 0,
             quiet: false,
             orthogonalizer: Orthogonalizer::NewtonSchulz5,
+            adamw_every: 1,
             quadratic_lr_weight_decay: false,
             cautious_weight_decay: false,
             adamw_beta_overrides: Vec::new(),
             adamw_weight_decay_multipliers: Vec::new(),
         }
     }
+}
+
+/// Which clock a [`Muon::step`] advances.
+///
+/// AdamW's [`MuonConfig::adamw_every`] cadence has to be a property of the PRIMARY
+/// optimization sequence. An extra update from a side stream that advanced the same
+/// counter would shift AdamW's phase and with it its effective learning rate, silently
+/// and only when the side stream is enabled. The kind is a required argument so a new
+/// extra-step call site must state which sequence it belongs to rather than inherit the
+/// primary one by writing nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepKind {
+    /// A step of the primary training sequence. Advances the step counter, and with it
+    /// the AdamW cadence.
+    Primary,
+    /// An extra update outside the primary sequence, e.g. one auxiliary resolution's
+    /// share of a pretraining step. NorMuon parameters take it immediately; the AdamW
+    /// cadence never sees it and the AdamW gradients it leaves are held for the next
+    /// primary tick, so enabling a side stream can change neither AdamW's update count
+    /// per primary step nor the step ledger a checkpoint is validated against.
+    Auxiliary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,8 +217,9 @@ struct Entry2D {
     layout: OrthoLayout,
     /// First-moment EMA buffer, shape [m, n].
     momentum: Tensor,
-    /// NorMuon second-moment EMA buffer (mean-of-squares per row). Matrix layout
-    /// stores [m, 1]; per-head layouts store [heads, block_rows, 1].
+    /// NorMuon second-moment EMA buffer: mean of squares over the SHORTER of the last
+    /// two axes, so it carries one moment per element of the LONGER axis. Its shape is
+    /// exactly `second_momentum_shape` of the block shape the orthogonalizer produces.
     /// Kept in fp32 regardless of param dtype: an EMA at gain (1-beta2)=0.05 in
     /// bf16 silently stalls because small increments round to zero.
     second_momentum: Tensor,
@@ -200,6 +236,9 @@ pub struct Muon {
     entries_2d: Vec<Entry2D>,
     adamw_indices: Vec<usize>,
     adamw_state: HashMap<usize, AdamWParamState>,
+    /// Count of PRIMARY optimization steps. Auxiliary steps deliberately do not advance
+    /// it: it is both the AdamW cadence clock and the step ledger a checkpoint's metadata
+    /// is validated against, and both mean "training steps taken".
     step_count: i64,
     params: Vec<Tensor>,
     /// Variable name per param index; keys optimizer-state sidecar tensors so
@@ -213,6 +252,10 @@ pub struct Muon {
     /// and optimizer moments, even when an earlier backward left a defined zero
     /// gradient in their slot.
     step_enabled: Vec<bool>,
+    /// True when the last [`Self::step`] deliberately skipped the AdamW update, so those
+    /// parameters still hold the gradient the next backward must accumulate into.
+    /// [`Self::zero_grad`] reads it and leaves those slots alone.
+    adamw_pending_grads: bool,
 }
 
 /// Single-matrix quintic orthogonalization.
@@ -345,7 +388,17 @@ fn attention_ortho_layout(name: &str, size: &[i64], cfg: &MuonConfig) -> OrthoLa
             heads: cols / head_dim,
             head_dim,
         }
-    } else if name.contains("attn_qkv") && rows == 3 * cols && rows % (3 * head_dim) == 0 {
+    } else if parameter_leaf_name(name) == "attn_qkv"
+        && rows == 3 * cols
+        && rows % (3 * head_dim) == 0
+    {
+        // Fused [3*dim, dim] QKV, split into per-head [3*head_dim, dim] blocks. Reached by
+        // `optim_head_ortho`'s `FusedQkvGptModel` (benchmarks/src/optim_transformer.rs:131),
+        // not by the bar model, whose fused weight is named `qkv_w`. The reference does not
+        // fuse at all: it keeps a `qk_bank` and a `vo_bank`, orthogonalizes Q/K per
+        // head-pair and V per layer (modded-nanogpt `train_gpt.py:1523-1525`, `:2027-2028`),
+        // so a future per-head experiment should start from that split rather than from this
+        // block form.
         OrthoLayout::RowHeads {
             heads: rows / (3 * head_dim),
             head_dim: 3 * head_dim,
@@ -370,22 +423,36 @@ fn attention_head_dim_for_name(name: &str, cfg: &MuonConfig) -> Option<i64> {
     }
 }
 
+/// A parameter's own name: the final segment of its VarStore path, which tch joins with `.`.
+///
+/// The attention matchers compare against this, EXACTLY. Substring-matching the whole path
+/// made `bar_layer_3.attn_out_w` satisfy the `attn_o` matcher, so enabling
+/// `per_attention_head_ortho` on the bar model would have silently split a [512, 512] output
+/// projection into column head-blocks. One tensor's name being a prefix of another's is not
+/// a hazard a routing table can be reviewed for; exact leaf comparison removes it.
+fn parameter_leaf_name(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(dot) => &name[dot + 1..],
+        None => name,
+    }
+}
+
 fn is_self_attention_projection_name(name: &str) -> bool {
-    ["attn_q", "attn_k", "attn_v", "attn_qkv", "attn_o"]
-        .iter()
-        .any(|needle| name.contains(needle))
+    matches!(
+        parameter_leaf_name(name),
+        "attn_q" | "attn_k" | "attn_v" | "attn_qkv" | "attn_o"
+    )
 }
 
 fn is_cross_attention_projection_name(name: &str) -> bool {
-    ["ca_q", "ca_k", "ca_v", "ca_out"]
-        .iter()
-        .any(|needle| name.contains(needle))
+    matches!(
+        parameter_leaf_name(name),
+        "ca_q" | "ca_k" | "ca_v" | "ca_out"
+    )
 }
 
 fn is_attention_output_projection_name(name: &str) -> bool {
-    ["attn_o", "ca_out"]
-        .iter()
-        .any(|needle| name.contains(needle))
+    matches!(parameter_leaf_name(name), "attn_o" | "ca_out")
 }
 
 #[cfg(test)]
@@ -399,12 +466,8 @@ fn orthogonalize_update(
         OrthoLayout::Matrix => quintic_orthogonalize(update, orth, ns_steps),
         OrthoLayout::RowHeads { heads, head_dim } => {
             let cols = update.size()[1];
-            batched_quintic_orthogonalize(
-                &update.reshape([heads, head_dim, cols]),
-                orth,
-                ns_steps,
-            )
-            .reshape(update.size().as_slice())
+            batched_quintic_orthogonalize(&update.reshape([heads, head_dim, cols]), orth, ns_steps)
+                .reshape(update.size().as_slice())
         }
         OrthoLayout::ColHeads { heads, head_dim } => {
             let rows = update.size()[0];
@@ -423,57 +486,83 @@ fn orthogonalize_update(
     }
 }
 
-fn second_momentum_shape(size: &[i64], layout: OrthoLayout) -> Vec<i64> {
-    match layout {
-        OrthoLayout::Matrix => vec![size[0], 1],
-        OrthoLayout::RowHeads { heads, head_dim } => vec![heads, head_dim, 1],
-        OrthoLayout::ColHeads { heads, .. } => vec![heads, size[0], 1],
+/// Axis the NorMuon second moment reduces over, as a negative index into the last two
+/// dims of the matrix (or stack of matrices) the orthogonalizer produced.
+///
+/// The reference keeps ONE moment per element of the LONGER axis and reduces over the
+/// shorter one: `red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2`
+/// (modded-nanogpt `train_gpt.py:888`, with the matching buffer shape at `:566-569`).
+/// Reducing over the fan-in unconditionally preconditions a wide matrix along its short
+/// axis and estimates every moment from fewer samples than the reference does.
+fn normuon_reduce_dim(size: &[i64]) -> i64 {
+    let rank = size.len();
+    if size[rank - 2] >= size[rank - 1] {
+        -1
+    } else {
+        -2
     }
 }
 
-/// NorMuon per-row second-moment rescale, all math in fp32. Scaling each row by
-/// `step_size_i * ratio` keeps the total Frobenius norm of the update
-/// (approximately) equal to its pre-divide value, because `ratio` is exactly the
-/// global correction `||U||_F / ||diag(step_size) U||_F`. The `lerp_` writes the
-/// raw second-moment EMA in place.
-fn normuon_rescale(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) -> Tensor {
-    let uf = update.to_kind(Kind::Float);
-    let cols = update.size()[1] as f64;
-    // Per-row sum of squares over fan-in: [rows, 1].
-    let row_sq_sum = uf
-        .square()
-        .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float);
-    // Per-row MEAN of squares (note the /cols): [rows, 1].
-    let v_mean = &row_sq_sum / cols;
-    // Frobenius^2 of the post-NS update, BEFORE the per-row divide: [1, 1].
-    let vnorm_sq = row_sq_sum.sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
-    // Raw EMA from 0, no bias correction: v = v*beta2 + v_mean*(1-beta2).
-    let _ = second_momentum.lerp_(&v_mean, 1.0 - beta2);
-    // Per-row step size = 1/(sqrt(v)+1e-10): [rows, 1].
-    let step_size = (second_momentum.sqrt() + 1e-10).reciprocal();
-    // Analytic post-divide Frobenius^2 = sum_i step_size_i^2 * row_sq_sum_i.
-    let vnorm_new_sq =
-        (step_size.square() * &row_sq_sum).sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
-    // Frobenius-preservation ratio: [1, 1].
-    let ratio = vnorm_sq.sqrt() / (vnorm_new_sq.sqrt() + 1e-10);
-    // Fused per-row scale, cast back to update kind: [rows, 1].
-    let scale = (&step_size * &ratio).to_kind(update.kind());
-    update * &scale
+/// Shape the orthogonalizer and the rescale actually operate on for `layout`, and the
+/// only shape the second-moment buffer may be derived from.
+fn ortho_block_shape(size: &[i64], layout: OrthoLayout) -> Vec<i64> {
+    match layout {
+        OrthoLayout::Matrix => vec![size[0], size[1]],
+        OrthoLayout::RowHeads { heads, head_dim } => vec![heads, head_dim, size[1]],
+        OrthoLayout::ColHeads { heads, head_dim } => vec![heads, size[0], head_dim],
+    }
 }
 
-fn normuon_rescale_batched(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) -> Tensor {
+/// Second-moment buffer shape: the block shape with the reduced axis collapsed to 1.
+/// Derived from [`normuon_reduce_dim`] so buffer and reduction cannot disagree.
+fn second_momentum_shape(size: &[i64], layout: OrthoLayout) -> Vec<i64> {
+    let mut shape = ortho_block_shape(size, layout);
+    let rank = shape.len();
+    let axis = if normuon_reduce_dim(&shape) == -1 {
+        rank - 1
+    } else {
+        rank - 2
+    };
+    shape[axis] = 1;
+    shape
+}
+
+/// NorMuon second-moment rescale for a matrix or a stack of matrices, all math in fp32.
+/// Scaling each slice along the reduced axis by `step_size * ratio` keeps the total
+/// Frobenius norm of the update (approximately) equal to its pre-divide value, because
+/// `ratio` is exactly the global correction `||U||_F / ||diag(step_size) U||_F`. The
+/// `lerp_` writes the raw second-moment EMA in place. Reference: `train_gpt.py:936-947`.
+fn normuon_rescale(update: &Tensor, second_momentum: &mut Tensor, beta2: f64) -> Tensor {
+    let size = update.size();
+    let rank = size.len();
+    let red_dim = normuon_reduce_dim(&size);
+    let red_len = size[if red_dim == -1 { rank - 1 } else { rank - 2 }] as f64;
     let uf = update.to_kind(Kind::Float);
-    let cols = update.size()[2] as f64;
-    let row_sq_sum = uf
+    // Sum of squares over the shorter axis, keepdim: the buffer's shape.
+    let sq_sum = uf
         .square()
-        .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float);
-    let v_mean = &row_sq_sum / cols;
-    let vnorm_sq = row_sq_sum.sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
+        .sum_dim_intlist([red_dim].as_slice(), true, Kind::Float);
+    // Per-slice MEAN of squares (note the /red_len).
+    let v_mean = &sq_sum / red_len;
+    // Frobenius^2 of the post-NS update, per matrix, BEFORE the divide.
+    let vnorm_sq = sq_sum.sum_dim_intlist([-2i64, -1].as_slice(), true, Kind::Float);
+    // A buffer allocated for the other axis would broadcast into a silently wrong
+    // preconditioner instead of failing, so the agreement is checked, not assumed.
+    debug_assert_eq!(
+        second_momentum.size(),
+        v_mean.size(),
+        "second-moment buffer shape disagrees with the NorMuon reduction axis"
+    );
+    // Raw EMA from 0, no bias correction: v = v*beta2 + v_mean*(1-beta2).
     let _ = second_momentum.lerp_(&v_mean, 1.0 - beta2);
+    // Per-slice step size = 1/(sqrt(v)+1e-10).
     let step_size = (second_momentum.sqrt() + 1e-10).reciprocal();
+    // Analytic post-divide Frobenius^2 = sum_i step_size_i^2 * sq_sum_i.
     let vnorm_new_sq =
-        (step_size.square() * &row_sq_sum).sum_dim_intlist([-2i64].as_slice(), true, Kind::Float);
+        (step_size.square() * &sq_sum).sum_dim_intlist([-2i64, -1].as_slice(), true, Kind::Float);
+    // Frobenius-preservation ratio.
     let ratio = vnorm_sq.sqrt() / (vnorm_new_sq.sqrt() + 1e-10);
+    // Fused per-slice scale, cast back to update kind.
     let scale = (&step_size * &ratio).to_kind(update.kind());
     update * &scale
 }
@@ -498,7 +587,7 @@ fn normuon_transform(
             let cols = update.size()[1];
             let blocks = update.reshape([heads, head_dim, cols]);
             let blocks = batched_quintic_orthogonalize(&blocks, orth, ns_steps);
-            let blocks = normuon_rescale_batched(&blocks, second_momentum, beta2);
+            let blocks = normuon_rescale(&blocks, second_momentum, beta2);
             let aspect_scale = (1.0_f64).max(head_dim as f64 / cols as f64).sqrt();
             (blocks.reshape(update.size().as_slice()), aspect_scale)
         }
@@ -509,7 +598,7 @@ fn normuon_transform(
                 .permute([1, 0, 2])
                 .contiguous();
             let blocks = batched_quintic_orthogonalize(&blocks, orth, ns_steps);
-            let blocks = normuon_rescale_batched(&blocks, second_momentum, beta2);
+            let blocks = normuon_rescale(&blocks, second_momentum, beta2);
             let aspect_scale = (1.0_f64).max(rows as f64 / head_dim as f64).sqrt();
             let update = blocks
                 .permute([1, 0, 2])
@@ -612,15 +701,46 @@ impl Muon {
             params,
             lr_scales: vec![1.0; names.len()],
             step_enabled: vec![true; names.len()],
+            adamw_pending_grads: false,
             names,
         }
     }
 
-    pub fn step(&mut self) {
+    /// One optimizer step of `kind`. NorMuon parameters update every step; AdamW
+    /// parameters update once every [`MuonConfig::adamw_every`] PRIMARY steps, over the
+    /// gradient ACCUMULATED across the intervening ones.
+    ///
+    /// At the default `1` this is an ordinary every-step update. At `2` it reproduces
+    /// modded-nanogpt's `do_adam` cadence (`train_gpt.py:2104-2106`,
+    /// `_is_adam_step(step) = step % 2 == 1`). That is NOT a halved update count with the
+    /// intervening gradient discarded: the reference skips `param.grad = None` for Adam
+    /// params on a non-Adam step (`train_gpt.py:821-823`), so the next backward sums into
+    /// the retained gradient and the update sees an effective 2x batch. Adam is invariant
+    /// to the gradient's overall scale, so summing rather than averaging leaves the step
+    /// size alone and buys pure variance reduction, plus half the optimizer work on the
+    /// embedding tables and output heads.
+    ///
+    /// The moments then advance once per N steps, so `beta1`/`beta2` span N times the
+    /// wall-clock they otherwise would and decoupled weight decay applies N times less
+    /// often. Both are properties of the recipe that chose N, not accidents of this port.
+    ///
+    /// The reference keys that cadence off the global TRAINING step rather than off a
+    /// count of optimizer calls, and [`StepKind`] is what keeps the two the same thing
+    /// here.
+    pub fn step(&mut self, kind: StepKind) {
         tch::no_grad(|| {
-            self.step_count += 1;
+            let do_adamw = match kind {
+                StepKind::Primary => {
+                    self.step_count += 1;
+                    self.step_count % (self.cfg.adamw_every.max(1) as i64) == 0
+                }
+                StepKind::Auxiliary => false,
+            };
             self.step_all_normuon();
-            self.step_all_adamw();
+            if do_adamw {
+                self.step_all_adamw();
+            }
+            self.adamw_pending_grads = !do_adamw;
         });
     }
 
@@ -775,11 +895,28 @@ impl Muon {
             .map_or(self.cfg.adamw_betas, |(_, betas)| *betas)
     }
 
+    /// Zero the gradients the next backward accumulates into.
+    ///
+    /// NorMuon parameters are zeroed every step. AdamW parameters are zeroed ONLY when the
+    /// previous [`Self::step`] actually applied their update; on a skipped step their
+    /// gradient is left in place so the next backward sums into it. That retention is what
+    /// makes the every-other-step cadence an effective 2x batch instead of throwing half
+    /// the gradient away.
     pub fn zero_grad(&self) {
-        for p in &self.params {
-            let mut g = p.grad();
+        let clear = |idx: usize| {
+            let mut g = self.params[idx].grad();
             if g.defined() {
                 let _ = g.zero_();
+            }
+        };
+        // Every parameter is routed to exactly one of the two groups, so this covers all of
+        // `self.params` — `assert_routing_partitions` in the pretrainer enforces that.
+        for entry in &self.entries_2d {
+            clear(entry.idx);
+        }
+        if !self.adamw_pending_grads {
+            for &idx in &self.adamw_indices {
+                clear(idx);
             }
         }
     }
@@ -1106,6 +1243,28 @@ impl Muon {
         muon + adamw
     }
 
+    /// Bytes of optimizer state once EVERY branch has taken its first step.
+    ///
+    /// [`Self::state_bytes`] reports what is allocated now, and the AdamW moments are lazy,
+    /// so before the first step it understates the steady state by two copies of every
+    /// AdamW-routed parameter. Capacity planning has to reserve the steady state: a probe
+    /// that measures a forward and a backward but never steps has not paid for these yet,
+    /// and training will.
+    pub fn steady_state_bytes(&self) -> usize {
+        let tensor_bytes = |t: &Tensor| t.numel() * t.kind().elt_size_in_bytes();
+        let muon: usize = self
+            .entries_2d
+            .iter()
+            .map(|e| tensor_bytes(&e.momentum) + tensor_bytes(&e.second_momentum))
+            .sum();
+        let adamw: usize = self
+            .adamw_indices
+            .iter()
+            .map(|&idx| 2 * tensor_bytes(&self.params[idx]))
+            .sum();
+        muon + adamw
+    }
+
     /// Test-only: shallow clone of the NorMuon second-moment buffer for the
     /// `n`-th 2D entry, so tests can assert it updates away from zero.
     #[cfg(test)]
@@ -1119,10 +1278,13 @@ mod tests {
     use tch::{nn, nn::Module, nn::OptimizerConfig, Device, Kind, Tensor};
 
     use super::{
-        attention_ortho_layout, batched_newtonschulz5, newtonschulz5, normuon_rescale,
-        normuon_transform, orthogonalize_update, quintic_orthogonalize, Muon, MuonConfig,
-        OrthoLayout, Orthogonalizer,
+        attention_ortho_layout, batched_newtonschulz5, is_attention_output_projection_name,
+        is_cross_attention_projection_name, is_self_attention_projection_name, newtonschulz5,
+        normuon_reduce_dim, normuon_rescale, normuon_transform, orthogonalize_update,
+        quintic_orthogonalize, second_momentum_shape, Muon, MuonConfig, OrthoLayout,
+        Orthogonalizer, StepKind,
     };
+    use crate::torch::test_rng;
 
     const HIDDEN: i64 = 128;
     const TRAIN_STEPS: usize = 500;
@@ -1218,7 +1380,7 @@ mod tests {
             let pred = net.forward(&xb);
             let loss = (&pred - &yb).square().mean(Kind::Float);
             loss.backward();
-            opt.step();
+            opt.step(StepKind::Primary);
             opt.zero_grad();
 
             if step % 50 == 0 || step == TRAIN_STEPS - 1 {
@@ -1262,7 +1424,7 @@ mod tests {
             let pred = net.forward(&xb);
             let loss = (&pred - &yb).square().mean(Kind::Float);
             loss.backward();
-            opt.step();
+            opt.step(StepKind::Primary);
             opt.zero_grad();
 
             if step % 50 == 0 || step == TRAIN_STEPS - 1 {
@@ -1274,6 +1436,7 @@ mod tests {
 
     #[test]
     fn muon_converges_bf16() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         let losses = train_muon_bf16(device, 42);
         let first = losses[0];
@@ -1294,6 +1457,7 @@ mod tests {
 
     #[test]
     fn muon_converges_on_synthetic_regression() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         let losses = train_muon(device, 42);
         let first = losses[0];
@@ -1314,6 +1478,7 @@ mod tests {
 
     #[test]
     fn adamw_converges_on_synthetic_regression() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         let losses = train_adamw(device, 42);
         let first = losses[0];
@@ -1334,6 +1499,7 @@ mod tests {
 
     #[test]
     fn muon_vs_adamw_comparison() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         let seed = 42;
 
@@ -1376,46 +1542,169 @@ mod tests {
         assert!(muon_final < 0.5, "Muon did not converge: {:.6}", muon_final);
     }
 
+    /// Frobenius preservation has to hold in BOTH orientations, with the buffer allocated
+    /// the way the optimizer allocates it. A wide matrix reduces over its ROWS, so a test
+    /// that hard-codes `[rows, 1]` only ever exercises the tall case.
     #[test]
     fn normuon_rescale_preserves_frobenius_norm() {
+        let _torch_rng_guard = test_rng::exclusive();
         let _g = tch::no_grad_guard();
         tch::manual_seed(7);
         let device = Device::Cpu;
-        // Post-NS-shaped update: [rows, cols], rows != cols to exercise broadcast.
-        let update = Tensor::randn([37, 53], (Kind::Float, device));
-        let pre_norm = update.square().sum(Kind::Float).sqrt().double_value(&[]);
+        for size in [[37i64, 53], [53, 37]] {
+            let update = Tensor::randn(size, (Kind::Float, device));
+            let pre_norm = update.square().sum(Kind::Float).sqrt().double_value(&[]);
 
-        let mut second_momentum = Tensor::zeros([37, 1], (Kind::Float, device));
-        let rescaled = normuon_rescale(&update, &mut second_momentum, 0.95);
+            let shape = second_momentum_shape(&size, OrthoLayout::Matrix);
+            let mut second_momentum = Tensor::zeros(shape.as_slice(), (Kind::Float, device));
+            let rescaled = normuon_rescale(&update, &mut second_momentum, 0.95);
 
-        let post_norm = rescaled.square().sum(Kind::Float).sqrt().double_value(&[]);
-        let rel = (post_norm - pre_norm).abs() / pre_norm;
-        println!(
-            "NorMuon rescale: ||U||_F {:.6} -> {:.6} (rel diff {:.2e})",
-            pre_norm, post_norm, rel
+            let post_norm = rescaled.square().sum(Kind::Float).sqrt().double_value(&[]);
+            let rel = (post_norm - pre_norm).abs() / pre_norm;
+            assert!(
+                rel < 1e-4,
+                "Frobenius norm not preserved for {size:?}: {pre_norm:.6} -> {post_norm:.6} (rel {rel:.2e})"
+            );
+
+            // Second moment must have moved off zero and stay finite.
+            let v_min = second_momentum.min().double_value(&[]);
+            let v_max = second_momentum.max().double_value(&[]);
+            assert!(
+                v_min > 0.0,
+                "second_momentum stayed at zero for {size:?}: min={v_min}"
+            );
+            assert!(
+                v_min.is_finite() && v_max.is_finite(),
+                "second_momentum not finite for {size:?}: [{v_min}, {v_max}]"
+            );
+        }
+    }
+
+    /// The second moment lives on the LONGER axis and reduces over the shorter one, which
+    /// is the reference's `red_dim = -1 if shape[-2] >= shape[-1] else -2`
+    /// (modded-nanogpt `train_gpt.py:888`, buffer at `:566-569`). Reducing over the last
+    /// axis unconditionally preconditions every wide matrix along its short axis; for the
+    /// bar model that is `ff_out_w [512, 2048]` in all ten layers and `bar_dyn_fc3_w
+    /// [512, 1664]`.
+    #[test]
+    fn normuon_second_moment_lives_on_the_longer_axis() {
+        let _g = tch::no_grad_guard();
+        let device = Device::Cpu;
+
+        assert_eq!(normuon_reduce_dim(&[512, 2048]), -2);
+        assert_eq!(normuon_reduce_dim(&[2048, 512]), -1);
+        // Square is the reference's `>=` tie, which it breaks towards the last axis.
+        assert_eq!(normuon_reduce_dim(&[512, 512]), -1);
+        assert_eq!(
+            second_momentum_shape(&[512, 2048], OrthoLayout::Matrix),
+            vec![1, 2048]
         );
-        assert!(
-            rel < 1e-4,
-            "Frobenius norm not preserved: {:.6} -> {:.6} (rel {:.2e})",
-            pre_norm,
-            post_norm,
-            rel
+        assert_eq!(
+            second_momentum_shape(&[2048, 512], OrthoLayout::Matrix),
+            vec![2048, 1]
+        );
+        assert_eq!(
+            second_momentum_shape(&[512, 512], OrthoLayout::Matrix),
+            vec![512, 1]
         );
 
-        // Second moment must have moved off zero and stay finite.
-        let v_min = second_momentum.min().double_value(&[]);
-        let v_max = second_momentum.max().double_value(&[]);
-        assert!(v_min > 0.0, "second_momentum stayed at zero: min={}", v_min);
+        // One EMA step from zero writes exactly `(1-beta2) * mean-of-squares` over the
+        // SHORT axis, so a wide update yields one moment per column.
+        let update = Tensor::arange(6, (Kind::Float, device)).reshape([2, 3]);
+        let mut wide = Tensor::zeros([1, 3], (Kind::Float, device));
+        let _ = normuon_rescale(&update, &mut wide, 0.9);
+        let expected = update
+            .square()
+            .sum_dim_intlist([-2i64].as_slice(), true, Kind::Float)
+            / 2.0
+            * 0.1;
+        assert!((&wide - &expected).abs().max().double_value(&[]) < 1e-9);
+
+        // The statistic is a property of the matrix, not of how it is stored: the
+        // transposed update must produce the transposed moments. This is what makes our
+        // `ff_out_w [512, 2048]` preconditioner agree with the reference's `c_proj`, which
+        // it stores transposed as `[mlp_hdim, dim]` (`train_gpt.py:1526`).
+        let mut tall = Tensor::zeros([3, 1], (Kind::Float, device));
+        let _ = normuon_rescale(&update.transpose(0, 1).contiguous(), &mut tall, 0.9);
         assert!(
-            v_max.is_finite() && v_min.is_finite(),
-            "second_momentum not finite: [{}, {}]",
-            v_min,
-            v_max
+            (&wide - &tall.transpose(0, 1))
+                .abs()
+                .max()
+                .double_value(&[])
+                < 1e-9,
+            "wide and tall storage of the same matrix disagree on the second moment"
+        );
+    }
+
+    /// Auxiliary steps must not be able to shift AdamW's cadence. When the parity keyed off
+    /// a count of `step()` calls, one auxiliary-resolution update per primary step turned
+    /// `adamw_every: 2` into an AdamW update on EVERY primary step and silently doubled the
+    /// AdamW parameters' effective learning rate as soon as `--auxiliary-resolutions` was
+    /// non-empty.
+    #[test]
+    fn auxiliary_steps_cannot_shift_the_adamw_cadence() {
+        let device = Device::Cpu;
+        let run = |aux_per_primary: usize| {
+            let vs = nn::VarStore::new(device);
+            let matrix = vs.root().ones("w", &[4, 4]);
+            let bias = vs.root().ones("b", &[4]);
+            let named = vec![
+                ("w".to_owned(), matrix.shallow_clone()),
+                ("b".to_owned(), bias.shallow_clone()),
+            ];
+            let mut opt = Muon::new_named(
+                &named,
+                MuonConfig {
+                    adamw_every: 2,
+                    quiet: true,
+                    ..MuonConfig::default()
+                },
+            );
+            let backward =
+                || (matrix.square().sum(Kind::Float) + bias.square().sum(Kind::Float)).backward();
+            let mut adamw_updates = Vec::new();
+            for _ in 0..6 {
+                backward();
+                opt.step(StepKind::Primary);
+                opt.zero_grad();
+                for _ in 0..aux_per_primary {
+                    backward();
+                    opt.step(StepKind::Auxiliary);
+                    opt.zero_grad();
+                }
+                adamw_updates.push(opt.adamw_state.get(&1).map_or(0, |state| state.step_count));
+            }
+            (adamw_updates, matrix.detach().copy())
+        };
+
+        let (no_aux, matrix_no_aux) = run(0);
+        let (one_aux, matrix_one_aux) = run(1);
+        let (three_aux, _) = run(3);
+
+        assert_eq!(no_aux, vec![0, 1, 1, 2, 2, 3]);
+        assert_eq!(
+            one_aux, no_aux,
+            "one auxiliary step per primary step shifted the AdamW cadence"
+        );
+        assert_eq!(
+            three_aux, no_aux,
+            "three auxiliary steps per primary step shifted the AdamW cadence"
+        );
+        // ...and the cadence is invariant because the auxiliary steps are excluded from the
+        // clock, not because they were turned into no-ops: NorMuon still applies them.
+        assert!(
+            (matrix_one_aux - matrix_no_aux)
+                .abs()
+                .max()
+                .double_value(&[])
+                > 1e-6,
+            "auxiliary steps did not reach the NorMuon parameters at all"
         );
     }
 
     #[test]
     fn batched_newtonschulz_matches_independent_single_matrix_path() {
+        let _torch_rng_guard = test_rng::exclusive();
         let _g = tch::no_grad_guard();
         tch::manual_seed(17);
         let device = Device::Cpu;
@@ -1435,6 +1724,7 @@ mod tests {
 
     #[test]
     fn attention_head_ortho_preserves_original_matrix_shape() {
+        let _torch_rng_guard = test_rng::exclusive();
         let _g = tch::no_grad_guard();
         tch::manual_seed(23);
         let device = Device::Cpu;
@@ -1543,11 +1833,55 @@ mod tests {
 
         assert_eq!(opt.set_named_lr_scale(&["policy_concentration"], 0.25), 1);
         (&actor + &critic + &shared).sum(Kind::Float).backward();
-        opt.step();
+        opt.step(StepKind::Primary);
 
         assert!((actor.double_value(&[]) + 0.025).abs() < 1e-7);
         assert!((critic.double_value(&[]) + 0.1).abs() < 1e-7);
         assert!((shared.double_value(&[]) + 0.1).abs() < 1e-7);
+    }
+
+    /// Capacity planning charges the optimizer's steady-state footprint against free VRAM
+    /// before any step has run, so [`Muon::steady_state_bytes`] must EXCEED
+    /// [`Muon::state_bytes`] by exactly the lazily-allocated AdamW moments and must equal it
+    /// once every branch has stepped. The pretrainer charges only the difference: NorMuon's
+    /// buffers are eager and already inside the device's baseline reading, so charging the
+    /// whole steady state would count the 2D branch twice.
+    #[test]
+    fn the_steady_state_footprint_is_the_cold_one_plus_the_lazy_adamw_moments() {
+        let matrix = Tensor::zeros([8, 4], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let bias = Tensor::zeros([8], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let vars = vec![
+            ("layer.weight".to_owned(), matrix.shallow_clone()),
+            ("layer.bias".to_owned(), bias.shallow_clone()),
+        ];
+        let mut opt = Muon::new_named(
+            &vars,
+            MuonConfig {
+                quiet: true,
+                ..MuonConfig::default()
+            },
+        );
+
+        let element = std::mem::size_of::<f32>();
+        // NorMuon: [8, 4] momentum plus an [8, 1] per-row second moment, both eager.
+        let normuon = (32 + 8) * element;
+        // AdamW: `m` and `v` over the [8] bias, both lazy.
+        let adamw = 2 * 8 * element;
+        assert_eq!(opt.state_bytes(), normuon);
+        assert_eq!(opt.steady_state_bytes(), normuon + adamw);
+        assert_eq!(
+            opt.steady_state_bytes() - opt.state_bytes(),
+            adamw,
+            "the pending part is exactly what a forward-and-backward probe has not paid for"
+        );
+
+        (matrix.sum(Kind::Float) + bias.sum(Kind::Float)).backward();
+        opt.step(StepKind::Primary);
+        assert_eq!(
+            opt.state_bytes(),
+            opt.steady_state_bytes(),
+            "after one step every branch is resident and the two figures must agree"
+        );
     }
 
     #[test]
@@ -1572,7 +1906,7 @@ mod tests {
         );
 
         (&actor + &critic).sum(Kind::Float).backward();
-        opt.step();
+        opt.step(StepKind::Primary);
         opt.zero_grad();
         let actor_before_critic_only_step = actor.double_value(&[]);
 
@@ -1581,7 +1915,7 @@ mod tests {
             1
         );
         critic.sum(Kind::Float).backward();
-        opt.step();
+        opt.step(StepKind::Primary);
 
         assert_eq!(actor.double_value(&[]), actor_before_critic_only_step);
         assert!(critic.double_value(&[]) < actor_before_critic_only_step);
@@ -1622,7 +1956,7 @@ mod tests {
         opt.zero_grad();
         opt.set_named_step_enabled(&["policy_concentration"], true);
         actor.sum(Kind::Float).backward();
-        opt.step();
+        opt.step(StepKind::Primary);
         assert_eq!(opt.adamw_state[&0].step_count, 2);
         assert!((actor.double_value(&[]) + 0.2).abs() < 1e-6);
     }
@@ -1646,7 +1980,7 @@ mod tests {
             },
         );
         (&phase.sum(Kind::Float) * 0.0 + &regular.sum(Kind::Float) * 0.0).backward();
-        opt.step();
+        opt.step(StepKind::Primary);
         assert_eq!(phase.min().double_value(&[]), 1.0);
         assert!((regular.max().double_value(&[]) - 0.95).abs() < 1e-6);
     }
@@ -1667,8 +2001,55 @@ mod tests {
         );
     }
 
+    /// The head-ortho matchers must key off a tensor's OWN name, not off any substring of
+    /// its path. `attn_out_w` contains `attn_o`, so under substring matching the bar model's
+    /// [512, 512] output projection satisfied both the self-attention and the output-
+    /// projection matcher, and enabling `per_attention_head_ortho` would have silently
+    /// split it into column head-blocks. `benchmarks/src/optim_head_ortho.rs` already flips
+    /// that flag, so this was a live trap and not a hypothetical one.
+    #[test]
+    fn head_ortho_matchers_key_off_exact_parameter_names() {
+        let cfg = MuonConfig {
+            per_attention_head_ortho: true,
+            attention_head_dim: 64,
+            cross_attention_head_dim: 64,
+            ..MuonConfig::default()
+        };
+
+        // The bar model's names must not be matched by any of them.
+        for name in [
+            "bar_layer_3.attn_out_w",
+            "bar_layer_3.qkv_w",
+            "bar_layer_3.ff_out_w",
+        ] {
+            assert!(!is_self_attention_projection_name(name), "{name}");
+            assert!(!is_cross_attention_projection_name(name), "{name}");
+            assert!(!is_attention_output_projection_name(name), "{name}");
+            assert_eq!(
+                attention_ortho_layout(name, &[512, 512], &cfg),
+                OrthoLayout::Matrix,
+                "{name}"
+            );
+        }
+
+        // The benchmark's names, which are exactly the matcher's own spellings, must be.
+        assert!(is_self_attention_projection_name("block0.attn_qkv"));
+        assert!(is_self_attention_projection_name("block0.attn_o"));
+        assert!(is_attention_output_projection_name("block0.attn_o"));
+        assert!(is_cross_attention_projection_name("cross_attn.ca_out"));
+        assert!(is_attention_output_projection_name("cross_attn.ca_out"));
+        assert_eq!(
+            attention_ortho_layout("block0.attn_o", &[256, 256], &cfg),
+            OrthoLayout::ColHeads {
+                heads: 4,
+                head_dim: 64
+            }
+        );
+    }
+
     #[test]
     fn normuon_step_updates_second_moment_and_stays_finite() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         tch::manual_seed(11);
         let vs = nn::VarStore::new(device);
@@ -1697,7 +2078,7 @@ mod tests {
             let pred = net.forward(&xb);
             let loss = (&pred - &yb).square().mean(Kind::Float);
             loss.backward();
-            opt.step();
+            opt.step(StepKind::Primary);
             opt.zero_grad();
         }
 
@@ -1725,6 +2106,7 @@ mod tests {
     /// flip of a new default, or any reordering of decay vs. update, breaks this.
     #[test]
     fn default_config_reproduces_legacy_decoupled_weight_decay() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         tch::manual_seed(4242);
         let vs = nn::VarStore::new(device);
@@ -1762,7 +2144,7 @@ mod tests {
             ("b".to_owned(), b.shallow_clone()),
         ];
         let mut opt = Muon::new_named(&named, cfg);
-        opt.step();
+        opt.step(StepKind::Primary);
 
         // Legacy NorMuon branch: EMA from zero, Nesterov lerp, NS5 + per-row second
         // moment, then `p*(1 - lr*wd) - lr*aspect*update`.
@@ -1795,8 +2177,14 @@ mod tests {
 
         let dw = (w.detach() - expected_w).abs().max().double_value(&[]);
         let db = (b.detach() - expected_b).abs().max().double_value(&[]);
-        assert!(dw < 1e-7, "NorMuon default path drifted from legacy: {dw:.3e}");
-        assert!(db < 1e-9, "AdamW default path drifted from legacy: {db:.3e}");
+        assert!(
+            dw < 1e-7,
+            "NorMuon default path drifted from legacy: {dw:.3e}"
+        );
+        assert!(
+            db < 1e-9,
+            "AdamW default path drifted from legacy: {db:.3e}"
+        );
     }
 
     /// The cautious mask must leave sign-agreeing coordinates untouched and skip
@@ -1829,8 +2217,10 @@ mod tests {
         let (_vs_plain, p_plain) = build();
         let (_vs_caut, p_caut) = build();
         let p0 = p_plain.detach().copy();
-        Muon::new_named(&[("p".to_owned(), p_plain.shallow_clone())], cfg(false)).step();
-        Muon::new_named(&[("p".to_owned(), p_caut.shallow_clone())], cfg(true)).step();
+        Muon::new_named(&[("p".to_owned(), p_plain.shallow_clone())], cfg(false))
+            .step(StepKind::Primary);
+        Muon::new_named(&[("p".to_owned(), p_caut.shallow_clone())], cfg(true))
+            .step(StepKind::Primary);
 
         // Reference mask: (descent_update * p) > 0, i.e. sign(target) == sign(p).
         // Coordinates 0 and 3 agree; 1 and 2 disagree and must skip decay.
@@ -1861,6 +2251,7 @@ mod tests {
     /// comparison would otherwise leave this module green.
     #[test]
     fn cautious_weight_decay_masks_the_normuon_branch_too() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         tch::manual_seed(5150);
         let w_init = Tensor::randn([8, 4], (Kind::Float, device));
@@ -1885,8 +2276,9 @@ mod tests {
 
         let (_a, wa) = build();
         let (_b, wb) = build();
-        Muon::new_named(&[("w".to_owned(), wa.shallow_clone())], cfg(false)).step();
-        Muon::new_named(&[("w".to_owned(), wb.shallow_clone())], cfg(true)).step();
+        Muon::new_named(&[("w".to_owned(), wa.shallow_clone())], cfg(false))
+            .step(StepKind::Primary);
+        Muon::new_named(&[("w".to_owned(), wb.shallow_clone())], cfg(true)).step(StepKind::Primary);
 
         // Reproduce the update the optimizer computed, to recover its sign per coordinate.
         let (update, _) = tch::no_grad(|| {
@@ -1926,6 +2318,7 @@ mod tests {
     /// which is why a wide matrix decays harder than a square one.
     #[test]
     fn quadratic_weight_decay_adds_one_factor_of_the_learning_rate() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         let (lr, wd) = (0.05f64, 0.8f64);
         // Same hazard as the beta-override test: draw once, `var_copy` in.
@@ -1962,8 +2355,8 @@ mod tests {
                 ("s".to_owned(), s.shallow_clone()),
             ]
         };
-        Muon::new_named(&named(&wa, &sa), cfg(false)).step();
-        Muon::new_named(&named(&wb, &sb), cfg(true)).step();
+        Muon::new_named(&named(&wa, &sa), cfg(false)).step(StepKind::Primary);
+        Muon::new_named(&named(&wb, &sb), cfg(true)).step(StepKind::Primary);
 
         // The optimizer step itself is identical, so the whole difference is decay.
         let aspect = 2.0_f64.sqrt();
@@ -1987,6 +2380,7 @@ mod tests {
 
     #[test]
     fn adamw_beta_overrides_apply_only_to_matching_parameters() {
+        let _torch_rng_guard = test_rng::exclusive();
         let device = Device::Cpu;
         // Drawn ONCE, outside the closure: `manual_seed` seeds the process-global ATen
         // generator, so two seeded draws inside a closure are not reproducible while
@@ -2015,21 +2409,18 @@ mod tests {
         // the override only becomes observable once the EMAs have history. Two
         // steps with a persistent optimizer each.
         let mut runs = Vec::new();
-        for overrides in [
-            Vec::new(),
-            vec![("bar_bin_embed".to_owned(), (0.5, 0.95))],
-        ] {
+        for overrides in [Vec::new(), vec![("bar_bin_embed".to_owned(), (0.5, 0.95))]] {
             let (vs, embed, gate) = build();
             let named = vec![
                 ("bar_bin_embed".to_owned(), embed.shallow_clone()),
                 ("attn_resid_lambda".to_owned(), gate.shallow_clone()),
             ];
             let mut opt = Muon::new_named(&named, cfg(overrides));
-            opt.step();
+            opt.step(StepKind::Primary);
             opt.zero_grad();
             let loss = embed.square().sum(Kind::Float) * 3.0 + gate.square().sum(Kind::Float) * 3.0;
             loss.backward();
-            opt.step();
+            opt.step(StepKind::Primary);
             runs.push((vs, embed.detach().copy(), gate.detach().copy()));
         }
 
@@ -2050,6 +2441,7 @@ mod tests {
     /// representative of a real transformer weight gradient.
     #[test]
     fn polar_express_orthogonalizes_better_than_newton_schulz() {
+        let _torch_rng_guard = test_rng::exclusive();
         let _g = tch::no_grad_guard();
         let device = Device::Cpu;
         tch::manual_seed(31337);
@@ -2067,11 +2459,8 @@ mod tests {
             )
         };
         let (ns_max, ns_mean) = deviation(&newtonschulz5(&g, 5));
-        let (pe_max, pe_mean) = deviation(&quintic_orthogonalize(
-            &g,
-            Orthogonalizer::PolarExpress5,
-            5,
-        ));
+        let (pe_max, pe_mean) =
+            deviation(&quintic_orthogonalize(&g, Orthogonalizer::PolarExpress5, 5));
         println!(
             "singular-value deviation from 1: NS5 max={ns_max:.4} mean={ns_mean:.4}, \
              PolarExpress5 max={pe_max:.4} mean={pe_mean:.4}"
@@ -2091,6 +2480,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Polar Express runs its own tuned 5-step schedule")]
     fn polar_express_rejects_non_default_step_counts() {
+        let _torch_rng_guard = test_rng::shared();
         let device = Device::Cpu;
         let vs = nn::VarStore::new(device);
         let w = vs.root().randn("w", &[4, 4], 0.0, 1.0);
@@ -2107,6 +2497,7 @@ mod tests {
 
     #[test]
     fn routing_names_report_the_realized_optimizer_split() {
+        let _torch_rng_guard = test_rng::shared();
         let device = Device::Cpu;
         let vs = nn::VarStore::new(device);
         let matrix = vs.root().randn("ff_out_w", &[8, 4], 0.0, 1.0);

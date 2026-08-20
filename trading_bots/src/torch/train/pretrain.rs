@@ -47,7 +47,7 @@ use crate::torch::dataset::{
     BAR_TIME_CONDITIONING,
 };
 use crate::torch::load::load_var_store_partial;
-use crate::torch::optim::muon::{Muon, MuonConfig, Orthogonalizer, DEFAULT_NS_STEPS};
+use crate::torch::optim::muon::{Muon, MuonConfig, Orthogonalizer, StepKind, DEFAULT_NS_STEPS};
 use crate::torch::world_model::{
     bar_adamw_embedding_substrings, bar_adamw_scalar_substrings,
     bar_muon_down_projection_substrings, bar_muon_name_substrings, world_model_metadata_path,
@@ -1464,7 +1464,7 @@ impl Trainer {
             grad_norm.is_finite(),
             "gradient norm is not finite at step {step}: {grad_norm}"
         );
-        self.optimizer.step();
+        self.optimizer.step(StepKind::Primary);
 
         let dyn_value = dyn_loss.double_value(&[]);
         let kl_value = kl_loss.double_value(&[]);

@@ -1,6 +1,6 @@
 use tch::{nn, Device, Kind, Tensor};
 
-use crate::torch::optim::muon::Muon;
+use crate::torch::optim::muon::{Muon, StepKind};
 
 use super::config::{
     LEARNING_RATE, MUON_LR, MUON_MOMENTUM, MUON_MOMENTUM_WARMUP_START, MUON_MOMENTUM_WARMUP_STEPS,
@@ -283,7 +283,7 @@ pub(crate) fn step_optimizer(
     advances_muon: bool,
 ) {
     opt.set_momentum(muon_momentum_for_step(*muon_momentum_step));
-    opt.step();
+    opt.step(StepKind::Primary);
     *optimizer_step += 1;
     if advances_muon {
         *muon_momentum_step += 1;

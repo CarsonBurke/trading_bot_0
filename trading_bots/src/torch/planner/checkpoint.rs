@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn checkpoint_roundtrip_restores_weights_and_optimizer_state() {
-        use crate::torch::optim::muon::{Muon, MuonConfig};
+        use crate::torch::optim::muon::{Muon, MuonConfig, StepKind};
         use crate::torch::train::optimizer_glue::named_trainable_variables;
         use tch::{Device, Kind};
 
@@ -696,11 +696,11 @@ mod tests {
             },
         );
         actor_named[0].1.square().sum(Kind::Float).backward();
-        actor_optimizer.step();
+        actor_optimizer.step(StepKind::Primary);
         actor_optimizer.zero_grad();
         for _ in 0..2 {
             critic_named[0].1.square().sum(Kind::Float).backward();
-            critic_optimizer.step();
+            critic_optimizer.step(StepKind::Primary);
             critic_optimizer.zero_grad();
         }
 

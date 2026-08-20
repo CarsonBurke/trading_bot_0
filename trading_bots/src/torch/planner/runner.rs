@@ -14,7 +14,7 @@ use crate::torch::{
     action_space::{beta_mean, sample_beta_action},
     bar_dist::DOF_R,
     cuda::cfg::configure_cuda,
-    optim::muon::{Muon, MuonConfig},
+    optim::muon::{Muon, MuonConfig, StepKind},
     train::{
         config::{
             PolicyObjective, LEARNING_RATE, MAX_GRAD_NORM, MUON_LR, MUON_MOMENTUM_WARMUP_START,
@@ -1132,7 +1132,7 @@ fn optimize_rollout(
                     let actor_norm = clip_gradients(actor_vars, MAX_GRAD_NORM, device);
                     actor_optimizer
                         .set_momentum(muon_momentum_for_step(*actor_optimizer_steps as i64));
-                    actor_optimizer.step();
+                    actor_optimizer.step(StepKind::Primary);
                     *actor_optimizer_steps += 1;
                     actor_loss_sum += losses.actor_loss.detach();
                     reverse_kl_sum += minibatch_kl;
@@ -1147,7 +1147,7 @@ fn optimize_rollout(
             critic_loss.backward();
             let critic_norm = clip_gradients(critic_vars, MAX_GRAD_NORM, device);
             critic_optimizer.set_momentum(muon_momentum_for_step(*critic_optimizer_steps as i64));
-            critic_optimizer.step();
+            critic_optimizer.step(StepKind::Primary);
             *critic_optimizer_steps += 1;
             critic_loss_sum += critic_loss.detach();
             aux_return_loss_sum += aux_return_loss.detach();
@@ -2001,7 +2001,7 @@ mod tests {
         let before_parameter = parameter.copy();
         let (stop, _) = kl_stops_before_optimizer_step(&mut summary, TARGET_KL * 2.0).unwrap();
         if !stop {
-            optimizer.step();
+            optimizer.step(StepKind::Primary);
         }
 
         assert!(stop);
@@ -2090,7 +2090,7 @@ mod tests {
         critic_optimizer.zero_grad();
         losses.critic_loss.backward();
         let _ = clip_gradients(&critic_vars, MAX_GRAD_NORM, Device::Cpu);
-        critic_optimizer.step();
+        critic_optimizer.step(StepKind::Primary);
 
         let after = tch::no_grad(|| planner.forward_mixed_precision(&input));
         assert!(policy_before.alpha.equal(&after.alpha));
@@ -2242,7 +2242,7 @@ mod tests {
             );
             for _ in 0..update {
                 named[0].1.square().sum(Kind::Float).backward();
-                optimizer.step();
+                optimizer.step(StepKind::Primary);
                 optimizer.zero_grad();
             }
             let path = resume_checkpoint_path(&base, update);
