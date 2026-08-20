@@ -252,28 +252,39 @@ pub fn get_macro_data(series: MacroSeries) -> Result<MacroData, MacroDataError> 
     Ok(data)
 }
 
+/// Every series the macro observation channel conditions on, in a fixed order.
+///
+/// One list, because two consumers need it: [`get_all_macro_data`] fetches it, and the PPO
+/// snapshot fingerprint enumerates its cache files. That fingerprint used to glob
+/// `long_data/macro_*.bin` instead, which hashed 163,840,726 bytes of an orphaned `macro_indicators*`
+/// schema no code has constructed since, and zero real series, so it recorded nothing about the
+/// inputs it claimed to pin.
+pub const ALL_SERIES: [MacroSeries; 15] = [
+    MacroSeries::RealGdp,
+    MacroSeries::GdpGrowth,
+    MacroSeries::UnemploymentRate,
+    MacroSeries::NonFarmPayrolls,
+    MacroSeries::JobsGrowth,
+    MacroSeries::InitialClaims,
+    MacroSeries::CpiAllItems,
+    MacroSeries::CoreCpi,
+    MacroSeries::PceInflation,
+    MacroSeries::FedFundsRate,
+    MacroSeries::Treasury10Y,
+    MacroSeries::Treasury2Y,
+    MacroSeries::ConsumerSentiment,
+    MacroSeries::RetailSales,
+    MacroSeries::IndustrialProd,
+];
+
 pub fn get_all_macro_data() -> Result<Vec<MacroData>, MacroDataError> {
-    use MacroSeries::*;
-    [
-        RealGdp,
-        GdpGrowth,
-        UnemploymentRate,
-        NonFarmPayrolls,
-        JobsGrowth,
-        InitialClaims,
-        CpiAllItems,
-        CoreCpi,
-        PceInflation,
-        FedFundsRate,
-        Treasury10Y,
-        Treasury2Y,
-        ConsumerSentiment,
-        RetailSales,
-        IndustrialProd,
-    ]
-    .into_iter()
-    .map(get_macro_data)
-    .collect()
+    ALL_SERIES.into_iter().map(get_macro_data).collect()
+}
+
+/// The one file `series` is cached in. Public so a fingerprint can name the exact inputs an
+/// observation reads instead of guessing at them with a filename prefix.
+pub fn series_cache_path(series: MacroSeries) -> PathBuf {
+    cache_path(series)
 }
 
 fn cache_path(series: MacroSeries) -> PathBuf {
@@ -540,7 +551,8 @@ pub fn get_value_at_timestamp(
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_path, conservative_availability_timestamp, is_nyse_session, FredResponse, MacroSeries,
+        cache_path, conservative_availability_timestamp, is_nyse_session, series_cache_path,
+        FredResponse, MacroSeries, ALL_SERIES,
     };
     use chrono::NaiveDate;
     use chrono::NaiveDateTime;
@@ -627,5 +639,42 @@ mod tests {
         assert_ne!(levels, growth);
         assert!(levels.to_string_lossy().ends_with("_v3.bin"));
         assert!(growth.to_string_lossy().ends_with("_v3.bin"));
+        assert_eq!(series_cache_path(MacroSeries::JobsGrowth), growth);
+    }
+
+    /// `ALL_SERIES` replaced a second hardcoded list inside `get_all_macro_data`, and it is now
+    /// also the input set the PPO snapshot fingerprint enumerates. Order is load-bearing on the
+    /// fetch side — the observation concatenates the returned vector positionally — so it is
+    /// pinned here rather than left to whoever next edits the constant.
+    #[test]
+    fn every_series_is_declared_once_in_the_observation_order() {
+        use MacroSeries::*;
+        assert_eq!(
+            ALL_SERIES,
+            [
+                RealGdp,
+                GdpGrowth,
+                UnemploymentRate,
+                NonFarmPayrolls,
+                JobsGrowth,
+                InitialClaims,
+                CpiAllItems,
+                CoreCpi,
+                PceInflation,
+                FedFundsRate,
+                Treasury10Y,
+                Treasury2Y,
+                ConsumerSentiment,
+                RetailSales,
+                IndustrialProd,
+            ]
+        );
+        let unique: std::collections::HashSet<MacroSeries> = ALL_SERIES.into_iter().collect();
+        assert_eq!(unique.len(), ALL_SERIES.len(), "a series is declared twice");
+        // Two series share a FRED id (PAYEMS as a level and as a growth rate); the cache path is
+        // what has to be unique, or one would silently overwrite the other.
+        let paths: std::collections::HashSet<_> =
+            ALL_SERIES.into_iter().map(series_cache_path).collect();
+        assert_eq!(paths.len(), ALL_SERIES.len(), "two series share a cache file");
     }
 }

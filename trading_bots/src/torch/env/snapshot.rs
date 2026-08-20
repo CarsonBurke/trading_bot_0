@@ -4,12 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::single::{load_market_data, EnvMarketData};
 use super::{Env, VecEnv};
+use crate::data::macro_econ;
 use crate::data::universe::{cached_bar_universe, LIVE_RES_SECS};
 use crate::history::{
     episode_tickers_combined::EpisodeHistory, meta_tickers_combined::MetaHistory,
@@ -217,7 +218,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn universe_fingerprint_covers_inactive_ticker_inputs() {
+    fn ppo_input_fingerprint_covers_inactive_ticker_inputs() {
         let root = std::env::temp_dir().join(format!(
             "trading-bot-snapshot-fingerprint-{}",
             uuid::Uuid::new_v4()
@@ -354,6 +355,18 @@ fn update_input_file(context: &mut DigestContext, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// SHA-256 over every file a PPO observation is built from: each eligible symbol's packed bars
+/// and earnings caches, then the macro caches.
+///
+/// The macro half enumerates [`macro_econ::ALL_SERIES`] rather than globbing the data directory.
+/// It used to filter `read_dir` on `starts_with("macro_") && ends_with(".bin")`, which made this a
+/// fingerprint of the DIRECTORY rather than of the inputs — and those differ exactly when someone
+/// tidies up. Measured when this was changed, that glob hashed 163,840,726 bytes across 15
+/// `macro_indicators*.bin` files left by a schema nothing constructs any more, and ZERO files
+/// matching the live `macro_{series}_{units}_{freq}_v{N}.bin` name that
+/// [`macro_econ::series_cache_path`] builds — so it recorded nothing at all about the series an
+/// observation reads. `update_input_file` records absence explicitly, so an uncached series is
+/// still represented.
 fn fingerprint_training_inputs(
     data_path: &Path,
     bars_path: &Path,
@@ -371,32 +384,25 @@ fn fingerprint_training_inputs(
         }
     }
 
-    let entries = fs::read_dir(data_path)
-        .with_context(|| {
-            format!(
-                "failed reading training data directory {}",
-                data_path.display()
-            )
-        })?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    let mut macro_files = entries
-        .into_iter()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("macro_") && name.ends_with(".bin"))
-        })
-        .collect::<Vec<PathBuf>>();
-    macro_files.sort();
-    context.update(&(macro_files.len() as u64).to_le_bytes());
-    for path in macro_files {
-        update_input_file(&mut context, &path)?;
+    context.update(&(macro_econ::ALL_SERIES.len() as u64).to_le_bytes());
+    for series in macro_econ::ALL_SERIES {
+        update_str(&mut context, series.series_id());
+        update_input_file(&mut context, &macro_econ::series_cache_path(series))?;
     }
     Ok(finish_hex(context))
 }
 
-fn universe_fingerprint() -> Result<String> {
+/// Identity of the PPO training universe and its inputs, memoized for the process.
+///
+/// Named for the trainer it gates, because [`crate::data::ingest::universe_fingerprint`] used to
+/// share the name and is an entirely different thing: that one is a SHA-256 of
+/// `long_data/universe.json` alone, it is folded into `BarTrainingProvenance` and thence into the
+/// bar world-model LINEAGE HASH, and `BarWorldModelMetadata::validate_schema` re-verifies that
+/// hash on every checkpoint load — so changing ITS definition makes every bar checkpoint on disk
+/// unloadable rather than merely stale. This one hashes the per-symbol input FILES and gates
+/// exactly one thing, the `universe_sha256` resume check below. The two are independent; the
+/// shared name was the hazard.
+fn ppo_input_fingerprint() -> Result<String> {
     if let Some(fingerprint) = UNIVERSE_FINGERPRINT.get() {
         return Ok(fingerprint.clone());
     }
@@ -854,7 +860,7 @@ impl VecEnvSnapshot {
             snapshot.format_version
         );
         ensure!(
-            snapshot.universe_sha256 == universe_fingerprint()?,
+            snapshot.universe_sha256 == ppo_input_fingerprint()?,
             "eligible training universe changed since checkpoint"
         );
         ensure!(!snapshot.envs.is_empty(), "environment snapshot is empty");
@@ -914,7 +920,7 @@ impl VecEnv {
     pub(crate) fn snapshot(&self) -> Result<VecEnvSnapshot> {
         Ok(VecEnvSnapshot {
             format_version: ENV_SNAPSHOT_FORMAT_VERSION,
-            universe_sha256: universe_fingerprint()?,
+            universe_sha256: ppo_input_fingerprint()?,
             envs: self.envs.iter().map(Env::snapshot).collect(),
         })
     }
