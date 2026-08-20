@@ -177,7 +177,26 @@ fn validate_strictly_increasing(bars: &[PackedBar]) -> Result<()> {
     Ok(())
 }
 
-/// Write a complete corpus file, replacing any existing one.
+/// Temp-file infix for an in-progress corpus write. Deliberately placed AFTER the `.bars`
+/// extension so a partial file can never be mistaken for a corpus member: every reader selects on
+/// `extension() == "bars"`, and `SYMBOL.300.bars.tmp-<pid>-<n>` has extension `tmp-<pid>-<n>`.
+pub const TEMP_INFIX: &str = ".bars.tmp-";
+
+/// True for a leftover [`write_bar_file`] temp file, i.e. one a killed writer abandoned.
+pub fn is_temp_bar_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(TEMP_INFIX))
+}
+
+/// Write a complete corpus file, replacing any existing one ATOMICALLY.
+///
+/// The records go to a temp file in the same directory, are fsynced, and are then renamed over
+/// `path`. Rename within a directory is atomic on Linux, so a kill at any instant leaves either the
+/// previous complete file or the new complete file and never a truncated one. Writing in place
+/// would not merely risk a short file: the header carries `count`, `first_ts_ms` and `last_ts_ms`
+/// and is written FIRST, so an interrupted in-place write leaves a header describing records that
+/// were never stored — and this corpus takes days of metered vendor bandwidth to reacquire.
 pub fn write_bar_file(
     path: &Path,
     symbol: &str,
@@ -187,7 +206,8 @@ pub fn write_bar_file(
     ensure!(res_secs > 0, "bar resolution must be positive");
     let symbol_field = encode_symbol(symbol)?;
     validate_strictly_increasing(bars)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating bar directory {}", parent.display()))?;
     }
@@ -198,18 +218,51 @@ pub fn write_bar_file(
         last_ts_ms: bars.last().map_or(0, |b| b.ts_ms),
         symbol: symbol_field,
     };
-    let file =
-        File::create(path).with_context(|| format!("creating bar file {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(&header.encode())?;
-    writer.write_all(bytemuck::cast_slice(bars))?;
-    writer.flush()?;
-    writer
-        .into_inner()
-        .map_err(|e| anyhow!("flushing bar file {}: {e}", path.display()))?
-        .sync_data()
-        .with_context(|| format!("syncing bar file {}", path.display()))?;
+    let temp = temp_path(path);
+    let staged = || -> Result<()> {
+        let file = File::create(&temp)
+            .with_context(|| format!("creating bar file {}", temp.display()))?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&header.encode())?;
+        writer.write_all(bytemuck::cast_slice(bars))?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| anyhow!("flushing bar file {}: {e}", temp.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing bar file {}", temp.display()))?;
+        fs::rename(&temp, path)
+            .with_context(|| format!("renaming {} onto {}", temp.display(), path.display()))
+    };
+    staged().inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })?;
+    // Makes the rename itself survive a machine crash, not merely a process kill. Reported and not
+    // propagated: the file is already complete and visible, so failing here would mark a landed
+    // symbol as failed, deny it its manifest record, and count it against the caller's failure
+    // tolerance — on a filesystem that simply does not support directory fsync, thousands of times.
+    if let Some(parent) = parent {
+        if let Err(error) = File::open(parent).and_then(|dir| dir.sync_all()) {
+            eprintln!("[bars] could not sync directory {}: {error}", parent.display());
+        }
+    }
     Ok(())
+}
+
+/// A unique sibling of `path` to stage a write in. Unique per process AND per call, so concurrent
+/// writers of the same symbol cannot collide on the staging file.
+fn temp_path(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bar_file");
+    let name = format!("{stem}{TEMP_INFIX}{}-{seq}", std::process::id());
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
 }
 
 /// Append only the records strictly newer than the file's `last_ts_ms`, updating the header

@@ -1108,7 +1108,7 @@ mod tests {
     fn reorganised(lead: usize, tail: usize) -> Vec<PackedBar> {
         let mut bars = Vec::with_capacity(lead + tail);
         let mut day = NaiveDate::from_ymd_opt(1993, 1, 4).unwrap();
-        let mut push = |bars: &mut Vec<PackedBar>, day: &mut NaiveDate, close: f32| {
+        let push = |bars: &mut Vec<PackedBar>, day: &mut NaiveDate, close: f32| {
             bars.push(bar(
                 (day.year(), day.month(), day.day()),
                 close,
