@@ -67,16 +67,19 @@ pub fn parse_bar_file_name(path: &Path) -> Result<(String, u32)> {
         .file_name()
         .and_then(|n| n.to_str())
         .with_context(|| format!("bar path {} has no UTF-8 file name", path.display()))?;
-    let stem = name.strip_suffix(&format!(".{FILE_EXTENSION}")).with_context(|| {
-        format!("bar file name {name:?} does not end in .{FILE_EXTENSION}")
-    })?;
+    let stem = name
+        .strip_suffix(&format!(".{FILE_EXTENSION}"))
+        .with_context(|| format!("bar file name {name:?} does not end in .{FILE_EXTENSION}"))?;
     let (symbol, res) = stem.rsplit_once('.').with_context(|| {
         format!("bar file name {name:?} is not <SYMBOL>.<res_secs>.{FILE_EXTENSION}")
     })?;
     let res_secs: u32 = res
         .parse()
         .with_context(|| format!("bar file name {name:?} has non-numeric resolution {res:?}"))?;
-    ensure!(!symbol.is_empty(), "bar file name {name:?} has an empty symbol");
+    ensure!(
+        !symbol.is_empty(),
+        "bar file name {name:?} has an empty symbol"
+    );
     ensure!(res_secs > 0, "bar file name {name:?} has resolution 0");
     Ok((symbol.to_string(), res_secs))
 }
@@ -119,17 +122,15 @@ impl Header {
             path.display()
         );
         Ok(Self {
-            res_secs: u32::from_le_bytes(
-                bytes[OFF_RES_SECS..OFF_RES_SECS + 4].try_into().unwrap(),
-            ),
+            res_secs: u32::from_le_bytes(bytes[OFF_RES_SECS..OFF_RES_SECS + 4].try_into().unwrap()),
             count: u64::from_le_bytes(bytes[OFF_COUNT..OFF_COUNT + 8].try_into().unwrap()),
             first_ts_ms: i64::from_le_bytes(
                 bytes[OFF_FIRST_TS..OFF_FIRST_TS + 8].try_into().unwrap(),
             ),
-            last_ts_ms: i64::from_le_bytes(
-                bytes[OFF_LAST_TS..OFF_LAST_TS + 8].try_into().unwrap(),
-            ),
-            symbol: bytes[OFF_SYMBOL..OFF_SYMBOL + SYMBOL_LEN].try_into().unwrap(),
+            last_ts_ms: i64::from_le_bytes(bytes[OFF_LAST_TS..OFF_LAST_TS + 8].try_into().unwrap()),
+            symbol: bytes[OFF_SYMBOL..OFF_SYMBOL + SYMBOL_LEN]
+                .try_into()
+                .unwrap(),
         })
     }
 
@@ -146,7 +147,10 @@ fn encode_symbol(symbol: &str) -> Result<[u8; SYMBOL_LEN]> {
         "symbol {symbol:?} is {} bytes, exceeds the {SYMBOL_LEN}-byte header field",
         bytes.len()
     );
-    ensure!(!bytes.contains(&0), "symbol {symbol:?} must not contain NUL");
+    ensure!(
+        !bytes.contains(&0),
+        "symbol {symbol:?} must not contain NUL"
+    );
     let mut out = [0u8; SYMBOL_LEN];
     out[..bytes.len()].copy_from_slice(bytes);
     Ok(out)
@@ -197,12 +201,7 @@ pub fn is_temp_bar_file(path: &Path) -> bool {
 /// would not merely risk a short file: the header carries `count`, `first_ts_ms` and `last_ts_ms`
 /// and is written FIRST, so an interrupted in-place write leaves a header describing records that
 /// were never stored — and this corpus takes days of metered vendor bandwidth to reacquire.
-pub fn write_bar_file(
-    path: &Path,
-    symbol: &str,
-    res_secs: u32,
-    bars: &[PackedBar],
-) -> Result<()> {
+pub fn write_bar_file(path: &Path, symbol: &str, res_secs: u32, bars: &[PackedBar]) -> Result<()> {
     ensure!(res_secs > 0, "bar resolution must be positive");
     let symbol_field = encode_symbol(symbol)?;
     validate_strictly_increasing(bars)?;
@@ -220,8 +219,8 @@ pub fn write_bar_file(
     };
     let temp = temp_path(path);
     let staged = || -> Result<()> {
-        let file = File::create(&temp)
-            .with_context(|| format!("creating bar file {}", temp.display()))?;
+        let file =
+            File::create(&temp).with_context(|| format!("creating bar file {}", temp.display()))?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&header.encode())?;
         writer.write_all(bytemuck::cast_slice(bars))?;
@@ -243,7 +242,10 @@ pub fn write_bar_file(
     // tolerance — on a filesystem that simply does not support directory fsync, thousands of times.
     if let Some(parent) = parent {
         if let Err(error) = File::open(parent).and_then(|dir| dir.sync_all()) {
-            eprintln!("[bars] could not sync directory {}: {error}", parent.display());
+            eprintln!(
+                "[bars] could not sync directory {}: {error}",
+                parent.display()
+            );
         }
     }
     Ok(())

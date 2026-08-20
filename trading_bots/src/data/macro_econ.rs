@@ -675,6 +675,10 @@ mod tests {
         // what has to be unique, or one would silently overwrite the other.
         let paths: std::collections::HashSet<_> =
             ALL_SERIES.into_iter().map(series_cache_path).collect();
-        assert_eq!(paths.len(), ALL_SERIES.len(), "two series share a cache file");
+        assert_eq!(
+            paths.len(),
+            ALL_SERIES.len(),
+            "two series share a cache file"
+        );
     }
 }

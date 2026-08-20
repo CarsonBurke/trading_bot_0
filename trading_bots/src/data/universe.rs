@@ -48,7 +48,10 @@ pub fn cached_bar_universe() -> &'static [String] {
 /// healthy small one.
 pub fn eligible_bar_universe(dir: &Path, res_secs: u32, min_bars: usize) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        eprintln!("[universe] cannot read bar corpus directory {}", dir.display());
+        eprintln!(
+            "[universe] cannot read bar corpus directory {}",
+            dir.display()
+        );
         return Vec::new();
     };
     let mut eligible = Vec::new();
@@ -84,7 +87,9 @@ pub fn corpus_bar_path(symbol: &str) -> PathBuf {
 /// Bars the corpus holds for `symbol`, read from the file header without touching a
 /// single record.
 pub fn corpus_bar_count(symbol: &str) -> Option<usize> {
-    BarFile::open(&corpus_bar_path(symbol)).ok().map(|file| file.len())
+    BarFile::open(&corpus_bar_path(symbol))
+        .ok()
+        .map(|file| file.len())
 }
 
 /// The `count` universe symbols with the deepest history, deepest first, ties broken

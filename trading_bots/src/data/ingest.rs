@@ -16,8 +16,8 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::torch::dataset::BarCorpus;
 use super::polygon::{self, Window};
+use crate::torch::dataset::BarCorpus;
 
 /// Aggregate windows are bounded by the 50k-row page cap (~186 extended-hours 5m bars per day).
 const MAX_WINDOW_DAYS: i64 = 269;
@@ -26,7 +26,16 @@ const MAX_WINDOW_DAYS: i64 = 269;
 /// Deliberately not a trailing window, even one ending at the train boundary: a symbol that
 /// delisted early in the corpus traded in none of the recent sessions, so a trailing sample would
 /// erase it and re-impose exactly the survivorship bias that admitting delisted tickers removes.
-const UNIVERSE_SAMPLES: usize = 60;
+///
+/// Scaled WITH [`PLAN_WINDOW_DAYS`], because what the ranking gate actually depends on is sample
+/// DENSITY, not sample count. `sample_trading_days` spaces these evenly, so the step is
+/// `window / count` and [`UNIVERSE_MIN_SESSIONS`] silently becomes a minimum TRADING LIFE of two
+/// steps. Holding the count at 60 while the window doubled would have stretched the step from 25
+/// to 55 days and the life requirement from 50 to 110 days, which drops 185 of the 5,684 symbols
+/// the cached ranking admits — 67 of them delisted, median $4.7M/day. That is the same
+/// survivorship defect the widened window exists to remove, re-entered through the short-lived
+/// end instead of the early end.
+const UNIVERSE_SAMPLES: usize = 120;
 /// Sampled sessions a symbol must have traded in to be ranked at all. At the density above this is
 /// a few months of trading, which is what separates a security from a stub listing.
 const UNIVERSE_MIN_SESSIONS: usize = 3;
@@ -41,9 +50,7 @@ const PLAN_EDGE_MARGIN_DAYS: i64 = 10;
 /// holiday is the widest gap an up-to-date series can legitimately show at its right edge.
 const FRESH_TAIL_DAYS: i64 = 5;
 /// Candidate liquidity floors reported beside the chosen one, so the cost of moving it is visible.
-const FLOOR_LADDER: [f64; 10] = [
-    1e5, 2.5e5, 5e5, 1e6, 2e6, 4e6, 8.5e6, 1.5e7, 3e7, 1e8,
-];
+const FLOOR_LADDER: [f64; 10] = [1e5, 2.5e5, 5e5, 1e6, 2e6, 4e6, 8.5e6, 1.5e7, 3e7, 1e8];
 /// Liquidity floor for corpus membership: median dollars traded per session, measured over the
 /// sampled training-window sessions a symbol actually traded in.
 ///
@@ -104,8 +111,31 @@ pub const MIN_DOLLAR_VOLUME: f64 = 1_000_000.0;
 pub const PINNED_SPLIT_BOUNDS: (i64, i64) = (1_759_839_000_000, 1_773_427_500_000);
 const PROGRESS_EVERY: usize = 25;
 const DAILY_RES_SECS: u32 = 86_400;
-/// Deepest history the subscription serves; requests beyond it answer `NOT_AUTHORIZED`.
-const PLAN_WINDOW_DAYS: i64 = 5 * 365;
+/// Deepest history the subscription serves; a request wholly outside it answers `NOT_AUTHORIZED`.
+///
+/// Ten years, probed rather than assumed. On 2026-08-19 the grouped-daily endpoint that
+/// [`ranking_sessions`] actually samples refused 2016-08-17, 2016-08-18 and 2016-08-19 with
+/// `403 NOT_AUTHORIZED` and served 2016-08-22 with 7,867 rows, so the left edge is 2016-08-22 —
+/// 3,649 days back. `10 * 365` therefore overstates the entitlement by one day;
+/// [`PLAN_EDGE_MARGIN_DAYS`] absorbs that, which is what it is for.
+///
+/// The refusal is per-request, not per-row: `range/1/day` for 2016-08-01..2016-08-31 answers `OK`
+/// with its first row CLAMPED to 2016-08-22, while 2016-07-01..2016-07-31 answers
+/// `NOT_AUTHORIZED`. So only a window that lies entirely beyond the edge is refused, and a
+/// single-session sample is exactly such a window — which is why the margin protects the floor
+/// and not the individual samples above it.
+///
+/// This was `5 * 365` while the plan was Starter, and staleness here is not inert: it is the sole
+/// input to the LEFT edge of [`ranking_sessions`], so a five-year floor put the first sampled
+/// session at 2021-09-22 and made every security that stopped trading before then unrankable and
+/// therefore undownloadable. Measured against the vendor's delisted reference set, that hole is
+/// 2,502 CS/ETF/ADRC securities, 888 of which cleared [`MIN_DOLLAR_VOLUME`] on their own
+/// in-window daily bars — 15.6% of the 5,684 the corpus admits — and it is spread evenly across
+/// 2016-2021 rather than concentrated at the far end. Widening the constant does not by itself
+/// repair the corpus: the cached ranking is reused unless `--refresh-universe` is passed, exactly
+/// so that this edit cannot move `universe.json` under the checkpoints whose lineage hash covers
+/// its digest.
+const PLAN_WINDOW_DAYS: i64 = 10 * 365;
 /// Share of symbols allowed to fail before the whole pass is reported as failed.
 const FAILURE_TOLERANCE: f64 = 0.01;
 /// Days to walk back looking for the newest reference-data entry for a ticker.
@@ -125,15 +155,19 @@ const IDENTITY_PROBE_SPAN_DAYS: i64 = 5;
 /// History window the corpus already on disk was downloaded under, credited to every file the
 /// ingest manifest predates.
 ///
-/// Measured rather than assumed: every one of the 5,728 `*.300.bars` files carries an identical
-/// left edge of 2021-08-17, one session after `2026-08-15 - 5*365d`, and 2026-08-15 is the day they
-/// were written. So the corpus is uniformly clipped at the five-year Starter window, and this is
-/// the span a pre-manifest file honestly claims.
+/// Measured when it was written, and since superseded by the corpus it describes: every one of the
+/// then-5,728 `*.300.bars` files carried an identical left edge of 2021-08-17, one session after
+/// `2026-08-15 - 5*365d`. The deep ingest has rewritten most of them — as of 2026-08-19 a
+/// 64-byte header scan of the same 5,728 files finds 3,036 at 2016-08-22 and only 12 still at
+/// 2021-08-17, 11 of which are the pre-manifest population this constant is for. The manifest now
+/// records all 5,684 downloaded symbols at `window_start_ms` 2016-08-22, so the bootstrap is
+/// reached by 44 files and no longer describes the corpus as a whole.
 ///
-/// Deliberately a SEPARATE constant from [`PLAN_WINDOW_DAYS`], which is the vendor's CURRENT
-/// entitlement and feeds universe sampling. Coupling them would re-credit the old corpus with depth
-/// it does not contain the moment the subscription deepens — which is exactly the situation this
-/// constant exists to survive.
+/// The VALUE must stay at the five-year Starter window regardless, because it is what a
+/// pre-manifest file honestly claims. Deliberately a SEPARATE constant from [`PLAN_WINDOW_DAYS`],
+/// which is the vendor's CURRENT entitlement and feeds universe sampling: coupling them would
+/// re-credit the old corpus with depth it does not contain the moment the subscription deepens,
+/// and the subscription has now deepened, so that hazard is live rather than hypothetical.
 const LEGACY_CORPUS_WINDOW_DAYS: i64 = 5 * 365;
 /// Journal of completed per-symbol downloads, beside the corpus it describes.
 const MANIFEST_FILE: &str = ".ingest_manifest.jsonl";
@@ -159,7 +193,9 @@ impl Resolution {
         let count: u32 = if count.is_empty() {
             1
         } else {
-            count.parse().with_context(|| format!("bad resolution {spec}"))?
+            count
+                .parse()
+                .with_context(|| format!("bad resolution {spec}"))?
         };
         let unit_secs = match unit {
             "" | "m" | "min" | "mins" | "minute" | "minutes" => 60,
@@ -707,7 +743,11 @@ fn report_liquidity(entries: &[UniverseEntry], floor: f64) {
             "[universe]   >= ${candidate:>12.0}/day | {:>7} | {:>8}{}",
             kept.len(),
             kept.iter().filter(|entry| entry.delisted).count(),
-            if candidate == floor { "  <- selected" } else { "" }
+            if candidate == floor {
+                "  <- selected"
+            } else {
+                ""
+            }
         );
     }
     let kept = entries
@@ -857,7 +897,8 @@ fn unterminated(path: &Path) -> Result<bool> {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
-            return Err(error).with_context(|| format!("reading ingest manifest {}", path.display()))
+            return Err(error)
+                .with_context(|| format!("reading ingest manifest {}", path.display()))
         }
     };
     let len = file
@@ -972,8 +1013,7 @@ impl Pass {
         force: bool,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Arc<Self>> {
-        fs::create_dir_all(out_dir)
-            .with_context(|| format!("creating {}", out_dir.display()))?;
+        fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
         let swept = sweep_temp_files(out_dir);
         if swept > 0 {
             println!("[ingest] swept {swept} staging file(s) left by an interrupted pass");
@@ -1390,7 +1430,13 @@ async fn persist(
         let first_ts_ms = bars[0].ts_ms;
         let last_ts_ms = bars[bars.len() - 1].ts_ms;
         write_bar_file(&path, &symbol, pass.res_secs, &bars)?;
-        pass.complete(&symbol, window_start_ms, bars.len(), first_ts_ms, last_ts_ms)?;
+        pass.complete(
+            &symbol,
+            window_start_ms,
+            bars.len(),
+            first_ts_ms,
+            last_ts_ms,
+        )?;
         Ok((bars.len(), first_ts_ms, last_ts_ms))
     })
     .await;
@@ -1527,7 +1573,6 @@ fn utc_date(ts_ms: i64) -> NaiveDate {
         .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is a valid date"))
 }
 
-
 /// Identity in force at `end`, walking back a few days in case the newest reference day is missing.
 async fn current_identity(
     symbol: &str,
@@ -1569,9 +1614,9 @@ async fn fetch_history(
         {
             // The newest window always lies inside the plan window, so a refusal there means the
             // subscription no longer covers this data rather than that history ran out.
-            Window::Unauthorized if newest => bail!(
-                "polygon refused the most recent window {from}..{to}; check plan entitlement"
-            ),
+            Window::Unauthorized if newest => {
+                bail!("polygon refused the most recent window {from}..{to}; check plan entitlement")
+            }
             // The entitlement ran out before `floor` did. Recorded, because a pass that stamps the
             // requested window on a series the vendor refused to serve would latch that claim and
             // skip the symbol forever — including after a genuine plan upgrade.
@@ -2039,7 +2084,10 @@ mod tests {
         let plan_floor = today - Duration::days(PLAN_WINDOW_DAYS);
         assert!(dates.len() >= UNIVERSE_SAMPLES - 2, "{}", dates.len());
         for date in &dates {
-            assert!(*date < boundary, "{date} is not before the train|val boundary");
+            assert!(
+                *date < boundary,
+                "{date} is not before the train|val boundary"
+            );
             assert!(*date >= plan_floor, "{date} predates the vendor window");
             assert!(!matches!(date.weekday(), Weekday::Sat | Weekday::Sun));
         }
@@ -2053,12 +2101,61 @@ mod tests {
         assert!(dates.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
+    /// The ranking window's LEFT edge is what decides whether a delisted security is rankable at
+    /// all, and [`PLAN_WINDOW_DAYS`] is its only input. At `5 * 365` the oldest sampled session sat
+    /// in late 2021, so every security that stopped trading before then had zero sampled sessions,
+    /// scored no liquidity, and was never downloaded — 2,502 CS/ETF/ADRC names by the vendor's own
+    /// delisted reference set, 888 of them above [`MIN_DOLLAR_VOLUME`] on their in-window daily
+    /// bars. This pins the two halves of the repair: the floor reaches the vendor's measured left
+    /// edge, and the sample DENSITY survives the extra depth.
+    #[test]
+    fn the_ranking_window_reaches_the_vendors_measured_left_edge() {
+        // The day the entitlement edge was probed: grouped-daily refused 2016-08-19 and served
+        // 2016-08-22 with 7,867 rows.
+        let today = NaiveDate::from_ymd_opt(2026, 8, 19).unwrap();
+        let entitlement_edge = NaiveDate::from_ymd_opt(2016, 8, 22).unwrap();
+        let train_end = DateTime::<Utc>::from_timestamp_millis(PINNED_SPLIT_BOUNDS.0).unwrap();
+
+        let plan_floor = today - Duration::days(PLAN_WINDOW_DAYS - PLAN_EDGE_MARGIN_DAYS);
+        assert!(
+            plan_floor >= entitlement_edge,
+            "the floor {plan_floor} asks for history the vendor refuses (edge {entitlement_edge}); \
+             `10 * 365` overstates the rolling decade by a day and the margin must absorb it"
+        );
+
+        let dates = ranking_sessions(train_end, today).unwrap();
+        let cliff = NaiveDate::from_ymd_opt(2021, 9, 22).unwrap();
+        assert!(
+            dates[0] < cliff,
+            "oldest sampled session {} still postdates the survivorship cliff {cliff}",
+            dates[0]
+        );
+
+        // The five-year constant, for contrast: it could not sample 2016-2021 at all, which is the
+        // entire mechanism of the hole.
+        let stale_floor = today - Duration::days(5 * 365 - PLAN_EDGE_MARGIN_DAYS);
+        assert!(stale_floor > cliff - Duration::days(30), "{stale_floor}");
+
+        // Density, not count: `sample_trading_days` spaces samples by `span / count`, so
+        // `UNIVERSE_MIN_SESSIONS` is really a minimum trading life of two steps. Deepening the
+        // window without scaling `UNIVERSE_SAMPLES` stretches that life requirement and evicts
+        // short-lived names — the same survivorship defect entering from the other end.
+        let step = (dates[dates.len() - 1] - dates[0]).num_days() / (dates.len() as i64 - 1);
+        assert!(step <= 30, "sample step grew to {step} days");
+        assert!(
+            (UNIVERSE_MIN_SESSIONS as i64 - 1) * step <= 60,
+            "ranking now demands {} days of trading life",
+            (UNIVERSE_MIN_SESSIONS as i64 - 1) * step
+        );
+    }
+
     /// A name that traded liquidly and then delisted must outrank a thin survivor. Ranking on all
     /// sampled sessions instead of the ones it traded in would bury it, which is the survivorship
     /// bias the delisted half of the reference data exists to remove.
     #[test]
     fn ranking_measures_each_symbol_over_its_own_life() {
-        let day = |offset: i64| NaiveDate::from_ymd_opt(2022, 1, 3).unwrap() + Duration::days(offset);
+        let day =
+            |offset: i64| NaiveDate::from_ymd_opt(2022, 1, 3).unwrap() + Duration::days(offset);
         let reference = ReferenceIndex {
             by_symbol: [
                 ("GONE", "Acquired Industries", "CS", false),
@@ -2118,10 +2215,7 @@ mod tests {
     fn scratch(label: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "ingest-{label}-{}-{seq}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ingest-{label}-{}-{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -2129,7 +2223,13 @@ mod tests {
 
     fn write_series(dir: &Path, symbol: &str, res_secs: u32, first: i64, last: i64) -> PathBuf {
         let path = bar_file_path(dir, symbol, res_secs);
-        write_bar_file(&path, symbol, res_secs, &[bar_at(first, 10.0), bar_at(last, 11.0)]).unwrap();
+        write_bar_file(
+            &path,
+            symbol,
+            res_secs,
+            &[bar_at(first, 10.0), bar_at(last, 11.0)],
+        )
+        .unwrap();
         path
     }
 
@@ -2202,15 +2302,45 @@ mod tests {
         // Once a ten-year download is recorded, the same request skips. This termination is the
         // whole difference from a left-edge test, which would never stop refetching a symbol whose
         // history legitimately starts after the window.
-        assert!(covered(&path, 300, end, false, ten_years, Some(ten_years), bootstrap));
-        let listed_late = write_series(&dir, "LATE", 300, day_start_ms(end) - 90 * day, day_start_ms(end) - day);
-        assert!(covered(&listed_late, 300, end, false, ten_years, Some(ten_years), bootstrap));
+        assert!(covered(
+            &path,
+            300,
+            end,
+            false,
+            ten_years,
+            Some(ten_years),
+            bootstrap
+        ));
+        let listed_late = write_series(
+            &dir,
+            "LATE",
+            300,
+            day_start_ms(end) - 90 * day,
+            day_start_ms(end) - day,
+        );
+        assert!(covered(
+            &listed_late,
+            300,
+            end,
+            false,
+            ten_years,
+            Some(ten_years),
+            bootstrap
+        ));
 
         // A file that already reaches past the request skips whatever the manifest says: this is
         // the left edge used as a skip reason only, which is what keeps `--daily` from re-pulling
         // the decades `deep_daily` wrote.
-        let deep = write_series(&dir, "DEEP", 86_400, ten_years - 4_000 * day, day_start_ms(end) - day);
-        assert!(covered(&deep, 86_400, end, false, ten_years, None, bootstrap));
+        let deep = write_series(
+            &dir,
+            "DEEP",
+            86_400,
+            ten_years - 4_000 * day,
+            day_start_ms(end) - day,
+        );
+        assert!(covered(
+            &deep, 86_400, end, false, ten_years, None, bootstrap
+        ));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2220,7 +2350,6 @@ mod tests {
     #[tokio::test]
     async fn a_completed_symbol_is_skipped_by_the_next_pass() {
         let dir = scratch("resume");
-        let day = 86_400_000i64;
         let now = Utc::now().timestamp_millis();
         let bars: Vec<PackedBar> = (0..8)
             .map(|i| bar_at(now - (8 - i) * 300_000, 10.0 + i as f32))
@@ -2229,8 +2358,16 @@ mod tests {
         let first = pass_over(&dir, 300, 10, false);
         let requested = first.requested_start_ms;
         // Nothing on disk, so neither symbol is covered.
-        assert!(!first.covers(bar_file_path(&dir, "AAA", 300), "AAA", false).await);
-        assert!(!first.covers(bar_file_path(&dir, "BBB", 300), "BBB", false).await);
+        assert!(
+            !first
+                .covers(bar_file_path(&dir, "AAA", 300), "AAA", false)
+                .await
+        );
+        assert!(
+            !first
+                .covers(bar_file_path(&dir, "BBB", 300), "BBB", false)
+                .await
+        );
         let outcome = persist(
             Arc::clone(&first),
             bar_file_path(&dir, "AAA", 300),
@@ -2247,8 +2384,16 @@ mod tests {
         // is still pending, and the record says what it was downloaded under.
         let resumed = pass_over(&dir, 300, 10, false);
         assert_eq!(resumed.requested_start_ms, requested);
-        assert!(resumed.covers(bar_file_path(&dir, "AAA", 300), "AAA", false).await);
-        assert!(!resumed.covers(bar_file_path(&dir, "BBB", 300), "BBB", false).await);
+        assert!(
+            resumed
+                .covers(bar_file_path(&dir, "AAA", 300), "AAA", false)
+                .await
+        );
+        assert!(
+            !resumed
+                .covers(bar_file_path(&dir, "BBB", 300), "BBB", false)
+                .await
+        );
         let entry = &resumed.recorded[&("AAA".to_string(), 300)];
         assert_eq!((entry.years, entry.bars), (10, 8));
         assert_eq!(entry.window_start_ms, requested);
@@ -2263,14 +2408,22 @@ mod tests {
         // Deleting the file behind the manifest's back must not make the record authoritative.
         fs::remove_file(bar_file_path(&dir, "AAA", 300)).unwrap();
         let after_loss = pass_over(&dir, 300, 10, false);
-        assert!(!after_loss.covers(bar_file_path(&dir, "AAA", 300), "AAA", false).await);
+        assert!(
+            !after_loss
+                .covers(bar_file_path(&dir, "AAA", 300), "AAA", false)
+                .await
+        );
 
         // And a record that is deeper than the request still skips: the pass asks for less than it
         // already has. Guards against the rolling window making a same-`years` rerun refetch.
         let shallower = pass_over(&dir, 300, 5, false);
         assert!(shallower.requested_start_ms > requested);
         write_series(&dir, "AAA", 300, bars[0].ts(), bars[7].ts());
-        assert!(shallower.covers(bar_file_path(&dir, "AAA", 300), "AAA", false).await);
+        assert!(
+            shallower
+                .covers(bar_file_path(&dir, "AAA", 300), "AAA", false)
+                .await
+        );
         // If it does fetch it anyway — which it will once the right edge goes stale, since the
         // right-edge test short-circuits before the intent test — it must fetch to the DEEPER
         // recorded floor. Refetching to the shallower request would replace ten years of
@@ -2305,14 +2458,19 @@ mod tests {
         };
         let mut journal = ManifestJournal::open(path.clone()).unwrap();
         for (index, symbol) in ["AAA", "BBB", "CCC"].iter().enumerate() {
-            journal.record(&entry(symbol, 1_000 + index as i64)).unwrap();
+            journal
+                .record(&entry(symbol, 1_000 + index as i64))
+                .unwrap();
         }
         drop(journal);
 
         // Round-trip first: what was written is what is read back.
         let intact = replay_manifest(&path);
         assert_eq!((intact.entries.len(), intact.damaged), (3, 0));
-        assert_eq!(intact.entries[&("BBB".to_string(), 300)].window_start_ms, 1_001);
+        assert_eq!(
+            intact.entries[&("BBB".to_string(), 300)].window_start_ms,
+            1_001
+        );
 
         // Now cut the file inside its last line, exactly as a kill mid-append would.
         let whole = fs::read(&path).unwrap();
@@ -2334,7 +2492,10 @@ mod tests {
         assert!(!unterminated(&path).unwrap());
         let healed = replay_manifest(&path);
         assert_eq!(healed.entries.len(), 3, "the re-recorded symbol must land");
-        assert_eq!(healed.entries[&("CCC".to_string(), 300)].window_start_ms, 1_002);
+        assert_eq!(
+            healed.entries[&("CCC".to_string(), 300)].window_start_ms,
+            1_002
+        );
 
         // Garbage is discarded line by line rather than poisoning the replay. The non-UTF-8 line is
         // the case that matters: a whole-iterator decoder would stop here and hide every record
@@ -2374,8 +2535,9 @@ mod tests {
         let now = Utc::now().timestamp_millis();
         for symbol in ["AAA", "BBB"] {
             let path = bar_file_path(&dir, symbol, 300);
-            let start = day_start_ms(Utc::now().date_naive() - Duration::days(LEGACY_CORPUS_WINDOW_DAYS))
-                + 86_400_000;
+            let start =
+                day_start_ms(Utc::now().date_naive() - Duration::days(LEGACY_CORPUS_WINDOW_DAYS))
+                    + 86_400_000;
             write_bar_file(
                 &path,
                 symbol,
@@ -2391,7 +2553,8 @@ mod tests {
         assert!(same.recorded.is_empty());
         for symbol in ["AAA", "BBB"] {
             assert!(
-                same.covers(bar_file_path(&dir, symbol, 300), symbol, false).await,
+                same.covers(bar_file_path(&dir, symbol, 300), symbol, false)
+                    .await,
                 "{symbol} would be refetched by a same-span pass"
             );
         }
@@ -2399,7 +2562,9 @@ mod tests {
         let deeper = pass_over(&dir, 300, 10, false);
         for symbol in ["AAA", "BBB"] {
             assert!(
-                !deeper.covers(bar_file_path(&dir, symbol, 300), symbol, false).await,
+                !deeper
+                    .covers(bar_file_path(&dir, symbol, 300), symbol, false)
+                    .await,
                 "{symbol} would be skipped by a ten-year pass"
             );
         }
@@ -2415,7 +2580,9 @@ mod tests {
     fn an_interrupted_write_can_never_expose_a_partial_corpus_file() {
         let dir = scratch("atomic");
         let path = bar_file_path(&dir, "AAA", 300);
-        let old: Vec<PackedBar> = (0..4).map(|i| bar_at(1_000_000 + i * 300_000, 1.0)).collect();
+        let old: Vec<PackedBar> = (0..4)
+            .map(|i| bar_at(1_000_000 + i * 300_000, 1.0))
+            .collect();
         write_bar_file(&path, "AAA", 300, &old).unwrap();
         // Large enough that the write is not instantaneous, small enough to stay well inside a
         // bounded-memory test: 400k records is 14 MB.
@@ -2431,7 +2598,10 @@ mod tests {
             while !reader_stop.load(Ordering::Relaxed) {
                 let file = BarFile::open(&reader_path).expect("the target is always openable");
                 let len = file.len();
-                assert!(len == 4 || len == 400_000, "partial corpus file of {len} bars");
+                assert!(
+                    len == 4 || len == 400_000,
+                    "partial corpus file of {len} bars"
+                );
                 seen += 1;
             }
             seen
@@ -2509,7 +2679,10 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 8, 15).expect("valid date");
         let boundary = pinned.date_naive();
         for date in ranking_sessions(pinned, today).expect("sessions") {
-            assert!(date < boundary, "sampled session {date} is not inside train");
+            assert!(
+                date < boundary,
+                "sampled session {date} is not inside train"
+            );
         }
     }
 

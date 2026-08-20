@@ -235,11 +235,12 @@ pub fn refresh_historical_bars_at(
     ticker: &str,
     completed_before: OffsetDateTime,
 ) -> Result<Vec<PackedBar>, HistoricalLoadError> {
-    download_live_tail(client, ticker, completed_before)?
-        .ok_or_else(|| HistoricalLoadError::Request {
+    download_live_tail(client, ticker, completed_before)?.ok_or_else(|| {
+        HistoricalLoadError::Request {
             ticker: ticker.to_string(),
             message: "IBKR returned no completed historical bars".to_string(),
-        })
+        }
+    })
 }
 
 /// Restrict every series to the timestamps all of them share.
@@ -342,10 +343,7 @@ pub fn to_ibkr_bars(bars: &[PackedBar]) -> Vec<historical::Bar> {
 ///
 /// The corpus format requires strictly increasing timestamps, so a repeated timestamp
 /// keeps its first observation rather than failing the whole append.
-fn to_packed_bars(
-    bars: &[historical::Bar],
-    completed_before: OffsetDateTime,
-) -> Vec<PackedBar> {
+fn to_packed_bars(bars: &[historical::Bar], completed_before: OffsetDateTime) -> Vec<PackedBar> {
     let mut packed: Vec<PackedBar> = bars
         .iter()
         .map(|bar| PackedBar {
@@ -433,7 +431,10 @@ fn download_live_tail(
     // creates the file from its name when the symbol has no tail yet. The Polygon corpus
     // is never touched.
     if let Err(error) = append_bars(&tail_path, &downloaded) {
-        eprintln!("failed extending live tail {}: {error:#}", tail_path.display());
+        eprintln!(
+            "failed extending live tail {}: {error:#}",
+            tail_path.display()
+        );
     }
 
     match load_with_live_tail(ticker, completed_before) {

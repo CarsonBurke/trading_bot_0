@@ -148,8 +148,7 @@ pub async fn run(args: DeepDailyArgs) -> Result<()> {
         symbols.truncate(args.limit);
     }
     let out_dir = bars_dir();
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating {}", out_dir.display()))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
     println!(
         "[deep-daily] {} symbols clearing ${:.0}/day -> {} (concurrency {}{})",
@@ -481,8 +480,12 @@ fn scan(
     // `r` and `s` as `BarDof` defines them: ln(close / prev_close) and ln(high / low).
     let mut returns = Vec::with_capacity(bars.len() - 1);
     for window in bars.windows(2) {
-        let (prev_close, high, low, close) =
-            (window[0].close, window[1].high, window[1].low, window[1].close);
+        let (prev_close, high, low, close) = (
+            window[0].close,
+            window[1].high,
+            window[1].low,
+            window[1].close,
+        );
         if (high / low).ln() as f64 > ANOMALY_LOG_LIMIT {
             out.extreme_range += 1;
         }
@@ -574,7 +577,12 @@ fn to_bars(chart: &ChartResult) -> Result<Converted> {
         .events
         .as_ref()
         .and_then(|events| events.splits.as_ref())
-        .map(|splits| splits.values().map(|split| session_date(split.date * 1000)).collect())
+        .map(|splits| {
+            splits
+                .values()
+                .map(|split| session_date(split.date * 1000))
+                .collect()
+        })
         .unwrap_or_default();
 
     let now = Utc::now().with_timezone(&New_York);
@@ -754,9 +762,8 @@ fn report(summary: &DeepDailySummary) {
 
     let bars: usize = summary.anomalies.iter().map(|entry| entry.bars).sum();
     let total: usize = summary.anomalies.iter().map(SymbolAnomalies::total).sum();
-    let sum = |pick: fn(&SymbolAnomalies) -> usize| -> usize {
-        summary.anomalies.iter().map(pick).sum()
-    };
+    let sum =
+        |pick: fn(&SymbolAnomalies) -> usize| -> usize { summary.anomalies.iter().map(pick).sum() };
     println!(
         "[deep-daily] {total} anomalous bars in {bars} ({:.2}/10k) at |r| or s > ln 4: \
          {} splices, {} ticks, {} jumps, {} extreme ranges, {} interior holes",
@@ -828,15 +835,30 @@ impl YahooClient {
         let mut headers = HeaderMap::new();
         // Yahoo rejects anything that does not present as a browser navigating its own site,
         // answering `429 Too Many Requests` on the very first request when these are absent.
-        headers.insert("accept", HeaderValue::from_static("application/json,text/plain,*/*"));
-        headers.insert("accept-language", HeaderValue::from_static("en-US,en;q=0.9"));
-        headers.insert("origin", HeaderValue::from_static("https://finance.yahoo.com"));
-        headers.insert("referer", HeaderValue::from_static("https://finance.yahoo.com/"));
+        headers.insert(
+            "accept",
+            HeaderValue::from_static("application/json,text/plain,*/*"),
+        );
+        headers.insert(
+            "accept-language",
+            HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://finance.yahoo.com"),
+        );
+        headers.insert(
+            "referer",
+            HeaderValue::from_static("https://finance.yahoo.com/"),
+        );
         headers.insert(
             "sec-ch-ua",
             HeaderValue::from_static("\"Chromium\";v=\"128\", \"Not;A=Brand\";v=\"24\""),
         );
-        headers.insert("sec-ch-ua-platform", HeaderValue::from_static("\"Windows\""));
+        headers.insert(
+            "sec-ch-ua-platform",
+            HeaderValue::from_static("\"Windows\""),
+        );
         let http = reqwest::Client::builder()
             .user_agent(BROWSER_USER_AGENT)
             .default_headers(headers)
@@ -861,12 +883,7 @@ impl YahooClient {
         };
         let envelope: ChartEnvelope = serde_json::from_str(&body)
             .with_context(|| format!("decoding yahoo chart for {symbol}"))?;
-        Ok(envelope
-            .chart
-            .result
-            .unwrap_or_default()
-            .into_iter()
-            .next())
+        Ok(envelope.chart.result.unwrap_or_default().into_iter().next())
     }
 
     /// One GET with bounded retries. `None` is a `404`, meaning the symbol does not exist.
@@ -1016,15 +1033,25 @@ mod tests {
         let winter = session_open_ms(NaiveDate::from_ymd_opt(2009, 1, 2).unwrap());
         let summer = session_open_ms(NaiveDate::from_ymd_opt(2009, 7, 2).unwrap());
         assert_eq!(
-            DateTime::<Utc>::from_timestamp_millis(winter).unwrap().hour(),
+            DateTime::<Utc>::from_timestamp_millis(winter)
+                .unwrap()
+                .hour(),
             5
         );
         assert_eq!(
-            DateTime::<Utc>::from_timestamp_millis(summer).unwrap().hour(),
+            DateTime::<Utc>::from_timestamp_millis(summer)
+                .unwrap()
+                .hour(),
             4
         );
-        assert_eq!(session_date(winter), NaiveDate::from_ymd_opt(2009, 1, 2).unwrap());
-        assert_eq!(session_date(summer), NaiveDate::from_ymd_opt(2009, 7, 2).unwrap());
+        assert_eq!(
+            session_date(winter),
+            NaiveDate::from_ymd_opt(2009, 1, 2).unwrap()
+        );
+        assert_eq!(
+            session_date(summer),
+            NaiveDate::from_ymd_opt(2009, 7, 2).unwrap()
+        );
     }
 
     #[test]
@@ -1041,7 +1068,10 @@ mod tests {
         assert_eq!(seams.len(), 1);
         assert_eq!(seams[0].kind, "jump");
         assert_eq!(seams[0].date, NaiveDate::from_ymd_opt(2026, 5, 26).unwrap());
-        assert_eq!(seams[0].index, 2, "the cut point is the bar the move lands on");
+        assert_eq!(
+            seams[0].index, 2,
+            "the cut point is the bar the move lands on"
+        );
     }
 
     #[test]
@@ -1071,7 +1101,10 @@ mod tests {
         // The recovery leg is booked a jump, exactly as the corpus audit books it: it has no
         // successor of its own to revert into. The gate still recognises it as the tick's tail.
         assert_eq!(anomalies.jumps, 1);
-        assert_eq!(anomalies.extreme_range, 1, "only the bad print's own bar spans 10x");
+        assert_eq!(
+            anomalies.extreme_range, 1,
+            "only the bad print's own bar spans 10x"
+        );
         assert!(
             seams.is_empty(),
             "a spike that returns to its own level is not a level shift: {seams:?}"
@@ -1141,8 +1174,7 @@ mod tests {
         assert_eq!(cut.seams.len(), 1, "the seam is reported, not swallowed");
         assert_eq!(bars.len(), MIN_TRUNCATED_BARS);
         assert_eq!(
-            anomalies.bars,
-            MIN_TRUNCATED_BARS,
+            anomalies.bars, MIN_TRUNCATED_BARS,
             "the counts describe what is written, not what was fetched"
         );
         assert_eq!(anomalies.total(), 0, "the kept tail is clean");
@@ -1162,7 +1194,11 @@ mod tests {
 
         assert_eq!(seams.len(), 1);
         assert!(reason.contains("clean tail"), "reason was {reason:?}");
-        assert_eq!(bars.len(), before, "a withheld symbol's bars are left alone");
+        assert_eq!(
+            bars.len(),
+            before,
+            "a withheld symbol's bars are left alone"
+        );
     }
 
     #[test]
@@ -1189,7 +1225,13 @@ mod tests {
         ];
         let mut day = NaiveDate::from_ymd_opt(2009, 2, 3).unwrap();
         for _ in 0..MIN_TRUNCATED_BARS {
-            bars.push(bar((day.year(), day.month(), day.day()), 10.0, 10.1, 9.9, 10.0));
+            bars.push(bar(
+                (day.year(), day.month(), day.day()),
+                10.0,
+                10.1,
+                9.9,
+                10.0,
+            ));
             day = day.succ_opt().unwrap();
         }
         let (anomalies, cut) =
@@ -1220,8 +1262,14 @@ mod tests {
                 .and_local_timezone(New_York)
                 .unwrap()
         };
-        assert!(!session_complete(date, at(9, 30)), "the session is still open");
-        assert!(!session_complete(date, at(15, 59)), "one minute before the close");
+        assert!(
+            !session_complete(date, at(9, 30)),
+            "the session is still open"
+        );
+        assert!(
+            !session_complete(date, at(15, 59)),
+            "one minute before the close"
+        );
         assert!(session_complete(date, at(16, 0)), "complete at the close");
         assert!(session_complete(
             date,
@@ -1257,7 +1305,10 @@ mod tests {
         assert_eq!(repaired, 0, "every row in this payload is well formed");
 
         assert_eq!(bars.len(), 2, "duplicate stamp collapsed, null row dropped");
-        assert_eq!(session_date(bars[0].ts()), NaiveDate::from_ymd_opt(2008, 9, 15).unwrap());
+        assert_eq!(
+            session_date(bars[0].ts()),
+            NaiveDate::from_ymd_opt(2008, 9, 15).unwrap()
+        );
         assert_eq!(bars[0].ts(), session_open_ms(session_date(bars[0].ts())));
         assert!(bars[1].ts() > bars[0].ts(), "strictly increasing");
         // adjclose/close = 5/10 halves every price; volume is untouched.
@@ -1270,8 +1321,14 @@ mod tests {
         // The later duplicate wins: close 12.2 * (6.1/12.2) = 6.1.
         assert!((bars[1].close - 6.1).abs() < 1e-5);
         assert_eq!(splits.len(), 1);
-        assert!(near_split(NaiveDate::from_ymd_opt(2008, 9, 16).unwrap(), &splits));
-        assert!(!near_split(NaiveDate::from_ymd_opt(2008, 10, 16).unwrap(), &splits));
+        assert!(near_split(
+            NaiveDate::from_ymd_opt(2008, 9, 16).unwrap(),
+            &splits
+        ));
+        assert!(!near_split(
+            NaiveDate::from_ymd_opt(2008, 10, 16).unwrap(),
+            &splits
+        ));
     }
 
     #[test]
@@ -1288,8 +1345,14 @@ mod tests {
         assert_eq!(repaired, 1);
         let only = bars[0];
         let (open, high, low, close) = (only.open, only.high, only.low, only.close);
-        assert!((low - open).abs() < 1e-5, "the low is pulled down to the open");
-        assert!((high - 21.825001).abs() < 1e-4, "the high was already valid");
+        assert!(
+            (low - open).abs() < 1e-5,
+            "the low is pulled down to the open"
+        );
+        assert!(
+            (high - 21.825001).abs() < 1e-4,
+            "the high was already valid"
+        );
         assert!(low <= open && low <= close && high >= open && high >= close);
         assert!(high >= low);
     }
