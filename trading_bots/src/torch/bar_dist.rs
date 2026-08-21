@@ -1906,15 +1906,13 @@ impl BarSupports {
         self.marginal_nll_bar(scoring) - self.encoding_identity_nats(scoring)
     }
 
-    /// `BAR_DOF * ln(NUM_BAR_BINS)`: the CATEGORICAL loss of a uniform head, i.e. the
-    /// value a zero-initialized [`BarEmissionHead`] starts at under the two discrete
-    /// rules. The mode-aware line is [`Self::uniform_nll_bar`].
+    /// `BAR_DOF * ln(NUM_BAR_BINS)`: the categorical loss of exactly uniform logits
+    /// under either discrete rule. The mode-aware line is [`Self::uniform_nll_bar`].
     pub fn uniform_categorical_nll_bar() -> f64 {
         BAR_DOF as f64 * (NUM_BAR_BINS as f64).ln()
     }
 
-    /// Per-DOF nats a UNIFORM-over-bins head pays under `scoring`, which is exactly where
-    /// the zero-initialized emission head starts.
+    /// Per-DOF nats exactly uniform logits pay under `scoring`.
     ///
     /// `ln(NUM_BAR_BINS)` for both discrete rules — the smoothed target still sums to one,
     /// so its cross entropy against a uniform prediction is the same — plus the measure
@@ -2920,8 +2918,9 @@ fn with_tail(lead: &[i64], tail: &[i64]) -> Vec<i64> {
 /// `[lo[0], hi[NUM_BAR_BINS - 1]]`, so the head can never be fitted on a prefix
 /// value that rollout cannot produce.
 ///
-/// The head weights are zero-initialized in the modded-nanogpt style, so training
-/// starts from exactly uniform categoricals (`nll = BAR_DOF * ln(NUM_BAR_BINS)`).
+/// The head weights use the modded-nanogpt fan-in-scaled uniform initialization,
+/// while biases stay zero. This keeps initial logits modest without severing the
+/// categorical NLL gradient into the belief.
 #[derive(Debug)]
 pub struct BarEmissionHead {
     heads: Vec<nn::Linear>,
@@ -2977,6 +2976,7 @@ impl BarEmissionHead {
             "bar emission head needs a positive latent dim"
         );
         let in_features = 2 * latent_dim + BAR_PREFIX_WIDTH;
+        let weight_bound = 3f64.sqrt() * 0.5 / (in_features as f64).sqrt();
         let heads = (0..BAR_DOF)
             .map(|dof| {
                 nn::linear(
@@ -2984,23 +2984,23 @@ impl BarEmissionHead {
                     in_features,
                     NUM_BAR_BINS,
                     nn::LinearConfig {
-                        ws_init: Init::Const(0.0),
+                        ws_init: Init::Uniform {
+                            lo: -weight_bound,
+                            up: weight_bound,
+                        },
                         bs_init: Some(Init::Const(0.0)),
                         bias: true,
                     },
                 )
             })
             .collect();
-        // Unit per-component scale, matching the RMS scale of both the belief and
-        // conditioning blocks. The heads are zero-init, so the table sees no
-        // gradient until they move.
+        // Start teacher-forced same-bar prefix features at zero. Nonzero linear weights are
+        // sufficient to carry NLL into the belief on step zero; random prefix features would
+        // instead give the four conditional rows arbitrary initial same-bar dependencies.
         let prefix_embed = vs.var(
             "bar_prefix_embed",
             &[BAR_PREFIX_SLOTS as i64 * NUM_BAR_BINS, BAR_PREFIX_EMBED_DIM],
-            Init::Randn {
-                mean: 0.0,
-                stdev: 1.0,
-            },
+            Init::Const(0.0),
         );
 
         let mut mask = vec![0f32; BAR_DOF * BAR_PREFIX_SLOTS];
@@ -5595,20 +5595,75 @@ mod tests {
             "density uniform NLL {} != {expected} + measure {measure}",
             mean.double_value(&[])
         );
+    }
 
-        // A freshly built head is zero-initialized, so it starts exactly uniform.
+    #[test]
+    fn fresh_hard_categorical_nll_has_a_finite_nonzero_belief_gradient() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let _ = tch::manual_seed(0xE115_510);
+        let supports = synthetic_supports(20_000, 0xE115_510);
+        let latent_dim = 24;
         let vs = nn::VarStore::new(Device::Cpu);
-        let head = BarEmissionHead::new(&vs.root(), 48);
-        let h = Tensor::randn([4, 128, 48], (Kind::Float, Device::Cpu));
-        let conditioning = Tensor::zeros_like(&h);
-        let mut rng = Rng::new(12);
-        let batch: Vec<BarDof> = (0..4 * 128).map(|_| synthetic_dof(&mut rng)).collect();
-        let batch_dof = dof_tensor(&batch).view([4, 128, BAR_DOF as i64]);
-        let (mean, _) = head.nll(&h, &conditioning, &batch_dof, &supports, BarScoring::Hard);
+        let head = BarEmissionHead::new(&vs.root(), latent_dim);
+        let fan_in = 2 * latent_dim + BAR_PREFIX_WIDTH;
+        let bound = 3f64.sqrt() * 0.5 / (fan_in as f64).sqrt();
+
+        for (dof, linear) in head.heads.iter().enumerate() {
+            let max_weight = linear.ws.abs().max().double_value(&[]);
+            assert!(
+                max_weight > 0.0 && max_weight <= bound * (1.0 + 1e-6),
+                "{} head weight magnitude {max_weight} is outside (0, {bound}]",
+                BAR_DOF_NAMES[dof]
+            );
+            assert_eq!(
+                linear
+                    .bs
+                    .as_ref()
+                    .expect("emission head bias")
+                    .abs()
+                    .max()
+                    .double_value(&[]),
+                0.0,
+                "{} head bias must remain zero",
+                BAR_DOF_NAMES[dof]
+            );
+        }
+        assert_eq!(
+            head.prefix_embed.abs().max().double_value(&[]),
+            0.0,
+            "same-bar prefix embeddings must start at zero"
+        );
+
+        let rows = 32;
+        let belief = Tensor::linspace(-1.0, 1.0, rows * latent_dim, (Kind::Float, Device::Cpu))
+            .view([rows, latent_dim])
+            .set_requires_grad(true);
+        let conditioning = Tensor::zeros_like(&belief);
+        let mut rng = Rng::new(0xB311_EF);
+        let samples: Vec<BarDof> = (0..rows).map(|_| synthetic_dof(&mut rng)).collect();
+        let target = dof_tensor(&samples);
+        let logits = head.logits(&belief, &conditioning, &supports.bin_ids(&target));
+        let max_logit = logits.abs().max().double_value(&[]);
         assert!(
-            (mean.double_value(&[]) - expected).abs() < 1e-3,
-            "fresh head NLL {} vs {expected}",
-            mean.double_value(&[])
+            logits.isfinite().all().int64_value(&[]) == 1 && max_logit < 4.0,
+            "fresh emission logits must be finite and modest, max magnitude was {max_logit}"
+        );
+
+        let (nll, _) = head.nll(&belief, &conditioning, &target, &supports, BarScoring::Hard);
+        assert!(
+            nll.double_value(&[]).is_finite(),
+            "fresh hard NLL is not finite"
+        );
+        nll.backward();
+        let belief_grad = belief.grad();
+        let grad_norm = belief_grad
+            .square()
+            .sum(Kind::Double)
+            .sqrt()
+            .double_value(&[]);
+        assert!(
+            belief_grad.isfinite().all().int64_value(&[]) == 1 && grad_norm > 0.0,
+            "fresh hard NLL must immediately train the belief, gradient norm was {grad_norm}"
         );
     }
 
@@ -5831,7 +5886,8 @@ mod tests {
         let supports = synthetic_supports(20_000, 0x3690);
         let vs = nn::VarStore::new(Device::Cpu);
         let head = BarEmissionHead::new(&vs.root(), 32);
-        // Break the zero init so the prefix conditioning has an effect.
+        // Amplify the initialized parameters so every prefix dependency is far above
+        // the numerical tolerance used below.
         tch::no_grad(|| {
             for variable in vs.trainable_variables() {
                 let mut variable = variable;
@@ -6003,27 +6059,20 @@ mod tests {
             }
         };
 
-        let (loss, _) = head.nll(&h, &conditioning, &target, &supports, BarScoring::Density);
+        let (loss, _) = head.nll(&h, &conditioning, &target, &supports, BarScoring::Hard);
         loss.backward();
         let head_weight = &head.heads[DOF_S].ws;
         assert!(
             grad_sum(head_weight) > 0.0,
             "head weights must receive gradient"
         );
-        // Zero-init heads mean the prefix table cannot have moved yet: the gradient
-        // into an embedding IS the head's prefix weight block, which is exactly zero.
-        assert_eq!(grad_sum(&head.prefix_embed), 0.0);
-        tch::no_grad(|| {
-            for linear in &head.heads {
-                let mut ws = linear.ws.shallow_clone();
-                let _ = ws.normal_(0.0, 0.2);
-            }
-        });
-        let (loss, _) = head.nll(&h, &conditioning, &target, &supports, BarScoring::Density);
-        loss.backward();
         assert!(
             grad_sum(&head.prefix_embed) > 0.0,
-            "the bin-embedding table must receive gradient once the heads are awake"
+            "the initialized prefix weight block must immediately train the bin-embedding table"
+        );
+        assert!(
+            grad_sum(&h) > 0.0 && grad_sum(&conditioning) > 0.0,
+            "hard NLL must reach both readout inputs at initialization"
         );
 
         // The frozen branch must leave every head parameter untouched, the embedding
@@ -6886,8 +6935,8 @@ mod tests {
         let latent = 12i64;
         let vs = nn::VarStore::new(Device::Cpu);
         let head = BarEmissionHead::new(&vs.root(), latent);
-        // Every head is zero-initialized, which is itself the degenerate independent case, so
-        // the dependent arm has to give the weights something to depend on.
+        // Amplify the initialized parameters so the dependent arm has a clear
+        // same-bar prefix signal.
         tch::no_grad(|| {
             for variable in vs.trainable_variables() {
                 let mut variable = variable;

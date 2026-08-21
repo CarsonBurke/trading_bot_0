@@ -107,9 +107,9 @@
 //! `p(r | strictly past bars)` outright: it conditions on no same-bar factor and there is
 //! nothing to marginalize. This module consumes [`WindowPaths::predicted_mean`] and
 //! [`WindowPaths::predicted_var`], which [`super::trade_bench::window_paths`] takes from
-//! [`super::trade_bench::forecast_r_probs`] — that prefix-free row, the same law
-//! [`super::growth::r_moments`] takes the objective's mean from. There is no parameter
-//! anywhere in this module through which a realized same-bar `s` could arrive, and
+//! [`super::trade_bench::forecast_r_probs`] — that prefix-free row, the same law the
+//! detached raw-payoff diagnostic reduces to moments. There is no parameter anywhere in
+//! this module through which a realized same-bar `s` could arrive, and
 //! `permuting_the_realized_same_bar_s_leaves_every_skill_statistic_bit_identical` asserts the
 //! value: every reported scalar is BIT-identical under an arbitrary reassignment of the
 //! realized `s`, compared on raw `f64` bit patterns rather than on formatted output, and the

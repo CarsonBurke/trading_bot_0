@@ -18,6 +18,10 @@
 //! detached in both dynamics branches, so the KL shapes the latent and never the
 //! decoder.
 //!
+//! Raw-payoff growth on optimizer batches is a detached diagnostic only. It is computed
+//! under `no_grad`, has fixed objective share zero, and cannot update either the trunk or
+//! emission head. Pinned held-out promotion evidence is computed separately.
+//!
 //! There is no SIGReg term and no latent-target JEPA term. Isotropy and effective
 //! rank are diagnostics only.
 //!
@@ -62,7 +66,7 @@ use shared::{
     run_dir::{RunDir, RunProvenance},
 };
 
-use super::growth::{self, GrowthSupport, LAMBDA_GROWTH};
+use super::growth::{self, GrowthSupport};
 use super::optimizer_glue::named_trainable_variables;
 use super::pretrain_aux::{
     AuxiliaryConfig, AuxiliaryReport, AuxiliaryStream, AUXILIARY_HELDOUT_CONTEXT,
@@ -207,8 +211,10 @@ const ADAMW_WEIGHT_DECAY: f64 = 0.005;
 const ADAMW_SCALAR_BETAS: (f64, f64) = (0.9, 0.99);
 /// Residual and post-branch lambdas use the reference scalar-momentum group.
 const ADAMW_RESID_POST_BETAS: (f64, f64) = (0.9, 0.95);
-/// Betas for embedding tables and the emission heads.
+/// The embedding tables retain the modded-nanogpt table recipe.
 const ADAMW_TABLE_BETAS: (f64, f64) = (0.5, 0.95);
+/// Emission heads use a decay-free head momentum group rather than embedding-table betas.
+const ADAMW_HEAD_BETAS: (f64, f64) = (0.9, 0.95);
 /// Attention weight scalars are distinct from residual/post mixing lambdas.
 const ADAMW_ATTENTION_SCALAR_SUBSTRINGS: [&str; 2] = ["qkv_lambda", "attn_out_lambda"];
 const ADAMW_RESID_POST_SUBSTRINGS: [&str; 2] = ["resid_lambda", "post_lambda"];
@@ -217,10 +223,9 @@ const ADAMW_OTHER_SCALAR_SUBSTRINGS: [&str; 2] = ["x0_lambda", "pope_theta_bias"
 const ADAMW_HIGH_LR_SCALAR_SUBSTRINGS: [&str; 3] =
     ["qkv_lambda", "attn_out_lambda", "resid_lambda"];
 const ADAMW_HIGH_LR_SCALAR_MULT: f64 = 5.0;
-/// Weight-decay multiplier on the embedding tables and the emission heads. Without it
-/// a decay that is quadratic in the learning rate is inert: `lr*lr*wd` is 3.2e-7 per
-/// step, which moves a weight by 0.3% over ten thousand steps
-/// (`train_gpt.py:2033`, `:2038`).
+/// Weight-decay multiplier on embedding tables only. Without it a decay that is
+/// quadratic in the learning rate is inert. Emission heads instead match NextLat
+/// with no weight decay.
 const ADAMW_TABLE_WEIGHT_DECAY_MULT: f64 = 150.0;
 
 /// Realized continuation length handed to the rollout diagnostics and the candle
@@ -230,12 +235,12 @@ const ADAMW_TABLE_WEIGHT_DECAY_MULT: f64 = 150.0;
 /// 100 bars, not 64: the NextLat reference measures its recursive d-step rollout over
 /// teacher-forced tokens by re-applying the dynamics to its own previous prediction,
 /// and what it is interested in is where that recursion DEGRADES, which needs a horizon
-/// well past the one the model was shaped at (`--dyn-horizon 4`). Peak memory does not
-/// move with this constant: the history is `context - SNAPSHOT_HORIZON` bars, so the KV
-/// cache still holds exactly `context` tokens once the rollout finishes. Wall-clock
-/// does: both the two-mode `rollout_nll` and the ancestral snapshot are linear in the
-/// depth, so this is 1.56x on those two passes, and both run on a handful of pinned
-/// windows rather than on the validation set.
+/// well past the one-step transition the model is shaped at (`--dyn-horizon 1`). Peak
+/// memory does not move with this constant: the history is
+/// `context - SNAPSHOT_HORIZON` bars, so the KV cache still holds exactly `context`
+/// tokens once the rollout finishes. Wall-clock does: both the two-mode `rollout_nll`
+/// and the ancestral snapshot are linear in the depth, so this is 1.56x on those two
+/// passes, and both run on a handful of pinned windows rather than on the validation set.
 const SNAPSHOT_HORIZON: i64 = 100;
 const _: () = assert!(
     ROLLOUT_HORIZONS[ROLLOUT_HORIZONS.len() - 1] as i64 == SNAPSHOT_HORIZON,
@@ -645,19 +650,6 @@ pub struct PretrainArgs {
     /// Weight on the NextLat KL term, applied UNCHANGED at every step. See
     /// [`Self::lambda_dyn`] for why nothing anneals it.
     pub lambda_kl: f64,
-    /// Weight on the EXPECTED-LOG-GROWTH term, applied UNCHANGED at every step.
-    ///
-    /// The default is [`LAMBDA_GROWTH`], which was derived from a gradient-norm
-    /// measurement rather than swept; that constant's doc comment carries the measurement.
-    /// `0.0` is the ablation's control arm: the term is still computed and still charted,
-    /// it simply does not enter the objective, so the two arms differ in exactly one
-    /// number and their `pretrain_growth_term` panels are directly comparable.
-    ///
-    /// Like [`Self::lambda_dyn`] and [`Self::lambda_kl`], nothing anneals it. The reasons
-    /// are on `lambda_dyn`, and one more applies here: the whole finding this term answers
-    /// is that the economics decay LATE in a run, so a weight that decayed with the
-    /// schedule would switch the term off exactly when it is needed.
-    pub lambda_growth: f64,
     /// Held-out windows in each pinned evaluation set. Pinned by [`EVAL_WINDOW_SEED`], so
     /// they are identical across runs, seeds and ablations.
     pub validation_windows: usize,
@@ -722,24 +714,11 @@ pub struct PretrainArgs {
     /// # The confound this exists to make unlaunchable
     ///
     /// The capacity probe reads free VRAM at startup and clamps the base batch to what the
-    /// card can actually hold. That is right for a long production run — it is why a run
-    /// survives a shared card at all — and it is categorically wrong for a controlled
-    /// experiment, because the clamp depends on what ELSE was resident at launch.
-    ///
-    /// Measured, on the two arms of the expected-log-growth ablation, both launched
-    /// `--batch-size 24` with identical seed and identical config:
-    ///
-    /// | run | free VRAM at the probe | base batch | steps |
-    /// |-----|------------------------|------------|-------|
-    /// | `growth_ablation_lambda0`  | 16.37 GiB | 23 | 10818 |
-    /// | `growth_ablation_lambda77` | 14.94 GiB | 21 | 11847 |
-    ///
-    /// The bar budget is fixed by `--epochs`, so the step count moves inversely with the
-    /// batch and the pair silently differed in gradient-noise level and in the LENGTH of the
-    /// lr and momentum schedules. Both banners were individually honest; the comparison
-    /// between them was not. Survival-by-degradation and controlled comparison are opposite
-    /// requirements and only the caller knows which one it is running, so this is a flag and
-    /// not a policy.
+    /// card can hold. That is right for a long production run and wrong for a controlled
+    /// comparison, because the clamp depends on what else was resident at launch. A changed
+    /// batch changes both gradient noise and the number of optimizer steps in a fixed bar
+    /// budget. Survival-by-degradation and controlled comparison are opposite requirements,
+    /// and only the caller knows which one it is running.
     ///
     /// With it set, a short-fall is an error naming the deficit and the deficit's cause,
     /// before the first step. [`super::pretrain_stats::compare_runs`] is the backstop for
@@ -1354,7 +1333,6 @@ fn probe_shape_used_bytes(
                 args.dyn_horizon as i64,
                 args.lambda_dyn,
                 args.lambda_kl,
-                args.lambda_growth,
                 BarScoring::Hard,
                 device,
             )
@@ -1720,12 +1698,10 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
 
     let (supports, supports_frozen) = fit_supports(&corpus, &args, &corpus_fingerprint)?;
     let supports_dev = supports.to_device(device);
-    // Before the capacity probe, because the probe measures the REAL training graph and the
-    // growth term is part of it. `new` is also where the log-argument bound is asserted
-    // against the ACTUAL fitted support, so a corpus whose `r` support is too wide for the
-    // leverage cap fails here rather than producing a NaN objective at step 400.
+    // Before the capacity probe, because the detached diagnostic is part of the measured
+    // step footprint. Construction also validates the fitted raw-payoff law before the run.
     let growth_deployment = GrowthSupport::new(&supports_dev, device)
-        .context("the deployment r support cannot carry the expected-log-growth term")?;
+        .context("the deployment r support cannot carry the raw-payoff growth diagnostic")?;
 
     let mut vs = nn::VarStore::new(device);
     let modules = BarModules::new(&vs.root());
@@ -1908,17 +1884,16 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         growth_supports.push(
             GrowthSupport::new(stream.supports_dev(), device).with_context(|| {
                 format!(
-                    "the {}s r support cannot carry the expected-log-growth term",
+                    "the {}s r support cannot carry the raw-payoff growth diagnostic",
                     stream.res_secs()
                 )
             })?,
         );
     }
-    // The prefix-free read is architectural, but it is checked here, on the real head and the
-    // real device, before a single step has trained on a mean the term could not measure: the
-    // failure mode is silent, and the check also catches a TF32 matmul.
+    // The prefix-free read is architectural, but it is checked here on the real head and
+    // device before the diagnostic is trusted; the check also catches a TF32 matmul.
     growth::verify_traded_law(&modules.head, &supports_dev, device)
-        .context("the expected-log-growth term's traded law does not check out")?;
+        .context("the raw-payoff growth diagnostic's traded law does not check out")?;
     print_banner(
         &args,
         &corpus,
@@ -3374,13 +3349,6 @@ fn validate_args(args: &PretrainArgs) -> Result<()> {
         "dynamics loss weights must be non-negative"
     );
     ensure!(
-        args.lambda_growth >= 0.0 && args.lambda_growth.is_finite(),
-        "--lambda-growth must be a non-negative finite weight, got {}. A NEGATIVE weight \
-         would maximize the expected log LOSS, i.e. it would train the model to bet the \
-         wrong way, and it would do it while every likelihood metric kept improving.",
-        args.lambda_growth
-    );
-    ensure!(
         args.validation_windows > 0,
         "--validation-windows must be positive; promotion needs a held-out set"
     );
@@ -3820,18 +3788,21 @@ impl EvaluationSets {
 // Optimizer
 // ---------------------------------------------------------------------------
 
-/// NorMuon on every 2-D weight, AdamW on the embedding tables, the five emission
-/// heads and every scalar gate. The two routings must exactly partition the
-/// VarStore: a parameter that matches neither list would be silently frozen, and a
-/// parameter that matches both would be routed by precedence rather than by intent.
+/// NorMuon on every 2-D weight; AdamW on embedding tables, emission heads, and
+/// every scalar gate. The routings must exactly partition the VarStore: a
+/// parameter that matches no list would be silently frozen, and a parameter
+/// matching more than one would be routed by precedence rather than by intent.
 fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
     let muon: Vec<String> = bar_muon_name_substrings()
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
-    let adamw_tables: Vec<String> = bar_adamw_embedding_substrings()
+    let adamw_embeddings: Vec<String> = bar_adamw_embedding_substrings()
         .iter()
-        .chain(BAR_EMISSION_ADAMW_NAME_SUBSTRINGS.iter())
+        .map(|s| (*s).to_owned())
+        .collect();
+    let adamw_heads: Vec<String> = BAR_EMISSION_ADAMW_NAME_SUBSTRINGS
+        .iter()
         .map(|s| (*s).to_owned())
         .collect();
     let adamw_scalars: Vec<String> = bar_adamw_scalar_substrings()
@@ -3839,23 +3810,34 @@ fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
         .map(|s| (*s).to_owned())
         .collect();
 
-    let force_adamw: Vec<String> = adamw_tables
+    let force_adamw: Vec<String> = adamw_embeddings
         .iter()
+        .chain(adamw_heads.iter())
         .chain(adamw_scalars.iter())
         .cloned()
         .collect();
-    let beta_overrides: Vec<(String, (f64, f64))> = adamw_tables
+    let beta_overrides: Vec<(String, (f64, f64))> = adamw_embeddings
         .iter()
         .map(|needle| (needle.clone(), ADAMW_TABLE_BETAS))
+        .chain(
+            adamw_heads
+                .iter()
+                .map(|needle| (needle.clone(), ADAMW_HEAD_BETAS)),
+        )
         .chain(
             ADAMW_RESID_POST_SUBSTRINGS
                 .iter()
                 .map(|needle| ((*needle).to_owned(), ADAMW_RESID_POST_BETAS)),
         )
         .collect();
-    let wd_multipliers: Vec<(String, f64)> = adamw_tables
+    let wd_multipliers: Vec<(String, f64)> = adamw_embeddings
         .iter()
         .map(|needle| (needle.clone(), ADAMW_TABLE_WEIGHT_DECAY_MULT))
+        .collect();
+    let no_weight_decay: Vec<String> = adamw_heads
+        .iter()
+        .chain(adamw_scalars.iter())
+        .cloned()
         .collect();
 
     let cfg = MuonConfig {
@@ -3869,16 +3851,15 @@ fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
         adamw_betas: ADAMW_SCALAR_BETAS,
         adamw_eps: ADAMW_EPS,
         adamw_wd: ADAMW_WEIGHT_DECAY,
-        // `wd_mul = 0` on every scalar and gate.
-        adamw_no_weight_decay_name_substrings: adamw_scalars.clone(),
+        // Emission heads and every scalar/gate are decay-free.
+        adamw_no_weight_decay_name_substrings: no_weight_decay,
         ns_steps: DEFAULT_NS_STEPS,
         force_adamw_name_substrings: force_adamw,
         muon_name_allowlist: muon.clone(),
         orthogonalizer: Orthogonalizer::PolarExpress5,
-        // The reference cadence: AdamW updates on odd steps over the gradient accumulated
-        // across the pair, so the embedding tables and the five emission heads see an
-        // effective 2x batch. Set here rather than in `MuonConfig::default` because the
-        // PPO and planner trainers share this optimizer under a different recipe.
+        // Preserve the reference cadence: each AdamW update consumes the gradients retained
+        // across two primary batches. This keeps embeddings/scalars unchanged while the head
+        // recovery is isolated to initialization, momentum, decay, and objective semantics.
         adamw_every: 2,
         quadratic_lr_weight_decay: true,
         cautious_weight_decay: true,
@@ -3888,7 +3869,14 @@ fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
     };
 
     let mut optimizer = Muon::new_named(named, cfg);
-    assert_routing_partitions(named, &optimizer, &muon, &adamw_tables, &adamw_scalars)?;
+    assert_routing_partitions(
+        named,
+        &optimizer,
+        &muon,
+        &adamw_embeddings,
+        &adamw_heads,
+        &adamw_scalars,
+    )?;
 
     // The per-matrix `max(1, rows/cols).sqrt()` multiplier is applied natively by the NorMuon
     // step, and is 1.0 for every down-projection because all of them are wider than tall;
@@ -3947,6 +3935,36 @@ fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
              betas={expected_betas:?}, wd_multiplier=0)"
         );
     }
+    for (group, needles, expected_betas, expected_wd_multiplier) in [
+        (
+            "embedding",
+            adamw_embeddings.as_slice(),
+            ADAMW_TABLE_BETAS,
+            ADAMW_TABLE_WEIGHT_DECAY_MULT,
+        ),
+        (
+            "emission head",
+            adamw_heads.as_slice(),
+            ADAMW_HEAD_BETAS,
+            0.0,
+        ),
+    ] {
+        for (name, _) in named
+            .iter()
+            .filter(|(name, _)| needles.iter().any(|needle| name.contains(needle)))
+        {
+            let Some((lr_scale, betas, wd_multiplier)) = optimizer.adamw_group_settings(name)
+            else {
+                bail!("{name} was classified as an {group} but was not routed to AdamW");
+            };
+            ensure!(
+                (lr_scale, betas, wd_multiplier) == (1.0, expected_betas, expected_wd_multiplier),
+                "{name} resolved to AdamW group (lr_scale={lr_scale}, betas={betas:?}, \
+                 wd_multiplier={wd_multiplier}), expected (lr_scale=1, \
+                 betas={expected_betas:?}, wd_multiplier={expected_wd_multiplier})"
+            );
+        }
+    }
     Ok(optimizer)
 }
 
@@ -3996,7 +4014,8 @@ fn assert_routing_partitions(
     named: &[(String, Tensor)],
     optimizer: &Muon,
     muon: &[String],
-    adamw_tables: &[String],
+    adamw_embeddings: &[String],
+    adamw_heads: &[String],
     adamw_scalars: &[String],
 ) -> Result<()> {
     let matches =
@@ -4006,7 +4025,8 @@ fn assert_routing_partitions(
         &names,
         &[
             ("NorMuon", muon),
-            ("AdamW table/head", adamw_tables),
+            ("AdamW embedding", adamw_embeddings),
+            ("AdamW emission head", adamw_heads),
             ("AdamW scalar", adamw_scalars),
         ],
     )?;
@@ -4079,11 +4099,9 @@ struct Trainer {
     /// Device-resident support set. One entry today; the row-routing set is what
     /// `rollout_beliefs` and a future merged-resolution corpus need.
     support_set_dev: BarSupportSet,
-    /// Device-resident constants of the expected-log-growth term, one per bin geometry:
-    /// index 0 is the deployment resolution and `1 + i` is `aux[i]`. Built once because the
-    /// alternative is a `[1, NUM_BAR_BINS]` host-to-device copy on every step, and because
-    /// the support-bound assertion inside [`GrowthSupport::new`] belongs where it can fail
-    /// before the run starts.
+    /// Device-resident constants of the raw-payoff growth diagnostic, one per bin geometry:
+    /// index 0 is the deployment resolution and `1 + i` is `aux[i]`. Built once to avoid a
+    /// `[1, NUM_BAR_BINS]` host-to-device copy on every step.
     growth_supports: Vec<GrowthSupport>,
     vs: nn::VarStore,
     modules: BarModules,
@@ -4264,18 +4282,15 @@ struct StepLoss {
     nll_dof: [f64; BAR_DOF],
     dyn_loss: f64,
     kl_loss: f64,
-    /// Mean raw-payoff growth loss in nats per bar under the deployed leverage cap: exact
-    /// `-log1p(f_hat R)` for wealth at or above `1e-4` and the explicit finite,
-    /// value/slope-matched continuation below it. Reported whatever `--lambda-growth` is,
-    /// so the ablation's two arms are comparable.
-    growth_loss: f64,
-    /// The growth term's detached diagnostics: mean `|f_hat|`, the fraction of bars where
-    /// the cap chose the size, and the smallest log argument seen.
+    /// Training-batch mean raw-payoff growth diagnostic in nats per bar under the deployed
+    /// leverage cap. It is detached and never enters `total`.
+    growth_diagnostic: f64,
+    /// Detached diagnostic statistics: mean `|f_hat|`, the fraction of bars where the cap
+    /// chose the size, and the smallest log argument seen.
     growth_stats: growth::GrowthStats,
     total: f64,
-    /// Share of the objective's total MAGNITUDE carried by each weighted term, in
-    /// `(nll, dyn, kl, growth)` order. They sum to one.
-    shares: (f64, f64, f64, f64),
+    /// Share of the objective's total magnitude carried by `(nll, dyn, kl)`.
+    shares: (f64, f64, f64),
     /// Mean `cos(h_t, h_{t+1})` over the batch.
     belief_autocorr: f64,
     /// `dyn` over the trivial-identity baseline `smooth_l1(h_t, sg[h_{t+k}])`.
@@ -4585,7 +4600,7 @@ impl Trainer {
                 self.probe_activation_footprint(step);
             }
 
-            let (nll_share, dyn_share, kl_share, growth_share) = loss.shares;
+            let (nll_share, dyn_share, kl_share) = loss.shares;
             let mut metrics = StepMetrics::nan();
             metrics.epoch = self.epoch;
             metrics.step = step;
@@ -4597,8 +4612,9 @@ impl Trainer {
             metrics.nll_share = nll_share;
             metrics.dyn_share = dyn_share;
             metrics.kl_share = kl_share;
-            metrics.growth_loss = loss.growth_loss;
-            metrics.growth_share = growth_share;
+            metrics.growth_loss = loss.growth_diagnostic;
+            // Existing report base retained: raw-payoff growth is excluded from optimization.
+            metrics.growth_share = 0.0;
             metrics.growth_abs_f = loss.growth_stats.mean_abs_f;
             metrics.growth_clamp_bind = loss.growth_stats.clamp_bind;
             metrics.belief_autocorr = loss.belief_autocorr;
@@ -4631,7 +4647,7 @@ impl Trainer {
             metrics.market_missing_bars = sample.market_missing as u64;
             metrics.market_total_bars = (span[0] * span[1]) as u64;
             self.reporter.record_step(&metrics)?;
-            self.warn_on_auxiliary_domination(step, dyn_share, kl_share, growth_share);
+            self.warn_on_auxiliary_domination(step, dyn_share, kl_share);
 
             let log_now = self.args.log_every > 0
                 && (step % self.args.log_every == 0 || step + 1 == self.schedule.total_steps);
@@ -4643,8 +4659,8 @@ impl Trainer {
                 // one the optimizer was actually serving.
                 println!(
                     "step {step}/{} | nll {:.4} nats/bar ({:.0}%) | dyn {:.4} x{:e} ({:.0}%) \
-                     | kl {:.4} x{:e} ({:.0}%) | growth {:+.3e} x{:e} ({:.0}%) |f| {:.2} \
-                     cap {:.0}% | total {:.4} | autocorr {:.3} | dyn/identity \
+                     | kl {:.4} x{:e} ({:.0}%) | growth diagnostic {:+.3e} (no_grad) \
+                     |f| {:.2} cap {:.0}% | total {:.4} | autocorr {:.3} | dyn/identity \
                      {:.3} | lr x{lr_mult:.3} | mom {momentum:.3} | grad {:.3} | {:.2} step/s",
                     self.schedule.total_steps,
                     loss.nll_bar,
@@ -4656,11 +4672,8 @@ impl Trainer {
                     self.args.lambda_kl,
                     100.0 * kl_share,
                     // Scientific notation: the whole tradeable content of the `r` prediction
-                    // is 5.25e-4 nats/bar, so three fixed decimals would print this term as
-                    // `-0.000` for the entire run.
-                    loss.growth_loss,
-                    self.args.lambda_growth,
-                    100.0 * growth_share,
+                    // is 5.25e-4 nats/bar, so fixed decimals would obscure the diagnostic.
+                    loss.growth_diagnostic,
                     loss.growth_stats.mean_abs_f,
                     100.0 * loss.growth_stats.clamp_bind,
                     loss.total,
@@ -5148,40 +5161,16 @@ impl Trainer {
             horizon < context,
             "--dyn-horizon {horizon} does not fit in a {context}-bar context"
         );
-        // Every auxiliary applies at its configured weight for every step of the run, which
-        // is the NextLat reference behaviour and, for `growth`, the behaviour the finding
-        // demands: the economics decay LATE, so a decaying weight would switch the term off
-        // exactly when it matters. Read once here so the objective, the reported shares and
-        // the domination warning all quote the SAME weights.
+        // NextLat weights are constant throughout the run. Raw-payoff growth is evaluated
+        // below only as a detached diagnostic and has no weight.
         let lambda_dyn = self.args.lambda_dyn;
         let lambda_kl = self.args.lambda_kl;
-        let lambda_growth = self.args.lambda_growth;
         let (supports, growth_support) = match stream {
             None => (&self.supports_dev, &self.growth_supports[0]),
             Some(index) => (
                 self.aux[index].supports_dev(),
                 &self.growth_supports[1 + index],
             ),
-        };
-
-        // Before the step's own forward, so the measurement cannot see gradients the step
-        // accumulated, and only on the deployment stream. It runs its own forwards and
-        // zeroes what it leaves behind; see `probe_growth_gradient_share`.
-        let growth_probe = if stream.is_none() && GROWTH_PROBE_STEPS.contains(&step) {
-            Some(probe_growth_gradient_share(
-                &self.vs,
-                &self.modules,
-                supports,
-                growth_support,
-                dof,
-                time_ids,
-                context,
-                horizon,
-                BarScoring::Hard,
-                self.device,
-            ))
-        } else {
-            None
         };
 
         self.optimizer.zero_grad();
@@ -5196,7 +5185,6 @@ impl Trainer {
                 horizon,
                 lambda_dyn,
                 lambda_kl,
-                lambda_growth,
                 BarScoring::Hard,
                 self.device,
             )
@@ -5205,7 +5193,7 @@ impl Trainer {
         // device tensor. Reading that tensor is the step's sole host synchronization.
         graph.loss.backward();
         let grad_norm_tensor = global_grad_norm_tensor(&self.vs, self.device);
-        let packed = pack_step_metrics(&graph, &grad_norm_tensor, growth_probe.as_ref());
+        let packed = pack_step_metrics(&graph, &grad_norm_tensor);
         let metrics = read_packed_step_metrics(&packed);
         ensure_finite_step_metrics(&metrics, step)?;
         let total = metrics[STEP_METRIC_TOTAL];
@@ -5215,7 +5203,7 @@ impl Trainer {
         nll_dof.copy_from_slice(&metrics[STEP_METRIC_NLL_DOF]);
         let dyn_value = metrics[STEP_METRIC_DYN];
         let kl_value = metrics[STEP_METRIC_KL];
-        let growth_value = metrics[STEP_METRIC_GROWTH];
+        let growth_value = metrics[STEP_METRIC_GROWTH_DIAGNOSTIC];
         let growth_stats = growth::GrowthStats {
             mean_abs_f: metrics[STEP_METRIC_GROWTH_STATS.start],
             clamp_bind: metrics[STEP_METRIC_GROWTH_STATS.start + 1],
@@ -5223,29 +5211,16 @@ impl Trainer {
         };
         let identity = metrics[STEP_METRIC_IDENTITY];
         let autocorr = metrics[STEP_METRIC_AUTOCORR];
-        // Raw open-tail returns may legitimately cross zero wealth. The growth loss pays
-        // those through its finite bankruptcy-domain continuation; only a non-finite raw
-        // argument indicates corrupted data or arithmetic. This guard runs before optimizer
-        // mutation (and is intentionally explicit even though packed-metric finiteness above
-        // checks the same tensor).
+        // Raw open-tail returns may legitimately cross zero wealth. The held-out diagnostic
+        // handles those through its finite bankruptcy-domain continuation; only a non-finite
+        // raw argument indicates corrupted data or arithmetic. This guard runs before
+        // optimizer mutation.
         ensure!(
             growth_stats.min_log_argument.is_finite(),
-            "the growth term produced a non-finite raw log argument at step {step}. The \
-             bankruptcy continuation handles every finite 1 + f_hat R, so this indicates a \
-             non-finite realized return or fraction"
+            "the raw-payoff growth diagnostic produced a non-finite raw log argument at step \
+             {step}. The bankruptcy continuation handles every finite 1 + f_hat R, so this \
+             indicates a non-finite realized return or fraction"
         );
-        let growth_probe = growth_probe.map(|_| GrowthGradientShare {
-            nll_norm: metrics[STEP_METRIC_PROBE_NLL_NORM],
-            unit_growth_norm: metrics[STEP_METRIC_PROBE_GROWTH_NORM],
-        });
-        if let Some(probe) = &growth_probe {
-            ensure!(
-                probe.unit_growth_norm > 0.0,
-                "the growth term reached no trainable parameter: its gradient norm is zero, so \
-                 it is decoration rather than an objective. The likely cause is a detach on \
-                 the path from the emission head's r factor back to the trunk."
-            );
-        }
         // `stream` is also the only thing that distinguishes a primary update from an
         // auxiliary resolution's share of one, and AdamW's `adamw_every` cadence is defined
         // over PRIMARY steps: keying it off a count of `step()` calls would silently halve
@@ -5254,25 +5229,17 @@ impl Trainer {
             None => StepKind::Primary,
             Some(_) => StepKind::Auxiliary,
         });
-        if let Some(probe) = growth_probe {
-            probe.report(step, lambda_growth);
-        }
         Ok(StepLoss {
             nll_bar: nll_value,
             nll_dof,
             dyn_loss: dyn_value,
             kl_loss: kl_value,
-            growth_loss: growth_value,
+            growth_diagnostic: growth_value,
             growth_stats,
             total,
             // Hard categorical NLL has no support-measure offset: the reported primary loss
             // is exactly the quantity whose magnitude enters this denominator.
-            shares: loss_shares(
-                nll_value,
-                lambda_dyn * dyn_value,
-                lambda_kl * kl_value,
-                lambda_growth * growth_value,
-            ),
+            shares: loss_shares(nll_value, lambda_dyn * dyn_value, lambda_kl * kl_value),
             belief_autocorr: autocorr,
             // A zero-init dynamics MLP is exactly the identity, so the ratio starts at 1.0
             // by construction and any departure is the MLP doing something. A degenerate
@@ -5781,9 +5748,24 @@ impl Trainer {
         // about the RUN for an entire analysis session, in preference to `unique_bar_reuse`
         // showing 2.85 on the same screen. Both go into the reports so the per-pass zeros are
         // drawn beside the number that contradicts them.
-        let run = self
-            .pass
-            .cumulative_coverage(&self.census, &self.pass_layout, &self.pass_ledger);
+        // A certified boundary pass has already been folded into `census`, while its full
+        // ledger remains available for the per-pass report above until `begin_pass`; counting
+        // that ledger again would double the run exposure. Under diagnostic `--steps`,
+        // however, an incomplete boundary is deliberately not absorbed, so its ledger remains
+        // the only record of the bars actually consumed and must stay in the reconstruction.
+        let pass_was_absorbed = epoch_boundary
+            && self
+                .audit
+                .as_ref()
+                .is_some_and(|audit| audit.require_full_pass().is_ok());
+        let run = if pass_was_absorbed {
+            let empty = PassLedger::new(&self.pass_layout);
+            self.pass
+                .cumulative_coverage(&self.census, &self.pass_layout, &empty)
+        } else {
+            self.pass
+                .cumulative_coverage(&self.census, &self.pass_layout, &self.pass_ledger)
+        };
         // Cheap, and it fires at the FIRST validation of any run rather than in hour forty: the
         // only way this trips is a reconstruction that lost or double-counted bars, which would
         // UNDERSTATE reuse — the exact direction of the original error. It adds no constraint to
@@ -5862,10 +5844,18 @@ impl Trainer {
         self.pass.covered_bars()
     }
 
-    /// Bar-tokens the run will have delivered at its last step, IF the ramp it is executing
-    /// right now holds for the rest of it.
+    /// Project the ACTUAL bar-tokens future steps can draw. Stage tails are short batches, so
+    /// summing nominal batch sizes overstates a one-pass recipe and used to emit a false
+    /// `MULTI-EPOCH RUN` warning even though the coverage ledger showed zero reused bars.
     fn projected_bar_tokens(&self, step: usize) -> u64 {
-        projected_bar_tokens(&self.schedule, self.bars_seen, step)
+        let assigned = std::array::from_fn(|stage| self.pass_layout.windows(stage).len());
+        projected_bar_tokens(
+            &self.schedule,
+            self.bars_seen,
+            step,
+            self.stage_cursor,
+            assigned,
+        )
     }
 
     /// Assemble this boundary's progress row.
@@ -7245,28 +7235,13 @@ impl Trainer {
         }
     }
 
-    /// Warn when an AUXILIARY term has held more than [`AUX_SHARE_WARN`] of the objective's
-    /// magnitude for [`AUX_SHARE_WARN_STREAK`] consecutive steps.
+    /// Warn when a NextLat auxiliary has held more than [`AUX_SHARE_WARN`] of the
+    /// objective's magnitude for [`AUX_SHARE_WARN_STREAK`] consecutive steps.
     ///
     /// Not a clamp. The right response to `dyn` taking over is a decision about
-    /// `--lambda-dyn`, and silently rescaling it would hide exactly the miscalibration that
-    /// let a 512x reduction fix turn a `1.0` default into 62% of the loss.
-    ///
-    /// `growth` is watched by the same machinery and for the same reason, though it is the
-    /// term least likely to trip it: its magnitude is ~5e-4 nats against `nll`'s ~4.93, so
-    /// at [`LAMBDA_GROWTH`] its objective share is ~1e-4 and a reading above 25% would mean
-    /// something had gone badly wrong with either the weight or the likelihood. Its WEIGHT
-    /// was sized on gradient norm, not on objective share — see
-    /// [`probe_growth_gradient_share`] — so this is a tripwire on the objective, not the
-    /// sizing rule.
-    fn warn_on_auxiliary_domination(
-        &mut self,
-        step: usize,
-        dyn_share: f64,
-        kl_share: f64,
-        growth_share: f64,
-    ) {
-        let worst = dyn_share.max(kl_share).max(growth_share);
+    /// `--lambda-dyn`; silently rescaling it would hide the miscalibration.
+    fn warn_on_auxiliary_domination(&mut self, step: usize, dyn_share: f64, kl_share: f64) {
+        let worst = dyn_share.max(kl_share);
         if !worst.is_finite() || worst <= AUX_SHARE_WARN {
             self.aux_share_streak = 0;
             return;
@@ -7275,9 +7250,7 @@ impl Trainer {
         if self.aux_share_streak % AUX_SHARE_WARN_STREAK != 0 {
             return;
         }
-        let (name, share, lambda) = if worst == growth_share {
-            ("growth", growth_share, self.args.lambda_growth)
-        } else if dyn_share >= kl_share {
+        let (name, share, lambda) = if dyn_share >= kl_share {
             ("dyn", dyn_share, self.args.lambda_dyn)
         } else {
             ("kl", kl_share, self.args.lambda_kl)
@@ -7384,20 +7357,43 @@ fn pinned_fingerprint(set: &PinnedSet) -> u64 {
 /// Bar-tokens a run will have delivered at its last step, given what it has consumed
 /// through `step` and the ramp the schedule is CURRENTLY carrying.
 ///
-/// `bars_seen` already includes `step`, so only the steps after it are projected, and the
-/// projection reads `schedule.batch_ramp` — which [`Trainer::hold_batch_if_short_of_vram`]
-/// MUTATES. A run whose batch was held therefore reports the smaller number from its FIRST
-/// epoch boundary instead of at the finish line, which is the whole point: `--epochs 3`
-/// executed at a held batch is 1.33 passes over the corpus, and that has to be findable in
-/// the first forty minutes rather than in hour forty.
+/// `bars_seen` already includes `step`, so only the steps after it are projected. Each
+/// stage is capped at its assigned windows because production draws a short final batch.
+/// This matters even without a VRAM hold: summing nominal batches overstates every stage by
+/// up to `batch - 1` windows and can turn a one-pass run into a false multi-epoch warning.
+///
+/// The projection reads `schedule.batch_ramp` — which
+/// [`Trainer::hold_batch_if_short_of_vram`] MUTATES. A run whose batch was held therefore
+/// reports the smaller number from its FIRST epoch boundary instead of at the finish line,
+/// which is the whole point: `--epochs 3` executed at a held batch can deliver only 1.33
+/// passes over the corpus, and that has to be findable early.
 ///
 /// Free-standing so the accounting can be checked against a hand-summed schedule without
 /// building a trainer, a corpus and a 39M-parameter model.
-fn projected_bar_tokens(schedule: &Schedule, bars_seen: u64, step: usize) -> u64 {
-    let remaining: u64 = ((step + 1)..schedule.total_steps)
-        .map(|future| schedule.bars_per_step(future))
-        .sum();
-    bars_seen + remaining
+fn projected_bar_tokens(
+    schedule: &Schedule,
+    bars_seen: u64,
+    step: usize,
+    mut cursor: [usize; RAMP_STAGES],
+    assigned: [usize; RAMP_STAGES],
+) -> u64 {
+    if schedule.completes_epoch(step) {
+        cursor = [0; RAMP_STAGES];
+    }
+    let mut projected = bars_seen;
+    for future in (step + 1)..schedule.total_steps {
+        let stage = schedule.stage(future);
+        let drawn = schedule
+            .batch(future)
+            .min(assigned[stage].saturating_sub(cursor[stage]));
+        projected = projected
+            .saturating_add((drawn as u64).saturating_mul(schedule.context(future) as u64));
+        cursor[stage] += drawn;
+        if schedule.completes_epoch(future) {
+            cursor = [0; RAMP_STAGES];
+        }
+    }
+    projected
 }
 
 /// One pinned snapshot window: observed conditioning history, a realized continuation aligned
@@ -8132,25 +8128,21 @@ struct TrainingGraph {
     nll_dof: Tensor,
     dyn_loss: Tensor,
     kl_loss: Tensor,
-    /// Mean raw-payoff growth loss under the deployed cap, including the explicit
-    /// bankruptcy-domain continuation, from [`growth::growth_loss`].
-    growth: Tensor,
-    /// `[GROWTH_STAT_COUNT]` detached growth diagnostics; see [`growth::GrowthStats`].
+    /// Detached raw-payoff diagnostic under the deployed cap, including the explicit
+    /// bankruptcy-domain continuation.
+    growth_diagnostic: Tensor,
+    /// `[GROWTH_STAT_COUNT]` detached statistics; see [`growth::GrowthStats`].
     growth_stats: Tensor,
     identity: Tensor,
     autocorr: Tensor,
 }
 
-/// The training objective's forward graph: one trunk pass, the teacher-forced likelihood, the
-/// two NextLat auxiliaries and the expected-log-growth term, each at its configured weight.
+/// The training objective's forward graph: one trunk pass, the teacher-forced likelihood and
+/// the two NextLat auxiliaries at their configured weights. The raw-payoff value is computed
+/// from the same beliefs under `no_grad` for existing reports; it is not a loss summand.
 ///
-/// Call inside [`autocast`]. Shared verbatim by [`Trainer::optimizer_step`] and
-/// [`probe_capacity`], which is the whole point of it being a function: a capacity probe that
-/// measured a DIFFERENT graph would derive a ramp for a model this run does not train, and
-/// the ramp is now the schedule rather than an aspiration the memory gate quietly rewrites.
-/// The growth term is therefore computed at `lambda_growth = 0` too — it costs the ablation's
-/// control arm ~2% of a step and it is what makes the two arms' `pretrain_growth_term` charts
-/// a comparison rather than one curve and one blank panel.
+/// Shared verbatim by [`Trainer::optimizer_step`] and [`probe_capacity`] so the capacity
+/// probe measures the graph and detached diagnostics the run actually executes.
 #[allow(clippy::too_many_arguments)]
 fn forward_losses(
     modules: &BarModules,
@@ -8162,7 +8154,6 @@ fn forward_losses(
     horizon: i64,
     lambda_dyn: f64,
     lambda_kl: f64,
-    lambda_growth: f64,
     scoring: BarScoring,
     device: Device,
 ) -> TrainingGraph {
@@ -8204,28 +8195,29 @@ fn forward_losses(
     let (dyn_loss, kl_loss, identity) = dynamics_losses(
         modules, dof, &bins, time_ids, &beliefs, context, horizon, device,
     );
-    // The SAME beliefs and forecast-safe conditioning the likelihood is scored from, paired
-    // with the realized log return each predicts. The conditioner contains target exogenous
-    // clock and current observed market, never an observed field from the target bar.
-    let growth::Growth {
-        loss: growth,
+    // Training-batch diagnostic only. `raw_payoff_diagnostic` itself enforces `no_grad`;
+    // the explicit scope makes the objective boundary visible at assembly too.
+    let growth::GrowthDiagnostic {
+        value: growth_diagnostic,
         stats: growth_stats,
-    } = growth::growth_loss(
-        &modules.head,
-        &beliefs,
-        &conditioning,
-        &target.select(-1, DOF_R as i64),
-        growth_support,
-    );
+    } = tch::no_grad(|| {
+        growth::raw_payoff_diagnostic(
+            &modules.head,
+            &beliefs,
+            &conditioning,
+            &target.select(-1, DOF_R as i64),
+            growth_support,
+        )
+    });
     let autocorr = belief_autocorrelation(&beliefs);
-    let loss = &nll + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss + lambda_growth * &growth;
+    let loss = &nll + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss;
     TrainingGraph {
         loss,
         nll,
         nll_dof,
         dyn_loss,
         kl_loss,
-        growth,
+        growth_diagnostic,
         growth_stats,
         identity,
         autocorr,
@@ -8465,25 +8457,17 @@ fn belief_autocorrelation(beliefs: &Tensor) -> Tensor {
 /// `-0.54` nats and any auxiliary term would read as 80%+ of an objective it is not remotely
 /// dominating.
 ///
-/// Four terms now, and `growth` is one of them for exactly the same reason `dyn` is: it
-/// carries a weight that had to be sized against `nll`, so a chart of absolute curves
-/// cannot show it taking over. The shares are returned in objective order —
-/// `(nll, dyn, kl, growth)`.
-fn loss_shares(
-    nll: f64,
-    weighted_dyn: f64,
-    weighted_kl: f64,
-    weighted_growth: f64,
-) -> (f64, f64, f64, f64) {
-    let total = nll.abs() + weighted_dyn.abs() + weighted_kl.abs() + weighted_growth.abs();
+/// The shares are returned in objective order: `(nll, dyn, kl)`. Raw-payoff growth has
+/// fixed share zero in the retained report base because it is diagnostic-only.
+fn loss_shares(nll: f64, weighted_dyn: f64, weighted_kl: f64) -> (f64, f64, f64) {
+    let total = nll.abs() + weighted_dyn.abs() + weighted_kl.abs();
     if !(total > 0.0) || !total.is_finite() {
-        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+        return (f64::NAN, f64::NAN, f64::NAN);
     }
     (
         nll.abs() / total,
         weighted_dyn.abs() / total,
         weighted_kl.abs() / total,
-        weighted_growth.abs() / total,
     )
 }
 
@@ -8593,36 +8577,18 @@ const STEP_METRIC_NLL: usize = 1;
 const STEP_METRIC_NLL_DOF: std::ops::Range<usize> = 2..2 + BAR_DOF;
 const STEP_METRIC_DYN: usize = 2 + BAR_DOF;
 const STEP_METRIC_KL: usize = 3 + BAR_DOF;
-const STEP_METRIC_GROWTH: usize = 4 + BAR_DOF;
+const STEP_METRIC_GROWTH_DIAGNOSTIC: usize = 4 + BAR_DOF;
 const STEP_METRIC_GROWTH_STATS: std::ops::Range<usize> =
     5 + BAR_DOF..5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
 const STEP_METRIC_IDENTITY: usize = 5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
 const STEP_METRIC_AUTOCORR: usize = STEP_METRIC_IDENTITY + 1;
 const STEP_METRIC_GRAD_NORM: usize = STEP_METRIC_AUTOCORR + 1;
-const STEP_METRIC_PROBE_NLL_NORM: usize = STEP_METRIC_GRAD_NORM + 2;
-const STEP_METRIC_PROBE_GROWTH_NORM: usize = STEP_METRIC_GRAD_NORM + 4;
-const STEP_METRIC_COUNT: usize = STEP_METRIC_GRAD_NORM + 5;
+const STEP_METRIC_COUNT: usize = STEP_METRIC_GRAD_NORM + 1;
 
 /// Pack every device-resident scalar read by one optimizer step. The caller performs this
-fn pack_step_metrics(
-    graph: &TrainingGraph,
-    grad_norm: &Tensor,
-    growth_probe: Option<&GrowthGradientProbe>,
-) -> Tensor {
+fn pack_step_metrics(graph: &TrainingGraph, grad_norm: &Tensor) -> Tensor {
     let flat_f32 = |tensor: &Tensor| tensor.detach().to_kind(Kind::Float).reshape([-1]);
-    let probe = match growth_probe {
-        Some(probe) => Tensor::stack(
-            &[
-                flat_f32(&probe.nll_value),
-                flat_f32(&probe.nll_norm),
-                flat_f32(&probe.growth_value),
-                flat_f32(&probe.growth_norm),
-            ],
-            0,
-        )
-        .reshape([-1]),
-        None => Tensor::zeros([4], (Kind::Float, graph.loss.device())),
-    };
+
     Tensor::cat(
         &[
             flat_f32(&graph.loss),
@@ -8630,12 +8596,11 @@ fn pack_step_metrics(
             flat_f32(&graph.nll_dof),
             flat_f32(&graph.dyn_loss),
             flat_f32(&graph.kl_loss),
-            flat_f32(&graph.growth),
+            flat_f32(&graph.growth_diagnostic),
             flat_f32(&graph.growth_stats),
             flat_f32(&graph.identity),
             flat_f32(&graph.autocorr),
             flat_f32(grad_norm),
-            probe,
         ],
         0,
     )
@@ -8653,7 +8618,7 @@ fn read_packed_step_metrics(packed: &Tensor) -> [f64; STEP_METRIC_COUNT] {
     })
 }
 
-/// Fail before optimizer mutation if the packed loss, gradient or any attached diagnostic is
+/// Fail before optimizer mutation if the packed loss, gradient or any diagnostic is
 /// non-finite. Kept separate so the safety boundary is directly testable.
 fn ensure_finite_step_metrics(metrics: &[f64; STEP_METRIC_COUNT], step: usize) -> Result<()> {
     let total = metrics[STEP_METRIC_TOTAL];
@@ -8697,166 +8662,6 @@ fn global_grad_norm_tensor(vs: &nn::VarStore, device: Device) -> Tensor {
                 .sqrt()
         }
     })
-}
-
-/// Steps at which a run MEASURES the growth term's share of the total gradient norm.
-///
-/// Two, because the ratio is not constant: at initialization the head is zero-init and every
-/// categorical is uniform, while by a couple of hundred steps the directional structure is
-/// partly learned and `E[R²]` — the denominator governing `df_raw/dmu_hat` when held fixed —
-/// has changed. [`LAMBDA_GROWTH`] was chosen to sit inside the 10-20% band at BOTH,
-/// which is a stronger property than hitting a target at one of them, and the run reprints
-/// the measurement so a corpus or architecture change that invalidates the constant is
-/// visible in the log rather than in an ablation six hours later.
-///
-/// 200 is after [`RAMP_PROBE_AFTER_STEPS`], so the second probe cannot bias the activation
-/// footprint the batch ramp is derived from.
-const GROWTH_PROBE_STEPS: [usize; 2] = [0, 200];
-
-/// Target share of the total gradient norm the growth term should carry.
-///
-/// The middle of the briefed 10-20% band. Below 10% the term is noise beside `nll`'s
-/// minibatch variation; above 20% it starts buying economics with density, and NLL STAYS
-/// PRIMARY — the density is what makes the model useful for anything beyond the sign.
-const GROWTH_GRADIENT_TARGET_SHARE: f64 = 0.15;
-
-/// Device-resident result of the occasional gradient-share probe. It joins the main graph's
-/// packed metric transfer rather than synchronizing independently before backward.
-struct GrowthGradientProbe {
-    nll_value: Tensor,
-    nll_norm: Tensor,
-    growth_value: Tensor,
-    growth_norm: Tensor,
-}
-
-/// A measured gradient-norm split between the likelihood and the growth term.
-struct GrowthGradientShare {
-    /// `||d(nll)/dtheta||` over every trainable parameter.
-    nll_norm: f64,
-    /// `||d(growth)/dtheta||` at `lambda_growth = 1`, so the number is a property of the
-    /// term and not of the current weight.
-    unit_growth_norm: f64,
-}
-
-impl GrowthGradientShare {
-    /// Share of `||g_nll|| + lambda ||g_growth||` carried by the growth term.
-    ///
-    /// A sum of norms rather than the norm of the sum, deliberately: the two gradients are
-    /// not orthogonal and the norm of their sum can be SMALLER than either, which would
-    /// make "share" read above one. What has to be sized is how much signal the term
-    /// injects, and that is its own norm against the primary's.
-    fn share(&self, lambda: f64) -> f64 {
-        let weighted = lambda * self.unit_growth_norm;
-        let total = self.nll_norm + weighted;
-        if total > 0.0 {
-            weighted / total
-        } else {
-            f64::NAN
-        }
-    }
-
-    /// The weight that would put the term at `target` of the total.
-    fn lambda_for(&self, target: f64) -> f64 {
-        if self.unit_growth_norm > 0.0 && target < 1.0 {
-            target * self.nll_norm / ((1.0 - target) * self.unit_growth_norm)
-        } else {
-            f64::NAN
-        }
-    }
-
-    fn report(&self, step: usize, lambda: f64) {
-        println!(
-            "growth gradient probe at step {step}: ||g_nll|| {:.4e}, ||g_growth|| {:.4e} at \
-             lambda 1, so lambda_growth {lambda:e} holds {:.1}% of the total gradient norm. \
-             {:.0}% would need lambda {:.3}. The shipped default is {LAMBDA_GROWTH:e}; see \
-             growth::LAMBDA_GROWTH for the measurement it was derived from.",
-            self.nll_norm,
-            self.unit_growth_norm,
-            100.0 * self.share(lambda),
-            100.0 * GROWTH_GRADIENT_TARGET_SHARE,
-            self.lambda_for(GROWTH_GRADIENT_TARGET_SHARE),
-        );
-    }
-}
-
-/// Measure `||d(nll)/dtheta||` and `||d(growth)/dtheta||` separately on THIS batch.
-///
-/// # Why a separate forward per term rather than one graph
-///
-/// The objective's own graph would need two retained backward passes through it, and the
-/// second would then have to be told not to free what the real step still needs. Two clean
-/// forwards cost two extra trunk passes at two steps of a 30,000-step run — well under a
-/// thousandth of the wall clock — and they cannot interact with the step that follows.
-///
-/// # Why this cannot perturb the run
-///
-/// The training forward consumes no RNG (there is no dropout anywhere in the bar trunk or
-/// the emission head), no optimizer step is taken, no weight is written, and the gradients
-/// the two backwards accumulate are zeroed before returning — after which `optimizer_step`
-/// zeroes them again before its own backward. The allocator pool is released so a probe
-/// cannot inflate the `used` reading [`Trainer::probe_activation_footprint`] takes at
-/// [`RAMP_PROBE_AFTER_STEPS`]. Both ablation arms run the identical code path at the
-/// identical steps, so even a residual effect is common to both.
-#[allow(clippy::too_many_arguments)]
-fn probe_growth_gradient_share(
-    vs: &nn::VarStore,
-    modules: &BarModules,
-    supports: &BarSupports,
-    growth_support: &GrowthSupport,
-    dof: &Tensor,
-    time_ids: &Tensor,
-    context: i64,
-    horizon: i64,
-    scoring: BarScoring,
-    device: Device,
-) -> GrowthGradientProbe {
-    let zero_grads = || {
-        for mut variable in vs.trainable_variables() {
-            variable.zero_grad();
-        }
-    };
-    // `lambda_* = 0`: the probe reads the unweighted terms off the graph. Values and norms
-    // remain on device and join the real step's packed transfer after its backward.
-    let measure = |want_growth: bool| -> (Tensor, Tensor) {
-        zero_grads();
-        let graph = autocast(device.is_cuda(), || {
-            forward_losses(
-                modules,
-                supports,
-                growth_support,
-                dof,
-                time_ids,
-                context,
-                horizon,
-                0.0,
-                0.0,
-                0.0,
-                scoring,
-                device,
-            )
-        });
-        let term = if want_growth {
-            &graph.growth
-        } else {
-            &graph.nll
-        };
-        let value = term.detach();
-        term.backward();
-        let norm = global_grad_norm_tensor(vs, device);
-        (value, norm)
-    };
-    let (nll_value, nll_norm) = measure(false);
-    let (growth_value, growth_norm) = measure(true);
-    zero_grads();
-    if device.is_cuda() {
-        crate::torch::cuda::empty_cache();
-    }
-    GrowthGradientProbe {
-        nll_value,
-        nll_norm,
-        growth_value,
-        growth_norm,
-    }
 }
 
 /// The measured ceiling, the ramp it produced, and the batch/context frontier.
@@ -9021,26 +8826,20 @@ fn print_banner(
     // print the sweep's whole lower half as `0.000` — i.e. as if the NextLat term were
     // switched off — in the one artifact that records which objective a run trained under.
     println!(
-        "objective      hard categorical NLL + {:e}*dyn + {:e}*kl + {:e}*growth, dynamics \
-         horizon {}. `dyn` and `kl` are NextLat (arXiv 2511.05963): `dyn` is smooth_l1 to the \
-         stop-gradient belief, MEANED over every element of [B, T, {BAR_MODEL_DIM}] exactly \
-         as the reference reduces it, so the weight is width-independent and 1.0 is the \
-         reference setting. `growth` sizes at the moment-correct quadratic Kelly fraction \
-         E[R]/E[R²] of p(r|PAST) — the head's prefix-free r row — clamped at the bench's \
-         {:.1}x leverage cap. It pays raw-tail realized returns: exact -log1p(f_hat R) for \
-         wealth at or above 1e-4 and an explicit value/slope-matched differentiable \
-         continuation below that numerical join. It is the only term that is a function \
-         of the quantity the strategy trades. Its weight was \
-         sized on GRADIENT norm, not objective share — its magnitude is ~5e-4 nats against \
-         nll's ~4.93 — and the run reprints that measurement at steps {:?}. Every step prints \
-         each term's share of the objective's magnitude and the run warns when an auxiliary \
-         term holds more than {:.0}% of it for {} consecutive steps.",
+        "objective      hard categorical NLL + {:e}*dyn + {:e}*kl, dynamics horizon {}. \
+         `dyn` and `kl` are attached NextLat terms (arXiv 2511.05963); `dyn` is smooth_l1 \
+         to the stop-gradient belief, meaned over every element of [B, T, {BAR_MODEL_DIM}] \
+         exactly as the reference reduces it. Raw-payoff growth is EXCLUDED FROM THE OPTIMIZER \
+         and DIAGNOSTIC-ONLY: under no_grad it evaluates the moment-correct quadratic Kelly \
+         fraction E[R]/E[R²] of the prefix-free p(r|PAST), clamped at {:.1}x, against raw \
+         realized returns with exact -log1p(f_hat R) above the bankruptcy join and the \
+         finite continuation below it. Its retained report objective share is fixed at zero. \
+         The run warns when an attached auxiliary holds more than {:.0}% of the objective \
+         for {} consecutive steps.",
         args.lambda_dyn,
         args.lambda_kl,
-        args.lambda_growth,
         args.dyn_horizon,
         trade_bench::LEVERAGE_CAP,
-        GROWTH_PROBE_STEPS,
         AUX_SHARE_WARN * 100.0,
         AUX_SHARE_WARN_STREAK,
     );
@@ -9242,6 +9041,90 @@ mod tests {
                     .iter()
                     .any(|needle| name.contains(needle)),
                 "{name} must be in the no-weight-decay scalar route"
+            );
+        }
+    }
+
+    #[test]
+    fn emission_heads_retain_reference_cadence_with_decay_free_head_momentum() {
+        cap_torch_threads();
+        tch::manual_seed(0xAD_A4);
+        let vs = nn::VarStore::new(Device::Cpu);
+        let _modules = BarModules::new(&vs.root());
+        let named = named_trainable_variables(&vs);
+        let mut optimizer = build_optimizer(&named).expect("the model must have exact routing");
+
+        let matches =
+            |name: &str, needles: &[&str]| needles.iter().any(|needle| name.contains(*needle));
+        let heads: Vec<(String, Tensor)> = named
+            .iter()
+            .filter(|(name, _)| matches(name, &BAR_EMISSION_ADAMW_NAME_SUBSTRINGS))
+            .map(|(name, tensor)| (name.clone(), tensor.shallow_clone()))
+            .collect();
+        assert!(!heads.is_empty(), "the model must expose emission heads");
+
+        for (name, _) in &heads {
+            assert_eq!(
+                optimizer.adamw_group_settings(name),
+                Some((1.0, ADAMW_HEAD_BETAS, 0.0)),
+                "{name} must use the decay-free head recipe"
+            );
+        }
+        for (name, _) in named
+            .iter()
+            .filter(|(name, _)| matches(name, bar_adamw_embedding_substrings()))
+        {
+            assert_eq!(
+                optimizer.adamw_group_settings(name),
+                Some((1.0, ADAMW_TABLE_BETAS, ADAMW_TABLE_WEIGHT_DECAY_MULT,)),
+                "{name} must retain the embedding-table recipe"
+            );
+        }
+
+        let initial: Vec<Tensor> = heads
+            .iter()
+            .map(|(_, tensor)| tch::no_grad(|| tensor.detach().copy()))
+            .collect();
+        for primary_step in 1..=2 {
+            optimizer.zero_grad();
+            let loss = heads
+                .iter()
+                .map(|(_, tensor)| tensor.sum(Kind::Float))
+                .reduce(|sum, term| sum + term)
+                .expect("there is at least one emission-head parameter");
+            loss.backward();
+            optimizer.step(StepKind::Primary);
+
+            let initialized = optimizer.initialized_adamw_names();
+            for ((name, tensor), before) in heads.iter().zip(&initial) {
+                let delta = (tensor - before).abs();
+                if primary_step == 1 {
+                    assert!(
+                        !initialized.contains(name) && delta.max().double_value(&[]) == 0.0,
+                        "{name} must retain its first-batch gradient without stepping"
+                    );
+                } else {
+                    assert!(
+                        initialized.contains(name),
+                        "{name} must update on the second primary step"
+                    );
+                    let min_delta = delta.min().double_value(&[]);
+                    let max_delta = delta.max().double_value(&[]);
+                    assert!(
+                        min_delta > ADAMW_LR * 0.99 && max_delta < ADAMW_LR * 1.01,
+                        "{name} moved [{min_delta}, {max_delta}] after the accumulated pair, \
+                         expected the {ADAMW_LR} AdamW update"
+                    );
+                }
+            }
+        }
+
+        optimizer.zero_grad();
+        for (name, tensor) in &heads {
+            let grad = tensor.grad();
+            assert!(
+                grad.defined() && grad.abs().max().double_value(&[]) == 0.0,
+                "{name} retained a gradient after its AdamW update"
             );
         }
     }
@@ -9729,9 +9612,6 @@ mod tests {
             dyn_horizon: 1,
             lambda_dyn: 1.0,
             lambda_kl: 1.0,
-            // The derived weight, not zero: a trainer test that ran the control arm would
-            // leave the term's gradient path untested by every test in this file.
-            lambda_growth: LAMBDA_GROWTH,
             validation_windows: 3,
             diagnostic_context: BAR_CONTEXT_RAMP_START,
             snapshot_windows: 1,
@@ -10230,7 +10110,7 @@ mod tests {
         let refs = sampler.batch_refs(0, 0, 1);
         let sample = sampler.batch_of(&refs, trainer.device);
         let growth_support = GrowthSupport::new(&trainer.supports_dev, trainer.device)
-            .expect("the test support carries the growth term");
+            .expect("the test support carries the growth diagnostic");
         let reading = probe_shape_used_bytes(
             &trainer.modules,
             &trainer.supports_dev,
@@ -10482,8 +10362,7 @@ mod tests {
         let promoted = checkpoint_parameters(&best);
 
         // Optimizer steps AFTER the promotion. `optimizer_step` takes its context from the
-        // batch, so the stage-0 sampler is valid at any step index; 4..7 keeps clear of
-        // `GROWTH_PROBE_STEPS` and the extra forward passes it would add.
+        // batch, so the stage-0 sampler is valid at any step index.
         let sample = {
             let sampler = &trainer.train_samplers[0];
             sampler.batch_of(&sampler.batch_refs(0, 0, 1), trainer.device)
@@ -11016,24 +10895,18 @@ mod tests {
             nll_dof: Tensor::from_slice(&[3.0f32, 4.0, 5.0, 6.0, 7.0]),
             dyn_loss: scalar(8.0),
             kl_loss: scalar(9.0),
-            growth: scalar(10.0),
+            growth_diagnostic: scalar(10.0),
             growth_stats: Tensor::from_slice(&[11.0f32, 12.0, 13.0]),
             identity: scalar(14.0),
             autocorr: scalar(15.0),
         };
-        let probe = GrowthGradientProbe {
-            nll_value: scalar(17.0),
-            nll_norm: scalar(18.0),
-            growth_value: scalar(19.0),
-            growth_norm: scalar(20.0),
-        };
-        let packed = pack_step_metrics(&graph, &scalar(16.0), Some(&probe));
+        let packed = pack_step_metrics(&graph, &scalar(16.0));
         assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
         assert_eq!(
             read_packed_step_metrics(&packed),
             [
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
-                16.0, 17.0, 18.0, 19.0, 20.0,
+                16.0,
             ]
         );
     }
@@ -11177,83 +11050,27 @@ mod tests {
         );
     }
 
-    /// The shares are of the objective's MAGNITUDE, so they stay meaningful when density
-    /// scoring is selected and the likelihood term is routinely negative.
-    ///
-    /// # What this test guards, and what it deliberately does NOT
-    ///
-    /// It guards two things about VALUE: that the four shares are magnitudes summing to one,
-    /// and that each auxiliary term is a small fraction of the objective's value at its
-    /// shipped weight. [`AUX_SHARE_WARN`] and [`Trainer::warn_on_auxiliary_domination`] watch
-    /// the same quantity at runtime, since they read `StepLoss::shares`.
-    ///
-    /// It does NOT govern [`LAMBDA_GROWTH`], and a reader must not conclude from the growth
-    /// bound below that the term is negligible. That constant was sized on GRADIENT-NORM
-    /// share, measured at 10.3% at step 0 and 19.6% at step 200 on the real corpus at the
-    /// deployed batch 24 — see the constant's own doc comment. Value share and gradient share
-    /// are different quantities and there is no tension between them: `growth` is ~0.16% of
-    /// the loss VALUE while carrying a sixth of the gradient NORM because the fitted raw
-    /// second moment is ~1e-5, amplifying the sizing response to mean changes. Gradient is
-    /// what trains; value is incidental.
-    ///
-    /// Nothing in the tree ASSERTS on gradient share. It is measured and reprinted by
-    /// [`probe_growth_gradient_share`] at [`GROWTH_PROBE_STEPS`], which hard-fails only on a
-    /// zero or non-finite growth gradient, i.e. on the term being decoration. That is an
-    /// observation, not an enforced bound, and it is stated here so the gap is explicit
-    /// rather than silently implied by a value-share test sitting next to it.
+    /// Objective shares use magnitudes, so they stay meaningful for negative density
+    /// diagnostics. Growth is excluded because its retained report share is fixed at zero.
     #[test]
     fn loss_shares_are_magnitudes_and_sum_to_one() {
-        let (nll, dyn_share, kl, growth) = loss_shares(17.0, 28.0, 0.0, 0.0);
-        assert!((nll + dyn_share + kl + growth - 1.0).abs() < 1e-12);
-        // The regression that motivated the chart: lambda_dyn = 1.0 put dyn at 62%.
+        let (nll, dyn_share, kl) = loss_shares(17.0, 28.0, 0.0);
+        assert!((nll + dyn_share + kl - 1.0).abs() < 1e-12);
         assert!(
             (dyn_share - 28.0 / 45.0).abs() < 1e-12,
             "dyn share {dyn_share}"
         );
         assert!(dyn_share > AUX_SHARE_WARN, "62% must trip the warning");
 
-        // A negative log density must not invert or blow up the denominator.
-        let (nll, dyn_share, kl, growth) = loss_shares(-30.0, 10.0, 10.0, 0.0);
-        assert!((nll + dyn_share + kl + growth - 1.0).abs() < 1e-12);
+        let (nll, dyn_share, kl) = loss_shares(-30.0, 10.0, 10.0);
+        assert!((nll + dyn_share + kl - 1.0).abs() < 1e-12);
         assert!((nll - 0.6).abs() < 1e-12, "nll share {nll}");
-        // A zero objective has no shares to report, and reporting zeros would draw a
-        // four-way tie that never happened.
-        assert!(loss_shares(0.0, 0.0, 0.0, 0.0).0.is_nan());
+        assert!(loss_shares(0.0, 0.0, 0.0).0.is_nan());
 
-        // The reference weight keeps the auxiliary term well inside the threshold at the
-        // production init figures: `dyn` measured 245 under the SUMMED reduction at step 0,
-        // i.e. 245/512 = 0.479 under the reference mean, against a categorical-scale
-        // `|nll|` of 24.26.
-        let (_, dyn_share, _, _) =
-            loss_shares(24.26, 1.0 * (245.0 / BAR_MODEL_DIM as f64), 0.0, 0.0);
+        let (_, dyn_share, _) = loss_shares(24.26, 245.0 / BAR_MODEL_DIM as f64, 0.0);
         assert!(
             dyn_share < AUX_SHARE_WARN,
             "the reference lambda_dyn = 1.0 leaves dyn at {dyn_share} of the objective"
-        );
-
-        // The growth term's VALUE share at the shipped weight, on the production init
-        // figures: `|nll|` 24.26 on the categorical scale, `dyn` 0.479 under the reference
-        // mean reduction, `kl` 1.0, and the growth term at its whole tradeable content of
-        // 5.25e-4 nats/bar. Measures 1.57e-3 at `LAMBDA_GROWTH` = 77.
-        //
-        // The bound is 5e-3, which is a real constraint and not a rubber stamp: it is 3.2x
-        // the current reading and it TRIPS at lambda ~247, well inside the order of magnitude
-        // Main asked it to catch. A violation would mean one of two things, both of which
-        // want a human. Either `LAMBDA_GROWTH` was raised to make the objective-share chart
-        // look respectable — which is sizing the term on the wrong quantity, since the
-        // constant is derived from gradient norm — or the growth term's magnitude itself moved
-        // by more than 3x, which would mean the 5.25e-4 measurement no longer describes the
-        // corpus and the whole premise of the term needs re-deriving.
-        //
-        // It is NOT a claim that the term is small in any sense that matters. See this test's
-        // doc comment: the gradient share at this same weight is 10.3% and 19.6%.
-        let (_, _, _, growth_share) = loss_shares(24.26, 0.479, 1.0, LAMBDA_GROWTH * 5.25e-4);
-        assert!(
-            growth_share < 5e-3,
-            "the growth term holds {growth_share} of the objective's MAGNITUDE at \
-             lambda_growth = {LAMBDA_GROWTH}; either the weight was raised against the \
-             objective-share chart instead of the gradient-norm probe, or the term's \
-             magnitude has moved off the measured 5.25e-4 nats/bar"
         );
     }
 
@@ -11278,6 +11095,29 @@ mod tests {
         assert_eq!(schedule.bars_per_step(stage_1), planned_tokens / 2);
         // Every other stage keeps its plan.
         assert_eq!(schedule.batch(2500), 16 * BATCH_RAMP[2]);
+    }
+
+    /// Projection must use the short tail of each partition stage, not nominal batch
+    /// capacity. Otherwise a one-pass recipe projects above one pass from step zero.
+    #[test]
+    fn projected_tokens_do_not_count_stage_tail_padding() {
+        let schedule = equal_stages(6, 4, [1; RAMP_STAGES]);
+        let assigned = [7, 8, 5];
+        let bars_seen = 4 * stage_context(0) as u64;
+        let projected = projected_bar_tokens(&schedule, bars_seen, 0, [4, 0, 0], assigned);
+        let expected: u64 = assigned
+            .iter()
+            .enumerate()
+            .map(|(stage, &windows)| windows as u64 * stage_context(stage) as u64)
+            .sum();
+        assert_eq!(projected, expected);
+        let nominal: u64 = (0..schedule.total_steps)
+            .map(|step| schedule.bars_per_step(step))
+            .sum();
+        assert!(
+            projected < nominal,
+            "the fixture must expose nominal tail padding"
+        );
     }
 
     /// The plateau bump follows modded-nanogpt's per-stage exponents, NOT a uniform square
@@ -11463,7 +11303,7 @@ mod tests {
 
         // Deliberately unequal and not 1.0, so a term picking up the wrong lambda cannot
         // hide behind another one or behind a multiply-by-one.
-        let (lambda_dyn, lambda_kl, lambda_growth) = (3e-2f64, 7e-2f64, 11e-2f64);
+        let (lambda_dyn, lambda_kl) = (3e-2f64, 7e-2f64);
         let (batch, context, horizon) = (2i64, 12i64, 2i64);
 
         tch::manual_seed(0x0B3E);
@@ -11471,7 +11311,7 @@ mod tests {
         let modules = BarModules::new(&vs.root());
         let supports = synthetic_supports();
         let growth_support = GrowthSupport::new(&supports, Device::Cpu)
-            .expect("the synthetic support carries the growth term");
+            .expect("the synthetic support carries the growth diagnostic");
         let (dof, time_ids) = synthetic_window(batch, context + 1, 0xB0B0);
 
         let mut totals: Vec<f64> = Vec::with_capacity(steps.len());
@@ -11489,7 +11329,6 @@ mod tests {
                 horizon,
                 lambda_dyn,
                 lambda_kl,
-                lambda_growth,
                 BarScoring::Density,
                 Device::Cpu,
             );
@@ -11498,13 +11337,20 @@ mod tests {
             // sum in f64 from f32-rounded terms cannot reproduce it to more than ~1e-7.
             let expected = graph.nll.double_value(&[])
                 + lambda_dyn * graph.dyn_loss.double_value(&[])
-                + lambda_kl * graph.kl_loss.double_value(&[])
-                + lambda_growth * graph.growth.double_value(&[]);
+                + lambda_kl * graph.kl_loss.double_value(&[]);
             let total_loss = graph.loss.double_value(&[]);
             assert!(
                 (total_loss - expected).abs() <= 1e-6 * (1.0 + total_loss.abs()),
                 "step {step}: objective {total_loss} is not nll + {lambda_dyn}*dyn + \
-                 {lambda_kl}*kl + {lambda_growth}*growth = {expected}"
+                 {lambda_kl}*kl = {expected}"
+            );
+            assert!(
+                !graph.growth_diagnostic.requires_grad(),
+                "raw-payoff growth must remain detached from every pretrain parameter"
+            );
+            assert!(
+                graph.growth_diagnostic.double_value(&[]).is_finite(),
+                "the training-batch raw-payoff diagnostic must still be reported"
             );
 
             graph.loss.backward();
@@ -11536,16 +11382,8 @@ mod tests {
             );
         }
 
-        // The negative control, which is the deleted anneal's terminal state: scale every
-        // auxiliary to zero and the dynamics head's gradient vanishes EXACTLY. This is what
-        // the run did for its final third, and it is what the assertions above would have
-        // caught. Keeping it here means the gradient check cannot silently become vacuous —
-        // if it ever stops discriminating, this half fails too.
-        //
-        // `lambda_growth` is zeroed with the others even though the growth term does not
-        // reach the dynamics MLP: leaving it live would make the control's claim "the
-        // dynamics head gets nothing from a zero-weighted auxiliary" rest on the growth
-        // term's graph shape rather than on the weights, and that is a weaker statement.
+        // The negative control, which is the deleted anneal's terminal state: scale both
+        // NextLat auxiliaries to zero and the dynamics head's gradient vanishes exactly.
         for mut variable in vs.trainable_variables() {
             variable.zero_grad();
         }
@@ -11557,7 +11395,6 @@ mod tests {
             &time_ids,
             context,
             horizon,
-            0.0,
             0.0,
             0.0,
             BarScoring::Density,
@@ -11574,324 +11411,6 @@ mod tests {
             "with both auxiliary weights at zero the dynamics head must receive no gradient \
              at all; it received {dead}, so this test's gradient check proves nothing"
         );
-    }
-
-    /// `--lambda-growth 0` must be EXACTLY inert, not nearly inert.
-    ///
-    /// Two things depend on that being bit-exact rather than approximate. The ablation's
-    /// control arm is only a single-variable comparison if the zero-weight objective is the
-    /// pre-change objective to the last bit; and `PromotionGate`'s selection rule reads the
-    /// control arm's numbers as the baseline the economic rule is judged against, so a
-    /// last-digit difference there would be attributed to the selection rule.
-    ///
-    /// It is a real assertion and not a tautology about `0.0 * x`, because `0.0 * x` is NOT
-    /// zero for every `x`: at `x = inf` or `x = NaN` it is NaN, and `total + NaN` is NaN.
-    /// So this is exactly the test that the growth term's clamps and log-argument guard hold
-    /// on real model output — a term that quietly produced an inf on some bar would poison
-    /// the CONTROL arm of its own ablation, which is the most confusing failure available
-    /// here.
-    #[test]
-    fn a_zero_growth_weight_leaves_the_objective_and_its_gradients_bit_identical() {
-        let _torch_rng_guard = test_rng::exclusive();
-        cap_torch_threads();
-        let (batch, context, horizon) = (2i64, 12i64, 2i64);
-        let (lambda_dyn, lambda_kl) = (3e-2f64, 7e-2f64);
-
-        tch::manual_seed(0x0C0F);
-        let vs = nn::VarStore::new(Device::Cpu);
-        let modules = BarModules::new(&vs.root());
-        let supports = synthetic_supports();
-        let growth_support = GrowthSupport::new(&supports, Device::Cpu)
-            .expect("the synthetic support carries the growth term");
-        let (dof, time_ids) = synthetic_window(batch, context + 1, 0xC0FE);
-
-        // Sorted, so the two readings are comparable element by element: `vs.variables()`
-        // hands back a `HashMap` whose order is seeded per process.
-        let grads = |vs: &nn::VarStore| -> Vec<(String, f64)> {
-            let mut out: Vec<(String, f64)> = named_trainable_variables(vs)
-                .into_iter()
-                .filter(|(_, tensor)| tensor.grad().defined())
-                .map(|(name, tensor)| {
-                    (
-                        name,
-                        tensor
-                            .grad()
-                            .to_kind(Kind::Double)
-                            .abs()
-                            .sum(Kind::Double)
-                            .double_value(&[]),
-                    )
-                })
-                .collect();
-            out.sort_by(|a, b| a.0.cmp(&b.0));
-            out
-        };
-        let zero = || {
-            for mut variable in vs.trainable_variables() {
-                variable.zero_grad();
-            }
-        };
-
-        // The shipped objective at zero growth weight.
-        zero();
-        let graph = forward_losses(
-            &modules,
-            &supports,
-            &growth_support,
-            &dof,
-            &time_ids,
-            context,
-            horizon,
-            lambda_dyn,
-            lambda_kl,
-            0.0,
-            BarScoring::Density,
-            Device::Cpu,
-        );
-        // The growth term still RAN — the control arm charts it, so a broken term would be
-        // caught here rather than silently skipped. And it is finite, which is what makes the
-        // `0.0 *` above a no-op.
-        let growth_value = graph.growth.double_value(&[]);
-        assert!(
-            growth_value.is_finite(),
-            "the growth term is {growth_value} on the control arm, so multiplying it by a \
-             zero weight cannot leave the objective unchanged"
-        );
-        let with_zero_weight = graph.loss.double_value(&[]);
-        graph.loss.backward();
-        let grads_with_zero_weight = grads(&vs);
-
-        // The pre-change objective, reconstructed from the SAME graph's terms: three terms,
-        // no growth summand at all.
-        zero();
-        let again = forward_losses(
-            &modules,
-            &supports,
-            &growth_support,
-            &dof,
-            &time_ids,
-            context,
-            horizon,
-            lambda_dyn,
-            lambda_kl,
-            0.0,
-            BarScoring::Density,
-            Device::Cpu,
-        );
-        let three_terms = &again.nll + lambda_dyn * &again.dyn_loss + lambda_kl * &again.kl_loss;
-        let without_the_term = three_terms.double_value(&[]);
-        three_terms.backward();
-        let grads_without_the_term = grads(&vs);
-
-        assert_eq!(
-            with_zero_weight, without_the_term,
-            "a zero growth weight moved the objective from {without_the_term} to \
-             {with_zero_weight}, so the ablation's control arm is not the pre-change run"
-        );
-        assert_eq!(
-            grads_with_zero_weight.len(),
-            grads_without_the_term.len(),
-            "a zero growth weight changed WHICH parameters receive a gradient"
-        );
-        for ((name, with), (other, without)) in grads_with_zero_weight
-            .iter()
-            .zip(grads_without_the_term.iter())
-        {
-            assert_eq!(name, other, "the two gradient readings are not aligned");
-            assert_eq!(
-                with, without,
-                "a zero growth weight moved {name}'s gradient from {without} to {with}"
-            );
-        }
-    }
-
-    /// The growth term ALONE must reach the trunk, with the likelihood contributing nothing.
-    ///
-    /// This is the assertion that separates an objective from a diagnostic. Every plausible
-    /// way of getting the marginalization wrong — a `no_grad` around the mixture, a `detach`
-    /// on the belief, reading the moments off a frozen logit table — leaves a term that still
-    /// prints a sensible number and still charts, while training nothing. `nll` is never
-    /// backwarded here, so the only path from the loss to a trunk weight runs through
-    /// `mu_hat` and `var_hat`, which is exactly the path the finding says the objective was
-    /// missing.
-    ///
-    /// # The zero-init head, measured
-    ///
-    /// At EXACTLY step 0 the trunk correctly receives nothing, and this test asserts that
-    /// too rather than papering over it. `BarEmissionHead` is zero-init, so the `r` row is
-    /// `logits = 0 * h + 0`; `d logits / d h` is the weight matrix, which is exactly zero, so
-    /// the whole growth gradient lands on the head's own weights (`d logits / d W = h`) and
-    /// none of it on the representation. That is a property of the initialization, not of the
-    /// term: the path opens as soon as the head is non-zero, i.e. after the first optimizer
-    /// step. Both halves are pinned here because the first is the reason the second cannot be
-    /// tested at init, and a future reader who deletes the perturbation would get a failure
-    /// they would be tempted to blame on the marginalization.
-    ///
-    /// The second half also pins WHERE the gradient lands. Reaching only `bar_dof_head` and
-    /// the prefix embedding would mean the term can rescale the emission head's `r` row but
-    /// cannot ask the representation for a better conditional mean — and the representation
-    /// is what the run's 0.068-nat drift was free to move.
-    #[test]
-    fn the_growth_term_alone_reaches_the_trunk() {
-        let _torch_rng_guard = test_rng::exclusive();
-        cap_torch_threads();
-        let (batch, context, horizon) = (2i64, 12i64, 2i64);
-
-        tch::manual_seed(0x0D0D);
-        let vs = nn::VarStore::new(Device::Cpu);
-        let modules = BarModules::new(&vs.root());
-        let supports = synthetic_supports();
-        let growth_support = GrowthSupport::new(&supports, Device::Cpu)
-            .expect("the synthetic support carries the growth term");
-        let (dof, time_ids) = synthetic_window(batch, context + 1, 0xD0D0);
-
-        let is_head = |name: &str| {
-            BAR_EMISSION_ADAMW_NAME_SUBSTRINGS
-                .iter()
-                .any(|part| name.contains(part))
-        };
-        // The growth term trains the trunk and the emission head. `bar_dyn` is the dynamics
-        // MLP, which only the NextLat auxiliaries reach, so it is neither.
-        let magnitudes = |vs: &nn::VarStore| -> (Vec<(String, f64)>, Vec<(String, f64)>) {
-            let mut trunk = Vec::new();
-            let mut head = Vec::new();
-            for (name, tensor) in named_trainable_variables(vs) {
-                if name.contains("bar_dyn") {
-                    continue;
-                }
-                let grad = tensor.grad();
-                let magnitude = if grad.defined() {
-                    grad.to_kind(Kind::Double)
-                        .abs()
-                        .sum(Kind::Double)
-                        .double_value(&[])
-                } else {
-                    0.0
-                };
-                if is_head(&name) {
-                    head.push((name, magnitude));
-                } else {
-                    trunk.push((name, magnitude));
-                }
-            }
-            (trunk, head)
-        };
-        let backward_only = |want_growth: bool| {
-            for mut variable in vs.trainable_variables() {
-                variable.zero_grad();
-            }
-            let graph = forward_losses(
-                &modules,
-                &supports,
-                &growth_support,
-                &dof,
-                &time_ids,
-                context,
-                horizon,
-                0.0,
-                0.0,
-                0.0,
-                BarScoring::Density,
-                Device::Cpu,
-            );
-            // One term only. `graph.loss` is never touched, so the other three terms
-            // contribute exactly zero to what follows.
-            if want_growth {
-                graph.growth.backward();
-            } else {
-                graph.nll.backward();
-            }
-        };
-        let backward_growth_only = || backward_only(true);
-
-        // Half one: at zero init the head learns and the trunk cannot, exactly as the weight
-        // matrix being zero requires.
-        backward_growth_only();
-        let (trunk, head) = magnitudes(&vs);
-        assert!(
-            !trunk.is_empty() && !head.is_empty(),
-            "the parameter split found {} trunk and {} head tensors, so this test asserts \
-             nothing",
-            trunk.len(),
-            head.len()
-        );
-        assert!(
-            head.iter().any(|(_, g)| *g > 0.0),
-            "the growth term reached none of the {} emission-head tensors even at zero init, \
-             so it is disconnected from the model entirely",
-            head.len()
-        );
-        for (name, magnitude) in &trunk {
-            assert_eq!(
-                *magnitude, 0.0,
-                "{name} received {magnitude} from the growth term at zero init, but the head's \
-                 weight matrix is exactly zero there, so no gradient can reach the trunk \
-                 through it; something else is feeding the trunk"
-            );
-        }
-
-        // Half two: give the head weights, and the representation becomes trainable toward
-        // the conditional mean. Small, so the perturbation cannot be what produces the
-        // gradient — it only opens the path.
-        tch::no_grad(|| {
-            for (name, mut tensor) in named_trainable_variables(&vs) {
-                if is_head(&name) {
-                    let noise = Tensor::randn_like(&tensor) * 0.02;
-                    let _ = tensor.g_add_(&noise);
-                }
-            }
-        });
-        backward_growth_only();
-        let (trunk, _) = magnitudes(&vs);
-        let reached = trunk.iter().filter(|(_, g)| *g > 0.0).count();
-        assert!(
-            reached > 0,
-            "with a non-zero emission head the growth term still reached none of the {} trunk \
-             parameters, so it is a diagnostic rather than an objective: it can only be read, \
-             never trained toward",
-            trunk.len()
-        );
-        // Two invariants instead of a raw fraction, because a fraction would be measuring the
-        // INITIALIZATION. This trunk zero-inits its residual output projections, so at init a
-        // gradient stops at the first zero it meets and only 45 of the 117 trunk tensors are
-        // reachable at all — by `nll` just as much as by `growth`.
-        backward_only(false);
-        let (nll_trunk, _) = magnitudes(&vs);
-        let live = |rows: &[(String, f64)]| -> BTreeSet<String> {
-            rows.iter()
-                .filter(|(_, g)| *g > 0.0)
-                .map(|(name, _)| name.clone())
-                .collect()
-        };
-        let (growth_live, nll_live) = (live(&trunk), live(&nll_trunk));
-
-        // It traverses the FULL DEPTH. This is the assertion that "only the last
-        // projection is learning" would fail, and it is stated per layer rather than as a
-        // count so it cannot be satisfied by a wide gradient in one block. Set equality is
-        // deliberately NOT asserted: different scalar objectives may cancel at different
-        // individual parameters even though both read the same representation, and the
-        // growth gradient is roughly four orders smaller than the likelihood's.
-        let layers: BTreeSet<String> = nll_live
-            .iter()
-            .filter(|name| name.starts_with("bar_layer_"))
-            .filter_map(|name| name.split('.').next().map(str::to_owned))
-            .collect();
-        assert!(
-            layers.len() > 1,
-            "only {} transformer layers are reachable at all, so a depth assertion proves \
-             nothing here",
-            layers.len()
-        );
-        for layer in &layers {
-            assert!(
-                growth_live.iter().any(|name| name.starts_with(layer)),
-                "the growth term's gradient never reaches {layer}, so it trains the layers \
-                 above it and leaves the representation beneath untouched; the likelihood \
-                 reaches {} trunk tensors and growth {}",
-                nll_live.len(),
-                growth_live.len()
-            );
-        }
     }
 
     /// The end-of-run guard: a shipped dynamics head that loses to `z_k = h_t` is a hard
@@ -12197,16 +11716,8 @@ mod tests {
     }
 
     /// `--exact-batch` turns the clamp into a refusal, because survival-by-degradation and
-    /// controlled comparison are opposite requirements.
-    ///
-    /// The two arms of the expected-log-growth ablation were launched identically at
-    /// `--batch-size 24` and ran at base 23 / 10818 steps and base 21 / 11847 steps, because
-    /// the probe read 16.37 and 14.94 GiB of free VRAM at their two launches. Neither run was
-    /// wrong and neither banner lied; the COMPARISON between them absorbed a gradient-noise
-    /// and schedule-length difference into a `lambda_growth` effect. This asserts the mode
-    /// that makes that pair impossible to launch, and asserts the clamping mode still clamps,
-    /// because a flag that silently changed the default would be a worse bug than the one it
-    /// fixes.
+    /// controlled comparison are opposite requirements. The assertion also ensures ordinary
+    /// production mode still clamps rather than silently changing its default.
     #[test]
     fn exact_batch_refuses_the_clamp_that_silently_confounds_an_ablation() {
         let capacity = measured_5090();

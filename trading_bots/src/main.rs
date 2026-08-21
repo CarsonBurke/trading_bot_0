@@ -131,7 +131,9 @@ enum Commands {
         #[arg(long, default_value_t = 20260811)]
         seed: u64,
     },
-    /// Pretrain the discrete distributional bar world model on the local bar corpus.
+    /// Pretrain the discrete distributional bar world model with Hard categorical NLL and
+    /// NextLat dynamics/KL. Raw-payoff growth is a detached training-batch diagnostic;
+    /// held-out promotion evidence is computed separately.
     Pretrain {
         /// Initialize from an existing pretrain checkpoint. Weights only: training
         /// restarts at step zero with a fresh optimizer and schedule.
@@ -244,9 +246,9 @@ enum Commands {
         #[arg(long, default_value_t = 4_000_000)]
         support_samples: usize,
 
-        /// Recursive latent-dynamics rollout depth. The NextLat reference defaults to 1;
-        /// the losses are averaged over the horizon either way.
-        #[arg(long, default_value_t = 4)]
+        /// Learnable latent-dynamics horizon. NextLat trains its one-step transition;
+        /// recursive rollout diagnostics still evaluate that transition at long horizons.
+        #[arg(long, default_value_t = 1)]
         dyn_horizon: usize,
 
         /// Weight on the NextLat hidden-state term, i.e. the reference's `lambda_mse`.
@@ -274,20 +276,6 @@ enum Commands {
         /// Weight on the NextLat categorical-KL term, i.e. the reference's `lambda_kl`.
         #[arg(long, default_value_t = 1.0)]
         lambda_kl: f64,
-
-        /// Weight on the EXPECTED-LOG-GROWTH term: raw-tail realized payoffs at the
-        /// moment-correct quadratic fraction `E[R] / E[R²]` of the model's own
-        /// `p(r|past)`, clamped at the trade bench's leverage cap. Wealth at or above
-        /// `1e-4` pays exact `-log1p(f_hat R)`; a value- and slope-matched differentiable
-        /// continuation penalizes bankruptcy without clipping the raw return.
-        ///
-        /// The default is `growth::LAMBDA_GROWTH`, which was DERIVED from a gradient-norm
-        /// measurement rather than swept: the term's magnitude is ~5e-4 nats against the
-        /// likelihood's ~4.93, so a weight chosen to make it look substantial in the
-        /// objective would be sizing it on the wrong quantity. `0.0` is the ablation's
-        /// control arm — the term is still computed and charted, it just does not train.
-        #[arg(long, default_value_t = trading_bot_0::torch::train::growth::LAMBDA_GROWTH)]
-        lambda_growth: f64,
 
         /// Held-out windows in each pinned evaluation set. Pinned by the campaign constant
         /// `EVAL_WINDOW_SEED`, so they are identical across runs, seeds and ablations.
@@ -365,13 +353,10 @@ enum Commands {
         /// Refuse to start if measured capacity would REDUCE --batch-size, instead of
         /// clamping to what fits.
         ///
-        /// Set this on every arm of an ablation. The capacity probe reads free VRAM at
-        /// startup, so two runs launched identically on a shared card can land on different
-        /// base batches and therefore different step counts: measured, the two arms of the
-        /// expected-log-growth ablation ran at base 23 / 10818 steps and base 21 / 11847
-        /// steps from the same `--batch-size 24`, because 16.37 and 14.94 GiB were free.
-        /// Clamping is right for a production run and wrong for a controlled comparison, and
-        /// only the caller knows which this is.
+        /// Set this on every arm of a controlled comparison. The capacity probe reads free
+        /// VRAM at startup, so otherwise identically configured runs on a shared card can
+        /// land on different base batches and step counts. Clamping is right for a production
+        /// run and wrong for a controlled comparison; only the caller knows which this is.
         #[arg(long, default_value_t = false)]
         exact_batch: bool,
     },
@@ -1384,7 +1369,6 @@ async fn run() {
             supports,
             freeze_supports,
             min_dollar_volume,
-            lambda_growth,
             exact_batch,
             lr_plateau_fraction,
         }) => {
@@ -1415,7 +1399,6 @@ async fn run() {
                 supports: supports.clone(),
                 freeze_supports: *freeze_supports,
                 min_dollar_volume: *min_dollar_volume,
-                lambda_growth: *lambda_growth,
                 exact_batch: *exact_batch,
                 lr_plateau_fraction: *lr_plateau_fraction,
             };
@@ -2001,7 +1984,6 @@ mod tests {
             dyn_horizon,
             lambda_dyn,
             lambda_kl,
-            lambda_growth,
             validation_windows,
             diagnostic_context,
             data_dir,
@@ -2030,7 +2012,9 @@ mod tests {
         );
         assert_eq!(lr_plateau_fraction, 0.40);
         assert_eq!(resolution_secs, 300);
-        assert_eq!(dyn_horizon, 4);
+        // NextLat learns one transition at a time; long-horizon recursive diagnostics
+        // remain controlled independently by their fixed rollout horizon grid.
+        assert_eq!(dyn_horizon, 1);
         // 1.0 is the NextLat reference's `lambda_mse` (arXiv 2511.05963,
         // `defaults.yaml`), and under `next_lat_loss`'s `Reduction::Mean` over
         // `[B, T, BAR_MODEL_DIM]` it is width-independent, so it stays 1.0 if
@@ -2048,15 +2032,6 @@ mod tests {
         assert_eq!(
             diagnostic_context,
             trading_bot_0::torch::train::pretrain::BAR_CONTEXT_RAMP_START
-        );
-        // Sized on gradient norm, not on objective share, and hard-coded rather than swept.
-        assert_eq!(
-            lambda_growth,
-            trading_bot_0::torch::train::growth::LAMBDA_GROWTH
-        );
-        assert!(
-            lambda_growth > 0.0,
-            "the default arm must TRAIN the growth term; 0.0 is the ablation control"
         );
         assert!(data_dir.ends_with("bars"), "{data_dir}");
         assert_eq!(

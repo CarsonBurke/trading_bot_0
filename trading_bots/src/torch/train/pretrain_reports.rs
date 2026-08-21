@@ -177,11 +177,12 @@ pub struct StepMetrics {
     /// Mean raw-payoff growth loss in nats per bar under the deployed leverage cap, where
     /// `f_hat = E[R]/E[R²]` is the moment-correct quadratic Kelly fraction of
     /// `p(r|past)`. Exact `-log1p(f_hat R)` applies at wealth `>= 1e-4`; a finite
-    /// value/slope-matched differentiable continuation applies below that numerical join.
-    /// Recorded whatever `--lambda-growth` is.
+    /// continuation covers the bankruptcy domain. This is diagnostic-only and never enters
+    /// the optimizer.
     pub growth_loss: f64,
-    /// Share of the objective's total MAGNITUDE carried by each term, i.e. the weighted
-    /// term over the sum of the four weighted magnitudes. They sum to one.
+    /// Share of the optimized objective's total magnitude carried by each attached term.
+    /// `nll_share + dyn_share + kl_share == 1`; `growth_share` is retained in the report
+    /// schema and is always zero because raw payoff is detached.
     ///
     /// Magnitudes and not the signed total: the explicitly requested
     /// `BarScoring::Density` fixed-support mixed-measure diagnostic can be negative because
@@ -2990,48 +2991,40 @@ impl PretrainReporter {
             vec![self.total_loss.labeled("train", len)],
         )?;
 
-        // What each term is actually WORTH in the objective. The absolute curves above
-        // cannot show a term taking over: `dyn` rising 20x while `nll` drifts up looks like
-        // two unrelated curves, and at a weight of 1.0 it was 62% of the loss.
+        // Relative magnitude of the three attached objective terms. The zero growth series
+        // is retained so old and new report files share one schema while making the training
+        // cutover explicit in every chart.
         write_chart(
             &dir,
             "pretrain_loss_shares",
             format!("Pretrain Loss Term Shares - {suffix}"),
             "record",
-            "weighted term / sum of weighted magnitudes (0.25 = the warning threshold)",
+            "attached term / sum of attached magnitudes (growth is diagnostic-only)",
             ScaleKind::Linear,
             vec![
                 self.nll_share.labeled("nll", len),
                 self.dyn_share.labeled("dyn", len),
                 self.kl_share.labeled("kl", len),
-                self.growth_share.labeled("growth", len),
+                self.growth_share.labeled("growth (detached)", len),
                 constant_series("aux warning threshold", AUX_SHARE_WARN, len),
             ],
         )?;
 
-        // The traded term, on its own panel because its scale is nothing like the others':
-        // the whole tradeable content of the `r` prediction is 5.25e-4 nats/bar, so on the
-        // shares chart above it is a flat line at zero and on any nats axis shared with
-        // `nll` it is invisible. Four series, because four different things can go wrong.
-        //
-        // `growth` is the realized log growth of the DEPLOYED policy: negative is good, and
-        // 0 is "took no position, or took one that exactly broke even". `share` is what it
-        // is worth in the objective, which is tiny by construction — its WEIGHT was sized on
-        // gradient norm, and the run prints that measurement separately. `mean |f_hat|` and
-        // `cap binds` are the two that answer whether the term is doing anything: on the run
-        // that motivated it, `|f*|` median rose 9.22 -> 10.69 and cap saturation 78% -> 86%
-        // while the realized hit rate FELL, so a healthy run is one where those two stop
-        // climbing.
+        // Raw-payoff evidence remains visible without being allowed to corrupt the
+        // categorical law. `growth` is the realized negative log growth of the deployed
+        // policy: negative is good, and zero means no position or exact break-even.
+        // `optimizer share` is structurally zero. `mean |f_hat|` and `cap binds` expose
+        // overconfident sizing even when likelihood looks acceptable.
         write_chart(
             &dir,
             "pretrain_growth_term",
-            format!("Pretrain Expected-Log-Growth Term - {suffix}"),
+            format!("Pretrain Raw-Payoff Diagnostic - {suffix}"),
             "record",
-            "nats/bar (growth), fraction (share, cap binds), leverage (mean |f_hat|)",
+            "nats/bar (growth), fraction (optimizer share, cap binds), leverage (mean |f_hat|)",
             ScaleKind::Linear,
             vec![
                 self.growth_loss.labeled("growth nats/bar", len),
-                self.growth_share.labeled("objective share", len),
+                self.growth_share.labeled("optimizer share", len),
                 self.growth_abs_f.labeled("mean |f_hat|", len),
                 self.growth_clamp_bind.labeled("cap binds", len),
             ],
