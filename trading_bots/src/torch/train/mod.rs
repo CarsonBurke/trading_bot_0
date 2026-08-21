@@ -27,6 +27,10 @@ mod trainer;
 pub(crate) mod update;
 pub(crate) mod value_loss;
 
+pub use horizon::{
+    run_receding_evaluation, RecedingArgs, RecedingBench, DEFAULT_FORECAST_HORIZON,
+    FORECAST_HORIZONS,
+};
 pub use loop_::train;
 pub use pretrain::{
     pretrain, pretrain_calibration, pretrain_candles, pretrain_trade, CalibrationArgs, CandleArgs,

@@ -69,24 +69,21 @@ pub const BAR_VOLUME_EMA_SPAN: f64 = 20.0;
 
 /// Which scoring rule turns the predicted categorical chain into nats.
 ///
-/// The three modes are NOT comparable to one another in absolute nats. They differ by
-/// additive constants that depend on the binning, so a `density` figure is tens of nats
-/// below a `smoothed` one on the identical model. Every artifact therefore records the
-/// mode, the lineage hash covers it, and `pretrain-compare` refuses to pair two runs that
-/// disagree.
+/// [`Self::Hard`] is the canonical pretraining contract. The other modes are diagnostics
+/// against deliberately different target laws or measures, and their absolute values must
+/// never be used to select or resume a categorical pretraining run.
 ///
-/// * [`Self::Smoothed`] inherits the critic's HL-Gauss setting: the target is a Gaussian at
-///   `BAR_LABEL_SIGMA_RATIO` local bin widths, discretized over the bins. That regularizes
-///   against a NOISY target, which is what a bootstrapped value estimate is — and what a
-///   bar observation is not. Kept because the campaign's earlier runs were scored under it.
-/// * [`Self::Hard`] is indexed cross entropy on the containing-bin class: proper for the
-///   discretized law, with no artificial floor or dense one-hot target, but its scale still
-///   moves with [`NUM_BAR_BINS`] because finer bins mean a smaller per-bin probability.
-/// * [`Self::Density`] is a finite-bin measure diagnostic: it scores atom bins as
-///   probability masses and continuous bins as the piecewise-constant quantity
-///   `P_b / width_b`. The fitted support clips observations into finite outer bins, so those
-///   bins do not define normalized continuous tails. This score is neither a proper open-tail
-///   density model nor guaranteed invariant to changing [`NUM_BAR_BINS`].
+/// * [`Self::Hard`] is indexed cross entropy on the containing-bin class: the proper score
+///   for the fixed discretized law, with no artificial floor or dense one-hot target. Its
+///   scale still moves with [`NUM_BAR_BINS`] because finer bins mean a smaller per-bin
+///   probability.
+/// * [`Self::Density`] is an explicitly named fixed-support mixed-measure diagnostic. It
+///   scores atom bins as probability masses and finite continuous bins as `P_b / width_b`.
+///   The fitted support clamps observations into finite catch-all edge bins, so this is not
+///   a normalized raw likelihood for open tails and is not comparable across bin geometries.
+/// * [`Self::Smoothed`] inherits the critic's HL-Gauss target. It remains available for
+///   historical diagnostics, but it is proper for the smoothed target law rather than the
+///   observed categorical bar law.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BarScoring {
@@ -108,8 +105,21 @@ impl BarScoring {
         }
     }
 
-    /// True when the observation's MEASURE enters the score, i.e. the continuous part is a
-    /// log density rather than a log probability. Only [`Self::Density`] is.
+    /// Unambiguous label for reports and checkpoint selection metadata.
+    ///
+    /// In particular, a density diagnostic must never be labeled as categorical NLL: its
+    /// finite-bin measure offset changes the displayed value even though it cannot change a
+    /// logit gradient or model ordering on fixed geometry.
+    pub fn report_contract(self) -> &'static str {
+        match self {
+            Self::Smoothed => "smoothed-target cross entropy (diagnostic)",
+            Self::Hard => "hard categorical NLL",
+            Self::Density => "fixed-support mixed-measure score (diagnostic)",
+        }
+    }
+
+    /// True when the finite-bin measure offset enters this fixed-support diagnostic. Only
+    /// [`Self::Density`] is; this says nothing about normalized open-tail likelihoods.
     pub fn is_density(self) -> bool {
         matches!(self, Self::Density)
     }
@@ -532,14 +542,26 @@ struct BarSupportsJson {
     /// `BAR_DOF` rows of `num_bins`: `E[x^2 | x in bin]`, same sample and same rule.
     #[serde(default)]
     bin_second_moments: Option<Vec<Vec<f64>>>,
+    /// `NUM_BAR_BINS` entries for DOF `r`: directly fitted `E[expm1(r) | r in bin]`
+    /// for observed bins, and zero for bins absent from the fit sample. Absent below
+    /// [`BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION`].
+    #[serde(default)]
+    bin_simple_return_means: Option<Vec<f64>>,
+    /// `NUM_BAR_BINS` entries for DOF `r`: directly fitted `E[expm1(r)^2 | r in bin]`
+    /// for observed bins. An unobserved bin carries the largest fitted conditional second
+    /// moment, a finite risk-only completion rather than an invented geometric payoff.
+    #[serde(default)]
+    bin_simple_return_second_moments: Option<Vec<f64>>,
 }
 
 impl BarSupportsJson {
-    /// The ONLY place [`BAR_SUPPORTS_FORMAT_VERSION`] is stamped, and it takes the fitted
-    /// moments as a REQUIRED argument. The version and the content that version promises
-    /// therefore cannot come apart: this constructor is unnameable without moments in hand,
-    /// so no code path can produce a v5 value whose moments are absent.
-    fn v5(supports: &BarSupports, moments: &BarBinMoments) -> Self {
+    /// The ONLY place [`BAR_SUPPORTS_FORMAT_VERSION`] is stamped, and it takes every fitted
+    /// moment promised by the current schema as a REQUIRED argument.
+    fn current(supports: &BarSupports, moments: &BarBinMoments) -> Self {
+        let simple = moments
+            .simple_return
+            .as_ref()
+            .expect("the current support schema requires fitted simple-return moments");
         Self {
             format_version: BAR_SUPPORTS_FORMAT_VERSION,
             num_bins: NUM_BAR_BINS,
@@ -551,24 +573,25 @@ impl BarSupportsJson {
             provenance: supports.provenance.clone(),
             bin_means: Some(moments.mean.iter().cloned().collect()),
             bin_second_moments: Some(moments.second.iter().cloned().collect()),
+            bin_simple_return_means: Some(simple.mean.clone()),
+            bin_simple_return_second_moments: Some(simple.second.clone()),
         }
     }
 }
 
-/// Current persisted schema. v4 adds [`BarSupportsProvenance`]; v5 adds the fitted per-bin
-/// conditional moments that [`BarSupports::bin_means`] exposes.
-pub(crate) const BAR_SUPPORTS_FORMAT_VERSION: u32 = 5;
-/// First schema carrying fitted per-bin moments. Below it `bin_means_measured()` is false and
-/// no consumer may invent a substitute — that is the whole point of versioning them separately.
+/// Current persisted schema. v4 adds [`BarSupportsProvenance`], v5 adds fitted log-space
+/// per-bin moments, and v6 adds directly measured simple-return moments for the traded DOF.
+pub(crate) const BAR_SUPPORTS_FORMAT_VERSION: u32 = 6;
+/// First schema carrying fitted log-space per-bin moments.
 pub(crate) const BAR_SUPPORTS_MOMENTS_VERSION: u32 = 5;
-/// Still readable, and deliberately so: the campaign's live supports were written under v3/v4 and
-/// refitting them would move the `nll_bar` scale mid-campaign. They load with no provenance
-/// (v3) and no fitted moments (v3, v4), which the caller must then accept explicitly rather
-/// than by default.
+/// First schema carrying `E[expm1(r) | bin]` and `E[expm1(r)^2 | bin]`.
+pub(crate) const BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION: u32 = 6;
+/// Still readable so an operator can run the explicit moments migration. Consumers that need
+/// simple-return moments must ask for them and fail on their absence; they never reconstruct
+/// them from v5's log-space moments.
 const BAR_SUPPORTS_LEGACY_VERSION: u32 = 3;
-/// Every schema this build accepts. An unlisted version is refused outright rather than
-/// coerced, because a support whose geometry we cannot name is not a support.
-const BAR_SUPPORTS_READABLE_VERSIONS: [u32; 3] = [5, 4, BAR_SUPPORTS_LEGACY_VERSION];
+/// Every schema this build accepts. An unlisted version is refused outright.
+const BAR_SUPPORTS_READABLE_VERSIONS: [u32; 4] = [6, 5, 4, BAR_SUPPORTS_LEGACY_VERSION];
 
 /// `format_version` of the artifact at `path`, read WITHOUT building a support.
 ///
@@ -696,37 +719,70 @@ pub struct BarSupports {
     provenance: Option<BarSupportsProvenance>,
 }
 
-/// Fitted `E[x | bin]` and `E[x^2 | bin]` per DOF, measured on the fit sample.
+/// Fitted conditional moments measured on raw, unclamped fit observations.
 ///
-/// Both are accumulated over RAW, UNCLAMPED observations, binned by the same rule
-/// [`BarSupports::bin_of`] applies. That is what makes the mean unbiased: `bin_of` clamps,
-/// so the outermost bin's probability is the probability that `x` lands ANYWHERE beyond the
-/// support bound, and the representative that makes `sum_b p_b m_b` an unbiased estimate of
-/// `E[x]` is therefore the untruncated `E[x | x beyond bound]`. A mean measured on clamped
-/// values would be pulled toward the bound and reproduce the very bias being removed, and
-/// `m_b` may legitimately fall outside `[lo_b, hi_b]` for the two catch-alls.
-///
-/// CAVEAT ON THE SECOND MOMENT, which a consumer must not launder into a population
-/// constant: `r` has a measured tail exponent near 1.8, so `E[x^2]` DOES NOT EXIST in the
-/// population and the outer entries are sample statistics that grow with sample size and
-/// with wherever the support clip was placed. They are strictly better than decoding a
-/// second moment off the bounds — that overstates by 9.6x on the lever arm alone — but a
-/// variance built from them is a statement about this sample's truncation, not a converged
-/// quantity. The mean has no such problem: first moments converge at exponent 1.8, which is
-/// what makes the Mincer-Zarnowitz MEAN slope a well-posed calibration target and the
-/// variance slope not one.
-// No `Clone`: `Tensor` has none, and `to_device` is the only copy anyone needs.
+/// Log-space moments exist for every DOF. Simple-return moments exist only for `r`, the traded
+/// DOF, and observed bins are accumulated from `R = expm1(r)` observation by observation. In
+/// particular, `E[R^2 | bin]` is not `E[R | bin]^2`, nor may it be reconstructed by applying
+/// `expm1` to either log-space moment. Because a conditional moment is undefined for an
+/// unobserved bin, those entries use the explicit conservative completion documented on
+/// [`BarSupports::simple_return_bin_moments`].
 #[derive(Debug)]
 struct BarBinMoments {
     mean: [Vec<f64>; BAR_DOF],
     second: [Vec<f64>; BAR_DOF],
+    simple_return: Option<SimpleReturnBinMoments>,
     /// `[BAR_DOF, NUM_BAR_BINS]` device copies for the tensor path.
     mean_t: Tensor,
     second_t: Tensor,
 }
 
+#[derive(Debug)]
+struct SimpleReturnBinMoments {
+    mean: Vec<f64>,
+    second: Vec<f64>,
+    /// `[1, NUM_BAR_BINS]` device copies.
+    mean_t: Tensor,
+    second_t: Tensor,
+}
+
+impl SimpleReturnBinMoments {
+    fn new(mean: Vec<f64>, second: Vec<f64>, device: Device) -> Self {
+        let narrow =
+            |row: Vec<f64>| -> Vec<f64> { row.into_iter().map(|x| x as f32 as f64).collect() };
+        let mean = narrow(mean);
+        let second = narrow(second);
+        let mean_t = Tensor::from_slice(&mean.iter().map(|&x| x as f32).collect::<Vec<_>>())
+            .view([1, NUM_BAR_BINS])
+            .to_device(device);
+        let second_t = Tensor::from_slice(&second.iter().map(|&x| x as f32).collect::<Vec<_>>())
+            .view([1, NUM_BAR_BINS])
+            .to_device(device);
+        Self {
+            mean,
+            second,
+            mean_t,
+            second_t,
+        }
+    }
+
+    fn to_device(&self, device: Device) -> Self {
+        Self {
+            mean: self.mean.clone(),
+            second: self.second.clone(),
+            mean_t: self.mean_t.to_device(device),
+            second_t: self.second_t.to_device(device),
+        }
+    }
+}
+
 impl BarBinMoments {
-    fn new(mean: [Vec<f64>; BAR_DOF], second: [Vec<f64>; BAR_DOF], device: Device) -> Self {
+    fn new(
+        mean: [Vec<f64>; BAR_DOF],
+        second: [Vec<f64>; BAR_DOF],
+        simple_return: Option<(Vec<f64>, Vec<f64>)>,
+        device: Device,
+    ) -> Self {
         // Narrowed to f32 for the tensor path and re-widened on the host side, exactly as
         // the bounds are, so a host lookup and a device lookup agree bit for bit and a JSON
         // round trip changes nothing.
@@ -748,6 +804,8 @@ impl BarBinMoments {
         Self {
             mean: narrow(mean),
             second: narrow(second),
+            simple_return: simple_return
+                .map(|(mean, second)| SimpleReturnBinMoments::new(mean, second, device)),
             mean_t,
             second_t,
         }
@@ -757,6 +815,10 @@ impl BarBinMoments {
         Self {
             mean: self.mean.clone(),
             second: self.second.clone(),
+            simple_return: self
+                .simple_return
+                .as_ref()
+                .map(|moments| moments.to_device(device)),
             mean_t: self.mean_t.to_device(device),
             second_t: self.second_t.to_device(device),
         }
@@ -773,72 +835,16 @@ impl BarBinMoments {
 /// property of every predicted mean, not a rounding choice, and it is therefore named,
 /// selected explicitly, and recorded rather than inferred.
 ///
-/// [`Self::Edge`] IS THE DEFAULT AND STAYS THE DEFAULT. Every historical number in this tree —
-/// the Mincer-Zarnowitz mean slopes, the Kelly bets, the horizon frontier, the skill deciles —
-/// was measured under it, and flipping the default would silently move every one of them
-/// without moving the artifact they were computed from. A consumer that wants the fitted
-/// decode asks for it by name.
+/// [`Self::Edge`] remains the default for geometry-valued operations such as sampling and the
+/// CRPS atom grid. A log-return first-moment consumer that needs fitted conditional means asks
+/// for [`Self::Fitted`] explicitly.
 ///
-/// EVERY PRODUCTION CONSUMER OF THE DECODE, and exactly what switching each one to
-/// [`Self::Fitted`] would change. Enumerated here rather than left to a grep because a partial
-/// switch is worse than none UNLESS the split is deliberate and written down: two consumers on
-/// two conventions otherwise produce two incomparable predicted means with no error anywhere.
-/// Located by symbol; the line numbers move.
-///
-/// The split is deliberate, and it is drawn in exactly one place — between the OBJECTIVE and
-/// every MEASUREMENT. Item (2) is the sole objective-side consumer and the sole consumer read
-/// under [`Self::Fitted`]. Items (1) and (3) through (7) are measurement-side and stay on
-/// [`Self::Edge`], so every number this tree has ever reported remains comparable with the one
-/// before it. FIRST-MOMENT consumers, all of which WOULD move if switched:
-/// 1. [`BarSupports::expectation`] — `sum_b p_b centers_b` over `[..., BAR_DOF, NUM_BAR_BINS]`
-///    logits, the generic predicted mean. Switching moves the predicted mean of EVERY DOF by
-///    `p_0 (m_0 - lo_0) + p_127 (m_127 - hi_127)`, which on `r` is the whole 3.1x catch-all
-///    re-pricing; it is the single highest-leverage switch and everything else inherits from it.
-/// 2. `train::growth::GrowthSupport::new` — maps the decode through `exp_m1` into the per-bin
-///    SIMPLE returns of the expected-log-growth term. SWITCHED, and the only one: it requests
-///    [`Self::Fitted`] by name and ERRORS on a support without measured moments rather than
-///    degrading. Under [`Self::Edge`] it priced `r`'s two open-ended bins at
-///    `exp_m1(-883.32 bps) = -8.4543%` and `exp_m1(+880.38 bps) = +9.2030%` against fitted
-///    conditional means of `-2.7794%` and `+2.9014%` — 3.04x and 3.17x too much on 1.4474% of
-///    the mass that carries 92.38% of the central second moment, so the cheapest route to
-///    expected log growth was to move mass into two bins that overpaid threefold. An objective
-///    may not pay for an outcome the corpus never realized; a measurement must keep its
-///    convention. That is the whole of the split. This consumer reaches NO solver: the growth
-///    term's `f_raw = mu/var` is saturated at `train::trade_bench::LEVERAGE_CAP` and its log
-///    argument is guarded off the support BOUNDS rather than off the decode, so the ruin-point
-///    and bracket consequence described under (6) does not arise here — it belongs to (6)
-///    alone, which is unchanged.
-/// 3. `train::horizon` (the frontier's one-bar decode) — the predicted mean the break-even cost
-///    curve is built on. Switching lowers every predicted `|mu|`, so break-even cost falls and
-///    the frontier shifts DOWN; the model-versus-baseline ORDERING is preserved only if the
-///    baselines are re-decoded in the same pass, which is why this one must not be switched
-///    alone.
-/// 4. `train::horizon` (the k-bar aggregate decode) — same tensor, same effect, aggregated over
-///    the holding horizon, so the shift compounds with `k`.
-/// 5. `train::skill::SkillCutpoints::with_support_geometry` — the decode defines the CONFIDENCE
-///    DECILE cutpoints. Switching compresses the outer deciles, so the same bars land in
-///    different deciles: the skill profile's x-axis moves and no decile is comparable across the
-///    switch. Deciles are the one place a decode change is invisible in the y-values and total
-///    in the x-binning.
-/// 6. `train::trade_bench::bin_returns` — the `exp_m1` per-bin simple returns the Kelly solve
-///    and every bench policy price their bets with. Same ruin-point consequence as (2).
-/// 7. `train::trade_bench` (the per-chunk `centers` row on the window paths) — feeds
-///    `predicted_mean`, `predicted_var` and hence the Mincer-Zarnowitz mean slope. This is the
-///    consumer the whole decode investigation is about: the slope is
-///    `Cov(mu, r) / Var(mu)`, so shrinking the catch-all decode shrinks `Var(mu)` far faster
-///    than `Cov(mu, r)` — 92.38% of `Var(mu)` sits in those two bins — and the slope RISES.
-///
-/// NON-first-moment consumers of the SAME array, which must NOT be switched:
-/// 8. [`BarSupports`]'s sampling path (`sample_flat`) — decodes a DRAWN bin to a value. The
-///    bound is correct here: a sample from the catch-all should not be an extreme nobody
-///    observed, and the conditional MEAN of a catch-all is not a plausible draw from it.
-/// 9. [`bar_crps_from_logits`] — treats the bins as atoms at their decode values. CRPS is a
-///    distributional score, not a first moment, and its atom grid is a property of the
-///    geometry.
-///
-/// A `#[cfg(test)]`-only site in `train::skill` also reads `centers(DOF_R)` to rebuild `mu` for
-/// a test; it is NOT a production consumer and is listed only because it has been miscounted as
-/// one.
+/// Economic sizing is deliberately outside this enum. Kelly and growth require two moments of
+/// the nonlinear simple return `R = expm1(r)`, so they use
+/// [`BarSupports::simple_return_bin_moments`] instead. Mapping either decode through `expm1`
+/// cannot recover `E[R | bin]`, and squaring one representative cannot recover `E[R^2 | bin]`.
+/// Keeping that API separate makes the forbidden approximations impossible to request as a
+/// decode convention.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MeanDecode {
     /// Bin MIDPOINTS, with the two outermost bins pinned to the support BOUNDS.
@@ -1015,20 +1021,19 @@ impl BarSupports {
         normalize_rows(marginal)
     }
 
-    /// Accumulate `E[x | bin]` and `E[x^2 | bin]` over the whole fit sample.
+    /// Accumulate conditional log-return moments for every DOF and conditional simple-return
+    /// moments for `r` over the whole fit sample.
     ///
-    /// One pass, exact, no subsampling: unlike the smoothed marginal this needs no kernel
-    /// evaluation, so the full sample is affordable and the outer bins — which hold under
-    /// 1% of the mass and dominate both moments — need every row they can get.
-    ///
-    /// RAW values, binned by [`Self::bin_of`], which clamps. See [`BarBinMoments`]: that
-    /// combination is what makes `sum_b p_b m_b` unbiased for `E[x]`, and it lets the two
-    /// catch-alls take a representative outside their own bounds.
+    /// Simple-return moments are measured directly from each raw observation:
+    /// `R = expm1(r)`, then accumulate `R` and `R^2`. Applying `expm1` to `E[r | bin]` would
+    /// erase Jensen curvature; squaring `E[R | bin]` would erase within-bin variance.
     fn measure_bin_moments(&self, samples: &[BarDof]) -> BarBinMoments {
         let bins = NUM_BAR_BINS as usize;
         let mut sum: [Vec<f64>; BAR_DOF] = std::array::from_fn(|_| vec![0.0; bins]);
         let mut sum_sq: [Vec<f64>; BAR_DOF] = std::array::from_fn(|_| vec![0.0; bins]);
         let mut count: [Vec<f64>; BAR_DOF] = std::array::from_fn(|_| vec![0.0; bins]);
+        let mut simple_sum = vec![0.0; bins];
+        let mut simple_sum_sq = vec![0.0; bins];
         for sample in samples.iter().filter(|d| d.is_finite()) {
             let values = sample.to_array();
             for dof in 0..BAR_DOF {
@@ -1037,13 +1042,22 @@ impl BarSupports {
                 sum[dof][bin] += x;
                 sum_sq[dof][bin] += x * x;
                 count[dof][bin] += 1.0;
+                if dof == DOF_R {
+                    let simple = x.exp_m1();
+                    simple_sum[bin] += simple;
+                    simple_sum_sq[bin] += simple * simple;
+                }
             }
         }
-        // An unobserved bin falls back to its center, the only value the geometry alone
-        // justifies. Equal-mass bins make this essentially unreachable on a real corpus —
-        // 4M rows over 128 bins — and where it does happen the bin carries no mass, so it
-        // cannot move a moment. It is NOT a silent stand-in for a measurement: an
-        // all-fallback support is impossible, because `fit` refuses an empty sample.
+        // Log-space moments retain the historical center for a zero-mass bin. They are generic
+        // decode diagnostics. Simple-return moments have an economic consumer, so an unobserved
+        // bin must not inherit a directional payoff from geometry: doing that would let a model
+        // manufacture Kelly edge merely by moving probability onto a bin absent from the fit.
+        // Observed bins remain direct measurements. An unobserved bin gets zero first moment and
+        // the largest observed conditional second moment. It therefore contributes no edge and
+        // at least as much quadratic risk as any evidenced bin; under the fitted marginal it has
+        // exactly zero weight, so this conservative completion cannot change either fitted
+        // aggregate moment.
         let mean: [Vec<f64>; BAR_DOF] = std::array::from_fn(|dof| {
             (0..bins)
                 .map(|bin| {
@@ -1061,8 +1075,6 @@ impl BarSupports {
                 .map(|bin| {
                     let n = count[dof][bin];
                     if n > 0.0 {
-                        // Clamped below `mean^2` so a consumer can never read a negative
-                        // within-bin variance out of rounding on a near-degenerate bin.
                         (sum_sq[dof][bin] / n).max(mean[dof][bin] * mean[dof][bin])
                     } else {
                         self.centers[dof][bin] * self.centers[dof][bin]
@@ -1070,7 +1082,30 @@ impl BarSupports {
                 })
                 .collect()
         });
-        BarBinMoments::new(mean, second, self.device)
+        let mut simple_mean = vec![0.0; bins];
+        let mut simple_second = vec![0.0; bins];
+        let mut conservative_second = 0.0f64;
+        for bin in 0..bins {
+            let n = count[DOF_R][bin];
+            if n > 0.0 {
+                let fitted_mean = simple_sum[bin] / n;
+                let fitted_second = (simple_sum_sq[bin] / n).max(fitted_mean * fitted_mean);
+                simple_mean[bin] = fitted_mean;
+                simple_second[bin] = fitted_second;
+                conservative_second = conservative_second.max(fitted_second);
+            }
+        }
+        for bin in 0..bins {
+            if count[DOF_R][bin] == 0.0 {
+                simple_second[bin] = conservative_second;
+            }
+        }
+        BarBinMoments::new(
+            mean,
+            second,
+            Some((simple_mean, simple_second)),
+            self.device,
+        )
     }
 
     fn from_bins(
@@ -1316,7 +1351,7 @@ impl BarSupports {
     ///
     /// Recomputes the empirical bin masses of `samples` through exactly [`Self::bin_of`] and
     /// refuses the upgrade unless every entry reproduces the PERSISTED `masses` row to within
-    /// `tolerance`. That single check covers both ways a v4 -> v5 upgrade can go quietly wrong:
+    /// `tolerance`. That check covers both ways a geometry-preserving moments upgrade can fail:
     /// a different SAMPLE (wrong budget, wrong seed, a corpus that grew, the wrong split
     /// bound) and a different BINNING RULE (a `bin_of`, atom-detection or clip change since the
     /// artifact was written). Either produces moments indexed by bins whose mass they do not
@@ -1405,6 +1440,32 @@ impl BarSupports {
     /// `[BAR_DOF, NUM_BAR_BINS]` fitted means and second moments on this support's device.
     pub fn bin_moment_tensors(&self) -> Option<(&Tensor, &Tensor)> {
         self.bin_moments
+            .as_ref()
+            .map(|moments| (&moments.mean_t, &moments.second_t))
+    }
+
+    /// Train-fitted per-bin simple-return moments for DOF `r`.
+    ///
+    /// Returns `(E[R | bin], E[R^2 | bin])` with `R = expm1(r)`. Observed bins are measured
+    /// directly over raw observations routed through the support's atom-aware binning rule.
+    /// A bin absent from the fit sample has first moment zero and the largest observed
+    /// conditional second moment, so forecast mass assigned to it adds no directional edge and
+    /// cannot lower the fitted risk scale. `None` means the artifact predates
+    /// [`BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION`]; consumers must fail rather than derive a
+    /// nonlinear approximation from log-return moments or bin geometry.
+    pub fn simple_return_bin_moments(&self) -> Option<(&[f64], &[f64])> {
+        self.bin_moments
+            .as_ref()?
+            .simple_return
+            .as_ref()
+            .map(|moments| (moments.mean.as_slice(), moments.second.as_slice()))
+    }
+
+    /// Device-resident `[1, NUM_BAR_BINS]` twin of [`Self::simple_return_bin_moments`].
+    pub fn simple_return_bin_moment_tensors(&self) -> Option<(&Tensor, &Tensor)> {
+        self.bin_moments
+            .as_ref()?
+            .simple_return
             .as_ref()
             .map(|moments| (&moments.mean_t, &moments.second_t))
     }
@@ -1677,14 +1738,14 @@ impl BarSupports {
         }
     }
 
-    /// Per-DOF `E_x[ln width(bin(x))]` over the fit sample: the additive term that turns a
-    /// categorical log-loss into a log-DENSITY loss.
+    /// Per-DOF `E_x[ln width(bin(x))]` over the fit sample: the additive term in the
+    /// fixed-support mixed-measure diagnostic.
     ///
-    /// Atoms carry a probability MASS rather than a density, so their zero-width bins
-    /// contribute exactly nothing. It is strongly NEGATIVE — a `128`-bin equal-mass tiling
-    /// of five-minute log returns has bins of order `1e-4` wide — which is why a `density`
-    /// figure sits tens of nats below a `hard` one on the identical model, and why the two
-    /// must never be compared.
+    /// Atoms carry a probability MASS, so their zero-width bins contribute nothing. The
+    /// continuous-bin term is strongly negative, which puts the diagnostic tens of nats
+    /// below Hard on the identical model. It is a target/support constant only on this
+    /// frozen finite geometry; the clamped catch-all edge bins do not turn it into a
+    /// normalized raw open-tail likelihood.
     pub fn log_measure_dof(&self) -> [f64; BAR_DOF] {
         std::array::from_fn(|dof| {
             (0..NUM_BAR_BINS as usize)
@@ -2018,30 +2079,31 @@ impl BarSupports {
         }
     }
 
-    /// Persist the fitted bin bounds as JSON next to the checkpoint. Decimal
-    /// round-tripping is faithful to within an ulp of `f64`, and `from_bins`
-    /// re-narrows to `f32`, so a reloaded support is bit-identical where evaluated.
+    /// Persist the support in the current schema.
     ///
-    /// REFUSES, before touching the filesystem, a support carrying no fitted moments.
-    /// [`BAR_SUPPORTS_FORMAT_VERSION`] is the only schema this build writes and its invariant
-    /// is that the moments are present, so such a support has no valid representation on disk.
-    /// Stamping v4 instead is NOT the alternative: the file would then be indistinguishable
-    /// from an honestly fitted pre-moments artifact and the caller's belief that it holds a
-    /// measurement would go unrecorded. Reaching this means the caller loaded a pre-v5 support
-    /// and is trying to hand it on as a checkpoint's own geometry, which
-    /// [`crate::torch::train::pretrain`] refuses at startup so it cannot surface here.
+    /// REFUSES before touching the filesystem unless both the generic log-space moments and
+    /// the traded DOF's directly measured simple-return moments are present. A v5 support can
+    /// be loaded for explicit migration, but cannot be silently re-saved as v6.
     pub fn save(&self, path: &Path) -> Result<()> {
         let Some(moments) = self.bin_moments.as_ref() else {
             bail!(
-                "refusing to write bar supports {}: these in-memory supports carry no fitted \
-                 per-bin moments, so no valid version {BAR_SUPPORTS_FORMAT_VERSION} artifact can \
-                 be written from them. They were loaded from a pre-v{BAR_SUPPORTS_MOMENTS_VERSION} \
-                 file; measure moments onto that exact geometry with the `bar-supports-moments` \
-                 subcommand and point this run at the result",
+                "refusing to write bar supports {}: these supports carry no fitted per-bin \
+                 moments; measure moments onto this exact geometry with the \
+                 `bar-supports-moments` subcommand",
                 path.display()
             );
         };
-        let json = BarSupportsJson::v5(self, moments);
+        if moments.simple_return.is_none() {
+            bail!(
+                "refusing to write bar supports {}: these supports lack directly measured \
+                 simple-return first and second moments required by format version \
+                 {BAR_SUPPORTS_FORMAT_VERSION}. They were loaded from a pre-v\
+                 {BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION} artifact; rerun \
+                 `bar-supports-moments` on this exact geometry",
+                path.display()
+            );
+        }
+        let json = BarSupportsJson::current(self, moments);
         let body = serde_json::to_vec_pretty(&json).context("serializing bar supports")?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -2065,6 +2127,27 @@ impl BarSupports {
                 BAR_SUPPORTS_READABLE_VERSIONS
             );
         }
+        if json.format_version < BAR_SUPPORTS_MOMENTS_VERSION
+            && (json.bin_means.is_some() || json.bin_second_moments.is_some())
+        {
+            bail!(
+                "bar supports {} declares legacy version {} but contains fitted log-return \
+                 moment members introduced in version {BAR_SUPPORTS_MOMENTS_VERSION}",
+                path.display(),
+                json.format_version
+            );
+        }
+        if json.format_version < BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION
+            && (json.bin_simple_return_means.is_some()
+                || json.bin_simple_return_second_moments.is_some())
+        {
+            bail!(
+                "bar supports {} declares version {} but contains fitted simple-return moment \
+                 members introduced in version {BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION}",
+                path.display(),
+                json.format_version
+            );
+        }
         // A file at or above the moments version MUST carry them. Without this a v5 written
         // by a build that failed to populate them would load with `bin_means_measured()`
         // false and be indistinguishable from an honest v4 — the version would claim a
@@ -2074,6 +2157,17 @@ impl BarSupports {
         {
             bail!(
                 "bar supports {} declares version {} but is missing fitted per-bin moments",
+                path.display(),
+                json.format_version
+            );
+        }
+        if json.format_version >= BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION
+            && (json.bin_simple_return_means.is_none()
+                || json.bin_simple_return_second_moments.is_none())
+        {
+            bail!(
+                "bar supports {} declares version {} but is missing fitted simple-return first \
+                 and second moments for DOF r",
                 path.display(),
                 json.format_version
             );
@@ -2111,9 +2205,9 @@ impl BarSupports {
             std::array::from_fn(|_| smoothed.next().expect("length checked above")),
             Device::Cpu,
         )?;
-        // Moments are attached only when BOTH rows are present and correctly shaped. A
-        // half-present pair is refused rather than half-attached, so `bin_means_measured()`
-        // is never true for a support whose second moments are absent.
+        // Generic moments are attached only as a complete pair. Simple-return moments are
+        // independently optional only for readable v5 artifacts; v6 was rejected above unless
+        // both rows were present.
         if let (Some(mean), Some(second)) = (json.bin_means, json.bin_second_moments) {
             let bins = NUM_BAR_BINS as usize;
             for (what, rows) in [("bin_means", &mean), ("bin_second_moments", &second)] {
@@ -2134,11 +2228,37 @@ impl BarSupports {
                     );
                 }
             }
+            let simple_return = match (
+                json.bin_simple_return_means,
+                json.bin_simple_return_second_moments,
+            ) {
+                (Some(simple_mean), Some(simple_second)) => {
+                    for (what, row) in [
+                        ("bin_simple_return_means", &simple_mean),
+                        ("bin_simple_return_second_moments", &simple_second),
+                    ] {
+                        if row.len() != bins || row.iter().any(|x| !x.is_finite()) {
+                            bail!(
+                                "bar supports {} has malformed {what}: expected {bins} finite \
+                                 entries",
+                                path.display()
+                            );
+                        }
+                    }
+                    Some((simple_mean, simple_second))
+                }
+                (None, None) => None,
+                _ => bail!(
+                    "bar supports {} has only one of the two fitted simple-return moment rows",
+                    path.display()
+                ),
+            };
             let mut mean = mean.into_iter();
             let mut second = second.into_iter();
             supports.bin_moments = Some(BarBinMoments::new(
                 std::array::from_fn(|_| mean.next().expect("length checked above")),
                 std::array::from_fn(|_| second.next().expect("length checked above")),
+                simple_return,
                 Device::Cpu,
             ));
         }
@@ -3043,15 +3163,9 @@ impl BarEmissionHead {
     }
 
     /// Ancestral sample of a bar's DOF from beliefs and forecast conditioning
-    /// `[..., latent_dim]`, returning `[..., BAR_DOF]`. Sequential over the five
-    /// chain factors (inherent to the factorization) and fully vectorized over
+    /// `[..., latent_dim]`, returning `[..., BAR_DOF]` values. Sequential over the
+    /// five chain factors (inherent to the factorization) and fully vectorized over
     /// every leading dimension.
-    ///
-    /// Each step conditions the rest of the chain on the BIN it drew, not on the
-    /// value it decoded to, so the rollout prefix is exactly the quantity the
-    /// teacher-forced path was fitted on. Re-binning the drawn value would round-trip
-    /// through `lo + (hi - lo) * u`, which can land on a bin boundary and shift the
-    /// conditioning by one bin.
     pub fn sample(
         &self,
         h: &Tensor,
@@ -3059,6 +3173,25 @@ impl BarEmissionHead {
         supports: &BarSupports,
         temperature: f64,
     ) -> Tensor {
+        self.sample_binned(h, conditioning, supports, temperature).0
+    }
+
+    /// Ancestral sample returning both the decoded DOF values and the exact bins drawn,
+    /// each shaped `[..., BAR_DOF]`.
+    ///
+    /// Each step conditions the rest of the chain on the BIN it drew, not on the
+    /// value it decoded to, so the rollout prefix is exactly the quantity the
+    /// teacher-forced path was fitted on. Returning those same bins lets downstream
+    /// conditional-moment reductions preserve the sampled categorical path without
+    /// recovering bins from continuous values. Such a round trip through
+    /// `lo + (hi - lo) * u` can land on a shared boundary and shift a bin by one.
+    pub fn sample_binned(
+        &self,
+        h: &Tensor,
+        conditioning: &Tensor,
+        supports: &BarSupports,
+        temperature: f64,
+    ) -> (Tensor, Tensor) {
         tch::no_grad(|| {
             let lead = leading_dims(h, self.latent_dim, "latent");
             assert_eq!(
@@ -3093,6 +3226,7 @@ impl BarEmissionHead {
                 .map(|_| Tensor::zeros([rows], (Kind::Int64, device)))
                 .collect();
             let mut sampled: Vec<Option<Tensor>> = (0..BAR_DOF).map(|_| None).collect();
+            let mut sampled_bins: Vec<Option<Tensor>> = (0..BAR_DOF).map(|_| None).collect();
 
             for (position, &dof) in BAR_CHAIN.iter().enumerate() {
                 let prefix_bins = Tensor::stack(&slot_bins, 1);
@@ -3103,16 +3237,25 @@ impl BarEmissionHead {
                     + masked.linear(&prefix_w_all.select(0, dof as i64), None::<Tensor>);
                 let (value, bin) = supports.sample_dof_binned(dof, &logits, temperature);
                 if position < BAR_PREFIX_SLOTS {
-                    slot_bins[position] = bin;
+                    slot_bins[position] = bin.shallow_clone();
                 }
                 sampled[dof] = Some(value);
+                sampled_bins[dof] = Some(bin);
             }
 
             let values: Vec<Tensor> = sampled
                 .into_iter()
                 .map(|v| v.expect("every DOF sampled"))
                 .collect();
-            Tensor::stack(&values, -1).reshape(with_tail(&lead, &[BAR_DOF as i64]))
+            let bins: Vec<Tensor> = sampled_bins
+                .into_iter()
+                .map(|v| v.expect("every DOF bin sampled"))
+                .collect();
+            let shape = with_tail(&lead, &[BAR_DOF as i64]);
+            (
+                Tensor::stack(&values, -1).reshape(shape.as_slice()),
+                Tensor::stack(&bins, -1).reshape(shape.as_slice()),
+            )
         })
     }
 
@@ -3778,6 +3921,36 @@ mod tests {
             );
         }
 
+        let (simple_means, simple_seconds) = supports
+            .simple_return_bin_moments()
+            .expect("fresh fit carries direct simple-return moments");
+        let r_masses = supports.bin_masses(DOF_R);
+        let fitted_simple_mean: f64 = r_masses
+            .iter()
+            .zip(simple_means)
+            .map(|(p, mean)| p * mean)
+            .sum();
+        let fitted_simple_second: f64 = r_masses
+            .iter()
+            .zip(simple_seconds)
+            .map(|(p, second)| p * second)
+            .sum();
+        let simple_rows: Vec<f64> = samples
+            .iter()
+            .filter(|d| d.is_finite())
+            .map(|d| (d.r as f64).exp_m1())
+            .collect();
+        let truth_simple_mean = simple_rows.iter().sum::<f64>() / simple_rows.len() as f64;
+        let truth_simple_second =
+            simple_rows.iter().map(|r| r * r).sum::<f64>() / simple_rows.len() as f64;
+        assert!(
+            (fitted_simple_mean - truth_simple_mean).abs()
+                < 1e-5 * truth_simple_second.sqrt().max(1e-12)
+        );
+        assert!(
+            (fitted_simple_second - truth_simple_second).abs()
+                < 1e-5 * truth_simple_second.max(1e-24)
+        );
         // The centers cannot do this, and `r` is where it hurts: the two catch-alls decode
         // to their outer bounds, so the same mixture badly overstates the second moment. If
         // this half ever passes, the centers have silently become conditional means and the
@@ -3795,6 +3968,51 @@ mod tests {
             center_second > 2.0 * truth_second,
             "the center decode is supposed to overstate E[r^2]; it gave {center_second:.6e} \
              against a true {truth_second:.6e}, so this fixture no longer exercises the bug"
+        );
+    }
+
+    /// A diagnostic support may legitimately have fewer observed values than bins. The fitted
+    /// marginal assigns those bins zero mass, but a model can later predict them, so their
+    /// economic moments still need a finite, conservative definition. They carry no directional
+    /// edge and the worst fitted conditional second moment: allocating forecast mass to one can
+    /// only add risk to the quadratic Kelly law, never manufacture a profitable certainty.
+    #[test]
+    fn unobserved_return_bins_are_directionless_and_carry_observed_worst_case_risk() {
+        let _torch_rng_guard = test_rng::shared();
+        let sample = BarDof {
+            r: 0.01f64.ln_1p() as f32,
+            ..BarDof::default()
+        };
+        let samples = vec![sample; 512];
+        let supports = BarSupports::fit(&samples);
+        let masses = supports.bin_masses(DOF_R);
+        let (means, seconds) = supports
+            .simple_return_bin_moments()
+            .expect("a fresh support has simple-return moments");
+        let worst_observed_second = (0..NUM_BAR_BINS as usize)
+            .filter(|&bin| masses[bin] > 0.0)
+            .map(|bin| seconds[bin])
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst_observed_second > 0.0 && worst_observed_second.is_finite(),
+            "the observed nonzero return must provide a finite risk fallback"
+        );
+
+        let mut unobserved = 0usize;
+        for bin in 0..NUM_BAR_BINS as usize {
+            assert!(means[bin].is_finite() && seconds[bin].is_finite());
+            if masses[bin] == 0.0 {
+                unobserved += 1;
+                assert_eq!(means[bin], 0.0, "unobserved bin {bin} invented edge");
+                assert_eq!(
+                    seconds[bin], worst_observed_second,
+                    "unobserved bin {bin} did not receive the conservative risk fallback"
+                );
+            }
+        }
+        assert!(
+            unobserved > 0,
+            "the degenerate fixture must leave bins unobserved"
         );
     }
 
@@ -3983,12 +4201,11 @@ mod tests {
         );
     }
 
-    /// A pre-v5 artifact reports no fitted moments rather than presenting its geometry as a
-    /// measurement, and a file CLAIMING v5 without them is refused outright. The refusal is
-    /// the load-bearing half: without it a v5 written by a build that failed to populate the
-    /// moments would be indistinguishable from an honest v4.
+    /// Current-schema round trips pin log-space and simple-return moments. Readable legacy
+    /// artifacts expose absence explicitly, and files claiming moments their version promises
+    /// are refused.
     #[test]
-    fn legacy_supports_report_no_fitted_moments_and_a_lying_v5_is_refused() {
+    fn support_moment_schema_round_trips_and_legacy_absence_is_loud() {
         let _torch_rng_guard = test_rng::shared();
         let dir = std::env::temp_dir().join(format!(
             "trading_bot_0_supports_moments_{}",
@@ -4000,33 +4217,61 @@ mod tests {
         let fitted = synthetic_supports(20_000, 0x5EED);
         fitted.save(&path).expect("save");
         let reloaded = BarSupports::load(&path).expect("load");
-        assert!(
-            reloaded.bin_means_measured(),
-            "a v5 round trip keeps its moments"
-        );
+        assert!(reloaded.bin_means_measured());
         for dof in 0..BAR_DOF {
-            let (before, after) = (
+            assert_eq!(
                 fitted.bin_means(dof).expect("fitted"),
                 reloaded.bin_means(dof).expect("reloaded"),
-            );
-            assert_eq!(
-                before, after,
                 "DOF {} means changed on reload",
                 BAR_DOF_NAMES[dof]
             );
+            assert_eq!(
+                fitted.bin_second_moments(dof).expect("fitted"),
+                reloaded.bin_second_moments(dof).expect("reloaded"),
+                "DOF {} second moments changed on reload",
+                BAR_DOF_NAMES[dof]
+            );
         }
-        // Moving them to a device must not lose them either — the training path only ever
-        // sees a `to_device` copy.
-        assert!(reloaded.to_device(Device::Cpu).bin_means_measured());
+        let fitted_simple = fitted
+            .simple_return_bin_moments()
+            .expect("fitted simple-return moments");
+        let reloaded_simple = reloaded
+            .simple_return_bin_moments()
+            .expect("reloaded simple-return moments");
+        assert_eq!(fitted_simple.0, reloaded_simple.0);
+        assert_eq!(fitted_simple.1, reloaded_simple.1);
+        let moved = reloaded.to_device(Device::Cpu);
+        assert_eq!(
+            moved.simple_return_bin_moments().expect("device copy"),
+            reloaded_simple
+        );
 
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
 
-        // v4: provenance but no moments. Loads, and says so.
+        // v5 has the generic fitted moments but predates direct simple-return moments. It is
+        // readable solely for explicit migration and cannot be re-saved as the current schema.
+        let object = raw.as_object_mut().expect("object");
+        object.insert("format_version".to_owned(), serde_json::json!(5));
+        object.remove("bin_simple_return_means");
+        object.remove("bin_simple_return_second_moments");
+        std::fs::write(&path, serde_json::to_vec(&raw).expect("serialize")).expect("write");
+        let v5 = BarSupports::load(&path).expect("v5 load for migration");
+        assert!(v5.bin_means_measured());
+        assert!(v5.simple_return_bin_moments().is_none());
+        assert!(v5
+            .save(&dir.join("must_not_upgrade_implicitly.json"))
+            .expect_err("v5 needs explicit measurement")
+            .to_string()
+            .contains("simple-return"));
+
+        // v4: provenance but no moments of either kind. Loads, and says so.
         let object = raw.as_object_mut().expect("object");
         object.insert("format_version".to_owned(), serde_json::json!(4));
         object.remove("bin_means");
         object.remove("bin_second_moments");
+        object.remove("bin_simple_return_means");
+        object.remove("bin_simple_return_second_moments");
         std::fs::write(&path, serde_json::to_vec(&raw).expect("serialize")).expect("write");
         let legacy = BarSupports::load(&path).expect("v4 load");
         assert!(
@@ -4035,6 +4280,7 @@ mod tests {
         );
         assert_eq!(legacy.bin_means(DOF_R), None);
         assert_eq!(legacy.bin_second_moments(DOF_R), None);
+        assert_eq!(legacy.simple_return_bin_moments(), None);
         // THE LOUD-ABSENCE CONTRACT, and the regression test for the removed
         // `unwrap_or_else(|| centers)`. The EDGE convention is always available, so the
         // ceiling still answers under it. The FITTED convention is NOT available here and
@@ -4085,6 +4331,25 @@ mod tests {
             "a v5 file missing its fitted moments must be refused, not loaded as a legacy one"
         );
 
+        // A v6 file with valid log moments but no direct simple-return moments is equally a lie.
+        let fitted = synthetic_supports(20_000, 0x5EE2);
+        fitted.save(&path).expect("save current");
+        let mut missing_simple: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+        missing_simple
+            .as_object_mut()
+            .expect("object")
+            .remove("bin_simple_return_second_moments");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&missing_simple).expect("serialize"),
+        )
+        .expect("write");
+        assert!(
+            BarSupports::load(&path).is_err(),
+            "a current file missing either simple-return moment row must be refused"
+        );
+
         // So is a half-present pair, which would otherwise attach means with no second
         // moments and let `bin_means_measured()` be true for an incomplete support.
         raw["bin_means"] = serde_json::json!(vec![vec![0.0f64; NUM_BAR_BINS as usize]; BAR_DOF]);
@@ -4097,11 +4362,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE PRODUCTION FAILURE, moved to the write boundary. A run whose supports came from the
-    /// live pre-v5 corpus artifact used to write a checkpoint sidecar stamped
-    /// `format_version: 5` with no moments in it, and then fail its own reload check — after
-    /// 1000 steps and its first promotion, holding a file the loader was right to refuse. The
-    /// write must fail INSTEAD, and nothing may reach disk.
+    /// A legacy support cannot be written as a current-schema checkpoint sidecar. The refusal
+    /// must happen before any filesystem effect rather than after a promotion produces an
+    /// artifact whose claimed moment schema it does not satisfy.
     #[test]
     fn a_support_carrying_no_fitted_moments_cannot_be_written_at_all() {
         let _torch_rng_guard = test_rng::shared();
@@ -4121,6 +4384,8 @@ mod tests {
         object.insert("format_version".to_owned(), serde_json::json!(4));
         object.remove("bin_means");
         object.remove("bin_second_moments");
+        object.remove("bin_simple_return_means");
+        object.remove("bin_simple_return_second_moments");
         std::fs::write(
             &corpus_artifact,
             serde_json::to_vec(&raw).expect("serialize"),
@@ -4346,11 +4611,22 @@ mod tests {
         let reloaded = BarSupports::load(&path).expect("load");
         assert_eq!(reloaded.provenance(), Some(&provenance));
 
-        // A v3 artifact carries no provenance field at all and must still load.
+        // A v3 artifact predates both provenance and every fitted-moment member. Build an
+        // internally honest legacy fixture rather than changing only the version tag on a v6
+        // document: the loader correctly rejects a legacy schema that contains future fields.
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
         raw["format_version"] = serde_json::json!(BAR_SUPPORTS_LEGACY_VERSION);
-        raw.as_object_mut().expect("object").remove("provenance");
+        let object = raw.as_object_mut().expect("object");
+        for member in [
+            "provenance",
+            "bin_means",
+            "bin_second_moments",
+            "bin_simple_return_means",
+            "bin_simple_return_second_moments",
+        ] {
+            object.remove(member);
+        }
         std::fs::write(&path, serde_json::to_vec(&raw).expect("serialize")).expect("write");
         let legacy = BarSupports::load(&path).expect("legacy load");
         assert_eq!(legacy.provenance(), None);
@@ -6252,6 +6528,11 @@ mod tests {
     #[test]
     fn hard_is_default_and_sparse_rules_do_not_allocate_probability_rows() {
         assert_eq!(BarScoring::default(), BarScoring::Hard);
+        assert_eq!(BarScoring::Hard.report_contract(), "hard categorical NLL");
+        assert_eq!(
+            BarScoring::Density.report_contract(),
+            "fixed-support mixed-measure score (diagnostic)"
+        );
         let supports = synthetic_supports(10_000, 0x5A25E);
         let mut rng = Rng::new(0x1D5);
         let samples: Vec<BarDof> = (0..17).map(|_| synthetic_dof(&mut rng)).collect();
@@ -6336,6 +6617,84 @@ mod tests {
                 "{scoring} indexed NLL gradient differs from dense one-hot cross entropy"
             );
         }
+    }
+
+    /// On one fixed categorical geometry Density is exactly Hard plus a target/support
+    /// constant. Pin all three consequences: equal logit gradients, equal one-step updates,
+    /// and equal ordering of two distinct models. This is why Density can be a diagnostic
+    /// without becoming a second pretraining objective.
+    #[test]
+    fn hard_and_density_have_identical_gradients_updates_and_model_ordering() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let supports = synthetic_supports(12_000, 0xF1_ED);
+        let mut rng = Rng::new(0xC0_57);
+        let samples: Vec<BarDof> = (0..29).map(|_| synthetic_dof(&mut rng)).collect();
+        let values = dof_tensor(&samples);
+        let shape = [samples.len() as i64, BAR_DOF as i64, NUM_BAR_BINS];
+        let elements = shape.iter().product::<i64>();
+        let base = (Tensor::arange(elements, (Kind::Float, Device::Cpu)) * 1.0e-3)
+            .sin()
+            .reshape(shape);
+        let hard_targets = supports.targets(&values, BarScoring::Hard);
+        let density_targets = supports.targets(&values, BarScoring::Density);
+
+        let hard_logits = base.detach().set_requires_grad(true);
+        let density_logits = base.detach().set_requires_grad(true);
+        let (hard_loss, _) = bar_nll_from_logits(&hard_logits, &hard_targets);
+        let (density_loss, _) = bar_nll_from_logits(&density_logits, &density_targets);
+        let expected_offset = density_targets
+            .log_measure()
+            .expect("Density carries its fixed-support measure term")
+            .to_kind(Kind::Double)
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Double)
+            .mean(Kind::Double)
+            .double_value(&[]);
+        assert!(
+            (density_loss.double_value(&[]) - hard_loss.double_value(&[]) - expected_offset).abs()
+                < 2.0e-5,
+            "Density must equal Hard plus only the realized target/support constant"
+        );
+
+        hard_loss.backward();
+        density_loss.backward();
+        let hard_grad = hard_logits.grad();
+        let density_grad = density_logits.grad();
+        assert!(
+            hard_grad.allclose(&density_grad, 0.0, 0.0, false),
+            "a fixed-support measure constant changed the logits gradient"
+        );
+        let learning_rate = 0.03125;
+        let hard_update = &hard_logits - &hard_grad * learning_rate;
+        let density_update = &density_logits - &density_grad * learning_rate;
+        assert!(
+            hard_update.allclose(&density_update, 0.0, 0.0, false),
+            "identical initialization and optimizer step must produce identical logits"
+        );
+
+        let challenger = (&base * 0.73 + base.flip([-1]) * 0.11).contiguous();
+        let hard_gap = bar_nll_from_logits(&challenger, &hard_targets)
+            .0
+            .double_value(&[])
+            - bar_nll_from_logits(&base, &hard_targets)
+                .0
+                .double_value(&[]);
+        let density_gap = bar_nll_from_logits(&challenger, &density_targets)
+            .0
+            .double_value(&[])
+            - bar_nll_from_logits(&base, &density_targets)
+                .0
+                .double_value(&[]);
+        assert!(hard_gap.abs() > 1.0e-5, "fixture models must be distinct");
+        assert!(
+            (hard_gap - density_gap).abs() < 2.0e-5,
+            "fixed-support measure constants must cancel from model comparisons: hard gap \
+             {hard_gap}, density gap {density_gap}"
+        );
+        assert_eq!(
+            hard_gap.total_cmp(&0.0),
+            density_gap.total_cmp(&0.0),
+            "Hard and Density must rank fixed-geometry models identically"
+        );
     }
 
     /// The hard rule is the `sigma -> 0` limit of the smoothed one. Probed at every bin's

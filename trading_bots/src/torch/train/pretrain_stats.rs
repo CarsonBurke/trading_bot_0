@@ -480,11 +480,11 @@ pub struct TradePolicySummary {
     pub cost_curve: Vec<JsonF64>,
 }
 
-/// The whole Kelly bench of one pinned pass, persisted beside the checkpoint it scored.
+/// The moment-correct quadratic Kelly bench of one pinned pass, persisted beside the
+/// checkpoint it scored. Model and marginal positions use `E[R] / E[R²]` reduced from
+/// train-fitted within-bin moments; the oracle remains a separate realized-return ceiling.
 ///
-/// Growth figures are natural log growth PER BAR, exactly as the bench produces them — NOT
-/// the basis points the charts draw — so a reader never has to know which of the two a
-/// number is in.
+/// Growth figures are realized natural log growth PER BAR, not the basis points charts draw.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TradeSummary {
     pub policies: Vec<TradePolicySummary>,

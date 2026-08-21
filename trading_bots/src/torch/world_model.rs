@@ -833,13 +833,6 @@ impl BarSupportSet {
 
     /// Row-routed ancestral sample, `[..., BAR_DOF]` from beliefs and their
     /// explicit forecast conditioning `[..., dim]`.
-    ///
-    /// Rows are PARTITIONED by resolution and each partition is sampled in its
-    /// own [`BarEmissionHead::sample`] call. The chain is sequential — each
-    /// sampled DOF conditions the next — and every step reads its support's bin
-    /// bounds and atoms, so masking two supports together inside one pass would
-    /// interleave two bin geometries and silently draw plausible-looking bars
-    /// from the wrong bins.
     pub fn sample(
         &self,
         head: &BarEmissionHead,
@@ -848,8 +841,29 @@ impl BarSupportSet {
         time_ids: &Tensor,
         temperature: f64,
     ) -> Tensor {
+        self.sample_binned(head, h, conditioning, time_ids, temperature)
+            .0
+    }
+
+    /// Row-routed ancestral sample returning both decoded values and the exact drawn bins,
+    /// each shaped `[..., BAR_DOF]`.
+    ///
+    /// Rows are PARTITIONED by resolution and each partition is sampled in its
+    /// own [`BarEmissionHead::sample_binned`] call. The chain is sequential — each
+    /// sampled DOF conditions the next — and every step reads its support's bin
+    /// bounds and atoms, so masking two supports together inside one pass would
+    /// interleave two bin geometries and silently draw plausible-looking bars
+    /// from the wrong bins.
+    pub fn sample_binned(
+        &self,
+        head: &BarEmissionHead,
+        h: &Tensor,
+        conditioning: &Tensor,
+        time_ids: &Tensor,
+        temperature: f64,
+    ) -> (Tensor, Tensor) {
         if self.entries.len() == 1 {
-            return head.sample(h, conditioning, &self.entries[0].2, temperature);
+            return head.sample_binned(h, conditioning, &self.entries[0].2, temperature);
         }
         let shape = h.size();
         assert_eq!(
@@ -864,7 +878,8 @@ impl BarSupportSet {
         let class = time_ids
             .reshape([rows, BAR_TIME_FEATURES as i64])
             .select(1, TIME_RESOLUTION as i64);
-        let mut out = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Float, h.device()));
+        let mut values = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Float, h.device()));
+        let mut bins = Tensor::zeros([rows, BAR_DOF as i64], (Kind::Int64, h.device()));
         let mut matched = Tensor::zeros([rows], (Kind::Bool, h.device()));
         for (entry, _, supports) in &self.entries {
             let selected = class.eq(*entry);
@@ -873,18 +888,22 @@ impl BarSupportSet {
             if index.numel() == 0 {
                 continue;
             }
-            let drawn = head.sample(
+            let (drawn_values, drawn_bins) = head.sample_binned(
                 &flat.index_select(0, &index),
                 &flat_conditioning.index_select(0, &index),
                 supports,
                 temperature,
             );
-            out = out.index_copy(0, &index, &drawn);
+            values = values.index_copy(0, &index, &drawn_values);
+            bins = bins.index_copy(0, &index, &drawn_bins);
         }
         self.assert_rows_routed(&matched, rows);
         let mut target = shape[..shape.len() - 1].to_vec();
         target.push(BAR_DOF as i64);
-        out.reshape(target.as_slice())
+        (
+            values.reshape(target.as_slice()),
+            bins.reshape(target.as_slice()),
+        )
     }
 }
 

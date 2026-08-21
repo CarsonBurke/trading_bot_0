@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, ensure, Context, Result};
+use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike, Weekday};
+use chrono_tz::America::New_York;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
@@ -126,9 +128,9 @@ const PASS_STREAM: u64 = 0xE7A1_0000_0000_0004;
 //
 // The channels fall into two groups and the split is load-bearing:
 //
-// * EXOGENOUS — [`TIME_MINUTE`] through [`TIME_DAY_EDGE`]. A function of bar timestamps
-//   alone, therefore knowable for a bar that has not happened yet, so a rollout reads it off
-//   the corpus for its imagined bars exactly as it always has.
+// * EXOGENOUS — [`TIME_MINUTE`] through [`TIME_DAY_EDGE`]. A function of an exchange calendar
+//   fixed before the decision, so free-running rollout timestamps come from
+//   [`forecast_schedule_after`], never from future bars in the corpus.
 // * OBSERVED — [`BAR_TIME_MARKET`]. The market proxy's own realized bar at the SAME instant
 //   as the row's bar. Knowable only once that bar exists, so every future-facing constructor
 //   emits [`MARKET_MISSING`] for it; see [`future_conditioning_ids`]. Reading the proxy's
@@ -331,15 +333,245 @@ pub fn bar_time_ids(
 ///
 /// The exogenous channels are a function of timestamps, so they are computed exactly as for a
 /// realized bar. The observed channels are not knowable and take [`MARKET_MISSING`], which is
-/// enforced structurally: this function has no way to name a [`MarketChannel`]. Every
-/// future-facing caller — [`BarCorpus::future_time_ids`] and the horizon planner's leg clock —
-/// goes through here, and `future_conditioning_ids_never_reveal_the_market` pins it.
+/// enforced structurally: this function has no way to name a [`MarketChannel`]. Future-facing
+/// callers first construct timestamps through [`forecast_schedule_after`], whose API likewise
+/// has no future corpus input.
 pub fn future_conditioning_ids(
     ts_ms: i64,
     prev_ts_ms: Option<i64>,
     res_secs: u32,
 ) -> [i64; BAR_TIME_FEATURES] {
     bar_time_ids(ts_ms, prev_ts_ms, res_secs, None)
+}
+
+/// Whether `date` is a regular full-day US-equity trading date.
+///
+/// This is a deterministic exchange calendar, not an inference from which bars happened to
+/// print. It covers the recurring NYSE full-day closures used by the corpus. Early closes are
+/// deliberately left on the ordinary 04:00--20:00 extended-hours grid: the early close of the
+/// core session does not close the whole extended-hours venue, and a fixed full-day grid is
+/// preferable to letting future print availability decide whether a forecast step exists.
+pub fn is_us_equity_trading_date(date: NaiveDate) -> bool {
+    if matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
+        return false;
+    }
+    let year = date.year();
+    let observed = |month: u32, day: u32| {
+        let holiday = NaiveDate::from_ymd_opt(year, month, day).expect("a fixed holiday is valid");
+        match holiday.weekday() {
+            Weekday::Sat => holiday - Duration::days(1),
+            Weekday::Sun => holiday + Duration::days(1),
+            _ => holiday,
+        }
+    };
+    // NYSE observes a Sunday New Year's Day on Monday, but stays open on the Friday before
+    // a Saturday New Year's Day (unlike the federal calendar).
+    let new_year = NaiveDate::from_ymd_opt(year, 1, 1).expect("New Year is valid");
+    let observed_new_year = if new_year.weekday() == Weekday::Sun {
+        new_year + Duration::days(1)
+    } else {
+        new_year
+    };
+    if date == observed_new_year
+        || date == nth_weekday(year, 1, Weekday::Mon, 3)
+        || date == nth_weekday(year, 2, Weekday::Mon, 3)
+        || date == easter_sunday(year) - Duration::days(2)
+        || date == last_weekday(year, 5, Weekday::Mon)
+        || (year >= 2022 && date == observed(6, 19))
+        || date == observed(7, 4)
+        || date == nth_weekday(year, 9, Weekday::Mon, 1)
+        || date == nth_weekday(year, 11, Weekday::Thu, 4)
+        || date == observed(12, 25)
+    {
+        return false;
+    }
+    true
+}
+
+fn nth_weekday(year: i32, month: u32, weekday: Weekday, nth: u32) -> NaiveDate {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("a calendar month starts");
+    let offset = (7 + weekday.num_days_from_monday() as i64
+        - first.weekday().num_days_from_monday() as i64)
+        % 7;
+    first + Duration::days(offset + 7 * i64::from(nth - 1))
+}
+
+fn last_weekday(year: i32, month: u32, weekday: Weekday) -> NaiveDate {
+    let next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .expect("the next calendar month starts");
+    let last = next - Duration::days(1);
+    let offset = (7 + last.weekday().num_days_from_monday() as i64
+        - weekday.num_days_from_monday() as i64)
+        % 7;
+    last - Duration::days(offset)
+}
+
+/// Gregorian Easter, using the Meeus/Jones/Butcher computus.
+fn easter_sunday(year: i32) -> NaiveDate {
+    let a = year % 19;
+    let b = year / 100;
+    let c = year % 100;
+    let d = b / 4;
+    let e = b % 4;
+    let f = (b + 8) / 25;
+    let g = (b - f + 1) / 3;
+    let h = (19 * a + b - d - g + 15) % 30;
+    let i = c / 4;
+    let k = c % 4;
+    let l = (32 + 2 * e + 2 * i - h - k) % 7;
+    let m = (a + 11 * h + 22 * l) / 451;
+    let month = (h + l - 7 * m + 114) / 31;
+    let day = (h + l - 7 * m + 114) % 31 + 1;
+    NaiveDate::from_ymd_opt(year, month as u32, day as u32).expect("computus returns a date")
+}
+
+/// Deterministic extended-hours timestamps beginning strictly after `decision_ts_ms`.
+///
+/// Intraday resolutions use the 04:00--20:00 ET weekday grid and skip the full-day exchange
+/// holidays in [`is_us_equity_trading_date`]. Daily and coarser resolutions retain the
+/// decision's ET wall-clock time and advance across trading dates. No corpus, symbol, proxy or
+/// future availability is consulted, so a halt or missing future file cannot move this clock.
+pub fn forecast_schedule_after(decision_ts_ms: i64, steps: usize, res_secs: u32) -> Vec<i64> {
+    assert!(steps > 0, "a forecast schedule needs at least one step");
+    assert!(
+        res_secs > 0,
+        "a forecast schedule needs a positive resolution"
+    );
+    let decision = New_York
+        .timestamp_millis_opt(decision_ts_ms)
+        .single()
+        .expect("a timestamp has one New York representation");
+    let mut local = decision.naive_local();
+    let mut out = Vec::with_capacity(steps);
+    while out.len() < steps {
+        if res_secs >= 86_400 {
+            loop {
+                local += Duration::days(1);
+                if is_us_equity_trading_date(local.date()) {
+                    break;
+                }
+            }
+        } else {
+            local += Duration::seconds(i64::from(res_secs));
+            loop {
+                let date = local.date();
+                let seconds = i64::from(local.time().num_seconds_from_midnight());
+                let in_session = (4 * 3600..20 * 3600).contains(&seconds);
+                if is_us_equity_trading_date(date) && in_session {
+                    break;
+                }
+                let next_date = if is_us_equity_trading_date(date) && seconds < 4 * 3600 {
+                    date
+                } else {
+                    date + Duration::days(1)
+                };
+                local = next_date
+                    .and_hms_opt(4, 0, 0)
+                    .expect("04:00 is a valid local wall time");
+            }
+        }
+        let scheduled = New_York
+            .from_local_datetime(&local)
+            .single()
+            .expect("the extended session does not cross a DST transition");
+        out.push(scheduled.timestamp_millis());
+    }
+    out
+}
+
+/// Forecast-safe time IDs on the deterministic US-equity schedule.
+pub fn forecast_schedule_ids_after(
+    decision_ts_ms: i64,
+    steps: usize,
+    res_secs: u32,
+) -> Vec<[i64; BAR_TIME_FEATURES]> {
+    let schedule = forecast_schedule_after(decision_ts_ms, steps, res_secs);
+    let mut previous = decision_ts_ms;
+    schedule
+        .into_iter()
+        .map(|ts_ms| {
+            let ids = future_conditioning_ids(ts_ms, Some(previous), res_secs);
+            previous = ts_ms;
+            ids
+        })
+        .collect()
+}
+
+/// The deterministic scheduled bar immediately before `ts_ms`.
+pub fn forecast_schedule_previous(ts_ms: i64, res_secs: u32) -> i64 {
+    assert!(
+        res_secs > 0,
+        "a forecast schedule needs a positive resolution"
+    );
+    assert!(
+        res_secs <= 16 * 3600 || res_secs >= 86_400,
+        "intraday resolutions must fit inside the 16-hour extended session"
+    );
+    let current = New_York
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .expect("a timestamp has one New York representation");
+    let mut local = current.naive_local();
+    loop {
+        if res_secs >= 86_400 {
+            local -= Duration::days(1);
+            while !is_us_equity_trading_date(local.date()) {
+                local -= Duration::days(1);
+            }
+            break;
+        }
+        local -= Duration::seconds(i64::from(res_secs));
+        let date = local.date();
+        let seconds = i64::from(local.time().num_seconds_from_midnight());
+        if is_us_equity_trading_date(date) && (4 * 3600..20 * 3600).contains(&seconds) {
+            break;
+        }
+        let mut previous_date = if seconds < 4 * 3600 {
+            date - Duration::days(1)
+        } else {
+            date
+        };
+        while !is_us_equity_trading_date(previous_date) {
+            previous_date -= Duration::days(1);
+        }
+        local = previous_date
+            .and_hms_opt(20, 0, 0)
+            .expect("20:00 is a valid local wall time")
+            - Duration::seconds(i64::from(res_secs));
+        break;
+    }
+    New_York
+        .from_local_datetime(&local)
+        .single()
+        .expect("the extended session does not cross a DST transition")
+        .timestamp_millis()
+}
+
+/// Deterministic forecast-safe IDs beginning at the scheduled `first_ts_ms` itself.
+pub fn forecast_schedule_ids_from(
+    first_ts_ms: i64,
+    steps: usize,
+    res_secs: u32,
+) -> Vec<[i64; BAR_TIME_FEATURES]> {
+    assert!(steps > 0, "a forecast schedule needs at least one step");
+    let mut timestamps = Vec::with_capacity(steps);
+    timestamps.push(first_ts_ms);
+    if steps > 1 {
+        timestamps.extend(forecast_schedule_after(first_ts_ms, steps - 1, res_secs));
+    }
+    let mut previous = forecast_schedule_previous(first_ts_ms, res_secs);
+    timestamps
+        .into_iter()
+        .map(|ts_ms| {
+            let ids = future_conditioning_ids(ts_ms, Some(previous), res_secs);
+            previous = ts_ms;
+            ids
+        })
+        .collect()
 }
 
 /// Largest [`TIME_ELAPSED`] bucket. At 300s, bucket 11 covers 512..1023 bars (1.8..3.6 days of
@@ -1247,15 +1479,14 @@ impl BarCorpus {
         ))
     }
 
-    /// `[endpoints.len(), steps, BAR_TIME_FEATURES]` i64: the exogenous conditioning of the
-    /// next `steps` **real** bars after `bar + from_offset`, with every observed market channel
-    /// at [`MARKET_MISSING`].
+    /// `[endpoints.len(), steps, BAR_TIME_FEATURES]` i64: deterministic exogenous conditioning
+    /// after `bar + from_offset`, with every observed market channel at [`MARKET_MISSING`].
     ///
-    /// A rollout's future clock cannot be extrapolated as `last_ts + k * res_secs` — weekends,
-    /// holidays and the 20:00 -> 04:00 gap all break that — so it is read off the corpus. Only
-    /// the CLOCK is: this function reads the target symbol's future timestamps, never the
-    /// proxy's future bars, and it goes through [`future_conditioning_ids`], which has no way
-    /// to name a [`MarketChannel`] at all.
+    /// This realized-rollout API requires all `steps` target bars to exist in the endpoint's
+    /// series, but never reads their timestamps or contents. The conditioning clock itself comes
+    /// from [`forecast_schedule_after`] using only the already-observed decision timestamp, so
+    /// future symbol halts and print availability cannot move it. Free-running generation that
+    /// does not select realized targets must use the deterministic schedule helpers directly.
     pub fn future_time_ids(
         &self,
         endpoints: &[BarEndpoint],
@@ -1274,24 +1505,34 @@ impl BarCorpus {
         let mut flat = vec![0i64; endpoints.len() * row];
         for (out, e) in flat.chunks_mut(row).zip(endpoints) {
             let bars = self.inner.files[e.series].bars();
-            let first = e.bar + from_offset + 1;
-            if first + steps > bars.len() {
-                bail!(
-                    "future_time_ids wants bars {first}..{} of {} but {} has {}",
-                    first + steps,
-                    self.symbol(e.series),
-                    self.symbol(e.series),
-                    bars.len()
-                );
-            }
-            for (slot, bar) in bars[first..first + steps].iter().enumerate() {
-                out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES].copy_from_slice(
-                    &future_conditioning_ids(
-                        bar.ts(),
-                        Some(bars[first + slot - 1].ts()),
-                        self.inner.res_secs,
-                    ),
-                );
+            let decision = e
+                .bar
+                .checked_add(from_offset)
+                .filter(|&bar| bar < bars.len())
+                .with_context(|| {
+                    format!(
+                        "future_time_ids decision offset {from_offset} escapes {} at bar {}",
+                        self.symbol(e.series),
+                        e.bar
+                    )
+                })?;
+            let _available_targets_end = decision
+                .checked_add(steps)
+                .and_then(|last| last.checked_add(1))
+                .filter(|&end| end <= bars.len())
+                .with_context(|| {
+                    format!(
+                        "future_time_ids wants {steps} bars after {} bar {decision}, but it has {}",
+                        self.symbol(e.series),
+                        bars.len()
+                    )
+                })?;
+            for (slot, ids) in
+                forecast_schedule_ids_after(bars[decision].ts(), steps, self.inner.res_secs)
+                    .into_iter()
+                    .enumerate()
+            {
+                out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES].copy_from_slice(&ids);
             }
         }
         Ok(Tensor::from_slice(&flat)
@@ -1815,6 +2056,182 @@ impl BarSampler {
             self.corpus.market.as_ref(),
             device,
         )
+    }
+
+    /// Forecast-safe deterministic clocks after one observed row inside each sampled window.
+    ///
+    /// `decision_offset` is relative to [`WindowRef::bar_index`]. Only that already-observed
+    /// timestamp is read; future timestamps and bar availability never enter the result.
+    pub fn forecast_time_ids(
+        &self,
+        refs: &[WindowRef],
+        decision_offset: usize,
+        steps: i64,
+        device: Device,
+    ) -> Result<Tensor> {
+        if refs.is_empty() {
+            bail!("forecast_time_ids needs at least one window");
+        }
+        if steps <= 0 {
+            bail!("forecast_time_ids steps must be positive, got {steps}");
+        }
+        let steps = steps as usize;
+        let row = steps * BAR_TIME_FEATURES;
+        let mut flat = vec![0i64; refs.len() * row];
+        for (out, reference) in flat.chunks_mut(row).zip(refs) {
+            let bars = self.corpus.files[reference.symbol as usize].bars();
+            let decision = reference
+                .bar_index
+                .checked_add(decision_offset as u32)
+                .map(|bar| bar as usize)
+                .filter(|&bar| bar < bars.len())
+                .with_context(|| {
+                    format!(
+                        "forecast decision offset {decision_offset} escapes {} at bar {}",
+                        self.symbol(reference.symbol),
+                        reference.bar_index
+                    )
+                })?;
+            for (slot, ids) in
+                forecast_schedule_ids_after(bars[decision].ts(), steps, self.corpus.res_secs)
+                    .into_iter()
+                    .enumerate()
+            {
+                out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES].copy_from_slice(&ids);
+            }
+        }
+        Ok(Tensor::from_slice(&flat)
+            .view([refs.len() as i64, steps as i64, BAR_TIME_FEATURES as i64])
+            .to_device(device))
+    }
+
+    /// Deterministic future clock with realized market-proxy channels for teacher-forced
+    /// scoring only.
+    ///
+    /// The timestamp grid is still derived solely from the decision row. Unlike
+    /// [`Self::forecast_time_ids`], this post-generation view joins market observations at
+    /// those scheduled timestamps. It must never be passed to free-running generation.
+    pub fn teacher_forced_future_time_ids(
+        &self,
+        refs: &[WindowRef],
+        decision_offset: usize,
+        steps: i64,
+        device: Device,
+    ) -> Result<Tensor> {
+        if refs.is_empty() {
+            bail!("teacher_forced_future_time_ids needs at least one window");
+        }
+        if steps <= 0 {
+            bail!("teacher_forced_future_time_ids steps must be positive, got {steps}");
+        }
+        let steps = steps as usize;
+        let row = steps * BAR_TIME_FEATURES;
+        let mut flat = vec![0i64; refs.len() * row];
+        for (out, reference) in flat.chunks_mut(row).zip(refs) {
+            let bars = self.corpus.files[reference.symbol as usize].bars();
+            let decision = reference
+                .bar_index
+                .checked_add(decision_offset as u32)
+                .map(|bar| bar as usize)
+                .filter(|&bar| bar < bars.len())
+                .with_context(|| {
+                    format!(
+                        "teacher-forced decision offset {decision_offset} escapes {} at bar {}",
+                        self.symbol(reference.symbol),
+                        reference.bar_index
+                    )
+                })?;
+            let mut previous = bars[decision].ts();
+            for (slot, ts_ms) in
+                forecast_schedule_after(bars[decision].ts(), steps, self.corpus.res_secs)
+                    .into_iter()
+                    .enumerate()
+            {
+                let ids = bar_time_ids(
+                    ts_ms,
+                    Some(previous),
+                    self.corpus.res_secs,
+                    self.corpus.market.as_ref(),
+                );
+                out[slot * BAR_TIME_FEATURES..(slot + 1) * BAR_TIME_FEATURES].copy_from_slice(&ids);
+                previous = ts_ms;
+            }
+        }
+        Ok(Tensor::from_slice(&flat)
+            .view([refs.len() as i64, steps as i64, BAR_TIME_FEATURES as i64])
+            .to_device(device))
+    }
+
+    /// Realized DOF aligned to the same deterministic schedule as [`Self::forecast_time_ids`].
+    ///
+    /// Alignment happens only after the forecast clock has been chosen. A missing scheduled
+    /// print is a flat carry of the last mark; an observed bar keeps the slot named by its own
+    /// timestamp, so a halt never compresses later returns toward the decision. Because an
+    /// observed bar's `r` is encoded against the previous observed close, the first print after
+    /// a halt carries the whole catch-up payoff exactly once.
+    pub fn aligned_future_dof(
+        &self,
+        refs: &[WindowRef],
+        decision_offset: usize,
+        steps: i64,
+        device: Device,
+    ) -> Result<Tensor> {
+        if refs.is_empty() {
+            bail!("aligned_future_dof needs at least one window");
+        }
+        if steps <= 0 {
+            bail!("aligned_future_dof steps must be positive, got {steps}");
+        }
+        let steps = steps as usize;
+        let row = steps * BAR_DOF;
+        let mut flat = vec![0f32; refs.len() * row];
+        let carried = BarDof::default().to_array();
+        for out in flat.chunks_mut(BAR_DOF) {
+            out.copy_from_slice(&carried);
+        }
+
+        for (out, reference) in flat.chunks_mut(row).zip(refs) {
+            let bars = self.corpus.files[reference.symbol as usize].bars();
+            let decision = reference
+                .bar_index
+                .checked_add(decision_offset as u32)
+                .map(|bar| bar as usize)
+                .filter(|&bar| bar < bars.len())
+                .with_context(|| {
+                    format!(
+                        "aligned future decision offset {decision_offset} escapes {} at bar {}",
+                        self.symbol(reference.symbol),
+                        reference.bar_index
+                    )
+                })?;
+            let schedule =
+                forecast_schedule_after(bars[decision].ts(), steps, self.corpus.res_secs);
+            let observed_start = decision + 1;
+            let observed_end = bars.partition_point(|bar| bar.ts() <= schedule[steps - 1]);
+            if observed_start >= observed_end {
+                continue;
+            }
+
+            let mut schedule_slot = 0usize;
+            for_each_window_dof(
+                bars,
+                observed_start,
+                observed_end - observed_start,
+                |bar, encoded| {
+                    while schedule_slot < steps && schedule[schedule_slot] < bar.ts() {
+                        schedule_slot += 1;
+                    }
+                    if schedule_slot < steps && schedule[schedule_slot] == bar.ts() {
+                        out[schedule_slot * BAR_DOF..(schedule_slot + 1) * BAR_DOF]
+                            .copy_from_slice(&encoded.to_array());
+                        schedule_slot += 1;
+                    }
+                },
+            );
+        }
+        Ok(Tensor::from_slice(&flat)
+            .view([refs.len() as i64, steps as i64, BAR_DOF as i64])
+            .to_device(device))
     }
 
     /// Windows the epoch order will hand out at `index`, for [`Self::prefetch`].
@@ -4109,6 +4526,185 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_forecast_clock_skips_full_day_holidays_and_weekends() {
+        for closed in [
+            "2023-01-02", // observed New Year
+            "2024-01-15", // MLK
+            "2024-02-19", // Presidents
+            "2024-03-29", // Good Friday
+            "2024-05-27", // Memorial
+            "2024-06-19", // Juneteenth
+            "2024-07-04", // Independence
+            "2024-09-02", // Labor
+            "2024-11-28", // Thanksgiving
+            "2024-12-25", // Christmas
+        ] {
+            let date = NaiveDate::parse_from_str(closed, "%Y-%m-%d").expect("test date");
+            assert!(!is_us_equity_trading_date(date), "{closed} must be closed");
+        }
+        assert!(
+            is_us_equity_trading_date(NaiveDate::from_ymd_opt(2021, 6, 18).expect("test date")),
+            "Juneteenth was not an NYSE full-day closure before 2022"
+        );
+
+        let schedule = forecast_schedule_after(et("2024-07-03T19:55:00"), 2, RES);
+        assert_eq!(schedule.len(), 2);
+        assert_eq!(schedule[0], et("2024-07-05T04:00:00"));
+        assert_eq!(schedule[1], et("2024-07-05T04:05:00"));
+    }
+
+    #[test]
+    fn deterministic_forecast_clock_keeps_et_wall_time_across_dst() {
+        let schedule = forecast_schedule_after(et("2024-03-08T19:55:00"), 2, RES);
+        assert_eq!(
+            schedule,
+            vec![et("2024-03-11T04:00:00"), et("2024-03-11T04:05:00")]
+        );
+        assert_eq!(
+            forecast_schedule_previous(schedule[0], RES),
+            et("2024-03-08T19:55:00")
+        );
+    }
+
+    #[test]
+    fn daily_forecast_clock_retains_wall_time_across_weekends_holidays_and_dst() {
+        let spring = forecast_schedule_after(et("2024-03-08T13:37:00"), 2, 86_400);
+        assert_eq!(
+            spring,
+            vec![et("2024-03-11T13:37:00"), et("2024-03-12T13:37:00")],
+            "the spring-DST weekend must not reset daily decisions to 04:00"
+        );
+        assert_eq!(
+            forecast_schedule_previous(spring[0], 86_400),
+            et("2024-03-08T13:37:00")
+        );
+
+        let holiday = forecast_schedule_after(et("2024-07-03T13:37:00"), 1, 86_400);
+        assert_eq!(
+            holiday,
+            vec![et("2024-07-05T13:37:00")],
+            "Independence Day must be skipped without changing the wall clock"
+        );
+
+        let fall = forecast_schedule_after(et("2024-11-01T13:37:00"), 1, 86_400);
+        assert_eq!(
+            fall,
+            vec![et("2024-11-04T13:37:00")],
+            "the fall-DST weekend must retain the decision wall clock"
+        );
+    }
+
+    #[test]
+    fn forecast_ids_have_exact_length_and_no_observed_future_channels() {
+        let first = et("2024-11-27T19:55:00");
+        let ids = forecast_schedule_ids_from(first, 100, RES);
+        assert_eq!(ids.len(), 100, "H100 must emit exactly 100 ID rows");
+        for row in &ids {
+            for feature in BAR_TIME_MARKET {
+                assert_eq!(row[feature], MARKET_MISSING);
+            }
+        }
+        // The API accepts only the already-known first scheduled instant. Future symbol
+        // timestamps and availability have no representation, so a halt cannot alter the IDs.
+        assert_eq!(ids, forecast_schedule_ids_from(first, 100, RES));
+        let thanksgiving = NaiveDate::from_ymd_opt(2024, 11, 28).expect("test date");
+        assert!(ids.iter().all(|row| {
+            !(row[TIME_WEEKDAY] == thanksgiving.weekday().num_days_from_monday() as i64)
+        }));
+    }
+
+    #[test]
+    fn future_symbol_halt_keeps_generation_inputs_and_gap_aligns_h100_targets() {
+        let make = |label: &str, halt: bool| {
+            let dir = std::env::temp_dir().join(format!(
+                "trading_bot_0_clock_{label}_{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).expect("clock fixture dir");
+            let mut bars = synth_bars(91, 500, et("2024-07-08T04:00:00"));
+            if halt {
+                // The decision is bar 1. Six scheduled prints disappear, then every later
+                // observation resumes in its true wall-clock slot.
+                for bar in &mut bars[2..] {
+                    let mut shifted = *bar;
+                    shifted.ts_ms = shifted.ts() + 30 * 60 * 1000;
+                    *bar = shifted;
+                }
+            }
+            write_bar_file(&bar_path(&dir, "AAA"), "AAA", RES, &bars).expect("clock bars");
+            let corpus = BarCorpus::load(&dir, RES, 100).expect("clock corpus");
+            (Fixture { dir }, corpus)
+        };
+        let (_base_dir, base) = make("base", false);
+        let (_halt_dir, halted) = make("halt", true);
+        let reference = WindowRef {
+            symbol: 0,
+            bar_index: 1,
+        };
+        let base_sampler = BarSampler::new(&base, Split::Train, 1, 7);
+        let halted_sampler = BarSampler::new(&halted, Split::Train, 1, 7);
+        let base_ids = base_sampler
+            .forecast_time_ids(&[reference], 0, 100, Device::Cpu)
+            .expect("base forecast clock");
+        let halted_ids = halted_sampler
+            .forecast_time_ids(&[reference], 0, 100, Device::Cpu)
+            .expect("halted forecast clock");
+        assert!(
+            base_ids.equal(&halted_ids),
+            "future observed timestamps changed the H100 sampler clock"
+        );
+        let base_history = base_sampler
+            .batch_of(&[reference], Device::Cpu)
+            .dof
+            .narrow(1, 0, 1);
+        let halted_history = halted_sampler
+            .batch_of(&[reference], Device::Cpu)
+            .dof
+            .narrow(1, 0, 1);
+        assert!(
+            base_history.equal(&halted_history),
+            "a future halt changed the observed generation history"
+        );
+        assert_eq!(base_ids.size(), vec![1, 100, BAR_TIME_FEATURES as i64]);
+
+        let targets = halted_sampler
+            .aligned_future_dof(&[reference], 0, 100, Device::Cpu)
+            .expect("halt-aligned targets");
+        assert_eq!(
+            targets.size(),
+            vec![1, 100, BAR_DOF as i64],
+            "scoring must retain exactly H rows"
+        );
+        let flat = BarDof::default().to_array();
+        for slot in 0..6i64 {
+            for (dof, &expected) in flat.iter().enumerate() {
+                assert_eq!(
+                    targets.double_value(&[0, slot, dof as i64]) as f32,
+                    expected,
+                    "missing scheduled slot {slot} was not a flat carry"
+                );
+            }
+        }
+
+        let bars = halted.bars(0);
+        let decision_close = bars[1].close;
+        let first_return = (bars[2].close / decision_close).ln();
+        assert!(
+            (targets.double_value(&[0, 6, DOF_R as i64]) - first_return as f64).abs() < 1e-6,
+            "the reappearance payoff did not stay at scheduled slot 6"
+        );
+        let cumulative = targets
+            .select(-1, DOF_R as i64)
+            .sum(Kind::Double)
+            .double_value(&[]);
+        let terminal = (bars[95].close / decision_close).ln() as f64;
+        assert!(
+            (cumulative - terminal).abs() < 1e-5,
+            "catch-up payoff was lost or counted more than once: {cumulative} vs {terminal}"
+        );
+    }
+
+    #[test]
     fn conditioning_ids_are_always_valid_embedding_rows() {
         // A dense sweep over five years at 7-minute steps walks every hour of every weekday
         // and both DST transitions ten times over, plus deliberately hostile inputs. The
@@ -5100,9 +5696,9 @@ mod tests {
         assert_eq!(covered.market_missing, 0);
     }
 
-    /// The imagined bars of a rollout must never carry proxy state: it does not exist yet. The
-    /// exogenous channels must still be real, or the fix would have been to blank the whole
-    /// tensor.
+    /// Imagined bars use a deterministic exchange clock and never carry proxy state. The
+    /// exogenous channels must remain invariant to which symbol supplies the already-observed
+    /// decision timestamp; future per-symbol prints are not inputs.
     #[test]
     fn future_conditioning_ids_never_reveal_the_market() {
         let (_fx, corpus, _) = market_fixture("future");
@@ -5122,8 +5718,8 @@ mod tests {
             )
             .expect("future ids");
 
+        let expected = forecast_schedule_ids_after(bars[from].ts(), steps as usize, RES);
         for step in 0..steps as usize {
-            let bar = from + 1 + step;
             for channel_index in BAR_TIME_MARKET {
                 assert_eq!(
                     ids.int64_value(&[0, step as i64, channel_index as i64]),
@@ -5131,23 +5727,35 @@ mod tests {
                     "step {step} leaked the proxy's future state"
                 );
             }
-            let want = future_conditioning_ids(bars[bar].ts(), Some(bars[bar - 1].ts()), RES);
-            for feature in [
-                TIME_MINUTE,
-                TIME_WEEKDAY,
-                TIME_SESSION,
-                TIME_RESOLUTION,
-                TIME_ELAPSED,
-                TIME_DAY_EDGE,
-            ] {
+            for feature in 0..BAR_TIME_FEATURES {
                 assert_eq!(
                     ids.int64_value(&[0, step as i64, feature as i64]),
-                    want[feature],
+                    expected[step][feature],
                     "step {step} {}",
                     BAR_TIME_NAMES[feature]
                 );
             }
         }
+
+        let proxy = series_of(&corpus, MARKET_PROXY_SYMBOL);
+        let proxy_bars = corpus.bars(proxy);
+        let same_decision = proxy_bars.partition_point(|bar| bar.ts() < bars[from].ts());
+        assert_eq!(proxy_bars[same_decision].ts(), bars[from].ts());
+        let proxy_ids = corpus
+            .future_time_ids(
+                &[BarEndpoint {
+                    series: proxy,
+                    bar: same_decision,
+                }],
+                0,
+                steps,
+                Device::Cpu,
+            )
+            .expect("proxy future ids");
+        assert!(
+            ids.equal(&proxy_ids),
+            "symbol identity or future print availability changed the forecast clock"
+        );
 
         // The same instant read WITH a channel is not missing, so the assertion above is about
         // the future-facing constructor and not about a corpus that has no proxy.

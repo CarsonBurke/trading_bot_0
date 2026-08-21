@@ -28,10 +28,11 @@
 //!   stated LITERATURE DEFAULT ([`IMPACT_K`]) and never a fitted parameter, swept over
 //!   [`IMPACT_K_GRID`] so no conclusion rests on one coefficient.
 //!
-//! Nothing here is calibrated to the model's returns. Every input is a property of the bar
-//! corpus, measured per symbol per calendar month, and the whole table is reported by
-//! liquidity decile so it is visible which part of a 5,297-symbol universe is tradeable at
-//! all rather than merely present.
+//! Nothing here is calibrated to the model's returns. Every fitted input is a property of bars
+//! strictly before [`CostCalibration::cutoff_ms`], measured per symbol per calendar month; no
+//! evaluated bar can enter a month estimate, a span-pooled fallback, or a cross-sectional median.
+//! The whole causal table is reported by liquidity decile so it is visible which part of a
+//! 5,297-symbol universe is tradeable at all rather than merely present.
 //!
 //! # Negative spread estimates are reported, not clamped
 //!
@@ -831,9 +832,16 @@ fn month_index(ts_ms: i64) -> Option<i32> {
 
 /// The whole universe's measured trading conditions, keyed by the panel's `u32` symbol id —
 /// the index into the run's symbol table, which is what the panel contract carries.
+///
+/// Every statistic, including cross-sectional fallbacks and span-pooled values, is fitted only
+/// from bars with `ts_ms < cutoff_ms`. Keeping the cutoff on the calibration makes that
+/// provenance inspectable instead of relying on a caller-side slice that a later refactor could
+/// accidentally widen.
 #[derive(Debug)]
 pub struct CostCalibration {
     pub res_secs: u32,
+    /// Exclusive upper timestamp bound of every bar admitted to this calibration.
+    pub cutoff_ms: i64,
     pub symbols: Vec<SymbolCost>,
     /// Cross-sectional median of the measurable pooled spreads, in bps. Neutral by
     /// construction, which is why it and not zero is what an unmeasured symbol is priced at.
@@ -847,24 +855,42 @@ pub struct CostCalibration {
 }
 
 impl CostCalibration {
-    /// Measure a set of `(symbol, bars)` series. The seam every test uses, and what
-    /// [`Self::from_corpus`] reduces to.
-    pub fn from_series(series: &[(String, &[PackedBar])], res_secs: u32) -> Result<Self> {
+    /// Measure a set of `(symbol, bars)` series using only bars strictly before `cutoff_ms`.
+    /// The seam every test uses, and what [`Self::from_corpus`] reduces to.
+    ///
+    /// Series must be timestamp-ordered, the same invariant required by
+    /// [`SymbolCost::measure`]. A symbol with no pre-cutoff bars is retained so its numeric id
+    /// remains aligned with the corpus and is priced from pre-cutoff cross-sectional fallbacks.
+    /// A universe with no pre-cutoff bars at all is rejected rather than reaching into the
+    /// evaluated split.
+    pub fn from_series(
+        series: &[(String, &[PackedBar])],
+        res_secs: u32,
+        cutoff_ms: i64,
+    ) -> Result<Self> {
         ensure!(!series.is_empty(), "a cost calibration needs a universe");
         let symbols: Vec<SymbolCost> = series
             .iter()
-            .map(|(symbol, bars)| SymbolCost::measure(symbol, bars, res_secs))
+            .map(|(symbol, bars)| {
+                let causal_end = bars.partition_point(|bar| bar.ts_ms < cutoff_ms);
+                SymbolCost::measure(symbol, &bars[..causal_end], res_secs)
+            })
             .collect();
-        Ok(Self::from_measured(symbols, res_secs))
+        Self::from_measured(symbols, res_secs, cutoff_ms)
     }
 
-    /// Measure the real packed corpus, in parallel over symbols.
+    /// Measure the real packed corpus, in parallel over symbols, using only bars strictly before
+    /// `cutoff_ms`.
     ///
     /// `threads` is bounded by the caller rather than left to rayon's default: this pass
-    /// touches every one of the corpus's ~451M bars, and it runs on a box that is also
+    /// touches every causal bar of every series in the corpus, and it runs on a box that is also
     /// training. Each worker holds one symbol's accumulators and nothing else, so peak memory
     /// is `threads * O(months)`, not `O(corpus)`.
-    pub fn from_corpus(corpus: &crate::torch::dataset::BarCorpus, threads: usize) -> Result<Self> {
+    pub fn from_corpus(
+        corpus: &crate::torch::dataset::BarCorpus,
+        threads: usize,
+        cutoff_ms: i64,
+    ) -> Result<Self> {
         use rayon::prelude::*;
 
         let count = corpus.series_count();
@@ -878,14 +904,20 @@ impl CostCalibration {
             (0..count)
                 .into_par_iter()
                 .map(|series| {
-                    SymbolCost::measure(corpus.symbol(series), corpus.bars(series), res_secs)
+                    let bars = corpus.bars(series);
+                    let causal_end = bars.partition_point(|bar| bar.ts_ms < cutoff_ms);
+                    SymbolCost::measure(corpus.symbol(series), &bars[..causal_end], res_secs)
                 })
                 .collect::<Vec<_>>()
         });
-        Ok(Self::from_measured(measured, res_secs))
+        Self::from_measured(measured, res_secs, cutoff_ms)
     }
 
-    fn from_measured(symbols: Vec<SymbolCost>, res_secs: u32) -> Self {
+    fn from_measured(symbols: Vec<SymbolCost>, res_secs: u32, cutoff_ms: i64) -> Result<Self> {
+        ensure!(
+            symbols.iter().any(|symbol| symbol.pooled.bars > 0),
+            "cost calibration cutoff {cutoff_ms} leaves no causal bars before the evaluated split"
+        );
         let mut spreads: Vec<f64> = symbols
             .iter()
             .filter_map(|s| s.pooled.measured_spread_bps())
@@ -899,15 +931,16 @@ impl CostCalibration {
             .filter(|(_, s)| s.pooled.measured_spread_bps().is_none())
             .map(|(index, _)| index as u32)
             .collect();
-        Self {
+        Ok(Self {
             res_secs,
+            cutoff_ms,
             fallback_spread_bps: median(&mut spreads),
             fallback_sigma_daily: median(&mut sigmas),
             fallback_harmonic_price: median(&mut prices),
             fallback_adv_usd: median(&mut advs),
             unmeasured,
             symbols,
-        }
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -1024,11 +1057,11 @@ impl BarCostModel {
 
     /// Resolve the `(symbol, month)` cost inputs.
     ///
-    /// Three tiers, in order, each strictly better than the next: the symbol's OWN month; the
-    /// symbol's own SPAN when that month was too noisy to estimate; the cross-sectional median
-    /// when the symbol's whole span was. Only the third counts as a fallback in
-    /// [`CostCalibration::unmeasured`], because falling back from one noisy month to the same
-    /// symbol's five years is still that symbol's own liquidity.
+    /// Three tiers, in order, each strictly better than the next: the symbol's nearest measured
+    /// pre-cutoff month; its own pre-cutoff pooled span when that month was too noisy; the
+    /// pre-cutoff cross-sectional median when the symbol's whole calibration span was. Only the
+    /// third counts as a fallback in [`CostCalibration::unmeasured`], because the first two are
+    /// still that symbol's own causal liquidity.
     pub fn resolve(&self, symbol: u32, ts_ms: i64) -> ResolvedCost {
         let entry = self.calibration.symbols.get(symbol as usize);
         self.resolve_from(
@@ -3375,8 +3408,95 @@ mod tests {
             .map(|(symbol, bars)| (symbol.clone(), bars.as_slice()))
             .collect();
         Arc::new(
-            CostCalibration::from_series(&borrowed, RES_SECS).expect("the calibration measures"),
+            CostCalibration::from_series(&borrowed, RES_SECS, i64::MAX)
+                .expect("the calibration measures"),
         )
+    }
+
+    #[test]
+    fn post_cutoff_market_data_cannot_change_calibration_or_evaluated_action_costs() {
+        let cutoff_ms = EPOCH_MS + 3 * 86_400_000;
+        let original = vec![
+            (
+                "ALPHA".to_owned(),
+                synthetic_bars(400, 0.0010, 0.0012, 40.0, 64, 0xCA05_A1),
+            ),
+            (
+                "BETA".to_owned(),
+                synthetic_bars(400, 0.0020, 0.0018, 90.0, 64, 0xCA05_B2),
+            ),
+        ];
+        let mut mutated = original.clone();
+        let mut mutated_bars = 0usize;
+        for (_, bars) in &mut mutated {
+            for bar in bars.iter_mut().filter(|bar| bar.ts_ms >= cutoff_ms) {
+                mutated_bars += 1;
+                bar.open *= 17.0;
+                bar.high = bar.open * 1.40;
+                bar.low = bar.open * 0.60;
+                bar.close = bar.open * 1.25;
+                bar.vwap = bar.open * 0.75;
+                bar.volume *= 10_000.0;
+                bar.trades = bar.trades.saturating_mul(1_000);
+            }
+        }
+        assert!(mutated_bars > 0, "the regression must mutate held-out bars");
+
+        let original_borrowed: Vec<(String, &[PackedBar])> = original
+            .iter()
+            .map(|(symbol, bars)| (symbol.clone(), bars.as_slice()))
+            .collect();
+        let mutated_borrowed: Vec<(String, &[PackedBar])> = mutated
+            .iter()
+            .map(|(symbol, bars)| (symbol.clone(), bars.as_slice()))
+            .collect();
+        let baseline = Arc::new(
+            CostCalibration::from_series(&original_borrowed, RES_SECS, cutoff_ms)
+                .expect("pre-cutoff bars calibrate"),
+        );
+        let changed = Arc::new(
+            CostCalibration::from_series(&mutated_borrowed, RES_SECS, cutoff_ms)
+                .expect("the same pre-cutoff bars calibrate"),
+        );
+
+        assert_eq!(baseline.cutoff_ms, cutoff_ms);
+        assert_eq!(
+            format!("{baseline:#?}"),
+            format!("{changed:#?}"),
+            "every fitted bucket, pooled moment, and cross-sectional fallback must be invariant"
+        );
+
+        let baseline_model = BarCostModel::new(baseline);
+        let changed_model = BarCostModel::new(changed);
+        for (symbol, (_, bars)) in original.iter().enumerate() {
+            for bar in bars.iter().filter(|bar| bar.ts_ms >= cutoff_ms) {
+                let ts_ms = bar.ts_ms;
+                for notional_frac in [0.0f32, 0.001, 0.01, 0.05] {
+                    assert_eq!(
+                        baseline_model
+                            .cost_bps(symbol as u32, ts_ms, notional_frac)
+                            .to_bits(),
+                        changed_model
+                            .cost_bps(symbol as u32, ts_ms, notional_frac)
+                            .to_bits(),
+                        "symbol {symbol} action at {} changed at participation {notional_frac}",
+                        ts_ms
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_rejects_a_cutoff_with_no_prior_bars() {
+        let bars = synthetic_bars(100, 0.0010, 0.0010, 50.0, 64, 0xCA05_00);
+        let series = vec![("LATE".to_owned(), bars.as_slice())];
+        let error = CostCalibration::from_series(&series, RES_SECS, EPOCH_MS)
+            .expect_err("the calibration must not reach into the evaluated split");
+        assert!(
+            error.to_string().contains("leaves no causal bars"),
+            "unexpected error: {error:#}"
+        );
     }
 
     /// The estimators' own data-generating process, run backwards.
@@ -4864,12 +4984,15 @@ mod tests {
         assert_eq!(corpus.series_count(), symbols);
 
         // The parallel corpus pass and the single-threaded series pass are the same measurement.
-        let parallel = CostCalibration::from_corpus(&corpus, 3).expect("the corpus calibrates");
+        let parallel =
+            CostCalibration::from_corpus(&corpus, 3, from_ms).expect("the corpus calibrates");
         let ordered: Vec<(String, &[PackedBar])> = (0..corpus.series_count())
             .map(|series| (corpus.symbol(series).to_owned(), corpus.bars(series)))
             .collect();
-        let serial =
-            CostCalibration::from_series(&ordered, RES_SECS).expect("the series calibrate");
+        let serial = CostCalibration::from_series(&ordered, RES_SECS, from_ms)
+            .expect("the series calibrate");
+        assert_eq!(parallel.cutoff_ms, from_ms);
+        assert_eq!(serial.cutoff_ms, from_ms);
         assert_eq!(parallel.len(), serial.len());
         assert_eq!(parallel.unmeasured, serial.unmeasured);
         for (index, (a, b)) in parallel.symbols.iter().zip(&serial.symbols).enumerate() {
@@ -5531,8 +5654,10 @@ mod tests {
             PINNED_SPLIT_BOUNDS,
         )
         .expect("the 300s corpus loads");
-        let calibration =
-            Arc::new(CostCalibration::from_corpus(&corpus, 4).expect("the corpus calibrates"));
+        let calibration = Arc::new(
+            CostCalibration::from_corpus(&corpus, 4, PINNED_SPLIT_BOUNDS.0)
+                .expect("the corpus calibrates"),
+        );
         let model = BarCostModel::new(Arc::clone(&calibration));
         // The ranking is over the FULL universe, deliberately: the question is which tenth of the
         // tradeable world these names occupy, not how they rank among themselves.
@@ -6854,8 +6979,10 @@ mod tests {
             PINNED_SPLIT_BOUNDS,
         )
         .expect("the 300s corpus loads");
-        let calibration =
-            Arc::new(CostCalibration::from_corpus(&corpus, 4).expect("the corpus calibrates"));
+        let calibration = Arc::new(
+            CostCalibration::from_corpus(&corpus, 4, PINNED_SPLIT_BOUNDS.0)
+                .expect("the corpus calibrates"),
+        );
         let universe = calibration.len();
         let unmeasured_symbols = calibration.unmeasured.len();
         let model = BarCostModel::new(calibration);

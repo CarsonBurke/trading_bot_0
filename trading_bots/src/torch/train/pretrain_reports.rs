@@ -55,19 +55,27 @@ use super::trade_bench::{
     SIZING_KNOBS, SIZING_SHAPES, TAIL_LEVELS, TAIL_RATIO_WARN,
 };
 use crate::torch::bar_dist::{
-    decode_dof, BarDof, BarScoring, BarSupports, BAR_DOF, BAR_DOF_NAMES, DOF_R, DOF_U, DOF_V,
-    NUM_BAR_BINS,
+    decode_dof, BarDof, BarScoring, BarSupports, BAR_DOF, BAR_DOF_NAMES, DOF_R, DOF_S, DOF_U,
+    DOF_V, NUM_BAR_BINS,
 };
 use crate::torch::dataset::{mix64, Split, MULTIPLICITY_BUCKETS};
 
 /// Resolution of the per-DOF PIT histogram.
 pub const PIT_HIST_BINS: usize = 16;
-/// Rollout horizons, in bars, reported by `pretrain_rollout_nll`.
+/// Teacher-forced rollout horizons, in bars, reported by
+/// `pretrain_teacher_forced_rollout_score`.
 ///
 /// The last entry is the depth of the realized continuation the snapshot windows
 /// hold; `pretrain::SNAPSHOT_HORIZON` asserts the two agree, because a horizon
 /// the continuation cannot reach is silently skipped rather than reported.
 pub const ROLLOUT_HORIZONS: [usize; 5] = [1, 4, 16, 64, 100];
+/// Absolute one-bar close log-return levels used by the pooled ancestral tail calibration.
+///
+/// The observed side has only `windows * horizon` conditional cases (800 at the production
+/// default), so the 0.03% row is deliberately charted beside that count and the
+/// path-clustered Monte Carlo SE. It is a tail-law diagnostic, not a claim that eight
+/// realized paths can resolve a three-in-ten-thousand event.
+pub const ANCESTRAL_TAIL_LEVELS: [f64; 4] = [0.01, 0.003, 0.001, 0.0003];
 /// Context the comparable diagnostic evaluation is pinned to, for axis labels.
 pub const DIAGNOSTIC_CONTEXT: i64 = 896;
 /// Causes a training bar cannot be a prediction target in a pass, in the order
@@ -166,31 +174,27 @@ pub struct StepMetrics {
     pub dyn_loss: f64,
     pub kl_loss: f64,
     pub total_loss: f64,
-    /// Mean `-log(1 + f_hat R)` in nats per bar under the deployed leverage cap, at the
-    /// log-optimal fraction of `p(r|past)` with the same-bar `s` marginalized out. Recorded
-    /// whatever `--lambda-growth` is, so a `lambda_growth = 0` control arm charts the same
-    /// curve and the ablation is a comparison rather than one panel and one blank.
+    /// Mean raw-payoff growth loss in nats per bar under the deployed leverage cap, where
+    /// `f_hat = E[R]/E[R²]` is the moment-correct quadratic Kelly fraction of
+    /// `p(r|past)`. Exact `-log1p(f_hat R)` applies at wealth `>= 1e-4`; a finite
+    /// value/slope-matched differentiable continuation applies below that numerical join.
+    /// Recorded whatever `--lambda-growth` is.
     pub growth_loss: f64,
     /// Share of the objective's total MAGNITUDE carried by each term, i.e. the weighted
     /// term over the sum of the four weighted magnitudes. They sum to one.
     ///
-    /// Magnitudes and not the signed total: under `BarScoring::Density` the likelihood term
-    /// is a log density and is routinely NEGATIVE, so a signed denominator would pass
-    /// through zero and make every share meaningless exactly when the objective is most
-    /// worth watching.
+    /// Magnitudes and not the signed total: the explicitly requested
+    /// `BarScoring::Density` fixed-support mixed-measure diagnostic can be negative because
+    /// of its finite-bin width offset, so a signed denominator would pass through zero.
     pub nll_share: f64,
     pub dyn_share: f64,
     pub kl_share: f64,
     pub growth_share: f64,
-    /// Mean `|f_hat|` the growth term sized at, under the deployed hard clamp. Comparable
-    /// to the trade bench's `quarter-Kelly mean |f|` and `|f*| median` figures, which is
-    /// what makes the training-time and evaluation-time views of the same decision one
-    /// picture.
+    /// Mean `|f_hat|` under the deployed hard clamp, directly comparable to the trade
+    /// bench because both use the same moment-correct `E[R]/E[R²]` contract.
     pub growth_abs_f: f64,
     /// Fraction of bars where the LEVERAGE CAP chose the position size rather than the
-    /// predictive law, i.e. `|mu_hat / var_hat| > cap`. 0.78-0.86 on the run that motivated
-    /// the term, and the reason the growth term's backward map is a smooth saturation
-    /// rather than the clamp itself.
+    /// predictive law, i.e. `|E[R] / E[R²]| > cap`.
     pub growth_clamp_bind: f64,
     /// Mean `cos(h_t, h_{t+1})` over the batch. A trunk that wins on the NextLat term by
     /// making beliefs SLOWLY VARYING — which the zero-init identity dynamics predicts
@@ -406,9 +410,9 @@ pub struct EpochMetrics {
     /// `class`, which the undivided number cannot distinguish from intra-bar skill.
     pub val_nll_dof_class: [f64; BAR_DOF],
     pub val_nll_dof_shape: [f64; BAR_DOF],
-    /// Log-optimal (Kelly) trading bench on the pinned diagnostic windows: what the
-    /// predictive distribution is worth in growth terms against the unconditional null.
-    /// See [`super::trade_bench`]; `TradeBench::nan()` when it was not measured.
+    /// Moment-correct quadratic Kelly bench on the pinned diagnostic windows: realized
+    /// growth from `E[R] / E[R²]` sizing against the unconditional null. See
+    /// [`super::trade_bench`]; `TradeBench::nan()` when it was not measured.
     pub trade: TradeBench,
 }
 
@@ -705,13 +709,14 @@ pub struct TestBattery {
     pub lr_plateau_fraction: f64,
     /// The trading bench on the TEST split, with the identical policy set.
     pub trade: TradeBench,
-    /// The artifact the NLL-PRIMARY rule would have shipped, scored on the same test set at
-    /// the same context.
+    /// The artifact the predictive-score-primary rule would have shipped, scored on the same
+    /// test set at the same context.
     ///
-    /// Selection is now economic — the 0.25x-cap trade edge, guarded by paired density
-    /// non-regression — because on the run that motivated the change the NLL-primary rule
-    /// promoted the best conditional NLL of the run and one of its worst economic reads. That
-    /// change is a claim, and a claim justified only by the run that produced it is an
+    /// Selection is now economic — the 0.25x-cap trade edge, guarded by paired Hard
+    /// categorical NLL non-regression — because on the run that motivated the change the
+    /// predictive-score-primary rule promoted its best score and one of its worst economic
+    /// reads.
+    /// That change is a claim, and a claim justified only by the run that produced it is an
     /// assertion. This field is the evidence: two artifacts, one held-out split each rule never
     /// saw, both currencies reported. `None` when both rules chose the same weights, which is
     /// itself a finding.
@@ -732,12 +737,12 @@ pub struct RivalSelection {
     pub step: usize,
     pub nll_bar_conditional: f64,
     pub nll_dof: [f64; BAR_DOF],
-    /// Net Kelly edge over the unconditional-marginal null at the SELECTION cap, in bps/bar:
-    /// the criterion the economic rule maximizes, measured on the rival's own weights.
+    /// Net moment-correct quadratic Kelly edge over the unconditional-marginal null at the
+    /// SELECTION cap, in bps/bar: the criterion the economic rule maximizes.
     pub selection_edge_bps: f64,
     /// The same at the headline 4x cap, in bps/bar, where 85% of bars are at the cap.
     pub edge_at_default: f64,
-    /// Quarter-Kelly annualized Sharpe, the fractional-Kelly row a deployable size would run.
+    /// Quarter of the quadratic Kelly fraction, reported as annualized realized Sharpe.
     pub sharpe: f64,
 }
 
@@ -778,12 +783,12 @@ impl TestBattery {
 /// Two of them exist because the headline "X nats better than the calibrated marginal"
 /// claim was, until now, comparing a held-out number against a TRAIN-fitted baseline that
 /// also credits an arithmetic identity of the encoding as skill. Every line here is
-/// recomputed per scoring mode, so a chart can never draw a `smoothed` yardstick under a
-/// `density` curve.
+/// recomputed per explicitly named scoring diagnostic. The full
+/// [`BarScoring::report_contract`] label is carried into every report title, so a
+/// fixed-support mixed-measure score cannot be mistaken for hard categorical NLL.
 #[derive(Clone, Copy, Debug)]
 pub struct HeldOutBaselines {
-    /// Scoring rule every figure in this struct, and every `nll` series it is drawn against,
-    /// is measured under.
+    /// Exact scoring contract every figure in this struct is measured under.
     pub scoring: BarScoring,
     /// Nats/bar a UNIFORM-over-bins head pays under `scoring`, which is where the
     /// zero-initialized emission head starts and the zero of the gain-vs-baselines chart.
@@ -847,18 +852,339 @@ impl HeldOutBaselines {
     }
 }
 
-/// Ancestral samples for the candle snapshot pictures.
+/// Free-running ancestral samples for the candle pictures and calibration reports.
 ///
-/// The reporter never invokes the model: the caller draws the samples with
-/// `BarWorldModel::rollout` and hands the tensor over, which keeps report
-/// emission independent of the model surface and directly testable.
+/// Both tensors are generated before the realized continuation is handed to the reporter.
+/// `dynamics_rollout` is the deployed cheap dynamics path. `exact_rollout` is an independently
+/// sampled exact-cache reference used only to measure distribution drift.
 pub struct SnapshotInput<'a> {
-    /// `[W, samples, H, BAR_DOF]` ancestral rollout of the pinned windows.
-    pub rollout: &'a Tensor,
-    /// `[W, H, BAR_DOF]` realized continuation of the same windows.
+    /// `[W, samples, H, BAR_DOF]` deployed `RolloutMode::Dynamics` ancestral draws.
+    pub dynamics_rollout: &'a Tensor,
+    /// `[W, samples, H, BAR_DOF]` exact-cache ancestral draws for the drift reference.
+    pub exact_rollout: &'a Tensor,
+    /// `[W, H, BAR_DOF]` realized continuation, used only after generation for scoring.
     pub future_dof: &'a Tensor,
     pub epoch: usize,
     pub global_step: usize,
+}
+
+/// Bounded free-running validation reduced onto the common horizon and tail axes.
+#[derive(Clone, Debug)]
+struct AncestralDiagnostics {
+    horizon: [f64; ROLLOUT_HORIZONS.len()],
+    endpoint_pit_mean: [f64; ROLLOUT_HORIZONS.len()],
+    endpoint_pit_se: [f64; ROLLOUT_HORIZONS.len()],
+    endpoint_coverage: [f64; ROLLOUT_HORIZONS.len()],
+    endpoint_coverage_se: [f64; ROLLOUT_HORIZONS.len()],
+    mean_error: [f64; ROLLOUT_HORIZONS.len()],
+    variance_ratio: [f64; ROLLOUT_HORIZONS.len()],
+    mean_mc_se: [f64; ROLLOUT_HORIZONS.len()],
+    exact_dynamics_w1: [f64; ROLLOUT_HORIZONS.len()],
+    exact_dynamics_mean_shift: [f64; ROLLOUT_HORIZONS.len()],
+    invalid_ohlc: [f64; ROLLOUT_HORIZONS.len()],
+    generated_flat_share: [f64; ROLLOUT_HORIZONS.len()],
+    realized_flat_share: [f64; ROLLOUT_HORIZONS.len()],
+    generated_flat_run: [f64; ROLLOUT_HORIZONS.len()],
+    realized_flat_run: [f64; ROLLOUT_HORIZONS.len()],
+    pooled_step_pit_mean: f64,
+    pooled_step_pit_se: f64,
+    conditional_cases: f64,
+    samples_per_case: f64,
+    pinned_paths: f64,
+    mc_paths: f64,
+    tail_level: [f64; ANCESTRAL_TAIL_LEVELS.len()],
+    tail_predicted: [f64; ANCESTRAL_TAIL_LEVELS.len()],
+    tail_realized: [f64; ANCESTRAL_TAIL_LEVELS.len()],
+    tail_realized_se: [f64; ANCESTRAL_TAIL_LEVELS.len()],
+    tail_mc_se: [f64; ANCESTRAL_TAIL_LEVELS.len()],
+}
+
+fn randomized_sample_pit(samples: &[f32], realized: f32, seed: u64) -> f64 {
+    let below = samples.iter().filter(|&&value| value < realized).count();
+    let equal = samples.iter().filter(|&&value| value == realized).count();
+    let u = (mix64(seed, 0) as f64) / ((u64::MAX as f64) + 1.0);
+    (below as f64 + u * equal as f64) / samples.len() as f64
+}
+
+fn sample_standard_error(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return f64::NAN;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (values.len() - 1) as f64;
+    (variance / values.len() as f64).sqrt()
+}
+
+fn flat_run_stats<I>(flat: I) -> (u64, u64, u64)
+where
+    I: IntoIterator<Item = bool>,
+{
+    let mut flat_bars = 0u64;
+    let mut runs = 0u64;
+    let mut run_bars = 0u64;
+    let mut current = 0u64;
+    for is_flat in flat {
+        if is_flat {
+            flat_bars += 1;
+            current += 1;
+        } else if current > 0 {
+            runs += 1;
+            run_bars += current;
+            current = 0;
+        }
+    }
+    if current > 0 {
+        runs += 1;
+        run_bars += current;
+    }
+    (flat_bars, runs, run_bars)
+}
+
+/// Score free-running draws without giving the generator access to any realized future bar.
+fn ancestral_diagnostics(
+    dynamics_rollout: &Tensor,
+    exact_rollout: &Tensor,
+    future_dof: &Tensor,
+) -> Result<AncestralDiagnostics> {
+    ensure!(
+        dynamics_rollout.dim() == 4,
+        "dynamics ancestral rollout must be [windows, samples, steps, BAR_DOF]"
+    );
+    let shape = dynamics_rollout.size();
+    let windows = shape[0] as usize;
+    let samples = shape[1] as usize;
+    let steps = shape[2] as usize;
+    ensure!(
+        windows > 0 && samples >= MIN_FAN_SAMPLES && steps == ROLLOUT_HORIZONS[4],
+        "ancestral rollout needs positive windows, at least {MIN_FAN_SAMPLES} samples, and exactly {} steps",
+        ROLLOUT_HORIZONS[4]
+    );
+    ensure!(
+        shape[3] == BAR_DOF as i64
+            && exact_rollout.size() == shape
+            && future_dof.size() == [windows as i64, steps as i64, BAR_DOF as i64],
+        "ancestral exact/dynamics/realized shapes disagree"
+    );
+
+    let dynamics = tensor_values(&dynamics_rollout.detach());
+    let exact = tensor_values(&exact_rollout.detach());
+    let realized = tensor_values(&future_dof.detach());
+    let draw_index = |window: usize, sample: usize, step: usize, dof: usize| {
+        (((window * samples + sample) * steps + step) * BAR_DOF) + dof
+    };
+    let realized_index =
+        |window: usize, step: usize, dof: usize| ((window * steps + step) * BAR_DOF) + dof;
+
+    let mut output = AncestralDiagnostics {
+        horizon: ROLLOUT_HORIZONS.map(|horizon| horizon as f64),
+        endpoint_pit_mean: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        endpoint_pit_se: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        endpoint_coverage: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        endpoint_coverage_se: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        mean_error: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        variance_ratio: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        mean_mc_se: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        exact_dynamics_w1: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        exact_dynamics_mean_shift: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        invalid_ohlc: [0.0; ROLLOUT_HORIZONS.len()],
+        generated_flat_share: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        realized_flat_share: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        generated_flat_run: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        realized_flat_run: [f64::NAN; ROLLOUT_HORIZONS.len()],
+        pooled_step_pit_mean: f64::NAN,
+        pooled_step_pit_se: f64::NAN,
+        conditional_cases: (windows * steps) as f64,
+        pinned_paths: windows as f64,
+        samples_per_case: samples as f64,
+        mc_paths: (windows * samples) as f64,
+        tail_level: ANCESTRAL_TAIL_LEVELS,
+        tail_predicted: [f64::NAN; ANCESTRAL_TAIL_LEVELS.len()],
+        tail_realized: [f64::NAN; ANCESTRAL_TAIL_LEVELS.len()],
+        tail_realized_se: [f64::NAN; ANCESTRAL_TAIL_LEVELS.len()],
+        tail_mc_se: [f64::NAN; ANCESTRAL_TAIL_LEVELS.len()],
+    };
+
+    for (slot, &horizon) in ROLLOUT_HORIZONS.iter().enumerate() {
+        let mut pits = Vec::with_capacity(windows);
+        let mut covered = 0usize;
+        let mut error_sum = 0.0;
+        let mut residual_square_sum = 0.0;
+        let mut predicted_variance_sum = 0.0;
+        let mut mc_variance_sum = 0.0;
+        let mut w1_sum = 0.0;
+        let mut mean_shift_sum = 0.0;
+        let mut invalid = 0u64;
+        let mut generated_flat = 0u64;
+        let mut generated_runs = 0u64;
+        let mut generated_run_bars = 0u64;
+        let mut realized_flat = 0u64;
+        let mut realized_runs = 0u64;
+        let mut realized_run_bars = 0u64;
+
+        for window in 0..windows {
+            let mut dynamics_returns = Vec::with_capacity(samples);
+            let mut exact_returns = Vec::with_capacity(samples);
+            for sample in 0..samples {
+                let dynamics_return = (0..horizon)
+                    .map(|step| dynamics[draw_index(window, sample, step, DOF_R)] as f64)
+                    .sum::<f64>();
+                let exact_return = (0..horizon)
+                    .map(|step| exact[draw_index(window, sample, step, DOF_R)] as f64)
+                    .sum::<f64>();
+                dynamics_returns.push(dynamics_return as f32);
+                exact_returns.push(exact_return as f32);
+
+                let (flat, runs, run_bars) = flat_run_stats(
+                    (0..horizon)
+                        .map(|step| dynamics[draw_index(window, sample, step, DOF_S)] == 0.0),
+                );
+                generated_flat += flat;
+                generated_runs += runs;
+                generated_run_bars += run_bars;
+
+                for step in 0..horizon {
+                    let base = draw_index(window, sample, step, 0);
+                    let legal = dynamics[base..base + BAR_DOF]
+                        .iter()
+                        .all(|value| value.is_finite())
+                        && dynamics[base + DOF_S] >= 0.0
+                        && (0.0..=1.0).contains(&dynamics[base + DOF_U])
+                        && (0.0..=1.0).contains(&dynamics[base + DOF_V]);
+                    invalid += u64::from(!legal);
+                }
+            }
+            let realized_return: f32 = (0..horizon)
+                .map(|step| realized[realized_index(window, step, DOF_R)])
+                .sum();
+            let (flat, runs, run_bars) = flat_run_stats(
+                (0..horizon).map(|step| realized[realized_index(window, step, DOF_S)] == 0.0),
+            );
+            realized_flat += flat;
+            realized_runs += runs;
+            realized_run_bars += run_bars;
+
+            let predicted_mean = dynamics_returns
+                .iter()
+                .map(|&value| value as f64)
+                .sum::<f64>()
+                / samples as f64;
+            let predicted_variance = dynamics_returns
+                .iter()
+                .map(|&value| (value as f64 - predicted_mean).powi(2))
+                .sum::<f64>()
+                / (samples.saturating_sub(1).max(1)) as f64;
+            let residual = realized_return as f64 - predicted_mean;
+            error_sum += residual;
+            residual_square_sum += residual * residual;
+            predicted_variance_sum += predicted_variance;
+            mc_variance_sum += predicted_variance / samples as f64;
+            let pit = randomized_sample_pit(
+                &dynamics_returns,
+                realized_return,
+                EVAL_WINDOW_SEED ^ ((window as u64) << 32) ^ horizon as u64,
+            );
+            pits.push(pit);
+            covered += usize::from((BAND_LOW..=BAND_HIGH).contains(&pit));
+
+            dynamics_returns.sort_by(f32::total_cmp);
+            exact_returns.sort_by(f32::total_cmp);
+            w1_sum += dynamics_returns
+                .iter()
+                .zip(&exact_returns)
+                .map(|(&dynamics, &exact)| (dynamics as f64 - exact as f64).abs())
+                .sum::<f64>()
+                / samples as f64;
+            mean_shift_sum += dynamics_returns
+                .iter()
+                .map(|&value| value as f64)
+                .sum::<f64>()
+                / samples as f64
+                - exact_returns.iter().map(|&value| value as f64).sum::<f64>() / samples as f64;
+        }
+
+        let pit_mean = pits.iter().sum::<f64>() / windows as f64;
+        let coverage = covered as f64 / windows as f64;
+        output.endpoint_pit_mean[slot] = pit_mean;
+        output.endpoint_pit_se[slot] = sample_standard_error(&pits);
+        output.endpoint_coverage[slot] = coverage;
+        output.endpoint_coverage_se[slot] = (coverage * (1.0 - coverage) / windows as f64).sqrt();
+        output.mean_error[slot] = error_sum / windows as f64;
+        output.variance_ratio[slot] = residual_square_sum / predicted_variance_sum;
+        output.mean_mc_se[slot] = mc_variance_sum.sqrt() / windows as f64;
+        output.exact_dynamics_w1[slot] = w1_sum / windows as f64;
+        output.exact_dynamics_mean_shift[slot] = mean_shift_sum / windows as f64;
+        output.invalid_ohlc[slot] = invalid as f64;
+        output.generated_flat_share[slot] =
+            generated_flat as f64 / (windows * samples * horizon) as f64;
+        output.realized_flat_share[slot] = realized_flat as f64 / (windows * horizon) as f64;
+        output.generated_flat_run[slot] = generated_run_bars as f64 / generated_runs.max(1) as f64;
+        output.realized_flat_run[slot] = realized_run_bars as f64 / realized_runs.max(1) as f64;
+    }
+
+    let mut step_pits = Vec::with_capacity(windows * steps);
+    let mut pit_path_means = Vec::with_capacity(windows);
+    for window in 0..windows {
+        let start = step_pits.len();
+        for step in 0..steps {
+            let law: Vec<f32> = (0..samples)
+                .map(|sample| dynamics[draw_index(window, sample, step, DOF_R)])
+                .collect();
+            step_pits.push(randomized_sample_pit(
+                &law,
+                realized[realized_index(window, step, DOF_R)],
+                EVAL_WINDOW_SEED ^ ((window as u64) << 32) ^ step as u64 ^ 0xA11C_E57A,
+            ));
+        }
+        pit_path_means.push(step_pits[start..].iter().sum::<f64>() / steps as f64);
+    }
+    output.pooled_step_pit_mean = step_pits.iter().sum::<f64>() / step_pits.len() as f64;
+    output.pooled_step_pit_se = sample_standard_error(&pit_path_means);
+    for (slot, &level) in ANCESTRAL_TAIL_LEVELS.iter().enumerate() {
+        let mut predicted = 0u64;
+        let mut observed = 0u64;
+        let mut path_rates = Vec::with_capacity(windows * samples);
+        let mut realized_path_rates = Vec::with_capacity(windows);
+        for window in 0..windows {
+            let mut window_observed = 0u64;
+            for step in 0..steps {
+                let exceeds = (realized[realized_index(window, step, DOF_R)] as f64)
+                    .exp_m1()
+                    .abs()
+                    > level;
+                observed += u64::from(exceeds);
+                window_observed += u64::from(exceeds);
+                for sample in 0..samples {
+                    predicted += u64::from(
+                        (dynamics[draw_index(window, sample, step, DOF_R)] as f64)
+                            .exp_m1()
+                            .abs()
+                            > level,
+                    );
+                }
+            }
+            realized_path_rates.push(window_observed as f64 / steps as f64);
+            for sample in 0..samples {
+                let exceedances = (0..steps)
+                    .filter(|&step| {
+                        (dynamics[draw_index(window, sample, step, DOF_R)] as f64)
+                            .exp_m1()
+                            .abs()
+                            > level
+                    })
+                    .count();
+                path_rates.push(exceedances as f64 / steps as f64);
+            }
+        }
+        output.tail_predicted[slot] = predicted as f64 / (windows * samples * steps) as f64;
+        output.tail_realized_se[slot] = sample_standard_error(&realized_path_rates);
+        output.tail_realized[slot] = observed as f64 / (windows * steps) as f64;
+        output.tail_mc_se[slot] = sample_standard_error(&path_rates);
+    }
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,6 +1547,9 @@ pub struct PretrainReporter {
     market_total_bars: u64,
 
     pit: Option<[[f64; PIT_HIST_BINS]; BAR_DOF]>,
+    /// Latest bounded free-running validation. Owned by the reporter so all four ancestral
+    /// bases are emitted through the same `.report.bin` cycle as every other pretrain metric.
+    ancestral: Option<AncestralDiagnostics>,
 
     /// One entry per snapshot, in snapshot order. Every scalar here is paired with
     /// the standard error of its own estimator: a snapshot statistic taken from
@@ -1408,6 +1737,7 @@ impl PretrainReporter {
             market_missing_bars: 0,
             market_total_bars: 0,
             pit: None,
+            ancestral: None,
             candle_dclose: Vec::new(),
             candle_dclose_se: Vec::new(),
             candle_dclose_mc_floor: Vec::new(),
@@ -1850,13 +2180,16 @@ impl PretrainReporter {
         }
     }
 
-    /// Ancestral candle snapshots: one `CandleFan` per window — the realized bars
-    /// against the ancestral quantile fan and a few genuine draws — plus the
-    /// pooled drift, band, coverage and rank-PIT scalars, each with the standard
-    /// error of its own estimator.
+    /// Free-running validation: deployed-dynamics candle fans plus proper path calibration,
+    /// bar validity, pooled tail calibration and exact-cache distribution drift.
     pub fn record_snapshot(&mut self, input: &SnapshotInput<'_>) -> Result<()> {
         self.epoch = input.epoch;
         self.global_step = input.global_step;
+        self.ancestral = Some(ancestral_diagnostics(
+            input.dynamics_rollout,
+            input.exact_rollout,
+            input.future_dof,
+        )?);
         let dir = self
             .gens_dir
             .join(self.epoch.to_string())
@@ -1866,7 +2199,7 @@ impl PretrainReporter {
                 &dir,
                 self.global_step,
                 Some(self.epoch),
-                &input.rollout.detach(),
+                &input.dynamics_rollout.detach(),
                 input.future_dof,
             )
         })
@@ -1945,17 +2278,25 @@ impl PretrainReporter {
         let dir = self.gens_dir.join(self.epoch.to_string());
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let uniform = self.baselines.uniform_nll_bar;
+        let score_contract = self.baselines.scoring.report_contract();
         let mut series = vec![
-            point_series("nll_bar", battery.nll_bar),
-            point_series("nll_bar vs uniform", uniform - battery.nll_bar),
+            point_series(&format!("{score_contract} nats/bar"), battery.nll_bar),
             point_series(
-                "nll_bar vs marginal",
+                &format!("{score_contract} vs uniform"),
+                uniform - battery.nll_bar,
+            ),
+            point_series(
+                &format!("{score_contract} vs marginal"),
                 self.marginal_nll_bar - battery.nll_bar,
             ),
-            point_series("uniform", uniform),
-            point_series("marginal", self.marginal_nll_bar),
+            point_series(&format!("uniform ({score_contract})"), uniform),
             point_series(
-                "scoring mode (0 smoothed, 1 hard, 2 density)",
+                &format!("marginal ({score_contract})"),
+                self.marginal_nll_bar,
+            ),
+            point_series(
+                "scoring contract code (0 smoothed diagnostic, 1 hard categorical NLL, 2 \
+                 fixed-support mixed-measure diagnostic)",
                 match self.baselines.scoring {
                     BarScoring::Smoothed => 0.0,
                     BarScoring::Hard => 1.0,
@@ -1971,11 +2312,11 @@ impl PretrainReporter {
         }
         for (i, horizon) in ROLLOUT_HORIZONS.iter().enumerate() {
             series.push(point_series(
-                &format!("rollout h{horizon} exact"),
+                &format!("TEACHER-FORCED score h{horizon} exact belief advance"),
                 battery.rollout_nll_exact[i],
             ));
             series.push(point_series(
-                &format!("rollout h{horizon} dynamics"),
+                &format!("TEACHER-FORCED score h{horizon} dynamics advance"),
                 battery.rollout_nll_dynamics[i],
             ));
         }
@@ -2085,7 +2426,7 @@ impl PretrainReporter {
                 rival.edge_at_default,
             ));
             series.push(point_series(
-                "rival quarter-kelly sharpe (annualized)",
+                "rival quarter quadratic-kelly sharpe (annualized)",
                 rival.sharpe,
             ));
             series.push(point_series(
@@ -2109,8 +2450,10 @@ impl PretrainReporter {
                 promoted_edge - rival.selection_edge_bps,
             ));
             series.push(point_series(
-                "RULE DELTA conditional nll, economic - nll (nats/bar, + = the edge was bought \
-                 with density)",
+                &format!(
+                    "RULE DELTA conditional {score_contract}, economic - predictive-score rule \
+                     (nats/bar, + = economic selection accepted a worse predictive score)"
+                ),
                 battery.nll_bar_conditional - rival.nll_bar_conditional,
             ));
         }
@@ -2125,8 +2468,8 @@ impl PretrainReporter {
             &dir,
             "pretrain_test",
             format!(
-                "Pretrain Held-out Test Battery - {name} - lineage {lineage} - corpus {corpus} \
-                 - split {}|{} - step {}",
+                "Pretrain Held-out Test Battery - {score_contract} - {name} - lineage {lineage} \
+                 - corpus {corpus} - split {}|{} - step {}",
                 battery.split_bounds.0, battery.split_bounds.1, self.global_step
             ),
             "single evaluation",
@@ -2204,19 +2547,17 @@ impl PretrainReporter {
         let len = self.tick;
         let epoch = self.epoch;
         let step = self.global_step;
-        // Every nats axis below is in the units of the scoring rule in force, and the three
-        // rules differ by tens of nats. The mode belongs in the title of every chart, not
-        // only in the banner of a log nobody opens next to the picture.
-        let suffix = format!(
-            "epoch {epoch} step {step} - scoring {}",
-            self.baselines.scoring
-        );
+        // A categorical NLL and a finite-support mixed-measure diagnostic can share gradients
+        // while differing by tens of displayed nats. Put the full contract in every chart
+        // title so the report cannot call the latter a categorical likelihood.
+        let score_contract = self.baselines.scoring.report_contract();
+        let suffix = format!("epoch {epoch} step {step} - {score_contract}");
         let diag = DIAGNOSTIC_CONTEXT;
 
         write_chart(
             &dir,
             "pretrain_nll_bar",
-            format!("Pretrain Bar NLL - {suffix}"),
+            format!("Pretrain Bar Score - {suffix}"),
             "record",
             "nats/bar (val = promotion metric at the DEPLOYED context, absent until the ramp \
              reaches it; band = 95% block bootstrap)",
@@ -2243,7 +2584,7 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_nll_bar_diag896",
-            format!("Pretrain Bar NLL (fixed {diag} context) - {suffix}"),
+            format!("Pretrain Bar Score (fixed {diag} context) - {suffix}"),
             "record",
             &format!(
                 "nats/bar at a pinned {diag} context, measured at EVERY validation from step \
@@ -2285,7 +2626,7 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_independent_marginal_nll",
-            format!("Pretrain Independent Marginals vs Chain-Conditional Joint NLL - {suffix}"),
+            format!("Pretrain Independent Marginals vs Chain-Conditional Joint Score - {suffix}"),
             "record",
             &format!(
                 "nats/bar at the fixed {diag} context. Each per-DOF marginal conditions only \
@@ -2343,7 +2684,7 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_nll_dof",
-            format!("Pretrain Bar NLL per DOF - {suffix}"),
+            format!("Pretrain Bar Score per DOF - {suffix}"),
             "record",
             &format!("nats (val series at the fixed {diag} context)"),
             ScaleKind::Linear,
@@ -2392,7 +2733,7 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_nll_vs_baselines",
-            format!("Pretrain NLL Gain vs Baselines - {suffix}"),
+            format!("Pretrain Score Gain vs Baselines - {suffix}"),
             "record",
             "nats/bar below the uniform chain",
             ScaleKind::Linear,
@@ -2731,17 +3072,23 @@ impl PretrainReporter {
 
         let mut rollout = Vec::with_capacity(2 * ROLLOUT_HORIZONS.len());
         for (i, horizon) in ROLLOUT_HORIZONS.iter().enumerate() {
-            rollout.push(self.rollout_exact[i].labeled(&format!("h{horizon} exact"), len));
+            rollout.push(self.rollout_exact[i].labeled(
+                &format!("TEACHER-FORCED h{horizon} exact belief advance"),
+                len,
+            ));
         }
         for (i, horizon) in ROLLOUT_HORIZONS.iter().enumerate() {
-            rollout.push(self.rollout_dynamics[i].labeled(&format!("h{horizon} dynamics"), len));
+            rollout.push(
+                self.rollout_dynamics[i]
+                    .labeled(&format!("TEACHER-FORCED h{horizon} dynamics advance"), len),
+            );
         }
         write_chart(
             &dir,
-            "pretrain_rollout_nll",
-            format!("Pretrain Rollout NLL by Horizon - {suffix}"),
+            "pretrain_teacher_forced_rollout_score",
+            format!("Pretrain TEACHER-FORCED Rollout Score by Horizon - {suffix}"),
             "record",
-            "nats/bar (exact vs dynamics belief advance)",
+            "proper score/bar (OBSERVED future bars advance every belief; NOT ancestral)",
             ScaleKind::Linear,
             rollout,
         )?;
@@ -2924,6 +3271,191 @@ impl PretrainReporter {
             ],
         )?;
 
+        if let Some(ancestral) = &self.ancestral {
+            let endpoint_cases =
+                ancestral.conditional_cases / ROLLOUT_HORIZONS.last().copied().unwrap() as f64;
+            write_chart(
+                &dir,
+                "pretrain_ancestral_calibration",
+                format!("Pretrain Free-Running Ancestral Close Calibration - {suffix}"),
+                "horizon slot (read the explicit horizon series)",
+                "cumulative close log-return calibration",
+                ScaleKind::Symlog,
+                vec![
+                    f64_series("HORIZON (bars)", &ancestral.horizon),
+                    f64_series(
+                        "randomized PIT mean of cumulative close return",
+                        &ancestral.endpoint_pit_mean,
+                    ),
+                    f64_series(
+                        "randomized PIT mean +1 SE",
+                        &array::from_fn::<_, 5, _>(|i| {
+                            ancestral.endpoint_pit_mean[i] + ancestral.endpoint_pit_se[i]
+                        }),
+                    ),
+                    f64_series(
+                        "randomized PIT mean -1 SE",
+                        &array::from_fn::<_, 5, _>(|i| {
+                            ancestral.endpoint_pit_mean[i] - ancestral.endpoint_pit_se[i]
+                        }),
+                    ),
+                    f64_series(
+                        "randomized central PIT coverage of cumulative close return (10/90)",
+                        &ancestral.endpoint_coverage,
+                    ),
+                    f64_series(
+                        "central coverage +1 binomial SE across pinned windows",
+                        &array::from_fn::<_, 5, _>(|i| {
+                            ancestral.endpoint_coverage[i] + ancestral.endpoint_coverage_se[i]
+                        }),
+                    ),
+                    f64_series("nominal central coverage", &[NOMINAL_COVERAGE; 5]),
+                    f64_series(
+                        "mean calibration: realized minus predicted cumulative return",
+                        &ancestral.mean_error,
+                    ),
+                    f64_series(
+                        "variance calibration: squared residual / predicted variance",
+                        &ancestral.variance_ratio,
+                    ),
+                    f64_series(
+                        "Monte Carlo SE of predicted cumulative-return mean",
+                        &ancestral.mean_mc_se,
+                    ),
+                    f64_series("pinned endpoint cases (windows)", &[endpoint_cases; 5]),
+                    f64_series(
+                        "ancestral samples per endpoint law",
+                        &[ancestral.samples_per_case; 5],
+                    ),
+                ],
+            )?;
+
+            write_chart(
+                &dir,
+                "pretrain_ancestral_tails",
+                format!("Pretrain Free-Running Ancestral One-Bar Tail Calibration - {suffix}"),
+                "tail slot (read the explicit threshold series)",
+                "pooled conditional exceedance rate; rare realized rows are underpowered",
+                ScaleKind::Symlog,
+                vec![
+                    f64_series(
+                        "ABS SIMPLE-RETURN THRESHOLD (%)",
+                        &ancestral.tail_level.map(|level| 100.0 * level),
+                    ),
+                    f64_series(
+                        "ancestral predicted exceedance rate",
+                        &ancestral.tail_predicted,
+                    ),
+                    f64_series(
+                        "predicted exceedance +1 path-clustered MC SE",
+                        &array::from_fn::<_, 4, _>(|i| {
+                            ancestral.tail_predicted[i] + ancestral.tail_mc_se[i]
+                        }),
+                    ),
+                    f64_series(
+                        "predicted exceedance -1 path-clustered MC SE",
+                        &array::from_fn::<_, 4, _>(|i| {
+                            ancestral.tail_predicted[i] - ancestral.tail_mc_se[i]
+                        }),
+                    ),
+                    f64_series(
+                        "realized exceedance rate (UNDERPOWERED at rare thresholds)",
+                        &ancestral.tail_realized,
+                    ),
+                    f64_series(
+                        "realized exceedance +1 SE across pinned paths",
+                        &array::from_fn::<_, 4, _>(|i| {
+                            ancestral.tail_realized[i] + ancestral.tail_realized_se[i]
+                        }),
+                    ),
+                    f64_series(
+                        "realized exceedance -1 SE across pinned paths",
+                        &array::from_fn::<_, 4, _>(|i| {
+                            ancestral.tail_realized[i] - ancestral.tail_realized_se[i]
+                        }),
+                    ),
+                    f64_series(
+                        "pooled realized conditional cases (serially dependent)",
+                        &[ancestral.conditional_cases; 4],
+                    ),
+                    f64_series(
+                        "independent pinned realized paths (SE clustering unit)",
+                        &[ancestral.pinned_paths; 4],
+                    ),
+                    f64_series(
+                        "effective Monte Carlo paths (windows x samples; SE clusters steps)",
+                        &[ancestral.mc_paths; 4],
+                    ),
+                    f64_series(
+                        "samples per conditional predictive law",
+                        &[ancestral.samples_per_case; 4],
+                    ),
+                    f64_series(
+                        "pooled one-step randomized PIT mean",
+                        &[ancestral.pooled_step_pit_mean; 4],
+                    ),
+                    f64_series(
+                        "pooled one-step randomized PIT mean SE across pinned paths",
+                        &[ancestral.pooled_step_pit_se; 4],
+                    ),
+                ],
+            )?;
+
+            write_chart(
+                &dir,
+                "pretrain_ancestral_bar_validity",
+                format!("Pretrain Free-Running Ancestral Bar Validity - {suffix}"),
+                "horizon slot (read the explicit horizon series)",
+                "raw validity counts and flat-bar behavior",
+                ScaleKind::Symlog,
+                vec![
+                    f64_series("HORIZON (bars)", &ancestral.horizon),
+                    f64_series(
+                        "cumulative invalid raw OHLC DOF count",
+                        &ancestral.invalid_ohlc,
+                    ),
+                    f64_series(
+                        "generated flat-bar share through horizon",
+                        &ancestral.generated_flat_share,
+                    ),
+                    f64_series(
+                        "realized flat-bar share through horizon",
+                        &ancestral.realized_flat_share,
+                    ),
+                    f64_series(
+                        "generated mean flat-run length through horizon",
+                        &ancestral.generated_flat_run,
+                    ),
+                    f64_series(
+                        "realized mean flat-run length through horizon",
+                        &ancestral.realized_flat_run,
+                    ),
+                ],
+            )?;
+
+            write_chart(
+                &dir,
+                "pretrain_ancestral_distribution_drift",
+                format!(
+                    "Pretrain Free-Running Exact-vs-Dynamics Close Distribution Drift - {suffix}"
+                ),
+                "horizon slot (read the explicit horizon series)",
+                "cumulative close log-return distribution difference",
+                ScaleKind::Symlog,
+                vec![
+                    f64_series("HORIZON (bars)", &ancestral.horizon),
+                    f64_series(
+                        "empirical Wasserstein-1(exact, dynamics; includes two-sample MC floor)",
+                        &ancestral.exact_dynamics_w1,
+                    ),
+                    f64_series(
+                        "mean(dynamics) minus mean(exact)",
+                        &ancestral.exact_dynamics_mean_shift,
+                    ),
+                ],
+            )?;
+        }
+
         // The snapshot scalars, each beside the noise of its own estimator.
         //
         // What used to sit here was a median-path-vs-realized MSE, which asserts that a
@@ -3094,8 +3626,8 @@ impl PretrainReporter {
             dir,
             "pretrain_trade_growth",
             format!(
-                "Pretrain Kelly Trade Growth ({windows}, cap {cap:.1}x, cost {cost:.2} bps) \
-                 - {suffix}"
+                "Pretrain Moment-Correct Quadratic Kelly Trade Growth ({windows}, cap \
+                 {cap:.1}x, cost {cost:.2} bps) - {suffix}"
             ),
             "record",
             "realized log growth, bps/bar",
@@ -3110,7 +3642,7 @@ impl PretrainReporter {
             dir,
             "pretrain_trade_vs_baselines",
             format!(
-                "Pretrain Kelly Edge over the Unconditional Null (break-even {}) - {suffix}",
+                "Pretrain Quadratic Kelly Edge over the Unconditional Null (break-even {}) - {suffix}",
                 self.trade_val
                     .map_or_else(|| "unmeasured".to_owned(), |t| break_even_label(&t)),
             ),
@@ -3148,7 +3680,7 @@ impl PretrainReporter {
                 dir,
                 "pretrain_trade_cost_curve",
                 format!(
-                    "Pretrain Kelly Edge vs Transaction Cost (val break-even {}{}) - {suffix}",
+                    "Pretrain Quadratic Kelly Edge vs Transaction Cost (val break-even {}{}) - {suffix}",
                     break_even_label(&val),
                     self.trade_test.map_or_else(String::new, |t| format!(
                         ", TEST break-even {}",
@@ -3165,7 +3697,7 @@ impl PretrainReporter {
         write_chart(
             dir,
             "pretrain_trade_sharpe",
-            format!("Pretrain Kelly Trade Sharpe ({windows}) - {suffix}"),
+            format!("Pretrain Moment-Correct Quadratic Kelly Trade Sharpe ({windows}) - {suffix}"),
             "record",
             format!("annualized Sharpe at {BARS_PER_YEAR:.0} bars/year").as_str(),
             ScaleKind::Linear,
@@ -3182,7 +3714,7 @@ impl PretrainReporter {
         write_chart(
             dir,
             "pretrain_trade_exposure",
-            format!("Pretrain Kelly Trade Exposure (cap {cap:.1}x) - {suffix}"),
+            format!("Pretrain Quadratic Kelly Trade Exposure (cap {cap:.1}x) - {suffix}"),
             "record",
             "fraction / notional per bar",
             ScaleKind::Linear,
@@ -3242,8 +3774,8 @@ impl PretrainReporter {
             dir,
             "pretrain_epoch_trade_edge",
             format!(
-                "Pretrain PER-EPOCH Kelly Edge over the Unconditional Null (epoch {}: {}, \
-                 break-even {}, {:.0}% of bars at the {:.1}x cap) - {suffix}",
+                "Pretrain PER-EPOCH Quadratic Kelly Edge over the Unconditional Null (epoch \
+                 {}: {}, break-even {}, {:.0}% of bars at the {:.1}x cap) - {suffix}",
                 last.epoch,
                 if last.trade.model_edge().ci_low > 0.0 {
                     "resolvable"
@@ -3324,9 +3856,9 @@ impl PretrainReporter {
             dir,
             "pretrain_epoch_trade",
             format!(
-                "Pretrain PER-EPOCH Kelly Trade Growth AND EXPOSURE ({} windows, cap \
-                 {:.1}x, cost {:.2} bps; epoch {}: |f| {:.2} with {:.0}% of bars AT THE \
-                 CAP, {} ruined bars) - {suffix}",
+                "Pretrain PER-EPOCH Moment-Correct Quadratic Kelly Trade Growth AND EXPOSURE \
+                 ({} windows, cap {:.1}x, cost {:.2} bps; epoch {}: |f| {:.2} with {:.0}% \
+                 of bars AT THE CAP, {} ruined bars) - {suffix}",
                 last.trade.windows,
                 last.trade.leverage_cap,
                 last.trade.cost_bps,
@@ -3491,8 +4023,8 @@ fn write_cap_and_tail_charts(
         dir,
         "pretrain_trade_cap_curve",
         format!(
-            "Pretrain Kelly Edge vs the Leverage Cap (headline {:.1}x, {:.0}% of bars \
-                 clipped there) - {suffix}",
+            "Pretrain Quadratic Kelly Edge vs the Leverage Cap (headline {:.1}x, {:.0}% of \
+                 bars clipped there) - {suffix}",
             val.leverage_cap,
             100.0 * val.policies[POLICY_MODEL].clamped_fraction,
         ),
@@ -3503,13 +4035,13 @@ fn write_cap_and_tail_charts(
     )?;
 
     // 2. The distribution of the uncapped optimum. Reading the mass at and beyond the
-    //    cap is how one sees whether the reported policy is Kelly or is a constant.
+    //    cap is how one sees whether the reported quadratic policy or the cap chose the size.
     write_chart(
         dir,
         "pretrain_trade_free_kelly",
         format!(
-            "Pretrain Uncapped Kelly |f*| Distribution (median {:.2}x, p95 {:.2}x, \
-                 {:.0}% at the {:.1}x cap) - {suffix}",
+            "Pretrain Uncapped Moment-Correct Kelly |f*| Distribution (median {:.2}x, p95 \
+                 {:.2}x, {:.0}% at the {:.1}x cap) - {suffix}",
             val.free_kelly.median,
             val.free_kelly.p95,
             100.0 * val.free_kelly.saturated,
@@ -3638,7 +4170,7 @@ pub fn write_trade_bench(dir: &Path, label: &str, trade: &TradeBench) -> Result<
     write_chart(
         dir,
         "pretrain_trade_growth",
-        format!("Pretrain Kelly Trade Growth - {suffix}"),
+        format!("Pretrain Moment-Correct Quadratic Kelly Trade Growth - {suffix}"),
         "single evaluation",
         "realized log growth, bps/bar",
         ScaleKind::Symlog,
@@ -3651,7 +4183,7 @@ pub fn write_trade_bench(dir: &Path, label: &str, trade: &TradeBench) -> Result<
         dir,
         "pretrain_trade_vs_baselines",
         format!(
-            "Pretrain Kelly Edge over the Unconditional Null (break-even {}) - {suffix}",
+            "Pretrain Quadratic Kelly Edge over the Unconditional Null (break-even {}) - {suffix}",
             break_even_label(trade)
         ),
         "single evaluation",
@@ -3664,7 +4196,7 @@ pub fn write_trade_bench(dir: &Path, label: &str, trade: &TradeBench) -> Result<
         dir,
         "pretrain_trade_cost_curve",
         format!(
-            "Pretrain Kelly Edge vs Transaction Cost (break-even {}) - {suffix}",
+            "Pretrain Quadratic Kelly Edge vs Transaction Cost (break-even {}) - {suffix}",
             break_even_label(trade)
         ),
         "cost grid index (see the `cost (bps)` series)",
@@ -3676,7 +4208,7 @@ pub fn write_trade_bench(dir: &Path, label: &str, trade: &TradeBench) -> Result<
     write_chart(
         dir,
         "pretrain_trade_sharpe",
-        format!("Pretrain Kelly Trade Sharpe - {suffix}"),
+        format!("Pretrain Moment-Correct Quadratic Kelly Trade Sharpe - {suffix}"),
         "single evaluation",
         format!("annualized Sharpe at {BARS_PER_YEAR:.0} bars/year").as_str(),
         ScaleKind::Linear,
@@ -3694,7 +4226,7 @@ pub fn write_trade_bench(dir: &Path, label: &str, trade: &TradeBench) -> Result<
         dir,
         "pretrain_trade_exposure",
         format!(
-            "Pretrain Kelly Trade Exposure (cap {:.1}x) - {suffix}",
+            "Pretrain Quadratic Kelly Trade Exposure (cap {:.1}x) - {suffix}",
             trade.leverage_cap
         ),
         "single evaluation",
@@ -3988,8 +4520,8 @@ pub fn write_mean_calibration(dir: &Path, label: &str, points: &[CalibrationPoin
         dir,
         "pretrain_shrunk_policy",
         format!(
-            "Pretrain Post-hoc Mean Shrinkage vs the Untouched Kelly Policy (slope fitted OUT \
-             OF SAMPLE) - {suffix}"
+            "Pretrain Post-hoc Mean Shrinkage vs the Untouched Moment-Correct Kelly Policy \
+             (slope fitted OUT OF SAMPLE) - {suffix}"
         ),
         "leverage cap index (see the `cap (x)` series)",
         "bps/bar / sharpe / fraction / notional per bar",
@@ -4125,8 +4657,8 @@ fn write_no_trade_band(dir: &Path, suffix: &str, points: &[CalibrationPoint]) ->
         dir,
         "pretrain_no_trade_band",
         format!(
-            "Pretrain Cost-Aware Sizing: the No-Trade Band the Cost-Blind Kelly Solve Does Not \
-             Have (cap {LEVERAGE_CAP:.1}x) - {suffix}"
+            "Pretrain Cost-Aware Sizing: the No-Trade Band the Cost-Blind Quadratic Kelly \
+             Reduction Does Not Have (cap {LEVERAGE_CAP:.1}x) - {suffix}"
         ),
         "no-trade band index (see the `band` series)",
         "bps/bar / bps / sharpe / fraction / notional per bar",
@@ -5468,25 +6000,24 @@ pub(super) fn point_series(label: &str, value: f64) -> ReportSeries {
     }
 }
 
+fn f64_series(label: &str, values: &[f64]) -> ReportSeries {
+    ReportSeries {
+        label: label.to_owned(),
+        values: values.iter().map(|&value| value as f32).collect(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Support decode comparison
 // ---------------------------------------------------------------------------
 
-/// The fitted-versus-edge decode comparison of a bar support, written by
+/// Geometry-preserving fitted-moment diagnostics written by
 /// `trading_bots::torch::train::support_moments::fit_support_moments`.
 ///
-/// Two panels, both properties of the SUPPORT ARTIFACT and of nothing else: no model, no
-/// checkpoint, no step. They cannot be produced from inside a training cycle and they do not
-/// move when a step does, which is why they are their own bases rather than more columns on a
-/// step-indexed chart.
-///
-/// EVERY CAVEAT LIVES IN A SERIES LABEL, NOT IN A TITLE, and that is deliberate: the TUI's
-/// `normalize_title` lowercases everything after each word's first letter, so emphasis in a
-/// title is destroyed before a reader sees it, while series legends render verbatim. The
-/// qualification that matters here is that THE FITTED DECODE IS NOT THE PRODUCTION PATH — every
-/// first-moment decode in the tree still reads `MeanDecode::Edge` — so a reader who sees a
-/// fitted-decode line and concludes the pipeline computes it would be wrong, and the label is
-/// the only place that correction survives rendering.
+/// The existing two report bases now include direct simple-return first/second moments for
+/// `r`, their within-bin dispersion, nonlinear-transform error, and explicit atom/open-tail
+/// provenance. Keeping these in the existing `.report.bin` panels avoids a second metadata
+/// convention for the same support artifact.
 pub fn write_support_decode(dir: &Path, decode: &SupportDecode) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let series = |rows: Vec<(String, Vec<f64>)>| -> Vec<ReportSeries> {
@@ -5501,8 +6032,8 @@ pub fn write_support_decode(dir: &Path, decode: &SupportDecode) -> Result<()> {
     write_chart(
         dir,
         "support_decode_moments",
-        "Bar Support Catch-All Leverage, Fitted Conditional Means Against the Edge Decode In \
-         Force - per DOF, model-free, measured on the support's own fit sample"
+        "Bar Support Fitted Conditional Moments - per DOF, model-free, measured on the \
+         support's own training fit sample"
             .to_owned(),
         "dof index (see the `dof index` series; tensor order r, s, u, v, w)",
         "% share / bps",
@@ -5514,8 +6045,7 @@ pub fn write_support_decode(dir: &Path, decode: &SupportDecode) -> Result<()> {
         dir,
         "support_decode_bins",
         format!(
-            "Bar Support Per-Bin Decode and Leverage for DOF {} - the two catch-alls against the \
-             126 interior bins",
+            "Bar Support Per-Bin Log/Simple-Return Moments and Provenance for DOF {}",
             BAR_DOF_NAMES[DOF_R]
         ),
         "bin index, 0 and 127 are the open-ended catch-alls",
@@ -5543,9 +6073,11 @@ pub fn write_support_decode(dir: &Path, decode: &SupportDecode) -> Result<()> {
 /// sees it, while series legends render verbatim. Four qualifications have to survive rendering:
 /// the atom probabilities are EXACT BY CONSTRUCTION and not a fitted result; the 1.66-1.84 tail
 /// figure is a SPREAD OF SIX PAIRWISE SLOPES with no point estimate and no standard error, so the
-/// band is drawn as two reference power laws and never as a value; both NLL columns are already on
-/// the SAME mixed-measure density footing because `scoring: density` adds `E[ln width]`; and the
-/// ruin bound is set by the SHORT side of the book, not by the worst down bar.
+/// band is drawn as two reference power laws and never as a value. The discrete diagnostic adds
+/// `E[ln width]` on finite bins solely to compare the fitted interiors on one frozen support; the
+/// clamped catch-all edge bins are not normalized open-tail likelihoods, and no cross-geometry or
+/// raw-tail-density claim is licensed. The ruin bound is set by the SHORT side of the book, not by
+/// the worst down bar.
 ///
 /// All ten are [`ScaleKind::Symlog`]: each carries its own x-axis as an explicit series — a bin
 /// edge, a threshold in bps, a component count, a leverage — sitting orders of magnitude away from
@@ -5775,15 +6307,14 @@ pub fn write_bar_family(dir: &Path, fit: &BarFamilyFit) -> Result<()> {
                 dof_axis.clone(),
             ),
             of(
-                "continuous family nats/bar, mixed-measure density footing (counting on the \
-                 atoms, Lebesgue elsewhere)"
+                "continuous family nats/bar on the fitted interior mixed measure (diagnostic; \
+                 excludes any normalized open-tail claim)"
                     .to_owned(),
                 fit.dofs.iter().map(|d| d.family_nll).collect(),
             ),
             of(
-                "discrete marginal nats/bar under scoring: density - ALREADY a log density on the \
-                 SAME measure, because the density rule adds E[ln width]; this is NOT a bin \
-                 probability and no offset is applied to either column"
+                "discrete fixed-support mixed-measure diagnostic nats/bar (`density`; finite-bin \
+                 E[ln width] offset; clamped edge bins are not normalized open-tail likelihoods)"
                     .to_owned(),
                 fit.dofs.iter().map(|d| d.discrete_nll).collect(),
             ),
@@ -6950,6 +7481,119 @@ mod tests {
     use shared::report::read_report;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[test]
+    fn randomized_pit_spreads_an_atom_instead_of_pinching_it_to_midpoint() {
+        let atom = [0.0f32; 32];
+        let first = randomized_sample_pit(&atom, 0.0, 11);
+        let second = randomized_sample_pit(&atom, 0.0, 29);
+        assert!((0.0..1.0).contains(&first));
+        assert!((0.0..1.0).contains(&second));
+        assert_ne!(first, second, "the tie mass must be randomized");
+        assert_ne!(first, 0.5, "mid-rank is not a randomized PIT for an atom");
+    }
+
+    #[test]
+    fn ancestral_horizon_axis_and_invalid_ohlc_counts_are_exact() {
+        let windows = 2usize;
+        let samples = MIN_FAN_SAMPLES;
+        let steps = ROLLOUT_HORIZONS[4];
+        let mut draws = vec![0.0f32; windows * samples * steps * BAR_DOF];
+        for window in 0..windows {
+            for sample in 0..samples {
+                for step in 0..steps {
+                    let row = (((window * samples + sample) * steps + step) * BAR_DOF) as usize;
+                    draws[row + DOF_U] = 0.5;
+                    draws[row + DOF_V] = 0.5;
+                }
+            }
+        }
+        // One raw generated row cannot decode to a legal OHLC position. It first enters the
+        // cumulative diagnostic at h16 and must remain counted at h64/h100.
+        let invalid_step = 10usize;
+        draws[invalid_step * BAR_DOF + DOF_U] = 1.5;
+        let dynamics = Tensor::from_slice(&draws).view([
+            windows as i64,
+            samples as i64,
+            steps as i64,
+            BAR_DOF as i64,
+        ]);
+        let exact = dynamics.shallow_clone();
+        let future = Tensor::zeros(
+            [windows as i64, steps as i64, BAR_DOF as i64],
+            (Kind::Float, Device::Cpu),
+        );
+        let diagnostics = ancestral_diagnostics(&dynamics, &exact, &future).unwrap();
+        assert_eq!(diagnostics.horizon, [1.0, 4.0, 16.0, 64.0, 100.0]);
+        assert_eq!(diagnostics.invalid_ohlc, [0.0, 0.0, 1.0, 1.0, 1.0]);
+        assert_eq!(
+            diagnostics.generated_flat_run,
+            [1.0, 4.0, 16.0, 64.0, 100.0]
+        );
+    }
+
+    #[test]
+    fn aligned_gap_path_is_scored_on_all_h100_rows_without_shifting_catch_up() {
+        let steps = ROLLOUT_HORIZONS[4];
+        let samples = MIN_FAN_SAMPLES;
+        let mut realized = vec![0.0f32; steps * BAR_DOF];
+        for row in realized.chunks_exact_mut(BAR_DOF) {
+            row.copy_from_slice(&BarDof::default().to_array());
+        }
+        let reappearance = 6usize;
+        realized[reappearance * BAR_DOF + DOF_R] = 1.2f32.ln();
+        realized[reappearance * BAR_DOF + DOF_S] = 0.25;
+        let future = Tensor::from_slice(&realized).view([1, steps as i64, BAR_DOF as i64]);
+        let dynamics = future.unsqueeze(1).repeat([1, samples as i64, 1, 1]);
+        let exact = dynamics.shallow_clone();
+
+        let diagnostics = ancestral_diagnostics(&dynamics, &exact, &future).unwrap();
+        assert_eq!(diagnostics.conditional_cases, steps as f64);
+        assert_eq!(diagnostics.invalid_ohlc, [0.0; ROLLOUT_HORIZONS.len()]);
+        assert_eq!(
+            diagnostics.exact_dynamics_mean_shift,
+            [0.0; ROLLOUT_HORIZONS.len()]
+        );
+        assert!(
+            diagnostics.pooled_step_pit_mean.is_finite(),
+            "every one of the H aligned rows must enter pooled PIT"
+        );
+        for (observed, predicted) in diagnostics
+            .tail_realized
+            .iter()
+            .zip(diagnostics.tail_predicted)
+        {
+            assert!((*observed - 1.0 / steps as f64).abs() < 1e-12);
+            assert!((predicted - 1.0 / steps as f64).abs() < 1e-12);
+        }
+        assert!(
+            diagnostics
+                .mean_error
+                .iter()
+                .all(|error| error.abs() < 1e-7),
+            "the same aligned cumulative payoff must feed every horizon score"
+        );
+
+        let candles = chained_candles(&realized);
+        assert_eq!(candles.len(), steps);
+        assert!(candles[..reappearance].iter().all(|bar| bar.close == 1.0));
+        assert!((candles[reappearance].close - 1.2).abs() < 1e-6);
+        assert!(candles[reappearance + 1..]
+            .iter()
+            .all(|bar| (bar.close - 1.2).abs() < 1e-6));
+        let actual_close: Vec<f32> = candles.iter().map(|bar| bar.close).collect();
+        let window = CandleWindow {
+            actual_close: actual_close.clone(),
+            quantiles: array::from_fn(|_| actual_close.clone()),
+            rank: vec![0.5; steps],
+            samples,
+        };
+        let expected_drift = 1.2f64.ln() / steps as f64;
+        assert!(
+            (window.drift_per_bar() - expected_drift).abs() < 1e-9,
+            "the fan centre must retain the aligned path's one-time catch-up drift"
+        );
+    }
+
     /// Every base this module can write. Aliased rather than restated: the list lives in
     /// `shared` so the TUI extends its `meta_chart_bases` from the SAME slice this test
     /// walks. A base registered with no writer and a base written with no registration
@@ -7030,15 +7674,21 @@ mod tests {
         // so an in-run cycle over one step's metrics cannot produce it. Executed by
         // `horizon::tests::the_horizon_frontier_base_is_written_and_read_back`.
         "pretrain_horizon_frontier",
+        // Written together by `horizon::write_receding_reports` after a whole held-out panel,
+        // one common max-H ancestral rollout and every-bar economic solves. The selected
+        // production horizon is highlighted inside these existing bases; neither is an
+        // optimizer-step metric. Both writers and the fixed comparison grid are exercised by
+        // `horizon::tests::receding_reports_persist_the_selected_run_and_keep_the_full_grid`.
+        "pretrain_receding_kelly",
+        "pretrain_receding_covariance",
         // Written by `skill::write_skill_profile`. Indexed by DECILE of the model's own
         // confidence rather than by step, and produced from a whole held-out panel scored with
         // no trading policy, so an in-run cycle over one step's metrics cannot produce it.
         // Executed by `skill::tests::the_skill_chart_round_trips_with_a_complete_finite_series`.
         "pretrain_skill_profile",
-        // Written by `write_support_decode`, from the v4 -> v5 support upgrade in
-        // `support_moments`. Indexed by DOF and by BIN rather than by step, and both need a
-        // support carrying MEASURED per-bin moments, which the artifact a training run loads does
-        // not have — that absence is the reason the module exists. Both are executed by
+        // Written by `write_support_decode` during the geometry-preserving support-moments
+        // upgrade. Indexed by DOF and BIN rather than step, with direct simple-return moment
+        // and provenance diagnostics. Both bases are exercised by
         // `support_moments::tests::the_support_decode_writes_both_registered_bases`.
         "support_decode_moments",
         "support_decode_bins",
@@ -7803,7 +8453,7 @@ mod tests {
                         }
                     })
                     .collect();
-                // The UNCAPPED log-optimal fraction is the primitive, exactly as
+                // The UNCAPPED moment-correct quadratic fraction is the primitive, exactly as
                 // `WindowPaths::free` documents: the model leans the right way more often
                 // than not, and on one bar in seven it asks for more than the cap allows, so
                 // the `clamped_fraction` diagnostic has something to measure. Every capped
@@ -8250,7 +8900,7 @@ mod tests {
 
         let windows = 2i64;
         let samples = 8i64;
-        let horizon = 4i64;
+        let horizon = ROLLOUT_HORIZONS[4] as i64;
         let rollout = Tensor::rand(
             [windows, samples, horizon, BAR_DOF as i64],
             (Kind::Float, Device::Cpu),
@@ -8261,7 +8911,8 @@ mod tests {
         ) * 0.01;
         reporter
             .record_snapshot(&SnapshotInput {
-                rollout: &rollout,
+                dynamics_rollout: &rollout,
+                exact_rollout: &rollout,
                 future_dof: &future,
                 epoch: 0,
                 global_step: STEP_DECIMATION,
@@ -8431,7 +9082,7 @@ mod tests {
         let epochs = 3usize;
         let windows = 2i64;
         let samples = 8i64;
-        let horizon = 4i64;
+        let horizon = ROLLOUT_HORIZONS[4] as i64;
         // ONE scene. Drawn once, outside the loop, and handed to every boundary: the
         // fixture makes a moving pinned set impossible rather than asserting it did not
         // move, and the trainer-side assertion that the real pinned set is equally fixed
@@ -8466,7 +9117,8 @@ mod tests {
             ) * 0.01;
             reporter
                 .record_snapshot(&SnapshotInput {
-                    rollout: &rollout,
+                    dynamics_rollout: &rollout,
+                    exact_rollout: &rollout,
                     future_dof: &future,
                     epoch,
                     global_step: step,
@@ -8888,8 +9540,12 @@ mod tests {
 
         let report = read_report(&root.join("0").join("pretrain_test.report.bin")).unwrap();
         assert!(
-            report.title.contains("best.ot") && report.title.contains("0f1e2d3c4b5a"),
-            "the battery must name the artifact and lineage it scored: {}",
+            report.title.contains("best.ot")
+                && report.title.contains("0f1e2d3c4b5a")
+                && report
+                    .title
+                    .contains(BarScoring::Smoothed.report_contract()),
+            "the battery must name the artifact, lineage, and exact scoring contract: {}",
             report.title
         );
         let ReportKind::MultiLine { series } = report.kind else {
@@ -8897,16 +9553,16 @@ mod tests {
         };
         let labels: Vec<&str> = series.iter().map(|s| s.label.as_str()).collect();
         for expected in [
-            "nll_bar",
-            "nll_bar vs uniform",
-            "nll_bar vs marginal",
-            "uniform",
-            "marginal",
+            "smoothed-target cross entropy (diagnostic) nats/bar",
+            "smoothed-target cross entropy (diagnostic) vs uniform",
+            "smoothed-target cross entropy (diagnostic) vs marginal",
+            "uniform (smoothed-target cross entropy (diagnostic))",
+            "marginal (smoothed-target cross entropy (diagnostic))",
             "nll r",
             "crps w",
             "pit tv u",
-            "rollout h64 exact",
-            "rollout h64 dynamics",
+            "TEACHER-FORCED score h64 exact belief advance",
+            "TEACHER-FORCED score h64 dynamics advance",
             "dir acc",
             "nll_bar se",
             "nll_bar ci95 low",
@@ -8930,7 +9586,7 @@ mod tests {
         let marginal_total: f64 = MARGINAL_DOF.iter().sum();
         let gain = series
             .iter()
-            .find(|s| s.label == "nll_bar vs marginal")
+            .find(|s| s.label == "smoothed-target cross entropy (diagnostic) vs marginal")
             .unwrap()
             .values[0] as f64;
         assert!((gain - (marginal_total - 21.4)).abs() < 1.0e-4);
@@ -9017,6 +9673,32 @@ mod tests {
             "unexpected error: {error}"
         );
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fixed_support_density_reports_are_never_labeled_categorical_nll() {
+        let root = scratch_dir("density_contract_label");
+        let mut reporter = PretrainReporter::new(&root, MARGINAL_DOF);
+        let mut baselines = smoothed_baselines();
+        baselines.scoring = BarScoring::Density;
+        baselines.scoring_floor_bar = 0.0;
+        reporter.set_held_out_baselines(baselines);
+        reporter
+            .record_epoch(&populated_epoch(0, 10, None))
+            .unwrap();
+
+        let report = read_report(&root.join("0").join("pretrain_nll_bar.report.bin")).unwrap();
+        assert!(
+            report.title.contains(BarScoring::Density.report_contract()),
+            "density report must state its exact fixed-support diagnostic contract: {}",
+            report.title
+        );
+        assert!(
+            !report.title.contains("Categorical NLL"),
+            "density diagnostic was mislabeled as categorical NLL: {}",
+            report.title
+        );
         fs::remove_dir_all(&root).ok();
     }
 

@@ -3,15 +3,14 @@
 //!
 //! # Why this module exists, and what it is NOT
 //!
-//! [`super::trade_bench`] answers "what is the predictive law WORTH under log-optimal
-//! sizing". Every number it reports is therefore conditioned on a policy: a Kelly solve, a
-//! leverage cap, a cost charge, a rebalance schedule. That is the right question for
-//! deployment and the wrong question for diagnosis, because a policy can hide a signal and a
-//! signal can be flattered by a policy. This module removes the policy entirely. It reads two
-//! numbers per bar out of the SAME marginalized predictive law the bench trades —
-//! `mu_hat = E[r | strictly past bars]` and `sigma_hat = sqrt(Var[r | strictly past bars])` —
-//! and scores them against the realized `r` with statistics that have no free parameters. No
-//! Kelly solve, no cap, no cost model, no position sizing, nothing fitted.
+//! [`super::trade_bench`] answers "what is the predictive law WORTH under moment-correct
+//! quadratic Kelly sizing". Every number it reports is conditioned on a policy: a moment
+//! reduction, leverage cap, cost charge, and rebalance schedule. That is the right question
+//! for deployment and the wrong question for diagnosis, because a policy can hide a signal
+//! and a signal can be flattered by a policy. This module removes the policy entirely. It
+//! reads two numbers per bar from the SAME predictive law the bench trades — `mu_hat =
+//! E[r | strictly past bars]` and `sigma_hat = sqrt(Var[r | strictly past bars])` — and
+//! scores them against realized `r` with no Kelly reduction, cap, cost model, or sizing.
 //!
 //! # The scoring rule has to survive the class imbalance, and raw accuracy does not
 //!
@@ -249,7 +248,7 @@ pub struct SkillBar {
     pub sigma: f64,
     /// The realized `r` the prediction is scored against.
     pub r: f64,
-    /// The bench's UNCAPPED log-optimal fraction for this bar.
+    /// The bench's UNCAPPED moment-correct quadratic Kelly fraction for this bar.
     ///
     /// Carried for exactly one purpose: reconciling this module's `sign(mu_hat)` accuracy
     /// with [`super::trade_bench::PolicyStats::hit_rate`], which scores `sign(f*)`. The two
@@ -1495,8 +1494,8 @@ pub struct ConfidenceCurve {
     /// decile 0 is a disjoint handful, and the "paired" difference is a BETWEEN-NAME comparison
     /// wearing a within-block interval.
     ///
-    /// The same power family sizes the book — Kelly is `mu/sigma^2`, this selector is `mu/sigma` —
-    /// so whichever way this lands is a statement about more than a diagnostic.
+    /// The traded book also compares a mean to a second-moment scale — its exact contract is
+    /// `E[R]/E[R²]` — so whichever way this lands is more than a cosmetic diagnostic.
     ///
     /// Measured rather than argued, for both selectors, because the two answers can differ and the
     /// consequence is a retraction either way.

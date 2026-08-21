@@ -1175,6 +1175,22 @@ mod planner_inference_discovery_tests {
             !bases.contains(&"pretrain_forecast_nll"),
             "the old base mislabeled a sum of per-DOF marginals as a joint forecast NLL"
         );
+        for ancestral in [
+            "pretrain_ancestral_calibration",
+            "pretrain_ancestral_tails",
+            "pretrain_ancestral_bar_validity",
+            "pretrain_ancestral_distribution_drift",
+        ] {
+            assert!(
+                bases.contains(&ancestral),
+                "{ancestral} must be scanned by meta_chart_bases"
+            );
+        }
+        assert!(bases.contains(&"pretrain_teacher_forced_rollout_score"));
+        assert!(
+            !bases.contains(&"pretrain_rollout_nll"),
+            "the unlabeled teacher-forced rollout base must not survive the clean cutover"
+        );
         // Sorted and deduplicated, which is what lets the scan be a single pass and what
         // stops a duplicated name costing one `read_dir` per copy.
         let mut sorted = bases.clone();

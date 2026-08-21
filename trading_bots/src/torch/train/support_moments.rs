@@ -1,36 +1,16 @@
-//! Measure the FITTED per-bin conditional moments of an EXISTING support and persist them.
+//! Measure fitted conditional moments against an EXISTING support and persist them without
+//! changing its geometry.
 //!
-//! This is the v4 -> v5 upgrade of `bar_supports.<res>.json`, and the whole point is what it
-//! does NOT do: it never refits the geometry. The bin edges, the atom set, the histogram and
-//! the smoothed marginal are carried across byte for byte, and the only new content is
-//! `bin_means` / `bin_second_moments`. That constraint is not conservatism — the supports
-//! define the model's output space and therefore the `nll_bar` scale, so moving a single edge
-//! would silently invalidate every persisted report, every `supports_sha256`, and every
-//! cross-checkpoint comparison in the tree. Measuring moments against the geometry already on
-//! disk invalidates nothing.
+//! The current upgrade adds, for DOF `r`, direct train-sample estimates of
+//! `E[expm1(r) | bin]` and `E[expm1(r)^2 | bin]` alongside the existing log-space moments.
+//! The bin edges, atom table, histogram, smoothed marginal, and provenance are copied
+//! value-for-value. This is a clean artifact migration: consumers requiring economic moments
+//! reject older files rather than reconstructing them from centers or log-space moments.
 //!
-//! WHY THE ARTIFACT NEEDED THIS AT ALL. `BAR_SUPPORTS_FORMAT_VERSION`,
-//! `BAR_SUPPORTS_MOMENTS_VERSION`, `BarBinMoments`, the `save` writer, the `load` validator and
-//! all three accessors were already present and correct in [`crate::torch::bar_dist`]. The only
-//! missing thing was a FILE: the live artifact is `format_version: 4` and carries no moments,
-//! so `bin_means()` returns `None` and `bin_means_measured()` is false. A code path gated on
-//! data nobody generated reads, to a source reader, exactly like a landed feature — and the
-//! `unwrap_or_else(|| centers)` fallback that used to sit in the two mean ceilings made the
-//! absence invisible at RUNTIME as well, by handing back the edge decode under the name of the
-//! fitted one. That fallback is gone; this module produces the data.
-//!
-//! WHAT THIS DOES NOT DO, EQUALLY DELIBERATELY: it switches NOTHING. Every production
-//! first-moment decode still reads [`MeanDecode::Edge`], which is what
-//! [`MeanDecode::default()`] returns, so no in-flight measurement moves. The fitted decode is
-//! available BY NAME to a consumer that asks for it, and the enumeration of every consumer that
-//! would have to be switched — plus what switching each one would change — lives beside the
-//! conventions in [`crate::torch::bar_dist::MeanDecode`].
-//!
-//! RESOURCE SHAPE, stated because it is load-bearing. One pass over a FIXED draw, with
-//! fixed-size accumulators: `BAR_DOF * NUM_BAR_BINS` triples of `(sum, sum_sq, count)`, i.e.
-//! 1,920 `f64` in total, independent of the corpus. The only sizeable allocation is the drawn
-//! sample itself, which is the same allocation `BarCorpus::fit_supports` already makes, so this
-//! adds no new high-water mark to anything.
+//! The pass is one exact scan over the fixed training draw with fixed-size accumulators.
+//! Observations are routed through the support's existing atom-aware binner. The two open tail
+//! bins therefore retain raw, unclamped tail observations, atom bins retain exact point-mass
+//! provenance, and neither case is laundered into a geometric representative.
 
 use std::path::Path;
 
@@ -52,7 +32,7 @@ pub struct SupportMomentsArgs {
     pub corpus: CorpusFlags,
     /// Support to measure moments FOR. Read, never written.
     pub supports: String,
-    /// Where the upgraded v5 artifact lands. A DIFFERENT path from `supports` by default and by
+    /// Where the upgraded current-schema artifact lands. A DIFFERENT path from `supports` by
     /// intent: every checkpoint's `.supports.<res>.json` sidecar is covered by its own
     /// `supports_sha256` and by `lineage_sha256`, so rewriting a support in place would make an
     /// existing checkpoint unloadable against its own training geometry.
@@ -193,6 +173,13 @@ pub struct SupportDecode {
     fitted: [Vec<f64>; BAR_DOF],
     /// `[BAR_DOF]` measured conditional second moments.
     second: [Vec<f64>; BAR_DOF],
+    /// Directly measured `E[R | bin]` for `R = expm1(r)`.
+    simple_return_mean: Vec<f64>,
+    /// Directly measured `E[R^2 | bin]`, including within-bin variance.
+    simple_return_second: Vec<f64>,
+    /// Numeric provenance for the r-bin diagnostic: -1 lower open tail, 0 continuous,
+    /// 1 upper open tail, 2 explicit atom.
+    r_bin_provenance: Vec<f64>,
     /// Per-DOF census under the edge decode.
     edge_census: [DecodeCensus; BAR_DOF],
     /// Per-DOF census under the fitted decode.
@@ -224,11 +211,27 @@ impl SupportDecode {
                 .context("a support carrying fitted means must carry second moments too")?
                 .to_vec();
         }
+        let (simple_return_mean, simple_return_second) =
+            supports.simple_return_bin_moments().context(
+                "the support decode diagnostic requires directly fitted r simple-return first \
+                 and second moments",
+            )?;
+        let atom_bins: std::collections::HashSet<usize> =
+            supports.atoms(DOF_R).iter().map(|atom| atom.bin).collect();
+        let r_bin_provenance = (0..=last)
+            .map(|bin| {
+                if atom_bins.contains(&bin) {
+                    2.0
+                } else if bin == 0 {
+                    -1.0
+                } else if bin == last {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
 
-        // The stand-in is `r`-only and two-bin: it re-prices bins 0 and 127 and leaves the
-        // other 126 at their midpoints. It is therefore a decode in its own right and is
-        // censused as one, so "how close was the stand-in" is answered on every share rather
-        // than on the two constants alone.
         let stand_in_row = |dof: usize| -> Option<Vec<f64>> {
             (dof == DOF_R).then(|| {
                 let mut row = edge[dof].clone();
@@ -237,7 +240,6 @@ impl SupportDecode {
                 row
             })
         };
-
         let edge_census = std::array::from_fn(|dof| DecodeCensus::measure(&edge[dof], &mass[dof]));
         let fitted_census =
             std::array::from_fn(|dof| DecodeCensus::measure(&fitted[dof], &mass[dof]));
@@ -254,12 +256,14 @@ impl SupportDecode {
                 stand_in: stand_in.as_ref().map_or(f64::NAN, |row| row[bin]),
             })
         });
-
         Ok(Self {
             mass,
             edge,
             fitted,
             second,
+            simple_return_mean: simple_return_mean.to_vec(),
+            simple_return_second: simple_return_second.to_vec(),
+            r_bin_provenance,
             edge_census,
             fitted_census,
             stand_in_census,
@@ -389,6 +393,40 @@ impl SupportDecode {
                 ),
             ]);
         }
+        let r_only = |value: f64| per_dof(&|dof| if dof == DOF_R { value } else { f64::NAN });
+        let simple_mean: f64 = self.mass[DOF_R]
+            .iter()
+            .zip(&self.simple_return_mean)
+            .map(|(p, mean)| p * mean)
+            .sum();
+        let simple_second: f64 = self.mass[DOF_R]
+            .iter()
+            .zip(&self.simple_return_second)
+            .map(|(p, second)| p * second)
+            .sum();
+        let squared_first: f64 = self.mass[DOF_R]
+            .iter()
+            .zip(&self.simple_return_mean)
+            .map(|(p, mean)| p * mean * mean)
+            .sum();
+        rows.extend([
+            (
+                "r marginal E[R], bps [DIRECT train-fitted simple return]".to_owned(),
+                r_only(simple_mean * bps),
+            ),
+            (
+                "r marginal sqrt(E[R^2]), bps [DIRECT train-fitted simple return]".to_owned(),
+                r_only(simple_second.sqrt() * bps),
+            ),
+            (
+                "r marginal sd, bps [E[R^2]-E[R]^2, DIRECT]".to_owned(),
+                r_only((simple_second - simple_mean * simple_mean).max(0.0).sqrt() * bps),
+            ),
+            (
+                "r within-bin contribution to E[R^2], % [lost by squaring E[R|bin]]".to_owned(),
+                r_only(100.0 * ratio(simple_second - squared_first, simple_second)),
+            ),
+        ]);
         rows.push((
             "histogram identification slack used, per-bin mass".to_owned(),
             per_dof(&|dof| self.mass_agreement[dof]),
@@ -398,6 +436,10 @@ impl SupportDecode {
 
     /// Per-bin series for one DOF, in the order the report writer consumes them.
     pub fn bin_rows(&self, dof: usize) -> Vec<(String, Vec<f64>)> {
+        assert_eq!(
+            dof, DOF_R,
+            "the per-bin support report includes r-only simple-return moments"
+        );
         let bins = NUM_BAR_BINS as usize;
         let bps = 1e4;
         let (edge, fitted, mass) = (&self.edge[dof], &self.fitted[dof], &self.mass[dof]);
@@ -422,6 +464,38 @@ impl SupportDecode {
             (
                 "bin index".to_owned(),
                 (0..bins).map(|bin| bin as f64).collect(),
+            ),
+            (
+                "bin provenance [-1 lower open tail, 0 continuous, 1 upper open tail, 2 atom]"
+                    .to_owned(),
+                self.r_bin_provenance.clone(),
+            ),
+            (
+                "E[R|bin], bps [DIRECT train-fitted simple return]".to_owned(),
+                self.simple_return_mean.iter().map(|m| m * bps).collect(),
+            ),
+            (
+                "sqrt(E[R^2|bin]), bps [DIRECT, includes within-bin dispersion]".to_owned(),
+                self.simple_return_second
+                    .iter()
+                    .map(|second| second.sqrt() * bps)
+                    .collect(),
+            ),
+            (
+                "simple-return within-bin sd, bps [DIRECT E[R^2]-E[R]^2]".to_owned(),
+                self.simple_return_second
+                    .iter()
+                    .zip(&self.simple_return_mean)
+                    .map(|(second, mean)| (second - mean * mean).max(0.0).sqrt() * bps)
+                    .collect(),
+            ),
+            (
+                "E[R|bin] minus expm1(E[r|bin]), bps [nonlinear approximation error]".to_owned(),
+                self.simple_return_mean
+                    .iter()
+                    .zip(fitted)
+                    .map(|(simple, log_mean)| (simple - log_mean.exp_m1()) * bps)
+                    .collect(),
             ),
             (
                 "edge decode, bps [PRODUCTION]".to_owned(),
@@ -653,9 +727,9 @@ pub fn fit_support_moments(args: SupportMomentsArgs) -> Result<()> {
     let differing = changed_members(source, destination)?;
     ensure!(
         differing.is_empty(),
-        "the upgraded support at {} differs from {} in {:?}, which it must not: only \
-         `format_version`, `bin_means` and `bin_second_moments` may change, because the bin edges \
-         define the `nll_bar` scale and every persisted report in the tree is expressed on it",
+        "the upgraded support at {} differs from {} in {:?}, which it must not: only the \
+         schema version and fitted log/simple-return moment members may change, because the \
+         bin edges define the `nll_bar` scale and every persisted report uses that geometry",
         destination.display(),
         source.display(),
         differing
@@ -675,8 +749,8 @@ pub fn fit_support_moments(args: SupportMomentsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Names of the JSON members that differ between two support files, EXCLUDING the three the
-/// upgrade is allowed to touch.
+/// Names of JSON members that differ between two support files, excluding the schema version
+/// and four fitted-moment members this upgrade is allowed to touch.
 ///
 /// Compared as parsed JSON rather than as text so key order and whitespace cannot register as a
 /// geometry change, and member-wise over the UNION of both key sets so a member this build does
@@ -701,7 +775,13 @@ fn compare_members(
     before: &serde_json::Map<String, serde_json::Value>,
     after: &serde_json::Map<String, serde_json::Value>,
 ) -> Vec<String> {
-    const MAY_CHANGE: [&str; 3] = ["format_version", "bin_means", "bin_second_moments"];
+    const MAY_CHANGE: [&str; 5] = [
+        "format_version",
+        "bin_means",
+        "bin_second_moments",
+        "bin_simple_return_means",
+        "bin_simple_return_second_moments",
+    ];
     let mut differing: Vec<String> = Vec::new();
     for key in before.keys().chain(after.keys()) {
         if MAY_CHANGE.contains(&key.as_str()) || differing.iter().any(|seen| seen == key) {
@@ -738,12 +818,9 @@ mod tests {
         serde_json::from_str(body).expect("fixture parses")
     }
 
-    /// The upgrade's whole licence is that it changes NOTHING but the moments and the version.
-    /// This is the check that enforces it, so it must be blind to the three permitted members
-    /// and sensitive to every other one, including a member it has never heard of and a member
-    /// that disappears.
+    /// The upgrade's whole licence is that it changes NOTHING but the moment members and version.
     #[test]
-    fn only_the_version_and_the_two_moment_rows_may_change() {
+    fn only_the_version_and_fitted_moment_rows_may_change() {
         let before = object(
             r#"{"format_version":4,"lo":[[1.0,2.0]],"hi":[[2.0,3.0]],"masses":[[0.5,0.5]],
                 "smoothed_marginal":[[0.5,0.5]],"provenance":{"sample_count":7},
@@ -751,14 +828,16 @@ mod tests {
         );
 
         let upgraded = object(
-            r#"{"format_version":5,"lo":[[1.0,2.0]],"hi":[[2.0,3.0]],"masses":[[0.5,0.5]],
+            r#"{"format_version":6,"lo":[[1.0,2.0]],"hi":[[2.0,3.0]],"masses":[[0.5,0.5]],
                 "smoothed_marginal":[[0.5,0.5]],"provenance":{"sample_count":7},
                 "a_member_this_build_does_not_know":[1,2,3],
-                "bin_means":[[1.5,2.5]],"bin_second_moments":[[2.3,6.3]]}"#,
+                "bin_means":[[1.5,2.5]],"bin_second_moments":[[2.3,6.3]],
+                "bin_simple_return_means":[1.6,2.7],
+                "bin_simple_return_second_moments":[2.7,7.5]}"#,
         );
         assert!(
             compare_members(&before, &upgraded).is_empty(),
-            "a legitimate v4 -> v5 upgrade must register no change"
+            "a legitimate geometry-preserving upgrade must register no change"
         );
 
         // The failure this exists to catch: a refit that moved one edge by one ulp. Nothing
@@ -863,9 +942,7 @@ mod tests {
         assert!(degenerate.span_share.is_nan());
     }
 
-    /// A support fitted in memory, which `BarSupports::fit` gives measured moments, so the
-    /// census runs on the same v5 shape the upgrade writes rather than on a struct literal that
-    /// could drift from [`SupportDecode::of`].
+    /// A support fitted in memory, carrying the same full moment set the upgrade writes.
     fn synthetic_supports(count: usize, seed: u64) -> BarSupports {
         let mut state = seed | 1;
         let mut next = || {
@@ -926,6 +1003,19 @@ mod tests {
                     .any(|s| s.values.iter().any(|v| v.is_finite())),
                 "{base} carries no finite value, so it is a blank panel"
             );
+            if base == "support_decode_bins" {
+                for required in [
+                    "E[R|bin], bps [DIRECT train-fitted simple return]",
+                    "sqrt(E[R^2|bin]), bps [DIRECT, includes within-bin dispersion]",
+                    "simple-return within-bin sd, bps [DIRECT E[R^2]-E[R]^2]",
+                    "bin provenance [-1 lower open tail, 0 continuous, 1 upper open tail, 2 atom]",
+                ] {
+                    assert!(
+                        series.iter().any(|row| row.label == required),
+                        "{base} is missing `{required}`"
+                    );
+                }
+            }
         }
         let _ = fs::remove_dir_all(&dir);
     }

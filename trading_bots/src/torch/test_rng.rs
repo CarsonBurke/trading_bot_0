@@ -288,6 +288,7 @@ mod tests {
         ("torch/train/pretrain.rs", "build_trainer"),  // incl. `manual_seed_all`
         ("torch/planner/runner.rs", "train_planner"),  // per-update reseed
         ("torch/train/horizon.rs", "run_horizon_sweep"), // per-replicate reseed
+        ("torch/train/horizon.rs", "run_receding_evaluation"), // common rollout seed
     ];
 
     /// Test helpers that seed.
@@ -334,6 +335,7 @@ mod tests {
         "train_muon(",
         "train_muon_bf16(",
         "run_horizon_sweep(",
+        "run_receding_evaluation(",
         // Also matches `RolloutFixture::new` in `planner/runner.rs`, which
         // draws through a model constructor and whose callers hold the guard.
         "Fixture::new(",

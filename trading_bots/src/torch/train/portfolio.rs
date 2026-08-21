@@ -3,8 +3,8 @@
 //!
 //! # The defect this replaces
 //!
-//! [`super::trade_bench`] answers "how would a log-optimal bettor size a single name?" and
-//! answers it correctly. It then reports the MEAN of that answer over 256 independent
+//! [`super::trade_bench`] answers "how would a quadratic-Kelly bettor size a single name from
+//! fitted E[R] and E[R²]?" and answers it correctly. It then reports the MEAN over 256 independent
 //! `(symbol, segment)` windows, each betting up to [`super::trade_bench::LEVERAGE_CAP`] of
 //! its OWN wealth. There is no shared capital, no cross-sectional allocation and no
 //! calendar: 256 books at 4x is 1,024x of gross exposure held simultaneously, and the mean
@@ -14,65 +14,22 @@
 //! 24,900x per year. That number is not a profit estimate. It is a proof that the framing
 //! is broken.
 //!
-//! This module fixes the framing, and nothing else. The per-name predictive law and the
-//! Kelly solve are [`super::trade_bench`]'s, called rather than copied — including the
-//! prefix-free read of `p(r | past)` that keeps the
-//! decision free of lookahead. What changes is everything above the single name:
+//! This module owns the shared calendar panel, measured execution-cost contract and the
+//! canonical constrained Kelly action used by the production pretraining evaluation.
 //!
-//! * **A panel, in calendar time.** Bars are grouped by `ts_ms` across symbols. Symbols do
-//!   not share a calendar — halts, listings, delistings, thin pre-market prints — so
-//!   absence is explicit and no price is ever forward-filled.
-//! * **One capital constraint.** `sum_i |w_i| <= GROSS_CAP` over the WHOLE book. That is
-//!   what binds a real trader: a prime broker limits gross, not per-name leverage.
-//! * **One equity curve.** `W_{t+1} = W_t * (1 + sum_i w_i r_i - cost_t)`, compounded
-//!   through the panel's own clock. A book that reaches zero is dead and stays dead.
-//! * **Annualization from the MEASURED span.** The panel knows its own first and last
-//!   instant and its own instant count, so bars-per-year is divided out of the data rather
-//!   than asserted by a constant.
+//! At every decision, [`solve_cost_aware_kelly`] receives the actual current holdings and
+//! maximizes predicted growth net of spread, fees and square-root impact. No-trade is therefore
+//! an optimizer result rather than a post-hoc band. The same solver and the same gross, net,
+//! per-name and ADV-participation constraints are used for model and perfect-foresight oracle.
 //!
-//! # Absence, precisely
-//!
-//! A symbol is tradeable at instant `t` only when it has a bar at `t` AND a bar at the
-//! instant immediately before it in the panel. Both are required because the payoff is a
-//! close-to-close return: without a bar at `t-1` there is no price at which the position
-//! could have been established, and inventing one is exactly the forward fill this refuses
-//! to do. An absent symbol therefore has target weight zero, contributes nothing to the
-//! payoff, and contributes only the turnover of unwinding whatever was held. That unwind is
-//! charged at `t`; its cost model needs a liquidity estimate rather than a price, so it uses
-//! the symbol's last observed dollar volume. No return and no price is ever fabricated.
-//!
-//! # The policies
-//!
-//! Weights come from ONE raw vector per policy, projected onto the gross ball. The
-//! projection is proportional because the raw vector is a preference ordering with
-//! magnitudes: scaling it preserves the relative bets, which is what a leverage limit does
-//! to a book, whereas truncating names would silently change the portfolio.
-//!
-//! * [`Policy::Model`] — raw `w_i = f*_i`, the uncapped per-name Kelly fraction.
-//! * [`Policy::MarketNeutral`] — the same vector with its mean subtracted, so the book
-//!   carries no net factor exposure and its P&L is cross-sectional selection alone.
-//! * [`Policy::Marginal`] — the unconditional-marginal NULL lifted to portfolio form: every
-//!   present name gets the same Kelly fraction of the train-fitted law of `r`, which after
-//!   the gross projection is the equal-weighted long book levered to the cap. It depends on
-//!   no model weight, so a run that cannot beat it has bought nothing.
-//! * [`Policy::EqualWeight`] — the same book UNLEVERED, gross exactly `1.0` at every cap.
-//!   It is the market, and it is what fixes the units. Note that it coincides with
-//!   [`Policy::Marginal`] at `GROSS_CAP = 1`; that is a fact about the null, not a bug.
-//! * [`Policy::Oracle`] — perfect foresight under the SAME gross constraint. Maximizing
-//!   `sum_i w_i r_i` over the L1 ball of radius `G` is a linear program whose solution is
-//!   the whole budget on the single largest `|r_i|`, so the ceiling is degenerate and
-//!   enormous. That is the honest ceiling of this constraint, and the model's share of it
-//!   is the fraction of available cross-sectional edge the predictor captures.
-//!
-//! # What is deliberately absent
-//!
-//! No risk model, no covariance shrinkage, no optimizer. A Kelly vector projected onto a
-//! gross ball is the smallest object that answers the question "does the predictive law
-//! make money in one book?", and every additional layer is a place for a fitted parameter
-//! to hide. The answer this produces is a LOWER bound in a known direction: a real book
-//! would net the positions against a factor model and rebalance less often.
+//! Cross-asset model rollouts are currently independent. [`TrailingFactorCovariance`] supplies
+//! the missing dependence with a strictly trailing, diagonally shrunk one-factor law. Its
+//! diagonal-plus-low-rank representation is PSD by construction and keeps a solve linear in
+//! portfolio breadth. The older one-step book and its diagnostics remain below as measurement
+//! primitives, but the production entry point is the every-bar receding evaluation in
+//! [`super::horizon`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -93,7 +50,7 @@ use super::portfolio_cost::{
 };
 use super::pretrain_stats::{BOOTSTRAP_DRAWS, BOOTSTRAP_SEED, CI_MASS};
 use super::trade_bench::{
-    bin_returns, forecast_r_probs, kelly_fraction, kelly_fractions, FREE_LEVERAGE, ROW_CHUNK,
+    forecast_r_probs, kelly_fraction, kelly_fractions, FREE_LEVERAGE, ROW_CHUNK,
 };
 
 // ---------------------------------------------------------------------------
@@ -103,10 +60,10 @@ use super::trade_bench::{
 /// Everything that is TRADEABLE at one instant of calendar time.
 ///
 /// `symbols[k]` indexes the panel's own symbol table ([`Panel::symbols`]) and
-/// `realized_r[k]` is that symbol's realized LOG return over the bar ending at `ts_ms`,
-/// measured against its close at the immediately preceding panel instant. A symbol that
-/// lacks either bar is simply not in the vectors: absence is a shorter vector, never a
-/// filled-forward price.
+/// `realized_r[k]` is that symbol's realized LOG return over the bar ending at `ts_ms`.
+/// When a symbol skipped panel instants, the return starts at its last own close and therefore
+/// carries the entire previously unmarked move when it next prints. A symbol that does not
+/// print is absent from the vectors and cannot trade on that row.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelSlice {
     pub ts_ms: i64,
@@ -117,8 +74,9 @@ pub struct PanelSlice {
 /// The predictive law of one slice, reduced to what a sizer needs.
 ///
 /// Entries align positionally with [`PanelSlice::symbols`]. `kelly_f` is the UNCAPPED
-/// log-optimal fraction of `p(r_i | past_i)`; the gross constraint is applied by the
-/// portfolio engine, never here, so one forecast serves every point of the gross curve.
+/// second-order Kelly fraction `E[R] / E[R²]` of `p(r_i | past_i)`; the gross constraint is
+/// applied by the portfolio engine, never here, so one forecast serves every point of the
+/// gross curve.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelForecast {
     pub kelly_f: Vec<f32>,
@@ -277,12 +235,12 @@ impl CostParts {
 ///
 /// # What it charges
 ///
-/// `half_spread + commission + regulatory + k * sigma_daily * sqrt(notional / ADV)`, every
-/// term measured per symbol per calendar month, with `k` a stated literature default swept
-/// over [`IMPACT_K_GRID`] rather than fitted, and with [`CostParts`] deciding which of the
-/// four terms this instance charges at all. The participation the impact term is evaluated at
-/// comes from [`Panel::adv_usd`] — a strictly trailing 20-day dollar volume — not from the
-/// calibration's own ADV, so the size argument is causal at the bar being traded.
+/// `half_spread + commission + regulatory + k * sigma_daily * sqrt(notional / ADV)`, with
+/// spread, commission price and volatility resolved from the symbol's nearest pre-cutoff
+/// calendar month and pre-cutoff pooled fallbacks. `k` is a stated literature default swept
+/// over [`IMPACT_K_GRID`] rather than fitted, and [`CostParts`] selects the charged terms.
+/// The participation passed to the impact term comes from [`Panel::adv_usd`] — strictly
+/// trailing observed dollar volume at the action — not the calibration's own ADV.
 pub struct PanelCost {
     model: BarCostModel,
     /// `series[panel id]` is the corpus series index the calibration is keyed by.
@@ -524,6 +482,10 @@ pub struct Panel {
     slices: Vec<PanelSlice>,
     /// `bar_index[t][k]` is the corpus bar index of `slices[t].symbols[k]`.
     bar_index: Vec<Vec<u32>>,
+    /// `elapsed_steps[t][k]` is the number of panel-clock steps covered by the cumulative
+    /// return in `slices[t].realized_r[k]`. It is one for an uninterrupted print and greater
+    /// than one when a symbol catches up after missing panel instants.
+    elapsed_steps: Vec<Vec<u32>>,
     /// `dollar_volume[t][k]` is the trailing mean dollar volume PER BAR of that symbol,
     /// measured strictly before the bar being traded. Multiplied by the panel's measured
     /// bars-per-day to become an ADV.
@@ -610,6 +572,7 @@ impl Panel {
             .collect();
         let mut bar_index = vec![Vec::new(); tradeable];
         let mut dollar_volume = vec![Vec::new(); tradeable];
+        let mut elapsed_steps = vec![Vec::new(); tradeable];
 
         for &(series, _) in chosen {
             let id = symbols.len() as u32;
@@ -625,13 +588,10 @@ impl Panel {
                 if tick == 0 || bar < config.min_history {
                     continue;
                 }
-                // Absence, in its two forms: no bar at this instant (the symbol never
-                // reaches this branch) and no bar at the one before it (the close the
-                // position would have been established at does not exist). Filling either
-                // in is the defect this refuses.
-                if bars[bar - 1].ts() != clock[tick - 1] {
-                    continue;
-                }
+                // A symbol is absent when it has no bar at this union-clock instant.  When it
+                // next prints, `bar - 1` is its last own mark, so the stored return carries the
+                // entire move across the gap.  Requiring that predecessor to equal the previous
+                // PANEL instant would instead discard the catch-up return and erase held P&L.
                 let (prev, close) = (bars[bar - 1].close, bars[bar].close);
                 if !(prev > 0.0 && close > 0.0) {
                     continue;
@@ -643,6 +603,13 @@ impl Panel {
                 let t = tick - 1;
                 slices[t].symbols.push(id);
                 slices[t].realized_r.push(realized as f32);
+                let steps = slot
+                    .get(&bars[bar - 1].ts())
+                    .map_or(tick.max(1), |&previous_tick| {
+                        tick.saturating_sub(previous_tick).max(1)
+                    });
+                elapsed_steps[t]
+                    .push(u32::try_from(steps).context("panel elapsed-step count exceeds u32")?);
                 bar_index[t].push(bar as u32);
                 dollar_volume[t].push(trailing.mean_per_bar());
                 placed = true;
@@ -671,6 +638,7 @@ impl Panel {
             series: series_of,
             slices,
             bar_index,
+            elapsed_steps,
             dollar_volume,
             first_factor,
             first_factor_share,
@@ -694,6 +662,8 @@ impl Panel {
             "dollar volume must align with the slices"
         );
         let mut bar_index = Vec::with_capacity(slices.len());
+        let mut elapsed_steps = Vec::with_capacity(slices.len());
+        let mut last_seen = vec![None; symbols.len()];
         for (t, slice) in slices.iter().enumerate() {
             ensure!(
                 slice.symbols.len() == slice.realized_r.len()
@@ -713,6 +683,14 @@ impl Panel {
                 "panel instants must strictly increase"
             );
             bar_index.push(vec![0u32; slice.symbols.len()]);
+            let mut row_steps = Vec::with_capacity(slice.symbols.len());
+            for &symbol in &slice.symbols {
+                let id = symbol as usize;
+                let steps = last_seen[id].map_or(t + 1, |previous| t - previous);
+                row_steps.push(u32::try_from(steps).expect("panel elapsed steps fit in u32"));
+                last_seen[id] = Some(t);
+            }
+            elapsed_steps.push(row_steps);
         }
         let trading_days = slices
             .iter()
@@ -726,6 +704,7 @@ impl Panel {
             series,
             slices,
             bar_index,
+            elapsed_steps,
             dollar_volume,
             first_factor,
             first_factor_share,
@@ -763,6 +742,16 @@ impl Panel {
     /// Corpus bar index of `slices[t].symbols[k]`.
     pub fn bar_index(&self, t: usize, k: usize) -> u32 {
         self.bar_index[t][k]
+    }
+
+    /// Panel-clock steps covered by `slices[t].realized_r[k]`.
+    pub fn elapsed_steps(&self, t: usize, k: usize) -> u32 {
+        self.elapsed_steps[t][k]
+    }
+
+    /// Elapsed panel-clock steps for every present symbol in slice `t`.
+    pub fn elapsed_steps_row(&self, t: usize) -> &[u32] {
+        &self.elapsed_steps[t]
     }
 
     /// Wall-clock span actually covered, in milliseconds.
@@ -1038,15 +1027,17 @@ impl TrailingDollarVolume {
 
 /// The unconditional-marginal NULL, lifted to the panel.
 ///
-/// One number — the log-optimal fraction of the train-fitted unconditional law of `r` —
-/// broadcast to every present symbol at every instant. It reads no model weight and no
-/// belief, which is exactly what makes it the null.
+/// One number — the quadratic Kelly fraction of the train-fitted unconditional `E[R]` and
+/// `E[R²]` — broadcast to every present symbol at every instant. It reads no model weight
+/// and no belief, which is exactly what makes it the null.
 pub fn marginal_forecasts(panel: &Panel, supports: &BarSupports) -> Vec<PanelForecast> {
-    let returns = bin_returns(supports);
+    let (returns, second_by_bin) = supports
+        .simple_return_bin_moments()
+        .expect("supports lack fitted simple-return moments; refit the v6 support artifact");
     let masses = supports.bin_masses(DOF_R);
-    let free = kelly_fraction(masses, &returns, FREE_LEVERAGE) as f32;
-    let mean: f64 = masses.iter().zip(&returns).map(|(p, r)| p * r).sum();
-    let second: f64 = masses.iter().zip(&returns).map(|(p, r)| p * r * r).sum();
+    let free = kelly_fraction(masses, returns, second_by_bin, FREE_LEVERAGE) as f32;
+    let mean: f64 = masses.iter().zip(returns).map(|(p, r)| p * r).sum();
+    let second: f64 = masses.iter().zip(second_by_bin).map(|(p, r2)| p * r2).sum();
     let var = (second - mean * mean).max(0.0) as f32;
     panel
         .slices()
@@ -1084,8 +1075,13 @@ pub fn model_forecasts(
         .supports_for(res_secs)
         .with_context(|| format!("the checkpoint carries no supports at {res_secs}s"))?;
     let device = model.device();
-    let returns_host = bin_returns(supports);
-    let returns = Tensor::from_slice(&returns_host)
+    let (returns_host, second_host) = supports
+        .simple_return_bin_moments()
+        .context("supports lack fitted simple-return moments; refit the v6 artifact")?;
+    let returns = Tensor::from_slice(returns_host)
+        .view([1, NUM_BAR_BINS])
+        .to_device(device);
+    let second_returns = Tensor::from_slice(second_host)
         .view([1, NUM_BAR_BINS])
         .to_device(device);
 
@@ -1175,11 +1171,16 @@ pub fn model_forecasts(
                     &block.narrow(0, start, rows),
                     &conditioning_block.narrow(0, start, rows),
                 );
-                let kelly = host_f32(&kelly_fractions(&probs, &returns, FREE_LEVERAGE));
+                let kelly = host_f32(&kelly_fractions(
+                    &probs,
+                    &returns,
+                    &second_returns,
+                    FREE_LEVERAGE,
+                ));
                 let probs = probs.to_kind(Kind::Double);
                 let mean = probs.matmul(&returns.reshape([NUM_BAR_BINS, 1])).squeeze();
                 let second = probs
-                    .matmul(&(&returns * &returns).reshape([NUM_BAR_BINS, 1]))
+                    .matmul(&second_returns.reshape([NUM_BAR_BINS, 1]))
                     .squeeze();
                 let var = (second - &mean * &mean).clamp_min(0.0);
                 let (mean, var) = (host_f32(&mean.reshape([-1])), host_f32(&var.reshape([-1])));
@@ -1332,6 +1333,809 @@ fn project_gross(raw: &mut [f64], budget: f64) -> bool {
         *w *= scale;
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Cost-aware receding-horizon Kelly solve
+// ---------------------------------------------------------------------------
+
+/// A positive-semidefinite diagonal-plus-one-factor covariance law.
+///
+/// `Covariance = diag(idiosyncratic) + factor_variance * loadings * loadings'`. The solver
+/// adds the forecast mean outer product separately, so its quadratic penalty is exactly
+/// `Cov(R) + E[R]E[R]'` without needing a second dense matrix. Every objective and update
+/// remains O(names), and the net-face ordering remains O(names log names).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FactorCovariance {
+    pub idiosyncratic: Vec<f64>,
+    pub loadings: Vec<f64>,
+    pub factor_variance: f64,
+    /// Strictly trailing observations in the estimate.
+    pub observations: usize,
+    /// Weight put on the diagonal target when estimating the factor law.
+    pub shrinkage: f64,
+    pub trailing_window: usize,
+}
+
+impl FactorCovariance {
+    pub fn independent(variances: Vec<f64>) -> Self {
+        let names = variances.len();
+        Self {
+            idiosyncratic: variances
+                .into_iter()
+                .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 })
+                .collect(),
+            loadings: vec![0.0; names],
+            factor_variance: 0.0,
+            observations: 0,
+            shrinkage: 1.0,
+            trailing_window: 0,
+        }
+    }
+
+    pub fn names(&self) -> usize {
+        self.idiosyncratic.len()
+    }
+
+    pub fn is_psd(&self) -> bool {
+        self.factor_variance.is_finite()
+            && self.factor_variance >= 0.0
+            && self
+                .idiosyncratic
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0)
+            && self.loadings.iter().all(|v| v.is_finite())
+            && self.idiosyncratic.len() == self.loadings.len()
+    }
+
+    pub fn quadratic_form(&self, weights: &[f64]) -> f64 {
+        assert_eq!(weights.len(), self.names());
+        let diagonal = weights
+            .iter()
+            .zip(&self.idiosyncratic)
+            .map(|(w, v)| w * w * v)
+            .sum::<f64>();
+        let factor = weights
+            .iter()
+            .zip(&self.loadings)
+            .map(|(w, b)| w * b)
+            .sum::<f64>();
+        diagonal + self.factor_variance * factor * factor
+    }
+
+    /// Scale a one-bar factor law to `horizon` bars under the declared random-walk fallback.
+    ///
+    /// Both PSD components scale together. Scaling only `factor_variance` changes the implied
+    /// correlations and leaves the residual risk at the wrong horizon.
+    pub fn scale_horizon(&mut self, horizon: usize) {
+        assert!(horizon >= 1, "a risk horizon is at least one bar");
+        let scale = horizon as f64;
+        for value in &mut self.idiosyncratic {
+            *value *= scale;
+        }
+        self.factor_variance *= scale;
+    }
+
+    /// Reconcile a historical factor shape with forecast first and raw-second moments.
+    ///
+    /// For each name, the historical factor share of its covariance diagonal is retained while
+    /// the total covariance diagonal is set exactly to `max(E[R_H²] - E[R_H]², 0)`. The solver
+    /// supplies `E[R_H]E[R_H]'`, including its diagonal, exactly once. Both components remain
+    /// positive semidefinite.
+    pub fn match_forecast_moments(&mut self, means: &[f64], second_moments: &[f64]) -> Result<()> {
+        ensure!(
+            means.len() == self.names() && second_moments.len() == self.names(),
+            "risk moments have {} means and {} raw seconds, expected {} of each",
+            means.len(),
+            second_moments.len(),
+            self.names()
+        );
+        ensure!(
+            means.iter().all(|value| value.is_finite())
+                && second_moments
+                    .iter()
+                    .all(|value| value.is_finite() && *value >= 0.0),
+            "aggregate first/raw-second moments must be finite and raw seconds non-negative"
+        );
+        for (i, (&mean, &second)) in means.iter().zip(second_moments).enumerate() {
+            let target = (second - mean * mean).max(0.0);
+            let factor_diagonal = self.factor_variance * self.loadings[i] * self.loadings[i];
+            let total = self.idiosyncratic[i] + factor_diagonal;
+            let factor_share = if total > 0.0 {
+                (factor_diagonal / total).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            self.idiosyncratic[i] = target * (1.0 - factor_share);
+            self.loadings[i] = if self.factor_variance > 0.0 && factor_share > 0.0 {
+                self.loadings[i].signum() * (target * factor_share / self.factor_variance).sqrt()
+            } else {
+                0.0
+            };
+        }
+        debug_assert!(self.is_psd());
+        Ok(())
+    }
+
+    pub fn diagonal(&self, index: usize) -> f64 {
+        self.idiosyncratic[index]
+            + self.factor_variance * self.loadings[index] * self.loadings[index]
+    }
+}
+
+/// Causal trailing one-factor covariance used when rollout paths are independent by asset.
+///
+/// A panel row is incorporated only by [`Self::observe`], which callers do after choosing
+/// and executing that row's action. [`Self::estimate`] therefore cannot see the return it is
+/// used to trade. Missing names are omitted rather than forward-filled. Cumulative log-return
+/// innovations are divided by `sqrt(elapsed_steps)`, the variance-preserving one-bar scaling;
+/// their sample mean is centered separately by the covariance fit.
+///
+/// Cross-products use a conservative exact-overlap convention: only uninterrupted one-step
+/// names enter a row's common factor and factor regression. A gap-normalized name still enters
+/// its own variance statistics, but never forms an endpoint-aligned cross-product with a return
+/// covering a different interval. This gives up uncertain factor evidence rather than inventing
+/// overlap, while keeping the estimator O(names).
+#[derive(Clone, Debug)]
+struct TrailingFactorRow {
+    factor: Option<f64>,
+    entries: Vec<(u32, f64, bool)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrailingFactorCovariance {
+    names: usize,
+    window: usize,
+    shrinkage: f64,
+    rows: VecDeque<TrailingFactorRow>,
+    factor_count: usize,
+    factor_sum: f64,
+    factor_square_sum: f64,
+    count: Vec<usize>,
+    return_sum: Vec<f64>,
+    return_square_sum: Vec<f64>,
+    factor_count_by_name: Vec<usize>,
+    factor_return_sum: Vec<f64>,
+    factor_by_name_sum: Vec<f64>,
+    factor_square_by_name_sum: Vec<f64>,
+    return_factor_sum: Vec<f64>,
+}
+
+impl TrailingFactorCovariance {
+    pub fn new(names: usize, window: usize, shrinkage: f64) -> Result<Self> {
+        ensure!(names > 0, "a factor covariance needs at least one name");
+        ensure!(
+            window >= 2,
+            "the trailing covariance window must be at least two rows"
+        );
+        ensure!(
+            (0.0..=1.0).contains(&shrinkage) && shrinkage.is_finite(),
+            "covariance shrinkage must lie in [0, 1]"
+        );
+        Ok(Self {
+            names,
+            window,
+            shrinkage,
+            rows: VecDeque::with_capacity(window),
+            factor_count: 0,
+            factor_sum: 0.0,
+            factor_square_sum: 0.0,
+            count: vec![0; names],
+            return_sum: vec![0.0; names],
+            factor_by_name_sum: vec![0.0; names],
+            factor_count_by_name: vec![0; names],
+            factor_return_sum: vec![0.0; names],
+            return_square_sum: vec![0.0; names],
+            factor_square_by_name_sum: vec![0.0; names],
+            return_factor_sum: vec![0.0; names],
+        })
+    }
+
+    fn apply_row(&mut self, row: &TrailingFactorRow, sign: f64) {
+        if let Some(factor) = row.factor {
+            if sign > 0.0 {
+                self.factor_count += 1;
+            } else {
+                self.factor_count -= 1;
+            }
+            self.factor_sum += sign * factor;
+            self.factor_square_sum += sign * factor * factor;
+        }
+        for &(symbol, ret, factor_eligible) in &row.entries {
+            let i = symbol as usize;
+            if sign > 0.0 {
+                self.count[i] += 1;
+            } else {
+                self.count[i] -= 1;
+            }
+            self.return_sum[i] += sign * ret;
+            self.return_square_sum[i] += sign * ret * ret;
+            if factor_eligible {
+                let factor = row
+                    .factor
+                    .expect("a factor-eligible entry belongs to a factor row");
+                if sign > 0.0 {
+                    self.factor_count_by_name[i] += 1;
+                } else {
+                    self.factor_count_by_name[i] -= 1;
+                }
+                self.factor_return_sum[i] += sign * ret;
+                self.factor_by_name_sum[i] += sign * factor;
+                self.factor_square_by_name_sum[i] += sign * factor * factor;
+                self.return_factor_sum[i] += sign * ret * factor;
+            }
+        }
+    }
+
+    /// Add a realized row after its decision. A catch-up log return is divided by the square
+    /// root of its elapsed panel steps before entering one-bar variance statistics. Gap returns
+    /// are excluded from common-factor cross-products because their intervals do not exactly
+    /// match the one-step names on the endpoint row. Updating, removal, and fitting remain
+    /// O(names present), O(names present), and O(names), respectively.
+    pub fn observe(
+        &mut self,
+        symbols: &[u32],
+        cumulative_simple_returns: &[f64],
+        elapsed_steps: &[u32],
+    ) -> Result<()> {
+        ensure!(
+            symbols.len() == cumulative_simple_returns.len()
+                && symbols.len() == elapsed_steps.len(),
+            "one realized return and elapsed-step count are required per present symbol"
+        );
+        let mut entries = Vec::with_capacity(symbols.len());
+        for ((&symbol, &ret), &steps) in symbols
+            .iter()
+            .zip(cumulative_simple_returns)
+            .zip(elapsed_steps)
+        {
+            ensure!(
+                (symbol as usize) < self.names,
+                "factor row names symbol {symbol} outside {} names",
+                self.names
+            );
+            ensure!(
+                ret.is_finite() && ret > -1.0,
+                "factor row contains an invalid cumulative simple return"
+            );
+            ensure!(steps > 0, "factor row elapsed steps must be positive");
+            let one_bar_innovation = if steps == 1 {
+                ret
+            } else {
+                (ret.ln_1p() / f64::from(steps).sqrt()).exp_m1()
+            };
+            entries.push((symbol, one_bar_innovation, steps == 1));
+        }
+        let mut factor_entries = entries
+            .iter()
+            .filter(|(_, _, factor_eligible)| *factor_eligible)
+            .map(|(_, ret, _)| *ret)
+            .peekable();
+        let factor = factor_entries.peek().is_some().then(|| {
+            let (sum, count) =
+                factor_entries.fold((0.0, 0usize), |(sum, count), ret| (sum + ret, count + 1));
+            sum / count as f64
+        });
+        let row = TrailingFactorRow { factor, entries };
+        self.apply_row(&row, 1.0);
+        self.rows.push_back(row);
+        if self.rows.len() > self.window {
+            let expired = self
+                .rows
+                .pop_front()
+                .expect("an overfull window has a first row");
+            self.apply_row(&expired, -1.0);
+        }
+        Ok(())
+    }
+
+    /// Estimate a PSD low-rank law, using `fallback_variance` for names with too little
+    /// trailing history. The sufficient statistics make this O(names), independent of the
+    /// trailing-window length.
+    pub fn estimate(&self, fallback_variance: &[f64]) -> Result<FactorCovariance> {
+        ensure!(
+            fallback_variance.len() == self.names,
+            "factor fallback has {} names, expected {}",
+            fallback_variance.len(),
+            self.names
+        );
+        let rows = self.rows.len();
+        let factor_variance = if self.factor_count >= 2 {
+            let count = self.factor_count as f64;
+            ((self.factor_square_sum - self.factor_sum * self.factor_sum / count) / (count - 1.0))
+                .max(0.0)
+        } else {
+            0.0
+        };
+        let mut loadings = vec![0.0; self.names];
+        let mut residual = vec![0.0; self.names];
+        for i in 0..self.names {
+            let n = self.count[i];
+            let fallback = fallback_variance[i].max(0.0);
+            let total_variance = if n >= 2 {
+                let n = n as f64;
+                ((self.return_square_sum[i] - self.return_sum[i].powi(2) / n) / (n - 1.0)).max(0.0)
+            } else {
+                fallback
+            };
+            let overlap = self.factor_count_by_name[i];
+            let beta = if n >= 2 && overlap >= 2 && factor_variance > 0.0 {
+                let overlap = overlap as f64;
+                let centered_factor_square = (self.factor_square_by_name_sum[i]
+                    - self.factor_by_name_sum[i].powi(2) / overlap)
+                    .max(0.0);
+                let centered_cross = self.return_factor_sum[i]
+                    - self.factor_return_sum[i] * self.factor_by_name_sum[i] / overlap;
+                let fitted = if centered_factor_square > 0.0 {
+                    centered_cross / centered_factor_square
+                } else {
+                    0.0
+                };
+                let max_loading = (total_variance / factor_variance).sqrt();
+                fitted.clamp(-max_loading, max_loading)
+            } else {
+                0.0
+            };
+            loadings[i] = beta * (1.0 - self.shrinkage).sqrt();
+            let factor_diagonal = factor_variance * beta * beta;
+            let fitted_residual = (total_variance - factor_diagonal).max(0.0);
+            residual[i] =
+                ((1.0 - self.shrinkage) * fitted_residual + self.shrinkage * fallback).max(0.0);
+        }
+        Ok(FactorCovariance {
+            idiosyncratic: residual,
+            loadings,
+            factor_variance,
+            observations: rows,
+            shrinkage: self.shrinkage,
+            trailing_window: self.window,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KellyConstraints {
+    pub gross_cap: f64,
+    pub net_min: f64,
+    pub net_max: f64,
+    pub per_name_cap: f64,
+    /// Maximum one-way trade notional as a fraction of trailing ADV.
+    pub max_adv_participation: f64,
+}
+
+impl Default for KellyConstraints {
+    fn default() -> Self {
+        Self {
+            gross_cap: DEFAULT_GROSS_CAP,
+            net_min: -DEFAULT_GROSS_CAP,
+            net_max: DEFAULT_GROSS_CAP,
+            per_name_cap: 0.25,
+            max_adv_participation: 0.01,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KellyAction {
+    pub target: Vec<f64>,
+    pub objective: f64,
+    pub expected_cost: f64,
+    pub iterations: usize,
+}
+
+const KELLY_COORDINATE_SWEEPS: usize = 32;
+const KELLY_LINE_SEARCH_STEPS: usize = 48;
+const KELLY_SOLVER_TOLERANCE: f64 = 1e-10;
+
+fn coordinate_value(
+    weight: f64,
+    mean: f64,
+    other_mean_projection: f64,
+    diagonal: f64,
+    loading: f64,
+    other_factor: f64,
+    factor_variance: f64,
+    held: f64,
+    symbol: u32,
+    ts_ms: i64,
+    adv_usd: f64,
+    capital_usd: f64,
+    cost: &dyn CostModel,
+) -> f64 {
+    let delta = (weight - held).abs();
+    let participation = if adv_usd > 0.0 {
+        delta * capital_usd / adv_usd
+    } else if delta == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    };
+    let execution = if delta == 0.0 {
+        0.0
+    } else {
+        delta * f64::from(cost.cost_bps(symbol, ts_ms, participation as f32)) * 1.0e-4
+    };
+    mean * weight
+        - 0.5 * (other_mean_projection + mean * weight).powi(2)
+        - 0.5 * diagonal * weight * weight
+        - 0.5 * factor_variance * (other_factor + loading * weight).powi(2)
+        - execution
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coupled_net_preserving_update(
+    i: usize,
+    j: usize,
+    weights: &mut [f64],
+    means: &[f64],
+    risk: &FactorCovariance,
+    held: &[f64],
+    symbols: &[u32],
+    adv_usd: &[f64],
+    ts_ms: i64,
+    capital_usd: f64,
+    cost: &dyn CostModel,
+    constraints: KellyConstraints,
+    gross: &mut f64,
+    factor: &mut f64,
+    mean_projection: &mut f64,
+) -> f64 {
+    let wi = weights[i];
+    let wj = weights[j];
+    let other_gross = *gross - wi.abs() - wj.abs();
+    let cap_i = constraints.max_adv_participation * adv_usd[i].max(0.0) / capital_usd;
+    let cap_j = constraints.max_adv_participation * adv_usd[j].max(0.0) / capital_usd;
+    // `d` buys i and sells j by the same portfolio weight, leaving net exposure exact.
+    let mut lo = (-constraints.per_name_cap - wi)
+        .max(wj - constraints.per_name_cap)
+        .max(held[i] - cap_i - wi)
+        .max(wj - held[j] - cap_j);
+    let mut hi = (constraints.per_name_cap - wi)
+        .min(wj + constraints.per_name_cap)
+        .min(held[i] + cap_i - wi)
+        .min(wj - held[j] + cap_j);
+    if lo > 0.0 || hi < 0.0 {
+        return 0.0;
+    }
+    let gross_at = |d: f64| other_gross + (wi + d).abs() + (wj - d).abs();
+    if gross_at(lo) > constraints.gross_cap + GROSS_TOLERANCE {
+        let mut outside = lo;
+        let mut inside = 0.0;
+        for _ in 0..KELLY_LINE_SEARCH_STEPS {
+            let mid = 0.5 * (outside + inside);
+            if gross_at(mid) <= constraints.gross_cap {
+                inside = mid;
+            } else {
+                outside = mid;
+            }
+        }
+        lo = inside;
+    }
+    if gross_at(hi) > constraints.gross_cap + GROSS_TOLERANCE {
+        let mut inside = 0.0;
+        let mut outside = hi;
+        for _ in 0..KELLY_LINE_SEARCH_STEPS {
+            let mid = 0.5 * (inside + outside);
+            if gross_at(mid) <= constraints.gross_cap {
+                inside = mid;
+            } else {
+                outside = mid;
+            }
+        }
+        hi = inside;
+    }
+    if hi - lo <= KELLY_SOLVER_TOLERANCE {
+        return 0.0;
+    }
+    let execution = |index: usize, weight: f64| {
+        let delta = (weight - held[index]).abs();
+        if delta == 0.0 {
+            return 0.0;
+        }
+        let participation = if adv_usd[index] > 0.0 {
+            delta * capital_usd / adv_usd[index]
+        } else {
+            f64::INFINITY
+        };
+        delta * f64::from(cost.cost_bps(symbols[index], ts_ms, participation as f32)) * 1.0e-4
+    };
+    let loading_delta = risk.loadings[i] - risk.loadings[j];
+    let mean_delta = means[i] - means[j];
+    let value = |d: f64| {
+        let next_i = wi + d;
+        let next_j = wj - d;
+        means[i] * next_i + means[j] * next_j
+            - 0.5 * risk.idiosyncratic[i] * next_i * next_i
+            - 0.5 * risk.idiosyncratic[j] * next_j * next_j
+            - 0.5 * risk.factor_variance * (*factor + d * loading_delta).powi(2)
+            - 0.5 * (*mean_projection + d * mean_delta).powi(2)
+            - execution(i, next_i)
+            - execution(j, next_j)
+    };
+    let phi = 0.5 * (5.0f64.sqrt() - 1.0);
+    let mut left = lo;
+    let mut right = hi;
+    let mut x1 = right - phi * (right - left);
+    let mut x2 = left + phi * (right - left);
+    let mut y1 = value(x1);
+    let mut y2 = value(x2);
+    for _ in 0..KELLY_LINE_SEARCH_STEPS {
+        if y1 < y2 {
+            left = x1;
+            x1 = x2;
+            y1 = y2;
+            x2 = left + phi * (right - left);
+            y2 = value(x2);
+        } else {
+            right = x2;
+            x2 = x1;
+            y2 = y1;
+            x1 = right - phi * (right - left);
+            y1 = value(x1);
+        }
+    }
+    let mut best = (0.0, value(0.0));
+    for candidate in [
+        x1,
+        x2,
+        lo,
+        hi,
+        (held[i] - wi).clamp(lo, hi),
+        (wj - held[j]).clamp(lo, hi),
+    ] {
+        let score = value(candidate);
+        if score > best.1 {
+            best = (candidate, score);
+        }
+    }
+    if best.0.abs() <= KELLY_SOLVER_TOLERANCE {
+        return 0.0;
+    }
+    weights[i] += best.0;
+    weights[j] -= best.0;
+    *gross = gross_at(best.0);
+    *factor += best.0 * loading_delta;
+    *mean_projection += best.0 * mean_delta;
+    best.0.abs()
+}
+
+/// Solve one every-bar Kelly action against actual holdings and execution costs.
+///
+/// Cyclic exact one-dimensional maximization is used because the objective is concave:
+/// diagonal-plus-factor covariance plus the predicted-mean outer product, minus the convex
+/// spread/fee/square-root-impact charge. Gross, net, per-name and ADV limits are intersected
+/// in each coordinate's interval. The held point is always considered explicitly; therefore
+/// a trade whose forecast benefit does not clear its cost remains exactly at the current holding.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_cost_aware_kelly(
+    symbols: &[u32],
+    means: &[f64],
+    risk: &FactorCovariance,
+    held: &[f64],
+    adv_usd: &[f64],
+    ts_ms: i64,
+    capital_usd: f64,
+    cost: &dyn CostModel,
+    constraints: KellyConstraints,
+) -> Result<KellyAction> {
+    let names = symbols.len();
+    ensure!(
+        means.len() == names
+            && held.len() == names
+            && adv_usd.len() == names
+            && risk.names() == names,
+        "Kelly inputs must have one entry per symbol"
+    );
+    ensure!(risk.is_psd(), "Kelly risk law is not positive semidefinite");
+    ensure!(
+        capital_usd > 0.0 && capital_usd.is_finite(),
+        "capital must be positive"
+    );
+    ensure!(
+        constraints.gross_cap > 0.0
+            && constraints.per_name_cap > 0.0
+            && constraints.max_adv_participation >= 0.0
+            && constraints.net_min <= constraints.net_max,
+        "invalid Kelly constraints"
+    );
+    ensure!(
+        means
+            .iter()
+            .chain(held)
+            .chain(adv_usd)
+            .all(|v| v.is_finite()),
+        "Kelly inputs contain a non-finite value"
+    );
+
+    let mut weights = held.to_vec();
+    let mut gross = weights.iter().map(|w| w.abs()).sum::<f64>();
+    let mut net = weights.iter().sum::<f64>();
+    let mut factor = weights
+        .iter()
+        .zip(&risk.loadings)
+        .map(|(w, b)| w * b)
+        .sum::<f64>();
+    let mut mean_projection = weights
+        .iter()
+        .zip(means)
+        .map(|(weight, mean)| weight * mean)
+        .sum::<f64>();
+    let mut completed = 0;
+    for sweep in 0..KELLY_COORDINATE_SWEEPS {
+        let before = weights.clone();
+        for i in 0..names {
+            let old = weights[i];
+            let other_gross = gross - old.abs();
+            let other_net = net - old;
+            let other_factor = factor - old * risk.loadings[i];
+            let other_mean_projection = mean_projection - old * means[i];
+            let participation_cap = if capital_usd > 0.0 {
+                constraints.max_adv_participation * adv_usd[i].max(0.0) / capital_usd
+            } else {
+                0.0
+            };
+            let mut lo = -constraints
+                .per_name_cap
+                .min((constraints.gross_cap - other_gross).max(0.0));
+            let mut hi = -lo;
+            lo = lo.max(constraints.net_min - other_net);
+            hi = hi.min(constraints.net_max - other_net);
+            lo = lo.max(held[i] - participation_cap);
+            hi = hi.min(held[i] + participation_cap);
+            ensure!(
+                lo <= hi + GROSS_TOLERANCE,
+                "constraints leave no feasible target for symbol {}",
+                symbols[i]
+            );
+            if hi - lo <= KELLY_SOLVER_TOLERANCE {
+                weights[i] = lo.min(hi).clamp(lo, hi);
+            } else {
+                // Golden-section maximization of the concave coordinate objective.  Endpoints
+                // and the exact held point are checked too, preserving the no-trade cusp.
+                let phi = 0.5 * (5.0f64.sqrt() - 1.0);
+                let mut left = lo;
+                let mut right = hi;
+                let mut x1 = right - phi * (right - left);
+                let mut x2 = left + phi * (right - left);
+                let value = |w| {
+                    let score = coordinate_value(
+                        w,
+                        means[i],
+                        other_mean_projection,
+                        risk.idiosyncratic[i],
+                        risk.loadings[i],
+                        other_factor,
+                        risk.factor_variance,
+                        held[i],
+                        symbols[i],
+                        ts_ms,
+                        adv_usd[i],
+                        capital_usd,
+                        cost,
+                    );
+                    if score.is_finite() {
+                        score
+                    } else {
+                        f64::NEG_INFINITY
+                    }
+                };
+                let mut y1 = value(x1);
+                let mut y2 = value(x2);
+                for _ in 0..KELLY_LINE_SEARCH_STEPS {
+                    if y1 < y2 {
+                        left = x1;
+                        x1 = x2;
+                        y1 = y2;
+                        x2 = left + phi * (right - left);
+                        y2 = value(x2);
+                    } else {
+                        right = x2;
+                        x2 = x1;
+                        y2 = y1;
+                        x1 = right - phi * (right - left);
+                        y1 = value(x1);
+                    }
+                }
+                let mut best = if y1 >= y2 { (x1, y1) } else { (x2, y2) };
+                for candidate in [lo, hi, held[i].clamp(lo, hi), old.clamp(lo, hi)] {
+                    let score = value(candidate);
+                    if score > best.1 {
+                        best = (candidate, score);
+                    }
+                }
+                weights[i] = best.0;
+            }
+            gross = other_gross + weights[i].abs();
+            net = other_net + weights[i];
+            factor = other_factor + weights[i] * risk.loadings[i];
+            mean_projection = other_mean_projection + weights[i] * means[i];
+        }
+        // A coordinate step cannot leave an exact-net face: from a flat zero-net book each
+        // single-name interval is `{0}`. Pair the strongest and weakest marginal alphas and
+        // move them by equal/opposite weights. Sorting is O(A log A), and the disjoint pair
+        // pass itself is O(A); no dense covariance is formed.
+        if names >= 2
+            && gross <= constraints.gross_cap + GROSS_TOLERANCE
+            && net >= constraints.net_min - GROSS_TOLERANCE
+            && net <= constraints.net_max + GROSS_TOLERANCE
+        {
+            let mut order: Vec<usize> = (0..names).collect();
+            order.sort_unstable_by(|&a, &b| {
+                let score = |i: usize| {
+                    means[i]
+                        - risk.idiosyncratic[i] * weights[i]
+                        - risk.factor_variance * risk.loadings[i] * factor
+                        - means[i] * mean_projection
+                };
+                score(b).total_cmp(&score(a))
+            });
+            for pair in 0..names / 2 {
+                let i = order[pair];
+                let j = order[names - 1 - pair];
+                coupled_net_preserving_update(
+                    i,
+                    j,
+                    &mut weights,
+                    means,
+                    risk,
+                    held,
+                    symbols,
+                    adv_usd,
+                    ts_ms,
+                    capital_usd,
+                    cost,
+                    constraints,
+                    &mut gross,
+                    &mut factor,
+                    &mut mean_projection,
+                );
+            }
+        }
+        completed = sweep + 1;
+        let movement = weights
+            .iter()
+            .zip(&before)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        if movement <= KELLY_SOLVER_TOLERANCE {
+            break;
+        }
+    }
+    let expected_cost = weights
+        .iter()
+        .zip(held)
+        .zip(symbols)
+        .zip(adv_usd)
+        .map(|(((w, h), symbol), adv)| {
+            let delta = (w - h).abs();
+            let participation = if *adv > 0.0 {
+                delta * capital_usd / adv
+            } else if delta == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            };
+            delta * f64::from(cost.cost_bps(*symbol, ts_ms, participation as f32)) * 1.0e-4
+        })
+        .sum::<f64>();
+    ensure!(
+        expected_cost.is_finite(),
+        "the selected Kelly action has an unpriceable execution leg"
+    );
+    let expected_return = means
+        .iter()
+        .zip(&weights)
+        .map(|(mean, weight)| mean * weight)
+        .sum::<f64>();
+    let objective = expected_return
+        - 0.5 * (risk.quadratic_form(&weights) + expected_return * expected_return)
+        - expected_cost;
+    Ok(KellyAction {
+        target: weights,
+        objective,
+        expected_cost,
+        iterations: completed,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2483,7 +3287,7 @@ pub struct EdgeVsCost {
     /// more of them, so a top-minus-bottom difference is a difference of differently
     /// attenuated quantities and its RATIO is inflated by the ratio of the two shares.
     pub flat_positioned_bars: u64,
-    /// Median `|f*|`, the uncapped Kelly fraction: `mu / sigma^2` of the per-name law.
+    /// Median `|f*|`, the uncapped quadratic Kelly fraction `E[R] / E[R²]`.
     pub median_abs_kelly: f64,
     /// Mean of the head's OWN predicted mean return, in bps, for the calibration comparison
     /// against [`Self::mean_r_bps`].
@@ -4566,9 +5370,9 @@ pub struct PortfolioArgs {
     /// Threads the per-symbol cost calibration is measured on, or `0` to skip the measurement
     /// entirely and report the flat arm alone.
     ///
-    /// The calibration walks every bar of every series in the corpus, which is minutes of CPU
-    /// on the real corpus, so it is a stated cost rather than a hidden one. Skipping it is
-    /// honest and visible: [`PortfolioBench::arms`] then holds one arm and
+    /// The calibration walks every pre-validation bar of every series in the corpus, which is
+    /// minutes of CPU on the real corpus, so it is a stated cost rather than a hidden one.
+    /// Skipping it is honest and visible: [`PortfolioBench::arms`] then holds one arm and
     /// [`EdgeVsCostTable::measured`] is `false`, so no cost column can be read as measured.
     pub cost_threads: usize,
     pub capital_usd: f64,
@@ -4616,13 +5420,14 @@ pub fn run_portfolio_backtest(args: &PortfolioArgs) -> Result<PortfolioBench> {
         model: &model_forecast,
         marginal: &marginal,
     };
-    // The measured per-symbol cost model, calibrated on THIS corpus so `Panel::series_of` is
-    // the right translation, and handed to the bench as the concrete type: the arms it builds
-    // wrap it in `PanelCost` per impact coefficient and per fee arm.
+    // The measured per-symbol cost model is keyed to THIS corpus so `Panel::series_of` is the
+    // right translation, but every fitted input stops strictly before validation begins. The
+    // held-out panel may use its observed decision price through other execution plumbing; it
+    // must never enter spread, volatility, ADV, price, or cross-sectional fallback calibration.
     let calibration = if args.cost_threads > 0 {
         Some(Arc::new(
-            CostCalibration::from_corpus(&corpus, args.cost_threads)
-                .context("measuring the per-symbol cost calibration")?,
+            CostCalibration::from_corpus(&corpus, args.cost_threads, val_start)
+                .context("measuring the causal per-symbol cost calibration")?,
         ))
     } else {
         None
@@ -5170,10 +5975,10 @@ mod tests {
         assert!((alt.returns[1] - run.returns[1]).abs() < 1e-12);
     }
 
-    /// The panel builder itself refuses a bar whose predecessor instant is missing, so the
-    /// no-forward-fill rule is established where the data is read, not patched downstream.
+    /// A missing print is absent on that row; its next print carries the whole move from the
+    /// symbol's last own close rather than erasing held P&L.
     #[test]
-    fn the_panel_never_forward_fills_a_missing_instant() {
+    fn the_panel_carries_a_missing_print_move_to_reappearance() {
         let dir = scratch_dir("gap");
         let res = 300u32;
         let history = 40usize;
@@ -5212,15 +6017,21 @@ mod tests {
             !at(hole_ts).symbols.contains(&holed_id),
             "a symbol with no bar at an instant cannot be tradeable at it"
         );
+        let reappearance = at(hole_ts + FIVE_MIN);
+        let slot = reappearance
+            .symbols
+            .iter()
+            .position(|id| *id == holed_id)
+            .expect("the next own print is tradeable and carries the gap");
+        let bars = corpus.bars(panel.series_of(holed_id));
+        let bar = bars
+            .iter()
+            .position(|bar| bar.ts() == hole_ts + FIVE_MIN)
+            .expect("reappearance bar");
+        let expected = (f64::from(bars[bar].close) / f64::from(bars[bar - 1].close)).ln();
         assert!(
-            !at(hole_ts + FIVE_MIN).symbols.contains(&holed_id),
-            "the instant AFTER a hole has no predecessor close, so it is not tradeable \
-             either; admitting it would be a close-to-close return across a gap the book \
-             was not positioned over"
-        );
-        assert!(
-            at(hole_ts + 2 * FIVE_MIN).symbols.contains(&holed_id),
-            "once both closes exist again the symbol is tradeable"
+            (f64::from(reappearance.realized_r[slot]) - expected).abs() < 1e-7,
+            "the reappearance must apply the full cumulative move from the last own mark"
         );
         // Breadth reports the hole rather than hiding it.
         assert_eq!(panel.breadth().min, 1);
@@ -5325,11 +6136,9 @@ mod tests {
         ];
         let panel = fixture_panel(&rows, 2);
         let forecasts = marginal_forecasts(&panel, &supports);
-        let expected = kelly_fraction(
-            supports.bin_masses(DOF_R),
-            &bin_returns(&supports),
-            FREE_LEVERAGE,
-        ) as f32;
+        let (first, second) = supports.simple_return_bin_moments().unwrap();
+        let expected =
+            kelly_fraction(supports.bin_masses(DOF_R), first, second, FREE_LEVERAGE) as f32;
         assert_eq!(forecasts.len(), 2);
         assert_eq!(forecasts[0].kelly_f, vec![expected; 2]);
         assert_eq!(forecasts[1].kelly_f, vec![expected; 1]);
@@ -5971,7 +6780,8 @@ mod tests {
             .map(|(symbol, bars)| (symbol.clone(), bars.as_slice()))
             .collect();
         BarCostModel::new(Arc::new(
-            CostCalibration::from_series(&borrowed, 300).expect("the calibration measures"),
+            CostCalibration::from_series(&borrowed, 300, i64::MAX)
+                .expect("the calibration measures"),
         ))
     }
 
@@ -6946,5 +7756,242 @@ mod tests {
                 "flat, impact-free, and one arm per (impact k, fee arm)"
             );
         }
+    }
+    #[test]
+    fn cost_aware_solver_has_an_endogenous_no_trade_region() {
+        let risk = FactorCovariance::independent(vec![0.01]);
+        let constraints = KellyConstraints {
+            gross_cap: 1.0,
+            net_min: -1.0,
+            net_max: 1.0,
+            per_name_cap: 1.0,
+            max_adv_participation: 1.0,
+        };
+        let free = solve_cost_aware_kelly(
+            &[0],
+            &[1.0e-3],
+            &risk,
+            &[0.0],
+            &[1.0e9],
+            1,
+            1.0e6,
+            &FlatCost::new(0.0),
+            constraints,
+        )
+        .unwrap();
+        assert!(free.target[0] > 0.09);
+        let costly = solve_cost_aware_kelly(
+            &[0],
+            &[1.0e-3],
+            &risk,
+            &[0.0],
+            &[1.0e9],
+            1,
+            1.0e6,
+            &FlatCost::new(20.0),
+            constraints,
+        )
+        .unwrap();
+        assert_eq!(
+            costly.target,
+            vec![0.0],
+            "cost must suppress the action before execution"
+        );
+
+        let held = solve_cost_aware_kelly(
+            &[0],
+            &[1.0e-3],
+            &risk,
+            &[0.08],
+            &[1.0e9],
+            1,
+            1.0e6,
+            &FlatCost::new(5.0),
+            constraints,
+        )
+        .unwrap();
+        assert_eq!(
+            held.target,
+            vec![0.08],
+            "actual holdings must create hysteresis rather than being ignored"
+        );
+    }
+
+    #[test]
+    fn panel_carries_elapsed_steps_across_missing_prints() {
+        let panel = Panel::from_parts(
+            vec!["A".to_owned()],
+            vec![
+                PanelSlice {
+                    ts_ms: 1,
+                    symbols: vec![0],
+                    realized_r: vec![0.01],
+                },
+                PanelSlice {
+                    ts_ms: 2,
+                    symbols: vec![],
+                    realized_r: vec![],
+                },
+                PanelSlice {
+                    ts_ms: 3,
+                    symbols: vec![0],
+                    realized_r: vec![0.02],
+                },
+            ],
+            vec![vec![1.0], vec![], vec![1.0]],
+        )
+        .unwrap();
+        assert_eq!(panel.elapsed_steps(0, 0), 1);
+        assert_eq!(panel.elapsed_steps(2, 0), 2);
+    }
+
+    #[test]
+    fn trailing_factor_covariance_is_psd_and_strictly_causal() {
+        let mut trailing = TrailingFactorCovariance::new(2, 4, 0.25).unwrap();
+        let fallback = [0.04, 0.09];
+        let before = trailing.estimate(&fallback).unwrap();
+        assert_eq!(before.observations, 0);
+        assert!(before.is_psd());
+        trailing.observe(&[0, 1], &[0.1, 0.2], &[1, 1]).unwrap();
+        let after_one = trailing.estimate(&fallback).unwrap();
+        assert_eq!(after_one.observations, 1);
+        assert!(after_one.is_psd());
+        trailing.observe(&[0, 1], &[-0.1, -0.2], &[1, 1]).unwrap();
+        let after_two = trailing.estimate(&fallback).unwrap();
+        assert_eq!(after_two.observations, 2);
+        assert!(after_two.is_psd());
+        for weights in [[1.0, 0.0], [0.0, 1.0], [1.0, -1.0], [-0.4, 0.7]] {
+            assert!(after_two.quadratic_form(&weights) >= -1e-14);
+        }
+        assert_ne!(
+            before, after_two,
+            "a return may affect only estimates made after it is observed"
+        );
+    }
+
+    #[test]
+    fn h100_scales_covariance_and_reconciles_exact_raw_second_diagonal() {
+        let mut risk = FactorCovariance {
+            idiosyncratic: vec![0.01, 0.02],
+            loadings: vec![0.5, -0.25],
+            factor_variance: 0.04,
+            observations: 10,
+            shrinkage: 0.25,
+            trailing_window: 20,
+        };
+        risk.scale_horizon(100);
+        assert_eq!(risk.idiosyncratic, vec![1.0, 2.0]);
+        assert_eq!(risk.factor_variance, 4.0);
+        let means = [0.3, -0.1];
+        let raw_seconds = [0.7, 0.2];
+        risk.match_forecast_moments(&means, &raw_seconds).unwrap();
+        assert!(risk.is_psd());
+        for i in 0..means.len() {
+            let expected_variance = (raw_seconds[i] - means[i] * means[i]).max(0.0);
+            assert!(
+                (risk.diagonal(i) - expected_variance).abs() < 1e-12,
+                "H100 covariance diagonal {i} is {}, expected {expected_variance}",
+                risk.diagonal(i)
+            );
+            assert!(
+                (risk.diagonal(i) + means[i] * means[i] - raw_seconds[i]).abs() < 1e-12,
+                "mean square must be added exactly once on diagonal {i}"
+            );
+        }
+        for weights in [[1.0, 0.0], [0.0, 1.0], [1.0, -1.0], [-0.4, 0.7]] {
+            assert!(risk.quadratic_form(&weights) >= -1e-14);
+        }
+    }
+
+    #[test]
+    fn same_sign_means_contribute_their_cross_product_to_kelly_risk() {
+        let means = [0.5, 0.5];
+        let risk = FactorCovariance::independent(vec![1.0, 1.0]);
+        let action = solve_cost_aware_kelly(
+            &[0, 1],
+            &means,
+            &risk,
+            &[0.0, 0.0],
+            &[1.0e12, 1.0e12],
+            1,
+            1.0,
+            &FlatCost::new(0.0),
+            KellyConstraints {
+                gross_cap: 4.0,
+                net_min: -4.0,
+                net_max: 4.0,
+                per_name_cap: 2.0,
+                max_adv_participation: 1.0,
+            },
+        )
+        .unwrap();
+        for &weight in &action.target {
+            assert!(
+                (weight - 1.0 / 3.0).abs() < 1e-6,
+                "correlated same-sign mean optimum should be 1/3, got {:?}",
+                action.target
+            );
+        }
+        let expected = means
+            .iter()
+            .zip(&action.target)
+            .map(|(mean, weight)| mean * weight)
+            .sum::<f64>();
+        let want = expected - 0.5 * (risk.quadratic_form(&action.target) + expected * expected);
+        assert!((action.objective - want).abs() < 1e-12);
+    }
+
+    #[test]
+    fn variance_normalized_multi_gap_inputs_match_one_bar_covariance() {
+        let rows = [0.01_f64, -0.015, 0.025];
+        let mut one_bar = TrailingFactorCovariance::new(1, 8, 0.0).unwrap();
+        let mut multi_gap = TrailingFactorCovariance::new(1, 8, 0.0).unwrap();
+        for ret in rows {
+            one_bar.observe(&[0], &[ret], &[1]).unwrap();
+            // Four independent steps carry twice one bar's log-return innovation scale.
+            let cumulative = (2.0 * ret.ln_1p()).exp_m1();
+            multi_gap.observe(&[0], &[cumulative], &[4]).unwrap();
+        }
+        let direct = one_bar.estimate(&[0.0]).unwrap();
+        let normalized = multi_gap.estimate(&[0.0]).unwrap();
+        assert_eq!(direct.observations, normalized.observations);
+        assert!(
+            (direct.diagonal(0) - normalized.diagonal(0)).abs() < 1e-14,
+            "sqrt-gap normalization must preserve one-bar variance: {} versus {}",
+            direct.diagonal(0),
+            normalized.diagonal(0)
+        );
+        assert!(
+            normalized.loadings[0].abs() < 1e-14 && normalized.factor_variance.abs() < 1e-14,
+            "mismatched-span evidence must remain idiosyncratic, not enter factor cross-products"
+        );
+    }
+
+    #[test]
+    fn exact_zero_net_can_establish_an_opposite_alpha_pair() {
+        let constraints = KellyConstraints {
+            gross_cap: 1.0,
+            net_min: 0.0,
+            net_max: 0.0,
+            per_name_cap: 0.5,
+            max_adv_participation: 1.0,
+        };
+        let action = solve_cost_aware_kelly(
+            &[0, 1],
+            &[0.1, -0.1],
+            &FactorCovariance::independent(vec![1.0, 1.0]),
+            &[0.0, 0.0],
+            &[1.0e9, 1.0e9],
+            1,
+            1.0e6,
+            &FlatCost::new(0.0),
+            constraints,
+        )
+        .unwrap();
+        assert!(action.target[0] > 0.05, "{:?}", action.target);
+        assert!(action.target[1] < -0.05, "{:?}", action.target);
+        assert!(action.target.iter().sum::<f64>().abs() < 1e-12);
+        assert!(action.target.iter().map(|w| w.abs()).sum::<f64>() <= 1.0 + 1e-12);
+        assert!(action.target.iter().all(|w| w.abs() <= 0.5 + 1e-12));
     }
 }

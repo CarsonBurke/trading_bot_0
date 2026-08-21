@@ -52,7 +52,11 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     "pretrain_growth_term",
     "pretrain_belief_autocorr",
     "pretrain_dyn_vs_identity",
-    "pretrain_rollout_nll",
+    "pretrain_teacher_forced_rollout_score",
+    "pretrain_ancestral_calibration",
+    "pretrain_ancestral_tails",
+    "pretrain_ancestral_bar_validity",
+    "pretrain_ancestral_distribution_drift",
     "pretrain_dir_acc",
     "pretrain_lr",
     "pretrain_muon_momentum",
@@ -190,6 +194,12 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // A whole held-out panel and a sampled multi-bar rollout per point, so no in-run cycle
     // can produce it.
     "pretrain_horizon_frontier",
+    // Canonical production strategy evaluation. Forecast horizon varies while the decision
+    // clock remains one bar; costs, actual holdings and constraints are inside the action
+    // solve. The companion base records the strictly trailing shrunk one-factor covariance
+    // provenance and its realized constraint audit.
+    "pretrain_receding_kelly",
+    "pretrain_receding_covariance",
     // Written by `trading_bots::torch::train::support_moments::fit_support_moments` via
     // `pretrain_reports::write_support_decode`. Properties of the SUPPORT ARTIFACT alone: the
     // fitted per-bin conditional means measured against the persisted bin geometry, beside the

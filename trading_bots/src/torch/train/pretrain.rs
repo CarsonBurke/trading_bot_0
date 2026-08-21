@@ -1,9 +1,9 @@
 //! Discrete distributional next-bar pretraining.
 //!
 //! The world model factorizes `p(bar_{t+1} | bar_{<=t})` into five categorical
-//! factors over equal-mass bins (see [`crate::torch::bar_dist`]) and is trained by
-//! maximum likelihood. Two auxiliary terms make the *latent* dynamics usable for
-//! planning without ever displacing the likelihood as the learning signal:
+//! factors over one fixed equal-mass support (see [`crate::torch::bar_dist`]) and trains
+//! them with the proper Hard categorical NLL. Two auxiliary terms make the *latent*
+//! dynamics usable without ever displacing that categorical score as the learning signal:
 //!
 //! ```text
 //! L = nll_bar                                            (primary, attached)
@@ -39,8 +39,8 @@ use crate::torch::bar_dist::{
     bar_categorical_kl, bar_crps_from_logits, bar_nll_decomposition, bar_nll_from_logits,
     bar_nll_terms, bar_pit_from_logits, bar_supports_format_version, BarScoring, BarSupports,
     BarSupportsProvenance, BAR_DOF, BAR_DOF_NAMES, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS,
-    BAR_LABEL_SIGMA_RATIO, BAR_SUPPORTS_FORMAT_VERSION, BAR_SUPPORTS_MOMENTS_VERSION, DOF_R, DOF_S,
-    DOF_U, DOF_V, NUM_BAR_BINS,
+    BAR_SUPPORTS_FORMAT_VERSION, BAR_SUPPORTS_MOMENTS_VERSION, DOF_R, DOF_S, DOF_U, DOF_V,
+    NUM_BAR_BINS,
 };
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::dataset::{
@@ -285,32 +285,33 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// What promotion compares, recorded into every checkpoint's metadata and folded into its
 /// lineage hash.
 ///
-/// # The primary criterion is ECONOMIC, guarded by a density non-regression test
+/// # The primary criterion is ECONOMIC, guarded by Hard categorical NLL
 ///
-/// This is the exact MIRROR of the rule that shipped until now — that one selected on
-/// `nll_bar_conditional` and guarded `nll_dof[r]`; this one selects on realized trading edge
-/// and guards the density — and the inversion is a measurement, not a preference.
+/// This is the exact mirror of the earlier selection rule: that rule selected on the
+/// predictive score and guarded `r`; this one selects on realized trading edge and uses the
+/// canonical Hard categorical score for both predictive non-regression guards.
 ///
-/// Run `bardist_v2` improved the traded factor's held-out NLL monotonically for its whole
-/// 30000-step life: `r` went -4.8510 -> -4.9186 nats, a 0.068-nat gain, and the conditional
-/// aggregate went -9.2060 -> -9.3817. Over the same span the trading it exists to do got
+/// The historical `bardist_v2` evidence was recorded under the legacy fixed-support
+/// mixed-measure diagnostic, not categorical NLL: its `r` score moved -4.8510 -> -4.9186
+/// nats and its conditional aggregate -9.2060 -> -9.3817 over 30000 steps. Those negative
+/// levels include the finite-bin measure constant and must not be relabeled as likelihoods.
+/// The model ordering is nevertheless the same as Hard on that frozen geometry, because the
+/// offset is prediction-independent. Over the same span the trading it exists to do got
 /// WORSE: the 0.25x cap edge fell 0.3796 -> 0.3717 -> 0.3382 bps/bar across the three
 /// passes, the headline 4x edge 5.0144 -> 4.7158 -> 4.3101, quarter-Kelly Sharpe from a peak
 /// of 6.28 at step 5000 to 4.96, and the realized hit rate 0.489 -> 0.485. The old rule
-/// promoted step 30000: the BEST conditional NLL of the run and one of its WORST economic
-/// reads. Selecting on NLL did not merely fail to help, it picked the bottom of the curve.
+/// promoted step 30000: the best predictive score of the run and one of its worst economic
+/// reads. Selecting on predictive score did not merely fail to help, it picked the bottom.
 ///
 /// The arithmetic that explains it. Total achievable Kelly growth is `s^2/2` for a per-bar
 /// Sharpe `s`, which this bench measures at 5.25e-4 nats/bar — confirmed twice over, by the
 /// cap curve peaking at +5.44 bps at 8x and by fractional-Kelly theory putting quarter-Kelly
 /// at `(2c - c^2) * g_max` = 2.30 bps against +2.45 measured. So the ENTIRE tradeable content
-/// of the `r` prediction is 5.25e-4 nats/bar: 0.011% of `r`'s NLL level and 0.8% of the gain
-/// the optimizer banked. Destroying half the economic value costs ~2e-4 nats, 0.3% of that
-/// gain. A density objective is ~10^4 times larger than the quantity we trade and only
-/// incidentally aligned with it; directional structure is the cheapest thing in the density,
-/// is learned by step ~3000, and thereafter the mean drifts under no meaningful constraint
-/// (uncapped `|f*|` median 9.22x -> 10.69x while the predicted tails stay WIDE at 0.67-0.89x
-/// of promised, so the inflation is in the MEAN, not in a shrinking sigma).
+/// of the `r` prediction is 5.25e-4 nats/bar: roughly 0.011% of the score level and 0.8% of
+/// the improvement the optimizer banked. The categorical objective is ~10^4 times larger
+/// than the quantity traded and only incidentally aligned with it; directional structure is
+/// cheap in that objective, learned by step ~3000, and thereafter the mean can drift while
+/// the predicted tails remain wide.
 ///
 /// # Why the criterion is the 0.25x cap column and not the 4x headline
 ///
@@ -320,7 +321,7 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// the finding. At 0.25x, 99.0% of bars sit at the cap, so the position is
 /// `0.25 * sign(f*)` for essentially every bar and the SIZE is a constant of the rule rather
 /// than an output of the model. What survives is exactly the realized-return-weighted sign
-/// accuracy of the conditional mean at fixed unit size — the one thing in the density that
+/// accuracy of the conditional mean at fixed unit size — the one part of the predictive law
 /// trading consumes — and it cannot be moved by mean inflation. The cap therefore binds
 /// hard on size; what it does NOT do is let the model choose the size, and that is the
 /// property selection needs.
@@ -345,13 +346,14 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// conditional figures agree to 0.0006-0.0022 nats at all twelve eligible reads and never
 /// disagree in sign), which is the evidence that the fixed ruler is not misleading.
 const SELECTION_METRIC: &str =
-    "net Kelly edge over the unconditional-marginal null at the 0.25x leverage cap, measured \
-     on the pinned val windows at the fixed diagnostic context, as a PAIRED per-window \
+    "net moment-correct quadratic Kelly edge over the unconditional-marginal null at the \
+     0.25x leverage cap, measured on the pinned val windows at the fixed diagnostic context, \
+     as a PAIRED per-window \
      difference against the incumbent that must clear 2.0 paired standard errors; gated by \
-     TWO non-regression guards on the same pass and the same windows, nll_bar_conditional at \
-     2.0 paired SE and nll_dof[r] at 1.0 paired SE. The NLL-selected artifact the previous \
-     rule would have shipped is kept beside it as pretrain_best_nll.ot and scored on the test \
-     split, so the rules are compared rather than asserted";
+     TWO Hard categorical NLL non-regression guards on the same pass and the same windows: \
+     nll_bar_conditional at 2.0 paired SE and nll_dof[r] at 1.0 paired SE. The NLL-selected \
+     artifact the previous rule would have shipped is kept beside it as pretrain_best_nll.ot \
+     and scored on the test split, so the rules are compared rather than asserted";
 const SELECTION_WEIGHTS: [f64; BAR_DOF] = [1.0; BAR_DOF];
 /// Leverage cap the economic criterion is measured at. See [`SELECTION_METRIC`] for why the
 /// 0.25x column rather than the 4x headline: at 0.25x the position size is a constant of the
@@ -401,9 +403,9 @@ const SELECTION_GUARD_SE_MULTIPLE: f64 = 1.0;
 /// 1-SE trip wire there would veto measured economic gains on movements in factors that the
 /// trade never touches. At 2.0 SE, with the paired conditional SE this bench resolves to
 /// ~2e-4 nats, the tolerance is ~4e-4 nats — about 76% of the ENTIRE 5.25e-4 nats/bar of
-/// tradeable content in the `r` prediction. So the guard fires only when the density has
-/// regressed by an amount comparable to everything trading could ever extract from it, which
-/// is the only scale at which a density regression is evidence about the economics.
+/// tradeable content in the `r` prediction. So the guard fires only when Hard categorical
+/// NLL has regressed by an amount comparable to everything trading could ever extract from
+/// it, which is the only scale at which a predictive regression is economic evidence.
 const SELECTION_NLL_TOLERANCE_SE_MULTIPLE: f64 = 2.0;
 /// Name of the artifact holding what the PREVIOUS, NLL-primary rule would have promoted.
 ///
@@ -586,14 +588,6 @@ pub struct PretrainArgs {
     pub auxiliary_resolutions: Vec<u32>,
     /// Bars drawn from the training split to fit the bin supports.
     pub support_samples: usize,
-    /// Scoring rule the objective AND every reported baseline are expressed in.
-    ///
-    /// One knob, threaded everywhere: the loss, the uniform / marginal /
-    /// conditional-marginal / encoding-identity / floor reference lines, the banner, the
-    /// charts, the per-window vectors and the checkpoint lineage all read this. The three
-    /// modes are not comparable in absolute nats, so `pretrain-compare` refuses to pair two
-    /// runs that disagree.
-    pub scoring: BarScoring,
     /// Recursive dynamics rollout depth.
     pub dyn_horizon: usize,
     /// Weight on the NextLat latent term, applied UNCHANGED at every step of the run.
@@ -1361,7 +1355,7 @@ fn probe_shape_used_bytes(
                 args.lambda_dyn,
                 args.lambda_kl,
                 args.lambda_growth,
-                args.scoring,
+                BarScoring::Hard,
                 device,
             )
         });
@@ -1612,6 +1606,53 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
     build_trainer(args, RUNS_PATH, Device::cuda_if_available())?.run_training()
 }
 
+/// Refuse to reinterpret initialization weights trained under another predictive contract.
+///
+/// Hard and Density happen to have identical logit gradients on one fixed support, but a
+/// checkpoint also carries selection readings, baselines, and lineage in the score's units.
+/// Treating a legacy Density artifact as Hard would silently relabel all of that history.
+fn validate_recorded_pretrain_scoring(recorded: Option<&str>) -> Result<()> {
+    let recorded = recorded.context(
+        "initialization checkpoint has no pretraining scoring contract; categorical pretraining \
+         now requires `hard`. Start a new run by omitting --weights",
+    )?;
+    let scoring: BarScoring = recorded.parse().map_err(|reason| {
+        anyhow!("initialization checkpoint records an unknown scoring contract: {reason}")
+    })?;
+    ensure!(
+        scoring == BarScoring::Hard,
+        "initialization checkpoint was trained/selected under `{scoring}`, but categorical \
+         pretraining now requires `{}`. Legacy Density and Smoothed artifacts remain diagnostic \
+         inputs only; start a new Hard run by omitting --weights",
+        BarScoring::Hard.report_contract(),
+    );
+    Ok(())
+}
+
+fn validate_pretrain_weights_contract(weights: Option<&str>) -> Result<()> {
+    let Some(weights) = weights else {
+        return Ok(());
+    };
+    let metadata_path = world_model_metadata_path(Path::new(weights));
+    ensure!(
+        metadata_path.exists(),
+        "no metadata sidecar beside {weights}; cannot verify the Hard categorical pretraining \
+         contract. Start a new run by omitting --weights"
+    );
+    let metadata = BarWorldModelMetadata::load(&metadata_path).with_context(|| {
+        format!(
+            "failed reading the initialization metadata {}; start a new run by omitting --weights",
+            metadata_path.display()
+        )
+    })?;
+    validate_recorded_pretrain_scoring(
+        metadata
+            .training
+            .as_ref()
+            .map(|training| training.scoring.as_str()),
+    )
+}
+
 /// Everything `pretrain` does before the first optimizer step, split out so a test can drive
 /// one validation of a real trainer against a synthetic corpus instead of only unit-testing
 /// the pieces around it. `runs_root` is a parameter for exactly that reason: a test must not
@@ -1627,6 +1668,7 @@ pub fn pretrain(args: PretrainArgs) -> Result<()> {
 /// instead of an accident of the machine the suite runs on.
 fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Result<Trainer> {
     validate_args(&args)?;
+    validate_pretrain_weights_contract(args.weights.as_deref())?;
     if device.is_cuda() {
         configure_cuda();
     }
@@ -1745,7 +1787,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
             base_batch,
             batch_ramp: &batch_ramp,
             seed: args.seed,
-            scoring: args.scoring,
+            scoring: BarScoring::Hard,
             device,
         },
         |aux_corpus, fingerprint| {
@@ -1836,7 +1878,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // ONE scoring rule for the whole run. Every reference below is recomputed in it, so a
     // banner line, a chart baseline and the gradient can never disagree about which
     // objective is in force.
-    let scoring = args.scoring;
+    let scoring = BarScoring::Hard;
     let marginal_nll_dof = supports.marginal_nll_dof(scoring);
     let marginal_nll_bar = supports.marginal_nll_bar(scoring);
     // Score the TRAIN-fitted q* as a fixed prediction against the pinned val windows. This
@@ -1846,15 +1888,6 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     let marginal_nll_dof_val =
         marginal_nll_dof_on(&supports, &eval.promotion, args.batch_size, device, scoring)
             .context("failed scoring the train-fitted marginal on the pinned val windows")?;
-    // The density rule adds `E[ln width]` to every observation's score. It is a constant of
-    // the supports, carries no gradient, and would otherwise set the denominator of the
-    // loss-term shares — making the 25% auxiliary-domination threshold mean a different
-    // thing under each `--scoring`.
-    let share_scale_offset = if scoring.is_density() {
-        supports.log_measure_bar()
-    } else {
-        0.0
-    };
     let parts = supports.marginal_nll_parts(scoring);
     let baselines = HeldOutBaselines {
         scoring,
@@ -1962,7 +1995,6 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         aux_report,
         aux_steps: 0,
         aux_bars_seen: 0,
-        share_scale_offset,
         vram_baseline_bytes: None,
         // Seeded from the startup probe so the FIRST stage transition is gated on a measured
         // figure. Before this the runtime probe only ran four steps into stage 0, so the
@@ -2072,7 +2104,16 @@ pub fn pretrain_candles(args: CandleArgs) -> Result<()> {
 
     let set = PinnedSet::pinned(&corpus, Split::Val, args.context, args.windows)?;
     let window = pinned_snapshot_window(&set, device);
-    let rollout = tch::no_grad(|| rollout_pinned_windows(&world, &window, args.samples));
+    let rollout = tch::no_grad(|| {
+        rollout_pinned_windows(
+            &world,
+            &window.history_dof,
+            &window.history_time_ids,
+            &window.future_time_ids,
+            args.samples,
+            RolloutMode::Dynamics,
+        )
+    });
 
     let output = Path::new(&args.output);
     let drawn = super::pretrain_reports::write_candle_windows(
@@ -4156,11 +4197,6 @@ struct Trainer {
     /// schedule is a function of, and the auxiliary stream must not stretch or compress it.
     aux_steps: usize,
     aux_bars_seen: u64,
-    /// Additive constant `--scoring` puts into `nll_bar` that no prediction can move:
-    /// `BarSupports::log_measure_bar` under the density rule, zero otherwise. Subtracted
-    /// before the loss-term shares are formed so [`AUX_SHARE_WARN`] means the same thing
-    /// under every rule.
-    share_scale_offset: f64,
     /// Device memory in use before the first optimizer step: the weights, the CUDA context
     /// and whatever the card's other tenants already held. Subtracted from a later reading
     /// to attribute the remainder to activations.
@@ -4228,8 +4264,10 @@ struct StepLoss {
     nll_dof: [f64; BAR_DOF],
     dyn_loss: f64,
     kl_loss: f64,
-    /// Mean `-log(1 + f_hat R)` in nats per bar under the deployed leverage cap. Reported
-    /// whatever `--lambda-growth` is, so the ablation's two arms are comparable.
+    /// Mean raw-payoff growth loss in nats per bar under the deployed leverage cap: exact
+    /// `-log1p(f_hat R)` for wealth at or above `1e-4` and the explicit finite,
+    /// value/slope-matched continuation below it. Reported whatever `--lambda-growth` is,
+    /// so the ablation's two arms are comparable.
     growth_loss: f64,
     /// The growth term's detached diagnostics: mean `|f_hat|`, the fraction of bars where
     /// the cap chose the size, and the smallest log argument seen.
@@ -4701,7 +4739,7 @@ impl Trainer {
             self.best_selection_edge_bps,
             self.best_selection_nll,
             self.best_val_nll_bar,
-            self.args.scoring,
+            BarScoring::Hard,
             self.marginal_nll_bar - self.best_val_nll_bar,
             self.marginal_nll_bar,
             self.baselines.uniform_nll_bar - self.best_val_nll_bar,
@@ -4865,7 +4903,7 @@ impl Trainer {
             self.args.batch_size,
             self.device,
             true,
-            self.args.scoring,
+            BarScoring::Hard,
             None,
             trade_bench::TRADE_WINDOWS,
         )?;
@@ -4876,14 +4914,14 @@ impl Trainer {
             world.supports(),
             &window,
             RolloutMode::Exact,
-            self.args.scoring,
+            BarScoring::Hard,
         );
         let dynamics = rollout_nll(
             world.modules(),
             world.supports(),
             &window,
             RolloutMode::Dynamics,
-            self.args.scoring,
+            BarScoring::Hard,
         );
         let dyn_identity = self.measure_dynamics_versus_identity(
             world.modules(),
@@ -4897,7 +4935,7 @@ impl Trainer {
              {:.4} dynamics",
             set.windows.len(),
             set.context,
-            self.args.scoring,
+            BarScoring::Hard,
             dispersion,
             self.marginal_nll_bar - stats.nll_bar,
             self.marginal_nll_bar,
@@ -5005,7 +5043,7 @@ impl Trainer {
             self.args.batch_size,
             self.device,
             true,
-            self.args.scoring,
+            BarScoring::Hard,
             None,
             trade_bench::TRADE_WINDOWS,
         )?;
@@ -5025,8 +5063,8 @@ impl Trainer {
         println!(
             "test split RULE COMPARISON on {} windows at context {}: ECONOMIC pick (step {}) \
              edge@{SELECTION_CAP:.2}x {promoted_edge:+.4} bps/bar, 4x edge {:+.4}, \
-             quarter-Kelly sharpe {:+.2}, conditional nll {:.4}; NLL pick (step {}) \
-             edge@{SELECTION_CAP:.2}x {:+.4}, 4x edge {:+.4}, quarter-Kelly sharpe {:+.2}, \
+             quarter-quadratic-Kelly sharpe {:+.2}, conditional nll {:.4}; NLL pick (step {}) \
+             edge@{SELECTION_CAP:.2}x {:+.4}, 4x edge {:+.4}, quarter-quadratic-Kelly sharpe {:+.2}, \
              conditional nll {:.4}. The economic rule bought {:+.4} bps/bar of 0.25x edge for \
              {:+.4} nats of conditional nll (negative means it cost nothing and gained on both). \
              Neither number fed either decision: this is the split that was touched once.",
@@ -5118,15 +5156,10 @@ impl Trainer {
         let lambda_dyn = self.args.lambda_dyn;
         let lambda_kl = self.args.lambda_kl;
         let lambda_growth = self.args.lambda_growth;
-        let (supports, share_scale_offset, growth_support) = match stream {
-            None => (
-                &self.supports_dev,
-                self.share_scale_offset,
-                &self.growth_supports[0],
-            ),
+        let (supports, growth_support) = match stream {
+            None => (&self.supports_dev, &self.growth_supports[0]),
             Some(index) => (
                 self.aux[index].supports_dev(),
-                self.aux[index].share_scale_offset(),
                 &self.growth_supports[1 + index],
             ),
         };
@@ -5144,7 +5177,7 @@ impl Trainer {
                 time_ids,
                 context,
                 horizon,
-                self.args.scoring,
+                BarScoring::Hard,
                 self.device,
             ))
         } else {
@@ -5164,7 +5197,7 @@ impl Trainer {
                 lambda_dyn,
                 lambda_kl,
                 lambda_growth,
-                self.args.scoring,
+                BarScoring::Hard,
                 self.device,
             )
         });
@@ -5190,17 +5223,16 @@ impl Trainer {
         };
         let identity = metrics[STEP_METRIC_IDENTITY];
         let autocorr = metrics[STEP_METRIC_AUTOCORR];
-        // The structural bound is 0.6876 at this cap and support, so this can only fire if
-        // the support, the cap or the clip stopped agreeing with each other. This guard and
-        // both finite guards above run before any optimizer parameter mutation.
+        // Raw open-tail returns may legitimately cross zero wealth. The growth loss pays
+        // those through its finite bankruptcy-domain continuation; only a non-finite raw
+        // argument indicates corrupted data or arithmetic. This guard runs before optimizer
+        // mutation (and is intentionally explicit even though packed-metric finiteness above
+        // checks the same tensor).
         ensure!(
-            growth_stats.min_log_argument > growth::LOG_ARGUMENT_FLOOR,
-            "the growth term's log argument fell to {:.6} at step {step}, at or below the \
-             {} floor. |f_hat| is capped at {} and the r support clips the simple return, so \
-             this means one of those three stopped holding — do not lower the floor.",
-            growth_stats.min_log_argument,
-            growth::LOG_ARGUMENT_FLOOR,
-            growth_support.cap()
+            growth_stats.min_log_argument.is_finite(),
+            "the growth term produced a non-finite raw log argument at step {step}. The \
+             bankruptcy continuation handles every finite 1 + f_hat R, so this indicates a \
+             non-finite realized return or fraction"
         );
         let growth_probe = growth_probe.map(|_| GrowthGradientShare {
             nll_norm: metrics[STEP_METRIC_PROBE_NLL_NORM],
@@ -5233,14 +5265,10 @@ impl Trainer {
             growth_loss: growth_value,
             growth_stats,
             total,
-            // The likelihood enters the share denominator on the CATEGORICAL scale: the
-            // density rule's measure constant is a property of the binning that no
-            // prediction moves and no gradient touches, so leaving it in would make the
-            // 25% threshold mean a different thing under each `--scoring`. Taken from the
-            // resolution this batch was scored against, because the two bin geometries have
-            // different measure constants and a mixed-up one would misreport every share.
+            // Hard categorical NLL has no support-measure offset: the reported primary loss
+            // is exactly the quantity whose magnitude enters this denominator.
             shares: loss_shares(
-                nll_value - share_scale_offset,
+                nll_value,
                 lambda_dyn * dyn_value,
                 lambda_kl * kl_value,
                 lambda_growth * growth_value,
@@ -5281,7 +5309,7 @@ impl Trainer {
             eval_batch,
             self.device,
             true,
-            self.args.scoring,
+            BarScoring::Hard,
             None,
             trade_bench::TRADE_WINDOWS,
         )?;
@@ -5312,7 +5340,7 @@ impl Trainer {
                 eval_batch,
                 self.device,
                 false,
-                self.args.scoring,
+                BarScoring::Hard,
                 None,
                 trade_bench::TRADE_WINDOWS,
             )?;
@@ -6016,14 +6044,14 @@ impl Trainer {
             &self.support_set_dev,
             &window,
             RolloutMode::Exact,
-            self.args.scoring,
+            BarScoring::Hard,
         );
         let dynamics = rollout_nll(
             &self.modules,
             &self.support_set_dev,
             &window,
             RolloutMode::Dynamics,
-            self.args.scoring,
+            BarScoring::Hard,
         );
         (exact, dynamics)
     }
@@ -6399,7 +6427,10 @@ impl Trainer {
             split_bounds_pinned: !self.args.derive_split_bounds,
             eval_window_seed: EVAL_WINDOW_SEED,
             train_seed: self.args.seed,
-            selection_metric: SELECTION_METRIC.to_owned(),
+            selection_metric: format!(
+                "{SELECTION_METRIC}; predictive scoring contract: {}",
+                BarScoring::Hard.report_contract()
+            ),
             selection_weights: SELECTION_WEIGHTS,
             selection_guard_dof: BAR_DOF_NAMES[SELECTION_GUARD_DOF].to_owned(),
             selection_guard_se_multiple: SELECTION_GUARD_SE_MULTIPLE,
@@ -6415,7 +6446,7 @@ impl Trainer {
                 .supports
                 .provenance()
                 .map(|p| p.corpus_fingerprint.clone()),
-            scoring: self.args.scoring.to_string(),
+            scoring: BarScoring::Hard.to_string(),
             // The context this artifact's selection was actually taken at, beside the one it
             // is meant to be deployed at. They differ only when the ramp never got there, and
             // that difference is the difference between a deployable artifact and one that is
@@ -6791,7 +6822,7 @@ impl Trainer {
             return Ok(());
         }
         let eval_batch = self.args.batch_size;
-        let scoring = self.args.scoring;
+        let scoring = BarScoring::Hard;
         for index in 0..self.aux.len() {
             let res = self.aux[index].res_secs();
             let audit = self.aux[index].audit();
@@ -6908,7 +6939,7 @@ impl Trainer {
             corpus_fingerprint: self.corpus_fingerprint.clone(),
             split_bounds: self.split_bounds(),
             marginal_nll_bar: self.marginal_nll_bar,
-            scoring: Some(self.args.scoring.to_string()),
+            scoring: Some(BarScoring::Hard.to_string()),
             windows,
             // Attached by the epoch-boundary writer, which is the only caller that has a
             // bench for these exact windows.
@@ -6963,7 +6994,7 @@ impl Trainer {
             eval_batch,
             self.device,
             false,
-            self.args.scoring,
+            BarScoring::Hard,
             None,
             trade_bench::TRADE_WINDOWS,
         )?;
@@ -7007,7 +7038,7 @@ impl Trainer {
             record.nll_conditional,
             record.bench_context,
             expected_nll,
-            self.args.scoring,
+            BarScoring::Hard,
             self.marginal_nll_bar - expected_nll,
             self.marginal_nll_bar,
             self.baselines.uniform_nll_bar - expected_nll,
@@ -7052,9 +7083,27 @@ impl Trainer {
             )
         })?;
         let window = self.snapshot_windows();
-        let rollout = rollout_pinned_windows(&world, &window, self.args.snapshot_samples);
+        // Generate both laws before exposing the realized continuation to the reporter. The
+        // dynamics law is the deployed forecast; exact-cache draws exist only as a drift ruler.
+        let dynamics_rollout = rollout_pinned_windows(
+            &world,
+            &window.history_dof,
+            &window.history_time_ids,
+            &window.future_time_ids,
+            self.args.snapshot_samples,
+            RolloutMode::Dynamics,
+        );
+        let exact_rollout = rollout_pinned_windows(
+            &world,
+            &window.history_dof,
+            &window.history_time_ids,
+            &window.future_time_ids,
+            self.args.snapshot_samples,
+            RolloutMode::Exact,
+        );
         self.reporter.record_snapshot(&SnapshotInput {
-            rollout: &rollout,
+            dynamics_rollout: &dynamics_rollout,
+            exact_rollout: &exact_rollout,
             future_dof: &window.future_dof,
             epoch: self.epoch,
             global_step: step,
@@ -7351,52 +7400,72 @@ fn projected_bar_tokens(schedule: &Schedule, bars_seen: u64, step: usize) -> u64
     bars_seen + remaining
 }
 
-/// One pinned snapshot window: conditioning history plus the realized continuation,
-/// each with its calendar. The continuation calendar is exogenous — weekends,
-/// holidays and the 20:00->04:00 gap make it unextrapolable — so it is supplied to
-/// every rollout rather than derived.
+/// One pinned snapshot window: observed conditioning history, a realized continuation aligned
+/// to the deterministic forecast schedule, and the forecast-safe continuation clock.
 struct SnapshotWindow {
     history_dof: Tensor,
     history_time_ids: Tensor,
     future_dof: Tensor,
+    /// Scheduled IDs with realized market-proxy channels, used only by exact teacher forcing.
+    teacher_forced_time_ids: Tensor,
+    /// Forecast-safe IDs: known calendar fields with every future market channel missing.
     future_time_ids: Tensor,
 }
 
-/// Split a pinned window set into conditioning history and realized continuation.
-/// The continuation calendar is exogenous and known, so it is supplied to every
-/// rollout rather than extrapolated from the last history timestamp — weekends,
-/// holidays and the 20:00->04:00 gap make such extrapolation wrong.
+/// Split a pinned window set into history, a deterministic future clock, and separately aligned
+/// scoring targets. Forecast IDs are generated before any realized continuation is inspected.
 fn pinned_snapshot_window(set: &PinnedSet, device: Device) -> SnapshotWindow {
-    let batch = set.sampler.batch_of(&set.windows, device);
     let history_len = set.context - SNAPSHOT_HORIZON;
+    let decision_offset =
+        usize::try_from(history_len - 1).expect("snapshot history has a decision row");
+    let future_time_ids = set
+        .sampler
+        .forecast_time_ids(&set.windows, decision_offset, SNAPSHOT_HORIZON, device)
+        .expect("a pinned snapshot decision has a deterministic forecast clock");
+    let batch = set.sampler.batch_of(&set.windows, device);
+    let future_dof = set
+        .sampler
+        .aligned_future_dof(&set.windows, decision_offset, SNAPSHOT_HORIZON, device)
+        .expect("snapshot realized bars align to their deterministic forecast clock");
+    let teacher_forced_time_ids = set
+        .sampler
+        .teacher_forced_future_time_ids(&set.windows, decision_offset, SNAPSHOT_HORIZON, device)
+        .expect("snapshot teacher forcing aligns market observations to the forecast clock");
     SnapshotWindow {
         history_dof: batch.dof.narrow(1, 0, history_len),
         history_time_ids: batch.time_ids.narrow(1, 0, history_len),
-        future_dof: batch.dof.narrow(1, history_len, SNAPSHOT_HORIZON),
-        future_time_ids: batch.time_ids.narrow(1, history_len, SNAPSHOT_HORIZON),
+        future_dof,
+        teacher_forced_time_ids,
+        future_time_ids,
     }
 }
 
 /// Ancestral rollout of every pinned window, `[W, samples, SNAPSHOT_HORIZON, BAR_DOF]`.
 ///
-/// The rollout KV cache is `windows * samples` sequences deep, so a batched call over
-/// every window at once would need tens of gigabytes. One window at a time keeps the
-/// peak at a few, and the result is identical because each window's ancestral samples
-/// are independent.
+/// The function has no realized-future argument. Its only post-decision input is
+/// `future_time_ids`, generated from the decision timestamp by [`pinned_snapshot_window`].
+/// One window at a time bounds the exact-mode KV cache at `samples` sequences rather than
+/// `windows * samples`.
 fn rollout_pinned_windows(
     world: &BarWorldModel,
-    window: &SnapshotWindow,
+    history_dof: &Tensor,
+    history_time_ids: &Tensor,
+    future_time_ids: &Tensor,
     samples: usize,
+    mode: RolloutMode,
 ) -> Tensor {
-    let parts: Vec<Tensor> = (0..window.history_dof.size()[0])
+    let parts: Vec<Tensor> = (0..history_dof.size()[0])
         .map(|index| {
-            world.rollout(
-                &window.history_dof.narrow(0, index, 1),
-                &window.history_time_ids.narrow(0, index, 1),
-                &window.future_time_ids.narrow(0, index, 1),
-                samples,
-                1.0,
-            )
+            world
+                .rollout_with(
+                    &history_dof.narrow(0, index, 1),
+                    &history_time_ids.narrow(0, index, 1),
+                    &future_time_ids.narrow(0, index, 1),
+                    samples,
+                    1.0,
+                    mode,
+                )
+                .dof
         })
         .collect();
     Tensor::cat(&parts, 0)
@@ -7536,11 +7605,10 @@ fn group_standard_error(groups: &[f64]) -> f64 {
 /// the calibration diagnostics; promotion only needs the NLL, and the diagnostics
 /// it does not compute are returned as NaN rather than zero.
 ///
-/// `shrink` asks the trading bench to solve a SECOND log-optimal fraction per bar, under the
-/// conditional mean recalibrated by an affine map fitted elsewhere — on windows disjoint from
-/// this set, which is why it is an argument rather than something this function could derive.
-/// `None` on every path but the calibration experiment, and the existing policies never read
-/// it, so a run's headline numbers do not move when it is set.
+/// `shrink` asks the trading bench to reduce a SECOND moment-correct quadratic fraction per
+/// bar after an affine mean recalibration fitted elsewhere — on windows disjoint from this
+/// set, which is why it is an argument rather than something this function could derive.
+/// `None` on every path but the calibration experiment.
 ///
 /// `trade_budget` is how many of the set's windows retain per-bar trading paths, counted from
 /// the front. It is an ARGUMENT rather than [`trade_bench::TRADE_WINDOWS`] read in place because
@@ -8064,7 +8132,8 @@ struct TrainingGraph {
     nll_dof: Tensor,
     dyn_loss: Tensor,
     kl_loss: Tensor,
-    /// Mean `-log(1 + f_hat R)` under the deployed cap, from [`growth::growth_loss`].
+    /// Mean raw-payoff growth loss under the deployed cap, including the explicit
+    /// bankruptcy-domain continuation, from [`growth::growth_loss`].
     growth: Tensor,
     /// `[GROWTH_STAT_COUNT]` detached growth diagnostics; see [`growth::GrowthStats`].
     growth_stats: Tensor,
@@ -8122,8 +8191,8 @@ fn forward_losses(
     let logits = modules
         .head
         .logits(&beliefs, &conditioning, &bins.narrow(1, 1, context));
-    // The objective and every reported baseline read the same `--scoring`. Reuse the target
-    // IDs already computed for the full window instead of locating the same bins twice.
+    // The caller's score and targets are one contract. Production pretraining always passes
+    // Hard; diagnostic tests may exercise the other target laws explicitly. Reuse the bin IDs.
     let target_bins = bins.narrow(1, 1, context);
     let targets = if scoring.is_smoothed() {
         supports.targets(&target, scoring)
@@ -8462,12 +8531,16 @@ fn rollout_nll(
     let mut out = [f64::NAN; ROLLOUT_HORIZONS.len()];
     let steps = window.future_dof.size()[1];
     tch::no_grad(|| {
+        let belief_time_ids = match mode {
+            RolloutMode::Exact => &window.teacher_forced_time_ids,
+            RolloutMode::Dynamics => &window.future_time_ids,
+        };
         let beliefs = modules.rollout_beliefs(
             supports,
             &window.history_dof,
             &window.history_time_ids,
             &window.future_dof,
-            &window.future_time_ids,
+            belief_time_ids,
             mode,
         );
         for (slot, horizon) in out.iter_mut().zip(ROLLOUT_HORIZONS) {
@@ -8482,7 +8555,10 @@ fn rollout_nll(
                 let history_len = window.history_time_ids.size()[1];
                 window.history_time_ids.narrow(1, history_len - 1, 1)
             } else {
-                window.future_time_ids.narrow(1, index - 1, 1)
+                match mode {
+                    RolloutMode::Exact => window.teacher_forced_time_ids.narrow(1, index - 1, 1),
+                    RolloutMode::Dynamics => window.future_time_ids.narrow(1, index - 1, 1),
+                }
             };
             let conditioning = modules
                 .trunk
@@ -8627,8 +8703,8 @@ fn global_grad_norm_tensor(vs: &nn::VarStore, device: Device) -> Tensor {
 ///
 /// Two, because the ratio is not constant: at initialization the head is zero-init and every
 /// categorical is uniform, while by a couple of hundred steps the directional structure is
-/// partly learned and `var_hat` — the `1/var_hat` in `df_raw/dmu_hat` — has shrunk by an
-/// order of magnitude. [`LAMBDA_GROWTH`] was chosen to sit inside the 10-20% band at BOTH,
+/// partly learned and `E[R²]` — the denominator governing `df_raw/dmu_hat` when held fixed —
+/// has changed. [`LAMBDA_GROWTH`] was chosen to sit inside the 10-20% band at BOTH,
 /// which is a stronger property than hitting a target at one of them, and the run reprints
 /// the measurement so a corpus or architecture change that invalidates the constant is
 /// visible in the log rather than in an ablation six hours later.
@@ -8945,13 +9021,16 @@ fn print_banner(
     // print the sweep's whole lower half as `0.000` — i.e. as if the NextLat term were
     // switched off — in the one artifact that records which objective a run trained under.
     println!(
-        "objective      nll + {:e}*dyn + {:e}*kl + {:e}*growth, dynamics horizon {}, scored \
-         under {}. `dyn` and `kl` are NextLat (arXiv 2511.05963): `dyn` is smooth_l1 to the \
+        "objective      hard categorical NLL + {:e}*dyn + {:e}*kl + {:e}*growth, dynamics \
+         horizon {}. `dyn` and `kl` are NextLat (arXiv 2511.05963): `dyn` is smooth_l1 to the \
          stop-gradient belief, MEANED over every element of [B, T, {BAR_MODEL_DIM}] exactly \
          as the reference reduces it, so the weight is width-independent and 1.0 is the \
-         reference setting. `growth` is -log(1 + f_hat R) at the log-optimal fraction of \
-         p(r|PAST) — the head's prefix-free r row — clamped at the bench's {:.1}x leverage cap: \
-         the only term that is a function of the quantity the strategy trades. Its weight was \
+         reference setting. `growth` sizes at the moment-correct quadratic Kelly fraction \
+         E[R]/E[R²] of p(r|PAST) — the head's prefix-free r row — clamped at the bench's \
+         {:.1}x leverage cap. It pays raw-tail realized returns: exact -log1p(f_hat R) for \
+         wealth at or above 1e-4 and an explicit value/slope-matched differentiable \
+         continuation below that numerical join. It is the only term that is a function \
+         of the quantity the strategy trades. Its weight was \
          sized on GRADIENT norm, not objective share — its magnitude is ~5e-4 nats against \
          nll's ~4.93 — and the run reprints that measurement at steps {:?}. Every step prints \
          each term's share of the objective's magnitude and the run warns when an auxiliary \
@@ -8960,32 +9039,19 @@ fn print_banner(
         args.lambda_kl,
         args.lambda_growth,
         args.dyn_horizon,
-        args.scoring,
         trade_bench::LEVERAGE_CAP,
         GROWTH_PROBE_STEPS,
         AUX_SHARE_WARN * 100.0,
         AUX_SHARE_WARN_STREAK,
     );
-    // The one line that says which units every nats figure below is in. The three modes
-    // differ by additive constants that depend on the binning, so a `density` figure sits
-    // tens of nats below a `smoothed` one on the identical model.
+    // This is a contract, not a runtime choice: diagnostics may evaluate another rule, but
+    // every optimizer step, promotion guard, reference line, and new checkpoint uses Hard.
     println!(
-        "scoring        {} — {}. Recorded in the checkpoint metadata, folded into the \
-         lineage hash, and checked by pretrain-compare, which REFUSES to pair two runs that \
-         disagree. The three modes are NOT comparable in absolute nats.",
-        args.scoring,
-        match args.scoring {
-            BarScoring::Smoothed =>
-                "Gaussian label smoothing at 0.75x the local bin width; proper for the \
-                 SMOOTHED law, not for the one we observe, and it pays an unreachable floor",
-            BarScoring::Hard =>
-                "one-hot cross entropy on the containing bin; proper for the discretized \
-                 law, no floor, but its scale moves with the bin count",
-            BarScoring::Density =>
-                "a finite-bin measure diagnostic: log P(atom) on an atom and log P_b - log \
-                 width_b inside a continuous bin. Clipped outer bins do not define normalized \
-                 continuous tails; this is not an open-tail density model or bin-count invariant",
-        },
+        "scoring        {} — canonical categorical pretraining contract. Recorded as `hard` in \
+         checkpoint metadata and named in the selection metadata/report labels. Density is \
+         available only as an explicitly invoked fixed-support mixed-measure diagnostic; it is \
+         not a normalized raw likelihood for clamped open tails.",
+        BarScoring::Hard.report_contract(),
     );
     println!(
         "evaluation     promotion on {} windows at context {}, diagnostic on {} windows at \
@@ -8997,7 +9063,11 @@ fn print_banner(
         args.diagnostic_context,
         args.seed,
     );
-    println!("selection      {SELECTION_METRIC}, weights {SELECTION_WEIGHTS:?}");
+    println!(
+        "selection      {SELECTION_METRIC}; predictive scoring contract: {}, weights \
+         {SELECTION_WEIGHTS:?}",
+        BarScoring::Hard.report_contract(),
+    );
     println!(
         "conditioning   {BAR_TIME_CONDITIONING}, calendar cardinality {BAR_TIME_CARDINALITY:?}"
     );
@@ -9019,17 +9089,17 @@ fn print_banner(
                 supports
                     .get(*res)
                     .expect("listed resolution is present")
-                    .marginal_nll_bar(args.scoring)
+                    .marginal_nll_bar(BarScoring::Hard)
             ))
             .collect::<Vec<_>>()
             .join(", ")
     );
     println!(
-        "baseline       dof order {BAR_DOF_NAMES:?}; uniform {:.4} nats/bar (where zero-init \
-         heads start), calibrated marginal {marginal_nll_bar:.4}, both under {}. Only \
+        "baseline       dof order {BAR_DOF_NAMES:?}; uniform {:.4} hard categorical nats/bar \
+         (where zero-init heads start), calibrated marginal {marginal_nll_bar:.4}. Only \
          progress past the MARGINAL is evidence of conditional structure: beating uniform \
          only proves the unconditional bin masses were learned.",
-        baselines.uniform_nll_bar, args.scoring,
+        baselines.uniform_nll_bar,
     );
     // Three corrections to the headline comparison, all of which move it the same way: the
     // reported gain over the calibrated marginal is smaller than it looks.
@@ -9053,8 +9123,8 @@ fn print_banner(
          {marginal_nll_bar:.4}, is the line conditional structure has to clear. The reported \
          nll_bar_conditional excludes it by scoring u and v only where s != 0 (conditional \
          marginal {:.4}).",
-        deployment_supports.encoding_identity_nats(args.scoring),
-        deployment_supports.marginal_plus_identity_nll_bar(args.scoring),
+        deployment_supports.encoding_identity_nats(BarScoring::Hard),
+        deployment_supports.marginal_plus_identity_nll_bar(BarScoring::Hard),
         baselines.marginal_nll_bar_conditional(),
     );
 
@@ -9064,33 +9134,13 @@ fn print_banner(
     let deployment = supports
         .get(args.resolution_secs)
         .expect("the deployment resolution is always fitted");
-    let floor_dof = deployment.scoring_floor(args.scoring);
-    let floor_bar = deployment.scoring_floor_bar(args.scoring);
-    if floor_bar > 0.0 {
-        println!(
-            "floor          label smoothing at sigma {BAR_LABEL_SIGMA_RATIO:.2}x bin width \
-             makes nll_bar a proper rule for the SMOOTHED law, so {floor_bar:.4} nats/bar is \
-             UNREACHABLE even by an oracle (per DOF {}). The marginal reference pays none of \
-             it, so the reachable range is {:.4}, not {marginal_nll_bar:.4}. The default \
-             --scoring hard avoids this smoothing floor.",
-            floor_dof
-                .iter()
-                .map(|f| format!("{f:.3}"))
-                .collect::<Vec<_>>()
-                .join("/"),
-            marginal_nll_bar - floor_bar,
-        );
-    } else {
-        println!(
-            "floor          {} scores the bin the observation actually landed in, so the \
-             floor is exactly zero: an oracle pays nothing and the whole {marginal_nll_bar:.4} \
-             nats of the marginal reference is reachable. Under smoothed it would be \
-             {:.4} nats of it that no model can ever recover.",
-            args.scoring,
-            deployment.scoring_floor_bar(BarScoring::Smoothed),
-        );
-    }
-    let split = deployment.marginal_nll_parts(args.scoring);
+    println!(
+        "floor          {} scores the bin the observation actually landed in, so the floor is \
+         exactly zero: an oracle pays nothing and the whole {marginal_nll_bar:.4} nats of the \
+         marginal reference is reachable.",
+        BarScoring::Hard.report_contract(),
+    );
+    let split = deployment.marginal_nll_parts(BarScoring::Hard);
     println!(
         "degeneracy     atom mass per DOF {}; of the {marginal_nll_bar:.4} marginal, \
          {:.4} is the atom-vs-continuous INDICATOR and {:.4} is intra-continuous shape. \
@@ -9115,6 +9165,21 @@ mod tests {
     use shared::bars::{write_bar_file, PackedBar, FILE_EXTENSION};
 
     const TEST_RES: u32 = 300;
+
+    #[test]
+    fn pretraining_initialization_requires_recorded_hard_contract() {
+        validate_recorded_pretrain_scoring(Some("hard"))
+            .expect("Hard checkpoint is valid initialization");
+        for recorded in [None, Some("density"), Some("smoothed"), Some("future-rule")] {
+            let error = validate_recorded_pretrain_scoring(recorded)
+                .expect_err("missing, legacy, and unknown contracts must not warm-start training")
+                .to_string();
+            assert!(
+                error.contains("omitting --weights") || error.contains("unknown scoring contract"),
+                "migration error must direct the user to a clean run: {error}"
+            );
+        }
+    }
     #[test]
     fn scalar_optimizer_groups_have_exact_reference_semantics() {
         let cases = [
@@ -9403,18 +9468,16 @@ mod tests {
             vec![TEST_RES, AUX_TEST_RES],
             "both resolutions must be routable, or one is scored against the other's bins"
         );
-        assert_ne!(
-            trainer
-                .support_set_dev
-                .get(TEST_RES)
-                .unwrap()
-                .marginal_nll_bar(trainer.args.scoring),
-            trainer
-                .support_set_dev
-                .get(AUX_TEST_RES)
-                .unwrap()
-                .marginal_nll_bar(trainer.args.scoring),
-            "the two resolutions were fitted to the same geometry, so they are not really separate"
+        // Equal-mass supports can have identical categorical marginal entropy even when their
+        // bin edges are entirely different, so NLL is not evidence of independent routing.
+        // The fixtures deliberately use different return scales; pin the resolution-specific
+        // geometry itself, which is the property the routing set must preserve.
+        let deployment_support = trainer.support_set_dev.get(TEST_RES).unwrap();
+        let auxiliary_support = trainer.support_set_dev.get(AUX_TEST_RES).unwrap();
+        assert!(
+            deployment_support.lower_bounds(DOF_R) != auxiliary_support.lower_bounds(DOF_R)
+                || deployment_support.upper_bounds(DOF_R) != auxiliary_support.upper_bounds(DOF_R),
+            "the deployment and auxiliary resolutions unexpectedly share return-bin geometry"
         );
         assert!(
             aux.corpus().supports_path().exists(),
@@ -9542,6 +9605,8 @@ mod tests {
         object.insert("format_version".to_owned(), serde_json::json!(4));
         object.remove("bin_means");
         object.remove("bin_second_moments");
+        object.remove("bin_simple_return_means");
+        object.remove("bin_simple_return_second_moments");
         std::fs::write(&path, serde_json::to_vec(&raw).expect("serialize")).expect("write");
 
         let runs = std::env::temp_dir().join(format!(
@@ -9661,7 +9726,6 @@ mod tests {
             min_bars: 100,
             auxiliary_resolutions: Vec::new(),
             support_samples: 1024,
-            scoring: BarScoring::Density,
             dyn_horizon: 1,
             lambda_dyn: 1.0,
             lambda_kl: 1.0,
@@ -9879,6 +9943,14 @@ mod tests {
         assert_eq!(provenance.selection_context, diag);
         assert_eq!(provenance.reached_context, diag);
         assert_eq!(provenance.deployed_context, deployed);
+        assert_eq!(provenance.scoring, "hard");
+        assert!(
+            provenance
+                .selection_metric
+                .contains(BarScoring::Hard.report_contract()),
+            "selection metadata must name the predictive contract: {}",
+            provenance.selection_metric
+        );
 
         std::fs::remove_dir_all(&runs).ok();
     }
@@ -10999,6 +11071,15 @@ mod tests {
         assert!(BAR_CONTEXT_RAMP_START > SNAPSHOT_HORIZON);
     }
 
+    #[test]
+    fn ancestral_generation_cannot_receive_observed_future_bars() {
+        // The function-pointer type is the enforcement boundary: the generator accepts only
+        // observed history and forecast-safe time IDs. There is no slot through which
+        // `SnapshotWindow::future_dof` can reach the world model.
+        let _: fn(&BarWorldModel, &Tensor, &Tensor, &Tensor, usize, RolloutMode) -> Tensor =
+            rollout_pinned_windows;
+    }
+
     /// A SLOWLY VARYING unit-RMS belief trajectory: one anchor plus `drift` of per-step
     /// noise, renormalized onto the shell the trunk emits on.
     ///
@@ -11111,9 +11192,9 @@ mod tests {
     /// share, measured at 10.3% at step 0 and 19.6% at step 200 on the real corpus at the
     /// deployed batch 24 — see the constant's own doc comment. Value share and gradient share
     /// are different quantities and there is no tension between them: `growth` is ~0.16% of
-    /// the loss VALUE while carrying a sixth of the gradient NORM, because `df_raw/dmu_hat =
-    /// 1/var_hat` with `var_hat ~ 1e-5` multiplies a tiny per-bar derivative by ~1e5 before it
-    /// reaches a parameter. Gradient is what trains; value is incidental.
+    /// the loss VALUE while carrying a sixth of the gradient NORM because the fitted raw
+    /// second moment is ~1e-5, amplifying the sizing response to mean changes. Gradient is
+    /// what trains; value is incidental.
     ///
     /// Nothing in the tree ASSERTS on gradient share. It is measured and reprinted by
     /// [`probe_growth_gradient_share`] at [`GROWTH_PROBE_STEPS`], which hard-fails only on a

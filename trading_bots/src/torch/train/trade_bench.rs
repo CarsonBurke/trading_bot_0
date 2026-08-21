@@ -1,31 +1,32 @@
-//! What the predictive distribution is WORTH: the log-optimal (Kelly) trading bench.
+//! What the predictive distribution is WORTH: the moment-correct quadratic Kelly bench.
 //!
 //! Nats are the objective, but nats do not say whether the head is economically
 //! useful. `-9.29` nats/bar against a `-3.78` marginal is `+5.5` nats of code length,
 //! and code length converts into money at an exchange rate nobody has measured. This
-//! module measures it, by asking the only question that has a unique answer:
-//! *assuming the model's predictive distribution is correct, how would one optimally
-//! trade it, and what does that earn?*
+//! module measures it with a declared economic reduction:
+//! *assuming the model's predictive distribution is correct, what does moment-correct
+//! quadratic Kelly sizing earn?*
 //!
-//! # The policy is derived, not tuned
+//! # The policy is declared, not tuned
 //!
-//! For a single-period bet on a return `R` with a known law, the wealth-maximizing
-//! fraction of capital is the one that maximizes expected LOG growth,
-//! `g(f) = E[ln(1 + f R)]` — the Kelly criterion. Nothing here is fitted: the
-//! predictive law comes from the head, the expectation is an exact finite sum over the
-//! 128 bins (each bin contributing its probability times the return its representative
-//! `r` decodes to, atoms contributing their exact point mass), and `g` is strictly
-//! concave in `f` on its domain, so the maximizer is unique and is found by bisecting
-//! `g'` inside the feasible bracket. Two clamps, both stated rather than tuned:
+//! The bench uses the second-order Kelly approximation
+//!
+//! ```text
+//! q(f) = f E[R] - 0.5 f² E[R²]
+//! f* = E[R] / E[R²]
+//! ```
+//!
+//! Nothing is tuned on evaluation data. The head supplies the categorical probabilities,
+//! while the support artifact supplies train-fitted `E[R | bin]` and `E[R² | bin]`.
+//! Reducing both is essential: pretending each conditional mean is a deterministic payoff
+//! deletes within-bin variance and over-sizes the position. The quadratic objective is
+//! strictly concave whenever `E[R²] > 0`, so the optimum is unique. Two guards remain:
 //!
 //! * [`LEVERAGE_CAP`] bounds `|f|`.
-//! * A position is taken only if the expected log growth at the optimum is strictly
-//!   positive. This is the "only trade high-confidence predictions" gate in its derived
-//!   form. `g(0) = 0` always, so the gate binds exactly when the model sees no edge at
-//!   all — a zero-edge law yields a zero position, not a coin flip.
+//! * The existing ruin-domain bracket keeps `1 + f R` positive on the live support
+//!   representatives, and a position is taken only when its quadratic growth is positive.
 //!
-//! There is no heuristic anywhere: no "long if the mean is positive", no threshold on a
-//! point forecast, no learned parameter, nothing fitted on evaluation data.
+//! There is no evaluation-fitted threshold or learned sizing parameter.
 //!
 //! # Only `r`, and only from the past
 //!
@@ -53,11 +54,10 @@
 //! # The baselines are the point
 //!
 //! A policy fed a fat-tailed unconditional law still posts a positive Sharpe, because
-//! equities drift up and log-optimal sizing of a drifting asset is profitable without
-//! any forecasting at all. So the number that matters is never the model's Sharpe; it
-//! is the model's growth MINUS the growth of the identical machinery driven by the
-//! fitted unconditional marginal. Six policies, identical solver, identical windows,
-//! identical costs, differing only in the distribution fed in or in the multiple staked:
+//! equities drift up and moment-correct Kelly sizing of a drifting asset is profitable
+//! without any forecasting at all. So the number that matters is never the model's Sharpe;
+//! it is the model's growth MINUS the growth of the same reduction driven by the fitted
+//! unconditional marginal. Six policies, identical windows and costs:
 //!
 //! * [`POLICY_MODEL`] — the conditional predictive law. The thing under test.
 //! * [`POLICY_HALF`], [`POLICY_QUARTER`] — the same law at half and quarter Kelly. Not
@@ -69,14 +69,13 @@
 //!   so a run that cannot beat it has bought nothing with its +5.5 nats.
 //! * [`POLICY_BUY_HOLD`] — `f = 1` every bar. Not a Kelly policy; it is the market, and
 //!   it is what fixes the units of [`LEVERAGE_CAP`].
-//! * [`POLICY_ORACLE`] — a point mass on the REALIZED return. Perfect foresight, same
-//!   solver, same cap. It is the attainable ceiling under this cap, so the model's share
-//!   of it is the fraction of available edge the predictor actually captures.
+//! * [`POLICY_ORACLE`] — perfect foresight on the REALIZED return. It is intentionally a
+//!   separate realized-return ceiling, capped by the same leverage limit rather than
+//!   pretending its point mass is the model's moment-reduced law.
 //!
-//! Every one of them is a clamp of ONE solved number per bar, [`WindowPaths::free`], the
-//! uncapped optimum. That is exact rather than convenient: `g` is concave, so the
-//! constrained optimum on `[-c, c]` is the projection of the free optimum onto it. It is
-//! also what makes the whole verdict re-derivable at any cap for free.
+//! Every model-derived policy is a clamp of ONE moment-correct number per bar,
+//! [`WindowPaths::free`]. Projecting the free quadratic optimum onto `[-c, c]` is exact for
+//! that declared quadratic objective, which makes the verdict re-derivable at any cap.
 //!
 //! # The cap is a confound, so it is reported as an axis
 //!
@@ -115,13 +114,13 @@
 //!
 //! The edge, its interval, its cost curve and its share of the perfect-foresight ceiling are
 //! computed for EVERY policy against the SAME null on the SAME windows, not for the model
-//! alone. Full Kelly is the ceiling of what the clamp permits and is routinely not the
-//! fraction one would run, so a half-Kelly row has to be quotable as the verdict without
-//! anyone re-deriving its interval by hand. [`TradeBench::model_edge`] and its siblings name
+//! alone. Full moment-correct Kelly is the ceiling of what the clamp permits and is routinely
+//! not the fraction one would run, so a half-Kelly row has to be quotable as the verdict
+//! without anyone re-deriving its interval by hand. [`TradeBench::model_edge`] and its siblings name
 //! the model's row for the consumers that only want the headline.
 //!
-//! The positions are cost-BLIND — Kelly on the raw predictive law, as specified — and
-//! costs are charged afterwards on the turnover that policy generated. That is
+//! The positions are cost-BLIND — quadratic Kelly on the raw predictive moments — and costs
+//! are charged afterwards on the turnover that policy generated. That is
 //! conservative in a known direction: a cost-aware trader would rebalance less and net
 //! more, so every net number here is a lower bound on what the same predictive law is
 //! worth.
@@ -154,15 +153,13 @@ const _: () = assert!(
 
 /// Hard bound on `|f|`, in units of wealth.
 ///
-/// Full Kelly is unbounded from above when a predictive law has no loss mass, and the
-/// outermost bins of an equal-mass support are open-ended catch-alls whose decoded
-/// center understates the true tail by construction ([`BarSupports`] clips the support
-/// at the `1e-4` quantile). Both facts argue for a cap. `4.0` is chosen because it is
-/// the practical portfolio-margin limit for US equities and because it does NOT bind on
-/// the unconditional null: the classic Kelly leverage for an equity index is
-/// `mu / sigma^2 ~ 0.08 / 0.04 ~ 2`, horizon-invariant since both scale linearly in
-/// time, so the marginal baseline lands near `2` and stays a real policy rather than a
-/// clamped constant. Nothing is tuned to the model, and
+/// Quadratic Kelly can become arbitrarily large as `E[R²]` approaches zero, and the
+/// outermost bins of an equal-mass support are open-ended catch-alls whose fitted moments
+/// remain uncertain. Both facts argue for a cap. `4.0` is chosen because it is the practical
+/// portfolio-margin limit for US equities and because it does NOT bind on the unconditional
+/// null: the classic quadratic Kelly leverage for an equity index is
+/// `mu / E[R²] ~ mu / sigma² ~ 0.08 / 0.04 ~ 2`, so the marginal baseline lands near `2`
+/// and stays a real policy rather than a clamped constant. Nothing is tuned to the model, and
 /// [`PolicyStats::clamped_fraction`] reports how often the cap binds, so a run in which
 /// the cap is doing the deciding says so.
 pub const LEVERAGE_CAP: f64 = 4.0;
@@ -207,17 +204,16 @@ const _: () = assert!(
     "the charted cost curve must contain the cost the headline numbers are charged at"
 );
 
-/// Rows per chunk of the traded law and the solver.
+/// Rows per chunk of the traded law and moment reduction.
 ///
 /// The bench runs inside a validation that shares the device with training, so the peak
 /// is bounded here rather than left to scale with the evaluation batch.
 pub const ROW_CHUNK: i64 = 1024;
 
-/// Bisection steps of the Kelly solve. The bracket is at most `2 * LEVERAGE_CAP` wide,
-/// so 60 halvings pin `f` to the last bits of an f64.
-const SOLVER_ITERATIONS: usize = 60;
-/// Fraction by which the feasible bracket is pulled inside the domain, where
-/// `ln(1 + f R) -> -inf`.
+/// Bisection steps of the MYOPIC cost-aware solve. The cost-blind quadratic reduction is
+/// closed form; only the kinked cost-aware diagnostic still needs this iteration count.
+const MYOPIC_SOLVER_ITERATIONS: usize = 60;
+/// Fraction by which the feasible bracket is pulled inside the ruin domain.
 const FEASIBLE_MARGIN: f64 = 1e-9;
 /// Floor on a bar's wealth multiplier, so a leveraged position against a realized move
 /// outside the fitted support costs a large finite number of nats instead of poisoning
@@ -234,7 +230,7 @@ pub const MAX_BREAK_EVEN_BPS: f64 = 1000.0;
 /// [`MAX_BREAK_EVEN_BPS`]: 48 halvings resolve it to `~4e-12` bps.
 const BREAK_EVEN_ITERATIONS: usize = 48;
 
-/// Hard ceiling on `|f|` the Kelly solve will return, DECLARED rather than emergent.
+/// Hard ceiling on `|f|` every moment-correct Kelly reduction will return.
 ///
 /// # Why this constant has to exist
 ///
@@ -265,12 +261,11 @@ const _: () = assert!(
     "the declared ruin bound must leave the headline cap free to bind on its own"
 );
 
-/// Sentinel for "solve without a cap of the caller's own", i.e. the uncapped optimum.
+/// Sentinel for "reduce without a cap of the caller's own", i.e. the free quadratic optimum.
 ///
-/// Distinct from [`MAX_LEVERAGE`], which bounds every solve no matter what a caller passes:
-/// this says only that the CALLER imposes nothing. A large finite value keeps the bisection's
-/// absolute resolution at `~1e-17` and leaves the bracket set by the distribution and the
-/// declared ceiling rather than by an arbitrary caller-side number.
+/// Distinct from [`MAX_LEVERAGE`], which bounds every reduction no matter what a caller
+/// passes: this says only that the CALLER imposes nothing. The large finite value leaves the
+/// bracket set by the moments, ruin domain, and declared ceiling.
 pub const FREE_LEVERAGE: f64 = 1.0e6;
 
 /// Leverage caps the whole bench is re-reported at.
@@ -324,8 +319,8 @@ pub const POLICY_COUNT: usize = 6;
 /// Series names, in policy-index order.
 pub const POLICY_NAMES: [&str; POLICY_COUNT] = [
     "model",
-    "half kelly",
-    "quarter kelly",
+    "half quadratic kelly",
+    "quarter quadratic kelly",
     "marginal null",
     "buy&hold",
     "oracle",
@@ -333,35 +328,16 @@ pub const POLICY_NAMES: [&str; POLICY_COUNT] = [
 /// Kelly multiple each policy stakes, `NAN` for the ones that are not Kelly on the model.
 ///
 /// Fractional Kelly is the standard remedy for model MISSPECIFICATION, not a timidity
-/// knob, and it belongs in the reported set rather than in a comment. Full Kelly is only
-/// growth-optimal when the law is exactly right and rebalancing is continuous; here the
-/// law is a 128-bin estimate whose outermost bins understate the true tail by
-/// construction, and rebalancing happens once per 5-minute bar across halts and gaps.
-/// Under an overstated edge, `g(f)` is concave and its ERROR is quadratic in the
-/// overstatement, so a bettor at `f*/2` keeps ~75% of the true growth while cutting
-/// variance and ruin exposure fourfold; a bettor at a mistakenly doubled `f*` can have
-/// negative growth. The asymmetry is why half Kelly is the professional default, and why
-/// this bench reports it as a first-class policy beside the full-Kelly headline.
+/// knob, and it belongs in the reported set rather than in a comment. The full row is the
+/// optimum of the declared quadratic approximation, not an exact expected-log optimum.
+/// Halves and quarters expose how much of the realized growth survives materially smaller
+/// variance and ruin exposure, so this bench reports them as first-class policies.
 pub const POLICY_KELLY_MULTIPLE: [f64; POLICY_COUNT] =
     [1.0, 0.5, 0.25, f64::NAN, f64::NAN, f64::NAN];
 
 // ---------------------------------------------------------------------------
 // The predictive object
 // ---------------------------------------------------------------------------
-
-/// Simple return of each `r` bin: `exp(center) - 1`.
-///
-/// The bin's representative value is its center, which is the atom itself on a
-/// zero-width bin and the midpoint of a continuous one — the same convention
-/// [`BarSupports::expectation`] and the CRPS use, so a bin means the same thing to the
-/// bench as it does to every other consumer of the support.
-pub fn bin_returns(supports: &BarSupports) -> Vec<f64> {
-    supports
-        .centers(DOF_R)
-        .iter()
-        .map(|center| center.exp_m1())
-        .collect()
-}
 
 /// `[rows, NUM_BAR_BINS]` probabilities of `p(r | strictly past bars)`.
 ///
@@ -386,11 +362,11 @@ pub fn forecast_r_probs(head: &BarEmissionHead, beliefs: &Tensor, conditioning: 
 }
 
 // ---------------------------------------------------------------------------
-// The Kelly solve
+// The moment-correct Kelly reduction
 // ---------------------------------------------------------------------------
 
-/// `E[ln(1 + f R)]` under a discrete law. Host-side twin of the tensor objective, used
-/// by the tests and by the reported growth accounting.
+/// `E[ln(1 + f R)]` under a discrete law, used to evaluate test fixtures under a known
+/// realized law. Sizing itself uses [`kelly_fraction`]'s quadratic moment contract.
 pub fn expected_log_growth(probs: &[f64], returns: &[f64], fraction: f64) -> f64 {
     assert_eq!(probs.len(), returns.len());
     probs
@@ -406,28 +382,32 @@ pub fn expected_log_growth(probs: &[f64], returns: &[f64], fraction: f64) -> f64
         .sum()
 }
 
-/// `[rows]` log-optimal fractions for `[rows, outcomes]` probabilities and returns.
+/// `[rows]` quadratic Kelly fractions for `[rows, outcomes]` categorical probabilities.
 ///
-/// `returns` may be `[outcomes]`, `[1, outcomes]` (one law shared by every row) or
-/// `[rows, outcomes]` (a per-row law, which is what the perfect-foresight oracle is).
+/// `returns` and `return_seconds` are the train-fitted within-bin `E[R | bin]` and
+/// `E[R² | bin]`. Each may be `[outcomes]`, `[1, outcomes]` (shared by every row), or
+/// `[rows, outcomes]`. Reducing both tables gives
 ///
-/// `g(f) = sum_b p_b ln(1 + f R_b)` is strictly concave wherever it is finite, so
-/// `g'(f) = sum_b p_b R_b / (1 + f R_b)` is strictly decreasing and a bisection on its
-/// sign inside the feasible bracket converges to the unique maximizer — and collapses
-/// onto the relevant endpoint when the maximizer is at the boundary, with no branch. The
-/// bracket is `[-cap, cap]` intersected with the open domain `1 + f R_b > 0` for every
-/// bin carrying mass, pulled inside by [`FEASIBLE_MARGIN`], and intersected again with the
-/// DECLARED ceiling [`MAX_LEVERAGE`]; it always contains `0`, since positive-return bins only
-/// bound the short side and negative ones only the long side.
+/// ```text
+/// mu = E[R]
+/// m2 = E[R²]
+/// f* = mu / m2
+/// ```
 ///
-/// The ceiling is applied here rather than left to callers on purpose: before it existed the
-/// binding constraint on an "uncapped" solve was the outermost bin's decoded return, so the
-/// bench's only ruin bound was a discretization constant that a support refit or a decode
-/// change would move silently. See [`MAX_LEVERAGE`].
+/// which maximizes the declared second-order growth approximation
+/// `q(f) = f E[R] - 0.5 f² E[R²]`. This is deliberately not an exact expected-log solve:
+/// treating each bin's conditional mean as a deterministic payoff would erase its
+/// within-bin variance and systematically over-size the position.
 ///
-/// The returned fraction is exactly `0` unless the expected log growth at the optimum is
-/// strictly positive.
-pub fn kelly_fractions(probs: &Tensor, returns: &Tensor, cap: f64) -> Tensor {
+/// The fraction retains the previous hard leverage ceiling and ruin-domain bracket derived
+/// from the live bin payoffs. The returned fraction is exactly zero unless the quadratic
+/// growth at the constrained optimum is strictly positive.
+pub fn kelly_fractions(
+    probs: &Tensor,
+    returns: &Tensor,
+    return_seconds: &Tensor,
+    cap: f64,
+) -> Tensor {
     assert!(
         cap > 0.0 && cap.is_finite(),
         "the leverage cap must be positive and finite"
@@ -436,18 +416,22 @@ pub fn kelly_fractions(probs: &Tensor, returns: &Tensor, cap: f64) -> Tensor {
     let size = probs.size();
     assert_eq!(size.len(), 2, "probs must be [rows, outcomes]");
     let (rows, outcomes) = (size[0], size[1]);
-    let returns = returns.to_kind(Kind::Double).reshape([-1, outcomes]);
-    let return_rows = returns.size()[0];
-    assert!(
-        return_rows == rows || return_rows == 1,
-        "returns must be shared ([1, outcomes]) or per-row ([rows, outcomes]), got \
-         [{return_rows}, {outcomes}] against {rows} rows"
-    );
-    let returns = if return_rows == rows {
-        returns
-    } else {
-        returns.expand([rows, outcomes], false)
+    let expand_moments = |values: &Tensor, name: &str| {
+        let values = values.to_kind(Kind::Double).reshape([-1, outcomes]);
+        let value_rows = values.size()[0];
+        assert!(
+            value_rows == rows || value_rows == 1,
+            "{name} must be shared ([1, outcomes]) or per-row ([rows, outcomes]), got \
+             [{value_rows}, {outcomes}] against {rows} rows"
+        );
+        if value_rows == rows {
+            values
+        } else {
+            values.expand([rows, outcomes], false)
+        }
     };
+    let returns = expand_moments(returns, "returns");
+    let return_seconds = expand_moments(return_seconds, "return_seconds");
 
     tch::no_grad(|| {
         let mass = probs
@@ -455,24 +439,10 @@ pub fn kelly_fractions(probs: &Tensor, returns: &Tensor, cap: f64) -> Tensor {
             .clamp_min(f64::MIN_POSITIVE);
         let probs = probs.divide(&mass);
         let live = probs.gt(0.0);
-        // A ZERO-PROBABILITY bin is excluded from the bounds below, so its own
-        // `1 + f R_b > 0` constraint is not enforced and the bisection may evaluate the slope
-        // at an `f` where that factor is exactly zero. The term would then be `0 * R_b / 0`,
-        // i.e. NaN, `slope.gt(0.0)` would be false for the whole row, and the bisection would
-        // collapse silently onto its lower bracket end instead of the optimum. An f32 softmax
-        // underflows to exactly zero about 103 logits below the mode, so the mass is
-        // reachable; the coincidence is not, which is exactly why it must be closed
-        // structurally rather than left to chance.
-        //
-        // Zeroing a dead bin's RETURN makes its factor identically `1` and its contribution
-        // identically `0` at every `f`. Nothing else moves: `longs`/`shorts` already require
-        // `live`, so the bounds are unchanged, and the growth sum's dead terms were already
-        // `0 * anything`. The host twin [`expected_log_growth`] has always branched on
-        // `p <= 0`; this is the tensor path acquiring the same guard, which is what the
-        // "identical code path" the scalar wrapper promises actually requires.
+        // Dead bins must not constrain the ruin bracket. Zero their first moments as well
+        // as masking the bounds so reciprocal infinities cannot leak into a live row.
         let returns = returns.masked_fill(&live.logical_not(), 0.0);
-        // `-1/R` is the bound each outcome imposes: positive-return bins bound `f` from
-        // BELOW (a short is ruined by an up move), negative ones from above.
+        let return_seconds = return_seconds.masked_fill(&live.logical_not(), 0.0);
         let bound = returns.reciprocal().neg();
         let longs = returns.gt(0.0).logical_and(&live);
         let shorts = returns.lt(0.0).logical_and(&live);
@@ -482,53 +452,50 @@ pub fn kelly_fractions(probs: &Tensor, returns: &Tensor, cap: f64) -> Tensor {
         let upper = bound
             .masked_fill(&shorts.logical_not(), f64::INFINITY)
             .amin([-1i64].as_slice(), false);
-        // Both bounds straddle zero, so scaling toward zero moves strictly inside the
-        // open domain and leaves an infinite bound infinite.
-        // `cap` is the CALLER's cap; `MAX_LEVERAGE` is the declared ceiling no caller can
-        // exceed. Taking the min of the two here is what keeps the bound out of the support.
         let cap = cap.min(MAX_LEVERAGE);
-        let mut lo = (lower * (1.0 - FEASIBLE_MARGIN)).clamp_min(-cap);
-        let mut hi = (upper * (1.0 - FEASIBLE_MARGIN)).clamp_max(cap);
+        let lo = (lower * (1.0 - FEASIBLE_MARGIN)).clamp_min(-cap);
+        let hi = (upper * (1.0 - FEASIBLE_MARGIN)).clamp_max(cap);
 
-        for _ in 0..SOLVER_ITERATIONS {
-            let mid = (&lo + &hi) * 0.5;
-            let slope = (&probs * &returns)
-                .divide(&(mid.unsqueeze(-1) * &returns + 1.0))
-                .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
-            let rising = slope.gt(0.0);
-            lo = mid.where_self(&rising, &lo);
-            hi = hi.where_self(&rising, &mid);
-        }
-        let fraction = (lo + hi) * 0.5;
-        let growth = (&probs
-            * (fraction.unsqueeze(-1) * &returns + 1.0)
-                .clamp_min(WEALTH_FLOOR)
-                .log())
-        .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
-        // The derived confidence gate: no position unless the optimum strictly grows
-        // wealth. `g(0) = 0`, so this fires exactly on a zero-edge law.
-        fraction.where_self(&growth.gt(0.0), &growth.zeros_like())
+        let mean = (&probs * &returns).sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let second = (&probs * &return_seconds)
+            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double)
+            .clamp_min(0.0);
+        let raw = &mean / second.clamp_min(f64::MIN_POSITIVE);
+        let fraction = raw.maximum(&lo).minimum(&hi);
+        let growth: Tensor = &fraction * &mean - 0.5 * &fraction * &fraction * &second;
+        fraction.where_self(
+            &second.gt(0.0).logical_and(&growth.gt(0.0)),
+            &growth.zeros_like(),
+        )
     })
 }
 
-/// Scalar convenience over [`kelly_fractions`], on the host. Identical code path, so the
-/// baseline that drives the null and the solver the tests pin cannot drift apart.
-pub fn kelly_fraction(probs: &[f64], returns: &[f64], cap: f64) -> f64 {
-    assert_eq!(probs.len(), returns.len(), "one return per outcome");
+/// Scalar host convenience over [`kelly_fractions`].
+pub fn kelly_fraction(probs: &[f64], returns: &[f64], return_seconds: &[f64], cap: f64) -> f64 {
+    assert_eq!(probs.len(), returns.len(), "one first moment per outcome");
+    assert_eq!(
+        probs.len(),
+        return_seconds.len(),
+        "one second moment per outcome"
+    );
     let outcomes = probs.len() as i64;
     let probs = Tensor::from_slice(probs).view([1, outcomes]);
     let returns = Tensor::from_slice(returns).view([1, outcomes]);
-    kelly_fractions(&probs, &returns, cap).double_value(&[0])
+    let return_seconds = Tensor::from_slice(return_seconds).view([1, outcomes]);
+    kelly_fractions(&probs, &returns, &return_seconds, cap).double_value(&[0])
 }
 
-/// The NULL policy's constant position: log-optimal sizing of the train-fitted
+/// The NULL policy's constant quadratic Kelly position under the train-fitted
 /// unconditional law of `r`.
 ///
 /// A function of the fitted support alone. No belief, no latent, no weight — which is
 /// exactly what makes it the null, and what makes it reproducible from the artifact
 /// beside the checkpoint rather than from the checkpoint.
 pub fn marginal_position(supports: &BarSupports, cap: f64) -> f64 {
-    kelly_fraction(supports.bin_masses(DOF_R), &bin_returns(supports), cap)
+    let (returns, return_seconds) = supports
+        .simple_return_bin_moments()
+        .expect("supports lack fitted simple-return moments; refit the v6 support artifact");
+    kelly_fraction(supports.bin_masses(DOF_R), returns, return_seconds, cap)
 }
 
 // ---------------------------------------------------------------------------
@@ -541,16 +508,12 @@ pub fn marginal_position(supports: &BarSupports, cap: f64) -> f64 {
 pub struct WindowPaths {
     /// `R_t = exp(r_t) - 1` of the bar each decision is paid on.
     pub realized: Vec<f64>,
-    /// The model's uncapped log-optimal fraction, per bar.
+    /// The model's uncapped moment-correct quadratic Kelly fraction, per bar.
     ///
     /// Retained because every capped and fractional variant is a CLAMP of it: the cap
     /// curve, half Kelly and quarter Kelly all fall out of this vector with no second
-    /// solve, and the histogram of `|f*|` is the direct measurement of how often the cap,
-    /// rather than the distribution, chose the size. Concavity is what makes the identity
-    /// exact: `g` is strictly increasing below its unique maximizer, so the constrained
-    /// optimum on `[-cap, cap]` is `clamp(f*, -cap, cap)`, and the strictly-positive-growth
-    /// gate survives the clamp because `g(f) > g(0) = 0` for every `f` strictly between `0`
-    /// and `f*`.
+    /// reduction. Projecting a quadratic optimum onto `[-cap, cap]` is exact for the
+    /// declared approximation.
     pub free: Vec<f64>,
     /// Fraction of wealth held INTO bar `t`, per policy, at the headline cap.
     pub positions: [Vec<f64>; POLICY_COUNT],
@@ -570,9 +533,8 @@ pub struct WindowPaths {
     /// different finding, so the two are measured separately rather than pooled into one
     /// "calibration" figure.
     pub predicted_var: Vec<f64>,
-    /// The uncapped log-optimal fraction under the RECALIBRATED mean, when the pass was
-    /// asked for one ([`MeanShrink`]). `None` on every ordinary bench, which is why the
-    /// existing policies cannot move when this is added.
+    /// The uncapped moment-correct fraction under the RECALIBRATED moments, when the pass
+    /// was asked for one ([`MeanShrink`]). `None` on every ordinary bench.
     pub free_shrunk: Option<Vec<f64>>,
     /// Probability mass the law put in the two CATCH-ALL bins of `r`, per bar.
     ///
@@ -697,19 +659,15 @@ impl TailCounts {
     }
 }
 
-/// The parts of the bench that belong to the ARTIFACT rather than to a chunk of windows:
-/// the support's bin returns and value bounds, and the unconditional null's uncapped
-/// fraction. Built once per evaluation so a 170-chunk pass does not re-derive them 170
-/// times, and so the null is provably one number for the whole pass.
+/// Artifact-level constants shared by every evaluated chunk: train-fitted within-bin
+/// simple-return moments, log-space centers/bounds, and the marginal fraction.
 #[derive(Debug)]
 pub struct TradeSetup {
+    /// `[1, NUM_BAR_BINS]` train-fitted `E[R | bin]`.
     returns: Tensor,
-    /// `[1, NUM_BAR_BINS]` bin CENTERS of the `r` support, in LOG-return space.
-    ///
-    /// The simple returns above are `exp(center) - 1`, so this is not redundant: the
-    /// conditional MEAN the calibration fit regresses against is a mean of `r` itself, and
-    /// `E[exp(r) - 1]` is a different number by Jensen. Both are kept so neither consumer
-    /// has to invert the other's transform.
+    /// `[1, NUM_BAR_BINS]` train-fitted `E[R² | bin]`, paired with `returns`.
+    return_seconds: Tensor,
+    /// `[1, NUM_BAR_BINS]` log-return centers used only by log-space calibration.
     centers: Tensor,
     /// `[1, NUM_BAR_BINS]` value bounds of each `r` bin, in LOG-return space, for the
     /// tail quantiles. Atoms have `lo == hi`, which makes their quantile the atom itself.
@@ -719,35 +677,42 @@ pub struct TradeSetup {
     /// curve instead of being frozen at the headline cap.
     free_marginal: f64,
     cap: f64,
-    /// The post-hoc mean recalibration to ALSO solve, when one was fitted elsewhere.
+    /// The optional out-of-sample mean recalibration to ALSO reduce.
     ///
-    /// `None` on every ordinary bench, and the existing policies never read it, so the
-    /// headline numbers of a run are bit-identical whether or not it is set.
+    /// Existing policy rows never read the recalibrated result.
     shrink: Option<MeanShrink>,
 }
 
 impl TradeSetup {
     pub fn new(supports: &BarSupports, device: Device, cap: f64) -> Self {
-        let returns = bin_returns(supports);
+        let (returns, return_seconds) = supports
+            .simple_return_bin_moments()
+            .expect("supports lack fitted simple-return moments; refit the v6 support artifact");
         let row = |values: &[f64]| {
             Tensor::from_slice(values)
                 .view([1, NUM_BAR_BINS])
                 .to_device(device)
         };
         Self {
-            returns: row(&returns),
+            returns: row(returns),
+            return_seconds: row(return_seconds),
             centers: row(supports.centers(DOF_R)),
             lo: row(supports.lower_bounds(DOF_R)),
             hi: row(supports.upper_bounds(DOF_R)),
-            // Solved uncapped: the headline cap is applied by clamping, so one number
-            // serves every point of the cap curve.
-            free_marginal: kelly_fraction(supports.bin_masses(DOF_R), &returns, FREE_LEVERAGE),
+            // Reduced at the effectively uncapped ceiling: the headline cap is applied by
+            // clamping, so one moment-correct number serves every point of the cap curve.
+            free_marginal: kelly_fraction(
+                supports.bin_masses(DOF_R),
+                returns,
+                return_seconds,
+                FREE_LEVERAGE,
+            ),
             cap,
             shrink: None,
         }
     }
 
-    /// Also solve the log-optimal fraction under a recalibrated conditional mean.
+    /// Also reduce the moment-correct fraction under a recalibrated conditional mean.
     ///
     /// A builder rather than an argument of [`Self::new`] because the recalibration is
     /// fitted on data — on a slice DISJOINT from the one this setup will be evaluated on —
@@ -797,6 +762,7 @@ impl TradeSetup {
             &realized_dof.narrow(0, 0, take).select(-1, DOF_R as i64),
             &TradedLaw {
                 returns: &self.returns,
+                return_seconds: &self.return_seconds,
                 centers: &self.centers,
                 bounds: Some((&self.lo, &self.hi)),
                 shrink: self.shrink,
@@ -810,28 +776,28 @@ impl TradeSetup {
 /// Everything about the traded law that is a property of the ARTIFACT rather than of a
 /// chunk of bars, in the form [`window_paths`] consumes.
 ///
-/// A struct rather than positional arguments because two of the fields are `[1, 128]`
-/// tensors over the same support that differ only by a transform, and a caller who swapped
-/// them would get a plausible wrong answer rather than a type error.
+/// A struct rather than positional arguments so callers cannot silently swap fitted first
+/// moments, second moments, and log-space calibration centers.
 #[derive(Debug)]
 pub struct TradedLaw<'a> {
-    /// `[1, NUM_BAR_BINS]` SIMPLE return of each `r` bin, `exp(center) - 1`.
+    /// `[1, NUM_BAR_BINS]` train-fitted `E[R | bin]`.
     pub returns: &'a Tensor,
+    /// `[1, NUM_BAR_BINS]` train-fitted `E[R² | bin]`.
+    pub return_seconds: &'a Tensor,
     /// `[1, NUM_BAR_BINS]` LOG-space center of each `r` bin.
     pub centers: &'a Tensor,
-    /// `[1, NUM_BAR_BINS]` log-space value bounds, for the tail quantiles. Without them the
-    /// positions are still produced and the tail block comes back empty, which is what the
-    /// solver-only tests want.
+    /// `[1, NUM_BAR_BINS]` log-space value bounds for tail quantiles.
     pub bounds: Option<(&'a Tensor, &'a Tensor)>,
-    /// A post-hoc mean recalibration to solve a SECOND uncapped optimum under.
+    /// A post-hoc mean recalibration to reduce into a second moment-correct fraction.
     pub shrink: Option<MeanShrink>,
 }
 
 impl<'a> TradedLaw<'a> {
-    /// The law with no tail bounds and no recalibration: the solver-only shape.
-    pub fn new(returns: &'a Tensor, centers: &'a Tensor) -> Self {
+    /// The law with no tail bounds and no recalibration.
+    pub fn new(returns: &'a Tensor, return_seconds: &'a Tensor, centers: &'a Tensor) -> Self {
         Self {
             returns,
+            return_seconds,
             centers,
             bounds: None,
             shrink: None,
@@ -849,9 +815,8 @@ impl<'a> TradedLaw<'a> {
     }
 }
 
-/// `clamp(f, -cap, cap)`, the constrained optimum of a concave `g` whose free maximizer is
-/// `f`. Written once so the cap curve, the fractional policies and the headline agree by
-/// construction rather than by two implementations that look the same.
+/// `clamp(f, -cap, cap)`, the constrained optimum of the declared concave quadratic whose
+/// free maximizer is `f`.
 pub fn clamp_fraction(free: f64, cap: f64) -> f64 {
     free.clamp(-cap, cap)
 }
@@ -1003,6 +968,7 @@ pub fn window_paths(
         free.extend(host_vec(&kelly_fractions(
             &probs,
             law.returns,
+            law.return_seconds,
             FREE_LEVERAGE,
         )));
         // The moments of `r` itself, not of the simple return: the calibration fit regresses
@@ -1038,21 +1004,23 @@ pub fn window_paths(
         trimmed_mean.extend(host_vec(&interior_mu.reshape([-1])));
         trimmed_var.extend(host_vec(&interior_variance));
         if let Some(shrink) = law.shrink {
-            // Shifting every bin's LOG value by `d` shifts the law's mean by exactly `d` and
-            // leaves every central moment untouched, so this recalibrates the one quantity
-            // the fit found miscalibrated and nothing else: `1 + R'_b = (1 + R_b) exp(d)`.
-            //
-            // Written as `R exp(d) + expm1(d)` rather than as `(1 + R) exp(d) - 1`, which is
-            // the same identity with the cancellation removed. A 5-minute bar's `R` is of
-            // order `1e-3` and `d` of order `1e-4`, so forming `1 + R` and subtracting one
-            // again discards ten bits of a quantity the Kelly solve then differentiates. It
-            // also makes the identity recalibration exactly the identity — `exp(0) = 1` and
-            // `expm1(0) = 0` are both exact — which is what lets a run's headline numbers be
-            // bit-identical whether or not a recalibration was requested.
+            // A log-space shift `d` transforms the simple return as `R' = a R + b`, where
+            // `a = exp(d)` and `b = expm1(d)`. Transform BOTH fitted moments: replacing the
+            // second moment by the square of the shifted conditional mean would reintroduce
+            // the within-bin deterministic-outcome bug this sizing contract excludes.
             let d = &mu * (shrink.beta - 1.0) + shrink.alpha;
+            let a = d.exp();
+            let b = d.expm1();
             let returns = law.returns.to_kind(Kind::Double);
-            let shifted = &returns * d.exp() + d.expm1();
-            free_shrunk.extend(host_vec(&kelly_fractions(&probs, &shifted, FREE_LEVERAGE)));
+            let return_seconds = law.return_seconds.to_kind(Kind::Double);
+            let shifted = &returns * &a + &b;
+            let shifted_seconds = &return_seconds * &a * &a + 2.0 * &returns * &a * &b + &b * &b;
+            free_shrunk.extend(host_vec(&kelly_fractions(
+                &probs,
+                &shifted,
+                &shifted_seconds,
+                FREE_LEVERAGE,
+            )));
         }
         if let Some((lo, hi)) = law.bounds {
             let realized_chunk = flat_r.narrow(0, start, len);
@@ -2170,35 +2138,29 @@ fn break_even_bps(edge_at: &impl Fn(f64) -> f64) -> f64 {
 
 /// A post-hoc affine recalibration of the traded conditional mean: `mu -> alpha + beta mu`.
 ///
-/// # Why this is the growth-optimal response to a fitted slope
+/// # Why this is an economic response to a fitted slope
 ///
-/// If the realized return satisfies `E[r | mu_hat] = alpha + beta mu_hat` with `beta < 1`,
-/// then `mu_hat` is not the conditional mean — `alpha + beta mu_hat` is, and the model's own
-/// number overstates the edge by `1 / beta`. Kelly sizing is monotone in the mean and its
-/// error is QUADRATIC in an overstatement, so trading the inflated mean is not a harmless
-/// scaling: it is the one error fractional Kelly exists to blunt. Sizing on the projection
-/// instead is not a tuned haircut, it is the same log-optimal solve applied to the law whose
-/// mean the data supports.
+/// If the realized return satisfies `E[r | mu_hat] = alpha + beta mu_hat`, the fitted
+/// projection is the supported log-return mean. The bench therefore shifts the law in
+/// log space and recomputes BOTH simple-return moments before applying its declared
+/// `E[R] / E[R²]` reduction.
 ///
 /// # Why it is a SHIFT of the support and not a scaling of the fraction
 ///
-/// Halving `f*` is not the log-optimal response to halving the mean: `f*` is the root of
-/// `sum_b p_b R_b / (1 + f R_b) = 0`, which depends on the whole law and not on its mean
-/// alone. The exact statement is that recentering the law is a transform of its SUPPORT:
-/// adding `d` to every bin's log value maps `1 + R_b` to `(1 + R_b) exp(d)`, shifts the mean
-/// of `r` by exactly `d`, and leaves every central moment — including the far tail the tail
-/// diagnostic says is honest — untouched. The recalibrated position is then the ordinary
-/// Kelly optimum of the recentered law, solved by the same bisection, with `d` chosen so the
-/// new mean is `alpha + beta mu`:
+/// Adding `d` to every bin's log value maps the simple return to
+/// `R' = exp(d) R + expm1(d)`. Consequently,
 ///
 /// ```text
-/// d = (alpha + beta mu) - mu = alpha + (beta - 1) mu
+/// E[R' | bin]  = a E[R | bin] + b
+/// E[R'² | bin] = a² E[R² | bin] + 2ab E[R | bin] + b²
+/// a = exp(d), b = expm1(d)
+/// d = alpha + (beta - 1) mu
 /// ```
 ///
-/// The identity `1 + f R'_b = (1 + f(e^d - 1)) (1 + w R_b)` with
-/// `w = f e^d / (1 + f(e^d - 1))` shows the shifted objective is the original growth curve
-/// reparametrized plus a deterministic term, which is why no approximation appears anywhere:
-/// the solve is the same solve.
+/// Transforming the second moment is the critical part: squaring the shifted bin mean
+/// would again erase within-bin variance. This recalibration is exact as a moment transform;
+/// the resulting quadratic Kelly fraction is still explicitly an approximation to
+/// expected-log-optimal sizing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeanShrink {
     /// Intercept of the calibration regression, in LOG-return units per bar.
@@ -3156,10 +3118,9 @@ pub struct MeanCalibration {
     ///
     /// Not a calibration statistic — it is the level the two slopes are relative to, and it is
     /// here because a population restriction can change it by an order of magnitude. A book of
-    /// bond funds and a book of small caps can share a slope and still hold completely
-    /// different positions, because the position is `mu_hat / sigma_hat^2` and a smaller
-    /// denominator levers harder. Reporting the slopes without this level would let two arms
-    /// look identically calibrated while one of them is trading ten times the size.
+    /// bond funds and a book of small caps can share a slope and still hold different
+    /// positions because the traded denominator is `E[R²]`, which scales with volatility.
+    /// Reporting the slopes without this level could hide that scale difference.
     pub mean_predicted_sd: f64,
     /// The same two slopes, split by the block's own REALIZED volatility.
     ///
@@ -3210,15 +3171,11 @@ impl MeanCalibration {
         self.variance.beta_ci.0.is_finite() && self.variance.beta_ci.0 > 1.0
     }
 
-    /// The model's implied Kelly size as a MULTIPLE of the growth optimum, from both slopes.
+    /// A diagnostic size-scale HEURISTIC from the log-mean and log-variance calibration
+    /// slopes. It is not the bench's actual simple-return `E[R] / E[R²]` reduction.
     ///
-    /// A single-period log-optimal fraction is `mu / Var` to leading order. The mean
-    /// regression says the head's `mu` is `1/b_mean` times the truth and the variance
-    /// regression says its `Var` is `1/b_var` times the truth, so the ratio of the head's
-    /// uncapped fraction to the true one is `b_var / b_mean`. Below one the head is
-    /// UNDER-levered in absolute terms even while its mean is inflated, which is the
-    /// configuration this run is actually in and the reason neither slope alone settles
-    /// whether the sizing is too large.
+    /// The ratio remains useful for separating mean inflation from spread calibration, but
+    /// production sizing recomputes fitted simple-return first and second moments directly.
     pub fn kelly_scale(&self) -> f64 {
         self.variance.beta / self.mean.beta
     }
@@ -3325,8 +3282,8 @@ impl MeanCalibration {
         }
         if let Some(shrink) = self.shrink() {
             lines.push(format!(
-                "  growth-optimal recalibration: mu -> {:+.5e} + {:.4} * mu (a bar at the \
-                 median |mu| is repriced by {:.1}%)",
+                "  moment-correct quadratic-Kelly recalibration: mu -> {:+.5e} + {:.4} * mu \
+                 (a bar at the median |mu| is repriced by {:.1}%)",
                 shrink.alpha,
                 shrink.beta,
                 100.0 * (shrink.beta - 1.0),
@@ -4985,7 +4942,7 @@ impl SizingShape {
             }
             Self::PartialAdjust => {
                 assert!(
-                    (0.0..=1.0).contains(&knob),
+                    (0.0..=1.0).contains(&knob) && knob.is_finite(),
                     "a partial-adjustment weight is a fraction of the way to the optimum, \
                      got {knob}"
                 );
@@ -5006,17 +4963,17 @@ impl SizingShape {
 // The cost INSIDE the objective: the myopic cost-aware solve
 // ---------------------------------------------------------------------------
 
-/// One bar's log-optimal fraction when the TRADING COST IS PART OF THE OBJECTIVE.
+/// One bar's cost-aware quadratic Kelly fraction.
 ///
 /// # The objective, and why it is a different policy rather than a better fill rule
 ///
-/// [`kelly_fractions`] maximizes `g(f) = sum_b p_b ln(1 + f R_b)`, which contains no cost
+/// [`kelly_fractions`] maximizes `q(f) = f E[R] - 0.5 f² E[R²]`, which contains no cost
 /// term. Every shape in [`SizingShape`] then POST-PROCESSES that cost-blind `f*`, so however
 /// clever the fill rule is, the point it is aiming at was chosen as if trading were free.
 /// This maximizes instead
 ///
 /// ```text
-/// G(f) = sum_b p_b ln(1 + f R_b) + ln(1 - c |f - f_prev|)
+/// Q(f) = f E[R] - 0.5 f² E[R²] + ln(1 - c |f - f_prev|)
 /// ```
 ///
 /// where `c` is the per-unit-notional cost [`Ledger::cost_of`] charges and `f_prev` is the
@@ -5027,17 +4984,13 @@ impl SizingShape {
 ///
 /// # Why the solve is still a bisection
 ///
-/// `G` is concave: `g` is strictly concave, `|f - f_prev|` is convex so `1 - c|f - f_prev|`
-/// is concave, it is positive on the admissible set, and `ln` of a positive concave function
-/// is concave. The only new feature is a KINK at `f_prev`, where `G` is not differentiable,
-/// so the smooth bisection is run on each side and the kink is tested directly:
+/// `Q` is concave: `q` is quadratic and strictly concave for `E[R²] > 0`, while the log
+/// cost term is concave on its admissible domain. The kink at `f_prev` is tested directly:
 ///
-/// * `f_prev` is optimal exactly when `0` lies in the subgradient interval there, i.e. when
-///   `|g'(f_prev)| <= c`. That inequality IS the no-trade region, and it is stated by the
-///   objective rather than chosen by a sweep.
-/// * `g'(f_prev) > c` puts the optimum strictly above `f_prev`: bisect `g'(f) - c/(1 - c(f -
-///   f_prev))` on `[f_prev, hi]`.
-/// * `g'(f_prev) < -c` mirrors it below.
+/// * `f_prev` is optimal when `|q'(f_prev)| <= c`.
+/// * `q'(f_prev) > c` puts the optimum above `f_prev`; bisect
+///   `q'(f) - c/(1 - c(f - f_prev))`.
+/// * `q'(f_prev) < -c` mirrors it below.
 ///
 /// # Still MYOPIC
 ///
@@ -5055,6 +5008,7 @@ impl SizingShape {
 pub fn myopic_fractions(
     probs: &Tensor,
     returns: &Tensor,
+    return_seconds: &Tensor,
     cap: f64,
     cost: f64,
     previous: &Tensor,
@@ -5070,7 +5024,7 @@ pub fn myopic_fractions(
     if cost == 0.0 {
         // No kink, no cost slope, nothing to add: the objective IS the cost-blind one, so
         // this returns the identical tensor rather than a numerically-close reconstruction.
-        return kelly_fractions(probs, returns, cap);
+        return kelly_fractions(probs, returns, return_seconds, cap);
     }
     let probs = probs.to_kind(Kind::Double);
     let size = probs.size();
@@ -5088,6 +5042,18 @@ pub fn myopic_fractions(
     } else {
         returns.expand([rows, outcomes], false)
     };
+    let return_seconds = return_seconds.to_kind(Kind::Double).reshape([-1, outcomes]);
+    let second_rows = return_seconds.size()[0];
+    assert!(
+        second_rows == rows || second_rows == 1,
+        "return_seconds must be shared ([1, outcomes]) or per-row ([rows, outcomes]), got \
+         [{second_rows}, {outcomes}] against {rows} rows"
+    );
+    let return_seconds = if second_rows == rows {
+        return_seconds
+    } else {
+        return_seconds.expand([rows, outcomes], false)
+    };
     let previous = previous.to_kind(Kind::Double).reshape([rows]);
 
     tch::no_grad(|| {
@@ -5100,6 +5066,11 @@ pub fn myopic_fractions(
         // zero-probability bin can never contribute `0 * R / 0` to a slope. See
         // [`kelly_fractions`], which relies on the same guard.
         let returns = returns.masked_fill(&live.logical_not(), 0.0);
+        let return_seconds = return_seconds.masked_fill(&live.logical_not(), 0.0);
+        let mean = (&probs * &returns).sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+        let second = (&probs * &return_seconds)
+            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double)
+            .clamp_min(0.0);
         let bound = returns.reciprocal().neg();
         let longs = returns.gt(0.0).logical_and(&live);
         let shorts = returns.lt(0.0).logical_and(&live);
@@ -5124,13 +5095,9 @@ pub fn myopic_fractions(
         // construction: it came from a previous solve under the same cap and law.
         let held = previous.clamp_tensor(Some(&lo), Some(&hi));
 
-        // The cost-free slope at the kink decides the branch, and its magnitude against `c`
-        // is the no-trade test.
-        let slope_at = |f: &Tensor| -> Tensor {
-            (&probs * &returns)
-                .divide(&(f.unsqueeze(-1) * &returns + 1.0))
-                .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double)
-        };
+        // The cost-free quadratic slope at the kink decides the branch, and its magnitude
+        // against `c` is the no-trade test.
+        let slope_at = |f: &Tensor| -> Tensor { &mean - &second * f };
         let kink_slope = slope_at(&held);
         let rises = kink_slope.gt(cost);
         let falls = kink_slope.lt(-cost);
@@ -5146,7 +5113,7 @@ pub fn myopic_fractions(
         // `+c/factor` on the DOWN side. Written as explicit tensor ops rather than as
         // `scalar - tensor`, which does not name a type here.
         let factor = |f: &Tensor| (f - &held).abs() * -cost + 1.0;
-        for _ in 0..SOLVER_ITERATIONS {
+        for _ in 0..MYOPIC_SOLVER_ITERATIONS {
             let mid = (&up_lo + &up_hi) * 0.5;
             let objective = slope_at(&mid) - factor(&mid).reciprocal() * cost;
             let rising = objective.gt(0.0);
@@ -5175,11 +5142,7 @@ pub fn myopic_fractions(
         // holding nothing is only preferable if going flat is itself affordable, so the
         // comparison is against the value of unwinding to zero rather than against `0`.
         let value_at = |f: &Tensor| -> Tensor {
-            let growth = (&probs
-                * (f.unsqueeze(-1) * &returns + 1.0)
-                    .clamp_min(WEALTH_FLOOR)
-                    .log())
-            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+            let growth = f * &mean - 0.5 * f * f * &second;
             growth + factor(f).clamp_min(WEALTH_FLOOR).log()
         };
         let flat = solved.zeros_like();
@@ -5798,9 +5761,8 @@ pub const ATTRIBUTION_SIGN_SEED: u64 = 0x5157_F11F_5EED_0001;
 /// across.
 ///
 /// The capped `|f|` is the wrong axis: the cap binds on most bars, so its histogram is a spike
-/// and a decile split on it is a split on nothing. `|f*|` is `|mu| / sigma^2` to first order
-/// and has real spread, which is what makes "is the model right where it bets big" a question
-/// this panel can answer at all.
+/// and a decile split on it is a split on nothing. `|f*|` is exactly
+/// `|E[R]| / E[R²]` before the declared guards, which leaves a real confidence spread.
 pub const ATTRIBUTION_DECILES: usize = 10;
 
 const PANEL_CORR_ABS: usize = 0;
@@ -8308,93 +8270,134 @@ mod tests {
         Tensor::from_slice(&values).view([rows, latent])
     }
 
+    fn deterministic_seconds<const N: usize>(returns: &[f64; N]) -> [f64; N] {
+        std::array::from_fn(|i| returns[i] * returns[i])
+    }
+
+    fn return_moment_tensors(supports: &BarSupports) -> (Tensor, Tensor) {
+        let (first, second) = supports
+            .simple_return_bin_moments()
+            .expect("test supports carry fitted simple-return moments");
+        (
+            Tensor::from_slice(first).view([1, NUM_BAR_BINS]),
+            Tensor::from_slice(second).view([1, NUM_BAR_BINS]),
+        )
+    }
+
+    fn squared(returns: &[f64]) -> Vec<f64> {
+        returns.iter().map(|r| r * r).collect()
+    }
+
     // -----------------------------------------------------------------------
     // The solver
     // -----------------------------------------------------------------------
 
     #[test]
-    fn solver_recovers_the_analytic_kelly_fraction() {
-        // A `b`-to-1 bet won with probability `p` has the textbook optimum
-        // `f = p - (1 - p) / b`.
-        for (p, b, expected) in [(0.6, 1.0, 0.2), (0.55, 2.0, 0.325), (0.51, 1.0, 0.02)] {
-            let probs = [p, 1.0 - p];
-            let returns = [b, -1.0];
-            let solved = kelly_fraction(&probs, &returns, LEVERAGE_CAP);
+    fn solver_recovers_the_declared_quadratic_kelly_fraction() {
+        for (probs, returns) in [
+            ([0.6, 0.4], [1.0, -1.0]),
+            ([0.55, 0.45], [2.0, -1.0]),
+            ([0.51, 0.49], [1.0, -1.0]),
+        ] {
+            let seconds = deterministic_seconds(&returns);
+            let mean: f64 = probs.iter().zip(returns).map(|(p, r)| p * r).sum();
+            let second: f64 = probs.iter().zip(seconds).map(|(p, r2)| p * r2).sum();
+            let expected = mean / second;
+            let solved = kelly_fraction(&probs, &returns, &seconds, LEVERAGE_CAP);
             assert!(
                 (solved - expected).abs() < 1e-9,
-                "kelly on a {b}:1 bet at p={p} solved to {solved}, analytic {expected}"
+                "quadratic Kelly solved to {solved}, analytic mu/E[R²] = {expected}"
             );
-            // And it really is the maximizer: perturbing it either way loses growth.
-            let best = expected_log_growth(&probs, &returns, solved);
-            for step in [-1e-4, 1e-4] {
-                assert!(
-                    expected_log_growth(&probs, &returns, solved + step) < best,
-                    "{solved} is not a local maximum of the expected log growth"
-                );
-            }
         }
-        // Two-sided asymmetric bet with a closed form: 0.5/(1 + 0.5f) = 0.4/(1 - 0.4f)
-        // solves at f = 0.25.
-        let solved = kelly_fraction(&[0.5, 0.5], &[0.5, -0.4], LEVERAGE_CAP);
+    }
+
+    #[test]
+    fn within_bin_second_moments_reduce_kelly_even_when_bin_means_match() {
+        let probs = [0.5, 0.5];
+        let means = [0.001, 0.001];
+        let concentrated_seconds = [0.0001, 0.0001];
+        let dispersed_seconds = [0.001, 0.001];
+        let concentrated = kelly_fraction(&probs, &means, &concentrated_seconds, FREE_LEVERAGE);
+        let dispersed = kelly_fraction(&probs, &means, &dispersed_seconds, FREE_LEVERAGE);
+        assert!((concentrated - 10.0).abs() < 1e-12);
+        assert!((dispersed - 1.0).abs() < 1e-12);
         assert!(
-            (solved - 0.25).abs() < 1e-9,
-            "asymmetric two-point kelly solved to {solved}, analytic 0.25"
+            dispersed < concentrated,
+            "larger within-bin E[R²] must lower Kelly: {dispersed} vs {concentrated}"
         );
     }
 
     #[test]
     fn a_symmetric_zero_edge_law_takes_exactly_no_position() {
         for magnitude in [0.002, 0.02, 0.2] {
-            let solved = kelly_fraction(&[0.5, 0.5], &[magnitude, -magnitude], LEVERAGE_CAP);
+            let returns = [magnitude, -magnitude];
+            let solved = kelly_fraction(
+                &[0.5, 0.5],
+                &returns,
+                &deterministic_seconds(&returns),
+                LEVERAGE_CAP,
+            );
             assert_eq!(
                 solved, 0.0,
                 "a symmetric +/-{magnitude} bet must take exactly zero position, got {solved}"
             );
         }
-        // Symmetric in SIMPLE returns is the zero-edge condition; a law symmetric in log
-        // space has a positive expected simple return and must NOT be flattened.
         let log_symmetric = [(0.01f64).exp_m1(), (-0.01f64).exp_m1()];
         assert!(
-            kelly_fraction(&[0.5, 0.5], &log_symmetric, LEVERAGE_CAP) > 0.0,
+            kelly_fraction(
+                &[0.5, 0.5],
+                &log_symmetric,
+                &deterministic_seconds(&log_symmetric),
+                LEVERAGE_CAP,
+            ) > 0.0,
             "a log-symmetric law has a positive expected return and is tradeable"
         );
     }
 
     #[test]
     fn the_solver_respects_the_cap_and_the_ruin_boundary() {
-        // No loss mass at all: growth is unbounded in `f`, so the cap must bind.
-        let capped = kelly_fraction(&[0.5, 0.5], &[0.01, 0.02], LEVERAGE_CAP);
-        assert!(
-            (capped - LEVERAGE_CAP).abs() < 1e-9,
-            "a law with no loss mass must saturate the cap, got {capped}"
+        let gains = [0.01, 0.02];
+        let capped = kelly_fraction(
+            &[0.5, 0.5],
+            &gains,
+            &deterministic_seconds(&gains),
+            LEVERAGE_CAP,
         );
-        // A 50% down bin makes any position at or above 2x ruinous, so the feasible
-        // bound binds strictly inside the cap.
-        let bounded = kelly_fraction(&[0.999, 0.001], &[0.01, -0.5], 10.0);
-        assert!(
-            bounded > 0.0 && bounded < 2.0,
-            "the feasible bracket must keep 1 + f R positive, got {bounded}"
+        assert!((capped - LEVERAGE_CAP).abs() < 1e-9);
+
+        let mixed = [0.01, -0.5];
+        let bounded = kelly_fraction(
+            &[0.999, 0.001],
+            &mixed,
+            &deterministic_seconds(&mixed),
+            10.0,
         );
-        // Mirror image on the short side.
-        let short = kelly_fraction(&[0.5, 0.5], &[-0.01, -0.02], LEVERAGE_CAP);
-        assert!(
-            (short + LEVERAGE_CAP).abs() < 1e-9,
-            "a law with no gain mass must saturate the SHORT cap, got {short}"
+        assert!(bounded > 0.0 && bounded < 2.0);
+
+        let losses = [-0.01, -0.02];
+        let short = kelly_fraction(
+            &[0.5, 0.5],
+            &losses,
+            &deterministic_seconds(&losses),
+            LEVERAGE_CAP,
         );
+        assert!((short + LEVERAGE_CAP).abs() < 1e-9);
     }
 
     #[test]
     fn the_solver_is_row_wise_and_matches_the_scalar_path() {
         let returns = [0.02, -0.01, 0.0];
+        let seconds = deterministic_seconds(&returns);
         let rows = [[0.4, 0.4, 0.2], [0.2, 0.6, 0.2], [1.0 / 3.0; 3]];
         let probs = Tensor::from_slice(&rows.concat()).view([3, 3]);
         let batched = host_vec(&kelly_fractions(
             &probs,
             &Tensor::from_slice(&returns).view([1, 3]),
+            &Tensor::from_slice(&seconds).view([1, 3]),
             LEVERAGE_CAP,
         ));
         for (row, expected) in rows.iter().zip(&batched) {
-            let scalar = kelly_fraction(row, &returns, LEVERAGE_CAP);
+            let scalar = kelly_fraction(row, &returns, &seconds, LEVERAGE_CAP);
             assert_eq!(
                 scalar, *expected,
                 "the batched solver must agree bit for bit with the scalar path"
@@ -8491,7 +8494,7 @@ mod tests {
         let latent = 20;
         let (_vs, head) = perturbed_head(latent, 0xA001);
         let supports = synthetic_supports(30_000, 0xA002);
-        let returns = Tensor::from_slice(&bin_returns(&supports)).view([1, NUM_BAR_BINS]);
+        let (returns, return_seconds) = return_moment_tensors(&supports);
         let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
         let free_null = marginal_position(&supports, FREE_LEVERAGE);
         let (windows, bars) = (3i64, 16i64);
@@ -8514,7 +8517,7 @@ mod tests {
                 &h,
                 &conditioning,
                 realized,
-                &TradedLaw::new(&returns, &centers),
+                &TradedLaw::new(&returns, &return_seconds, &centers),
                 free_null,
                 LEVERAGE_CAP,
             )
@@ -8556,6 +8559,7 @@ mod tests {
         let independent = host_vec(&kelly_fractions(
             &forecast_r_probs(&head, &flat, &flat_conditioning),
             &returns,
+            &return_seconds,
             FREE_LEVERAGE,
         ));
         for (window, paths) in honest.windows.iter().enumerate() {
@@ -8590,12 +8594,10 @@ mod tests {
         assert_eq!(first, second, "the null must be bit-reproducible");
         assert!(
             first.is_finite() && first != 0.0,
-            "a drifting equity law has a nonzero log-optimal position, got {first}"
+            "a drifting equity law has a nonzero moment-correct position, got {first}"
         );
-        // Solving under the cap and clamping the uncapped solve are the same policy, because
-        // `g` is concave: this is the identity the whole cap curve rests on, and it is
-        // checked here rather than assumed. To SOLVER tolerance, not bitwise — the two
-        // bisections start from different brackets, so their last bits differ by design.
+        // Projecting the free quadratic optimum onto a tighter cap is the same constrained
+        // policy; this identity is what the whole cap curve rests on.
         let free = marginal_position(&supports, FREE_LEVERAGE);
         let clamped = clamp_fraction(free, LEVERAGE_CAP);
         assert!(
@@ -8608,7 +8610,7 @@ mod tests {
         let latent = 12;
         let (_a, head_a) = perturbed_head(latent, 0xB002);
         let (_b, head_b) = perturbed_head(latent, 0xB003);
-        let returns = Tensor::from_slice(&bin_returns(&supports)).view([1, NUM_BAR_BINS]);
+        let (returns, return_seconds) = return_moment_tensors(&supports);
         let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
         let h = beliefs(8, latent, 0xB004).view([2, 4, latent]);
         let conditioning = beliefs(8, latent, 0xB005).view([2, 4, latent]);
@@ -8619,7 +8621,7 @@ mod tests {
                 &h,
                 &conditioning,
                 &realized,
-                &TradedLaw::new(&returns, &centers),
+                &TradedLaw::new(&returns, &return_seconds, &centers),
                 marginal_position(&supports, FREE_LEVERAGE),
                 LEVERAGE_CAP,
             )
@@ -8681,7 +8683,7 @@ mod tests {
                     } else {
                         realized
                             .iter()
-                            .map(|r| kelly_fraction(&[1.0], &[*r], LEVERAGE_CAP))
+                            .map(|r| LEVERAGE_CAP * r.signum() * f64::from(*r != 0.0))
                             .collect()
                     }
                 });
@@ -8968,7 +8970,7 @@ mod tests {
         let latent = 12;
         let (_vs, head) = perturbed_head(latent, 0x1A01);
         let supports = synthetic_supports(30_000, 0x1A02);
-        let returns = Tensor::from_slice(&bin_returns(&supports)).view([1, NUM_BAR_BINS]);
+        let (returns, return_seconds) = return_moment_tensors(&supports);
         let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
         let lo = Tensor::from_slice(supports.lower_bounds(DOF_R)).view([1, NUM_BAR_BINS]);
         let hi = Tensor::from_slice(supports.upper_bounds(DOF_R)).view([1, NUM_BAR_BINS]);
@@ -8990,7 +8992,7 @@ mod tests {
             &h,
             &conditioning,
             &realized,
-            &TradedLaw::new(&returns, &centers).with_bounds(&lo, &hi),
+            &TradedLaw::new(&returns, &return_seconds, &centers).with_bounds(&lo, &hi),
             marginal_position(&supports, FREE_LEVERAGE),
             LEVERAGE_CAP,
         )
@@ -9043,29 +9045,6 @@ mod tests {
             break_even_bps(&|_| 1e-6).is_infinite(),
             "an edge cost cannot touch never breaks even"
         );
-    }
-
-    #[test]
-    fn the_bin_returns_are_the_supports_own_geometry() {
-        let supports = synthetic_supports(20_000, 0xF001);
-        let returns = bin_returns(&supports);
-        assert_eq!(returns.len(), NUM_BAR_BINS as usize);
-        assert!(
-            returns.windows(2).all(|pair| pair[0] <= pair[1]),
-            "bin returns inherit the support's value order"
-        );
-        assert!(
-            returns.iter().all(|r| *r > -1.0 && r.is_finite()),
-            "a simple return derived from a finite log return is above -100%"
-        );
-        for (bin, center) in supports.centers(DOF_R).iter().enumerate() {
-            assert!((returns[bin] - center.exp_m1()).abs() < 1e-15);
-        }
-        // An atom's bin reproduces the atom's own return exactly.
-        for atom in supports.atoms(DOF_R) {
-            let bin = supports.bin_of(DOF_R, atom.value as f64);
-            assert!((returns[bin] - (atom.value as f64).exp_m1()).abs() < 1e-9);
-        }
     }
 
     #[test]
@@ -9448,6 +9427,8 @@ mod tests {
         let (masses, truth, model) = inflated_law(beta, 0.012);
         let true_returns: Vec<f64> = truth.iter().map(|c| c.exp() - 1.0).collect();
         let model_returns: Vec<f64> = model.iter().map(|c| c.exp() - 1.0).collect();
+        let true_seconds: Vec<f64> = true_returns.iter().map(|r| r * r).collect();
+        let model_seconds: Vec<f64> = model_returns.iter().map(|r| r * r).collect();
         let mean_model: f64 = masses.iter().zip(&model).map(|(p, c)| p * c).sum();
 
         // The recalibration the fitted slope prescribes, applied exactly as `window_paths`
@@ -9458,6 +9439,7 @@ mod tests {
             .iter()
             .map(|r| (1.0 + r) * shift.exp() - 1.0)
             .collect();
+        let shrunk_seconds: Vec<f64> = shrunk_returns.iter().map(|r| r * r).collect();
         let shrunk_mean: f64 = masses
             .iter()
             .zip(&model)
@@ -9470,8 +9452,8 @@ mod tests {
              against {mean_true:.3e}"
         );
 
-        let unshrunk_f = kelly_fraction(&masses, &model_returns, FREE_LEVERAGE);
-        let shrunk_f = kelly_fraction(&masses, &shrunk_returns, FREE_LEVERAGE);
+        let unshrunk_f = kelly_fraction(&masses, &model_returns, &model_seconds, FREE_LEVERAGE);
+        let shrunk_f = kelly_fraction(&masses, &shrunk_returns, &shrunk_seconds, FREE_LEVERAGE);
         assert!(
             shrunk_f > 0.0 && shrunk_f < unshrunk_f,
             "an inflated mean has to ask for a strictly larger position: {unshrunk_f:.4} \
@@ -9487,13 +9469,13 @@ mod tests {
             "sizing on the recalibrated mean must earn more under the truth: {shrunk_growth:.6e} \
              against {unshrunk_growth:.6e}"
         );
-        // And it must be the OPTIMUM of the true law, not merely an improvement: the true
-        // law's own Kelly fraction is what the recalibration reconstructs.
-        let oracle_f = kelly_fraction(&masses, &true_returns, FREE_LEVERAGE);
+        // Recalibration reconstructs the true law here, so it must also reconstruct that
+        // law's moment-correct quadratic Kelly fraction.
+        let true_f = kelly_fraction(&masses, &true_returns, &true_seconds, FREE_LEVERAGE);
         assert!(
-            (shrunk_f - oracle_f).abs() < 1e-6 * oracle_f.abs().max(1.0),
-            "recalibrating by the true slope reconstructs the true law, so its position must \
-             be the true law's own optimum: {shrunk_f:.6} against {oracle_f:.6}"
+            (shrunk_f - true_f).abs() < 1e-6 * true_f.abs().max(1.0),
+            "recalibrating by the true slope reconstructs the true moments: \
+             {shrunk_f:.6} against {true_f:.6}"
         );
     }
 
@@ -9747,6 +9729,8 @@ mod tests {
                 let mut predicted_mean = Vec::with_capacity(bars);
                 let mut model_rows = Vec::with_capacity(bars * bins);
                 let mut shrunk_rows = Vec::with_capacity(bars * bins);
+                let mut model_seconds = Vec::with_capacity(bars * bins);
+                let mut shrunk_seconds = Vec::with_capacity(bars * bins);
                 for bar in 0..bars {
                     let slot = (window * bars + bar) as f64;
                     // A true edge that changes sign and magnitude across bars.
@@ -9755,8 +9739,12 @@ mod tests {
                     let shift = MeanShrink { alpha: 0.0, beta }.shift(mu_model);
                     predicted_mean.push(mu_model);
                     for centered in &shape {
-                        model_rows.push((centered + mu_model).exp() - 1.0);
-                        shrunk_rows.push((centered + mu_model + shift).exp() - 1.0);
+                        let model_return = (centered + mu_model).exp() - 1.0;
+                        let shrunk_return = (centered + mu_model + shift).exp() - 1.0;
+                        model_rows.push(model_return);
+                        shrunk_rows.push(shrunk_return);
+                        model_seconds.push(model_return * model_return);
+                        shrunk_seconds.push(shrunk_return * shrunk_return);
                     }
                     let q = (slot * PHI).fract();
                     let bin = cumulative.iter().position(|c| *c >= q).unwrap_or(bins - 1);
@@ -9765,8 +9753,18 @@ mod tests {
                 let row =
                     |values: &[f64]| Tensor::from_slice(values).view([bars as i64, bins as i64]);
                 let probs = mass_row.expand([bars as i64, bins as i64], false);
-                let free = host_vec(&kelly_fractions(&probs, &row(&model_rows), FREE_LEVERAGE));
-                let shrunk = host_vec(&kelly_fractions(&probs, &row(&shrunk_rows), FREE_LEVERAGE));
+                let free = host_vec(&kelly_fractions(
+                    &probs,
+                    &row(&model_rows),
+                    &row(&model_seconds),
+                    FREE_LEVERAGE,
+                ));
+                let shrunk = host_vec(&kelly_fractions(
+                    &probs,
+                    &row(&shrunk_rows),
+                    &row(&shrunk_seconds),
+                    FREE_LEVERAGE,
+                ));
                 let mut paths = WindowPaths::unmeasured(
                     realized.clone(),
                     free.clone(),
@@ -10008,7 +10006,7 @@ mod tests {
         let latent = 12;
         let (_vs, head) = perturbed_head(latent, 0xCA11_0101);
         let supports = synthetic_supports(30_000, 0xCA11_0102);
-        let returns = Tensor::from_slice(&bin_returns(&supports)).view([1, NUM_BAR_BINS]);
+        let (returns, return_seconds) = return_moment_tensors(&supports);
         let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
         let (windows, bars) = (2i64, 24i64);
         let h = beliefs(windows * bars, latent, 0xCA11_0103).view([windows, bars, latent]);
@@ -10021,7 +10019,8 @@ mod tests {
         )
         .view([windows, bars]);
 
-        let law = TradedLaw::new(&returns, &centers).with_shrink(MeanShrink::identity());
+        let law =
+            TradedLaw::new(&returns, &return_seconds, &centers).with_shrink(MeanShrink::identity());
         let chunk = window_paths(
             &head,
             &h,
@@ -10348,9 +10347,8 @@ mod tests {
     ///
     /// That is the whole requirement, and the first version of this fixture failed it: with
     /// `f*` above the cap every solve returns the cap, the inaction region is the entire
-    /// range at any cost, and the branch tests pass while testing nothing. Here `g'` is
-    /// `+1.6e-3` at flat and crosses zero near `3.8`, so a bench-scale cost carves an
-    /// inaction region with the range straddling it on both sides.
+    /// range at any cost, and the branch tests pass while testing nothing. Here `q'` is
+    /// `+1.6e-3` at flat and crosses zero near `3.8`.
     fn myopic_law() -> (Vec<f64>, Vec<f64>) {
         (vec![0.52, 0.28, 0.20], vec![0.02, -0.01, -0.03])
     }
@@ -10360,6 +10358,7 @@ mod tests {
         myopic_fractions(
             &Tensor::from_slice(probs).view([1, outcomes]),
             &Tensor::from_slice(returns).view([1, outcomes]),
+            &Tensor::from_slice(&squared(returns)).view([1, outcomes]),
             cap,
             cost,
             &Tensor::from_slice(&[previous]),
@@ -10373,7 +10372,7 @@ mod tests {
     #[test]
     fn the_myopic_solve_is_the_cost_blind_solve_at_zero_cost() {
         let (probs, returns) = myopic_law();
-        let blind = kelly_fraction(&probs, &returns, LEVERAGE_CAP);
+        let blind = kelly_fraction(&probs, &returns, &squared(&returns), LEVERAGE_CAP);
         for previous in [-LEVERAGE_CAP, -1.0, 0.0, 1.0, 2.5, LEVERAGE_CAP] {
             assert_eq!(
                 myopic_scalar(&probs, &returns, LEVERAGE_CAP, 0.0, previous),
@@ -10385,22 +10384,14 @@ mod tests {
 
     /// The limit approached from above, and the RATE at which it is approached.
     ///
-    /// The first version of this test demanded the gap be under `1e-6` at `0.001` bps and it
-    /// failed at `2.3e-4` - correctly. The myopic optimum sits where `g'(f) = c/(1 - c(f-held))`,
-    /// so to first order it is displaced from the cost-blind root by `c / |g''(f*)|`, and this
-    /// law's `g''` is about `-4.3e-4`: a cost of `1e-7` moves the optimum by `2.3e-4` and no
-    /// tolerance on the displacement alone is meaningful. The displacement LAW is, and it is a
-    /// far stronger statement than any tolerance, so the test asserts that instead: halving the
-    /// cost must halve the gap.
-    ///
-    /// It also says something the panel needs. `|g''|` this small means the objective is nearly
-    /// FLAT near its optimum, so the sizing is weakly determined by the law and strongly
-    /// determined by whatever else touches it - the cap, the cost, the recalibration. That is
-    /// the same fact as "the cap binds on 74-93% of bars", seen from the solver's side.
+    /// The myopic optimum sits where `q'(f) = c/(1 - c(f-held))`, so to first order it is
+    /// displaced from the cost-blind root by `c / |q''|`. This law's raw second moment,
+    /// and therefore `|q''|`, is about `4.2e-4`. Halving a small cost must halve the gap;
+    /// the test asserts that first-order law rather than an arbitrary absolute tolerance.
     #[test]
     fn the_myopic_gap_to_the_cost_blind_solve_is_first_order_in_the_cost() {
         let (probs, returns) = myopic_law();
-        let blind = kelly_fraction(&probs, &returns, LEVERAGE_CAP);
+        let blind = kelly_fraction(&probs, &returns, &squared(&returns), LEVERAGE_CAP);
         let gap_at = |bps: f64| {
             (myopic_scalar(&probs, &returns, LEVERAGE_CAP, bps * 1e-4, 0.0) - blind).abs()
         };
@@ -10426,42 +10417,35 @@ mod tests {
             }
             previous = (bps, gap);
         }
-        // And the displacement is the predicted `c / |g''|` rather than an arbitrary number.
-        let slope = |f: f64| -> f64 {
-            probs
-                .iter()
-                .zip(&returns)
-                .map(|(p, r)| p * r / (1.0 + f * r))
-                .sum::<f64>()
-        };
-        let curvature = (slope(blind + 1e-3) - slope(blind - 1e-3)) / 2e-3;
+        // Quadratic Kelly has constant curvature `-E[R²]`, so its first-order displacement
+        // under a small linear cost is exactly governed by that fitted second moment.
+        let curvature = -probs
+            .iter()
+            .zip(&returns)
+            .map(|(p, r)| p * r * r)
+            .sum::<f64>();
         let predicted = 1.0e-4 / curvature.abs();
         let measured = gap_at(1.0);
         assert!(
             (measured / predicted - 1.0).abs() < 0.05,
             "the displacement at 1 bp was {measured}, against the first-order prediction \
-             c/|g''| = {predicted}"
+             c/|q''| = {predicted}"
         );
     }
 
     /// The INACTION REGION, which is the property no post-processing of a cost-blind `f*` can
     /// have: it emerges from the kink, and its width is set by the cost.
     ///
-    /// `|g'(f_prev)| <= c` is the exact condition, so the test states it in those terms rather
-    /// than by eyeballing a width: at a holding where the cost-free slope is small the solve
-    /// must return the holding UNCHANGED, and at one where it is large it must move.
+    /// `|q'(f_prev)| <= c` is the exact condition: inside it the solve must keep the
+    /// holding unchanged, while outside it the solve must move along the quadratic slope.
     #[test]
     fn the_myopic_solve_holds_still_exactly_inside_the_subgradient_interval() {
         let (probs, returns) = myopic_law();
         // The bench's own default, so the region under test is the one the pass actually solves.
         let cost = DEFAULT_COST_BPS * 1e-4;
-        let slope = |f: f64| -> f64 {
-            probs
-                .iter()
-                .zip(&returns)
-                .map(|(p, r)| p * r / (1.0 + f * r))
-                .sum()
-        };
+        let mean: f64 = probs.iter().zip(&returns).map(|(p, r)| p * r).sum();
+        let second: f64 = probs.iter().zip(&returns).map(|(p, r)| p * r * r).sum();
+        let slope = |f: f64| -> f64 { mean - second * f };
         let mut held_still = 0usize;
         let mut moved = 0usize;
         for step in 0..=40 {
@@ -10576,6 +10560,7 @@ mod tests {
                 .view([1, outcomes])
                 .expand([rows, outcomes], false),
             &Tensor::from_slice(&returns).view([1, outcomes]),
+            &Tensor::from_slice(&squared(&returns)).view([1, outcomes]),
             LEVERAGE_CAP,
             cost,
             &Tensor::from_slice(&holdings),
@@ -10595,12 +10580,14 @@ mod tests {
     #[test]
     fn the_myopic_solve_beats_the_cost_blind_target_on_the_cost_aware_objective() {
         let (probs, returns) = myopic_law();
-        let blind = kelly_fraction(&probs, &returns, LEVERAGE_CAP);
+        let blind = kelly_fraction(&probs, &returns, &squared(&returns), LEVERAGE_CAP);
         for bps in [2.0, 10.0, 40.0] {
             let cost = bps * 1e-4;
             for previous in [-2.0, -0.25, 0.0, 1.0, 3.0] {
+                let mean: f64 = probs.iter().zip(&returns).map(|(p, r)| p * r).sum();
+                let second: f64 = probs.iter().zip(&returns).map(|(p, r)| p * r * r).sum();
                 let value = |f: f64| {
-                    expected_log_growth(&probs, &returns, f)
+                    f * mean - 0.5 * f * f * second
                         + (1.0 - cost * (f - previous).abs()).max(WEALTH_FLOOR).ln()
                 };
                 let solved = myopic_scalar(&probs, &returns, LEVERAGE_CAP, cost, previous);
@@ -10622,20 +10609,14 @@ mod tests {
         }
     }
 
-    /// A ZERO-PROBABILITY bin whose `-1/R` lands exactly on a bisection midpoint used to make
-    /// the cost-blind slope `0 * R / 0`, i.e. NaN, which turned the whole row's sign test
-    /// false and collapsed the bisection onto its lower bracket end.
-    ///
-    /// Constructed rather than hoped for: the live bins bound nothing inside the cap, so the
-    /// bracket is exactly `[-cap, cap]` and the second midpoint is `+cap/2 = 2.0`; a dead bin
-    /// at `R = -0.5` has `1 + 2 R = 0` there. The uncapped optimum of the live pair is `25`,
-    /// so the correct answer is the cap and the pre-guard answer was `2.0` — a 2x sizing
-    /// error, silent, on any bar whose law underflowed a bin to zero.
+    /// A zero-probability bin must contribute neither a moment nor a ruin-domain bound.
+    /// The dead bin below has an extreme loss while the live pair's quadratic optimum is
+    /// beyond the cap, so retaining the dead bin anywhere in the reduction changes the answer.
     #[test]
-    fn a_zero_probability_bin_cannot_poison_the_slope() {
+    fn a_zero_probability_bin_cannot_poison_the_reduction() {
         let probs = [0.5, 0.5, 0.0];
         let returns = [0.02, -0.01, -0.5];
-        let solved = kelly_fraction(&probs, &returns, LEVERAGE_CAP);
+        let solved = kelly_fraction(&probs, &returns, &squared(&returns), LEVERAGE_CAP);
         assert!(
             solved.is_finite(),
             "a zero-mass bin produced a non-finite fraction: {solved}"
@@ -10647,7 +10628,12 @@ mod tests {
         // The dead bin carries no mass, so deleting it entirely must change nothing.
         assert_eq!(
             solved,
-            kelly_fraction(&probs[..2], &returns[..2], LEVERAGE_CAP),
+            kelly_fraction(
+                &probs[..2],
+                &returns[..2],
+                &squared(&returns[..2]),
+                LEVERAGE_CAP,
+            ),
             "a zero-mass bin changed the answer, so it was contributing to the sum"
         );
         // Same guard on the myopic path, which shares the hazard.

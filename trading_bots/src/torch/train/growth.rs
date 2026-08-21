@@ -50,15 +50,15 @@
 //! (see [`r_probs`] for why "past only" costs nothing to obtain):
 //!
 //! ```text
-//! mu_hat  = sum_i p_i R_i                        (R_i = exp(d_i) - 1, simple return)
-//! var_hat = sum_i p_i R_i^2 - mu_hat^2
-//! f_raw   = mu_hat / (var_hat + VARIANCE_FLOOR)
-//! f_hat   = clamp(f_raw, -F, +F)                 (F = trade_bench::LEVERAGE_CAP)
-//! L       = -log(1 + f_hat * R_realized)
+//! mu_hat = sum_i p_i E[R | bin_i]                 (R = expm1(r))
+//! m2_hat = sum_i p_i E[R² | bin_i]
+//! f_raw  = mu_hat / (m2_hat + SECOND_MOMENT_FLOOR)
+//! f_hat  = clamp(f_raw, -F, +F)                  (F = trade_bench::LEVERAGE_CAP)
+//! L      = bankruptcy_safe_neg_log(1 + f_hat * R_realized)
 //! ```
 //!
-//! `R_realized` is DATA and carries no gradient, so the whole derivative flows through
-//! `f_hat`:
+//! `R_realized` is raw DATA and carries no gradient, so the whole derivative flows through
+//! `f_hat`. At wealth `>= BANKRUPTCY_BARRIER_START`, where the loss is exact log utility:
 //!
 //! ```text
 //! dL/dtheta = -[ R / (1 + f_hat R) ] * df_hat/dtheta
@@ -70,18 +70,18 @@
 //! d E[L] / d f = -E[ R / (1 + f R) ]
 //! ```
 //!
-//! which is exactly the Kelly first-order condition and vanishes precisely at the true
-//! growth optimum `f*`. So `-E[log(1 + f_hat R)]` is minimized over `f_hat` at `f_hat =
-//! f*`, and because `f_hat` is a differentiable function of `mu_hat` with
-//! `df_raw/dmu_hat = 1/(var_hat + eps) > 0`, the gradient pushes the CONDITIONAL MEAN in
-//! the direction that improves realized log growth. Nothing else in the objective does
-//! that: `nll` is minimized by the whole density and is 10,000x larger.
+//! which is the exact expected-log first-order condition with respect to `f` there. Raw
+//! observations in or near bankruptcy use the explicit continuation documented below. The
+//! mapping from the predicted law to `f_hat` is the declared second-order approximation:
+//! expanding `E[log(1 + fR)]` gives
 //!
-//! Note what is NOT claimed. `mu/var` is the second-order (Gaussian) Kelly optimum, not
-//! the exact solve [`trade_bench::kelly_fraction`] bisects for. That is deliberate: the
-//! exact solve is an iterated bisection with no useful derivative, while `mu/var` is the
-//! stationary point of the same second-order expansion and shares its sign and its zero.
-//! The economics are reported by the bench's exact solver either way.
+//! ```text
+//! E[log(1 + fR)] = f E[R] - 0.5 f² E[R²] + O(f³ E[R³]),
+//! ```
+//!
+//! whose stationary point is `E[R] / E[R²]`. The raw second moment — not the variance —
+//! is required by that expansion. The bench uses the same moment-correct contract, so the
+//! training objective and economic selection no longer size two different policies.
 //!
 //! # The saturation, and why the forward and backward maps differ
 //!
@@ -99,34 +99,40 @@
 //! f_hat  = f_soft + (clamp(f_raw, -F, F) - f_soft).detach()
 //! ```
 //!
-//! The reported loss is therefore EXACTLY the deployed policy's realized log growth, and
-//! the gradient is `df_soft/df_raw = (F / (F + |f_raw|))^2 > 0`: a strictly positive,
+//! The forward fraction is therefore EXACTLY the deployed hard-clamped policy. Wealth at or
+//! above the numerical join pays its exact realized log growth; raw-tail observations below
+//! it pay the explicit continuation. The fraction's gradient is
+//! `df_soft/df_raw = (F / (F + |f_raw|))^2 > 0`: a strictly positive,
 //! bar-wise down-weighting of over-confident bars that never changes the sign of the
 //! Kelly gradient. The algebraic surrogate is chosen over `F*tanh(f_raw/F)` because its
 //! derivative decays as `(F/|f_raw|)^2` rather than `exp(-2|f_raw|/F)`; at the measured
 //! median `|f_raw|` of ~10 with `F = 4` that is 8.2% of full weight instead of 1.3%,
 //! which is the difference between an attenuated signal and no signal. That median, and
-//! the 78-86% bind fraction above it, were measured on runs whose bins were priced at the
-//! EDGE decode; [`GrowthSupport`] now prices them at their fitted conditional means, so
-//! both figures will be re-measured by the next run rather than assumed to carry over.
+//! the 78-86% bind fraction above it, were measured on runs whose bins used geometric
+//! representatives and squared first moments. [`GrowthSupport`] now reads both fitted
+//! simple-return moments directly, so both figures will be re-measured rather than assumed.
 //!
-//! # Safety of the logarithm
+//! # Raw tails and the bankruptcy domain
 //!
-//! The argument is `1 + f_hat R_realized`, and `R_realized` is DATA clipped to the support's
-//! BOUNDS — `lower_bounds`/`upper_bounds`, never the bin decode — so this bound is invariant
-//! to what the bins are priced at. On the live 300s support those bounds are
-//! `[-0.088332, +0.088038]` in log space, the largest reachable simple return is
-//! `exp(0.088038) - 1 = 0.092030`, and `|f_hat R| <= 4 * 0.092030 = 0.3681` leaves the log
-//! argument at or above 0.6319. [`GrowthSupport::new`] ASSERTS that bound from the actual
-//! fitted support rather than trusting it, and every step checks the realized minimum
-//! against [`LOG_ARGUMENT_FLOOR`]. A NaN here would poison training silently, which is the
-//! failure mode this repository has hit repeatedly.
+//! The fitted edge-bin moments include the RAW open-tail observations, so the realized
+//! payoff must use the same raw simple return. Clipping `r_realized` to the finite support
+//! geometry would size on one law and train against another. Every observation with
+//! `1 + f_hat R >= BANKRUPTCY_BARRIER_START` therefore pays exact
+//! `-log1p(f_hat R)`, including solvent wealth far below the old 0.5 support tripwire.
+//!
+//! Expected log utility diverges at bankruptcy, while a finite tensor objective must still
+//! provide a usable gradient. Within the tiny numerical neighborhood below
+//! [`BANKRUPTCY_BARRIER_START`], the loss uses the quadratic continuation of `-log(a)` about
+//! that point, where `a = 1 + f_hat R`. It matches both value and slope at the join, is finite
+//! for every finite raw return admitted by the encoded-data domain, and grows quadratically
+//! once wealth crosses zero. This is an explicit differentiable bankruptcy penalty, not a
+//! clamp of the observation or of the paid wealth law.
 
 use anyhow::{ensure, Context, Result};
 use tch::{Device, Kind, Tensor};
 
 use crate::torch::bar_dist::{
-    BarEmissionHead, BarSupports, MeanDecode, BAR_CHAIN, BAR_DOF, BAR_SUPPORTS_MOMENTS_VERSION,
+    BarEmissionHead, BarSupports, BAR_CHAIN, BAR_DOF, BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION,
     DOF_R, NUM_BAR_BINS,
 };
 
@@ -148,11 +154,11 @@ const _: () = assert!(
 /// # Measured, not guessed
 ///
 /// The term's own MAGNITUDE is ~5e-4 nats against `nll`'s ~4.93, so weighting it by its
-/// objective share would be measuring the wrong quantity: `1.0` looks inert on that chart
-/// and any weight that made it look substantial would be enormous. Its GRADIENT is not
-/// small — `df_raw/dmu_hat = 1/var_hat` with `var_hat ~ 1e-5` multiplies the per-bar
-/// derivative by ~1e5 before it reaches a parameter — so the weight is set from a
-/// GRADIENT-NORM measurement, and sweeping is forbidden by the one-seed policy.
+/// objective share would be measuring the wrong quantity: `1.0` looks inert on that chart.
+/// Its gradient is not small — holding the raw second moment fixed,
+/// `df_raw/dmu_hat = 1/m2_hat` with `m2_hat ~ 1e-5` multiplies the per-bar derivative by
+/// ~1e5 before it reaches a parameter — so the weight is set from a GRADIENT-NORM
+/// measurement, and sweeping is forbidden by the one-seed policy.
 ///
 /// The measurement is `||d(growth)/dtheta|| / (||d(nll)/dtheta|| + lambda
 /// ||d(growth)/dtheta||)` over every trainable parameter, taken by
@@ -224,28 +230,27 @@ const _: () = assert!(
 /// a weight.
 pub const LAMBDA_GROWTH: f64 = 77.0;
 
-/// Floor on `var_hat` in the Kelly denominator, in units of squared simple return.
+/// Floor on `E[R²]` in the quadratic Kelly denominator, in squared simple-return units.
 ///
-/// It exists only to keep a degenerate belief — a point mass, `var_hat == 0` — from
-/// dividing by zero; the saturation, not this constant, is what bounds `f_hat`. A
-/// realistic `var_hat` is ~1e-5, so at 1e-12 the floor is seven orders of magnitude
-/// below the quantity it guards and does not shrink `f_raw` anywhere it matters.
-const VARIANCE_FLOOR: f64 = 1e-12;
+/// It keeps a degenerate zero-return belief from dividing by zero. A realistic raw second
+/// moment is ~1e-5, so this is seven orders below the quantity it guards.
+const SECOND_MOMENT_FLOOR: f64 = 1e-12;
 
-/// Hard lower bound the log's argument must stay above, checked every step.
+/// Small positive wealth where the finite bankruptcy continuation joins exact log utility.
 ///
-/// The structural bound is 0.6319 (see the module docs), so 0.5 is slack by a factor of
-/// 1.36 in `|f_hat R|`. It is a tripwire for a broken support or a broken clamp, not a
-/// working limit, and it is an error rather than a clamp because the only healthy
-/// response to it firing is to stop and look.
-pub const LOG_ARGUMENT_FLOOR: f64 = 0.5;
+/// `-log(a)` is used unchanged for every `a >= 1e-4`, including deeply distressed but
+/// solvent positions such as `a = 0.1`. At smaller wealth, the value- and slope-matched
+/// quadratic continuation avoids evaluating `log` at zero or below. `1e-4` is well resolved
+/// in f32 while leaving four orders of magnitude between the join and ordinary unit wealth;
+/// under encoded log returns (`r >= -30`) and the 4x leverage cap, the continuation remains
+/// finite even at the most adverse long-side raw return.
+pub const BANKRUPTCY_BARRIER_START: f64 = 1e-4;
 
 /// Bound on the UNSATURATED Kelly fraction, applied before the smooth surrogate.
 ///
-/// Purely a finiteness guard. `mu_hat` is an expectation over the DECODED bin returns, the
-/// largest of which is 0.029014 under the fitted decode on the live 300s support, so the
-/// largest `f_raw` a real belief can produce is `0.029014 / VARIANCE_FLOOR = 2.9e10` and
-/// this limit never binds in training. It exists because the surrogate `F f / (F + |f|)` is
+/// Purely a finiteness guard. `mu_hat` is an expectation over fitted per-bin simple-return
+/// means, so its magnitude is bounded by their largest entry and this limit never binds on a
+/// valid support. It exists because the surrogate `F f / (F + |f|)` is
 /// a ratio of two quantities that both diverge
 /// with `f`: at `f_raw = inf` it evaluates to `inf / inf = NaN`, and the straight-through
 /// construction would then carry that NaN into the objective. At 1e12 the surrogate's
@@ -255,117 +260,46 @@ const SURROGATE_LIMIT: f64 = 1e12;
 
 /// Per-resolution device-resident constants of the growth term.
 ///
-/// Built once per run per bin geometry, because a `[1, NUM_BAR_BINS]` host-to-device copy
-/// on every step would be pure launch overhead and because the support bound assertion
-/// belongs at construction, where it can fail before a single step has run.
-///
-/// # The objective prices each bin at its FITTED conditional mean
-///
-/// [`MeanDecode::Fitted`], asked for BY NAME. [`MeanDecode::Edge`] is and remains the tree's
-/// default, because every measurement in the tree — the Mincer-Zarnowitz slopes, the bench's
-/// Kelly bets, the horizon frontier, the skill deciles — was taken under it. This is the one
-/// OBJECTIVE-side consumer of the decode, and an objective may not pay for an outcome the
-/// corpus never realized.
-///
-/// `r`'s two outermost bins are open-ended: `bin_of` clamps, so bin 0 catches every move
-/// below its bound and bin 127 every move above it. `BarSupports::from_bins` pins their edge
-/// centers ONTO those bounds — `-883.32` and `+880.38` bps on the live 300s support — while
-/// the measured conditional means there are `-281.88` and `+286.01` bps. As simple returns
-/// that is `-8.4543%` / `+9.2030%` against `-2.7794%` / `+2.9014%`, so the edge decode paid
-/// 3.04x and 3.17x what those two bins are worth. They hold 1.4474% of the marginal mass but
-/// 92.38% of its central second moment and 41.00% of its absolute first moment, so this is
-/// not a rounding choice in `mu_hat = sum_b p_b R_b`: it is most of what `mu_hat` can
-/// express. Under the edge decode the cheapest route to the expected log growth
-/// [`LAMBDA_GROWTH`] rewards was to move mass into the two bins that overpaid threefold —
-/// an in-the-loss driver of exactly the over-dispersion the Mincer-Zarnowitz mean slope
-/// reports, applied unannealed at every step.
-///
-/// A support carrying no measured moments makes this term UNBUILDABLE and [`Self::new`] says
-/// so. It does NOT fall back: a fallback restores the pricing above in full with nothing
-/// anywhere saying it did, which is the failure `MeanDecode` exists to make unrepresentable.
+/// Both rows come from the support artifact's directly measured simple-return law:
+/// `E[expm1(r) | bin]` and `E[expm1(r)^2 | bin]`. Neither bin centers nor nonlinear
+/// transforms of log-space conditional moments participate in sizing.
 #[derive(Debug)]
 pub struct GrowthSupport {
-    /// `[1, NUM_BAR_BINS]` simple return `exp(d_b) - 1` of each `r` bin at the FITTED decode
-    /// `d_b = E[r | r in bin b]`.
-    ///
-    /// DELIBERATELY not the same convention as [`super::trade_bench::bin_returns`], which is
-    /// measurement-side and stays on [`MeanDecode::Edge`] so its numbers remain comparable
-    /// with every one that came before. The objective prices a bin at what it is worth; the
-    /// bench keeps the convention its history was measured under.
+    /// `[1, NUM_BAR_BINS]` fitted `E[R | bin]`, `R = expm1(r)`.
     returns: Tensor,
-    /// `[1, NUM_BAR_BINS]`, the elementwise square, i.e. `E[R|bin]^2` and not `E[R^2|bin]`.
-    ///
-    /// The artifact's `bin_second_moments` are LOG-space, so no exact simple-return second
-    /// moment is available to read and squaring the decode is the consistent choice. It
-    /// understates the marginal second moment by ~12%, against the ~5.25x OVERstatement the
-    /// edge decode produced, and the residual sits in the same two catch-alls.
+    /// `[1, NUM_BAR_BINS]` fitted `E[R^2 | bin]`, including within-bin dispersion.
     returns_sq: Tensor,
-    /// Inclusive support BOUNDS of `r` in LOG space, i.e. the clamp `BarSupports::bin_ids`
-    /// itself applies. Read from `lower_bounds`/`upper_bounds`, which hold the bin edges and
-    /// are therefore INDEPENDENT of the decode above: the realized return is clipped to
-    /// these before it enters the log, so the log-argument guard stays sound whatever the
-    /// bins are priced at, and re-pricing them cannot move it.
-    log_lo: f64,
-    log_hi: f64,
-    /// Leverage cap, from [`LEVERAGE_CAP`]. Not a second constant: training and
-    /// evaluation are sized at the same cap or the two numbers are not comparable.
     cap: f64,
 }
-
 impl GrowthSupport {
-    /// Errors, rather than degrading to [`MeanDecode::Edge`], on a supports artifact with no
-    /// fitted per-bin moments. See the type docs for what the degradation would cost.
+    /// Refuses supports predating directly fitted simple-return moments. Reconstructing these
+    /// rows from bin centers, `E[r | bin]`, or `E[r^2 | bin]` is prohibited: every such route
+    /// loses either nonlinear curvature or within-bin variance. Finite support bounds are
+    /// categorical routing geometry only; they never truncate the fitted or realized payoff.
     pub fn new(supports: &BarSupports, device: Device) -> Result<Self> {
-        let decode = supports
-            .mean_decode(DOF_R, MeanDecode::Fitted)
-            .with_context(|| {
-                format!(
-                    "the expected-log-growth objective prices every r bin at its fitted \
-                     conditional mean, which only a bar supports artifact of version \
-                     {BAR_SUPPORTS_MOMENTS_VERSION} or later carries. The one loaded here has \
-                     none, so it predates v{BAR_SUPPORTS_MOMENTS_VERSION}: measure moments onto \
-                     this exact geometry with the `bar-supports-moments` subcommand and point \
-                     the run at the result. Falling back to the {} decode is PROHIBITED here — \
-                     it would silently pay 3.1x for the two open-ended r bins, which is the \
-                     defect this decode exists to remove",
-                    MeanDecode::Edge
-                )
-            })?;
-        let returns: Vec<f32> = decode.iter().map(|d| d.exp_m1() as f32).collect();
+        let (returns, returns_sq) =
+            supports
+                .simple_return_bin_moment_tensors()
+                .with_context(|| {
+                    format!(
+                        "the expected-log-growth objective requires directly fitted E[R|bin] and \
+                     E[R^2|bin] for R=expm1(r), carried only by bar supports format version \
+                     {BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION} or later. The loaded artifact \
+                     predates v{BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION}; rerun \
+                     `bar-supports-moments` on its exact geometry. Deriving these moments from \
+                     bin centers or log-return moments is prohibited"
+                    )
+                })?;
         ensure!(
-            returns.len() == NUM_BAR_BINS as usize,
-            "the r support has {} bins, expected {NUM_BAR_BINS}",
-            returns.len()
+            returns.size() == [1, NUM_BAR_BINS] && returns_sq.size() == [1, NUM_BAR_BINS],
+            "the fitted r simple-return moment rows have shapes {:?} and {:?}, expected \
+             [1, {NUM_BAR_BINS}]",
+            returns.size(),
+            returns_sq.size()
         );
-        let log_lo = supports.lower_bounds(DOF_R)[0];
-        let log_hi = supports.upper_bounds(DOF_R)[NUM_BAR_BINS as usize - 1];
-        ensure!(
-            log_lo.is_finite() && log_hi.is_finite() && log_lo < log_hi,
-            "the r support spans [{log_lo}, {log_hi}], which is not a usable clip range"
-        );
-        // The structural safety of the logarithm, asserted from the ACTUAL fitted support
-        // rather than from the bounds quoted in the module docs. `1 + f R` is smallest at
-        // the most negative reachable return and the largest allowed long position, and
-        // largest-magnitude losses can also come from a short against the top bin. Computed
-        // from the BOUNDS and not from the decode on purpose: the realized return is what
-        // enters the log, and it is clipped to the bounds.
-        let worst = (log_lo.exp_m1().abs()).max(log_hi.exp_m1().abs());
-        ensure!(
-            1.0 - LEVERAGE_CAP * worst > LOG_ARGUMENT_FLOOR,
-            "at cap {LEVERAGE_CAP} the r support's extreme simple return {worst:.6} drives \
-             the growth term's log argument to {:.4}, at or below the {LOG_ARGUMENT_FLOOR} \
-             floor. Either the support was fitted on unclipped returns or the cap moved; do \
-             not lower the floor.",
-            1.0 - LEVERAGE_CAP * worst
-        );
-        let row = Tensor::from_slice(&returns)
-            .view([1, NUM_BAR_BINS])
-            .to_device(device);
         Ok(Self {
-            returns_sq: &row * &row,
-            returns: row,
-            log_lo,
-            log_hi,
+            returns: returns.to_device(device),
+            returns_sq: returns_sq.to_device(device),
             cap: LEVERAGE_CAP,
         })
     }
@@ -383,9 +317,9 @@ impl GrowthSupport {
 /// One step's growth term: the attached scalar loss and its detached diagnostics.
 #[derive(Debug)]
 pub struct Growth {
-    /// Mean `-log(1 + f_hat R)` over every bar of the batch, in nats per bar. Attached,
-    /// with the straight-through saturation described in the module docs: the VALUE is
-    /// the deployed hard-clamped policy's realized log growth.
+    /// Mean realized growth loss over every bar of the batch, in nats per bar. Attached,
+    /// with exact `-log(1 + f_hat R)` above [`BANKRUPTCY_BARRIER_START`] and its explicit
+    /// finite bankruptcy-domain continuation below it.
     pub loss: Tensor,
     /// `[GROWTH_STAT_COUNT]` detached diagnostics, in the order
     /// `[mean |f_hat|, clamp-bind fraction, min log argument]`. One tensor so a step
@@ -405,7 +339,7 @@ pub struct GrowthStats {
     /// Fraction of bars where `|f_raw| > F`, i.e. where the deployed clamp chose the
     /// size instead of the predictive law. 0.78-0.86 on the run that motivated the term.
     pub clamp_bind: f64,
-    /// Smallest `1 + f_hat R` in the batch. The guard reads this.
+    /// Smallest raw `1 + f_hat R` in the batch, before the bankruptcy continuation.
     pub min_log_argument: f64,
 }
 
@@ -472,8 +406,10 @@ pub fn r_moments(probs: &Tensor, support: &GrowthSupport) -> (Tensor, Tensor) {
     )
 }
 
-/// The per-bar objective: `-log(1 + f_hat R)` at the straight-through saturated Kelly
-/// fraction, plus the diagnostics.
+/// The per-bar expected-log objective at the straight-through saturated quadratic-Kelly
+/// fraction. Wealth above the tiny numerical join pays exact log utility; the explicit
+/// bankruptcy continuation handles raw-tail observations below
+/// [`BANKRUPTCY_BARRIER_START`].
 ///
 /// Isolated from the belief on purpose. Retargeting the economics — growth net
 /// of a turnover penalty, say — is a change to this function and to nothing else.
@@ -483,15 +419,13 @@ fn per_bar_growth(
     realized_return: &Tensor,
     cap: f64,
 ) -> Growth {
-    // `E[R^2] - E[R]^2` is not a cancelling subtraction here: `E[R^2] ~ 1e-5` against
-    // `mu^2 ~ 1e-8`. The clamp only catches f32 rounding on a near-degenerate belief.
-    let variance = (second_moment - mu_hat * mu_hat).clamp_min(0.0);
-    // `mu_hat` is an expectation over returns bounded by the support, so the true bound
-    // here is `0.0781 / VARIANCE_FLOOR = 7.8e10` and [`SURROGATE_LIMIT`] cannot bind on
-    // any belief this model can hold. It binds on a corrupt input, and it must: the
-    // surrogate below is a ratio whose numerator and denominator both diverge, so an
-    // infinite `f_raw` would give `inf/inf = NaN` in the objective.
-    let f_raw = (mu_hat / (variance + VARIANCE_FLOOR)).clamp(-SURROGATE_LIMIT, SURROGATE_LIMIT);
+    // The second-order expected-log expansion is
+    // `f E[R] - 0.5 f² E[R²]`; its stationary point is `E[R] / E[R²]`, not
+    // `E[R] / Var(R)`. The directly fitted within-bin second moments preserve the
+    // curvature that squaring conditional means would erase.
+    let second_moment = second_moment.clamp_min(0.0);
+    let f_raw =
+        (mu_hat / (second_moment + SECOND_MOMENT_FLOOR)).clamp(-SURROGATE_LIMIT, SURROGATE_LIMIT);
     let f_hard = f_raw.clamp(-cap, cap);
     // `F f / (F + |f|)`: exactly `f` to first order, bounded by `F`, derivative
     // `(F / (F + |f|))^2` which is positive everywhere and decays as a square rather
@@ -499,8 +433,21 @@ fn per_bar_growth(
     let f_soft = &f_raw * cap / (f_raw.abs() + cap);
     let f_hat = &f_soft + (&f_hard - &f_soft).detach();
 
+    // `-log(a)` cannot be both exact all the way to `a = 0` and finite at bankruptcy.
+    // Join its second-order Taylor expansion at a small positive numerical epsilon: this is
+    // value- and slope-matched, keeps distressed solvent wealth such as 0.1 exact, and
+    // penalizes raw ruin observations quadratically without clamping their payoff.
+    let barrier = BANKRUPTCY_BARRIER_START;
     let argument = &f_hat * realized_return + 1.0;
-    let loss = -argument.log().mean(Kind::Float);
+    let shortfall = ((barrier - &argument) / barrier).clamp_min(0.0);
+    let bankruptcy_loss: Tensor = -barrier.ln() + &shortfall + 0.5 * &shortfall * &shortfall;
+    // `where_self` evaluates both branches eagerly, so protect only the dormant log operand
+    // below the join. The selected bankruptcy branch still receives the raw argument.
+    let exact_log_operand = argument.clamp_min(barrier);
+    let exact_log_loss = -exact_log_operand.log();
+    let per_bar_loss = bankruptcy_loss.where_self(&argument.lt(barrier), &exact_log_loss);
+
+    let loss = per_bar_loss.mean(Kind::Float);
 
     let axis = [-1i64];
     let stats = tch::no_grad(|| {
@@ -519,6 +466,14 @@ fn per_bar_growth(
         )
     });
     Growth { loss, stats }
+}
+
+/// Convert the observed log return into the payoff law used by both fitted moments and loss.
+///
+/// Open-tail observations deliberately remain raw: support bounds describe categorical
+/// routing geometry, not a cap on the simple return paid by the position.
+fn realized_simple_returns(realized_log_r: &Tensor) -> Tensor {
+    realized_log_r.detach().to_kind(Kind::Float).expm1()
 }
 
 /// The growth term for one training batch.
@@ -544,15 +499,11 @@ pub fn growth_loss(
         let flat = beliefs.reshape([-1, latent]).to_kind(Kind::Float);
         let flat_conditioning = conditioning.reshape([-1, latent]).to_kind(Kind::Float);
         let (mu_hat, second_moment) = r_moments(&r_probs(head, &flat, &flat_conditioning), support);
-        // DATA: clipped to the same support the bins are clamped onto, then converted to a
-        // simple return with the same `exp_m1` convention as the bin returns. Detached
-        // because a gradient into the realized bar would be a gradient into the future.
-        let realized = realized_log_r
-            .detach()
-            .reshape([-1])
-            .to_kind(Kind::Float)
-            .clamp(support.log_lo, support.log_hi)
-            .expm1();
+        // DATA: the fitted open-tail moments retain raw observations, so the paid law must
+        // retain the same raw return. Detach because a gradient into the realized bar would
+        // be a gradient into the future; the numerical bankruptcy continuation, not a target
+        // clip, handles wealth below the tiny safe-log join.
+        let realized = realized_simple_returns(&realized_log_r.reshape([-1]));
         assert_eq!(
             realized.size(),
             mu_hat.size(),
@@ -658,7 +609,7 @@ pub fn verify_traded_law(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::torch::bar_dist::{BarDof, BAR_DOF_NAMES, DOF_S, DOF_U};
+    use crate::torch::bar_dist::{BarDof, DOF_S, DOF_U};
     use crate::torch::test_rng;
     use tch::nn;
 
@@ -817,67 +768,19 @@ mod tests {
         );
     }
 
-    /// A distribution with KNOWN mean and variance must produce the analytic
-    /// `f_hat = mu / sigma^2`.
-    ///
-    /// Built by driving the term's own moment path with a two-point law placed exactly on
-    /// two bin centers, so `mu` and `sigma^2` are closed form and the assertion is against
-    /// arithmetic rather than against another implementation.
+    /// Known raw moments must produce the declared analytic fraction
+    /// `f_hat = E[R] / E[R²]`.
     #[test]
-    fn a_known_mean_and_variance_give_the_analytic_kelly_fraction() {
-        let supports = synthetic_supports(40_000, 0x6706_0001);
-        let support = GrowthSupport::new(&supports, Device::Cpu).expect("support");
-        let returns = Vec::<f64>::try_from(support.returns.to_kind(Kind::Double).reshape([-1]))
-            .expect("bin returns");
-        // Two bins well inside the support and far enough apart to give a real variance.
-        let (lo_bin, hi_bin) = (32usize, 96usize);
-        let (r_lo, r_hi) = (returns[lo_bin], returns[hi_bin]);
-        let spread = r_hi - r_lo;
-        // `p_hi` is SOLVED so the analytic fraction lands on a chosen value inside the cap,
-        // rather than left wherever a round probability happens to put it. With `p` the mass
-        // on the high bin, `mu = r_lo + p*spread` and `sigma^2 = p(1-p)*spread^2` are exact,
-        // so `f = mu/sigma^2` is a quadratic in `p`:
-        //
-        //     f*spread^2 * p^2 + (spread - f*spread^2) * p + r_lo = 0.
-        //
-        // This is not fussiness. A fitted `r` support spans ~0.15 in simple return, so
-        // `1/sigma^2` is ~1e3 and a round `p_hi = 0.4` puts the analytic fraction at -100,
-        // i.e. 25x outside the leverage cap and deep inside the saturation the OTHER half of
-        // the suite covers. The unclamped regime has to be reached deliberately, and that is
-        // itself the finding this fixture records: at this support's width the log-optimal
-        // fraction is outside the cap for all but a narrow band of beliefs, which is why the
-        // bench measures 78-86% cap saturation.
+    fn known_raw_moments_give_the_analytic_quadratic_kelly_fraction() {
         for target in [-3.0f64, -0.75, 0.75, 3.0] {
-            let curvature = target * spread * spread;
-            let discriminant = (spread - curvature).powi(2) - 4.0 * curvature * r_lo;
+            let second = 1.0e-3;
+            let mu = target * second;
             assert!(
-                discriminant > 0.0,
-                "no two-point law on these bins reaches f = {target}"
+                second >= mu * mu,
+                "fixture moments must describe a valid return law"
             );
-            let root = discriminant.sqrt();
-            let p_hi = [
-                (curvature - spread + root) / (2.0 * curvature),
-                (curvature - spread - root) / (2.0 * curvature),
-            ]
-            .into_iter()
-            .find(|p| *p > 0.0 && *p < 1.0)
-            .expect("one root places positive mass on both bins");
-            let p_lo = 1.0 - p_hi;
-            let mu = p_lo * r_lo + p_hi * r_hi;
-            let second = p_lo * r_lo * r_lo + p_hi * r_hi * r_hi;
-            let variance = second - mu * mu;
-            let analytic = mu / variance;
-            assert!(
-                (analytic - target).abs() < 1e-9 * target.abs(),
-                "the solved law gives f = {analytic} against the requested {target}, so the \
-                 quadratic above is wrong and the assertion below would be self-consistent \
-                 rather than analytic"
-            );
-            assert!(
-                analytic.abs() < LEVERAGE_CAP,
-                "the fixture must stay inside the cap to test the analytic value, got \
-                 {analytic}"
-            );
+            let analytic = mu / second;
+            assert!(analytic.abs() < LEVERAGE_CAP);
 
             let mu_t = Tensor::from_slice(&[mu as f32]);
             let second_t = Tensor::from_slice(&[second as f32]);
@@ -889,50 +792,23 @@ mod tests {
             let error = (stats.mean_abs_f - analytic.abs()).abs() / analytic.abs();
             assert!(
                 error < 1e-5,
-                "at p_hi = {p_hi} the term solved f_hat = {} against the analytic \
-                 mu/sigma^2 = {analytic}",
+                "the term sized {} against analytic mu/E[R²] = {analytic}",
                 stats.mean_abs_f
             );
-            assert_eq!(
-                growth.loss.double_value(&[]),
-                0.0,
-                "a zero realized return must cost exactly zero growth"
-            );
-            assert_eq!(stats.clamp_bind, 0.0, "the fixture is inside the cap");
+            assert_eq!(growth.loss.double_value(&[]), 0.0);
+            assert_eq!(stats.clamp_bind, 0.0);
         }
     }
 
-    /// The log's argument must stay inside its guarded range on adversarial input, and
-    /// the loss must stay finite.
-    ///
-    /// Adversarial means: a point mass (zero variance, so `f_raw` hits the variance
-    /// floor and explodes), a mean of the wrong sign against the realized return, a
-    /// realized return outside the support entirely, and a non-finite one.
+    /// Every finite raw observation, including returns far beyond the categorical support
+    /// geometry, must produce a finite objective under the capped fraction.
     #[test]
-    fn the_log_argument_never_leaves_its_guarded_range() {
-        let supports = synthetic_supports(40_000, 0x6707_0001);
-        let support = GrowthSupport::new(&supports, Device::Cpu).expect("support");
-        let worst = support.log_lo.exp_m1().abs().max(support.log_hi.exp_m1());
-
-        // Adversarial means: point masses (zero variance, so `f_raw` saturates the
-        // variance floor), means far outside anything an expectation over the support can
-        // produce, and both signs so the realized return is fought as well as followed.
+    fn finite_raw_returns_produce_finite_growth_losses() {
         let means = [0.0f32, 1e-9, -1e-9, 0.08, -0.08, 1e30, -1e30];
-        // Second moments spanning a point mass, a plausible one and an absurd one.
         let seconds = [0.0f32, 1e-18, 1e30, 6.4e-3];
-        // Realized LOG returns, including two well outside the support so the clip has
-        // work to do.
-        let realized = [
-            0.0f32,
-            support.log_lo as f32,
-            support.log_hi as f32,
-            -30.0,
-            30.0,
-        ];
-        let clipped = Tensor::from_slice(&realized)
-            .clamp(support.log_lo, support.log_hi)
-            .expm1();
-        let rows = clipped.size()[0];
+        let realized =
+            realized_simple_returns(&Tensor::from_slice(&[0.0f32, -0.8, 0.8, -30.0, 30.0]));
+        let rows = realized.size()[0];
         let spread = |value: f32| {
             Tensor::from_slice(&[value])
                 .expand([rows], false)
@@ -940,17 +816,17 @@ mod tests {
         };
         for &mean in &means {
             for &second in &seconds {
-                let growth = per_bar_growth(&spread(mean), &spread(second), &clipped, LEVERAGE_CAP);
+                let growth =
+                    per_bar_growth(&spread(mean), &spread(second), &realized, LEVERAGE_CAP);
                 let stats = GrowthStats::read(&growth.stats);
                 let loss = growth.loss.double_value(&[]);
                 assert!(
                     loss.is_finite(),
-                    "mean {mean} second {second} produced a non-finite growth loss {loss}"
+                    "mean {mean} second {second} produced a non-finite raw-tail loss {loss}"
                 );
                 assert!(
-                    stats.min_log_argument > LOG_ARGUMENT_FLOOR,
-                    "mean {mean} second {second}: log argument fell to {}",
-                    stats.min_log_argument
+                    stats.min_log_argument.is_finite(),
+                    "mean {mean} second {second} produced a non-finite wealth argument"
                 );
                 assert!(
                     stats.mean_abs_f <= LEVERAGE_CAP + 1e-6,
@@ -959,38 +835,70 @@ mod tests {
                 );
             }
         }
-        // The structural bound the guard is slack against, from the ACTUAL support.
-        assert!(
-            1.0 - LEVERAGE_CAP * worst > LOG_ARGUMENT_FLOOR,
-            "the support itself violates the structural bound"
-        );
-        // A non-finite realized bar is the one input that legitimately propagates. It
-        // means the corpus handed the trainer a broken bar, and the step's finiteness
-        // check is where that must be refused — silently absorbing it would hide a data
-        // fault behind a plausible loss.
-        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let poisoned = Tensor::from_slice(&[bad])
-                .clamp(support.log_lo, support.log_hi)
-                .expm1();
+    }
+
+    /// Every wealth value above the tiny numerical join uses exact expected-log utility.
+    /// The 0.1 case specifically prevents the old 0.5 tripwire from becoming a payoff
+    /// approximation over valid solvent wealth.
+    #[test]
+    fn solvent_payoffs_including_ten_percent_wealth_are_exact_negative_log1p() {
+        let second = 1.0e-3f64;
+        for (target_fraction, realized) in [(0.75f64, 0.2f64), (3.0, -0.3)] {
+            let mean = target_fraction * (second + SECOND_MOMENT_FLOOR);
             let growth = per_bar_growth(
-                &Tensor::from_slice(&[1e-4f32]),
-                &Tensor::from_slice(&[6.4e-3f32]),
-                &poisoned,
+                &Tensor::from_slice(&[mean as f32]),
+                &Tensor::from_slice(&[second as f32]),
+                &Tensor::from_slice(&[realized as f32]),
                 LEVERAGE_CAP,
             );
-            let loss = growth.loss.double_value(&[]);
-            if bad.is_nan() {
-                assert!(loss.is_nan(), "a NaN bar must not be silently absorbed");
-            } else {
-                // `clamp` maps both infinities onto the support, so the term itself is
-                // safe and the loss stays finite.
-                assert!(
-                    loss.is_finite(),
-                    "an infinite bar clips onto the support and must give a finite loss, \
-                     got {loss}"
-                );
-            }
+            let wealth = 1.0 + target_fraction * realized;
+            assert!(wealth >= 0.1 && wealth > BANKRUPTCY_BARRIER_START);
+            let expected = -(target_fraction * realized).ln_1p();
+            let actual = growth.loss.double_value(&[]);
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "wealth {wealth}: payoff was {actual}, expected exact -log1p(fR) = {expected}"
+            );
         }
+    }
+
+    /// Crossing zero wealth must not clip the target or poison the graph. The continuation
+    /// pays a large finite loss and its gradient still pushes the predicted fraction away
+    /// from the ruinous side.
+    #[test]
+    fn ruin_is_finite_strongly_adverse_and_differentiable() {
+        let second = 1.0e-3f64;
+        let target_fraction = 3.0f64;
+        let mut mean =
+            Tensor::from_slice(&[(target_fraction * (second + SECOND_MOMENT_FLOOR)) as f32])
+                .set_requires_grad(true);
+        let realized = realized_simple_returns(&Tensor::from_slice(&[-30.0f32]));
+        let growth = per_bar_growth(
+            &mean,
+            &Tensor::from_slice(&[second as f32]),
+            &realized,
+            LEVERAGE_CAP,
+        );
+        let value = growth.loss.double_value(&[]);
+        let stats = GrowthStats::read(&growth.stats);
+        assert!(
+            value.is_finite() && value > 15.0,
+            "near-total-loss ruin must be finite and strongly adverse, got {value}"
+        );
+        assert!(
+            stats.min_log_argument < -1.9,
+            "the raw extreme-negative ruin argument was clipped or rewritten: {}",
+            stats.min_log_argument
+        );
+
+        mean.zero_grad();
+        growth.loss.backward();
+        let gradient = mean.grad().double_value(&[]);
+        assert!(
+            gradient.is_finite() && gradient > 100.0,
+            "ruin must provide a strong differentiable signal away from the position, got \
+             dL/dmu={gradient}"
+        );
     }
 
     /// The saturation must never kill the gradient, which is the whole reason the
@@ -998,11 +906,11 @@ mod tests {
     #[test]
     fn the_saturated_fraction_still_carries_gradient() {
         for raw in [0.5f64, 4.0, 10.0, 100.0] {
-            // `mu / (var + eps) = raw` with a realistic variance.
-            let variance = 1e-5f64;
-            let mu = raw * variance;
+            // `mu / (E[R²] + eps) = raw` with a realistic raw second moment.
+            let second = 1e-5f64;
+            let mu = raw * second;
             let mut mean = Tensor::from_slice(&[mu as f32]).set_requires_grad(true);
-            let second = Tensor::from_slice(&[(variance + mu * mu) as f32]);
+            let second = Tensor::from_slice(&[second as f32]);
             let realized = Tensor::from_slice(&[0.002f32]);
             let growth = per_bar_growth(&mean, &second, &realized, LEVERAGE_CAP);
             let value = growth.loss.double_value(&[]);
@@ -1029,104 +937,148 @@ mod tests {
         }
     }
 
-    /// The support-bound assertion has to be a real gate, not decoration: a support that
-    /// admits returns large enough to make `1 + f R` unsafe at the cap must be refused at
-    /// construction.
+    /// The support geometry routes an extreme observation into an open tail, but both its
+    /// fitted moment contribution and its realized payoff must remain the same RAW simple
+    /// return rather than the finite edge bound.
     #[test]
-    fn a_support_that_breaks_the_log_bound_is_refused() {
-        let wide: Vec<BarDof> = (0..40_000)
+    fn open_tail_moments_and_payoffs_share_the_raw_return_law() {
+        let raw_tail_log = -0.8f32;
+        let samples: Vec<BarDof> = (0..40_000)
             .map(|i| {
-                let x = (i as f32 / 40_000.0 - 0.5) * 2.0;
+                let x = (i as f32 / 39_999.0 - 0.5) * 2.0;
                 BarDof {
-                    // Roughly +/- 0.7 in log space: a simple return near +1.0, which at a
-                    // 4x cap drives the log argument to -3.
-                    r: 0.7 * x,
-                    s: 0.7 * x.abs() + 1e-4,
+                    r: if i == 0 { raw_tail_log } else { 0.01 * x },
+                    s: 0.02,
                     u: 0.5,
                     v: 0.5,
                     w: x,
                 }
             })
             .collect();
-        let supports = BarSupports::fit(&wide);
-        let error = GrowthSupport::new(&supports, Device::Cpu)
-            .expect_err("a support this wide must be refused")
-            .to_string();
+        let supports = BarSupports::fit(&samples);
         assert!(
-            error.contains("log argument"),
-            "the refusal must name the invariant it is protecting, got: {error}"
+            f64::from(raw_tail_log) < supports.lower_bounds(DOF_R)[0],
+            "fixture observation must lie in the fitted lower open tail"
         );
-        // And the narrow, real-shaped support must be accepted, or the gate is vacuous.
+        let flat: Vec<f32> = samples
+            .iter()
+            .flat_map(|sample| sample.to_array())
+            .collect();
+        let dof = Tensor::from_slice(&flat).view([-1, BAR_DOF as i64]);
+        let bins = Vec::<i64>::try_from(
+            supports
+                .bin_ids(&dof)
+                .select(-1, DOF_R as i64)
+                .reshape([-1]),
+        )
+        .expect("r bin ids");
+        let mut tail_sum = 0.0f64;
+        let mut tail_count = 0usize;
+        for (sample, bin) in samples.iter().zip(bins) {
+            if bin == 0 {
+                tail_sum += f64::from(sample.r).exp_m1();
+                tail_count += 1;
+            }
+        }
+        let raw_tail_mean = tail_sum / tail_count as f64;
+        let (fitted_means, _) = supports
+            .simple_return_bin_moments()
+            .expect("fresh fit carries raw simple-return moments");
         assert!(
-            GrowthSupport::new(&synthetic_supports(40_000, 0x6708_0001), Device::Cpu).is_ok(),
-            "a realistically clipped support must be accepted"
+            (fitted_means[0] - raw_tail_mean).abs() < 1e-7,
+            "lower-tail fitted E[R] {} does not equal the raw routed observations \
+             {raw_tail_mean}",
+            fitted_means[0]
         );
-        assert_eq!(BAR_DOF_NAMES[DOF_R], "r", "the traded DOF must be r");
+
+        let paid = realized_simple_returns(&Tensor::from_slice(&[raw_tail_log])).double_value(&[0]);
+        let raw_simple = f64::from(raw_tail_log).exp_m1();
+        let clipped_simple = supports.lower_bounds(DOF_R)[0].exp_m1();
+        assert!(
+            (paid - raw_simple).abs() < 1e-6,
+            "paid tail return {paid} differs from its raw simple return {raw_simple}"
+        );
+        assert!(
+            (paid - clipped_simple).abs() > 0.1,
+            "fixture cannot distinguish raw payoff {paid} from clipped payoff {clipped_simple}"
+        );
+
+        let second = 1.0e-3f64;
+        let fraction = 0.5f64;
+        let growth = per_bar_growth(
+            &Tensor::from_slice(&[(fraction * (second + SECOND_MOMENT_FLOOR)) as f32]),
+            &Tensor::from_slice(&[second as f32]),
+            &Tensor::from_slice(&[paid as f32]),
+            LEVERAGE_CAP,
+        );
+        let expected = -(fraction * raw_simple).ln_1p();
+        let actual = growth.loss.double_value(&[]);
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "tail payoff was {actual}, expected raw-law -log1p(fR) = {expected}"
+        );
     }
 
-    /// The objective must price every `r` bin at its FITTED conditional mean, never at the
-    /// EDGE decode `centers()` returns.
-    ///
-    /// A pin on the ECONOMICS rather than on a literal: both conventions are read off the
-    /// same support and the term is asserted to have been built on the fitted one, so
-    /// rebuilding [`GrowthSupport::new`] on `centers(DOF_R)` fails the first loop. The
-    /// second half keeps that from being vacuous — on a geometry where the two conventions
-    /// coincided at the catch-alls the loop would pass under either.
+    /// Growth sizing consumes both directly fitted simple-return rows. The one-hot law below
+    /// isolates one bin with real within-bin variance: the persisted second moment must exceed
+    /// the squared first moment, and the decoded variance must therefore be positive where the
+    /// removed approximation was identically zero.
     #[test]
-    fn the_objective_prices_bins_at_their_fitted_conditional_means() {
+    fn fitted_simple_return_second_moments_change_the_decoded_variance() {
         let supports = synthetic_supports(40_000, 0x6709_0001);
         let support = GrowthSupport::new(&supports, Device::Cpu).expect("support");
-        let built = Vec::<f64>::try_from(support.returns.to_kind(Kind::Double).reshape([-1]))
-            .expect("bin returns");
-        let fitted = supports
-            .mean_decode(DOF_R, MeanDecode::Fitted)
-            .expect("a freshly fitted support carries measured moments");
-        let edge = supports.centers(DOF_R);
-        assert_eq!(built.len(), fitted.len(), "one priced return per bin");
-        for (bin, (&got, &decode)) in built.iter().zip(fitted).enumerate() {
-            let want = decode.exp_m1();
-            assert!(
-                (got - want).abs() <= 1e-7 * want.abs().max(1e-6),
-                "bin {bin} is priced at {got:.9e}, its fitted decode is {want:.9e}"
-            );
-        }
-        // Non-vacuity, stated on the GEOMETRY rather than on a ratio of decoded returns. How
-        // far a catch-all's conditional mean sits from its bound depends on how heavy the fit
-        // sample's tails are — 3.04x and 3.17x on the live 300s corpus, less on a synthetic
-        // fixture — but what is STRUCTURAL, and what the defect was, is that the edge decode
-        // pins these two bins onto their bounds while the mass inside them does not sit there.
-        let (lo, hi) = (supports.lower_bounds(DOF_R), supports.upper_bounds(DOF_R));
-        for bin in [0usize, NUM_BAR_BINS as usize - 1] {
-            let bound = if bin == 0 { lo[bin] } else { hi[bin] };
-            assert_eq!(
-                edge[bin], bound,
-                "bin {bin}: the edge decode must be pinned ONTO the support bound, or there is \
-                 no mispricing here and this test guards nothing"
-            );
-            let width = hi[bin] - lo[bin];
-            assert!(
-                (fitted[bin] - bound).abs() > 0.1 * width,
-                "bin {bin}: its fitted mean {:.6e} sits within 10% of the {width:.6e}-wide \
-                 bin's bound {bound:.6e}, so the two decodes barely differ and the loop above \
-                 proves nothing",
-                fitted[bin]
-            );
-            assert!(
-                (built[bin] - bound.exp_m1()).abs() > 1e-9,
-                "bin {bin} is still priced at the EDGE decode {:.6e}",
-                bound.exp_m1()
-            );
-        }
+        let (fitted_mean, fitted_second) = supports
+            .simple_return_bin_moments()
+            .expect("freshly fitted supports carry simple-return moments");
+        let built_mean = Vec::<f64>::try_from(support.returns.to_kind(Kind::Double).reshape([-1]))
+            .expect("bin first moments");
+        let built_second =
+            Vec::<f64>::try_from(support.returns_sq.to_kind(Kind::Double).reshape([-1]))
+                .expect("bin second moments");
+        assert_eq!(built_mean, fitted_mean);
+        assert_eq!(built_second, fitted_second);
+
+        let bin = (0..NUM_BAR_BINS as usize)
+            .filter(|&i| fitted_mean[i].abs() > 1.0e-12)
+            .max_by(|&a, &b| {
+                let variance = |i: usize| fitted_second[i] - fitted_mean[i] * fitted_mean[i];
+                variance(a).total_cmp(&variance(b))
+            })
+            .expect("r has a dispersed bin with nonzero mean");
+        let within_bin_variance = fitted_second[bin] - fitted_mean[bin] * fitted_mean[bin];
+        assert!(
+            within_bin_variance > 0.0,
+            "fixture bin {bin} has no within-bin simple-return variance"
+        );
+        assert!(
+            fitted_second[bin] > fitted_mean[bin] * fitted_mean[bin],
+            "E[R^2|bin] must strictly exceed E[R|bin]^2 on the dispersed fixture"
+        );
+
+        let mut probabilities = vec![0.0f32; NUM_BAR_BINS as usize];
+        probabilities[bin] = 1.0;
+        let probs = Tensor::from_slice(&probabilities).view([1, NUM_BAR_BINS]);
+        let (decoded_mean, decoded_second) = r_moments(&probs, &support);
+        let decoded_variance =
+            decoded_second.double_value(&[0]) - decoded_mean.double_value(&[0]).powi(2);
+        assert!(
+            decoded_variance > 0.0,
+            "the fitted second-moment decode must preserve within-bin variance"
+        );
+
+        let moment_correct = (fitted_mean[bin] / fitted_second[bin]).abs();
+        let deterministic = (fitted_mean[bin] / (fitted_mean[bin] * fitted_mean[bin])).abs();
+        assert!(
+            moment_correct < deterministic,
+            "within-bin E[R²] must reduce Kelly below the deterministic-bin decode: \
+             {moment_correct} vs {deterministic}"
+        );
     }
 
-    /// A supports artifact with no measured per-bin moments makes this term UNBUILDABLE.
-    ///
-    /// The prohibited alternative is `bin_means(DOF_R).unwrap_or_else(|| centers(DOF_R))`,
-    /// which is what `bar_dist`'s own mean-ceiling helpers used to do: it restores the edge
-    /// pricing on precisely the artifacts nobody refitted, and the objective then pays 3.1x
-    /// for the two catch-alls with nothing anywhere saying so.
+    /// A readable v5 support has fitted log-return moments but no fitted simple-return moments;
+    /// it must make the growth term unbuildable rather than trigger a nonlinear fallback.
     #[test]
-    fn a_support_without_fitted_moments_refuses_to_build_the_term() {
+    fn a_support_without_simple_return_moments_refuses_to_build_the_term() {
         let dir = std::env::temp_dir().join(format!(
             "trading_bot_0_growth_decode_{}",
             uuid::Uuid::new_v4()
@@ -1135,35 +1087,34 @@ mod tests {
         let path = dir.join("bar_supports.300.json");
         synthetic_supports(40_000, 0x670A_0001)
             .save(&path)
-            .expect("a fitted support writes a v5 artifact");
+            .expect("a fitted support writes a current artifact");
 
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
         let object = raw.as_object_mut().expect("object");
-        object.insert("format_version".to_owned(), serde_json::json!(4));
-        object.remove("bin_means");
-        object.remove("bin_second_moments");
+        object.insert("format_version".to_owned(), serde_json::json!(5));
+        object.remove("bin_simple_return_means");
+        object.remove("bin_simple_return_second_moments");
         std::fs::write(&path, serde_json::to_vec(&raw).expect("serialize")).expect("write");
 
-        let legacy = BarSupports::load(&path).expect("a pre-moments artifact still loads");
+        let legacy = BarSupports::load(&path).expect("a v5 artifact still loads for migration");
         std::fs::remove_dir_all(&dir).ok();
-        assert!(
-            !legacy.bin_means_measured(),
-            "this fixture has to be a support WITHOUT moments or it tests nothing"
-        );
+        assert!(legacy.bin_means_measured());
+        assert!(legacy.simple_return_bin_moments().is_none());
         let error = format!(
             "{:#}",
             GrowthSupport::new(&legacy, Device::Cpu)
-                .expect_err("the growth term must refuse a support carrying no fitted moments")
+                .expect_err("growth must refuse absent simple-return moments")
         );
         assert!(
-            error.contains(&format!("version {BAR_SUPPORTS_MOMENTS_VERSION}"))
-                && error.contains(&format!("pre-v{BAR_SUPPORTS_MOMENTS_VERSION}")),
-            "the refusal must name the required artifact version and the one it got: {error}"
+            error.contains(&format!(
+                "version {BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION}"
+            )) && error.contains(&format!(
+                "predates v{BAR_SUPPORTS_SIMPLE_RETURN_MOMENTS_VERSION}"
+            )),
+            "the refusal must name the required artifact version: {error}"
         );
-        assert!(
-            !error.contains("log argument"),
-            "the refusal must be about the missing decode, not the log bound: {error}"
-        );
+        assert!(error.contains("Deriving these moments"));
+        assert!(!error.contains("log argument"));
     }
 }

@@ -244,28 +244,6 @@ enum Commands {
         #[arg(long, default_value_t = 4_000_000)]
         support_samples: usize,
 
-        /// Scoring rule for the next-bar log-likelihood: `smoothed`, `hard` or `density`.
-        ///
-        /// THE THREE MODES ARE NOT COMPARABLE IN ABSOLUTE NATS. They differ by additive
-        /// constants that depend on the binning, so a `density` figure sits tens of nats
-        /// below a `smoothed` one on the identical model. The mode is written into the
-        /// checkpoint metadata, folded into the lineage hash, and `pretrain-compare`
-        /// refuses to pair two runs that disagree.
-        ///
-        /// * `hard` (default) — sparse categorical cross entropy on the containing-bin class,
-        ///   indexed rather than one-hot. Proper for the discretized law and floor-free, but
-        ///   its scale moves with the bin count.
-        /// * `density` — the hard score plus the finite selected bin's log width. Useful as
-        ///   a within-support measure diagnostic, but the clipped catch-all tails are not a
-        ///   normalized continuous-tail model, so absolute tail-density and bin-count
-        ///   invariance claims are invalid.
-        /// * `smoothed` — the old Gaussian label smoothing at 0.75x the local bin width.
-        ///   Proper for the SMOOTHED law rather than the observed one, and it imposes an
-        ///   unreachable 4.6482 nats/bar floor. Kept only so the campaign's earlier runs
-        ///   stay comparable.
-        #[arg(long, default_value_t = trading_bot_0::torch::bar_dist::BarScoring::default())]
-        scoring: trading_bot_0::torch::bar_dist::BarScoring,
-
         /// Recursive latent-dynamics rollout depth. The NextLat reference defaults to 1;
         /// the losses are averaged over the horizon either way.
         #[arg(long, default_value_t = 4)]
@@ -297,9 +275,11 @@ enum Commands {
         #[arg(long, default_value_t = 1.0)]
         lambda_kl: f64,
 
-        /// Weight on the EXPECTED-LOG-GROWTH term: `-log(1 + f_hat R)` at the log-optimal
-        /// fraction of the model's own `p(r|past)`, with the same-bar `s` marginalized out
-        /// and the fraction clamped at the trade bench's leverage cap.
+        /// Weight on the EXPECTED-LOG-GROWTH term: raw-tail realized payoffs at the
+        /// moment-correct quadratic fraction `E[R] / E[R²]` of the model's own
+        /// `p(r|past)`, clamped at the trade bench's leverage cap. Wealth at or above
+        /// `1e-4` pays exact `-log1p(f_hat R)`; a value- and slope-matched differentiable
+        /// continuation penalizes bankruptcy without clipping the raw return.
         ///
         /// The default is `growth::LAMBDA_GROWTH`, which was DERIVED from a gradient-norm
         /// measurement rather than swept: the term's magnitude is ~5e-4 nats against the
@@ -519,27 +499,27 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         min_dollar_volume: f64,
     },
-    /// Does the predictor have a forecast HORIZON it can afford to trade?
+    /// Production every-bar receding-horizon Kelly/oracle evaluation.
     ///
-    /// Break-even cost is gross edge over turnover, so the one lever left to a signal that
-    /// cannot pay the spread at a 5-minute rebalance is trading less often. This sweeps the
-    /// holding period and measures two distinct policies at each one: the CONTROL, which keeps
-    /// the one-bar forecast and merely holds it (which is all a no-trade band does), and the
-    /// EXPERIMENT, which forecasts the k-bar aggregate log return from a sampled multi-bar
-    /// rollout and sizes on that law. Equal-weight, the unconditional marginal null and a
-    /// perfect-foresight oracle are measured at every horizon beside the model, because a
-    /// corner where a baseline wins is not a model result.
-    ///
-    /// Inference only, over the calendar-aligned PINNED held-out panel.
-    PretrainHorizon {
-        /// Checkpoint to sweep, e.g. `weights/pretrain_best.ot`. Its metadata and supports
-        /// sidecars are resolved beside it.
+    /// At every calendar panel row this recomputes an autoregressive world-model forecast,
+    /// solves a cost-aware constrained multi-asset action from the actual current holdings,
+    /// executes only that action, and repeats one bar later. Forecast horizon is independent
+    /// of the fixed one-bar rebalance clock. Validation is the default; the locked test split
+    /// requires both `--split test` and `--allow-test`.
+    PretrainKelly {
         #[arg(long)]
         weights: String,
 
-        /// Directory the `pretrain_horizon_frontier.report.bin` chart is written into.
+        /// Directory receiving only `.report.bin` outputs.
         #[arg(long)]
         output: String,
+
+        #[arg(long, value_enum, default_value_t = PlannerDataSplit::Validation)]
+        split: PlannerDataSplit,
+
+        /// Explicitly unlock the test split for the one final evaluation.
+        #[arg(long, default_value_t = false)]
+        allow_test: bool,
 
         #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
         data_dir: String,
@@ -547,51 +527,61 @@ enum Commands {
         #[arg(long, default_value_t = 300)]
         resolution_secs: u32,
 
-        /// Pin the two split instants as `<b0>,<b1>` epoch millis. Defaults to the campaign
-        /// pin `ingest::PINNED_SPLIT_BOUNDS`, which is what makes the panel held out.
         #[arg(long, value_parser = parse_split_bounds)]
         split_bounds: Option<(i64, i64)>,
 
-        /// Panel breadth: at most this many symbols, ranked by dollar volume measured
-        /// STRICTLY BEFORE the traded span.
         #[arg(long, default_value_t = 48)]
         max_symbols: usize,
 
-        /// Panel length, in calendar instants of the deployment resolution.
         #[arg(long, default_value_t = 7_800)]
         max_instants: usize,
 
-        /// Flat one-way cost, in bps, the net-growth column is charged at. The headline
-        /// break-even column is a flat-cost equivalent and does not depend on it.
-        #[arg(long, default_value_t = trading_bot_0::torch::train::portfolio::DEFAULT_COST_BPS)]
-        cost_bps: f32,
+        /// Production horizon; the report also compares 1/4/16/39/78/100 on the same clock.
+        #[arg(
+            long,
+            default_value_t = trading_bot_0::torch::train::horizon::DEFAULT_FORECAST_HORIZON,
+            value_parser = trading_bot_0::torch::train::horizon::parse_forecast_horizon
+        )]
+        forecast_horizon: usize,
 
-        /// Book capital, which is what makes a size a fraction of ADV and therefore a cost.
         #[arg(long, default_value_t = 1.0e7)]
         capital_usd: f64,
 
-        /// Gross exposure cap imposed at every rebalance.
         #[arg(long, default_value_t = trading_bot_0::torch::train::portfolio::DEFAULT_GROSS_CAP)]
         gross_cap: f64,
 
-        /// Monte-Carlo paths per (name, rebalance) of the k-bar rollout.
+        #[arg(long, default_value_t = -2.0)]
+        net_min: f64,
+
+        #[arg(long, default_value_t = 2.0)]
+        net_max: f64,
+
+        #[arg(long, default_value_t = 0.25)]
+        per_name_cap: f64,
+
+        #[arg(long, default_value_t = 0.01)]
+        max_adv_participation: f64,
+
+        #[arg(long, default_value_t = 1_860)]
+        covariance_window: usize,
+
+        #[arg(long, default_value_t = 0.25)]
+        covariance_shrinkage: f64,
+
         #[arg(long, default_value_t = trading_bot_0::torch::train::horizon::DEFAULT_SAMPLES)]
         samples: usize,
 
-        /// Independent replicate sample sets, which is where the reported standard errors of
-        /// the sampled rows come from.
-        #[arg(long, default_value_t = trading_bot_0::torch::train::horizon::DEFAULT_REPLICATES)]
-        replicates: usize,
+        /// CPU threads used to fit PanelCost. Must be positive.
+        #[arg(long, default_value_t = 4)]
+        cost_threads: usize,
 
         #[arg(long, default_value_t = 0x5EED)]
         seed: i64,
 
-        /// Run on the CPU even where CUDA is available.
         #[arg(long, default_value_t = false)]
         cpu: bool,
 
-        /// Label carried into the chart title.
-        #[arg(long, default_value_t = String::from("horizon"))]
+        #[arg(long, default_value_t = String::from("receding-kelly"))]
         label: String,
     },
     /// Does the traded conditional MEAN stay calibrated, and does correcting it recover the
@@ -724,8 +714,9 @@ enum Commands {
         #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().join("bar_supports.300.json").to_string_lossy().into_owned())]
         supports: String,
 
-        /// Where the upgraded v5 artifact lands. MUST differ from `--supports`.
-        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().join("bar_supports.300.v5.json").to_string_lossy().into_owned())]
+        /// Where the upgraded v6 artifact lands, including fitted per-bin
+        /// `E[expm1(r)]` and `E[expm1(r)^2]`. MUST differ from `--supports`.
+        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().join("bar_supports.300.v6.json").to_string_lossy().into_owned())]
         output_supports: String,
 
         /// Directory the `support_decode_moments` and `support_decode_bins` charts are written
@@ -882,7 +873,7 @@ enum Commands {
 
         /// A second support file whose DOF `r` bounds are compared against `--supports`, so the
         /// claim "which geometry this used does not matter" is a measurement. Empty to skip.
-        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().join("bar_supports.300.v5.json").to_string_lossy().into_owned())]
+        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().join("bar_supports.300.v6.json").to_string_lossy().into_owned())]
         cross_check_supports: String,
 
         /// Directory the six `bar_seam_*` charts are written into, i.e. a run's `gens/<n>`.
@@ -1378,7 +1369,6 @@ async fn run() {
             min_bars,
             auxiliary_resolutions,
             support_samples,
-            scoring,
             dyn_horizon,
             lambda_dyn,
             lambda_kl,
@@ -1410,7 +1400,6 @@ async fn run() {
                 min_bars: *min_bars,
                 auxiliary_resolutions: auxiliary_resolutions.clone(),
                 support_samples: *support_samples,
-                scoring: *scoring,
                 dyn_horizon: *dyn_horizon,
                 lambda_dyn: *lambda_dyn,
                 lambda_kl: *lambda_kl,
@@ -1540,24 +1529,44 @@ async fn run() {
                 .expect("skill audit task panicked")
                 .expect("skill audit failed");
         }
-        Some(Commands::PretrainHorizon {
+        Some(Commands::PretrainKelly {
             weights,
             output,
+            split,
+            allow_test,
             data_dir,
             resolution_secs,
             split_bounds,
             max_symbols,
             max_instants,
-            cost_bps,
+            forecast_horizon,
             capital_usd,
             gross_cap,
+            net_min,
+            net_max,
+            per_name_cap,
+            max_adv_participation,
+            covariance_window,
+            covariance_shrinkage,
             samples,
-            replicates,
+            cost_threads,
             seed,
             cpu,
             label,
         }) => {
-            let args = torch::train::horizon::HorizonArgs {
+            let config = torch::train::horizon::RecedingConfig {
+                capital_usd: *capital_usd,
+                constraints: torch::train::portfolio::KellyConstraints {
+                    gross_cap: *gross_cap,
+                    net_min: *net_min,
+                    net_max: *net_max,
+                    per_name_cap: *per_name_cap,
+                    max_adv_participation: *max_adv_participation,
+                },
+                covariance_window: *covariance_window,
+                covariance_shrinkage: *covariance_shrinkage,
+            };
+            let args = torch::train::horizon::RecedingArgs {
                 bars_dir: std::path::PathBuf::from(data_dir),
                 checkpoint: std::path::PathBuf::from(weights),
                 gens_dir: std::path::PathBuf::from(output),
@@ -1569,23 +1578,25 @@ async fn run() {
                 },
                 split_bounds: split_bounds
                     .unwrap_or(trading_bot_0::data::ingest::PINNED_SPLIT_BOUNDS),
+                split: split.split(),
+                allow_test: *allow_test,
                 max_symbols: *max_symbols,
                 max_instants: *max_instants,
-                cost_bps: *cost_bps,
                 capital_usd: *capital_usd,
-                gross_cap: *gross_cap,
+                forecast_horizon: *forecast_horizon,
                 samples: *samples,
-                replicates: *replicates,
                 seed: *seed,
+                cost_threads: *cost_threads,
+                config,
                 label: label.clone(),
             };
-            let frontier = tokio::task::spawn_blocking(move || {
-                torch::train::horizon::run_horizon_sweep(&args)
+            let bench = tokio::task::spawn_blocking(move || {
+                torch::train::horizon::run_receding_evaluation(&args)
             })
             .await
-            .expect("horizon sweep task panicked")
-            .expect("horizon sweep failed");
-            print!("{}", frontier.table());
+            .expect("receding Kelly evaluation task panicked")
+            .expect("receding Kelly evaluation failed");
+            print!("{}", bench.table());
         }
         Some(Commands::PretrainCalibration {
             checkpoints,
@@ -2048,6 +2059,15 @@ mod tests {
             "the default arm must TRAIN the growth term; 0.0 is the ablation control"
         );
         assert!(data_dir.ends_with("bars"), "{data_dir}");
+        assert_eq!(
+            trading_bot_0::torch::bar_dist::BarScoring::default(),
+            trading_bot_0::torch::bar_dist::BarScoring::Hard
+        );
+        assert!(
+            Cli::try_parse_from(["trading_bot", "pretrain", "--scoring", "density"]).is_err(),
+            "pretraining has one Hard categorical contract; Density is a diagnostic API, not \
+             a training/selection CLI objective"
+        );
     }
 
     /// `pretrain-calibration`'s defaults are what every published economic number in
@@ -2226,5 +2246,86 @@ mod tests {
             "0.8",
         ])
         .is_err());
+    }
+    #[test]
+    fn receding_kelly_defaults_to_validation_and_test_requires_unlock() {
+        let cli = Cli::try_parse_from([
+            "trading_bot",
+            "pretrain-kelly",
+            "--weights",
+            "checkpoint.ot",
+            "--output",
+            "gens/0",
+        ])
+        .expect("production Kelly CLI should parse");
+        let Some(Commands::PretrainKelly {
+            split,
+            allow_test,
+            forecast_horizon,
+            ..
+        }) = cli.command
+        else {
+            panic!("pretrain-kelly should parse as PretrainKelly");
+        };
+        assert_eq!(split, PlannerDataSplit::Validation);
+        assert!(!allow_test);
+        assert_eq!(
+            forecast_horizon,
+            trading_bot_0::torch::train::horizon::DEFAULT_FORECAST_HORIZON
+        );
+        assert!(
+            trading_bot_0::torch::train::horizon::validate_receding_split(
+                PlannerDataSplit::Test.split(),
+                false,
+            )
+            .is_err(),
+            "naming test alone must not unlock the locked split"
+        );
+        assert!(
+            trading_bot_0::torch::train::horizon::validate_receding_split(
+                PlannerDataSplit::Test.split(),
+                true,
+            )
+            .is_ok(),
+            "the explicit unlock must make the final test score addressable"
+        );
+    }
+    #[test]
+    fn receding_kelly_cli_accepts_only_exact_evaluated_forecast_horizons() {
+        for (value, expected) in [("1", 1usize), ("100", 100usize)] {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "pretrain-kelly",
+                "--weights",
+                "checkpoint.ot",
+                "--output",
+                "gens/0",
+                "--forecast-horizon",
+                value,
+            ])
+            .expect("an exact production-grid horizon should parse");
+            let Some(Commands::PretrainKelly {
+                forecast_horizon, ..
+            }) = cli.command
+            else {
+                panic!("pretrain-kelly should parse as PretrainKelly");
+            };
+            assert_eq!(forecast_horizon, expected);
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "trading_bot",
+                "pretrain-kelly",
+                "--weights",
+                "checkpoint.ot",
+                "--output",
+                "gens/0",
+                "--forecast-horizon",
+                "2",
+            ])
+            .is_err(),
+            "a horizon without an exact evaluated prefix must fail at CLI parsing"
+        );
     }
 }
