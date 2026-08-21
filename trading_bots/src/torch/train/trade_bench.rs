@@ -517,38 +517,30 @@ pub struct WindowPaths {
     pub free: Vec<f64>,
     /// Fraction of wealth held INTO bar `t`, per policy, at the headline cap.
     pub positions: [Vec<f64>; POLICY_COUNT],
-    /// `E[r | strictly past bars]` per bar, in LOG-return space, under the same prefix-free
-    /// law the position was solved from.
+    /// `E[r | strictly past bars]` per bar, in LOG-return space, reduced from the support's
+    /// train-fitted `E[r | bin]` under the same prefix-free law the position was solved from.
     ///
-    /// This is the one number the Kelly size is almost entirely a function of, and the only
-    /// one a likelihood is nearly blind to, so it is retained per bar rather than reduced:
-    /// [`mean_calibration`] regresses the realized `r` on it, which is the only way to see
-    /// whether the traded mean is inflated. Empty on windows built by the accounting-only
-    /// constructor.
+    /// This is retained per bar because [`mean_calibration`] regresses the realized `r` on it.
+    /// Empty on windows built by the accounting-only constructor.
     pub predicted_mean: Vec<f64>,
-    /// `Var[r | strictly past bars]` per bar, in LOG-return space, from the same law.
+    /// `Var[r | strictly past bars]` per bar, reduced as
+    /// `sum_b p_b E[r² | b] - E[r]^2`.
     ///
-    /// Regressed against the realized squared residual by [`mean_calibration`]. A mean that
-    /// is inflated while the variance is honest is a fixable sizing error; both wrong is a
-    /// different finding, so the two are measured separately rather than pooled into one
-    /// "calibration" figure.
+    /// The fitted conditional second moments preserve within-bin dispersion, including in the
+    /// open-tail bins. Regressed against the realized squared residual by [`mean_calibration`].
     pub predicted_var: Vec<f64>,
     /// The uncapped moment-correct fraction under the RECALIBRATED moments, when the pass
     /// was asked for one ([`MeanShrink`]). `None` on every ordinary bench.
     pub free_shrunk: Option<Vec<f64>>,
-    /// Probability mass the law put in the two CATCH-ALL bins of `r`, per bar.
-    ///
-    /// The discriminator between a decode artifact and a learned error: the artifact's damage is
-    /// proportional to this mass, so a flat ~1.45% across every name is the marginal's own
-    /// equal-mass construction showing through, while tens of ppm on quiet names and percent on
-    /// loud ones would be something the model learned. Empty when the pass did not form it.
+    /// Probability mass the law put in the two open-tail bins of `r`, per bar.
     pub outer_mass: Vec<f64>,
-    /// Upper catch-all mass minus lower, per bar. Only the NET moves `mu_hat`.
+    /// Upper open-tail mass minus lower, per bar.
     pub outer_signed: Vec<f64>,
-    /// `E[r | past]` and `Var[r | past]` with those two bins zeroed and the row renormalized.
+    /// `E[r | past]` and `Var[r | past]` under the fitted within-bin moments after conditioning
+    /// the categorical law on an interior bin.
     ///
-    /// Same law, same pass, same bars - only the catch-alls removed. Refitting the calibration
-    /// against these answers whether the miscalibration survives the decode convention.
+    /// This is exact population-restriction evidence. It never assigns a catch-all a geometric
+    /// center or a hard-coded replacement.
     pub trimmed_mean: Vec<f64>,
     pub trimmed_var: Vec<f64>,
 }
@@ -660,15 +652,18 @@ impl TailCounts {
 }
 
 /// Artifact-level constants shared by every evaluated chunk: train-fitted within-bin
-/// simple-return moments, log-space centers/bounds, and the marginal fraction.
+/// simple-return moments for Kelly sizing, train-fitted log-return moments for calibration,
+/// log-space bounds for tail quantiles, and the marginal fraction.
 #[derive(Debug)]
 pub struct TradeSetup {
     /// `[1, NUM_BAR_BINS]` train-fitted `E[R | bin]`.
     returns: Tensor,
     /// `[1, NUM_BAR_BINS]` train-fitted `E[R² | bin]`, paired with `returns`.
     return_seconds: Tensor,
-    /// `[1, NUM_BAR_BINS]` log-return centers used only by log-space calibration.
-    centers: Tensor,
+    /// `[1, NUM_BAR_BINS]` train-fitted `E[r | bin]` for predictive calibration.
+    log_means: Tensor,
+    /// `[1, NUM_BAR_BINS]` train-fitted `E[r² | bin]`, including within-bin dispersion.
+    log_seconds: Tensor,
     /// `[1, NUM_BAR_BINS]` value bounds of each `r` bin, in LOG-return space, for the
     /// tail quantiles. Atoms have `lo == hi`, which makes their quantile the atom itself.
     lo: Tensor,
@@ -688,15 +683,25 @@ impl TradeSetup {
         let (returns, return_seconds) = supports
             .simple_return_bin_moments()
             .expect("supports lack fitted simple-return moments; refit the v6 support artifact");
+        let (log_means, log_seconds) = supports
+            .bin_moment_tensors()
+            .expect("supports lack fitted log-return moments; refit the v6 support artifact");
         let row = |values: &[f64]| {
             Tensor::from_slice(values)
+                .view([1, NUM_BAR_BINS])
+                .to_device(device)
+        };
+        let log_row = |moments: &Tensor| {
+            moments
+                .select(0, DOF_R as i64)
                 .view([1, NUM_BAR_BINS])
                 .to_device(device)
         };
         Self {
             returns: row(returns),
             return_seconds: row(return_seconds),
-            centers: row(supports.centers(DOF_R)),
+            log_means: log_row(log_means),
+            log_seconds: log_row(log_seconds),
             lo: row(supports.lower_bounds(DOF_R)),
             hi: row(supports.upper_bounds(DOF_R)),
             // Reduced at the effectively uncapped ceiling: the headline cap is applied by
@@ -763,7 +768,8 @@ impl TradeSetup {
             &TradedLaw {
                 returns: &self.returns,
                 return_seconds: &self.return_seconds,
-                centers: &self.centers,
+                log_means: &self.log_means,
+                log_seconds: &self.log_seconds,
                 bounds: Some((&self.lo, &self.hi)),
                 shrink: self.shrink,
             },
@@ -776,16 +782,18 @@ impl TradeSetup {
 /// Everything about the traded law that is a property of the ARTIFACT rather than of a
 /// chunk of bars, in the form [`window_paths`] consumes.
 ///
-/// A struct rather than positional arguments so callers cannot silently swap fitted first
-/// moments, second moments, and log-space calibration centers.
+/// A struct rather than positional arguments so callers cannot silently swap fitted
+/// simple-return sizing moments, fitted log-return calibration moments, and tail geometry.
 #[derive(Debug)]
 pub struct TradedLaw<'a> {
     /// `[1, NUM_BAR_BINS]` train-fitted `E[R | bin]`.
     pub returns: &'a Tensor,
     /// `[1, NUM_BAR_BINS]` train-fitted `E[R² | bin]`.
     pub return_seconds: &'a Tensor,
-    /// `[1, NUM_BAR_BINS]` LOG-space center of each `r` bin.
-    pub centers: &'a Tensor,
+    /// `[1, NUM_BAR_BINS]` train-fitted `E[r | bin]`.
+    pub log_means: &'a Tensor,
+    /// `[1, NUM_BAR_BINS]` train-fitted `E[r² | bin]`.
+    pub log_seconds: &'a Tensor,
     /// `[1, NUM_BAR_BINS]` log-space value bounds for tail quantiles.
     pub bounds: Option<(&'a Tensor, &'a Tensor)>,
     /// A post-hoc mean recalibration to reduce into a second moment-correct fraction.
@@ -794,11 +802,17 @@ pub struct TradedLaw<'a> {
 
 impl<'a> TradedLaw<'a> {
     /// The law with no tail bounds and no recalibration.
-    pub fn new(returns: &'a Tensor, return_seconds: &'a Tensor, centers: &'a Tensor) -> Self {
+    pub fn new(
+        returns: &'a Tensor,
+        return_seconds: &'a Tensor,
+        log_means: &'a Tensor,
+        log_seconds: &'a Tensor,
+    ) -> Self {
         Self {
             returns,
             return_seconds,
-            centers,
+            log_means,
+            log_seconds,
             bounds: None,
             shrink: None,
         }
@@ -915,8 +929,6 @@ pub fn window_paths(
     let flat_conditioning = conditioning.reshape([rows, latent]);
     let flat_r = realized_r.reshape([rows]).to_kind(Kind::Double);
     let realized = flat_r.expm1();
-    let centers = law.centers.to_kind(Kind::Double);
-
     let mut free = Vec::with_capacity(rows as usize);
     let mut free_shrunk = Vec::with_capacity(if law.shrink.is_some() {
         rows as usize
@@ -925,37 +937,27 @@ pub fn window_paths(
     });
     let mut predicted_mean = Vec::with_capacity(rows as usize);
     let mut predicted_var = Vec::with_capacity(rows as usize);
-    // CATCH-ALL DECOMPOSITION, formed in the same pass because it needs the same `rows x 128`
-    // probabilities the moments come from and a second pass would be a second population.
+    // CATCH-ALL MASS EVIDENCE, formed in the same pass because it needs the same
+    // `rows x NUM_BAR_BINS` probabilities as the fitted moments.
     //
-    // An equal-mass support's outermost bins are catch-alls for everything past the clip, and
-    // they decode to the CLIPPED BOUND rather than to a fitted interior value - `-883.32` and
-    // `+880.38` bps on the live 300s support against fitted conditional means near `+/-280`.
-    // Every moment read off `centers` therefore prices roughly 1.45% of the mass three times
-    // too far out. Zeroing those two bins and renormalizing removes that contribution by
-    // construction, so the pair of fits (`mu` versus `mu` with the catch-alls dropped) is what
-    // separates a decode artifact from a learned error in the conditional mean.
-    //
-    // Dropping rather than re-centring on purpose: re-centring would need the fitted per-bin
-    // means, which live in the support artifact and are being added there. Dropping is
-    // available today, needs no schema, and BOUNDS the artifact - it removes the whole outer
-    // contribution rather than shrinking it, so a slope that does not move under it cannot be
-    // rescued by a better decode either.
+    // The calibration moments themselves always use all-bin fitted E[r|bin] and E[r²|bin].
+    // Removing and renormalizing the two open-tail bins remains a useful population
+    // restriction: it says how calibration changes when the law is conditioned on an
+    // interior outcome, without assigning either catch-all a geometric or hard-coded value.
     let mut outer_mass = Vec::with_capacity(rows as usize);
-    // SIGNED net, upper catch-all minus lower. The two are separate quantities with separate
-    // consequences: the TOTAL drives the variance artifact, which is symmetric in the decode
-    // error, while only the NET moves the MEAN - a symmetric pair of catch-alls at +/-880 bps
-    // leaves `mu_hat` untouched no matter how much mass they hold.
+    // Upper catch-all mass minus lower, retained as exact tail-tilt evidence.
     let mut outer_signed = Vec::with_capacity(rows as usize);
     let mut trimmed_mean = Vec::with_capacity(rows as usize);
     let mut trimmed_var = Vec::with_capacity(rows as usize);
+    let log_means = law.log_means.to_kind(Kind::Double);
+    let log_seconds = law.log_seconds.to_kind(Kind::Double);
     let interior = {
         let mut keep = vec![1.0f64; NUM_BAR_BINS as usize];
         keep[0] = 0.0;
         keep[NUM_BAR_BINS as usize - 1] = 0.0;
         Tensor::from_slice(&keep)
             .view([1, NUM_BAR_BINS as i64])
-            .to_device(centers.device())
+            .to_device(log_means.device())
     };
     let mut exceed_lower: [Vec<f64>; TAIL_LEVELS.len()] = std::array::from_fn(|_| Vec::new());
     let mut exceed_upper: [Vec<f64>; TAIL_LEVELS.len()] = std::array::from_fn(|_| Vec::new());
@@ -971,20 +973,18 @@ pub fn window_paths(
             law.return_seconds,
             FREE_LEVERAGE,
         )));
-        // The moments of `r` itself, not of the simple return: the calibration fit regresses
-        // the realized LOG return, and `E[exp(r) - 1] != exp(E[r]) - 1`.
+        // Calibration reduces the persisted within-bin log moments. Geometric centers are
+        // support geometry for sampling/CRPS, not representatives of a catch-all (or any other
+        // bin) in a predictive moment.
         let mass = probs
             .to_kind(Kind::Double)
             .sum_dim_intlist([-1i64].as_slice(), true, Kind::Double)
             .clamp_min(f64::MIN_POSITIVE);
         let normalized = probs.to_kind(Kind::Double).divide(&mass);
-        let mu = (&normalized * &centers).sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
-        let deviation = &centers - &mu;
-        let var = (&normalized * &deviation * &deviation).sum_dim_intlist(
-            [-1i64].as_slice(),
-            false,
-            Kind::Double,
-        );
+        let mu = (&normalized * &log_means).sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
+        let second =
+            (&normalized * &log_seconds).sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
+        let var = (second - &mu * &mu).clamp_min(0.0).reshape([-1]);
         predicted_mean.extend(host_vec(&mu.reshape([-1])));
         predicted_var.extend(host_vec(&var));
         let lower_outer = normalized.select(-1, 0);
@@ -997,10 +997,15 @@ pub fn window_paths(
             .clamp_min(f64::MIN_POSITIVE);
         let interior_probs = interior_probs.divide(&interior_mass);
         let interior_mu =
-            (&interior_probs * &centers).sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
-        let interior_deviation = &centers - &interior_mu;
-        let interior_variance = (&interior_probs * &interior_deviation * &interior_deviation)
-            .sum_dim_intlist([-1i64].as_slice(), false, Kind::Double);
+            (&interior_probs * &log_means).sum_dim_intlist([-1i64].as_slice(), true, Kind::Double);
+        let interior_second = (&interior_probs * &log_seconds).sum_dim_intlist(
+            [-1i64].as_slice(),
+            true,
+            Kind::Double,
+        );
+        let interior_variance = (interior_second - &interior_mu * &interior_mu)
+            .clamp_min(0.0)
+            .reshape([-1]);
         trimmed_mean.extend(host_vec(&interior_mu.reshape([-1])));
         trimmed_var.extend(host_vec(&interior_variance));
         if let Some(shrink) = law.shrink {
@@ -2831,10 +2836,9 @@ pub struct VolatilityCell {
     /// about calibration should do.
     pub mean_slope: f64,
     pub var_slope: f64,
-    /// Mean total catch-all mass of the cell's bars, or `NaN` when the pass did not form the
-    /// decomposition. Reported beside the slopes because the two accounts of a heterogeneous
-    /// slope differ in exactly this quantity: one shared decode convention leaves it flat across
-    /// cells, a head that learned different tails does not.
+    /// Mean total open-tail mass of the cell's bars, or `NaN` when the pass did not form the
+    /// decomposition. Reported beside the slopes to show whether calibration changes track a
+    /// population shift into the law's open tails.
     pub outer_mass: f64,
 }
 
@@ -2913,8 +2917,8 @@ impl VolatilityGradient {
         self.measured() && self.var_gradient < -2.0 * self.var_gradient_se
     }
 
-    /// `tag` names the decode convention the slopes were fitted under: two arms print the same
-    /// cells over the same blocks and are only distinguishable by it.
+    /// `tag` names the fitted-moment population the slopes were measured over (full law or
+    /// interior-only restriction).
     pub fn report_lines(&self, tag: &str) -> Vec<String> {
         if !self.measured() {
             return vec![format!(
@@ -3128,7 +3132,7 @@ pub struct MeanCalibration {
     /// still cannot say whether the miscalibration is a fixed misplacement of mass or a learned
     /// error in the bulk, and those have different fixes. See [`VolatilityGradient`].
     pub gradient: VolatilityGradient,
-    /// What the two catch-all bins are worth to both fits, when the pass formed it.
+    /// Exact open-tail mass evidence and fitted-moment interior restriction, when formed.
     pub outer: Option<OuterDecomposition>,
 }
 
@@ -3289,14 +3293,9 @@ impl MeanCalibration {
                 100.0 * (shrink.beta - 1.0),
             ));
         }
-        lines.extend(self.gradient.report_lines("as-traded"));
+        lines.extend(self.gradient.report_lines("fitted full law"));
         match &self.outer {
-            Some(outer) => {
-                lines.extend(outer.report_lines());
-                // The verdict needs the AS-TRADED slope, which lives here and not on the
-                // decomposition: the decomposition only carries the two re-decoded arms.
-                lines.extend(outer.phi.verdict_lines(&self.mean, &outer.redecoded.mean));
-            }
+            Some(outer) => lines.extend(outer.report_lines()),
             // Absent because the pass did not form it, which is not the same as a law with no
             // catch-all mass, so it must not read as one.
             None => lines.push("  catch-all decomposition: not measured".to_owned()),
@@ -3384,93 +3383,55 @@ pub fn mean_calibration(windows: &[WindowPaths], blocks: &[u64]) -> MeanCalibrat
             &bar_blocks,
         ),
         outer: (decomposition.len() == mu.len())
-            .then(|| OuterDecomposition::measure(&decomposition, &realized, &bar_blocks, &mu)),
+            .then(|| OuterDecomposition::measure(&decomposition, &realized, &bar_blocks)),
     }
 }
 
-/// One bar's catch-all sufficient statistics, which are all a re-decode needs.
+/// One bar's exact open-tail population restriction.
 #[derive(Clone, Copy, Debug)]
 pub struct OuterBar {
-    /// Total mass in the two catch-all bins.
+    /// Total mass in the two open-tail bins.
     pub mass: f64,
-    /// Upper catch-all mass minus lower.
+    /// Upper open-tail mass minus lower.
     pub signed: f64,
-    /// Mean of the law RESTRICTED to the interior bins and renormalized.
+    /// Mean of the fitted-moment law restricted to interior bins and renormalized.
     pub interior_mean: f64,
-    /// Variance of that same restricted law.
+    /// Variance of that same restricted law, including within-bin dispersion.
     pub interior_var: f64,
 }
 
-impl OuterBar {
-    /// `(mu, var)` of the FULL law with the two catch-alls moved to `decode`.
-    ///
-    /// Exact, not an approximation, and it needs no second forward pass: a mixture of the
-    /// interior law with weight `1 - mass` and two atoms carries its moments in closed form, so
-    /// the interior mean and variance plus the two masses are sufficient statistics for the law
-    /// under ANY choice of decode point. That is what makes the fitted-mean arm and the
-    /// original-centre arm the same measurement seen twice rather than two passes.
-    pub fn redecoded(&self, decode: (f64, f64)) -> (f64, f64) {
-        let lower = 0.5 * (self.mass - self.signed);
-        let upper = 0.5 * (self.mass + self.signed);
-        let interior = 1.0 - self.mass;
-        let mean = interior * self.interior_mean + lower * decode.0 + upper * decode.1;
-        let second = interior * (self.interior_var + self.interior_mean * self.interior_mean)
-            + lower * decode.0 * decode.0
-            + upper * decode.1 * decode.1;
-        (mean, (second - mean * mean).max(0.0))
+/// A pooled point estimate with a block-bootstrap standard error and percentile interval.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockedScalar {
+    pub point: f64,
+    pub se: f64,
+    pub ci: (f64, f64),
+}
+
+impl BlockedScalar {
+    pub fn nan() -> Self {
+        Self {
+            point: f64::NAN,
+            se: f64::NAN,
+            ci: (f64::NAN, f64::NAN),
+        }
+    }
+
+    pub fn measured(&self) -> bool {
+        self.point.is_finite() && self.ci.0.is_finite() && self.ci.1.is_finite()
     }
 }
 
-/// Fitted conditional means of the two catch-all bins of `r`, in LOG-return units.
-///
-/// `E[r | bin]` on training data for bins `0` and `127`, measured off the persisted 300s
-/// quantile grid: `-277.12` and `+283.62` bps, against the `-883.32` and `+880.38` the decode
-/// currently uses. A catch-all's mass sits near its INNER edge, so the bound is the wrong
-/// representative for a moment by a factor of about 3.1 while being the right one for a sample.
-///
-/// Declared here because the support artifact does NOT carry fitted per-bin means. The live
-/// `long_data/bars/bar_supports.300.json` and every checkpoint sidecar in this tree are
-/// `format_version` 4, whose key set is exactly
-/// `{dof_names, format_version, hi, lo, masses, num_bins, provenance, smoothed_marginal}`, while
-/// [`BAR_SUPPORTS_MOMENTS_VERSION`] is 5 - so `BarSupports::bin_means_measured` is FALSE and
-/// `BarSupports::bin_means` returns `None` on every artifact that exists. This pair is therefore
-/// not a two-bin approximation to a landed object; it is the ONLY fitted-mean decode there is,
-/// and it is a two-bin one: it re-prices bins `0` and `127` and leaves the other 126 at their
-/// MIDPOINTS. Measured independently off the same artifact, the two marginal-decoded levels
-/// agree to `0.28%` in sd - `45.450` bps midpoint interior against `45.321` centroid - because
-/// only 19 interior bins move at all and the largest move is `4.50` bps at bin `126`. That is
-/// why the arm is quoted for the MEAN, which is linear in each bin's law and therefore
-/// insensitive at this scale, and NOT as the expected value of a three-decimal variance
-/// criterion. Whoever lands a 128-bin means vector must read the same 128-vector into
-/// `predicted_var` and into the comparator, or the mismatch reappears one bin inboard of where
-/// this removes it.
-pub const OUTER_REDECODE: (f64, f64) = (-0.027712, 0.028362);
-
-/// One decode convention, fitted on the same bars as every other.
-///
-/// # The mean arm is a point estimate and the variance arm is a BOUND
-///
-/// A single value per catch-all bin is exactly the right representative for a MEAN - a mean is
-/// linear in the bin's law, so `E[r]` under the true within-bin law equals `E[r]` under a point
-/// mass at that law's mean. It is the WRONG representative for a variance, which is not linear:
-/// collapsing a bin to a point discards its within-bin dispersion, measured independently at
-/// `12.02%` of the true second moment with `98.6%` of that sitting in these two bins.
-///
-/// So `predicted_sd` and the variance slope of a re-decoded arm are one-sided: the sd is a LOWER
-/// bound on what a second-moment decode reads, and the variance slope is therefore an UPPER
-/// bound. The mean slope carries no such caveat. Anyone comparing the post-fix pipeline against
-/// this arm must compare against a second-moment decode, not against this variance column.
+/// Calibration of one exact conditional-moment population restriction.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DecodeArm {
+pub struct MomentArm {
     pub mean: MzFit,
     pub variance: MzFit,
-    /// RMS predicted sd of `r` under this convention, so the arms are comparable as LEVELS and
-    /// not only as slopes. One-sided for a re-decoded arm - see the type's own doc.
+    /// RMS predicted sd of `r` under this population restriction.
     pub predicted_sd: f64,
 }
 
-impl DecodeArm {
-    /// Fit both moments of one convention. `moments[i]` is `(mu, var)` for bar `i`.
+impl MomentArm {
     fn measure(moments: &[(f64, f64)], realized: &[f64], blocks: &[u64]) -> Self {
         let mut mu = Vec::with_capacity(moments.len());
         let mut variance = Vec::with_capacity(moments.len());
@@ -3494,803 +3455,29 @@ impl DecodeArm {
     }
 }
 
-// ---------------------------------------------------------------------------
-// What SHARE of the forecast's variation the two catch-all bins carry
-// ---------------------------------------------------------------------------
-
-/// Index of each bootstrapped scalar inside [`PhiCensus`].
+/// Exact evidence about the predictive law's two open-tail bins.
 ///
-/// One ordering, used by the estimator that fills the array, by the accessors that read it and by
-/// [`PHI_LABELS`]. A parallel field list would be two orderings a permutation could silently
-/// desynchronize, and these are dimensionless numbers near zero and one that no reader could tell
-/// apart if they were swapped.
-const PHI_SHARE: usize = 0;
-const PHI_INTERIOR_SHARE: usize = 1;
-const PHI_CROSS_SHARE: usize = 2;
-const PHI_INTERIOR_OUTER_CORR: usize = 3;
-const PHI_BETA_MEASURED: usize = 4;
-const PHI_BETA_EXACT: usize = 5;
-const PHI_BETA_MODEL: usize = 6;
-const PHI_BETA_REDECODED: usize = 7;
-const PHI_GAP_MECHANISM: usize = 8;
-const PHI_GAP_MAP: usize = 9;
-const PHI_FITTED_SHARE: usize = 10;
-const PHI_CHANNEL_RATIO: usize = 11;
-const PHI_OUTER_CORR: usize = 12;
-pub const PHI_SCALARS: usize = 13;
-
-/// Series names of [`PhiCensus::scalars`], in index order.
-///
-/// Every label that names a PREDICTION also names the assumption it rests on, in the label
-/// itself. A chart's title is normalized before it is drawn - emphasis in a title does not
-/// survive - while series legend labels render verbatim, so a caveat is only legible if it is
-/// here. The standard this is written to is not "is the number emitted" but "can a reader reach
-/// the wrong conclusion from what is drawn", which is the defect a per-pass census titled as the
-/// truth committed elsewhere in this tree.
-pub const PHI_LABELS: [&str; PHI_SCALARS] = [
-    "phi = Var(catch-all term) / Var(as-traded mean)",
-    "interior share = Var(I) / Var(f)",
-    "cross share 2Cov(I,D)/Var(f) - NONZERO REFUTES the phi->beta map",
-    "corr(interior, fitted catch-all term) - the Cov(I,T)=0 test",
-    "beta MEASURED, as-traded mean (in-draw, pairable)",
-    "beta PREDICTED exact - assumes only that the fitted decode is the true mean",
-    "beta PREDICTED phi-model - also assumes Cov(I,T)=0 and one channel",
-    "beta MEASURED, fitted-decode arm - the map's premise is that this reads 1.0",
-    "paired gap measured - exact: zero means the decode explains the slope",
-    "paired gap exact - phi-model: zero means the published map is a sound summary",
-    "phi under the fitted decode",
-    "channel ratio Var(D_edge)/(g^2 Var(D_fitted)) - one if a single channel",
-    "corr(D_edge, D_fitted)",
-];
-
-/// A pooled point estimate with a block-bootstrap standard error and percentile interval.
-///
-/// `point` is the estimate over EVERY bar, not the mean of the resampled draws: the draws measure
-/// how far the pooled number would move under resampling of `(symbol, calendar month)` blocks,
-/// which is the convention [`MzFit`] reports its slope under and therefore the only one whose
-/// intervals are comparable to a slope's.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BlockedScalar {
-    pub point: f64,
-    pub se: f64,
-    pub ci: (f64, f64),
-}
-
-impl BlockedScalar {
-    pub fn nan() -> Self {
-        Self {
-            point: f64::NAN,
-            se: f64::NAN,
-            ci: (f64::NAN, f64::NAN),
-        }
-    }
-
-    pub fn measured(&self) -> bool {
-        self.point.is_finite() && self.ci.0.is_finite() && self.ci.1.is_finite()
-    }
-
-    /// True when the interval EXCLUDES `value`, i.e. the estimate is resolvably away from it.
-    ///
-    /// Gated on the interval being measured, so an unmeasured scalar answers `false` — "not
-    /// resolvably different" — rather than manufacturing a resolution out of `NaN` comparisons,
-    /// which are all false and would otherwise read as "excludes nothing" by accident rather than
-    /// by decision.
-    pub fn excludes(&self, value: f64) -> bool {
-        self.measured() && !(self.ci.0..=self.ci.1).contains(&value)
-    }
-
-    /// True when two blocked estimates' intervals overlap at all.
-    ///
-    /// The weakest honest reading of "these agree", and only for estimates that are NOT paired:
-    /// two quantities computed from the same bars have strongly correlated errors, so this
-    /// declares agreement too easily and disagreement never. Prefer a paired difference - see
-    /// [`PhiCensus::mechanism_gap`] - wherever one exists.
-    pub fn overlaps(&self, other: &Self) -> bool {
-        self.measured() && other.measured() && self.ci.0 <= other.ci.1 && other.ci.0 <= self.ci.1
-    }
-}
-
-/// Second-moment sufficient statistics of one block's four channels.
-///
-/// `f` is the as-traded (edge-decoded) conditional mean, `d` the part of it the two catch-all bins
-/// contribute, `t` what those same two bins contribute under [`OUTER_REDECODE`], and `y` the
-/// realized log return. Fourteen numbers per block are sufficient for every variance, covariance,
-/// correlation AND SLOPE the census reports, so a bootstrap refit costs one pass over the BLOCKS
-/// rather than over the bars - the same property [`RegressionSums`] gives a single slope, for the
-/// same reason.
-///
-/// Carrying `y` here rather than pairing against a separately-bootstrapped [`MzFit`] is what makes
-/// the measured slope and its prediction differenceable INSIDE a draw. Pairing across two
-/// estimators would additionally require their surviving row sets to coincide, which is a
-/// precondition nothing could check from the outside; pairing inside one accumulator makes it
-/// true by construction.
-#[derive(Clone, Copy, Debug, Default)]
-struct DecodeSums {
-    n: f64,
-    f: f64,
-    d: f64,
-    t: f64,
-    y: f64,
-    ff: f64,
-    dd: f64,
-    tt: f64,
-    fd: f64,
-    ft: f64,
-    fy: f64,
-    dt: f64,
-    dy: f64,
-    ty: f64,
-}
-
-impl DecodeSums {
-    fn push(&mut self, f: f64, d: f64, t: f64, y: f64) {
-        self.n += 1.0;
-        self.f += f;
-        self.d += d;
-        self.t += t;
-        self.y += y;
-        self.ff += f * f;
-        self.dd += d * d;
-        self.tt += t * t;
-        self.fd += f * d;
-        self.ft += f * t;
-        self.fy += f * y;
-        self.dt += d * t;
-        self.dy += d * y;
-        self.ty += t * y;
-    }
-
-    fn absorb(&mut self, other: &Self) {
-        self.n += other.n;
-        self.f += other.f;
-        self.d += other.d;
-        self.t += other.t;
-        self.y += other.y;
-        self.ff += other.ff;
-        self.dd += other.dd;
-        self.tt += other.tt;
-        self.fd += other.fd;
-        self.ft += other.ft;
-        self.fy += other.fy;
-        self.dt += other.dt;
-        self.dy += other.dy;
-        self.ty += other.ty;
-    }
-
-    /// Every reported scalar, from the fourteen sums and the measured directional gain.
-    ///
-    /// The interior contribution is `I = f - d` IDENTICALLY - not a separate accumulator that
-    /// could drift from one - so `Var(f) = Var(I) + 2Cov(I,D) + Var(D)` holds exactly and the
-    /// three shares sum to one to floating precision. That identity is why the CROSS share is
-    /// reported rather than assumed away: the `phi`-to-`beta` map is derived under `Cov(I,T) = 0`,
-    /// so a cross share that is not small refutes the map rather than inconveniencing it.
-    fn census(&self, gain: f64) -> [f64; PHI_SCALARS] {
-        let mut out = [f64::NAN; PHI_SCALARS];
-        if self.n < 2.0 {
-            return out;
-        }
-        let n = self.n;
-        let var = |s: f64, ss: f64| (ss - s * s / n) / (n - 1.0);
-        let cov = |a: f64, b: f64, ab: f64| (ab - a * b / n) / (n - 1.0);
-        let vf = var(self.f, self.ff);
-        let vd = var(self.d, self.dd);
-        let vt = var(self.t, self.tt);
-        let cfd = cov(self.f, self.d, self.fd);
-        let cft = cov(self.f, self.t, self.ft);
-        let cfy = cov(self.f, self.y, self.fy);
-        let cdt = cov(self.d, self.t, self.dt);
-        let cdy = cov(self.d, self.y, self.dy);
-        let cty = cov(self.t, self.y, self.ty);
-        if !(vf > 0.0) {
-            return out;
-        }
-        // `I = f - d`, so every interior moment is an exact combination of the channels'.
-        let vi = vf - 2.0 * cfd + vd;
-        let cid = cfd - vd;
-        let cit = cft - cdt;
-        // The FITTED-decode mean is `I + t = f - d + t`.
-        let v_fitted = vi + 2.0 * cit + vt;
-        let cy_fitted = cfy - cdy + cty;
-        let phi = vd / vf;
-        out[PHI_SHARE] = phi;
-        out[PHI_INTERIOR_SHARE] = vi / vf;
-        out[PHI_CROSS_SHARE] = 2.0 * cid / vf;
-        out[PHI_INTERIOR_OUTER_CORR] = if vi > 0.0 && vt > 0.0 {
-            cit / (vi * vt).sqrt()
-        } else {
-            f64::NAN
-        };
-        // The OLS slope of the realized return on the as-traded mean: the same normal equation
-        // `Cov(x,y)/Var(x)` that `RegressionSums::solve` uses, over the same rows, so this is the
-        // calibration slope itself and not a second estimator of it.
-        let measured = cfy / vf;
-        // `Cov(f, I + t) / Var(f)`. Under the single assumption that the fitted decode IS the
-        // conditional mean this is the calibration slope EXACTLY, with no orthogonality
-        // assumption: `f` and `I + t` are both functions of the same information set, so
-        // `Cov(f, y) = Cov(f, E[y | information])` identically.
-        let exact = (vf - cfd + cft) / vf;
-        let model = 1.0 - phi * (1.0 - 1.0 / gain);
-        out[PHI_BETA_MEASURED] = measured;
-        out[PHI_BETA_EXACT] = exact;
-        out[PHI_BETA_MODEL] = model;
-        out[PHI_BETA_REDECODED] = if v_fitted > 0.0 {
-            cy_fitted / v_fitted
-        } else {
-            f64::NAN
-        };
-        // Differences formed INSIDE the draw, which is the whole point of accumulating `y` here:
-        // the measured slope and its prediction share the realized return and the resampled
-        // blocks, so most of their sampling variance is common and cancels. An interval on either
-        // one is far wider than the interval on their difference, and the difference is what the
-        // hypothesis is about.
-        out[PHI_GAP_MECHANISM] = measured - exact;
-        out[PHI_GAP_MAP] = exact - model;
-        out[PHI_FITTED_SHARE] = if v_fitted > 0.0 {
-            vt / v_fitted
-        } else {
-            f64::NAN
-        };
-        out[PHI_CHANNEL_RATIO] = if vt > 0.0 && gain.is_finite() && gain != 0.0 {
-            vd / (gain * gain * vt)
-        } else {
-            f64::NAN
-        };
-        out[PHI_OUTER_CORR] = if vd > 0.0 && vt > 0.0 {
-            cdt / (vd * vt).sqrt()
-        } else {
-            f64::NAN
-        };
-        out
-    }
-}
-
-/// Least-squares recovery of the decode the forecasts were actually formed under, in the
-/// SYMMETRIC / DIRECTIONAL basis.
-///
-/// # Why the decode is measured here rather than read from a constant
-///
-/// The catch-all contribution is `D = c_lo p_0 + c_hi p_127` with two decode values fixed across
-/// bars and two probabilities varying, so a no-intercept regression of `D` on the two masses
-/// recovers the decode EXACTLY and its residual is zero up to floating error. Three things
-/// follow, none available from a hardcoded pair:
-///
-/// * The residual is a live check that `D` is what this module claims it is. A non-zero RMS says
-///   the identity `D = f - (1 - mass) * interior_mean` has broken, which is the one way the whole
-///   census could be silently measuring something else.
-/// * The recovered decode is a GEOMETRY fingerprint. Several checkpoints scored in one pass must
-///   recover the same one; if they do not they resolved different supports and no slope of one is
-///   comparable to a slope of another - a failure otherwise invisible because every individual
-///   number stays correct.
-/// * The directional gain the amplification argument turns on stops being an inherited constant
-///   and becomes a per-checkpoint measurement.
-///
-/// # Why `(s, a)` and not `(p_0, p_127)`
-///
-/// Substituting `p_0 = (s - a)/2`, `p_127 = (s + a)/2`,
-///
-/// ```text
-/// D = s (c_lo + c_hi)/2 + a (c_hi - c_lo)/2
-/// ```
-///
-/// so the design columns become the common catch-all LEVEL and the directional TILT, which are
-/// nearly orthogonal by construction, where `p_0` and `p_127` are two similar small numbers that
-/// move together across bars. Regressing on the latter is the classic ill-conditioned fit: it
-/// returns a well-fitting pair whose individual coefficients are meaningless, with a SMALL
-/// residual and a large condition number. `(s, a)` is also the basis the amplification is defined
-/// in - it is the ratio of the two `a` coefficients - so the quantity needed comes out directly.
-/// The condition number is reported beside the residual precisely because a small residual alone
-/// does not establish that either coefficient is identified.
-#[derive(Clone, Copy, Debug, Default)]
-struct EdgeRecovery {
-    n: f64,
-    ss: f64,
-    sa: f64,
-    aa: f64,
-    sd: f64,
-    ad: f64,
-    dd: f64,
-}
-
-impl EdgeRecovery {
-    fn push(&mut self, level: f64, tilt: f64, d: f64) {
-        self.n += 1.0;
-        self.ss += level * level;
-        self.sa += level * tilt;
-        self.aa += tilt * tilt;
-        self.sd += level * d;
-        self.ad += tilt * d;
-        self.dd += d * d;
-    }
-
-    /// `(midpoint, half-span, residual RMS, condition number)`, all `NaN` when degenerate.
-    ///
-    /// The condition number is the 2-norm one of the NORMAL matrix, i.e. the square of the design
-    /// matrix's. Stated because the two differ by a factor of two in the exponent and quoting the
-    /// wrong one understates an ill-conditioned fit.
-    fn solve(&self) -> (f64, f64, f64, f64) {
-        let det = self.ss * self.aa - self.sa * self.sa;
-        if self.n < 2.0 || !(det.abs() > 0.0) {
-            return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
-        }
-        let midpoint = (self.aa * self.sd - self.sa * self.ad) / det;
-        let half_span = (self.ss * self.ad - self.sa * self.sd) / det;
-        let residual = self.dd - midpoint * self.sd - half_span * self.ad;
-        let trace = self.ss + self.aa;
-        let spread = ((self.ss - self.aa) * (self.ss - self.aa) + 4.0 * self.sa * self.sa).sqrt();
-        let (high, low) = (0.5 * (trace + spread), 0.5 * (trace - spread));
-        (
-            midpoint,
-            half_span,
-            (residual.max(0.0) / self.n).sqrt(),
-            if low > 0.0 { high / low } else { f64::INFINITY },
-        )
-    }
-}
-
-/// How much of the forecast mean's VARIATION the two catch-all bins carry, and what that predicts
-/// for the calibration slope.
-///
-/// # The prediction this exists to falsify
-///
-/// Write the as-traded conditional mean as `f = I + D`, where `I` is the interior bins'
-/// contribution and `D = c_lo p_0 + c_hi p_127` is the two catch-alls'. In the level/tilt basis
-/// `s = p_127 + p_0`, `a = p_127 - p_0`,
-///
-/// ```text
-/// D = s (c_lo + c_hi)/2  +  a (c_hi - c_lo)/2
-/// ```
-///
-/// so the SYMMETRIC channel is priced by the decode's midpoint and the DIRECTIONAL channel by its
-/// half-span. On the live 300s geometry the edge decode's half-span is `881.85` bps against the
-/// fitted decode's `280.37`, a directional amplification of `g = 3.145x`, while the midpoints are
-/// `-1.47` and `+3.25` bps - the two channels are not proportional. Modelling the forecast as
-/// `f = I + g T` with the fitted decode giving the true conditional mean `E[y | past] = I + T`,
-/// and ASSUMING `Cov(I, T) = 0`, gives
-///
-/// ```text
-/// beta = 1 - phi (1 - 1/g),   phi = Var(g T) / Var(f)
-/// ```
-///
-/// which maps `beta = 0.8777` to `phi = 0.179` and `beta = 1.0058` to `phi = 0`. That map is a
-/// MODEL, and this type measures every input it rests on including the two assumptions it hides:
-///
-/// * `Cov(I, T) = 0`. Reported as the CROSS share `2Cov(I,D)/Var(f)` - which with
-///   `Var(f) = Var(I) + 2Cov(I,D) + Var(D)` makes the three shares sum to one exactly, so the
-///   cross term is not a nuisance to bound but a third share to read - and as `corr(I, T)`. If it
-///   is material the map is wrong, and that is a refutation of the mechanism, not a nuisance.
-/// * `D = g T`, i.e. that the symmetric channel is negligible. Reported as the CHANNEL RATIO
-///   `Var(D) / (g^2 Var(T))`, one when the single-channel picture holds, and as `corr(D, T)`.
-///
-/// Because both assumptions are avoidable, the census also reports the EXACT prediction
-/// `Cov(f, I + T) / Var(f)`, which needs neither. The three numbers to read together are the
-/// MEASURED slope, the EXACT prediction and the MODEL prediction, and the two gaps between them
-/// are separate claims that can come apart:
-///
-/// * measured == exact says the catch-all decode accounts for the slope - the miscalibration is a
-///   REPRESENTATION artifact rather than a learned error in the conditional mean.
-/// * exact == model says the published `phi`-to-`beta` map is a sound summary of that mechanism.
-///
-/// Both gaps are formed INSIDE each bootstrap draw, so their intervals are paired rather than the
-/// difference of two independent ones. And the whole chain rests on one PREMISE that is itself
-/// measured: the fitted-decode arm's own slope must read `1.0`. An arm resolvably away from one
-/// invalidates the exact prediction as well, so it is reported beside the rest instead of assumed.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PhiCensus {
-    scalars: [BlockedScalar; PHI_SCALARS],
-    /// Half-span ratio of the recovered decode to [`OUTER_REDECODE`]: the `g` above, MEASURED.
-    /// Static geometry, so it is held fixed across the bootstrap draws.
-    pub directional_gain: f64,
-    /// The recovered decode's `(c_lo + c_hi)/2` and `(c_hi - c_lo)/2`, in LOG-return units.
-    pub recovered_midpoint: f64,
-    pub recovered_half_span: f64,
-    /// The same thing as `(c_lo, c_hi)`, for comparison against a support artifact's `lo`/`hi`.
-    pub recovered_edge: (f64, f64),
-    /// RMS of `D` minus its two-term reconstruction. Zero up to floating error whenever the census
-    /// is measuring what it claims to.
-    pub recovery_residual_rms: f64,
-    /// Condition number of the recovery's normal matrix. A small residual beside a large
-    /// condition number means the fit reproduces `D` without identifying either coefficient.
-    pub recovery_condition: f64,
-    pub blocks: usize,
-    pub samples: usize,
-}
-
-impl PhiCensus {
-    pub fn nan() -> Self {
-        Self {
-            scalars: [BlockedScalar::nan(); PHI_SCALARS],
-            directional_gain: f64::NAN,
-            recovered_midpoint: f64::NAN,
-            recovered_half_span: f64::NAN,
-            recovered_edge: (f64::NAN, f64::NAN),
-            recovery_residual_rms: f64::NAN,
-            recovery_condition: f64::NAN,
-            blocks: 0,
-            samples: 0,
-        }
-    }
-
-    pub fn measured(&self) -> bool {
-        self.samples > 0
-    }
-
-    /// Every scalar in [`PHI_LABELS`] order, for a report writer that charts all of them.
-    pub fn scalars(&self) -> &[BlockedScalar; PHI_SCALARS] {
-        &self.scalars
-    }
-
-    /// Share of the as-traded mean's variance carried by the two catch-all bins.
-    pub fn phi(&self) -> BlockedScalar {
-        self.scalars[PHI_SHARE]
-    }
-
-    pub fn interior_share(&self) -> BlockedScalar {
-        self.scalars[PHI_INTERIOR_SHARE]
-    }
-
-    /// `2Cov(I,D)/Var(f)`: the term the `phi`-to-`beta` map assumes away.
-    pub fn cross_share(&self) -> BlockedScalar {
-        self.scalars[PHI_CROSS_SHARE]
-    }
-
-    pub fn interior_outer_corr(&self) -> BlockedScalar {
-        self.scalars[PHI_INTERIOR_OUTER_CORR]
-    }
-
-    /// The calibration slope itself, accumulated here so it can be paired with its predictions.
-    pub fn beta_measured(&self) -> BlockedScalar {
-        self.scalars[PHI_BETA_MEASURED]
-    }
-
-    /// `Cov(f, I + T)/Var(f)`: assumes only that the fitted decode is the conditional mean.
-    pub fn beta_exact(&self) -> BlockedScalar {
-        self.scalars[PHI_BETA_EXACT]
-    }
-
-    /// `1 - phi (1 - 1/g)`, the published map's prediction.
-    pub fn beta_model(&self) -> BlockedScalar {
-        self.scalars[PHI_BETA_MODEL]
-    }
-
-    /// The fitted-decode arm's own slope. The map's premise is that this reads `1.0`.
-    pub fn beta_redecoded(&self) -> BlockedScalar {
-        self.scalars[PHI_BETA_REDECODED]
-    }
-
-    /// Paired `measured - exact`. Zero means the amplification mechanism explains the slope.
-    pub fn mechanism_gap(&self) -> BlockedScalar {
-        self.scalars[PHI_GAP_MECHANISM]
-    }
-
-    /// Paired `exact - model`. Zero means the published map summarizes the mechanism soundly.
-    pub fn map_gap(&self) -> BlockedScalar {
-        self.scalars[PHI_GAP_MAP]
-    }
-
-    pub fn fitted_share(&self) -> BlockedScalar {
-        self.scalars[PHI_FITTED_SHARE]
-    }
-
-    /// `Var(D)/(g^2 Var(T))`: one when the amplification really is a single channel.
-    pub fn channel_ratio(&self) -> BlockedScalar {
-        self.scalars[PHI_CHANNEL_RATIO]
-    }
-
-    pub fn outer_corr(&self) -> BlockedScalar {
-        self.scalars[PHI_OUTER_CORR]
-    }
-
-    /// The three shares, which sum to one by construction. Reported so a reader can watch the
-    /// identity hold rather than take it on faith; a sum away from one is a bug in this module.
-    pub fn share_sum(&self) -> f64 {
-        self.phi().point + self.interior_share().point + self.cross_share().point
-    }
-
-    /// `phi` the published map would need to produce a given slope, inverted from
-    /// `beta = 1 - phi (1 - 1/g)`.
-    ///
-    /// The comparison the whole task turns on: a historical slope implies a `phi`, and the
-    /// measured `phi` either is that number or is not. `NaN` when the gain is degenerate rather
-    /// than a division that reads as an answer.
-    pub fn phi_implied_by(&self, beta: f64) -> f64 {
-        let attenuation = 1.0 - 1.0 / self.directional_gain;
-        if !attenuation.is_finite() || attenuation == 0.0 {
-            return f64::NAN;
-        }
-        (1.0 - beta) / attenuation
-    }
-
-    pub fn report_lines(&self) -> Vec<String> {
-        if !self.measured() {
-            return vec![
-                "  catch-all variance census: not measured (the pass carried no decomposition)"
-                    .to_owned(),
-            ];
-        }
-        let mut lines = vec![format!(
-            "  decode RECOVERED from the rows: midpoint {:+.4} bps, half-span {:+.4} bps => \
-             (lo {:+.2}, hi {:+.2}) bps, against the fitted midpoint {:+.4} / half-span {:+.4}; \
-             directional gain g = {:.5}x; residual {:.3e} bps/bar, normal-matrix condition \
-             {:.3e}, over {} bars / {} blocks",
-            self.recovered_midpoint * 1e4,
-            self.recovered_half_span * 1e4,
-            self.recovered_edge.0 * 1e4,
-            self.recovered_edge.1 * 1e4,
-            0.5 * (OUTER_REDECODE.0 + OUTER_REDECODE.1) * 1e4,
-            0.5 * (OUTER_REDECODE.1 - OUTER_REDECODE.0) * 1e4,
-            self.directional_gain,
-            self.recovery_residual_rms * 1e4,
-            self.recovery_condition,
-            self.samples,
-            self.blocks,
-        )];
-        for (label, scalar) in PHI_LABELS.iter().zip(&self.scalars) {
-            lines.push(format!(
-                "  {label}: {:+.5} (se {:.5}, 95% CI {:+.5}..{:+.5})",
-                scalar.point, scalar.se, scalar.ci.0, scalar.ci.1,
-            ));
-        }
-        lines.push(format!(
-            "  the three shares sum to {:.6}, which is Var(f) = Var(I) + 2Cov(I,D) + Var(D) \
-             holding rather than a coincidence",
-            self.share_sum(),
-        ));
-        lines
-    }
-
-    /// The verdict on the amplification mechanism, from the PAIRED gaps.
-    ///
-    /// `edge` and `redecoded` are the independently-bootstrapped slopes of the same two arms, used
-    /// only as a CROSS-CHECK: this census recomputes both slopes from its own accumulator, so the
-    /// two routes must agree to floating error and a disagreement is a defect in one of them. The
-    /// verdict itself is read off the paired gaps, which are strictly sharper.
-    pub fn verdict_lines(&self, edge: &MzFit, redecoded: &MzFit) -> Vec<String> {
-        if !self.measured() {
-            return Vec::new();
-        }
-        let mut lines = vec![format!(
-            "  slope CROSS-CHECK: this census reads {:+.6} for the as-traded arm and {:+.6} for \
-             the fitted-decode arm; the independent regressions read {:+.6} and {:+.6} \
-             (differences {:+.2e} and {:+.2e} — anything but floating error is a defect)",
-            self.beta_measured().point,
-            self.beta_redecoded().point,
-            edge.beta,
-            redecoded.beta,
-            self.beta_measured().point - edge.beta,
-            self.beta_redecoded().point - redecoded.beta,
-        )];
-        let mechanism = self.mechanism_gap();
-        lines.push(format!(
-            "  MECHANISM (paired): measured minus exact prediction = {:+.5} (95% CI \
-             {:+.5}..{:+.5}) — {}",
-            mechanism.point,
-            mechanism.ci.0,
-            mechanism.ci.1,
-            if !mechanism.measured() {
-                "UNRESOLVED, the paired interval did not form"
-            } else if mechanism.excludes(0.0) {
-                "REFUTED on these bars: the catch-all decode does NOT account for the slope, so \
-                 the residual miscalibration is a property of the head and not of the decode"
-            } else {
-                "CONSISTENT: the catch-all decode accounts for the slope within the paired \
-                 interval, so the miscalibration is a REPRESENTATION artifact"
-            },
-        ));
-        let map = self.map_gap();
-        lines.push(format!(
-            "  MAP (paired): exact minus phi-model prediction = {:+.5} (95% CI {:+.5}..{:+.5}), \
-             cross share {:+.5} moves beta by at most {:.5}, channel ratio {:+.4} — {}",
-            map.point,
-            map.ci.0,
-            map.ci.1,
-            self.cross_share().point,
-            0.5 * self.cross_share().point.abs() * (1.0 - 1.0 / self.directional_gain).abs(),
-            self.channel_ratio().point,
-            if !map.measured() {
-                "UNRESOLVED"
-            } else if map.excludes(0.0) {
-                "the published beta = 1 - phi(1 - 1/g) does NOT reproduce the exact prediction, so \
-                 its Cov(I,T) = 0 and single-channel assumptions are not innocuous here"
-            } else {
-                "the published beta = 1 - phi(1 - 1/g) reproduces the exact prediction"
-            },
-        ));
-        let arm = self.beta_redecoded();
-        lines.push(format!(
-            "  PREMISE: the fitted-decode arm's slope is {:+.4} (CI {:+.4}..{:+.4}), which {} \
-             perfect calibration. The exact prediction assumes this arm IS the conditional mean, \
-             so an arm resolvably away from 1.0 invalidates the prediction as well as the map",
-            arm.point,
-            arm.ci.0,
-            arm.ci.1,
-            if arm.excludes(1.0) {
-                "EXCLUDES"
-            } else {
-                "contains"
-            },
-        ));
-        lines.push(format!(
-            "  INVERSION: this census's phi is {:+.5}; the map would need phi = {:+.5} to produce \
-             the measured {:+.4}, and phi = {:+.5} to produce a slope of 1.0000",
-            self.phi().point,
-            self.phi_implied_by(self.beta_measured().point),
-            self.beta_measured().point,
-            self.phi_implied_by(1.0),
-        ));
-        lines
-    }
-}
-
-/// Measure the catch-all variance census over every bar of a decomposed pass.
-///
-/// `edge_mean[i]` is bar `i`'s as-traded conditional mean - the same `mu` the calibration slope
-/// regresses - and `realized[i]` the realized LOG return, the same `y`. The catch-all
-/// contribution is taken as `D = mu - (1 - mass) * interior_mean`, which is
-/// `c_lo p_0 + c_hi p_127` IDENTICALLY and needs no decode constant: the interior sum is exactly
-/// what `trimmed_mean` renormalizes, so the subtraction cancels the 126 interior terms and
-/// nothing else. It is also well conditioned - on this geometry `D` is of the same order as `mu`
-/// itself, because `881.85` bps of half-span against `1.45%` of mass is a first-order
-/// contribution rather than a correction - so the difference of two same-order quantities is
-/// benign.
-///
-/// The row filter is `{mu, D, T, y}` all finite, which is a subset of the `{mu, y}` filter
-/// [`mincer_zarnowitz`] applies to the same bars, so `beta_measured` is that regression's slope on
-/// the same rows whenever the decomposition is finite - a property the tests pin rather than
-/// assume.
-fn measure_phi(
-    bars: &[OuterBar],
-    edge_mean: &[f64],
-    realized: &[f64],
-    blocks: &[u64],
-) -> PhiCensus {
-    assert_eq!(
-        bars.len(),
-        edge_mean.len(),
-        "one forecast mean per decomposed bar"
-    );
-    assert_eq!(
-        bars.len(),
-        realized.len(),
-        "one realized return per decomposed bar"
-    );
-    assert_eq!(bars.len(), blocks.len(), "every bar needs a block");
-
-    let mut grouped: BTreeMap<u64, DecodeSums> = BTreeMap::new();
-    let mut recovery = EdgeRecovery::default();
-    let mut samples = 0usize;
-    for (((bar, mean), y), block) in bars.iter().zip(edge_mean).zip(realized).zip(blocks) {
-        let lower = 0.5 * (bar.mass - bar.signed);
-        let upper = 0.5 * (bar.mass + bar.signed);
-        let d = mean - (1.0 - bar.mass) * bar.interior_mean;
-        let t = lower * OUTER_REDECODE.0 + upper * OUTER_REDECODE.1;
-        if !mean.is_finite() || !y.is_finite() || !d.is_finite() || !t.is_finite() {
-            continue;
-        }
-        grouped.entry(*block).or_default().push(*mean, d, t, *y);
-        // The LEVEL and TILT columns, not the two masses: see [`EdgeRecovery`] for why the basis
-        // is the difference between an identified fit and a well-fitting meaningless one.
-        recovery.push(bar.mass, bar.signed, d);
-        samples += 1;
-    }
-    let (recovered_midpoint, recovered_half_span, recovery_residual_rms, recovery_condition) =
-        recovery.solve();
-    // MEASURED geometry, held fixed across the draws because it is a property of the support and
-    // not of the sample: resampling blocks must move the variance shares, never the bin values
-    // the decode reads.
-    let directional_gain = recovered_half_span / (0.5 * (OUTER_REDECODE.1 - OUTER_REDECODE.0));
-
-    let totals: Vec<DecodeSums> = grouped.into_values().collect();
-    let mut pooled = DecodeSums::default();
-    for block in &totals {
-        pooled.absorb(block);
-    }
-    let point = pooled.census(directional_gain);
-    let mut census = PhiCensus {
-        scalars: std::array::from_fn(|index| BlockedScalar {
-            point: point[index],
-            ..BlockedScalar::nan()
-        }),
-        directional_gain,
-        recovered_midpoint,
-        recovered_half_span,
-        recovered_edge: (
-            recovered_midpoint - recovered_half_span,
-            recovered_midpoint + recovered_half_span,
-        ),
-        recovery_residual_rms,
-        recovery_condition,
-        blocks: totals.len(),
-        samples,
-    };
-    if totals.len() < 2 {
-        // One block is one observation: there is no dispersion to estimate, and a zero-width
-        // interval reported as precision is the failure this refuses to commit.
-        return census;
-    }
-
-    // The same stream as `mincer_zarnowitz` and `block_bootstrap`: same RNG, same seed, same draw
-    // count, blocks visited in the same `BTreeMap` order. A `phi` interval is therefore taken over
-    // the same construction as the slope it sits beside, and every scalar of a single draw comes
-    // from ONE resample, which is what makes the two gaps paired rather than differences of
-    // independent intervals.
-    let mut rng = ChaCha12Rng::seed_from_u64(BOOTSTRAP_SEED);
-    let mut columns: [Vec<f64>; PHI_SCALARS] =
-        std::array::from_fn(|_| Vec::with_capacity(BOOTSTRAP_DRAWS));
-    for _ in 0..BOOTSTRAP_DRAWS {
-        let mut draw = DecodeSums::default();
-        for _ in 0..totals.len() {
-            draw.absorb(totals.choose(&mut rng).expect("totals is non-empty"));
-        }
-        let values = draw.census(directional_gain);
-        for (column, value) in columns.iter_mut().zip(values) {
-            if value.is_finite() {
-                column.push(value);
-            }
-        }
-    }
-    let tail = (1.0 - CI_MASS) / 2.0;
-    for (scalar, column) in census.scalars.iter_mut().zip(columns.iter_mut()) {
-        if column.len() < 2 {
-            continue;
-        }
-        column.sort_by(f64::total_cmp);
-        scalar.se = standard_deviation(column);
-        scalar.ci = (
-            sorted_percentile(column, tail),
-            sorted_percentile(column, 1.0 - tail),
-        );
-    }
-    census
-}
-
-/// What the two CATCH-ALL bins of `r` are worth to the calibration, measured two ways.
-///
-/// # Why two arms and not one
-///
-/// The catch-alls hold real mass and the law is not wrong to put it there; what is wrong is
-/// pricing it at the clipped BOUND. So there are two different questions:
-///
-/// * ZEROED and renormalized answers "is the decode SUFFICIENT to explain the miscalibration".
-///   Zeroing cannot fail to detect an artifact that is present, so it is robust for that
-///   question and an UPPER BOUND on the correction - it discards the legitimate tail
-///   contribution along with the mispricing, so its slopes overshoot perfect calibration. A
-///   slope that fails to move even here cannot be rescued by any decode.
-/// * RE-DECODED at [`OUTER_REDECODE`] answers "what will the pipeline read after the fix". Same
-///   mass, valued at its fitted conditional mean, so it is the point estimate and the
-///   comparator the fix is checked against.
-///
-/// The two are one result, not a discrepancy: on the measured level a `0.24` variance slope maps
-/// to about `1.28` re-decoded and about `2.58` zeroed, and a mean slope past one in the zeroed
-/// arm is the diagnostic over-correcting BY CONSTRUCTION rather than the head being
-/// under-dispersed.
+/// The full-law calibration is [`MeanCalibration::mean`] / [`MeanCalibration::variance`].
+/// This companion reports their probability mass and the calibration of the same fitted
+/// within-bin moments after conditioning on an interior bin. It is deliberately not a
+/// "re-decode" experiment: v6 persists all-bin first and second moments, so there is no second
+/// convention to approximate and no hard-coded catch-all endpoint.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OuterDecomposition {
-    /// Mean total catch-all mass per bar. The equal-mass construction puts the MARGINAL law's
-    /// value at `2/128 = 1.5625%`, so a head at that level has learned nothing about its tails.
+    /// Mean total open-tail mass per bar.
     pub mass: f64,
-    /// Mean SIGNED net, upper minus lower. Only this moves `mu_hat`: at the current decode each
-    /// unit of net mass carries `1763.7` bps of conditional mean against a `mu` near 1 bp, so
-    /// `0.06%` of net mass doubles a typical forecast.
+    /// Mean upper-minus-lower open-tail mass.
     pub signed: f64,
-    pub redecoded: DecodeArm,
-    pub zeroed: DecodeArm,
-    /// The RE-DECODED arm split by the block's own realized volatility, with each cell's mean
-    /// catch-all mass beside its slopes - the pair that separates "one shared convention error"
-    /// from "a head that learned different tails for different names".
+    /// Fitted-moment law conditioned on an interior bin.
+    pub interior: MomentArm,
+    /// The interior-only arm split by the block's realized volatility.
     pub gradient: VolatilityGradient,
-    /// What SHARE of the forecast mean's variation those two bins carry, and what it predicts for
-    /// the slope. The sharpest falsifiable form of the decode hypothesis: see [`PhiCensus`].
-    pub phi: PhiCensus,
 }
 
 impl OuterDecomposition {
-    fn measure(bars: &[OuterBar], realized: &[f64], blocks: &[u64], edge_mean: &[f64]) -> Self {
+    fn measure(bars: &[OuterBar], realized: &[f64], blocks: &[u64]) -> Self {
         let count = bars.len().max(1) as f64;
-        let redecoded: Vec<(f64, f64)> = bars
-            .iter()
-            .map(|bar| bar.redecoded(OUTER_REDECODE))
-            .collect();
-        let zeroed: Vec<(f64, f64)> = bars
+        let interior: Vec<(f64, f64)> = bars
             .iter()
             .map(|bar| (bar.interior_mean, bar.interior_var))
             .collect();
@@ -4298,7 +3485,7 @@ impl OuterDecomposition {
         let mut mu = Vec::with_capacity(bars.len());
         let mut variance = Vec::with_capacity(bars.len());
         let mut residual_squares = Vec::with_capacity(bars.len());
-        for ((m, v), r) in redecoded.iter().zip(realized) {
+        for ((m, v), r) in interior.iter().zip(realized) {
             mu.push(*m);
             variance.push(*v);
             residual_squares.push((r - m) * (r - m));
@@ -4306,8 +3493,7 @@ impl OuterDecomposition {
         Self {
             mass: bars.iter().map(|bar| bar.mass).sum::<f64>() / count,
             signed: bars.iter().map(|bar| bar.signed).sum::<f64>() / count,
-            redecoded: DecodeArm::measure(&redecoded, realized, blocks),
-            zeroed: DecodeArm::measure(&zeroed, realized, blocks),
+            interior: MomentArm::measure(&interior, realized, blocks),
             gradient: volatility_gradient(
                 &mu,
                 realized,
@@ -4316,43 +3502,33 @@ impl OuterDecomposition {
                 Some(&outer),
                 blocks,
             ),
-            phi: measure_phi(bars, edge_mean, realized, blocks),
         }
     }
 
     pub fn report_lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
-            "  catch-all mass: {:.4}% of the law per bar (marginal construction {:.4}%, so the \
+            "  open-tail mass: {:.4}% of the law per bar (marginal construction {:.4}%, so the \
              head has trimmed {:.1}% of the equal-mass tail), signed net {:+.4}%",
             100.0 * self.mass,
             100.0 * 2.0 / NUM_BAR_BINS as f64,
             100.0 * (1.0 - self.mass * NUM_BAR_BINS as f64 / 2.0),
             100.0 * self.signed,
         )];
-        for (label, arm) in [
-            ("ZEROED    ", &self.zeroed),
-            ("RE-DECODED", &self.redecoded),
-        ] {
-            lines.push(format!(
-                "  {label} catch-alls: mean slope {:+.4} (se {:.4}), var slope {:+.4} (se \
-                 {:.4}), predicted sd {:7.2} bps/bar",
-                arm.mean.beta,
-                arm.mean.beta_se,
-                arm.variance.beta,
-                arm.variance.beta_se,
-                arm.predicted_sd * 1e4,
-            ));
-        }
+        lines.push(format!(
+            "  fitted interior-only law: mean slope {:+.4} (se {:.4}), var slope {:+.4} \
+             (se {:.4}), predicted sd {:7.2} bps/bar",
+            self.interior.mean.beta,
+            self.interior.mean.beta_se,
+            self.interior.variance.beta,
+            self.interior.variance.beta_se,
+            self.interior.predicted_sd * 1e4,
+        ));
         lines.push(
-            "  ZEROED is an UPPER BOUND on the correction - it discards the legitimate tail too, \
-             so a mean slope past 1.0 there is the diagnostic over-correcting, not the head being \
-             under-dispersed. RE-DECODED is the MEAN's point estimate; its VARIANCE column is \
-             one-sided, because a point mass per catch-all drops the within-bin dispersion, so \
-             its predicted sd is a lower bound and its var slope an upper bound"
+            "  interior-only is a population restriction, not a replacement decode: both this \
+             arm and the full calibration use persisted fitted E[r|bin] and E[r²|bin]"
                 .to_owned(),
         );
-        lines.extend(self.gradient.report_lines("re-decoded"));
-        lines.extend(self.phi.report_lines());
+        lines.extend(self.gradient.report_lines("fitted interior-only law"));
         lines
     }
 }
@@ -8284,6 +7460,16 @@ mod tests {
         )
     }
 
+    fn log_moment_tensors(supports: &BarSupports) -> (Tensor, Tensor) {
+        let (first, second) = supports
+            .bin_moment_tensors()
+            .expect("test supports carry fitted log-return moments");
+        (
+            first.select(0, DOF_R as i64).view([1, NUM_BAR_BINS]),
+            second.select(0, DOF_R as i64).view([1, NUM_BAR_BINS]),
+        )
+    }
+
     fn squared(returns: &[f64]) -> Vec<f64> {
         returns.iter().map(|r| r * r).collect()
     }
@@ -8495,7 +7681,7 @@ mod tests {
         let (_vs, head) = perturbed_head(latent, 0xA001);
         let supports = synthetic_supports(30_000, 0xA002);
         let (returns, return_seconds) = return_moment_tensors(&supports);
-        let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
+        let (log_means, log_seconds) = log_moment_tensors(&supports);
         let free_null = marginal_position(&supports, FREE_LEVERAGE);
         let (windows, bars) = (3i64, 16i64);
         let h = beliefs(windows * bars, latent, 0xA003).view([windows, bars, latent]);
@@ -8517,7 +7703,7 @@ mod tests {
                 &h,
                 &conditioning,
                 realized,
-                &TradedLaw::new(&returns, &return_seconds, &centers),
+                &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds),
                 free_null,
                 LEVERAGE_CAP,
             )
@@ -8611,7 +7797,7 @@ mod tests {
         let (_a, head_a) = perturbed_head(latent, 0xB002);
         let (_b, head_b) = perturbed_head(latent, 0xB003);
         let (returns, return_seconds) = return_moment_tensors(&supports);
-        let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
+        let (log_means, log_seconds) = log_moment_tensors(&supports);
         let h = beliefs(8, latent, 0xB004).view([2, 4, latent]);
         let conditioning = beliefs(8, latent, 0xB005).view([2, 4, latent]);
         let realized = Tensor::zeros([2, 4], (Kind::Float, Device::Cpu));
@@ -8621,7 +7807,7 @@ mod tests {
                 &h,
                 &conditioning,
                 &realized,
-                &TradedLaw::new(&returns, &return_seconds, &centers),
+                &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds),
                 marginal_position(&supports, FREE_LEVERAGE),
                 LEVERAGE_CAP,
             )
@@ -8971,7 +8157,7 @@ mod tests {
         let (_vs, head) = perturbed_head(latent, 0x1A01);
         let supports = synthetic_supports(30_000, 0x1A02);
         let (returns, return_seconds) = return_moment_tensors(&supports);
-        let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
+        let (log_means, log_seconds) = log_moment_tensors(&supports);
         let lo = Tensor::from_slice(supports.lower_bounds(DOF_R)).view([1, NUM_BAR_BINS]);
         let hi = Tensor::from_slice(supports.upper_bounds(DOF_R)).view([1, NUM_BAR_BINS]);
         let (windows, bars) = (3i64, 64i64);
@@ -8992,7 +8178,8 @@ mod tests {
             &h,
             &conditioning,
             &realized,
-            &TradedLaw::new(&returns, &return_seconds, &centers).with_bounds(&lo, &hi),
+            &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds)
+                .with_bounds(&lo, &hi),
             marginal_position(&supports, FREE_LEVERAGE),
             LEVERAGE_CAP,
         )
@@ -9479,219 +8666,143 @@ mod tests {
         );
     }
 
-    /// The clipped support bounds of `r` on the live 300s grid: the decode convention the
-    /// pipeline reads today, and the thing the decomposition is asked to undo.
-    const BOUND: (f64, f64) = (-0.088332, 0.088038);
-
     #[test]
-    fn redecoding_the_catch_alls_reproduces_a_direct_sum_over_the_bins() {
-        // An explicit law: 128 bins, the outer two carrying deliberately lopsided mass so the
-        // signed net is not zero and a symmetric bug cannot pass.
+    fn fitted_all_bin_log_moments_drive_calibration_without_changing_kelly() {
+        let _torch_rng_guard = test_rng::shared();
+        let latent = 12;
+        let (_vs, head) = perturbed_head(latent, 0xCA11_0701);
+        let supports = synthetic_supports(30_000, 0xCA11_0702);
+        let (returns, return_seconds) = return_moment_tensors(&supports);
         let bins = NUM_BAR_BINS as usize;
-        let mut probs = vec![0.0f64; bins];
-        probs[0] = 0.004;
-        probs[bins - 1] = 0.018;
-        let interior: f64 = 1.0 - probs[0] - probs[bins - 1];
-        let centers: Vec<f64> = (0..bins)
-            .map(|bin| 0.0004 * (bin as f64 - (bins as f64 - 1.0) / 2.0))
+
+        // Keep interior fitted means on the geometric values, but move both open-tail means.
+        // This isolates the historical leak: only using the geometric catch-all centers can
+        // disagree with the direct fitted reduction below.
+        let mut fitted_means = supports.centers(DOF_R).to_vec();
+        fitted_means[0] = -0.011;
+        fitted_means[bins - 1] = 0.023;
+        let mut fitted_seconds: Vec<f64> = fitted_means.iter().map(|m| m * m).collect();
+        // All within-bin dispersion is in the open tails. A representative-only reduction
+        // therefore misses the entire increment, while the persisted second moments retain it.
+        fitted_seconds[0] += 3.0e-4;
+        fitted_seconds[bins - 1] += 7.0e-4;
+        let concentrated_seconds: Vec<f64> = fitted_means.iter().map(|m| m * m).collect();
+        let log_means = Tensor::from_slice(&fitted_means).view([1, NUM_BAR_BINS]);
+        let log_seconds = Tensor::from_slice(&fitted_seconds).view([1, NUM_BAR_BINS]);
+        let concentrated = Tensor::from_slice(&concentrated_seconds).view([1, NUM_BAR_BINS]);
+
+        let (windows, bars) = (2i64, 11i64);
+        let rows = windows * bars;
+        let h = beliefs(rows, latent, 0xCA11_0703).view([windows, bars, latent]);
+        let conditioning = beliefs(rows, latent, 0xCA11_0704).view([windows, bars, latent]);
+        let realized = Tensor::zeros([windows, bars], (Kind::Float, Device::Cpu));
+        let free_null = marginal_position(&supports, FREE_LEVERAGE);
+        let fitted = window_paths(
+            &head,
+            &h,
+            &conditioning,
+            &realized,
+            &TradedLaw::new(&returns, &return_seconds, &log_means, &log_seconds),
+            free_null,
+            LEVERAGE_CAP,
+        )
+        .expect("fitted-moment paths");
+        let no_within_bin = window_paths(
+            &head,
+            &h,
+            &conditioning,
+            &realized,
+            &TradedLaw::new(&returns, &return_seconds, &log_means, &concentrated),
+            free_null,
+            LEVERAGE_CAP,
+        )
+        .expect("representative-only comparator");
+
+        let probs = forecast_r_probs(
+            &head,
+            &h.reshape([rows, latent]),
+            &conditioning.reshape([rows, latent]),
+        )
+        .to_kind(Kind::Double);
+        let mass = probs
+            .sum_dim_intlist([-1i64].as_slice(), true, Kind::Double)
+            .clamp_min(f64::MIN_POSITIVE);
+        let normalized = probs.divide(&mass);
+        let fitted_means_t = log_means.to_kind(Kind::Double);
+        let fitted_seconds_t = log_seconds.to_kind(Kind::Double);
+        let expected_mean = (&normalized * &fitted_means_t).sum_dim_intlist(
+            [-1i64].as_slice(),
+            false,
+            Kind::Double,
+        );
+        let expected_second = (&normalized * &fitted_seconds_t).sum_dim_intlist(
+            [-1i64].as_slice(),
+            false,
+            Kind::Double,
+        );
+        let expected_var = (expected_second - &expected_mean * &expected_mean).clamp_min(0.0);
+        let expected_mean = host_vec(&expected_mean);
+        let expected_var = host_vec(&expected_var);
+        let observed_mean: Vec<f64> = fitted
+            .windows
+            .iter()
+            .flat_map(|window| window.predicted_mean.iter().copied())
             .collect();
-        // A non-uniform interior, so `interior_mean` is not the midpoint by accident.
-        let weights: Vec<f64> = (1..bins - 1).map(|bin| 1.0 + (bin % 7) as f64).collect();
-        let total: f64 = weights.iter().sum();
-        for (bin, weight) in weights.iter().enumerate() {
-            probs[bin + 1] = interior * weight / total;
-        }
-
-        // The interior law, renormalized - exactly what `window_paths` forms with the mask.
-        let interior_mean: f64 =
-            (1..bins - 1).map(|b| probs[b] * centers[b]).sum::<f64>() / interior;
-        let interior_second: f64 = (1..bins - 1)
-            .map(|b| probs[b] * centers[b] * centers[b])
-            .sum::<f64>()
-            / interior;
-        let bar = OuterBar {
-            mass: probs[0] + probs[bins - 1],
-            signed: probs[bins - 1] - probs[0],
-            interior_mean,
-            interior_var: interior_second - interior_mean * interior_mean,
-        };
-
-        // Against a direct sum over all 128 bins with the two catch-alls valued at `decode`.
-        for decode in [BOUND, OUTER_REDECODE, (-0.01, 0.02)] {
-            let mut values = centers.clone();
-            values[0] = decode.0;
-            values[bins - 1] = decode.1;
-            let direct_mean: f64 = (0..bins).map(|b| probs[b] * values[b]).sum();
-            let direct_second: f64 = (0..bins).map(|b| probs[b] * values[b] * values[b]).sum();
-            let direct_var = direct_second - direct_mean * direct_mean;
-            let (mean, var) = bar.redecoded(decode);
+        let observed_var: Vec<f64> = fitted
+            .windows
+            .iter()
+            .flat_map(|window| window.predicted_var.iter().copied())
+            .collect();
+        for index in 0..rows as usize {
             assert!(
-                (mean - direct_mean).abs() < 1e-15,
-                "the closed form has to be the same number as the sum: {mean:.6e} against \
-                 {direct_mean:.6e} at decode {decode:?}"
+                (observed_mean[index] - expected_mean[index]).abs() < 1e-12,
+                "row {index}: calibration mean did not reduce fitted E[r|bin]"
             );
             assert!(
-                (var - direct_var).abs() < 1e-15,
-                "and so does the variance: {var:.6e} against {direct_var:.6e} at decode \
-                 {decode:?}"
+                (observed_var[index] - expected_var[index]).abs() < 1e-12,
+                "row {index}: calibration variance did not reduce fitted E[r²|bin]"
             );
         }
-    }
 
-    /// Windows whose INTERIOR law is perfectly calibrated and whose reported mean is inflated
-    /// purely by pricing catch-all mass at the clipped bound.
-    ///
-    /// The whole point of the fixture: there is no learned error anywhere in it. The conditional
-    /// mean of the interior law IS the true conditional mean, so a decomposition that works must
-    /// read `beta = 1` off the zeroed arm while the as-traded slope reads `beta` - and one that
-    /// merely rescales something cannot, because the inflation is carried by a signed mass whose
-    /// contribution depends on the decode point rather than by a factor on `mu`.
-    fn decode_artifact_windows(beta: f64, windows: usize, bars: usize) -> Vec<WindowPaths> {
-        // Enough mass to carry the inflation at the bound without ever exceeding the total, and
-        // near the equal-mass construction's own `2/128 = 1.5625%`.
-        let mass = 0.02;
-        let spread = BOUND.1 + BOUND.0;
-        let lever = BOUND.1 - BOUND.0;
-        (0..windows)
-            .map(|window| {
-                let mut realized = Vec::with_capacity(bars);
-                let mut predicted_mean = Vec::with_capacity(bars);
-                let mut predicted_var = Vec::with_capacity(bars);
-                let mut outer_mass = Vec::with_capacity(bars);
-                let mut outer_signed = Vec::with_capacity(bars);
-                let mut trimmed_mean = Vec::with_capacity(bars);
-                let mut trimmed_var = Vec::with_capacity(bars);
-                for bar in 0..bars {
-                    let slot = (window * bars + bar) as u64;
-                    // A per-bar true mean that changes sign, plus a block-level level shift so
-                    // the blocked interval has clustering to be wider than.
-                    let mu = 0.0004 * (2.0 * uniform(0xCA11_0700, window as u64) - 1.0)
-                        + 0.0008 * (2.0 * uniform(mix64(0xCA11_0700, 1), slot) - 1.0);
-                    // Antithetic noise: sums to zero inside the window, so no finite-sample
-                    // correlation with `mu` can manufacture a slope.
-                    let sign = if bar % 2 == 0 { 1.0 } else { -1.0 };
-                    let eps = sign * 0.004 * (0.5 + uniform(mix64(0xCA11_0700, 2), slot / 2));
-                    realized.push((mu + eps).exp() - 1.0);
-                    // Solve the signed net that makes the FULL law's mean `mu / beta` when the
-                    // catch-alls are decoded at the bound.
-                    let signed =
-                        2.0 * (mu / beta - (1.0 - mass) * mu - 0.5 * mass * spread) / lever;
-                    assert!(
-                        signed.abs() <= mass,
-                        "the fixture must stay a probability: {signed:.4e} of net against \
-                         {mass:.4e} of mass"
-                    );
-                    let interior_var = 0.012 * 0.012;
-                    let bar_stats = OuterBar {
-                        mass,
-                        signed,
-                        interior_mean: mu,
-                        interior_var,
-                    };
-                    let (full_mean, full_var) = bar_stats.redecoded(BOUND);
-                    predicted_mean.push(full_mean);
-                    predicted_var.push(full_var);
-                    outer_mass.push(mass);
-                    outer_signed.push(signed);
-                    trimmed_mean.push(mu);
-                    trimmed_var.push(interior_var);
-                }
-                let mut paths = WindowPaths::unmeasured(
-                    realized.clone(),
-                    vec![0.0; bars],
-                    std::array::from_fn(|_| vec![0.0; bars]),
-                );
-                paths.predicted_mean = predicted_mean;
-                paths.predicted_var = predicted_var;
-                paths.outer_mass = outer_mass;
-                paths.outer_signed = outer_signed;
-                paths.trimmed_mean = trimmed_mean;
-                paths.trimmed_var = trimmed_var;
-                paths
-            })
-            .collect()
-    }
-
-    #[test]
-    fn zeroing_the_catch_alls_recovers_a_slope_the_decode_convention_destroyed() {
-        let beta = 0.7;
-        let windows = decode_artifact_windows(beta, 64, 64);
-        let blocks: Vec<u64> = (0..windows.len() as u64).map(|w| w / 2).collect();
-        let calibration = mean_calibration(&windows, &blocks);
-
-        // As traded, the slope is the artifact and nothing else.
+        let geometric = Tensor::from_slice(supports.centers(DOF_R))
+            .view([1, NUM_BAR_BINS])
+            .to_kind(Kind::Double);
+        let geometric_mean = host_vec(&(&normalized * geometric).sum_dim_intlist(
+            [-1i64].as_slice(),
+            false,
+            Kind::Double,
+        ));
         assert!(
-            (calibration.mean.beta - beta).abs() < 2.0 * calibration.mean.beta_se.max(1e-9),
-            "the as-traded slope must read the inflation: {:.4} against {beta:.4} (se {:.4})",
-            calibration.mean.beta,
-            calibration.mean.beta_se
-        );
-        let outer = calibration
-            .outer
-            .as_ref()
-            .expect("the fixture carries a catch-all decomposition for every bar");
-
-        // ZEROED removes the whole outer contribution, and since the interior law IS the truth
-        // here, it has to land on perfect calibration.
-        assert!(
-            (outer.zeroed.mean.beta - 1.0).abs() < 2.0 * outer.zeroed.mean.beta_se.max(1e-9),
-            "zeroing an artifact that is the ONLY error must recover perfect calibration: \
-             {:.4} (se {:.4})",
-            outer.zeroed.mean.beta,
-            outer.zeroed.mean.beta_se
-        );
-
-        // RE-DECODED moves the same mass to a nearer point, so it recovers PART of the slope -
-        // strictly between the two, which is what makes it a point estimate rather than a bound.
-        assert!(
-            outer.redecoded.mean.beta > calibration.mean.beta
-                && outer.redecoded.mean.beta < outer.zeroed.mean.beta,
-            "the re-decoded arm has to sit strictly between as-traded and zeroed: {:.4} \
-             against {:.4} and {:.4}",
-            outer.redecoded.mean.beta,
-            calibration.mean.beta,
-            outer.zeroed.mean.beta
-        );
-
-        // And the masses are reported, not inferred: a decomposition that lost them would still
-        // pass every slope assertion above.
-        assert!(
-            (outer.mass - 0.02).abs() < 1e-12,
-            "the mean catch-all mass has to be the fixture's own: {:.6}",
-            outer.mass
-        );
-    }
-
-    #[test]
-    fn a_pass_without_the_decomposition_reports_it_absent_rather_than_zero() {
-        // Same windows with the four decomposition vectors dropped: every slope still fits, and
-        // the arms must be ABSENT. A zero here would read as "the law holds no catch-all mass",
-        // which is a finding, and this is the lack of one.
-        let mut windows = decode_artifact_windows(0.7, 8, 32);
-        for window in &mut windows {
-            window.outer_mass.clear();
-            window.outer_signed.clear();
-            window.trimmed_mean.clear();
-            window.trimmed_var.clear();
-        }
-        let blocks: Vec<u64> = (0..windows.len() as u64).collect();
-        let calibration = mean_calibration(&windows, &blocks);
-        assert!(
-            calibration.mean.beta.is_finite(),
-            "the mean fit still stands on its own"
-        );
-        assert!(
-            calibration.outer.is_none(),
-            "an unformed decomposition must not read as zero"
-        );
-        assert!(
-            calibration
-                .report_lines()
+            observed_mean
                 .iter()
-                .any(|line| line.contains("catch-all decomposition: not measured")),
-            "and the console has to say so: {:?}",
-            calibration.report_lines()
+                .zip(geometric_mean)
+                .any(|(fitted, edge)| (*fitted - edge).abs() > 1e-8),
+            "the fixture moved the catch-all fitted means but calibration still matches geometry"
         );
+
+        for (with_moments, representative_only) in fitted.windows.iter().zip(&no_within_bin.windows)
+        {
+            assert_eq!(
+                with_moments.free, representative_only.free,
+                "log calibration moments must not alter simple-return Kelly sizing"
+            );
+            assert_eq!(
+                with_moments.positions, representative_only.positions,
+                "every policy position must remain byte-for-byte unchanged"
+            );
+            assert_eq!(
+                with_moments.predicted_mean,
+                representative_only.predicted_mean
+            );
+            assert!(
+                with_moments
+                    .predicted_var
+                    .iter()
+                    .zip(&representative_only.predicted_var)
+                    .all(|(fitted, collapsed)| fitted > collapsed),
+                "open-tail within-bin E[r²|bin] must strictly increase every predictive variance"
+            );
+        }
     }
 
     /// Windows carrying a per-bar recalibrated fraction, for the accounting of the shrunk
@@ -10006,8 +9117,6 @@ mod tests {
         let latent = 12;
         let (_vs, head) = perturbed_head(latent, 0xCA11_0101);
         let supports = synthetic_supports(30_000, 0xCA11_0102);
-        let (returns, return_seconds) = return_moment_tensors(&supports);
-        let centers = Tensor::from_slice(supports.centers(DOF_R)).view([1, NUM_BAR_BINS]);
         let (windows, bars) = (2i64, 24i64);
         let h = beliefs(windows * bars, latent, 0xCA11_0103).view([windows, bars, latent]);
         let conditioning =
@@ -10018,19 +9127,14 @@ mod tests {
                 .collect::<Vec<f32>>(),
         )
         .view([windows, bars]);
-
-        let law =
-            TradedLaw::new(&returns, &return_seconds, &centers).with_shrink(MeanShrink::identity());
-        let chunk = window_paths(
-            &head,
-            &h,
-            &conditioning,
-            &realized,
-            &law,
-            marginal_position(&supports, FREE_LEVERAGE),
-            LEVERAGE_CAP,
-        )
-        .expect("paths");
+        let realized_dof =
+            Tensor::zeros([windows, bars, BAR_DOF as i64], (Kind::Float, Device::Cpu));
+        realized_dof.select(-1, DOF_R as i64).copy_(&realized);
+        let setup = TradeSetup::new(&supports, Device::Cpu, LEVERAGE_CAP)
+            .with_shrink(Some(MeanShrink::identity()));
+        let chunk = setup
+            .paths(&head, &h, &conditioning, &realized_dof, windows as usize)
+            .expect("paths");
         for window in &chunk.windows {
             let shrunk = window
                 .free_shrunk
@@ -10049,15 +9153,16 @@ mod tests {
                 window.predicted_var.iter().all(|v| *v > 0.0),
                 "a 128-bin predictive law has strictly positive variance"
             );
-            // The conditional mean lives inside the support, which is the cheapest available
-            // check that it is a mean of `r` and not of the simple return.
-            let (lo, hi) = (
-                supports.centers(DOF_R)[0],
-                supports.centers(DOF_R)[NUM_BAR_BINS as usize - 1],
-            );
+            // A convex reduction must stay inside the fitted per-bin mean range. This also
+            // checks that calibration remained in log-return rather than simple-return space.
+            let fitted = supports
+                .bin_means(DOF_R)
+                .expect("test support carries fitted log moments");
+            let lo = fitted.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = fitted.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             assert!(
                 window.predicted_mean.iter().all(|m| *m >= lo && *m <= hi),
-                "a conditional mean outside the bin centers it averages is not a mean"
+                "a conditional mean outside the fitted E[r|bin] range is not a mean"
             );
         }
     }

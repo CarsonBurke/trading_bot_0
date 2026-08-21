@@ -1413,15 +1413,14 @@ impl RowPopulation {
 /// Stream one population's per-bar rows to disk.
 ///
 /// Written as a fixed-layout little-endian body plus a JSON header, and STREAMED: rows are never
-/// accumulated, in any language. `trimmed_mean` / `trimmed_var` are emitted rather than any
-/// single decode's mean, because `OuterBar::redecoded` is a closed form in
-/// `(mass, signed, interior_mean, interior_var)`, so those four reconstruct EVERY decode arm at
-/// ANY decode pair, offline, forever. Emitting one arm's `mu` would lock the artifact to one
-/// convention; emitting the sufficient statistics locks it to none. `predicted_mean` and
-/// `predicted_var` ride along because they are what the pipeline reads TODAY, and the per-row
-/// `all_finite` flag exists so the INTERSECTION of usable rows across checkpoints is
-/// reconstructible without a rerun — `mincer_zarnowitz` filters on `x`, so two checkpoints can
-/// silently be fitted on different row sets and no cross-checkpoint pairing would be valid.
+/// accumulated, in any language. `predicted_mean` / `predicted_var` are the all-bin persisted
+/// fitted-moment reduction. `trimmed_mean` / `trimmed_var` are the exact companion restriction
+/// conditioned on an interior bin; `outer_mass` / `outer_signed` retain the corresponding
+/// open-tail probability evidence. No field encodes or reconstructs an alternate geometric
+/// moment convention. The per-row `all_finite` flag exists so the INTERSECTION of usable rows
+/// across checkpoints is reconstructible without a rerun — `mincer_zarnowitz` filters on `x`,
+/// so two checkpoints can silently be fitted on different row sets and no cross-checkpoint
+/// pairing would be valid.
 ///
 /// The population is written INTO the artifact. Every measurement failure this campaign has
 /// suffered was a statistic correct over a population someone assumed.

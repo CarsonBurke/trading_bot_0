@@ -20,7 +20,6 @@ use crate::torch::bar_dist::{
     BarDof, BarSupports, MeanDecode, BAR_DOF, BAR_DOF_NAMES, DOF_R, NUM_BAR_BINS,
 };
 use crate::torch::train::pretrain::{load_corpus, CorpusFlags};
-use crate::torch::train::trade_bench::OUTER_REDECODE;
 
 use super::pretrain_reports::write_support_decode;
 
@@ -61,21 +60,17 @@ pub struct SupportMomentsArgs {
 /// moves a mass by 2.5e-7, which is 250,000 times this tolerance.
 pub const DEFAULT_MASS_TOLERANCE: f64 = 1e-12;
 
-/// One catch-all bin under all three decode conventions.
+/// One open-tail bin under geometric and fitted-moment conventions.
 #[derive(Clone, Copy, Debug)]
 struct CatchAll {
     /// Bin index, i.e. `0` or `NUM_BAR_BINS - 1`.
     bin: usize,
     /// Marginal probability of the bin.
     mass: f64,
-    /// What the bin decodes to today: the support BOUND.
+    /// Geometric support representative used by sampling and the CRPS grid.
     edge: f64,
-    /// The MEASURED conditional mean of the bin.
+    /// Persisted train-fitted conditional mean used by moment consumers.
     fitted: f64,
-    /// The hardcoded stand-in the investigation used before this was measured, or `NaN` on a
-    /// DOF the stand-in was never defined for. NOT zero: the stand-in is a two-bin constant for
-    /// `r` alone, and a zero there would read as "the stand-in said the bin decodes to zero".
-    stand_in: f64,
 }
 
 /// The census of one DOF's decode, under one convention.
@@ -180,13 +175,11 @@ pub struct SupportDecode {
     /// Numeric provenance for the r-bin diagnostic: -1 lower open tail, 0 continuous,
     /// 1 upper open tail, 2 explicit atom.
     r_bin_provenance: Vec<f64>,
-    /// Per-DOF census under the edge decode.
+    /// Per-DOF census under the geometric decode.
     edge_census: [DecodeCensus; BAR_DOF],
-    /// Per-DOF census under the fitted decode.
+    /// Per-DOF census under the persisted fitted-moment decode.
     fitted_census: [DecodeCensus; BAR_DOF],
-    /// Per-DOF census under the two-bin stand-in, defined for `r` only.
-    stand_in_census: [Option<DecodeCensus>; BAR_DOF],
-    /// The lower and upper catch-all of every DOF, under all three conventions.
+    /// The lower and upper open-tail bins of every DOF.
     catch_alls: [[CatchAll; 2]; BAR_DOF],
     /// Worst per-bin mass deviation the histogram identification tolerated, per DOF.
     mass_agreement: [f64; BAR_DOF],
@@ -232,28 +225,15 @@ impl SupportDecode {
             })
             .collect();
 
-        let stand_in_row = |dof: usize| -> Option<Vec<f64>> {
-            (dof == DOF_R).then(|| {
-                let mut row = edge[dof].clone();
-                row[0] = OUTER_REDECODE.0;
-                row[last] = OUTER_REDECODE.1;
-                row
-            })
-        };
         let edge_census = std::array::from_fn(|dof| DecodeCensus::measure(&edge[dof], &mass[dof]));
         let fitted_census =
             std::array::from_fn(|dof| DecodeCensus::measure(&fitted[dof], &mass[dof]));
-        let stand_in_census = std::array::from_fn(|dof| {
-            stand_in_row(dof).map(|row| DecodeCensus::measure(&row, &mass[dof]))
-        });
         let catch_alls = std::array::from_fn(|dof| {
-            let stand_in = stand_in_row(dof);
             [0usize, last].map(|bin| CatchAll {
                 bin,
                 mass: mass[dof][bin],
                 edge: edge[dof][bin],
                 fitted: fitted[dof][bin],
-                stand_in: stand_in.as_ref().map_or(f64::NAN, |row| row[bin]),
             })
         });
         Ok(Self {
@@ -266,7 +246,6 @@ impl SupportDecode {
             r_bin_provenance,
             edge_census,
             fitted_census,
-            stand_in_census,
             catch_alls,
             mass_agreement,
             rows,
@@ -275,13 +254,9 @@ impl SupportDecode {
 
     /// Per-DOF summary series, in the order the report writer consumes them.
     ///
-    /// EVERY fitted-decode label carries "NOT the production decode" and every edge label
-    /// carries "production", verbatim, in the SERIES LABEL rather than the title — the TUI's
-    /// `normalize_title` lowercases everything after each word's first letter, so a caveat in a
-    /// title is destroyed before a reader sees it, while series legends render as written. The
-    /// test is not whether the true number is drawn: it is whether a competent reader can still
-    /// conclude that the fitted numbers describe what the pipeline computes. With the
-    /// qualification attached to every line, they cannot.
+    /// Labels distinguish geometric representatives from fitted moments at every use. Geometry
+    /// remains exact for sampling/CRPS; predictive first and second moments use the persisted
+    /// fitted rows.
     pub fn summary_rows(&self) -> Vec<(String, Vec<f64>)> {
         let per_dof =
             |pick: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..BAR_DOF).map(pick).collect() };
@@ -296,9 +271,12 @@ impl SupportDecode {
             ),
         ];
         for (tag, census) in [
-            ("edge decode = PRODUCTION", &self.edge_census),
             (
-                "fitted decode = NOT the production decode",
+                "geometric support decode [sampling/CRPS]",
+                &self.edge_census,
+            ),
+            (
+                "persisted fitted conditional means [moments]",
                 &self.fitted_census,
             ),
         ] {
@@ -333,60 +311,19 @@ impl SupportDecode {
                 ),
             ]);
         }
-        // The stand-in's arm, non-finite on every DOF it was never defined for. The renderer
-        // drops non-finite points, so an undefined arm reads as ABSENT rather than as a
-        // measured zero — which for a decode constant would be a substantive and false claim.
-        let stand_in = |pick: &dyn Fn(&DecodeCensus) -> f64| -> Vec<f64> {
-            (0..BAR_DOF)
-                .map(|dof| {
-                    self.stand_in_census[dof]
-                        .as_ref()
-                        .map_or(f64::NAN, |census| pick(census))
-                })
-                .collect()
-        };
-        const STAND_IN: &str = "OUTER_REDECODE stand-in = r only, 2 bins, never measured";
-        rows.extend([
-            (
-                format!("catch-all share of |first moment|, % [{STAND_IN}]"),
-                stand_in(&|census| 100.0 * census.first_share),
-            ),
-            (
-                format!("catch-all share of central 2nd moment, % [{STAND_IN}]"),
-                stand_in(&|census| 100.0 * census.second_share),
-            ),
-            (
-                format!("catch-all share of that span, % [{STAND_IN}]"),
-                stand_in(&|census| 100.0 * census.span_share),
-            ),
-            (
-                format!("representable mean ceiling, bps [{STAND_IN}]"),
-                stand_in(&|census| census.ceiling * bps),
-            ),
-        ]);
+        // Every fitted value below comes directly from the persisted all-bin moment rows.
         for (slot, side) in [(0usize, "lower"), (1usize, "upper")] {
             rows.extend([
                 (
-                    format!("{side} catch-all decode, bps [edge = PRODUCTION]"),
+                    format!("{side} open-tail geometric representative, bps [sampling/CRPS]"),
                     per_dof(&|dof| self.catch_alls[dof][slot].edge * bps),
                 ),
                 (
-                    format!("{side} catch-all decode, bps [MEASURED conditional mean]"),
+                    format!("{side} open-tail E[x|bin], bps [PERSISTED fitted moment]"),
                     per_dof(&|dof| self.catch_alls[dof][slot].fitted * bps),
                 ),
                 (
-                    format!("{side} catch-all decode, bps [{STAND_IN}]"),
-                    per_dof(&|dof| self.catch_alls[dof][slot].stand_in * bps),
-                ),
-                (
-                    format!("{side} catch-all: stand-in minus MEASURED, bps"),
-                    per_dof(&|dof| {
-                        (self.catch_alls[dof][slot].stand_in - self.catch_alls[dof][slot].fitted)
-                            * bps
-                    }),
-                ),
-                (
-                    format!("{side} catch-all: edge minus MEASURED, bps"),
+                    format!("{side} open-tail: geometry minus fitted E[x|bin], bps"),
                     per_dof(&|dof| {
                         (self.catch_alls[dof][slot].edge - self.catch_alls[dof][slot].fitted) * bps
                     }),
@@ -498,11 +435,11 @@ impl SupportDecode {
                     .collect(),
             ),
             (
-                "edge decode, bps [PRODUCTION]".to_owned(),
+                "geometric representative, bps [sampling/CRPS]".to_owned(),
                 edge.iter().map(|d| d * bps).collect(),
             ),
             (
-                "fitted decode, bps [NOT the production decode]".to_owned(),
+                "E[x|bin], bps [PERSISTED train-fitted moment]".to_owned(),
                 fitted.iter().map(|d| d * bps).collect(),
             ),
             (
@@ -528,27 +465,28 @@ impl SupportDecode {
                 mass.iter().map(|p| 100.0 * p).collect(),
             ),
             (
-                "share of |first moment|, % [edge = PRODUCTION]".to_owned(),
+                "share of |first moment|, % [geometric representative]".to_owned(),
                 share(edge, mean_edge, false),
             ),
             (
-                "share of |first moment|, % [fitted = NOT production]".to_owned(),
+                "share of |first moment|, % [persisted fitted E[x|bin]]".to_owned(),
                 share(fitted, mean_fitted, false),
             ),
             (
-                "share of the decoded mean's estimation variance, % [edge = PRODUCTION]".to_owned(),
+                "share of decoded-mean estimation variance, % [geometric representative]"
+                    .to_owned(),
                 share(edge, mean_edge, true),
             ),
             (
-                "share of the decoded mean's estimation variance, % [fitted = NOT production]"
+                "share of decoded-mean estimation variance, % [persisted fitted E[x|bin]]"
                     .to_owned(),
                 share(fitted, mean_fitted, true),
             ),
         ]
     }
 
-    /// The lines the operator reads: the stand-in against the measurement, and the shares that
-    /// tell them whether the moments pass is sane.
+    /// The lines the operator reads: persisted fitted moments against geometric support
+    /// representatives, plus the shares that tell them whether the moments pass is sane.
     pub fn report_lines(&self) -> Vec<String> {
         let bps = 1e4;
         let mut lines = vec![format!(
@@ -562,11 +500,11 @@ impl SupportDecode {
         for dof in 0..BAR_DOF {
             let (edge, fitted) = (&self.edge_census[dof], &self.fitted_census[dof]);
             lines.push(format!(
-                "DOF {}: catch-alls hold {:.4}% of the mass and control, EDGE-decoded (the \
-                 production path), {:.4}% of |first moment| / {:.4}% of the decoded mean's \
-                 estimation variance / {:.4}% of a {:.4} bps reachable span; FITTED-decoded \
-                 {:.4}% / {:.4}% / {:.4}% of {:.4} bps. All-bin ceiling {:.4} -> {:.4} bps, \
-                 interior ceiling {:.4} -> {:.4} bps.",
+                "DOF {}: open tails hold {:.4}% of the mass and control, under GEOMETRIC \
+                 representatives, {:.4}% of |first moment| / {:.4}% of the decoded mean's \
+                 estimation variance / {:.4}% of a {:.4} bps reachable span; under PERSISTED \
+                 fitted E[x|bin], {:.4}% / {:.4}% / {:.4}% of {:.4} bps. All-bin ceiling \
+                 {:.4} -> {:.4} bps, interior ceiling {:.4} -> {:.4} bps.",
                 BAR_DOF_NAMES[dof],
                 100.0 * (self.catch_alls[dof][0].mass + self.catch_alls[dof][1].mass),
                 100.0 * edge.first_share,
@@ -584,36 +522,18 @@ impl SupportDecode {
             ));
             for side in &self.catch_alls[dof] {
                 let name = if side.bin == 0 { "lower" } else { "upper" };
-                if side.stand_in.is_finite() {
-                    lines.push(format!(
-                        "DOF {} {name} catch-all (bin {}, mass {:.6}%): edge {:.4} bps, stand-in \
-                         {:.4} bps, MEASURED {:.4} bps. The stand-in missed the measurement by \
-                         {:+.4} bps ({:+.2}% of it); the edge decode missed it by {:+.4} bps and \
-                         is {:.4}x too far out.",
-                        BAR_DOF_NAMES[dof],
-                        side.bin,
-                        100.0 * side.mass,
-                        side.edge * bps,
-                        side.stand_in * bps,
-                        side.fitted * bps,
-                        (side.stand_in - side.fitted) * bps,
-                        100.0 * ratio(side.stand_in - side.fitted, side.fitted.abs()),
-                        (side.edge - side.fitted) * bps,
-                        ratio(side.edge.abs(), side.fitted.abs()),
-                    ));
-                } else {
-                    lines.push(format!(
-                        "DOF {} {name} catch-all (bin {}, mass {:.6}%): edge {:.4} bps, MEASURED \
-                         {:.4} bps, so the edge decode is {:.4}x too far out. No stand-in was \
-                         ever defined for this DOF.",
-                        BAR_DOF_NAMES[dof],
-                        side.bin,
-                        100.0 * side.mass,
-                        side.edge * bps,
-                        side.fitted * bps,
-                        ratio(side.edge.abs(), side.fitted.abs()),
-                    ));
-                }
+                lines.push(format!(
+                    "DOF {} {name} open-tail bin {} (mass {:.6}%): geometric representative \
+                     {:.4} bps, persisted fitted E[x|bin] {:.4} bps; geometry differs by \
+                     {:+.4} bps and is {:.4}x as far from zero.",
+                    BAR_DOF_NAMES[dof],
+                    side.bin,
+                    100.0 * side.mass,
+                    side.edge * bps,
+                    side.fitted * bps,
+                    (side.edge - side.fitted) * bps,
+                    ratio(side.edge.abs(), side.fitted.abs()),
+                ));
             }
         }
         lines

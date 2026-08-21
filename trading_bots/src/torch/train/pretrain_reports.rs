@@ -4399,26 +4399,15 @@ pub fn write_mean_calibration(dir: &Path, label: &str, points: &[CalibrationPoin
             over(&|p| p.trade.model_edge().mean * 1e4),
         ),
         series_of("nll_bar conditional", over(&|p| p.nll_bar_conditional)),
-        // The two decode arms beside the as-traded slope, which is the whole decomposition: the
-        // as-traded slope is what the pipeline reads today, RE-DECODED is what it will read after
-        // the fix, and ZEROED bounds the correction from above. A checkpoint whose pass did not
-        // form the decomposition contributes a non-finite point, which the renderer drops, so an
-        // unmeasured arm reads as absent rather than as zero.
+        // The exact fitted-moment full law is the headline above. The interior-only arm keeps
+        // open-tail population evidence without introducing a second decode convention.
         series_of(
-            "beta, mean (re-decoded catch-alls)",
-            over(&|p| arm(p, &|outer| outer.redecoded.mean.beta)),
+            "beta, mean (fitted interior-only law)",
+            over(&|p| arm(p, &|outer| outer.interior.mean.beta)),
         ),
         series_of(
-            "beta, mean (zeroed catch-alls, upper bound)",
-            over(&|p| arm(p, &|outer| outer.zeroed.mean.beta)),
-        ),
-        series_of(
-            "beta, variance (re-decoded catch-alls)",
-            over(&|p| arm(p, &|outer| outer.redecoded.variance.beta)),
-        ),
-        series_of(
-            "beta, variance (zeroed catch-alls, upper bound)",
-            over(&|p| arm(p, &|outer| outer.zeroed.variance.beta)),
+            "beta, variance (fitted interior-only law)",
+            over(&|p| arm(p, &|outer| outer.interior.variance.beta)),
         ),
         series_of(
             "catch-all mass, % of the law per bar",
