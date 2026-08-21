@@ -290,35 +290,28 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// What promotion compares, recorded into every checkpoint's metadata and folded into its
 /// lineage hash.
 ///
-/// # The primary criterion is ECONOMIC, guarded by Hard categorical NLL
+/// # Two primary coordinates, each protected against resolved harm in the other
 ///
-/// This is the exact mirror of the earlier selection rule: that rule selected on the
-/// predictive score and guarded `r`; this one selects on realized trading edge and uses the
-/// canonical Hard categorical score for both predictive non-regression guards.
+/// Neither edge nor conditional NLL is a universal scalar objective. The legacy `bardist_v2`
+/// run showed why NLL alone is unsafe: its NLL-selected checkpoint carried a statistically
+/// resolved 0.0414 bps/bar edge regression. The recovery run showed the mirror image: the
+/// edge-selected step 14000 was dominated on the held-out split by the NLL-led step 19634
+/// (0.5060 vs 0.5471 bps/bar at 0.25x, 5.4122 vs 5.5034 at 4x, and 16.7312 vs 16.6317
+/// conditional NLL), with only quarter-Kelly Sharpe moving the other way (5.93 vs 5.79).
 ///
-/// The historical `bardist_v2` evidence was recorded under the legacy fixed-support
-/// mixed-measure diagnostic, not categorical NLL: its `r` score moved -4.8510 -> -4.9186
-/// nats and its conditional aggregate -9.2060 -> -9.3817 over 30000 steps. Those negative
-/// levels include the finite-bin measure constant and must not be relabeled as likelihoods.
-/// The model ordering is nevertheless the same as Hard on that frozen geometry, because the
-/// offset is prediction-independent. Over the same span the trading it exists to do got
-/// WORSE: the 0.25x cap edge fell 0.3796 -> 0.3717 -> 0.3382 bps/bar across the three
-/// passes, the headline 4x edge 5.0144 -> 4.7158 -> 4.3101, quarter-Kelly Sharpe from a peak
-/// of 6.28 at step 5000 to 4.96, and the realized hit rate 0.489 -> 0.485. The old rule
-/// promoted step 30000: the best predictive score of the run and one of its worst economic
-/// reads. Selecting on predictive score did not merely fail to help, it picked the bottom.
+/// The rule therefore admits either statistically resolved improvement, but only on the
+/// non-inferior frontier: a resolved edge regression vetoes an NLL-led move, and a resolved
+/// conditional-NLL regression vetoes an edge-led move. The likelihood of `r`, the traded
+/// factor, is an independent veto in both directions. An unresolved movement in both primary
+/// coordinates is not evidence that either model is better and leaves the incumbent standing.
 ///
-/// The arithmetic that explains it. Total achievable Kelly growth is `s^2/2` for a per-bar
-/// Sharpe `s`, which this bench measures at 5.25e-4 nats/bar — confirmed twice over, by the
-/// cap curve peaking at +5.44 bps at 8x and by fractional-Kelly theory putting quarter-Kelly
-/// at `(2c - c^2) * g_max` = 2.30 bps against +2.45 measured. So the ENTIRE tradeable content
-/// of the `r` prediction is 5.25e-4 nats/bar: roughly 0.011% of the score level and 0.8% of
-/// the improvement the optimizer banked. The categorical objective is ~10^4 times larger
-/// than the quantity traded and only incidentally aligned with it; directional structure is
-/// cheap in that objective, learned by step ~3000, and thereafter the mean can drift while
-/// the predicted tails remain wide.
+/// The `bardist_v2` evidence was recorded under the legacy fixed-support mixed-measure
+/// diagnostic, not categorical NLL: its negative levels include a finite-bin measure constant
+/// and must not be relabeled as likelihoods. Model ordering on that frozen geometry is still
+/// identical to Hard scoring because the offset is prediction-independent. The current rule
+/// and every promoted artifact state the canonical Hard categorical contract explicitly.
 ///
-/// # Why the criterion is the 0.25x cap column and not the 4x headline
+/// # Why the economic coordinate is the 0.25x cap column and not the 4x headline
 ///
 /// At the headline 4x cap, 85% of bars sit AT the cap: the position is `4 * sign(f*)` on most
 /// bars and `f*` on the rest, so the metric moves when the model's own `|f*|` inflates even
@@ -337,7 +330,7 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// and nothing more. Its per-bar turnover is logged beside it at every decision so a reader
 /// can see what the edge would cost to collect.
 ///
-/// # Both criteria on one ruler
+/// # Paired statistical Pareto rule
 ///
 /// Edge and NLL are both taken from the DIAGNOSTIC pass: the pinned val windows at the fixed
 /// [`PretrainArgs::diagnostic_context`], which every ramp stage has trained at and which does
@@ -347,20 +340,20 @@ pub const EVAL_WINDOW_SEED: u64 = 0xE7A1_5E7D_0001;
 /// rule actually runs at. Scoring the two criteria on two different passes would difference
 /// two different quantities. Eligibility is unchanged and still gated on the DEPLOYED
 /// context — a checkpoint the planner loads must have been trained at the positional range it
-/// runs at — and on this run the two rulers rank models identically for NLL (the 896 and 2048
-/// conditional figures agree to 0.0006-0.0022 nats at all twelve eligible reads and never
-/// disagree in sign), which is the evidence that the fixed ruler is not misleading.
+/// runs at.
 const SELECTION_METRIC: &str =
-    "net moment-correct quadratic Kelly edge over the unconditional-marginal null at the \
-     0.25x leverage cap, measured on the pinned val windows at the fixed diagnostic context, \
-     as a PAIRED per-window \
-     difference against the incumbent that must clear 2.0 paired standard errors; gated by \
-     TWO Hard categorical NLL non-regression guards on the same pass and the same windows: \
-     nll_bar_conditional at 2.0 paired SE and nll_dof[r] at 1.0 paired SE. The NLL-selected \
-     artifact the previous rule would have shipped is kept beside it as pretrain_best_nll.ot \
-     and scored on the test split, so the rules are compared rather than asserted";
+    "paired statistical Pareto selection on the pinned val windows at the fixed diagnostic \
+     context: promote a net moment-correct quadratic Kelly edge improvement over the \
+     unconditional-marginal null at the 0.25x leverage cap that clears 2.0 paired standard \
+     errors when conditional nll_bar and nll_dof[r] do not significantly regress, OR promote \
+     a conditional nll_bar improvement that clears 2.0 paired standard errors when economic \
+     edge and nll_dof[r] do not significantly regress. A significant regression in edge, \
+     conditional nll_bar, or nll_dof[r] vetoes promotion by the opposite arm; unresolved \
+     movement in both primary coordinates promotes nothing. The legacy NLL-only comparator \
+     is retained as pretrain_best_nll.ot only when it selects different weights and is never \
+     loaded by the planner";
 const SELECTION_WEIGHTS: [f64; BAR_DOF] = [1.0; BAR_DOF];
-/// Leverage cap the economic criterion is measured at. See [`SELECTION_METRIC`] for why the
+/// Leverage cap the economic coordinate is measured at. See [`SELECTION_METRIC`] for why the
 /// 0.25x column rather than the 4x headline: at 0.25x the position size is a constant of the
 /// rule, so the metric cannot be moved by the model inflating its own conditional mean.
 pub const SELECTION_CAP_SLOT: usize = 0;
@@ -370,8 +363,8 @@ const _: () = assert!(
     "the selection cap must be the lowest charted cap column, so the promotion criterion and \
      the charted cap curve are the same measurement"
 );
-/// Standard errors of the PAIRED edge difference a candidate must clear to displace the
-/// incumbent.
+/// Standard errors of the PAIRED edge difference required to resolve either an improvement or
+/// a regression.
 ///
 /// A single read's edge interval is ~+/-1.6 bps wide, so a naive argmax over the ~31 reads of
 /// a run promotes noise essentially every time. That interval is the LEVEL's, though, and the
@@ -382,42 +375,34 @@ const _: () = assert!(
 /// is the scale it will see, so at 2.0 SE the band is ~0.040 bps.
 ///
 /// 2.0 and not 1.0: one-sided, 1.0 SE is a 0.159 false-promotion rate per read, which over a
-/// dozen eligible reads makes a noise promotion near-certain, and because promotion is a
-/// RATCHET every noise promotion permanently raises the bar against genuine ones. 2.0 puts
-/// that rate at 0.023, bounds the expected number of noise promotions over a run's eligible
-/// reads at ~0.3, and bounds the noise inflation of the FINAL artifact at ~0.040 bps, 11% of
-/// the base. 2.0 and not 3.0: the damage the old rule actually shipped was a 0.0414 bps
+/// dozen eligible reads makes a noise promotion near-certain. 2.0 puts that rate at 0.023 and
+/// bounds the expected number of noise promotions over a run's eligible reads at ~0.3. 2.0
+/// and not 3.0: the damage the old NLL-only rule actually shipped was a 0.0414 bps
 /// epoch-over-epoch decline, 2.07 SE, so a 3.0-SE band would no longer resolve the very
-/// regression this rule exists to stop.
+/// regression the edge veto exists to stop.
 const SELECTION_EDGE_SE_MULTIPLE: f64 = 2.0;
 /// The factor the per-DOF guard protects.
 const SELECTION_GUARD_DOF: usize = DOF_R;
-/// Standard errors of the PAIRED `r` difference a candidate may drift before promotion is
-/// refused. At 1.0 any regression the bench can actually resolve blocks the promotion, and
-/// one it cannot resolve is by definition not evidence. UNCHANGED by the inversion of the
-/// primary criterion: `r` is the factor the trade is taken on, so a resolvable regression in
-/// it is the most sensitive detector available of an economic read that got lucky, and the
-/// economic criterion — resolvable only to ~5% — cannot substitute for it.
+/// Standard errors of the PAIRED `r` difference allowed before either Pareto arm is vetoed.
+/// At 1.0 any regression the bench can actually resolve blocks promotion. `r` is the factor
+/// the trade is taken on, so a resolved regression in its likelihood is evidence that neither
+/// an aggregate-NLL read nor an economic read alone is sufficient.
 const SELECTION_GUARD_SE_MULTIPLE: f64 = 1.0;
-/// Standard errors of the PAIRED `nll_bar_conditional` difference a candidate may regress by
-/// before promotion is refused, whatever its edge.
+/// Standard errors of the PAIRED `nll_bar_conditional` difference required to resolve either
+/// an improvement or a regression.
 ///
-/// Looser than [`SELECTION_GUARD_SE_MULTIPLE`] on purpose, and the asymmetry is the finding
-/// again. The aggregate is dominated by the intra-bar shape factors `s`, `u` and `v`, which
-/// carry over a nat of headroom each, cannot affect P&L, and move far more than `r` does; a
-/// 1-SE trip wire there would veto measured economic gains on movements in factors that the
-/// trade never touches. At 2.0 SE, with the paired conditional SE this bench resolves to
-/// ~2e-4 nats, the tolerance is ~4e-4 nats — about 76% of the ENTIRE 5.25e-4 nats/bar of
-/// tradeable content in the `r` prediction. So the guard fires only when Hard categorical
-/// NLL has regressed by an amount comparable to everything trading could ever extract from
-/// it, which is the only scale at which a predictive regression is economic evidence.
-const SELECTION_NLL_TOLERANCE_SE_MULTIPLE: f64 = 2.0;
-/// Name of the artifact holding what the PREVIOUS, NLL-primary rule would have promoted.
+/// The aggregate is dominated by the intra-bar shape factors `s`, `u` and `v`, which carry
+/// over a nat of headroom each and cannot affect P&L. At 2.0 SE, with the paired conditional
+/// SE this bench resolves to ~2e-4 nats, the band is ~4e-4 nats — about 76% of the entire
+/// 5.25e-4 nats/bar of tradeable content in the `r` prediction. The same calibrated band is
+/// used symmetrically: an NLL move past it may promote when edge is non-inferior, and an NLL
+/// regression past it vetoes an edge-led promotion.
+const SELECTION_NLL_SE_MULTIPLE: f64 = 2.0;
+/// Name of the artifact holding what the legacy NLL-only rule would have promoted.
 ///
-/// Kept as a first-class sidecar and scored on the test split beside the economically
-/// selected `pretrain_best.ot`, because a selection rule justified only by the run that
-/// motivated it is an assertion. Two artifacts on one held-out split is the comparison that
-/// makes it evidence. The planner never loads this file.
+/// It remains a deliberately unconstrained comparator for the test-split rule comparison,
+/// not a second deployable best. A duplicate final winner is deleted with its sidecars; the
+/// planner always loads `pretrain_best.ot`.
 const NLL_RULE_CHECKPOINT: &str = "pretrain_best_nll.ot";
 
 /// Monte-Carlo draws behind the independent per-DOF marginal NLLs, and the number of
@@ -1959,7 +1944,6 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         nll_rule_scores: None,
         nll_rule_step: 0,
         nll_rule_promotions: 0,
-        nll_rule_edge_bps: f64::NAN,
         promotions: 0,
         train_nll_sum: 0.0,
         train_nll_dof_sum: [0.0; BAR_DOF],
@@ -4157,37 +4141,33 @@ struct Trainer {
     bars_seen: u64,
     epoch: usize,
     best_val_nll_bar: f64,
-    /// Best conditional held-out NLL seen so far, which is what the RIVAL, NLL-primary rule
-    /// selects on. It decides [`NLL_RULE_CHECKPOINT`] and nothing else: the artifact the
-    /// planner loads is chosen economically. Still tracked and charted so the campaign stays
-    /// comparable to every run scored before the rule was inverted.
+    /// Best conditional held-out NLL seen so far, which the legacy NLL-only comparator selects
+    /// on. It decides [`NLL_RULE_CHECKPOINT`] and nothing else; the planner loads the paired
+    /// Pareto selection in `pretrain_best.ot`.
     best_val_nll_bar_conditional: f64,
-    /// Per-window vector of the checkpoint the ECONOMIC rule has promoted, which is what both
-    /// non-regression guards pair a candidate against.
+    /// Per-window vector of the checkpoint the paired Pareto rule has promoted. Both primary
+    /// coordinates and the `r` veto are paired against this same incumbent.
     best_scores: Option<WindowScores>,
-    /// Mean per-window edge at [`SELECTION_CAP`], in bps/bar, of the promoted checkpoint —
-    /// the value a candidate has to beat. `NEG_INFINITY` until the first promotion, so the
-    /// first eligible read promotes on eligibility alone.
+    /// Mean per-window edge at [`SELECTION_CAP`], in bps/bar, of the Pareto incumbent. An
+    /// edge-led candidate must improve it significantly; an NLL-led candidate must not
+    /// significantly regress it. `NEG_INFINITY` until the first promotion.
     best_selection_edge_bps: f64,
     /// Its per-window vector, which is what makes the candidate comparison PAIRED. Without it
     /// the rule could only difference two levels, whose interval is ~+/-1.6 bps and would
     /// resolve nothing at the 0.02 bps scale the decision lives at.
     best_selection_edge_windows: Option<Vec<f64>>,
     /// Conditional NLL of the promoted checkpoint on the selection pass, recorded so the
-    /// promotion line and the checkpoint metadata can both state the trade-off the economic
-    /// choice bought or paid for.
+    /// promotion line and checkpoint metadata state both Pareto coordinates.
     best_selection_nll: f64,
     /// Global step the promoted artifact's weights are from, so the terminal rule comparison
     /// names two steps rather than two file names.
     promoted_step: usize,
-    /// Per-window vector of the RIVAL, NLL-selected artifact, paired against by its own guard
-    /// so the two rules run under exactly the discipline each one claims.
+    /// Per-window vector of the legacy NLL-only comparator, paired against by its own `r`
+    /// guard so the historical rule comparison remains exact.
     nll_rule_scores: Option<WindowScores>,
-    /// Step, promotion count and economic reading of the rival artifact, for the terminal
-    /// comparison. Zero and `NAN` until it first writes.
+    /// Step and promotion count of the comparator artifact. Zero until it first writes.
     nll_rule_step: usize,
     nll_rule_promotions: usize,
-    nll_rule_edge_bps: f64,
     promotions: usize,
     /// Training NLL accumulated since the last epoch report, so the reported train
     /// curve is an average over the interval rather than one noisy minibatch.
@@ -4248,10 +4228,10 @@ struct Trainer {
     /// Context of the held-out set the currently promoted checkpoint was selected on. Zero
     /// until the first promotion.
     selection_context: i64,
-    /// Best conditional held-out NLL seen at EACH evaluation context, not only at the deployed
-    /// one. The deployed-context entry is what `pretrain_best.ot` holds and the only one the
-    /// planner may load; the diagnostic-context entry is what makes a run that never reached
-    /// the deployed context still have a defensible best rather than a last-step snapshot.
+    /// Best conditional held-out NLL seen at each evaluation context. This is a reporting
+    /// census, not the planner selection: the deployed-context entry is represented by the
+    /// legacy NLL-only comparator, while `pretrain_best.ot` is the paired-Pareto winner.
+    /// Short-run diagnostic-context bests retain their own explicitly named artifacts.
     best_by_context: BTreeMap<i64, f64>,
     /// The diagnostic-context best artifact, once one exists.
     diagnostic_best: Option<PathBuf>,
@@ -4309,9 +4289,8 @@ enum PromotionTarget {
 
 /// What a promotion decision measured, carried into the artifact it promoted.
 ///
-/// BOTH numbers, always, in both directions. A promotion that bought edge at the cost of
-/// density has to say so on the file itself, and one that improved both has to say that too,
-/// so a reader holding the checkpoint can see the trade-off without the run's log.
+/// BOTH numbers, always, in both directions, so a reader holding the checkpoint can tell which
+/// Pareto arm resolved and whether the other coordinate moved with or against it.
 #[derive(Clone, Copy, Debug)]
 struct SelectionRecord {
     step: usize,
@@ -4335,14 +4314,16 @@ pub enum SelectionOutcome {
     /// is not a refusal and must never read as one.
     NotEligible,
     Promoted,
-    /// The paired economic gain did not clear the noise band.
-    RefusedInsideNoise,
-    /// The conditional density regressed beyond tolerance.
+    /// Neither primary coordinate supplied an admissible statistically resolved improvement.
+    RefusedNoResolvedImprovement,
+    /// NLL improved significantly, but economic edge significantly regressed.
+    RefusedEdgeGuard,
+    /// Edge improved significantly, but conditional NLL significantly regressed.
     RefusedNllGuard,
-    /// The traded factor regressed beyond tolerance.
+    /// The traded factor significantly regressed.
     RefusedDofGuard,
-    /// The bench produced nothing comparable to the incumbent, so the criterion was unmeasured
-    /// at this read. Distinct from a refusal on the merits.
+    /// The bench produced nothing comparable to the incumbent, so the paired frontier was
+    /// unmeasured at this read. Distinct from a refusal on the merits.
     Unmeasurable,
 }
 
@@ -4385,9 +4366,9 @@ pub struct SelectionLedger {
     pub rotations: f64,
     pub nll_conditional: f64,
     /// Paired conditional-NLL difference against the incumbent, POSITIVE when the candidate is
-    /// worse, beside the tolerance the guard allowed.
+    /// worse, beside the symmetric band used to resolve improvements and regressions.
     pub nll_delta: f64,
-    pub nll_tolerance: f64,
+    pub nll_band: f64,
     pub incumbent_nll: f64,
     /// Paired difference of the guarded factor, same sign convention.
     pub dof_delta: f64,
@@ -4411,59 +4392,85 @@ impl SelectionLedger {
             rotations: f64::NAN,
             nll_conditional: f64::NAN,
             nll_delta: f64::NAN,
-            nll_tolerance: f64::NAN,
+            nll_band: f64::NAN,
             incumbent_nll: f64::NAN,
             dof_delta: f64::NAN,
         }
     }
 }
 
-/// THE promotion rule, as a pure function of what the bench and the density measured.
+fn significance_band(dispersion: Dispersion, multiple: f64) -> f64 {
+    if dispersion.se.is_finite() && dispersion.se >= 0.0 {
+        multiple * dispersion.se
+    } else {
+        f64::NAN
+    }
+}
+
+/// THE paired statistical Pareto promotion rule, as a pure function of the three paired
+/// measurements.
 ///
-/// Extracted from the validation loop so the rule can be exercised without a Trainer, a
-/// corpus or a card. A selection rule whose refusals can only be observed by completing a
-/// 31k-step run is a rule whose refusals are asserted rather than demonstrated, and this one
-/// exists primarily to REFUSE: on the run that motivated it, the honest verdict over twelve
-/// eligible reads is "nothing after the first was measurably better".
+/// Extracted from the validation loop so every arm and veto can be exercised without a
+/// Trainer, corpus, or card. Positive edge differences are improvements; negative NLL
+/// differences are improvements. Each primary coordinate uses its calibrated paired-SE band
+/// symmetrically:
 ///
-/// The order is the rule and is not arbitrary.
+/// * significant edge improvement promotes when conditional NLL does not significantly regress;
+/// * significant conditional-NLL improvement promotes when edge does not significantly regress;
+/// * a significant regression in either primary coordinate vetoes promotion by the other arm;
+/// * a significant `r`-factor regression vetoes either arm;
+/// * unresolved movement in both primary coordinates promotes nothing.
 ///
-/// 1. `first` short-circuits: there is no incumbent, so nothing is comparable and a run with
-///    no artifact has produced nothing anybody can act on.
-/// 2. Measurability, because an unmeasured criterion is not a verdict against a candidate.
-///    The incumbent stands and the read is recorded as unmeasured, not as a refusal.
-/// 3. The economic band. A candidate inside it is UNRESOLVED, not better, and the guards have
-///    nothing to protect against a promotion that is not going to happen anyway.
-/// 4. The two density guards, aggregate before per-factor. Both are non-regression vetoes, so
-///    neither can ever cause a promotion — only block one — which is what keeps the rule
-///    economic while still refusing a model whose density has genuinely broken.
-///
-/// Every comparison is `>` against a threshold derived from the PAIRED standard error of the
-/// same quantity, so a NaN measurement fails the band and passes the guards: an unresolved
-/// candidate does not displace an incumbent, and an unmeasured guard does not veto on
-/// evidence it does not have.
+/// `first` short-circuits only after the current candidate itself is measurable; paired deltas
+/// are intentionally absent without an incumbent. Every later decision requires finite paired
+/// edge, conditional-NLL and `r` evidence because either missing guard leaves Pareto dominance
+/// unresolved rather than clearing the candidate.
+
 fn selection_outcome(
     first: bool,
+    candidate_usable: bool,
     candidate_edge: &[f64],
     edge_gain: Option<Dispersion>,
-    nll_guard: Option<Dispersion>,
-    dof_guard: Option<Dispersion>,
+    nll_delta: Option<Dispersion>,
+    dof_delta: Option<Dispersion>,
 ) -> SelectionOutcome {
+    if !candidate_usable
+        || candidate_edge.is_empty()
+        || candidate_edge.iter().any(|value| !value.is_finite())
+    {
+        return SelectionOutcome::Unmeasurable;
+    }
     if first {
         return SelectionOutcome::Promoted;
     }
-    let Some(gain) = edge_gain.filter(|_| !candidate_edge.is_empty()) else {
+    let (Some(edge), Some(nll), Some(dof)) = (edge_gain, nll_delta, dof_delta) else {
         return SelectionOutcome::Unmeasurable;
     };
-    if !(gain.mean > SELECTION_EDGE_SE_MULTIPLE * gain.se.max(0.0)) {
-        return SelectionOutcome::RefusedInsideNoise;
+    let measured = |dispersion: Dispersion| {
+        dispersion.mean.is_finite() && dispersion.se.is_finite() && dispersion.se >= 0.0
+    };
+    if !measured(edge) || !measured(nll) || !measured(dof) {
+        return SelectionOutcome::Unmeasurable;
     }
-    if nll_guard
-        .is_some_and(|delta| delta.mean > SELECTION_NLL_TOLERANCE_SE_MULTIPLE * delta.se.max(0.0))
-    {
-        return SelectionOutcome::RefusedNllGuard;
+
+    let edge_band = significance_band(edge, SELECTION_EDGE_SE_MULTIPLE);
+    let nll_band = significance_band(nll, SELECTION_NLL_SE_MULTIPLE);
+    let edge_improved = edge.mean > edge_band;
+    let edge_regressed = edge.mean < -edge_band;
+    let nll_improved = nll.mean < -nll_band;
+    let nll_regressed = nll.mean > nll_band;
+    let edge_arm = edge_improved && !nll_regressed;
+    let nll_arm = nll_improved && !edge_regressed;
+    if !edge_arm && !nll_arm {
+        if edge_improved && nll_regressed {
+            return SelectionOutcome::RefusedNllGuard;
+        }
+        if nll_improved && edge_regressed {
+            return SelectionOutcome::RefusedEdgeGuard;
+        }
+        return SelectionOutcome::RefusedNoResolvedImprovement;
     }
-    if dof_guard.is_some_and(|delta| delta.mean > SELECTION_GUARD_SE_MULTIPLE * delta.se.max(0.0)) {
+    if dof.mean > significance_band(dof, SELECTION_GUARD_SE_MULTIPLE) {
         return SelectionOutcome::RefusedDofGuard;
     }
     SelectionOutcome::Promoted
@@ -4742,10 +4749,10 @@ impl Trainer {
         let elapsed = started.elapsed().as_secs_f64();
         println!(
             "pretrain finished: {} steps in {elapsed:.1}s ({:.2} step/s), {} promotions on the \
-             0.25x-cap edge criterion, promoted edge {:+.4} bps/bar with conditional nll \
-             {:.4} nats/bar; the promoted artifact's deployed-context held-out nll is {:.4} \
-             nats/bar under {} scoring ({:+.4} vs the calibrated marginal {:.4}, {:+.4} vs \
-             uniform {:.4})",
+             paired statistical Pareto frontier, promoted edge@0.25x {:+.4} bps/bar with \
+             conditional nll {:.4} nats/bar; the promoted artifact's deployed-context held-out \
+             nll is {:.4} nats/bar under {} scoring ({:+.4} vs the calibrated marginal {:.4}, \
+             {:+.4} vs uniform {:.4})",
             self.schedule.total_steps,
             self.schedule.total_steps as f64 / elapsed.max(1e-9),
             self.promotions,
@@ -4847,19 +4854,24 @@ impl Trainer {
             .map(|(context, best)| format!("{context} bars: {best:.4}"))
             .collect();
         println!(
-            "pretrain finished: best conditional held-out nll per evaluation context [{}]. NLL is \
-             the GUARD, not the criterion: the planner loads `pretrain_best.ot`, chosen on the \
-             0.25x-cap trade edge, and the NLL-best of the eligible reads is {}{}",
+            "pretrain finished: best conditional held-out nll per evaluation context [{}]. The \
+             planner loads `pretrain_best.ot`, chosen on the paired statistical Pareto \
+             frontier. The legacy NLL-only comparator is {}{}",
             per_context.join(", "),
-            if self.nll_rule_promotions > 0 {
+            if self.nll_rule_promotions == 0 {
+                "not written: no eligible read had finite conditional nll".to_owned()
+            } else if self.nll_rule_step == self.promoted_step {
                 format!(
-                    "{NLL_RULE_CHECKPOINT} from step {} ({} rival promotions), kept for the \
-                     test-split comparison and never loaded by the planner",
+                    "the same final step {} ({} comparator promotions), so the test battery \
+                     does not score duplicate weights",
                     self.nll_rule_step, self.nll_rule_promotions,
                 )
             } else {
-                "not written: no eligible read ever improved on the first one's conditional nll"
-                    .to_owned()
+                format!(
+                    "{NLL_RULE_CHECKPOINT} from step {} ({} comparator promotions), kept for the \
+                     test-split comparison and never loaded by the planner",
+                    self.nll_rule_step, self.nll_rule_promotions,
+                )
             },
             self.diagnostic_best.as_ref().map_or_else(
                 || ". No fixed-context best was ever written.".to_owned(),
@@ -5003,41 +5015,57 @@ impl Trainer {
         battery.selection_context = self.selection_context;
         battery.deployed_context = self.eval.promotion.context;
         battery.reached_context = self.reached_context;
-        battery.lr_plateau_fraction = self.schedule.lr_plateau_fraction;
         battery.trade = trade;
         for line in battery.trade.report_lines() {
             println!("test split {line}");
         }
         // The comparison that makes the inverted rule evidence rather than an assertion: the
-        // artifact the PREVIOUS rule would have shipped, scored on the SAME test set, in the
-        // same pass shape, at the same context.
+        // legacy NLL-only rule would have shipped, scored on the SAME test set and in the same
+        // pass shape only when it differs from the Pareto winner.
         let rival = self.nll_rule_battery(set, &battery)?;
         battery.nll_rule = rival;
         Ok((battery, dyn_identity))
     }
 
-    /// Score [`NLL_RULE_CHECKPOINT`] on the test split beside the promoted artifact.
+    /// Score the legacy NLL-only comparator on the test split beside the Pareto artifact.
     ///
-    /// `None` when the rival rule never wrote a file, which happens exactly when the first
-    /// eligible read held the best conditional NLL of the run: then both rules chose the same
-    /// weights and there is nothing to compare. That is a finding, and the terminal line says
-    /// so rather than leaving a silent gap.
-    ///
-    /// The two artifacts are scored on ONE set at ONE context and their difference is reported
-    /// in both currencies, so the trade-off the economic rule accepted is measured on data that
-    /// fed neither rule's decision. This is the only place the test split is allowed to see two
-    /// models, and it still sees each exactly once.
+    /// `None` when the legacy rule and the Pareto rule chose the same final step. In that case
+    /// the duplicate comparator and its sidecars are removed without a second test evaluation.
+    /// When they differ, both artifacts are scored on one set at one context.
     fn nll_rule_battery(
         &self,
         set: &PinnedSet,
         promoted: &TestBattery,
     ) -> Result<Option<RivalSelection>> {
         let checkpoint = self.run.weights.join(NLL_RULE_CHECKPOINT);
+        if self.nll_rule_step == self.promoted_step {
+            for redundant in [
+                world_model_metadata_path(&checkpoint),
+                world_model_supports_path(&checkpoint, self.args.resolution_secs),
+                window_scores_path(&checkpoint),
+                checkpoint.clone(),
+            ] {
+                if redundant.exists() {
+                    std::fs::remove_file(&redundant).with_context(|| {
+                        format!(
+                            "failed removing redundant comparator {}",
+                            redundant.display()
+                        )
+                    })?;
+                }
+            }
+            println!(
+                "test split: paired Pareto and legacy NLL-only selection both chose step {}; \
+                 the duplicate comparator artifact and sidecars were removed without scoring. \
+                 `pretrain_best.ot` remains the planner artifact.",
+                self.promoted_step,
+            );
+            return Ok(None);
+        }
         if !checkpoint.exists() {
             println!(
-                "test split: the NLL rule wrote no rival artifact — no eligible read improved on \
-                 the first one's conditional nll, so both rules selected the same weights and \
-                 there is nothing to compare. The economic rule cost nothing here."
+                "test split: the legacy NLL-only rule wrote no comparator artifact, so only the \
+                 paired Pareto winner is scored."
             );
             return Ok(None);
         }
@@ -5045,8 +5073,9 @@ impl Trainer {
         let world =
             BarWorldModel::load(&checkpoint, &metadata, self.device).with_context(|| {
                 format!(
-                    "the NLL-selected rival {} could not be reloaded for the test comparison",
-                    checkpoint.display()
+                    "the legacy NLL-only comparator {} could not be reloaded for the test \
+                     comparison",
+                    checkpoint.display(),
                 )
             })?;
         let stats = evaluate(
@@ -5067,20 +5096,21 @@ impl Trainer {
             step: self.nll_rule_step,
             nll_bar_conditional: stats.nll_bar_conditional,
             nll_dof: stats.nll_dof,
-            // `CapPoint::edge` is net log growth per bar; the criterion is bps, as everywhere.
+            // `CapPoint::edge` is net log growth per bar; the Pareto coordinate is reported in
+            // bps everywhere.
             selection_edge_bps: trade.cap_curve[SELECTION_CAP_SLOT].edge * 1.0e4,
             edge_at_default: trade.model_edge().mean * 1.0e4,
             sharpe: trade.policies[trade_bench::POLICY_QUARTER].sharpe,
         };
         let promoted_edge = promoted.trade.cap_curve[SELECTION_CAP_SLOT].edge * 1.0e4;
         println!(
-            "test split RULE COMPARISON on {} windows at context {}: ECONOMIC pick (step {}) \
+            "test split RULE COMPARISON on {} windows at context {}: PARETO pick (step {}) \
              edge@{SELECTION_CAP:.2}x {promoted_edge:+.4} bps/bar, 4x edge {:+.4}, \
-             quarter-quadratic-Kelly sharpe {:+.2}, conditional nll {:.4}; NLL pick (step {}) \
-             edge@{SELECTION_CAP:.2}x {:+.4}, 4x edge {:+.4}, quarter-quadratic-Kelly sharpe {:+.2}, \
-             conditional nll {:.4}. The economic rule bought {:+.4} bps/bar of 0.25x edge for \
-             {:+.4} nats of conditional nll (negative means it cost nothing and gained on both). \
-             Neither number fed either decision: this is the split that was touched once.",
+             quarter-quadratic-Kelly sharpe {:+.2}, conditional nll {:.4}; legacy NLL-only \
+             comparator (step {}) edge@{SELECTION_CAP:.2}x {:+.4}, 4x edge {:+.4}, \
+             quarter-quadratic-Kelly sharpe {:+.2}, conditional nll {:.4}. Pareto minus \
+             comparator: edge {:+.4} bps/bar, conditional nll {:+.4} nats/bar. Neither number \
+             fed either decision: this is the split that was touched once.",
             set.windows.len(),
             set.context,
             self.promoted_step,
@@ -5437,9 +5467,9 @@ impl Trainer {
                 dispersion.minimum_detectable_effect(),
             );
             // ---------------------------------------------------------------------------
-            // The decision. The PRIMARY criterion is economic; the density is the guard.
-            // [`SELECTION_METRIC`] carries the measurement that inverted this and the
-            // calibration of every threshold below.
+            // The decision. Edge and conditional NLL are symmetric promotion arms; each may
+            // promote only when the other is statistically non-inferior, and `r` may veto both.
+            // [`SELECTION_METRIC`] states the full persisted contract and calibration.
             //
             // Both criteria are read off the DIAGNOSTIC pass: one pinned set at one fixed
             // context that never moves for the life of the run, and the only context the
@@ -5454,19 +5484,25 @@ impl Trainer {
             let candidate_edge = self.selection_edge_windows(&diagnostic.trade_paths);
             let edge_level = self.bootstrap_traded(&self.eval.diagnostic, &candidate_edge);
             let edge_gain = self.selection_edge_gain(&self.eval.diagnostic, &candidate_edge);
-            let nll_guard = self.conditional_regression(&self.eval.diagnostic, &diagnostic_scores);
-            let dof_guard = self.returns_regression(&self.eval.diagnostic, &diagnostic_scores);
+            let nll_delta = self.conditional_difference(&self.eval.diagnostic, &diagnostic_scores);
+            let dof_delta = self.returns_difference(&self.eval.diagnostic, &diagnostic_scores);
+            let candidate_usable = selection_nll.is_finite()
+                && !diagnostic_scores.windows.is_empty()
+                && diagnostic_scores
+                    .windows
+                    .iter()
+                    .all(|window| window.nll_dof[SELECTION_GUARD_DOF].is_finite());
             // Thresholds in the units the decision is taken in, so the log states the number
             // that was actually compared rather than a multiple the reader has to apply.
             let edge_band = edge_gain.map_or(f64::NAN, |gain| {
-                SELECTION_EDGE_SE_MULTIPLE * gain.se.max(0.0)
+                significance_band(gain, SELECTION_EDGE_SE_MULTIPLE)
             });
-            let nll_tolerance = nll_guard.map_or(f64::NAN, |delta| {
-                SELECTION_NLL_TOLERANCE_SE_MULTIPLE * delta.se.max(0.0)
+            let nll_band = nll_delta.map_or(f64::NAN, |delta| {
+                significance_band(delta, SELECTION_NLL_SE_MULTIPLE)
             });
             // The bench's own row at the selection cap. Read once rather than indexed twice:
-            // the criterion, the exposure it was collected at and the rotation rate that pays
-            // for it all have to come from ONE measurement of ONE policy.
+            // the edge coordinate, the exposure it was collected at and the rotation rate that
+            // pays for it all have to come from ONE measurement of ONE policy.
             let cap_point = trade.cap_curve[SELECTION_CAP_SLOT];
             ledger = SelectionLedger {
                 outcome: SelectionOutcome::Unmeasurable,
@@ -5483,14 +5519,13 @@ impl Trainer {
                 // carried no position cannot inflate the rotation rate.
                 rotations: cap_point.turnover / cap_point.mean_abs_position,
                 nll_conditional: selection_nll,
-                nll_delta: nll_guard.map_or(f64::NAN, |delta| delta.mean),
-                nll_tolerance,
+                nll_delta: nll_delta.map_or(f64::NAN, |delta| delta.mean),
+                nll_band,
                 incumbent_nll: self.best_selection_nll,
-                dof_delta: dof_guard.map_or(f64::NAN, |delta| delta.mean),
+                dof_delta: dof_delta.map_or(f64::NAN, |delta| delta.mean),
             };
-            // Every decision states BOTH numbers and both incumbents, in the order the rule
-            // reads them, so a promotion that bought edge at the cost of density and one that
-            // improved both are distinguishable at a glance instead of by reconstruction.
+            // Every decision states BOTH coordinates and both incumbents so either Pareto arm
+            // and every veto can be reconstructed from the log without another channel.
             println!(
                 "step {step}: SELECTION on the {}-bar ruler — edge@{SELECTION_CAP:.2}x \
                  {:+.4} bps/bar (level SE {:.4}, turnover {:.3}/bar absolute at gross {:.3}, \
@@ -5507,25 +5542,27 @@ impl Trainer {
             );
             let outcome = selection_outcome(
                 forced || self.promotions == 0,
+                candidate_usable,
                 &candidate_edge,
                 edge_gain,
-                nll_guard,
-                dof_guard,
+                nll_delta,
+                dof_delta,
             );
             // Reporting only. [`selection_outcome`] already decided; this says why, in the
             // units the decision was taken in, so the log states the numbers that were
             // compared rather than multiples a reader has to apply.
             match outcome {
                 SelectionOutcome::Promoted if forced || self.promotions == 0 => {
-                    // Unconditional. There is no incumbent to beat, and a run whose only
-                    // artifact is an unevaluated `pretrain_last.ot` has produced nothing
-                    // anybody can act on. `forced` additionally means the run never reached
-                    // the deployed context, which is a stated caveat on the file; no selection
-                    // at all is a wasted run.
+                    // No incumbent exists, so paired deltas cannot decide. The current edge,
+                    // conditional NLL and `r` scores were still required to be finite above:
+                    // the first promotion is comparison-free, not measurement-free. `forced`
+                    // additionally means the run never reached deployed context, which is a
+                    // stated caveat on the artifact.
                     println!(
-                        "step {step}: FIRST promotion at the {}-bar context{} — there is no \
-                         incumbent to pair against, so neither the noise band nor either guard \
-                         is applicable and the artifact is written on eligibility alone.",
+                        "step {step}: FIRST promotion at the {}-bar context{} — the current \
+                         edge, conditional NLL and r score are measured, but there is no \
+                         incumbent to pair against, so the artifact is written without a \
+                         paired comparison.",
                         selected_context,
                         if forced {
                             format!(
@@ -5540,86 +5577,92 @@ impl Trainer {
                     );
                 }
                 SelectionOutcome::Unmeasurable => {
-                    // The bench is the criterion, so a read the bench could not measure is a
-                    // read that cannot decide. Refusing keeps the incumbent, which is the safe
-                    // half.
+                    // Edge is required to establish the paired frontier at all. Refusing keeps
+                    // the incumbent, which is the safe half.
                     println!(
                         "step {step}: REFUSING promotion — the trade bench produced no vector \
                          comparable to the incumbent's ({} traded windows against the \
-                         incumbent's {}), so the economic criterion is unmeasured at this read. \
-                         The incumbent stands; this is not evidence against the candidate.",
+                         incumbent's {}), so the paired Pareto comparison is unmeasurable at \
+                         this read. The incumbent stands; this is not evidence against the \
+                         candidate.",
                         candidate_edge.len(),
                         self.best_selection_edge_windows
                             .as_ref()
                             .map_or(0, Vec::len),
                     );
                 }
-                SelectionOutcome::RefusedInsideNoise => {
-                    let gain = edge_gain.expect("a measurable comparison implies a gain");
+                SelectionOutcome::RefusedNoResolvedImprovement => {
+                    let edge = edge_gain.expect("a measurable comparison implies an edge delta");
                     println!(
-                        "step {step}: REFUSING promotion — paired edge gain {:+.4} +/- {:.4} \
-                         bps/bar does not clear the {SELECTION_EDGE_SE_MULTIPLE:.1}-SE band \
-                         ({edge_band:+.4}). A single read's edge INTERVAL is ~+/-1.6 bps and \
-                         the within-cell read-to-read sd is ~0.02 bps, so an argmax over a \
-                         run's reads promotes noise; a candidate inside the band is not \
-                         better, it is unresolved.",
-                        gain.mean, gain.se,
+                        "step {step}: REFUSING promotion — neither Pareto arm supplied an \
+                         admissible resolved improvement: paired edge delta {:+.4} +/- {:.4} \
+                         bps/bar against its {edge_band:.4} band; paired conditional-nll delta \
+                         {:+.4} nats against its {nll_band:.6} band (+ means worse). Unresolved \
+                         movement cannot promote, and a resolved deterioration is not an \
+                         improvement.",
+                        edge.mean, edge.se, ledger.nll_delta,
+                    );
+                }
+                SelectionOutcome::RefusedEdgeGuard => {
+                    let edge = edge_gain.expect("an edge veto implies a measured edge delta");
+                    let nll = nll_delta.expect("an NLL-led promotion implies a measured delta");
+                    println!(
+                        "step {step}: REFUSING promotion — conditional nll IMPROVED by {:.4} \
+                         nats, clearing its {SELECTION_NLL_SE_MULTIPLE:.1}-SE band \
+                         ({nll_band:.6}), but economic edge REGRESSED by {:.4} bps/bar, beyond \
+                         its {SELECTION_EDGE_SE_MULTIPLE:.1}-SE band ({edge_band:.4}). A \
+                         resolved economic regression vetoes the NLL arm.",
+                        -nll.mean, -edge.mean,
                     );
                 }
                 SelectionOutcome::RefusedNllGuard => {
-                    let delta = nll_guard.expect("a regression implies a measured delta");
+                    let delta = nll_delta.expect("an NLL veto implies a measured delta");
                     println!(
-                        "step {step}: REFUSING promotion — edge improved by {:+.4} bps/bar, \
-                         which clears the band, but conditional nll REGRESSED by {:+.4} nats \
-                         against the incumbent, more than the \
-                         {SELECTION_NLL_TOLERANCE_SE_MULTIPLE:.1} paired SE \
-                         ({nll_tolerance:.6}) the guard allows. At this bench's paired \
-                         resolution that tolerance is comparable to the ENTIRE 5.25e-4 \
-                         nats/bar of tradeable content in the r prediction, so a regression \
-                         past it is a density that has genuinely broken rather than one that \
-                         merely moved.",
+                        "step {step}: REFUSING promotion — economic edge IMPROVED by {:+.4} \
+                         bps/bar, clearing its {SELECTION_EDGE_SE_MULTIPLE:.1}-SE band \
+                         ({edge_band:.4}), but conditional nll REGRESSED by {:+.4} nats, beyond \
+                         its {SELECTION_NLL_SE_MULTIPLE:.1}-SE band ({nll_band:.6}). A resolved \
+                         predictive regression vetoes the edge arm.",
                         edge_gain.map_or(f64::NAN, |gain| gain.mean),
                         delta.mean,
                     );
                 }
                 SelectionOutcome::RefusedDofGuard => {
-                    let delta = dof_guard.expect("a regression implies a measured delta");
+                    let delta = dof_delta.expect("an r veto implies a measured delta");
+                    let dof_band = significance_band(delta, SELECTION_GUARD_SE_MULTIPLE);
                     println!(
-                        "step {step}: REFUSING promotion — edge improved by {:+.4} bps/bar and \
-                         the aggregate density held, but {} regressed by {:+.4} nats, more \
-                         than the {SELECTION_GUARD_SE_MULTIPLE:.1} paired SE ({:.6}) the guard \
-                         allows. {} is the factor the trade is actually taken on and is \
-                         resolved ~100x better than the edge is, so a resolvable regression in \
-                         it outranks an economic read that could still be luck.",
-                        edge_gain.map_or(f64::NAN, |gain| gain.mean),
+                        "step {step}: REFUSING promotion — a primary coordinate cleared its \
+                         paired band, but {} regressed by {:+.4} nats, more than the \
+                         {SELECTION_GUARD_SE_MULTIPLE:.1}-SE band ({dof_band:.6}) allowed. {} \
+                         is the traded factor and vetoes either Pareto arm.",
                         BAR_DOF_NAMES[SELECTION_GUARD_DOF],
                         delta.mean,
-                        delta.se,
                         BAR_DOF_NAMES[SELECTION_GUARD_DOF],
                     );
                 }
                 SelectionOutcome::Promoted => {
-                    let gain = edge_gain.expect("a cleared band implies a gain");
+                    let edge = edge_gain.expect("a measurable promotion implies an edge delta");
+                    let edge_led = edge.mean > edge_band;
+                    let nll_led = ledger.nll_delta < -nll_band;
                     println!(
-                        "step {step}: PROMOTING — paired edge gain {:+.4} +/- {:.4} bps/bar \
-                         clears the {SELECTION_EDGE_SE_MULTIPLE:.1}-SE band ({edge_band:+.4}); \
-                         conditional nll {} by {:+.4} nats against a tolerance of \
-                         {nll_tolerance:.6}; paired {} delta {:+.4} nats. {}",
-                        gain.mean,
-                        gain.se,
-                        if ledger.nll_delta <= 0.0 {
-                            "IMPROVED"
-                        } else {
-                            "COST, and this promotion is paying for its edge with density:"
-                        },
-                        -ledger.nll_delta,
+                        "step {step}: PROMOTING on the {}{}{} arm — paired edge delta {:+.4} \
+                         +/- {:.4} bps/bar against its {edge_band:.4} band; paired \
+                         conditional-nll delta {:+.4} nats against its {nll_band:.6} band; \
+                         paired {} delta {:+.4} nats. {}",
+                        if edge_led { "edge" } else { "" },
+                        if edge_led && nll_led { "+" } else { "" },
+                        if nll_led { "NLL" } else { "" },
+                        edge.mean,
+                        edge.se,
+                        ledger.nll_delta,
                         BAR_DOF_NAMES[SELECTION_GUARD_DOF],
                         ledger.dof_delta,
-                        if ledger.nll_delta > 0.0 {
-                            "The trade-off is recorded in the artifact's metadata; the \
-                             NLL-selected alternative is kept beside it under its own name."
+                        if nll_delta.is_some() && dof_delta.is_some() {
+                            "The other primary coordinate is statistically non-inferior and \
+                             the traded-factor veto is clear."
                         } else {
-                            "Both criteria moved the same way at this read."
+                            "An optional comparison was unmeasured and therefore supplied \
+                             neither improvement nor veto evidence."
                         },
                     );
                 }
@@ -5643,18 +5686,17 @@ impl Trainer {
                 self.best_selection_edge_windows = Some(candidate_edge);
                 self.best_selection_nll = selection_nll;
                 self.promoted_step = step;
-                // The guards pair against the DIAGNOSTIC vector because that is the ruler the
-                // decision was taken on; the sidecar written beside the weights stays the
+                // Both Pareto coordinates and the `r` veto pair against the DIAGNOSTIC vector
+                // because that is the ruler the decision used; the persisted sidecar stays the
                 // deployed-context vector, so cross-run pairing is unchanged.
                 self.best_scores = Some(diagnostic_scores);
                 self.promotions += 1;
                 self.selection_context = selected_context;
             }
-            // The RIVAL rule, replayed unchanged on every eligible read: primary
-            // `nll_bar_conditional` on the deployed pass, guarded by paired `nll_dof[r]`. It
-            // is what the previous rule would have shipped, and it is kept so the inversion
-            // is evidence on the test split rather than an assertion. See
-            // [`Self::promote_nll_rule`].
+            // The legacy NLL-only comparator, replayed unchanged on every eligible read:
+            // primary `nll_bar_conditional` on the deployed pass, guarded by paired
+            // `nll_dof[r]`. It records what the former rule would have shipped without
+            // affecting the planner artifact. See [`Self::promote_nll_rule`].
             self.promote_nll_rule(step, &scores, target, ledger.edge_bps)?;
             promotion_stats = Some(stats);
         }
@@ -6199,9 +6241,9 @@ impl Trainer {
             return Ok(());
         }
         self.record_context_best(context, selection);
-        // The deployed-context NLL best is [`NLL_RULE_CHECKPOINT`], written by
-        // `promote_nll_rule`; the artifact the planner loads is chosen economically. This path
-        // only ever owns the diagnostic-context name.
+        // The deployed-context NLL comparator is [`NLL_RULE_CHECKPOINT`], written by
+        // `promote_nll_rule`; the artifact the planner loads is Pareto-selected. This path only
+        // ever owns the diagnostic-context name.
         if context == self.eval.promotion.context {
             return Ok(());
         }
@@ -6247,16 +6289,14 @@ impl Trainer {
         }
     }
 
-    /// The RIVAL selection rule, replayed on every eligible read: primary
+    /// The legacy NLL-only comparator, replayed on every eligible read: primary
     /// `nll_bar_conditional` on the deployed-context pass, gated by the paired `nll_dof[r]`
     /// guard at [`SELECTION_GUARD_SE_MULTIPLE`]. Writes [`NLL_RULE_CHECKPOINT`], which the
     /// planner never loads.
     ///
-    /// This is the rule that shipped before the inversion, run UNCHANGED and in full — same
-    /// primary, same guard, same multiple, same pass, same windows — so the terminal
-    /// test-split comparison is between the new rule and the REAL previous rule rather than a
-    /// strawman reconstruction of it. Without this artifact the inversion is an assertion;
-    /// with it there are two checkpoints on one held-out split and the claim is checkable.
+    /// Its semantics are deliberately narrow and historical: it shows what the former rule
+    /// would have shipped without the Pareto edge veto. The test battery omits it when its final
+    /// step equals the Pareto winner, so a rule comparison never duplicates the same weights.
     ///
     /// Deliberately NOT round-trip re-scored the way [`Self::promote`] is: that costs a full
     /// pass over the pinned set, this artifact is never deployed, and the reload below already
@@ -6276,16 +6316,17 @@ impl Trainer {
         let set = self.promotion_set(target);
         let context = set.context;
         let guard = self.nll_rule_regression(set, scores);
-        let regressed =
-            guard.is_some_and(|delta| delta.mean > SELECTION_GUARD_SE_MULTIPLE * delta.se.max(0.0));
+        let regressed = guard.is_some_and(|delta| {
+            delta.mean > significance_band(delta, SELECTION_GUARD_SE_MULTIPLE)
+        });
         let improved = selection < self.best_val_nll_bar_conditional;
         if !improved || regressed {
             return Ok(());
         }
         let previous = self.best_val_nll_bar_conditional;
         let path = self.run.weights.join(NLL_RULE_CHECKPOINT);
-        // The rival's artifact records BOTH numbers too, so the two files can be compared
-        // against each other without either run's log.
+        // The comparator artifact records both coordinates, so it can be compared to the
+        // planner artifact without either run's log.
         let record = SelectionRecord {
             step,
             bench_context: context,
@@ -6306,14 +6347,13 @@ impl Trainer {
         self.nll_rule_scores = Some(scores.clone());
         self.nll_rule_step = step;
         self.nll_rule_promotions += 1;
-        self.nll_rule_edge_bps = edge_bps;
         self.record_context_best(context, selection);
         println!(
-            "step {step}: the NLL RULE would have promoted here — conditional nll \
+            "step {step}: the legacy NLL-only comparator promoted here — conditional nll \
              {selection:.4} nats/bar at {context} bars, improving on {}, with the 0.25x edge at \
-             {edge_bps:+.4} bps/bar. Written to {} as the rival artifact. The planner loads the \
-             ECONOMICALLY selected pretrain_best.ot; this file exists so the two rules are \
-             compared on the test split instead of argued about.",
+             {edge_bps:+.4} bps/bar. Written to {} as a non-deployable comparator. The planner \
+             loads the paired-Pareto `pretrain_best.ot`; the test battery scores this artifact \
+             only if the final selected steps differ.",
             if previous.is_finite() {
                 format!("{previous:.4}")
             } else {
@@ -6531,21 +6571,21 @@ impl Trainer {
         ))
     }
 
-    /// Paired regression of the guarded factor against the ECONOMICALLY promoted checkpoint.
-    /// Positive means the candidate is worse at the factor the trade is taken on.
-    fn returns_regression(&self, set: &PinnedSet, candidate: &WindowScores) -> Option<Dispersion> {
+    /// Paired `r`-factor difference against the Pareto incumbent. Positive means the candidate
+    /// is worse at the factor the trade is taken on.
+    fn returns_difference(&self, set: &PinnedSet, candidate: &WindowScores) -> Option<Dispersion> {
         self.paired_difference(set, self.best_scores.as_ref(), candidate, |window| {
             window.nll_dof[SELECTION_GUARD_DOF]
         })
     }
 
-    /// Paired regression of the conditional aggregate against the same incumbent. Positive
-    /// means the candidate's density is worse.
+    /// Paired conditional-NLL difference against the Pareto incumbent. Positive means the
+    /// candidate is worse; negative means it improved.
     ///
     /// Unlike the scalar criteria above, this estimand is a sum of per-DOF ratios. Every
     /// resample therefore repeats raw numerators and denominators and recomputes both pooled
     /// checkpoint levels before differencing them.
-    fn conditional_regression(
+    fn conditional_difference(
         &self,
         set: &PinnedSet,
         candidate: &WindowScores,
@@ -6580,10 +6620,9 @@ impl Trainer {
         Some(difference)
     }
 
-    /// The rival NLL rule's own guard, pairing against the rival's own incumbent rather than
-    /// against the economically promoted artifact. Without this the two rules would not be
-    /// running the disciplines they claim, and the terminal comparison would be between the
-    /// new rule and a strawman.
+    /// The legacy NLL-only comparator's own `r` guard, paired against that comparator's
+    /// incumbent. This preserves the historical rule exactly rather than manufacturing an
+    /// easier baseline for the Pareto rule.
     fn nll_rule_regression(&self, set: &PinnedSet, candidate: &WindowScores) -> Option<Dispersion> {
         self.paired_difference(set, self.nll_rule_scores.as_ref(), candidate, |window| {
             window.nll_dof[SELECTION_GUARD_DOF]
@@ -6640,8 +6679,8 @@ impl Trainer {
         block_bootstrap(values, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED)
     }
 
-    /// Paired per-window difference of the economic criterion against the promoted
-    /// checkpoint's, in bps/bar. Positive means the candidate is economically better.
+    /// Paired per-window difference of the economic Pareto coordinate against the incumbent,
+    /// in bps/bar. Positive means the candidate is economically better.
     ///
     /// `None` until there is an incumbent vector of the same length to pair against.
     fn selection_edge_gain(&self, set: &PinnedSet, candidate: &[f64]) -> Option<Dispersion> {
@@ -9831,6 +9870,13 @@ mod tests {
             "selection metadata must name the predictive contract: {}",
             provenance.selection_metric
         );
+        assert!(
+            provenance
+                .selection_metric
+                .contains("paired statistical Pareto selection"),
+            "pretrain_best.ot metadata must name the rule that selected it: {}",
+            provenance.selection_metric
+        );
 
         std::fs::remove_dir_all(&runs).ok();
     }
@@ -11878,8 +11924,8 @@ mod tests {
         );
     }
 
-    /// A paired measurement with a chosen mean and standard error, for driving
-    /// [`selection_outcome`] over a synthetic sequence. Only `mean` and `se` are read.
+    /// A paired measurement with a chosen mean and standard error. Only `mean` and `se` enter
+    /// [`selection_outcome`]; the remaining fields keep the fixture structurally honest.
     fn paired(mean: f64, se: f64) -> Dispersion {
         Dispersion {
             mean,
@@ -11891,284 +11937,177 @@ mod tests {
         }
     }
 
-    /// One synthetic read: the criterion, the guarded density, and the noise each was
-    /// measured at. Scales are the ones `bardist_v2` actually produced — 0.02 bps of paired
-    /// edge SE, 0.05 nats of paired conditional-NLL SE, 0.0003 nats on `r`.
-    #[derive(Clone, Copy)]
-    struct Read {
-        step: usize,
-        edge_bps: f64,
-        nll: f64,
+    fn measured_edge() -> Vec<f64> {
+        vec![0.0; trade_bench::TRADE_WINDOWS]
     }
 
-    const EDGE_SE: f64 = 0.0204;
-    const NLL_SE: f64 = 0.0526;
+    const EDGE_SE: f64 = 0.0200;
+    const NLL_SE: f64 = 0.0500;
     const DOF_SE: f64 = 0.0003;
 
-    /// Replay [`selection_outcome`] over a sequence of reads exactly as `validate` does,
-    /// pairing each candidate against the standing incumbent. Returns the promoted step and
-    /// every decision, so a test can assert on the refusals and not only the winner.
-    fn replay(reads: &[Read]) -> (usize, Vec<(usize, SelectionOutcome)>) {
-        let mut incumbent: Option<Read> = None;
-        let mut trail = Vec::new();
-        let edge = vec![0.0; trade_bench::TRADE_WINDOWS];
-        for read in reads {
-            let outcome = match incumbent {
-                None => selection_outcome(true, &edge, None, None, None),
-                Some(inc) => selection_outcome(
+    #[test]
+    fn significant_edge_improvement_promotes_when_likelihood_is_non_inferior() {
+        let edge_band = SELECTION_EDGE_SE_MULTIPLE * EDGE_SE;
+        assert_eq!(
+            selection_outcome(
+                false,
+                true,
+                &measured_edge(),
+                Some(paired(1.01 * edge_band, EDGE_SE)),
+                // A small regression inside the symmetric NLL band is non-inferior.
+                Some(paired(0.25 * SELECTION_NLL_SE_MULTIPLE * NLL_SE, NLL_SE)),
+                Some(paired(0.0, DOF_SE)),
+            ),
+            SelectionOutcome::Promoted
+        );
+        assert_eq!(
+            selection_outcome(
+                false,
+                true,
+                &measured_edge(),
+                Some(paired(1.01 * edge_band, EDGE_SE)),
+                None,
+                None,
+            ),
+            SelectionOutcome::Unmeasurable,
+            "missing opposite-primary or traded-factor evidence cannot establish Pareto dominance"
+        );
+    }
+
+    /// Recovery-run final comparison: the edge move is positive but unresolved
+    /// (+0.0258 +/- 0.0190 bps/bar), while the ~0.1035-nat NLL improvement clears its paired
+    /// 2-SE band. This is the observation the edge-only ratchet incorrectly refused.
+    #[test]
+    fn significant_nll_improvement_promotes_when_edge_is_economically_non_inferior() {
+        assert_eq!(
+            selection_outcome(
+                false,
+                true,
+                &measured_edge(),
+                Some(paired(0.0258, 0.0190)),
+                Some(paired(-0.1035, NLL_SE)),
+                Some(paired(0.0, DOF_SE)),
+            ),
+            SelectionOutcome::Promoted,
+            "the NLL arm must promote a resolved predictive improvement when edge did not \
+             significantly regress"
+        );
+    }
+
+    /// `bardist_v2` counterexample: an NLL-led candidate regressed edge by 0.0414 bps/bar at
+    /// 0.0200 paired SE, a 2.07-SE loss. The symmetric edge band must preserve that veto.
+    #[test]
+    fn resolved_edge_regression_vetoes_an_nll_led_promotion() {
+        assert_eq!(
+            selection_outcome(
+                false,
+                true,
+                &measured_edge(),
+                Some(paired(-0.0414, EDGE_SE)),
+                Some(paired(-0.1760, NLL_SE)),
+                Some(paired(0.0, DOF_SE)),
+            ),
+            SelectionOutcome::RefusedEdgeGuard
+        );
+    }
+
+    #[test]
+    fn resolved_nll_regression_vetoes_an_edge_led_promotion() {
+        let edge_band = SELECTION_EDGE_SE_MULTIPLE * EDGE_SE;
+        let nll_band = SELECTION_NLL_SE_MULTIPLE * NLL_SE;
+        assert_eq!(
+            selection_outcome(
+                false,
+                true,
+                &measured_edge(),
+                Some(paired(1.01 * edge_band, EDGE_SE)),
+                Some(paired(1.01 * nll_band, NLL_SE)),
+                Some(paired(0.0, DOF_SE)),
+            ),
+            SelectionOutcome::RefusedNllGuard
+        );
+    }
+
+    #[test]
+    fn resolved_r_regression_vetoes_either_pareto_arm() {
+        let dof_band = SELECTION_GUARD_SE_MULTIPLE * DOF_SE;
+        for (edge, nll) in [
+            (
+                paired(3.0 * SELECTION_EDGE_SE_MULTIPLE * EDGE_SE, EDGE_SE),
+                paired(0.0, NLL_SE),
+            ),
+            (
+                paired(0.0, EDGE_SE),
+                paired(-3.0 * SELECTION_NLL_SE_MULTIPLE * NLL_SE, NLL_SE),
+            ),
+        ] {
+            assert_eq!(
+                selection_outcome(
                     false,
-                    &edge,
-                    Some(paired(read.edge_bps - inc.edge_bps, EDGE_SE)),
-                    // POSITIVE means the candidate is worse, which is the guard's convention.
-                    Some(paired(read.nll - inc.nll, NLL_SE)),
-                    Some(paired((read.nll - inc.nll) * 0.05, DOF_SE)),
+                    true,
+                    &measured_edge(),
+                    Some(edge),
+                    Some(nll),
+                    Some(paired(1.01 * dof_band, DOF_SE)),
                 ),
-            };
-            if outcome == SelectionOutcome::Promoted {
-                incumbent = Some(*read);
-            }
-            trail.push((read.step, outcome));
+                SelectionOutcome::RefusedDofGuard
+            );
         }
-        (
-            incumbent
-                .expect("the first eligible read always promotes")
-                .step,
-            trail,
-        )
     }
 
-    /// SELECT-ECON-001. When the economically best checkpoint and the NLL-best checkpoint are
-    /// DIFFERENT models, the rule promotes the economic one and the decision says what the
-    /// density cost.
-    ///
-    /// This is the whole point of the inversion and it is not hypothetical: on `bardist_v2`
-    /// the two rules disagree over the entire run. The NLL-primary rule promoted the LAST
-    /// eligible read, whose conditional NLL was the best of the run (-9.3817 nats at the fixed
-    /// 896-bar ruler) and whose 0.25x-cap edge was 0.34 bps/bar, near the worst; the economic
-    /// peak sat at 0.38-0.40 bps/bar around steps 7000-10364, where the NLL was 0.176 nats
-    /// WORSE. The arithmetic says that is the right trade: total achievable Kelly growth is
-    /// s^2/2 = 5.25e-4 nats/bar, so 0.176 nats of density is ~340x the entire tradeable
-    /// content of the prediction and cannot be paid for in anything we trade.
-    ///
-    /// The sequence below is that shape, compressed: edge falls monotonically while NLL
-    /// improves monotonically. A rule that selects on NLL lands on the last read. This one
-    /// must land on the first and must refuse every later read explicitly.
     #[test]
-    fn selection_prefers_the_economically_best_read_over_the_nll_best_one() {
-        // Each later read is worth 0.15 bps LESS - far outside the 2-SE band of 0.0408 - while
-        // its density improves by 0.5 nats, far more than the guard's 0.105-nat tolerance ever
-        // has to allow. Nothing here is marginal; the two criteria simply disagree.
-        let reads: Vec<Read> = (0..5)
-            .map(|i| Read {
-                step: 1000 * (i + 1),
-                edge_bps: 0.40 - 0.15 * i as f64,
-                nll: -9.0 - 0.5 * i as f64,
-            })
-            .collect();
-        let (promoted, trail) = replay(&reads);
-        assert_eq!(
-            promoted, 1000,
-            "the economically best read is the first one; a rule that promoted a later read \
-             selected on density, which is the behaviour being removed"
-        );
-        let nll_best = reads
-            .iter()
-            .min_by(|a, b| a.nll.total_cmp(&b.nll))
-            .expect("a non-empty sequence has an NLL minimum");
-        assert_ne!(
-            nll_best.step, promoted,
-            "this fixture is only a test of the inversion if the two rules disagree"
-        );
-        assert!(
-            trail[1..]
-                .iter()
-                .all(|(_, outcome)| *outcome == SelectionOutcome::RefusedInsideNoise),
-            "every later read is economically worse and must be refused on the CRITERION, not \
-             by a guard: {trail:?}"
-        );
-        // The cost is a real number the promotion has to be able to state, in both directions.
-        // The ledger records the paired difference against the incumbent, positive when the
-        // candidate is worse, so the promoted artifact's density gap against the NLL-best read
-        // is recoverable from the ledger rather than only from the log.
-        let cost = reads[0].nll - nll_best.nll;
-        assert!(
-            cost > 0.0,
-            "the economic pick is supposed to be paying for its edge with density here"
-        );
-        assert!(
-            cost > 5.25e-4,
-            "a density cost below the {:.3e} nats/bar of total achievable Kelly growth would \
-             make the trade-off untestable rather than favourable",
-            5.25e-4
-        );
-    }
-
-    /// SELECT-NOISE-001. A candidate whose economic gain is inside the paired noise band is
-    /// REFUSED, and the refusal is attributed to the band rather than to a guard.
-    ///
-    /// A single read's edge interval is ~+/-1.6 bps, so a naive argmax over the ~31 reads of a
-    /// run promotes noise essentially every time. That interval is the LEVEL's and is
-    /// common-mode across checkpoints scored on identical windows; the relevant scale is the
-    /// PAIRED one, ~0.02 bps within a (stage, epoch) cell. This test pins the band at that
-    /// scale from both sides: just inside is refused, just outside promotes. Without the second
-    /// half the rule could pass by refusing everything.
-    #[test]
-    fn a_candidate_inside_the_paired_noise_band_is_refused() {
-        let band = SELECTION_EDGE_SE_MULTIPLE * EDGE_SE;
-        let edge = vec![0.0; trade_bench::TRADE_WINDOWS];
-        // Identical density on both sides, so only the criterion can decide.
-        let inside = selection_outcome(
-            false,
-            &edge,
-            Some(paired(band * 0.99, EDGE_SE)),
-            Some(paired(0.0, NLL_SE)),
-            Some(paired(0.0, DOF_SE)),
-        );
-        assert_eq!(
-            inside,
-            SelectionOutcome::RefusedInsideNoise,
-            "a gain of {:.4} bps against a {:.4} bps band is unresolved, not better",
-            band * 0.99,
-            band
-        );
-        let outside = selection_outcome(
-            false,
-            &edge,
-            Some(paired(band * 1.01, EDGE_SE)),
-            Some(paired(0.0, NLL_SE)),
-            Some(paired(0.0, DOF_SE)),
-        );
-        assert_eq!(
-            outside,
-            SelectionOutcome::Promoted,
-            "a gain that clears the band with both guards flat must promote, or the rule is \
-             not a selection rule"
-        );
-        // Exactly at the band is refused: the comparison is strict, so a candidate that only
-        // equals its own noise scale does not displace an incumbent.
+    fn unresolved_movement_in_both_primary_coordinates_promotes_nothing() {
         assert_eq!(
             selection_outcome(
                 false,
-                &edge,
-                Some(paired(band, EDGE_SE)),
-                Some(paired(0.0, NLL_SE)),
+                true,
+                &measured_edge(),
+                Some(paired(0.99 * SELECTION_EDGE_SE_MULTIPLE * EDGE_SE, EDGE_SE,)),
+                Some(paired(-0.99 * SELECTION_NLL_SE_MULTIPLE * NLL_SE, NLL_SE,)),
                 Some(paired(0.0, DOF_SE)),
             ),
-            SelectionOutcome::RefusedInsideNoise,
-            "the band is a strict threshold"
+            SelectionOutcome::RefusedNoResolvedImprovement
         );
-        // An unresolvable measurement must not promote either. NaN fails `>` in both
-        // directions, and the branch order has to make that a refusal rather than a promotion.
         assert_eq!(
             selection_outcome(
                 false,
-                &edge,
+                true,
+                &measured_edge(),
                 Some(paired(f64::NAN, EDGE_SE)),
-                Some(paired(0.0, NLL_SE)),
+                Some(paired(f64::NAN, NLL_SE)),
                 Some(paired(0.0, DOF_SE)),
             ),
-            SelectionOutcome::RefusedInsideNoise,
-            "an unmeasurable gain must never displace an incumbent"
-        );
-        // No comparable bench vector at all is a THIRD state, distinct from a refusal on the
-        // merits: the incumbent stands but nothing was measured against it.
-        assert_eq!(
-            selection_outcome(false, &[], Some(paired(1.0, EDGE_SE)), None, None),
             SelectionOutcome::Unmeasurable,
-            "an unmeasured criterion is not evidence against the candidate"
-        );
-        assert_eq!(
-            selection_outcome(false, &edge, None, None, None),
-            SelectionOutcome::Unmeasurable,
-            "no paired vector means no comparison, whatever the level says"
+            "non-finite paired movements cannot displace an incumbent"
         );
     }
 
-    /// SELECT-GUARD-001. A density regression beyond tolerance BLOCKS promotion even when the
-    /// economic criterion improves by more than its band.
-    ///
-    /// The mirror of the rule that shipped until now, and the half that keeps the inversion
-    /// honest: selection is economic, but a model whose predictive law has genuinely broken is
-    /// not promotable on a trading read that could still be luck. Both guards are tested
-    /// because they protect different things - the aggregate density and the ONE factor the
-    /// trade is actually taken on - and because a guard that never fires is indistinguishable
-    /// from one that is not wired up.
     #[test]
-    fn a_density_regression_blocks_promotion_even_when_the_edge_improves() {
-        let edge = vec![0.0; trade_bench::TRADE_WINDOWS];
-        let band = SELECTION_EDGE_SE_MULTIPLE * EDGE_SE;
-        // A large, unambiguous economic gain: 100x the band. Nothing here is marginal on the
-        // criterion, so only a guard can produce a refusal.
-        let big_gain = || Some(paired(100.0 * band, EDGE_SE));
-        let nll_tolerance = SELECTION_NLL_TOLERANCE_SE_MULTIPLE * NLL_SE;
+    fn first_read_promotes_and_missing_edge_comparison_is_unmeasurable() {
         assert_eq!(
-            selection_outcome(
-                false,
-                &edge,
-                big_gain(),
-                Some(paired(nll_tolerance * 1.01, NLL_SE)),
-                Some(paired(0.0, DOF_SE)),
-            ),
-            SelectionOutcome::RefusedNllGuard,
-            "a conditional-NLL regression past {nll_tolerance:.6} nats must veto, however good \
-             the edge looks"
-        );
-        // Just inside the tolerance the same candidate promotes, which is what makes the guard
-        // a tolerance rather than a prohibition on any density movement at all. Selection is
-        // economic, and a density that merely MOVED is not one that broke.
-        assert_eq!(
-            selection_outcome(
-                false,
-                &edge,
-                big_gain(),
-                Some(paired(nll_tolerance * 0.99, NLL_SE)),
-                Some(paired(0.0, DOF_SE)),
-            ),
+            selection_outcome(true, true, &measured_edge(), None, None, None),
             SelectionOutcome::Promoted,
-            "a regression inside tolerance must not block an edge that cleared its band"
+            "the first eligible measured read has no incumbent and must leave a usable artifact"
         );
-        // The per-factor guard on `r`, the factor the trade is taken on. It is resolved ~100x
-        // better than the edge is, so it is held to a TIGHTER multiple, and it has to fire on
-        // a regression the aggregate guard would have waved through.
-        let dof_tolerance = SELECTION_GUARD_SE_MULTIPLE * DOF_SE;
-        assert!(
-            dof_tolerance < nll_tolerance,
-            "the guarded factor is resolved far better than the aggregate, so its tolerance \
-             must be the tighter of the two"
+        assert_eq!(
+            selection_outcome(true, false, &[], None, None, None),
+            SelectionOutcome::Unmeasurable,
+            "first-read status cannot turn an unusable current candidate into a checkpoint"
         );
         assert_eq!(
             selection_outcome(
                 false,
-                &edge,
-                big_gain(),
-                // Aggregate density IMPROVES, so only the per-factor guard can refuse.
-                Some(paired(-nll_tolerance, NLL_SE)),
-                Some(paired(dof_tolerance * 1.01, DOF_SE)),
-            ),
-            SelectionOutcome::RefusedDofGuard,
-            "a resolvable regression in {} must veto even when the aggregate density improved",
-            BAR_DOF_NAMES[SELECTION_GUARD_DOF]
-        );
-        // Neither guard can CAUSE a promotion. A density improvement with no economic gain is
-        // refused on the criterion, which is the property that makes selection economic rather
-        // than a two-criterion compromise.
-        assert_eq!(
-            selection_outcome(
                 false,
-                &edge,
-                Some(paired(0.0, EDGE_SE)),
-                Some(paired(-10.0 * nll_tolerance, NLL_SE)),
-                Some(paired(-10.0 * dof_tolerance, DOF_SE)),
+                &[],
+                Some(paired(1.0, EDGE_SE)),
+                Some(paired(-1.0, NLL_SE)),
+                None,
             ),
-            SelectionOutcome::RefusedInsideNoise,
-            "an enormous density improvement with no edge gain must NOT promote; the guards \
-             are vetoes, not criteria"
+            SelectionOutcome::Unmeasurable
         );
-        // And a guard with nothing measured cannot veto on evidence it does not have.
         assert_eq!(
-            selection_outcome(false, &edge, big_gain(), None, None),
-            SelectionOutcome::Promoted,
-            "an unmeasured guard must not block a resolved economic gain"
+            selection_outcome(false, true, &measured_edge(), None, None, None),
+            SelectionOutcome::Unmeasurable
         );
     }
 }

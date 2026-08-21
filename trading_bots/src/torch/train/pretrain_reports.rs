@@ -710,36 +710,30 @@ pub struct TestBattery {
     pub lr_plateau_fraction: f64,
     /// The trading bench on the TEST split, with the identical policy set.
     pub trade: TradeBench,
-    /// The artifact the predictive-score-primary rule would have shipped, scored on the same
-    /// test set at the same context.
+    /// The artifact the legacy NLL-only rule would have shipped, scored on the same test set
+    /// and at the same context only when it differs from the paired-Pareto winner.
     ///
-    /// Selection is now economic — the 0.25x-cap trade edge, guarded by paired Hard
-    /// categorical NLL non-regression — because on the run that motivated the change the
-    /// predictive-score-primary rule promoted its best score and one of its worst economic
-    /// reads.
-    /// That change is a claim, and a claim justified only by the run that produced it is an
-    /// assertion. This field is the evidence: two artifacts, one held-out split each rule never
-    /// saw, both currencies reported. `None` when both rules chose the same weights, which is
-    /// itself a finding.
+    /// This preserves the historical counterfactual that exposed a resolved edge regression
+    /// without presenting it as a second deployable best. `None` when both rules chose the same
+    /// final step, so the held-out split never scores duplicate weights.
     pub nll_rule: Option<RivalSelection>,
 }
 
-/// The rival selection rule's artifact as the test split measures it.
+/// The legacy NLL-only comparator as the test split measures it.
 ///
-/// Deliberately a small flat record rather than a second [`TestBattery`]: the comparison needs
-/// the two currencies the rules disagree in and the step each one chose, and a full second
-/// battery would invite the reader to treat the rival as a shipped artifact. It is not one —
-/// the planner never loads it.
+/// Deliberately a small flat record rather than a second [`TestBattery`]: it carries only the
+/// two currencies needed to compare selection rules and can never be mistaken for the artifact
+/// the planner loads.
 #[derive(Clone, Debug)]
 pub struct RivalSelection {
     pub checkpoint: PathBuf,
     pub model_lineage: String,
-    /// Global step the rival rule selected.
+    /// Global step the legacy comparator selected.
     pub step: usize,
     pub nll_bar_conditional: f64,
     pub nll_dof: [f64; BAR_DOF],
     /// Net moment-correct quadratic Kelly edge over the unconditional-marginal null at the
-    /// SELECTION cap, in bps/bar: the criterion the economic rule maximizes.
+    /// selection cap, in bps/bar.
     pub selection_edge_bps: f64,
     /// The same at the headline 4x cap, in bps/bar, where 85% of bars are at the cap.
     pub edge_at_default: f64,
@@ -1518,14 +1512,16 @@ pub struct PretrainReporter {
     selection_nll: Series,
     selection_nll_incumbent: Series,
     selection_nll_delta: Series,
-    selection_nll_tolerance: Series,
+    selection_nll_band: Series,
     selection_dof_delta: Series,
-    refused_noise_trace: Series,
+    refused_no_improvement_trace: Series,
+    refused_edge_trace: Series,
     refused_nll_trace: Series,
     refused_dof_trace: Series,
     unmeasurable_trace: Series,
-    /// Cumulative counters behind the four refusal traces.
-    refused_noise: usize,
+    /// Cumulative counters behind the four refusal traces and the unmeasurable trace.
+    refused_no_improvement: usize,
+    refused_edge: usize,
     refused_nll: usize,
     refused_dof: usize,
     unmeasurable: usize,
@@ -1716,13 +1712,15 @@ impl PretrainReporter {
             selection_nll: Series::default(),
             selection_nll_incumbent: Series::default(),
             selection_nll_delta: Series::default(),
-            selection_nll_tolerance: Series::default(),
+            selection_nll_band: Series::default(),
             selection_dof_delta: Series::default(),
-            refused_noise_trace: Series::default(),
+            refused_no_improvement_trace: Series::default(),
+            refused_edge_trace: Series::default(),
             refused_nll_trace: Series::default(),
             refused_dof_trace: Series::default(),
             unmeasurable_trace: Series::default(),
-            refused_noise: 0,
+            refused_no_improvement: 0,
+            refused_edge: 0,
             refused_nll: 0,
             refused_dof: 0,
             unmeasurable: 0,
@@ -1976,18 +1974,19 @@ impl PretrainReporter {
             self.selection_nll_incumbent
                 .set(tick, selection.incumbent_nll);
             self.selection_nll_delta.set(tick, selection.nll_delta);
-            self.selection_nll_tolerance
-                .set(tick, selection.nll_tolerance);
+            self.selection_nll_band.set(tick, selection.nll_band);
             self.selection_dof_delta.set(tick, selection.dof_delta);
             match selection.outcome {
-                SelectionOutcome::RefusedInsideNoise => self.refused_noise += 1,
+                SelectionOutcome::RefusedNoResolvedImprovement => self.refused_no_improvement += 1,
+                SelectionOutcome::RefusedEdgeGuard => self.refused_edge += 1,
                 SelectionOutcome::RefusedNllGuard => self.refused_nll += 1,
                 SelectionOutcome::RefusedDofGuard => self.refused_dof += 1,
                 SelectionOutcome::Unmeasurable => self.unmeasurable += 1,
                 SelectionOutcome::Promoted | SelectionOutcome::NotEligible => {}
             }
-            self.refused_noise_trace
-                .set(tick, self.refused_noise as f64);
+            self.refused_no_improvement_trace
+                .set(tick, self.refused_no_improvement as f64);
+            self.refused_edge_trace.set(tick, self.refused_edge as f64);
             self.refused_nll_trace.set(tick, self.refused_nll as f64);
             self.refused_dof_trace.set(tick, self.refused_dof as f64);
             self.unmeasurable_trace.set(tick, self.unmeasurable as f64);
@@ -2400,16 +2399,14 @@ impl PretrainReporter {
             battery.lr_plateau_fraction,
         ));
         push_trade_series(&mut series, &battery.trade);
-        // The RULE COMPARISON. Selection is economic now; the artifact the previous,
-        // NLL-primary rule would have shipped is scored on this same split so the change is
-        // evidence rather than an assertion. Both currencies for both artifacts, and the two
-        // paired differences, because a promotion that bought edge at the cost of density has
-        // to say so on the file itself.
+        // The historical rule comparison. The paired-Pareto winner is always the planner
+        // artifact; the legacy NLL-only comparator appears only when it chose different weights.
+        // Both currencies for both artifacts make the veto's out-of-sample cost visible.
         if let Some(rival) = &battery.nll_rule {
             let rival_lineage: String = rival.model_lineage.chars().take(12).collect();
             series.push(point_series(
                 &format!(
-                    "RIVAL nll-rule step (lineage {rival_lineage}, {})",
+                    "COMPARATOR legacy NLL-only step (lineage {rival_lineage}, {})",
                     rival
                         .checkpoint
                         .file_name()
@@ -2419,24 +2416,24 @@ impl PretrainReporter {
                 rival.step as f64,
             ));
             series.push(point_series(
-                &format!("rival edge @{SELECTION_CAP:.2}x cap bps/bar (the criterion)"),
+                &format!("comparator edge @{SELECTION_CAP:.2}x cap bps/bar"),
                 rival.selection_edge_bps,
             ));
             series.push(point_series(
-                &format!("rival edge @{LEVERAGE_CAP:.2}x cap bps/bar (headline)"),
+                &format!("comparator edge @{LEVERAGE_CAP:.2}x cap bps/bar (headline)"),
                 rival.edge_at_default,
             ));
             series.push(point_series(
-                "rival quarter quadratic-kelly sharpe (annualized)",
+                "comparator quarter quadratic-kelly sharpe (annualized)",
                 rival.sharpe,
             ));
             series.push(point_series(
-                "rival conditional nll_bar",
+                "comparator conditional nll_bar",
                 rival.nll_bar_conditional,
             ));
             for (dof, name) in BAR_DOF_NAMES.iter().enumerate() {
                 series.push(point_series(
-                    &format!("rival nll {name}"),
+                    &format!("comparator nll {name}"),
                     rival.nll_dof[dof],
                 ));
             }
@@ -2445,15 +2442,15 @@ impl PretrainReporter {
             let promoted_edge = battery.trade.cap_curve[SELECTION_CAP_SLOT].edge * 1.0e4;
             series.push(point_series(
                 &format!(
-                    "RULE DELTA edge @{SELECTION_CAP:.2}x cap, economic - nll (bps/bar, + = the \
-                     economic rule won on its own criterion out of sample)"
+                    "RULE DELTA edge @{SELECTION_CAP:.2}x cap, Pareto - legacy NLL-only \
+                     (bps/bar, + = Pareto won on edge out of sample)"
                 ),
                 promoted_edge - rival.selection_edge_bps,
             ));
             series.push(point_series(
                 &format!(
-                    "RULE DELTA conditional {score_contract}, economic - predictive-score rule \
-                     (nats/bar, + = economic selection accepted a worse predictive score)"
+                    "RULE DELTA conditional {score_contract}, Pareto - legacy NLL-only \
+                     (nats/bar, + = Pareto has worse predictive score)"
                 ),
                 battery.nll_bar_conditional - rival.nll_bar_conditional,
             ));
@@ -3149,39 +3146,38 @@ impl PretrainReporter {
             vec![self.effective_rank.labeled("effective rank", len)],
         )?;
 
-        // The promotion LEDGER, not a step count. Selection is on the 0.25x-cap trade edge and
-        // the density is the guard, so a reader has to see both criteria, both incumbents, the
-        // noise band the gain had to clear and the tolerance the guard allowed — on one panel,
-        // in the units the decision was taken in. Cumulative refusal counts by REASON sit
-        // beside the promotion count: a rule whose refusals are invisible cannot be audited,
-        // and "refused inside the noise band" and "refused because the density regressed" are
-        // different findings that a single "did not promote" would merge.
+        // The promotion LEDGER, not a step count. Edge and conditional NLL are symmetric Pareto
+        // arms, so the panel carries both paired deltas, both calibrated bands and each veto.
+        // Cumulative refusal counts by reason sit beside the promotion count: an unresolved
+        // frontier move, an edge veto, an NLL veto and an `r` veto are distinct findings.
         write_chart(
             &dir,
             "pretrain_promotions",
             format!(
-                "Pretrain Promotion Ledger (economic criterion at the {SELECTION_CAP:.2}x cap, \
-                 density as the guard) - {suffix}"
+                "Pretrain Promotion Ledger (paired statistical Pareto: edge @{SELECTION_CAP:.2}x \
+                 and conditional NLL, with r veto) - {suffix}"
             ),
             "record",
             "bps/bar, nats/bar, cumulative decisions",
             ScaleKind::Symlog,
             vec![
                 self.promotion_trace.labeled("promotions", len),
-                self.refused_noise_trace
-                    .labeled("refused: inside the noise band", len),
+                self.refused_no_improvement_trace
+                    .labeled("refused: no admissible resolved improvement", len),
+                self.refused_edge_trace
+                    .labeled("refused: resolved edge veto", len),
                 self.refused_nll_trace
-                    .labeled("refused: conditional nll guard", len),
-                self.refused_dof_trace.labeled("refused: r guard", len),
+                    .labeled("refused: resolved conditional nll veto", len),
+                self.refused_dof_trace.labeled("refused: r veto", len),
                 self.unmeasurable_trace
                     .labeled("no comparable bench vector", len),
                 self.selection_edge.labeled("edge @0.25x cap, bps/bar", len),
                 self.selection_edge_incumbent
                     .labeled("incumbent edge, bps/bar", len),
                 self.selection_edge_gain
-                    .labeled("paired edge gain, bps/bar", len),
+                    .labeled("paired edge delta (+ = better), bps/bar", len),
                 self.selection_edge_band
-                    .labeled("noise band the gain must clear, bps/bar", len),
+                    .labeled("paired edge significance band, bps/bar", len),
                 self.selection_turnover.labeled(
                     &format!("turnover/bar @{SELECTION_CAP:.2}x cap (absolute weight units)"),
                     len,
@@ -3198,8 +3194,8 @@ impl PretrainReporter {
                     .labeled("incumbent conditional nll", len),
                 self.selection_nll_delta
                     .labeled("paired nll delta (+ = worse)", len),
-                self.selection_nll_tolerance
-                    .labeled("nll tolerance the guard allows", len),
+                self.selection_nll_band
+                    .labeled("paired nll significance band", len),
                 self.selection_dof_delta
                     .labeled("paired r delta (+ = worse)", len),
             ],
