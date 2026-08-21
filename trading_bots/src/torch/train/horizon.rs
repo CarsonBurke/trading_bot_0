@@ -1679,9 +1679,14 @@ pub fn run_receding_book(
         );
 
         // Participation is a per-row availability mask, not a last-value cache. An absent
-        // symbol gets a zero trade cap and therefore carries its marked holding at zero cost.
+        // symbol and a symbol's first print after an absence both get a zero trade cap. The
+        // latter print realizes the cumulative move from the symbol's prior close, so its
+        // pre-existing holding must earn that move before it can trade again.
         adv.fill(0.0);
         for (k, &id) in slice.symbols.iter().enumerate() {
+            if panel.elapsed_steps(t, k) > 1 {
+                continue;
+            }
             let measured = f64::from(panel.adv_usd(t, k));
             if measured.is_finite() && measured > 0.0 {
                 adv[id as usize] = measured;
@@ -5255,6 +5260,126 @@ mod tests {
         assert!(run.max_abs_net <= config.constraints.net_max + 1e-9);
         assert!(run.max_name <= config.constraints.per_name_cap + 1e-9);
         assert!(run.max_participation <= config.constraints.max_adv_participation + 1e-12);
+    }
+
+    #[test]
+    fn model_cannot_trade_a_catch_up_print_before_booking_its_realized_move() {
+        let gap_return = 1.2f64.ln() as f32;
+        let panel = Panel::from_parts(
+            vec!["CLOCK".to_owned(), "GAPPED".to_owned()],
+            vec![
+                PanelSlice {
+                    ts_ms: 1,
+                    symbols: vec![0, 1],
+                    realized_r: vec![0.0, 0.0],
+                },
+                PanelSlice {
+                    ts_ms: 2,
+                    symbols: vec![0],
+                    realized_r: vec![0.0],
+                },
+                PanelSlice {
+                    ts_ms: 3,
+                    symbols: vec![0, 1],
+                    realized_r: vec![0.0, gap_return],
+                },
+                PanelSlice {
+                    ts_ms: 4,
+                    symbols: vec![0, 1],
+                    realized_r: vec![0.0, 0.0],
+                },
+            ],
+            vec![
+                vec![1.0e9, 1.0e9],
+                vec![1.0e9],
+                vec![1.0e9, 1.0e9],
+                vec![1.0e9, 1.0e9],
+            ],
+        )
+        .unwrap();
+        assert_eq!(panel.elapsed_steps(2, 1), 2);
+        assert_eq!(panel.elapsed_steps(3, 1), 1);
+
+        let forecast = |mean_simple: f64| ForecastMoment {
+            mean_simple,
+            second_simple: 1.0,
+            frictionless_kelly: mean_simple,
+        };
+        let moments = vec![
+            vec![forecast(0.0), forecast(0.2)],
+            vec![forecast(0.0)],
+            vec![forecast(0.0), forecast(-0.2)],
+            vec![forecast(0.0), forecast(-0.2)],
+        ];
+        let periods: Vec<Period> = panel
+            .slices()
+            .iter()
+            .enumerate()
+            .map(|(instant, slice)| Period {
+                instant,
+                ts_ms: slice.ts_ms,
+                legs: slice
+                    .symbols
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &id)| Leg {
+                        id,
+                        slot,
+                        row: instant as u32,
+                        steps: 1,
+                        realized_log: f64::from(slice.realized_r[slot]),
+                        adv_usd: 1.0e9,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let config = RecedingConfig {
+            capital_usd: 1.0e6,
+            constraints: KellyConstraints {
+                gross_cap: 1.0,
+                net_min: -1.0,
+                net_max: 1.0,
+                per_name_cap: 1.0,
+                max_adv_participation: 1.0,
+            },
+            covariance_window: 2,
+            covariance_shrinkage: 0.25,
+        };
+        let cost_bps = 10.0f32;
+        let run = run_receding_book(
+            &panel,
+            &moments,
+            &periods,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            1,
+            &FlatCost::new(cost_bps),
+            config,
+        )
+        .unwrap();
+
+        assert_eq!(
+            run.actions, 2,
+            "only the opening trade and the next-consecutive-print reversal may execute"
+        );
+        assert!(
+            (run.log_equity[2] - run.log_equity[1]).abs() < 1e-14,
+            "the missing row fabricated payoff or cost"
+        );
+        let opening_cost = 1.0 - run.log_equity[1].exp();
+        assert!(opening_cost > 0.0);
+        let opening_target = opening_cost / (f64::from(cost_bps) * 1.0e-4);
+        let held_before_gap = opening_target / (1.0 - opening_cost);
+        let realized_gap = f64::from(gap_return).exp_m1();
+        let expected_catch_up = (1.0 + held_before_gap * realized_gap).ln();
+        assert!(
+            ((run.log_equity[3] - run.log_equity[2]) - expected_catch_up).abs() < 1e-9,
+            "the changed forecast captured or dodged the already-realized catch-up move"
+        );
+        assert!(
+            run.log_equity[4] < run.log_equity[3] && run.execution_cost > opening_cost + 1e-12,
+            "the symbol did not resume trading on its next consecutive print"
+        );
     }
     #[test]
     fn locked_test_split_is_opt_in() {
