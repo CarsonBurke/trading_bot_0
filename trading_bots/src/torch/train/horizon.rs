@@ -1787,16 +1787,34 @@ pub fn run_receding_book(
             RecedingPolicy::BuyHold if p == 0 => equal_target()?,
             RecedingPolicy::BuyHold => held.clone(),
         };
-        let target_gross = target.iter().map(|weight| weight.abs()).sum::<f64>();
-        let target_net = target.iter().sum::<f64>();
-        ensure!(
-            target_gross <= config.constraints.gross_cap + 1e-9
-                && target_net >= config.constraints.net_min - 1e-9
-                && target_net <= config.constraints.net_max + 1e-9
-                && target
+        let portfolio_violations = |weights: &[f64]| {
+            let gross = weights.iter().map(|weight| weight.abs()).sum::<f64>();
+            let net = weights.iter().sum::<f64>();
+            [
+                (gross - config.constraints.gross_cap).max(0.0),
+                (config.constraints.net_min - net)
+                    .max(0.0)
+                    .max((net - config.constraints.net_max).max(0.0)),
+                weights
                     .iter()
-                    .all(|weight| weight.abs() <= config.constraints.per_name_cap + 1e-9),
-            "{} violated a hard portfolio constraint at row {t}",
+                    .map(|weight| (weight.abs() - config.constraints.per_name_cap).max(0.0))
+                    .fold(0.0, f64::max),
+            ]
+        };
+        let held_violations = portfolio_violations(&held);
+        let target_violations = portfolio_violations(&target);
+        ensure!(
+            target.iter().all(|weight| weight.is_finite())
+                && target_violations
+                    .iter()
+                    .zip(held_violations)
+                    .all(|(target, held)| *target <= held + 1e-9)
+                && target.iter().zip(&held).all(|(target, held)| {
+                    (target.abs() - config.constraints.per_name_cap).max(0.0)
+                        <= (held.abs() - config.constraints.per_name_cap).max(0.0) + 1e-9
+                }),
+            "{} worsened a hard portfolio-constraint violation at row {t}: \
+             held={held_violations:?}, target={target_violations:?}",
             policy.name()
         );
 

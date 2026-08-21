@@ -1727,6 +1727,277 @@ const KELLY_COORDINATE_SWEEPS: usize = 32;
 const KELLY_LINE_SEARCH_STEPS: usize = 48;
 const KELLY_SOLVER_TOLERANCE: f64 = 1e-10;
 
+#[derive(Debug)]
+struct KellyEnvelope {
+    constraints: KellyConstraints,
+    per_name_caps: Vec<f64>,
+    seed: Vec<f64>,
+    recovery_progress: f64,
+}
+
+fn recovery_target_at_progress(
+    held: &[f64],
+    participation_caps: &[f64],
+    constraints: KellyConstraints,
+    progress: f64,
+) -> Option<KellyEnvelope> {
+    let held_gross = held.iter().map(|weight| weight.abs()).sum::<f64>();
+    let held_net = held.iter().sum::<f64>();
+    let effective = KellyConstraints {
+        gross_cap: if held_gross > constraints.gross_cap {
+            held_gross + progress * (constraints.gross_cap - held_gross)
+        } else {
+            constraints.gross_cap
+        },
+        net_min: if held_net < constraints.net_min {
+            held_net + progress * (constraints.net_min - held_net)
+        } else {
+            constraints.net_min
+        },
+        net_max: if held_net > constraints.net_max {
+            held_net + progress * (constraints.net_max - held_net)
+        } else {
+            constraints.net_max
+        },
+        per_name_cap: constraints.per_name_cap,
+        max_adv_participation: constraints.max_adv_participation,
+    };
+    let per_name_caps = held
+        .iter()
+        .map(|weight| {
+            if weight.abs() > constraints.per_name_cap {
+                weight.abs() + progress * (constraints.per_name_cap - weight.abs())
+            } else {
+                constraints.per_name_cap
+            }
+        })
+        .collect::<Vec<_>>();
+    recovery_target_for_limits(held, participation_caps, effective, per_name_caps, progress)
+}
+
+fn recovery_target_for_limits(
+    held: &[f64],
+    participation_caps: &[f64],
+    effective: KellyConstraints,
+    per_name_caps: Vec<f64>,
+    recovery_progress: f64,
+) -> Option<KellyEnvelope> {
+    // The point closest to zero in each interval minimizes gross before the net constraint.
+    // Moving its net to the nearest allowed boundary adds exactly that movement to gross, so
+    // this is also a feasibility certificate for the entire box/net/gross intersection.
+    let mut lower = Vec::with_capacity(held.len());
+    let mut upper = Vec::with_capacity(held.len());
+    let mut seed = Vec::with_capacity(held.len());
+    for ((weight, participation), per_name_cap) in
+        held.iter().zip(participation_caps).zip(&per_name_caps)
+    {
+        let raw_lo = (-*per_name_cap).max(*weight - *participation);
+        let raw_hi = (*per_name_cap).min(*weight + *participation);
+        if raw_lo > raw_hi {
+            return None;
+        }
+        let (lo, hi) = (raw_lo, raw_hi);
+        lower.push(lo);
+        upper.push(hi);
+        seed.push(0.0f64.clamp(lo, hi));
+    }
+
+    let reachable_net_min = lower.iter().sum::<f64>().max(effective.net_min);
+    let reachable_net_max = upper.iter().sum::<f64>().min(effective.net_max);
+    if reachable_net_min > reachable_net_max {
+        return None;
+    }
+    let current_net = seed.iter().sum::<f64>();
+    let target_net = current_net.clamp(reachable_net_min, reachable_net_max);
+    let mut remaining = target_net - current_net;
+    if remaining > 0.0 {
+        for (weight, hi) in seed.iter_mut().zip(&upper) {
+            let step = remaining.min(hi - *weight);
+            *weight += step;
+            remaining -= step;
+            if remaining <= KELLY_SOLVER_TOLERANCE {
+                break;
+            }
+        }
+    } else if remaining < 0.0 {
+        for (weight, lo) in seed.iter_mut().zip(&lower) {
+            let step = (-remaining).min(*weight - lo);
+            *weight -= step;
+            remaining += step;
+            if remaining >= -KELLY_SOLVER_TOLERANCE {
+                break;
+            }
+        }
+    }
+    if remaining.abs() > GROSS_TOLERANCE {
+        return None;
+    }
+    let gross = seed.iter().map(|weight| weight.abs()).sum::<f64>();
+    if gross > effective.gross_cap {
+        return None;
+    }
+    Some(KellyEnvelope {
+        constraints: effective,
+        per_name_caps,
+        seed,
+        recovery_progress,
+    })
+}
+
+fn kelly_envelope(
+    held: &[f64],
+    participation_caps: &[f64],
+    constraints: KellyConstraints,
+) -> Option<KellyEnvelope> {
+    let gross = held.iter().map(|weight| weight.abs()).sum::<f64>();
+    let net = held.iter().sum::<f64>();
+    let configured_feasible = gross <= constraints.gross_cap
+        && net >= constraints.net_min
+        && net <= constraints.net_max
+        && held
+            .iter()
+            .all(|weight| weight.abs() <= constraints.per_name_cap);
+    if configured_feasible {
+        return Some(KellyEnvelope {
+            constraints,
+            per_name_caps: vec![constraints.per_name_cap; held.len()],
+            seed: held.to_vec(),
+            recovery_progress: 1.0,
+        });
+    }
+
+    if let Some(strict) = recovery_target_at_progress(held, participation_caps, constraints, 1.0) {
+        return Some(strict);
+    }
+    let mut feasible_progress = 0.0;
+    let mut infeasible_progress = 1.0;
+    for _ in 0..KELLY_LINE_SEARCH_STEPS {
+        let candidate = 0.5 * (feasible_progress + infeasible_progress);
+        if recovery_target_at_progress(held, participation_caps, constraints, candidate).is_some() {
+            feasible_progress = candidate;
+        } else {
+            infeasible_progress = candidate;
+        }
+    }
+    let mut envelope =
+        recovery_target_at_progress(held, participation_caps, constraints, feasible_progress)?;
+
+    // A common relaxation gives every violated family equal priority. If one immovable family
+    // blocks it, tighten the remaining families one at a time. Each step retains all bounds
+    // already achieved, so this reaches a Pareto recovery frontier rather than letting an
+    // illiquid name prevent recoverable gross or net progress elsewhere.
+    let initial_gross_cap = envelope.constraints.gross_cap;
+    if initial_gross_cap > constraints.gross_cap + KELLY_SOLVER_TOLERANCE {
+        let mut lo = 0.0;
+        let mut hi = 1.0;
+        for _ in 0..KELLY_LINE_SEARCH_STEPS {
+            let progress = 0.5 * (lo + hi);
+            let mut candidate = envelope.constraints;
+            candidate.gross_cap =
+                initial_gross_cap + progress * (constraints.gross_cap - initial_gross_cap);
+            if recovery_target_for_limits(
+                held,
+                participation_caps,
+                candidate,
+                envelope.per_name_caps.clone(),
+                envelope.recovery_progress.max(progress),
+            )
+            .is_some()
+            {
+                lo = progress;
+            } else {
+                hi = progress;
+            }
+        }
+        let mut tightened = envelope.constraints;
+        tightened.gross_cap = initial_gross_cap + lo * (constraints.gross_cap - initial_gross_cap);
+        envelope = recovery_target_for_limits(
+            held,
+            participation_caps,
+            tightened,
+            envelope.per_name_caps,
+            envelope.recovery_progress.max(lo),
+        )?;
+    }
+
+    let initial_net_min = envelope.constraints.net_min;
+    let initial_net_max = envelope.constraints.net_max;
+    if initial_net_min < constraints.net_min - KELLY_SOLVER_TOLERANCE
+        || initial_net_max > constraints.net_max + KELLY_SOLVER_TOLERANCE
+    {
+        let mut lo = 0.0;
+        let mut hi = 1.0;
+        for _ in 0..KELLY_LINE_SEARCH_STEPS {
+            let progress = 0.5 * (lo + hi);
+            let mut candidate = envelope.constraints;
+            candidate.net_min =
+                initial_net_min + progress * (constraints.net_min - initial_net_min);
+            candidate.net_max =
+                initial_net_max + progress * (constraints.net_max - initial_net_max);
+            if recovery_target_for_limits(
+                held,
+                participation_caps,
+                candidate,
+                envelope.per_name_caps.clone(),
+                envelope.recovery_progress.max(progress),
+            )
+            .is_some()
+            {
+                lo = progress;
+            } else {
+                hi = progress;
+            }
+        }
+        let mut tightened = envelope.constraints;
+        tightened.net_min = initial_net_min + lo * (constraints.net_min - initial_net_min);
+        tightened.net_max = initial_net_max + lo * (constraints.net_max - initial_net_max);
+        envelope = recovery_target_for_limits(
+            held,
+            participation_caps,
+            tightened,
+            envelope.per_name_caps,
+            envelope.recovery_progress.max(lo),
+        )?;
+    }
+
+    for i in 0..held.len() {
+        let initial_cap = envelope.per_name_caps[i];
+        if initial_cap <= constraints.per_name_cap + KELLY_SOLVER_TOLERANCE {
+            continue;
+        }
+        let mut lo = 0.0;
+        let mut hi = 1.0;
+        for _ in 0..KELLY_LINE_SEARCH_STEPS {
+            let progress = 0.5 * (lo + hi);
+            let mut candidate_caps = envelope.per_name_caps.clone();
+            candidate_caps[i] = initial_cap + progress * (constraints.per_name_cap - initial_cap);
+            if recovery_target_for_limits(
+                held,
+                participation_caps,
+                envelope.constraints,
+                candidate_caps,
+                envelope.recovery_progress.max(progress),
+            )
+            .is_some()
+            {
+                lo = progress;
+            } else {
+                hi = progress;
+            }
+        }
+        let mut tightened_caps = envelope.per_name_caps;
+        tightened_caps[i] = initial_cap + lo * (constraints.per_name_cap - initial_cap);
+        envelope = recovery_target_for_limits(
+            held,
+            participation_caps,
+            envelope.constraints,
+            tightened_caps,
+            envelope.recovery_progress.max(lo),
+        )?;
+    }
+    Some(envelope)
+}
+
 fn coordinate_value(
     weight: f64,
     mean: f64,
@@ -1776,6 +2047,7 @@ fn coupled_net_preserving_update(
     capital_usd: f64,
     cost: &dyn CostModel,
     constraints: KellyConstraints,
+    per_name_caps: &[f64],
     gross: &mut f64,
     factor: &mut f64,
     mean_projection: &mut f64,
@@ -1786,12 +2058,12 @@ fn coupled_net_preserving_update(
     let cap_i = constraints.max_adv_participation * adv_usd[i].max(0.0) / capital_usd;
     let cap_j = constraints.max_adv_participation * adv_usd[j].max(0.0) / capital_usd;
     // `d` buys i and sells j by the same portfolio weight, leaving net exposure exact.
-    let mut lo = (-constraints.per_name_cap - wi)
-        .max(wj - constraints.per_name_cap)
+    let mut lo = (-per_name_caps[i] - wi)
+        .max(wj - per_name_caps[j])
         .max(held[i] - cap_i - wi)
         .max(wj - held[j] - cap_j);
-    let mut hi = (constraints.per_name_cap - wi)
-        .min(wj + constraints.per_name_cap)
+    let mut hi = (per_name_caps[i] - wi)
+        .min(wj + per_name_caps[j])
         .min(held[i] + cap_i - wi)
         .min(wj - held[j] + cap_j);
     if lo > 0.0 || hi < 0.0 {
@@ -1904,8 +2176,10 @@ fn coupled_net_preserving_update(
 /// Cyclic exact one-dimensional maximization is used because the objective is concave:
 /// diagonal-plus-factor covariance plus the predicted-mean outer product, minus the convex
 /// spread/fee/square-root-impact charge. Gross, net, per-name and ADV limits are intersected
-/// in each coordinate's interval. The held point is always considered explicitly; therefore
-/// a trade whose forecast benefit does not clear its cost remains exactly at the current holding.
+/// in each coordinate's interval. A configured-feasible held portfolio follows the ordinary
+/// objective exactly. If market moves leave the held portfolio outside newly binding hard caps,
+/// the solver first maximizes feasible progress back toward all caps inside the one-bar ADV box,
+/// then maximizes the cost-aware objective on that recovery envelope.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_cost_aware_kelly(
     symbols: &[u32],
@@ -1932,11 +2206,28 @@ pub fn solve_cost_aware_kelly(
         "capital must be positive"
     );
     ensure!(
-        constraints.gross_cap > 0.0
+        constraints.gross_cap.is_finite()
+            && constraints.net_min.is_finite()
+            && constraints.net_max.is_finite()
+            && constraints.per_name_cap.is_finite()
+            && constraints.max_adv_participation.is_finite()
+            && constraints.gross_cap > 0.0
             && constraints.per_name_cap > 0.0
             && constraints.max_adv_participation >= 0.0
             && constraints.net_min <= constraints.net_max,
         "invalid Kelly constraints"
+    );
+    let maximum_abs_net = constraints
+        .gross_cap
+        .min(constraints.per_name_cap * names as f64);
+    ensure!(
+        constraints.net_min <= maximum_abs_net && constraints.net_max >= -maximum_abs_net,
+        "Kelly gross/per-name caps and net bounds have an empty configured intersection: \
+         gross_cap={}, per_name_cap={}, names={names}, net_bounds=[{}, {}]",
+        constraints.gross_cap,
+        constraints.per_name_cap,
+        constraints.net_min,
+        constraints.net_max,
     );
     ensure!(
         means
@@ -1946,8 +2237,33 @@ pub fn solve_cost_aware_kelly(
             .all(|v| v.is_finite()),
         "Kelly inputs contain a non-finite value"
     );
+    let held_gross = held.iter().map(|weight| weight.abs()).sum::<f64>();
+    let held_net = held.iter().sum::<f64>();
+    ensure!(
+        held_gross.is_finite() && held_net.is_finite(),
+        "held Kelly portfolio has non-finite aggregate exposure: gross={held_gross}, net={held_net}"
+    );
 
-    let mut weights = held.to_vec();
+    let participation_caps = adv_usd
+        .iter()
+        .map(|adv| constraints.max_adv_participation * adv.max(0.0) / capital_usd)
+        .collect::<Vec<_>>();
+    let Some(envelope) = kelly_envelope(held, &participation_caps, constraints) else {
+        bail!(
+            "cannot construct a Kelly recovery envelope: held_gross={held_gross}, \
+             held_net={held_net}, configured_gross={}, configured_net=[{}, {}], \
+             per_name_cap={}, max_participation={}, participation_caps={participation_caps:?}",
+            constraints.gross_cap,
+            constraints.net_min,
+            constraints.net_max,
+            constraints.per_name_cap,
+            constraints.max_adv_participation,
+        );
+    };
+    let active_constraints = envelope.constraints;
+    let per_name_caps = envelope.per_name_caps;
+    let recovery_progress = envelope.recovery_progress;
+    let mut weights = envelope.seed;
     let mut gross = weights.iter().map(|w| w.abs()).sum::<f64>();
     let mut net = weights.iter().sum::<f64>();
     let mut factor = weights
@@ -1969,24 +2285,32 @@ pub fn solve_cost_aware_kelly(
             let other_net = net - old;
             let other_factor = factor - old * risk.loadings[i];
             let other_mean_projection = mean_projection - old * means[i];
-            let participation_cap = if capital_usd > 0.0 {
-                constraints.max_adv_participation * adv_usd[i].max(0.0) / capital_usd
-            } else {
-                0.0
-            };
-            let mut lo = -constraints
-                .per_name_cap
-                .min((constraints.gross_cap - other_gross).max(0.0));
+            let participation_cap = participation_caps[i];
+            let mut lo =
+                -per_name_caps[i].min((active_constraints.gross_cap - other_gross).max(0.0));
             let mut hi = -lo;
-            lo = lo.max(constraints.net_min - other_net);
-            hi = hi.min(constraints.net_max - other_net);
+            lo = lo.max(active_constraints.net_min - other_net);
+            hi = hi.min(active_constraints.net_max - other_net);
             lo = lo.max(held[i] - participation_cap);
             hi = hi.min(held[i] + participation_cap);
             ensure!(
                 lo <= hi + GROSS_TOLERANCE,
-                "constraints leave no feasible target for symbol {}",
-                symbols[i]
+                "Kelly coordinate interval is empty for symbol {}: lo={lo:.17e}, hi={hi:.17e}, \
+                 current={old:.17e}, held={:.17e}, gross={gross:.17e}, \
+                 gross_cap={:.17e}, net={net:.17e}, net_bounds=[{:.17e}, {:.17e}], \
+                 per_name_cap={:.17e}, participation_cap={participation_cap:.17e}, \
+                 recovery_progress={recovery_progress:.17e}",
+                symbols[i],
+                held[i],
+                active_constraints.gross_cap,
+                active_constraints.net_min,
+                active_constraints.net_max,
+                per_name_caps[i],
             );
+            if lo > hi {
+                lo = old;
+                hi = old;
+            }
             if hi - lo <= KELLY_SOLVER_TOLERANCE {
                 weights[i] = lo.min(hi).clamp(lo, hi);
             } else {
@@ -2055,9 +2379,9 @@ pub fn solve_cost_aware_kelly(
         // move them by equal/opposite weights. Sorting is O(A log A), and the disjoint pair
         // pass itself is O(A); no dense covariance is formed.
         if names >= 2
-            && gross <= constraints.gross_cap + GROSS_TOLERANCE
-            && net >= constraints.net_min - GROSS_TOLERANCE
-            && net <= constraints.net_max + GROSS_TOLERANCE
+            && gross <= active_constraints.gross_cap + GROSS_TOLERANCE
+            && net >= active_constraints.net_min - GROSS_TOLERANCE
+            && net <= active_constraints.net_max + GROSS_TOLERANCE
         {
             let mut order: Vec<usize> = (0..names).collect();
             order.sort_unstable_by(|&a, &b| {
@@ -2084,7 +2408,8 @@ pub fn solve_cost_aware_kelly(
                     ts_ms,
                     capital_usd,
                     cost,
-                    constraints,
+                    active_constraints,
+                    &per_name_caps,
                     &mut gross,
                     &mut factor,
                     &mut mean_projection,
@@ -7815,6 +8140,170 @@ mod tests {
             vec![0.08],
             "actual holdings must create hysteresis rather than being ignored"
         );
+    }
+
+    fn portfolio_violations(
+        weights: &[f64],
+        constraints: KellyConstraints,
+    ) -> (f64, f64, Vec<f64>) {
+        let gross = weights.iter().map(|weight| weight.abs()).sum::<f64>();
+        let net = weights.iter().sum::<f64>();
+        (
+            (gross - constraints.gross_cap).max(0.0),
+            (constraints.net_min - net)
+                .max(0.0)
+                .max((net - constraints.net_max).max(0.0)),
+            weights
+                .iter()
+                .map(|weight| (weight.abs() - constraints.per_name_cap).max(0.0))
+                .collect(),
+        )
+    }
+
+    fn assert_adv_bound_recovery(initial: &[f64], constraints: KellyConstraints) {
+        let symbols = (0..initial.len() as u32).collect::<Vec<_>>();
+        let means = initial
+            .iter()
+            .map(|weight| weight.signum())
+            .collect::<Vec<_>>();
+        let risk = FactorCovariance::independent(vec![0.01; initial.len()]);
+        let adv = vec![1.0; initial.len()];
+        let participation_cap = constraints.max_adv_participation;
+        let mut held = initial.to_vec();
+        let mut first_bar_bound = false;
+        for bar in 0..32 {
+            let before = portfolio_violations(&held, constraints);
+            let action = solve_cost_aware_kelly(
+                &symbols,
+                &means,
+                &risk,
+                &held,
+                &adv,
+                bar,
+                1.0,
+                &FlatCost::new(10_000.0),
+                constraints,
+            )
+            .unwrap();
+            assert!(
+                action.objective.is_finite()
+                    && action.expected_cost.is_finite()
+                    && action.target.iter().all(|weight| weight.is_finite()),
+                "recovery action must remain finite: {action:?}"
+            );
+            let max_delta = action
+                .target
+                .iter()
+                .zip(&held)
+                .map(|(target, current)| (target - current).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                max_delta <= participation_cap + 1e-10,
+                "recovery exceeded the one-bar ADV box: {max_delta}"
+            );
+            if bar == 0 {
+                first_bar_bound = max_delta >= participation_cap - 1e-10;
+            }
+
+            let after = portfolio_violations(&action.target, constraints);
+            assert!(after.0 <= before.0 + 1e-10, "gross violation worsened");
+            assert!(after.1 <= before.1 + 1e-10, "net violation worsened");
+            for (name, (after, before)) in after.2.iter().zip(&before.2).enumerate() {
+                assert!(
+                    after <= &(before + 1e-10),
+                    "per-name violation worsened for name {name}"
+                );
+            }
+            let before_total = before.0 + before.1 + before.2.iter().sum::<f64>();
+            let after_total = after.0 + after.1 + after.2.iter().sum::<f64>();
+            if before_total > 1e-9 {
+                assert!(
+                    after_total < before_total - 1e-10,
+                    "reachable recovery did not make strict progress: {before_total} -> {after_total}"
+                );
+            }
+            held = action.target;
+            if after_total <= 1e-9 {
+                assert!(
+                    held.iter().map(|weight| weight.abs()).sum::<f64>()
+                        <= constraints.gross_cap + 1e-9
+                        && held.iter().sum::<f64>() >= constraints.net_min - 1e-9
+                        && held.iter().sum::<f64>() <= constraints.net_max + 1e-9
+                        && held
+                            .iter()
+                            .all(|weight| weight.abs() <= constraints.per_name_cap + 1e-9)
+                );
+                assert!(first_bar_bound, "the initial ADV limit was not binding");
+                return;
+            }
+        }
+        panic!("portfolio did not recover to the configured constraints: {held:?}");
+    }
+
+    #[test]
+    fn gross_infeasible_holdings_recover_monotonically_through_binding_adv() {
+        assert_adv_bound_recovery(
+            &[0.8, -0.8],
+            KellyConstraints {
+                gross_cap: 1.0,
+                net_min: -2.0,
+                net_max: 2.0,
+                per_name_cap: 1.0,
+                max_adv_participation: 0.1,
+            },
+        );
+    }
+
+    #[test]
+    fn net_infeasible_holdings_recover_monotonically_through_binding_adv() {
+        assert_adv_bound_recovery(
+            &[0.5, 0.5],
+            KellyConstraints {
+                gross_cap: 2.0,
+                net_min: -0.2,
+                net_max: 0.2,
+                per_name_cap: 1.0,
+                max_adv_participation: 0.1,
+            },
+        );
+    }
+
+    #[test]
+    fn per_name_infeasible_holdings_recover_monotonically_through_binding_adv() {
+        assert_adv_bound_recovery(
+            &[0.8, 0.0],
+            KellyConstraints {
+                gross_cap: 2.0,
+                net_min: -2.0,
+                net_max: 2.0,
+                per_name_cap: 0.3,
+                max_adv_participation: 0.1,
+            },
+        );
+    }
+
+    #[test]
+    fn an_immovable_infeasible_holding_remains_an_admissible_finite_action() {
+        let action = solve_cost_aware_kelly(
+            &[0],
+            &[1.0],
+            &FactorCovariance::independent(vec![0.01]),
+            &[0.8],
+            &[0.0],
+            1,
+            1.0,
+            &FlatCost::new(10_000.0),
+            KellyConstraints {
+                gross_cap: 1.0,
+                net_min: -1.0,
+                net_max: 1.0,
+                per_name_cap: 0.3,
+                max_adv_participation: 0.1,
+            },
+        )
+        .unwrap();
+        assert_eq!(action.target, vec![0.8]);
+        assert!(action.objective.is_finite() && action.expected_cost.is_finite());
     }
 
     #[test]
