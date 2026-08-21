@@ -13,11 +13,12 @@
 //! interleaved, instead of a chart with one point per epoch.
 //!
 //! Two validation contexts are reported separately and must not be conflated.
-//! `pretrain_nll_bar` carries the *promotion* metric, measured at the full
-//! context and therefore only defined once the context ramp has finished.
-//! `pretrain_nll_bar_diag896` and every per-DOF, calibration and diagnostic
-//! series carry the *fixed 896-context* evaluation, which is configured
-//! identically in every run and is the only curve comparable across ablations.
+//! `pretrain_nll_bar` carries the deployed-context predictive diagnostic and is therefore only
+//! defined once the context ramp has finished; it is not the promotion criterion.
+//! `pretrain_promotions` carries the economics-primary decision measured at the fixed diagnostic
+//! context. `pretrain_nll_bar_diag896` and every per-DOF, calibration and diagnostic series use
+//! that fixed evaluation, which is configured identically in every run and is the only curve
+//! comparable across ablations.
 
 use std::array;
 use std::collections::{BTreeMap, BTreeSet};
@@ -328,13 +329,13 @@ pub struct EpochMetrics {
     /// `val_nll_bar_diag` with the encoding tautology excluded: `u` and `v` are scored only
     /// on bars with `s != 0`, where the encoding does not already determine them.
     ///
-    /// From the DIAGNOSTIC pass, so it is defined at every ramp stage from step 0. The
-    /// deployed-context twin is `val_nll_bar_conditional_deployed`, which is the number
-    /// selection actually compares and is only defined once the ramp gets there.
+    /// From the DIAGNOSTIC pass, so it is defined at every ramp stage from step 0 and is the
+    /// conditional-NLL guard beside the economic selection criterion. The deployed-context
+    /// twin remains a predictive diagnostic only and is defined only when that pass actually
+    /// ran; a terminal artifact forced from the diagnostic context must not populate it.
     pub val_nll_bar_conditional: f64,
     pub val_nll_dof_conditional: [f64; BAR_DOF],
-    /// The selection metric itself, at the deployed context. Unmeasured before the ramp
-    /// reaches it.
+    /// Conditional NLL measured on the deployed-context pass. Not a selection criterion.
     pub val_nll_bar_conditional_deployed: f64,
     /// NLL of each independently marginalized per-DOF law. Every factor conditions only on
     /// strictly past bars, but their sum is not a joint forecast score.
@@ -350,8 +351,8 @@ pub struct EpochMetrics {
     pub val_promotion_context: f64,
     /// Longest context the run has taken an optimizer step at.
     pub reached_context: f64,
-    /// The promotion decision this tick took, in full: both criteria, both incumbents, the
-    /// thresholds actually applied and the outcome.
+    /// The promotion decision this tick took, in full: economic criterion, predictive guards,
+    /// incumbents, thresholds actually applied and the outcome.
     ///
     /// Promoted OR refused. A refusal is the interesting half — the rule exists to refuse —
     /// and a rule whose refusals leave no trace is one nobody can audit. Charted on
@@ -631,19 +632,18 @@ pub struct UnmeasuredMetric {
     pub reason: String,
 }
 
-/// The [`EpochMetrics`] fields that exist only once the promotion pass has run at the
-/// deployed context.
+/// [`EpochMetrics`] fields whose values exist only when the deployed-context pass actually ran.
 ///
 /// Named here rather than at the call site so the declaration and the reporter's own list of
-/// charted val metrics cannot drift apart: `a_skipped_promotion_declares_every_gated_metric`
-/// asserts every one of these is a metric the reporter actually checks.
-pub const DEPLOYED_CONTEXT_METRICS: [&str; 6] = [
+/// charted val metrics cannot drift apart: `an_unmeasured_metric_is_absent_from_the_series_and_says_so`
+/// asserts every one is a metric the reporter actually checks. Promotion context is deliberately
+/// excluded: a forced terminal diagnostic promotion reports its shorter context as the caveat.
+pub const DEPLOYED_CONTEXT_METRICS: [&str; 5] = [
     "val_nll_bar",
     "val_nll_bar_se",
     "val_nll_bar_ci",
     "val_nll_bar_se_level",
     "val_nll_bar_conditional_deployed",
-    "val_promotion_context",
 ];
 
 /// End-of-run held-out battery, emitted exactly once as `pretrain_test`.
@@ -710,12 +710,13 @@ pub struct TestBattery {
     pub lr_plateau_fraction: f64,
     /// The trading bench on the TEST split, with the identical policy set.
     pub trade: TradeBench,
-    /// The artifact the legacy NLL-only rule would have shipped, scored on the same test set
-    /// and at the same context only when it differs from the paired-Pareto winner.
+    /// The artifact the legacy NLL-only rule would have shipped, scored on the same independent
+    /// test windows and at the same context only when it differs from the economics-primary
+    /// winner.
     ///
-    /// This preserves the historical counterfactual that exposed a resolved edge regression
-    /// without presenting it as a second deployable best. `None` when both rules chose the same
-    /// final step, so the held-out split never scores duplicate weights.
+    /// This is a diagnostic counterfactual, not a second deployable best or evidence of deployed
+    /// profitability. `None` when both rules chose the same final step, so the held-out split
+    /// never scores duplicate weights.
     pub nll_rule: Option<RivalSelection>,
 }
 
@@ -1500,9 +1501,9 @@ pub struct PretrainReporter {
     unique_bar_reuse: Series,
     effective_rank: Series,
     promotion_trace: Series,
-    /// The promotion LEDGER, one point per eligible read. Both criteria, both incumbents, the
-    /// thresholds applied, and a cumulative count per refusal reason, so `pretrain_promotions`
-    /// answers "what did the rule decide and why" instead of only "how many times".
+    /// The promotion LEDGER, one point per eligible read. The economic criterion, its predictive
+    /// guards, incumbents, thresholds, and a cumulative count per refusal reason make
+    /// `pretrain_promotions` answer "what did the rule decide and why".
     selection_edge: Series,
     selection_edge_incumbent: Series,
     selection_edge_gain: Series,
@@ -1514,14 +1515,12 @@ pub struct PretrainReporter {
     selection_nll_delta: Series,
     selection_nll_band: Series,
     selection_dof_delta: Series,
-    refused_no_improvement_trace: Series,
-    refused_edge_trace: Series,
+    refused_no_edge_improvement_trace: Series,
     refused_nll_trace: Series,
     refused_dof_trace: Series,
     unmeasurable_trace: Series,
-    /// Cumulative counters behind the four refusal traces and the unmeasurable trace.
-    refused_no_improvement: usize,
-    refused_edge: usize,
+    /// Cumulative counters behind the three refusal traces and the unmeasurable trace.
+    refused_no_edge_improvement: usize,
     refused_nll: usize,
     refused_dof: usize,
     unmeasurable: usize,
@@ -1714,13 +1713,11 @@ impl PretrainReporter {
             selection_nll_delta: Series::default(),
             selection_nll_band: Series::default(),
             selection_dof_delta: Series::default(),
-            refused_no_improvement_trace: Series::default(),
-            refused_edge_trace: Series::default(),
+            refused_no_edge_improvement_trace: Series::default(),
             refused_nll_trace: Series::default(),
             refused_dof_trace: Series::default(),
             unmeasurable_trace: Series::default(),
-            refused_no_improvement: 0,
-            refused_edge: 0,
+            refused_no_edge_improvement: 0,
             refused_nll: 0,
             refused_dof: 0,
             unmeasurable: 0,
@@ -1977,16 +1974,16 @@ impl PretrainReporter {
             self.selection_nll_band.set(tick, selection.nll_band);
             self.selection_dof_delta.set(tick, selection.dof_delta);
             match selection.outcome {
-                SelectionOutcome::RefusedNoResolvedImprovement => self.refused_no_improvement += 1,
-                SelectionOutcome::RefusedEdgeGuard => self.refused_edge += 1,
+                SelectionOutcome::RefusedNoResolvedEdgeImprovement => {
+                    self.refused_no_edge_improvement += 1
+                }
                 SelectionOutcome::RefusedNllGuard => self.refused_nll += 1,
                 SelectionOutcome::RefusedDofGuard => self.refused_dof += 1,
                 SelectionOutcome::Unmeasurable => self.unmeasurable += 1,
                 SelectionOutcome::Promoted | SelectionOutcome::NotEligible => {}
             }
-            self.refused_no_improvement_trace
-                .set(tick, self.refused_no_improvement as f64);
-            self.refused_edge_trace.set(tick, self.refused_edge as f64);
+            self.refused_no_edge_improvement_trace
+                .set(tick, self.refused_no_edge_improvement as f64);
             self.refused_nll_trace.set(tick, self.refused_nll as f64);
             self.refused_dof_trace.set(tick, self.refused_dof as f64);
             self.unmeasurable_trace.set(tick, self.unmeasurable as f64);
@@ -2399,9 +2396,9 @@ impl PretrainReporter {
             battery.lr_plateau_fraction,
         ));
         push_trade_series(&mut series, &battery.trade);
-        // The historical rule comparison. The paired-Pareto winner is always the planner
-        // artifact; the legacy NLL-only comparator appears only when it chose different weights.
-        // Both currencies for both artifacts make the veto's out-of-sample cost visible.
+        // The historical diagnostic comparison. The economics-primary winner is always the
+        // planner artifact; the legacy NLL-only comparator appears only when it chose different
+        // weights. Both currencies are independent-window model-quality reads, not deployed P&L.
         if let Some(rival) = &battery.nll_rule {
             let rival_lineage: String = rival.model_lineage.chars().take(12).collect();
             series.push(point_series(
@@ -2442,15 +2439,16 @@ impl PretrainReporter {
             let promoted_edge = battery.trade.cap_curve[SELECTION_CAP_SLOT].edge * 1.0e4;
             series.push(point_series(
                 &format!(
-                    "RULE DELTA edge @{SELECTION_CAP:.2}x cap, Pareto - legacy NLL-only \
-                     (bps/bar, + = Pareto won on edge out of sample)"
+                    "RULE DELTA edge @{SELECTION_CAP:.2}x cap, economics-primary - legacy \
+                     NLL-only (bps/bar, + = economics-primary has higher independent-window \
+                     edge; not deployed profitability)"
                 ),
                 promoted_edge - rival.selection_edge_bps,
             ));
             series.push(point_series(
                 &format!(
-                    "RULE DELTA conditional {score_contract}, Pareto - legacy NLL-only \
-                     (nats/bar, + = Pareto has worse predictive score)"
+                    "RULE DELTA conditional {score_contract}, economics-primary - legacy \
+                     NLL-only (nats/bar, + = economics-primary has worse predictive score)"
                 ),
                 battery.nll_bar_conditional - rival.nll_bar_conditional,
             ));
@@ -3146,31 +3144,29 @@ impl PretrainReporter {
             vec![self.effective_rank.labeled("effective rank", len)],
         )?;
 
-        // The promotion LEDGER, not a step count. Edge and conditional NLL are symmetric Pareto
-        // arms, so the panel carries both paired deltas, both calibrated bands and each veto.
-        // Cumulative refusal counts by reason sit beside the promotion count: an unresolved
-        // frontier move, an edge veto, an NLL veto and an `r` veto are distinct findings.
+        // The promotion LEDGER, not a step count. Economic edge is the sole primary criterion;
+        // conditional NLL and `r` are regression vetoes. Cumulative refusal counts distinguish
+        // unresolved/non-improving edge, an NLL veto, an `r` veto, and unmeasurable evidence.
         write_chart(
             &dir,
             "pretrain_promotions",
             format!(
-                "Pretrain Promotion Ledger (paired statistical Pareto: edge @{SELECTION_CAP:.2}x \
-                 and conditional NLL, with r veto) - {suffix}"
+                "Pretrain Promotion Ledger (economics-primary edge @{SELECTION_CAP:.2}x; \
+                 conditional NLL and r regression vetoes) - {suffix}"
             ),
             "record",
             "bps/bar, nats/bar, cumulative decisions",
             ScaleKind::Symlog,
             vec![
                 self.promotion_trace.labeled("promotions", len),
-                self.refused_no_improvement_trace
-                    .labeled("refused: no admissible resolved improvement", len),
-                self.refused_edge_trace
-                    .labeled("refused: resolved edge veto", len),
+                self.refused_no_edge_improvement_trace
+                    .labeled("refused: no resolved economic edge improvement", len),
                 self.refused_nll_trace
-                    .labeled("refused: resolved conditional nll veto", len),
-                self.refused_dof_trace.labeled("refused: r veto", len),
+                    .labeled("refused: conditional nll regression veto", len),
+                self.refused_dof_trace
+                    .labeled("refused: r regression veto", len),
                 self.unmeasurable_trace
-                    .labeled("no comparable bench vector", len),
+                    .labeled("unmeasurable economic criterion or guard", len),
                 self.selection_edge.labeled("edge @0.25x cap, bps/bar", len),
                 self.selection_edge_incumbent
                     .labeled("incumbent edge, bps/bar", len),
@@ -3189,15 +3185,16 @@ impl PretrainReporter {
                     ),
                     len,
                 ),
-                self.selection_nll.labeled("conditional nll", len),
+                self.selection_nll
+                    .labeled("conditional nll guard level", len),
                 self.selection_nll_incumbent
                     .labeled("incumbent conditional nll", len),
                 self.selection_nll_delta
-                    .labeled("paired nll delta (+ = worse)", len),
+                    .labeled("paired nll guard delta (+ = worse)", len),
                 self.selection_nll_band
-                    .labeled("paired nll significance band", len),
+                    .labeled("paired nll regression veto band", len),
                 self.selection_dof_delta
-                    .labeled("paired r delta (+ = worse)", len),
+                    .labeled("paired r guard delta (+ = worse)", len),
             ],
         )?;
 
@@ -9366,13 +9363,14 @@ mod tests {
         let root = scratch_dir("promotions");
         let mut reporter = PretrainReporter::new(&root, MARGINAL_DOF);
         let weights = checkpoint(&root, "best.ot", b"weights-v1");
-        for (epoch, promoted) in [
-            (0usize, Some(weights.clone())),
-            (1, None),
-            (2, Some(weights.clone())),
+        for (epoch, promoted, outcome) in [
+            (0usize, Some(weights.clone()), SelectionOutcome::Promoted),
+            (1, None, SelectionOutcome::RefusedNoResolvedEdgeImprovement),
+            (2, Some(weights.clone()), SelectionOutcome::RefusedNllGuard),
         ] {
             let mut metrics = populated_epoch(epoch, epoch * 10, promoted);
             metrics.effective_rank = f64::NAN;
+            metrics.selection.outcome = outcome;
             reporter.record_epoch(&metrics).unwrap();
         }
 
@@ -9381,6 +9379,30 @@ mod tests {
             panic!("expected MultiLine");
         };
         assert_eq!(series[0].values, vec![1.0, 1.0, 2.0]);
+        assert_eq!(
+            series.len(),
+            16,
+            "the ledger has one economic criterion and no obsolete likelihood-led arm"
+        );
+        let outcome_labels: Vec<&str> = series[..5].iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            outcome_labels,
+            [
+                "promotions",
+                "refused: no resolved economic edge improvement",
+                "refused: conditional nll regression veto",
+                "refused: r regression veto",
+                "unmeasurable economic criterion or guard",
+            ]
+        );
+        assert!(
+            series.iter().all(|row| !row.label.contains("edge veto")),
+            "likelihood-led promotion and its edge-guard refusal must not remain in the schema"
+        );
+        assert_eq!(series[1].values, vec![0.0, 1.0, 1.0]);
+        assert_eq!(series[2].values, vec![0.0, 0.0, 1.0]);
+        assert_eq!(series[3].values, vec![0.0, 0.0, 0.0]);
+        assert_eq!(series[4].values, vec![0.0, 0.0, 0.0]);
 
         for epoch in 0..3 {
             assert!(

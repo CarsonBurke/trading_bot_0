@@ -1484,6 +1484,9 @@ pub struct RecedingRun {
     pub log_equity: Vec<f64>,
     /// Panel indices actually scored. Boundary rows without a full `horizon` are absent.
     pub decision_instants: Vec<usize>,
+    /// Calendar years from the first scored decision to the last. Stored so stdout can use the
+    /// same run-specific annualizer as reports after the panel has been released.
+    pub decision_span_years: f64,
     pub turnover: f64,
     pub execution_cost: f64,
     pub max_gross: f64,
@@ -1519,7 +1522,16 @@ impl RecedingRun {
         result
     }
     pub fn annual_log_growth(&self, panel: &Panel) -> f64 {
-        self.log_equity.last().copied().unwrap_or(0.0) / self.span_years(panel)
+        let measured_span = self.span_years(panel);
+        assert!(
+            (self.decision_span_years.is_nan() && measured_span.is_nan())
+                || self.decision_span_years == measured_span,
+            "recorded receding annualizer must match the run's decision instants"
+        );
+        self.recorded_annual_log_growth()
+    }
+    fn recorded_annual_log_growth(&self) -> f64 {
+        self.log_equity.last().copied().unwrap_or(0.0) / self.decision_span_years
     }
 
     pub fn annual_difference_dispersion(&self, baseline: &Self, panel: &Panel) -> Dispersion {
@@ -1624,6 +1636,7 @@ pub fn run_receding_book(
         actions: 0,
         log_equity: vec![0.0],
         decision_instants: Vec::with_capacity(oracle_periods.len()),
+        decision_span_years: f64::NAN,
         turnover: 0.0,
         execution_cost: 0.0,
         max_gross: 0.0,
@@ -1895,6 +1908,12 @@ pub fn run_receding_book(
         observed_until = t + 1;
         run.covariance_observations = trailing.estimate(&zero_second)?.observations;
     }
+    run.decision_span_years = run.span_years(panel);
+    ensure!(
+        run.decision_span_years.is_finite() && run.decision_span_years > 0.0,
+        "receding evaluation requires at least two decisions at distinct timestamps; got {}",
+        run.decision_instants.len()
+    );
     Ok(run)
 }
 
@@ -2174,7 +2193,6 @@ pub struct RecedingBench {
     pub runs: Vec<RecedingRun>,
     pub split: Split,
     pub instants: usize,
-    pub span_years: f64,
     pub symbols: usize,
     pub samples: usize,
     pub selected_horizon: usize,
@@ -2194,8 +2212,7 @@ impl RecedingBench {
             self.selected_horizon,
         );
         for run in &self.runs {
-            let growth = run.log_equity.last().copied().unwrap_or(0.0)
-                / self.span_years.max(f64::MIN_POSITIVE);
+            let growth = run.recorded_annual_log_growth();
             let marker =
                 if run.policy == RecedingPolicy::Model && run.horizon == self.selected_horizon {
                     "*"
@@ -2344,7 +2361,6 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         runs,
         split: args.split,
         instants: panel.instants(),
-        span_years: panel.span_years(),
         symbols: panel.symbols().len(),
         samples: args.samples,
         selected_horizon: args.forecast_horizon,
@@ -5051,6 +5067,29 @@ mod tests {
     }
 
     #[test]
+    fn receding_book_rejects_a_zero_decision_span() {
+        let (panel, mut moments, mut oracle, config) = receding_fixture();
+        moments.truncate(1);
+        oracle.truncate(1);
+        let err = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            1,
+            &FlatCost::new(0.0),
+            config,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at least two decisions at distinct timestamps"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn every_horizon_reforecasts_and_rebalances_on_every_calendar_row() {
         let (panel, moments, oracle, config) = receding_fixture();
         let marginal = ForecastMoment {
@@ -5395,6 +5434,12 @@ mod tests {
         let instants = panel.instants();
         let shrinkage = config.covariance_shrinkage;
         let window = config.covariance_window;
+        // Deliberately score a strict interior decision span so panel-span annualization would
+        // disagree with the report and stdout contract this fixture protects.
+        let first_decision = 1usize;
+        let decision_span_years = (panel.slices()[instants - 1].ts_ms
+            - panel.slices()[first_decision].ts_ms) as f64
+            / (365.25 * 86_400_000.0);
         let runs: Vec<RecedingRun> = FORECAST_HORIZONS
             .iter()
             .flat_map(|&horizon| {
@@ -5403,15 +5448,11 @@ mod tests {
                     .map(move |policy| RecedingRun {
                         policy,
                         horizon,
-                        reforecasts: instants,
+                        reforecasts: instants - first_decision,
                         actions: 1,
-                        log_equity: vec![
-                            0.0,
-                            0.001 * horizon as f64,
-                            0.002 * horizon as f64,
-                            0.003 * horizon as f64,
-                        ],
-                        decision_instants: (0..instants).collect(),
+                        log_equity: vec![0.0, 0.001 * horizon as f64, 0.003 * horizon as f64],
+                        decision_instants: (first_decision..instants).collect(),
+                        decision_span_years,
                         turnover: 0.1,
                         execution_cost: 1e-5,
                         max_gross: 0.2,
@@ -5457,6 +5498,16 @@ mod tests {
         let ReportKind::MultiLine { series: h1_series } = h1.kind else {
             panic!("H1 Kelly report must be multiline")
         };
+        let summary = RecedingBench {
+            runs: runs.clone(),
+            split: Split::Val,
+            instants,
+            symbols: panel.symbols().len(),
+            samples: 1,
+            selected_horizon: 1,
+            checkpoint: "fixture.ot".to_owned(),
+            lineage_sha256: "fixture".to_owned(),
+        };
         let ReportKind::MultiLine {
             series: h100_series,
         } = h100.kind
@@ -5471,6 +5522,33 @@ mod tests {
                 .expect("the fixed comparison grid remains in every selected report");
             assert_eq!(grid.values, expected_grid);
         }
+
+        let report_model_h1 = h1_series
+            .iter()
+            .find(|row| row.label == "model net log growth/year")
+            .expect("model annual-growth report row")
+            .values[0] as f64;
+        let selected_run = summary
+            .runs
+            .iter()
+            .find(|run| run.policy == RecedingPolicy::Model && run.horizon == 1)
+            .expect("selected H1 model run");
+        let stdout_growth = selected_run.recorded_annual_log_growth();
+        assert!(
+            (stdout_growth - report_model_h1).abs()
+                <= f64::from(f32::EPSILON) * stdout_growth.abs().max(1.0),
+            "stdout and report must annualize over the same decision span: stdout={stdout_growth}, \
+             report={report_model_h1}"
+        );
+        let table = summary.table();
+        let selected_line = table
+            .lines()
+            .find(|line| line.starts_with('*'))
+            .expect("stdout marks the selected production row");
+        assert!(
+            selected_line.contains(&format!("{stdout_growth:>14.6}")),
+            "stdout selected row must print the decision-span report value: {selected_line}"
+        );
 
         let selected_h1 = h1_series
             .iter()
