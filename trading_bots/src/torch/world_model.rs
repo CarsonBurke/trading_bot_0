@@ -350,6 +350,31 @@ pub struct BarTrainingProvenance {
     /// recorded, so an unrecorded sidecar keeps validating against its own stored hash.
     #[serde(default)]
     pub lr_plateau_fraction: f64,
+    /// Optimizer recipe that produced this checkpoint. `None` only for sidecars
+    /// written before optimizer provenance was recorded.
+    #[serde(default)]
+    pub optimizer: Option<BarOptimizerProvenance>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BarOptimizerProvenance {
+    pub name: String,
+    /// `None` records that the row controller was disabled for this newly written
+    /// checkpoint; the enclosing `optimizer: None` is the legacy/unknown state.
+    #[serde(default)]
+    pub row_learned_lr: Option<BarRowLearnedLrProvenance>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BarRowLearnedLrProvenance {
+    pub c: f64,
+    pub controller_lr: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub eps: f64,
+    pub warmup_primary_steps: i64,
+    pub evidence_clip: f64,
+    pub evidence: String,
 }
 
 impl BarWorldModelMetadata {
@@ -552,11 +577,30 @@ impl BarWorldModelMetadata {
         let Some(training) = &self.training else {
             return "none".to_owned();
         };
+        let optimizer_suffix = training.optimizer.as_ref().map_or_else(String::new, |optimizer| {
+            let row_lr = optimizer.row_learned_lr.as_ref().map_or_else(
+                || "off".to_owned(),
+                |controller| {
+                    format!(
+                        "on,c={:016x},lr={:016x},betas={:016x}:{:016x},eps={:016x},warmup={},clip={:016x},evidence={}",
+                        controller.c.to_bits(),
+                        controller.controller_lr.to_bits(),
+                        controller.beta1.to_bits(),
+                        controller.beta2.to_bits(),
+                        controller.eps.to_bits(),
+                        controller.warmup_primary_steps,
+                        controller.evidence_clip.to_bits(),
+                        controller.evidence,
+                    )
+                },
+            );
+            format!(";optimizer={};row_learned_lr={row_lr}", optimizer.name)
+        });
         format!(
             "corpus={};bounds={}:{};pinned={};eval_seed={:016x};train_seed={:016x};\
              metric={};weights={};guard={}@{:016x};min_dollar_volume_bits={:016x};symbols={};\
              supports_frozen={};supports_corpus={};universe={};universe_train_end={};\
-             scoring={};context={}@{}/{};batch_ramp={}{}",
+             scoring={};context={}@{}/{};batch_ramp={}{}{}",
             training.corpus_fingerprint,
             training.split_bounds.0,
             training.split_bounds.1,
@@ -608,6 +652,7 @@ impl BarWorldModelMetadata {
                     training.lr_plateau_fraction.to_bits()
                 )
             },
+            optimizer_suffix,
         )
     }
 
@@ -1023,6 +1068,99 @@ impl BarLayer {
     }
 }
 
+/// Fixed, training-free residual recirculation between two trunk depths.
+///
+/// Layer indices are zero-based. For each token, the first pass captures the
+/// post-destination and post-source residuals. Their norm-matched mixture is
+/// rerun through layers above the destination, overwriting that token's upper
+/// KV entries for future tokens while the first-pass final residual is read out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecirculationConfig {
+    source_layer: usize,
+    destination_layer: usize,
+    alpha: f64,
+    beta_one: bool,
+    ramp_positions: usize,
+}
+
+impl RecirculationConfig {
+    pub fn new(
+        source_layer: usize,
+        destination_layer: usize,
+        alpha: f64,
+        beta_one: bool,
+        ramp_positions: usize,
+    ) -> Result<Self> {
+        let config = Self {
+            source_layer,
+            destination_layer,
+            alpha,
+            beta_one,
+            ramp_positions,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.source_layer >= BAR_LAYERS {
+            bail!(
+                "recirculation source layer {} is outside the zero-based 0..{} trunk",
+                self.source_layer,
+                BAR_LAYERS
+            );
+        }
+        if self.destination_layer >= BAR_LAYERS {
+            bail!(
+                "recirculation destination layer {} is outside the zero-based 0..{} trunk",
+                self.destination_layer,
+                BAR_LAYERS
+            );
+        }
+        if self.destination_layer >= self.source_layer {
+            bail!(
+                "recirculation requires destination < source, got destination {} and source {}",
+                self.destination_layer,
+                self.source_layer
+            );
+        }
+        if !self.alpha.is_finite() || !(0.0..=1.0).contains(&self.alpha) {
+            bail!(
+                "recirculation alpha must be finite and in [0, 1], got {}",
+                self.alpha
+            );
+        }
+        if self.ramp_positions == 0 {
+            bail!("recirculation ramp positions must be positive");
+        }
+        Ok(())
+    }
+
+    pub fn source_layer(&self) -> usize {
+        self.source_layer
+    }
+
+    pub fn destination_layer(&self) -> usize {
+        self.destination_layer
+    }
+
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
+    pub fn beta_one(&self) -> bool {
+        self.beta_one
+    }
+
+    pub fn ramp_positions(&self) -> usize {
+        self.ramp_positions
+    }
+
+    fn alpha_at(&self, position: usize) -> f64 {
+        self.alpha * (position.min(self.ramp_positions) as f64 / self.ramp_positions as f64)
+    }
+}
+
 /// Causal PoPE/FA4 transformer over bars.
 pub struct BarTrunk {
     /// Five `[NUM_BAR_BINS, D]` tables, one per degree of freedom.
@@ -1101,6 +1239,100 @@ impl BarTrunk {
         }
         tch::no_grad(|| self.run(dof, bin_ids, time_ids, window).detach())
     }
+    /// Serialized teacher-forced trunk pass using one evolving KV cache.
+    ///
+    /// This is the control arm for fixed recirculation. It is deliberately
+    /// separate from [`Self::forward`]: the experiment must not mistake
+    /// parallel-prefill versus decode-kernel drift for a recirculation effect.
+    pub fn forward_serialized(
+        &self,
+        dof: &Tensor,
+        bin_ids: &Tensor,
+        time_ids: &Tensor,
+    ) -> Tensor {
+        tch::no_grad(|| {
+            self.run_serialized(dof, bin_ids, time_ids, None)
+                .expect("the no-recirculation serialized path has no invalid config")
+                .detach()
+        })
+    }
+
+    /// Evaluation-only collapsed sequential recirculation.
+    ///
+    /// One bar is one token. A token's post-source residual is norm-matched
+    /// into its own post-destination residual, then layers above the destination
+    /// are rerun to overwrite that token's upper KV state for future bars. The
+    /// first-pass final residual remains the readout. Normal forward, prefill,
+    /// cached serving and training never enter this path.
+    pub fn forward_recirculated(
+        &self,
+        dof: &Tensor,
+        bin_ids: &Tensor,
+        time_ids: &Tensor,
+        config: &RecirculationConfig,
+    ) -> Result<Tensor> {
+        config.validate()?;
+        tch::no_grad(|| {
+            self.run_serialized(dof, bin_ids, time_ids, Some(config))
+                .map(|beliefs| beliefs.detach())
+        })
+    }
+
+    fn run_serialized(
+        &self,
+        dof: &Tensor,
+        bin_ids: &Tensor,
+        time_ids: &Tensor,
+        config: Option<&RecirculationConfig>,
+    ) -> Result<Tensor> {
+        let tokens = self.token_embedding(dof, bin_ids, time_ids);
+        let length = tokens.size()[1];
+        if length <= 0 {
+            bail!("serialized bar trunk requires at least one token");
+        }
+        if length > BAR_MAX_CONTEXT {
+            bail!(
+                "serialized bar trunk length {length} exceeds BAR_MAX_CONTEXT {BAR_MAX_CONTEXT}"
+            );
+        }
+        let mut cache = BarKvCache::new(BAR_MAX_CONTEXT);
+        let mut beliefs = Vec::with_capacity(length as usize);
+        for position in 0..length {
+            let token = tokens.narrow(1, position, 1);
+            let belief = if position == 0 {
+                self.prefill_serialized_token(&token, &mut cache, config)?
+            } else {
+                self.decode_serialized_token(&token, &mut cache, config)?
+            };
+            beliefs.push(belief);
+        }
+        Ok(Tensor::cat(&beliefs, 1))
+    }
+
+    fn recirculate_residual(
+        destination: &Tensor,
+        source: &Tensor,
+        config: &RecirculationConfig,
+        position: usize,
+    ) -> Tensor {
+        let alpha = config.alpha_at(position);
+        if alpha == 0.0 {
+            return destination.shallow_clone();
+        }
+        let destination_norm = destination
+            .pow_tensor_scalar(2.0)
+            .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float)
+            .sqrt();
+        let source_norm = source
+            .pow_tensor_scalar(2.0)
+            .sum_dim_intlist([-1i64].as_slice(), true, Kind::Float)
+            .sqrt()
+            .clamp_min(BAR_NORM_EPS);
+        let matched = source * (destination_norm / source_norm).to_kind(source.kind());
+        let beta = if config.beta_one { 1.0 } else { 1.0 - alpha };
+        beta * destination + alpha * matched
+    }
+
 
     fn run(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor, window: i64) -> Tensor {
         let x0 = self.token_embedding(dof, bin_ids, time_ids);
@@ -1283,6 +1515,182 @@ impl BarTrunk {
         cache.write_index = len % capacity;
         rms_norm(&x)
     }
+    fn prefill_serialized_token(
+        &self,
+        token: &Tensor,
+        cache: &mut BarKvCache,
+        config: Option<&RecirculationConfig>,
+    ) -> Result<Tensor> {
+        debug_assert_eq!(token.size()[1], 1);
+        let position = Tensor::from_slice(&[0i64]).to_device(token.device());
+        let mut x = token.shallow_clone();
+        let mut destination = None;
+        let mut source = None;
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let (query, key, value) = layer.qkv(&rms_norm(&x));
+            let kind = attention_kind(&x);
+            let polar = pope_expand_qk_fp32(
+                &query,
+                &key,
+                &position,
+                &position,
+                &layer.pope_theta_bias,
+                POPE_FREQUENCY_BASE,
+            );
+            let polar = PolarQk {
+                query: polar.query.to_kind(kind).contiguous(),
+                key: polar.key.to_kind(kind).contiguous(),
+            };
+            let value = value.to_kind(kind).contiguous();
+            let attention = strict_pope_prefill(&polar, &value);
+            x = layer.attention_residual(&x, &attention, token);
+            x = layer.feed_forward(&x);
+            if config.is_some_and(|config| layer_index == config.destination_layer) {
+                destination = Some(x.shallow_clone());
+            }
+            if config.is_some_and(|config| layer_index == config.source_layer) {
+                source = Some(x.shallow_clone());
+            }
+            layers.push(BarLayerKv::prefilled(&polar.key, &value, 1));
+        }
+        let belief = rms_norm(&x);
+        cache.layers = layers;
+        if let Some(config) = config.filter(|config| config.alpha_at(0) > 0.0) {
+            self.overwrite_recirculated_cache(
+                token,
+                cache,
+                config,
+                0,
+                0,
+                0,
+                destination.expect("validated destination was traversed"),
+                source.expect("validated source was traversed"),
+            );
+        }
+        cache.length = 1;
+        cache.next_position = 1;
+        cache.write_index = 0;
+        Ok(belief)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn overwrite_recirculated_cache(
+        &self,
+        token: &Tensor,
+        cache: &mut BarKvCache,
+        config: &RecirculationConfig,
+        absolute_position: i64,
+        write_index: i64,
+        previous_length: i64,
+        destination: Tensor,
+        source: Tensor,
+    ) {
+        let position = Tensor::from_slice(&[absolute_position]).to_device(token.device());
+        let mut x = Self::recirculate_residual(
+            &destination,
+            &source,
+            config,
+            absolute_position as usize,
+        );
+        for (layer, layer_cache) in self
+            .layers
+            .iter()
+            .zip(cache.layers.iter_mut())
+            .skip(config.destination_layer + 1)
+        {
+            let (query, key, value) = layer.qkv(&rms_norm(&x));
+            let kind = attention_kind(&x);
+            let polar = pope_expand_qk_fp32(
+                &query,
+                &key,
+                &position,
+                &position,
+                &layer.pope_theta_bias,
+                POPE_FREQUENCY_BASE,
+            );
+            let query = polar.query.to_kind(kind).contiguous();
+            let key = polar.key.to_kind(kind).contiguous();
+            let value = value.to_kind(kind).contiguous();
+            layer_cache.key.narrow(1, write_index, 1).copy_(&key);
+            layer_cache.value.narrow(1, write_index, 1).copy_(&value);
+            let (active_key, active_value) = layer_cache.active_after_write(previous_length);
+            let attention = strict_pope_decode(&query, &active_key, &active_value);
+            x = layer.attention_residual(&x, &attention, token);
+            x = layer.feed_forward(&x);
+        }
+    }
+
+    fn decode_serialized_token(
+        &self,
+        token: &Tensor,
+        cache: &mut BarKvCache,
+        config: Option<&RecirculationConfig>,
+    ) -> Result<Tensor> {
+        assert_eq!(
+            cache.layers.len(),
+            self.layers.len(),
+            "bar KV cache has an incompatible layer count"
+        );
+        cache.ensure_append_capacity();
+        let absolute_position = cache.next_position;
+        let position = Tensor::from_slice(&[absolute_position]).to_device(token.device());
+        let write_index = cache.write_index;
+        let previous_length = cache.length;
+        let mut x = token.shallow_clone();
+        let mut destination = None;
+        let mut source = None;
+        for (layer_index, (layer, layer_cache)) in self
+            .layers
+            .iter()
+            .zip(cache.layers.iter_mut())
+            .enumerate()
+        {
+            let (query, key, value) = layer.qkv(&rms_norm(&x));
+            let kind = attention_kind(&x);
+            let polar = pope_expand_qk_fp32(
+                &query,
+                &key,
+                &position,
+                &position,
+                &layer.pope_theta_bias,
+                POPE_FREQUENCY_BASE,
+            );
+            let query = polar.query.to_kind(kind).contiguous();
+            let key = polar.key.to_kind(kind).contiguous();
+            let value = value.to_kind(kind).contiguous();
+            layer_cache.key.narrow(1, write_index, 1).copy_(&key);
+            layer_cache.value.narrow(1, write_index, 1).copy_(&value);
+            let (active_key, active_value) = layer_cache.active_after_write(previous_length);
+            let attention = strict_pope_decode(&query, &active_key, &active_value);
+            x = layer.attention_residual(&x, &attention, token);
+            x = layer.feed_forward(&x);
+            if config.is_some_and(|config| layer_index == config.destination_layer) {
+                destination = Some(x.shallow_clone());
+            }
+            if config.is_some_and(|config| layer_index == config.source_layer) {
+                source = Some(x.shallow_clone());
+            }
+        }
+        let belief = rms_norm(&x);
+        if let Some(config) =
+            config.filter(|config| config.alpha_at(absolute_position as usize) > 0.0)
+        {
+            self.overwrite_recirculated_cache(
+                token,
+                cache,
+                config,
+                absolute_position,
+                write_index,
+                previous_length,
+                destination.expect("validated destination was traversed"),
+                source.expect("validated source was traversed"),
+            );
+        }
+        cache.finish_append();
+        Ok(belief)
+    }
+
 
     fn decode(&self, token: &Tensor, cache: &mut BarKvCache) -> Tensor {
         assert_eq!(
@@ -2612,6 +3020,7 @@ mod tests {
             selection_nll_conditional: Some(-9.3817),
             batch_ramp: vec![1, 2, 3],
             lr_plateau_fraction: 0.40,
+            optimizer: None,
         }
     }
 
@@ -2701,6 +3110,48 @@ mod tests {
         // beside the batch ramp and the scoring rule the same comparison needs.
         let sidecar = serde_json::to_value(of(BarScoring::Density)).expect("serialize");
         assert_eq!(sidecar["training"]["lr_plateau_fraction"], 0.40);
+
+        let mut off_recipe = training_fixture(BarScoring::Density);
+        off_recipe.optimizer = Some(BarOptimizerProvenance {
+            name: "NorMuon + AdamW".to_owned(),
+            row_learned_lr: None,
+        });
+        let mut on_recipe = off_recipe.clone();
+        on_recipe
+            .optimizer
+            .as_mut()
+            .expect("optimizer provenance")
+            .row_learned_lr = Some(BarRowLearnedLrProvenance {
+                c: 1.0,
+                controller_lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+                warmup_primary_steps: 100,
+                evidence_clip: 3.0,
+                evidence: "-mean(g_raw * delta_previous)".to_owned(),
+            });
+        let off_metadata = BarWorldModelMetadata::for_checkpoint_with(
+            &weights,
+            &[300],
+            300,
+            Some(off_recipe),
+        )
+        .expect("off optimizer provenance");
+        let on_metadata = BarWorldModelMetadata::for_checkpoint_with(
+            &weights,
+            &[300],
+            300,
+            Some(on_recipe),
+        )
+        .expect("enabled optimizer provenance");
+        assert_ne!(off_metadata.lineage_sha256, on_metadata.lineage_sha256);
+        let sidecar = serde_json::to_value(on_metadata).expect("serialize controller provenance");
+        assert_eq!(sidecar["training"]["optimizer"]["row_learned_lr"]["c"], 1.0);
+        assert_eq!(
+            sidecar["training"]["optimizer"]["row_learned_lr"]["warmup_primary_steps"],
+            100
+        );
 
         // An artifact that records no provenance at all is still distinguishable from every
         // recorded one, which is the point of hashing "none".
@@ -2829,6 +3280,72 @@ mod tests {
             f64::try_from((market_logits - base_logits).abs().max()).expect("market gap") > 1e-5,
             "the current observed market did not reach the emission logits after wake-up"
         );
+    }
+
+    #[test]
+    fn fixed_recirculation_is_sequential_validated_and_finite() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let supports = synthetic_supports();
+        let vs = nn::VarStore::new(Device::Cpu);
+        let modules = BarModules::new(&vs.root());
+        wake_projections(&vs, 0x51A1);
+        let (dof, ids, time_ids) = synthetic_inputs(&supports, 2, 16, 0x51A2);
+
+        let serial = modules.trunk.forward_serialized(&dof, &ids, &time_ids);
+        let disabled =
+            RecirculationConfig::new(4, 1, 0.0, false, 10).expect("valid disabled config");
+        let disabled_out = modules
+            .trunk
+            .forward_recirculated(&dof, &ids, &time_ids, &disabled)
+            .expect("disabled recirculation");
+        assert_eq!(
+            f64::try_from((&serial - &disabled_out).abs().max()).expect("disabled delta"),
+            0.0,
+            "alpha zero must be an exact no-op on the serialized path"
+        );
+
+        let enabled =
+            RecirculationConfig::new(4, 1, 0.15, false, 10).expect("valid enabled config");
+        let enabled_out = modules
+            .trunk
+            .forward_recirculated(&dof, &ids, &time_ids, &enabled)
+            .expect("enabled recirculation");
+        assert_eq!(
+            f64::try_from(
+                (&serial.narrow(1, 0, 1) - &enabled_out.narrow(1, 0, 1))
+                    .abs()
+                    .max()
+            )
+            .expect("token zero delta"),
+            0.0,
+            "the position-zero ramp must make token zero an exact no-op"
+        );
+        assert_eq!(
+            f64::try_from(
+                (&serial.narrow(1, 1, 1) - &enabled_out.narrow(1, 1, 1))
+                    .abs()
+                    .max()
+            )
+            .expect("token one delta"),
+            0.0,
+            "token one must use its first-pass readout; its recirculation can affect only future tokens"
+        );
+        assert!(
+            f64::try_from(
+                (serial.narrow(1, 2, 14) - enabled_out.narrow(1, 2, 14))
+                    .abs()
+                    .max()
+            )
+            .expect("later delta")
+                > 1e-6,
+            "positive alpha must change at least one later belief"
+        );
+        assert!(bool::try_from(enabled_out.isfinite().all()).expect("finite check"));
+
+        assert!(RecirculationConfig::new(2, 2, 0.1, false, 10).is_err());
+        assert!(RecirculationConfig::new(1, 4, 0.1, false, 10).is_err());
+        assert!(RecirculationConfig::new(BAR_LAYERS, 1, 0.1, false, 10).is_err());
+        assert!(RecirculationConfig::new(4, 1, f64::NAN, false, 10).is_err());
     }
 
     #[test]

@@ -16,9 +16,12 @@
 //! outer product. Model and oracle pass through identical solver, cost, holding and constraint
 //! contracts.
 //!
-//! Raw predictive diagnostics remain outside this module. Economic output is written only as
-//! `.report.bin`, defaults to validation, and refuses the locked test split without an explicit
-//! second opt-in.
+//! The selected-horizon reports also carry a clearly labelled, non-self-financing scalar
+//! moment diagnostic beside a four-rung shared-book attribution. Validation additionally writes
+//! the fixed solver-safe dead-zone frontier; locked test never does. One optional, predeclared
+//! mean-sign hysteresis candidate can be paired against Raw without changing production defaults.
+//! Economic output is written only as `.report.bin`, defaults to validation, and refuses the
+//! locked test split without an explicit second opt-in.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,8 +45,13 @@ use super::portfolio::{
 };
 use super::portfolio_cost::{BarCostModel, CostCalibration};
 use super::pretrain_reports::write_chart;
-use super::pretrain_stats::{block_bootstrap, Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED};
-use super::trade_bench::{forecast_r_probs, kelly_fractions, FREE_LEVERAGE, ROW_CHUNK};
+use super::pretrain_stats::{
+    block_bootstrap, moving_block_bootstrap, Dispersion, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED,
+};
+use super::trade_bench::{
+    expected_log_growth, forecast_r_probs, kelly_fractions, BAND_FRACTIONS, FREE_LEVERAGE,
+    LEVERAGE_CAP, ROW_CHUNK,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1475,13 +1483,157 @@ impl RecedingPolicy {
     }
 }
 
+/// How a receding decision turns the incumbent constrained solve into the executed target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RecedingActionRule {
+    /// Execute the exact target returned by the existing cost-aware constrained solver.
+    Incumbent,
+    /// Hold causally tradable coordinates whose incumbent change is no larger than the stated
+    /// absolute portfolio-weight width, then rerun the same solver for every remaining name.
+    SolverSafeBand { absolute_weight: f64 },
+}
+
+impl RecedingActionRule {
+    fn absolute_weight(self) -> f64 {
+        match self {
+            Self::Incumbent => 0.0,
+            Self::SolverSafeBand { absolute_weight } => absolute_weight,
+        }
+    }
+}
+
+/// Optional causal transformation of the model forecast mean before the unchanged joint solve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RecedingSignalRule {
+    Raw,
+    MeanSignHysteresis { margin_simple: f64 },
+}
+
+impl RecedingSignalRule {
+    fn margin_simple(self) -> f64 {
+        match self {
+            Self::Raw => 0.0,
+            Self::MeanSignHysteresis { margin_simple } => margin_simple,
+        }
+    }
+}
+
+fn apply_mean_sign_hysteresis(
+    means: &mut [f64],
+    present_symbols: &[u32],
+    retained_sign: &mut [i8],
+    margin_simple: f64,
+) -> (usize, usize) {
+    debug_assert!(margin_simple > 0.0);
+    let mut retained_opposing_signs = 0;
+    let mut threshold_flips = 0;
+    for &id in present_symbols {
+        let index = id as usize;
+        let mean = means[index];
+        let next_sign = if mean > margin_simple {
+            1
+        } else if mean < -margin_simple {
+            -1
+        } else {
+            0
+        };
+        if retained_sign[index] == 0 {
+            if mean > 0.0 {
+                retained_sign[index] = 1;
+            } else if mean < 0.0 {
+                retained_sign[index] = -1;
+            }
+        } else if next_sign != 0 {
+            if next_sign != retained_sign[index] {
+                threshold_flips += 1;
+                retained_sign[index] = next_sign;
+            }
+        } else if mean != 0.0 && mean.signum() != f64::from(retained_sign[index]) {
+            means[index] = f64::from(retained_sign[index]) * mean.abs();
+            retained_opposing_signs += 1;
+        }
+    }
+    (retained_opposing_signs, threshold_flips)
+}
+
+fn solver_safe_frozen_mask(
+    incumbent_target: &[f64],
+    held: &[f64],
+    adv: &[f64],
+    absolute_weight: f64,
+) -> Vec<bool> {
+    incumbent_target
+        .iter()
+        .zip(held)
+        .zip(adv)
+        .map(|((&target, &current), &available)| {
+            available > 0.0 && (target - current).abs() <= absolute_weight
+        })
+        .collect()
+}
+
+fn apply_receding_action_rule(
+    action_rule: RecedingActionRule,
+    incumbent_target: Vec<f64>,
+    held: &[f64],
+    adv: &[f64],
+    rerun: impl FnOnce(&[f64]) -> Result<Vec<f64>>,
+) -> Result<(Vec<f64>, usize, usize)> {
+    ensure!(
+        incumbent_target.len() == held.len() && adv.len() == held.len(),
+        "receding action-rule vectors must have identical lengths"
+    );
+    let absolute_weight = action_rule.absolute_weight();
+    ensure!(
+        absolute_weight.is_finite() && absolute_weight >= 0.0,
+        "receding action-rule width must be finite and nonnegative, got {absolute_weight}"
+    );
+    let eligible = adv.iter().filter(|value| **value > 0.0).count();
+    if action_rule == RecedingActionRule::Incumbent || absolute_weight == 0.0 {
+        return Ok((incumbent_target, eligible, 0));
+    }
+    let frozen = solver_safe_frozen_mask(&incumbent_target, held, adv, absolute_weight);
+    let frozen_count = frozen.iter().filter(|value| **value).count();
+    if frozen_count == 0 {
+        return Ok((incumbent_target, eligible, 0));
+    }
+    let mut banded_adv = adv.to_vec();
+    for (available, is_frozen) in banded_adv.iter_mut().zip(&frozen) {
+        if *is_frozen {
+            *available = 0.0;
+        }
+    }
+    let banded_target = rerun(&banded_adv)?;
+    ensure!(
+        banded_target.len() == held.len(),
+        "receding band rerun returned the wrong target length"
+    );
+    ensure!(
+        banded_target
+            .iter()
+            .zip(held)
+            .zip(&frozen)
+            .all(|((&target, &current), &is_frozen)| {
+                !is_frozen || target.to_bits() == current.to_bits()
+            }),
+        "solver-safe band failed to hold a frozen coordinate"
+    );
+    Ok((banded_target, eligible, frozen_count))
+}
+
 #[derive(Clone, Debug)]
 pub struct RecedingRun {
     pub policy: RecedingPolicy,
     pub horizon: usize,
     pub reforecasts: usize,
     pub actions: usize,
+    pub action_rule: RecedingActionRule,
+    pub signal_rule: RecedingSignalRule,
     pub log_equity: Vec<f64>,
+    /// Cumulative gross log equity along the exact targets chosen by this run, before charging
+    /// execution cost. This is an accounting decomposition of the production decisions, not a
+    /// separately re-solved frictionless policy.
+    pub gross_log_equity: Vec<f64>,
     /// Panel indices actually scored. Boundary rows without a full `horizon` are absent.
     pub decision_instants: Vec<usize>,
     /// Calendar years from the first scored decision to the last. Stored so stdout can use the
@@ -1489,6 +1641,14 @@ pub struct RecedingRun {
     pub decision_span_years: f64,
     pub turnover: f64,
     pub execution_cost: f64,
+    /// Causally tradable coordinate-decisions considered by the action rule.
+    pub eligible_action_legs: usize,
+    /// Eligible coordinate-decisions frozen before the solver-safe second solve.
+    pub frozen_action_legs: usize,
+    /// Present model forecasts whose opposing sign was reflected inside the retained-state band.
+    pub retained_opposing_signs: usize,
+    /// Present model forecasts that crossed a strict threshold and changed retained sign.
+    pub threshold_flips: usize,
     pub max_gross: f64,
     pub max_abs_net: f64,
     pub max_name: f64,
@@ -1600,6 +1760,8 @@ impl Default for RecedingConfig {
 /// reconciles its diagonal to `max(E[R_H²] - E[R_H]², 0)`. The shared solver then adds the
 /// predicted-mean outer product. The oracle uses zero covariance plus its deterministic
 /// realized-H mean outer product. Both use identical costs, drifted holdings and constraints.
+/// A solver-safe band first obtains that exact incumbent target, freezes only eligible small
+/// moves by zeroing their ADV, and reruns the same joint solver for the remaining coordinates.
 #[allow(clippy::too_many_arguments)]
 pub fn run_receding_book(
     panel: &Panel,
@@ -1607,10 +1769,26 @@ pub fn run_receding_book(
     oracle_periods: &[Period],
     marginal: ForecastMoment,
     policy: RecedingPolicy,
+    action_rule: RecedingActionRule,
+    signal_rule: RecedingSignalRule,
     horizon: usize,
     cost: &dyn CostModel,
     config: RecedingConfig,
 ) -> Result<RecedingRun> {
+    let band_width = action_rule.absolute_weight();
+    ensure!(
+        band_width.is_finite() && band_width >= 0.0,
+        "receding action-rule width must be finite and nonnegative, got {band_width}"
+    );
+    let signal_margin = signal_rule.margin_simple();
+    ensure!(
+        signal_margin.is_finite() && signal_margin >= 0.0,
+        "receding signal-rule margin must be finite and nonnegative, got {signal_margin}"
+    );
+    ensure!(
+        policy == RecedingPolicy::Model || signal_rule == RecedingSignalRule::Raw,
+        "receding signal rules may only transform Model forecasts"
+    );
     ensure!(horizon >= 1, "a forecast horizon is at least one bar");
     ensure!(
         moments.len() == oracle_periods.len(),
@@ -1627,18 +1805,32 @@ pub fn run_receding_book(
     let mut adv = vec![0.0; names];
     let zero_second = vec![0.0; names];
     let mut one_bar_fallback = vec![0.0; names];
+    // Zero means uninitialized; missing symbols deliberately retain their prior nonzero state.
+    // Raw and a zero-margin candidate do not allocate, consult or mutate hysteresis state.
+    let mut retained_sign = if signal_margin > 0.0 {
+        vec![0i8; names]
+    } else {
+        Vec::new()
+    };
     let mut log_wealth: f64 = 0.0;
     let mut observed_until = 0usize;
     let mut run = RecedingRun {
         policy,
         horizon,
         reforecasts: 0,
+        action_rule,
+        signal_rule,
         actions: 0,
         log_equity: vec![0.0],
+        gross_log_equity: vec![0.0],
         decision_instants: Vec::with_capacity(oracle_periods.len()),
         decision_span_years: f64::NAN,
         turnover: 0.0,
         execution_cost: 0.0,
+        eligible_action_legs: 0,
+        frozen_action_legs: 0,
+        retained_opposing_signs: 0,
+        threshold_flips: 0,
         max_gross: 0.0,
         max_abs_net: 0.0,
         max_name: 0.0,
@@ -1729,6 +1921,16 @@ pub fn run_receding_book(
             }
             RecedingPolicy::EqualWeight | RecedingPolicy::BuyHold => {}
         }
+        if policy == RecedingPolicy::Model && signal_margin > 0.0 {
+            let (retained, flips) = apply_mean_sign_hysteresis(
+                &mut means,
+                &slice.symbols,
+                &mut retained_sign,
+                signal_margin,
+            );
+            run.retained_opposing_signs += retained;
+            run.threshold_flips += flips;
+        }
         ensure!(
             means.iter().chain(&second).all(|value| value.is_finite()),
             "{} has a non-finite H={horizon} moment at row {t}",
@@ -1765,19 +1967,58 @@ pub fn run_receding_book(
         run.mean_factor_variance +=
             (risk.factor_variance - run.mean_factor_variance) / (p + 1) as f64;
         let equity = config.capital_usd * log_wealth.exp();
-        let equal_target = || -> Result<Vec<f64>> {
+        let equal_desired = || {
             let mut desired = vec![0.0; names];
             let weight =
                 1.0f64.min(config.constraints.gross_cap) / slice.symbols.len().max(1) as f64;
             for &id in &slice.symbols {
                 desired[id as usize] = weight.min(config.constraints.per_name_cap);
             }
+            desired
+        };
+        let solve_target = |solver_adv: &[f64]| -> Result<Vec<f64>> {
+            let (desired, solver_risk) = match policy {
+                RecedingPolicy::Model | RecedingPolicy::Marginal | RecedingPolicy::Oracle => {
+                    (&means[..], &risk)
+                }
+                RecedingPolicy::EqualWeight => {
+                    let desired = equal_desired();
+                    return Ok(solve_cost_aware_kelly(
+                        &symbol_ids,
+                        &desired,
+                        &FactorCovariance::independent(vec![1.0; names]),
+                        &held,
+                        solver_adv,
+                        slice.ts_ms,
+                        equity,
+                        cost,
+                        config.constraints,
+                    )?
+                    .target);
+                }
+                RecedingPolicy::BuyHold if p == 0 => {
+                    let desired = equal_desired();
+                    return Ok(solve_cost_aware_kelly(
+                        &symbol_ids,
+                        &desired,
+                        &FactorCovariance::independent(vec![1.0; names]),
+                        &held,
+                        solver_adv,
+                        slice.ts_ms,
+                        equity,
+                        cost,
+                        config.constraints,
+                    )?
+                    .target);
+                }
+                RecedingPolicy::BuyHold => return Ok(held.clone()),
+            };
             Ok(solve_cost_aware_kelly(
                 &symbol_ids,
-                &desired,
-                &FactorCovariance::independent(vec![1.0; names]),
+                desired,
+                solver_risk,
                 &held,
-                &adv,
+                solver_adv,
                 slice.ts_ms,
                 equity,
                 cost,
@@ -1785,26 +2026,14 @@ pub fn run_receding_book(
             )?
             .target)
         };
-
-        let target = match policy {
-            RecedingPolicy::Model | RecedingPolicy::Marginal | RecedingPolicy::Oracle => {
-                solve_cost_aware_kelly(
-                    &symbol_ids,
-                    &means,
-                    &risk,
-                    &held,
-                    &adv,
-                    slice.ts_ms,
-                    equity,
-                    cost,
-                    config.constraints,
-                )?
-                .target
-            }
-            RecedingPolicy::EqualWeight => equal_target()?,
-            RecedingPolicy::BuyHold if p == 0 => equal_target()?,
-            RecedingPolicy::BuyHold => held.clone(),
-        };
+        let incumbent_target = solve_target(&adv)?;
+        let (target, eligible_legs, frozen_legs) =
+            apply_receding_action_rule(action_rule, incumbent_target, &held, &adv, |banded_adv| {
+                solve_target(banded_adv)
+            })
+            .with_context(|| format!("{} action rule failed at row {t}", policy.name()))?;
+        run.eligible_action_legs += eligible_legs;
+        run.frozen_action_legs += frozen_legs;
         let portfolio_violations = |weights: &[f64]| {
             let gross = weights.iter().map(|weight| weight.abs()).sum::<f64>();
             let net = weights.iter().sum::<f64>();
@@ -1867,6 +2096,7 @@ pub fn run_receding_book(
         }
         ensure!(
             cost_fraction.is_finite()
+                && cost_fraction >= 0.0
                 && run.max_participation <= config.constraints.max_adv_participation + 1e-9,
             "{} selected an unpriceable or over-participation action at row {t}",
             policy.name()
@@ -1882,7 +2112,13 @@ pub fn run_receding_book(
             .zip(&realized)
             .map(|(&id, ret)| target[id as usize] * ret)
             .sum::<f64>();
-        let multiplier = 1.0 + payoff - cost_fraction;
+        let gross_multiplier = 1.0 + payoff;
+        ensure!(
+            gross_multiplier > 0.0 && gross_multiplier.is_finite(),
+            "{} H={horizon} has non-positive gross wealth at panel row {t}",
+            policy.name()
+        );
+        let multiplier = gross_multiplier - cost_fraction;
         ensure!(
             multiplier > 0.0 && multiplier.is_finite(),
             "{} H={horizon} ruined at panel row {t}",
@@ -1897,6 +2133,13 @@ pub fn run_receding_book(
         }
         log_wealth += multiplier.ln();
         run.log_equity.push(log_wealth);
+        let gross_log_wealth = run
+            .gross_log_equity
+            .last()
+            .copied()
+            .expect("gross curve starts at zero")
+            + gross_multiplier.ln();
+        run.gross_log_equity.push(gross_log_wealth);
         run.turnover += turnover;
         run.execution_cost += cost_fraction;
         run.max_gross = run.max_gross.max(held.iter().map(|w| w.abs()).sum::<f64>());
@@ -1908,6 +2151,16 @@ pub fn run_receding_book(
         observed_until = t + 1;
         run.covariance_observations = trailing.estimate(&zero_second)?.observations;
     }
+    ensure!(
+        run.gross_log_equity.len() == run.log_equity.len()
+            && run
+                .gross_log_equity
+                .windows(2)
+                .zip(run.log_equity.windows(2))
+                .all(|(gross, net)| { (gross[1] - gross[0]) + 1e-12 >= net[1] - net[0] }),
+        "{} gross/net execution-cost accounting failed",
+        policy.name()
+    );
     run.decision_span_years = run.span_years(panel);
     ensure!(
         run.decision_span_years.is_finite() && run.decision_span_years > 0.0,
@@ -1936,6 +2189,1777 @@ impl ReportSeriesNew for ReportSeries {
 }
 
 pub const RECEDING_COVARIANCE_BASE: &str = "pretrain_receding_covariance";
+
+pub const RECEDING_ATTRIBUTION_BASE: &str = "pretrain_receding_attribution";
+
+/// Fixed rungs in the selected-horizon attribution ladder.  Stages 1--4 differ from their
+/// predecessor by exactly the factor named in [`Self::label`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RecedingAttributionStage {
+    ScalarMoment = 0,
+    DiagonalZeroCost = 1,
+    FactorZeroCost = 2,
+    FactorNoImpactCost = 3,
+    ProductionAllIn = 4,
+}
+
+pub const RECEDING_ATTRIBUTION_STAGES: [RecedingAttributionStage; 5] = [
+    RecedingAttributionStage::ScalarMoment,
+    RecedingAttributionStage::DiagonalZeroCost,
+    RecedingAttributionStage::FactorZeroCost,
+    RecedingAttributionStage::FactorNoImpactCost,
+    RecedingAttributionStage::ProductionAllIn,
+];
+
+impl RecedingAttributionStage {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ScalarMoment => "0 scalar capped-moment diagnostic (non-self-financing)",
+            Self::DiagonalZeroCost => "1 shared diagonal forecast risk, zero cost",
+            Self::FactorZeroCost => "2 shared production factor risk, zero cost",
+            Self::FactorNoImpactCost => {
+                "3 shared production factor risk, measured impact-free cost"
+            }
+            Self::ProductionAllIn => "4 production factor risk, all-in cost",
+        }
+    }
+
+    pub const fn apples_to_previous(self) -> f64 {
+        match self {
+            Self::ScalarMoment => f64::NAN,
+            Self::DiagonalZeroCost => 0.0,
+            Self::FactorZeroCost | Self::FactorNoImpactCost | Self::ProductionAllIn => 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ScalarMomentAttribution {
+    pub decision_instants: Vec<usize>,
+    pub model_log_growth: Vec<f64>,
+    pub marginal_log_growth: Vec<f64>,
+    pub eligible_legs: usize,
+    pub catch_up_excluded_legs: usize,
+}
+/// Evaluate the deliberately non-self-financing scalar diagnostic. Each scored decision row has
+/// equal weight regardless of breadth; within a row, only fresh one-clock-step prints share that
+/// weight. A row made entirely of overnight/catch-up prints is counted and skipped rather than
+/// turned into a fresh trade. The singleton call into `trade_bench` is intentional: it reuses
+/// that benchmark's expected-log wealth-floor contract without claiming to reproduce its
+/// categorical ruin-domain bracket or independent-window execution policy.
+pub fn scalar_moment_attribution(
+    panel: &Panel,
+    moments: &[Vec<ForecastMoment>],
+    periods: &[Period],
+    marginal: ForecastMoment,
+    horizon: usize,
+) -> Result<ScalarMomentAttribution> {
+    ensure!(
+        horizon >= 1,
+        "a scalar attribution horizon is at least one bar"
+    );
+    ensure!(
+        moments.len() == periods.len(),
+        "scalar moments and realized periods must have identical decision rows"
+    );
+    let marginal_fraction = if marginal.second_simple > 0.0 {
+        (marginal.mean_simple / marginal.second_simple).clamp(-LEVERAGE_CAP, LEVERAGE_CAP)
+    } else {
+        0.0
+    };
+    let mut out = ScalarMomentAttribution {
+        decision_instants: Vec::with_capacity(periods.len()),
+        model_log_growth: Vec::with_capacity(periods.len()),
+        marginal_log_growth: Vec::with_capacity(periods.len()),
+        eligible_legs: 0,
+        catch_up_excluded_legs: 0,
+    };
+    for (row, (row_moments, period)) in moments.iter().zip(periods).enumerate() {
+        let slice = &panel.slices()[period.instant];
+        ensure!(
+            row_moments.len() == slice.symbols.len() && period.legs.len() == slice.symbols.len(),
+            "scalar row {row} does not align with panel instant {}",
+            period.instant
+        );
+        let mut model_sum = 0.0;
+        let mut marginal_sum = 0.0;
+        let mut eligible = 0usize;
+        for (slot, (moment, leg)) in row_moments.iter().zip(&period.legs).enumerate() {
+            ensure!(
+                leg.id == slice.symbols[slot] && leg.slot == slot && leg.steps == horizon,
+                "scalar row {row} is not a full aligned H={horizon} realization"
+            );
+            if panel.elapsed_steps(period.instant, slot) != 1 {
+                out.catch_up_excluded_legs += 1;
+                continue;
+            }
+            let model_fraction = if moment.second_simple > 0.0 {
+                (moment.mean_simple / moment.second_simple).clamp(-LEVERAGE_CAP, LEVERAGE_CAP)
+            } else {
+                0.0
+            };
+            let realized = leg.realized_log.exp_m1();
+            model_sum += expected_log_growth(&[1.0], &[realized], model_fraction);
+            marginal_sum += expected_log_growth(&[1.0], &[realized], marginal_fraction);
+            eligible += 1;
+        }
+        if eligible == 0 {
+            continue;
+        }
+        out.eligible_legs += eligible;
+        out.decision_instants.push(period.instant);
+        out.model_log_growth.push(model_sum / eligible as f64);
+        out.marginal_log_growth.push(marginal_sum / eligible as f64);
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Debug)]
+pub struct RecedingAttributionResult {
+    pub stage: RecedingAttributionStage,
+    pub model_net_bps_per_decision_bar: Dispersion,
+    pub model_gross_bps_per_decision_bar: Dispersion,
+    pub net_edge_bps_per_decision_bar: Dispersion,
+    pub gross_edge_bps_per_decision_bar: Dispersion,
+    /// Exact positive log drag on the model arm: gross minus net.
+    pub model_cost_drag_bps_per_decision_bar: Dispersion,
+    /// Signed effect of relative costs on model-minus-marginal edge: net edge minus gross edge.
+    pub edge_cost_contribution_bps_per_decision_bar: Dispersion,
+    /// Paired adjacent-rung change for the model book. Undefined for scalar stage 0 and the
+    /// first self-financing book at stage 1.
+    pub model_stage_minus_previous_net_bps_per_decision_bar: Dispersion,
+    pub model_stage_minus_previous_gross_bps_per_decision_bar: Dispersion,
+    /// Change in exact positive cost drag (`gross - net`) from the previous rung.
+    pub model_stage_minus_previous_cost_drag_bps_per_decision_bar: Dispersion,
+    pub model_net_log_growth_per_year: f64,
+    pub model_gross_log_growth_per_year: f64,
+    pub net_edge_log_growth_per_year: f64,
+    pub gross_edge_log_growth_per_year: f64,
+    pub model_cost_drag_log_per_year: f64,
+    pub edge_cost_contribution_log_per_year: f64,
+    pub model_stage_minus_previous_net_log_growth_per_year: f64,
+    pub model_stage_minus_previous_gross_log_growth_per_year: f64,
+    pub model_stage_minus_previous_cost_drag_log_per_year: f64,
+    pub model_stage_minus_previous_total_turnover: f64,
+    pub model_turnover: f64,
+    pub marginal_turnover: f64,
+    pub model_execution_cost: f64,
+    pub marginal_execution_cost: f64,
+    pub max_gross: f64,
+    pub max_abs_net: f64,
+    pub max_name: f64,
+    pub max_participation: f64,
+    pub covariance_observations: f64,
+    pub covariance_shrinkage: f64,
+    pub mean_factor_variance: f64,
+    pub cost_month_substitutions: f64,
+    pub cost_cross_section_substitutions: f64,
+    pub decision_rows: usize,
+    pub eligible_scalar_legs: f64,
+    pub catch_up_excluded_scalar_legs: f64,
+}
+
+fn daily_scaled_dispersion(
+    values: &[f64],
+    decision_instants: &[usize],
+    panel: &Panel,
+    scale: f64,
+) -> Dispersion {
+    assert_eq!(
+        values.len(),
+        decision_instants.len(),
+        "one realized increment per decision instant"
+    );
+    let days: Vec<u64> = decision_instants
+        .iter()
+        .map(|&instant| panel.slices()[instant].ts_ms.div_euclid(86_400_000) as u64)
+        .collect();
+    let mut result = block_bootstrap(values, &days, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+    result.mean *= scale;
+    result.se *= scale;
+    result.ci_low *= scale;
+    result.ci_high *= scale;
+    result
+}
+
+/// UTC start-day groups and the conservative moving length for overlapping scalar H-step
+/// outcomes. H=1 retains the ordinary daily bootstrap exactly. Every multi-bar horizon adds
+/// a boundary day beyond its ceiling in measured-session units, because a window started
+/// near the session close can cross into the next start day even when H is shorter than one
+/// full session.
+fn scalar_moving_day_blocks(
+    decision_instants: &[usize],
+    panel: &Panel,
+    horizon: usize,
+) -> (Vec<u64>, usize) {
+    let days: Vec<u64> = decision_instants
+        .iter()
+        .map(|&instant| panel.slices()[instant].ts_ms.div_euclid(86_400_000) as u64)
+        .collect();
+    let instants_per_day = panel.instants_per_day();
+    assert!(
+        instants_per_day.is_finite() && instants_per_day > 0.0,
+        "scalar moving-day bootstrap needs a measured panel session"
+    );
+    let uncapped_len = if horizon == 1 {
+        1
+    } else {
+        (horizon as f64 / instants_per_day).ceil() as usize + 1
+    };
+    let distinct_days = days
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    (days, uncapped_len.min(distinct_days.max(1)))
+}
+
+fn moving_day_scaled_dispersion(
+    values: &[f64],
+    days: &[u64],
+    block_len: usize,
+    scale: f64,
+) -> Dispersion {
+    let mut result =
+        moving_block_bootstrap(values, days, block_len, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+    result.mean *= scale;
+    result.se *= scale;
+    result.ci_low *= scale;
+    result.ci_high *= scale;
+    result
+}
+
+fn log_increments(path: &[f64]) -> Vec<f64> {
+    path.windows(2).map(|pair| pair[1] - pair[0]).collect()
+}
+
+fn path_bps_dispersion(run: &RecedingRun, path: &[f64], panel: &Panel) -> Dispersion {
+    daily_scaled_dispersion(&log_increments(path), &run.decision_instants, panel, 1.0e4)
+}
+
+fn paired_path_bps_dispersion(
+    lhs: &RecedingRun,
+    lhs_path: &[f64],
+    rhs: &RecedingRun,
+    rhs_path: &[f64],
+    panel: &Panel,
+) -> Dispersion {
+    assert_eq!(
+        lhs.decision_instants, rhs.decision_instants,
+        "paired attribution paths must score identical decisions"
+    );
+    let values: Vec<f64> = log_increments(lhs_path)
+        .into_iter()
+        .zip(log_increments(rhs_path))
+        .map(|(lhs, rhs)| lhs - rhs)
+        .collect();
+    daily_scaled_dispersion(&values, &lhs.decision_instants, panel, 1.0e4)
+}
+
+fn edge_cost_contribution_bps_dispersion(
+    model: &RecedingRun,
+    marginal: &RecedingRun,
+    panel: &Panel,
+) -> Dispersion {
+    assert_eq!(
+        model.decision_instants, marginal.decision_instants,
+        "cost attribution arms must score identical decisions"
+    );
+    let values: Vec<f64> = log_increments(&model.log_equity)
+        .into_iter()
+        .zip(log_increments(&marginal.log_equity))
+        .zip(log_increments(&model.gross_log_equity))
+        .zip(log_increments(&marginal.gross_log_equity))
+        .map(
+            |(((model_net, marginal_net), model_gross), marginal_gross)| {
+                (model_net - marginal_net) - (model_gross - marginal_gross)
+            },
+        )
+        .collect();
+    daily_scaled_dispersion(&values, &model.decision_instants, panel, 1.0e4)
+}
+
+fn stage_cost_drag_change_bps_dispersion(
+    model: &RecedingRun,
+    previous: &RecedingRun,
+    panel: &Panel,
+) -> Dispersion {
+    assert_eq!(
+        model.decision_instants, previous.decision_instants,
+        "adjacent attribution rungs must score identical decisions"
+    );
+    let values: Vec<f64> = log_increments(&model.gross_log_equity)
+        .into_iter()
+        .zip(log_increments(&model.log_equity))
+        .zip(log_increments(&previous.gross_log_equity))
+        .zip(log_increments(&previous.log_equity))
+        .map(|(((gross, net), previous_gross), previous_net)| {
+            (gross - net) - (previous_gross - previous_net)
+        })
+        .collect();
+    daily_scaled_dispersion(&values, &model.decision_instants, panel, 1.0e4)
+}
+
+fn annual_path_growth(run: &RecedingRun, path: &[f64]) -> f64 {
+    path.last().copied().unwrap_or(0.0) / run.decision_span_years
+}
+
+fn book_attribution_result(
+    stage: RecedingAttributionStage,
+    model: &RecedingRun,
+    marginal: &RecedingRun,
+    previous_model: Option<&RecedingRun>,
+    panel: &Panel,
+) -> RecedingAttributionResult {
+    let model_net = path_bps_dispersion(model, &model.log_equity, panel);
+    let model_gross = path_bps_dispersion(model, &model.gross_log_equity, panel);
+    let net_edge = paired_path_bps_dispersion(
+        model,
+        &model.log_equity,
+        marginal,
+        &marginal.log_equity,
+        panel,
+    );
+    let gross_edge = paired_path_bps_dispersion(
+        model,
+        &model.gross_log_equity,
+        marginal,
+        &marginal.gross_log_equity,
+        panel,
+    );
+    let model_cost_drag = paired_path_bps_dispersion(
+        model,
+        &model.gross_log_equity,
+        model,
+        &model.log_equity,
+        panel,
+    );
+    let edge_cost_contribution = edge_cost_contribution_bps_dispersion(model, marginal, panel);
+    let model_net_annual = model.annual_log_growth(panel);
+    let model_gross_annual = annual_path_growth(model, &model.gross_log_equity);
+    let marginal_net_annual = marginal.annual_log_growth(panel);
+    let marginal_gross_annual = annual_path_growth(marginal, &marginal.gross_log_equity);
+    let net_edge_annual = model_net_annual - marginal_net_annual;
+    let gross_edge_annual = model_gross_annual - marginal_gross_annual;
+    let model_cost_drag_annual = model_gross_annual - model_net_annual;
+    let edge_cost_contribution_annual = net_edge_annual - gross_edge_annual;
+    let (
+        stage_net_change,
+        stage_gross_change,
+        stage_cost_drag_change,
+        stage_net_change_annual,
+        stage_gross_change_annual,
+        stage_cost_drag_change_annual,
+        stage_turnover_change,
+    ) = if let Some(previous) = previous_model {
+        assert_eq!(
+            model.decision_instants, previous.decision_instants,
+            "adjacent attribution rungs must score identical decisions"
+        );
+        let net = paired_path_bps_dispersion(
+            model,
+            &model.log_equity,
+            previous,
+            &previous.log_equity,
+            panel,
+        );
+        let gross = paired_path_bps_dispersion(
+            model,
+            &model.gross_log_equity,
+            previous,
+            &previous.gross_log_equity,
+            panel,
+        );
+        let cost_drag = stage_cost_drag_change_bps_dispersion(model, previous, panel);
+        let previous_net_annual = previous.annual_log_growth(panel);
+        let previous_gross_annual = annual_path_growth(previous, &previous.gross_log_equity);
+        let net_annual = model_net_annual - previous_net_annual;
+        let gross_annual = model_gross_annual - previous_gross_annual;
+        (
+            net,
+            gross,
+            cost_drag,
+            net_annual,
+            gross_annual,
+            (model_gross_annual - model_net_annual) - (previous_gross_annual - previous_net_annual),
+            model.turnover - previous.turnover,
+        )
+    } else {
+        (
+            Dispersion::nan(),
+            Dispersion::nan(),
+            Dispersion::nan(),
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        )
+    };
+    let tolerance = 1e-9;
+    assert!(
+        model_cost_drag.mean >= -tolerance
+            && model_cost_drag_annual >= -tolerance
+            && ((model_gross.mean - model_net.mean) - model_cost_drag.mean).abs() <= tolerance
+            && ((net_edge.mean - gross_edge.mean) - edge_cost_contribution.mean).abs() <= tolerance
+            && ((model_gross_annual - model_net_annual) - model_cost_drag_annual).abs()
+                <= tolerance
+            && ((net_edge_annual - gross_edge_annual) - edge_cost_contribution_annual).abs()
+                <= tolerance,
+        "receding attribution gross/net/cost accounting identity failed at stage {}",
+        stage as u8
+    );
+    if previous_model.is_some() {
+        assert!(
+            ((stage_gross_change.mean - stage_net_change.mean) - stage_cost_drag_change.mean).abs()
+                <= tolerance
+                && ((stage_gross_change_annual - stage_net_change_annual)
+                    - stage_cost_drag_change_annual)
+                    .abs()
+                    <= tolerance,
+            "adjacent-rung gross/net/cost accounting identity failed at stage {}",
+            stage as u8
+        );
+    }
+    RecedingAttributionResult {
+        stage,
+        model_net_bps_per_decision_bar: model_net,
+        model_gross_bps_per_decision_bar: model_gross,
+        net_edge_bps_per_decision_bar: net_edge,
+        gross_edge_bps_per_decision_bar: gross_edge,
+        model_cost_drag_bps_per_decision_bar: model_cost_drag,
+        edge_cost_contribution_bps_per_decision_bar: edge_cost_contribution,
+        model_stage_minus_previous_net_bps_per_decision_bar: stage_net_change,
+        model_stage_minus_previous_gross_bps_per_decision_bar: stage_gross_change,
+        model_stage_minus_previous_cost_drag_bps_per_decision_bar: stage_cost_drag_change,
+        model_net_log_growth_per_year: model_net_annual,
+        model_gross_log_growth_per_year: model_gross_annual,
+        net_edge_log_growth_per_year: net_edge_annual,
+        gross_edge_log_growth_per_year: gross_edge_annual,
+        model_cost_drag_log_per_year: model_cost_drag_annual,
+        edge_cost_contribution_log_per_year: edge_cost_contribution_annual,
+        model_stage_minus_previous_net_log_growth_per_year: stage_net_change_annual,
+        model_stage_minus_previous_gross_log_growth_per_year: stage_gross_change_annual,
+        model_stage_minus_previous_cost_drag_log_per_year: stage_cost_drag_change_annual,
+        model_stage_minus_previous_total_turnover: stage_turnover_change,
+        model_turnover: model.turnover,
+        marginal_turnover: marginal.turnover,
+        model_execution_cost: model.execution_cost,
+        marginal_execution_cost: marginal.execution_cost,
+        max_gross: model.max_gross,
+        max_abs_net: model.max_abs_net,
+        max_name: model.max_name,
+        max_participation: model.max_participation,
+        covariance_observations: model.covariance_observations as f64,
+        covariance_shrinkage: model.covariance_shrinkage,
+        mean_factor_variance: model.mean_factor_variance,
+        cost_month_substitutions: model.cost_month_substitutions as f64,
+        cost_cross_section_substitutions: model.cost_cross_section_substitutions as f64,
+        decision_rows: model.decision_instants.len(),
+        eligible_scalar_legs: f64::NAN,
+        catch_up_excluded_scalar_legs: f64::NAN,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_receding_attribution(
+    dir: &Path,
+    label: &str,
+    panel: &Panel,
+    moments: &[Vec<ForecastMoment>],
+    periods: &[Period],
+    marginal: ForecastMoment,
+    horizon: usize,
+    production_runs: &[RecedingRun],
+    production_cost: &PanelCost,
+    config: RecedingConfig,
+) -> Result<Vec<RecedingAttributionResult>> {
+    let production_model = production_runs
+        .iter()
+        .find(|run| {
+            run.policy == RecedingPolicy::Model
+                && run.horizon == horizon
+                && run.signal_rule == RecedingSignalRule::Raw
+        })
+        .with_context(|| format!("missing selected all-in model run at H={horizon}"))?;
+    let production_marginal = production_runs
+        .iter()
+        .find(|run| run.policy == RecedingPolicy::Marginal && run.horizon == horizon)
+        .with_context(|| format!("missing selected all-in marginal run at H={horizon}"))?;
+    let scalar = scalar_moment_attribution(panel, moments, periods, marginal, horizon)?;
+    ensure!(
+        production_model.decision_instants == production_marginal.decision_instants,
+        "selected production book arms must share decision instants"
+    );
+    ensure!(
+        scalar
+            .decision_instants
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+            && scalar.decision_instants.iter().all(|instant| {
+                production_model
+                    .decision_instants
+                    .binary_search(instant)
+                    .is_ok()
+            }),
+        "scalar scored rows must be an ordered subset of production decision instants"
+    );
+    let zero_cost = FlatCost::new(0.0);
+    let no_impact_cost = production_cost.with_parts(CostParts::NoImpact);
+    let mut book_runs = Vec::with_capacity(3);
+    for stage in [
+        RecedingAttributionStage::DiagonalZeroCost,
+        RecedingAttributionStage::FactorZeroCost,
+        RecedingAttributionStage::FactorNoImpactCost,
+    ] {
+        let mut stage_config = config;
+        if stage == RecedingAttributionStage::DiagonalZeroCost {
+            stage_config.covariance_shrinkage = 1.0;
+        }
+        let stage_cost: &dyn CostModel = if stage == RecedingAttributionStage::FactorNoImpactCost {
+            &no_impact_cost
+        } else {
+            &zero_cost
+        };
+        let model = run_receding_book(
+            panel,
+            moments,
+            periods,
+            marginal,
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            horizon,
+            stage_cost,
+            stage_config,
+        )?;
+        let marginal_run = run_receding_book(
+            panel,
+            moments,
+            periods,
+            marginal,
+            RecedingPolicy::Marginal,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            horizon,
+            stage_cost,
+            stage_config,
+        )?;
+        book_runs.push((stage, model, marginal_run));
+    }
+    for (_, model, marginal_run) in &book_runs {
+        ensure!(
+            model.decision_instants == production_model.decision_instants
+                && marginal_run.decision_instants == production_model.decision_instants,
+            "every attribution book arm must share the selected production decision instants"
+        );
+    }
+
+    let scalar_edge: Vec<f64> = scalar
+        .model_log_growth
+        .iter()
+        .zip(&scalar.marginal_log_growth)
+        .map(|(model, marginal)| model - marginal)
+        .collect();
+    let span_years = scalar
+        .decision_instants
+        .first()
+        .zip(scalar.decision_instants.last())
+        .map(|(&first, &last)| {
+            (panel.slices()[last].ts_ms - panel.slices()[first].ts_ms) as f64
+                / (365.25 * 86_400_000.0)
+        })
+        .unwrap_or(f64::NAN);
+    ensure!(
+        span_years.is_finite() && span_years > 0.0,
+        "scalar attribution needs at least two distinct decision instants"
+    );
+    let scalar_model_sum = scalar.model_log_growth.iter().sum::<f64>();
+    let scalar_edge_sum = scalar_edge.iter().sum::<f64>();
+    let (scalar_days, scalar_block_len) =
+        scalar_moving_day_blocks(&scalar.decision_instants, panel, horizon);
+    let scalar_net = moving_day_scaled_dispersion(
+        &scalar.model_log_growth,
+        &scalar_days,
+        scalar_block_len,
+        1.0e4 / horizon as f64,
+    );
+    let scalar_edge_dispersion = moving_day_scaled_dispersion(
+        &scalar_edge,
+        &scalar_days,
+        scalar_block_len,
+        1.0e4 / horizon as f64,
+    );
+    let mut results = vec![RecedingAttributionResult {
+        stage: RecedingAttributionStage::ScalarMoment,
+        model_net_bps_per_decision_bar: scalar_net,
+        model_gross_bps_per_decision_bar: Dispersion::nan(),
+        net_edge_bps_per_decision_bar: scalar_edge_dispersion,
+        gross_edge_bps_per_decision_bar: Dispersion::nan(),
+        model_cost_drag_bps_per_decision_bar: Dispersion::nan(),
+        edge_cost_contribution_bps_per_decision_bar: Dispersion::nan(),
+        model_stage_minus_previous_net_bps_per_decision_bar: Dispersion::nan(),
+        model_stage_minus_previous_gross_bps_per_decision_bar: Dispersion::nan(),
+        model_stage_minus_previous_cost_drag_bps_per_decision_bar: Dispersion::nan(),
+        model_net_log_growth_per_year: scalar_model_sum / horizon as f64 / span_years,
+        model_gross_log_growth_per_year: f64::NAN,
+        net_edge_log_growth_per_year: scalar_edge_sum / horizon as f64 / span_years,
+        gross_edge_log_growth_per_year: f64::NAN,
+        model_cost_drag_log_per_year: f64::NAN,
+        edge_cost_contribution_log_per_year: f64::NAN,
+        model_stage_minus_previous_net_log_growth_per_year: f64::NAN,
+        model_stage_minus_previous_gross_log_growth_per_year: f64::NAN,
+        model_stage_minus_previous_cost_drag_log_per_year: f64::NAN,
+        model_stage_minus_previous_total_turnover: f64::NAN,
+        model_turnover: f64::NAN,
+        marginal_turnover: f64::NAN,
+        model_execution_cost: f64::NAN,
+        marginal_execution_cost: f64::NAN,
+        max_gross: f64::NAN,
+        max_abs_net: f64::NAN,
+        max_name: f64::NAN,
+        max_participation: f64::NAN,
+        covariance_observations: f64::NAN,
+        covariance_shrinkage: f64::NAN,
+        mean_factor_variance: f64::NAN,
+        cost_month_substitutions: f64::NAN,
+        cost_cross_section_substitutions: f64::NAN,
+        decision_rows: scalar.decision_instants.len(),
+        eligible_scalar_legs: scalar.eligible_legs as f64,
+        catch_up_excluded_scalar_legs: scalar.catch_up_excluded_legs as f64,
+    }];
+    for index in 0..book_runs.len() {
+        let (stage, model, marginal_run) = &book_runs[index];
+        let previous_model = index.checked_sub(1).map(|previous| &book_runs[previous].1);
+        results.push(book_attribution_result(
+            *stage,
+            model,
+            marginal_run,
+            previous_model,
+            panel,
+        ));
+    }
+    // These are references to the already-computed production arms. Stage 4 never calls the
+    // solver and therefore remains bit-for-bit sourced from the original all-in run.
+    results.push(book_attribution_result(
+        RecedingAttributionStage::ProductionAllIn,
+        production_model,
+        production_marginal,
+        Some(
+            &book_runs
+                .last()
+                .expect("stage 3 book precedes production")
+                .1,
+        ),
+        panel,
+    ));
+    ensure!(
+        results
+            .iter()
+            .map(|result| result.stage)
+            .eq(RECEDING_ATTRIBUTION_STAGES),
+        "attribution results must retain the fixed five-stage axis"
+    );
+
+    write_receding_attribution_report(dir, label, horizon, &results)?;
+    Ok(results)
+}
+
+fn write_receding_attribution_report(
+    dir: &Path,
+    label: &str,
+    horizon: usize,
+    results: &[RecedingAttributionResult],
+) -> Result<()> {
+    ensure!(
+        results
+            .iter()
+            .map(|result| result.stage)
+            .eq(RECEDING_ATTRIBUTION_STAGES),
+        "attribution report requires the fixed five-stage axis"
+    );
+    let values =
+        |f: fn(&RecedingAttributionResult) -> f64| results.iter().map(f).collect::<Vec<f64>>();
+    let stage_map = RECEDING_ATTRIBUTION_STAGES
+        .iter()
+        .map(|stage| stage.label())
+        .collect::<Vec<_>>()
+        .join("; ");
+    write_chart(
+        dir,
+        RECEDING_ATTRIBUTION_BASE,
+        format!(
+            "Selected-H Receding Attribution - {label} - H={horizon}; CI: scalar stage 0 overlap-aware moving day blocks, shared stages 1-4 daily blocks; stages: {stage_map}"
+        ),
+        "fixed attribution stage [0..4]",
+        "matched economic level / audit",
+        ScaleKind::Linear,
+        vec![
+            report_series("stage index", (0..5).map(|stage| stage as f64).collect()),
+            report_series(
+                "apples-to-previous",
+                RECEDING_ATTRIBUTION_STAGES
+                    .iter()
+                    .map(|stage| stage.apples_to_previous())
+                    .collect(),
+            ),
+            report_series(
+                "model net log growth (bps/decision-bar)",
+                values(|r| r.model_net_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "model net log growth (bps/decision-bar), ci low (scalar stage 0 overlap-aware moving-day blocks; shared stages daily blocks)",
+                values(|r| r.model_net_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "model net log growth (bps/decision-bar), ci high (scalar stage 0 overlap-aware moving-day blocks; shared stages daily blocks)",
+                values(|r| r.model_net_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "model gross log growth (bps/decision-bar)",
+                values(|r| r.model_gross_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "model gross log growth (bps/decision-bar), daily-block ci low",
+                values(|r| r.model_gross_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "model gross log growth (bps/decision-bar), daily-block ci high",
+                values(|r| r.model_gross_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "model exact cost drag, gross minus net (bps/decision-bar)",
+                values(|r| r.model_cost_drag_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "model exact cost drag, gross minus net (bps/decision-bar), paired daily-block ci low",
+                values(|r| r.model_cost_drag_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "model exact cost drag, gross minus net (bps/decision-bar), paired daily-block ci high",
+                values(|r| r.model_cost_drag_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "model minus marginal net edge (bps/decision-bar)",
+                values(|r| r.net_edge_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "model minus marginal net edge (bps/decision-bar), paired ci low (scalar stage 0 overlap-aware moving-day blocks; shared stages daily blocks)",
+                values(|r| r.net_edge_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "model minus marginal net edge (bps/decision-bar), paired ci high (scalar stage 0 overlap-aware moving-day blocks; shared stages daily blocks)",
+                values(|r| r.net_edge_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "model minus marginal gross edge (bps/decision-bar)",
+                values(|r| r.gross_edge_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "model minus marginal gross edge (bps/decision-bar), paired daily-block ci low",
+                values(|r| r.gross_edge_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "model minus marginal gross edge (bps/decision-bar), paired daily-block ci high",
+                values(|r| r.gross_edge_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "signed edge cost contribution, net edge minus gross edge (bps/decision-bar)",
+                values(|r| r.edge_cost_contribution_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "signed edge cost contribution, net edge minus gross edge (bps/decision-bar), paired daily-block ci low",
+                values(|r| r.edge_cost_contribution_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "signed edge cost contribution, net edge minus gross edge (bps/decision-bar), paired daily-block ci high",
+                values(|r| r.edge_cost_contribution_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "model net log growth/year",
+                values(|r| r.model_net_log_growth_per_year),
+            ),
+            report_series(
+                "model gross log growth/year",
+                values(|r| r.model_gross_log_growth_per_year),
+            ),
+            report_series(
+                "model exact cost drag, gross minus net (log/year)",
+                values(|r| r.model_cost_drag_log_per_year),
+            ),
+            report_series(
+                "model minus marginal net edge (log/year)",
+                values(|r| r.net_edge_log_growth_per_year),
+            ),
+            report_series(
+                "model minus marginal gross edge (log/year)",
+                values(|r| r.gross_edge_log_growth_per_year),
+            ),
+            report_series(
+                "signed edge cost contribution, net edge minus gross edge (log/year)",
+                values(|r| r.edge_cost_contribution_log_per_year),
+            ),
+            report_series(
+                "model stage minus previous net log growth (bps/decision-bar)",
+                values(|r| r.model_stage_minus_previous_net_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "model stage minus previous net log growth (bps/decision-bar), paired daily-block ci low",
+                values(|r| r.model_stage_minus_previous_net_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "model stage minus previous net log growth (bps/decision-bar), paired daily-block ci high",
+                values(|r| r.model_stage_minus_previous_net_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "model stage minus previous gross log growth (bps/decision-bar)",
+                values(|r| r.model_stage_minus_previous_gross_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "model stage minus previous gross log growth (bps/decision-bar), paired daily-block ci low",
+                values(|r| r.model_stage_minus_previous_gross_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "model stage minus previous gross log growth (bps/decision-bar), paired daily-block ci high",
+                values(|r| r.model_stage_minus_previous_gross_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "model stage minus previous exact cost drag (bps/decision-bar)",
+                values(|r| r.model_stage_minus_previous_cost_drag_bps_per_decision_bar.mean),
+            ),
+            report_series(
+                "model stage minus previous exact cost drag (bps/decision-bar), paired daily-block ci low",
+                values(|r| r.model_stage_minus_previous_cost_drag_bps_per_decision_bar.ci_low),
+            ),
+            report_series(
+                "model stage minus previous exact cost drag (bps/decision-bar), paired daily-block ci high",
+                values(|r| r.model_stage_minus_previous_cost_drag_bps_per_decision_bar.ci_high),
+            ),
+            report_series(
+                "model stage minus previous net log growth/year",
+                values(|r| r.model_stage_minus_previous_net_log_growth_per_year),
+            ),
+            report_series(
+                "model stage minus previous gross log growth/year",
+                values(|r| r.model_stage_minus_previous_gross_log_growth_per_year),
+            ),
+            report_series(
+                "model stage minus previous exact cost drag log/year",
+                values(|r| r.model_stage_minus_previous_cost_drag_log_per_year),
+            ),
+            report_series(
+                "model stage minus previous total turnover",
+                values(|r| r.model_stage_minus_previous_total_turnover),
+            ),
+            report_series(
+                "model total turnover (sum abs weight changes)",
+                values(|r| r.model_turnover),
+            ),
+            report_series(
+                "marginal total turnover (sum abs weight changes)",
+                values(|r| r.marginal_turnover),
+            ),
+            report_series(
+                "model total execution cost fraction",
+                values(|r| r.model_execution_cost),
+            ),
+            report_series(
+                "marginal total execution cost fraction",
+                values(|r| r.marginal_execution_cost),
+            ),
+            report_series(
+                "max post-return gross (holding)",
+                values(|r| r.max_gross),
+            ),
+            report_series(
+                "max post-return abs net (holding)",
+                values(|r| r.max_abs_net),
+            ),
+            report_series(
+                "max post-return per-name (holding)",
+                values(|r| r.max_name),
+            ),
+            report_series("max ADV participation", values(|r| r.max_participation)),
+            report_series(
+                "strictly trailing covariance observations",
+                values(|r| r.covariance_observations),
+            ),
+            report_series(
+                "covariance diagonal shrinkage",
+                values(|r| r.covariance_shrinkage),
+            ),
+            report_series(
+                "mean H-horizon factor variance",
+                values(|r| r.mean_factor_variance),
+            ),
+            report_series(
+                "PanelCost month-level substitutions",
+                values(|r| r.cost_month_substitutions),
+            ),
+            report_series(
+                "PanelCost cross-sectional substitutions",
+                values(|r| r.cost_cross_section_substitutions),
+            ),
+            report_series(
+                "scored decision rows (scalar subset at stage 0)",
+                values(|r| r.decision_rows as f64),
+            ),
+            report_series(
+                "scalar eligible fresh-print legs",
+                values(|r| r.eligible_scalar_legs),
+            ),
+            report_series(
+                "scalar catch-up legs excluded",
+                values(|r| r.catch_up_excluded_scalar_legs),
+            ),
+        ],
+    )
+}
+pub const RECEDING_POLICY_FRONTIER_BASE: &str = "pretrain_receding_policy_frontier";
+
+#[derive(Clone, Debug)]
+pub struct RecedingPolicyFrontierResult {
+    pub band_fraction_of_per_name_cap: f64,
+    pub absolute_weight: f64,
+    pub configured_gross_cap: f64,
+    pub configured_net_min: f64,
+    pub configured_net_max: f64,
+    pub configured_per_name_cap: f64,
+    pub configured_max_adv_participation: f64,
+    pub model_net_bps_per_decision_bar: Dispersion,
+    pub model_gross_bps_per_decision_bar: Dispersion,
+    pub model_cost_drag_bps_per_decision_bar: Dispersion,
+    pub paired_net_gain_bps_per_decision_bar: Dispersion,
+    pub paired_gross_gain_bps_per_decision_bar: Dispersion,
+    pub paired_cost_drag_change_bps_per_decision_bar: Dispersion,
+    pub model_net_log_growth_per_year: f64,
+    pub model_gross_log_growth_per_year: f64,
+    pub model_cost_drag_log_per_year: f64,
+    pub paired_net_gain_log_growth_per_year: f64,
+    pub paired_gross_gain_log_growth_per_year: f64,
+    pub paired_cost_drag_change_log_per_year: f64,
+    pub total_turnover: f64,
+    pub turnover_share_of_incumbent: f64,
+    pub total_execution_cost: f64,
+    pub frozen_action_legs: usize,
+    pub eligible_action_legs: usize,
+    pub frozen_eligible_leg_fraction: f64,
+    pub actions: usize,
+    pub cost_month_substitutions: usize,
+    pub cost_cross_section_substitutions: usize,
+    pub cost_month_substitution_action_fraction: f64,
+    pub cost_cross_section_substitution_action_fraction: f64,
+    pub max_gross: f64,
+    pub max_abs_net: f64,
+    pub max_name: f64,
+    pub max_participation: f64,
+    pub decision_rows: usize,
+}
+
+fn receding_policy_frontier_result(
+    fraction: f64,
+    constraints: KellyConstraints,
+    run: &RecedingRun,
+    incumbent: &RecedingRun,
+    panel: &Panel,
+) -> RecedingPolicyFrontierResult {
+    assert_eq!(
+        run.decision_instants, incumbent.decision_instants,
+        "policy-frontier arms must use exact common decision rows"
+    );
+    let model_net = path_bps_dispersion(run, &run.log_equity, panel);
+    let model_gross = path_bps_dispersion(run, &run.gross_log_equity, panel);
+    let cost_drag =
+        paired_path_bps_dispersion(run, &run.gross_log_equity, run, &run.log_equity, panel);
+    let mut paired_net = paired_path_bps_dispersion(
+        run,
+        &run.log_equity,
+        incumbent,
+        &incumbent.log_equity,
+        panel,
+    );
+    let mut paired_gross = paired_path_bps_dispersion(
+        run,
+        &run.gross_log_equity,
+        incumbent,
+        &incumbent.gross_log_equity,
+        panel,
+    );
+    let mut paired_cost_drag = stage_cost_drag_change_bps_dispersion(run, incumbent, panel);
+    if fraction == 0.0 {
+        let exactly_zero = |measured: Dispersion| Dispersion {
+            mean: 0.0,
+            se: 0.0,
+            ci_low: 0.0,
+            ci_high: 0.0,
+            blocks: measured.blocks,
+            samples: measured.samples,
+        };
+        paired_net = exactly_zero(paired_net);
+        paired_gross = exactly_zero(paired_gross);
+        paired_cost_drag = exactly_zero(paired_cost_drag);
+    }
+    let net_annual = run.annual_log_growth(panel);
+    let gross_annual = annual_path_growth(run, &run.gross_log_equity);
+    let incumbent_net_annual = incumbent.annual_log_growth(panel);
+    let incumbent_gross_annual = annual_path_growth(incumbent, &incumbent.gross_log_equity);
+    let paired_net_annual = net_annual - incumbent_net_annual;
+    let paired_gross_annual = gross_annual - incumbent_gross_annual;
+    let cost_drag_annual = gross_annual - net_annual;
+    let incumbent_cost_drag_annual = incumbent_gross_annual - incumbent_net_annual;
+    let paired_cost_drag_annual = cost_drag_annual - incumbent_cost_drag_annual;
+    let tolerance = 1e-9;
+    assert!(
+        ((model_gross.mean - model_net.mean) - cost_drag.mean).abs() <= tolerance
+            && ((paired_gross.mean - paired_net.mean) - paired_cost_drag.mean).abs() <= tolerance
+            && ((gross_annual - net_annual) - cost_drag_annual).abs() <= tolerance
+            && ((paired_gross_annual - paired_net_annual) - paired_cost_drag_annual).abs()
+                <= tolerance,
+        "receding policy frontier gross/net/cost accounting identity failed at band {fraction}"
+    );
+    RecedingPolicyFrontierResult {
+        band_fraction_of_per_name_cap: fraction,
+        absolute_weight: fraction * constraints.per_name_cap,
+        configured_gross_cap: constraints.gross_cap,
+        configured_net_min: constraints.net_min,
+        configured_net_max: constraints.net_max,
+        configured_per_name_cap: constraints.per_name_cap,
+        configured_max_adv_participation: constraints.max_adv_participation,
+        model_net_bps_per_decision_bar: model_net,
+        model_gross_bps_per_decision_bar: model_gross,
+        model_cost_drag_bps_per_decision_bar: cost_drag,
+        paired_net_gain_bps_per_decision_bar: paired_net,
+        paired_gross_gain_bps_per_decision_bar: paired_gross,
+        paired_cost_drag_change_bps_per_decision_bar: paired_cost_drag,
+        model_net_log_growth_per_year: net_annual,
+        model_gross_log_growth_per_year: gross_annual,
+        model_cost_drag_log_per_year: cost_drag_annual,
+        paired_net_gain_log_growth_per_year: paired_net_annual,
+        paired_gross_gain_log_growth_per_year: paired_gross_annual,
+        paired_cost_drag_change_log_per_year: paired_cost_drag_annual,
+        total_turnover: run.turnover,
+        turnover_share_of_incumbent: if incumbent.turnover > 0.0 {
+            run.turnover / incumbent.turnover
+        } else {
+            1.0
+        },
+        total_execution_cost: run.execution_cost,
+        frozen_action_legs: run.frozen_action_legs,
+        eligible_action_legs: run.eligible_action_legs,
+        frozen_eligible_leg_fraction: if run.eligible_action_legs > 0 {
+            run.frozen_action_legs as f64 / run.eligible_action_legs as f64
+        } else {
+            0.0
+        },
+        actions: run.actions,
+        cost_month_substitutions: run.cost_month_substitutions,
+        cost_cross_section_substitutions: run.cost_cross_section_substitutions,
+        cost_month_substitution_action_fraction: if run.actions > 0 {
+            run.cost_month_substitutions as f64 / run.actions as f64
+        } else {
+            0.0
+        },
+        cost_cross_section_substitution_action_fraction: if run.actions > 0 {
+            run.cost_cross_section_substitutions as f64 / run.actions as f64
+        } else {
+            0.0
+        },
+        max_gross: run.max_gross,
+        max_abs_net: run.max_abs_net,
+        max_name: run.max_name,
+        max_participation: run.max_participation,
+        decision_rows: run.decision_instants.len(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_receding_policy_frontier(
+    dir: &Path,
+    label: &str,
+    panel: &Panel,
+    moments: &[Vec<ForecastMoment>],
+    periods: &[Period],
+    marginal: ForecastMoment,
+    horizon: usize,
+    production_runs: &[RecedingRun],
+    cost: &dyn CostModel,
+    config: RecedingConfig,
+) -> Result<Vec<RecedingPolicyFrontierResult>> {
+    ensure!(
+        config.constraints.per_name_cap.is_finite() && config.constraints.per_name_cap >= 0.0,
+        "policy-frontier per-name cap must be finite and nonnegative"
+    );
+    let incumbent = production_runs
+        .iter()
+        .find(|run| {
+            run.policy == RecedingPolicy::Model
+                && run.horizon == horizon
+                && run.action_rule == RecedingActionRule::Incumbent
+                && run.signal_rule == RecedingSignalRule::Raw
+        })
+        .with_context(|| format!("missing selected-H incumbent Model run at H={horizon}"))?;
+    let mut arms = Vec::with_capacity(BAND_FRACTIONS.len());
+    for &fraction in &BAND_FRACTIONS {
+        ensure!(
+            fraction.is_finite() && fraction >= 0.0,
+            "fixed policy-frontier band fraction must be finite and nonnegative"
+        );
+        let absolute_weight = fraction * config.constraints.per_name_cap;
+        ensure!(
+            absolute_weight.is_finite(),
+            "policy-frontier absolute band weight must be finite"
+        );
+        let banded;
+        let run = if fraction == 0.0 {
+            incumbent
+        } else {
+            banded = run_receding_book(
+                panel,
+                moments,
+                periods,
+                marginal,
+                RecedingPolicy::Model,
+                RecedingActionRule::SolverSafeBand { absolute_weight },
+                RecedingSignalRule::Raw,
+                horizon,
+                cost,
+                config,
+            )?;
+            &banded
+        };
+        arms.push(receding_policy_frontier_result(
+            fraction,
+            config.constraints,
+            run,
+            incumbent,
+            panel,
+        ));
+    }
+    ensure!(
+        arms.iter()
+            .map(|arm| arm.band_fraction_of_per_name_cap)
+            .eq(BAND_FRACTIONS),
+        "policy frontier must retain the fixed trade-bench band order"
+    );
+    write_receding_policy_frontier_report(dir, label, horizon, &arms)?;
+    Ok(arms)
+}
+
+fn write_receding_policy_frontier_report(
+    dir: &Path,
+    label: &str,
+    horizon: usize,
+    arms: &[RecedingPolicyFrontierResult],
+) -> Result<()> {
+    ensure!(
+        arms.len() == BAND_FRACTIONS.len()
+            && arms
+                .iter()
+                .map(|arm| arm.band_fraction_of_per_name_cap)
+                .eq(BAND_FRACTIONS),
+        "policy-frontier report requires the fixed trade-bench band grid"
+    );
+    let values =
+        |f: fn(&RecedingPolicyFrontierResult) -> f64| arms.iter().map(f).collect::<Vec<_>>();
+    let dispersion = |f: fn(&RecedingPolicyFrontierResult) -> Dispersion,
+                      field: fn(Dispersion) -> f64| {
+        arms.iter().map(|arm| field(f(arm))).collect::<Vec<_>>()
+    };
+    let mean = |value: Dispersion| value.mean;
+    let ci_low = |value: Dispersion| value.ci_low;
+    let ci_high = |value: Dispersion| value.ci_high;
+    write_chart(
+        dir,
+        RECEDING_POLICY_FRONTIER_BASE,
+        format!(
+            "Selected-H Solver-Safe Receding Policy Frontier - {label} - H={horizon}; fixed widths are trade_bench::BAND_FRACTIONS times per-name cap; b=0 reuses the incumbent all-in Model run; CIs use matched daily blocks"
+        ),
+        "band-grid index",
+        "matched economic level / audit",
+        ScaleKind::Linear,
+        vec![
+            report_series(
+                "band fraction of per-name cap",
+                values(|r| r.band_fraction_of_per_name_cap),
+            ),
+            report_series(
+                "configured per-name cap",
+                values(|r| r.configured_per_name_cap),
+            ),
+            report_series("absolute band weight", values(|r| r.absolute_weight)),
+            report_series(
+                "configured gross cap",
+                values(|r| r.configured_gross_cap),
+            ),
+            report_series(
+                "configured net minimum",
+                values(|r| r.configured_net_min),
+            ),
+            report_series(
+                "configured net maximum",
+                values(|r| r.configured_net_max),
+            ),
+            report_series(
+                "configured max ADV participation",
+                values(|r| r.configured_max_adv_participation),
+            ),
+            report_series(
+                "model net log growth (bps/decision-bar)",
+                dispersion(|r| r.model_net_bps_per_decision_bar, mean),
+            ),
+            report_series(
+                "model net log growth (bps/decision-bar), daily-block ci low",
+                dispersion(|r| r.model_net_bps_per_decision_bar, ci_low),
+            ),
+            report_series(
+                "model net log growth (bps/decision-bar), daily-block ci high",
+                dispersion(|r| r.model_net_bps_per_decision_bar, ci_high),
+            ),
+            report_series(
+                "model gross log growth (bps/decision-bar)",
+                dispersion(|r| r.model_gross_bps_per_decision_bar, mean),
+            ),
+            report_series(
+                "model gross log growth (bps/decision-bar), daily-block ci low",
+                dispersion(|r| r.model_gross_bps_per_decision_bar, ci_low),
+            ),
+            report_series(
+                "model gross log growth (bps/decision-bar), daily-block ci high",
+                dispersion(|r| r.model_gross_bps_per_decision_bar, ci_high),
+            ),
+            report_series(
+                "model exact cost drag, gross minus net (bps/decision-bar)",
+                dispersion(|r| r.model_cost_drag_bps_per_decision_bar, mean),
+            ),
+            report_series(
+                "model exact cost drag, gross minus net (bps/decision-bar), daily-block ci low",
+                dispersion(|r| r.model_cost_drag_bps_per_decision_bar, ci_low),
+            ),
+            report_series(
+                "model exact cost drag, gross minus net (bps/decision-bar), daily-block ci high",
+                dispersion(|r| r.model_cost_drag_bps_per_decision_bar, ci_high),
+            ),
+            report_series(
+                "band minus incumbent net log growth (bps/decision-bar)",
+                dispersion(|r| r.paired_net_gain_bps_per_decision_bar, mean),
+            ),
+            report_series(
+                "band minus incumbent net log growth (bps/decision-bar), paired daily-block ci low",
+                dispersion(|r| r.paired_net_gain_bps_per_decision_bar, ci_low),
+            ),
+            report_series(
+                "band minus incumbent net log growth (bps/decision-bar), paired daily-block ci high",
+                dispersion(|r| r.paired_net_gain_bps_per_decision_bar, ci_high),
+            ),
+            report_series(
+                "band minus incumbent gross log growth (bps/decision-bar)",
+                dispersion(|r| r.paired_gross_gain_bps_per_decision_bar, mean),
+            ),
+            report_series(
+                "band minus incumbent gross log growth (bps/decision-bar), paired daily-block ci low",
+                dispersion(|r| r.paired_gross_gain_bps_per_decision_bar, ci_low),
+            ),
+            report_series(
+                "band minus incumbent gross log growth (bps/decision-bar), paired daily-block ci high",
+                dispersion(|r| r.paired_gross_gain_bps_per_decision_bar, ci_high),
+            ),
+            report_series(
+                "band minus incumbent exact cost drag (bps/decision-bar)",
+                dispersion(
+                    |r| r.paired_cost_drag_change_bps_per_decision_bar,
+                    mean,
+                ),
+            ),
+            report_series(
+                "band minus incumbent exact cost drag (bps/decision-bar), paired daily-block ci low",
+                dispersion(
+                    |r| r.paired_cost_drag_change_bps_per_decision_bar,
+                    ci_low,
+                ),
+            ),
+            report_series(
+                "band minus incumbent exact cost drag (bps/decision-bar), paired daily-block ci high",
+                dispersion(
+                    |r| r.paired_cost_drag_change_bps_per_decision_bar,
+                    ci_high,
+                ),
+            ),
+            report_series(
+                "model net log growth/year",
+                values(|r| r.model_net_log_growth_per_year),
+            ),
+            report_series(
+                "model gross log growth/year",
+                values(|r| r.model_gross_log_growth_per_year),
+            ),
+            report_series(
+                "model exact cost drag log/year",
+                values(|r| r.model_cost_drag_log_per_year),
+            ),
+            report_series(
+                "band minus incumbent net log growth/year",
+                values(|r| r.paired_net_gain_log_growth_per_year),
+            ),
+            report_series(
+                "band minus incumbent gross log growth/year",
+                values(|r| r.paired_gross_gain_log_growth_per_year),
+            ),
+            report_series(
+                "band minus incumbent exact cost drag log/year",
+                values(|r| r.paired_cost_drag_change_log_per_year),
+            ),
+            report_series("total turnover", values(|r| r.total_turnover)),
+            report_series(
+                "turnover share of incumbent",
+                values(|r| r.turnover_share_of_incumbent),
+            ),
+            report_series(
+                "total execution cost fraction",
+                values(|r| r.total_execution_cost),
+            ),
+            report_series(
+                "frozen causally tradable legs",
+                values(|r| r.frozen_action_legs as f64),
+            ),
+            report_series(
+
+                "eligible causally tradable legs",
+                values(|r| r.eligible_action_legs as f64),
+            ),
+            report_series(
+                "frozen / eligible causally tradable legs",
+                values(|r| r.frozen_eligible_leg_fraction),
+            ),
+            report_series("executed actions", values(|r| r.actions as f64)),
+            report_series(
+                "PanelCost month-level substitutions",
+                values(|r| r.cost_month_substitutions as f64),
+            ),
+            report_series(
+                "PanelCost cross-sectional substitutions",
+                values(|r| r.cost_cross_section_substitutions as f64),
+            ),
+            report_series(
+                "PanelCost month-level substitutions / executed actions",
+                values(|r| r.cost_month_substitution_action_fraction),
+            ),
+            report_series(
+                "PanelCost cross-sectional substitutions / executed actions",
+                values(|r| r.cost_cross_section_substitution_action_fraction),
+            ),
+            report_series(
+                "max post-return gross (holding)",
+                values(|r| r.max_gross),
+            ),
+            report_series(
+                "max post-return abs net (holding)",
+                values(|r| r.max_abs_net),
+            ),
+            report_series(
+                "max post-return per-name (holding)",
+                values(|r| r.max_name),
+            ),
+            report_series("max ADV participation", values(|r| r.max_participation)),
+            report_series(
+                "scored decision rows",
+                values(|r| r.decision_rows as f64),
+            ),
+        ],
+    )
+}
+pub const RECEDING_HYSTERESIS_BASE: &str = "pretrain_receding_hysteresis";
+
+#[derive(Clone, Debug)]
+pub struct RecedingHysteresisResult {
+    pub candidate: bool,
+    pub margin_simple: f64,
+    pub net_bps_per_decision_bar: Dispersion,
+    pub gross_bps_per_decision_bar: Dispersion,
+    pub cost_drag_bps_per_decision_bar: Dispersion,
+    pub paired_net_gain_bps_per_decision_bar: Dispersion,
+    pub paired_gross_gain_bps_per_decision_bar: Dispersion,
+    pub paired_cost_drag_change_bps_per_decision_bar: Dispersion,
+    pub net_log_growth_per_year: f64,
+    pub gross_log_growth_per_year: f64,
+    pub cost_drag_log_per_year: f64,
+    pub paired_net_gain_log_growth_per_year: f64,
+    pub paired_gross_gain_log_growth_per_year: f64,
+    pub paired_cost_drag_change_log_per_year: f64,
+    pub total_turnover: f64,
+    pub turnover_share_of_raw: f64,
+    pub total_execution_cost: f64,
+    pub actions: usize,
+    pub retained_opposing_signs: usize,
+    pub threshold_flips: usize,
+    pub cost_month_substitutions: usize,
+    pub cost_cross_section_substitutions: usize,
+    pub cost_month_substitution_action_fraction: f64,
+    pub cost_cross_section_substitution_action_fraction: f64,
+    pub configured_gross_cap: f64,
+    pub configured_net_min: f64,
+    pub configured_net_max: f64,
+    pub configured_per_name_cap: f64,
+    pub configured_max_adv_participation: f64,
+    /// Post-return holding maxima. They may exceed solve-time caps after an asset moves; the
+    /// next constrained solve may reduce but never worsen an inherited violation.
+    pub max_gross: f64,
+    pub max_abs_net: f64,
+    pub max_name: f64,
+    /// Solve-time action participation, so unlike holding maxima this is a hard constraint.
+    pub max_participation: f64,
+    pub decision_rows: usize,
+}
+
+fn exactly_zero_dispersion(measured: Dispersion) -> Dispersion {
+    Dispersion {
+        mean: 0.0,
+        se: 0.0,
+        ci_low: 0.0,
+        ci_high: 0.0,
+        blocks: measured.blocks,
+        samples: measured.samples,
+    }
+}
+
+fn receding_hysteresis_result(
+    candidate: bool,
+    margin_simple: f64,
+    constraints: KellyConstraints,
+    run: &RecedingRun,
+    raw: &RecedingRun,
+    panel: &Panel,
+) -> RecedingHysteresisResult {
+    assert_eq!(
+        run.decision_instants, raw.decision_instants,
+        "hysteresis and raw arms must score exact common decision rows"
+    );
+    let net = path_bps_dispersion(run, &run.log_equity, panel);
+    let gross = path_bps_dispersion(run, &run.gross_log_equity, panel);
+    let cost_drag =
+        paired_path_bps_dispersion(run, &run.gross_log_equity, run, &run.log_equity, panel);
+    let measured_paired_net =
+        paired_path_bps_dispersion(run, &run.log_equity, raw, &raw.log_equity, panel);
+    let measured_paired_gross = paired_path_bps_dispersion(
+        run,
+        &run.gross_log_equity,
+        raw,
+        &raw.gross_log_equity,
+        panel,
+    );
+    let measured_paired_cost_drag = stage_cost_drag_change_bps_dispersion(run, raw, panel);
+    let (paired_net, paired_gross, paired_cost_drag) = if candidate {
+        (
+            measured_paired_net,
+            measured_paired_gross,
+            measured_paired_cost_drag,
+        )
+    } else {
+        (
+            exactly_zero_dispersion(measured_paired_net),
+            exactly_zero_dispersion(measured_paired_gross),
+            exactly_zero_dispersion(measured_paired_cost_drag),
+        )
+    };
+    let net_annual = run.annual_log_growth(panel);
+    let gross_annual = annual_path_growth(run, &run.gross_log_equity);
+    let raw_net_annual = raw.annual_log_growth(panel);
+    let raw_gross_annual = annual_path_growth(raw, &raw.gross_log_equity);
+    let paired_net_annual = if candidate {
+        net_annual - raw_net_annual
+    } else {
+        0.0
+    };
+    let paired_gross_annual = if candidate {
+        gross_annual - raw_gross_annual
+    } else {
+        0.0
+    };
+    let cost_drag_annual = gross_annual - net_annual;
+    let paired_cost_drag_annual = if candidate {
+        cost_drag_annual - (raw_gross_annual - raw_net_annual)
+    } else {
+        0.0
+    };
+    let tolerance = 1e-9;
+    assert!(
+        ((gross.mean - net.mean) - cost_drag.mean).abs() <= tolerance
+            && ((paired_gross.mean - paired_net.mean) - paired_cost_drag.mean).abs() <= tolerance
+            && ((gross_annual - net_annual) - cost_drag_annual).abs() <= tolerance
+            && ((paired_gross_annual - paired_net_annual) - paired_cost_drag_annual).abs()
+                <= tolerance,
+        "receding hysteresis gross/net/cost accounting identity failed"
+    );
+    RecedingHysteresisResult {
+        candidate,
+        margin_simple,
+        net_bps_per_decision_bar: net,
+        gross_bps_per_decision_bar: gross,
+        cost_drag_bps_per_decision_bar: cost_drag,
+        paired_net_gain_bps_per_decision_bar: paired_net,
+        paired_gross_gain_bps_per_decision_bar: paired_gross,
+        paired_cost_drag_change_bps_per_decision_bar: paired_cost_drag,
+        net_log_growth_per_year: net_annual,
+        gross_log_growth_per_year: gross_annual,
+        cost_drag_log_per_year: cost_drag_annual,
+        paired_net_gain_log_growth_per_year: paired_net_annual,
+        paired_gross_gain_log_growth_per_year: paired_gross_annual,
+        paired_cost_drag_change_log_per_year: paired_cost_drag_annual,
+        total_turnover: run.turnover,
+        turnover_share_of_raw: if raw.turnover > 0.0 {
+            run.turnover / raw.turnover
+        } else {
+            f64::NAN
+        },
+        total_execution_cost: run.execution_cost,
+        actions: run.actions,
+        retained_opposing_signs: run.retained_opposing_signs,
+        threshold_flips: run.threshold_flips,
+        cost_month_substitutions: run.cost_month_substitutions,
+        cost_cross_section_substitutions: run.cost_cross_section_substitutions,
+        cost_month_substitution_action_fraction: if run.actions > 0 {
+            run.cost_month_substitutions as f64 / run.actions as f64
+        } else {
+            0.0
+        },
+        cost_cross_section_substitution_action_fraction: if run.actions > 0 {
+            run.cost_cross_section_substitutions as f64 / run.actions as f64
+        } else {
+            0.0
+        },
+        configured_gross_cap: constraints.gross_cap,
+        configured_net_min: constraints.net_min,
+        configured_net_max: constraints.net_max,
+        configured_per_name_cap: constraints.per_name_cap,
+        configured_max_adv_participation: constraints.max_adv_participation,
+        max_gross: run.max_gross,
+        max_abs_net: run.max_abs_net,
+        max_name: run.max_name,
+        max_participation: run.max_participation,
+        decision_rows: run.decision_instants.len(),
+    }
+}
+
+pub fn write_receding_hysteresis(
+    dir: &Path,
+    label: &str,
+    panel: &Panel,
+    horizon: usize,
+    margin_simple: f64,
+    raw: &RecedingRun,
+    candidate: &RecedingRun,
+    constraints: KellyConstraints,
+) -> Result<Vec<RecedingHysteresisResult>> {
+    ensure!(
+        margin_simple.is_finite() && margin_simple >= 0.0,
+        "hysteresis margin must be finite and nonnegative"
+    );
+    ensure!(
+        raw.policy == RecedingPolicy::Model
+            && raw.action_rule == RecedingActionRule::Incumbent
+            && raw.signal_rule == RecedingSignalRule::Raw
+            && raw.horizon == horizon,
+        "hysteresis report requires the selected-H raw all-in Model incumbent"
+    );
+    ensure!(
+        candidate.policy == RecedingPolicy::Model
+            && candidate.action_rule == RecedingActionRule::Incumbent
+            && candidate.signal_rule == RecedingSignalRule::MeanSignHysteresis { margin_simple }
+            && candidate.horizon == horizon,
+        "hysteresis report candidate does not match its configured selected-H rule"
+    );
+    let rows = vec![
+        receding_hysteresis_result(false, 0.0, constraints, raw, raw, panel),
+        receding_hysteresis_result(true, margin_simple, constraints, candidate, raw, panel),
+    ];
+    ensure!(
+        rows[0].decision_rows == rows[1].decision_rows
+            && rows[0].decision_rows == raw.decision_instants.len(),
+        "hysteresis report rows do not share exact decision-row counts"
+    );
+    write_receding_hysteresis_report(dir, label, horizon, &rows)?;
+    Ok(rows)
+}
+
+fn write_receding_hysteresis_report(
+    dir: &Path,
+    label: &str,
+    horizon: usize,
+    rows: &[RecedingHysteresisResult],
+) -> Result<()> {
+    ensure!(
+        rows.len() == 2 && !rows[0].candidate && rows[1].candidate,
+        "hysteresis report requires exactly raw then candidate"
+    );
+    let values = |f: fn(&RecedingHysteresisResult) -> f64| rows.iter().map(f).collect::<Vec<_>>();
+    let dispersion = |f: fn(&RecedingHysteresisResult) -> Dispersion,
+                      field: fn(Dispersion) -> f64| {
+        rows.iter().map(|row| field(f(row))).collect::<Vec<_>>()
+    };
+    let mean = |value: Dispersion| value.mean;
+    let ci_low = |value: Dispersion| value.ci_low;
+    let ci_high = |value: Dispersion| value.ci_high;
+    let mut series = vec![
+        report_series(
+            "candidate row (raw=0, hysteresis=1)",
+            values(|r| r.candidate as u8 as f64),
+        ),
+        report_series(
+            "configured mean-sign margin (simple return)",
+            values(|r| r.margin_simple),
+        ),
+        report_series(
+            "configured mean-sign margin (bps)",
+            values(|r| r.margin_simple * 1.0e4),
+        ),
+    ];
+    let dispersion_fields: &[(&str, fn(&RecedingHysteresisResult) -> Dispersion)] = &[
+        ("net log growth", |r: &RecedingHysteresisResult| {
+            r.net_bps_per_decision_bar
+        }),
+        ("gross log growth", |r: &RecedingHysteresisResult| {
+            r.gross_bps_per_decision_bar
+        }),
+        (
+            "exact cost drag, gross minus net",
+            |r: &RecedingHysteresisResult| r.cost_drag_bps_per_decision_bar,
+        ),
+        (
+            "candidate minus raw net log growth",
+            |r: &RecedingHysteresisResult| r.paired_net_gain_bps_per_decision_bar,
+        ),
+        (
+            "candidate minus raw gross log growth",
+            |r: &RecedingHysteresisResult| r.paired_gross_gain_bps_per_decision_bar,
+        ),
+        (
+            "candidate minus raw exact cost drag",
+            |r: &RecedingHysteresisResult| r.paired_cost_drag_change_bps_per_decision_bar,
+        ),
+    ];
+    for &(name, getter) in dispersion_fields {
+        series.push(report_series(
+            format!("{name} (bps/decision-bar)"),
+            dispersion(getter, mean),
+        ));
+        series.push(report_series(
+            format!("{name} (bps/decision-bar), daily-block ci low"),
+            dispersion(getter, ci_low),
+        ));
+        series.push(report_series(
+            format!("{name} (bps/decision-bar), daily-block ci high"),
+            dispersion(getter, ci_high),
+        ));
+    }
+    let value_fields: &[(&str, fn(&RecedingHysteresisResult) -> f64)] = &[
+        ("net log growth/year", |r: &RecedingHysteresisResult| {
+            r.net_log_growth_per_year
+        }),
+        ("gross log growth/year", |r: &RecedingHysteresisResult| {
+            r.gross_log_growth_per_year
+        }),
+        (
+            "exact cost drag log/year",
+            |r: &RecedingHysteresisResult| r.cost_drag_log_per_year,
+        ),
+        (
+            "candidate minus raw net log growth/year",
+            |r: &RecedingHysteresisResult| r.paired_net_gain_log_growth_per_year,
+        ),
+        (
+            "candidate minus raw gross log growth/year",
+            |r: &RecedingHysteresisResult| r.paired_gross_gain_log_growth_per_year,
+        ),
+        (
+            "candidate minus raw exact cost drag log/year",
+            |r: &RecedingHysteresisResult| r.paired_cost_drag_change_log_per_year,
+        ),
+        ("total turnover", |r: &RecedingHysteresisResult| {
+            r.total_turnover
+        }),
+        ("turnover share of raw", |r: &RecedingHysteresisResult| {
+            r.turnover_share_of_raw
+        }),
+        (
+            "total execution cost fraction",
+            |r: &RecedingHysteresisResult| r.total_execution_cost,
+        ),
+        ("executed actions", |r: &RecedingHysteresisResult| {
+            r.actions as f64
+        }),
+        (
+            "opposing signs retained inside margin",
+            |r: &RecedingHysteresisResult| r.retained_opposing_signs as f64,
+        ),
+        (
+            "strict threshold sign flips",
+            |r: &RecedingHysteresisResult| r.threshold_flips as f64,
+        ),
+        (
+            "PanelCost month-level substitutions",
+            |r: &RecedingHysteresisResult| r.cost_month_substitutions as f64,
+        ),
+        (
+            "PanelCost cross-sectional substitutions",
+            |r: &RecedingHysteresisResult| r.cost_cross_section_substitutions as f64,
+        ),
+        (
+            "PanelCost month substitutions / actions",
+            |r: &RecedingHysteresisResult| r.cost_month_substitution_action_fraction,
+        ),
+        (
+            "PanelCost cross-section substitutions / actions",
+            |r: &RecedingHysteresisResult| r.cost_cross_section_substitution_action_fraction,
+        ),
+        ("configured gross cap", |r: &RecedingHysteresisResult| {
+            r.configured_gross_cap
+        }),
+        ("configured net minimum", |r: &RecedingHysteresisResult| {
+            r.configured_net_min
+        }),
+        ("configured net maximum", |r: &RecedingHysteresisResult| {
+            r.configured_net_max
+        }),
+        ("configured per-name cap", |r: &RecedingHysteresisResult| {
+            r.configured_per_name_cap
+        }),
+        (
+            "configured max ADV participation",
+            |r: &RecedingHysteresisResult| r.configured_max_adv_participation,
+        ),
+        (
+            "max post-return gross (holding)",
+            |r: &RecedingHysteresisResult| r.max_gross,
+        ),
+        (
+            "max post-return abs net (holding)",
+            |r: &RecedingHysteresisResult| r.max_abs_net,
+        ),
+        (
+            "max post-return per-name (holding)",
+            |r: &RecedingHysteresisResult| r.max_name,
+        ),
+        ("max ADV participation", |r: &RecedingHysteresisResult| {
+            r.max_participation
+        }),
+        ("scored decision rows", |r: &RecedingHysteresisResult| {
+            r.decision_rows as f64
+        }),
+    ];
+    for &(name, getter) in value_fields {
+        series.push(report_series(name, values(getter)));
+    }
+    write_chart(
+        dir,
+        RECEDING_HYSTERESIS_BASE,
+        format!(
+            "Preselected Selected-H Mean-Sign Hysteresis - {label} - H={horizon}; raw and exactly one configured candidate share cached forecasts, costs and locked decision rows"
+        ),
+        "policy row (0 raw, 1 candidate)",
+        "matched economic level / paired audit",
+        ScaleKind::Linear,
+        series,
+    )
+}
 
 pub fn write_receding_reports(
     dir: &Path,
@@ -2121,9 +4145,18 @@ pub fn write_receding_reports(
                     .map(|r| r.cost_cross_section_substitutions as f64)
                     .collect(),
             ),
-            ReportSeries::new("max gross", model.iter().map(|r| r.max_gross).collect()),
-            ReportSeries::new("max abs net", model.iter().map(|r| r.max_abs_net).collect()),
-            ReportSeries::new("max per-name", model.iter().map(|r| r.max_name).collect()),
+            ReportSeries::new(
+                "max post-return gross (holding)",
+                model.iter().map(|r| r.max_gross).collect(),
+            ),
+            ReportSeries::new(
+                "max post-return abs net (holding)",
+                model.iter().map(|r| r.max_abs_net).collect(),
+            ),
+            ReportSeries::new(
+                "max post-return per-name (holding)",
+                model.iter().map(|r| r.max_name).collect(),
+            ),
             ReportSeries::new(
                 "max ADV participation",
                 model.iter().map(|r| r.max_participation).collect(),
@@ -2159,6 +4192,8 @@ pub struct RecedingArgs {
     pub samples: usize,
     pub seed: i64,
     pub cost_threads: usize,
+    /// Optional one-candidate selected-H mean-sign hysteresis margin, in basis points.
+    pub mean_sign_hysteresis_bps: Option<f64>,
     pub config: RecedingConfig,
     pub label: String,
 }
@@ -2184,6 +4219,7 @@ impl RecedingArgs {
             cost_threads: 4,
             config,
             label: "receding-kelly".to_owned(),
+            mean_sign_hysteresis_bps: None,
         }
     }
 }
@@ -2246,11 +4282,22 @@ pub fn validate_receding_split(split: Split, allow_test: bool) -> Result<()> {
     );
     Ok(())
 }
+
+/// The fixed multi-width band frontier is a validation diagnostic, never a locked-test selector.
+pub const fn should_write_receding_policy_frontier(split: Split) -> bool {
+    matches!(split, Split::Val)
+}
 /// Production evaluator: one causal panel scan, one common max-H ancestral rollout, then an
 /// every-bar cost-aware solve for every horizon prefix and baseline.
 pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
     crate::torch::cuda::cfg::configure_cuda();
     validate_receding_split(args.split, args.allow_test)?;
+    if let Some(margin_bps) = args.mean_sign_hysteresis_bps {
+        ensure!(
+            margin_bps.is_finite() && margin_bps >= 0.0,
+            "--mean-sign-hysteresis-bps must be finite and nonnegative"
+        );
+    }
 
     ensure!(
         args.samples >= 2,
@@ -2325,6 +4372,8 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
     );
     let cost = PanelCost::new(&panel, BarCostModel::new(calibration), CostParts::All);
     let mut runs = Vec::with_capacity(FORECAST_HORIZONS.len() * RECEDING_POLICIES.len());
+    let mut selected_periods = None;
+    let mut selected_marginal = None;
     for &horizon in &FORECAST_HORIZONS {
         let moments = forecasts
             .horizon(horizon)
@@ -2346,8 +4395,21 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
             let mut config = args.config;
             config.capital_usd = args.capital_usd;
             runs.push(run_receding_book(
-                &panel, moments, &oracle, marginal, policy, horizon, &cost, config,
+                &panel,
+                moments,
+                &oracle,
+                marginal,
+                policy,
+                RecedingActionRule::Incumbent,
+                RecedingSignalRule::Raw,
+                horizon,
+                &cost,
+                config,
             )?);
+        }
+        if horizon == args.forecast_horizon {
+            selected_periods = Some(oracle);
+            selected_marginal = Some(marginal);
         }
     }
     write_receding_reports(
@@ -2356,6 +4418,80 @@ pub fn run_receding_evaluation(args: &RecedingArgs) -> Result<RecedingBench> {
         &panel,
         &runs,
         args.forecast_horizon,
+    )?;
+    let mut attribution_config = args.config;
+    attribution_config.capital_usd = args.capital_usd;
+    let selected_moments = forecasts
+        .horizon(args.forecast_horizon)
+        .expect("the selected production horizon is cached");
+    let selected_periods = selected_periods
+        .as_deref()
+        .expect("the selected production periods were retained");
+    let selected_marginal =
+        selected_marginal.expect("the selected production marginal moment was retained");
+    if let Some(margin_bps) = args.mean_sign_hysteresis_bps {
+        let margin_simple = margin_bps * 1.0e-4;
+        ensure!(
+            margin_simple.is_finite(),
+            "--mean-sign-hysteresis-bps is too large to convert to simple return"
+        );
+        let candidate = run_receding_book(
+            &panel,
+            selected_moments,
+            selected_periods,
+            selected_marginal,
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MeanSignHysteresis { margin_simple },
+            args.forecast_horizon,
+            &cost,
+            attribution_config,
+        )?;
+        let raw = runs
+            .iter()
+            .find(|run| {
+                run.policy == RecedingPolicy::Model
+                    && run.horizon == args.forecast_horizon
+                    && run.action_rule == RecedingActionRule::Incumbent
+                    && run.signal_rule == RecedingSignalRule::Raw
+            })
+            .expect("the selected-H raw Model incumbent was evaluated");
+        write_receding_hysteresis(
+            &args.gens_dir,
+            &args.label,
+            &panel,
+            args.forecast_horizon,
+            margin_simple,
+            raw,
+            &candidate,
+            attribution_config.constraints,
+        )?;
+    }
+    if should_write_receding_policy_frontier(args.split) {
+        write_receding_policy_frontier(
+            &args.gens_dir,
+            &args.label,
+            &panel,
+            selected_moments,
+            selected_periods,
+            selected_marginal,
+            args.forecast_horizon,
+            &runs,
+            &cost,
+            attribution_config,
+        )?;
+    }
+    write_receding_attribution(
+        &args.gens_dir,
+        &args.label,
+        &panel,
+        selected_moments,
+        selected_periods,
+        selected_marginal,
+        args.forecast_horizon,
+        &runs,
+        &cost,
+        attribution_config,
     )?;
     Ok(RecedingBench {
         runs,
@@ -5010,12 +7146,12 @@ mod tests {
                 realized_r: vec![0.001],
             },
             PanelSlice {
-                ts_ms: 2,
+                ts_ms: 86_400_001,
                 symbols: vec![0],
                 realized_r: vec![-0.0005],
             },
             PanelSlice {
-                ts_ms: 3,
+                ts_ms: 172_800_001,
                 symbols: vec![0],
                 realized_r: vec![0.0007],
             },
@@ -5065,6 +7201,612 @@ mod tests {
         };
         (panel, moments, oracle, config)
     }
+    #[test]
+    fn mean_sign_hysteresis_is_causal_strict_and_preserves_moment_variance() {
+        let margin = 8.0e-4;
+        let mut state = vec![0i8; 2];
+        let mut means = vec![3.0e-4, -4.0e-4];
+        let second = [0.01, 0.02];
+        assert_eq!(
+            apply_mean_sign_hysteresis(&mut means, &[0, 1], &mut state, margin),
+            (0, 0),
+            "the first nonzero forecast initializes state without changing its sign"
+        );
+        assert_eq!(state, [1, -1]);
+        assert_eq!(means, [3.0e-4, -4.0e-4]);
+
+        let state_before_missing = state.clone();
+        assert_eq!(
+            apply_mean_sign_hysteresis(&mut means, &[], &mut state, margin),
+            (0, 0)
+        );
+        assert_eq!(
+            state, state_before_missing,
+            "missing symbols retain sign state"
+        );
+
+        means[0] = -margin;
+        let variance_before = second[0] - means[0] * means[0];
+        assert_eq!(
+            apply_mean_sign_hysteresis(&mut means, &[0], &mut state, margin),
+            (1, 0),
+            "an opposing sign exactly at the threshold is retained, not flipped"
+        );
+        assert_eq!(means[0], margin);
+        assert_eq!(
+            second[0] - means[0] * means[0],
+            variance_before,
+            "sign reflection must preserve mu squared and declared variance"
+        );
+
+        means[0] = -margin - 1.0e-12;
+        assert_eq!(
+            apply_mean_sign_hysteresis(&mut means, &[0], &mut state, margin),
+            (0, 1),
+            "only a strict threshold crossing flips retained sign"
+        );
+        assert_eq!(state[0], -1);
+        assert!(means[0] < -margin);
+
+        // A present catch-up print uses this same state transition. Its trading exclusion is
+        // independently enforced by the zero-ADV availability path in run_receding_book.
+        means[1] = margin + 1.0e-12;
+        assert_eq!(
+            apply_mean_sign_hysteresis(&mut means, &[1], &mut state, margin),
+            (0, 1)
+        );
+        assert_eq!(state[1], 1);
+    }
+
+    #[test]
+    fn raw_and_zero_margin_hysteresis_runs_are_bit_identical() {
+        let (panel, moments, oracle, config) = receding_fixture();
+        let cost = FlatCost::new(3.0);
+        let raw = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let zero = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MeanSignHysteresis { margin_simple: 0.0 },
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        assert_eq!(raw.log_equity, zero.log_equity);
+        assert_eq!(raw.gross_log_equity, zero.gross_log_equity);
+        assert_eq!(raw.decision_instants, zero.decision_instants);
+        assert_eq!(raw.actions, zero.actions);
+        assert_eq!(raw.reforecasts, zero.reforecasts);
+        assert_eq!(
+            raw.decision_span_years.to_bits(),
+            zero.decision_span_years.to_bits()
+        );
+        assert_eq!(raw.turnover.to_bits(), zero.turnover.to_bits());
+        assert_eq!(raw.execution_cost.to_bits(), zero.execution_cost.to_bits());
+        assert_eq!(raw.eligible_action_legs, zero.eligible_action_legs);
+        assert_eq!(raw.frozen_action_legs, zero.frozen_action_legs);
+        assert_eq!(raw.max_gross.to_bits(), zero.max_gross.to_bits());
+        assert_eq!(raw.max_abs_net.to_bits(), zero.max_abs_net.to_bits());
+        assert_eq!(raw.max_name.to_bits(), zero.max_name.to_bits());
+        assert_eq!(
+            raw.max_participation.to_bits(),
+            zero.max_participation.to_bits()
+        );
+        assert_eq!(raw.covariance_observations, zero.covariance_observations);
+        assert_eq!(
+            raw.covariance_shrinkage.to_bits(),
+            zero.covariance_shrinkage.to_bits()
+        );
+        assert_eq!(raw.cost_month_substitutions, zero.cost_month_substitutions);
+        assert_eq!(
+            raw.cost_cross_section_substitutions,
+            zero.cost_cross_section_substitutions
+        );
+        assert_eq!(raw.covariance_window, zero.covariance_window);
+        assert_eq!(
+            raw.mean_factor_variance.to_bits(),
+            zero.mean_factor_variance.to_bits()
+        );
+        assert_eq!(zero.retained_opposing_signs, 0);
+        assert_eq!(zero.threshold_flips, 0);
+    }
+    #[test]
+    fn receding_signal_rule_rejects_invalid_or_non_model_configuration() {
+        let (panel, moments, oracle, config) = receding_fixture();
+        for margin_simple in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(run_receding_book(
+                &panel,
+                &moments,
+                &oracle,
+                ForecastMoment::default(),
+                RecedingPolicy::Model,
+                RecedingActionRule::Incumbent,
+                RecedingSignalRule::MeanSignHysteresis { margin_simple },
+                1,
+                &FlatCost::new(0.0),
+                config,
+            )
+            .is_err());
+        }
+        assert!(run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Marginal,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MeanSignHysteresis {
+                margin_simple: 8.0e-4,
+            },
+            1,
+            &FlatCost::new(0.0),
+            config,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn receding_hysteresis_round_trips_two_exact_paired_rows() {
+        let dir = scratch_dir("receding_hysteresis");
+        let (panel, moments, oracle, config) = receding_fixture();
+        let cost = FlatCost::new(3.0);
+        let raw = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let margin_simple = 8.0e-4;
+        let candidate = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MeanSignHysteresis { margin_simple },
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        assert_eq!(candidate.decision_instants, raw.decision_instants);
+        assert!(candidate.max_gross <= config.constraints.gross_cap + 1e-9);
+        assert!(
+            candidate.max_abs_net
+                <= config
+                    .constraints
+                    .net_min
+                    .abs()
+                    .max(config.constraints.net_max.abs())
+                    + 1e-9
+        );
+        assert!(candidate.max_name <= config.constraints.per_name_cap + 1e-9);
+        assert!(candidate.max_participation <= config.constraints.max_adv_participation + 1e-9);
+        // These are post-return holdings, not solve targets. A large realized move may carry
+        // them beyond the configured solve caps before the next rebalance.
+        let mut candidate = candidate;
+        candidate.max_gross = config.constraints.gross_cap + 0.05;
+        candidate.max_abs_net = config.constraints.net_max.abs() + 0.04;
+        candidate.max_name = config.constraints.per_name_cap + 0.03;
+        let rows = write_receding_hysteresis(
+            &dir,
+            "fixture",
+            &panel,
+            1,
+            margin_simple,
+            &raw,
+            &candidate,
+            config.constraints,
+        )
+        .unwrap();
+        assert!(shared::report::PRETRAIN_REPORT_BASES.contains(&RECEDING_HYSTERESIS_BASE));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].decision_rows, rows[1].decision_rows);
+        assert_eq!(rows[1].max_gross, config.constraints.gross_cap + 0.05);
+        assert_eq!(rows[1].max_abs_net, config.constraints.net_max.abs() + 0.04);
+        assert_eq!(rows[1].max_name, config.constraints.per_name_cap + 0.03);
+        for dispersion in [
+            rows[0].paired_net_gain_bps_per_decision_bar,
+            rows[0].paired_gross_gain_bps_per_decision_bar,
+            rows[0].paired_cost_drag_change_bps_per_decision_bar,
+        ] {
+            assert_eq!(
+                (
+                    dispersion.mean,
+                    dispersion.se,
+                    dispersion.ci_low,
+                    dispersion.ci_high
+                ),
+                (0.0, 0.0, 0.0, 0.0)
+            );
+        }
+        let report =
+            read_report(&dir.join(format!("{RECEDING_HYSTERESIS_BASE}.report.bin"))).unwrap();
+        let ReportKind::MultiLine { series } = report.kind else {
+            panic!("hysteresis evidence must be a multiline report")
+        };
+        assert!(series.iter().all(|series| series.values.len() == 2));
+        assert!(series.iter().any(|series| {
+            series.label == "configured mean-sign margin (simple return)"
+                && series.values == vec![0.0, margin_simple as f32]
+        }));
+    }
+
+    #[test]
+    fn locked_test_never_writes_the_validation_band_frontier() {
+        assert!(should_write_receding_policy_frontier(Split::Val));
+        assert!(!should_write_receding_policy_frontier(Split::Test));
+    }
+    #[test]
+    fn solver_safe_action_rule_holds_only_below_band_tradable_coordinates() {
+        let held: Vec<f64> = vec![0.10, -0.20, 0.30];
+        let incumbent: Vec<f64> = vec![0.11, 0.0, 0.31];
+        let adv: Vec<f64> = vec![1.0, 1.0, 0.0];
+        let incumbent_bits: Vec<u64> = incumbent.iter().map(|value| value.to_bits()).collect();
+        let (zero, eligible, frozen) = apply_receding_action_rule(
+            RecedingActionRule::SolverSafeBand {
+                absolute_weight: 0.0,
+            },
+            incumbent.clone(),
+            &held,
+            &adv,
+            |_| panic!("b=0 must not invoke a second solve"),
+        )
+        .unwrap();
+        assert_eq!(
+            zero.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            incumbent_bits,
+            "b=0 must return the incumbent target bit-for-bit"
+        );
+        assert_eq!((eligible, frozen), (2, 0));
+
+        let (banded, eligible, frozen) = apply_receding_action_rule(
+            RecedingActionRule::SolverSafeBand {
+                absolute_weight: 0.05,
+            },
+            incumbent,
+            &held,
+            &adv,
+            |available| {
+                assert_eq!(available, &[0.0, 1.0, 0.0]);
+                Ok(vec![held[0], 0.05, held[2]])
+            },
+        )
+        .unwrap();
+        assert_eq!(banded[0].to_bits(), held[0].to_bits());
+        assert_eq!(
+            banded[1], 0.05,
+            "the above-band leg remains solver-controlled"
+        );
+        assert_eq!((eligible, frozen), (2, 1));
+    }
+
+    #[test]
+    fn solver_safe_frozen_candidates_expand_monotonically_on_a_fixed_decision() {
+        let held = [0.10, -0.20, 0.30, 0.0];
+        let incumbent = [0.11, -0.10, 0.31, 0.50];
+        let adv = [1.0, 1.0, 0.0, 1.0];
+        let cap = 0.5;
+        let mut previous = vec![false; held.len()];
+        for &fraction in &BAND_FRACTIONS {
+            let frozen = solver_safe_frozen_mask(&incumbent, &held, &adv, fraction * cap);
+            assert!(
+                previous
+                    .iter()
+                    .zip(&frozen)
+                    .all(|(&was_frozen, &is_frozen)| !was_frozen || is_frozen),
+                "wider fixed bands may not remove a frozen candidate"
+            );
+            assert!(
+                !frozen[2],
+                "an untradable coordinate is never an eligible candidate"
+            );
+            previous = frozen;
+        }
+    }
+
+    #[test]
+    fn zero_width_receding_band_is_observably_identical_to_the_incumbent() {
+        let (panel, moments, oracle, config) = receding_fixture();
+        let cost = FlatCost::new(3.0);
+        let incumbent = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let zero = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::SolverSafeBand {
+                absolute_weight: 0.0,
+            },
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        assert_eq!(incumbent.log_equity, zero.log_equity);
+        assert_eq!(incumbent.gross_log_equity, zero.gross_log_equity);
+        assert_eq!(incumbent.decision_instants, zero.decision_instants);
+        assert_eq!(incumbent.actions, zero.actions);
+        assert_eq!(incumbent.turnover.to_bits(), zero.turnover.to_bits());
+        assert_eq!(
+            incumbent.execution_cost.to_bits(),
+            zero.execution_cost.to_bits()
+        );
+        assert_eq!(incumbent.max_gross.to_bits(), zero.max_gross.to_bits());
+        assert_eq!(incumbent.max_abs_net.to_bits(), zero.max_abs_net.to_bits());
+        assert_eq!(incumbent.max_name.to_bits(), zero.max_name.to_bits());
+        assert_eq!(
+            incumbent.max_participation.to_bits(),
+            zero.max_participation.to_bits()
+        );
+        assert_eq!(incumbent.eligible_action_legs, zero.eligible_action_legs);
+        assert_eq!(zero.frozen_action_legs, 0);
+    }
+
+    #[test]
+    fn solver_safe_band_keeps_shared_constraint_audits_feasible() {
+        let (panel, moments, oracle, config) = receding_fixture();
+        let run = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::SolverSafeBand {
+                absolute_weight: config.constraints.per_name_cap,
+            },
+            RecedingSignalRule::Raw,
+            1,
+            &FlatCost::new(3.0),
+            config,
+        )
+        .unwrap();
+        assert!(run.max_gross <= config.constraints.gross_cap + 1e-9);
+        assert!(run.max_abs_net <= config.constraints.net_max.abs() + 1e-9);
+        assert!(run.max_name <= config.constraints.per_name_cap + 1e-9);
+        assert!(run.max_participation <= config.constraints.max_adv_participation + 1e-9);
+        assert!(run.frozen_action_legs <= run.eligible_action_legs);
+        assert_eq!(
+            run.frozen_action_legs, run.eligible_action_legs,
+            "a cap-wide band must freeze every feasible incumbent move in this fixture"
+        );
+        assert_eq!(run.actions, 0, "frozen targets must remain exactly held");
+        let narrow = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::SolverSafeBand {
+                absolute_weight: 0.01,
+            },
+            RecedingSignalRule::Raw,
+            1,
+            &FlatCost::new(3.0),
+            config,
+        )
+        .unwrap();
+        assert!(
+            narrow.actions > 0,
+            "an above-band incumbent move must remain solver-controlled"
+        );
+    }
+
+    #[test]
+    fn receding_action_rule_rejects_invalid_band_widths() {
+        let (panel, moments, oracle, config) = receding_fixture();
+        for absolute_weight in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(run_receding_book(
+                &panel,
+                &moments,
+                &oracle,
+                ForecastMoment::default(),
+                RecedingPolicy::Model,
+                RecedingActionRule::SolverSafeBand { absolute_weight },
+                RecedingSignalRule::Raw,
+                1,
+                &FlatCost::new(0.0),
+                config,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn receding_policy_frontier_round_trips_the_fixed_registered_grid() {
+        let dir = scratch_dir("receding_policy_frontier");
+        let (panel, moments, oracle, config) = receding_fixture();
+        let cost = FlatCost::new(3.0);
+        let incumbent = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let arms = write_receding_policy_frontier(
+            &dir,
+            "fixture",
+            &panel,
+            &moments,
+            &oracle,
+            ForecastMoment::default(),
+            1,
+            std::slice::from_ref(&incumbent),
+            &cost,
+            config,
+        )
+        .unwrap();
+        assert!(shared::report::PRETRAIN_REPORT_BASES.contains(&RECEDING_POLICY_FRONTIER_BASE));
+        assert_eq!(arms.len(), BAND_FRACTIONS.len());
+        assert!(arms
+            .iter()
+            .map(|arm| arm.band_fraction_of_per_name_cap)
+            .eq(BAND_FRACTIONS));
+        assert_eq!(arms[0].absolute_weight, 0.0);
+        for dispersion in [
+            arms[0].paired_net_gain_bps_per_decision_bar,
+            arms[0].paired_gross_gain_bps_per_decision_bar,
+            arms[0].paired_cost_drag_change_bps_per_decision_bar,
+        ] {
+            assert_eq!(dispersion.mean, 0.0);
+            assert_eq!(dispersion.se, 0.0);
+            assert_eq!(dispersion.ci_low, 0.0);
+            assert_eq!(dispersion.ci_high, 0.0);
+        }
+        assert_eq!(arms[0].paired_net_gain_log_growth_per_year, 0.0);
+        assert_eq!(arms[0].paired_gross_gain_log_growth_per_year, 0.0);
+        assert_eq!(arms[0].paired_cost_drag_change_log_per_year, 0.0);
+        assert_eq!(arms[0].turnover_share_of_incumbent, 1.0);
+        for arm in &arms {
+            assert_eq!(
+                arm.absolute_weight,
+                arm.band_fraction_of_per_name_cap * arm.configured_per_name_cap
+            );
+            assert_eq!(arm.configured_gross_cap, config.constraints.gross_cap);
+            assert_eq!(arm.configured_net_min, config.constraints.net_min);
+            assert_eq!(arm.configured_net_max, config.constraints.net_max);
+            assert_eq!(arm.configured_per_name_cap, config.constraints.per_name_cap);
+            assert_eq!(
+                arm.configured_max_adv_participation,
+                config.constraints.max_adv_participation
+            );
+            assert!(arm.cost_month_substitutions <= arm.actions);
+            assert!(arm.cost_cross_section_substitutions <= arm.actions);
+            assert!(arm.frozen_action_legs <= arm.eligible_action_legs);
+            assert!((0.0..=1.0).contains(&arm.frozen_eligible_leg_fraction));
+            assert!(
+                ((arm.model_gross_bps_per_decision_bar.mean
+                    - arm.model_net_bps_per_decision_bar.mean)
+                    - arm.model_cost_drag_bps_per_decision_bar.mean)
+                    .abs()
+                    < 1e-9
+            );
+            assert!(
+                ((arm.paired_gross_gain_bps_per_decision_bar.mean
+                    - arm.paired_net_gain_bps_per_decision_bar.mean)
+                    - arm.paired_cost_drag_change_bps_per_decision_bar.mean)
+                    .abs()
+                    < 1e-9
+            );
+            assert!(
+                ((arm.paired_gross_gain_log_growth_per_year
+                    - arm.paired_net_gain_log_growth_per_year)
+                    - arm.paired_cost_drag_change_log_per_year)
+                    .abs()
+                    < 1e-9
+            );
+        }
+        let report =
+            read_report(&dir.join(format!("{RECEDING_POLICY_FRONTIER_BASE}.report.bin"))).unwrap();
+        assert_eq!(report.x_label.as_deref(), Some("band-grid index"));
+        let ReportKind::MultiLine { series } = report.kind else {
+            panic!("policy frontier must be a multiline report")
+        };
+        assert!(series.iter().all(|row| {
+            row.values.len() == BAND_FRACTIONS.len()
+                && row.values.iter().all(|value| value.is_finite())
+        }));
+        let axis = series
+            .iter()
+            .find(|row| row.label == "band fraction of per-name cap")
+            .expect("fixed band-fraction axis");
+        assert_eq!(
+            axis.values,
+            BAND_FRACTIONS
+                .iter()
+                .map(|value| *value as f32)
+                .collect::<Vec<_>>()
+        );
+        let exact_series = |label: &str| {
+            series
+                .iter()
+                .find(|row| row.label == label)
+                .unwrap_or_else(|| panic!("missing frontier audit series {label}"))
+        };
+        for (label, expected) in [
+            ("configured gross cap", config.constraints.gross_cap),
+            ("configured net minimum", config.constraints.net_min),
+            ("configured net maximum", config.constraints.net_max),
+            ("configured per-name cap", config.constraints.per_name_cap),
+            (
+                "configured max ADV participation",
+                config.constraints.max_adv_participation,
+            ),
+        ] {
+            assert_eq!(
+                exact_series(label).values,
+                vec![expected as f32; BAND_FRACTIONS.len()],
+                "configured constraint series {label}"
+            );
+        }
+        assert_eq!(
+            exact_series("PanelCost month-level substitutions").values,
+            vec![0.0; BAND_FRACTIONS.len()]
+        );
+        assert_eq!(
+            exact_series("PanelCost cross-sectional substitutions").values,
+            vec![0.0; BAND_FRACTIONS.len()]
+        );
+        assert_eq!(
+            exact_series("PanelCost month-level substitutions / executed actions").values,
+            vec![0.0; BAND_FRACTIONS.len()]
+        );
+        assert_eq!(
+            exact_series("PanelCost cross-sectional substitutions / executed actions").values,
+            vec![0.0; BAND_FRACTIONS.len()]
+        );
+        assert_eq!(
+            exact_series("executed actions").values,
+            arms.iter()
+                .map(|arm| arm.actions as f32)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn receding_book_rejects_a_zero_decision_span() {
@@ -5077,6 +7819,8 @@ mod tests {
             &oracle,
             ForecastMoment::default(),
             RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
             1,
             &FlatCost::new(0.0),
             config,
@@ -5110,6 +7854,8 @@ mod tests {
                 &horizon_oracle,
                 marginal,
                 RecedingPolicy::Model,
+                RecedingActionRule::Incumbent,
+                RecedingSignalRule::Raw,
                 horizon,
                 &FlatCost::new(0.0),
                 config,
@@ -5131,6 +7877,8 @@ mod tests {
                 &oracle,
                 marginal,
                 policy,
+                RecedingActionRule::Incumbent,
+                RecedingSignalRule::Raw,
                 1,
                 &FlatCost::new(3.0),
                 config,
@@ -5152,6 +7900,8 @@ mod tests {
             &oracle,
             ForecastMoment::default(),
             RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
             1,
             &FlatCost::new(0.0),
             config,
@@ -5163,6 +7913,108 @@ mod tests {
         assert!(
             (run.log_equity[1] - expected).abs() <= 1e-8,
             "H1 chose a weight inconsistent with E[R] / E[R²]"
+        );
+        assert_eq!(
+            run.gross_log_equity, run.log_equity,
+            "zero-cost gross and net paths must be identical"
+        );
+    }
+
+    #[test]
+    fn receding_gross_net_cost_attribution_closes_exactly() {
+        let (panel, moments, oracle, config) = receding_fixture();
+        let marginal = ForecastMoment {
+            mean_simple: 0.001,
+            second_simple: 0.01,
+            frictionless_kelly: 0.1,
+        };
+        let cost = FlatCost::new(3.0);
+        let model = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            marginal,
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let marginal_run = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            marginal,
+            RecedingPolicy::Marginal,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &cost,
+            config,
+        )
+        .unwrap();
+        let previous_model = run_receding_book(
+            &panel,
+            &moments,
+            &oracle,
+            marginal,
+            RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
+            1,
+            &FlatCost::new(0.0),
+            config,
+        )
+        .unwrap();
+        let result = book_attribution_result(
+            RecedingAttributionStage::ProductionAllIn,
+            &model,
+            &marginal_run,
+            Some(&previous_model),
+            &panel,
+        );
+        assert!(
+            ((result.model_gross_bps_per_decision_bar.mean
+                - result.model_net_bps_per_decision_bar.mean)
+                - result.model_cost_drag_bps_per_decision_bar.mean)
+                .abs()
+                < 1e-10
+        );
+        assert!(
+            ((result.net_edge_bps_per_decision_bar.mean
+                - result.gross_edge_bps_per_decision_bar.mean)
+                - result.edge_cost_contribution_bps_per_decision_bar.mean)
+                .abs()
+                < 1e-10
+        );
+        assert!(result.model_cost_drag_bps_per_decision_bar.mean > 0.0);
+        assert!(
+            ((result.model_gross_log_growth_per_year - result.model_net_log_growth_per_year)
+                - result.model_cost_drag_log_per_year)
+                .abs()
+                < 1e-10
+        );
+        assert!(
+            ((result
+                .model_stage_minus_previous_gross_bps_per_decision_bar
+                .mean
+                - result
+                    .model_stage_minus_previous_net_bps_per_decision_bar
+                    .mean)
+                - result
+                    .model_stage_minus_previous_cost_drag_bps_per_decision_bar
+                    .mean)
+                .abs()
+                < 1e-10
+        );
+        assert!(
+            ((result.model_stage_minus_previous_gross_log_growth_per_year
+                - result.model_stage_minus_previous_net_log_growth_per_year)
+                - result.model_stage_minus_previous_cost_drag_log_per_year)
+                .abs()
+                < 1e-10
         );
     }
 
@@ -5183,6 +8035,8 @@ mod tests {
             &oracle,
             ForecastMoment::default(),
             RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
             1,
             &cost,
             config,
@@ -5194,6 +8048,8 @@ mod tests {
             &oracle,
             ForecastMoment::default(),
             RecedingPolicy::Oracle,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
             1,
             &cost,
             config,
@@ -5279,6 +8135,8 @@ mod tests {
             &periods,
             ForecastMoment::default(),
             RecedingPolicy::BuyHold,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::Raw,
             1,
             &FlatCost::new(10.0),
             config,
@@ -5302,7 +8160,7 @@ mod tests {
     }
 
     #[test]
-    fn model_cannot_trade_a_catch_up_print_before_booking_its_realized_move() {
+    fn hysteresis_state_persists_while_a_catch_up_forecast_flips_but_cannot_trade() {
         let gap_return = 1.2f64.ln() as f32;
         let panel = Panel::from_parts(
             vec!["CLOCK".to_owned(), "GAPPED".to_owned()],
@@ -5391,6 +8249,8 @@ mod tests {
             &periods,
             ForecastMoment::default(),
             RecedingPolicy::Model,
+            RecedingActionRule::Incumbent,
+            RecedingSignalRule::MeanSignHysteresis { margin_simple: 0.1 },
             1,
             &FlatCost::new(cost_bps),
             config,
@@ -5401,6 +8261,11 @@ mod tests {
             run.actions, 2,
             "only the opening trade and the next-consecutive-print reversal may execute"
         );
+        assert_eq!(
+            run.threshold_flips, 1,
+            "the present catch-up forecast updates retained sign"
+        );
+        assert_eq!(run.retained_opposing_signs, 0);
         assert!(
             (run.log_equity[2] - run.log_equity[1]).abs() < 1e-14,
             "the missing row fabricated payoff or cost"
@@ -5420,6 +8285,370 @@ mod tests {
             "the symbol did not resume trading on its next consecutive print"
         );
     }
+    #[test]
+    fn scalar_moving_day_length_covers_multibar_session_boundaries() {
+        const INSTANTS_PER_DAY: usize = 78;
+        const DAYS: usize = 5;
+        let slices: Vec<PanelSlice> = (0..INSTANTS_PER_DAY * DAYS)
+            .map(|instant| PanelSlice {
+                ts_ms: (instant / INSTANTS_PER_DAY) as i64 * 86_400_000
+                    + (instant % INSTANTS_PER_DAY) as i64,
+                symbols: vec![0],
+                realized_r: vec![0.0],
+            })
+            .collect();
+        let panel = Panel::from_parts(
+            vec!["A".to_owned()],
+            slices,
+            vec![vec![1.0e9]; INSTANTS_PER_DAY * DAYS],
+        )
+        .unwrap();
+        assert_eq!(panel.instants_per_day(), INSTANTS_PER_DAY as f64);
+        let decisions: Vec<usize> = (0..INSTANTS_PER_DAY * DAYS).collect();
+
+        let (days, one_bar_len) = scalar_moving_day_blocks(&decisions, &panel, 1);
+        assert_eq!(days.len(), decisions.len());
+        assert_eq!(days.first(), Some(&0));
+        assert_eq!(days.last(), Some(&((DAYS - 1) as u64)));
+        assert_eq!(one_bar_len, 1);
+        for horizon in [4, 16, 39, 78] {
+            assert_eq!(
+                scalar_moving_day_blocks(&decisions, &panel, horizon).1,
+                2,
+                "H={horizon} can cross a start-day boundary"
+            );
+        }
+        assert_eq!(scalar_moving_day_blocks(&decisions, &panel, 100).1, 3);
+        assert_eq!(
+            scalar_moving_day_blocks(&decisions, &panel, 10_000).1,
+            DAYS,
+            "moving length is capped by observed distinct start days"
+        );
+    }
+
+    #[test]
+    fn scalar_attribution_is_row_equal_capped_and_excludes_catch_up_legs() {
+        let panel = Panel::from_parts(
+            vec!["A".to_owned(), "B".to_owned(), "C".to_owned()],
+            vec![
+                PanelSlice {
+                    ts_ms: 1,
+                    symbols: vec![0, 1],
+                    realized_r: vec![0.1f64.ln_1p() as f32, (-0.05f64).ln_1p() as f32],
+                },
+                PanelSlice {
+                    ts_ms: 2,
+                    symbols: vec![0],
+                    realized_r: vec![0.02f64.ln_1p() as f32],
+                },
+                PanelSlice {
+                    ts_ms: 3,
+                    symbols: vec![0, 1],
+                    realized_r: vec![0.03f64.ln_1p() as f32, 0.5f64.ln_1p() as f32],
+                },
+                // C's first appearance covers four panel-clock steps, so this entire scalar row
+                // is excluded while the shared book still retains the decision instant.
+                PanelSlice {
+                    ts_ms: 4,
+                    symbols: vec![2],
+                    realized_r: vec![0.25f64.ln_1p() as f32],
+                },
+            ],
+            vec![vec![1.0e9; 2], vec![1.0e9], vec![1.0e9; 2], vec![1.0e9]],
+        )
+        .unwrap();
+        assert_eq!(panel.elapsed_steps(2, 1), 2);
+        let moment = |fraction: f64| ForecastMoment {
+            mean_simple: 0.01 * fraction,
+            second_simple: 0.01,
+            frictionless_kelly: fraction,
+        };
+        let moments = vec![
+            vec![moment(10.0), moment(-10.0)],
+            vec![moment(1.0)],
+            vec![moment(2.0), moment(4.0)],
+            vec![moment(4.0)],
+        ];
+        let simple_returns: Vec<Vec<f64>> =
+            vec![vec![0.1, -0.05], vec![0.02], vec![0.03, 0.5], vec![0.25]];
+        let periods: Vec<Period> = panel
+            .slices()
+            .iter()
+            .enumerate()
+            .map(|(instant, slice)| Period {
+                instant,
+                ts_ms: slice.ts_ms,
+                legs: slice
+                    .symbols
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &id)| Leg {
+                        id,
+                        slot,
+                        row: instant as u32,
+                        steps: 1,
+                        realized_log: simple_returns[instant][slot].ln_1p(),
+                        adv_usd: 1.0e9,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let scalar = scalar_moment_attribution(
+            &panel,
+            &moments,
+            &periods,
+            ForecastMoment {
+                mean_simple: 0.0,
+                second_simple: 0.01,
+                frictionless_kelly: 0.0,
+            },
+            1,
+        )
+        .unwrap();
+        let row_zero =
+            ((1.0 + LEVERAGE_CAP * 0.1).ln() + (1.0 + (-LEVERAGE_CAP) * -0.05).ln()) / 2.0;
+        assert!((scalar.model_log_growth[0] - row_zero).abs() < 1e-12);
+        assert!((scalar.model_log_growth[1] - 1.02f64.ln()).abs() < 1e-12);
+        assert!((scalar.model_log_growth[2] - 1.06f64.ln()).abs() < 1e-12);
+        assert_eq!(scalar.eligible_legs, 4);
+        assert_eq!(scalar.catch_up_excluded_legs, 2);
+        assert_eq!(scalar.decision_instants, vec![0, 1, 2]);
+        assert_eq!(scalar.decision_instants.len() + 1, periods.len());
+        assert!(scalar.marginal_log_growth.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn attribution_book_arms_keep_identical_decision_rows() {
+        let (panel, moments, oracle, config) = receding_fixture();
+        let marginal = ForecastMoment {
+            mean_simple: 0.001,
+            second_simple: 0.01,
+            frictionless_kelly: 0.1,
+        };
+        let mut runs = Vec::new();
+        for shrinkage in [1.0, config.covariance_shrinkage] {
+            let mut stage_config = config;
+            stage_config.covariance_shrinkage = shrinkage;
+            for policy in [RecedingPolicy::Model, RecedingPolicy::Marginal] {
+                runs.push(
+                    run_receding_book(
+                        &panel,
+                        &moments,
+                        &oracle,
+                        marginal,
+                        policy,
+                        RecedingActionRule::Incumbent,
+                        RecedingSignalRule::Raw,
+                        1,
+                        &FlatCost::new(0.0),
+                        stage_config,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        assert!(runs
+            .iter()
+            .all(|run| run.decision_instants == runs[0].decision_instants));
+        let scalar = scalar_moment_attribution(&panel, &moments, &oracle, marginal, 1).unwrap();
+        assert_eq!(scalar.decision_instants, runs[0].decision_instants);
+        assert_eq!(runs[0].covariance_shrinkage, 1.0);
+        assert_eq!(runs[2].covariance_shrinkage, config.covariance_shrinkage);
+    }
+
+    #[test]
+    fn receding_attribution_writes_the_registered_five_stage_schema() {
+        let dir = scratch_dir("receding_attribution_schema");
+        let dispersion = |value: f64| Dispersion {
+            mean: value,
+            se: 0.1,
+            ci_low: value - 0.2,
+            ci_high: value + 0.2,
+            blocks: 2,
+            samples: 3,
+        };
+        let results: Vec<RecedingAttributionResult> = RECEDING_ATTRIBUTION_STAGES
+            .iter()
+            .enumerate()
+            .map(|(index, &stage)| {
+                let adjacent = index >= 2;
+                let scalar = stage == RecedingAttributionStage::ScalarMoment;
+                let portfolio = if scalar { f64::NAN } else { index as f64 };
+                let net = dispersion(index as f64);
+                let net_edge = dispersion(index as f64 - 0.5);
+                let gross = if scalar {
+                    Dispersion::nan()
+                } else {
+                    dispersion(index as f64 + 1.0)
+                };
+                let gross_edge = if scalar {
+                    Dispersion::nan()
+                } else {
+                    dispersion(index as f64 - 0.75)
+                };
+                RecedingAttributionResult {
+                    stage,
+                    model_net_bps_per_decision_bar: net,
+                    model_gross_bps_per_decision_bar: gross,
+                    net_edge_bps_per_decision_bar: net_edge,
+                    gross_edge_bps_per_decision_bar: gross_edge,
+                    model_cost_drag_bps_per_decision_bar: if scalar {
+                        Dispersion::nan()
+                    } else {
+                        dispersion(1.0)
+                    },
+                    edge_cost_contribution_bps_per_decision_bar: if scalar {
+                        Dispersion::nan()
+                    } else {
+                        dispersion(0.25)
+                    },
+                    model_stage_minus_previous_net_bps_per_decision_bar: if adjacent {
+                        dispersion(index as f64 * 0.2)
+                    } else {
+                        Dispersion::nan()
+                    },
+                    model_stage_minus_previous_gross_bps_per_decision_bar: if adjacent {
+                        dispersion(index as f64 * 0.2 + 0.1)
+                    } else {
+                        Dispersion::nan()
+                    },
+                    model_stage_minus_previous_cost_drag_bps_per_decision_bar: if adjacent {
+                        dispersion(0.1)
+                    } else {
+                        Dispersion::nan()
+                    },
+                    model_net_log_growth_per_year: index as f64,
+                    model_gross_log_growth_per_year: if scalar {
+                        f64::NAN
+                    } else {
+                        index as f64 + 1.0
+                    },
+                    net_edge_log_growth_per_year: index as f64 - 0.5,
+                    gross_edge_log_growth_per_year: if scalar {
+                        f64::NAN
+                    } else {
+                        index as f64 - 0.75
+                    },
+                    model_cost_drag_log_per_year: if scalar { f64::NAN } else { 1.0 },
+                    edge_cost_contribution_log_per_year: if scalar { f64::NAN } else { 0.25 },
+                    model_stage_minus_previous_net_log_growth_per_year: if adjacent {
+                        index as f64 * 0.2
+                    } else {
+                        f64::NAN
+                    },
+                    model_stage_minus_previous_gross_log_growth_per_year: if adjacent {
+                        index as f64 * 0.2 + 0.1
+                    } else {
+                        f64::NAN
+                    },
+                    model_stage_minus_previous_cost_drag_log_per_year: if adjacent {
+                        0.1
+                    } else {
+                        f64::NAN
+                    },
+                    model_stage_minus_previous_total_turnover: if adjacent {
+                        0.05
+                    } else {
+                        f64::NAN
+                    },
+                    model_turnover: portfolio,
+                    marginal_turnover: portfolio,
+                    model_execution_cost: portfolio,
+                    marginal_execution_cost: portfolio,
+                    max_gross: portfolio,
+                    max_abs_net: portfolio,
+                    max_name: portfolio,
+                    max_participation: portfolio,
+                    covariance_observations: portfolio,
+                    covariance_shrinkage: portfolio,
+                    mean_factor_variance: portfolio,
+                    cost_month_substitutions: portfolio,
+                    cost_cross_section_substitutions: portfolio,
+                    decision_rows: if scalar { 2 } else { 3 },
+                    eligible_scalar_legs: if scalar { 5.0 } else { f64::NAN },
+                    catch_up_excluded_scalar_legs: if scalar { 1.0 } else { f64::NAN },
+                }
+            })
+            .collect();
+        write_receding_attribution_report(&dir, "fixture", 39, &results).unwrap();
+        assert!(shared::report::PRETRAIN_REPORT_BASES.contains(&RECEDING_ATTRIBUTION_BASE));
+        let report =
+            read_report(&dir.join(format!("{RECEDING_ATTRIBUTION_BASE}.report.bin"))).unwrap();
+        assert!(RECEDING_ATTRIBUTION_STAGES
+            .iter()
+            .all(|stage| report.title.contains(stage.label())));
+        let ReportKind::MultiLine { series } = report.kind else {
+            panic!("attribution must be a multiline report")
+        };
+        assert!(series.iter().all(|row| row.values.len() == 5));
+        let axis = series
+            .iter()
+            .find(|row| row.label == "stage index")
+            .expect("fixed stage axis");
+        assert_eq!(axis.values, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        let apples = series
+            .iter()
+            .find(|row| row.label == "apples-to-previous")
+            .expect("comparability axis");
+        assert!(apples.values[0].is_nan());
+        assert_eq!(&apples.values[1..], &[0.0, 1.0, 1.0, 1.0]);
+        let scored_rows = series
+            .iter()
+            .find(|row| row.label == "scored decision rows (scalar subset at stage 0)")
+            .expect("scalar and book row counts");
+        assert_eq!(scored_rows.values, vec![2.0, 3.0, 3.0, 3.0, 3.0]);
+        let adjacent_series = |label: &str| {
+            series
+                .iter()
+                .find(|row| row.label == label)
+                .unwrap_or_else(|| panic!("missing adjacent-rung series {label}"))
+        };
+        let adjacent_net =
+            adjacent_series("model stage minus previous net log growth (bps/decision-bar)");
+        let adjacent_gross =
+            adjacent_series("model stage minus previous gross log growth (bps/decision-bar)");
+        let adjacent_cost =
+            adjacent_series("model stage minus previous exact cost drag (bps/decision-bar)");
+        for row in [adjacent_net, adjacent_gross, adjacent_cost] {
+            assert!(row.values[0].is_nan() && row.values[1].is_nan());
+            assert!(row.values[2..].iter().all(|value| value.is_finite()));
+        }
+        for stage in 2..5 {
+            assert!(
+                ((adjacent_gross.values[stage] - adjacent_net.values[stage])
+                    - adjacent_cost.values[stage])
+                    .abs()
+                    < 1e-6
+            );
+        }
+        let adjacent_turnover = adjacent_series("model stage minus previous total turnover");
+        assert!(
+            adjacent_turnover.values[0].is_nan()
+                && adjacent_turnover.values[1].is_nan()
+                && adjacent_turnover.values[2..]
+                    .iter()
+                    .all(|value| value.is_finite())
+        );
+        for label in [
+            "model total turnover (sum abs weight changes)",
+            "model total execution cost fraction",
+            "model gross log growth (bps/decision-bar)",
+            "model exact cost drag, gross minus net (bps/decision-bar)",
+            "max gross",
+            "mean H-horizon factor variance",
+        ] {
+            assert!(
+                series
+                    .iter()
+                    .find(|row| row.label == label)
+                    .expect("portfolio audit series")
+                    .values[0]
+                    .is_nan(),
+                "undefined scalar portfolio field {label} must remain NaN"
+            );
+        }
+    }
+
     #[test]
     fn locked_test_split_is_opt_in() {
         assert!(validate_receding_split(Split::Val, false).is_ok());
@@ -5450,11 +8679,18 @@ mod tests {
                         horizon,
                         reforecasts: instants - first_decision,
                         actions: 1,
+                        action_rule: RecedingActionRule::Incumbent,
+                        signal_rule: RecedingSignalRule::Raw,
                         log_equity: vec![0.0, 0.001 * horizon as f64, 0.003 * horizon as f64],
+                        gross_log_equity: vec![0.0, 0.001 * horizon as f64, 0.003 * horizon as f64],
                         decision_instants: (first_decision..instants).collect(),
                         decision_span_years,
                         turnover: 0.1,
                         execution_cost: 1e-5,
+                        eligible_action_legs: 1,
+                        frozen_action_legs: 0,
+                        retained_opposing_signs: 0,
+                        threshold_flips: 0,
                         max_gross: 0.2,
                         max_abs_net: 0.2,
                         max_name: 0.2,

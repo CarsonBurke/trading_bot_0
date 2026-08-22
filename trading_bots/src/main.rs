@@ -73,6 +73,10 @@ struct Cli {
     /// and re-means every market conditioning row mid-campaign.
     #[arg(long, global = true, default_value_t = false)]
     freeze_market_supports: bool,
+    /// Explicitly authorize an evaluation whose static work estimate exceeds its
+    /// fail-closed minute-scale budget. Applies only to this one CLI invocation.
+    #[arg(long, global = true, default_value_t = false)]
+    allow_long_eval: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -201,6 +205,10 @@ enum Commands {
         /// test-split report, because a schedule nobody recorded explains no number later.
         #[arg(long, default_value_t = trading_bot_0::torch::train::pretrain::LR_PLATEAU_FRACTION)]
         lr_plateau_fraction: f64,
+        /// Enable signed-delta row-wise learned learning rates on Muon-routed matrices.
+        /// Off by default. AdamW parameters and auxiliary-resolution updates remain static.
+        #[arg(long, default_value_t = false)]
+        sdlr: bool,
 
         /// Batch size at the first ramp stage. The declared ceiling for the later stages is
         /// 2x and 3x, but the ramp that RUNS is derived from a device capacity probe taken
@@ -528,6 +536,10 @@ enum Commands {
             value_parser = trading_bot_0::torch::train::horizon::parse_forecast_horizon
         )]
         forecast_horizon: usize,
+
+        /// Evaluate exactly one selected-H causal mean-sign hysteresis candidate, in bps.
+        #[arg(long)]
+        mean_sign_hysteresis_bps: Option<f64>,
 
         #[arg(long, default_value_t = 1.0e7)]
         capital_usd: f64,
@@ -897,6 +909,59 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         min_dollar_volume: f64,
     },
+    /// Evaluate fixed, training-free sequential residual recirculation on a frozen bar model.
+    ///
+    /// Stage A screens a deterministic validation prefix. Stage B uses only the disjoint
+    /// validation remainder and cannot retune the Stage-A choice. The test split is not
+    /// constructed unless the fixed choice clears the NLL, uncertainty, direction, rank and
+    /// serialized-kernel control gates.
+    PretrainRecirculate {
+        #[arg(long)]
+        weights: String,
+
+        /// Checkpoint metadata sidecar. Stated explicitly so provenance cannot resolve from
+        /// an unintended neighbouring artifact.
+        #[arg(long)]
+        metadata: String,
+
+        /// Directory receiving `pretrain_recirculation_sweep.report.bin`.
+        #[arg(long)]
+        output: String,
+
+        /// Total Stage-A prefix: 8 windows choose the paper-scaled layer pair and the
+        /// disjoint remainder chooses alpha/beta for that pair.
+        #[arg(long, default_value_t = 24)]
+        screen_windows: usize,
+
+        /// Total pinned validation draw. Confirmation is the disjoint remainder after Stage A.
+        #[arg(long, default_value_t = 64)]
+        confirmation_windows: usize,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::train::pretrain::BAR_CONTEXT_RAMP_START)]
+        context: i64,
+
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
+
+        #[arg(long, default_value_t = trading_bot_0::data::ingest::bars_dir().to_string_lossy().into_owned())]
+        data_dir: String,
+
+        #[arg(long, default_value_t = 300)]
+        resolution_secs: u32,
+
+        #[arg(long, default_value_t = trading_bot_0::torch::dataset::DEFAULT_MIN_BARS)]
+        min_bars: usize,
+
+        #[arg(long, value_parser = parse_split_bounds)]
+        split_bounds: Option<(i64, i64)>,
+
+        #[arg(long, default_value_t = false)]
+        derive_split_bounds: bool,
+
+        #[arg(long, default_value_t = 0.0)]
+        min_dollar_volume: f64,
+    },
+
     /// Does the run's THIRD pass over the corpus MEMORIZE, and does that memorization move the
     /// held-out mean slope?
     ///
@@ -1282,6 +1347,127 @@ enum Commands {
     },
 }
 
+fn eval_work_product(factors: impl IntoIterator<Item = usize>) -> u64 {
+    factors
+        .into_iter()
+        .fold(1u64, |work, factor| work.saturating_mul(factor as u64))
+}
+
+fn enforce_cli_eval_budget(cli: &Cli) -> anyhow::Result<()> {
+    let allow = cli.allow_long_eval;
+    match cli.command.as_ref() {
+        Some(Commands::PretrainCandles {
+            windows, samples, ..
+        }) => torch::train::eval_budget::enforce(
+            "pretrain-candles",
+            "ancestral decode row-steps",
+            eval_work_product([
+                *windows,
+                *samples,
+                *torch::train::pretrain_reports::ROLLOUT_HORIZONS
+                    .last()
+                    .expect("rollout horizon grid is non-empty"),
+            ]),
+            250_000,
+            allow,
+        ),
+        Some(Commands::PretrainTrade {
+            windows, context, ..
+        })
+        | Some(Commands::PretrainSkill {
+            windows, context, ..
+        }) => torch::train::eval_budget::enforce(
+            "pretrain held-out window evaluation",
+            "scored bar-tokens",
+            eval_work_product([
+                (*windows).min(torch::train::trade_bench::TRADE_WINDOWS),
+                (*context).max(0) as usize,
+            ]),
+            500_000,
+            allow,
+        ),
+        Some(Commands::PretrainKelly {
+            max_symbols,
+            max_instants,
+            forecast_horizon,
+            samples,
+            ..
+        }) => torch::train::eval_budget::enforce(
+            "pretrain-kelly",
+            "forecast row-steps",
+            eval_work_product([
+                *max_symbols,
+                *max_instants,
+                *forecast_horizon,
+                *samples,
+            ]),
+            50_000_000,
+            allow,
+        ),
+        Some(Commands::PretrainCalibration {
+            checkpoints,
+            fit_windows,
+            trade_windows,
+            context,
+            dry_run,
+            ..
+        }) if !dry_run => torch::train::eval_budget::enforce(
+            "pretrain-calibration",
+            "scored bar-tokens",
+            eval_work_product([
+                checkpoints.len(),
+                fit_windows.saturating_add(*trade_windows),
+                (*context).max(0) as usize,
+            ]),
+            2_000_000,
+            allow,
+        ),
+        Some(Commands::PretrainMemProbe {
+            checkpoints,
+            gap_windows,
+            arm_windows,
+            context,
+            ..
+        }) => {
+            let windows = checkpoints
+                .len()
+                .saturating_mul(gap_windows.saturating_mul(2))
+                .saturating_add(arm_windows.saturating_mul(2));
+            torch::train::eval_budget::enforce(
+                "pretrain-mem-probe",
+                "scored bar-tokens",
+                eval_work_product([windows, (*context).max(0) as usize]),
+                4_000_000,
+                allow,
+            )
+        }
+        Some(Commands::InferPlanner {
+            episodes,
+            horizon,
+            rollout_length,
+            ..
+        }) => torch::train::eval_budget::enforce(
+            "infer-planner",
+            "sequential imagined decode steps",
+            eval_work_product([
+                *episodes,
+                *rollout_length,
+                horizon.unwrap_or(torch::planner::runner::DEFAULT_PLANNER_HORIZON),
+            ]),
+            20_000,
+            allow,
+        ),
+        Some(Commands::BarSplitSeams { .. }) => torch::train::eval_budget::enforce(
+            "bar-split-seams",
+            "full-corpus scans",
+            1,
+            0,
+            allow,
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn main() {
     // Must precede the runtime: `set_var` is only sound while the process is single-threaded.
     trading_bot_0::data::load_dotenv();
@@ -1300,6 +1486,7 @@ async fn run() {
     // Once, before dispatch: every subcommand that opens a corpus consults the same market
     // buckets, so the freeze is a property of the invocation rather than of one arm.
     torch::dataset::set_freeze_market_supports(cli.freeze_market_supports);
+    enforce_cli_eval_budget(&cli).expect("evaluation work budget rejected command");
 
     match &cli.command {
         Some(Commands::Genetic {
@@ -1371,6 +1558,7 @@ async fn run() {
             min_dollar_volume,
             exact_batch,
             lr_plateau_fraction,
+            sdlr,
         }) => {
             let args = PretrainArgs {
                 weights: weights.clone(),
@@ -1401,6 +1589,7 @@ async fn run() {
                 min_dollar_volume: *min_dollar_volume,
                 exact_batch: *exact_batch,
                 lr_plateau_fraction: *lr_plateau_fraction,
+                sdlr: *sdlr,
             };
             tokio::task::spawn_blocking(move || torch::train::pretrain(args))
                 .await
@@ -1523,6 +1712,7 @@ async fn run() {
             max_symbols,
             max_instants,
             forecast_horizon,
+            mean_sign_hysteresis_bps,
             capital_usd,
             gross_cap,
             net_min,
@@ -1567,6 +1757,7 @@ async fn run() {
                 max_instants: *max_instants,
                 capital_usd: *capital_usd,
                 forecast_horizon: *forecast_horizon,
+                mean_sign_hysteresis_bps: *mean_sign_hysteresis_bps,
                 samples: *samples,
                 seed: *seed,
                 cost_threads: *cost_threads,
@@ -1730,6 +1921,46 @@ async fn run() {
                 .await
                 .expect("split seam audit task panicked")
                 .expect("split seam audit failed");
+        }
+        Some(Commands::PretrainRecirculate {
+            weights,
+            metadata,
+            output,
+            screen_windows,
+            confirmation_windows,
+            context,
+            batch_size,
+            data_dir,
+            resolution_secs,
+            min_bars,
+            split_bounds,
+            derive_split_bounds,
+            min_dollar_volume,
+        }) => {
+            let args = torch::train::recirculate::RecirculateArgs {
+                weights: weights.clone(),
+                metadata: metadata.clone(),
+                output: output.clone(),
+                screen_windows: *screen_windows,
+                confirmation_windows: *confirmation_windows,
+                context: *context,
+                batch_size: *batch_size,
+                allow_long_eval: cli.allow_long_eval,
+                corpus: torch::train::CorpusFlags {
+                    data_dir: data_dir.clone(),
+                    resolution_secs: *resolution_secs,
+                    min_bars: *min_bars,
+                    split_bounds: *split_bounds,
+                    derive_split_bounds: *derive_split_bounds,
+                    min_dollar_volume: *min_dollar_volume,
+                },
+            };
+            tokio::task::spawn_blocking(move || {
+                torch::train::recirculate::pretrain_recirculate(args)
+            })
+            .await
+            .expect("recirculation sweep task panicked")
+            .expect("recirculation sweep failed");
         }
         Some(Commands::PretrainMemProbe {
             checkpoints,
@@ -1953,7 +2184,10 @@ async fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_paper_symbols, Cli, Commands, PlannerDataSplit, StreamingModelVariant};
+    use super::{
+        default_paper_symbols, enforce_cli_eval_budget, Cli, Commands, PlannerDataSplit,
+        StreamingModelVariant,
+    };
     use clap::Parser;
     use trading_bot_0::torch::model::ModelVariant;
 
@@ -1988,6 +2222,7 @@ mod tests {
             diagnostic_context,
             data_dir,
             lr_plateau_fraction,
+            sdlr,
             ..
         }) = pretrain.command
         else {
@@ -2011,6 +2246,7 @@ mod tests {
             trading_bot_0::torch::train::pretrain::LR_PLATEAU_FRACTION
         );
         assert_eq!(lr_plateau_fraction, 0.40);
+        assert!(!sdlr, "row learned learning rates must remain explicit opt-in");
         assert_eq!(resolution_secs, 300);
         // NextLat learns one transition at a time; long-horizon recursive diagnostics
         // remain controlled independently by their fixed rollout horizon grid.
@@ -2043,6 +2279,76 @@ mod tests {
             "pretraining has one Hard categorical contract; Density is a diagnostic API, not \
              a training/selection CLI objective"
         );
+    }
+
+    #[test]
+    fn pretrain_sdlr_is_explicitly_reachable() {
+        let cli = Cli::try_parse_from(["trading_bot", "pretrain", "--sdlr"])
+            .expect("the SDLR opt-in should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Pretrain { sdlr: true, .. })
+        ));
+    }
+
+    #[test]
+    fn pretrain_recirculate_defaults_pin_the_two_stage_contract() {
+        let cli = Cli::try_parse_from([
+            "trading_bot",
+            "pretrain-recirculate",
+            "--weights",
+            "weights/pretrain_best.ot",
+            "--metadata",
+            "weights/pretrain_best.ot.metadata.json",
+            "--output",
+            "gens/0",
+        ])
+        .expect("pretrain-recirculate should parse");
+        assert!(!cli.allow_long_eval);
+        let Some(Commands::PretrainRecirculate {
+            screen_windows,
+            confirmation_windows,
+            context,
+            batch_size,
+            resolution_secs,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected PretrainRecirculate");
+        };
+        assert_eq!(screen_windows, 24);
+        assert_eq!(confirmation_windows, 64);
+        assert_eq!(
+            context,
+            trading_bot_0::torch::train::pretrain::BAR_CONTEXT_RAMP_START
+        );
+        assert_eq!(batch_size, 8);
+        assert_eq!(resolution_secs, 300);
+    }
+
+    #[test]
+    fn expensive_evaluations_require_one_invocation_scoped_opt_in() {
+        let args = [
+            "trading_bot",
+            "pretrain-kelly",
+            "--weights",
+            "weights/pretrain_best.ot",
+            "--output",
+            "gens/0",
+        ];
+        let cli = Cli::try_parse_from(args).expect("Kelly command parses");
+        let error =
+            enforce_cli_eval_budget(&cli).expect_err("production-sized Kelly must fail closed");
+        assert!(error.to_string().contains("--allow-long-eval"));
+
+        let cli = Cli::try_parse_from(
+            args.into_iter()
+                .chain(["--allow-long-eval"])
+                .collect::<Vec<_>>(),
+        )
+        .expect("explicit long-evaluation opt-in parses");
+        assert!(cli.allow_long_eval);
+        enforce_cli_eval_budget(&cli).expect("explicit opt-in authorizes the long evaluation");
     }
 
     /// `pretrain-calibration`'s defaults are what every published economic number in
@@ -2236,6 +2542,7 @@ mod tests {
         let Some(Commands::PretrainKelly {
             split,
             allow_test,
+            mean_sign_hysteresis_bps,
             forecast_horizon,
             ..
         }) = cli.command
@@ -2244,6 +2551,7 @@ mod tests {
         };
         assert_eq!(split, PlannerDataSplit::Validation);
         assert!(!allow_test);
+        assert_eq!(mean_sign_hysteresis_bps, None);
         assert_eq!(
             forecast_horizon,
             trading_bot_0::torch::train::horizon::DEFAULT_FORECAST_HORIZON
@@ -2264,6 +2572,39 @@ mod tests {
             .is_ok(),
             "the explicit unlock must make the final test score addressable"
         );
+    }
+    #[test]
+    fn receding_kelly_accepts_one_explicit_hysteresis_margin() {
+        let cli = Cli::try_parse_from([
+            "trading_bot",
+            "pretrain-kelly",
+            "--weights",
+            "checkpoint.ot",
+            "--output",
+            "gens/0",
+            "--split",
+            "test",
+            "--allow-test",
+            "--forecast-horizon",
+            "1",
+            "--mean-sign-hysteresis-bps",
+            "8",
+        ])
+        .expect("the preselected hysteresis margin should parse");
+        let Some(Commands::PretrainKelly {
+            mean_sign_hysteresis_bps,
+            split,
+            allow_test,
+            forecast_horizon,
+            ..
+        }) = cli.command
+        else {
+            panic!("pretrain-kelly should parse as PretrainKelly");
+        };
+        assert_eq!(mean_sign_hysteresis_bps, Some(8.0));
+        assert_eq!(split, PlannerDataSplit::Test);
+        assert!(allow_test);
+        assert_eq!(forecast_horizon, 1);
     }
     #[test]
     fn receding_kelly_cli_accepts_only_exact_evaluated_forecast_horizons() {

@@ -1187,6 +1187,13 @@ mod planner_inference_discovery_tests {
             );
         }
         assert!(bases.contains(&"pretrain_teacher_forced_rollout_score"));
+        assert!(bases.contains(&"pretrain_recirculation_sweep"));
+        for sdlr in ["pretrain_sdlr_alpha", "pretrain_sdlr_evidence"] {
+            assert!(
+                bases.contains(&sdlr),
+                "{sdlr} must be discoverable whenever centered outcome-LR is enabled"
+            );
+        }
         assert!(
             !bases.contains(&"pretrain_rollout_nll"),
             "the unlabeled teacher-forced rollout base must not survive the clean cutover"

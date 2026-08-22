@@ -212,6 +212,17 @@ pub struct StepMetrics {
     /// Observed gradient norm. Nothing clips on it; Muon orthogonalization does
     /// that job, so this is a pure diagnostic.
     pub grad_norm: f64,
+    /// Row-wise signed-delta learning-rate diagnostics. NaN when the controller
+    /// is disabled or before the first primary update has produced a reading.
+    pub sdlr_alpha_mean: f64,
+    pub sdlr_alpha_std: f64,
+    pub sdlr_alpha_min: f64,
+    pub sdlr_alpha_max: f64,
+    pub sdlr_alpha_bound_fraction: f64,
+    pub sdlr_evidence_mean: f64,
+    pub sdlr_evidence_std: f64,
+    pub sdlr_objective: f64,
+    pub sdlr_update_magnitude: f64,
     pub context: i64,
     pub batch_size: usize,
     pub bars_seen: u64,
@@ -267,6 +278,15 @@ impl StepMetrics {
             lr_mult: f64::NAN,
             muon_momentum: f64::NAN,
             grad_norm: f64::NAN,
+            sdlr_alpha_mean: f64::NAN,
+            sdlr_alpha_std: f64::NAN,
+            sdlr_alpha_min: f64::NAN,
+            sdlr_alpha_max: f64::NAN,
+            sdlr_alpha_bound_fraction: f64::NAN,
+            sdlr_evidence_mean: f64::NAN,
+            sdlr_evidence_std: f64::NAN,
+            sdlr_objective: f64::NAN,
+            sdlr_update_magnitude: f64::NAN,
             context: 0,
             batch_size: 0,
             bars_seen: 0,
@@ -851,12 +871,13 @@ impl HeldOutBaselines {
 /// Free-running ancestral samples for the candle pictures and calibration reports.
 ///
 /// Both tensors are generated before the realized continuation is handed to the reporter.
-/// `dynamics_rollout` is the deployed cheap dynamics path. `exact_rollout` is an independently
-/// sampled exact-cache reference used only to measure distribution drift.
+/// `exact_rollout` is the canonical exact-cache predictive law used by candle forecasts.
+/// `dynamics_rollout` is the unverified one-step latent draft retained as a recursive
+/// diagnostic and measured against exact-cache.
 pub struct SnapshotInput<'a> {
-    /// `[W, samples, H, BAR_DOF]` deployed `RolloutMode::Dynamics` ancestral draws.
+    /// `[W, samples, H, BAR_DOF]` unverified `RolloutMode::Dynamics` draft draws.
     pub dynamics_rollout: &'a Tensor,
-    /// `[W, samples, H, BAR_DOF]` exact-cache ancestral draws for the drift reference.
+    /// `[W, samples, H, BAR_DOF]` canonical `RolloutMode::Exact` predictive draws.
     pub exact_rollout: &'a Tensor,
     /// `[W, H, BAR_DOF]` realized continuation, used only after generation for scoring.
     pub future_dof: &'a Tensor,
@@ -940,7 +961,9 @@ where
     (flat_bars, runs, run_bars)
 }
 
-/// Score free-running draws without giving the generator access to any realized future bar.
+/// Score the unverified free-running Dynamics draft without giving its generator access to
+/// any realized future bar. Exact-cache enters only the explicitly named distribution-drift
+/// comparison; calibration, tails and validity continue to expose the draft's failures.
 fn ancestral_diagnostics(
     dynamics_rollout: &Tensor,
     exact_rollout: &Tensor,
@@ -1396,6 +1419,15 @@ struct StepAccumulator {
     lr_mult: Mean,
     muon_momentum: Mean,
     grad_norm: Mean,
+    sdlr_alpha_mean: Mean,
+    sdlr_alpha_std: Mean,
+    sdlr_alpha_min: Mean,
+    sdlr_alpha_max: Mean,
+    sdlr_alpha_bound_fraction: Mean,
+    sdlr_evidence_mean: Mean,
+    sdlr_evidence_std: Mean,
+    sdlr_objective: Mean,
+    sdlr_update_magnitude: Mean,
     context: Mean,
     batch_size: Mean,
     bars_seen: u64,
@@ -1433,6 +1465,17 @@ impl StepAccumulator {
         self.lr_mult.push(step.lr_mult);
         self.muon_momentum.push(step.muon_momentum);
         self.grad_norm.push(step.grad_norm);
+        self.sdlr_alpha_mean.push(step.sdlr_alpha_mean);
+        self.sdlr_alpha_std.push(step.sdlr_alpha_std);
+        self.sdlr_alpha_min.push(step.sdlr_alpha_min);
+        self.sdlr_alpha_max.push(step.sdlr_alpha_max);
+        self.sdlr_alpha_bound_fraction
+            .push(step.sdlr_alpha_bound_fraction);
+        self.sdlr_evidence_mean.push(step.sdlr_evidence_mean);
+        self.sdlr_evidence_std.push(step.sdlr_evidence_std);
+        self.sdlr_objective.push(step.sdlr_objective);
+        self.sdlr_update_magnitude
+            .push(step.sdlr_update_magnitude);
         self.context.push(step.context as f64);
         self.batch_size.push(step.batch_size as f64);
         self.bars_seen = self.bars_seen.max(step.bars_seen);
@@ -1498,6 +1541,15 @@ pub struct PretrainReporter {
     lr: Series,
     muon_momentum: Series,
     grad_norm: Series,
+    sdlr_alpha_mean: Series,
+    sdlr_alpha_std: Series,
+    sdlr_alpha_min: Series,
+    sdlr_alpha_max: Series,
+    sdlr_alpha_bound_fraction: Series,
+    sdlr_evidence_mean: Series,
+    sdlr_evidence_std: Series,
+    sdlr_objective: Series,
+    sdlr_update_magnitude: Series,
     unique_bar_reuse: Series,
     effective_rank: Series,
     promotion_trace: Series,
@@ -1699,6 +1751,15 @@ impl PretrainReporter {
             lr: Series::default(),
             muon_momentum: Series::default(),
             grad_norm: Series::default(),
+            sdlr_alpha_mean: Series::default(),
+            sdlr_alpha_std: Series::default(),
+            sdlr_alpha_min: Series::default(),
+            sdlr_alpha_max: Series::default(),
+            sdlr_alpha_bound_fraction: Series::default(),
+            sdlr_evidence_mean: Series::default(),
+            sdlr_evidence_std: Series::default(),
+            sdlr_objective: Series::default(),
+            sdlr_update_magnitude: Series::default(),
             unique_bar_reuse: Series::default(),
             effective_rank: Series::default(),
             promotion_trace: Series::default(),
@@ -2177,8 +2238,8 @@ impl PretrainReporter {
         }
     }
 
-    /// Free-running validation: deployed-dynamics candle fans plus proper path calibration,
-    /// bar validity, pooled tail calibration and exact-cache distribution drift.
+    /// Free-running validation: canonical exact-cache candle fans plus explicitly labelled
+    /// dynamics-draft path calibration, bar validity, pooled tails and distribution drift.
     pub fn record_snapshot(&mut self, input: &SnapshotInput<'_>) -> Result<()> {
         self.epoch = input.epoch;
         self.global_step = input.global_step;
@@ -2196,7 +2257,7 @@ impl PretrainReporter {
                 &dir,
                 self.global_step,
                 Some(self.epoch),
-                &input.dynamics_rollout.detach(),
+                &input.exact_rollout.detach(),
                 input.future_dof,
             )
         })
@@ -2501,6 +2562,19 @@ impl PretrainReporter {
         self.lr.set(tick, acc.lr_mult.value());
         self.muon_momentum.set(tick, acc.muon_momentum.value());
         self.grad_norm.set(tick, acc.grad_norm.value());
+        self.sdlr_alpha_mean.set(tick, acc.sdlr_alpha_mean.value());
+        self.sdlr_alpha_std.set(tick, acc.sdlr_alpha_std.value());
+        self.sdlr_alpha_min.set(tick, acc.sdlr_alpha_min.value());
+        self.sdlr_alpha_max.set(tick, acc.sdlr_alpha_max.value());
+        self.sdlr_alpha_bound_fraction
+            .set(tick, acc.sdlr_alpha_bound_fraction.value());
+        self.sdlr_evidence_mean
+            .set(tick, acc.sdlr_evidence_mean.value());
+        self.sdlr_evidence_std
+            .set(tick, acc.sdlr_evidence_std.value());
+        self.sdlr_objective.set(tick, acc.sdlr_objective.value());
+        self.sdlr_update_magnitude
+            .set(tick, acc.sdlr_update_magnitude.value());
         self.context.set(tick, acc.context.value());
         self.batch_size.set(tick, acc.batch_size.value());
         self.free_vram_gib.set(tick, acc.free_vram_gib.value());
@@ -3124,6 +3198,48 @@ impl PretrainReporter {
             vec![self.grad_norm.labeled("grad norm", len)],
         )?;
 
+        if self.sdlr_alpha_mean.measured() {
+            write_chart(
+                &dir,
+                "pretrain_sdlr_alpha",
+                format!("Pretrain SDLR Row Multipliers - {suffix}"),
+                "record",
+                "alpha = exp(2*sigmoid(logit)-1), aggregated over Muon matrix rows; \
+                 bound fraction is the share at exp(-1) or exp(1). Each reading is from the \
+                 preceding primary update so it shares the training step's one device transfer",
+                ScaleKind::Linear,
+                vec![
+                    self.sdlr_alpha_mean.labeled("alpha mean", len),
+                    self.sdlr_alpha_std.labeled("alpha std", len),
+                    self.sdlr_alpha_min.labeled("alpha min", len),
+                    self.sdlr_alpha_max.labeled("alpha max", len),
+                    self.sdlr_alpha_bound_fraction
+                        .labeled("alpha bound fraction", len),
+                ],
+            )?;
+        }
+
+        if self.sdlr_evidence_mean.measured() {
+            write_chart(
+                &dir,
+                "pretrain_sdlr_evidence",
+                format!("Pretrain SDLR Signed-Delta Evidence - {suffix}"),
+                "record",
+                "within-matrix centered, population-standardized and +/-3-clamped \
+                 -mean(g_raw_current * actual_signed_delta_previous); controller objective \
+                 and mean absolute logit update are reported on the same cadence. Each reading \
+                 is from the preceding primary update so it shares the step's one device transfer",
+                ScaleKind::Symlog,
+                vec![
+                    self.sdlr_evidence_mean.labeled("centered evidence mean", len),
+                    self.sdlr_evidence_std.labeled("centered evidence std", len),
+                    self.sdlr_objective.labeled("controller objective", len),
+                    self.sdlr_update_magnitude
+                        .labeled("mean |logit update|", len),
+                ],
+            )?;
+        }
+
         write_chart(
             &dir,
             "pretrain_unique_bar_reuse",
@@ -3263,9 +3379,11 @@ impl PretrainReporter {
             write_chart(
                 &dir,
                 "pretrain_ancestral_calibration",
-                format!("Pretrain Free-Running Ancestral Close Calibration - {suffix}"),
+                format!(
+                    "Pretrain Unverified Dynamics-Draft Free-Running Ancestral Close Calibration - {suffix}"
+                ),
                 "horizon slot (read the explicit horizon series)",
-                "cumulative close log-return calibration",
+                "Unverified Dynamics-draft cumulative close log-return calibration",
                 ScaleKind::Symlog,
                 vec![
                     f64_series("HORIZON (bars)", &ancestral.horizon),
@@ -3319,9 +3437,12 @@ impl PretrainReporter {
             write_chart(
                 &dir,
                 "pretrain_ancestral_tails",
-                format!("Pretrain Free-Running Ancestral One-Bar Tail Calibration - {suffix}"),
+                format!(
+                    "Pretrain Unverified Dynamics-Draft Free-Running Ancestral One-Bar Tail \
+                     Calibration - {suffix}"
+                ),
                 "tail slot (read the explicit threshold series)",
-                "pooled conditional exceedance rate; rare realized rows are underpowered",
+                "Unverified Dynamics-draft pooled conditional exceedance rate; rare realized rows are underpowered",
                 ScaleKind::Symlog,
                 vec![
                     f64_series(
@@ -3390,9 +3511,11 @@ impl PretrainReporter {
             write_chart(
                 &dir,
                 "pretrain_ancestral_bar_validity",
-                format!("Pretrain Free-Running Ancestral Bar Validity - {suffix}"),
+                format!(
+                    "Pretrain Unverified Dynamics-Draft Free-Running Ancestral Bar Validity - {suffix}"
+                ),
                 "horizon slot (read the explicit horizon series)",
-                "raw validity counts and flat-bar behavior",
+                "Unverified Dynamics-draft raw validity counts and flat-bar behavior",
                 ScaleKind::Symlog,
                 vec![
                     f64_series("HORIZON (bars)", &ancestral.horizon),
@@ -3452,9 +3575,9 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_candle_rollout_dclose",
-            format!("Pretrain Candle Rollout Fan-Centre Drift - {suffix}"),
+            format!("Pretrain Exact-Cache Candle Rollout Fan-Centre Drift - {suffix}"),
             "snapshot",
-            "mean per-bar log increment of the fan centre",
+            "Exact-Cache mean per-bar log increment of the fan centre",
             ScaleKind::Linear,
             vec![
                 ReportSeries {
@@ -3488,9 +3611,9 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_candle_rollout_band",
-            format!("Pretrain Candle Rollout Band Width - {suffix}"),
+            format!("Pretrain Exact-Cache Candle Rollout Band Width - {suffix}"),
             "snapshot",
-            "mean ln(p90 / p10)",
+            "Exact-Cache mean ln(p90 / p10)",
             ScaleKind::Linear,
             vec![ReportSeries {
                 label: "band".to_owned(),
@@ -3505,9 +3628,9 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_candle_rollout_coverage",
-            format!("Pretrain Candle Rollout Coverage - {suffix}"),
+            format!("Pretrain Exact-Cache Candle Rollout Coverage - {suffix}"),
             "snapshot",
-            "windows whose realized close fell inside the 10/90 band",
+            "windows whose realized close fell inside the Exact-Cache 10/90 band",
             ScaleKind::Linear,
             vec![
                 ReportSeries {
@@ -3551,9 +3674,9 @@ impl PretrainReporter {
         write_chart(
             &dir,
             "pretrain_candle_rollout_pit",
-            format!("Pretrain Candle Rollout Rank PIT - {suffix}"),
+            format!("Pretrain Exact-Cache Candle Rollout Rank PIT - {suffix}"),
             "snapshot",
-            "rank of the realized close among the ancestral draws",
+            "rank of the realized close among the Exact-Cache ancestral draws",
             ScaleKind::Linear,
             vec![
                 ReportSeries {
@@ -5532,10 +5655,11 @@ impl CandleSummary {
 /// ancestral quantile fan, with [`SNAPSHOT_OVERLAY_PATHS`] genuine draws overlaid —
 /// and return the fans they depict.
 ///
-/// `drawn` is the `[W, samples, H, BAR_DOF]` ancestral rollout and `future_dof` the
-/// `[W, H, BAR_DOF]` realized continuation of the same windows. Both are DOF paths,
-/// chained here onto a common relative scale so windows at different price levels
-/// are comparable.
+/// `drawn` is the canonical exact-cache `[W, samples, H, BAR_DOF]` ancestral rollout and
+/// `future_dof` the `[W, H, BAR_DOF]` realized continuation of the same windows. Both are DOF
+/// paths, chained here onto a common relative scale so windows at different price levels are
+/// comparable. The unverified Dynamics recursion belongs in [`ancestral_diagnostics`], not in
+/// this forecast writer.
 ///
 /// `global_step` and `epoch` only name the files. The step comes FIRST in the tag
 /// because the TUI's snapshot discovery parses it off the front of the file name to
@@ -5658,9 +5782,9 @@ pub fn write_candle_windows(
                 // binomial read on 100 "trials" would score as an 18-sigma miss. The
                 // nominal belongs to the across-window rate, which has its own chart.
                 title: format!(
-                    "Pretrain Rollout Fan - step {global_step} - window {:02} - realized CLOSE \
-                     inside the {:.0}/{:.0} band on {}/{steps} bars (ONE dependent path; the \
-                     nominal {:.0}% is a rate ACROSS windows - see \
+                    "Pretrain Exact-Cache Rollout Fan - step {global_step} - window {:02} - \
+                     realized CLOSE inside the {:.0}/{:.0} band on {}/{steps} bars (ONE \
+                     dependent path; the nominal {:.0}% is a rate ACROSS windows - see \
                      pretrain_candle_rollout_coverage) - fan-centre se {:.1}e-4 at h1, \
                      {:.1}e-4 at h{steps} (log, from {samples} draws)",
                     window + 1,
@@ -7649,13 +7773,28 @@ mod tests {
         // so an in-run cycle over one step's metrics cannot produce it. Executed by
         // `horizon::tests::the_horizon_frontier_base_is_written_and_read_back`.
         "pretrain_horizon_frontier",
-        // Written together by `horizon::write_receding_reports` after a whole held-out panel,
-        // one common max-H ancestral rollout and every-bar economic solves. The selected
-        // production horizon is highlighted inside these existing bases; neither is an
-        // optimizer-step metric. Both writers and the fixed comparison grid are exercised by
-        // `horizon::tests::receding_reports_persist_the_selected_run_and_keep_the_full_grid`.
+        // Written by `horizon::write_receding_reports`,
+        // `horizon::write_receding_attribution`, `horizon::write_receding_policy_frontier`, and
+        // optional `horizon::write_receding_hysteresis` after a whole held-out panel, one common
+        // max-H ancestral rollout and every-bar economic solves. The selected production
+        // horizon is highlighted inside the existing grid reports and held fixed across the
+        // attribution ladder. Validation alone reuses it as the zero-width fixed-frontier
+        // incumbent; locked test never writes that selection grid. The optional hysteresis
+        // base instead carries exactly one predeclared margin paired against the selected-H Raw
+        // incumbent on common cached rows, and is absent unless named on the CLI. None is an
+        // optimizer-step metric. The grid writers are exercised by
+        // `horizon::tests::receding_reports_persist_the_selected_run_and_keep_the_full_grid`;
+        // the attribution writer and schema by
+        // `horizon::tests::receding_attribution_writes_the_registered_five_stage_schema`; the
+        // frontier writer by
+        // `horizon::tests::receding_policy_frontier_round_trips_the_fixed_registered_grid`; and
+        // hysteresis by
+        // `horizon::tests::receding_hysteresis_round_trips_two_exact_paired_rows`.
         "pretrain_receding_kelly",
         "pretrain_receding_covariance",
+        "pretrain_receding_attribution",
+        "pretrain_receding_policy_frontier",
+        "pretrain_receding_hysteresis",
         // Written by `skill::write_skill_profile`. Indexed by DECILE of the model's own
         // confidence rather than by step, and produced from a whole held-out panel scored with
         // no trading policy, so an in-run cycle over one step's metrics cannot produce it.
@@ -7715,6 +7854,10 @@ mod tests {
         // `the_heldout_power_census_writes_both_registered_bases`.
         "pretrain_heldout_census",
         "pretrain_heldout_power",
+        // Written by the frozen-checkpoint two-stage recirculation sweep rather than an
+        // optimizer-step cycle. Executed by
+        // `recirculate::tests::recirculation_report_is_registered_and_readable`.
+        "pretrain_recirculation_sweep",
     ];
 
     static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -7929,6 +8072,97 @@ mod tests {
         let out = write_candle_windows(&dir, 7, None, rollout, future).expect("snapshot writes");
         fs::remove_dir_all(&dir).ok();
         out
+    }
+
+    #[test]
+    fn record_snapshot_pictures_exact_cache_while_dynamics_drift_stays_visible() {
+        cap_torch_threads();
+        let (windows, samples, steps) = (2usize, 8usize, ROLLOUT_HORIZONS[4]);
+        let rollout = |base_return: f32, sample_spread: f32| {
+            let mut values = Vec::with_capacity(windows * samples * steps * BAR_DOF);
+            for _window in 0..windows {
+                for sample in 0..samples {
+                    let sample_offset = (sample as f32 - 3.5) * sample_spread;
+                    for _step in 0..steps {
+                        values.extend([base_return + sample_offset, 0.0, 0.5, 0.5, 0.0]);
+                    }
+                }
+            }
+            Tensor::from_slice(&values).view([
+                windows as i64,
+                samples as i64,
+                steps as i64,
+                BAR_DOF as i64,
+            ])
+        };
+        let exact = rollout(0.01, 0.01);
+        let dynamics = rollout(-0.02, 1.0e-4);
+        let realized_row = [0.0f32, 0.0, 0.5, 0.5, 0.0];
+        let future = Tensor::from_slice(&realized_row.repeat(windows * steps)).view([
+            windows as i64,
+            steps as i64,
+            BAR_DOF as i64,
+        ]);
+        let dir = scratch_dir("snapshot_law_selection");
+        let mut reporter = PretrainReporter::new(&dir, [f64::NAN; BAR_DOF]);
+        reporter
+            .record_snapshot(&SnapshotInput {
+                dynamics_rollout: &dynamics,
+                exact_rollout: &exact,
+                future_dof: &future,
+                epoch: 3,
+                global_step: 17,
+            })
+            .expect("snapshot records");
+
+        assert!(
+            reporter.candle_dclose[0] > 0.005,
+            "the candle summary selected something other than the positive exact-cache drift: {}",
+            reporter.candle_dclose[0]
+        );
+        let diagnostics = reporter.ancestral.as_ref().expect("ancestral diagnostics");
+        let terminal = ROLLOUT_HORIZONS.len() - 1;
+        assert!(
+            (diagnostics.exact_dynamics_mean_shift[terminal] + 3.0).abs() < 1.0e-5,
+            "dynamics-minus-exact drift must remain visible: {}",
+            diagnostics.exact_dynamics_mean_shift[terminal]
+        );
+        assert!(
+            diagnostics.exact_dynamics_w1[terminal] > 1.0,
+            "the exact-vs-dynamics distance disappeared: {}",
+            diagnostics.exact_dynamics_w1[terminal]
+        );
+        assert!(
+            diagnostics.mean_error[terminal] > 1.9,
+            "ancestral calibration must continue scoring the negative Dynamics draft"
+        );
+        assert!(
+            reporter.candle_band[0] > 1.0
+                && reporter.candle_coverage_first[0] == 1.0
+                && reporter.candle_coverage_terminal[0] == 1.0
+                && reporter.candle_rank_first[0] < 0.75
+                && reporter.candle_rank_terminal[0] < 0.75,
+            "band, coverage and PIT summaries must all come from the broad Exact-Cache law"
+        );
+
+        let fan_path = dir
+            .join("3")
+            .join("candle_snapshots")
+            .join("step17_epoch003_window01_fan.report.bin");
+        let fan = read_report(&fan_path).expect("exact-cache fan reads back");
+        assert!(
+            fan.title.contains("Exact-Cache"),
+            "the canonical candle law must be explicit in the artifact title: {}",
+            fan.title
+        );
+        let ReportKind::CandleFan { bands, .. } = fan.kind else {
+            panic!("snapshot must remain a candle fan");
+        };
+        assert!(
+            bands[FAN_CENTRE_INDEX].closes[steps - 1] > 2.0,
+            "the pictured fan followed the negative Dynamics draft instead of exact-cache"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// A poisoned fan must read as UNMEASURED, not as a large drift.
@@ -8858,6 +9092,15 @@ mod tests {
             metrics.lr_mult = 1.0;
             metrics.muon_momentum = 0.85;
             metrics.grad_norm = 3.5;
+            metrics.sdlr_alpha_mean = 1.02;
+            metrics.sdlr_alpha_std = 0.08;
+            metrics.sdlr_alpha_min = 0.81;
+            metrics.sdlr_alpha_max = 1.24;
+            metrics.sdlr_alpha_bound_fraction = 0.0;
+            metrics.sdlr_evidence_mean = 0.0;
+            metrics.sdlr_evidence_std = 0.99;
+            metrics.sdlr_objective = -0.003;
+            metrics.sdlr_update_magnitude = 1.0e-3;
             metrics.context = 896;
             metrics.batch_size = 16;
             metrics.bars_seen = 1_000_000 * (step as u64 + 1);
@@ -8946,6 +9189,38 @@ mod tests {
                  the TUI never scans for it and the chart is invisible; add it there"
             );
         }
+        for base in [
+            "pretrain_ancestral_calibration",
+            "pretrain_ancestral_tails",
+            "pretrain_ancestral_bar_validity",
+        ] {
+            let report =
+                read_report(&dir.join(format!("{base}.report.bin"))).expect("diagnostic reads");
+            assert!(
+                report.title.contains("Dynamics-Draft")
+                    && report
+                        .y_label
+                        .as_deref()
+                        .is_some_and(|label| label.contains("Dynamics-draft")),
+                "{base} must say that it scores the unverified Dynamics draft: {} / {:?}",
+                report.title,
+                report.y_label
+            );
+        }
+        for base in [
+            "pretrain_candle_rollout_dclose",
+            "pretrain_candle_rollout_band",
+            "pretrain_candle_rollout_coverage",
+            "pretrain_candle_rollout_pit",
+        ] {
+            let report =
+                read_report(&dir.join(format!("{base}.report.bin"))).expect("candle summary reads");
+            assert!(
+                report.title.contains("Exact-Cache"),
+                "{base} must identify its canonical predictive law: {}",
+                report.title
+            );
+        }
         let marginal_report =
             read_report(&dir.join("pretrain_independent_marginal_nll.report.bin"))
                 .expect("independent-marginal report reads");
@@ -8992,6 +9267,11 @@ mod tests {
         assert!(
             compare.title.contains("band on") && compare.title.contains("fan-centre se"),
             "the fan must state its in-band rate and its centre's standard error: {}",
+            compare.title
+        );
+        assert!(
+            compare.title.contains("Exact-Cache"),
+            "the candle fan must identify its canonical predictive law: {}",
             compare.title
         );
         match compare.kind {

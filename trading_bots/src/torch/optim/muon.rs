@@ -14,6 +14,16 @@ const NS_C: f64 = 2.0315;
 /// Canonical Newton-Schulz iteration count; the reference default and the only
 /// value real training should ever use.
 pub const DEFAULT_NS_STEPS: usize = 5;
+/// Primary steps during which the row-wise learned learning-rate controller only
+/// observes credit and leaves every multiplier at one.
+pub const ROW_LR_WARMUP_STEPS: i64 = 100;
+/// Adam learning rate for the row-wise controller.
+pub const ROW_LR_CONTROLLER_LR: f64 = 1e-3;
+pub const ROW_LR_CONTROLLER_BETAS: (f64, f64) = (0.9, 0.999);
+pub const ROW_LR_CONTROLLER_EPS: f64 = 1e-8;
+/// Full log-alpha span. `log(alpha) = span * (sigmoid(logit) - 1/2)`;
+/// `span = 2` is the reference `c = 1`, bounding alpha in `[exp(-1), exp(1)]`.
+pub const ROW_LR_LOG_SPAN: f64 = 2.0;
 
 pub(crate) fn newton_schulz_polynomial_bits() -> [u64; 3] {
     [NS_A.to_bits(), NS_B.to_bits(), NS_C.to_bits()]
@@ -145,6 +155,10 @@ pub struct MuonConfig {
     /// bite at all. `adamw_no_weight_decay_name_substrings` remains the `wd_mul = 0`
     /// case and takes precedence.
     pub adamw_weight_decay_multipliers: Vec<(String, f64)>,
+    /// Enable the row-wise learned learning-rate controller on Muon-routed
+    /// matrices. Disabled by default; the disabled branch allocates no controller
+    /// tensors and leaves the existing optimizer arithmetic untouched.
+    pub row_learned_lr: bool,
 }
 
 impl Default for MuonConfig {
@@ -175,6 +189,7 @@ impl Default for MuonConfig {
             cautious_weight_decay: false,
             adamw_beta_overrides: Vec::new(),
             adamw_weight_decay_multipliers: Vec::new(),
+            row_learned_lr: false,
         }
     }
 }
@@ -223,6 +238,48 @@ struct Entry2D {
     /// Kept in fp32 regardless of param dtype: an EMA at gain (1-beta2)=0.05 in
     /// bf16 silently stalls because small increments round to zero.
     second_momentum: Tensor,
+    /// Allocated only when `row_learned_lr` is enabled.
+    row_lr: Option<RowLrState>,
+}
+
+struct RowLrState {
+    /// One logit and Adam pair per parameter row, always fp32 on the parameter device.
+    logit: Tensor,
+    adam_m: Tensor,
+    adam_v: Tensor,
+    /// Previous PRIMARY step's actual signed parameter delta, excluding decoupled decay.
+    previous_delta: Tensor,
+    adam_step: i64,
+}
+
+/// Number and order of controller diagnostics in
+/// [`Muon::row_learned_lr_metrics_tensor`].
+pub const ROW_LR_METRIC_COUNT: usize = 9;
+
+/// Host representation of the latest primary-step diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowLearnedLrMetrics {
+    pub alpha_mean: f64,
+    pub alpha_std: f64,
+    pub alpha_min: f64,
+    pub alpha_max: f64,
+    pub alpha_bound_fraction: f64,
+    pub evidence_mean: f64,
+    pub evidence_std: f64,
+    pub objective: f64,
+    pub update_magnitude: f64,
+}
+
+#[derive(Default)]
+struct RowLrMetricAccumulator {
+    observations: Vec<RowLrObservation>,
+}
+
+struct RowLrObservation {
+    alpha: Tensor,
+    evidence: Tensor,
+    objective_per_row: Tensor,
+    update_magnitude: Tensor,
 }
 
 struct AdamWParamState {
@@ -256,6 +313,10 @@ pub struct Muon {
     /// parameters still hold the gradient the next backward must accumulate into.
     /// [`Self::zero_grad`] reads it and leaves those slots alone.
     adamw_pending_grads: bool,
+    /// Present only when the controller is enabled and the latest primary step
+    /// observed at least one routed matrix gradient. Kept device-resident so the
+    /// pretrainer can fold it into its existing single metrics transfer.
+    row_lr_metrics: Option<Tensor>,
 }
 
 /// Single-matrix quintic orthogonalization.
@@ -609,6 +670,143 @@ fn normuon_transform(
     }
 }
 
+impl RowLrState {
+    fn new(rows: i64, cols: i64, device: Device) -> Self {
+        Self {
+            logit: Tensor::zeros([rows, 1], (Kind::Float, device)),
+            adam_m: Tensor::zeros([rows, 1], (Kind::Float, device)),
+            adam_v: Tensor::zeros([rows, 1], (Kind::Float, device)),
+            previous_delta: Tensor::zeros([rows, cols], (Kind::Float, device)),
+            adam_step: 0,
+        }
+    }
+
+    /// Form this step's detached row multiplier from the OLD logits, then update
+    /// those logits from current raw-gradient evidence for use on the NEXT primary
+    /// step. Auxiliary calls pass `None` and use the frozen multiplier without
+    /// touching any controller state.
+    fn scale_gradient(
+        &mut self,
+        raw_gradient: &Tensor,
+        primary_step: Option<i64>,
+    ) -> (Tensor, Option<RowLrObservation>) {
+        let sigmoid = self.logit.sigmoid();
+        let log_alpha = &sigmoid * ROW_LR_LOG_SPAN - ROW_LR_LOG_SPAN / 2.0;
+        let alpha = log_alpha.exp();
+        let scaled = raw_gradient * alpha.to_kind(raw_gradient.kind());
+        let Some(primary_step) = primary_step else {
+            return (scaled, None);
+        };
+
+        let raw_f32 = raw_gradient
+            .to_kind(Kind::Float)
+            .nan_to_num(0.0, 0.0, 0.0);
+        let evidence_raw = -(&raw_f32 * &self.previous_delta)
+            .mean_dim([1i64].as_slice(), true, Kind::Float);
+        let centered = &evidence_raw - evidence_raw.mean(Kind::Float);
+        let std = centered.square().mean(Kind::Float).sqrt();
+        let evidence = (&centered / std.clamp_min(1e-8))
+            .clamp(-3.0, 3.0)
+            .nan_to_num(0.0, 0.0, 0.0);
+        let objective_per_row = -&evidence * &log_alpha;
+        let mut update_magnitude = Tensor::zeros_like(&self.logit);
+
+        if primary_step > ROW_LR_WARMUP_STEPS {
+            let rows = self.logit.size()[0] as f64;
+            let objective_gradient =
+                -&evidence * ROW_LR_LOG_SPAN * &sigmoid * (1.0 - &sigmoid) / rows;
+            let (beta1, beta2) = ROW_LR_CONTROLLER_BETAS;
+            let _ = self.adam_m.lerp_(&objective_gradient, 1.0 - beta1);
+            let _ = self
+                .adam_v
+                .lerp_(&objective_gradient.square(), 1.0 - beta2);
+            self.adam_step += 1;
+            let bc1 = 1.0 - beta1.powi(self.adam_step as i32);
+            let bc2 = 1.0 - beta2.powi(self.adam_step as i32);
+            let denom = self.adam_v.sqrt() / bc2.sqrt() + ROW_LR_CONTROLLER_EPS;
+            let logit_delta =
+                &self.adam_m / denom * (-ROW_LR_CONTROLLER_LR / bc1);
+            update_magnitude = logit_delta.abs();
+            let _ = self.logit.g_add_(&logit_delta);
+        }
+
+        (
+            scaled,
+            Some(RowLrObservation {
+                alpha,
+                evidence,
+                objective_per_row,
+                update_magnitude,
+            }),
+        )
+    }
+}
+
+impl RowLrMetricAccumulator {
+    fn push(&mut self, observation: RowLrObservation) {
+        self.observations.push(observation);
+    }
+
+    fn finish(self) -> Option<Tensor> {
+        if self.observations.is_empty() {
+            return None;
+        }
+        let alpha = Tensor::cat(
+            &self
+                .observations
+                .iter()
+                .map(|item| item.alpha.reshape([-1]))
+                .collect::<Vec<_>>(),
+            0,
+        );
+        let evidence = Tensor::cat(
+            &self
+                .observations
+                .iter()
+                .map(|item| item.evidence.reshape([-1]))
+                .collect::<Vec<_>>(),
+            0,
+        );
+        let objective = Tensor::cat(
+            &self
+                .observations
+                .iter()
+                .map(|item| item.objective_per_row.reshape([-1]))
+                .collect::<Vec<_>>(),
+            0,
+        );
+        let update_magnitude = Tensor::cat(
+            &self
+                .observations
+                .iter()
+                .map(|item| item.update_magnitude.reshape([-1]))
+                .collect::<Vec<_>>(),
+            0,
+        );
+        let lower = (-ROW_LR_LOG_SPAN / 2.0).exp();
+        let upper = (ROW_LR_LOG_SPAN / 2.0).exp();
+        let at_bound = alpha
+            .le(lower + 1e-6)
+            .logical_or(&alpha.ge(upper - 1e-6))
+            .to_kind(Kind::Float)
+            .mean(Kind::Float);
+        Some(Tensor::stack(
+            &[
+                alpha.mean(Kind::Float),
+                alpha.std(false),
+                alpha.min(),
+                alpha.max(),
+                at_bound,
+                evidence.mean(Kind::Float),
+                evidence.std(false),
+                objective.mean(Kind::Float),
+                update_magnitude.mean(Kind::Float),
+            ],
+            0,
+        ))
+    }
+}
+
 impl Muon {
     pub fn new(trainable_vars: &[Tensor], cfg: MuonConfig) -> Self {
         let named: Vec<(String, Tensor)> = trainable_vars
@@ -661,6 +859,9 @@ impl Muon {
                         second_momentum_shape(&size, layout).as_slice(),
                         (Kind::Float, device),
                     ),
+                    row_lr: cfg
+                        .row_learned_lr
+                        .then(|| RowLrState::new(m, n, device)),
                 });
             } else {
                 adamw_indices.push(i);
@@ -702,6 +903,7 @@ impl Muon {
             lr_scales: vec![1.0; names.len()],
             step_enabled: vec![true; names.len()],
             adamw_pending_grads: false,
+            row_lr_metrics: None,
             names,
         }
     }
@@ -729,14 +931,14 @@ impl Muon {
     /// here.
     pub fn step(&mut self, kind: StepKind) {
         tch::no_grad(|| {
-            let do_adamw = match kind {
-                StepKind::Primary => {
-                    self.step_count += 1;
-                    self.step_count % (self.cfg.adamw_every.max(1) as i64) == 0
-                }
-                StepKind::Auxiliary => false,
+            let primary = kind == StepKind::Primary;
+            let do_adamw = if primary {
+                self.step_count += 1;
+                self.step_count % (self.cfg.adamw_every.max(1) as i64) == 0
+            } else {
+                false
             };
-            self.step_all_normuon();
+            self.step_all_normuon(primary);
             if do_adamw {
                 self.step_all_adamw();
             }
@@ -744,7 +946,7 @@ impl Muon {
         });
     }
 
-    fn step_all_normuon(&mut self) {
+    fn step_all_normuon(&mut self, primary: bool) {
         let beta1 = self.cfg.momentum;
         let beta2 = self.cfg.beta2;
         let nesterov = self.cfg.nesterov;
@@ -753,6 +955,7 @@ impl Muon {
         let orth = self.cfg.orthogonalizer;
         let quadratic = self.cfg.quadratic_lr_weight_decay;
         let cautious = self.cfg.cautious_weight_decay;
+        let mut row_lr_metrics = RowLrMetricAccumulator::default();
 
         for entry in &mut self.entries_2d {
             if !self.step_enabled[entry.idx] {
@@ -763,13 +966,31 @@ impl Muon {
                 continue;
             }
             let lr = base_lr * self.lr_scales[entry.idx];
+            let (controlled_gradient, observation) = if primary {
+                match entry.row_lr.as_mut() {
+                    Some(controller) => {
+                        let (gradient, observation) =
+                            controller.scale_gradient(&grad, Some(self.step_count));
+                        (Some(gradient), observation)
+                    }
+                    None => (None, None),
+                }
+            } else {
+                // Auxiliary updates retain the exact static NorMuon path. In particular they
+                // neither consume current logits nor alter the primary credit tensor.
+                (None, None)
+            };
+            if let Some(observation) = observation {
+                row_lr_metrics.push(observation);
+            }
+            let gradient = controlled_gradient.as_ref().unwrap_or(&grad);
 
-            // First-moment EMA: buf = buf*beta1 + grad*(1-beta1).
-            let _ = entry.momentum.lerp_(&grad, 1.0 - beta1);
+            // The learned row scale acts on the raw gradient, before either optimizer
+            // momentum or orthogonalization can mix its evidence across time or rows.
+            let _ = entry.momentum.lerp_(gradient, 1.0 - beta1);
 
-            // Nesterov combine: update = grad*(1-beta1) + momentum*beta1.
             let update = if nesterov {
-                grad.lerp(&entry.momentum, beta1)
+                gradient.lerp(&entry.momentum, beta1)
             } else {
                 entry.momentum.shallow_clone()
             };
@@ -787,8 +1008,6 @@ impl Muon {
             // the pre-step parameter, so the composition is `p - decay*p - lr*u`.
             let mut p = self.params[entry.idx].shallow_clone();
             let update = update.to_kind(p.kind());
-            // `aspect_scale` is this implementation's per-matrix lr multiplier, so
-            // the total step is `lr_mul * per_matrix_lr_mul * base_lr`.
             let eff_lr = lr * aspect_scale;
             let decay = if quadratic {
                 wd * base_lr * eff_lr
@@ -797,14 +1016,31 @@ impl Muon {
             };
             if decay > 0.0 {
                 if cautious {
-                    // Non-strict `>= 0`, unlike AdamW's strict `> 0`.
                     let keep = (&update * &p).ge(0).to_kind(p.kind()) * decay;
                     let _ = p.g_sub_(&(&p * keep));
                 } else {
                     let _ = p.g_mul_scalar_(1.0 - decay);
                 }
             }
+            if primary {
+                if let Some(controller) = entry.row_lr.as_mut() {
+                    // This is theta_new - theta_old from the gradient update only. Decoupled
+                    // decay above is intentionally absent from the next-step credit tensor.
+                    let signed_delta = &update * (-eff_lr);
+                    controller.previous_delta.copy_(
+                        &signed_delta
+                            .to_kind(Kind::Float)
+                            .nan_to_num(0.0, 0.0, 0.0),
+                    );
+                    let _ = p.g_add_(&signed_delta);
+                    continue;
+                }
+            }
+            // Exact controller-off and auxiliary arithmetic.
             let _ = p.g_add_(&(update * (-eff_lr)));
+        }
+        if primary {
+            self.row_lr_metrics = row_lr_metrics.finish();
         }
     }
 
@@ -924,6 +1160,34 @@ impl Muon {
     pub fn lr(&self) -> f64 {
         self.cfg.lr
     }
+    /// Device-resident packed diagnostics from the latest primary step, in
+    /// [`RowLearnedLrMetrics`] field order. `None` when disabled or when no routed
+    /// matrix had a gradient.
+    pub fn row_learned_lr_metrics_tensor(&self) -> Option<Tensor> {
+        self.row_lr_metrics.as_ref().map(Tensor::shallow_clone)
+    }
+
+    /// Host view for tests and non-packed callers. Pretraining uses the tensor
+    /// accessor above to preserve its one device-to-host metrics transfer.
+    pub fn row_learned_lr_metrics(&self) -> Option<RowLearnedLrMetrics> {
+        let packed = self.row_lr_metrics.as_ref()?;
+        let values: [f64; ROW_LR_METRIC_COUNT] =
+            Vec::<f64>::try_from(packed.to_kind(Kind::Double).reshape([-1]))
+                .expect("controller metrics are convertible")
+                .try_into()
+                .expect("controller metric schema is fixed");
+        Some(RowLearnedLrMetrics {
+            alpha_mean: values[0],
+            alpha_std: values[1],
+            alpha_min: values[2],
+            alpha_max: values[3],
+            alpha_bound_fraction: values[4],
+            evidence_mean: values[5],
+            evidence_std: values[6],
+            objective: values[7],
+            update_magnitude: values[8],
+        })
+    }
 
     pub fn set_lr(&mut self, lr: f64) {
         self.cfg.lr = lr;
@@ -1040,6 +1304,28 @@ impl Muon {
                 format!("{name}.__second_momentum"),
                 entry.second_momentum.to_device(Device::Cpu),
             ));
+            if let Some(controller) = &entry.row_lr {
+                named.push((
+                    format!("{name}.__row_lr_logit"),
+                    controller.logit.to_device(Device::Cpu),
+                ));
+                named.push((
+                    format!("{name}.__row_lr_adam_m"),
+                    controller.adam_m.to_device(Device::Cpu),
+                ));
+                named.push((
+                    format!("{name}.__row_lr_adam_v"),
+                    controller.adam_v.to_device(Device::Cpu),
+                ));
+                named.push((
+                    format!("{name}.__row_lr_previous_delta"),
+                    controller.previous_delta.to_device(Device::Cpu),
+                ));
+                named.push((
+                    format!("{name}.__row_lr_adam_step"),
+                    Tensor::from(controller.adam_step),
+                ));
+            }
         }
         for (&idx, state) in &self.adamw_state {
             let name = &self.names[idx];
@@ -1091,6 +1377,34 @@ impl Muon {
                     })?;
                 entry.momentum.copy_(momentum);
                 entry.second_momentum.copy_(second);
+                if let Some(controller) = entry.row_lr.as_mut() {
+                    controller.logit.copy_(
+                        loaded
+                            .get(&format!("{name}.__row_lr_logit"))
+                            .with_context(|| format!("optimizer state missing row LR logit for {name}"))?,
+                    );
+                    controller.adam_m.copy_(
+                        loaded
+                            .get(&format!("{name}.__row_lr_adam_m"))
+                            .with_context(|| format!("optimizer state missing row LR m for {name}"))?,
+                    );
+                    controller.adam_v.copy_(
+                        loaded
+                            .get(&format!("{name}.__row_lr_adam_v"))
+                            .with_context(|| format!("optimizer state missing row LR v for {name}"))?,
+                    );
+                    controller.previous_delta.copy_(
+                        loaded
+                            .get(&format!("{name}.__row_lr_previous_delta"))
+                            .with_context(|| {
+                                format!("optimizer state missing row LR previous delta for {name}")
+                            })?,
+                    );
+                    controller.adam_step = loaded
+                        .get(&format!("{name}.__row_lr_adam_step"))
+                        .with_context(|| format!("optimizer state missing row LR step for {name}"))?
+                        .int64_value(&[]);
+                }
             }
             self.adamw_state.clear();
             for &idx in &self.adamw_indices {
@@ -1115,6 +1429,7 @@ impl Muon {
             Ok(())
         })?;
         self.step_count = global_step_count;
+        self.row_lr_metrics = None;
         Ok(())
     }
 
@@ -1176,6 +1491,34 @@ impl Muon {
             );
             expected_keys.insert(momentum_name);
             expected_keys.insert(second_name);
+            if let Some(controller) = &entry.row_lr {
+                for (suffix, expected) in [
+                    ("__row_lr_logit", &controller.logit),
+                    ("__row_lr_adam_m", &controller.adam_m),
+                    ("__row_lr_adam_v", &controller.adam_v),
+                    ("__row_lr_previous_delta", &controller.previous_delta),
+                ] {
+                    let key = format!("{name}.{suffix}");
+                    let tensor = loaded
+                        .get(&key)
+                        .with_context(|| format!("optimizer state missing {suffix} for {name}"))?;
+                    ensure!(
+                        tensor.size() == expected.size() && tensor.kind() == expected.kind(),
+                        "optimizer {suffix} schema mismatch for {name}"
+                    );
+                    expected_keys.insert(key);
+                }
+                let step_key = format!("{name}.__row_lr_adam_step");
+                ensure!(
+                    loaded
+                        .get(&step_key)
+                        .with_context(|| format!("optimizer state missing row LR step for {name}"))?
+                        .numel()
+                        == 1,
+                    "optimizer row LR step is not scalar for {name}"
+                );
+                expected_keys.insert(step_key);
+            }
         }
 
         let initialized = expected_initialized_adamw
@@ -1256,14 +1599,22 @@ impl Muon {
     }
 
     /// Total bytes of optimizer state currently allocated.
-    /// 2D params: `momentum` + `second_momentum` per param.
+    /// 2D params: NorMuon moments plus the optional row-controller tensors.
     /// 1D params: AdamW `m` + `v` per param (lazy — zero until first step).
     pub fn state_bytes(&self) -> usize {
         let tensor_bytes = |t: &Tensor| t.numel() * t.kind().elt_size_in_bytes();
         let muon: usize = self
             .entries_2d
             .iter()
-            .map(|e| tensor_bytes(&e.momentum) + tensor_bytes(&e.second_momentum))
+            .map(|entry| {
+                let base = tensor_bytes(&entry.momentum) + tensor_bytes(&entry.second_momentum);
+                entry.row_lr.as_ref().map_or(base, |controller| {
+                    base + tensor_bytes(&controller.logit)
+                        + tensor_bytes(&controller.adam_m)
+                        + tensor_bytes(&controller.adam_v)
+                        + tensor_bytes(&controller.previous_delta)
+                })
+            })
             .sum();
         let adamw: usize = self
             .adamw_state
@@ -1285,7 +1636,15 @@ impl Muon {
         let muon: usize = self
             .entries_2d
             .iter()
-            .map(|e| tensor_bytes(&e.momentum) + tensor_bytes(&e.second_momentum))
+            .map(|entry| {
+                let base = tensor_bytes(&entry.momentum) + tensor_bytes(&entry.second_momentum);
+                entry.row_lr.as_ref().map_or(base, |controller| {
+                    base + tensor_bytes(&controller.logit)
+                        + tensor_bytes(&controller.adam_m)
+                        + tensor_bytes(&controller.adam_v)
+                        + tensor_bytes(&controller.previous_delta)
+                })
+            })
             .sum();
         let adamw: usize = self
             .adamw_indices
@@ -2547,5 +2906,205 @@ mod tests {
             opt.adamw_param_names(),
             vec!["attn_resid_lambda".to_owned()]
         );
+    }
+    fn controller_config() -> MuonConfig {
+        MuonConfig {
+            lr: 1e-2,
+            momentum: 0.0,
+            nesterov: false,
+            beta2: 0.0,
+            weight_decay: 0.0,
+            row_learned_lr: true,
+            quiet: true,
+            ..MuonConfig::default()
+        }
+    }
+
+    fn backward_rows(parameter: &Tensor, rows: &[f32]) {
+        let gradient = Tensor::from_slice(rows).reshape(parameter.size().as_slice());
+        (parameter * gradient).sum(Kind::Float).backward();
+    }
+
+    #[test]
+    fn controller_off_and_enabled_warmup_are_exactly_equivalent() {
+        let _torch_rng_guard = test_rng::shared();
+        let initial = Tensor::from_slice(&[0.2f32, -0.4, 0.7, -0.1]).reshape([2, 2]);
+        let off_param = initial.copy().set_requires_grad(true);
+        let on_param = initial.copy().set_requires_grad(true);
+        let mut off_cfg = controller_config();
+        off_cfg.row_learned_lr = false;
+        let mut off = Muon::new_named(&[("w".to_owned(), off_param.shallow_clone())], off_cfg);
+        let mut on =
+            Muon::new_named(&[("w".to_owned(), on_param.shallow_clone())], controller_config());
+
+        backward_rows(&off_param, &[1.0, -2.0, 0.5, 3.0]);
+        backward_rows(&on_param, &[1.0, -2.0, 0.5, 3.0]);
+        off.step(StepKind::Primary);
+        on.step(StepKind::Primary);
+
+        assert!(off_param.equal(&on_param));
+        assert!(off.entries_2d[0].row_lr.is_none());
+        assert!(off.row_learned_lr_metrics().is_none());
+        let state = on.entries_2d[0].row_lr.as_ref().unwrap();
+        assert_eq!(state.logit.abs().max().double_value(&[]), 0.0);
+        assert_eq!(state.logit.kind(), Kind::Float);
+        assert_eq!(state.previous_delta.kind(), Kind::Float);
+        assert_eq!(state.logit.device(), on_param.device());
+        let metrics = on.row_learned_lr_metrics().unwrap();
+        assert_eq!(metrics.alpha_mean, 1.0);
+        assert_eq!(metrics.alpha_std, 0.0);
+        assert_eq!(metrics.update_magnitude, 0.0);
+    }
+
+    #[test]
+    fn productive_and_harmful_rows_move_alpha_in_opposite_directions_after_warmup() {
+        let _torch_rng_guard = test_rng::shared();
+        let parameter = Tensor::zeros([2, 2], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let mut optimizer = Muon::new_named(
+            &[("w".to_owned(), parameter.shallow_clone())],
+            controller_config(),
+        );
+        optimizer.step_count = super::ROW_LR_WARMUP_STEPS;
+        optimizer.entries_2d[0]
+            .row_lr
+            .as_mut()
+            .unwrap()
+            .previous_delta
+            .copy_(&Tensor::from_slice(&[-1.0f32, -1.0, 1.0, 1.0]).reshape([2, 2]));
+
+        backward_rows(&parameter, &[1.0, 1.0, 1.0, 1.0]);
+        optimizer.step(StepKind::Primary);
+        let first = optimizer.row_learned_lr_metrics().unwrap();
+        assert_eq!(first.alpha_mean, 1.0, "the logit update must take effect next step");
+        assert!(first.evidence_mean.abs() < 1e-6);
+        assert!((first.evidence_std - 1.0).abs() < 1e-6);
+        let logit = &optimizer.entries_2d[0].row_lr.as_ref().unwrap().logit;
+        assert!(logit.double_value(&[0, 0]) > 0.0, "productive row must speed up");
+        assert!(logit.double_value(&[1, 0]) < 0.0, "harmful row must slow down");
+
+        optimizer.zero_grad();
+        backward_rows(&parameter, &[1.0, 1.0, 1.0, 1.0]);
+        optimizer.step(StepKind::Primary);
+        let second = optimizer.row_learned_lr_metrics().unwrap();
+        assert!(second.alpha_max > 1.0);
+        assert!(second.alpha_min < 1.0);
+    }
+
+    #[test]
+    fn controller_alpha_is_finite_and_bounded_even_for_saturated_logits() {
+        let _torch_rng_guard = test_rng::shared();
+        let parameter = Tensor::zeros([2, 2], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let mut optimizer = Muon::new_named(
+            &[("w".to_owned(), parameter.shallow_clone())],
+            controller_config(),
+        );
+        optimizer.entries_2d[0]
+            .row_lr
+            .as_mut()
+            .unwrap()
+            .logit
+            .copy_(&Tensor::from_slice(&[1000.0f32, -1000.0]).reshape([2, 1]));
+        backward_rows(&parameter, &[0.0, 0.0, 0.0, 0.0]);
+        optimizer.step(StepKind::Primary);
+        let metrics = optimizer.row_learned_lr_metrics().unwrap();
+        assert!(metrics.alpha_min.is_finite() && metrics.alpha_max.is_finite());
+        assert!(metrics.alpha_min >= (-1.0f64).exp());
+        assert!(metrics.alpha_max <= 1.0f64.exp());
+        assert_eq!(metrics.alpha_bound_fraction, 1.0);
+        assert_eq!(metrics.evidence_mean, 0.0);
+        assert_eq!(metrics.evidence_std, 0.0);
+    }
+
+    #[test]
+    fn controller_excludes_adamw_and_auxiliary_updates_from_its_state() {
+        let _torch_rng_guard = test_rng::shared();
+        let matrix = Tensor::zeros([2, 2], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let adamw = Tensor::zeros([2], (Kind::Float, Device::Cpu)).set_requires_grad(true);
+        let mut optimizer = Muon::new_named(
+            &[
+                ("matrix".to_owned(), matrix.shallow_clone()),
+                ("bias".to_owned(), adamw.shallow_clone()),
+            ],
+            controller_config(),
+        );
+        assert!(optimizer.entries_2d[0].row_lr.is_some());
+        assert_eq!(optimizer.adamw_indices, vec![1]);
+
+        backward_rows(&matrix, &[1.0, 2.0, 3.0, 4.0]);
+        adamw.sum(Kind::Float).backward();
+        optimizer.step(StepKind::Primary);
+        let state = optimizer.entries_2d[0].row_lr.as_ref().unwrap();
+        let before = (
+            state.logit.copy(),
+            state.adam_m.copy(),
+            state.adam_v.copy(),
+            state.previous_delta.copy(),
+            state.adam_step,
+        );
+
+        optimizer.zero_grad();
+        backward_rows(&matrix, &[-4.0, -3.0, -2.0, -1.0]);
+        optimizer.step(StepKind::Auxiliary);
+        let state = optimizer.entries_2d[0].row_lr.as_ref().unwrap();
+        assert!(state.logit.equal(&before.0));
+        assert!(state.adam_m.equal(&before.1));
+        assert!(state.adam_v.equal(&before.2));
+        assert!(state.previous_delta.equal(&before.3));
+        assert_eq!(state.adam_step, before.4);
+    }
+
+    #[test]
+    fn enabling_controller_does_not_change_adamw_routed_matrix_updates() {
+        let _torch_rng_guard = test_rng::shared();
+        let initial = Tensor::from_slice(&[0.2f32, -0.3, 0.5, 0.7]).reshape([2, 2]);
+        let off_param = initial.copy().set_requires_grad(true);
+        let on_param = initial.copy().set_requires_grad(true);
+        let cfg = |enabled| MuonConfig {
+            use_muon_for_2d: true,
+            force_adamw_name_substrings: vec!["head".to_owned()],
+            adamw_lr: 0.01,
+            adamw_betas: (0.9, 0.999),
+            row_learned_lr: enabled,
+            quiet: true,
+            ..MuonConfig::default()
+        };
+        let mut off =
+            Muon::new_named(&[("head".to_owned(), off_param.shallow_clone())], cfg(false));
+        let mut on =
+            Muon::new_named(&[("head".to_owned(), on_param.shallow_clone())], cfg(true));
+        backward_rows(&off_param, &[1.0, -2.0, 3.0, -4.0]);
+        backward_rows(&on_param, &[1.0, -2.0, 3.0, -4.0]);
+        off.step(StepKind::Primary);
+        on.step(StepKind::Primary);
+        assert!(off_param.equal(&on_param));
+        assert!(on.entries_2d.is_empty());
+        assert!(on.row_learned_lr_metrics().is_none());
+    }
+
+    #[test]
+    fn previous_delta_is_the_actual_signed_muon_update_without_weight_decay() {
+        let _torch_rng_guard = test_rng::shared();
+        let parameter =
+            Tensor::from_slice(&[0.5f32, -0.25, 0.75, -1.0]).reshape([2, 2]).set_requires_grad(true);
+        let before = parameter.copy();
+        let mut cfg = controller_config();
+        cfg.weight_decay = 0.4;
+        let decay = cfg.weight_decay * cfg.lr;
+        let mut optimizer =
+            Muon::new_named(&[("w".to_owned(), parameter.shallow_clone())], cfg);
+        backward_rows(&parameter, &[1.0, -2.0, 3.0, -4.0]);
+        optimizer.step(StepKind::Primary);
+
+        let actual_without_decay = &parameter - &before * (1.0 - decay);
+        let recorded = &optimizer.entries_2d[0]
+            .row_lr
+            .as_ref()
+            .unwrap()
+            .previous_delta;
+        let error = (recorded - actual_without_decay.to_kind(Kind::Float))
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(error < 1e-6, "credit delta included decay or missed the applied update: {error}");
     }
 }

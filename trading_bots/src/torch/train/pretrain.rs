@@ -53,13 +53,17 @@ use crate::torch::dataset::{
     BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING,
 };
 use crate::torch::load::load_var_store_partial;
-use crate::torch::optim::muon::{Muon, MuonConfig, Orthogonalizer, StepKind, DEFAULT_NS_STEPS};
+use crate::torch::optim::muon::{
+    Muon, MuonConfig, Orthogonalizer, StepKind, DEFAULT_NS_STEPS, ROW_LR_CONTROLLER_BETAS,
+    ROW_LR_CONTROLLER_EPS, ROW_LR_CONTROLLER_LR, ROW_LR_LOG_SPAN, ROW_LR_METRIC_COUNT,
+    ROW_LR_WARMUP_STEPS,
+};
 use crate::torch::world_model::{
     bar_adamw_embedding_substrings, bar_adamw_scalar_substrings,
     bar_muon_down_projection_substrings, bar_muon_name_substrings, world_model_metadata_path,
-    world_model_supports_path, BarModules, BarSupportSet, BarTrainingProvenance, BarWorldModel,
-    BarWorldModelMetadata, RolloutMode, BAR_ARCHITECTURE, BAR_LAYERS, BAR_MAX_CONTEXT,
-    BAR_MODEL_DIM,
+    world_model_supports_path, BarModules, BarOptimizerProvenance, BarRowLearnedLrProvenance,
+    BarSupportSet, BarTrainingProvenance, BarWorldModel, BarWorldModelMetadata, RolloutMode,
+    BAR_ARCHITECTURE, BAR_LAYERS, BAR_MAX_CONTEXT, BAR_MODEL_DIM,
 };
 use shared::{
     paths::RUNS_PATH,
@@ -232,16 +236,21 @@ const ADAMW_TABLE_WEIGHT_DECAY_MULT: f64 = 150.0;
 /// snapshot writer. Must cover the longest reported rollout horizon, which the
 /// static assertion below enforces.
 ///
-/// 100 bars, not 64: the NextLat reference measures its recursive d-step rollout over
-/// teacher-forced tokens by re-applying the dynamics to its own previous prediction,
-/// and what it is interested in is where that recursion DEGRADES, which needs a horizon
-/// well past the one-step transition the model is shaped at (`--dyn-horizon 1`). Peak
-/// memory does not move with this constant: the history is
+/// 100 bars, not 64: the diagnostic recursively re-applies the unverified one-step Dynamics
+/// draft to its own previous prediction so the report can show where it DEGRADES against
+/// exact-cache, well past the one-step transition the model is shaped at
+/// (`--dyn-horizon 1`).
+/// Peak memory does not move with this constant: the history is
 /// `context - SNAPSHOT_HORIZON` bars, so the KV cache still holds exactly `context`
 /// tokens once the rollout finishes. Wall-clock does: both the two-mode `rollout_nll`
 /// and the ancestral snapshot are linear in the depth, so this is 1.56x on those two
 /// passes, and both run on a handful of pinned windows rather than on the validation set.
 const SNAPSHOT_HORIZON: i64 = 100;
+/// Canonical predictive law pictured by the standalone candle command.
+///
+/// The dynamics recursion is an unverified one-step latent draft. Its long-horizon law
+/// belongs in the exact-vs-dynamics diagnostics, not in the checkpoint's candle forecast.
+const CANDLE_ROLLOUT_MODE: RolloutMode = RolloutMode::Exact;
 const _: () = assert!(
     ROLLOUT_HORIZONS[ROLLOUT_HORIZONS.len() - 1] as i64 == SNAPSHOT_HORIZON,
     "the realized continuation must reach the deepest reported horizon exactly; a horizon \
@@ -582,7 +591,7 @@ pub struct PretrainArgs {
     pub auxiliary_resolutions: Vec<u32>,
     /// Bars drawn from the training split to fit the bin supports.
     pub support_samples: usize,
-    /// Recursive dynamics rollout depth.
+    /// Recursive unverified dynamics-draft training depth.
     pub dyn_horizon: usize,
     /// Weight on the NextLat latent term, applied UNCHANGED at every step of the run.
     ///
@@ -625,10 +634,11 @@ pub struct PretrainArgs {
     ///   `speculative_propose` (`:678-703`), which advances the draft state through it at
     ///   `:701`.
     ///
-    /// [`BarDynamics`] is on NextLat's side of that line, not modded-nanogpt's. It is a
-    /// shipped component of the frozen inference bundle (`world_model.rs:15-18`), its
-    /// weights are in the checkpoint, and [`RolloutMode::Dynamics`] advances beliefs
-    /// through it. Its only training signal is these two terms. Annealing them to zero
+    /// [`BarDynamics`] is on NextLat's side of that line, not modded-nanogpt's. Its weights
+    /// ship in the frozen bundle (`world_model.rs:15-18`) only as a speculative latent draft
+    /// that must be verified against exact-cache; it is not the canonical predictive law.
+    /// [`RolloutMode::Dynamics`] recursively probes that draft for diagnostics. Its only
+    /// training signal is these two terms. Annealing them to zero
     /// leaves the trunk training for another third of the run while the dynamics head is
     /// frozen against a moving target, and the head rots: in job 2865 `dyn/identity` was
     /// 0.63-0.75 while the terms were live — the MLP beating the trivial identity map by
@@ -734,6 +744,9 @@ pub struct PretrainArgs {
     /// of an algebraic identity, and the value is recorded in the checkpoint metadata and in
     /// the run's report so a future reader can tell which schedule produced a number.
     pub lr_plateau_fraction: f64,
+    /// Enable row-wise signed-delta learning-rate adaptation for Muon-routed matrices.
+    /// Disabled by default; AdamW parameters and auxiliary-resolution updates are excluded.
+    pub sdlr: bool,
 }
 
 impl PretrainArgs {
@@ -1704,7 +1717,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     }
 
     let named = named_trainable_variables(&vs);
-    let optimizer = build_optimizer(&named)?;
+    let optimizer = build_optimizer(&named, args.sdlr)?;
 
     let (train_samplers, eval) = build_samplers(&corpus, &args)?;
 
@@ -2074,7 +2087,7 @@ pub fn pretrain_candles(args: CandleArgs) -> Result<()> {
             &window.history_time_ids,
             &window.future_time_ids,
             args.samples,
-            RolloutMode::Dynamics,
+            CANDLE_ROLLOUT_MODE,
         )
     });
 
@@ -3323,6 +3336,11 @@ fn validate_args(args: &PretrainArgs) -> Result<()> {
     );
     ensure!(args.batch_size > 0, "--batch-size must be positive");
     ensure!(
+        !args.sdlr || args.auxiliary_resolutions.is_empty(),
+        "--sdlr currently supports only the primary resolution; remove \
+         --auxiliary-resolutions so every controller credit compares adjacent primary updates"
+    );
+    ensure!(
         args.dyn_horizon > 0,
         "--dyn-horizon must be at least 1; the dynamics model needs one step to train"
     );
@@ -3780,7 +3798,7 @@ impl EvaluationSets {
 /// every scalar gate. The routings must exactly partition the VarStore: a
 /// parameter that matches no list would be silently frozen, and a parameter
 /// matching more than one would be routed by precedence rather than by intent.
-fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
+fn build_optimizer(named: &[(String, Tensor)], row_learned_lr: bool) -> Result<Muon> {
     let muon: Vec<String> = bar_muon_name_substrings()
         .iter()
         .map(|s| (*s).to_owned())
@@ -3853,6 +3871,7 @@ fn build_optimizer(named: &[(String, Tensor)]) -> Result<Muon> {
         cautious_weight_decay: true,
         adamw_beta_overrides: beta_overrides,
         adamw_weight_decay_multipliers: wd_multipliers,
+        row_learned_lr,
         ..MuonConfig::default()
     };
 
@@ -4279,6 +4298,7 @@ struct StepLoss {
     /// `dyn` over the trivial-identity baseline `smooth_l1(h_t, sg[h_{t+k}])`.
     dyn_vs_identity: f64,
     grad_norm: f64,
+    row_learned_lr: [f64; ROW_LR_METRIC_COUNT],
 }
 
 /// Which held-out set a promotion decision was taken on. `Deployed` is the only
@@ -4618,6 +4638,15 @@ impl Trainer {
             metrics.belief_autocorr = loss.belief_autocorr;
             metrics.dyn_vs_identity = loss.dyn_vs_identity;
             metrics.lr_mult = lr_mult;
+            metrics.sdlr_alpha_mean = loss.row_learned_lr[0];
+            metrics.sdlr_alpha_std = loss.row_learned_lr[1];
+            metrics.sdlr_alpha_min = loss.row_learned_lr[2];
+            metrics.sdlr_alpha_max = loss.row_learned_lr[3];
+            metrics.sdlr_alpha_bound_fraction = loss.row_learned_lr[4];
+            metrics.sdlr_evidence_mean = loss.row_learned_lr[5];
+            metrics.sdlr_evidence_std = loss.row_learned_lr[6];
+            metrics.sdlr_objective = loss.row_learned_lr[7];
+            metrics.sdlr_update_magnitude = loss.row_learned_lr[8];
             metrics.muon_momentum = momentum;
             metrics.grad_norm = loss.grad_norm;
             metrics.context = self.schedule.context(step);
@@ -5123,15 +5152,16 @@ impl Trainer {
         Ok(Some(rival))
     }
 
-    /// Measure the shipped dynamics head against the trivial `z_k = h_t` identity map on the
-    /// promoted checkpoint, and report it. The VERDICT is
+    /// Measure the checkpoint's speculative dynamics-draft head against the trivial
+    /// `z_k = h_t` identity map, and report it. The VERDICT is
     /// [`check_dynamics_beats_identity`], which `run_training` applies only after the report
     /// has been finalized.
     ///
-    /// [`BarDynamics`] is exported in the checkpoint and [`RolloutMode::Dynamics`] advances
-    /// beliefs through it, so `dyn / identity > 1` means the artifact carries a component
-    /// that actively degrades the belief it is asked to advance — a trained MLP losing to
-    /// doing nothing. That is never a legitimate end state, and it is silent in every other
+    /// [`BarDynamics`] is exported only as a latent draft that must be verified against the
+    /// canonical exact-cache law. [`RolloutMode::Dynamics`] recursively probes it here, so
+    /// `dyn / identity > 1` means the artifact carries a draft component that actively
+    /// degrades the belief it is asked to advance — a trained MLP losing to doing nothing.
+    /// That is never a legitimate end state, and it is silent in every other
     /// number the battery prints: the head's own loss keeps shrinking along with the beliefs
     /// it is chasing, so only the ratio against the trivial baseline exposes it.
     ///
@@ -5214,11 +5244,12 @@ impl Trainer {
                 self.device,
             )
         });
-        // Backward first so the gradient norm can join every loss and diagnostic in one
-        // device tensor. Reading that tensor is the step's sole host synchronization.
+        // Backward first so the gradient norm and the preceding primary controller
+        // diagnostics can join every loss in one device-to-host transfer.
         graph.loss.backward();
         let grad_norm_tensor = global_grad_norm_tensor(&self.vs, self.device);
-        let packed = pack_step_metrics(&graph, &grad_norm_tensor);
+        let row_lr_metrics = self.optimizer.row_learned_lr_metrics_tensor();
+        let packed = pack_step_metrics(&graph, &grad_norm_tensor, row_lr_metrics.as_ref());
         let metrics = read_packed_step_metrics(&packed);
         ensure_finite_step_metrics(&metrics, step)?;
         let total = metrics[STEP_METRIC_TOTAL];
@@ -5276,6 +5307,9 @@ impl Trainer {
                 f64::NAN
             },
             grad_norm,
+            row_learned_lr: metrics[STEP_METRIC_ROW_LR]
+                .try_into()
+                .expect("controller metric slice has fixed width"),
         })
     }
 
@@ -6550,6 +6584,19 @@ impl Trainer {
             // whether a checkpoint at one full pass sat at peak rate or at the annealed floor,
             // which is the difference between two entirely different experiments.
             lr_plateau_fraction: self.schedule.lr_plateau_fraction,
+            optimizer: Some(BarOptimizerProvenance {
+                name: "NorMuon (Polar Express 5) + AdamW".to_owned(),
+                row_learned_lr: self.args.sdlr.then(|| BarRowLearnedLrProvenance {
+                    c: ROW_LR_LOG_SPAN / 2.0,
+                    controller_lr: ROW_LR_CONTROLLER_LR,
+                    beta1: ROW_LR_CONTROLLER_BETAS.0,
+                    beta2: ROW_LR_CONTROLLER_BETAS.1,
+                    eps: ROW_LR_CONTROLLER_EPS,
+                    warmup_primary_steps: ROW_LR_WARMUP_STEPS,
+                    evidence_clip: 3.0,
+                    evidence: "-mean(g_raw_current * actual_signed_delta_previous), centered and population-standardized within each matrix".to_owned(),
+                }),
+            }),
         }
     }
 
@@ -7158,8 +7205,9 @@ impl Trainer {
             )
         })?;
         let window = self.snapshot_windows();
-        // Generate both laws before exposing the realized continuation to the reporter. The
-        // dynamics law is the deployed forecast; exact-cache draws exist only as a drift ruler.
+        // Generate both laws before exposing the realized continuation to the reporter.
+        // Exact-cache is the canonical predictive law. Dynamics remains an unverified
+        // one-step latent draft whose recursive law is retained here only for diagnostics.
         let dynamics_rollout = rollout_pinned_windows(
             &world,
             &window.history_dof,
@@ -7385,8 +7433,8 @@ pub(super) struct EvalStats {
     window_nll_dof: Vec<[f64; BAR_DOF]>,
     crps_dof: [f64; BAR_DOF],
     pit: PitHistogram,
-    dir_acc: f64,
-    effective_rank: f64,
+    pub(super) dir_acc: f64,
+    pub(super) effective_rank: f64,
     /// NLL of each independently marginalized per-DOF law. These are valid marginal
     /// forecasts from strictly past bars, but their sum is not a joint forecast likelihood.
     independent_marginal_nll_dof: [f64; BAR_DOF],
@@ -7681,6 +7729,38 @@ fn group_standard_error(groups: &[f64]) -> f64 {
     (variance / n).sqrt()
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum EvaluationTrunk<'a> {
+    Parallel,
+    Serialized,
+    Recirculated(&'a crate::torch::world_model::RecirculationConfig),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn evaluate_with_trunk(
+    modules: &BarModules,
+    supports: &BarSupports,
+    set: &PinnedSet,
+    batch: usize,
+    device: Device,
+    scoring: BarScoring,
+    trunk: EvaluationTrunk<'_>,
+) -> Result<EvalStats> {
+    evaluate_impl(
+        modules,
+        supports,
+        set,
+        batch,
+        device,
+        false,
+        scoring,
+        None,
+        0,
+        trunk,
+        true,
+    )
+}
+
 /// Teacher-forced evaluation over a pinned window set, in full precision so the
 /// number is reproducible independently of the training autocast policy. `full` adds
 /// the calibration diagnostics; promotion only needs the NLL, and the diagnostics
@@ -7713,6 +7793,35 @@ pub(super) fn evaluate(
     scoring: BarScoring,
     shrink: Option<MeanShrink>,
     trade_budget: usize,
+) -> Result<EvalStats> {
+    evaluate_impl(
+        modules,
+        supports,
+        set,
+        batch,
+        device,
+        full,
+        scoring,
+        shrink,
+        trade_budget,
+        EvaluationTrunk::Parallel,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_impl(
+    modules: &BarModules,
+    supports: &BarSupports,
+    set: &PinnedSet,
+    batch: usize,
+    device: Device,
+    full: bool,
+    scoring: BarScoring,
+    shrink: Option<MeanShrink>,
+    trade_budget: usize,
+    trunk: EvaluationTrunk<'_>,
+    focused_diagnostics: bool,
 ) -> Result<EvalStats> {
     let mut nll_dof_sum = [0.0f64; BAR_DOF];
     let mut crps_dof_sum = [0.0f64; BAR_DOF];
@@ -7752,17 +7861,33 @@ pub(super) fn evaluate(
         let context = sample.dof.size()[1] - 1;
         let rows = chunk.len() as f64;
 
-        let (per_window, live, extras) = tch::no_grad(|| {
+        let (per_window, live, extras, focused) = tch::no_grad(|| {
             let input = sample.dof.narrow(1, 0, context);
             let target = sample.dof.narrow(1, 1, context);
             let bin_ids = supports.bin_ids(&input);
-            let beliefs = modules.trunk.forward(
-                &input,
-                &bin_ids,
-                &sample.time_ids.narrow(1, 0, context),
-                0,
-                false,
-            );
+            let beliefs = match trunk {
+                EvaluationTrunk::Parallel => modules.trunk.forward(
+                    &input,
+                    &bin_ids,
+                    &sample.time_ids.narrow(1, 0, context),
+                    0,
+                    false,
+                ),
+                EvaluationTrunk::Serialized => modules.trunk.forward_serialized(
+                    &input,
+                    &bin_ids,
+                    &sample.time_ids.narrow(1, 0, context),
+                ),
+                EvaluationTrunk::Recirculated(config) => modules
+                    .trunk
+                    .forward_recirculated(
+                        &input,
+                        &bin_ids,
+                        &sample.time_ids.narrow(1, 0, context),
+                        config,
+                    )
+                    .expect("recirculation config was validated before evaluation"),
+            };
             let soft_targets = supports.targets(&target, scoring);
             let target_bins = supports.bin_ids(&target);
             let current_time = sample.time_ids.narrow(1, 0, context);
@@ -7787,6 +7912,13 @@ pub(super) fn evaluate(
             );
             let live_count = live_mask.sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
 
+            let focused = focused_diagnostics.then(|| {
+                (
+                    direction_hits(modules, supports, &beliefs, &conditioning, &target, context),
+                    (chunk_index == 0)
+                        .then(|| belief_effective_rank(&flatten_beliefs(&beliefs))),
+                )
+            });
             let extras = full.then(|| {
                 let crps = dof_array(&bar_crps_from_logits(&logits, &target, supports));
                 // A per-chunk key, not one stream reused 171 times: `counter_uniforms` is
@@ -7849,6 +7981,7 @@ pub(super) fn evaluate(
                         .expect("live-bar counts are convertible"),
                 ),
                 extras,
+                focused,
             )
         });
 
@@ -7906,6 +8039,13 @@ pub(super) fn evaluate(
                 *acc += value * marginal.rows;
             }
             trade_paths.absorb(extras.trade);
+        }
+        if let Some((direction, rank)) = focused {
+            direction_correct += direction.0;
+            direction_total += direction.1;
+            if let Some(rank) = rank {
+                effective_rank = rank;
+            }
         }
         rows_total += rows;
     }
@@ -8488,9 +8628,10 @@ fn check_dynamics_beats_identity(ratio: f64, horizon: i64) -> Result<()> {
         ratio <= 1.0,
         "the promoted checkpoint's dynamics head is WORSE THAN DOING NOTHING: dyn/identity \
          is {ratio:.3} on the test split at horizon {horizon}, where 1.0 is the trivial \
-         `z_k = h_t` identity map. BarDynamics ships inside the checkpoint and \
-         RolloutMode::Dynamics advances beliefs through it, so this artifact would hand a \
-         planner a latent predictor that degrades the belief it is asked to advance. The \
+         `z_k = h_t` identity map. BarDynamics ships only as a speculative latent draft \
+         that must be verified against exact-cache, and RolloutMode::Dynamics recursively \
+         probes it here. This artifact would therefore hand a planner a draft that degrades \
+         the belief it is asked to advance even before verification. The \
          cause is almost always that the dynamics head stopped receiving gradient while the \
          trunk kept training — check that --lambda-dyn and --lambda-kl are non-zero and \
          that nothing scales them down over the run."
@@ -8668,39 +8809,56 @@ const STEP_METRIC_GROWTH_STATS: std::ops::Range<usize> =
 const STEP_METRIC_IDENTITY: usize = 5 + BAR_DOF + growth::GROWTH_STAT_COUNT;
 const STEP_METRIC_AUTOCORR: usize = STEP_METRIC_IDENTITY + 1;
 const STEP_METRIC_GRAD_NORM: usize = STEP_METRIC_AUTOCORR + 1;
-const STEP_METRIC_COUNT: usize = STEP_METRIC_GRAD_NORM + 1;
+const STEP_METRIC_BASE_COUNT: usize = STEP_METRIC_GRAD_NORM + 1;
+const STEP_METRIC_ROW_LR: std::ops::Range<usize> =
+    STEP_METRIC_BASE_COUNT..STEP_METRIC_BASE_COUNT + ROW_LR_METRIC_COUNT;
+const STEP_METRIC_COUNT: usize = STEP_METRIC_ROW_LR.end;
 
-/// Pack every device-resident scalar read by one optimizer step. The caller performs this
-fn pack_step_metrics(graph: &TrainingGraph, grad_norm: &Tensor) -> Tensor {
+/// Pack every device-resident scalar read by one optimizer step. Controller diagnostics
+/// are from the preceding primary update, allowing them to share this transfer without
+/// adding a synchronization after the optimizer step. The disabled path retains the
+/// original packet exactly and is padded with host-side NaNs by the reader.
+fn pack_step_metrics(
+    graph: &TrainingGraph,
+    grad_norm: &Tensor,
+    row_lr_metrics: Option<&Tensor>,
+) -> Tensor {
     let flat_f32 = |tensor: &Tensor| tensor.detach().to_kind(Kind::Float).reshape([-1]);
 
-    Tensor::cat(
-        &[
-            flat_f32(&graph.loss),
-            flat_f32(&graph.nll),
-            flat_f32(&graph.nll_dof),
-            flat_f32(&graph.dyn_loss),
-            flat_f32(&graph.kl_loss),
-            flat_f32(&graph.growth_diagnostic),
-            flat_f32(&graph.growth_stats),
-            flat_f32(&graph.identity),
-            flat_f32(&graph.autocorr),
-            flat_f32(grad_norm),
-        ],
-        0,
-    )
+    let base = [
+        flat_f32(&graph.loss),
+        flat_f32(&graph.nll),
+        flat_f32(&graph.nll_dof),
+        flat_f32(&graph.dyn_loss),
+        flat_f32(&graph.kl_loss),
+        flat_f32(&graph.growth_diagnostic),
+        flat_f32(&graph.growth_stats),
+        flat_f32(&graph.identity),
+        flat_f32(&graph.autocorr),
+        flat_f32(grad_norm),
+    ];
+    match row_lr_metrics {
+        Some(metrics) => {
+            let mut tensors = Vec::from(base);
+            tensors.push(flat_f32(metrics));
+            Tensor::cat(&tensors, 0)
+        }
+        None => Tensor::cat(&base, 0),
+    }
 }
 
 /// The optimizer step's single device-to-host metric transfer.
 fn read_packed_step_metrics(packed: &Tensor) -> [f64; STEP_METRIC_COUNT] {
     let values = Vec::<f64>::try_from(packed.to_kind(Kind::Double).reshape([-1]))
         .expect("packed step metrics are convertible");
-    values.try_into().unwrap_or_else(|values: Vec<f64>| {
-        panic!(
-            "packed step metrics carry {} entries, expected {STEP_METRIC_COUNT}",
-            values.len()
-        )
-    })
+    assert!(
+        values.len() == STEP_METRIC_BASE_COUNT || values.len() == STEP_METRIC_COUNT,
+        "packed step metrics carry {} entries, expected {STEP_METRIC_BASE_COUNT} or {STEP_METRIC_COUNT}",
+        values.len()
+    );
+    let mut out = [f64::NAN; STEP_METRIC_COUNT];
+    out[..values.len()].copy_from_slice(&values);
+    out
 }
 
 /// Fail before optimizer mutation if the packed loss, gradient or any diagnostic is
@@ -8717,8 +8875,16 @@ fn ensure_finite_step_metrics(metrics: &[f64; STEP_METRIC_COUNT], step: usize) -
         "gradient norm is not finite at step {step}: {grad_norm}"
     );
     ensure!(
-        metrics.iter().all(|value| value.is_finite()),
+        metrics[..STEP_METRIC_BASE_COUNT]
+            .iter()
+            .all(|value| value.is_finite()),
         "packed loss/gradient diagnostics are not finite at step {step}: {metrics:?}"
+    );
+    let controller = &metrics[STEP_METRIC_ROW_LR];
+    ensure!(
+        controller.iter().all(|value| value.is_nan())
+            || controller.iter().all(|value| value.is_finite()),
+        "row learned-LR diagnostics are partially non-finite at step {step}: {controller:?}"
     );
     Ok(())
 }
@@ -8875,6 +9041,19 @@ fn print_banner(
             "[PINNED by --split-bounds]"
         } else {
             "[PINNED to the campaign default ingest::PINNED_SPLIT_BOUNDS]"
+        }
+    );
+    println!(
+        "row lr         {}",
+        if args.sdlr {
+            format!(
+                "ENABLED on primary Muon matrices only: alpha=exp(2*sigmoid(logit)-1), \
+                 controller Adam lr={ROW_LR_CONTROLLER_LR:e} betas={:?} eps={ROW_LR_CONTROLLER_EPS:e}, \
+                 warmup={ROW_LR_WARMUP_STEPS} primary steps, evidence clipped at +/-3",
+                ROW_LR_CONTROLLER_BETAS,
+            )
+        } else {
+            "OFF (default; no controller tensors allocated)".to_owned()
         }
     );
     println!("corpus id      {corpus_fingerprint}");
@@ -9137,7 +9316,8 @@ mod tests {
         let vs = nn::VarStore::new(Device::Cpu);
         let _modules = BarModules::new(&vs.root());
         let named = named_trainable_variables(&vs);
-        let mut optimizer = build_optimizer(&named).expect("the model must have exact routing");
+        let mut optimizer =
+            build_optimizer(&named, false).expect("the model must have exact routing");
 
         let matches =
             |name: &str, needles: &[&str]| needles.iter().any(|needle| name.contains(*needle));
@@ -9724,7 +9904,21 @@ mod tests {
             // The recipe default, so every trainer test in this file exercises the schedule
             // every persisted run was produced under.
             lr_plateau_fraction: LR_PLATEAU_FRACTION,
+            sdlr: false,
         }
+    }
+
+    #[test]
+    fn sdlr_rejects_non_adjacent_primary_credit_from_auxiliary_streams() {
+        let dir = PathBuf::from(".");
+        let mut args = test_args(0x5EED, &dir);
+        args.sdlr = true;
+        args.auxiliary_resolutions = vec![86_400];
+        let error = validate_args(&args).expect_err("SDLR with auxiliary updates must be refused");
+        assert!(
+            error.to_string().contains("--auxiliary-resolutions"),
+            "unexpected validation error: {error:#}"
+        );
     }
 
     /// EVAL-GATE-001 and EVAL-GATE-002. A ramp stage below the deployed context must still
@@ -10992,14 +11186,27 @@ mod tests {
             identity: scalar(14.0),
             autocorr: scalar(15.0),
         };
-        let packed = pack_step_metrics(&graph, &scalar(16.0));
-        assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
+        let packed = pack_step_metrics(&graph, &scalar(16.0), None);
+        assert_eq!(packed.size(), [STEP_METRIC_BASE_COUNT as i64]);
+        let read = read_packed_step_metrics(&packed);
         assert_eq!(
-            read_packed_step_metrics(&packed),
-            [
+            &read[..STEP_METRIC_BASE_COUNT],
+            &[
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
                 16.0,
             ]
+        );
+        assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
+
+        let row_lr = Tensor::arange(ROW_LR_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
+        let packed = pack_step_metrics(&graph, &scalar(16.0), Some(&row_lr));
+        assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
+        let read = read_packed_step_metrics(&packed);
+        assert_eq!(
+            &read[STEP_METRIC_ROW_LR],
+            &(0..ROW_LR_METRIC_COUNT)
+                .map(|value| value as f64)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -11034,6 +11241,11 @@ mod tests {
             "snapshot horizon {SNAPSHOT_HORIZON} cannot reach rollout horizon {longest}"
         );
         assert!(BAR_CONTEXT_RAMP_START > SNAPSHOT_HORIZON);
+    }
+
+    #[test]
+    fn standalone_candles_use_the_canonical_exact_cache_law() {
+        assert!(matches!(CANDLE_ROLLOUT_MODE, RolloutMode::Exact));
     }
 
     #[test]

@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, Datelike, Utc};
 use rand::seq::IndexedRandom;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
 
@@ -137,40 +137,60 @@ impl fmt::Display for Dispersion {
 /// a regime, so treating them as independent draws would divide the variance by a sample
 /// size the data does not have.
 pub fn block_bootstrap(values: &[f64], blocks: &[u64], draws: usize, seed: u64) -> Dispersion {
+    moving_block_bootstrap(values, blocks, 1, draws, seed)
+}
+
+/// Circular moving-block bootstrap over the ordered distinct block IDs.
+///
+/// A draw samples consecutive groups in chunks of `block_len`, wrapping at the end, until
+/// exactly the original number of groups has been selected. `Dispersion::blocks` reports the
+/// resulting number of independently selected chunks, not the raw group count. Group totals
+/// and counts travel together, preserving the natural observation weighting even when group
+/// sizes differ. `values` may already be a paired difference series; resampling it directly
+/// preserves the pairing without making either arm an independent draw.
+pub fn moving_block_bootstrap(
+    values: &[f64],
+    blocks: &[u64],
+    block_len: usize,
+    draws: usize,
+    seed: u64,
+) -> Dispersion {
     assert_eq!(
         values.len(),
         blocks.len(),
         "every value needs a block assignment"
     );
+    assert!(block_len >= 1, "moving block length must be at least one");
     let finite: Vec<(u64, f64)> = blocks
         .iter()
         .copied()
         .zip(values.iter().copied())
-        .filter(|(_, v)| v.is_finite())
+        .filter(|(_, value)| value.is_finite())
         .collect();
     if finite.is_empty() {
         return Dispersion::nan();
     }
 
-    // (sum, count) per block, in a deterministic order.
+    // BTreeMap order is the time order when callers use monotone calendar block IDs.
     let mut grouped: BTreeMap<u64, (f64, u64)> = BTreeMap::new();
     for (block, value) in &finite {
         let entry = grouped.entry(*block).or_insert((0.0, 0));
         entry.0 += *value;
         entry.1 += 1;
     }
-    let totals: Vec<(f64, u64)> = grouped.values().copied().collect();
+    let totals: Vec<(f64, u64)> = grouped.into_values().collect();
     let samples = finite.len();
     let mean = totals.iter().map(|(sum, _)| *sum).sum::<f64>() / samples as f64;
-    if totals.len() < 2 || draws == 0 {
-        // One block is one observation: there is no dispersion to estimate, and pretending
-        // otherwise would report a zero-width interval as if it were precision.
+    let resampling_blocks = totals.len() / block_len + usize::from(totals.len() % block_len != 0);
+    if resampling_blocks < 2 || draws == 0 {
+        // One effective chunk always carries the full circular sample, so a zero-width
+        // interval would falsely present deterministic resampling as measured precision.
         return Dispersion {
             mean,
             se: f64::NAN,
             ci_low: f64::NAN,
             ci_high: f64::NAN,
-            blocks: totals.len(),
+            blocks: resampling_blocks,
             samples,
         };
     }
@@ -180,13 +200,28 @@ pub fn block_bootstrap(values: &[f64], blocks: &[u64], draws: usize, seed: u64) 
     for _ in 0..draws {
         let mut sum = 0.0;
         let mut count = 0u64;
-        for _ in 0..totals.len() {
-            let (block_sum, block_count) = totals
-                .choose(&mut rng)
-                .copied()
-                .expect("totals is non-empty");
-            sum += block_sum;
-            count += block_count;
+        if block_len == 1 {
+            // Keep the ordinary block bootstrap's seeded draw sequence exactly unchanged.
+            for _ in 0..totals.len() {
+                let (block_sum, block_count) = totals
+                    .choose(&mut rng)
+                    .copied()
+                    .expect("totals is non-empty");
+                sum += block_sum;
+                count += block_count;
+            }
+        } else {
+            let mut selected = 0usize;
+            while selected < totals.len() {
+                let start = rng.random_range(0..totals.len());
+                let chunk_len = block_len.min(totals.len() - selected);
+                for offset in 0..chunk_len {
+                    let (block_sum, block_count) = totals[(start + offset) % totals.len()];
+                    sum += block_sum;
+                    count += block_count;
+                }
+                selected += chunk_len;
+            }
         }
         means.push(sum / count as f64);
     }
@@ -195,7 +230,7 @@ pub fn block_bootstrap(values: &[f64], blocks: &[u64], draws: usize, seed: u64) 
     let draw_mean = means.iter().sum::<f64>() / means.len() as f64;
     let variance = means
         .iter()
-        .map(|m| (m - draw_mean) * (m - draw_mean))
+        .map(|sample_mean| (sample_mean - draw_mean).powi(2))
         .sum::<f64>()
         / (means.len() - 1) as f64;
     let tail = (1.0 - CI_MASS) / 2.0;
@@ -204,7 +239,7 @@ pub fn block_bootstrap(values: &[f64], blocks: &[u64], draws: usize, seed: u64) 
         se: variance.sqrt(),
         ci_low: percentile(&means, tail),
         ci_high: percentile(&means, 1.0 - tail),
-        blocks: totals.len(),
+        blocks: resampling_blocks,
         samples,
     }
 }
@@ -1238,6 +1273,87 @@ mod tests {
         let a = block_bootstrap(&values, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
         let b = block_bootstrap(&values, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn moving_blocks_of_one_are_the_ordinary_block_bootstrap() {
+        let values = [1.0, 2.0, f64::NAN, 4.0, 8.0, 16.0];
+        let blocks = [30, 10, 20, 20, 40, 40];
+        let ordinary = block_bootstrap(&values, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        assert_eq!(
+            ordinary,
+            Dispersion {
+                mean: 6.2,
+                se: 2.708_208_107_744_120_2,
+                ci_low: 1.5,
+                ci_high: 10.571_428_571_428_571,
+                blocks: 4,
+                samples: 5,
+            },
+            "block_len=1 must preserve the legacy seeded bootstrap draws"
+        );
+        let moving = moving_block_bootstrap(&values, &blocks, 1, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        assert_eq!(moving, ordinary);
+    }
+
+    #[test]
+    fn longer_moving_blocks_capture_serial_group_dependence() {
+        let blocks: Vec<u64> = (0..80).collect();
+        let values: Vec<f64> = (0..80)
+            .map(|group| if (group / 10) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let daily = moving_block_bootstrap(&values, &blocks, 1, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        let moving = moving_block_bootstrap(&values, &blocks, 5, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        assert_eq!(moving.blocks, 16);
+        assert_eq!(moving.mean, daily.mean);
+        assert_eq!(moving.samples, 80);
+        assert!(
+            moving.se > 1.7 * daily.se,
+            "serially aware SE {:.5} should materially exceed daily {:.5}",
+            moving.se,
+            daily.se
+        );
+    }
+
+    #[test]
+    fn moving_bootstrap_nonfinite_single_block_contract_matches_ordinary_bootstrap() {
+        let values = [f64::NAN, 1.0, f64::INFINITY, 3.0];
+        let blocks = [7, 7, 8, 7];
+        let ordinary = block_bootstrap(&values, &blocks, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        let moving = moving_block_bootstrap(&values, &blocks, 3, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+
+        assert_eq!(moving.mean, ordinary.mean);
+        assert_eq!(moving.blocks, 1);
+        assert_eq!(moving.samples, 2);
+        assert!(moving.se.is_nan() && moving.ci_low.is_nan() && moving.ci_high.is_nan());
+
+        let empty = moving_block_bootstrap(&[f64::NAN], &[7], 3, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
+        assert!(empty.mean.is_nan() && empty.se.is_nan());
+        assert_eq!(empty.blocks, 0);
+        assert_eq!(empty.samples, 0);
+
+        let full_sample_chunk = moving_block_bootstrap(
+            &[1.0, 2.0, 3.0],
+            &[1, 2, 3],
+            3,
+            BOOTSTRAP_DRAWS,
+            BOOTSTRAP_SEED,
+        );
+        assert_eq!(full_sample_chunk.mean, 2.0);
+        assert_eq!(full_sample_chunk.blocks, 1);
+        assert_eq!(full_sample_chunk.samples, 3);
+        assert!(
+            full_sample_chunk.se.is_nan()
+                && full_sample_chunk.ci_low.is_nan()
+                && full_sample_chunk.ci_high.is_nan(),
+            "one effective moving chunk cannot identify dispersion"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "moving block length must be at least one")]
+    fn moving_bootstrap_rejects_zero_length_blocks() {
+        let _ = moving_block_bootstrap(&[1.0], &[0], 0, BOOTSTRAP_DRAWS, BOOTSTRAP_SEED);
     }
     /// Conditional NLL pools bar-level sufficient statistics. A mean of window ratios can say
     /// "no change" on the same data, so both the reported point and every paired bootstrap

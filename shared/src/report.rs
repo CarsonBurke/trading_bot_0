@@ -60,6 +60,11 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     "pretrain_dir_acc",
     "pretrain_lr",
     "pretrain_muon_momentum",
+    // Centered per-output-row outcome-LR controller diagnostics. These remain distinct
+    // panels because alpha allocation and the signed one-step evidence that trains it have
+    // different scales and failure signatures.
+    "pretrain_sdlr_alpha",
+    "pretrain_sdlr_evidence",
     "pretrain_grad_norm",
     "pretrain_unique_bar_reuse",
     "pretrain_stage_coverage",
@@ -200,6 +205,19 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // provenance and its realized constraint audit.
     "pretrain_receding_kelly",
     "pretrain_receding_covariance",
+    // Selected production-H attribution ladder. One cached forecast panel is held fixed while
+    // the shared receding book adds factor risk, measured non-impact costs and finally impact;
+    // stage zero is explicitly a non-self-financing scalar moment diagnostic.
+    "pretrain_receding_attribution",
+    // Validation-only selected production-H solver-safe dead-zone frontier. It reuses the
+    // cached all-in Model incumbent at width zero and reruns only the same constrained action
+    // solver at the fixed trade_bench::BAND_FRACTIONS widths; locked test never writes this
+    // grid, and no marginal arm or additional inference is involved.
+    "pretrain_receding_policy_frontier",
+    // Optional selected-H two-row evidence for one predeclared causal mean-sign hysteresis
+    // margin against the cached raw incumbent. It is absent unless explicitly requested and
+    // never expands into a locked-test policy-selection grid.
+    "pretrain_receding_hysteresis",
     // Written by `trading_bots::torch::train::support_moments::fit_support_moments` via
     // `pretrain_reports::write_support_decode`. Properties of the SUPPORT ARTIFACT alone: the
     // fitted per-bin conditional means measured against the persisted bin geometry, beside the
@@ -284,6 +302,10 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // from THIS slice, which is what makes a written-but-unregistered base unrepresentable.
     "pretrain_heldout_census",
     "pretrain_heldout_power",
+    // Written by the frozen-checkpoint fixed recirculation experiment. It contains the
+    // serialized-alpha0 control, Stage-A screen, disjoint Stage-B confirmation, and the
+    // gated test result in one discoverable artifact.
+    "pretrain_recirculation_sweep",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
