@@ -1928,7 +1928,9 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // memory hold is left as a safety net for contention instead of being the thing that
     // silently rewrites the schedule on every run.
     let requested_batch = args.batch_size;
-    let (capacity, base_batch, batch_ramp, notice) = if let Some(resume) = &resume {
+    let (capacity, base_batch, derived_batch_ramp, batch_ramp, notice) = if let Some(resume) =
+        &resume
+    {
         ensure!(
             resume.recovery.stage_steps.len() == RAMP_STAGES,
             "resume recovery stage count {} does not match current {RAMP_STAGES}",
@@ -1953,14 +1955,32 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
             absolute
         );
         let batch_ramp = std::array::from_fn(|stage| absolute[stage] / resume.recovery.base_batch);
+        let derived_batch_ramp = if resume.recovery.derived_batch_ramp.is_empty() {
+            // Legacy recovery sidecars could only resume when no runtime hold occurred,
+            // so their recorded realized ramp is also the only available planned ramp.
+            batch_ramp
+        } else {
+            ensure!(
+                resume.recovery.derived_batch_ramp.len() == RAMP_STAGES
+                    && resume
+                        .recovery
+                        .derived_batch_ramp
+                        .iter()
+                        .all(|multiple| *multiple > 0),
+                "resume checkpoint carries an invalid planned batch ramp {:?}",
+                resume.recovery.derived_batch_ramp
+            );
+            std::array::from_fn(|stage| resume.recovery.derived_batch_ramp[stage])
+        };
         (
             None,
             resume.recovery.base_batch,
+            derived_batch_ramp,
             batch_ramp,
             Some(format!(
-                "resuming at step {} with recorded exact batch ramp {:?}; capacity probe is \
-                 non-authoritative and was not rerun",
-                resume.next_step, absolute
+                "resuming at step {} with recorded planned batch ramp {:?} and realized \
+                     batch ramp {:?}; capacity probe is non-authoritative and was not rerun",
+                resume.next_step, derived_batch_ramp, absolute
             )),
         )
     } else {
@@ -1979,7 +1999,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
             batch_ramp,
             notice,
         } = resolve_ramp(capacity.as_ref(), requested_batch, args.exact_batch)?;
-        (capacity, base_batch, batch_ramp, notice)
+        (capacity, base_batch, batch_ramp, batch_ramp, notice)
     };
     // A probe consumes the trunk RNG. Resume skips it, but both paths restart the deterministic
     // training stream from the run seed rather than inheriting initialization/probe draws.
@@ -2061,12 +2081,13 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         &corpus,
         Split::Train,
         &stage_contexts(),
-        &ramp_token_weights(&batch_ramp),
+        &ramp_token_weights(&derived_batch_ramp),
         args.seed,
     )
     .context("failed partitioning the training split across the ramp contexts")?;
-    print_pass_plan(&pass, base_batch, &batch_ramp);
-    let stage_steps = Schedule::steps_for_pass(pass.windows_per_stage(), base_batch, &batch_ramp);
+    print_pass_plan(&pass, base_batch, &derived_batch_ramp);
+    let stage_steps =
+        Schedule::steps_for_pass(pass.windows_per_stage(), base_batch, &derived_batch_ramp);
     let total_steps = match args.steps {
         Some(steps) => {
             ensure!(steps > 0, "--steps must be positive");
@@ -2275,7 +2296,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         // the guard disabled.
         activation_bytes_per_token: capacity.as_ref().map(|c| c.per_token_bytes),
         capacity,
-        derived_batch_ramp: batch_ramp,
+        derived_batch_ramp,
         requested_batch,
         stage_step,
         reached_context,
@@ -6560,6 +6581,7 @@ impl Trainer {
         BarPretrainRecovery {
             total_steps: self.schedule.total_steps,
             stage_steps: self.schedule.stage_steps.to_vec(),
+            derived_batch_ramp: self.derived_batch_ramp.to_vec(),
             base_batch: self.schedule.base_batch,
             requested_batch: self.requested_batch,
             exact_batch: self.args.exact_batch,
@@ -6581,9 +6603,17 @@ impl Trainer {
     fn write_recovery_checkpoint(&self, weights: &Path, step: usize) -> Result<PathBuf> {
         let res = self.args.resolution_secs;
         let supports_path = world_model_supports_path(weights, res);
+        let supports_tmp = temporary_sibling(&supports_path);
         self.supports
-            .save(&supports_path)
-            .with_context(|| format!("failed writing {}", supports_path.display()))?;
+            .save(&supports_tmp)
+            .with_context(|| format!("failed writing {}", supports_tmp.display()))?;
+        File::open(&supports_tmp)?.sync_all()?;
+        fs::rename(&supports_tmp, &supports_path).with_context(|| {
+            format!(
+                "failed committing support state {}",
+                supports_path.display()
+            )
+        })?;
 
         let optimizer_path = world_model_optimizer_path(weights);
         let metadata_path = world_model_metadata_path(weights);

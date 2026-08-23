@@ -402,6 +402,10 @@ pub struct BarOptimizerAblationProvenance {
 pub struct BarPretrainRecovery {
     pub total_steps: usize,
     pub stage_steps: Vec<usize>,
+    /// Startup-planned batch multipliers used to partition the pass and size each stage.
+    /// Empty only on recovery sidecars written before runtime-held ramps were resumable.
+    #[serde(default)]
+    pub derived_batch_ramp: Vec<usize>,
     pub base_batch: usize,
     pub requested_batch: usize,
     pub exact_batch: bool,
@@ -618,7 +622,7 @@ impl BarWorldModelMetadata {
         if self.res_secs == 0 {
             bail!("world-model bar resolution must be positive");
         }
-        if self.pretrain_recovery.is_some() {
+        if let Some(recovery) = &self.pretrain_recovery {
             ensure!(
                 self.optimizer_checkpoint_sha256
                     .as_ref()
@@ -639,6 +643,16 @@ impl BarWorldModelMetadata {
                     .len()
                     == self.optimizer_initialized_adamw.len(),
                 "pretrain recovery metadata repeats an initialized AdamW name"
+            );
+            ensure!(
+                recovery.derived_batch_ramp.is_empty()
+                    || (recovery.derived_batch_ramp.len() == recovery.stage_steps.len()
+                        && recovery
+                            .derived_batch_ramp
+                            .iter()
+                            .all(|multiple| *multiple > 0)),
+                "pretrain recovery metadata carries an invalid planned batch ramp {:?}",
+                recovery.derived_batch_ramp
             );
         } else {
             ensure!(
@@ -783,8 +797,21 @@ impl BarWorldModelMetadata {
         let Some(recovery) = &self.pretrain_recovery else {
             return String::new();
         };
+        let derived_batch_ramp_suffix = if recovery.derived_batch_ramp.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ",derived_batch_ramp={}",
+                recovery
+                    .derived_batch_ramp
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         format!(
-            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=total_steps={},stage_steps={},base_batch={},requested_batch={},exact_batch={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},auxiliary_resolutions={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}",
+            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=total_steps={},stage_steps={}{},base_batch={},requested_batch={},exact_batch={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},auxiliary_resolutions={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}",
             self.optimizer_checkpoint_sha256.as_deref().unwrap_or("none"),
             self.optimizer_initialized_adamw.join(","),
             recovery.total_steps,
@@ -794,6 +821,7 @@ impl BarWorldModelMetadata {
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
+            derived_batch_ramp_suffix,
             recovery.base_batch,
             recovery.requested_batch,
             recovery.exact_batch,
@@ -3188,6 +3216,82 @@ mod tests {
             lr_plateau_fraction: 0.40,
             optimizer: None,
         }
+    }
+
+    #[test]
+    fn recovery_planned_batch_ramp_is_lineage_bound_and_legacy_compatible() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let dir = temp_dir("recovery_ramp_lineage");
+        let supports = synthetic_supports();
+        let (weights, _metadata_path, _vs) = write_fixture(&dir, &supports);
+        let mut metadata = BarWorldModelMetadata::for_checkpoint_with(
+            &weights,
+            &[300],
+            300,
+            Some(training_fixture(BarScoring::Hard)),
+        )
+        .expect("metadata");
+        metadata.attach_pretrain_recovery(
+            "1".repeat(64),
+            Vec::new(),
+            BarPretrainRecovery {
+                total_steps: 90,
+                stage_steps: vec![10, 20, 60],
+                derived_batch_ramp: vec![1, 2, 3],
+                base_batch: 8,
+                requested_batch: 8,
+                exact_batch: true,
+                epochs: 1,
+                steps_override: None,
+                dyn_horizon: 1,
+                lambda_dyn: 1.0,
+                lambda_kl: 1.0,
+                auxiliary_resolutions: Vec::new(),
+                checkpoint_every: 32,
+                validate_every: 64,
+                ablation_lr: 1e-3,
+                smd_meta_lr: 1e5,
+            },
+        );
+        metadata.validate_schema().expect("recovery metadata");
+
+        let mut tampered = metadata.clone();
+        tampered
+            .pretrain_recovery
+            .as_mut()
+            .expect("recovery")
+            .derived_batch_ramp[1] = 1;
+        assert!(
+            tampered.validate_schema().is_err(),
+            "the planned pass partition must be lineage-bound"
+        );
+
+        let mut legacy = metadata;
+        legacy
+            .pretrain_recovery
+            .as_mut()
+            .expect("recovery")
+            .derived_batch_ramp
+            .clear();
+        legacy.lineage_sha256 = legacy.compute_lineage_sha256();
+        let mut legacy_value = serde_json::to_value(&legacy).expect("serialize legacy");
+        legacy_value
+            .get_mut("pretrain_recovery")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("recovery object")
+            .remove("derived_batch_ramp");
+        let decoded: BarWorldModelMetadata =
+            serde_json::from_value(legacy_value).expect("deserialize legacy");
+        assert!(decoded
+            .pretrain_recovery
+            .as_ref()
+            .expect("recovery")
+            .derived_batch_ramp
+            .is_empty());
+        decoded
+            .validate_schema()
+            .expect("legacy recovery lineage remains compatible");
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// The scoring rule decides what every `nll_bar` in a run MEANS — the three modes are
