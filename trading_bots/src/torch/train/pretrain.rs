@@ -34,6 +34,7 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nvml_wrapper::Nvml;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -52,6 +53,7 @@ use crate::torch::dataset::{
     CoverageAudit, PassCensus, PassLayout, PassLedger, PassPlan, Split, WindowRef,
     BAR_TIME_CARDINALITY, BAR_TIME_CONDITIONING,
 };
+use crate::torch::hashing::file_sha256;
 use crate::torch::load::load_var_store_partial;
 use crate::torch::optim::muon::{
     Muon, MuonConfig, Orthogonalizer, StepKind, DEFAULT_NS_STEPS, ROW_LR_CONTROLLER_BETAS,
@@ -61,9 +63,11 @@ use crate::torch::optim::muon::{
 use crate::torch::world_model::{
     bar_adamw_embedding_substrings, bar_adamw_scalar_substrings,
     bar_muon_down_projection_substrings, bar_muon_name_substrings, world_model_metadata_path,
-    world_model_supports_path, BarModules, BarOptimizerProvenance, BarRowLearnedLrProvenance,
-    BarSupportSet, BarTrainingProvenance, BarWorldModel, BarWorldModelMetadata, RolloutMode,
-    BAR_ARCHITECTURE, BAR_LAYERS, BAR_MAX_CONTEXT, BAR_MODEL_DIM,
+    world_model_optimizer_path, world_model_supports_path, BarModules,
+    BarOptimizerAblationProvenance, BarOptimizerProvenance, BarPretrainRecovery,
+    BarRowLearnedLrProvenance, BarSupportSet, BarTrainingProvenance, BarWorldModel,
+    BarWorldModelMetadata, RolloutMode, BAR_ARCHITECTURE, BAR_LAYERS, BAR_MAX_CONTEXT,
+    BAR_MODEL_DIM,
 };
 use shared::{
     paths::RUNS_PATH,
@@ -85,6 +89,10 @@ use super::pretrain_stats::{
     block_bootstrap, block_bootstrap_conditional_difference, calendar_month, window_scores_path,
     ConditionalNllStats, Dispersion, TradeSummary, WindowScore, WindowScores, BOOTSTRAP_DRAWS,
     BOOTSTRAP_SEED, WINDOW_SCORES_FORMAT_VERSION,
+};
+use super::smd_idbd::{
+    PretrainOptimizer, PretrainOptimizerAblation, SMD_BETA_MAX, SMD_BETA_MIN, SMD_BETA_UPDATE_CLIP,
+    SMD_METRIC_COUNT,
 };
 use super::trade_bench::{self, BenchConfig, ChunkPaths, MeanShrink, TradeBench, TradeSetup};
 
@@ -557,6 +565,9 @@ pub struct PretrainArgs {
     /// Optional checkpoint to initialize from. Weights only; training restarts at
     /// step zero with a fresh optimizer and a freshly derived schedule.
     pub weights: Option<String>,
+    /// Recovery checkpoint whose weights, optimizer state and exact schedule are restored.
+    /// Mutually exclusive with the weights-only initialization path.
+    pub resume_checkpoint: Option<String>,
     pub run: Option<String>,
     /// One epoch is one pass worth of BAR-TOKENS over the training split, not a guaranteed
     /// pass over every unique bar: the context ramp gives each stage its own anchor list and
@@ -747,6 +758,13 @@ pub struct PretrainArgs {
     /// Enable row-wise signed-delta learning-rate adaptation for Muon-routed matrices.
     /// Disabled by default; AdamW parameters and auxiliary-resolution updates are excluded.
     pub sdlr: bool,
+    /// Strictly opt-in optimizer experiment. `None` preserves the production
+    /// NorMuon + AdamW path, including its allocation and arithmetic.
+    pub optimizer_ablation: Option<PretrainOptimizerAblation>,
+    /// Absolute initial learning rate shared by both ablation arms.
+    pub ablation_lr: f64,
+    /// Schraudolph SMD meta learning rate, used only by `smd-idbd`.
+    pub smd_meta_lr: f64,
 }
 
 impl PretrainArgs {
@@ -1300,28 +1318,30 @@ impl CapacityModel {
     }
 }
 
-/// [`CAPACITY_PROBE_STEPS`] forward-and-backward passes at ONE shape, then the device's
-/// `used` bytes with the pool warm and the last graph already dropped — the steady state a
-/// training step sits in, not the first pass's transient.
+/// [`CAPACITY_PROBE_STEPS`] forward-and-selected-backward passes at ONE shape, then the
+/// device's `used` bytes with the pool warm and the last graph already dropped — the steady
+/// state a training step sits in, not the first pass's transient.
 ///
 /// The pool is released first so the reading prices THIS shape rather than this shape plus a
 /// cached predecessor. `None` off CUDA or without NVML; the passes still run, so a CPU test
 /// can assert the invariants that make the probe non-destructive.
 ///
 /// Nothing persistent changes here. There is no optimizer step, so the weights reach step 0
-/// exactly as initialized and the moment buffers exactly as zeroed; the gradients the
-/// backwards allocate are deliberately LEFT resident, because training needs them,
-/// [`Trainer::optimizer_step`] zeroes them before its own first backward, and they belong in
-/// the baseline rather than in the per-step model.
+/// exactly as initialized and the moment buffers exactly as zeroed. The selected optimizer's
+/// backward path is load-bearing: SMD retains the gradient graph and builds its exact HVP, so
+/// measuring a plain backward would underprice only that arm. Gradients are deliberately LEFT
+/// resident because training needs them, [`Trainer::optimizer_step`] zeroes them before its
+/// own first backward, and they belong in the baseline rather than in the per-step model.
 fn probe_shape_used_bytes(
     modules: &BarModules,
     supports: &BarSupports,
     growth_support: &GrowthSupport,
     sample: &BarBatch,
     args: &PretrainArgs,
+    optimizer: &mut PretrainOptimizer,
     context: i64,
     device: Device,
-) -> Option<u64> {
+) -> Result<Option<u64>> {
     crate::torch::cuda::empty_cache();
     for _ in 0..CAPACITY_PROBE_STEPS {
         let graph = autocast(device.is_cuda(), || {
@@ -1339,14 +1359,14 @@ fn probe_shape_used_bytes(
                 device,
             )
         });
-        graph.loss.backward();
+        optimizer.backward(&graph.loss)?;
     }
-    device_used_bytes(device)
+    Ok(device_used_bytes(device))
 }
 
 /// Measure the affine footprint model on the real training graph, at the deployed context.
 ///
-/// Runs [`CAPACITY_PROBE_STEPS`] forward-and-backward passes at each of
+/// Runs [`CAPACITY_PROBE_STEPS`] forward-and-selected-backward passes at each of
 /// [`CAPACITY_PROBE_BATCHES`], reading device-wide `used` with the allocator pool released
 /// between shapes so each reading prices ONE shape rather than that shape plus a cached
 /// predecessor. No optimizer step: the weights must reach step 0 exactly as initialized and
@@ -1365,44 +1385,48 @@ fn probe_capacity(
     supports: &BarSupports,
     growth_support: &GrowthSupport,
     sampler: &BarSampler,
-    optimizer: &Muon,
+    optimizer: &mut PretrainOptimizer,
     args: &PretrainArgs,
     device: Device,
-) -> Option<CapacityModel> {
+) -> Result<Option<CapacityModel>> {
     if !device.is_cuda() {
-        return None;
+        return Ok(None);
     }
     let context = stage_context(RAMP_STAGES - 1);
     let horizon = args.dyn_horizon as i64;
     if horizon >= context {
-        return None;
+        return Ok(None);
     }
 
     let mut points = [(0usize, 0u64); CAPACITY_PROBE_BATCHES.len()];
     for (slot, &batch) in points.iter_mut().zip(CAPACITY_PROBE_BATCHES.iter()) {
         if sampler.batches_per_epoch(batch) == 0 {
-            return None;
+            return Ok(None);
         }
         let refs = sampler.batch_refs(0, 0, batch);
         let sample = sampler.batch_of(&refs, device);
-        *slot = (
-            batch,
-            probe_shape_used_bytes(
-                modules,
-                supports,
-                growth_support,
-                &sample,
-                args,
-                context,
-                device,
-            )?,
-        );
+        let Some(used_bytes) = probe_shape_used_bytes(
+            modules,
+            supports,
+            growth_support,
+            &sample,
+            args,
+            optimizer,
+            context,
+            device,
+        )?
+        else {
+            return Ok(None);
+        };
+        *slot = (batch, used_bytes);
     }
 
     // Released pool, so `free` counts what the driver would actually hand out and `baseline`
     // excludes the probe's own activations.
     crate::torch::cuda::empty_cache();
-    let (free_bytes, baseline_bytes) = device_memory(device)?;
+    let Some((free_bytes, baseline_bytes)) = device_memory(device) else {
+        return Ok(None);
+    };
 
     let (small_batch, small_used) = points[0];
     let (large_batch, large_used) = points[points.len() - 1];
@@ -1416,17 +1440,17 @@ fn probe_capacity(
              DECLARED ramp {BATCH_RAMP:?} under the runtime memory hold.",
             small_used, large_used
         );
-        return None;
+        return Ok(None);
     }
     let per_token_bytes = byte_span / token_span;
     // The batch-independent remainder of the smaller reading, plus the optimizer state that is
     // not resident YET. Clamped at zero: a negative intercept means co-tenant noise dominated
     // the fit, and pretending the fixed cost is negative would inflate the ramp.
     //
-    // `steady_state_bytes - state_bytes` and not the steady state alone. NorMuon allocates its
-    // momentum and second-moment buffers eagerly in `Muon::new_named`, so they are ALREADY
-    // inside `baseline_bytes`; only the AdamW moments are lazy, and adding the whole steady
-    // state here would charge the 2D branch twice and shrink every derived stage for nothing.
+    // `steady_state_bytes - state_bytes` and not the steady state alone. Every eager state
+    // tensor is already inside `baseline_bytes`: NorMuon momentum in production, or fp32
+    // beta/v/pending-Hv in SMD. Only production AdamW moments are lazy. Adding the whole
+    // steady state would charge eager state twice and shrink the derived ramp for nothing.
     let pending_optimizer_bytes = optimizer
         .steady_state_bytes()
         .saturating_sub(optimizer.state_bytes()) as f64;
@@ -1439,9 +1463,9 @@ fn probe_capacity(
     println!(
         "capacity probe: {} B/bar-token at context {context}, from {:.2} GiB used at batch \
          {small_batch} and {:.2} GiB at batch {large_batch} ({} bar-tokens apart); fixed \
-         per-step cost {:.2} GiB (incl. {:.2} GiB of AdamW moments the probe did not step into \
-         existence, on top of {:.2} GiB of NorMuon state already resident); {:.2} GiB free and \
-         {:.2} GiB in use with the allocator pool released",
+         per-step cost {:.2} GiB (incl. {:.2} GiB of lazy optimizer state the probe did not \
+         step into existence, on top of {:.2} GiB of optimizer state already resident); \
+         {:.2} GiB free and {:.2} GiB in use with the allocator pool released",
         per_token_bytes.round(),
         CapacityModel::gib(small_used as f64),
         CapacityModel::gib(large_used as f64),
@@ -1453,12 +1477,12 @@ fn probe_capacity(
         CapacityModel::gib(baseline_bytes as f64),
     );
 
-    Some(CapacityModel {
+    Ok(Some(CapacityModel {
         per_token_bytes,
         fixed_bytes,
         free_bytes,
         baseline_bytes,
-    })
+    }))
 }
 
 /// The base batch, the ramp the run will actually execute, and the notice explaining any
@@ -1633,6 +1657,139 @@ fn validate_pretrain_weights_contract(weights: Option<&str>) -> Result<()> {
     )
 }
 
+#[derive(Clone)]
+struct PretrainResume {
+    checkpoint: PathBuf,
+    optimizer: PathBuf,
+    metadata: BarWorldModelMetadata,
+    recovery: BarPretrainRecovery,
+    next_step: usize,
+}
+
+fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
+    let Some(checkpoint) = args.resume_checkpoint.as_deref().map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let metadata_path = world_model_metadata_path(&checkpoint);
+    let metadata = BarWorldModelMetadata::load(&metadata_path)
+        .with_context(|| format!("failed reading resume metadata {}", metadata_path.display()))?;
+    metadata.validate_schema()?;
+    metadata.validate_checkpoint(&checkpoint)?;
+    metadata.validate_supports(&checkpoint)?;
+    let recovery = metadata
+        .pretrain_recovery
+        .clone()
+        .context("checkpoint is weights-only and has no exact pretraining recovery contract")?;
+    let optimizer = world_model_optimizer_path(&checkpoint);
+    let expected_optimizer_hash = metadata
+        .optimizer_checkpoint_sha256
+        .as_deref()
+        .context("recovery checkpoint metadata has no optimizer-state hash")?;
+    let actual_optimizer_hash = file_sha256(&optimizer).with_context(|| {
+        format!(
+            "required optimizer recovery sidecar is missing or unreadable: {}",
+            optimizer.display()
+        )
+    })?;
+    ensure!(
+        actual_optimizer_hash == expected_optimizer_hash,
+        "optimizer recovery sidecar hash mismatch at {}: metadata={}, actual={}",
+        optimizer.display(),
+        expected_optimizer_hash,
+        actual_optimizer_hash
+    );
+    let training = metadata
+        .training
+        .as_ref()
+        .context("recovery checkpoint has no pretraining provenance")?;
+    let global_step = training
+        .global_step
+        .context("recovery checkpoint has no global optimizer step")?;
+    let next_step = global_step
+        .checked_add(1)
+        .context("resume global step overflow")?;
+    ensure!(
+        next_step < recovery.total_steps,
+        "resume checkpoint already reached final step {global_step} of {}; use its deployment \
+         artifacts rather than resuming a completed run",
+        recovery.total_steps
+    );
+
+    ensure!(
+        args.seed == training.train_seed,
+        "--seed mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.lr_plateau_fraction.to_bits() == training.lr_plateau_fraction.to_bits(),
+        "--lr-plateau-fraction mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.epochs == recovery.epochs,
+        "--epochs mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.steps == recovery.steps_override,
+        "--steps mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.batch_size == recovery.requested_batch,
+        "--batch-size mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.exact_batch == recovery.exact_batch,
+        "--exact-batch mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.dyn_horizon == recovery.dyn_horizon
+            && args.lambda_dyn.to_bits() == recovery.lambda_dyn.to_bits()
+            && args.lambda_kl.to_bits() == recovery.lambda_kl.to_bits(),
+        "dynamics objective arguments mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.auxiliary_resolutions == recovery.auxiliary_resolutions,
+        "--auxiliary-resolutions mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.checkpoint_every == recovery.checkpoint_every
+            && args.validate_every == recovery.validate_every,
+        "checkpoint or validation cadence mismatch with resume checkpoint"
+    );
+    ensure!(
+        args.ablation_lr.to_bits() == recovery.ablation_lr.to_bits()
+            && args.smd_meta_lr.to_bits() == recovery.smd_meta_lr.to_bits(),
+        "optimizer hyperparameters mismatch with resume checkpoint"
+    );
+    let recorded_optimizer = training
+        .optimizer
+        .as_ref()
+        .context("recovery checkpoint has no optimizer provenance")?;
+    ensure!(
+        recorded_optimizer.row_learned_lr.is_some() == args.sdlr,
+        "--sdlr mismatch with resume checkpoint"
+    );
+    let recorded_variant = recorded_optimizer
+        .ablation
+        .as_ref()
+        .map(|ablation| ablation.variant.as_str());
+    let requested_variant = args.optimizer_ablation.map(|variant| match variant {
+        PretrainOptimizerAblation::FixedSgd => "fixed-sgd",
+        PretrainOptimizerAblation::SmdIdbd => "smd-idbd",
+    });
+    ensure!(
+        recorded_variant == requested_variant,
+        "--optimizer-ablation mismatch with resume checkpoint: recorded {:?}, requested {:?}",
+        recorded_variant,
+        requested_variant
+    );
+    Ok(Some(PretrainResume {
+        checkpoint,
+        optimizer,
+        metadata,
+        recovery,
+        next_step,
+    }))
+}
+
 /// Everything `pretrain` does before the first optimizer step, split out so a test can drive
 /// one validation of a real trainer against a synthetic corpus instead of only unit-testing
 /// the pieces around it. `runs_root` is a parameter for exactly that reason: a test must not
@@ -1649,6 +1806,7 @@ fn validate_pretrain_weights_contract(weights: Option<&str>) -> Result<()> {
 fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Result<Trainer> {
     validate_args(&args)?;
     validate_pretrain_weights_contract(args.weights.as_deref())?;
+    let resume = preflight_resume(&args)?;
     if device.is_cuda() {
         configure_cuda();
     }
@@ -1666,6 +1824,28 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // contains. The corpus also grows under running jobs and the split instants are
     // percentiles of it, so the identity of the data is a first-class output of the run.
     let corpus_fingerprint = corpus.identity_fingerprint();
+    if let Some(resume) = &resume {
+        let training = resume
+            .metadata
+            .training
+            .as_ref()
+            .expect("preflight requires training provenance");
+        ensure!(
+            corpus_fingerprint == training.corpus_fingerprint,
+            "corpus fingerprint mismatch with resume checkpoint: recorded {}, current {}",
+            training.corpus_fingerprint,
+            corpus_fingerprint
+        );
+        ensure!(
+            args.resolution_secs == resume.metadata.res_secs,
+            "--resolution-secs mismatch with resume checkpoint"
+        );
+        args.supports = Some(
+            world_model_supports_path(&resume.checkpoint, args.resolution_secs)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
 
     // RECORDED, not inferred, and recorded HERE — before the first optimizer step and before
     // any checkpoint the record has to explain can exist.
@@ -1707,7 +1887,11 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
 
     let mut vs = nn::VarStore::new(device);
     let modules = BarModules::new(&vs.root());
-    if let Some(path) = args.weights.as_deref() {
+    if let Some(path) = args.weights.as_deref().or_else(|| {
+        resume
+            .as_ref()
+            .and_then(|resume| resume.checkpoint.to_str())
+    }) {
         let summary = load_var_store_partial(&mut vs, path)
             .map_err(|err| anyhow!("failed loading {path}: {err}"))?;
         summary
@@ -1717,7 +1901,24 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     }
 
     let named = named_trainable_variables(&vs);
-    let optimizer = build_optimizer(&named, args.sdlr)?;
+    let mut optimizer = match args.optimizer_ablation {
+        None => PretrainOptimizer::production(build_optimizer(&named, args.sdlr)?),
+        Some(PretrainOptimizerAblation::FixedSgd) => {
+            PretrainOptimizer::fixed_sgd(&named, args.ablation_lr)
+        }
+        Some(PretrainOptimizerAblation::SmdIdbd) => {
+            PretrainOptimizer::smd_idbd(&named, args.ablation_lr, args.smd_meta_lr)
+        }
+    };
+    if let Some(resume) = &resume {
+        let expected_primary_steps =
+            i64::try_from(resume.next_step).context("resume step exceeds i64")?;
+        optimizer.load_state_strict(
+            &resume.optimizer,
+            &resume.metadata.optimizer_initialized_adamw,
+            expected_primary_steps,
+        )?;
+    }
 
     let (train_samplers, eval) = build_samplers(&corpus, &args)?;
 
@@ -1726,28 +1927,66 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
     // plateau bumps, the banner, the eval batch — reads the derived plan, so the runtime
     // memory hold is left as a safety net for contention instead of being the thing that
     // silently rewrites the schedule on every run.
-    let capacity = probe_capacity(
-        &modules,
-        &supports_dev,
-        &growth_deployment,
-        &train_samplers[RAMP_STAGES - 1],
-        &optimizer,
-        &args,
-        device,
-    );
-    // The probe consumes RNG through the trunk's forward passes. Re-seed so the training
-    // stream is byte-identical to what it would have been without a probe: a capacity
-    // measurement must not move the run it is measuring.
+    let requested_batch = args.batch_size;
+    let (capacity, base_batch, batch_ramp, notice) = if let Some(resume) = &resume {
+        ensure!(
+            resume.recovery.stage_steps.len() == RAMP_STAGES,
+            "resume recovery stage count {} does not match current {RAMP_STAGES}",
+            resume.recovery.stage_steps.len()
+        );
+        let absolute = resume
+            .metadata
+            .training
+            .as_ref()
+            .expect("preflight requires training provenance")
+            .batch_ramp
+            .as_slice();
+        ensure!(
+            absolute.len() == RAMP_STAGES
+                && absolute
+                    .iter()
+                    .all(|batch| *batch >= resume.recovery.base_batch)
+                && absolute
+                    .iter()
+                    .all(|batch| batch % resume.recovery.base_batch == 0),
+            "resume checkpoint carries an invalid realized batch ramp {:?}",
+            absolute
+        );
+        let batch_ramp = std::array::from_fn(|stage| absolute[stage] / resume.recovery.base_batch);
+        (
+            None,
+            resume.recovery.base_batch,
+            batch_ramp,
+            Some(format!(
+                "resuming at step {} with recorded exact batch ramp {:?}; capacity probe is \
+                 non-authoritative and was not rerun",
+                resume.next_step, absolute
+            )),
+        )
+    } else {
+        let capacity = probe_capacity(
+            &modules,
+            &supports_dev,
+            &growth_deployment,
+            &train_samplers[RAMP_STAGES - 1],
+            &mut optimizer,
+            &args,
+            device,
+        )
+        .context("failed probing training-step device capacity")?;
+        let RampPlan {
+            base_batch,
+            batch_ramp,
+            notice,
+        } = resolve_ramp(capacity.as_ref(), requested_batch, args.exact_batch)?;
+        (capacity, base_batch, batch_ramp, notice)
+    };
+    // A probe consumes the trunk RNG. Resume skips it, but both paths restart the deterministic
+    // training stream from the run seed rather than inheriting initialization/probe draws.
     tch::manual_seed(args.seed as i64);
     if device.is_cuda() {
         tch::Cuda::manual_seed_all(args.seed);
     }
-    let requested_batch = args.batch_size;
-    let RampPlan {
-        base_batch,
-        batch_ramp,
-        notice,
-    } = resolve_ramp(capacity.as_ref(), requested_batch, args.exact_batch)?;
     if let Some(notice) = notice {
         println!("{notice}");
     }
@@ -1849,9 +2088,66 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         batch_ramp,
         args.lr_plateau_fraction,
     );
-    // Epoch 0's geometry, so the first step draws from a partition rather than from a sampler
-    // that would happily hand out the same anchors three times.
-    let pass_layout = pass.layout(0);
+    if let Some(resume) = &resume {
+        ensure!(
+            resume.recovery.total_steps == total_steps,
+            "reconstructed total steps {total_steps} differ from checkpoint {}",
+            resume.recovery.total_steps
+        );
+        ensure!(
+            resume.recovery.stage_steps.as_slice() == stage_steps,
+            "reconstructed stage steps {:?} differ from checkpoint {:?}",
+            stage_steps,
+            resume.recovery.stage_steps
+        );
+    }
+    let next_step = resume.as_ref().map_or(0, |resume| resume.next_step);
+    let epoch = schedule.epoch_of(next_step);
+    let pass_layout = pass.layout(epoch);
+    let mut pass_ledger = PassLedger::new(&pass_layout);
+    let mut stage_cursor = [0usize; RAMP_STAGES];
+    let epoch_first_step = epoch * schedule.steps_per_epoch;
+    for previous_step in epoch_first_step..next_step {
+        let stage = schedule.stage(previous_step);
+        let cursor = stage_cursor[stage];
+        let drawn = pass_layout
+            .draw(stage, cursor, schedule.batch(previous_step))
+            .len();
+        ensure!(
+            drawn > 0,
+            "cannot reconstruct resume cursor at prior step {previous_step}"
+        );
+        pass_ledger.mark(stage, cursor, drawn);
+        stage_cursor[stage] += drawn;
+    }
+    let bars_per_pass = pass
+        .windows_per_stage()
+        .iter()
+        .enumerate()
+        .map(|(stage, windows)| *windows as u64 * stage_context(stage) as u64)
+        .sum::<u64>();
+    let epoch_start_bars = epoch as u64 * bars_per_pass;
+    let bars_seen = epoch_start_bars
+        + stage_cursor
+            .iter()
+            .enumerate()
+            .map(|(stage, windows)| *windows as u64 * stage_context(stage) as u64)
+            .sum::<u64>();
+    let mut census = PassCensus::default();
+    for completed_epoch in 0..epoch {
+        census.absorb(&pass.layout(completed_epoch));
+    }
+    let reached_context = (0..next_step)
+        .map(|step| schedule.context(step))
+        .max()
+        .unwrap_or(0);
+    let (current_stage, stage_step) = if next_step < total_steps {
+        schedule.stage_at(next_step)
+    } else {
+        (RAMP_STAGES - 1, 0)
+    };
+    let _ = current_stage;
+    let completed_passes = epoch;
 
     // ONE scoring rule for the whole run. Every reference below is recomputed in it, so a
     // banner line, a chart baseline and the gradient can never disagree about which
@@ -1924,6 +2220,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         args,
         device,
         schedule,
+        next_step,
         run,
         supports,
         supports_dev,
@@ -1942,15 +2239,15 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         corpus_fingerprint,
         supports_frozen,
         symbol_count: corpus.symbols().len(),
-        pass_ledger: PassLedger::new(&pass_layout),
+        pass_ledger,
         pass_layout,
         pass,
-        stage_cursor: [0; RAMP_STAGES],
-        completed_passes: 0,
+        stage_cursor,
+        completed_passes,
         audit: None,
-        census: PassCensus::default(),
-        bars_seen: 0,
-        epoch: 0,
+        census,
+        bars_seen,
+        epoch,
         best_val_nll_bar: f64::INFINITY,
         best_val_nll_bar_conditional: f64::INFINITY,
         best_scores: None,
@@ -1980,13 +2277,13 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         capacity,
         derived_batch_ramp: batch_ramp,
         requested_batch,
-        stage_step: 0,
-        reached_context: 0,
+        stage_step,
+        reached_context,
         selection_context: 0,
         best_by_context: BTreeMap::new(),
         diagnostic_best: None,
         epoch_started: Instant::now(),
-        epoch_start_bars: 0,
+        epoch_start_bars,
         epoch_dyn_identity_sum: 0.0,
         epoch_dyn_identity_steps: 0,
         snapshot_window_fingerprint,
@@ -3334,6 +3631,36 @@ fn validate_args(args: &PretrainArgs) -> Result<()> {
          than extreme ones, so they are refused at the boundary instead of clamped.",
         args.lr_plateau_fraction
     );
+    ensure!(
+        args.ablation_lr.is_finite() && args.ablation_lr > 0.0,
+        "--ablation-lr must be finite and positive, got {}",
+        args.ablation_lr
+    );
+    ensure!(
+        args.smd_meta_lr.is_finite() && args.smd_meta_lr > 0.0,
+        "--smd-meta-lr must be finite and positive, got {}",
+        args.smd_meta_lr
+    );
+    ensure!(
+        args.optimizer_ablation.is_none() || !args.sdlr,
+        "--optimizer-ablation conflicts with --sdlr; each is a separate optimizer experiment"
+    );
+    ensure!(
+        args.optimizer_ablation.is_none() || args.exact_batch,
+        "--optimizer-ablation requires --exact-batch so both benchmark arms keep the declared \
+         primary-resolution batch and identical global target-step accounting"
+    );
+    ensure!(
+        args.optimizer_ablation.is_none() || args.auxiliary_resolutions.is_empty(),
+        "--optimizer-ablation supports only the primary resolution; remove \
+         --auxiliary-resolutions. In particular, shared SMD beta/v across heterogeneous \
+         resolution objectives has no defined meta-gradient"
+    );
+    ensure!(
+        args.resume_checkpoint.is_none() || args.auxiliary_resolutions.is_empty(),
+        "--resume-checkpoint currently supports only the primary-resolution stream; auxiliary \
+         cursors and their coverage ledgers are not part of the recovery contract"
+    );
     ensure!(args.batch_size > 0, "--batch-size must be positive");
     ensure!(
         !args.sdlr || args.auxiliary_resolutions.is_empty(),
@@ -3387,6 +3714,12 @@ fn validate_args(args: &PretrainArgs) -> Result<()> {
             "--split-bounds must be ascending: got {b0} | {b1} (epoch millis)"
         );
     }
+    ensure!(
+        args.weights.is_none() || args.resume_checkpoint.is_none(),
+        "--weights and --resume-checkpoint are mutually exclusive: --weights is a fresh \
+         optimizer warm start, while --resume-checkpoint continues model, optimizer, data, \
+         and schedule state"
+    );
     Ok(())
 }
 
@@ -4096,10 +4429,18 @@ fn assert_routing_partitions(
 // Trainer
 // ---------------------------------------------------------------------------
 
+fn temporary_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
 struct Trainer {
     args: PretrainArgs,
     device: Device,
     schedule: Schedule,
+    /// First global target step not yet applied. Zero for a fresh run.
+    next_step: usize,
     run: RunDir,
     supports: BarSupports,
     supports_dev: BarSupports,
@@ -4112,7 +4453,7 @@ struct Trainer {
     growth_supports: Vec<GrowthSupport>,
     vs: nn::VarStore,
     modules: BarModules,
-    optimizer: Muon,
+    optimizer: PretrainOptimizer,
     train_samplers: Vec<BarSampler>,
     eval: EvaluationSets,
     reporter: PretrainReporter,
@@ -4299,6 +4640,7 @@ struct StepLoss {
     dyn_vs_identity: f64,
     grad_norm: f64,
     row_learned_lr: [f64; ROW_LR_METRIC_COUNT],
+    smd_idbd: [f64; SMD_METRIC_COUNT],
 }
 
 /// Which held-out set a promotion decision was taken on. `Deployed` is the only
@@ -4511,7 +4853,11 @@ impl Trainer {
     /// which makes reporting a promotion after the terminal battery a compile error.
     fn run_training(mut self) -> Result<()> {
         let started = Instant::now();
-        let mut last_stage = usize::MAX;
+        let mut last_stage = if self.next_step == 0 {
+            usize::MAX
+        } else {
+            self.schedule.stage(self.next_step)
+        };
         // Everything the card already holds before a single activation is allocated: the
         // weights, the gradients, the CUDA context, and whatever the other tenants of a
         // shared GPU are holding. The ramp's headroom test is measured against this.
@@ -4523,7 +4869,7 @@ impl Trainer {
         crate::torch::cuda::empty_cache();
         self.vram_baseline_bytes = device_used_bytes(self.device);
 
-        for step in 0..self.schedule.total_steps {
+        for step in self.next_step..self.schedule.total_steps {
             let stage = self.schedule.stage(step);
             if stage != last_stage {
                 // A stage boundary is where a shared card kills a run: two of them died
@@ -4580,8 +4926,11 @@ impl Trainer {
             self.stage_cursor[stage] = cursor + batch;
 
             let lr_mult = self.schedule.lr_multiplier(step);
-            self.optimizer.set_lr(NORMUON_LR * lr_mult);
-            self.optimizer.set_adamw_lr(ADAMW_LR * lr_mult);
+            self.optimizer.set_learning_rates(
+                NORMUON_LR * lr_mult,
+                ADAMW_LR * lr_mult,
+                self.args.ablation_lr * lr_mult,
+            );
             let momentum = self.schedule.momentum(step);
             self.optimizer.set_momentum(momentum);
 
@@ -4639,6 +4988,16 @@ impl Trainer {
             metrics.dyn_vs_identity = loss.dyn_vs_identity;
             metrics.lr_mult = lr_mult;
             metrics.sdlr_alpha_mean = loss.row_learned_lr[0];
+            metrics.smd_gain_mean = loss.smd_idbd[0];
+            metrics.smd_gain_std = loss.smd_idbd[1];
+            metrics.smd_gain_min = loss.smd_idbd[2];
+            metrics.smd_gain_max = loss.smd_idbd[3];
+            metrics.smd_gain_bound_fraction = loss.smd_idbd[4];
+            metrics.smd_credit_mean = loss.smd_idbd[5];
+            metrics.smd_credit_std = loss.smd_idbd[6];
+            metrics.smd_beta_update_abs_mean = loss.smd_idbd[7];
+            metrics.smd_trace_rms = loss.smd_idbd[8];
+            metrics.smd_hv_gradient_rms_ratio = loss.smd_idbd[9];
             metrics.sdlr_alpha_std = loss.row_learned_lr[1];
             metrics.sdlr_alpha_min = loss.row_learned_lr[2];
             metrics.sdlr_alpha_max = loss.row_learned_lr[3];
@@ -5244,12 +5603,19 @@ impl Trainer {
                 self.device,
             )
         });
-        // Backward first so the gradient norm and the preceding primary controller
-        // diagnostics can join every loss in one device-to-host transfer.
-        graph.loss.backward();
+        // Backward first so the gradient norm and optimizer diagnostics can join every loss
+        // in one device-to-host transfer. Only the explicit SMD arm builds a gradient graph
+        // and an exact Pearlmutter HVP; production and fixed SGD take ordinary backward.
+        self.optimizer.backward(&graph.loss)?;
         let grad_norm_tensor = global_grad_norm_tensor(&self.vs, self.device);
         let row_lr_metrics = self.optimizer.row_learned_lr_metrics_tensor();
-        let packed = pack_step_metrics(&graph, &grad_norm_tensor, row_lr_metrics.as_ref());
+        let smd_metrics = self.optimizer.smd_metrics_tensor();
+        let packed = pack_step_metrics(
+            &graph,
+            &grad_norm_tensor,
+            row_lr_metrics.as_ref(),
+            smd_metrics.as_ref(),
+        );
         let metrics = read_packed_step_metrics(&packed);
         ensure_finite_step_metrics(&metrics, step)?;
         let total = metrics[STEP_METRIC_TOTAL];
@@ -5284,7 +5650,7 @@ impl Trainer {
         self.optimizer.step(match stream {
             None => StepKind::Primary,
             Some(_) => StepKind::Auxiliary,
-        });
+        })?;
         Ok(StepLoss {
             nll_bar: nll_value,
             nll_dof,
@@ -5310,6 +5676,9 @@ impl Trainer {
             row_learned_lr: metrics[STEP_METRIC_ROW_LR]
                 .try_into()
                 .expect("controller metric slice has fixed width"),
+            smd_idbd: metrics[STEP_METRIC_SMD_IDBD]
+                .try_into()
+                .expect("SMD metric slice has fixed width"),
         })
     }
 
@@ -6187,28 +6556,107 @@ impl Trainer {
     ///
     /// They are written TOGETHER because the alternative was measured to be a trap. `last`
     /// used to be written only from `validate`, on the validation cadence, while the tagged
+    fn recovery_contract(&self) -> BarPretrainRecovery {
+        BarPretrainRecovery {
+            total_steps: self.schedule.total_steps,
+            stage_steps: self.schedule.stage_steps.to_vec(),
+            base_batch: self.schedule.base_batch,
+            requested_batch: self.requested_batch,
+            exact_batch: self.args.exact_batch,
+            epochs: self.args.epochs,
+            steps_override: self.args.steps,
+            dyn_horizon: self.args.dyn_horizon,
+            lambda_dyn: self.args.lambda_dyn,
+            lambda_kl: self.args.lambda_kl,
+            auxiliary_resolutions: self.args.auxiliary_resolutions.clone(),
+            checkpoint_every: self.args.checkpoint_every,
+            validate_every: self.args.validate_every,
+            ablation_lr: self.args.ablation_lr,
+            smd_meta_lr: self.args.smd_meta_lr,
+        }
+    }
+
+    /// Commit a recoverable weight/optimizer/metadata bundle. Metadata is renamed last and
+    /// hashes both preceding files, so every interrupted replacement is rejected on resume.
+    fn write_recovery_checkpoint(&self, weights: &Path, step: usize) -> Result<PathBuf> {
+        let res = self.args.resolution_secs;
+        let supports_path = world_model_supports_path(weights, res);
+        self.supports
+            .save(&supports_path)
+            .with_context(|| format!("failed writing {}", supports_path.display()))?;
+
+        let optimizer_path = world_model_optimizer_path(weights);
+        let metadata_path = world_model_metadata_path(weights);
+        let weights_tmp = temporary_sibling(weights);
+        let optimizer_tmp = temporary_sibling(&optimizer_path);
+        let metadata_tmp = temporary_sibling(&metadata_path);
+        self.vs
+            .save(&weights_tmp)
+            .with_context(|| format!("failed writing {}", weights_tmp.display()))?;
+        self.optimizer.save_state(&optimizer_tmp)?;
+        let initialized_adamw = self.optimizer.initialized_adamw_names();
+        let expected_steps = i64::try_from(step + 1).context("checkpoint step exceeds i64")?;
+        self.optimizer
+            .validate_state_strict(&optimizer_tmp, &initialized_adamw, expected_steps)?;
+        File::open(&weights_tmp)?.sync_all()?;
+        File::open(&optimizer_tmp)?.sync_all()?;
+        fs::rename(&weights_tmp, weights)
+            .with_context(|| format!("failed committing weights {}", weights.display()))?;
+        fs::rename(&optimizer_tmp, &optimizer_path).with_context(|| {
+            format!(
+                "failed committing optimizer state {}",
+                optimizer_path.display()
+            )
+        })?;
+
+        let mut metadata = BarWorldModelMetadata::for_checkpoint_with(
+            weights,
+            &[res],
+            res,
+            Some(self.training_provenance(step, 0, None, SELECTION_METRIC)),
+        )?;
+        metadata.attach_pretrain_recovery(
+            file_sha256(&optimizer_path)?,
+            initialized_adamw,
+            self.recovery_contract(),
+        );
+        metadata
+            .save(&metadata_tmp)
+            .with_context(|| format!("failed writing {}", metadata_tmp.display()))?;
+        File::open(&metadata_tmp)?.sync_all()?;
+        fs::rename(&metadata_tmp, &metadata_path)
+            .with_context(|| format!("failed committing metadata {}", metadata_path.display()))?;
+        if let Some(parent) = weights
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(metadata_path)
+    }
+
     /// snapshot is written every `checkpoint_every` steps — a much finer one. That left a
     /// directory listing in which `pretrain_step_30720.ot` was a genuinely later state than
     /// `pretrain_last.ot`, which is the opposite of what the name promises. Writing both here
     /// makes `last` provably no older than the newest `pretrain_step_*.ot`.
     fn write_step_artifacts(&self, step: usize) -> Result<()> {
         let path = self.run.weights.join(format!("pretrain_step_{step}.ot"));
-        self.write_checkpoint(&path, step, 0, None)?;
+        self.write_recovery_checkpoint(&path, step)?;
         self.prune_step_checkpoints()?;
         self.write_last_checkpoint(step)?;
         Ok(())
     }
 
-    /// `pretrain_last.ot`: the weights after optimizer step `step`, and nothing more.
+    /// `pretrain_last.ot`: the weights and optimizer state after optimizer step `step`.
     ///
     /// It carries NO held-out scores — no `.windows.json` sidecar — and its metadata records
-    /// `selection_context = 0`, so the file itself states that no decision chose it and that
-    /// any number measured from it belongs to a read nobody reported. `global_step` in that
-    /// same metadata says which step it holds, which is the question a reader of a weights
-    /// directory actually has and which used to be answerable only from the run's log.
+    /// `selection_context = 0`, so the file itself states that no decision chose it. The
+    /// recovery contract preserves model, optimizer, data cursor and schedule state; a resumed
+    /// run starts a new reporting and promotion ledger. `global_step` identifies the next
+    /// sample and schedule position exactly.
     fn write_last_checkpoint(&self, step: usize) -> Result<PathBuf> {
         let path = self.run.weights.join("pretrain_last.ot");
-        self.write_checkpoint(&path, step, 0, None)?;
+        self.write_recovery_checkpoint(&path, step)?;
         Ok(path)
     }
 
@@ -6216,7 +6664,6 @@ impl Trainer {
     /// AND with what those numbers were worth.
     ///
     /// Promotion is gated on the deployed context and the batch ramp is memory-gated, so the
-    /// two are not the same event and in job 2856 they were 9221 steps apart: epochs 1 and 2
     /// finished with nothing but a rolling `pretrain_last.ot` that the next step-cadence write
     /// overwrote. An epoch of compute must be recoverable and, separately, EVALUABLE — the
     /// window-score sidecar carries the whole diagnostic pass for these exact weights, so an
@@ -6499,6 +6946,7 @@ impl Trainer {
             }
             for sidecar in [
                 world_model_metadata_path(&path),
+                world_model_optimizer_path(&path),
                 world_model_supports_path(&path, self.args.resolution_secs),
                 window_scores_path(&path),
             ] {
@@ -6538,6 +6986,7 @@ impl Trainer {
             split_bounds: self.split_bounds(),
             split_bounds_pinned: !self.args.derive_split_bounds,
             eval_window_seed: EVAL_WINDOW_SEED,
+
             train_seed: self.args.seed,
             selection_metric: format!(
                 "{selection_metric}; predictive scoring contract: {}",
@@ -6585,7 +7034,14 @@ impl Trainer {
             // which is the difference between two entirely different experiments.
             lr_plateau_fraction: self.schedule.lr_plateau_fraction,
             optimizer: Some(BarOptimizerProvenance {
-                name: "NorMuon (Polar Express 5) + AdamW".to_owned(),
+                name: match self.args.optimizer_ablation {
+                    None => "NorMuon (Polar Express 5) + AdamW",
+                    Some(PretrainOptimizerAblation::FixedSgd) => "fixed SGD",
+                    Some(PretrainOptimizerAblation::SmdIdbd) => {
+                        "batch-step Schraudolph SMD-IDBD"
+                    }
+                }
+                .to_owned(),
                 row_learned_lr: self.args.sdlr.then(|| BarRowLearnedLrProvenance {
                     c: ROW_LR_LOG_SPAN / 2.0,
                     controller_lr: ROW_LR_CONTROLLER_LR,
@@ -6595,6 +7051,21 @@ impl Trainer {
                     warmup_primary_steps: ROW_LR_WARMUP_STEPS,
                     evidence_clip: 3.0,
                     evidence: "-mean(g_raw_current * actual_signed_delta_previous), centered and population-standardized within each matrix".to_owned(),
+                }),
+                ablation: self.args.optimizer_ablation.map(|variant| {
+                    let smd = variant == PretrainOptimizerAblation::SmdIdbd;
+                    BarOptimizerAblationProvenance {
+                        variant: match variant {
+                            PretrainOptimizerAblation::FixedSgd => "fixed-sgd",
+                            PretrainOptimizerAblation::SmdIdbd => "smd-idbd",
+                        }
+                        .to_owned(),
+                        initial_lr: self.args.ablation_lr,
+                        meta_lr: smd.then_some(self.args.smd_meta_lr),
+                        exact_hvp: smd,
+                        beta_bounds: smd.then_some((SMD_BETA_MIN, SMD_BETA_MAX)),
+                        beta_update_clip: smd.then_some(SMD_BETA_UPDATE_CLIP),
+                    }
                 }),
             }),
         }
@@ -7747,17 +8218,7 @@ pub(super) fn evaluate_with_trunk(
     trunk: EvaluationTrunk<'_>,
 ) -> Result<EvalStats> {
     evaluate_impl(
-        modules,
-        supports,
-        set,
-        batch,
-        device,
-        false,
-        scoring,
-        None,
-        0,
-        trunk,
-        true,
+        modules, supports, set, batch, device, false, scoring, None, 0, trunk, true,
     )
 }
 
@@ -7915,8 +8376,7 @@ fn evaluate_impl(
             let focused = focused_diagnostics.then(|| {
                 (
                     direction_hits(modules, supports, &beliefs, &conditioning, &target, context),
-                    (chunk_index == 0)
-                        .then(|| belief_effective_rank(&flatten_beliefs(&beliefs))),
+                    (chunk_index == 0).then(|| belief_effective_rank(&flatten_beliefs(&beliefs))),
                 )
             });
             let extras = full.then(|| {
@@ -8812,16 +9272,19 @@ const STEP_METRIC_GRAD_NORM: usize = STEP_METRIC_AUTOCORR + 1;
 const STEP_METRIC_BASE_COUNT: usize = STEP_METRIC_GRAD_NORM + 1;
 const STEP_METRIC_ROW_LR: std::ops::Range<usize> =
     STEP_METRIC_BASE_COUNT..STEP_METRIC_BASE_COUNT + ROW_LR_METRIC_COUNT;
-const STEP_METRIC_COUNT: usize = STEP_METRIC_ROW_LR.end;
+const STEP_METRIC_SMD_IDBD: std::ops::Range<usize> =
+    STEP_METRIC_ROW_LR.end..STEP_METRIC_ROW_LR.end + SMD_METRIC_COUNT;
+const STEP_METRIC_COUNT: usize = STEP_METRIC_SMD_IDBD.end;
 
-/// Pack every device-resident scalar read by one optimizer step. Controller diagnostics
-/// are from the preceding primary update, allowing them to share this transfer without
-/// adding a synchronization after the optimizer step. The disabled path retains the
-/// original packet exactly and is padded with host-side NaNs by the reader.
+/// Pack every device-resident scalar read by one optimizer step. The production path retains
+/// its original packet exactly. SMD diagnostics describe the pending update and occupy the
+/// same single transfer; the unused row-controller slots are device-side NaNs so every metric
+/// keeps one fixed index.
 fn pack_step_metrics(
     graph: &TrainingGraph,
     grad_norm: &Tensor,
     row_lr_metrics: Option<&Tensor>,
+    smd_metrics: Option<&Tensor>,
 ) -> Tensor {
     let flat_f32 = |tensor: &Tensor| tensor.detach().to_kind(Kind::Float).reshape([-1]);
 
@@ -8837,14 +9300,20 @@ fn pack_step_metrics(
         flat_f32(&graph.autocorr),
         flat_f32(grad_norm),
     ];
-    match row_lr_metrics {
-        Some(metrics) => {
-            let mut tensors = Vec::from(base);
-            tensors.push(flat_f32(metrics));
-            Tensor::cat(&tensors, 0)
-        }
-        None => Tensor::cat(&base, 0),
+    let mut tensors = Vec::from(base);
+    if let Some(metrics) = row_lr_metrics {
+        tensors.push(flat_f32(metrics));
+    } else if smd_metrics.is_some() {
+        tensors.push(Tensor::full(
+            [ROW_LR_METRIC_COUNT as i64],
+            f64::NAN,
+            (Kind::Float, graph.loss.device()),
+        ));
     }
+    if let Some(metrics) = smd_metrics {
+        tensors.push(flat_f32(metrics));
+    }
+    Tensor::cat(&tensors, 0)
 }
 
 /// The optimizer step's single device-to-host metric transfer.
@@ -8852,9 +9321,15 @@ fn read_packed_step_metrics(packed: &Tensor) -> [f64; STEP_METRIC_COUNT] {
     let values = Vec::<f64>::try_from(packed.to_kind(Kind::Double).reshape([-1]))
         .expect("packed step metrics are convertible");
     assert!(
-        values.len() == STEP_METRIC_BASE_COUNT || values.len() == STEP_METRIC_COUNT,
-        "packed step metrics carry {} entries, expected {STEP_METRIC_BASE_COUNT} or {STEP_METRIC_COUNT}",
-        values.len()
+        [
+            STEP_METRIC_BASE_COUNT,
+            STEP_METRIC_ROW_LR.end,
+            STEP_METRIC_COUNT,
+        ]
+        .contains(&values.len()),
+        "packed step metrics carry {} entries, expected {STEP_METRIC_BASE_COUNT}, {}, or {STEP_METRIC_COUNT}",
+        values.len(),
+        STEP_METRIC_ROW_LR.end,
     );
     let mut out = [f64::NAN; STEP_METRIC_COUNT];
     out[..values.len()].copy_from_slice(&values);
@@ -8885,6 +9360,11 @@ fn ensure_finite_step_metrics(metrics: &[f64; STEP_METRIC_COUNT], step: usize) -
         controller.iter().all(|value| value.is_nan())
             || controller.iter().all(|value| value.is_finite()),
         "row learned-LR diagnostics are partially non-finite at step {step}: {controller:?}"
+    );
+    let smd = &metrics[STEP_METRIC_SMD_IDBD];
+    ensure!(
+        smd.iter().all(|value| value.is_nan()) || smd.iter().all(|value| value.is_finite()),
+        "SMD-IDBD diagnostics are partially non-finite at step {step}: {smd:?}"
     );
     Ok(())
 }
@@ -9864,6 +10344,7 @@ mod tests {
     fn test_args(seed: u64, dir: &Path) -> PretrainArgs {
         PretrainArgs {
             weights: None,
+            resume_checkpoint: None,
             run: None,
             epochs: 1,
             steps: Some(9),
@@ -9874,6 +10355,9 @@ mod tests {
             min_bars: 100,
             auxiliary_resolutions: Vec::new(),
             support_samples: 1024,
+            optimizer_ablation: None,
+            ablation_lr: 1e-3,
+            smd_meta_lr: 0.05,
             dyn_horizon: 1,
             lambda_dyn: 1.0,
             lambda_kl: 1.0,
@@ -9919,6 +10403,26 @@ mod tests {
             error.to_string().contains("--auxiliary-resolutions"),
             "unexpected validation error: {error:#}"
         );
+    }
+
+    #[test]
+    fn optimizer_ablation_validation_rejects_conflicts_and_nonfinite_rates() {
+        let dir = PathBuf::from(".");
+        let mut args = test_args(0x5EED, &dir);
+        args.optimizer_ablation = Some(PretrainOptimizerAblation::SmdIdbd);
+        validate_args(&args).expect("the isolated primary-resolution SMD arm is valid");
+
+        args.sdlr = true;
+        assert!(validate_args(&args).is_err());
+        args.sdlr = false;
+        args.auxiliary_resolutions = vec![86_400];
+        assert!(validate_args(&args).is_err());
+        args.auxiliary_resolutions.clear();
+        args.ablation_lr = f64::NAN;
+        assert!(validate_args(&args).is_err());
+        args.ablation_lr = 1e-3;
+        args.smd_meta_lr = f64::INFINITY;
+        assert!(validate_args(&args).is_err());
     }
 
     /// EVAL-GATE-001 and EVAL-GATE-002. A ramp stage below the deployed context must still
@@ -10368,7 +10872,7 @@ mod tests {
         let mut args = test_args(0x5EED, &dir);
         args.validation_windows = 1;
         args.snapshot_windows = 1;
-        let trainer =
+        let mut trainer =
             build_trainer(args, &runs.display().to_string(), Device::Cpu).expect("trainer builds");
 
         // The device is pinned above, so this is a GUARANTEE and not a property of the host:
@@ -10388,7 +10892,12 @@ mod tests {
             .collect();
         let state_before = trainer.optimizer.state_bytes();
         assert!(
-            trainer.optimizer.initialized_adamw_names().is_empty(),
+            trainer
+                .optimizer
+                .production_ref()
+                .expect("fixture uses production optimizer")
+                .initialized_adamw_names()
+                .is_empty(),
             "the AdamW moments must still be unallocated before any step"
         );
 
@@ -10403,9 +10912,11 @@ mod tests {
             &growth_support,
             &sample,
             &trainer.args,
+            &mut trainer.optimizer,
             128,
             trainer.device,
-        );
+        )
+        .expect("the selected optimizer backward must succeed");
         assert_eq!(reading, None, "a CPU device has no VRAM reading to give");
 
         // The passes really ran: a backward left gradients behind. They are the ONE thing the
@@ -10432,7 +10943,12 @@ mod tests {
             "the probe must not allocate optimizer state"
         );
         assert!(
-            trainer.optimizer.initialized_adamw_names().is_empty(),
+            trainer
+                .optimizer
+                .production_ref()
+                .expect("fixture uses production optimizer")
+                .initialized_adamw_names()
+                .is_empty(),
             "an allocated AdamW moment proves the probe took an optimizer step"
         );
 
@@ -11186,7 +11702,7 @@ mod tests {
             identity: scalar(14.0),
             autocorr: scalar(15.0),
         };
-        let packed = pack_step_metrics(&graph, &scalar(16.0), None);
+        let packed = pack_step_metrics(&graph, &scalar(16.0), None, None);
         assert_eq!(packed.size(), [STEP_METRIC_BASE_COUNT as i64]);
         let read = read_packed_step_metrics(&packed);
         assert_eq!(
@@ -11199,12 +11715,24 @@ mod tests {
         assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
 
         let row_lr = Tensor::arange(ROW_LR_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
-        let packed = pack_step_metrics(&graph, &scalar(16.0), Some(&row_lr));
-        assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
+        let packed = pack_step_metrics(&graph, &scalar(16.0), Some(&row_lr), None);
+        assert_eq!(packed.size(), [STEP_METRIC_ROW_LR.end as i64]);
         let read = read_packed_step_metrics(&packed);
         assert_eq!(
             &read[STEP_METRIC_ROW_LR],
             &(0..ROW_LR_METRIC_COUNT)
+                .map(|value| value as f64)
+                .collect::<Vec<_>>()
+        );
+
+        let smd = Tensor::arange(SMD_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
+        let packed = pack_step_metrics(&graph, &scalar(16.0), None, Some(&smd));
+        assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
+        let read = read_packed_step_metrics(&packed);
+        assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
+        assert_eq!(
+            &read[STEP_METRIC_SMD_IDBD],
+            &(0..SMD_METRIC_COUNT)
                 .map(|value| value as f64)
                 .collect::<Vec<_>>()
         );
@@ -11228,6 +11756,13 @@ mod tests {
             .expect_err("infinite gradient must stop the step")
             .to_string()
             .contains("gradient norm is not finite"));
+
+        let mut bad_smd = finite;
+        bad_smd[STEP_METRIC_SMD_IDBD.start] = f64::NAN;
+        assert!(ensure_finite_step_metrics(&bad_smd, 7)
+            .expect_err("partially non-finite SMD diagnostics must stop the step")
+            .to_string()
+            .contains("SMD-IDBD diagnostics"));
     }
 
     /// The snapshot window must be long enough for every horizon the report plots,

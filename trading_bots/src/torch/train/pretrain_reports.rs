@@ -223,6 +223,17 @@ pub struct StepMetrics {
     pub sdlr_evidence_std: f64,
     pub sdlr_objective: f64,
     pub sdlr_update_magnitude: f64,
+    /// Batch-step Schraudolph SMD-IDBD diagnostics. NaN outside the explicit SMD arm.
+    pub smd_gain_mean: f64,
+    pub smd_gain_std: f64,
+    pub smd_gain_min: f64,
+    pub smd_gain_max: f64,
+    pub smd_gain_bound_fraction: f64,
+    pub smd_credit_mean: f64,
+    pub smd_credit_std: f64,
+    pub smd_beta_update_abs_mean: f64,
+    pub smd_trace_rms: f64,
+    pub smd_hv_gradient_rms_ratio: f64,
     pub context: i64,
     pub batch_size: usize,
     pub bars_seen: u64,
@@ -287,6 +298,16 @@ impl StepMetrics {
             sdlr_evidence_std: f64::NAN,
             sdlr_objective: f64::NAN,
             sdlr_update_magnitude: f64::NAN,
+            smd_gain_mean: f64::NAN,
+            smd_gain_std: f64::NAN,
+            smd_gain_min: f64::NAN,
+            smd_gain_max: f64::NAN,
+            smd_gain_bound_fraction: f64::NAN,
+            smd_credit_mean: f64::NAN,
+            smd_credit_std: f64::NAN,
+            smd_beta_update_abs_mean: f64::NAN,
+            smd_trace_rms: f64::NAN,
+            smd_hv_gradient_rms_ratio: f64::NAN,
             context: 0,
             batch_size: 0,
             bars_seen: 0,
@@ -1428,6 +1449,16 @@ struct StepAccumulator {
     sdlr_evidence_std: Mean,
     sdlr_objective: Mean,
     sdlr_update_magnitude: Mean,
+    smd_gain_mean: Mean,
+    smd_gain_std: Mean,
+    smd_gain_min: Mean,
+    smd_gain_max: Mean,
+    smd_gain_bound_fraction: Mean,
+    smd_credit_mean: Mean,
+    smd_credit_std: Mean,
+    smd_beta_update_abs_mean: Mean,
+    smd_trace_rms: Mean,
+    smd_hv_gradient_rms_ratio: Mean,
     context: Mean,
     batch_size: Mean,
     bars_seen: u64,
@@ -1474,8 +1505,20 @@ impl StepAccumulator {
         self.sdlr_evidence_mean.push(step.sdlr_evidence_mean);
         self.sdlr_evidence_std.push(step.sdlr_evidence_std);
         self.sdlr_objective.push(step.sdlr_objective);
-        self.sdlr_update_magnitude
-            .push(step.sdlr_update_magnitude);
+        self.sdlr_update_magnitude.push(step.sdlr_update_magnitude);
+        self.smd_gain_mean.push(step.smd_gain_mean);
+        self.smd_gain_std.push(step.smd_gain_std);
+        self.smd_gain_min.push(step.smd_gain_min);
+        self.smd_gain_max.push(step.smd_gain_max);
+        self.smd_gain_bound_fraction
+            .push(step.smd_gain_bound_fraction);
+        self.smd_credit_mean.push(step.smd_credit_mean);
+        self.smd_credit_std.push(step.smd_credit_std);
+        self.smd_beta_update_abs_mean
+            .push(step.smd_beta_update_abs_mean);
+        self.smd_trace_rms.push(step.smd_trace_rms);
+        self.smd_hv_gradient_rms_ratio
+            .push(step.smd_hv_gradient_rms_ratio);
         self.context.push(step.context as f64);
         self.batch_size.push(step.batch_size as f64);
         self.bars_seen = self.bars_seen.max(step.bars_seen);
@@ -1550,6 +1593,16 @@ pub struct PretrainReporter {
     sdlr_evidence_std: Series,
     sdlr_objective: Series,
     sdlr_update_magnitude: Series,
+    smd_gain_mean: Series,
+    smd_gain_std: Series,
+    smd_gain_min: Series,
+    smd_gain_max: Series,
+    smd_gain_bound_fraction: Series,
+    smd_credit_mean: Series,
+    smd_credit_std: Series,
+    smd_beta_update_abs_mean: Series,
+    smd_trace_rms: Series,
+    smd_hv_gradient_rms_ratio: Series,
     unique_bar_reuse: Series,
     effective_rank: Series,
     promotion_trace: Series,
@@ -1760,6 +1813,16 @@ impl PretrainReporter {
             sdlr_evidence_std: Series::default(),
             sdlr_objective: Series::default(),
             sdlr_update_magnitude: Series::default(),
+            smd_gain_mean: Series::default(),
+            smd_gain_std: Series::default(),
+            smd_gain_min: Series::default(),
+            smd_gain_max: Series::default(),
+            smd_gain_bound_fraction: Series::default(),
+            smd_credit_mean: Series::default(),
+            smd_credit_std: Series::default(),
+            smd_beta_update_abs_mean: Series::default(),
+            smd_trace_rms: Series::default(),
+            smd_hv_gradient_rms_ratio: Series::default(),
             unique_bar_reuse: Series::default(),
             effective_rank: Series::default(),
             promotion_trace: Series::default(),
@@ -2575,6 +2638,19 @@ impl PretrainReporter {
         self.sdlr_objective.set(tick, acc.sdlr_objective.value());
         self.sdlr_update_magnitude
             .set(tick, acc.sdlr_update_magnitude.value());
+        self.smd_gain_mean.set(tick, acc.smd_gain_mean.value());
+        self.smd_gain_std.set(tick, acc.smd_gain_std.value());
+        self.smd_gain_min.set(tick, acc.smd_gain_min.value());
+        self.smd_gain_max.set(tick, acc.smd_gain_max.value());
+        self.smd_gain_bound_fraction
+            .set(tick, acc.smd_gain_bound_fraction.value());
+        self.smd_credit_mean.set(tick, acc.smd_credit_mean.value());
+        self.smd_credit_std.set(tick, acc.smd_credit_std.value());
+        self.smd_beta_update_abs_mean
+            .set(tick, acc.smd_beta_update_abs_mean.value());
+        self.smd_trace_rms.set(tick, acc.smd_trace_rms.value());
+        self.smd_hv_gradient_rms_ratio
+            .set(tick, acc.smd_hv_gradient_rms_ratio.value());
         self.context.set(tick, acc.context.value());
         self.batch_size.set(tick, acc.batch_size.value());
         self.free_vram_gib.set(tick, acc.free_vram_gib.value());
@@ -3231,11 +3307,52 @@ impl PretrainReporter {
                  is from the preceding primary update so it shares the step's one device transfer",
                 ScaleKind::Symlog,
                 vec![
-                    self.sdlr_evidence_mean.labeled("centered evidence mean", len),
+                    self.sdlr_evidence_mean
+                        .labeled("centered evidence mean", len),
                     self.sdlr_evidence_std.labeled("centered evidence std", len),
                     self.sdlr_objective.labeled("controller objective", len),
                     self.sdlr_update_magnitude
                         .labeled("mean |logit update|", len),
+                ],
+            )?;
+        }
+        if self.smd_gain_mean.measured() {
+            write_chart(
+                &dir,
+                "pretrain_smd_idbd_gain",
+                format!("Pretrain Batch-Step SMD-IDBD Gain - {suffix}"),
+                "record",
+                "p = absolute scheduled lr * exp(beta), with beta in [-10, 2]; bound fraction \
+                 is the share saturated at either beta bound",
+                ScaleKind::Symlog,
+                vec![
+                    self.smd_gain_mean.labeled("gain mean", len),
+                    self.smd_gain_std.labeled("gain std", len),
+                    self.smd_gain_min.labeled("gain min", len),
+                    self.smd_gain_max.labeled("gain max", len),
+                    self.smd_gain_bound_fraction
+                        .labeled("beta bound fraction", len),
+                ],
+            )?;
+        }
+
+        if self.smd_credit_mean.measured() {
+            write_chart(
+                &dir,
+                "pretrain_smd_idbd_credit",
+                format!("Pretrain Batch-Step SMD-IDBD Credit and Curvature - {suffix}"),
+                "record",
+                "Schraudolph stochastic meta-descent credit d*v, beta update, sensitivity \
+                 trace, and exact Pearlmutter HVP / gradient RMS ratio",
+                ScaleKind::Symlog,
+                vec![
+                    self.smd_credit_mean.labeled("credit mean", len),
+                    self.smd_credit_std.labeled("credit std", len),
+                    self.smd_beta_update_abs_mean
+                        .labeled("mean |beta update|", len),
+                    self.smd_trace_rms.labeled("trace RMS", len),
+                    self.smd_hv_gradient_rms_ratio
+                        .labeled("Hv / gradient RMS", len),
                 ],
             )?;
         }
@@ -9101,6 +9218,16 @@ mod tests {
             metrics.sdlr_evidence_std = 0.99;
             metrics.sdlr_objective = -0.003;
             metrics.sdlr_update_magnitude = 1.0e-3;
+            metrics.smd_gain_mean = 1.01e-3;
+            metrics.smd_gain_std = 0.08e-3;
+            metrics.smd_gain_min = 0.81e-3;
+            metrics.smd_gain_max = 1.24e-3;
+            metrics.smd_gain_bound_fraction = 0.0;
+            metrics.smd_credit_mean = 0.003;
+            metrics.smd_credit_std = 0.2;
+            metrics.smd_beta_update_abs_mean = 1.0e-3;
+            metrics.smd_trace_rms = 0.04;
+            metrics.smd_hv_gradient_rms_ratio = 0.3;
             metrics.context = 896;
             metrics.batch_size = 16;
             metrics.bars_seen = 1_000_000 * (step as u64 + 1);

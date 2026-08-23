@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use tch::{autocast, nn, nn::Init, Device, Kind, Tensor};
@@ -201,6 +201,16 @@ pub struct BarWorldModelMetadata {
     /// Absent on a checkpoint written before v7, and on anything but a pretraining run.
     #[serde(default)]
     pub training: Option<BarTrainingProvenance>,
+    /// SHA-256 of the optimizer-state sidecar committed with a recovery checkpoint.
+    /// Absent for deployment artifacts and checkpoints written before recovery was supported.
+    #[serde(default)]
+    pub optimizer_checkpoint_sha256: Option<String>,
+    /// Lazy production AdamW buffers expected in the strict optimizer schema.
+    #[serde(default)]
+    pub optimizer_initialized_adamw: Vec<String>,
+    /// Exact schedule and objective contract required to continue this training run.
+    #[serde(default)]
+    pub pretrain_recovery: Option<BarPretrainRecovery>,
 }
 
 /// Which DATA and which SELECTION RULE produced a checkpoint.
@@ -363,6 +373,50 @@ pub struct BarOptimizerProvenance {
     /// checkpoint; the enclosing `optimizer: None` is the legacy/unknown state.
     #[serde(default)]
     pub row_learned_lr: Option<BarRowLearnedLrProvenance>,
+    /// Strictly opt-in pretraining optimizer experiment. `None` is the production recipe
+    /// and deliberately contributes no canonical text, preserving existing lineage hashes.
+    #[serde(default)]
+    pub ablation: Option<BarOptimizerAblationProvenance>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BarOptimizerAblationProvenance {
+    /// Canonical CLI variant: `fixed-sgd` or `smd-idbd`.
+    pub variant: String,
+    /// Absolute initial learning rate before the shared schedule multiplier.
+    pub initial_lr: f64,
+    /// SMD meta learning rate. Absent for the matched fixed-SGD control.
+    #[serde(default)]
+    pub meta_lr: Option<f64>,
+    /// True only for the SMD arm, whose HVP is computed by autograd from a gradient graph.
+    pub exact_hvp: bool,
+    /// Per-coordinate log-gain multiplier bounds. Absent for fixed SGD.
+    #[serde(default)]
+    pub beta_bounds: Option<(f64, f64)>,
+    /// Per-step per-coordinate beta update clamp. Absent for fixed SGD.
+    #[serde(default)]
+    pub beta_update_clip: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BarPretrainRecovery {
+    pub total_steps: usize,
+    pub stage_steps: Vec<usize>,
+    pub base_batch: usize,
+    pub requested_batch: usize,
+    pub exact_batch: bool,
+    pub epochs: usize,
+    #[serde(default)]
+    pub steps_override: Option<usize>,
+    pub dyn_horizon: usize,
+    pub lambda_dyn: f64,
+    pub lambda_kl: f64,
+    #[serde(default)]
+    pub auxiliary_resolutions: Vec<u32>,
+    pub checkpoint_every: usize,
+    pub validate_every: usize,
+    pub ablation_lr: f64,
+    pub smd_meta_lr: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -434,6 +488,9 @@ impl BarWorldModelMetadata {
             checkpoint_sha256: file_sha256(checkpoint)?,
             lineage_sha256: String::new(),
             training,
+            optimizer_checkpoint_sha256: None,
+            optimizer_initialized_adamw: Vec::new(),
+            pretrain_recovery: None,
         };
         metadata.lineage_sha256 = metadata.compute_lineage_sha256();
         Ok(metadata)
@@ -460,6 +517,20 @@ impl BarWorldModelMetadata {
         let path = world_model_metadata_path(checkpoint);
         Self::for_checkpoint_with(checkpoint, resolutions, res_secs, training)?.save(&path)?;
         Ok(path)
+    }
+
+    /// Attach the optimizer and exact-continuation contract to recovery metadata, then
+    /// recompute lineage so neither the sidecar hash nor the schedule can be edited in place.
+    pub fn attach_pretrain_recovery(
+        &mut self,
+        optimizer_checkpoint_sha256: String,
+        optimizer_initialized_adamw: Vec<String>,
+        recovery: BarPretrainRecovery,
+    ) {
+        self.optimizer_checkpoint_sha256 = Some(optimizer_checkpoint_sha256);
+        self.optimizer_initialized_adamw = optimizer_initialized_adamw;
+        self.pretrain_recovery = Some(recovery);
+        self.lineage_sha256 = self.compute_lineage_sha256();
     }
 
     /// Which corpus and selection rule produced this checkpoint, when it says.
@@ -547,6 +618,35 @@ impl BarWorldModelMetadata {
         if self.res_secs == 0 {
             bail!("world-model bar resolution must be positive");
         }
+        if self.pretrain_recovery.is_some() {
+            ensure!(
+                self.optimizer_checkpoint_sha256
+                    .as_ref()
+                    .is_some_and(|hash| !hash.is_empty()),
+                "pretrain recovery metadata has no optimizer-state hash"
+            );
+            ensure!(
+                self.training
+                    .as_ref()
+                    .and_then(|training| training.global_step)
+                    .is_some(),
+                "pretrain recovery metadata has no global optimizer step"
+            );
+            ensure!(
+                self.optimizer_initialized_adamw
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == self.optimizer_initialized_adamw.len(),
+                "pretrain recovery metadata repeats an initialized AdamW name"
+            );
+        } else {
+            ensure!(
+                self.optimizer_checkpoint_sha256.is_none()
+                    && self.optimizer_initialized_adamw.is_empty(),
+                "optimizer recovery fields are present without a recovery contract"
+            );
+        }
         if self.supports_sha256.is_empty() {
             bail!("world-model metadata has no supports hash");
         }
@@ -594,7 +694,30 @@ impl BarWorldModelMetadata {
                     )
                 },
             );
-            format!(";optimizer={};row_learned_lr={row_lr}", optimizer.name)
+            let ablation = optimizer.ablation.as_ref().map_or_else(String::new, |ablation| {
+                let meta_lr = ablation.meta_lr.map_or_else(
+                    || "none".to_owned(),
+                    |value| format!("{:016x}", value.to_bits()),
+                );
+                let beta_bounds = ablation.beta_bounds.map_or_else(
+                    || "none".to_owned(),
+                    |(low, high)| format!("{:016x}:{:016x}", low.to_bits(), high.to_bits()),
+                );
+                let beta_update_clip = ablation.beta_update_clip.map_or_else(
+                    || "none".to_owned(),
+                    |value| format!("{:016x}", value.to_bits()),
+                );
+                format!(
+                    ";ablation={},initial_lr={:016x},meta_lr={meta_lr},exact_hvp={},beta_bounds={beta_bounds},beta_update_clip={beta_update_clip}",
+                    ablation.variant,
+                    ablation.initial_lr.to_bits(),
+                    ablation.exact_hvp,
+                )
+            });
+            format!(
+                ";optimizer={};row_learned_lr={row_lr}{ablation}",
+                optimizer.name
+            )
         });
         format!(
             "corpus={};bounds={}:{};pinned={};eval_seed={:016x};train_seed={:016x};\
@@ -656,6 +779,44 @@ impl BarWorldModelMetadata {
         )
     }
 
+    fn recovery_canonical(&self) -> String {
+        let Some(recovery) = &self.pretrain_recovery else {
+            return String::new();
+        };
+        format!(
+            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=total_steps={},stage_steps={},base_batch={},requested_batch={},exact_batch={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},auxiliary_resolutions={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}",
+            self.optimizer_checkpoint_sha256.as_deref().unwrap_or("none"),
+            self.optimizer_initialized_adamw.join(","),
+            recovery.total_steps,
+            recovery
+                .stage_steps
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            recovery.base_batch,
+            recovery.requested_batch,
+            recovery.exact_batch,
+            recovery.epochs,
+            recovery
+                .steps_override
+                .map_or_else(|| "none".to_owned(), |steps| steps.to_string()),
+            recovery.dyn_horizon,
+            recovery.lambda_dyn.to_bits(),
+            recovery.lambda_kl.to_bits(),
+            recovery
+                .auxiliary_resolutions
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            recovery.checkpoint_every,
+            recovery.validate_every,
+            recovery.ablation_lr.to_bits(),
+            recovery.smd_meta_lr.to_bits(),
+        )
+    }
+
     /// SHA-256 over every architectural constant that changes what a weight means, including
     /// the supports hash and the corpus the run was trained and scored on.
     fn compute_lineage_sha256(&self) -> String {
@@ -682,7 +843,7 @@ impl BarWorldModelMetadata {
              fa4_contract=strict-bshd-qk128-v64;cache_contract={};label_sigma_ratio_bits={:016x};\
              prefix_embed_dim={};volume_ema_span_bits={:016x};time_features={};\
              time_cardinality={cardinality};time_conditioning={};\
-             session_boundary_minutes={boundaries};training={}",
+             session_boundary_minutes={boundaries};training={}{}",
             self.format_version,
             self.architecture,
             self.model_dim,
@@ -721,6 +882,7 @@ impl BarWorldModelMetadata {
             BAR_TIME_FEATURES,
             BAR_TIME_CONDITIONING,
             self.training_canonical(),
+            self.recovery_canonical(),
         );
         digest(&SHA256, canonical.as_bytes())
             .as_ref()
@@ -749,6 +911,11 @@ fn sidecar_path(checkpoint: &Path, suffix: &str) -> PathBuf {
 /// Metadata sidecar of a checkpoint: `foo.ot` -> `foo.metadata.json`.
 pub fn world_model_metadata_path(checkpoint: impl AsRef<Path>) -> PathBuf {
     sidecar_path(checkpoint.as_ref(), "metadata.json")
+}
+
+/// Optimizer recovery sidecar: `foo.ot` -> `foo.optimizer.ot`.
+pub fn world_model_optimizer_path(checkpoint: impl AsRef<Path>) -> PathBuf {
+    sidecar_path(checkpoint.as_ref(), "optimizer.ot")
 }
 
 /// Supports sidecar of a checkpoint at one resolution:
@@ -1244,12 +1411,7 @@ impl BarTrunk {
     /// This is the control arm for fixed recirculation. It is deliberately
     /// separate from [`Self::forward`]: the experiment must not mistake
     /// parallel-prefill versus decode-kernel drift for a recirculation effect.
-    pub fn forward_serialized(
-        &self,
-        dof: &Tensor,
-        bin_ids: &Tensor,
-        time_ids: &Tensor,
-    ) -> Tensor {
+    pub fn forward_serialized(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor) -> Tensor {
         tch::no_grad(|| {
             self.run_serialized(dof, bin_ids, time_ids, None)
                 .expect("the no-recirculation serialized path has no invalid config")
@@ -1291,9 +1453,7 @@ impl BarTrunk {
             bail!("serialized bar trunk requires at least one token");
         }
         if length > BAR_MAX_CONTEXT {
-            bail!(
-                "serialized bar trunk length {length} exceeds BAR_MAX_CONTEXT {BAR_MAX_CONTEXT}"
-            );
+            bail!("serialized bar trunk length {length} exceeds BAR_MAX_CONTEXT {BAR_MAX_CONTEXT}");
         }
         let mut cache = BarKvCache::new(BAR_MAX_CONTEXT);
         let mut beliefs = Vec::with_capacity(length as usize);
@@ -1332,7 +1492,6 @@ impl BarTrunk {
         let beta = if config.beta_one { 1.0 } else { 1.0 - alpha };
         beta * destination + alpha * matched
     }
-
 
     fn run(&self, dof: &Tensor, bin_ids: &Tensor, time_ids: &Tensor, window: i64) -> Tensor {
         let x0 = self.token_embedding(dof, bin_ids, time_ids);
@@ -1587,12 +1746,8 @@ impl BarTrunk {
         source: Tensor,
     ) {
         let position = Tensor::from_slice(&[absolute_position]).to_device(token.device());
-        let mut x = Self::recirculate_residual(
-            &destination,
-            &source,
-            config,
-            absolute_position as usize,
-        );
+        let mut x =
+            Self::recirculate_residual(&destination, &source, config, absolute_position as usize);
         for (layer, layer_cache) in self
             .layers
             .iter()
@@ -1640,11 +1795,8 @@ impl BarTrunk {
         let mut x = token.shallow_clone();
         let mut destination = None;
         let mut source = None;
-        for (layer_index, (layer, layer_cache)) in self
-            .layers
-            .iter()
-            .zip(cache.layers.iter_mut())
-            .enumerate()
+        for (layer_index, (layer, layer_cache)) in
+            self.layers.iter().zip(cache.layers.iter_mut()).enumerate()
         {
             let (query, key, value) = layer.qkv(&rms_norm(&x));
             let kind = attention_kind(&x);
@@ -1690,7 +1842,6 @@ impl BarTrunk {
         cache.finish_append();
         Ok(belief)
     }
-
 
     fn decode(&self, token: &Tensor, cache: &mut BarKvCache) -> Tensor {
         assert_eq!(
@@ -2989,6 +3140,21 @@ mod tests {
             );
         }
 
+        // Recovery fields were added to metadata v8. Their serde defaults and empty canonical
+        // rendering keep every older v8 deployment sidecar byte-for-byte lineage compatible.
+        let mut legacy_value = serde_json::to_value(&metadata).expect("serialize metadata");
+        let legacy_object = legacy_value.as_object_mut().expect("metadata object");
+        legacy_object.remove("optimizer_checkpoint_sha256");
+        legacy_object.remove("optimizer_initialized_adamw");
+        legacy_object.remove("pretrain_recovery");
+        let legacy: BarWorldModelMetadata =
+            serde_json::from_value(legacy_value).expect("deserialize legacy metadata");
+        assert!(legacy.optimizer_checkpoint_sha256.is_none());
+        assert!(legacy.optimizer_initialized_adamw.is_empty());
+        assert!(legacy.pretrain_recovery.is_none());
+        legacy
+            .validate_schema()
+            .expect("legacy metadata remains lineage-compatible");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -3115,6 +3281,7 @@ mod tests {
         off_recipe.optimizer = Some(BarOptimizerProvenance {
             name: "NorMuon + AdamW".to_owned(),
             row_learned_lr: None,
+            ablation: None,
         });
         let mut on_recipe = off_recipe.clone();
         on_recipe
@@ -3122,29 +3289,21 @@ mod tests {
             .as_mut()
             .expect("optimizer provenance")
             .row_learned_lr = Some(BarRowLearnedLrProvenance {
-                c: 1.0,
-                controller_lr: 1e-3,
-                beta1: 0.9,
-                beta2: 0.999,
-                eps: 1e-8,
-                warmup_primary_steps: 100,
-                evidence_clip: 3.0,
-                evidence: "-mean(g_raw * delta_previous)".to_owned(),
-            });
-        let off_metadata = BarWorldModelMetadata::for_checkpoint_with(
-            &weights,
-            &[300],
-            300,
-            Some(off_recipe),
-        )
-        .expect("off optimizer provenance");
-        let on_metadata = BarWorldModelMetadata::for_checkpoint_with(
-            &weights,
-            &[300],
-            300,
-            Some(on_recipe),
-        )
-        .expect("enabled optimizer provenance");
+            c: 1.0,
+            controller_lr: 1e-3,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            warmup_primary_steps: 100,
+            evidence_clip: 3.0,
+            evidence: "-mean(g_raw * delta_previous)".to_owned(),
+        });
+        let off_metadata =
+            BarWorldModelMetadata::for_checkpoint_with(&weights, &[300], 300, Some(off_recipe))
+                .expect("off optimizer provenance");
+        let on_metadata =
+            BarWorldModelMetadata::for_checkpoint_with(&weights, &[300], 300, Some(on_recipe))
+                .expect("enabled optimizer provenance");
         assert_ne!(off_metadata.lineage_sha256, on_metadata.lineage_sha256);
         let sidecar = serde_json::to_value(on_metadata).expect("serialize controller provenance");
         assert_eq!(sidecar["training"]["optimizer"]["row_learned_lr"]["c"], 1.0);
@@ -3152,6 +3311,40 @@ mod tests {
             sidecar["training"]["optimizer"]["row_learned_lr"]["warmup_primary_steps"],
             100
         );
+
+        // Adding an absent ablation field must not move the production lineage: legacy JSON
+        // omits it, serde supplies None, and canonical rendering contributes no bytes.
+        let mut legacy_json =
+            serde_json::to_value(&off_metadata).expect("serialize production optimizer");
+        legacy_json["training"]["optimizer"]
+            .as_object_mut()
+            .expect("optimizer object")
+            .remove("ablation");
+        let legacy: BarWorldModelMetadata =
+            serde_json::from_value(legacy_json).expect("deserialize legacy optimizer");
+        assert_eq!(legacy.lineage_sha256, off_metadata.lineage_sha256);
+        assert!(!legacy.training_canonical().contains(";ablation="));
+
+        let mut smd_recipe = training_fixture(BarScoring::Density);
+        smd_recipe.optimizer = Some(BarOptimizerProvenance {
+            name: "batch-step Schraudolph SMD-IDBD".to_owned(),
+            row_learned_lr: None,
+            ablation: Some(BarOptimizerAblationProvenance {
+                variant: "smd-idbd".to_owned(),
+                initial_lr: 1e-3,
+                meta_lr: Some(0.05),
+                exact_hvp: true,
+                beta_bounds: Some((-10.0, 2.0)),
+                beta_update_clip: Some(2.0),
+            }),
+        });
+        let smd_metadata =
+            BarWorldModelMetadata::for_checkpoint_with(&weights, &[300], 300, Some(smd_recipe))
+                .expect("SMD optimizer provenance");
+        assert_ne!(smd_metadata.lineage_sha256, off_metadata.lineage_sha256);
+        let canonical = smd_metadata.training_canonical();
+        assert!(canonical.contains(";ablation=smd-idbd"));
+        assert!(canonical.contains("exact_hvp=true"));
 
         // An artifact that records no provenance at all is still distinguishable from every
         // recorded one, which is the point of hashing "none".

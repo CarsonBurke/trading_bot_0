@@ -3,7 +3,7 @@ use colored::{self, Colorize};
 use shared::{paths::RUNS_PATH, run_dir::RunDir};
 use trading_bot_0::torch::model::ModelVariant;
 use trading_bot_0::torch::planner::PlannerDataSplit;
-use trading_bot_0::torch::train::PretrainArgs;
+use trading_bot_0::torch::train::{PretrainArgs, PretrainOptimizerAblation};
 use trading_bot_0::{genetic, torch};
 
 /// Symbols to paper/live trade when the operator names none.
@@ -141,8 +141,17 @@ enum Commands {
     Pretrain {
         /// Initialize from an existing pretrain checkpoint. Weights only: training
         /// restarts at step zero with a fresh optimizer and schedule.
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "resume_checkpoint")]
         weights: Option<String>,
+
+        /// Continue model, optimizer, deterministic data cursor, and schedule state from an
+        /// interrupted primary-resolution run. Requires the checkpoint's `.optimizer.ot` and
+        /// `.metadata.json` sidecars. The new run starts a fresh reporting/promotion ledger.
+        #[arg(
+            long,
+            conflicts_with_all = ["weights", "auxiliary_resolutions"]
+        )]
+        resume_checkpoint: Option<String>,
 
         #[arg(long)]
         run: Option<String>,
@@ -209,6 +218,21 @@ enum Commands {
         /// Off by default. AdamW parameters and auxiliary-resolution updates remain static.
         #[arg(long, default_value_t = false)]
         sdlr: bool,
+        /// Strictly opt-in matched optimizer experiment. Absence preserves production
+        /// NorMuon + AdamW exactly.
+        #[arg(
+            long,
+            value_enum,
+            conflicts_with_all = ["sdlr", "auxiliary_resolutions"],
+            requires = "exact_batch"
+        )]
+        optimizer_ablation: Option<PretrainOptimizerAblation>,
+        /// Absolute initial learning rate for both fixed-SGD and SMD-IDBD.
+        #[arg(long, default_value_t = 1e-3)]
+        ablation_lr: f64,
+        /// Schraudolph SMD meta learning rate, used only by `--optimizer-ablation smd-idbd`.
+        #[arg(long, default_value_t = 0.05)]
+        smd_meta_lr: f64,
 
         /// Batch size at the first ramp stage. The declared ceiling for the later stages is
         /// 2x and 3x, but the ramp that RUNS is derived from a device capacity probe taken
@@ -1395,12 +1419,7 @@ fn enforce_cli_eval_budget(cli: &Cli) -> anyhow::Result<()> {
         }) => torch::train::eval_budget::enforce(
             "pretrain-kelly",
             "forecast row-steps",
-            eval_work_product([
-                *max_symbols,
-                *max_instants,
-                *forecast_horizon,
-                *samples,
-            ]),
+            eval_work_product([*max_symbols, *max_instants, *forecast_horizon, *samples]),
             50_000_000,
             allow,
         ),
@@ -1457,13 +1476,9 @@ fn enforce_cli_eval_budget(cli: &Cli) -> anyhow::Result<()> {
             20_000,
             allow,
         ),
-        Some(Commands::BarSplitSeams { .. }) => torch::train::eval_budget::enforce(
-            "bar-split-seams",
-            "full-corpus scans",
-            1,
-            0,
-            allow,
-        ),
+        Some(Commands::BarSplitSeams { .. }) => {
+            torch::train::eval_budget::enforce("bar-split-seams", "full-corpus scans", 1, 0, allow)
+        }
         _ => Ok(()),
     }
 }
@@ -1531,6 +1546,7 @@ async fn run() {
         }
         Some(Commands::Pretrain {
             weights,
+            resume_checkpoint,
             run,
             epochs,
             steps,
@@ -1559,9 +1575,13 @@ async fn run() {
             exact_batch,
             lr_plateau_fraction,
             sdlr,
+            optimizer_ablation,
+            ablation_lr,
+            smd_meta_lr,
         }) => {
             let args = PretrainArgs {
                 weights: weights.clone(),
+                resume_checkpoint: resume_checkpoint.clone(),
                 run: run.clone(),
                 epochs: *epochs,
                 steps: *steps,
@@ -1590,6 +1610,9 @@ async fn run() {
                 exact_batch: *exact_batch,
                 lr_plateau_fraction: *lr_plateau_fraction,
                 sdlr: *sdlr,
+                optimizer_ablation: *optimizer_ablation,
+                ablation_lr: *ablation_lr,
+                smd_meta_lr: *smd_meta_lr,
             };
             tokio::task::spawn_blocking(move || torch::train::pretrain(args))
                 .await
@@ -2186,10 +2209,19 @@ async fn run() {
 mod tests {
     use super::{
         default_paper_symbols, enforce_cli_eval_budget, Cli, Commands, PlannerDataSplit,
-        StreamingModelVariant,
+        PretrainOptimizerAblation, StreamingModelVariant,
     };
     use clap::Parser;
     use trading_bot_0::torch::model::ModelVariant;
+    fn with_large_cli_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("cli-contract".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn CLI contract")
+            .join()
+            .expect("CLI contract panicked");
+    }
 
     #[test]
     fn train_defaults_are_executable_contracts() {
@@ -2207,90 +2239,245 @@ mod tests {
     /// batch size sizes every ramp stage, and the step count must stay corpus-derived.
     #[test]
     fn pretrain_defaults_are_executable_contracts() {
-        let pretrain =
-            Cli::try_parse_from(["trading_bot", "pretrain"]).expect("pretrain should parse");
-        let Some(Commands::Pretrain {
-            epochs,
-            steps,
-            batch_size,
-            seed,
-            resolution_secs,
-            dyn_horizon,
-            lambda_dyn,
-            lambda_kl,
-            validation_windows,
-            diagnostic_context,
-            data_dir,
-            lr_plateau_fraction,
-            sdlr,
-            ..
-        }) = pretrain.command
-        else {
-            panic!("pretrain subcommand should parse as Pretrain");
-        };
-        // One, not three. `bardist_v2` ran at 3 because THIS default was 3 at that run's
-        // commit (a0ff3b29 changed it from 1 to 3), so three passes were deliberate rather
-        // than a bug — and deliberate is not correct. The corpus carries ~1.0M effective
-        // observations against 366M nominal bars and 31.8M parameters; passes above one
-        // re-present the same 1,031 sessions and add no market-factor realizations. The
-        // default is the recipe, so it is asserted here.
-        assert_eq!(epochs, 1);
-        assert_eq!(steps, None);
-        assert_eq!(batch_size, 24);
-        assert_eq!(seed, 0x5EED);
-        // The default must stay 0.40: every persisted comparison in `training/runs` was
-        // produced under it, so a run that does not pass the flag has to reproduce that
-        // schedule exactly.
-        assert_eq!(
-            lr_plateau_fraction,
-            trading_bot_0::torch::train::pretrain::LR_PLATEAU_FRACTION
-        );
-        assert_eq!(lr_plateau_fraction, 0.40);
-        assert!(!sdlr, "row learned learning rates must remain explicit opt-in");
-        assert_eq!(resolution_secs, 300);
-        // NextLat learns one transition at a time; long-horizon recursive diagnostics
-        // remain controlled independently by their fixed rollout horizon grid.
-        assert_eq!(dyn_horizon, 1);
-        // 1.0 is the NextLat reference's `lambda_mse` (arXiv 2511.05963,
-        // `defaults.yaml`), and under `next_lat_loss`'s `Reduction::Mean` over
-        // `[B, T, BAR_MODEL_DIM]` it is width-independent, so it stays 1.0 if
-        // `BAR_MODEL_DIM` ever moves.
-        //
-        // This assertion previously read `1.0 / BAR_MODEL_DIM`. That was the
-        // compensation for a summed feature axis, and the sum was REVERTED at
-        // `pretrain.rs:7859-7862` precisely because it made the knob width-dependent
-        // and took 62% of the objective while `nll` rose 16.34 -> 17.19 over 4000
-        // steps. The compensation is therefore obsolete: keeping it would have pinned
-        // the default at 1/512 of the reference under a mean reduction.
-        assert_eq!(lambda_dyn, 1.0);
-        assert_eq!(lambda_kl, 1.0);
-        assert_eq!(validation_windows, 4096);
-        assert_eq!(
-            diagnostic_context,
-            trading_bot_0::torch::train::pretrain::BAR_CONTEXT_RAMP_START
-        );
-        assert!(data_dir.ends_with("bars"), "{data_dir}");
-        assert_eq!(
-            trading_bot_0::torch::bar_dist::BarScoring::default(),
-            trading_bot_0::torch::bar_dist::BarScoring::Hard
-        );
-        assert!(
-            Cli::try_parse_from(["trading_bot", "pretrain", "--scoring", "density"]).is_err(),
-            "pretraining has one Hard categorical contract; Density is a diagnostic API, not \
+        with_large_cli_stack(|| {
+            let pretrain =
+                Cli::try_parse_from(["trading_bot", "pretrain"]).expect("pretrain should parse");
+            let Some(Commands::Pretrain {
+                epochs,
+                steps,
+                batch_size,
+                seed,
+                resolution_secs,
+                dyn_horizon,
+                lambda_dyn,
+                lambda_kl,
+                validation_windows,
+                diagnostic_context,
+                data_dir,
+                lr_plateau_fraction,
+                sdlr,
+                optimizer_ablation,
+                ablation_lr,
+                smd_meta_lr,
+                ..
+            }) = pretrain.command
+            else {
+                panic!("pretrain subcommand should parse as Pretrain");
+            };
+            // One, not three. `bardist_v2` ran at 3 because THIS default was 3 at that run's
+            // commit (a0ff3b29 changed it from 1 to 3), so three passes were deliberate rather
+            // than a bug — and deliberate is not correct. The corpus carries ~1.0M effective
+            // observations against 366M nominal bars and 31.8M parameters; passes above one
+            // re-present the same 1,031 sessions and add no market-factor realizations. The
+            // default is the recipe, so it is asserted here.
+            assert_eq!(epochs, 1);
+            assert_eq!(steps, None);
+            assert_eq!(batch_size, 24);
+            assert_eq!(seed, 0x5EED);
+            // The default must stay 0.40: every persisted comparison in `training/runs` was
+            // produced under it, so a run that does not pass the flag has to reproduce that
+            // schedule exactly.
+            assert_eq!(
+                lr_plateau_fraction,
+                trading_bot_0::torch::train::pretrain::LR_PLATEAU_FRACTION
+            );
+            assert_eq!(lr_plateau_fraction, 0.40);
+            assert!(
+                !sdlr,
+                "row learned learning rates must remain explicit opt-in"
+            );
+            assert_eq!(optimizer_ablation, None);
+            assert_eq!(ablation_lr, 1e-3);
+            assert_eq!(smd_meta_lr, 0.05);
+            assert_eq!(resolution_secs, 300);
+            // NextLat learns one transition at a time; long-horizon recursive diagnostics
+            // remain controlled independently by their fixed rollout horizon grid.
+            assert_eq!(dyn_horizon, 1);
+            // 1.0 is the NextLat reference's `lambda_mse` (arXiv 2511.05963,
+            // `defaults.yaml`), and under `next_lat_loss`'s `Reduction::Mean` over
+            // `[B, T, BAR_MODEL_DIM]` it is width-independent, so it stays 1.0 if
+            // `BAR_MODEL_DIM` ever moves.
+            //
+            // This assertion previously read `1.0 / BAR_MODEL_DIM`. That was the
+            // compensation for a summed feature axis, and the sum was REVERTED at
+            // `pretrain.rs:7859-7862` precisely because it made the knob width-dependent
+            // and took 62% of the objective while `nll` rose 16.34 -> 17.19 over 4000
+            // steps. The compensation is therefore obsolete: keeping it would have pinned
+            // the default at 1/512 of the reference under a mean reduction.
+            assert_eq!(lambda_dyn, 1.0);
+            assert_eq!(lambda_kl, 1.0);
+            assert_eq!(validation_windows, 4096);
+            assert_eq!(
+                diagnostic_context,
+                trading_bot_0::torch::train::pretrain::BAR_CONTEXT_RAMP_START
+            );
+            assert!(data_dir.ends_with("bars"), "{data_dir}");
+            assert_eq!(
+                trading_bot_0::torch::bar_dist::BarScoring::default(),
+                trading_bot_0::torch::bar_dist::BarScoring::Hard
+            );
+            assert!(
+                Cli::try_parse_from(["trading_bot", "pretrain", "--scoring", "density"]).is_err(),
+                "pretraining has one Hard categorical contract; Density is a diagnostic API, not \
              a training/selection CLI objective"
-        );
+            );
+        });
     }
 
     #[test]
     fn pretrain_sdlr_is_explicitly_reachable() {
-        let cli = Cli::try_parse_from(["trading_bot", "pretrain", "--sdlr"])
-            .expect("the SDLR opt-in should parse");
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Pretrain { sdlr: true, .. })
-        ));
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from(["trading_bot", "pretrain", "--sdlr"])
+                .expect("the SDLR opt-in should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Pretrain { sdlr: true, .. })
+            ));
+        });
     }
 
+    #[test]
+    fn pretrain_fixed_sgd_ablation_is_explicit() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "pretrain",
+                "--optimizer-ablation",
+                "fixed-sgd",
+                "--ablation-lr",
+                "0.002",
+                "--exact-batch",
+            ])
+            .expect("fixed SGD ablation should parse");
+            let Some(Commands::Pretrain {
+                optimizer_ablation,
+                ablation_lr,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected fixed-SGD pretrain command");
+            };
+            assert_eq!(
+                optimizer_ablation,
+                Some(PretrainOptimizerAblation::FixedSgd)
+            );
+            assert_eq!(ablation_lr, 0.002);
+        });
+    }
+
+    #[test]
+    fn pretrain_smd_idbd_ablation_is_explicit() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "pretrain",
+                "--optimizer-ablation",
+                "smd-idbd",
+                "--smd-meta-lr",
+                "0.1",
+                "--exact-batch",
+            ])
+            .expect("SMD-IDBD ablation should parse");
+            let Some(Commands::Pretrain {
+                optimizer_ablation,
+                smd_meta_lr,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected SMD-IDBD pretrain command");
+            };
+            assert_eq!(optimizer_ablation, Some(PretrainOptimizerAblation::SmdIdbd));
+            assert_eq!(smd_meta_lr, 0.1);
+        });
+    }
+
+    #[test]
+    fn pretrain_optimizer_ablation_requires_exact_batch() {
+        with_large_cli_stack(|| {
+            assert!(Cli::try_parse_from([
+                "trading_bot",
+                "pretrain",
+                "--optimizer-ablation",
+                "fixed-sgd",
+            ])
+            .is_err());
+        });
+    }
+
+    #[test]
+    fn pretrain_optimizer_ablation_conflicts_are_rejected() {
+        with_large_cli_stack(|| {
+            for conflicting in [
+                vec![
+                    "trading_bot",
+                    "pretrain",
+                    "--optimizer-ablation",
+                    "fixed-sgd",
+                    "--sdlr",
+                ],
+                vec![
+                    "trading_bot",
+                    "pretrain",
+                    "--optimizer-ablation",
+                    "smd-idbd",
+                    "--auxiliary-resolutions",
+                    "86400",
+                ],
+            ] {
+                assert!(
+                    Cli::try_parse_from(conflicting).is_err(),
+                    "optimizer ablations must reject SDLR and auxiliary-resolution combinations"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn pretrain_resume_is_distinct_and_primary_resolution_only() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "pretrain",
+                "--resume-checkpoint",
+                "weights/pretrain_last.ot",
+            ])
+            .expect("primary-resolution recovery should parse");
+            let Some(Commands::Pretrain {
+                resume_checkpoint,
+                weights,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected pretrain command");
+            };
+            assert_eq!(
+                resume_checkpoint.as_deref(),
+                Some("weights/pretrain_last.ot")
+            );
+            assert!(weights.is_none());
+
+            for conflicting in [
+                vec![
+                    "trading_bot",
+                    "pretrain",
+                    "--resume-checkpoint",
+                    "weights/pretrain_last.ot",
+                    "--weights",
+                    "weights/pretrain_best.ot",
+                ],
+                vec![
+                    "trading_bot",
+                    "pretrain",
+                    "--resume-checkpoint",
+                    "weights/pretrain_last.ot",
+                    "--auxiliary-resolutions",
+                    "86400",
+                ],
+            ] {
+                assert!(Cli::try_parse_from(conflicting).is_err());
+            }
+        });
+    }
     #[test]
     fn pretrain_recirculate_defaults_pin_the_two_stage_contract() {
         let cli = Cli::try_parse_from([

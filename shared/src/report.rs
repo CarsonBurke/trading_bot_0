@@ -65,6 +65,9 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // different scales and failure signatures.
     "pretrain_sdlr_alpha",
     "pretrain_sdlr_evidence",
+    // Strictly opt-in batch-step Schraudolph SMD-IDBD diagnostics.
+    "pretrain_smd_idbd_gain",
+    "pretrain_smd_idbd_credit",
     "pretrain_grad_norm",
     "pretrain_unique_bar_reuse",
     "pretrain_stage_coverage",

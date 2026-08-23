@@ -1194,6 +1194,12 @@ mod planner_inference_discovery_tests {
                 "{sdlr} must be discoverable whenever centered outcome-LR is enabled"
             );
         }
+        for smd in ["pretrain_smd_idbd_gain", "pretrain_smd_idbd_credit"] {
+            assert!(
+                bases.contains(&smd),
+                "{smd} must be discoverable whenever batch-step SMD-IDBD is enabled"
+            );
+        }
         assert!(
             !bases.contains(&"pretrain_rollout_nll"),
             "the unlabeled teacher-forced rollout base must not survive the clean cutover"
