@@ -283,6 +283,10 @@ pub struct BarTrainingProvenance {
     /// reason: a checkpoint cannot be relabelled with a mode it was not trained under, and
     /// `pretrain-compare` refuses to pair two runs that disagree.
     pub scoring: String,
+    /// Opt-in categorical beta-NLL training objective. `None` is proper Hard categorical
+    /// NLL and contributes no lineage suffix, preserving legacy hashes.
+    #[serde(default)]
+    pub beta_nll: Option<BarBetaNllProvenance>,
     /// Context length, in bars, of the held-out set the promotion decision was actually
     /// taken on.
     ///
@@ -397,6 +401,12 @@ pub struct BarOptimizerAblationProvenance {
     #[serde(default)]
     pub beta_update_clip: Option<f64>,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BarBetaNllProvenance {
+    pub exponent: f64,
+    pub variance_normalization: String,
+    pub variance_floor_ratio: f64,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BarPretrainRecovery {
@@ -415,6 +425,9 @@ pub struct BarPretrainRecovery {
     pub dyn_horizon: usize,
     pub lambda_dyn: f64,
     pub lambda_kl: f64,
+    /// Opt-in categorical beta-NLL exponent. `None` is the production proper-NLL objective.
+    #[serde(default)]
+    pub beta_nll: Option<f64>,
     #[serde(default)]
     pub auxiliary_resolutions: Vec<u32>,
     pub checkpoint_every: usize,
@@ -733,11 +746,22 @@ impl BarWorldModelMetadata {
                 optimizer.name
             )
         });
+        let beta_nll_suffix = training
+            .beta_nll
+            .as_ref()
+            .map_or_else(String::new, |beta_nll| {
+                format!(
+                ";beta_nll=exponent:{:016x},variance_normalization:{},variance_floor_ratio:{:016x}",
+                beta_nll.exponent.to_bits(),
+                beta_nll.variance_normalization,
+                beta_nll.variance_floor_ratio.to_bits(),
+            )
+            });
         format!(
             "corpus={};bounds={}:{};pinned={};eval_seed={:016x};train_seed={:016x};\
              metric={};weights={};guard={}@{:016x};min_dollar_volume_bits={:016x};symbols={};\
              supports_frozen={};supports_corpus={};universe={};universe_train_end={};\
-             scoring={};context={}@{}/{};batch_ramp={}{}{}",
+             scoring={};context={}@{}/{};batch_ramp={}{}{}{}",
             training.corpus_fingerprint,
             training.split_bounds.0,
             training.split_bounds.1,
@@ -790,6 +814,7 @@ impl BarWorldModelMetadata {
                 )
             },
             optimizer_suffix,
+            beta_nll_suffix,
         )
     }
 
@@ -810,8 +835,11 @@ impl BarWorldModelMetadata {
                     .join(",")
             )
         };
+        let beta_nll_suffix = recovery.beta_nll.map_or_else(String::new, |beta| {
+            format!(",beta_nll={:016x}", beta.to_bits())
+        });
         format!(
-            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=total_steps={},stage_steps={}{},base_batch={},requested_batch={},exact_batch={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},auxiliary_resolutions={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}",
+            ";optimizer_checkpoint_sha256={};optimizer_initialized_adamw={};recovery=total_steps={},stage_steps={}{},base_batch={},requested_batch={},exact_batch={},epochs={},steps_override={},dyn_horizon={},lambda_dyn={:016x},lambda_kl={:016x},auxiliary_resolutions={},checkpoint_every={},validate_every={},ablation_lr={:016x},smd_meta_lr={:016x}{}",
             self.optimizer_checkpoint_sha256.as_deref().unwrap_or("none"),
             self.optimizer_initialized_adamw.join(","),
             recovery.total_steps,
@@ -842,6 +870,7 @@ impl BarWorldModelMetadata {
             recovery.validate_every,
             recovery.ablation_lr.to_bits(),
             recovery.smd_meta_lr.to_bits(),
+            beta_nll_suffix,
         )
     }
 
@@ -3191,6 +3220,7 @@ mod tests {
             corpus_fingerprint: "c0ffee".to_owned(),
             split_bounds: (1_759_839_000_000, 1_773_427_500_000),
             split_bounds_pinned: true,
+
             eval_window_seed: 0xE7A1_5E7D_0001,
             train_seed: 0x5EED,
             selection_metric: "nll_bar_conditional".to_owned(),
@@ -3204,6 +3234,7 @@ mod tests {
             universe_fingerprint: None,
             universe_train_end_ms: None,
             scoring: scoring.to_string(),
+            beta_nll: None,
             selection_context: BAR_MAX_CONTEXT,
             deployed_context: BAR_MAX_CONTEXT,
             reached_context: BAR_MAX_CONTEXT,
@@ -3216,6 +3247,52 @@ mod tests {
             lr_plateau_fraction: 0.40,
             optimizer: None,
         }
+    }
+    #[test]
+    fn beta_nll_objective_is_lineage_bound_and_legacy_absence_is_stable() {
+        let _torch_rng_guard = test_rng::exclusive();
+        let dir = temp_dir("beta_nll_lineage");
+        let supports = synthetic_supports();
+        let (weights, _metadata_path, _vs) = write_fixture(&dir, &supports);
+        let baseline = BarWorldModelMetadata::for_checkpoint_with(
+            &weights,
+            &[300],
+            300,
+            Some(training_fixture(BarScoring::Hard)),
+        )
+        .expect("baseline metadata");
+        baseline
+            .validate_schema()
+            .expect("legacy absent beta-NLL field remains valid");
+
+        let mut training = training_fixture(BarScoring::Hard);
+        training.beta_nll = Some(BarBetaNllProvenance {
+            exponent: 0.5,
+            variance_normalization:
+                "fitted categorical predictive variance / train-marginal variance".to_owned(),
+            variance_floor_ratio: 1.0e-6,
+        });
+        let beta =
+            BarWorldModelMetadata::for_checkpoint_with(&weights, &[300], 300, Some(training))
+                .expect("beta-NLL metadata");
+        beta.validate_schema().expect("beta-NLL metadata validates");
+        assert_ne!(
+            baseline.lineage_sha256, beta.lineage_sha256,
+            "changing the training objective must change model lineage"
+        );
+
+        let mut tampered = beta;
+        tampered
+            .training
+            .as_mut()
+            .and_then(|training| training.beta_nll.as_mut())
+            .expect("beta-NLL provenance")
+            .exponent = 0.75;
+        assert!(
+            tampered.validate_schema().is_err(),
+            "editing the beta exponent after writing must invalidate lineage"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3246,6 +3323,7 @@ mod tests {
                 dyn_horizon: 1,
                 lambda_dyn: 1.0,
                 lambda_kl: 1.0,
+                beta_nll: None,
                 auxiliary_resolutions: Vec::new(),
                 checkpoint_every: 32,
                 validate_every: 64,

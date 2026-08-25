@@ -214,6 +214,15 @@ enum Commands {
         /// test-split report, because a schedule nobody recorded explains no number later.
         #[arg(long, default_value_t = trading_bot_0::torch::train::pretrain::LR_PLATEAU_FRACTION)]
         lr_plateau_fraction: f64,
+        /// Opt-in categorical beta-NLL exponent. Reweights each per-factor Hard NLL by the
+        /// detached predicted variance relative to that factor's train-marginal variance.
+        /// Absence preserves proper Hard categorical NLL exactly.
+        #[arg(
+            long,
+            requires = "exact_batch",
+            conflicts_with_all = ["sdlr", "optimizer_ablation", "auxiliary_resolutions"]
+        )]
+        beta_nll: Option<f64>,
         /// Enable signed-delta row-wise learned learning rates on Muon-routed matrices.
         /// Off by default. AdamW parameters and auxiliary-resolution updates remain static.
         #[arg(long, default_value_t = false)]
@@ -1574,6 +1583,7 @@ async fn run() {
             min_dollar_volume,
             exact_batch,
             lr_plateau_fraction,
+            beta_nll,
             sdlr,
             optimizer_ablation,
             ablation_lr,
@@ -1609,6 +1619,7 @@ async fn run() {
                 min_dollar_volume: *min_dollar_volume,
                 exact_batch: *exact_batch,
                 lr_plateau_fraction: *lr_plateau_fraction,
+                beta_nll: *beta_nll,
                 sdlr: *sdlr,
                 optimizer_ablation: *optimizer_ablation,
                 ablation_lr: *ablation_lr,
@@ -2255,6 +2266,7 @@ mod tests {
                 diagnostic_context,
                 data_dir,
                 lr_plateau_fraction,
+                beta_nll,
                 sdlr,
                 optimizer_ablation,
                 ablation_lr,
@@ -2282,6 +2294,7 @@ mod tests {
                 trading_bot_0::torch::train::pretrain::LR_PLATEAU_FRACTION
             );
             assert_eq!(lr_plateau_fraction, 0.40);
+            assert_eq!(beta_nll, None);
             assert!(
                 !sdlr,
                 "row learned learning rates must remain explicit opt-in"
@@ -2388,6 +2401,52 @@ mod tests {
             };
             assert_eq!(optimizer_ablation, Some(PretrainOptimizerAblation::SmdIdbd));
             assert_eq!(smd_meta_lr, 0.1);
+        });
+    }
+
+    #[test]
+    fn pretrain_beta_nll_is_explicit_and_isolated() {
+        with_large_cli_stack(|| {
+            let cli = Cli::try_parse_from([
+                "trading_bot",
+                "pretrain",
+                "--beta-nll",
+                "0.5",
+                "--exact-batch",
+            ])
+            .expect("categorical beta-NLL should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Pretrain {
+                    beta_nll: Some(0.5),
+                    ..
+                })
+            ));
+            for conflicting in [
+                vec!["trading_bot", "pretrain", "--beta-nll", "0.5"],
+                vec![
+                    "trading_bot",
+                    "pretrain",
+                    "--beta-nll",
+                    "0.5",
+                    "--exact-batch",
+                    "--sdlr",
+                ],
+                vec![
+                    "trading_bot",
+                    "pretrain",
+                    "--beta-nll",
+                    "0.5",
+                    "--exact-batch",
+                    "--optimizer-ablation",
+                    "fixed-sgd",
+                ],
+            ] {
+                assert!(
+                    Cli::try_parse_from(conflicting).is_err(),
+                    "beta-NLL must remain a one-variable exact-batch ablation"
+                );
+            }
         });
     }
 

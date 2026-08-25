@@ -43,9 +43,9 @@ use tch::{autocast, nn, Device, Kind, Reduction, Tensor};
 use crate::torch::bar_dist::{
     bar_categorical_kl, bar_crps_from_logits, bar_nll_decomposition, bar_nll_from_logits,
     bar_nll_terms, bar_pit_from_logits, bar_supports_format_version, BarScoring, BarSupports,
-    BarSupportsProvenance, BAR_DOF, BAR_DOF_NAMES, BAR_EMISSION_ADAMW_NAME_SUBSTRINGS,
-    BAR_SUPPORTS_FORMAT_VERSION, BAR_SUPPORTS_MOMENTS_VERSION, DOF_R, DOF_S, DOF_U, DOF_V,
-    NUM_BAR_BINS,
+    BarSupportsProvenance, CategoricalBetaNll, BAR_DOF, BAR_DOF_NAMES,
+    BAR_EMISSION_ADAMW_NAME_SUBSTRINGS, BAR_SUPPORTS_FORMAT_VERSION, BAR_SUPPORTS_MOMENTS_VERSION,
+    BETA_NLL_VARIANCE_FLOOR_RATIO, DOF_R, DOF_S, DOF_U, DOF_V, NUM_BAR_BINS,
 };
 use crate::torch::cuda::cfg::configure_cuda;
 use crate::torch::dataset::{
@@ -63,7 +63,7 @@ use crate::torch::optim::muon::{
 use crate::torch::world_model::{
     bar_adamw_embedding_substrings, bar_adamw_scalar_substrings,
     bar_muon_down_projection_substrings, bar_muon_name_substrings, world_model_metadata_path,
-    world_model_optimizer_path, world_model_supports_path, BarModules,
+    world_model_optimizer_path, world_model_supports_path, BarBetaNllProvenance, BarModules,
     BarOptimizerAblationProvenance, BarOptimizerProvenance, BarPretrainRecovery,
     BarRowLearnedLrProvenance, BarSupportSet, BarTrainingProvenance, BarWorldModel,
     BarWorldModelMetadata, RolloutMode, BAR_ARCHITECTURE, BAR_LAYERS, BAR_MAX_CONTEXT,
@@ -755,6 +755,11 @@ pub struct PretrainArgs {
     /// of an algebraic identity, and the value is recorded in the checkpoint metadata and in
     /// the run's report so a future reader can tell which schedule produced a number.
     pub lr_plateau_fraction: f64,
+    /// Exponent for the categorical beta-NLL ablation. Absence keeps the proper Hard
+    /// categorical NLL objective exactly. Present values lie in `(0, 1]` and reweight each
+    /// per-factor Hard NLL by the detached predicted variance relative to that factor's
+    /// train-marginal variance.
+    pub beta_nll: Option<f64>,
     /// Enable row-wise signed-delta learning-rate adaptation for Muon-routed matrices.
     /// Disabled by default; AdamW parameters and auxiliary-resolution updates are excluded.
     pub sdlr: bool,
@@ -1336,6 +1341,7 @@ fn probe_shape_used_bytes(
     modules: &BarModules,
     supports: &BarSupports,
     growth_support: &GrowthSupport,
+    beta_nll: Option<&CategoricalBetaNll>,
     sample: &BarBatch,
     args: &PretrainArgs,
     optimizer: &mut PretrainOptimizer,
@@ -1355,6 +1361,7 @@ fn probe_shape_used_bytes(
                 args.dyn_horizon as i64,
                 args.lambda_dyn,
                 args.lambda_kl,
+                beta_nll,
                 BarScoring::Hard,
                 device,
             )
@@ -1384,6 +1391,7 @@ fn probe_capacity(
     modules: &BarModules,
     supports: &BarSupports,
     growth_support: &GrowthSupport,
+    beta_nll: Option<&CategoricalBetaNll>,
     sampler: &BarSampler,
     optimizer: &mut PretrainOptimizer,
     args: &PretrainArgs,
@@ -1409,6 +1417,7 @@ fn probe_capacity(
             modules,
             supports,
             growth_support,
+            beta_nll,
             &sample,
             args,
             optimizer,
@@ -1755,6 +1764,10 @@ fn preflight_resume(args: &PretrainArgs) -> Result<Option<PretrainResume>> {
         "checkpoint or validation cadence mismatch with resume checkpoint"
     );
     ensure!(
+        args.beta_nll.map(f64::to_bits) == recovery.beta_nll.map(f64::to_bits),
+        "--beta-nll mismatch with resume checkpoint"
+    );
+    ensure!(
         args.ablation_lr.to_bits() == recovery.ablation_lr.to_bits()
             && args.smd_meta_lr.to_bits() == recovery.smd_meta_lr.to_bits(),
         "optimizer hyperparameters mismatch with resume checkpoint"
@@ -1880,6 +1893,11 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
 
     let (supports, supports_frozen) = fit_supports(&corpus, &args, &corpus_fingerprint)?;
     let supports_dev = supports.to_device(device);
+    let beta_nll = args
+        .beta_nll
+        .map(|beta| supports_dev.categorical_beta_nll(beta))
+        .transpose()
+        .context("failed constructing categorical beta-NLL geometry")?;
     // Before the capacity probe, because the detached diagnostic is part of the measured
     // step footprint. Construction also validates the fitted raw-payoff law before the run.
     let growth_deployment = GrowthSupport::new(&supports_dev, device)
@@ -1988,6 +2006,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
             &modules,
             &supports_dev,
             &growth_deployment,
+            beta_nll.as_ref(),
             &train_samplers[RAMP_STAGES - 1],
             &mut optimizer,
             &args,
@@ -2245,6 +2264,7 @@ fn build_trainer(mut args: PretrainArgs, runs_root: &str, device: Device) -> Res
         run,
         supports,
         supports_dev,
+        beta_nll,
         support_set_dev,
         growth_supports,
         vs,
@@ -3652,6 +3672,27 @@ fn validate_args(args: &PretrainArgs) -> Result<()> {
          than extreme ones, so they are refused at the boundary instead of clamped.",
         args.lr_plateau_fraction
     );
+    if let Some(beta) = args.beta_nll {
+        ensure!(
+            beta.is_finite() && beta > 0.0 && beta <= 1.0,
+            "--beta-nll must lie in (0, 1], got {beta}"
+        );
+        ensure!(
+            args.exact_batch,
+            "--beta-nll requires --exact-batch so the objective arm retains the declared batch \
+             and matched global target-step accounting"
+        );
+        ensure!(
+            !args.sdlr && args.optimizer_ablation.is_none(),
+            "--beta-nll conflicts with optimizer experiments; vary one training mechanism at a \
+             time"
+        );
+        ensure!(
+            args.auxiliary_resolutions.is_empty(),
+            "--beta-nll supports only the primary resolution so every variance weight uses one \
+             fitted support geometry"
+        );
+    }
     ensure!(
         args.ablation_lr.is_finite() && args.ablation_lr > 0.0,
         "--ablation-lr must be finite and positive, got {}",
@@ -4465,6 +4506,9 @@ struct Trainer {
     run: RunDir,
     supports: BarSupports,
     supports_dev: BarSupports,
+    /// Device-resident fitted-moment geometry for the opt-in categorical beta-NLL objective.
+    /// `None` is the production proper-NLL path and performs no beta-specific arithmetic.
+    beta_nll: Option<CategoricalBetaNll>,
     /// Device-resident support set. One entry today; the row-routing set is what
     /// `rollout_beliefs` and a future merged-resolution corpus need.
     support_set_dev: BarSupportSet,
@@ -4644,6 +4688,10 @@ struct Trainer {
 struct StepLoss {
     nll_bar: f64,
     nll_dof: [f64; BAR_DOF],
+    /// Likelihood term attached to the optimizer. Equal to `nll_bar` outside beta-NLL.
+    objective_nll: f64,
+    beta_weight_mean_dof: [f64; BAR_DOF],
+    beta_variance_floor_share_dof: [f64; BAR_DOF],
     dyn_loss: f64,
     kl_loss: f64,
     /// Training-batch mean raw-payoff growth diagnostic in nats per bar under the deployed
@@ -4994,6 +5042,11 @@ impl Trainer {
             metrics.step = step;
             metrics.nll_bar = loss.nll_bar;
             metrics.nll_dof = loss.nll_dof;
+            if self.beta_nll.is_some() {
+                metrics.beta_nll_objective = loss.objective_nll;
+                metrics.beta_nll_weight_mean_dof = loss.beta_weight_mean_dof;
+                metrics.beta_nll_variance_floor_share_dof = loss.beta_variance_floor_share_dof;
+            }
             metrics.dyn_loss = loss.dyn_loss;
             metrics.kl_loss = loss.kl_loss;
             metrics.total_loss = loss.total;
@@ -5607,6 +5660,7 @@ impl Trainer {
                 &self.growth_supports[1 + index],
             ),
         };
+        let beta_nll = stream.is_none().then_some(self.beta_nll.as_ref()).flatten();
 
         self.optimizer.zero_grad();
         let graph = autocast(self.device.is_cuda(), || {
@@ -5620,6 +5674,7 @@ impl Trainer {
                 horizon,
                 lambda_dyn,
                 lambda_kl,
+                beta_nll,
                 BarScoring::Hard,
                 self.device,
             )
@@ -5644,6 +5699,15 @@ impl Trainer {
         let nll_value = metrics[STEP_METRIC_NLL];
         let mut nll_dof = [f64::NAN; BAR_DOF];
         nll_dof.copy_from_slice(&metrics[STEP_METRIC_NLL_DOF]);
+        let objective_nll = if metrics[STEP_METRIC_BETA_NLL_OBJECTIVE].is_finite() {
+            metrics[STEP_METRIC_BETA_NLL_OBJECTIVE]
+        } else {
+            nll_value
+        };
+        let mut beta_weight_mean_dof = [f64::NAN; BAR_DOF];
+        beta_weight_mean_dof.copy_from_slice(&metrics[STEP_METRIC_BETA_NLL_WEIGHT]);
+        let mut beta_variance_floor_share_dof = [f64::NAN; BAR_DOF];
+        beta_variance_floor_share_dof.copy_from_slice(&metrics[STEP_METRIC_BETA_NLL_FLOOR]);
         let dyn_value = metrics[STEP_METRIC_DYN];
         let kl_value = metrics[STEP_METRIC_KL];
         let growth_value = metrics[STEP_METRIC_GROWTH_DIAGNOSTIC];
@@ -5675,14 +5739,17 @@ impl Trainer {
         Ok(StepLoss {
             nll_bar: nll_value,
             nll_dof,
+            objective_nll,
+            beta_weight_mean_dof,
+            beta_variance_floor_share_dof,
             dyn_loss: dyn_value,
             kl_loss: kl_value,
             growth_diagnostic: growth_value,
             growth_stats,
             total,
-            // Hard categorical NLL has no support-measure offset: the reported primary loss
-            // is exactly the quantity whose magnitude enters this denominator.
-            shares: loss_shares(nll_value, lambda_dyn * dyn_value, lambda_kl * kl_value),
+            // The likelihood share follows the term actually attached to the optimizer.
+            // Validation and promotion still read the separate proper Hard NLL.
+            shares: loss_shares(objective_nll, lambda_dyn * dyn_value, lambda_kl * kl_value),
             belief_autocorr: autocorr,
             // A zero-init dynamics MLP is exactly the identity, so the ratio starts at 1.0
             // by construction and any departure is the MLP doing something. A degenerate
@@ -6590,6 +6657,7 @@ impl Trainer {
             dyn_horizon: self.args.dyn_horizon,
             lambda_dyn: self.args.lambda_dyn,
             lambda_kl: self.args.lambda_kl,
+            beta_nll: self.args.beta_nll,
             auxiliary_resolutions: self.args.auxiliary_resolutions.clone(),
             checkpoint_every: self.args.checkpoint_every,
             validate_every: self.args.validate_every,
@@ -7038,6 +7106,13 @@ impl Trainer {
                 .provenance()
                 .map(|p| p.corpus_fingerprint.clone()),
             scoring: BarScoring::Hard.to_string(),
+            beta_nll: self.args.beta_nll.map(|exponent| BarBetaNllProvenance {
+                exponent,
+                variance_normalization:
+                    "fitted categorical predictive variance / train-marginal variance"
+                        .to_owned(),
+                variance_floor_ratio: BETA_NLL_VARIANCE_FLOOR_RATIO,
+            }),
             // The context this artifact's selection was actually taken at, beside the one it
             // is meant to be deployed at. They differ only when the ramp never got there, and
             // that difference is the difference between a deployable artifact and one that is
@@ -8839,8 +8914,14 @@ fn next_lat_loss(predicted: &Tensor, target: &Tensor) -> Tensor {
 /// One optimizer step's graph, still attached.
 struct TrainingGraph {
     loss: Tensor,
+    /// Proper Hard categorical NLL, always used for reporting, validation and promotion.
     nll: Tensor,
     nll_dof: Tensor,
+    /// Likelihood term actually attached to the optimizer. Present only for beta-NLL;
+    /// production uses `nll` directly without a clone or beta-specific allocation.
+    objective_nll: Option<Tensor>,
+    /// Per-DOF detached mean beta weights and variance-floor shares. Absent on production.
+    beta_diagnostics: Option<(Tensor, Tensor)>,
     dyn_loss: Tensor,
     kl_loss: Tensor,
     /// Detached raw-payoff diagnostic under the deployed cap, including the explicit
@@ -8869,6 +8950,7 @@ fn forward_losses(
     horizon: i64,
     lambda_dyn: f64,
     lambda_kl: f64,
+    beta_nll: Option<&CategoricalBetaNll>,
     scoring: BarScoring,
     device: Device,
 ) -> TrainingGraph {
@@ -8905,7 +8987,21 @@ fn forward_losses(
     } else {
         supports.targets_from_class_ids(&target_bins, scoring)
     };
-    let (nll, nll_dof) = bar_nll_from_logits(&logits, &targets);
+    let (objective_nll, nll, nll_dof, beta_diagnostics) = match beta_nll {
+        Some(beta_nll) => {
+            let beta = beta_nll.loss(&logits, &targets);
+            (
+                Some(beta.objective),
+                beta.proper_nll,
+                beta.proper_nll_dof,
+                Some((beta.weight_mean_dof, beta.variance_floor_share_dof)),
+            )
+        }
+        None => {
+            let (nll, nll_dof) = bar_nll_from_logits(&logits, &targets);
+            (None, nll, nll_dof, None)
+        }
+    };
 
     let (dyn_loss, kl_loss, identity) = dynamics_losses(
         modules, dof, &bins, time_ids, &beliefs, context, horizon, device,
@@ -8925,11 +9021,14 @@ fn forward_losses(
         )
     });
     let autocorr = belief_autocorrelation(&beliefs);
-    let loss = &nll + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss;
+    let likelihood = objective_nll.as_ref().unwrap_or(&nll);
+    let loss = likelihood + lambda_dyn * &dyn_loss + lambda_kl * &kl_loss;
     TrainingGraph {
         loss,
         nll,
         nll_dof,
+        objective_nll,
+        beta_diagnostics,
         dyn_loss,
         kl_loss,
         growth_diagnostic,
@@ -9304,12 +9403,20 @@ const STEP_METRIC_ROW_LR: std::ops::Range<usize> =
     STEP_METRIC_BASE_COUNT..STEP_METRIC_BASE_COUNT + ROW_LR_METRIC_COUNT;
 const STEP_METRIC_SMD_IDBD: std::ops::Range<usize> =
     STEP_METRIC_ROW_LR.end..STEP_METRIC_ROW_LR.end + SMD_METRIC_COUNT;
-const STEP_METRIC_COUNT: usize = STEP_METRIC_SMD_IDBD.end;
+const STEP_METRIC_BETA_NLL: std::ops::Range<usize> =
+    STEP_METRIC_SMD_IDBD.end..STEP_METRIC_SMD_IDBD.end + 1 + 2 * BAR_DOF;
+const STEP_METRIC_BETA_NLL_OBJECTIVE: usize = STEP_METRIC_BETA_NLL.start;
+const STEP_METRIC_BETA_NLL_WEIGHT: std::ops::Range<usize> =
+    STEP_METRIC_BETA_NLL_OBJECTIVE + 1..STEP_METRIC_BETA_NLL_OBJECTIVE + 1 + BAR_DOF;
+const STEP_METRIC_BETA_NLL_FLOOR: std::ops::Range<usize> =
+    STEP_METRIC_BETA_NLL_WEIGHT.end..STEP_METRIC_BETA_NLL_WEIGHT.end + BAR_DOF;
+const STEP_METRIC_COUNT: usize = STEP_METRIC_BETA_NLL.end;
 
-/// Pack every device-resident scalar read by one optimizer step. The production path retains
-/// its original packet exactly. SMD diagnostics describe the pending update and occupy the
-/// same single transfer; the unused row-controller slots are device-side NaNs so every metric
-/// keeps one fixed index.
+/// Pack every device-resident scalar read by one optimizer step.
+///
+/// The production packet is byte-for-byte unchanged. Optional segments are appended in fixed
+/// order; a later segment supplies NaN placeholders for absent earlier segments, so one host
+/// transfer remains sufficient without allocating placeholders on the production path.
 fn pack_step_metrics(
     graph: &TrainingGraph,
     grad_norm: &Tensor,
@@ -9317,6 +9424,7 @@ fn pack_step_metrics(
     smd_metrics: Option<&Tensor>,
 ) -> Tensor {
     let flat_f32 = |tensor: &Tensor| tensor.detach().to_kind(Kind::Float).reshape([-1]);
+    let beta_metrics = graph.beta_diagnostics.as_ref();
 
     let base = [
         flat_f32(&graph.loss),
@@ -9333,7 +9441,7 @@ fn pack_step_metrics(
     let mut tensors = Vec::from(base);
     if let Some(metrics) = row_lr_metrics {
         tensors.push(flat_f32(metrics));
-    } else if smd_metrics.is_some() {
+    } else if smd_metrics.is_some() || beta_metrics.is_some() {
         tensors.push(Tensor::full(
             [ROW_LR_METRIC_COUNT as i64],
             f64::NAN,
@@ -9342,6 +9450,22 @@ fn pack_step_metrics(
     }
     if let Some(metrics) = smd_metrics {
         tensors.push(flat_f32(metrics));
+    } else if beta_metrics.is_some() {
+        tensors.push(Tensor::full(
+            [SMD_METRIC_COUNT as i64],
+            f64::NAN,
+            (Kind::Float, graph.loss.device()),
+        ));
+    }
+    if let Some((weight_mean_dof, floor_share_dof)) = beta_metrics {
+        tensors.push(flat_f32(
+            graph
+                .objective_nll
+                .as_ref()
+                .expect("beta diagnostics require the beta objective"),
+        ));
+        tensors.push(flat_f32(weight_mean_dof));
+        tensors.push(flat_f32(floor_share_dof));
     }
     Tensor::cat(&tensors, 0)
 }
@@ -9354,12 +9478,15 @@ fn read_packed_step_metrics(packed: &Tensor) -> [f64; STEP_METRIC_COUNT] {
         [
             STEP_METRIC_BASE_COUNT,
             STEP_METRIC_ROW_LR.end,
-            STEP_METRIC_COUNT,
+            STEP_METRIC_SMD_IDBD.end,
+            STEP_METRIC_BETA_NLL.end,
         ]
         .contains(&values.len()),
-        "packed step metrics carry {} entries, expected {STEP_METRIC_BASE_COUNT}, {}, or {STEP_METRIC_COUNT}",
+        "packed step metrics carry {} entries, expected {STEP_METRIC_BASE_COUNT}, {}, {}, or {}",
         values.len(),
         STEP_METRIC_ROW_LR.end,
+        STEP_METRIC_SMD_IDBD.end,
+        STEP_METRIC_BETA_NLL.end,
     );
     let mut out = [f64::NAN; STEP_METRIC_COUNT];
     out[..values.len()].copy_from_slice(&values);
@@ -9395,6 +9522,12 @@ fn ensure_finite_step_metrics(metrics: &[f64; STEP_METRIC_COUNT], step: usize) -
     ensure!(
         smd.iter().all(|value| value.is_nan()) || smd.iter().all(|value| value.is_finite()),
         "SMD-IDBD diagnostics are partially non-finite at step {step}: {smd:?}"
+    );
+    let beta_nll = &metrics[STEP_METRIC_BETA_NLL];
+    ensure!(
+        beta_nll.iter().all(|value| value.is_nan())
+            || beta_nll.iter().all(|value| value.is_finite()),
+        "beta-NLL diagnostics are partially non-finite at step {step}: {beta_nll:?}"
     );
     Ok(())
 }
@@ -9599,8 +9732,18 @@ fn print_banner(
     // `lambda_dyn` is swept over orders of magnitude, so a fixed three-decimal format would
     // print the sweep's whole lower half as `0.000` — i.e. as if the NextLat term were
     // switched off — in the one artifact that records which objective a run trained under.
+    let likelihood_objective = args.beta_nll.map_or_else(
+        || "proper Hard categorical NLL".to_owned(),
+        |beta| {
+            format!(
+                "categorical beta-NLL(beta={beta}): Hard NLL times stop-gradient \
+                 (fitted predictive variance / train-marginal variance)^beta, variance-ratio \
+                 floor {BETA_NLL_VARIANCE_FLOOR_RATIO:e}"
+            )
+        },
+    );
     println!(
-        "objective      hard categorical NLL + {:e}*dyn + {:e}*kl, dynamics horizon {}. \
+        "objective      {likelihood_objective} + {:e}*dyn + {:e}*kl, dynamics horizon {}. \
          `dyn` and `kl` are attached NextLat terms (arXiv 2511.05963); `dyn` is smooth_l1 \
          to the stop-gradient belief, meaned over every element of [B, T, {BAR_MODEL_DIM}] \
          exactly as the reference reduces it. Raw-payoff growth is EXCLUDED FROM THE OPTIMIZER \
@@ -10418,6 +10561,7 @@ mod tests {
             // The recipe default, so every trainer test in this file exercises the schedule
             // every persisted run was produced under.
             lr_plateau_fraction: LR_PLATEAU_FRACTION,
+            beta_nll: None,
             sdlr: false,
         }
     }
@@ -10452,6 +10596,32 @@ mod tests {
         assert!(validate_args(&args).is_err());
         args.ablation_lr = 1e-3;
         args.smd_meta_lr = f64::INFINITY;
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn beta_nll_validation_requires_one_isolated_exact_batch_arm() {
+        let dir = PathBuf::from(".");
+        let mut args = test_args(0x5EED, &dir);
+        args.beta_nll = Some(0.5);
+        args.exact_batch = true;
+        validate_args(&args).expect("the isolated beta-NLL arm is valid");
+
+        for invalid in [0.0, -0.1, 1.1, f64::NAN, f64::INFINITY] {
+            args.beta_nll = Some(invalid);
+            assert!(
+                validate_args(&args).is_err(),
+                "beta exponent {invalid} must be refused"
+            );
+        }
+        args.beta_nll = Some(0.5);
+        args.exact_batch = false;
+        assert!(validate_args(&args).is_err());
+        args.exact_batch = true;
+        args.sdlr = true;
+        assert!(validate_args(&args).is_err());
+        args.sdlr = false;
+        args.auxiliary_resolutions = vec![86_400];
         assert!(validate_args(&args).is_err());
     }
 
@@ -10940,6 +11110,7 @@ mod tests {
             &trainer.modules,
             &trainer.supports_dev,
             &growth_support,
+            None,
             &sample,
             &trainer.args,
             &mut trainer.optimizer,
@@ -11721,10 +11892,12 @@ mod tests {
     #[test]
     fn step_metrics_use_one_stable_packed_transfer_layout() {
         let scalar = |value: f32| Tensor::from(value);
-        let graph = TrainingGraph {
+        let mut graph = TrainingGraph {
             loss: scalar(1.0),
             nll: scalar(2.0),
             nll_dof: Tensor::from_slice(&[3.0f32, 4.0, 5.0, 6.0, 7.0]),
+            objective_nll: None,
+            beta_diagnostics: None,
             dyn_loss: scalar(8.0),
             kl_loss: scalar(9.0),
             growth_diagnostic: scalar(10.0),
@@ -11757,7 +11930,7 @@ mod tests {
 
         let smd = Tensor::arange(SMD_METRIC_COUNT as i64, (Kind::Float, Device::Cpu));
         let packed = pack_step_metrics(&graph, &scalar(16.0), None, Some(&smd));
-        assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
+        assert_eq!(packed.size(), [STEP_METRIC_SMD_IDBD.end as i64]);
         let read = read_packed_step_metrics(&packed);
         assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
         assert_eq!(
@@ -11766,6 +11939,31 @@ mod tests {
                 .map(|value| value as f64)
                 .collect::<Vec<_>>()
         );
+        graph.objective_nll = Some(scalar(17.0));
+        graph.beta_diagnostics = Some((
+            Tensor::from_slice(&[1.0f32, 1.1, 1.2, 1.3, 1.4]),
+            Tensor::from_slice(&[0.0f32, 0.1, 0.2, 0.3, 0.4]),
+        ));
+        let packed = pack_step_metrics(&graph, &scalar(16.0), None, None);
+        assert_eq!(packed.size(), [STEP_METRIC_COUNT as i64]);
+        let read = read_packed_step_metrics(&packed);
+        assert!(read[STEP_METRIC_ROW_LR].iter().all(|value| value.is_nan()));
+        assert!(read[STEP_METRIC_SMD_IDBD]
+            .iter()
+            .all(|value| value.is_nan()));
+        assert_eq!(read[STEP_METRIC_BETA_NLL_OBJECTIVE], 17.0);
+        for (actual, expected) in read[STEP_METRIC_BETA_NLL_WEIGHT]
+            .iter()
+            .zip([1.0, 1.1, 1.2, 1.3, 1.4])
+        {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        for (actual, expected) in read[STEP_METRIC_BETA_NLL_FLOOR]
+            .iter()
+            .zip([0.0, 0.1, 0.2, 0.3, 0.4])
+        {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
     }
 
     #[test]
@@ -12198,6 +12396,7 @@ mod tests {
                 horizon,
                 lambda_dyn,
                 lambda_kl,
+                None,
                 BarScoring::Density,
                 Device::Cpu,
             );
@@ -12266,6 +12465,7 @@ mod tests {
             horizon,
             0.0,
             0.0,
+            None,
             BarScoring::Density,
             Device::Cpu,
         );

@@ -68,6 +68,9 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // Strictly opt-in batch-step Schraudolph SMD-IDBD diagnostics.
     "pretrain_smd_idbd_gain",
     "pretrain_smd_idbd_credit",
+    // Strictly opt-in categorical beta-NLL objective and detached variance weights.
+    "pretrain_beta_nll_objective",
+    "pretrain_beta_nll_weights",
     "pretrain_grad_norm",
     "pretrain_unique_bar_reuse",
     "pretrain_stage_coverage",

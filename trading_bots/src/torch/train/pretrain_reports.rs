@@ -172,6 +172,11 @@ pub struct StepMetrics {
     pub step: usize,
     pub nll_bar: f64,
     pub nll_dof: [f64; BAR_DOF],
+    /// Categorical beta-NLL term attached to the optimizer, and its detached per-DOF
+    /// uncertainty weights. NaN outside the explicit beta-NLL arm.
+    pub beta_nll_objective: f64,
+    pub beta_nll_weight_mean_dof: [f64; BAR_DOF],
+    pub beta_nll_variance_floor_share_dof: [f64; BAR_DOF],
     pub dyn_loss: f64,
     pub kl_loss: f64,
     pub total_loss: f64,
@@ -274,6 +279,9 @@ impl StepMetrics {
             step: 0,
             nll_bar: f64::NAN,
             nll_dof: [f64::NAN; BAR_DOF],
+            beta_nll_objective: f64::NAN,
+            beta_nll_weight_mean_dof: [f64::NAN; BAR_DOF],
+            beta_nll_variance_floor_share_dof: [f64::NAN; BAR_DOF],
             dyn_loss: f64::NAN,
             kl_loss: f64::NAN,
             total_loss: f64::NAN,
@@ -1425,6 +1433,9 @@ struct StepAccumulator {
     steps: usize,
     nll_bar: Mean,
     nll_dof: [Mean; BAR_DOF],
+    beta_nll_objective: Mean,
+    beta_nll_weight_mean_dof: [Mean; BAR_DOF],
+    beta_nll_variance_floor_share_dof: [Mean; BAR_DOF],
     dyn_loss: Mean,
     kl_loss: Mean,
     total_loss: Mean,
@@ -1479,6 +1490,21 @@ impl StepAccumulator {
         self.steps += 1;
         self.nll_bar.push(step.nll_bar);
         for (slot, &value) in self.nll_dof.iter_mut().zip(step.nll_dof.iter()) {
+            slot.push(value);
+        }
+        self.beta_nll_objective.push(step.beta_nll_objective);
+        for (slot, &value) in self
+            .beta_nll_weight_mean_dof
+            .iter_mut()
+            .zip(step.beta_nll_weight_mean_dof.iter())
+        {
+            slot.push(value);
+        }
+        for (slot, &value) in self
+            .beta_nll_variance_floor_share_dof
+            .iter_mut()
+            .zip(step.beta_nll_variance_floor_share_dof.iter())
+        {
             slot.push(value);
         }
         self.dyn_loss.push(step.dyn_loss);
@@ -1561,6 +1587,9 @@ pub struct PretrainReporter {
     nll_bar_diag: Series,
     nll_dof_train: [Series; BAR_DOF],
     nll_dof_val: [Series; BAR_DOF],
+    beta_nll_objective: Series,
+    beta_nll_weight_mean_dof: [Series; BAR_DOF],
+    beta_nll_variance_floor_share_dof: [Series; BAR_DOF],
     vs_uniform_train: Series,
     vs_uniform_val: Series,
     vs_uniform_diag: Series,
@@ -1781,6 +1810,9 @@ impl PretrainReporter {
             nll_bar_diag: Series::default(),
             nll_dof_train: array::from_fn(|_| Series::default()),
             nll_dof_val: array::from_fn(|_| Series::default()),
+            beta_nll_objective: Series::default(),
+            beta_nll_weight_mean_dof: array::from_fn(|_| Series::default()),
+            beta_nll_variance_floor_share_dof: array::from_fn(|_| Series::default()),
             vs_uniform_train: Series::default(),
             vs_uniform_val: Series::default(),
             vs_uniform_diag: Series::default(),
@@ -2609,6 +2641,13 @@ impl PretrainReporter {
         for dof in 0..BAR_DOF {
             self.nll_dof_train[dof].set(tick, acc.nll_dof[dof].value());
         }
+        self.beta_nll_objective
+            .set(tick, acc.beta_nll_objective.value());
+        for dof in 0..BAR_DOF {
+            self.beta_nll_weight_mean_dof[dof].set(tick, acc.beta_nll_weight_mean_dof[dof].value());
+            self.beta_nll_variance_floor_share_dof[dof]
+                .set(tick, acc.beta_nll_variance_floor_share_dof[dof].value());
+        }
         self.dyn_loss.set(tick, acc.dyn_loss.value());
         self.kl_loss.set(tick, acc.kl_loss.value());
         self.total_loss.set(tick, acc.total_loss.value());
@@ -3273,6 +3312,43 @@ impl PretrainReporter {
             ScaleKind::Symlog,
             vec![self.grad_norm.labeled("grad norm", len)],
         )?;
+
+        if self.beta_nll_objective.measured() {
+            write_chart(
+                &dir,
+                "pretrain_beta_nll_objective",
+                format!("Pretrain Categorical Beta-NLL Objective - {suffix}"),
+                "record",
+                "nats/bar; proper Hard categorical NLL remains the validation and promotion \
+                 score, while beta-NLL is the variance-reweighted term attached to the optimizer",
+                ScaleKind::Linear,
+                vec![
+                    self.nll_bar_train.labeled("proper Hard NLL", len),
+                    self.beta_nll_objective.labeled("optimized beta-NLL", len),
+                ],
+            )?;
+            let mut series = Vec::with_capacity(2 * BAR_DOF);
+            for dof in 0..BAR_DOF {
+                series.push(
+                    self.beta_nll_weight_mean_dof[dof]
+                        .labeled(&format!("mean weight {}", BAR_DOF_NAMES[dof]), len),
+                );
+                series.push(
+                    self.beta_nll_variance_floor_share_dof[dof]
+                        .labeled(&format!("variance-floor share {}", BAR_DOF_NAMES[dof]), len),
+                );
+            }
+            write_chart(
+                &dir,
+                "pretrain_beta_nll_weights",
+                format!("Pretrain Categorical Beta-NLL Weights - {suffix}"),
+                "record",
+                "detached (predicted fitted-moment variance / train-marginal variance)^beta; \
+                 floor share is the fraction below the fixed numerical variance-ratio floor",
+                ScaleKind::Linear,
+                series,
+            )?;
+        }
 
         if self.sdlr_alpha_mean.measured() {
             write_chart(
@@ -9196,6 +9272,9 @@ mod tests {
             metrics.step = step;
             metrics.nll_bar = 24.0 - step as f64 * 0.01;
             metrics.nll_dof = [4.8; BAR_DOF];
+            metrics.beta_nll_objective = 23.5;
+            metrics.beta_nll_weight_mean_dof = [1.1; BAR_DOF];
+            metrics.beta_nll_variance_floor_share_dof = [0.0; BAR_DOF];
             metrics.dyn_loss = 0.5;
             metrics.kl_loss = 0.25;
             metrics.total_loss = 24.75;

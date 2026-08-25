@@ -3484,20 +3484,85 @@ impl BarTargets {
     }
 }
 
-/// Per-factor nats of `[..., BAR_DOF, NUM_BAR_BINS]` logits under the scoring rule
-/// `targets` was built with, reduced over the bin axis only: the result is
-/// `[..., BAR_DOF]`.
+/// Numerical floor on predicted variance relative to the train-marginal variance.
 ///
-/// [`bar_nll_from_logits`] averages this over every leading axis. Hard and density targets
-/// use an indexed gather; only smoothed targets perform dense soft-target cross entropy.
-pub fn bar_nll_terms(logits: &Tensor, targets: &BarTargets) -> Tensor {
-    let lead = factor_dims(logits, "logits");
-    assert_eq!(
-        targets.class_ids.size(),
-        with_tail(&lead, &[BAR_DOF as i64]),
-        "class IDs must match the logits' leading and DOF dimensions"
-    );
-    let log_probs = logits.log_softmax(-1, Kind::Float);
+/// The Gaussian formulation of beta-NLL has strictly positive variance by construction.
+/// A categorical law can put all mass on an atom with zero within-bin variance, so the
+/// generalized weight needs an explicit positive domain for a fractional exponent. This is
+/// numerical only: at beta=0 the ordinary Hard NLL path is used and remains bit-identical.
+pub const BETA_NLL_VARIANCE_FLOOR_RATIO: f64 = 1.0e-6;
+
+/// Fixed train-support geometry for the categorical generalization of beta-NLL.
+///
+/// Seitzer et al.'s beta-NLL weights each Gaussian NLL by a stop-gradient predicted variance
+/// raised to `beta`. This model predicts categoricals rather than Gaussians, so the analogous
+/// uncertainty is the categorical law's fitted within-bin plus between-bin variance. Dividing
+/// by the train-marginal variance standardizes the five differently-scaled bar factors and
+/// makes the marginal predictor's weight exactly one.
+#[derive(Debug)]
+pub(crate) struct CategoricalBetaNll {
+    beta: f64,
+    bin_mean: Tensor,
+    bin_within_variance: Tensor,
+    marginal_variance: Tensor,
+}
+
+pub(crate) struct CategoricalBetaNllLoss {
+    pub objective: Tensor,
+    pub proper_nll: Tensor,
+    pub proper_nll_dof: Tensor,
+    pub weight_mean_dof: Tensor,
+    pub variance_floor_share_dof: Tensor,
+}
+
+impl BarSupports {
+    pub(crate) fn categorical_beta_nll(&self, beta: f64) -> Result<CategoricalBetaNll> {
+        ensure!(
+            beta.is_finite() && beta > 0.0 && beta <= 1.0,
+            "categorical beta-NLL exponent must lie in (0, 1], got {beta}"
+        );
+        let moments = self
+            .bin_moments
+            .as_ref()
+            .context("categorical beta-NLL requires fitted per-bin moments")?;
+        let mut marginal_variance = [0.0f32; BAR_DOF];
+        for dof in 0..BAR_DOF {
+            let mean = self.masses[dof]
+                .iter()
+                .zip(&moments.mean[dof])
+                .map(|(probability, value)| probability * value)
+                .sum::<f64>();
+            let second = self.masses[dof]
+                .iter()
+                .zip(&moments.second[dof])
+                .map(|(probability, value)| probability * value)
+                .sum::<f64>();
+            let variance = second - mean * mean;
+            ensure!(
+                variance.is_finite() && variance > 0.0,
+                "categorical beta-NLL needs positive train-marginal variance for DOF {}, got \
+                 {variance}",
+                BAR_DOF_NAMES[dof]
+            );
+            marginal_variance[dof] = variance as f32;
+        }
+        let bin_mean = moments.mean_t.shallow_clone();
+        let bin_within_variance = (&moments.second_t - moments.mean_t.square()).clamp_min(0.0);
+        let marginal_variance = Tensor::from_slice(&marginal_variance).to_device(self.device);
+        Ok(CategoricalBetaNll {
+            beta,
+            bin_mean,
+            bin_within_variance,
+            marginal_variance,
+        })
+    }
+}
+
+fn bar_nll_terms_from_log_probs(
+    logits: &Tensor,
+    log_probs: &Tensor,
+    targets: &BarTargets,
+) -> Tensor {
     let cross_entropy = match &targets.probabilities {
         Some(probabilities) => {
             assert_eq!(
@@ -3512,6 +3577,76 @@ pub fn bar_nll_terms(logits: &Tensor, targets: &BarTargets) -> Tensor {
             .squeeze_dim(-1),
     };
     cross_entropy + targets.measure_or_zero(logits)
+}
+
+/// Per-factor nats of `[..., BAR_DOF, NUM_BAR_BINS]` logits under the scoring rule
+/// `targets` was built with, reduced over the bin axis only: the result is
+/// `[..., BAR_DOF]`.
+///
+/// [`bar_nll_from_logits`] averages this over every leading axis. Hard and density targets
+/// use an indexed gather; only smoothed targets perform dense soft-target cross entropy.
+pub fn bar_nll_terms(logits: &Tensor, targets: &BarTargets) -> Tensor {
+    let lead = factor_dims(logits, "logits");
+    assert_eq!(
+        targets.class_ids.size(),
+        with_tail(&lead, &[BAR_DOF as i64]),
+        "class IDs must match the logits' leading and DOF dimensions"
+    );
+    let log_probs = logits.log_softmax(-1, Kind::Float);
+    bar_nll_terms_from_log_probs(logits, &log_probs, targets)
+}
+
+impl CategoricalBetaNll {
+    pub(crate) fn loss(&self, logits: &Tensor, targets: &BarTargets) -> CategoricalBetaNllLoss {
+        assert_eq!(
+            targets.scoring(),
+            BarScoring::Hard,
+            "categorical beta-NLL is defined only over the canonical Hard target law"
+        );
+        let lead = factor_dims(logits, "logits");
+        assert_eq!(
+            targets.class_ids.size(),
+            with_tail(&lead, &[BAR_DOF as i64]),
+            "class IDs must match the logits' leading and DOF dimensions"
+        );
+        let log_probs = logits.log_softmax(-1, Kind::Float);
+        let proper_terms = bar_nll_terms_from_log_probs(logits, &log_probs, targets);
+        let probabilities = log_probs.exp();
+        let predicted_mean =
+            (&probabilities * &self.bin_mean).sum_dim_intlist([-1].as_slice(), true, Kind::Float);
+        let centered = &self.bin_mean - predicted_mean;
+        let predicted_variance = (probabilities * (&self.bin_within_variance + centered.square()))
+            .sum_dim_intlist([-1].as_slice(), false, Kind::Float);
+        let variance_ratio = &predicted_variance / &self.marginal_variance;
+        let floor_share = variance_ratio
+            .lt(BETA_NLL_VARIANCE_FLOOR_RATIO)
+            .to_kind(Kind::Float)
+            .reshape([-1, BAR_DOF as i64])
+            .mean_dim([0i64].as_slice(), false, Kind::Float);
+        let weight = variance_ratio
+            .clamp_min(BETA_NLL_VARIANCE_FLOOR_RATIO)
+            .pow_tensor_scalar(self.beta)
+            .detach();
+        let proper_nll_dof = proper_terms.reshape([-1, BAR_DOF as i64]).mean_dim(
+            [0i64].as_slice(),
+            false,
+            Kind::Float,
+        );
+        let weighted_nll_dof = (&proper_terms * &weight)
+            .reshape([-1, BAR_DOF as i64])
+            .mean_dim([0i64].as_slice(), false, Kind::Float);
+        let weight_mean_dof =
+            weight
+                .reshape([-1, BAR_DOF as i64])
+                .mean_dim([0i64].as_slice(), false, Kind::Float);
+        CategoricalBetaNllLoss {
+            objective: weighted_nll_dof.sum(Kind::Float),
+            proper_nll: proper_nll_dof.sum(Kind::Float),
+            proper_nll_dof,
+            weight_mean_dof,
+            variance_floor_share_dof: floor_share,
+        }
+    }
 }
 
 /// Nats per bar of `[..., BAR_DOF, NUM_BAR_BINS]` logits under the scoring rule `targets`
@@ -7028,6 +7163,63 @@ mod tests {
         println!(
             "teacher-forcing inflation on the synthetic fixture: {dependent_inflation:.4} \
              nats/bar dependent, {independent_inflation:.2e} independent"
+        );
+    }
+    #[test]
+    fn categorical_beta_nll_standardizes_the_marginal_law_to_unit_weight() {
+        let _torch_rng_guard = test_rng::shared();
+        let supports = synthetic_supports(20_000, 0xBE7A);
+        let beta_nll = supports
+            .categorical_beta_nll(0.5)
+            .expect("fitted supports carry beta-NLL geometry");
+        let mut rng = Rng::new(0xA11C_E);
+        let samples: Vec<BarDof> = (0..512).map(|_| synthetic_dof(&mut rng)).collect();
+        let target = dof_tensor(&samples);
+        let targets = supports.targets(&target, BarScoring::Hard);
+        let mut flat = Vec::with_capacity(BAR_DOF * NUM_BAR_BINS as usize);
+        for dof in 0..BAR_DOF {
+            flat.extend(
+                supports
+                    .bin_masses(dof)
+                    .iter()
+                    .map(|probability| (probability.max(1.0e-30) as f32).ln()),
+            );
+        }
+        let logits = Tensor::from_slice(&flat)
+            .view([1, BAR_DOF as i64, NUM_BAR_BINS])
+            .expand([samples.len() as i64, BAR_DOF as i64, NUM_BAR_BINS], false)
+            .contiguous()
+            .set_requires_grad(true);
+        let loss = beta_nll.loss(&logits, &targets);
+        let proper = loss.proper_nll.double_value(&[]);
+        let objective = loss.objective.double_value(&[]);
+        assert!(
+            (objective - proper).abs() < 2.0e-4,
+            "the train-marginal predictor must have unit beta weight: objective {objective}, \
+             proper NLL {proper}"
+        );
+        for dof in 0..BAR_DOF {
+            let weight = loss.weight_mean_dof.double_value(&[dof as i64]);
+            assert!(
+                (weight - 1.0).abs() < 2.0e-4,
+                "{} marginal beta weight is {weight}, expected one",
+                BAR_DOF_NAMES[dof]
+            );
+            assert_eq!(
+                loss.variance_floor_share_dof.double_value(&[dof as i64]),
+                0.0,
+                "{} unexpectedly hit the numerical variance floor",
+                BAR_DOF_NAMES[dof]
+            );
+        }
+        assert!(
+            !loss.weight_mean_dof.requires_grad(),
+            "beta weights must be stop-gradient"
+        );
+        loss.objective.backward();
+        assert!(
+            logits.grad().defined(),
+            "the reweighted categorical objective must remain differentiable"
         );
     }
 }
