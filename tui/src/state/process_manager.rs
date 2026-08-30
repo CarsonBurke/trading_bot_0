@@ -486,7 +486,7 @@ fn is_training_subcommand(arg: &str) -> bool {
 }
 
 fn run_dir_from_name(name: &str) -> Option<RunDir> {
-    RunDir::named(RUNS_PATH, name).ok()
+    RunDir::named_observable(RUNS_PATH, name).ok()
 }
 
 fn latest_observable_run() -> Option<RunDir> {
@@ -496,30 +496,24 @@ fn latest_observable_run() -> Option<RunDir> {
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter_map(|entry| {
             let root = entry.path();
-            let weights = root.join("weights");
-            if !weights.is_dir() || !has_observable_data(&root) {
+            if !has_observable_data(&root) {
                 return None;
             }
             let activity = [
                 root.clone(),
                 root.join("training.log"),
                 root.join("gens"),
-                weights.clone(),
+                root.join("weights"),
             ]
             .into_iter()
             .filter_map(|path| fs::metadata(path).ok()?.modified().ok())
             .max()?;
-            Some((activity, entry.file_name(), root, weights))
+            let run = RunDir::open_observable(&root).ok()?;
+            Some((activity, entry.file_name(), run))
         })
         .collect::<Vec<_>>();
     runs.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
-    let (_, _, root, weights) = runs.into_iter().next()?;
-    Some(RunDir {
-        gens: root.join("gens"),
-        log_file: root.join("training.log"),
-        root,
-        weights,
-    })
+    runs.into_iter().next().map(|(_, _, run)| run)
 }
 
 fn has_observable_data(root: &Path) -> bool {
