@@ -408,7 +408,7 @@ const MS_PER_DAY: i64 = 86_400_000;
 
 /// Relative slack allowed when asserting the gross constraint, absorbing the f64 rounding of
 /// the projection itself and nothing else.
-const GROSS_TOLERANCE: f64 = 1e-9;
+pub(super) const GROSS_TOLERANCE: f64 = 1e-9;
 
 /// Log10 wealth a DEAD book is drawn at, for the picture alone.
 ///
@@ -1778,7 +1778,7 @@ fn recovery_target_at_progress(
 fn recovery_target_for_limits(
     held: &[f64],
     participation_caps: &[f64],
-    effective: KellyConstraints,
+    mut effective: KellyConstraints,
     per_name_caps: Vec<f64>,
     recovery_progress: f64,
 ) -> Option<KellyEnvelope> {
@@ -1804,11 +1804,15 @@ fn recovery_target_for_limits(
 
     let reachable_net_min = lower.iter().sum::<f64>().max(effective.net_min);
     let reachable_net_max = upper.iter().sum::<f64>().min(effective.net_max);
-    if reachable_net_min > reachable_net_max {
+    if reachable_net_min > reachable_net_max + KELLY_SOLVER_TOLERANCE {
         return None;
     }
     let current_net = seed.iter().sum::<f64>();
-    let target_net = current_net.clamp(reachable_net_min, reachable_net_max);
+    let target_net = if reachable_net_min <= reachable_net_max {
+        current_net.clamp(reachable_net_min, reachable_net_max)
+    } else {
+        0.5 * (reachable_net_min + reachable_net_max)
+    };
     let mut remaining = target_net - current_net;
     if remaining > 0.0 {
         for (weight, hi) in seed.iter_mut().zip(&upper) {
@@ -1833,9 +1837,15 @@ fn recovery_target_for_limits(
         return None;
     }
     let gross = seed.iter().map(|weight| weight.abs()).sum::<f64>();
-    if gross > effective.gross_cap {
+    if gross > effective.gross_cap + GROSS_TOLERANCE {
         return None;
     }
+    // Feasibility accepts roundoff-sized overshoots above. Carry the same tolerance into the
+    // active envelope or the coordinate solver sees an empty interval at an immovable holding.
+    effective.gross_cap = effective.gross_cap.max(gross);
+    let seed_net = seed.iter().sum::<f64>();
+    effective.net_min = effective.net_min.min(seed_net);
+    effective.net_max = effective.net_max.max(seed_net);
     Some(KellyEnvelope {
         constraints: effective,
         per_name_caps,
@@ -8304,6 +8314,49 @@ mod tests {
         .unwrap();
         assert_eq!(action.target, vec![0.8]);
         assert!(action.objective.is_finite() && action.expected_cost.is_finite());
+    }
+
+    #[test]
+    fn recovery_envelope_accepts_an_ulp_tight_immovable_frontier() {
+        let names = 48;
+        let mut held: Vec<f64> = vec![0.0; names];
+        for index in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12] {
+            held[index] = 0.05;
+        }
+        held[13] = 0.027_678_169_248_562_98;
+        held[8] = -0.05;
+        for weight in held.iter_mut().take(20).skip(14) {
+            *weight = -0.05;
+        }
+        held[20] = -0.026_371_766_303_138_42;
+        assert!((held.iter().map(|weight| weight.abs()).sum::<f64>() - 1.004_049_935_551_701_4).abs() < 1.0e-14);
+        assert!((held.iter().sum::<f64>() - 0.251_306_402_945_424_6).abs() < 1.0e-14);
+
+        let mut adv = vec![0.0; names];
+        adv[8] = 7.317_740_423_100_693e9;
+        let constraints = KellyConstraints {
+            gross_cap: 1.0,
+            net_min: -0.25,
+            net_max: 0.25,
+            per_name_cap: 0.05,
+            max_adv_participation: 0.005,
+        };
+        let action = solve_cost_aware_kelly(
+            &(0..names as u32).collect::<Vec<_>>(),
+            &vec![0.0; names],
+            &FactorCovariance::independent(vec![0.01; names]),
+            &held,
+            &adv,
+            1,
+            1.0e7,
+            &FlatCost::new(10.0),
+            constraints,
+        )
+        .expect("the zero-progress recovery frontier must remain numerically feasible");
+        let before = portfolio_violations(&held, constraints);
+        let after = portfolio_violations(&action.target, constraints);
+        assert!(after.0 <= before.0 + GROSS_TOLERANCE);
+        assert!(after.1 <= before.1 + KELLY_SOLVER_TOLERANCE);
     }
 
     #[test]
