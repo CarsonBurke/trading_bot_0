@@ -1,0 +1,116 @@
+{
+  "spec_version": 3,
+  "note": "Refusal-safe pinned template for audit Part 3. Raw and standardized supports were fitted from the same authenticated corpus, split, 4,000,000-sample population, and seed 24301. It intentionally has no s_seed, so it refuses before mlq submission until current-schema control noise is measured.",
+
+  "defaults": {
+    "launcher": "./torch-env.sh",
+    "launcher_sha256": "df35eee0966350f9c2fd3ae5a514fd507c73adf6c10e4a968d12508218b10738",
+    "executable": "training/campaign_binaries/wave0-v5-recovered-9791829f",
+    "executable_sha256": "9791829f9c60632294df36fe3fb26e1071d177625b045f08ab424eddae72335b",
+    "mlq_max_parallel_runs": 1,
+    "mlq_time_limit": "12h",
+    "runs_dir": "training/runs",
+    "ledger": "training/campaign_ledger.jsonl",
+    "diagnostic_context": 896,
+    "resolution_secs": 300,
+    "supports": "long_data/bars/bar_supports.raw.300.seed24301.v6.json",
+    "supports_sha256": "58c87dfc2f9dbba4e45981d8b07d4ec7d5befbe79ed898a63e1dda8f78344d45",
+    "market_supports": "long_data/bars/bar_market_supports.300.json",
+    "market_supports_sha256": "8795b9b9c2c15440bb11be3f56333ac5dfd5fa46329cc534a9cc96d55c0ba2c9",
+    "common_flags": [
+      "--split-bounds", "1759839000000,1773427500000",
+      "--freeze-supports",
+      "--freeze-market-supports",
+      "--exact-batch",
+      "--batch-size", "24",
+      "--epochs", "1",
+      "--validate-every", "1000"
+    ],
+    "note": "Every controlled arm resolves the 2025-10-07T12:10:00Z / 2026-03-13T18:45:00Z split, frozen target and market supports, and exact batch 24. Geometry-preserving arms use the campaign raw v6 supports authenticated by supports_sha256; a geometry-changing arm must name its own supports and supports_sha256 explicitly. Both target geometries authenticate corpus 334ee0f1a975, 4,000,000 fit samples, and seed 24301. Launcher, executable, target supports, and market supports are full-digest pins rechecked by each MLQ worker before exec."
+  },
+
+  "tiers": {
+    "screen": {
+      "steps": 3000,
+      "validation_windows": 2048,
+      "seeds": [24301, 24302, 24303],
+      "note": "3000 steps lands on clean validation boundaries (1000/2000/2999) and floor(0.40*3000)=1200 fully anneals to the 0.15 LR floor. All controlled arms use the same three W0.5 seeds and the same 2048-window prefix."
+    },
+    "confirm": {
+      "steps": 6500,
+      "validation_windows": 4096,
+      "seeds": [24301, 24302, 24303],
+      "artifact": "pretrain_best",
+      "run_tag": "confirm",
+      "note": "Full stage 0. Confirmation consumes promoted pretrain_best.windows.json, whose trade summary is mandatory for the binding saturation and ruin tripwires; it must never fall back to a trade-free diagnostic sidecar. Three seeds is what makes s_seed^2/3 in the carry threshold real."
+    },
+    "deploy": {
+      "steps": 19635,
+      "validation_windows": 4096,
+      "context": 2048,
+      "artifact": "pretrain_best",
+      "seeds": [24301, 24302, 24303],
+      "note": "Deployed context, so the comparator artifact is pretrain_best.windows.json rather than the diag896 sidecar. Promotion-eligible only.",
+      "note-run-tag": "run_tag defaults to the tier name and is appended to every run name, because 3.4's <wave><n>_<stack-hash>_s<seed> does not distinguish tiers and the same arm and seed run at both screen and confirm would collide in RunDir::create_fresh. Set \"run_tag\": \"\" for the audit's literal form."
+    }
+  },
+
+  "note-s-seed": "There is deliberately NO `s_seed` key here. Until W0.5 has measured the between-seed sd, the driver refuses every cull decision rather than defaulting one. When it has been measured, add: \"s_seed\": {\"screen\": {\"edge_difference\": <sd>, \"model_growth_difference\": <sd>}}, \"s_seed_provenance\": \"<the three control run names and the step read>\" — the provenance string is mandatory, because a threshold denominated in an unattributed number is not justifiable from the ledger later. Both can also be passed on the command line as --s-seed screen:edge_difference=<sd> --s-seed-provenance '<...>'.",
+
+  "arms": [
+    {
+      "name": "control",
+      "wave": "0",
+      "control": true,
+      "class": "geometry_preserving",
+      "flags": [],
+      "note": "W0.5 noise floor and the incumbent of every arm with an empty carried stack. Unmodified defaults: no flags beyond defaults.common_flags."
+    },
+    {
+      "name": "B1",
+      "wave": "B",
+      "class": "geometry_preserving",
+      "carried_stack": [],
+      "flags": ["--direct-t2-weight", "1.0", "--direct-t3-weight", "1.0"],
+      "note": "T1.3. The direct t+2/t+3 heads already execute at weight 0 for matched compute, so the control pays for them and gets nothing."
+    },
+    {
+      "name": "B2",
+      "wave": "B",
+      "class": "geometry_preserving",
+      "carried_stack": [],
+      "flags": ["--lr-plateau-fraction", "0.85"],
+      "note": "T2.4, a calibration arm. Success is the MZ slope moving from 0.6653 toward the 1.0058 measured at the plateau operating point, so the guard is the number that matters here, not the primary."
+    },
+    {
+      "name": "C1",
+      "wave": "C",
+      "class": "geometry_preserving",
+      "carried_stack": ["B1"],
+      "incumbent": "B1",
+      "flags": ["--dof-loss-weight-w", "0.0"],
+      "note": "T1.2. Zero headroom on w, so its gradient is pure noise into a shared trunk. FLAG NAME IS A PLACEHOLDER: Wave C is 'small code' in 3.2 and the flag does not exist yet; the driver passes arm flags through verbatim and does not validate them."
+    },
+    {
+      "name": "E1",
+      "wave": "E",
+      "class": "geometry_changing",
+      "supports": "long_data/bars/bar_supports.volstd.300.seed24301.v8.json",
+      "supports_sha256": "af3070feae1aa17ed1794d483521c35291f0878c1666bca8613a7230aa73ed2a",
+      "flags": ["--vol-standardize-targets"],
+      "note": "T1.1 changes only the target scaling and its resulting authenticated v8 geometry. Its supports match the control on corpus 334ee0f1a975, split bounds, 4,000,000 fit samples, seed 24301, market supports, executable, training seeds, and compute contract."
+    },
+    {
+      "name": "F4",
+      "wave": "F",
+      "class": "geometry_preserving",
+      "carried_stack": ["B1"],
+      "incumbent": "B1",
+      "tiers": ["confirm"],
+      "exempt_from_cull": true,
+      "exempt_reason": "Correctness arm (T3.3 embargo at the train/val seam). Expected to make measured numbers slightly WORSE and adopted regardless of sign (3.2 Wave F). Only a non-finite loss blocks adoption.",
+      "flags": ["--seam-embargo-bars", "2048"],
+      "note": "Wave F enters at confirm tier, skipping screen, because a 3000-step screen is biased AGAINST capacity/correctness arms. FLAG NAME IS A PLACEHOLDER."
+    }
+  ]
+}
