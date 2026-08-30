@@ -81,6 +81,7 @@ void at_cuda_empty_cache();
 void at_backward(tensor, int, int);
 int at_requires_grad(tensor);
 int at_grad_set_enabled(int);
+int at_autograd_set_multithreading_enabled(int);
 
 tensor at_get(tensor, int index);
 void at_fill_double(tensor, double);

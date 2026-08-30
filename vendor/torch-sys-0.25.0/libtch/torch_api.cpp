@@ -321,6 +321,13 @@ int at_grad_set_enabled(int b) {
   return -1;
 }
 
+int at_autograd_set_multithreading_enabled(int b) {
+  PROTECT(auto &state = c10::AutogradState::get_tls_state();
+          bool is_enabled = state.get_multithreading_enabled();
+          state.set_multithreading_enabled(b); return is_enabled;)
+  return -1;
+}
+
 tensor at_get(tensor t, int index) {
   PROTECT(return new torch::Tensor((*t)[index]);)
   return nullptr;
