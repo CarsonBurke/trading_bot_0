@@ -174,6 +174,17 @@ impl RunDir {
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let run = Self::open_observable(root)?;
+        if !run.weights.is_dir() {
+            bail!("weights dir does not exist: {}", run.weights.display());
+        }
+        Ok(run)
+    }
+
+    /// Open a run for report/log viewing. Training artifacts may not exist for screen-only,
+    /// interrupted, or externally prepared runs, so only the root and generation directory are
+    /// required.
+    pub fn open_observable(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let gens = root.join("gens");
         let weights = root.join("weights");
@@ -184,9 +195,6 @@ impl RunDir {
         }
         if !gens.is_dir() {
             bail!("gens dir does not exist: {}", gens.display());
-        }
-        if !weights.is_dir() {
-            bail!("weights dir does not exist: {}", weights.display());
         }
 
         Ok(Self {
@@ -200,6 +208,11 @@ impl RunDir {
     pub fn named(runs_path: impl AsRef<Path>, name: &str) -> Result<Self> {
         validate_run_name(name)?;
         Self::open(runs_path.as_ref().join(name))
+    }
+
+    pub fn named_observable(runs_path: impl AsRef<Path>, name: &str) -> Result<Self> {
+        validate_run_name(name)?;
+        Self::open_observable(runs_path.as_ref().join(name))
     }
 
     pub fn select(runs_path: impl AsRef<Path>, name: &str) -> Result<Self> {
@@ -272,7 +285,8 @@ impl RunDir {
         None
     }
 
-    /// Scan runs newest-to-oldest, return the first whose gens dir is non-empty.
+    /// Scan runs newest-to-oldest, return the first whose gens dir is non-empty. Report-only
+    /// runs are valid results even when they never produced a weights directory.
     pub fn latest_with_data(runs_path: &str) -> Option<Self> {
         if let Ok(run) = Self::latest(runs_path) {
             if has_generation_data(&run.gens) {
@@ -290,16 +304,10 @@ impl RunDir {
 
         for entry in dirs {
             let root = entry.path();
-            let gens = root.join("gens");
-            if has_generation_data(&gens) {
-                let weights = root.join("weights");
-                let log_file = root.join("training.log");
-                return Some(Self {
-                    root,
-                    gens,
-                    weights,
-                    log_file,
-                });
+            if has_generation_data(&root.join("gens")) {
+                if let Ok(run) = Self::open_observable(root) {
+                    return Some(run);
+                }
             }
         }
         None
@@ -447,6 +455,26 @@ mod tests {
 
         first.activate(&runs).unwrap();
         assert_eq!(RunDir::latest(runs_str).unwrap().root, first.root);
+        fs::remove_dir_all(runs).unwrap();
+    }
+
+    #[test]
+    fn observable_run_does_not_require_training_weights() {
+        let runs = temp_runs();
+        let run = RunDir::create_fresh(runs.to_str().unwrap(), Some("reports-only")).unwrap();
+        fs::write(run.gens.join("pretrain_metric.report.bin"), b"report").unwrap();
+        fs::remove_dir_all(&run.weights).unwrap();
+
+        assert!(RunDir::named(&runs, "reports-only").is_err());
+        let observable = RunDir::named_observable(&runs, "reports-only").unwrap();
+        assert_eq!(observable.root, run.root);
+        assert_eq!(
+            RunDir::latest_with_data(runs.to_str().unwrap())
+                .unwrap()
+                .root,
+            run.root
+        );
+
         fs::remove_dir_all(runs).unwrap();
     }
 

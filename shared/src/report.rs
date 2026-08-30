@@ -49,6 +49,10 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     "pretrain_kl_loss",
     "pretrain_total_loss",
     "pretrain_loss_shares",
+    "pretrain_direct_horizon_nll",
+    "pretrain_direct_objective",
+    "pretrain_direct_gradients",
+    "pretrain_direct_timing",
     "pretrain_growth_term",
     "pretrain_belief_autocorr",
     "pretrain_dyn_vs_identity",
@@ -92,6 +96,32 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     "pretrain_trade_cap_curve",
     "pretrain_trade_free_kelly",
     "pretrain_trade_tail",
+    // The VOLATILITY half of the same validation, on the same record-tick axis. Every base
+    // above scores the conditional MEAN, which on 5-minute bars carries an `R^2` of order
+    // `1e-3`; the bar's own variance is the quantity this corpus can actually predict, and
+    // until these two existed nothing anywhere said whether the model beats a three-parameter
+    // HAR-RV regression at it. Two bases because they are different objects: the first is the
+    // LEVEL of each forecaster's QLIKE plus its measured level bias, and the second is the
+    // PAIRED difference against the HAR baseline with its block-bootstrap interval, which is
+    // not recoverable from four independently-intervalled levels.
+    "pretrain_vol_qlike",
+    "pretrain_vol_vs_har",
+    // The TARGET side of the same run: not what the model predicts, but what it was asked to
+    // predict. All three are measured once on the evaluation split by
+    // `BarCorpus::audit_target_geometry` before step zero, and all three are written on EVERY
+    // run rather than only on the standardized arm — a per-symbol occupancy spread means
+    // nothing without the control's spread beside it, and a chart the control does not write
+    // cannot supply one.
+    //
+    // Three bases because they are three different objects on three different axes and none is
+    // recoverable from another: the DIVISOR's own distribution and its two correctness
+    // tripwires, the QUOTIENT's scale and shape as the supports fitter receives it, and what
+    // the quotient does to the 128-bin grid the emission head actually predicts on, decomposed
+    // BY SYMBOL because a pooled equal-mass histogram is balanced by construction on either
+    // parametrization and therefore cannot see the defect at all.
+    "pretrain_sigma_dist",
+    "pretrain_target_scale",
+    "pretrain_bin_occupancy",
     // The EPOCH-INDEXED panel. Distinct bases from the trade series above on purpose:
     // those are the dense record-tick curves measured at every validation, these are one
     // point per pass over the corpus. Neither is derivable from the other and neither
@@ -138,6 +168,17 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // neither is producible from inside a training cycle.
     "pretrain_mean_calibration",
     "pretrain_shrunk_policy",
+    // Written by `pretrain_reports::write_sizing_rule_chart`, from the SAME pass that sized
+    // the book, and present only when that pass sized on something other than the control
+    // rule. Indexed by LEVERAGE CAP and not derivable from any base above: every other
+    // `pretrain_trade_*` base conditions on whatever rule was in force and cannot say what
+    // the rule it replaced would have done on the same bars, while `pretrain_shrunk_policy`
+    // is the offline two-pass comparison of a fraction the incumbent did NOT trade. This one
+    // is the in-run, promotion-deciding difference: exact expected-log versus its
+    // second-order surrogate and/or recalibrated versus raw mean, paired window by window at
+    // every cap, with both Mincer-Zarnowitz slopes — the APPLIED one and the MEASURED one —
+    // as reference lines and the count of control bars whose optimum left the ruin domain.
+    "pretrain_sizing_rule",
     // Written by the same writer, from the same two passes: the COST-AWARE sizing axis.
     // `trade_bench`'s Kelly solve maximizes `E[ln(1 + f R)]`, which carries no cost term, so
     // the position is chosen frictionlessly and the charge is levied afterwards on whatever
@@ -188,6 +229,15 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // different quantities. Distinct from `pretrain_horizon_frontier`, which scores POLICIES
     // under two constructions rather than the bare signal.
     "pretrain_signal_decay",
+    // The INFORMATION COEFFICIENT of the same signal at the same horizons, with intervals.
+    // Separate from `pretrain_signal_decay` because that base's `corr` column is a single
+    // pooled Pearson number with no interval, and neither of the two statements this base
+    // makes is recoverable from it: a rank correlation bounds every bar's influence, which a
+    // moment statistic on a kurtosis-of-tens regressand does not, and it is invariant to any
+    // monotone reparameterization of either axis, which makes it the only directional metric
+    // here that survives a change of the `r` bin geometry. Both the rank and the Pearson
+    // version are charted with block-bootstrap bands so the gap between them is readable.
+    "pretrain_rank_ic",
     // Written by `trading_bots::torch::train::skill::write_skill_profile`: the DIRECTIONAL
     // skill of the predictor, scored with no trading policy anywhere in the measurement.
     // Decile-indexed rather than step-indexed - the x axis is the model's own confidence, not
@@ -217,6 +267,10 @@ pub const PRETRAIN_REPORT_BASES: &[&str] = &[
     // solver at the fixed trade_bench::BAND_FRACTIONS widths; locked test never writes this
     // grid, and no marginal arm or additional inference is involved.
     "pretrain_receding_policy_frontier",
+    // Validation-only selected-H causal forecast-moment EMA frontier. It reuses the cached
+    // forecast panel and unchanged cost-aware solver, pairing fixed half-lives against the raw
+    // Model and Marginal runs on identical decision rows. Locked test never writes this grid.
+    "pretrain_receding_persistence",
     // Optional selected-H two-row evidence for one predeclared causal mean-sign hysteresis
     // margin against the cached raw incumbent. It is absent unless explicitly requested and
     // never expands into a locked-test policy-selection grid.

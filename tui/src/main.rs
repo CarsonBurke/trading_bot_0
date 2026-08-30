@@ -951,7 +951,7 @@ impl App {
     }
 
     fn switch_to_run(&mut self, name: &str) -> Result<()> {
-        let run = RunDir::named(RUNS_PATH, name)?;
+        let run = RunDir::named_observable(RUNS_PATH, name)?;
         let is_live = self
             .process_manager
             .live_run()
@@ -1187,7 +1187,23 @@ mod planner_inference_discovery_tests {
             );
         }
         assert!(bases.contains(&"pretrain_teacher_forced_rollout_score"));
+        // The volatility half of the trade bench and the interval'd information coefficient.
+        // Spot-checked by name on top of the registry sweep above for the same reason the
+        // ancestral family is: these are the panels a reader goes looking for to answer "does
+        // the model beat HAR-RV", and a rename that silently dropped one would leave the
+        // sweep passing against a registry that no longer mentions them.
+        for volatility in [
+            "pretrain_vol_qlike",
+            "pretrain_vol_vs_har",
+            "pretrain_rank_ic",
+        ] {
+            assert!(
+                bases.contains(&volatility),
+                "{volatility} must be scanned by meta_chart_bases"
+            );
+        }
         assert!(bases.contains(&"pretrain_recirculation_sweep"));
+        assert!(bases.contains(&"pretrain_receding_persistence"));
         for sdlr in ["pretrain_sdlr_alpha", "pretrain_sdlr_evidence"] {
             assert!(
                 bases.contains(&sdlr),
